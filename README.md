@@ -265,11 +265,16 @@ realscript/
 - 快照、回放和时间旅行调试；
 - 可选 LLVM ORC JIT。
 
-## 设计文档
-
-完整设计见：
+## 设计与规范文档
 
 - [RealScript 游戏脚本引擎总体设计](docs/ENGINE_DESIGN.md)
+- [规范文档索引](docs/spec/README.md)
+- [语言规范 Draft v0.1](docs/spec/LANGUAGE_SPEC.md)
+- [Typed MIR 规范 Draft v0.1](docs/spec/MIR_SPEC.md)
+- [运行时模型规范 Draft v0.1](docs/spec/RUNTIME_MODEL.md)
+- [字节码与原生 ABI 规范 Draft v0.1](docs/spec/BYTECODE_AND_ABI.md)
+
+规范草案用于建立实现和测试边界，尚未承诺源代码、字节码或 ABI 的稳定兼容性。
 
 ## 主要参考项目
 
@@ -291,8 +296,9 @@ RealScript 不直接复制任何单一项目，而是重点研究下列系统的
 - [x] 确立字节码解释 + C++17 AOT 双后端；
 - [x] 确立统一 HIR/MIR、Runtime ABI 和元数据模型；
 - [x] 确立 DAP/LSP、热重载和确定性目标；
-- [ ] 完成语言规范 v0.1；
-- [ ] 冻结首版 MIR 和字节码格式；
+- [x] 建立语言规范 v0.1 草案；
+- [x] 建立 MIR、运行时、字节码与原生 ABI 规范草案；
+- [ ] 冻结首版 MIR 和字节码物理格式；
 - [ ] 建立 C++17 工程骨架；
 - [ ] 实现最小编译器与解释器闭环；
 - [ ] 建立基准测试与差分测试。
