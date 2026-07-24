@@ -47,6 +47,9 @@ enum class SyntaxKind {
     ModuleKeyword,
     ImportKeyword,
     ReturnKeyword,
+    IfKeyword,
+    ElseKeyword,
+    WhileKeyword,
     TrueKeyword,
     FalseKeyword,
     NullKeyword,
@@ -72,12 +75,15 @@ enum class SyntaxKind {
     TypeName,
     BlockStatement,
     ReturnStatement,
+    IfStatement,
+    WhileStatement,
     VariableDeclarationStatement,
     ExpressionStatement,
     LiteralExpression,
     NameExpression,
     UnaryExpression,
     BinaryExpression,
+    AssignmentExpression,
     ParenthesizedExpression,
     CallExpression,
 };
@@ -166,6 +172,15 @@ struct BinaryExpressionSyntax final : ExpressionSyntax {
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
+struct AssignmentExpressionSyntax final : ExpressionSyntax {
+    SyntaxToken identifierToken;
+    SyntaxToken equalsToken;
+    std::unique_ptr<ExpressionSyntax> expression;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::AssignmentExpression; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
 struct ParenthesizedExpressionSyntax final : ExpressionSyntax {
     SyntaxToken openParenToken;
     std::unique_ptr<ExpressionSyntax> expression;
@@ -192,6 +207,30 @@ struct ReturnStatementSyntax final : StatementSyntax {
     SyntaxToken semicolonToken;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ReturnStatement; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct IfStatementSyntax final : StatementSyntax {
+    SyntaxToken ifKeyword;
+    SyntaxToken openParenToken;
+    std::unique_ptr<ExpressionSyntax> condition;
+    SyntaxToken closeParenToken;
+    std::unique_ptr<StatementSyntax> thenStatement;
+    std::optional<SyntaxToken> elseKeyword;
+    std::unique_ptr<StatementSyntax> elseStatement;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::IfStatement; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct WhileStatementSyntax final : StatementSyntax {
+    SyntaxToken whileKeyword;
+    SyntaxToken openParenToken;
+    std::unique_ptr<ExpressionSyntax> condition;
+    SyntaxToken closeParenToken;
+    std::unique_ptr<StatementSyntax> body;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::WhileStatement; }
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
@@ -300,13 +339,16 @@ private:
     [[nodiscard]] BlockStatementSyntax parseBlockStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseReturnStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseIfStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseWhileStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseVariableDeclarationStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseExpressionStatement();
-    [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseExpression(int parentPrecedence = 0);
+    [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseExpression();
+    [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseAssignmentExpression();
+    [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseBinaryExpression(int parentPrecedence = 0);
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parsePrimaryExpression();
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseCallExpression();
     [[nodiscard]] bool isVariableDeclarationStart() const noexcept;
-    void synchronizeMember();
 
     const text::SourceText& source_;
     diagnostics::DiagnosticBag& diagnostics_;

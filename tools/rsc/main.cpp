@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -58,7 +59,11 @@ int main(int argc, char** argv) {
 
             if (mode == "--mir" && !diagnostics.hasErrors()) {
                 realscript::mir::Lowerer lowerer;
-                std::cout << realscript::mir::printModule(lowerer.lower(semanticModel));
+                const auto module = lowerer.lower(semanticModel);
+                (void)realscript::mir::verifyModule(module, diagnostics);
+                if (!diagnostics.hasErrors()) {
+                    std::cout << realscript::mir::printModule(module);
+                }
             } else if (mode != "--check") {
                 printUsage();
                 return 2;

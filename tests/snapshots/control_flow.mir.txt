@@ -1,0 +1,58 @@
+module Demo.Flow
+
+func @clamp(int, int) -> int {
+  locals [0:int, 1:int, 2:int]
+bb0:
+  %0:int = param 0
+  store.local 0, %0
+  %1:int = param 1
+  store.local 1, %1
+  %2:int = load.local 0
+  %3:int = const.i32 0
+  %4:bool = lt.i32 %2, %3
+  br %4, bb1, bb2
+bb1:
+  %5:int = const.i32 0
+  store.local 2, %5
+  jmp bb3
+bb2:
+  %6:int = load.local 0
+  store.local 2, %6
+  jmp bb3
+bb3:
+  jmp bb4
+bb4:
+  %7:int = load.local 2
+  %8:int = load.local 1
+  %9:bool = gt.i32 %7, %8
+  br %9, bb5, bb6
+bb5:
+  %10:int = load.local 2
+  %11:int = const.i32 1
+  %12:int = sub.i32 %10, %11
+  store.local 2, %12
+  jmp bb4
+bb6:
+  %13:int = load.local 2
+  ret %13
+}
+
+func @guarded(bool, int) -> bool {
+  locals [0:bool, 1:int]
+bb0:
+  %0:bool = param 0
+  store.local 0, %0
+  %1:int = param 1
+  store.local 1, %1
+  %2:bool = load.local 0
+  %4:bool = const.bool false
+  br %2, bb1, bb2(%4)
+bb1:
+  %5:int = load.local 1
+  %6:int = const.i32 0
+  %7:bool = gt.i32 %5, %6
+  jmp bb2(%7)
+bb2(%3:bool):
+  ret %3
+}
+

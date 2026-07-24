@@ -44,8 +44,11 @@ enum class BoundNodeKind {
     VariableExpression,
     UnaryExpression,
     BinaryExpression,
+    AssignmentExpression,
     BlockStatement,
     ReturnStatement,
+    IfStatement,
+    WhileStatement,
     VariableDeclarationStatement,
     ExpressionStatement,
 };
@@ -113,6 +116,12 @@ struct BoundBinaryExpression final : BoundExpression {
     [[nodiscard]] BoundNodeKind kind() const noexcept override { return BoundNodeKind::BinaryExpression; }
 };
 
+struct BoundAssignmentExpression final : BoundExpression {
+    VariableSymbol variable;
+    std::unique_ptr<BoundExpression> expression;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override { return BoundNodeKind::AssignmentExpression; }
+};
+
 struct BoundBlockStatement final : BoundStatement {
     std::vector<std::unique_ptr<BoundStatement>> statements;
     [[nodiscard]] BoundNodeKind kind() const noexcept override { return BoundNodeKind::BlockStatement; }
@@ -121,6 +130,19 @@ struct BoundBlockStatement final : BoundStatement {
 struct BoundReturnStatement final : BoundStatement {
     std::unique_ptr<BoundExpression> expression;
     [[nodiscard]] BoundNodeKind kind() const noexcept override { return BoundNodeKind::ReturnStatement; }
+};
+
+struct BoundIfStatement final : BoundStatement {
+    std::unique_ptr<BoundExpression> condition;
+    std::unique_ptr<BoundStatement> thenStatement;
+    std::unique_ptr<BoundStatement> elseStatement;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override { return BoundNodeKind::IfStatement; }
+};
+
+struct BoundWhileStatement final : BoundStatement {
+    std::unique_ptr<BoundExpression> condition;
+    std::unique_ptr<BoundStatement> body;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override { return BoundNodeKind::WhileStatement; }
 };
 
 struct BoundVariableDeclarationStatement final : BoundStatement {
@@ -158,9 +180,15 @@ private:
     [[nodiscard]] std::unique_ptr<BoundBlockStatement> bindBlockStatement(
         const syntax::BlockStatementSyntax& syntax,
         bool createScope);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindEmbeddedStatement(
+        const syntax::StatementSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundStatement> bindStatement(const syntax::StatementSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundStatement> bindReturnStatement(
         const syntax::ReturnStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindIfStatement(
+        const syntax::IfStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindWhileStatement(
+        const syntax::WhileStatementSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundStatement> bindVariableDeclaration(
         const syntax::VariableDeclarationStatementSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundStatement> bindExpressionStatement(
@@ -175,6 +203,8 @@ private:
         const syntax::UnaryExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindBinaryExpression(
         const syntax::BinaryExpressionSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundExpression> bindAssignmentExpression(
+        const syntax::AssignmentExpressionSyntax& syntax);
 
     [[nodiscard]] PrimitiveType bindType(const syntax::TypeSyntax& syntax, bool allowVoid);
     [[nodiscard]] const VariableSymbol* lookupVariable(const std::string& name) const noexcept;
@@ -187,7 +217,6 @@ private:
     std::vector<std::unordered_map<std::string, VariableSymbol>> scopes_;
     PrimitiveType currentReturnType_ = PrimitiveType::Error;
     std::size_t nextVariableIndex_ = 0;
-    bool sawReturn_ = false;
 };
 
 } // namespace realscript::semantic

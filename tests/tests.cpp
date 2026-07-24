@@ -4,7 +4,9 @@
 #include "realscript/syntax/Syntax.h"
 #include "realscript/text/Text.h"
 
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -16,6 +18,45 @@ void require(bool condition, const std::string& message) {
     }
 }
 
+std::string readFile(const std::string& path) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        throw std::runtime_error("cannot read fixture: " + path);
+    }
+    std::ostringstream out;
+    out << stream.rdbuf();
+    return out.str();
+}
+
+bool containsDiagnostic(
+    const realscript::diagnostics::DiagnosticBag& diagnostics,
+    const std::string& code) {
+    for (const auto& diagnostic : diagnostics.items()) {
+        if (diagnostic.code == code) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string lowerSource(
+    const std::string& sourceText,
+    realscript::diagnostics::DiagnosticBag& diagnostics,
+    const std::string& name = "test.rs") {
+    realscript::text::SourceText source(sourceText, name);
+    realscript::syntax::Parser parser(source, diagnostics);
+    auto unit = parser.parseCompilationUnit();
+    realscript::semantic::Binder binder(diagnostics);
+    auto model = binder.bind(unit);
+    if (diagnostics.hasErrors()) {
+        return {};
+    }
+    realscript::mir::Lowerer lowerer;
+    const auto module = lowerer.lower(model);
+    (void)realscript::mir::verifyModule(module, diagnostics);
+    return diagnostics.hasErrors() ? std::string{} : realscript::mir::printModule(module);
+}
+
 void testSourceTextLineMap() {
     realscript::text::SourceText source("first\r\nsecond\nthird", "lines.rs");
     require(source.lineCount() == 3, "line map must recognize CRLF and LF");
@@ -23,116 +64,169 @@ void testSourceTextLineMap() {
     require(position.line == 1 && position.column == 1, "line/column mapping is incorrect");
 }
 
-void testLexerRecognizesCoreTokens() {
-    realscript::text::SourceText source(
-        "int add(int a, int b) { return a + b * 2; }",
-        "lexer.rs");
+void testLexerRecognizesControlFlowKeywords() {
+    realscript::text::SourceText source("if else while", "lexer.rs");
     realscript::diagnostics::DiagnosticBag diagnostics;
     realscript::syntax::Lexer lexer(source, diagnostics);
     const auto tokens = lexer.lexAll();
-
-    require(!diagnostics.hasErrors(), "valid token stream produced diagnostics");
-    require(tokens.front().kind == realscript::syntax::SyntaxKind::IntKeyword,
-            "first token must be int keyword");
-    require(tokens[1].kind == realscript::syntax::SyntaxKind::IdentifierToken,
-            "function name must be an identifier");
-    require(tokens[tokens.size() - 2].kind == realscript::syntax::SyntaxKind::CloseBraceToken,
-            "function must end with a close brace");
-    require(tokens.back().kind == realscript::syntax::SyntaxKind::EndOfFileToken,
-            "lexer must append EOF");
+    require(!diagnostics.hasErrors(), "control-flow keywords produced diagnostics");
+    require(tokens[0].kind == realscript::syntax::SyntaxKind::IfKeyword, "if keyword missing");
+    require(tokens[1].kind == realscript::syntax::SyntaxKind::ElseKeyword, "else keyword missing");
+    require(tokens[2].kind == realscript::syntax::SyntaxKind::WhileKeyword, "while keyword missing");
 }
 
-void testLexerReportsInvalidCharacter() {
-    realscript::text::SourceText source("@", "bad.rs");
-    realscript::diagnostics::DiagnosticBag diagnostics;
-    realscript::syntax::Lexer lexer(source, diagnostics);
-    const auto tokens = lexer.lexAll();
-    (void)tokens;
-    require(diagnostics.items().size() == 1, "invalid character must produce one diagnostic");
-    require(diagnostics.items().front().code == "RS1000", "invalid character code changed");
-}
-
-void testParserBuildsCompilationUnit() {
+void testParserBuildsControlFlowAndAssignment() {
     realscript::text::SourceText source(
-        "module Demo.Core;\n"
-        "import Engine.Math;\n"
-        "int add(int a, int b) { return a + b; }\n",
+        "int choose(bool flag) { int value; if (flag) value = 1; else value = 2; while (value < 3) value = value + 1; return value; }",
         "parser.rs");
     realscript::diagnostics::DiagnosticBag diagnostics;
     realscript::syntax::Parser parser(source, diagnostics);
     auto unit = parser.parseCompilationUnit();
-
-    require(!diagnostics.hasErrors(), "valid compilation unit produced diagnostics");
-    require(unit.moduleDeclaration != nullptr, "module declaration was not parsed");
-    require(unit.moduleDeclaration->fullName() == "Demo.Core", "module name is incorrect");
-    require(unit.imports.size() == 1 && unit.imports[0].fullName() == "Engine.Math",
-            "import declaration is incorrect");
+    require(!diagnostics.hasErrors(), "valid control-flow syntax produced diagnostics");
     require(unit.functions.size() == 1, "expected one function");
-    require(unit.functions[0].parameters.size() == 2, "expected two parameters");
+    const auto& statements = unit.functions.front().body.statements;
+    require(statements.size() == 4, "unexpected control-flow statement count");
+    require(statements[1]->kind() == realscript::syntax::SyntaxKind::IfStatement,
+            "if statement was not parsed");
+    require(statements[2]->kind() == realscript::syntax::SyntaxKind::WhileStatement,
+            "while statement was not parsed");
 }
 
-void testBinderAndMirLowering() {
-    realscript::text::SourceText source(
-        "module Demo.Core;\n"
-        "int add(int a, int b) {\n"
-        "    int doubled = b * 2;\n"
-        "    return a + doubled;\n"
-        "}\n",
-        "mir.rs");
+void testDefiniteAssignmentRejectsPartialBranch() {
     realscript::diagnostics::DiagnosticBag diagnostics;
-    realscript::syntax::Parser parser(source, diagnostics);
-    auto unit = parser.parseCompilationUnit();
-    realscript::semantic::Binder binder(diagnostics);
-    auto model = binder.bind(unit);
-
-    require(!diagnostics.hasErrors(), "valid function failed semantic binding");
-    require(model.functions.size() == 1, "semantic model must contain one function");
-    require(model.functions[0].variableCount == 3, "parameter/local variable indexing is incorrect");
-
-    realscript::mir::Lowerer lowerer;
-    const auto text = realscript::mir::printModule(lowerer.lower(model));
-    require(text.find("mul.i32") != std::string::npos, "MIR must contain integer multiply");
-    require(text.find("add.i32") != std::string::npos, "MIR must contain integer add");
-    require(text.find("ret %") != std::string::npos, "MIR must contain value return");
+    (void)lowerSource(
+        "int choose(bool flag) { int value; if (flag) value = 1; return value; }",
+        diagnostics,
+        "partial.rs");
+    require(containsDiagnostic(diagnostics, "RS2300"),
+            "partially assigned local must produce RS2300");
 }
 
-void testUndefinedNameDiagnostic() {
-    realscript::text::SourceText source(
-        "int broken(int value) { return missing + value; }",
-        "undefined.rs");
+void testDefiniteAssignmentAcceptsBothBranches() {
     realscript::diagnostics::DiagnosticBag diagnostics;
-    realscript::syntax::Parser parser(source, diagnostics);
-    auto unit = parser.parseCompilationUnit();
-    realscript::semantic::Binder binder(diagnostics);
-    const auto model = binder.bind(unit);
-    (void)model;
-
-    bool found = false;
-    for (const auto& diagnostic : diagnostics.items()) {
-        found = found || diagnostic.code == "RS2102";
-    }
-    require(found, "undefined name must produce RS2102");
+    const auto mir = lowerSource(
+        "int choose(bool flag) { int value; if (flag) value = 1; else value = 2; return value; }",
+        diagnostics,
+        "complete.rs");
+    require(!diagnostics.hasErrors(), "both assignment branches must satisfy definite assignment");
+    require(mir.find("store.local 1") != std::string::npos, "assignment must lower to local stores");
+    require(mir.find("load.local 1") != std::string::npos, "return must load the mutable local");
 }
 
-void testOperatorPrecedence() {
-    realscript::text::SourceText source(
-        "int value() { return 1 + 2 * 3; }",
-        "precedence.rs");
-    realscript::diagnostics::DiagnosticBag diagnostics;
-    realscript::syntax::Parser parser(source, diagnostics);
-    auto unit = parser.parseCompilationUnit();
+void testAllPathReturnAnalysis() {
+    realscript::diagnostics::DiagnosticBag completeDiagnostics;
+    (void)lowerSource(
+        "int choose(bool flag) { if (flag) return 1; else return 2; }",
+        completeDiagnostics,
+        "returns.rs");
+    require(!containsDiagnostic(completeDiagnostics, "RS2001"),
+            "if/else returning on both paths must satisfy return analysis");
 
-    require(!diagnostics.hasErrors(), "precedence sample failed to parse");
-    const auto& function = unit.functions.front();
-    const auto& returnStatement = static_cast<const realscript::syntax::ReturnStatementSyntax&>(
-        *function.body.statements.front());
-    const auto& root = static_cast<const realscript::syntax::BinaryExpressionSyntax&>(
-        *returnStatement.expression);
-    require(root.operatorToken.kind == realscript::syntax::SyntaxKind::PlusToken,
-            "addition must be the root expression");
-    const auto& right = static_cast<const realscript::syntax::BinaryExpressionSyntax&>(*root.right);
-    require(right.operatorToken.kind == realscript::syntax::SyntaxKind::StarToken,
-            "multiplication must bind tighter than addition");
+    realscript::diagnostics::DiagnosticBag missingDiagnostics;
+    (void)lowerSource(
+        "int choose(bool flag) { if (flag) return 1; }",
+        missingDiagnostics,
+        "missing-return.rs");
+    require(containsDiagnostic(missingDiagnostics, "RS2001"),
+            "reachable function end must produce RS2001");
+}
+
+void testMultiBlockMirAndVerifier() {
+    realscript::diagnostics::DiagnosticBag diagnostics;
+    const auto mir = lowerSource(
+        "int count(int value) { while (value > 0) value = value - 1; return value; }",
+        diagnostics,
+        "loop.rs");
+    require(!diagnostics.hasErrors(), "loop MIR must pass structural verification");
+    require(mir.find("br %") != std::string::npos, "loop MIR must contain a conditional branch");
+    require(mir.find("jmp bb") != std::string::npos, "loop MIR must contain jumps");
+    require(mir.find("store.local") != std::string::npos, "assignment must store a local");
+}
+
+void testShortCircuitUsesBlockParameter() {
+    realscript::diagnostics::DiagnosticBag diagnostics;
+    const auto mir = lowerSource(
+        "bool guarded(bool enabled, int value) { return enabled && value > 0; }",
+        diagnostics,
+        "short-circuit.rs");
+    require(!diagnostics.hasErrors(), "short-circuit MIR must verify");
+    require(mir.find("bb2(%") != std::string::npos, "short-circuit merge must use a block parameter");
+    require(mir.find("and.bool") == std::string::npos, "short-circuit must not lower to eager and.bool");
+}
+
+
+void testShortCircuitAssignmentIsNotDefinite() {
+    realscript::diagnostics::DiagnosticBag diagnostics;
+    (void)lowerSource(
+        "int guarded(bool enabled) { int value; bool used = enabled && (value = 1) > 0; return value; }",
+        diagnostics,
+        "short-circuit-assignment.rs");
+    require(containsDiagnostic(diagnostics, "RS2300"),
+            "assignment in a conditional RHS must not be definitely assigned afterward");
+}
+
+void testInfiniteLoopMakesEndpointUnreachable() {
+    realscript::diagnostics::DiagnosticBag diagnostics;
+    const auto mir = lowerSource(
+        "int forever() { while (true) { } }",
+        diagnostics,
+        "forever.rs");
+    require(!containsDiagnostic(diagnostics, "RS2001"),
+            "literal infinite loop must make the function endpoint unreachable");
+    require(!diagnostics.hasErrors(), "infinite loop MIR must verify");
+    require(mir.find("jmp bb1") != std::string::npos,
+            "infinite loop must lower to a cycle without a synthetic return");
+}
+
+void testVerifierRejectsMissingTarget() {
+    realscript::mir::Module module;
+    realscript::mir::Function function;
+    function.name = "broken";
+    function.returnType = realscript::semantic::PrimitiveType::Void;
+    realscript::mir::BasicBlock block;
+    block.id = 0;
+    block.terminator.kind = realscript::mir::TerminatorKind::Jump;
+    block.terminator.target = 99;
+    function.blocks.push_back(block);
+    module.functions.push_back(function);
+
+    realscript::diagnostics::DiagnosticBag diagnostics;
+    require(!realscript::mir::verifyModule(module, diagnostics), "invalid MIR must fail verification");
+    require(containsDiagnostic(diagnostics, "RS3009"), "missing target must produce RS3009");
+}
+
+
+void testVerifierHandlesMalformedOperands() {
+    realscript::mir::Module module;
+    realscript::mir::Function function;
+    function.name = "bad-operands";
+    function.returnType = realscript::semantic::PrimitiveType::Void;
+    realscript::mir::BasicBlock block;
+    block.id = 0;
+    realscript::mir::Instruction instruction;
+    instruction.result = 0;
+    instruction.resultType = realscript::semantic::PrimitiveType::Int;
+    instruction.opcode = realscript::mir::Opcode::AddInt;
+    block.instructions.push_back(instruction);
+    block.terminator.kind = realscript::mir::TerminatorKind::ReturnVoid;
+    function.blocks.push_back(block);
+    module.functions.push_back(function);
+
+    realscript::diagnostics::DiagnosticBag diagnostics;
+    require(!realscript::mir::verifyModule(module, diagnostics),
+            "malformed operands must fail verification without crashing");
+    require(containsDiagnostic(diagnostics, "RS3012"),
+            "malformed operands must produce RS3012");
+}
+
+void testControlFlowSnapshot() {
+    const std::string root = REALSCRIPT_SOURCE_DIR;
+    const auto source = readFile(root + "/tests/fixtures/control_flow.rs");
+    const auto expected = readFile(root + "/tests/snapshots/control_flow.mir.txt");
+    realscript::diagnostics::DiagnosticBag diagnostics;
+    const auto actual = lowerSource(source, diagnostics, "control_flow.rs");
+    require(!diagnostics.hasErrors(), "control-flow fixture failed to compile");
+    require(actual == expected, "control-flow MIR snapshot changed");
 }
 
 } // namespace
@@ -150,12 +244,18 @@ int main() {
     };
 
     run("SourceText line map", testSourceTextLineMap);
-    run("Lexer core tokens", testLexerRecognizesCoreTokens);
-    run("Lexer invalid character", testLexerReportsInvalidCharacter);
-    run("Parser compilation unit", testParserBuildsCompilationUnit);
-    run("Binder and MIR", testBinderAndMirLowering);
-    run("Undefined name diagnostic", testUndefinedNameDiagnostic);
-    run("Operator precedence", testOperatorPrecedence);
+    run("Lexer control-flow keywords", testLexerRecognizesControlFlowKeywords);
+    run("Parser control flow", testParserBuildsControlFlowAndAssignment);
+    run("Definite assignment partial branch", testDefiniteAssignmentRejectsPartialBranch);
+    run("Definite assignment both branches", testDefiniteAssignmentAcceptsBothBranches);
+    run("All-path return analysis", testAllPathReturnAnalysis);
+    run("Multi-block MIR verifier", testMultiBlockMirAndVerifier);
+    run("Short-circuit block parameter", testShortCircuitUsesBlockParameter);
+    run("Short-circuit definite assignment", testShortCircuitAssignmentIsNotDefinite);
+    run("Infinite loop endpoint", testInfiniteLoopMakesEndpointUnreachable);
+    run("Verifier missing target", testVerifierRejectsMissingTarget);
+    run("Verifier malformed operands", testVerifierHandlesMalformedOperands);
+    run("Control-flow MIR snapshot", testControlFlowSnapshot);
 
     return failures == 0 ? 0 : 1;
 }
