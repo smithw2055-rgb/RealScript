@@ -51,7 +51,8 @@ The Phase 1A semantic profile implements:
 - local declaration and duplicate-name validation;
 - name resolution;
 - integer arithmetic and comparison;
-- Boolean equality and logical operators;
+- Boolean equality and logical negation;
+- explicit deferral of short-circuit `&&`/`||` until multi-block MIR exists;
 - return-type validation;
 - explicit diagnostics for parsed-but-not-yet-bound features.
 
@@ -64,7 +65,7 @@ The initial MIR is a single-basic-block SSA-like form with:
 - typed parameter values;
 - integer, Boolean and string constants;
 - integer arithmetic and comparisons;
-- Boolean logical operations;
+- Boolean equality and logical negation;
 - local values represented by SSA value IDs;
 - explicit value and void returns;
 - source spans retained on every instruction.
