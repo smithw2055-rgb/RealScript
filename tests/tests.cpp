@@ -28,6 +28,22 @@ std::string readFile(const std::string& path) {
     return out.str();
 }
 
+std::string normalizeLineEndings(const std::string& text) {
+    std::string normalized;
+    normalized.reserve(text.size());
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        if (text[index] == '\r') {
+            if (index + 1 < text.size() && text[index + 1] == '\n') {
+                ++index;
+            }
+            normalized.push_back('\n');
+        } else {
+            normalized.push_back(text[index]);
+        }
+    }
+    return normalized;
+}
+
 bool containsDiagnostic(
     const realscript::diagnostics::DiagnosticBag& diagnostics,
     const std::string& code) {
@@ -226,7 +242,9 @@ void testControlFlowSnapshot() {
     realscript::diagnostics::DiagnosticBag diagnostics;
     const auto actual = lowerSource(source, diagnostics, "control_flow.rs");
     require(!diagnostics.hasErrors(), "control-flow fixture failed to compile");
-    require(actual == expected, "control-flow MIR snapshot changed");
+    require(
+        normalizeLineEndings(actual) == normalizeLineEndings(expected),
+        "control-flow MIR snapshot changed");
 }
 
 } // namespace

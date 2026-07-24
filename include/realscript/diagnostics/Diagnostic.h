@@ -17,6 +17,7 @@ struct Diagnostic {
     std::string code;
     std::string message;
     text::TextSpan span;
+    std::string sourceName;
 };
 
 class DiagnosticBag {
@@ -25,7 +26,8 @@ public:
         std::string code,
         std::string message,
         text::TextSpan span,
-        DiagnosticSeverity severity = DiagnosticSeverity::Error);
+        DiagnosticSeverity severity = DiagnosticSeverity::Error,
+        std::string sourceName = {});
 
     void append(const DiagnosticBag& other);
     [[nodiscard]] bool hasErrors() const noexcept;

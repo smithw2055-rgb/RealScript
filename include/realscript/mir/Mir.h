@@ -23,6 +23,8 @@ enum class Opcode {
     ConstantNull,
     LoadLocal,
     StoreLocal,
+    ConvertNullToString,
+    Call,
     NegateInt,
     LogicalNot,
     AddInt,
@@ -47,6 +49,9 @@ struct Instruction {
     std::int64_t integerImmediate = 0;
     bool boolImmediate = false;
     std::string stringImmediate;
+    semantic::SymbolId symbolId = 0;
+    std::string symbolName;
+    std::vector<semantic::PrimitiveType> parameterTypes;
     text::TextSpan sourceSpan;
 };
 
@@ -82,6 +87,8 @@ struct BasicBlock {
 };
 
 struct Function {
+    semantic::SymbolId symbolId = 0;
+    std::string moduleName;
     std::string name;
     semantic::PrimitiveType returnType = semantic::PrimitiveType::Error;
     std::vector<semantic::PrimitiveType> parameterTypes;
@@ -103,10 +110,13 @@ private:
     void collectLocalTypes(const semantic::BoundStatement& statement);
     void lowerStatement(const semantic::BoundStatement& statement);
     [[nodiscard]] ValueId lowerExpression(const semantic::BoundExpression& expression);
-    [[nodiscard]] ValueId lowerShortCircuit(const semantic::BoundBinaryExpression& expression);
+    [[nodiscard]] ValueId lowerShortCircuit(
+        const semantic::BoundBinaryExpression& expression);
 
     [[nodiscard]] BlockId createBlock();
-    [[nodiscard]] ValueId addBlockParameter(BlockId block, semantic::PrimitiveType type);
+    [[nodiscard]] ValueId addBlockParameter(
+        BlockId block,
+        semantic::PrimitiveType type);
     [[nodiscard]] BasicBlock& block(BlockId id);
     [[nodiscard]] const BasicBlock& block(BlockId id) const;
     [[nodiscard]] bool hasCurrentBlock() const noexcept;
@@ -119,8 +129,14 @@ private:
         semantic::PrimitiveType type,
         std::vector<ValueId> operands,
         text::TextSpan sourceSpan);
-    void emitStoreLocal(std::size_t localIndex, ValueId value, text::TextSpan sourceSpan);
-    void emitJump(BlockId target, std::vector<ValueId> arguments, text::TextSpan sourceSpan);
+    void emitStoreLocal(
+        std::size_t localIndex,
+        ValueId value,
+        text::TextSpan sourceSpan);
+    void emitJump(
+        BlockId target,
+        std::vector<ValueId> arguments,
+        text::TextSpan sourceSpan);
     void emitBranch(
         ValueId condition,
         BlockId trueTarget,
@@ -137,7 +153,9 @@ private:
 
 [[nodiscard]] const char* opcodeName(Opcode opcode) noexcept;
 [[nodiscard]] const char* terminatorName(TerminatorKind kind) noexcept;
-[[nodiscard]] bool verifyModule(const Module& module, diagnostics::DiagnosticBag& diagnostics);
+[[nodiscard]] bool verifyModule(
+    const Module& module,
+    diagnostics::DiagnosticBag& diagnostics);
 [[nodiscard]] std::string printModule(const Module& module);
 
 } // namespace realscript::mir

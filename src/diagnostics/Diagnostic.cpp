@@ -1,6 +1,7 @@
 #include "realscript/diagnostics/Diagnostic.h"
 
 #include <sstream>
+#include <utility>
 
 namespace realscript::diagnostics {
 
@@ -8,8 +9,15 @@ void DiagnosticBag::report(
     std::string code,
     std::string message,
     text::TextSpan span,
-    DiagnosticSeverity severity) {
-    diagnostics_.push_back({severity, std::move(code), std::move(message), span});
+    DiagnosticSeverity severity,
+    std::string sourceName) {
+    diagnostics_.push_back({
+        severity,
+        std::move(code),
+        std::move(message),
+        span,
+        std::move(sourceName),
+    });
 }
 
 void DiagnosticBag::append(const DiagnosticBag& other) {
@@ -25,10 +33,16 @@ bool DiagnosticBag::hasErrors() const noexcept {
     return false;
 }
 
-std::string formatDiagnostic(const Diagnostic& diagnostic, const text::SourceText& source) {
+std::string formatDiagnostic(
+    const Diagnostic& diagnostic,
+    const text::SourceText& source) {
     const auto position = source.linePosition(diagnostic.span.start);
+    const auto& sourceName = diagnostic.sourceName.empty()
+        ? source.name()
+        : diagnostic.sourceName;
+
     std::ostringstream out;
-    out << source.name() << ':' << (position.line + 1) << ':' << (position.column + 1)
+    out << sourceName << ':' << (position.line + 1) << ':' << (position.column + 1)
         << ": "
         << (diagnostic.severity == DiagnosticSeverity::Error ? "error" : "warning")
         << ' ' << diagnostic.code << ": " << diagnostic.message;

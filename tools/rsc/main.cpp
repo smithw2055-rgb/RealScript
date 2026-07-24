@@ -1,14 +1,16 @@
+#include "realscript/compiler/Compilation.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/mir/Mir.h"
-#include "realscript/semantic/Semantic.h"
 #include "realscript/syntax/Syntax.h"
 #include "realscript/text/Text.h"
 
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -23,57 +25,99 @@ std::string readFile(const std::string& path) {
 }
 
 void printUsage() {
-    std::cerr << "usage: rsc <file.rs> [--tokens|--mir]\n";
+    std::cerr
+        << "usage: rsc <file.rs>... [--check|--tokens|--mir|--symbols]\n";
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2 || argc > 3) {
+    if (argc < 2) {
         printUsage();
         return 2;
     }
 
-    const std::string path = argv[1];
-    const std::string mode = argc == 3 ? argv[2] : "--check";
+    std::string mode = "--check";
+    std::vector<std::string> paths;
+    for (int i = 1; i < argc; ++i) {
+        const std::string argument = argv[i];
+        if (argument.rfind("--", 0) == 0) {
+            mode = argument;
+        } else {
+            paths.push_back(argument);
+        }
+    }
+
+    if (paths.empty()) {
+        printUsage();
+        return 2;
+    }
 
     try {
-        realscript::text::SourceText source(readFile(path), path);
-        realscript::diagnostics::DiagnosticBag diagnostics;
-
         if (mode == "--tokens") {
+            if (paths.size() != 1) {
+                std::cerr << "--tokens accepts exactly one source file\n";
+                return 2;
+            }
+
+            realscript::text::SourceText source(
+                readFile(paths.front()),
+                paths.front());
+            realscript::diagnostics::DiagnosticBag diagnostics;
             realscript::syntax::Lexer lexer(source, diagnostics);
             for (const auto& token : lexer.lexAll()) {
                 std::cout << token.span.start << ':' << token.span.length << ' '
-                          << realscript::syntax::syntaxKindName(token.kind);
+                    << realscript::syntax::syntaxKindName(token.kind);
                 if (!token.text.empty()) {
                     std::cout << " `" << token.text << '`';
                 }
                 std::cout << '\n';
             }
-        } else {
-            realscript::syntax::Parser parser(source, diagnostics);
-            auto syntaxTree = parser.parseCompilationUnit();
-            realscript::semantic::Binder binder(diagnostics);
-            auto semanticModel = binder.bind(syntaxTree);
-
-            if (mode == "--mir" && !diagnostics.hasErrors()) {
-                realscript::mir::Lowerer lowerer;
-                const auto module = lowerer.lower(semanticModel);
-                (void)realscript::mir::verifyModule(module, diagnostics);
-                if (!diagnostics.hasErrors()) {
-                    std::cout << realscript::mir::printModule(module);
-                }
-            } else if (mode != "--check") {
-                printUsage();
-                return 2;
+            for (const auto& diagnostic : diagnostics.items()) {
+                std::cerr << realscript::diagnostics::formatDiagnostic(
+                    diagnostic,
+                    source) << '\n';
             }
+            return diagnostics.hasErrors() ? 1 : 0;
         }
 
-        for (const auto& diagnostic : diagnostics.items()) {
-            std::cerr << realscript::diagnostics::formatDiagnostic(diagnostic, source) << '\n';
+        realscript::compiler::Compilation compilation;
+        for (const auto& path : paths) {
+            compilation.addSource({path, readFile(path)});
         }
-        return diagnostics.hasErrors() ? 1 : 0;
+        const auto result = compilation.build();
+
+        if (mode == "--mir") {
+            for (const auto& module : result.modules) {
+                std::cout << realscript::mir::printModule(module);
+            }
+        } else if (mode == "--symbols") {
+            for (const auto& module : result.modules) {
+                for (const auto& function : module.functions) {
+                    std::cout << module.name << "::" << function.name
+                        << " 0x" << std::hex << function.symbolId
+                        << std::dec << '\n';
+                }
+            }
+        } else if (mode != "--check") {
+            printUsage();
+            return 2;
+        }
+
+        for (const auto& diagnostic : result.diagnostics.items()) {
+            std::cerr
+                << (diagnostic.sourceName.empty()
+                    ? "<compilation>"
+                    : diagnostic.sourceName)
+                << ": "
+                << (diagnostic.severity ==
+                        realscript::diagnostics::DiagnosticSeverity::Error
+                    ? "error"
+                    : "warning")
+                << ' ' << diagnostic.code << ": "
+                << diagnostic.message << '\n';
+        }
+        return result.diagnostics.hasErrors() ? 1 : 0;
     } catch (const std::exception& error) {
         std::cerr << "rsc: " << error.what() << '\n';
         return 2;

@@ -2,74 +2,83 @@
 #include "FlowAnalysis.h"
 
 #include <unordered_set>
+#include <utility>
 
 namespace realscript::semantic {
-
-const char* primitiveTypeName(PrimitiveType type) noexcept {
-    switch (type) {
-    case PrimitiveType::Error: return "<error>";
-    case PrimitiveType::Void: return "void";
-    case PrimitiveType::Bool: return "bool";
-    case PrimitiveType::Int: return "int";
-    case PrimitiveType::String: return "string";
-    case PrimitiveType::Null: return "null";
-    }
-    return "<unknown>";
-}
-
-PrimitiveType resolvePrimitiveType(const std::string& name) noexcept {
-    if (name == "void") return PrimitiveType::Void;
-    if (name == "bool") return PrimitiveType::Bool;
-    if (name == "int") return PrimitiveType::Int;
-    if (name == "string") return PrimitiveType::String;
-    return PrimitiveType::Error;
-}
-
-bool isNumericType(PrimitiveType type) noexcept {
-    return type == PrimitiveType::Int;
-}
 
 Binder::Binder(diagnostics::DiagnosticBag& diagnostics)
     : diagnostics_(diagnostics) {}
 
 SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
-    SemanticModel model;
-    if (syntaxTree.moduleDeclaration) {
-        model.moduleName = syntaxTree.moduleDeclaration->fullName();
-    }
+    ModuleBindingInput input;
+    input.moduleName = syntaxTree.moduleDeclaration
+        ? syntaxTree.moduleDeclaration->fullName()
+        : "";
+    input.units = {&syntaxTree};
 
-    std::unordered_set<std::string> functionNames;
+    std::unordered_set<std::string> functionKeys;
     for (const auto& functionSyntax : syntaxTree.functions) {
-        if (!functionNames.insert(functionSyntax.identifierToken.text).second) {
+        auto symbol = declareFunctionSymbol(
+            input.moduleName,
+            functionSyntax,
+            diagnostics_);
+        const auto key = canonicalFunctionKey(symbol);
+        if (!functionKeys.insert(key).second) {
             diagnostics_.report(
                 "RS2000",
-                "function '" + functionSyntax.identifierToken.text + "' is already declared",
+                "function overload '" + key + "' is already declared",
                 functionSyntax.identifierToken.span);
         }
-        model.functions.push_back(bindFunction(functionSyntax));
+        input.visibleFunctions[symbol.name].push_back(symbol);
+        input.declarations.push_back(std::move(symbol));
     }
-    return model;
+
+    return bindModule(input);
 }
 
-BoundFunction Binder::bindFunction(const syntax::FunctionDeclarationSyntax& syntaxTree) {
+SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
+    visibleFunctions_ = input.visibleFunctions;
+
+    SemanticModel result;
+    result.moduleName = input.moduleName;
+
+    std::size_t declarationIndex = 0;
+    for (const auto* unit : input.units) {
+        for (const auto& functionSyntax : unit->functions) {
+            if (declarationIndex >= input.declarations.size()) {
+                diagnostics_.report(
+                    "RS2009",
+                    "function declaration table is incomplete",
+                    functionSyntax.identifierToken.span);
+                continue;
+            }
+            result.functions.push_back(bindFunction(
+                functionSyntax,
+                input.declarations[declarationIndex++]));
+        }
+    }
+
+    return result;
+}
+
+BoundFunction Binder::bindFunction(
+    const syntax::FunctionDeclarationSyntax& syntaxTree,
+    const FunctionSymbol& symbol) {
     BoundFunction result;
-    result.symbol.name = syntaxTree.identifierToken.text;
-    result.symbol.returnType = bindType(syntaxTree.returnType, true);
+    result.symbol = symbol;
 
     scopes_.clear();
     pushScope();
-    currentReturnType_ = result.symbol.returnType;
-    nextVariableIndex_ = 0;
+    currentReturnType_ = symbol.returnType;
+    nextVariableIndex_ = symbol.parameters.size();
 
-    for (const auto& parameterSyntax : syntaxTree.parameters) {
-        VariableSymbol parameter;
-        parameter.name = parameterSyntax.identifierToken.text;
-        parameter.type = bindType(parameterSyntax.type, false);
-        parameter.index = nextVariableIndex_++;
-        parameter.parameter = true;
-        if (declareVariable(parameter, parameterSyntax.identifierToken.span)) {
-            result.symbol.parameters.push_back(parameter);
-        }
+    for (std::size_t i = 0; i < symbol.parameters.size(); ++i) {
+        auto parameter = symbol.parameters[i];
+        parameter.name = syntaxTree.parameters[i].identifierToken.text;
+        (void)declareVariable(
+            parameter,
+            syntaxTree.parameters[i].identifierToken.span);
+        result.symbol.parameters[i].name = parameter.name;
     }
 
     result.body = bindBlockStatement(syntaxTree.body, false);
@@ -80,7 +89,8 @@ BoundFunction Binder::bindFunction(const syntax::FunctionDeclarationSyntax& synt
         detail::canReachFunctionEnd(result, diagnostics_)) {
         diagnostics_.report(
             "RS2001",
-            "not all control-flow paths in function '" + result.symbol.name + "' return a value",
+            "not all control-flow paths in function '" +
+                result.symbol.name + "' return a value",
             syntaxTree.identifierToken.span);
     }
 
@@ -115,18 +125,22 @@ std::unique_ptr<BoundStatement> Binder::bindEmbeddedStatement(
     return result;
 }
 
-std::unique_ptr<BoundStatement> Binder::bindStatement(const syntax::StatementSyntax& syntaxTree) {
+std::unique_ptr<BoundStatement> Binder::bindStatement(
+    const syntax::StatementSyntax& syntaxTree) {
     switch (syntaxTree.kind()) {
     case syntax::SyntaxKind::BlockStatement:
         return bindBlockStatement(
-            static_cast<const syntax::BlockStatementSyntax&>(syntaxTree), true);
+            static_cast<const syntax::BlockStatementSyntax&>(syntaxTree),
+            true);
     case syntax::SyntaxKind::ReturnStatement:
         return bindReturnStatement(
             static_cast<const syntax::ReturnStatementSyntax&>(syntaxTree));
     case syntax::SyntaxKind::IfStatement:
-        return bindIfStatement(static_cast<const syntax::IfStatementSyntax&>(syntaxTree));
+        return bindIfStatement(
+            static_cast<const syntax::IfStatementSyntax&>(syntaxTree));
     case syntax::SyntaxKind::WhileStatement:
-        return bindWhileStatement(static_cast<const syntax::WhileStatementSyntax&>(syntaxTree));
+        return bindWhileStatement(
+            static_cast<const syntax::WhileStatementSyntax&>(syntaxTree));
     case syntax::SyntaxKind::VariableDeclarationStatement:
         return bindVariableDeclaration(
             static_cast<const syntax::VariableDeclarationStatementSyntax&>(syntaxTree));
@@ -134,7 +148,10 @@ std::unique_ptr<BoundStatement> Binder::bindStatement(const syntax::StatementSyn
         return bindExpressionStatement(
             static_cast<const syntax::ExpressionStatementSyntax&>(syntaxTree));
     default:
-        diagnostics_.report("RS2099", "unsupported statement kind", syntaxTree.span());
+        diagnostics_.report(
+            "RS2099",
+            "unsupported statement kind",
+            syntaxTree.span());
         return std::make_unique<BoundExpressionStatement>();
     }
 }
@@ -146,7 +163,10 @@ std::unique_ptr<BoundStatement> Binder::bindReturnStatement(
 
     if (currentReturnType_ == PrimitiveType::Void) {
         if (syntaxTree.expression) {
-            diagnostics_.report("RS2002", "void function cannot return a value", syntaxTree.expression->span());
+            diagnostics_.report(
+                "RS2002",
+                "void function cannot return a value",
+                syntaxTree.expression->span());
             result->expression = bindExpression(*syntaxTree.expression);
         }
         return result;
@@ -155,22 +175,18 @@ std::unique_ptr<BoundStatement> Binder::bindReturnStatement(
     if (!syntaxTree.expression) {
         diagnostics_.report(
             "RS2003",
-            "function returning '" + std::string(primitiveTypeName(currentReturnType_)) +
+            "function returning '" +
+                std::string(primitiveTypeName(currentReturnType_)) +
                 "' must return a value",
             syntaxTree.returnKeyword.span);
         return result;
     }
 
-    result->expression = bindExpression(*syntaxTree.expression);
-    if (result->expression->type != PrimitiveType::Error &&
-        currentReturnType_ != PrimitiveType::Error &&
-        result->expression->type != currentReturnType_) {
-        diagnostics_.report(
-            "RS2004",
-            "cannot return '" + std::string(primitiveTypeName(result->expression->type)) +
-                "' from function returning '" + primitiveTypeName(currentReturnType_) + "'",
-            syntaxTree.expression->span());
-    }
+    result->expression = convertExpression(
+        bindExpression(*syntaxTree.expression),
+        currentReturnType_,
+        syntaxTree.expression->span(),
+        "return value");
     return result;
 }
 
@@ -178,11 +194,11 @@ std::unique_ptr<BoundStatement> Binder::bindIfStatement(
     const syntax::IfStatementSyntax& syntaxTree) {
     auto result = std::make_unique<BoundIfStatement>();
     result->span = syntaxTree.span();
-    result->condition = bindExpression(*syntaxTree.condition);
-    if (result->condition->type != PrimitiveType::Bool &&
-        result->condition->type != PrimitiveType::Error) {
-        diagnostics_.report("RS2007", "if condition must have type 'bool'", syntaxTree.condition->span());
-    }
+    result->condition = convertExpression(
+        bindExpression(*syntaxTree.condition),
+        PrimitiveType::Bool,
+        syntaxTree.condition->span(),
+        "if condition");
     result->thenStatement = bindEmbeddedStatement(*syntaxTree.thenStatement);
     if (syntaxTree.elseStatement) {
         result->elseStatement = bindEmbeddedStatement(*syntaxTree.elseStatement);
@@ -194,11 +210,11 @@ std::unique_ptr<BoundStatement> Binder::bindWhileStatement(
     const syntax::WhileStatementSyntax& syntaxTree) {
     auto result = std::make_unique<BoundWhileStatement>();
     result->span = syntaxTree.span();
-    result->condition = bindExpression(*syntaxTree.condition);
-    if (result->condition->type != PrimitiveType::Bool &&
-        result->condition->type != PrimitiveType::Error) {
-        diagnostics_.report("RS2008", "while condition must have type 'bool'", syntaxTree.condition->span());
-    }
+    result->condition = convertExpression(
+        bindExpression(*syntaxTree.condition),
+        PrimitiveType::Bool,
+        syntaxTree.condition->span(),
+        "while condition");
     result->body = bindEmbeddedStatement(*syntaxTree.body);
     return result;
 }
@@ -215,18 +231,12 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
     };
 
     (void)declareVariable(result->variable, syntaxTree.identifierToken.span);
-
     if (syntaxTree.initializer) {
-        result->initializer = bindExpression(*syntaxTree.initializer);
-        if (result->initializer->type != PrimitiveType::Error &&
-            result->variable.type != PrimitiveType::Error &&
-            result->initializer->type != result->variable.type) {
-            diagnostics_.report(
-                "RS2006",
-                "cannot initialize '" + std::string(primitiveTypeName(result->variable.type)) +
-                    "' with '" + primitiveTypeName(result->initializer->type) + "'",
-                syntaxTree.initializer->span());
-        }
+        result->initializer = convertExpression(
+            bindExpression(*syntaxTree.initializer),
+            result->variable.type,
+            syntaxTree.initializer->span(),
+            "initializer");
     }
     return result;
 }
@@ -259,18 +269,80 @@ std::unique_ptr<BoundExpression> Binder::bindExpression(
             static_cast<const syntax::AssignmentExpressionSyntax&>(syntaxTree));
     case syntax::SyntaxKind::ParenthesizedExpression:
         return bindExpression(
-            *static_cast<const syntax::ParenthesizedExpressionSyntax&>(syntaxTree).expression);
+            *static_cast<const syntax::ParenthesizedExpressionSyntax&>(
+                syntaxTree).expression);
     case syntax::SyntaxKind::CallExpression:
-        diagnostics_.report(
-            "RS2100",
-            "function calls are parsed but not bound in the Phase 1B profile",
-            syntaxTree.span());
-        return makeError(syntaxTree.span());
+        return bindCallExpression(
+            static_cast<const syntax::CallExpressionSyntax&>(syntaxTree));
     default:
-        diagnostics_.report("RS2199", "unsupported expression kind", syntaxTree.span());
+        diagnostics_.report(
+            "RS2199",
+            "unsupported expression kind",
+            syntaxTree.span());
         return makeError(syntaxTree.span());
     }
 }
 
+PrimitiveType Binder::bindType(
+    const syntax::TypeSyntax& syntaxTree,
+    bool allowVoid) {
+    const auto type = resolvePrimitiveType(syntaxTree.name.text);
+    if (type == PrimitiveType::Error) {
+        diagnostics_.report(
+            "RS2200",
+            "type '" + syntaxTree.name.text +
+                "' is not implemented in the Phase 1C profile",
+            syntaxTree.span());
+        return type;
+    }
+    if (type == PrimitiveType::Void && !allowVoid) {
+        diagnostics_.report(
+            "RS2201",
+            "void is not valid in this type position",
+            syntaxTree.span());
+        return PrimitiveType::Error;
+    }
+    return type;
+}
+
+const VariableSymbol* Binder::lookupVariable(
+    const std::string& name) const noexcept {
+    for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
+        const auto found = it->find(name);
+        if (found != it->end()) {
+            return &found->second;
+        }
+    }
+    return nullptr;
+}
+
+bool Binder::declareVariable(VariableSymbol variable, text::TextSpan span) {
+    auto& scope = scopes_.back();
+    if (scope.find(variable.name) != scope.end()) {
+        diagnostics_.report(
+            "RS2202",
+            "name '" + variable.name + "' is already declared in this scope",
+            span);
+        return false;
+    }
+    scope.emplace(variable.name, std::move(variable));
+    return true;
+}
+
+void Binder::pushScope() {
+    scopes_.emplace_back();
+}
+
+void Binder::popScope() {
+    scopes_.pop_back();
+}
+
+std::unique_ptr<BoundErrorExpression> Binder::makeError(
+    text::TextSpan span) const {
+    auto result = std::make_unique<BoundErrorExpression>();
+    result->type = PrimitiveType::Error;
+    result->span = span;
+    return result;
+}
 
 } // namespace realscript::semantic

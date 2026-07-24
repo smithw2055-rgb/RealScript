@@ -1,14 +1,16 @@
 #include "FlowAnalysis.h"
 
-#include <algorithm>
 #include <unordered_set>
+#include <utility>
 
 namespace realscript::semantic {
 namespace {
 
 using AssignedSet = std::unordered_set<std::size_t>;
 
-AssignedSet intersectAssigned(const AssignedSet& left, const AssignedSet& right) {
+AssignedSet intersectAssigned(
+    const AssignedSet& left,
+    const AssignedSet& right) {
     AssignedSet result;
     const auto& smaller = left.size() <= right.size() ? left : right;
     const auto& larger = left.size() <= right.size() ? right : left;
@@ -26,7 +28,8 @@ bool isLiteralTrue(const BoundExpression& expression) {
         return false;
     }
     const auto& literal = static_cast<const BoundLiteralExpression&>(expression);
-    return std::holds_alternative<bool>(literal.value) && std::get<bool>(literal.value);
+    return std::holds_alternative<bool>(literal.value) &&
+        std::get<bool>(literal.value);
 }
 
 class FlowAnalyzer {
@@ -48,6 +51,66 @@ private:
         bool reachable = true;
     };
 
+    void analyzeExpression(
+        const BoundExpression& expression,
+        AssignedSet& assigned) {
+        switch (expression.kind()) {
+        case BoundNodeKind::VariableExpression: {
+            const auto& variable =
+                static_cast<const BoundVariableExpression&>(expression).variable;
+            if (assigned.find(variable.index) == assigned.end()) {
+                diagnostics_.report(
+                    "RS2300",
+                    "variable '" + variable.name +
+                        "' is used before it is definitely assigned",
+                    expression.span);
+            }
+            return;
+        }
+        case BoundNodeKind::AssignmentExpression: {
+            const auto& assignment =
+                static_cast<const BoundAssignmentExpression&>(expression);
+            analyzeExpression(*assignment.expression, assigned);
+            assigned.insert(assignment.variable.index);
+            return;
+        }
+        case BoundNodeKind::ConversionExpression:
+            analyzeExpression(
+                *static_cast<const BoundConversionExpression&>(
+                    expression).expression,
+                assigned);
+            return;
+        case BoundNodeKind::CallExpression: {
+            const auto& call =
+                static_cast<const BoundCallExpression&>(expression);
+            for (const auto& argument : call.arguments) {
+                analyzeExpression(*argument, assigned);
+            }
+            return;
+        }
+        case BoundNodeKind::UnaryExpression:
+            analyzeExpression(
+                *static_cast<const BoundUnaryExpression&>(expression).operand,
+                assigned);
+            return;
+        case BoundNodeKind::BinaryExpression: {
+            const auto& binary =
+                static_cast<const BoundBinaryExpression&>(expression);
+            analyzeExpression(*binary.left, assigned);
+            if (binary.operatorKind == BoundBinaryOperatorKind::LogicalAnd ||
+                binary.operatorKind == BoundBinaryOperatorKind::LogicalOr) {
+                auto rightAssigned = assigned;
+                analyzeExpression(*binary.right, rightAssigned);
+            } else {
+                analyzeExpression(*binary.right, assigned);
+            }
+            return;
+        }
+        default:
+            return;
+        }
+    }
+
     State analyzeStatement(const BoundStatement& statement, State state) {
         if (!state.reachable) {
             return state;
@@ -55,7 +118,8 @@ private:
 
         switch (statement.kind()) {
         case BoundNodeKind::BlockStatement: {
-            const auto& block = static_cast<const BoundBlockStatement&>(statement);
+            const auto& block =
+                static_cast<const BoundBlockStatement&>(statement);
             for (const auto& child : block.statements) {
                 state = analyzeStatement(*child, std::move(state));
                 if (!state.reachable) {
@@ -65,7 +129,8 @@ private:
             return state;
         }
         case BoundNodeKind::ReturnStatement: {
-            const auto& returnStatement = static_cast<const BoundReturnStatement&>(statement);
+            const auto& returnStatement =
+                static_cast<const BoundReturnStatement&>(statement);
             if (returnStatement.expression) {
                 analyzeExpression(*returnStatement.expression, state.assigned);
             }
@@ -83,37 +148,48 @@ private:
             }
             return state;
         }
-        case BoundNodeKind::ExpressionStatement: {
-            const auto& expressionStatement =
-                static_cast<const BoundExpressionStatement&>(statement);
-            analyzeExpression(*expressionStatement.expression, state.assigned);
+        case BoundNodeKind::ExpressionStatement:
+            analyzeExpression(
+                *static_cast<const BoundExpressionStatement&>(
+                    statement).expression,
+                state.assigned);
             return state;
-        }
         case BoundNodeKind::IfStatement: {
-            const auto& ifStatement = static_cast<const BoundIfStatement&>(statement);
+            const auto& ifStatement =
+                static_cast<const BoundIfStatement&>(statement);
             analyzeExpression(*ifStatement.condition, state.assigned);
 
-            State thenState{state.assigned, true};
-            thenState = analyzeStatement(*ifStatement.thenStatement, std::move(thenState));
-
-            State elseState{state.assigned, true};
-            if (ifStatement.elseStatement) {
-                elseState = analyzeStatement(*ifStatement.elseStatement, std::move(elseState));
-            }
+            auto thenState = analyzeStatement(
+                *ifStatement.thenStatement,
+                {state.assigned, true});
+            auto elseState = ifStatement.elseStatement
+                ? analyzeStatement(
+                    *ifStatement.elseStatement,
+                    {state.assigned, true})
+                : State{state.assigned, true};
 
             if (!thenState.reachable && !elseState.reachable) {
                 return {{}, false};
             }
             if (thenState.reachable && elseState.reachable) {
-                return {intersectAssigned(thenState.assigned, elseState.assigned), true};
+                return {
+                    intersectAssigned(
+                        thenState.assigned,
+                        elseState.assigned),
+                    true,
+                };
             }
-            return thenState.reachable ? std::move(thenState) : std::move(elseState);
+            return thenState.reachable
+                ? std::move(thenState)
+                : std::move(elseState);
         }
         case BoundNodeKind::WhileStatement: {
-            const auto& whileStatement = static_cast<const BoundWhileStatement&>(statement);
+            const auto& whileStatement =
+                static_cast<const BoundWhileStatement&>(statement);
             analyzeExpression(*whileStatement.condition, state.assigned);
-            State bodyState{state.assigned, true};
-            (void)analyzeStatement(*whileStatement.body, std::move(bodyState));
+            (void)analyzeStatement(
+                *whileStatement.body,
+                {state.assigned, true});
             if (isLiteralTrue(*whileStatement.condition)) {
                 state.reachable = false;
             }
@@ -124,47 +200,8 @@ private:
         }
     }
 
-    void analyzeExpression(const BoundExpression& expression, AssignedSet& assigned) {
-        switch (expression.kind()) {
-        case BoundNodeKind::VariableExpression: {
-            const auto& variable = static_cast<const BoundVariableExpression&>(expression).variable;
-            if (assigned.find(variable.index) == assigned.end()) {
-                diagnostics_.report(
-                    "RS2300",
-                    "variable '" + variable.name + "' is used before it is definitely assigned",
-                    expression.span);
-            }
-            return;
-        }
-        case BoundNodeKind::AssignmentExpression: {
-            const auto& assignment = static_cast<const BoundAssignmentExpression&>(expression);
-            analyzeExpression(*assignment.expression, assigned);
-            assigned.insert(assignment.variable.index);
-            return;
-        }
-        case BoundNodeKind::UnaryExpression:
-            analyzeExpression(*static_cast<const BoundUnaryExpression&>(expression).operand, assigned);
-            return;
-        case BoundNodeKind::BinaryExpression: {
-            const auto& binary = static_cast<const BoundBinaryExpression&>(expression);
-            analyzeExpression(*binary.left, assigned);
-            if (binary.operatorKind == BoundBinaryOperatorKind::LogicalAnd ||
-                binary.operatorKind == BoundBinaryOperatorKind::LogicalOr) {
-                auto rightAssigned = assigned;
-                analyzeExpression(*binary.right, rightAssigned);
-            } else {
-                analyzeExpression(*binary.right, assigned);
-            }
-            return;
-        }
-        default:
-            return;
-        }
-    }
-
     diagnostics::DiagnosticBag& diagnostics_;
 };
-
 
 } // namespace
 
@@ -178,5 +215,4 @@ bool canReachFunctionEnd(
 }
 
 } // namespace detail
-
 } // namespace realscript::semantic

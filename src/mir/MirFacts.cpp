@@ -11,6 +11,8 @@ const char* opcodeName(Opcode opcode) noexcept {
     case Opcode::ConstantNull: return "const.null";
     case Opcode::LoadLocal: return "load.local";
     case Opcode::StoreLocal: return "store.local";
+    case Opcode::ConvertNullToString: return "conv.null.string";
+    case Opcode::Call: return "call";
     case Opcode::NegateInt: return "neg.i32";
     case Opcode::LogicalNot: return "not.bool";
     case Opcode::AddInt: return "add.i32";
@@ -38,6 +40,5 @@ const char* terminatorName(TerminatorKind kind) noexcept {
     }
     return "unknown";
 }
-
 
 } // namespace realscript::mir

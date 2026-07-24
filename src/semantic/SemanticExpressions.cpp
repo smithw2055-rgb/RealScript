@@ -1,5 +1,8 @@
 #include "realscript/semantic/Semantic.h"
 
+#include <limits>
+#include <utility>
+
 namespace realscript::semantic {
 
 std::unique_ptr<BoundExpression> Binder::bindLiteralExpression(
@@ -67,20 +70,20 @@ std::unique_ptr<BoundExpression> Binder::bindUnaryExpression(
     case syntax::SyntaxKind::PlusToken:
         operatorKind = BoundUnaryOperatorKind::Identity;
         resultType = PrimitiveType::Int;
-        if (operand->type != PrimitiveType::Int) goto invalid_operator;
+        if (operand->type != resultType) goto invalidOperator;
         break;
     case syntax::SyntaxKind::MinusToken:
         operatorKind = BoundUnaryOperatorKind::Negation;
         resultType = PrimitiveType::Int;
-        if (operand->type != PrimitiveType::Int) goto invalid_operator;
+        if (operand->type != resultType) goto invalidOperator;
         break;
     case syntax::SyntaxKind::BangToken:
         operatorKind = BoundUnaryOperatorKind::LogicalNegation;
         resultType = PrimitiveType::Bool;
-        if (operand->type != PrimitiveType::Bool) goto invalid_operator;
+        if (operand->type != resultType) goto invalidOperator;
         break;
     default:
-        goto invalid_operator;
+        goto invalidOperator;
     }
 
     {
@@ -92,11 +95,11 @@ std::unique_ptr<BoundExpression> Binder::bindUnaryExpression(
         return result;
     }
 
-invalid_operator:
+invalidOperator:
     diagnostics_.report(
         "RS2103",
-        "unary operator '" + syntaxTree.operatorToken.text + "' is not defined for '" +
-            primitiveTypeName(operand->type) + "'",
+        "unary operator '" + syntaxTree.operatorToken.text +
+            "' is not defined for '" + primitiveTypeName(operand->type) + "'",
         syntaxTree.operatorToken.span);
     return makeError(syntaxTree.span());
 }
@@ -105,7 +108,8 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
     const syntax::BinaryExpressionSyntax& syntaxTree) {
     auto left = bindExpression(*syntaxTree.left);
     auto right = bindExpression(*syntaxTree.right);
-    if (left->type == PrimitiveType::Error || right->type == PrimitiveType::Error) {
+    if (left->type == PrimitiveType::Error ||
+        right->type == PrimitiveType::Error) {
         return makeError(syntaxTree.span());
     }
 
@@ -118,35 +122,71 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
         tokenKind == syntax::SyntaxKind::StarToken ||
         tokenKind == syntax::SyntaxKind::SlashToken ||
         tokenKind == syntax::SyntaxKind::PercentToken) {
-        if (left->type != PrimitiveType::Int || right->type != PrimitiveType::Int) {
-            goto invalid_operator;
+        if (left->type != PrimitiveType::Int ||
+            right->type != PrimitiveType::Int) {
+            goto invalidOperator;
         }
         resultType = PrimitiveType::Int;
         switch (tokenKind) {
-        case syntax::SyntaxKind::PlusToken: operatorKind = BoundBinaryOperatorKind::Addition; break;
-        case syntax::SyntaxKind::MinusToken: operatorKind = BoundBinaryOperatorKind::Subtraction; break;
-        case syntax::SyntaxKind::StarToken: operatorKind = BoundBinaryOperatorKind::Multiplication; break;
-        case syntax::SyntaxKind::SlashToken: operatorKind = BoundBinaryOperatorKind::Division; break;
-        default: operatorKind = BoundBinaryOperatorKind::Remainder; break;
+        case syntax::SyntaxKind::PlusToken:
+            operatorKind = BoundBinaryOperatorKind::Addition;
+            break;
+        case syntax::SyntaxKind::MinusToken:
+            operatorKind = BoundBinaryOperatorKind::Subtraction;
+            break;
+        case syntax::SyntaxKind::StarToken:
+            operatorKind = BoundBinaryOperatorKind::Multiplication;
+            break;
+        case syntax::SyntaxKind::SlashToken:
+            operatorKind = BoundBinaryOperatorKind::Division;
+            break;
+        default:
+            operatorKind = BoundBinaryOperatorKind::Remainder;
+            break;
         }
     } else if (tokenKind == syntax::SyntaxKind::LessToken ||
                tokenKind == syntax::SyntaxKind::LessOrEqualsToken ||
                tokenKind == syntax::SyntaxKind::GreaterToken ||
                tokenKind == syntax::SyntaxKind::GreaterOrEqualsToken) {
-        if (left->type != PrimitiveType::Int || right->type != PrimitiveType::Int) {
-            goto invalid_operator;
+        if (left->type != PrimitiveType::Int ||
+            right->type != PrimitiveType::Int) {
+            goto invalidOperator;
         }
         resultType = PrimitiveType::Bool;
         switch (tokenKind) {
-        case syntax::SyntaxKind::LessToken: operatorKind = BoundBinaryOperatorKind::Less; break;
-        case syntax::SyntaxKind::LessOrEqualsToken: operatorKind = BoundBinaryOperatorKind::LessOrEquals; break;
-        case syntax::SyntaxKind::GreaterToken: operatorKind = BoundBinaryOperatorKind::Greater; break;
-        default: operatorKind = BoundBinaryOperatorKind::GreaterOrEquals; break;
+        case syntax::SyntaxKind::LessToken:
+            operatorKind = BoundBinaryOperatorKind::Less;
+            break;
+        case syntax::SyntaxKind::LessOrEqualsToken:
+            operatorKind = BoundBinaryOperatorKind::LessOrEquals;
+            break;
+        case syntax::SyntaxKind::GreaterToken:
+            operatorKind = BoundBinaryOperatorKind::Greater;
+            break;
+        default:
+            operatorKind = BoundBinaryOperatorKind::GreaterOrEquals;
+            break;
         }
     } else if (tokenKind == syntax::SyntaxKind::EqualsEqualsToken ||
                tokenKind == syntax::SyntaxKind::BangEqualsToken) {
         if (left->type != right->type) {
-            goto invalid_operator;
+            if (classifyConversion(left->type, right->type) !=
+                ConversionKind::None) {
+                left = convertExpression(
+                    std::move(left),
+                    right->type,
+                    syntaxTree.left->span(),
+                    "equality operand");
+            } else if (classifyConversion(right->type, left->type) !=
+                       ConversionKind::None) {
+                right = convertExpression(
+                    std::move(right),
+                    left->type,
+                    syntaxTree.right->span(),
+                    "equality operand");
+            } else {
+                goto invalidOperator;
+            }
         }
         resultType = PrimitiveType::Bool;
         operatorKind = tokenKind == syntax::SyntaxKind::EqualsEqualsToken
@@ -154,15 +194,16 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
             : BoundBinaryOperatorKind::NotEquals;
     } else if (tokenKind == syntax::SyntaxKind::AmpersandAmpersandToken ||
                tokenKind == syntax::SyntaxKind::PipePipeToken) {
-        if (left->type != PrimitiveType::Bool || right->type != PrimitiveType::Bool) {
-            goto invalid_operator;
+        if (left->type != PrimitiveType::Bool ||
+            right->type != PrimitiveType::Bool) {
+            goto invalidOperator;
         }
         resultType = PrimitiveType::Bool;
         operatorKind = tokenKind == syntax::SyntaxKind::AmpersandAmpersandToken
             ? BoundBinaryOperatorKind::LogicalAnd
             : BoundBinaryOperatorKind::LogicalOr;
     } else {
-        goto invalid_operator;
+        goto invalidOperator;
     }
 
     {
@@ -175,11 +216,12 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
         return result;
     }
 
-invalid_operator:
+invalidOperator:
     diagnostics_.report(
         "RS2104",
-        "binary operator '" + syntaxTree.operatorToken.text + "' is not defined for '" +
-            primitiveTypeName(left->type) + "' and '" + primitiveTypeName(right->type) + "'",
+        "binary operator '" + syntaxTree.operatorToken.text +
+            "' is not defined for '" + primitiveTypeName(left->type) +
+            "' and '" + primitiveTypeName(right->type) + "'",
         syntaxTree.operatorToken.span);
     return makeError(syntaxTree.span());
 }
@@ -195,15 +237,11 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
         return makeError(syntaxTree.span());
     }
 
-    auto value = bindExpression(*syntaxTree.expression);
-    if (value->type != PrimitiveType::Error && variable->type != PrimitiveType::Error &&
-        value->type != variable->type) {
-        diagnostics_.report(
-            "RS2106",
-            "cannot assign '" + std::string(primitiveTypeName(value->type)) + "' to variable '" +
-                variable->name + "' of type '" + primitiveTypeName(variable->type) + "'",
-            syntaxTree.expression->span());
-    }
+    auto value = convertExpression(
+        bindExpression(*syntaxTree.expression),
+        variable->type,
+        syntaxTree.expression->span(),
+        "assignment");
 
     auto result = std::make_unique<BoundAssignmentExpression>();
     result->span = syntaxTree.span();
@@ -213,59 +251,123 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
     return result;
 }
 
-PrimitiveType Binder::bindType(const syntax::TypeSyntax& syntaxTree, bool allowVoid) {
-    const auto type = resolvePrimitiveType(syntaxTree.name.text);
-    if (type == PrimitiveType::Error) {
-        diagnostics_.report(
-            "RS2200",
-            "type '" + syntaxTree.name.text + "' is not implemented in the Phase 1B profile",
-            syntaxTree.span());
-        return PrimitiveType::Error;
+std::unique_ptr<BoundExpression> Binder::bindCallExpression(
+    const syntax::CallExpressionSyntax& syntaxTree) {
+    std::vector<std::unique_ptr<BoundExpression>> arguments;
+    arguments.reserve(syntaxTree.arguments.size());
+    for (const auto& argumentSyntax : syntaxTree.arguments) {
+        arguments.push_back(bindExpression(*argumentSyntax));
     }
-    if (type == PrimitiveType::Void && !allowVoid) {
-        diagnostics_.report("RS2201", "void is not valid in this type position", syntaxTree.span());
-        return PrimitiveType::Error;
-    }
-    return type;
-}
 
-const VariableSymbol* Binder::lookupVariable(const std::string& name) const noexcept {
-    for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
-        const auto found = it->find(name);
-        if (found != it->end()) {
-            return &found->second;
+    const auto overloads = visibleFunctions_.find(syntaxTree.identifierToken.text);
+    if (overloads == visibleFunctions_.end()) {
+        diagnostics_.report(
+            "RS2100",
+            "undefined function '" + syntaxTree.identifierToken.text + "'",
+            syntaxTree.identifierToken.span);
+        return makeError(syntaxTree.span());
+    }
+
+    const FunctionSymbol* best = nullptr;
+    int bestScore = std::numeric_limits<int>::max();
+    bool ambiguous = false;
+
+    for (const auto& candidate : overloads->second) {
+        if (candidate.parameters.size() != arguments.size()) {
+            continue;
+        }
+
+        int score = 0;
+        bool applicable = true;
+        for (std::size_t i = 0; i < arguments.size(); ++i) {
+            const auto rank = conversionRank(
+                arguments[i]->type,
+                candidate.parameters[i].type);
+            if (rank < 0) {
+                applicable = false;
+                break;
+            }
+            score += rank;
+        }
+
+        if (!applicable) {
+            continue;
+        }
+        if (score < bestScore) {
+            best = &candidate;
+            bestScore = score;
+            ambiguous = false;
+        } else if (score == bestScore && best && best->id != candidate.id) {
+            ambiguous = true;
         }
     }
-    return nullptr;
-}
 
-bool Binder::declareVariable(VariableSymbol variable, text::TextSpan span) {
-    auto& scope = scopes_.back();
-    if (scope.find(variable.name) != scope.end()) {
+    if (!best) {
         diagnostics_.report(
-            "RS2202",
-            "name '" + variable.name + "' is already declared in this scope",
-            span);
-        return false;
+            "RS2107",
+            "no applicable overload for function '" +
+                syntaxTree.identifierToken.text + "'",
+            syntaxTree.span());
+        return makeError(syntaxTree.span());
     }
-    scope.emplace(variable.name, std::move(variable));
-    return true;
-}
+    if (ambiguous) {
+        diagnostics_.report(
+            "RS2108",
+            "call to function '" + syntaxTree.identifierToken.text +
+                "' is ambiguous",
+            syntaxTree.span());
+        return makeError(syntaxTree.span());
+    }
 
-void Binder::pushScope() {
-    scopes_.emplace_back();
-}
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        arguments[i] = convertExpression(
+            std::move(arguments[i]),
+            best->parameters[i].type,
+            syntaxTree.arguments[i]->span(),
+            "argument");
+    }
 
-void Binder::popScope() {
-    scopes_.pop_back();
-}
-
-std::unique_ptr<BoundErrorExpression> Binder::makeError(text::TextSpan span) const {
-    auto result = std::make_unique<BoundErrorExpression>();
-    result->type = PrimitiveType::Error;
-    result->span = span;
+    auto result = std::make_unique<BoundCallExpression>();
+    result->span = syntaxTree.span();
+    result->type = best->returnType;
+    result->function = *best;
+    result->arguments = std::move(arguments);
     return result;
 }
 
+std::unique_ptr<BoundExpression> Binder::convertExpression(
+    std::unique_ptr<BoundExpression> expression,
+    PrimitiveType target,
+    text::TextSpan span,
+    const std::string& context) {
+    if (!expression) {
+        return makeError(span);
+    }
+    if (expression->type == PrimitiveType::Error ||
+        target == PrimitiveType::Error) {
+        return expression;
+    }
+
+    const auto conversion = classifyConversion(expression->type, target);
+    if (conversion == ConversionKind::None) {
+        diagnostics_.report(
+            "RS2106",
+            "cannot convert '" +
+                std::string(primitiveTypeName(expression->type)) +
+                "' to '" + primitiveTypeName(target) + "' for " + context,
+            span);
+        return makeError(span);
+    }
+    if (conversion == ConversionKind::Identity) {
+        return expression;
+    }
+
+    auto result = std::make_unique<BoundConversionExpression>();
+    result->span = span;
+    result->type = target;
+    result->conversion = conversion;
+    result->expression = std::move(expression);
+    return result;
+}
 
 } // namespace realscript::semantic

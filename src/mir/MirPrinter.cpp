@@ -1,24 +1,51 @@
 #include "realscript/mir/Mir.h"
 
+#include <iomanip>
 #include <sstream>
 
 namespace realscript::mir {
+namespace {
+
+void printArguments(
+    std::ostringstream& out,
+    const std::vector<ValueId>& arguments) {
+    if (arguments.empty()) {
+        return;
+    }
+    out << '(';
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        if (i != 0) {
+            out << ", ";
+        }
+        out << '%' << arguments[i];
+    }
+    out << ')';
+}
+
+} // namespace
 
 std::string printModule(const Module& module) {
     std::ostringstream out;
     if (!module.name.empty()) {
         out << "module " << module.name << "\n\n";
     }
+
     for (const auto& function : module.functions) {
-        out << "func @" << function.name << '(';
+        out << "func @" << function.name << "(";
         for (std::size_t i = 0; i < function.parameterTypes.size(); ++i) {
-            if (i != 0) out << ", ";
+            if (i != 0) {
+                out << ", ";
+            }
             out << semantic::primitiveTypeName(function.parameterTypes[i]);
         }
-        out << ") -> " << semantic::primitiveTypeName(function.returnType) << " {\n";
+        out << ") -> " << semantic::primitiveTypeName(function.returnType)
+            << " {\n";
+
         out << "  locals [";
         for (std::size_t i = 0; i < function.localTypes.size(); ++i) {
-            if (i != 0) out << ", ";
+            if (i != 0) {
+                out << ", ";
+            }
             out << i << ':' << semantic::primitiveTypeName(function.localTypes[i]);
         }
         out << "]\n";
@@ -28,9 +55,12 @@ std::string printModule(const Module& module) {
             if (!basicBlock.parameters.empty()) {
                 out << '(';
                 for (std::size_t i = 0; i < basicBlock.parameters.size(); ++i) {
-                    if (i != 0) out << ", ";
+                    if (i != 0) {
+                        out << ", ";
+                    }
                     out << '%' << basicBlock.parameters[i].value << ':'
-                        << semantic::primitiveTypeName(basicBlock.parameters[i].type);
+                        << semantic::primitiveTypeName(
+                            basicBlock.parameters[i].type);
                 }
                 out << ')';
             }
@@ -40,9 +70,11 @@ std::string printModule(const Module& module) {
                 out << "  ";
                 if (instruction.result >= 0) {
                     out << '%' << instruction.result << ':'
-                        << semantic::primitiveTypeName(instruction.resultType) << " = ";
+                        << semantic::primitiveTypeName(instruction.resultType)
+                        << " = ";
                 }
                 out << opcodeName(instruction.opcode);
+
                 if (instruction.opcode == Opcode::Parameter ||
                     instruction.opcode == Opcode::ConstantInt) {
                     out << ' ' << instruction.integerImmediate;
@@ -53,10 +85,22 @@ std::string printModule(const Module& module) {
                 } else if (instruction.opcode == Opcode::LoadLocal) {
                     out << ' ' << instruction.localIndex;
                 } else if (instruction.opcode == Opcode::StoreLocal) {
-                    out << ' ' << instruction.localIndex << ", %" << instruction.operands.front();
+                    out << ' ' << instruction.localIndex << ", %"
+                        << instruction.operands.front();
+                } else if (instruction.opcode == Opcode::Call) {
+                    out << " @" << instruction.symbolName << "[0x"
+                        << std::hex << instruction.symbolId << std::dec << "](";
+                    for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
+                        if (i != 0) {
+                            out << ", ";
+                        }
+                        out << '%' << instruction.operands[i];
+                    }
+                    out << ')';
                 } else {
                     for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
-                        out << (i == 0 ? " " : ", ") << '%' << instruction.operands[i];
+                        out << (i == 0 ? " %" : ", %")
+                            << instruction.operands[i];
                     }
                 }
                 out << '\n';
@@ -66,33 +110,13 @@ std::string printModule(const Module& module) {
             out << "  " << terminatorName(terminator.kind);
             if (terminator.kind == TerminatorKind::Jump) {
                 out << " bb" << terminator.target;
-                if (!terminator.arguments.empty()) {
-                    out << '(';
-                    for (std::size_t i = 0; i < terminator.arguments.size(); ++i) {
-                        if (i != 0) out << ", ";
-                        out << '%' << terminator.arguments[i];
-                    }
-                    out << ')';
-                }
+                printArguments(out, terminator.arguments);
             } else if (terminator.kind == TerminatorKind::Branch) {
-                out << " %" << terminator.condition << ", bb" << terminator.target;
-                if (!terminator.arguments.empty()) {
-                    out << '(';
-                    for (std::size_t i = 0; i < terminator.arguments.size(); ++i) {
-                        if (i != 0) out << ", ";
-                        out << '%' << terminator.arguments[i];
-                    }
-                    out << ')';
-                }
+                out << " %" << terminator.condition << ", bb"
+                    << terminator.target;
+                printArguments(out, terminator.arguments);
                 out << ", bb" << terminator.falseTarget;
-                if (!terminator.falseArguments.empty()) {
-                    out << '(';
-                    for (std::size_t i = 0; i < terminator.falseArguments.size(); ++i) {
-                        if (i != 0) out << ", ";
-                        out << '%' << terminator.falseArguments[i];
-                    }
-                    out << ')';
-                }
+                printArguments(out, terminator.falseArguments);
             } else if (terminator.kind == TerminatorKind::ReturnValue) {
                 out << " %" << terminator.value;
             }
@@ -100,8 +124,8 @@ std::string printModule(const Module& module) {
         }
         out << "}\n\n";
     }
+
     return out.str();
 }
-
 
 } // namespace realscript::mir

@@ -12,6 +12,7 @@ add_library(realscript_frontend STATIC
     src/syntax/Lexer.cpp
     src/syntax/SyntaxNodes.cpp
     src/syntax/Parser.cpp
+    src/semantic/Symbols.cpp
     src/semantic/FlowAnalysis.cpp
     src/semantic/SemanticBinding.cpp
     src/semantic/SemanticExpressions.cpp
@@ -20,6 +21,7 @@ add_library(realscript_frontend STATIC
     src/mir/MirExpressions.cpp
     src/mir/MirVerifier.cpp
     src/mir/MirPrinter.cpp
+    src/compiler/Compilation.cpp
 )
 
 add_library(RealScript::Frontend ALIAS realscript_frontend)
@@ -50,11 +52,18 @@ target_compile_features(rsc PRIVATE cxx_std_17)
 
 if(REALSCRIPT_BUILD_TESTS)
     enable_testing()
+
     add_executable(realscript_tests tests/tests.cpp)
     target_link_libraries(realscript_tests PRIVATE RealScript::Frontend)
     target_compile_features(realscript_tests PRIVATE cxx_std_17)
     target_compile_definitions(
         realscript_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
     add_test(NAME realscript.frontend COMMAND realscript_tests)
+
+    add_executable(realscript_phase1c_tests tests/phase1c_tests.cpp)
+    target_link_libraries(realscript_phase1c_tests PRIVATE RealScript::Frontend)
+    target_compile_features(realscript_phase1c_tests PRIVATE cxx_std_17)
+    add_test(NAME realscript.phase1c COMMAND realscript_phase1c_tests)
 endif()
