@@ -1,7 +1,7 @@
 name: Apply Phase 1C bundle
 
 on:
-  push:
+  pull_request:
     branches:
       - agent/function-calls-modules-incremental
   workflow_dispatch:
@@ -13,7 +13,7 @@ jobs:
   apply:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout target branch
         uses: actions/checkout@v4
         with:
           ref: agent/function-calls-modules-incremental
@@ -26,6 +26,7 @@ jobs:
           base64 --decode .phase1c.tar.gz.b64 > /tmp/phase1c.tar.gz
           tar -xzf /tmp/phase1c.tar.gz
           rm .phase1c.tar.gz.b64
+          rm .phase1c-trigger
           rm .github/workflows/apply-phase1c.yml
 
           git config user.name "github-actions[bot]"
