@@ -1,0 +1,31 @@
+name: Export Phase 2A Source
+
+on:
+  pull_request:
+    branches:
+      - agent/typed-register-bytecode
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Phase 2A base
+        uses: actions/checkout@v4
+        with:
+          ref: agent/typed-register-bytecode
+
+      - name: Create source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --exclude=.git --exclude=build -czf realscript-source.tar.gz .
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: realscript-phase2a-source
+          path: realscript-source.tar.gz
+          if-no-files-found: error
