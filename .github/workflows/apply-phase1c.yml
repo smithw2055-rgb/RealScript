@@ -4,8 +4,7 @@ on:
   push:
     branches:
       - agent/function-calls-modules-incremental
-    paths:
-      - .github/workflows/apply-phase1c.yml
+  workflow_dispatch:
 
 permissions:
   contents: write
