@@ -1,0 +1,48 @@
+name: Apply Phase 2C Bundle
+
+on:
+  pull_request:
+    branches:
+      - agent/runtime-linking-observability
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Phase 2C branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/runtime-linking-observability
+          fetch-depth: 0
+
+      - name: Verify and extract bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .phase2c.part.* > /tmp/phase2c.b64
+          echo "a85ed715e9e6dfa5d4f1d46264abf29062956b0fe60cc3f411c4a365ed6e58da  /tmp/phase2c.b64" | sha256sum --check
+          base64 --decode /tmp/phase2c.b64 > /tmp/phase2c.tar.gz
+          echo "104cb92247dd536fc9c9f8d66975586616a2d2672af63b5346da5baae7bc3e09  /tmp/phase2c.tar.gz" | sha256sum --check
+          tar -xzf /tmp/phase2c.tar.gz
+          test -f src/runtime/RuntimeServices.cpp
+          test -f tests/phase2c_tests.cpp
+
+      - name: Configure
+        run: cmake -S . -B build -DREALSCRIPT_BUILD_TESTS=ON -DREALSCRIPT_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build --config Debug
+      - name: Test
+        run: ctest --test-dir build -C Debug --output-on-failure
+      - name: Check formatting
+        run: git diff --check
+      - name: Commit Phase 2C sources
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CMakeLists.txt README.md include/realscript/runtime/Runtime.h src/runtime/Interpreter.cpp src/runtime/RuntimeServices.cpp tests/phase2c_tests.cpp docs/roadmap/PHASE_2C.md docs/spec/EMBEDDING_AND_OBSERVABILITY_V0.md
+          git commit -m "Add runtime linking observability and embedding"
+          git push origin HEAD:agent/runtime-linking-observability
