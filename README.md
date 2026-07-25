@@ -4,11 +4,11 @@ RealScript 是一门面向现代游戏引擎的嵌入式强类型脚本语言与
 
 它采用接近 C# 的表达方式，以 C++17 游戏引擎为主要宿主，长期目标包括：快速字节码解释、C++17 AOT、可选 LLVM ORC JIT、源码级调试、热重载、沙箱 Mod，以及固定 Tick 的确定性模拟。
 
-> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端和 Phase 2A 类型化字节码工具链已经完成。语言、字节码和 ABI 尚未冻结。
+> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端、Phase 2A 类型化字节码工具链和 Phase 2B 解释器基线已经完成。语言、字节码和 ABI 尚未冻结。
 
 ## 当前可运行能力
 
-Phase 1A–2A 已经实现：
+Phase 1A–2B 已经实现：
 
 - 无外部依赖的 C++17/CMake 工程；
 - `SourceText`、`TextSpan` 和 CRLF/LF 行列映射；
@@ -31,6 +31,9 @@ Phase 1A–2A 已经实现：
 - 类型化寄存器字节码、函数引用表和块参数；
 - `.rsbc` 0.1 Section 容器、确定性编码和防御性解码；
 - 字节码反汇编器与语义验证器；
+- 类型化寄存器解释器、调用帧和跨模块调用；
+- Checked Arithmetic Trap、运行时错误和脚本栈；
+- 指令预算、递归预算与外部函数解析边界；
 - `rsc` Token、检查、MIR、Symbol、Bytecode 和二进制输出模式；
 - Linux/Windows GitHub Actions 构建；
 - 前端、控制流、模块、调用、增量编译和字节码测试。
@@ -41,6 +44,7 @@ Phase 1A–2A 已经实现：
 - [Phase 1B — Control Flow and Multi-Block MIR](docs/roadmap/PHASE_1B.md)
 - [Phase 1C — Calls, Modules and Incremental Compilation](docs/roadmap/PHASE_1C.md)
 - [Phase 2A — Typed Register Bytecode](docs/roadmap/PHASE_2A.md)
+- [Phase 2B — Bytecode Interpreter and Runtime Baseline](docs/roadmap/PHASE_2B.md)
 
 ## 快速开始
 
@@ -126,7 +130,15 @@ rsc math.rs --emit-bytecode math.rsbc
 rsc math.rsbc --disassemble
 ```
 
-`.rsbc` 在执行前必须先通过物理解码检查和字节码语义验证。Phase 2A 只建立格式、Lowerer、Codec、Disassembler 和 Verifier，解释器从 Phase 2B 开始。
+`.rsbc` 在执行前必须先通过物理解码检查和字节码语义验证。
+
+执行无参数入口函数：
+
+```bash
+rsc game.rs --run Game.Main::main
+```
+
+Phase 2B 已加入类型化寄存器解释器、函数调用、分支参数、预算与结构化运行时错误。
 
 ## Phase 1C 的符号与增量模型
 

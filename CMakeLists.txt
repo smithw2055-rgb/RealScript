@@ -27,6 +27,7 @@ add_library(realscript_frontend STATIC
     src/bytecode/BytecodeVerifier.cpp
     src/bytecode/BytecodeDisassembler.cpp
     src/bytecode/BytecodeCodec.cpp
+    src/runtime/Interpreter.cpp
 )
 
 add_library(RealScript::Frontend ALIAS realscript_frontend)
@@ -80,4 +81,9 @@ if(REALSCRIPT_BUILD_TESTS)
         PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     )
     add_test(NAME realscript.phase2a COMMAND realscript_phase2a_tests)
+
+    add_executable(realscript_phase2b_tests tests/phase2b_tests.cpp)
+    target_link_libraries(realscript_phase2b_tests PRIVATE RealScript::Frontend)
+    target_compile_features(realscript_phase2b_tests PRIVATE cxx_std_17)
+    add_test(NAME realscript.phase2b COMMAND realscript_phase2b_tests)
 endif()

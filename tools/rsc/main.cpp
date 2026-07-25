@@ -2,6 +2,7 @@
 #include "realscript/compiler/Compilation.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/mir/Mir.h"
+#include "realscript/runtime/Runtime.h"
 #include "realscript/syntax/Syntax.h"
 #include "realscript/text/Text.h"
 
@@ -68,7 +69,8 @@ void printUsage() {
         << "usage: rsc <file.rs>... "
            "[--check|--tokens|--mir|--symbols|--bytecode]\n"
         << "       rsc <file.rs>... --emit-bytecode <module.rsbc>\n"
-        << "       rsc <module.rsbc> --disassemble\n";
+        << "       rsc <module.rsbc> --disassemble\n"
+        << "       rsc <file.rs>... --run <module::function>\n";
 }
 
 void printDiagnostics(
@@ -101,7 +103,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> paths;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
-        if (argument == "--emit-bytecode") {
+        if (argument == "--emit-bytecode" || argument == "--run") {
             mode = argument;
             if (index + 1 >= argc) {
                 printUsage();
@@ -174,7 +176,30 @@ int main(int argc, char** argv) {
         }
         auto result = compilation.build();
 
-        if (!result.diagnostics.hasErrors() &&
+        if (!result.diagnostics.hasErrors() && mode == "--run") {
+            std::vector<realscript::bytecode::Module> modules;
+            realscript::bytecode::Lowerer lowerer;
+            for (const auto& mirModule : result.modules) {
+                auto module = lowerer.lower(mirModule);
+                (void)realscript::bytecode::verifyModule(module, result.diagnostics);
+                modules.push_back(std::move(module));
+            }
+            if (!result.diagnostics.hasErrors()) {
+                realscript::runtime::Interpreter interpreter(std::move(modules));
+                const auto execution = interpreter.invoke(outputPath);
+                if (execution.succeeded) {
+                    std::cout << realscript::runtime::valueToString(execution.value) << '\n';
+                } else {
+                    std::cerr << "runtime error "
+                        << realscript::runtime::errorCodeName(execution.error.code)
+                        << ": " << execution.error.message << '\n';
+                    for (const auto& frame : execution.error.stackTrace) {
+                        std::cerr << "  at " << frame << '\n';
+                    }
+                    return 1;
+                }
+            }
+        } else if (!result.diagnostics.hasErrors() &&
             (mode == "--bytecode" || mode == "--emit-bytecode")) {
             std::vector<realscript::bytecode::Module> modules;
             realscript::bytecode::Lowerer lowerer;
