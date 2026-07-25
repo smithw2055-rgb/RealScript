@@ -1,0 +1,31 @@
+name: Export Phase 2B Source
+
+on:
+  pull_request:
+    branches:
+      - agent/bytecode-interpreter-runtime
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Phase 2B base
+        uses: actions/checkout@v4
+        with:
+          ref: agent/bytecode-interpreter-runtime
+
+      - name: Create source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --exclude=.git --exclude=build -czf "$RUNNER_TEMP/realscript-source.tar.gz" .
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: realscript-phase2b-source
+          path: ${{ runner.temp }}/realscript-source.tar.gz
+          if-no-files-found: error
