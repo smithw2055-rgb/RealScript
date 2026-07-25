@@ -188,7 +188,9 @@ int main(int argc, char** argv) {
                 realscript::runtime::Interpreter interpreter(std::move(modules));
                 const auto execution = interpreter.invoke(outputPath);
                 if (execution.succeeded) {
-                    std::cout << realscript::runtime::valueToString(execution.value) << '\n';
+                    std::cout << realscript::runtime::valueToString(
+                        execution.value,
+                        interpreter.heap().get()) << '\n';
                 } else {
                     std::cerr << "runtime error "
                         << realscript::runtime::errorCodeName(execution.error.code)

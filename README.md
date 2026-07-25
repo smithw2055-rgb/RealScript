@@ -4,7 +4,7 @@ RealScript 是一门面向现代游戏引擎的嵌入式强类型脚本语言与
 
 它采用接近 C# 的表达方式，以 C++17 游戏引擎为主要宿主，长期目标包括：快速字节码解释、C++17 AOT、可选 LLVM ORC JIT、源码级调试、热重载、沙箱 Mod，以及固定 Tick 的确定性模拟。
 
-> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端、Phase 2A 类型化字节码工具链和 Phase 2B 解释器基线已经完成。语言、字节码和 ABI 尚未冻结。
+> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端、Phase 2A–2C 字节码运行时，以及 Phase 3A 托管堆与精确 GC 基线已经完成。语言、字节码、对象 ABI 和 GC 策略尚未冻结。
 
 ## 当前可运行能力
 
@@ -34,6 +34,10 @@ Phase 1A–2C 已经实现：
 - 类型化寄存器解释器、调用帧和跨模块调用；
 - Checked Arithmetic Trap、运行时错误和脚本栈；
 - 指令预算、递归预算与外部函数解析边界；
+- 可复用 `ProgramImage`、`BindingRegistry`、Trace 和运行统计；
+- `ObjectRef` 代际句柄、String/Array/Record 托管对象；
+- 精确 Shadow Stack 根、持久根和增量 Mark/Sweep；
+- 写屏障、GC 工作预算、回收统计和托管字符串字面量；
 - `rsc` Token、检查、MIR、Symbol、Bytecode 和二进制输出模式；
 - Linux/Windows GitHub Actions 构建；
 - 前端、控制流、模块、调用、增量编译和字节码测试。
@@ -45,6 +49,8 @@ Phase 1A–2C 已经实现：
 - [Phase 1C — Calls, Modules and Incremental Compilation](docs/roadmap/PHASE_1C.md)
 - [Phase 2A — Typed Register Bytecode](docs/roadmap/PHASE_2A.md)
 - [Phase 2B — Bytecode Interpreter and Runtime Baseline](docs/roadmap/PHASE_2B.md)
+- [Phase 2C — Linking, Observability and Embedding](docs/roadmap/PHASE_2C.md)
+- [Phase 3A — Managed Heap and Precise GC Baseline](docs/roadmap/PHASE_3A.md)
 
 ## 快速开始
 
@@ -193,7 +199,8 @@ Decoder 负责文件边界、Section、计数和 Tag；Verifier 继续检查类�
 - `break`、`continue`、`for`、`foreach`、`switch`；
 - 异常和协程；
 - 增量语法树与持久化构建缓存；
-- 字节码 VM、异常/GC 信息和原生 AOT。
+- 源语言对象/数组表达式和相应 MIR/Bytecode；
+- 异常表、协程状态、调试 GC Map 和原生 AOT。
 
 未实现能力会得到明确诊断，不会使用占位运行时行为假装支持。
 
@@ -237,6 +244,7 @@ include/realscript/
   mir/           多基本块 Typed MIR、Lowerer 和 Verifier
   compiler/      多文件 Compilation、模块图和增量快照
   bytecode/      类型化寄存器字节码、Codec、Verifier 和 Disassembler
+  runtime/       ProgramImage、Interpreter、ManagedHeap 和宿主嵌入
 src/              对应实现
 tools/rsc/        编译器命令行
 tests/fixtures/   源码 conformance fixtures
@@ -254,10 +262,15 @@ docs/roadmap/     实现切片和路线图
 - [运行时模型规范 Draft v0.1](docs/spec/RUNTIME_MODEL.md)
 - [字节码与原生 ABI 规范 Draft v0.1](docs/spec/BYTECODE_AND_ABI.md)
 - [`.rsbc` 0.1 物理格式](docs/spec/BYTECODE_FORMAT_V0.md)
+- [Embedding and Observability Draft v0.1](docs/spec/EMBEDDING_AND_OBSERVABILITY_V0.md)
+- [Managed Heap and GC Implemented Draft v0.1](docs/spec/MANAGED_HEAP_GC_V0.md)
 - [Phase 1A 实现说明](docs/roadmap/PHASE_1A.md)
 - [Phase 1B 实现说明](docs/roadmap/PHASE_1B.md)
 - [Phase 1C 实现说明](docs/roadmap/PHASE_1C.md)
 - [Phase 2A 实现说明](docs/roadmap/PHASE_2A.md)
+- [Phase 2B 实现说明](docs/roadmap/PHASE_2B.md)
+- [Phase 2C 实现说明](docs/roadmap/PHASE_2C.md)
+- [Phase 3A 实现说明](docs/roadmap/PHASE_3A.md)
 
 ## 路线图
 
@@ -267,8 +280,10 @@ docs/roadmap/     实现切片和路线图
 - [x] Phase 1B：赋值、控制流、流分析、多块 MIR、块参数和验证器；
 - [x] Phase 1C：函数调用、重载、模块符号和增量编译；
 - [x] Phase 2A：类型化寄存器字节码、编码器、反汇编器和验证器；
-- [ ] Phase 2B：解释器、调用栈、异常基线和执行预算；
-- [ ] Phase 3：对象模型、GC 和 C++ Native Binding；
+- [x] Phase 2B：解释器、调用栈、运行时错误和执行预算；
+- [x] Phase 2C：链接镜像、宿主绑定、Trace 和嵌入门面；
+- [x] Phase 3A：托管引用、精确根和增量 Mark/Sweep；
+- [ ] Phase 3B：对象/数组语言语义、类型描述符和 Native Handle；
 - [ ] Phase 4：DAP、LSP 和热重载；
 - [ ] Phase 5：C++17 AOT；
 - [ ] Phase 6：确定性、性能优化和可选 JIT。
@@ -306,3 +321,29 @@ auto result = runtime.invoke("Game.Main::main", {}, options);
 
 - [Phase 2C — Linking, Observability and Embedding](docs/roadmap/PHASE_2C.md)
 - [Embedding and Observability Draft v0.1](docs/spec/EMBEDDING_AND_OBSERVABILITY_V0.md)
+
+
+## Phase 3A 托管堆与精确 GC
+
+Phase 3A 建立非移动托管堆，并将脚本字符串字面量迁移为代际 `ObjectRef`：
+
+```cpp
+runtime::EngineRuntime runtime(sharedImage);
+auto heap = runtime.heap();
+
+auto array = heap->allocateArray(4);
+auto text = heap->allocateString("hello");
+heap->arraySet(*array, 0, *text);
+
+const auto root = heap->addPersistentRoot(*array);
+heap->requestCollection();
+// 解释器会在指令 safepoint 按 gcWorkBudget 分步执行 GC
+heap->removePersistentRoot(root);
+```
+
+活动解释器帧通过 Shadow Stack 精确登记参数、Local 和 Register。Array/Record 写入执行写屏障；旧 `ObjectRef` 通过 generation 检查拒绝复用后的悬空访问。
+
+详细说明：
+
+- [Phase 3A — Managed Heap and Precise GC Baseline](docs/roadmap/PHASE_3A.md)
+- [Managed Heap and GC Implemented Draft v0.1](docs/spec/MANAGED_HEAP_GC_V0.md)

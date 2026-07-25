@@ -44,6 +44,8 @@ RealScript 不允许以 C++ 未定义行为作为脚本语义。所有可观察�
 | [RUNTIME_MODEL.md](RUNTIME_MODEL.md) | 值与对象模型、GC、字符串、数组、句柄、任务、线程、调试、预算和热重载 | Draft v0.1 |
 | [BYTECODE_AND_ABI.md](BYTECODE_AND_ABI.md) | 字节码逻辑模型、验证器、调用约定、Runtime C ABI、Native Thunk 和版本兼容 | Draft v0.1 |
 | [BYTECODE_FORMAT_V0.md](BYTECODE_FORMAT_V0.md) | Phase 2A 已实现的 `.rsbc` 0.1 物理编码、Section、指令记录和安全边界 | Implemented Draft v0.1 |
+| [EMBEDDING_AND_OBSERVABILITY_V0.md](EMBEDDING_AND_OBSERVABILITY_V0.md) | Phase 2C 链接镜像、宿主绑定、Trace、统计与嵌入门面 | Implemented Draft v0.1 |
+| [MANAGED_HEAP_GC_V0.md](MANAGED_HEAP_GC_V0.md) | Phase 3A ObjectRef、托管对象、精确根、写屏障与增量 Mark/Sweep | Implemented Draft v0.1 |
 | [../ENGINE_DESIGN.md](../ENGINE_DESIGN.md) | 总体架构、参考项目、性能目标和实施路线 | Draft v0.1 |
 
 ## 4. 符合性档位

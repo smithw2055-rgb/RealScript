@@ -24,6 +24,26 @@ struct State {
     const std::unordered_map<semantic::SymbolId, FunctionLocation>* functions = nullptr;
     const ExternalFunction* externalResolver = nullptr;
     const TraceSink* trace = nullptr;
+    ManagedHeap* heap = nullptr;
+    ShadowStack shadowStack;
+};
+
+class ShadowFrameScope {
+public:
+    ShadowFrameScope(
+        ShadowStack& shadowStack,
+        const std::vector<Value>* arguments,
+        const std::vector<Value>* locals,
+        const std::vector<Value>* registers)
+        : shadowStack_(shadowStack) {
+        shadowStack_.pushFrame(arguments, locals, registers);
+    }
+    ~ShadowFrameScope() { shadowStack_.popFrame(); }
+    ShadowFrameScope(const ShadowFrameScope&) = delete;
+    ShadowFrameScope& operator=(const ShadowFrameScope&) = delete;
+
+private:
+    ShadowStack& shadowStack_;
 };
 
 void emitTrace(State& state, TraceEventKind kind, std::string operation = {}) {
@@ -53,6 +73,15 @@ bool consume(State& state) {
     }
     ++state.executed;
     state.statistics.instructionsExecuted = state.executed;
+    if (state.heap && state.limits.gcWorkBudget != 0) {
+        const auto work = state.heap->step(
+            state.shadowStack,
+            state.limits.gcWorkBudget);
+        state.statistics.gcWorkPerformed += work;
+        if (work != 0) {
+            emitTrace(state, TraceEventKind::GcStep, std::to_string(work));
+        }
+    }
     return true;
 }
 
@@ -61,11 +90,51 @@ bool expectType(
     const Value& value,
     semantic::PrimitiveType type,
     const std::string& context) {
+    if (const auto* reference = std::get_if<ObjectRef>(&value)) {
+        if (!state.heap || !state.heap->isAlive(*reference)) {
+            return fail(state, ErrorCode::InvalidObjectReference,
+                context + " contains an invalid managed object reference");
+        }
+    }
     if (valueType(value) != type) {
         return fail(state, ErrorCode::TypeMismatch,
             context + " expected '" + semantic::primitiveTypeName(type) +
             "', got '" + semantic::primitiveTypeName(valueType(value)) + "'");
     }
+    return true;
+}
+
+
+bool valuesEqual(State& state, const Value& left, const Value& right, bool& equal) {
+    if (valueType(left) != valueType(right)) {
+        equal = false;
+        return true;
+    }
+    if (valueType(left) != semantic::PrimitiveType::String) {
+        equal = left == right;
+        return true;
+    }
+    if (std::holds_alternative<NullString>(left) ||
+        std::holds_alternative<NullString>(right)) {
+        equal = std::holds_alternative<NullString>(left) &&
+            std::holds_alternative<NullString>(right);
+        return true;
+    }
+    const auto getText = [&](const Value& value) -> std::optional<std::string_view> {
+        if (const auto* text = std::get_if<std::string>(&value)) return *text;
+        if (const auto* reference = std::get_if<ObjectRef>(&value)) {
+            if (!state.heap) return std::nullopt;
+            return state.heap->stringView(*reference);
+        }
+        return std::nullopt;
+    };
+    const auto leftText = getText(left);
+    const auto rightText = getText(right);
+    if (!leftText || !rightText) {
+        return fail(state, ErrorCode::InvalidObjectReference,
+            "string equality encountered an invalid managed reference");
+    }
+    equal = *leftText == *rightText;
     return true;
 }
 
@@ -172,8 +241,26 @@ bool executeInstruction(
         return storeResult(instruction.integerImmediate);
     case bytecode::Opcode::ConstantBool:
         return storeResult(instruction.boolImmediate);
-    case bytecode::Opcode::ConstantString:
-        return storeResult(instruction.stringImmediate);
+    case bytecode::Opcode::ConstantString: {
+        if (!state.heap) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "string allocation requires a managed heap");
+        }
+        RuntimeError allocationError;
+        const auto reference = state.heap->allocateString(
+            instruction.stringImmediate,
+            &allocationError);
+        if (!reference) {
+            return fail(state,
+                allocationError.code == ErrorCode::None
+                    ? ErrorCode::OutOfMemory
+                    : allocationError.code,
+                allocationError.message.empty()
+                    ? "managed string allocation failed"
+                    : allocationError.message);
+        }
+        return storeResult(*reference);
+    }
     case bytecode::Opcode::ConstantNull:
         return storeResult(std::monostate{});
     case bytecode::Opcode::LoadLocal:
@@ -220,7 +307,8 @@ bool executeInstruction(
     if (!left || !right) return false;
 
     if (instruction.opcode == bytecode::Opcode::Equal || instruction.opcode == bytecode::Opcode::NotEqual) {
-        const bool equal = *left == *right;
+        bool equal = false;
+        if (!valuesEqual(state, *left, *right, equal)) return false;
         return storeResult(instruction.opcode == bytecode::Opcode::Equal ? equal : !equal);
     }
     if (!expectType(state, *left, semantic::PrimitiveType::Int, "binary operation") ||
@@ -272,6 +360,7 @@ bool executeFunction(
     emitTrace(state, TraceEventKind::FunctionEnter);
     std::vector<Value> locals(function.localTypes.size());
     std::vector<Value> registers(function.registerTypes.size());
+    ShadowFrameScope roots(state.shadowStack, &arguments, &locals, &registers);
     const bytecode::BasicBlock* block = findBlock(function, 0);
     if (!block) {
         state.stack.pop_back();
@@ -303,7 +392,8 @@ bool executeFunction(
                 return fail(state, ErrorCode::InvalidProgram, "return register is invalid");
             }
             result = registers[terminator.value];
-            emitTrace(state, TraceEventKind::FunctionExit, valueToString(result));
+            emitTrace(state, TraceEventKind::FunctionExit,
+                valueToString(result, state.heap));
             state.stack.pop_back();
             return true;
         }
@@ -355,16 +445,29 @@ bool executeFunction(
 } // namespace
 
 Interpreter::Interpreter(std::vector<bytecode::Module> modules)
-    : modules_(std::move(modules)) {}
+    : modules_(std::move(modules)),
+      heap_(std::make_shared<ManagedHeap>()) {}
 
 Interpreter::Interpreter(std::shared_ptr<const ProgramImage> program)
-    : program_(std::move(program)) {
+    : Interpreter(std::move(program), std::make_shared<ManagedHeap>()) {}
+
+Interpreter::Interpreter(
+    std::shared_ptr<const ProgramImage> program,
+    std::shared_ptr<ManagedHeap> heap)
+    : program_(std::move(program)),
+      heap_(heap ? std::move(heap) : std::make_shared<ManagedHeap>()) {
     if (program_) modules_ = program_->modules();
 }
 
 void Interpreter::setExternalResolver(ExternalFunction resolver) {
     externalResolver_ = std::move(resolver);
 }
+
+void Interpreter::setHeap(std::shared_ptr<ManagedHeap> heap) {
+    heap_ = heap ? std::move(heap) : std::make_shared<ManagedHeap>();
+}
+
+std::shared_ptr<ManagedHeap> Interpreter::heap() const noexcept { return heap_; }
 
 void Interpreter::setBindingRegistry(std::shared_ptr<const BindingRegistry> bindings) {
     bindings_ = std::move(bindings);
@@ -415,7 +518,12 @@ ExecutionResult Interpreter::invoke(
         missing.error.message = "entry function was not found";
         return missing;
     }
-    State state{options.limits, 0, {}, {}, {}, &functions, &externalResolver_, &options.trace};
+    State state;
+    state.limits = options.limits;
+    state.functions = &functions;
+    state.externalResolver = &externalResolver_;
+    state.trace = &options.trace;
+    state.heap = heap_.get();
     Value value;
     ExecutionResult execution;
     execution.succeeded = executeFunction(state, found->second, arguments, value);
@@ -464,6 +572,8 @@ const char* errorCodeName(ErrorCode code) noexcept {
     case ErrorCode::RecursionLimitExceeded: return "recursion-limit-exceeded";
     case ErrorCode::ExternalFunctionUnresolved: return "external-function-unresolved";
     case ErrorCode::DuplicateSymbol: return "duplicate-symbol";
+    case ErrorCode::InvalidObjectReference: return "invalid-object-reference";
+    case ErrorCode::OutOfMemory: return "out-of-memory";
     case ErrorCode::InvalidProgram: return "invalid-program";
     }
     return "unknown";
@@ -474,15 +584,30 @@ semantic::PrimitiveType valueType(const Value& value) noexcept {
     if (std::holds_alternative<NullString>(value)) return semantic::PrimitiveType::String;
     if (std::holds_alternative<bool>(value)) return semantic::PrimitiveType::Bool;
     if (std::holds_alternative<std::int64_t>(value)) return semantic::PrimitiveType::Int;
-    return semantic::PrimitiveType::String;
+    if (std::holds_alternative<std::string>(value)) return semantic::PrimitiveType::String;
+    const auto& reference = std::get<ObjectRef>(value);
+    return reference.kind == ObjectKind::String
+        ? semantic::PrimitiveType::String
+        : semantic::PrimitiveType::Error;
 }
 
 std::string valueToString(const Value& value) {
+    return valueToString(value, nullptr);
+}
+
+std::string valueToString(const Value& value, const ManagedHeap* heap) {
     if (std::holds_alternative<std::monostate>(value)) return "null";
     if (std::holds_alternative<NullString>(value)) return "null";
     if (std::holds_alternative<bool>(value)) return std::get<bool>(value) ? "true" : "false";
     if (std::holds_alternative<std::int64_t>(value)) return std::to_string(std::get<std::int64_t>(value));
-    return std::get<std::string>(value);
+    if (std::holds_alternative<std::string>(value)) return std::get<std::string>(value);
+    const auto reference = std::get<ObjectRef>(value);
+    if (heap) {
+        const auto text = heap->stringView(reference);
+        if (text) return std::string(*text);
+    }
+    return "<object:" + std::to_string(reference.slot) + ":" +
+        std::to_string(reference.generation) + ">";
 }
 
 } // namespace realscript::runtime

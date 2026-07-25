@@ -84,11 +84,18 @@ std::optional<semantic::SymbolId> ProgramImage::findFunction(const std::string& 
 }
 
 EngineRuntime::EngineRuntime(std::shared_ptr<const ProgramImage> program)
-    : program_(std::move(program)) {}
+    : program_(std::move(program)),
+      heap_(std::make_shared<ManagedHeap>()) {}
 
 void EngineRuntime::setBindings(std::shared_ptr<const BindingRegistry> bindings) {
     bindings_ = std::move(bindings);
 }
+
+void EngineRuntime::setHeap(std::shared_ptr<ManagedHeap> heap) {
+    heap_ = heap ? std::move(heap) : std::make_shared<ManagedHeap>();
+}
+
+std::shared_ptr<ManagedHeap> EngineRuntime::heap() const noexcept { return heap_; }
 
 ExecutionResult EngineRuntime::invoke(
     const std::string& qualifiedName,
@@ -100,7 +107,7 @@ ExecutionResult EngineRuntime::invoke(
         result.error.message = "runtime has no linked program image";
         return result;
     }
-    Interpreter interpreter(program_);
+    Interpreter interpreter(program_, heap_);
     interpreter.setBindingRegistry(bindings_);
     return interpreter.invoke(qualifiedName, arguments, std::move(options));
 }
@@ -114,6 +121,7 @@ const char* traceEventKindName(TraceEventKind kind) noexcept {
     case TraceEventKind::Instruction: return "instruction";
     case TraceEventKind::Branch: return "branch";
     case TraceEventKind::ExternalCall: return "external-call";
+    case TraceEventKind::GcStep: return "gc-step";
     case TraceEventKind::RuntimeError: return "runtime-error";
     }
     return "unknown";

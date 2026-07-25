@@ -248,6 +248,9 @@ HostHandle
 
 ## 12. GC
 
+> Phase 3A 的已实现非移动增量 Mark/Sweep 边界、ObjectRef 代际句柄和精确根规则见 [MANAGED_HEAP_GC_V0.md](MANAGED_HEAP_GC_V0.md)。本文其余条款仍描述长期完整运行时目标。
+
+
 ### 12.1 基本要求
 
 v0.1 运行时必须提供精确 GC：

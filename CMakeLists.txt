@@ -29,6 +29,7 @@ add_library(realscript_frontend STATIC
     src/bytecode/BytecodeCodec.cpp
     src/runtime/Interpreter.cpp
     src/runtime/RuntimeServices.cpp
+    src/runtime/ManagedHeap.cpp
 )
 
 add_library(RealScript::Frontend ALIAS realscript_frontend)
@@ -92,4 +93,9 @@ if(REALSCRIPT_BUILD_TESTS)
     target_link_libraries(realscript_phase2c_tests PRIVATE RealScript::Frontend)
     target_compile_features(realscript_phase2c_tests PRIVATE cxx_std_17)
     add_test(NAME realscript.phase2c COMMAND realscript_phase2c_tests)
+
+    add_executable(realscript_phase3a_tests tests/phase3a_tests.cpp)
+    target_link_libraries(realscript_phase3a_tests PRIVATE RealScript::Frontend)
+    target_compile_features(realscript_phase3a_tests PRIVATE cxx_std_17)
+    add_test(NAME realscript.phase3a COMMAND realscript_phase3a_tests)
 endif()
