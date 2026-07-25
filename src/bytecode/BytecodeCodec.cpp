@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -11,44 +10,36 @@ namespace {
 
 constexpr std::uint32_t InvalidIndex = 0xffffffffu;
 constexpr std::uint32_t SectionStrings = 1;
-constexpr std::uint32_t SectionReferences = 2;
-constexpr std::uint32_t SectionFunctions = 3;
-constexpr std::uint32_t SectionCode = 4;
-constexpr std::uint32_t SectionCount = 4;
+constexpr std::uint32_t SectionTypes = 2;
+constexpr std::uint32_t SectionReferences = 3;
+constexpr std::uint32_t SectionFunctions = 4;
+constexpr std::uint32_t SectionCode = 5;
+constexpr std::uint32_t SectionCount = 5;
 
 class Writer {
 public:
     void u8(std::uint8_t value) { data_.push_back(value); }
-
     void u16(std::uint16_t value) {
         u8(static_cast<std::uint8_t>(value));
         u8(static_cast<std::uint8_t>(value >> 8));
     }
-
     void u32(std::uint32_t value) {
         for (int shift = 0; shift < 32; shift += 8) {
             u8(static_cast<std::uint8_t>(value >> shift));
         }
     }
-
     void u64(std::uint64_t value) {
         for (int shift = 0; shift < 64; shift += 8) {
             u8(static_cast<std::uint8_t>(value >> shift));
         }
     }
-
-    void i64(std::int64_t value) {
-        u64(static_cast<std::uint64_t>(value));
-    }
-
+    void i64(std::int64_t value) { u64(static_cast<std::uint64_t>(value)); }
     void bytes(const char* values, std::size_t count) {
         data_.insert(data_.end(), values, values + count);
     }
-
     void bytes(const std::vector<std::uint8_t>& values) {
         data_.insert(data_.end(), values.begin(), values.end());
     }
-
     void patchU32(std::size_t offset, std::uint32_t value) {
         if (offset + 4 > data_.size()) {
             throw std::logic_error("bytecode writer patch is outside buffer");
@@ -57,13 +48,9 @@ public:
             data_[offset++] = static_cast<std::uint8_t>(value >> shift);
         }
     }
-
     [[nodiscard]] std::size_t size() const noexcept { return data_.size(); }
-    [[nodiscard]] const std::vector<std::uint8_t>& data() const noexcept {
-        return data_;
-    }
+    [[nodiscard]] const std::vector<std::uint8_t>& data() const noexcept { return data_; }
     [[nodiscard]] std::vector<std::uint8_t> take() { return std::move(data_); }
-
 private:
     std::vector<std::uint8_t> data_;
 };
@@ -80,18 +67,15 @@ public:
             end_ = begin + size;
         }
     }
-
     [[nodiscard]] bool valid() const noexcept { return valid_; }
     [[nodiscard]] bool empty() const noexcept { return position_ == end_; }
     [[nodiscard]] std::size_t remaining() const noexcept {
         return valid_ && position_ <= end_ ? end_ - position_ : 0;
     }
-
     std::uint8_t u8() {
         if (!require(1)) return 0;
         return data_[position_++];
     }
-
     std::uint16_t u16() {
         std::uint16_t result = 0;
         for (int shift = 0; shift < 16; shift += 8) {
@@ -99,7 +83,6 @@ public:
         }
         return result;
     }
-
     std::uint32_t u32() {
         std::uint32_t result = 0;
         for (int shift = 0; shift < 32; shift += 8) {
@@ -107,7 +90,6 @@ public:
         }
         return result;
     }
-
     std::uint64_t u64() {
         std::uint64_t result = 0;
         for (int shift = 0; shift < 64; shift += 8) {
@@ -115,16 +97,13 @@ public:
         }
         return result;
     }
-
     std::int64_t i64() { return static_cast<std::int64_t>(u64()); }
-
     std::string string(std::size_t count) {
         if (!require(count)) return {};
         const auto* begin = reinterpret_cast<const char*>(data_.data() + position_);
         position_ += count;
         return std::string(begin, count);
     }
-
 private:
     bool require(std::size_t count) {
         if (!valid_ || count > end_ - position_) {
@@ -133,7 +112,6 @@ private:
         }
         return true;
     }
-
     const std::vector<std::uint8_t>& data_;
     std::size_t position_ = 0;
     std::size_t end_ = 0;
@@ -146,9 +124,9 @@ std::uint8_t encodeType(semantic::PrimitiveType type) {
     case semantic::PrimitiveType::Bool: return 1;
     case semantic::PrimitiveType::Int: return 2;
     case semantic::PrimitiveType::String: return 3;
-    case semantic::PrimitiveType::Null: return 4;
-    case semantic::PrimitiveType::Error:
-        break;
+    case semantic::PrimitiveType::Object: return 4;
+    case semantic::PrimitiveType::Null: return 5;
+    case semantic::PrimitiveType::Error: break;
     }
     throw std::logic_error("invalid type in bytecode encoder");
 }
@@ -159,7 +137,8 @@ bool decodeType(std::uint8_t tag, semantic::PrimitiveType& type) {
     case 1: type = semantic::PrimitiveType::Bool; return true;
     case 2: type = semantic::PrimitiveType::Int; return true;
     case 3: type = semantic::PrimitiveType::String; return true;
-    case 4: type = semantic::PrimitiveType::Null; return true;
+    case 4: type = semantic::PrimitiveType::Object; return true;
+    case 5: type = semantic::PrimitiveType::Null; return true;
     default: return false;
     }
 }
@@ -168,15 +147,12 @@ class StringPool {
 public:
     std::uint32_t add(const std::string& value) {
         const auto found = indices_.find(value);
-        if (found != indices_.end()) {
-            return found->second;
-        }
+        if (found != indices_.end()) return found->second;
         const auto index = static_cast<std::uint32_t>(values_.size());
         values_.push_back(value);
         indices_.emplace(value, index);
         return index;
     }
-
     [[nodiscard]] std::uint32_t indexOf(const std::string& value) const {
         const auto found = indices_.find(value);
         if (found == indices_.end()) {
@@ -184,11 +160,9 @@ public:
         }
         return found->second;
     }
-
     [[nodiscard]] const std::vector<std::string>& values() const noexcept {
         return values_;
     }
-
 private:
     std::vector<std::string> values_;
     std::unordered_map<std::string, std::uint32_t> indices_;
@@ -196,9 +170,14 @@ private:
 
 void writeTypes(Writer& writer, const std::vector<semantic::PrimitiveType>& types) {
     writer.u32(static_cast<std::uint32_t>(types.size()));
-    for (const auto type : types) {
-        writer.u8(encodeType(type));
-    }
+    for (const auto type : types) writer.u8(encodeType(type));
+}
+
+void writeTypeIds(
+    Writer& writer,
+    const std::vector<semantic::SymbolId>& typeIds) {
+    writer.u32(static_cast<std::uint32_t>(typeIds.size()));
+    for (const auto typeId : typeIds) writer.u64(typeId);
 }
 
 bool readTypes(
@@ -222,11 +201,25 @@ bool readTypes(
     return reader.valid();
 }
 
+bool readTypeIds(
+    Reader& reader,
+    std::vector<semantic::SymbolId>& typeIds,
+    diagnostics::DiagnosticBag& diagnostics) {
+    const auto count = reader.u32();
+    if (!reader.valid() || count > reader.remaining() / 8) {
+        diagnostics.report("RS5003", "truncated bytecode type ID list", {});
+        return false;
+    }
+    typeIds.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        typeIds.push_back(reader.u64());
+    }
+    return reader.valid();
+}
+
 void writeRegisters(Writer& writer, const std::vector<Register>& values) {
     writer.u32(static_cast<std::uint32_t>(values.size()));
-    for (const auto value : values) {
-        writer.u32(value);
-    }
+    for (const auto value : values) writer.u32(value);
 }
 
 bool readRegisters(Reader& reader, std::vector<Register>& values) {
@@ -251,14 +244,32 @@ struct FunctionRecord {
     std::uint32_t codeSize = 0;
 };
 
+bool validStringIndex(
+    std::uint32_t index,
+    const std::vector<std::string>& strings,
+    diagnostics::DiagnosticBag& diagnostics,
+    const char* message) {
+    if (index >= strings.size()) {
+        diagnostics.report("RS5007", message, {});
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 std::vector<std::uint8_t> encodeModule(const Module& module) {
     StringPool strings;
     strings.add(module.name);
-    for (const auto& reference : module.functionReferences) {
-        strings.add(reference.name);
+    for (const auto& type : module.types) {
+        strings.add(type.moduleName);
+        strings.add(type.name);
+        for (const auto& field : type.fields) {
+            strings.add(field.name);
+            if (!field.typeName.empty()) strings.add(field.typeName);
+        }
     }
+    for (const auto& reference : module.functionReferences) strings.add(reference.name);
     for (const auto& function : module.functions) {
         strings.add(function.name);
         for (const auto& block : function.blocks) {
@@ -277,14 +288,32 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         stringSection.bytes(value.data(), value.size());
     }
 
+    Writer typeSection;
+    typeSection.u32(static_cast<std::uint32_t>(module.types.size()));
+    for (const auto& type : module.types) {
+        typeSection.u64(type.id);
+        typeSection.u32(strings.indexOf(type.moduleName));
+        typeSection.u32(strings.indexOf(type.name));
+        typeSection.u32(static_cast<std::uint32_t>(type.fields.size()));
+        for (const auto& field : type.fields) {
+            typeSection.u32(strings.indexOf(field.name));
+            typeSection.u8(encodeType(field.type));
+            typeSection.u32(field.typeName.empty()
+                ? InvalidIndex
+                : strings.indexOf(field.typeName));
+            typeSection.u32(static_cast<std::uint32_t>(field.index));
+        }
+    }
+
     Writer referenceSection;
-    referenceSection.u32(
-        static_cast<std::uint32_t>(module.functionReferences.size()));
+    referenceSection.u32(static_cast<std::uint32_t>(module.functionReferences.size()));
     for (const auto& reference : module.functionReferences) {
         referenceSection.u64(reference.symbolId);
         referenceSection.u32(strings.indexOf(reference.name));
         referenceSection.u8(encodeType(reference.returnType));
+        referenceSection.u64(reference.returnTypeId);
         writeTypes(referenceSection, reference.parameterTypes);
+        writeTypeIds(referenceSection, reference.parameterTypeIds);
     }
 
     Writer codeSection;
@@ -305,6 +334,7 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
                 codeSection.u32(instruction.result);
                 writeRegisters(codeSection, instruction.operands);
                 codeSection.u32(instruction.index);
+                codeSection.u32(instruction.typeIndex);
                 codeSection.i64(instruction.integerImmediate);
                 codeSection.u8(instruction.boolImmediate ? 1 : 0);
                 codeSection.u32(
@@ -333,7 +363,9 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         functionSection.u64(function.symbolId);
         functionSection.u32(strings.indexOf(function.name));
         functionSection.u8(encodeType(function.returnType));
+        functionSection.u64(function.returnTypeId);
         writeTypes(functionSection, function.parameterTypes);
+        writeTypeIds(functionSection, function.parameterTypeIds);
         writeTypes(functionSection, function.localTypes);
         writeTypes(functionSection, function.registerTypes);
         functionSection.u32(codeRanges[index].first);
@@ -356,6 +388,7 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
     const std::array<std::pair<std::uint32_t, const Writer*>, SectionCount>
         sections{{
             {SectionStrings, &stringSection},
+            {SectionTypes, &typeSection},
             {SectionReferences, &referenceSection},
             {SectionFunctions, &functionSection},
             {SectionCode, &codeSection},
@@ -364,8 +397,7 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
     for (std::size_t index = 0; index < sections.size(); ++index) {
         const auto offset = static_cast<std::uint32_t>(writer.size());
         writer.bytes(sections[index].second->data());
-        const auto size = static_cast<std::uint32_t>(
-            sections[index].second->size());
+        const auto size = static_cast<std::uint32_t>(sections[index].second->size());
         const auto entry = directoryOffset + index * 12;
         writer.patchU32(entry, sections[index].first);
         writer.patchU32(entry + 4, offset);
@@ -385,8 +417,7 @@ bool decodeModule(
     }
 
     Reader header(bytes, 0, bytes.size());
-    const auto magic = header.string(4);
-    if (magic != "RSBC") {
+    if (header.string(4) != "RSBC") {
         diagnostics.report("RS5000", "invalid bytecode magic", {});
         return false;
     }
@@ -398,7 +429,7 @@ bool decodeModule(
         diagnostics.report("RS5003", "truncated bytecode header", {});
         return false;
     }
-    if (module.version.major != 0 || module.version.minor != 1) {
+    if (module.version.major != 0 || module.version.minor != 2) {
         diagnostics.report("RS5001", "unsupported bytecode version", {});
         return false;
     }
@@ -422,6 +453,7 @@ bool decodeModule(
     }
     for (const auto kind : {
              SectionStrings,
+             SectionTypes,
              SectionReferences,
              SectionFunctions,
              SectionCode,
@@ -434,17 +466,15 @@ bool decodeModule(
 
     const auto directoryEnd = static_cast<std::uint32_t>(16 + SectionCount * 12);
     std::vector<SectionEntry> orderedSections;
-    orderedSections.reserve(sections.size());
-    for (const auto& entry : sections) {
-        if (entry.second.offset < directoryEnd) {
+    for (const auto& [kind, entry] : sections) {
+        (void)kind;
+        if (entry.offset < directoryEnd) {
             diagnostics.report("RS5002", "bytecode section overlaps the header", {});
             return false;
         }
-        orderedSections.push_back(entry.second);
+        orderedSections.push_back(entry);
     }
-    std::sort(
-        orderedSections.begin(),
-        orderedSections.end(),
+    std::sort(orderedSections.begin(), orderedSections.end(),
         [](const SectionEntry& left, const SectionEntry& right) {
             return left.offset < right.offset;
         });
@@ -488,6 +518,65 @@ bool decodeModule(
     module.name = strings.front();
 
     {
+        const auto section = sections.at(SectionTypes);
+        Reader reader(bytes, section.offset, section.size);
+        const auto count = reader.u32();
+        if (!reader.valid() || count > reader.remaining() / 24 + 1) {
+            diagnostics.report("RS5003", "truncated type descriptor section", {});
+            return false;
+        }
+        module.types.reserve(count);
+        for (std::uint32_t index = 0; index < count; ++index) {
+            semantic::TypeSymbol type;
+            type.id = reader.u64();
+            const auto moduleNameIndex = reader.u32();
+            const auto nameIndex = reader.u32();
+            if (!validStringIndex(moduleNameIndex, strings, diagnostics,
+                    "invalid type module string index") ||
+                !validStringIndex(nameIndex, strings, diagnostics,
+                    "invalid type name string index")) {
+                return false;
+            }
+            type.moduleName = strings[moduleNameIndex];
+            type.name = strings[nameIndex];
+            const auto fieldCount = reader.u32();
+            if (!reader.valid() || fieldCount > reader.remaining() / 13) {
+                diagnostics.report("RS5003", "truncated field descriptor list", {});
+                return false;
+            }
+            type.fields.reserve(fieldCount);
+            for (std::uint32_t fieldIndex = 0; fieldIndex < fieldCount; ++fieldIndex) {
+                semantic::FieldSymbol field;
+                const auto fieldNameIndex = reader.u32();
+                if (!validStringIndex(fieldNameIndex, strings, diagnostics,
+                        "invalid field name string index")) {
+                    return false;
+                }
+                field.name = strings[fieldNameIndex];
+                if (!decodeType(reader.u8(), field.type)) {
+                    diagnostics.report("RS5004", "invalid field type tag", {});
+                    return false;
+                }
+                const auto typeNameIndex = reader.u32();
+                if (typeNameIndex != InvalidIndex) {
+                    if (!validStringIndex(typeNameIndex, strings, diagnostics,
+                            "invalid field type-name string index")) {
+                        return false;
+                    }
+                    field.typeName = strings[typeNameIndex];
+                }
+                field.index = reader.u32();
+                type.fields.push_back(std::move(field));
+            }
+            module.types.push_back(std::move(type));
+        }
+        if (!reader.valid() || !reader.empty()) {
+            diagnostics.report("RS5003", "invalid type descriptor section", {});
+            return false;
+        }
+    }
+
+    {
         const auto section = sections.at(SectionReferences);
         Reader reader(bytes, section.offset, section.size);
         const auto count = reader.u32();
@@ -499,16 +588,18 @@ bool decodeModule(
             FunctionReference reference;
             reference.symbolId = reader.u64();
             const auto nameIndex = reader.u32();
-            if (nameIndex >= strings.size()) {
-                diagnostics.report("RS5007", "invalid reference name string index", {});
+            if (!validStringIndex(nameIndex, strings, diagnostics,
+                    "invalid reference name string index")) {
                 return false;
             }
             reference.name = strings[nameIndex];
             if (!decodeType(reader.u8(), reference.returnType)) {
-                diagnostics.report("RS5004", "invalid reference return type", {});
+                diagnostics.report("RS5004", "invalid function reference return type", {});
                 return false;
             }
-            if (!readTypes(reader, reference.parameterTypes, diagnostics)) {
+            reference.returnTypeId = reader.u64();
+            if (!readTypes(reader, reference.parameterTypes, diagnostics) ||
+                !readTypeIds(reader, reference.parameterTypeIds, diagnostics)) {
                 return false;
             }
             module.functionReferences.push_back(std::move(reference));
@@ -533,13 +624,18 @@ bool decodeModule(
             FunctionRecord record;
             record.function.symbolId = reader.u64();
             const auto nameIndex = reader.u32();
-            if (nameIndex >= strings.size()) {
-                diagnostics.report("RS5007", "invalid function name string index", {});
+            if (!validStringIndex(nameIndex, strings, diagnostics,
+                    "invalid function name string index")) {
                 return false;
             }
             record.function.name = strings[nameIndex];
-            if (!decodeType(reader.u8(), record.function.returnType) ||
-                !readTypes(reader, record.function.parameterTypes, diagnostics) ||
+            if (!decodeType(reader.u8(), record.function.returnType)) {
+                diagnostics.report("RS5004", "invalid function return type", {});
+                return false;
+            }
+            record.function.returnTypeId = reader.u64();
+            if (!readTypes(reader, record.function.parameterTypes, diagnostics) ||
+                !readTypeIds(reader, record.function.parameterTypeIds, diagnostics) ||
                 !readTypes(reader, record.function.localTypes, diagnostics) ||
                 !readTypes(reader, record.function.registerTypes, diagnostics)) {
                 diagnostics.report("RS5004", "invalid function type metadata", {});
@@ -576,10 +672,7 @@ bool decodeModule(
     }
 
     for (auto& record : records) {
-        Reader reader(
-            bytes,
-            codeSection.offset + record.codeOffset,
-            record.codeSize);
+        Reader reader(bytes, codeSection.offset + record.codeOffset, record.codeSize);
         const auto blockCount = reader.u32();
         if (!reader.valid() || blockCount > reader.remaining() / 37 + 1) {
             diagnostics.report("RS5003", "invalid bytecode block count", {});
@@ -589,9 +682,11 @@ bool decodeModule(
             BasicBlock block;
             block.id = reader.u32();
             const auto parameterCount = reader.u32();
-            for (std::uint32_t parameter = 0;
-                 parameter < parameterCount;
-                 ++parameter) {
+            if (!reader.valid() || parameterCount > reader.remaining() / 5) {
+                diagnostics.report("RS5003", "invalid block parameter count", {});
+                return false;
+            }
+            for (std::uint32_t parameter = 0; parameter < parameterCount; ++parameter) {
                 BlockParameter value;
                 value.target = reader.u32();
                 if (!decodeType(reader.u8(), value.type)) {
@@ -602,7 +697,7 @@ bool decodeModule(
             }
 
             const auto instructionCount = reader.u32();
-            if (!reader.valid() || instructionCount > reader.remaining() / 26 + 1) {
+            if (!reader.valid() || instructionCount > reader.remaining() / 30 + 1) {
                 diagnostics.report("RS5003", "invalid bytecode instruction count", {});
                 return false;
             }
@@ -622,12 +717,13 @@ bool decodeModule(
                     return false;
                 }
                 instruction.index = reader.u32();
+                instruction.typeIndex = reader.u32();
                 instruction.integerImmediate = reader.i64();
                 instruction.boolImmediate = reader.u8() != 0;
                 const auto stringIndex = reader.u32();
                 if (instruction.opcode == Opcode::ConstantString) {
-                    if (stringIndex >= strings.size()) {
-                        diagnostics.report("RS5007", "invalid constant string index", {});
+                    if (!validStringIndex(stringIndex, strings, diagnostics,
+                            "invalid constant string index")) {
                         return false;
                     }
                     instruction.stringImmediate = strings[stringIndex];

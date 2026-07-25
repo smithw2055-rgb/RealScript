@@ -4,6 +4,26 @@
 #include <utility>
 
 namespace realscript::semantic {
+namespace {
+
+bool sameObjectType(
+    const BoundExpression& expression,
+    const std::string& targetTypeName) {
+    return expression.type != PrimitiveType::Object ||
+        targetTypeName.empty() ||
+        expression.typeName == targetTypeName;
+}
+
+const FieldSymbol* findField(
+    const TypeSymbol& type,
+    const std::string& name) {
+    for (const auto& field : type.fields) {
+        if (field.name == name) return &field;
+    }
+    return nullptr;
+}
+
+} // namespace
 
 std::unique_ptr<BoundExpression> Binder::bindLiteralExpression(
     const syntax::LiteralExpressionSyntax& syntaxTree) {
@@ -53,6 +73,7 @@ std::unique_ptr<BoundExpression> Binder::bindNameExpression(
     auto result = std::make_unique<BoundVariableExpression>();
     result->span = syntaxTree.span();
     result->type = variable->type;
+    result->typeName = variable->typeName;
     result->variable = *variable;
     return result;
 }
@@ -176,17 +197,29 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
                     std::move(left),
                     right->type,
                     syntaxTree.left->span(),
-                    "equality operand");
+                    "equality operand",
+                    right->typeName);
             } else if (classifyConversion(right->type, left->type) !=
                        ConversionKind::None) {
                 right = convertExpression(
                     std::move(right),
                     left->type,
                     syntaxTree.right->span(),
-                    "equality operand");
+                    "equality operand",
+                    left->typeName);
             } else {
                 goto invalidOperator;
             }
+        }
+        if (left->type == PrimitiveType::Object &&
+            right->type == PrimitiveType::Object &&
+            !left->typeName.empty() && !right->typeName.empty() &&
+            left->typeName != right->typeName) {
+            goto invalidOperator;
+        }
+        if (left->type == PrimitiveType::Object && right->type == PrimitiveType::Object) {
+            if (left->typeName.empty()) left->typeName = right->typeName;
+            if (right->typeName.empty()) right->typeName = left->typeName;
         }
         resultType = PrimitiveType::Bool;
         operatorKind = tokenKind == syntax::SyntaxKind::EqualsEqualsToken
@@ -241,11 +274,13 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
         bindExpression(*syntaxTree.expression),
         variable->type,
         syntaxTree.expression->span(),
-        "assignment");
+        "assignment",
+        variable->typeName);
 
     auto result = std::make_unique<BoundAssignmentExpression>();
     result->span = syntaxTree.span();
     result->type = variable->type;
+    result->typeName = variable->typeName;
     result->variable = *variable;
     result->expression = std::move(value);
     return result;
@@ -283,7 +318,10 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
             const auto rank = conversionRank(
                 arguments[i]->type,
                 candidate.parameters[i].type);
-            if (rank < 0) {
+            if (rank < 0 ||
+                (candidate.parameters[i].type == PrimitiveType::Object &&
+                 arguments[i]->type == PrimitiveType::Object &&
+                 !sameObjectType(*arguments[i], candidate.parameters[i].typeName))) {
                 applicable = false;
                 break;
             }
@@ -324,14 +362,115 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
             std::move(arguments[i]),
             best->parameters[i].type,
             syntaxTree.arguments[i]->span(),
-            "argument");
+            "argument",
+            best->parameters[i].typeName);
     }
 
     auto result = std::make_unique<BoundCallExpression>();
     result->span = syntaxTree.span();
     result->type = best->returnType;
+    result->typeName = best->returnTypeName;
     result->function = *best;
     result->arguments = std::move(arguments);
+    return result;
+}
+
+std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
+    const syntax::NewObjectExpressionSyntax& syntaxTree) {
+    const auto found = visibleTypes_.find(syntaxTree.type.name.text);
+    if (found == visibleTypes_.end()) {
+        diagnostics_.report(
+            "RS2403",
+            "cannot allocate unknown type '" + syntaxTree.type.name.text + "'",
+            syntaxTree.type.span());
+        return makeError(syntaxTree.span());
+    }
+    auto result = std::make_unique<BoundNewObjectExpression>();
+    result->span = syntaxTree.span();
+    result->type = PrimitiveType::Object;
+    result->typeName = canonicalTypeName(found->second);
+    result->objectType = found->second;
+    return result;
+}
+
+std::unique_ptr<BoundExpression> Binder::bindMemberAccessExpression(
+    const syntax::MemberAccessExpressionSyntax& syntaxTree) {
+    auto receiver = bindExpression(*syntaxTree.receiver);
+    if (receiver->type != PrimitiveType::Object || receiver->typeName.empty()) {
+        diagnostics_.report(
+            "RS2404",
+            "member access requires a class reference",
+            syntaxTree.receiver->span());
+        return makeError(syntaxTree.span());
+    }
+    const auto type = visibleTypes_.find(receiver->typeName);
+    if (type == visibleTypes_.end()) {
+        diagnostics_.report(
+            "RS2405",
+            "type descriptor '" + receiver->typeName + "' is unavailable",
+            syntaxTree.receiver->span());
+        return makeError(syntaxTree.span());
+    }
+    const auto* field = findField(type->second, syntaxTree.nameToken.text);
+    if (!field) {
+        diagnostics_.report(
+            "RS2406",
+            "type '" + receiver->typeName + "' has no field '" +
+                syntaxTree.nameToken.text + "'",
+            syntaxTree.nameToken.span);
+        return makeError(syntaxTree.span());
+    }
+    auto result = std::make_unique<BoundMemberAccessExpression>();
+    result->span = syntaxTree.span();
+    result->type = field->type;
+    result->typeName = field->typeName;
+    result->receiver = std::move(receiver);
+    result->ownerType = type->second;
+    result->field = *field;
+    return result;
+}
+
+std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
+    const syntax::MemberAssignmentExpressionSyntax& syntaxTree) {
+    auto receiver = bindExpression(*syntaxTree.receiver);
+    if (receiver->type != PrimitiveType::Object || receiver->typeName.empty()) {
+        diagnostics_.report(
+            "RS2404",
+            "member assignment requires a class reference",
+            syntaxTree.receiver->span());
+        return makeError(syntaxTree.span());
+    }
+    const auto type = visibleTypes_.find(receiver->typeName);
+    if (type == visibleTypes_.end()) {
+        diagnostics_.report(
+            "RS2405",
+            "type descriptor '" + receiver->typeName + "' is unavailable",
+            syntaxTree.receiver->span());
+        return makeError(syntaxTree.span());
+    }
+    const auto* field = findField(type->second, syntaxTree.nameToken.text);
+    if (!field) {
+        diagnostics_.report(
+            "RS2406",
+            "type '" + receiver->typeName + "' has no field '" +
+                syntaxTree.nameToken.text + "'",
+            syntaxTree.nameToken.span);
+        return makeError(syntaxTree.span());
+    }
+    auto value = convertExpression(
+        bindExpression(*syntaxTree.expression),
+        field->type,
+        syntaxTree.expression->span(),
+        "field assignment",
+        field->typeName);
+    auto result = std::make_unique<BoundMemberAssignmentExpression>();
+    result->span = syntaxTree.span();
+    result->type = field->type;
+    result->typeName = field->typeName;
+    result->receiver = std::move(receiver);
+    result->ownerType = type->second;
+    result->field = *field;
+    result->expression = std::move(value);
     return result;
 }
 
@@ -339,13 +478,25 @@ std::unique_ptr<BoundExpression> Binder::convertExpression(
     std::unique_ptr<BoundExpression> expression,
     PrimitiveType target,
     text::TextSpan span,
-    const std::string& context) {
+    const std::string& context,
+    std::string targetTypeName) {
     if (!expression) {
         return makeError(span);
     }
     if (expression->type == PrimitiveType::Error ||
         target == PrimitiveType::Error) {
         return expression;
+    }
+
+    if (target == PrimitiveType::Object &&
+        expression->type == PrimitiveType::Object &&
+        !sameObjectType(*expression, targetTypeName)) {
+        diagnostics_.report(
+            "RS2410",
+            "cannot convert object type '" + expression->typeName +
+                "' to '" + targetTypeName + "' for " + context,
+            span);
+        return makeError(span);
     }
 
     const auto conversion = classifyConversion(expression->type, target);
@@ -359,12 +510,16 @@ std::unique_ptr<BoundExpression> Binder::convertExpression(
         return makeError(span);
     }
     if (conversion == ConversionKind::Identity) {
+        if (target == PrimitiveType::Object && !targetTypeName.empty()) {
+            expression->typeName = std::move(targetTypeName);
+        }
         return expression;
     }
 
     auto result = std::make_unique<BoundConversionExpression>();
     result->span = span;
     result->type = target;
+    result->typeName = std::move(targetTypeName);
     result->conversion = conversion;
     result->expression = std::move(expression);
     return result;

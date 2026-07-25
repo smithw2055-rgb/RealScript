@@ -1,5 +1,8 @@
 # RealScript 语言规范
 
+> Phase 3B 已实现的最小 `class`、`new`、字段访问、对象 null 与身份相等边界见 [OBJECT_MODEL_V0.md](OBJECT_MODEL_V0.md)。构造函数、方法、继承与接口仍属于后续实现。
+
+
 - 规范版本：Draft v0.1
 - `language_version`：0.1
 - 状态：规范草案，不保证源代码向后兼容

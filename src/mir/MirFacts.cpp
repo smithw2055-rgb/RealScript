@@ -12,6 +12,11 @@ const char* opcodeName(Opcode opcode) noexcept {
     case Opcode::LoadLocal: return "load.local";
     case Opcode::StoreLocal: return "store.local";
     case Opcode::ConvertNullToString: return "conv.null.string";
+    case Opcode::ConvertNullToObject: return "conv.null.object";
+    case Opcode::NewObject: return "new.object";
+    case Opcode::CheckNotNull: return "check.notnull";
+    case Opcode::LoadField: return "load.field";
+    case Opcode::StoreField: return "store.field";
     case Opcode::Call: return "call";
     case Opcode::NegateInt: return "neg.i32";
     case Opcode::LogicalNot: return "not.bool";

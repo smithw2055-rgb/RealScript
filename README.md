@@ -4,11 +4,11 @@ RealScript 是一门面向现代游戏引擎的嵌入式强类型脚本语言与
 
 它采用接近 C# 的表达方式，以 C++17 游戏引擎为主要宿主，长期目标包括：快速字节码解释、C++17 AOT、可选 LLVM ORC JIT、源码级调试、热重载、沙箱 Mod，以及固定 Tick 的确定性模拟。
 
-> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端、Phase 2A–2C 字节码运行时，以及 Phase 3A 托管堆与精确 GC 基线已经完成。语言、字节码、对象 ABI 和 GC 策略尚未冻结。
+> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端、Phase 2A–2C 字节码运行时，Phase 3A 托管堆与精确 GC 基线，以及 Phase 3B 语言可见对象模型已经完成。语言、字节码、对象 ABI 和 GC 策略尚未冻结。
 
 ## 当前可运行能力
 
-Phase 1A–2C 已经实现：
+Phase 1A–3B 已经实现：
 
 - 无外部依赖的 C++17/CMake 工程；
 - `SourceText`、`TextSpan` 和 CRLF/LF 行列映射；
@@ -29,7 +29,7 @@ Phase 1A–2C 已经实现：
 - 模块源码、公有签名和依赖指纹；
 - 基于上一轮 `BuildSnapshot` 的模块级语义/MIR 复用；
 - 类型化寄存器字节码、函数引用表和块参数；
-- `.rsbc` 0.1 Section 容器、确定性编码和防御性解码；
+- `.rsbc` 0.2 Section 容器、类型描述符、确定性编码和防御性解码；
 - 字节码反汇编器与语义验证器；
 - 类型化寄存器解释器、调用帧和跨模块调用；
 - Checked Arithmetic Trap、运行时错误和脚本栈；
@@ -38,6 +38,9 @@ Phase 1A–2C 已经实现：
 - `ObjectRef` 代际句柄、String/Array/Record 托管对象；
 - 精确 Shadow Stack 根、持久根和增量 Mark/Sweep；
 - 写屏障、GC 工作预算、回收统计和托管字符串字面量；
+- 模块级 `class`、稳定 TypeId 和声明顺序字段布局；
+- `new Type()`、字段读写、对象 Null Check 和身份相等；
+- 对象 MIR/Bytecode、精确引用字段图和运行时签名 TypeId 校验；
 - `rsc` Token、检查、MIR、Symbol、Bytecode 和二进制输出模式；
 - Linux/Windows GitHub Actions 构建；
 - 前端、控制流、模块、调用、增量编译和字节码测试。
@@ -51,6 +54,7 @@ Phase 1A–2C 已经实现：
 - [Phase 2B — Bytecode Interpreter and Runtime Baseline](docs/roadmap/PHASE_2B.md)
 - [Phase 2C — Linking, Observability and Embedding](docs/roadmap/PHASE_2C.md)
 - [Phase 3A — Managed Heap and Precise GC Baseline](docs/roadmap/PHASE_3A.md)
+- [Phase 3B — Language-visible Object Model and Fields](docs/roadmap/PHASE_3B.md)
 
 ## 快速开始
 
@@ -184,7 +188,7 @@ Phase 1C 的转换排序刻意保持较小：
 
 字节码保留多基本块、类型化寄存器、显式局部槽位和边参数。MIR `ValueId` 直接映射到寄存器，调用通过带签名的函数引用表索引表达。
 
-`.rsbc` 0.1 使用 little-endian 固定宽度整数和四个 Section：字符串、函数引用、函数元数据和代码。编码器不写入时间戳、裸地址或平台结构体填充，因此同一模块能够稳定地产生相同字节。
+`.rsbc` 0.2 使用 little-endian 固定宽度整数和五个 Section：字符串、类型描述符、函数引用、函数元数据和代码。编码器不写入时间戳、裸地址或平台结构体填充，因此同一模块能够稳定地产生相同字节。
 
 Decoder 负责文件边界、Section、计数和 Tag；Verifier 继续检查类型、定义支配、分支参数、调用和返回。两层都成功前不得进入执行器。
 
@@ -192,14 +196,14 @@ Decoder 负责文件边界、Section、计数和 Tag；Verifier 继续检查类�
 
 尚未实现：
 
-- `class`、`struct`、`interface`、`enum`；
-- 成员函数、字段、访问控制和命名导入；
+- `struct`、`interface`、`enum`；
+- 构造函数、成员函数、继承、访问控制和命名导入；
 - 完整数值类型、数值提升和用户定义转换；
 - 泛型和运行时构造未知泛型实例；
 - `break`、`continue`、`for`、`foreach`、`switch`；
 - 异常和协程；
 - 增量语法树与持久化构建缓存；
-- 源语言对象/数组表达式和相应 MIR/Bytecode；
+- 源语言数组表达式、成员方法和相应运行时模型；
 - 异常表、协程状态、调试 GC Map 和原生 AOT。
 
 未实现能力会得到明确诊断，不会使用占位运行时行为假装支持。
@@ -261,7 +265,7 @@ docs/roadmap/     实现切片和路线图
 - [Typed MIR 规范 Draft v0.1](docs/spec/MIR_SPEC.md)
 - [运行时模型规范 Draft v0.1](docs/spec/RUNTIME_MODEL.md)
 - [字节码与原生 ABI 规范 Draft v0.1](docs/spec/BYTECODE_AND_ABI.md)
-- [`.rsbc` 0.1 物理格式](docs/spec/BYTECODE_FORMAT_V0.md)
+- [`.rsbc` 0.2 物理格式](docs/spec/BYTECODE_FORMAT_V0.md)
 - [Embedding and Observability Draft v0.1](docs/spec/EMBEDDING_AND_OBSERVABILITY_V0.md)
 - [Managed Heap and GC Implemented Draft v0.1](docs/spec/MANAGED_HEAP_GC_V0.md)
 - [Phase 1A 实现说明](docs/roadmap/PHASE_1A.md)
@@ -271,6 +275,7 @@ docs/roadmap/     实现切片和路线图
 - [Phase 2B 实现说明](docs/roadmap/PHASE_2B.md)
 - [Phase 2C 实现说明](docs/roadmap/PHASE_2C.md)
 - [Phase 3A 实现说明](docs/roadmap/PHASE_3A.md)
+- [Phase 3B 实现说明](docs/roadmap/PHASE_3B.md)
 
 ## 路线图
 
@@ -283,7 +288,8 @@ docs/roadmap/     实现切片和路线图
 - [x] Phase 2B：解释器、调用栈、运行时错误和执行预算；
 - [x] Phase 2C：链接镜像、宿主绑定、Trace 和嵌入门面；
 - [x] Phase 3A：托管引用、精确根和增量 Mark/Sweep；
-- [ ] Phase 3B：对象/数组语言语义、类型描述符和 Native Handle；
+- [x] Phase 3B：class、对象字段、类型描述符和对象 Bytecode；
+- [ ] Phase 3C：数组、Native Handle、Heap Snapshot 和泄漏诊断；
 - [ ] Phase 4：DAP、LSP 和热重载；
 - [ ] Phase 5：C++17 AOT；
 - [ ] Phase 6：确定性、性能优化和可选 JIT。
@@ -347,3 +353,33 @@ heap->removePersistentRoot(root);
 
 - [Phase 3A — Managed Heap and Precise GC Baseline](docs/roadmap/PHASE_3A.md)
 - [Managed Heap and GC Implemented Draft v0.1](docs/spec/MANAGED_HEAP_GC_V0.md)
+
+
+## Phase 3B 语言可见对象模型
+
+Phase 3B 将 `class`、`new` 和字段访问贯穿源码、Typed MIR、`.rsbc` 与解释器：
+
+```csharp
+module Game.Objects;
+
+class Point
+{
+    int x;
+    int y;
+}
+
+int main()
+{
+    Point point = new Point();
+    point.x = 40;
+    point.y = 2;
+    return point.x + point.y;
+}
+```
+
+每个类拥有由规范名称生成的稳定 TypeId。`.rsbc` 0.2 保存有序字段布局和精确对象签名；解释器在函数入口、返回、Null Check 和字段访问处验证运行时 TypeId。GC 只扫描描述符中的 `string` 与 class 引用字段。
+
+详细说明：
+
+- [Phase 3B — Language-visible Object Model and Fields](docs/roadmap/PHASE_3B.md)
+- [Object Model Implemented Draft v0.1](docs/spec/OBJECT_MODEL_V0.md)

@@ -6,6 +6,16 @@
 namespace realscript::mir {
 namespace {
 
+void printSignatureType(
+    std::ostringstream& out,
+    semantic::PrimitiveType type,
+    semantic::SymbolId typeId) {
+    out << semantic::primitiveTypeName(type);
+    if (type == semantic::PrimitiveType::Object && typeId != 0) {
+        out << "[0x" << std::hex << typeId << std::dec << ']';
+    }
+}
+
 void printArguments(
     std::ostringstream& out,
     const std::vector<ValueId>& arguments) {
@@ -36,7 +46,12 @@ std::string printModule(const Module& module) {
             if (i != 0) {
                 out << ", ";
             }
-            out << semantic::primitiveTypeName(function.parameterTypes[i]);
+            printSignatureType(
+                out,
+                function.parameterTypes[i],
+                i < function.parameterTypeIds.size()
+                    ? function.parameterTypeIds[i]
+                    : 0);
         }
         out << ") -> " << semantic::primitiveTypeName(function.returnType)
             << " {\n";
@@ -86,6 +101,21 @@ std::string printModule(const Module& module) {
                     out << ' ' << instruction.localIndex;
                 } else if (instruction.opcode == Opcode::StoreLocal) {
                     out << ' ' << instruction.localIndex << ", %"
+                        << instruction.operands.front();
+                } else if (instruction.opcode == Opcode::NewObject) {
+                    out << " @" << instruction.symbolName << "[0x"
+                        << std::hex << instruction.typeId << std::dec << "]";
+                } else if (instruction.opcode == Opcode::LoadField) {
+                    out << " @" << instruction.symbolName << '.'
+                        << instruction.fieldIndex << ", %"
+                        << instruction.operands.front();
+                } else if (instruction.opcode == Opcode::StoreField) {
+                    out << " @" << instruction.symbolName << '.'
+                        << instruction.fieldIndex << ", %"
+                        << instruction.operands[0] << ", %"
+                        << instruction.operands[1];
+                } else if (instruction.opcode == Opcode::CheckNotNull) {
+                    out << " @" << instruction.symbolName << ", %"
                         << instruction.operands.front();
                 } else if (instruction.opcode == Opcode::Call) {
                     out << " @" << instruction.symbolName << "[0x"

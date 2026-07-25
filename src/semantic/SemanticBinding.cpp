@@ -16,11 +16,28 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
         : "";
     input.units = {&syntaxTree};
 
+    for (const auto& classSyntax : syntaxTree.classes) {
+        auto type = declareTypeShell(input.moduleName, classSyntax);
+        input.visibleTypes[type.name] = type;
+        input.visibleTypes[canonicalTypeName(type)] = type;
+        input.types.push_back(type);
+    }
+    for (std::size_t index = 0; index < syntaxTree.classes.size(); ++index) {
+        (void)populateTypeFields(
+            input.types[index],
+            syntaxTree.classes[index],
+            input.visibleTypes,
+            diagnostics_);
+        input.visibleTypes[input.types[index].name] = input.types[index];
+        input.visibleTypes[canonicalTypeName(input.types[index])] = input.types[index];
+    }
+
     std::unordered_set<std::string> functionKeys;
     for (const auto& functionSyntax : syntaxTree.functions) {
         auto symbol = declareFunctionSymbol(
             input.moduleName,
             functionSyntax,
+            input.visibleTypes,
             diagnostics_);
         const auto key = canonicalFunctionKey(symbol);
         if (!functionKeys.insert(key).second) {
@@ -38,9 +55,11 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
 
 SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
     visibleFunctions_ = input.visibleFunctions;
+    visibleTypes_ = input.visibleTypes;
 
     SemanticModel result;
     result.moduleName = input.moduleName;
+    result.types = input.types;
 
     std::size_t declarationIndex = 0;
     for (const auto* unit : input.units) {
@@ -70,6 +89,7 @@ BoundFunction Binder::bindFunction(
     scopes_.clear();
     pushScope();
     currentReturnType_ = symbol.returnType;
+    currentReturnTypeName_ = symbol.returnTypeName;
     nextVariableIndex_ = symbol.parameters.size();
 
     for (std::size_t i = 0; i < symbol.parameters.size(); ++i) {
@@ -186,7 +206,11 @@ std::unique_ptr<BoundStatement> Binder::bindReturnStatement(
         bindExpression(*syntaxTree.expression),
         currentReturnType_,
         syntaxTree.expression->span(),
-        "return value");
+        "return value",
+        currentReturnTypeName_);
+    if (result->expression && currentReturnType_ == PrimitiveType::Object) {
+        result->expression->typeName = currentReturnTypeName_;
+    }
     return result;
 }
 
@@ -223,9 +247,11 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
     const syntax::VariableDeclarationStatementSyntax& syntaxTree) {
     auto result = std::make_unique<BoundVariableDeclarationStatement>();
     result->span = syntaxTree.span();
+    std::string declaredTypeName;
     result->variable = {
         syntaxTree.identifierToken.text,
-        bindType(syntaxTree.type, false),
+        bindType(syntaxTree.type, false, &declaredTypeName),
+        declaredTypeName,
         nextVariableIndex_++,
         false,
     };
@@ -236,7 +262,19 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
             bindExpression(*syntaxTree.initializer),
             result->variable.type,
             syntaxTree.initializer->span(),
-            "initializer");
+            "initializer",
+            result->variable.typeName);
+        if (result->initializer && result->variable.type == PrimitiveType::Object) {
+            if (!result->initializer->typeName.empty() &&
+                result->initializer->typeName != result->variable.typeName) {
+                diagnostics_.report(
+                    "RS2410",
+                    "cannot initialize '" + result->variable.typeName +
+                        "' with '" + result->initializer->typeName + "'",
+                    syntaxTree.initializer->span());
+            }
+            result->initializer->typeName = result->variable.typeName;
+        }
     }
     return result;
 }
@@ -274,6 +312,15 @@ std::unique_ptr<BoundExpression> Binder::bindExpression(
     case syntax::SyntaxKind::CallExpression:
         return bindCallExpression(
             static_cast<const syntax::CallExpressionSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::NewObjectExpression:
+        return bindNewObjectExpression(
+            static_cast<const syntax::NewObjectExpressionSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::MemberAccessExpression:
+        return bindMemberAccessExpression(
+            static_cast<const syntax::MemberAccessExpressionSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::MemberAssignmentExpression:
+        return bindMemberAssignmentExpression(
+            static_cast<const syntax::MemberAssignmentExpressionSyntax&>(syntaxTree));
     default:
         diagnostics_.report(
             "RS2199",
@@ -285,24 +332,30 @@ std::unique_ptr<BoundExpression> Binder::bindExpression(
 
 PrimitiveType Binder::bindType(
     const syntax::TypeSyntax& syntaxTree,
-    bool allowVoid) {
-    const auto type = resolvePrimitiveType(syntaxTree.name.text);
-    if (type == PrimitiveType::Error) {
-        diagnostics_.report(
-            "RS2200",
-            "type '" + syntaxTree.name.text +
-                "' is not implemented in the Phase 1C profile",
-            syntaxTree.span());
-        return type;
+    bool allowVoid,
+    std::string* typeName) {
+    if (typeName) typeName->clear();
+    const auto primitive = resolvePrimitiveType(syntaxTree.name.text);
+    if (primitive != PrimitiveType::Error) {
+        if (primitive == PrimitiveType::Void && !allowVoid) {
+            diagnostics_.report(
+                "RS2201",
+                "void is not valid in this type position",
+                syntaxTree.span());
+            return PrimitiveType::Error;
+        }
+        return primitive;
     }
-    if (type == PrimitiveType::Void && !allowVoid) {
-        diagnostics_.report(
-            "RS2201",
-            "void is not valid in this type position",
-            syntaxTree.span());
-        return PrimitiveType::Error;
+    const auto found = visibleTypes_.find(syntaxTree.name.text);
+    if (found != visibleTypes_.end()) {
+        if (typeName) *typeName = canonicalTypeName(found->second);
+        return PrimitiveType::Object;
     }
-    return type;
+    diagnostics_.report(
+        "RS2200",
+        "unknown type '" + syntaxTree.name.text + "'",
+        syntaxTree.span());
+    return PrimitiveType::Error;
 }
 
 const VariableSymbol* Binder::lookupVariable(

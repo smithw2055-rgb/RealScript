@@ -6,6 +6,16 @@
 namespace realscript::bytecode {
 namespace {
 
+void printSignatureType(
+    std::ostringstream& out,
+    semantic::PrimitiveType type,
+    semantic::SymbolId typeId) {
+    out << semantic::primitiveTypeName(type);
+    if (type == semantic::PrimitiveType::Object && typeId != 0) {
+        out << "[0x" << std::hex << typeId << std::dec << ']';
+    }
+}
+
 void printRegisters(
     std::ostringstream& out,
     const std::vector<Register>& registers) {
@@ -29,6 +39,25 @@ std::string disassembleModule(const Module& module) {
     out << "rsbc " << module.version.major << '.' << module.version.minor
         << " module " << module.name << "\n";
 
+    if (!module.types.empty()) {
+        out << "\ntypes:\n";
+        for (std::size_t index = 0; index < module.types.size(); ++index) {
+            const auto& type = module.types[index];
+            out << "  type" << index << " @"
+                << semantic::canonicalTypeName(type) << "[0x"
+                << std::hex << type.id << std::dec << "] {";
+            for (std::size_t fieldIndex = 0; fieldIndex < type.fields.size(); ++fieldIndex) {
+                if (fieldIndex != 0) out << ", ";
+                const auto& field = type.fields[fieldIndex];
+                out << field.name << ':'
+                    << (field.type == semantic::PrimitiveType::Object
+                        ? field.typeName
+                        : semantic::primitiveTypeName(field.type));
+            }
+            out << "}\n";
+        }
+    }
+
     if (!module.functionReferences.empty()) {
         out << "\nreferences:\n";
         for (std::size_t index = 0; index < module.functionReferences.size(); ++index) {
@@ -41,8 +70,12 @@ std::string disassembleModule(const Module& module) {
                 if (parameter != 0) {
                     out << ", ";
                 }
-                out << semantic::primitiveTypeName(
-                    reference.parameterTypes[parameter]);
+                printSignatureType(
+                    out,
+                    reference.parameterTypes[parameter],
+                    parameter < reference.parameterTypeIds.size()
+                        ? reference.parameterTypeIds[parameter]
+                        : 0);
             }
             out << ") -> " << semantic::primitiveTypeName(reference.returnType)
                 << '\n';
@@ -56,7 +89,12 @@ std::string disassembleModule(const Module& module) {
             if (index != 0) {
                 out << ", ";
             }
-            out << semantic::primitiveTypeName(function.parameterTypes[index]);
+            printSignatureType(
+                out,
+                function.parameterTypes[index],
+                index < function.parameterTypeIds.size()
+                    ? function.parameterTypeIds[index]
+                    : 0);
         }
         out << ") -> " << semantic::primitiveTypeName(function.returnType)
             << " {\n";
@@ -122,6 +160,24 @@ std::string disassembleModule(const Module& module) {
                     out << " \"" << instruction.stringImmediate << "\"";
                     break;
                 case Opcode::ConstantNull:
+                    break;
+                case Opcode::NewObject:
+                    out << " type" << instruction.typeIndex;
+                    break;
+                case Opcode::CheckNotNull:
+                    out << " type" << instruction.typeIndex << ", r"
+                        << instruction.operands.front();
+                    break;
+                case Opcode::LoadField:
+                    out << " type" << instruction.typeIndex << '.'
+                        << instruction.index << ", r"
+                        << instruction.operands.front();
+                    break;
+                case Opcode::StoreField:
+                    out << " type" << instruction.typeIndex << '.'
+                        << instruction.index << ", r"
+                        << instruction.operands[0] << ", r"
+                        << instruction.operands[1];
                     break;
                 case Opcode::Call:
                     if (instruction.index < module.functionReferences.size()) {

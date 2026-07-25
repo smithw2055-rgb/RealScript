@@ -16,13 +16,15 @@ bool validRegisterType(semantic::PrimitiveType type) noexcept {
     return type == semantic::PrimitiveType::Bool ||
         type == semantic::PrimitiveType::Int ||
         type == semantic::PrimitiveType::String ||
+        type == semantic::PrimitiveType::Object ||
         type == semantic::PrimitiveType::Null;
 }
 
 bool validStorageType(semantic::PrimitiveType type) noexcept {
     return type == semantic::PrimitiveType::Bool ||
         type == semantic::PrimitiveType::Int ||
-        type == semantic::PrimitiveType::String;
+        type == semantic::PrimitiveType::String ||
+        type == semantic::PrimitiveType::Object;
 }
 
 bool validReturnType(semantic::PrimitiveType type) noexcept {
@@ -30,10 +32,25 @@ bool validReturnType(semantic::PrimitiveType type) noexcept {
         validStorageType(type);
 }
 
+bool validTypeIdentity(
+    semantic::PrimitiveType type,
+    semantic::SymbolId typeId) noexcept {
+    return type == semantic::PrimitiveType::Object
+        ? typeId != 0
+        : typeId == 0;
+}
+
+semantic::SymbolId typeIdAt(
+    const std::vector<semantic::SymbolId>& typeIds,
+    std::size_t index) noexcept {
+    return index < typeIds.size() ? typeIds[index] : 0;
+}
+
 bool instructionDefinesValue(
     const Instruction& instruction,
     const Module& module) noexcept {
-    if (instruction.opcode == Opcode::StoreLocal) {
+    if (instruction.opcode == Opcode::StoreLocal ||
+        instruction.opcode == Opcode::StoreField) {
         return false;
     }
     if (instruction.opcode == Opcode::Call &&
@@ -54,12 +71,18 @@ std::size_t expectedOperandCount(
     case Opcode::ConstantString:
     case Opcode::ConstantNull:
     case Opcode::LoadLocal:
+    case Opcode::NewObject:
         return 0;
     case Opcode::StoreLocal:
     case Opcode::ConvertNullToString:
+    case Opcode::ConvertNullToObject:
+    case Opcode::CheckNotNull:
+    case Opcode::LoadField:
     case Opcode::NegateInt:
     case Opcode::LogicalNot:
         return 1;
+    case Opcode::StoreField:
+        return 2;
     case Opcode::Call:
         return instruction.index < module.functionReferences.size()
             ? module.functionReferences[instruction.index].parameterTypes.size()
@@ -76,7 +99,7 @@ bool verifyModule(
     diagnostics::DiagnosticBag& diagnostics) {
     const auto initialCount = diagnostics.items().size();
 
-    if (module.version.major != 0 || module.version.minor != 1) {
+    if (module.version.major != 0 || module.version.minor != 2) {
         diagnostics.report(
             "RS5100",
             "unsupported in-memory bytecode version",
@@ -84,6 +107,31 @@ bool verifyModule(
     }
     if (module.name.empty()) {
         diagnostics.report("RS5101", "bytecode module name is empty", {});
+    }
+
+    std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> typeDescriptors;
+    for (const auto& type : module.types) {
+        if (type.id == 0 || type.name.empty() ||
+            !typeDescriptors.emplace(type.id, &type).second) {
+            diagnostics.report(
+                "RS5150",
+                "duplicate or invalid bytecode type descriptor",
+                {});
+        }
+        for (std::size_t fieldIndex = 0; fieldIndex < type.fields.size(); ++fieldIndex) {
+            const auto& field = type.fields[fieldIndex];
+            if (field.index != fieldIndex || field.name.empty() ||
+                !validStorageType(field.type) ||
+                (field.type == semantic::PrimitiveType::Object &&
+                    field.typeName.empty()) ||
+                (field.type != semantic::PrimitiveType::Object &&
+                    !field.typeName.empty())) {
+                diagnostics.report(
+                    "RS5151",
+                    "invalid bytecode field descriptor",
+                    {});
+            }
+        }
     }
 
     std::unordered_map<semantic::SymbolId, const Function*> internalFunctions;
@@ -109,7 +157,9 @@ bool verifyModule(
         if (found != references.end() &&
             (found->second->name != reference.name ||
              found->second->returnType != reference.returnType ||
-             found->second->parameterTypes != reference.parameterTypes)) {
+             found->second->returnTypeId != reference.returnTypeId ||
+             found->second->parameterTypes != reference.parameterTypes ||
+             found->second->parameterTypeIds != reference.parameterTypeIds)) {
             diagnostics.report(
                 "RS5104",
                 "conflicting bytecode references share a SymbolId",
@@ -117,17 +167,31 @@ bool verifyModule(
         } else {
             references[reference.symbolId] = &reference;
         }
-        if (!validReturnType(reference.returnType)) {
+        if (!validReturnType(reference.returnType) ||
+            !validTypeIdentity(reference.returnType, reference.returnTypeId)) {
             diagnostics.report(
                 "RS5105",
-                "bytecode function reference has an invalid return type",
+                "bytecode function reference has an invalid return type identity",
                 {});
         }
-        for (const auto type : reference.parameterTypes) {
-            if (!validStorageType(type)) {
+        if (!reference.parameterTypeIds.empty() &&
+            reference.parameterTypeIds.size() != reference.parameterTypes.size()) {
+            diagnostics.report(
+                "RS5106",
+                "bytecode function reference type ID count is invalid",
+                {});
+        }
+        for (std::size_t parameter = 0;
+             parameter < reference.parameterTypes.size();
+             ++parameter) {
+            const auto type = reference.parameterTypes[parameter];
+            if (!validStorageType(type) ||
+                !validTypeIdentity(
+                    type,
+                    typeIdAt(reference.parameterTypeIds, parameter))) {
                 diagnostics.report(
                     "RS5106",
-                    "bytecode function reference has an invalid parameter type",
+                    "bytecode function reference has an invalid parameter type identity",
                     {});
             }
         }
@@ -135,7 +199,9 @@ bool verifyModule(
         const auto internal = internalFunctions.find(reference.symbolId);
         if (internal != internalFunctions.end() &&
             (internal->second->returnType != reference.returnType ||
-             internal->second->parameterTypes != reference.parameterTypes)) {
+             internal->second->returnTypeId != reference.returnTypeId ||
+             internal->second->parameterTypes != reference.parameterTypes ||
+             internal->second->parameterTypeIds != reference.parameterTypeIds)) {
             diagnostics.report(
                 "RS5107",
                 "internal bytecode call reference signature does not match function",
@@ -147,17 +213,31 @@ bool verifyModule(
         if (function.name.empty()) {
             diagnostics.report("RS5108", "bytecode function name is empty", {});
         }
-        if (!validReturnType(function.returnType)) {
+        if (!validReturnType(function.returnType) ||
+            !validTypeIdentity(function.returnType, function.returnTypeId)) {
             diagnostics.report(
                 "RS5109",
-                "bytecode function has an invalid return type",
+                "bytecode function has an invalid return type identity",
                 {});
         }
-        for (const auto type : function.parameterTypes) {
-            if (!validStorageType(type)) {
+        if (!function.parameterTypeIds.empty() &&
+            function.parameterTypeIds.size() != function.parameterTypes.size()) {
+            diagnostics.report(
+                "RS5110",
+                "bytecode function parameter type ID count is invalid",
+                {});
+        }
+        for (std::size_t parameter = 0;
+             parameter < function.parameterTypes.size();
+             ++parameter) {
+            const auto type = function.parameterTypes[parameter];
+            if (!validStorageType(type) ||
+                !validTypeIdentity(
+                    type,
+                    typeIdAt(function.parameterTypeIds, parameter))) {
                 diagnostics.report(
                     "RS5110",
-                    "bytecode function has an invalid parameter type",
+                    "bytecode function has an invalid parameter type identity",
                     {});
             }
         }
@@ -476,6 +556,78 @@ bool verifyModule(
                             "RS5135",
                             "invalid null-to-string bytecode conversion",
                             {});
+                    }
+                    break;
+                case Opcode::ConvertNullToObject:
+                    if (instruction.operands.size() != 1 ||
+                        registerType(instruction.operands.front()) !=
+                            semantic::PrimitiveType::Null ||
+                        resultType != semantic::PrimitiveType::Object) {
+                        diagnostics.report(
+                            "RS5152",
+                            "invalid null-to-object bytecode conversion",
+                            {});
+                    }
+                    break;
+                case Opcode::NewObject:
+                    if (instruction.typeIndex >= module.types.size() ||
+                        resultType != semantic::PrimitiveType::Object) {
+                        diagnostics.report(
+                            "RS5153",
+                            "invalid bytecode object allocation",
+                            {});
+                    }
+                    break;
+                case Opcode::CheckNotNull:
+                    if (instruction.typeIndex >= module.types.size() ||
+                        instruction.operands.size() != 1 ||
+                        registerType(instruction.operands.front()) !=
+                            semantic::PrimitiveType::Object ||
+                        resultType != semantic::PrimitiveType::Object) {
+                        diagnostics.report(
+                            "RS5154",
+                            "invalid bytecode object null check",
+                            {});
+                    }
+                    break;
+                case Opcode::LoadField:
+                case Opcode::StoreField:
+                    if (instruction.typeIndex >= module.types.size()) {
+                        diagnostics.report(
+                            "RS5155",
+                            "bytecode field access references an invalid type",
+                            {});
+                        break;
+                    }
+                    {
+                        const auto& type = module.types[instruction.typeIndex];
+                        if (instruction.index >= type.fields.size() ||
+                            instruction.operands.empty() ||
+                            registerType(instruction.operands[0]) !=
+                                semantic::PrimitiveType::Object) {
+                            diagnostics.report(
+                                "RS5156",
+                                "invalid bytecode field access",
+                                {});
+                            break;
+                        }
+                        const auto fieldType = type.fields[instruction.index].type;
+                        if (instruction.opcode == Opcode::LoadField) {
+                            if (instruction.operands.size() != 1 ||
+                                resultType != fieldType) {
+                                diagnostics.report(
+                                    "RS5157",
+                                    "bytecode field load type mismatch",
+                                    {});
+                            }
+                        } else if (instruction.operands.size() != 2 ||
+                                   registerType(instruction.operands[1]) != fieldType ||
+                                   instruction.result != InvalidRegister) {
+                            diagnostics.report(
+                                "RS5158",
+                                "bytecode field store type mismatch",
+                                {});
+                        }
                     }
                     break;
                 case Opcode::Call:

@@ -8,7 +8,8 @@ namespace realscript::bytecode {
 namespace {
 
 bool definesValue(const mir::Instruction& instruction) noexcept {
-    if (instruction.opcode == mir::Opcode::StoreLocal) {
+    if (instruction.opcode == mir::Opcode::StoreLocal ||
+        instruction.opcode == mir::Opcode::StoreField) {
         return false;
     }
     return instruction.opcode != mir::Opcode::Call ||
@@ -25,6 +26,11 @@ Opcode lowerOpcode(mir::Opcode opcode) {
     case mir::Opcode::LoadLocal: return Opcode::LoadLocal;
     case mir::Opcode::StoreLocal: return Opcode::StoreLocal;
     case mir::Opcode::ConvertNullToString: return Opcode::ConvertNullToString;
+    case mir::Opcode::ConvertNullToObject: return Opcode::ConvertNullToObject;
+    case mir::Opcode::NewObject: return Opcode::NewObject;
+    case mir::Opcode::CheckNotNull: return Opcode::CheckNotNull;
+    case mir::Opcode::LoadField: return Opcode::LoadField;
+    case mir::Opcode::StoreField: return Opcode::StoreField;
     case mir::Opcode::Call: return Opcode::Call;
     case mir::Opcode::NegateInt: return Opcode::NegateInt;
     case mir::Opcode::LogicalNot: return Opcode::LogicalNot;
@@ -57,12 +63,19 @@ TerminatorKind lowerTerminator(mir::TerminatorKind kind) {
 std::string referenceKey(const mir::Instruction& instruction) {
     std::string result = std::to_string(instruction.symbolId) + ":" +
         instruction.symbolName + "(";
-    for (const auto type : instruction.parameterTypes) {
-        result += semantic::primitiveTypeName(type);
+    for (std::size_t index = 0; index < instruction.parameterTypes.size(); ++index) {
+        result += semantic::primitiveTypeName(instruction.parameterTypes[index]);
+        result.push_back('#');
+        result += std::to_string(
+            index < instruction.parameterTypeIds.size()
+                ? instruction.parameterTypeIds[index]
+                : 0);
         result.push_back(',');
     }
     result += ")->";
     result += semantic::primitiveTypeName(instruction.resultType);
+    result.push_back('#');
+    result += std::to_string(instruction.resultTypeId);
     return result;
 }
 
@@ -71,15 +84,24 @@ std::string referenceKey(const mir::Instruction& instruction) {
 Module Lowerer::lower(const mir::Module& source) const {
     Module result;
     result.name = source.name;
+    result.types = source.types;
 
     std::unordered_map<std::string, std::uint32_t> referenceIndices;
+    std::unordered_map<semantic::SymbolId, std::uint32_t> typeIndices;
+    for (std::size_t index = 0; index < result.types.size(); ++index) {
+        typeIndices.emplace(
+            result.types[index].id,
+            static_cast<std::uint32_t>(index));
+    }
 
     for (const auto& sourceFunction : source.functions) {
         Function function;
         function.symbolId = sourceFunction.symbolId;
         function.name = sourceFunction.name;
         function.returnType = sourceFunction.returnType;
+        function.returnTypeId = sourceFunction.returnTypeId;
         function.parameterTypes = sourceFunction.parameterTypes;
+        function.parameterTypeIds = sourceFunction.parameterTypeIds;
         function.localTypes = sourceFunction.localTypes;
 
         mir::ValueId maximumValue = -1;
@@ -119,6 +141,22 @@ Module Lowerer::lower(const mir::Module& source) const {
                     sourceInstruction.opcode == mir::Opcode::Parameter
                         ? sourceInstruction.integerImmediate
                         : sourceInstruction.localIndex);
+                if (sourceInstruction.opcode == mir::Opcode::LoadField ||
+                    sourceInstruction.opcode == mir::Opcode::StoreField) {
+                    instruction.index = static_cast<std::uint32_t>(
+                        sourceInstruction.fieldIndex);
+                }
+                if (sourceInstruction.opcode == mir::Opcode::NewObject ||
+                    sourceInstruction.opcode == mir::Opcode::CheckNotNull ||
+                    sourceInstruction.opcode == mir::Opcode::LoadField ||
+                    sourceInstruction.opcode == mir::Opcode::StoreField) {
+                    const auto foundType = typeIndices.find(sourceInstruction.typeId);
+                    if (foundType == typeIndices.end()) {
+                        throw std::logic_error(
+                            "MIR object instruction references missing type descriptor");
+                    }
+                    instruction.typeIndex = foundType->second;
+                }
                 instruction.integerImmediate = sourceInstruction.integerImmediate;
                 instruction.boolImmediate = sourceInstruction.boolImmediate;
                 instruction.stringImmediate = sourceInstruction.stringImmediate;
@@ -131,12 +169,15 @@ Module Lowerer::lower(const mir::Module& source) const {
                     } else {
                         const auto index = static_cast<std::uint32_t>(
                             result.functionReferences.size());
-                        result.functionReferences.push_back({
-                            sourceInstruction.symbolId,
-                            sourceInstruction.symbolName,
-                            sourceInstruction.resultType,
-                            sourceInstruction.parameterTypes,
-                        });
+                        FunctionReference reference;
+                        reference.symbolId = sourceInstruction.symbolId;
+                        reference.name = sourceInstruction.symbolName;
+                        reference.returnType = sourceInstruction.resultType;
+                        reference.returnTypeId = sourceInstruction.resultTypeId;
+                        reference.parameterTypes = sourceInstruction.parameterTypes;
+                        reference.parameterTypeIds =
+                            sourceInstruction.parameterTypeIds;
+                        result.functionReferences.push_back(std::move(reference));
                         referenceIndices.emplace(key, index);
                         instruction.index = index;
                     }

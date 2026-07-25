@@ -20,7 +20,7 @@ MIR → Typed Register Bytecode
         └── Defensive Decoder
                 │
                 ▼
-             .rsbc 0.1
+             .rsbc 0.1 (initial baseline)
 ```
 
 Phase 2A intentionally stops before instruction execution. Phase 2B can build the interpreter on a validated and testable module representation rather than combining file parsing, verification and execution in one step.
@@ -54,10 +54,10 @@ Function references are deduplicated by stable symbol identity, name and full si
 
 ## `.rsbc` container
 
-The v0.1 container uses:
+The Phase 2A v0.1 container established the original shape. Phase 3B advances the implemented format to 0.2 by adding type descriptors and exact object TypeIds. The shared container uses:
 
 - `RSBC` magic;
-- bytecode version 0.1;
+- a versioned bytecode header (currently 0.2);
 - little-endian fixed-width scalar fields;
 - a section directory;
 - string, function-reference, function metadata and code sections;

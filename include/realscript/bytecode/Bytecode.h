@@ -18,7 +18,7 @@ constexpr Register InvalidRegister = std::numeric_limits<Register>::max();
 
 struct Version {
     std::uint16_t major = 0;
-    std::uint16_t minor = 1;
+    std::uint16_t minor = 2;
 };
 
 enum class Opcode : std::uint8_t {
@@ -30,6 +30,11 @@ enum class Opcode : std::uint8_t {
     LoadLocal,
     StoreLocal,
     ConvertNullToString,
+    ConvertNullToObject,
+    NewObject,
+    CheckNotNull,
+    LoadField,
+    StoreField,
     Call,
     NegateInt,
     LogicalNot,
@@ -50,7 +55,9 @@ struct FunctionReference {
     semantic::SymbolId symbolId = 0;
     std::string name;
     semantic::PrimitiveType returnType = semantic::PrimitiveType::Error;
+    semantic::SymbolId returnTypeId = 0;
     std::vector<semantic::PrimitiveType> parameterTypes;
+    std::vector<semantic::SymbolId> parameterTypeIds;
 };
 
 struct Instruction {
@@ -58,6 +65,7 @@ struct Instruction {
     Register result = InvalidRegister;
     std::vector<Register> operands;
     std::uint32_t index = 0;
+    std::uint32_t typeIndex = 0;
     std::int64_t integerImmediate = 0;
     bool boolImmediate = false;
     std::string stringImmediate;
@@ -97,7 +105,9 @@ struct Function {
     semantic::SymbolId symbolId = 0;
     std::string name;
     semantic::PrimitiveType returnType = semantic::PrimitiveType::Error;
+    semantic::SymbolId returnTypeId = 0;
     std::vector<semantic::PrimitiveType> parameterTypes;
+    std::vector<semantic::SymbolId> parameterTypeIds;
     std::vector<semantic::PrimitiveType> localTypes;
     std::vector<semantic::PrimitiveType> registerTypes;
     std::vector<BasicBlock> blocks;
@@ -106,6 +116,7 @@ struct Function {
 struct Module {
     Version version;
     std::string name;
+    std::vector<semantic::TypeSymbol> types;
     std::vector<FunctionReference> functionReferences;
     std::vector<Function> functions;
 };

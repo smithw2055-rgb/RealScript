@@ -41,6 +41,8 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(IfKeyword);
         RS_KIND(ElseKeyword);
         RS_KIND(WhileKeyword);
+        RS_KIND(ClassKeyword);
+        RS_KIND(NewKeyword);
         RS_KIND(TrueKeyword);
         RS_KIND(FalseKeyword);
         RS_KIND(NullKeyword);
@@ -59,6 +61,8 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(VoidKeyword);
         RS_KIND(CompilationUnit);
         RS_KIND(ModuleDeclaration);
+        RS_KIND(ClassDeclaration);
+        RS_KIND(FieldDeclaration);
         RS_KIND(ImportDeclaration);
         RS_KIND(FunctionDeclaration);
         RS_KIND(Parameter);
@@ -74,8 +78,11 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(UnaryExpression);
         RS_KIND(BinaryExpression);
         RS_KIND(AssignmentExpression);
+        RS_KIND(MemberAssignmentExpression);
         RS_KIND(ParenthesizedExpression);
         RS_KIND(CallExpression);
+        RS_KIND(MemberAccessExpression);
+        RS_KIND(NewObjectExpression);
 #undef RS_KIND
     }
     return "UnknownSyntaxKind";
@@ -89,6 +96,8 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"if", SyntaxKind::IfKeyword},
         {"else", SyntaxKind::ElseKeyword},
         {"while", SyntaxKind::WhileKeyword},
+        {"class", SyntaxKind::ClassKeyword},
+        {"new", SyntaxKind::NewKeyword},
         {"true", SyntaxKind::TrueKeyword},
         {"false", SyntaxKind::FalseKeyword},
         {"null", SyntaxKind::NullKeyword},

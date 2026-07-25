@@ -1,5 +1,8 @@
 # RealScript 运行时模型规范
 
+> Phase 3B 的语言可见对象、运行时 TypeId 和精确字段引用图见 [OBJECT_MODEL_V0.md](OBJECT_MODEL_V0.md)。
+
+
 - 规范版本：Draft v0.1
 - 适用版本：`language_version = 0.1`
 - 状态：对象模型和行为约束草案，物理布局尚未冻结

@@ -20,6 +20,10 @@ struct NullString {
     friend constexpr bool operator==(NullString, NullString) noexcept { return true; }
 };
 
+struct NullObject {
+    friend constexpr bool operator==(NullObject, NullObject) noexcept { return true; }
+};
+
 enum class ObjectKind : std::uint8_t {
     String,
     Array,
@@ -50,6 +54,7 @@ struct ObjectRef {
 using Value = std::variant<
     std::monostate,
     NullString,
+    NullObject,
     bool,
     std::int64_t,
     std::string,
@@ -67,6 +72,7 @@ enum class ErrorCode {
     ExternalFunctionUnresolved,
     DuplicateSymbol,
     InvalidObjectReference,
+    NullReference,
     OutOfMemory,
     InvalidProgram,
 };
@@ -142,6 +148,11 @@ public:
     [[nodiscard]] std::optional<ObjectRef> allocateRecord(
         std::size_t fieldCount,
         RuntimeError* error = nullptr);
+    [[nodiscard]] std::optional<ObjectRef> allocateObject(
+        semantic::SymbolId typeId,
+        std::vector<Value> fields,
+        std::vector<std::size_t> referenceFields,
+        RuntimeError* error = nullptr);
 
     [[nodiscard]] bool isAlive(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<std::string_view> stringView(ObjectRef reference) const;
@@ -153,6 +164,8 @@ public:
         Value value,
         RuntimeError* error = nullptr);
     [[nodiscard]] std::optional<std::size_t> fieldCount(ObjectRef reference) const;
+    [[nodiscard]] std::optional<semantic::SymbolId> objectTypeId(
+        ObjectRef reference) const;
     [[nodiscard]] std::optional<Value> fieldGet(ObjectRef reference, std::size_t index) const;
     bool fieldSet(
         ObjectRef reference,

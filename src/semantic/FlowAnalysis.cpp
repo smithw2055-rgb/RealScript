@@ -88,6 +88,21 @@ private:
             }
             return;
         }
+        case BoundNodeKind::MemberAccessExpression:
+            analyzeExpression(
+                *static_cast<const BoundMemberAccessExpression&>(
+                    expression).receiver,
+                assigned);
+            return;
+        case BoundNodeKind::MemberAssignmentExpression: {
+            const auto& assignment =
+                static_cast<const BoundMemberAssignmentExpression&>(expression);
+            analyzeExpression(*assignment.receiver, assigned);
+            analyzeExpression(*assignment.expression, assigned);
+            return;
+        }
+        case BoundNodeKind::NewObjectExpression:
+            return;
         case BoundNodeKind::UnaryExpression:
             analyzeExpression(
                 *static_cast<const BoundUnaryExpression&>(expression).operand,

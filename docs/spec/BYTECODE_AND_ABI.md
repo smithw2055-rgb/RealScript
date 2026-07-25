@@ -1,5 +1,8 @@
 # RealScript 字节码与原生 ABI 规范
 
+> 当前 `.rsbc` 0.2 的类型描述符、对象指令和精确对象签名编码见 [BYTECODE_FORMAT_V0.md](BYTECODE_FORMAT_V0.md) 与 [OBJECT_MODEL_V0.md](OBJECT_MODEL_V0.md)。
+
+
 - 规范版本：Draft v0.1
 - `bytecode_format_version`：0.1
 - `runtime_abi_version`：0.1

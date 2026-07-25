@@ -50,6 +50,8 @@ enum class SyntaxKind {
     IfKeyword,
     ElseKeyword,
     WhileKeyword,
+    ClassKeyword,
+    NewKeyword,
     TrueKeyword,
     FalseKeyword,
     NullKeyword,
@@ -70,6 +72,8 @@ enum class SyntaxKind {
     CompilationUnit,
     ModuleDeclaration,
     ImportDeclaration,
+    ClassDeclaration,
+    FieldDeclaration,
     FunctionDeclaration,
     Parameter,
     TypeName,
@@ -84,8 +88,11 @@ enum class SyntaxKind {
     UnaryExpression,
     BinaryExpression,
     AssignmentExpression,
+    MemberAssignmentExpression,
     ParenthesizedExpression,
     CallExpression,
+    MemberAccessExpression,
+    NewObjectExpression,
 };
 
 using TokenValue = std::variant<std::monostate, std::int64_t, double, bool, std::string>;
@@ -201,6 +208,37 @@ struct CallExpressionSyntax final : ExpressionSyntax {
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
+
+struct MemberAccessExpressionSyntax final : ExpressionSyntax {
+    std::unique_ptr<ExpressionSyntax> receiver;
+    SyntaxToken dotToken;
+    SyntaxToken nameToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::MemberAccessExpression; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct MemberAssignmentExpressionSyntax final : ExpressionSyntax {
+    std::unique_ptr<ExpressionSyntax> receiver;
+    SyntaxToken dotToken;
+    SyntaxToken nameToken;
+    SyntaxToken equalsToken;
+    std::unique_ptr<ExpressionSyntax> expression;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::MemberAssignmentExpression; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct NewObjectExpressionSyntax final : ExpressionSyntax {
+    SyntaxToken newKeyword;
+    TypeSyntax type;
+    SyntaxToken openParenToken;
+    SyntaxToken closeParenToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::NewObjectExpression; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
 struct ReturnStatementSyntax final : StatementSyntax {
     SyntaxToken returnKeyword;
     std::unique_ptr<ExpressionSyntax> expression;
@@ -270,6 +308,27 @@ struct ParameterSyntax final : SyntaxNode {
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
+
+struct FieldDeclarationSyntax final : SyntaxNode {
+    TypeSyntax type;
+    SyntaxToken identifierToken;
+    SyntaxToken semicolonToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::FieldDeclaration; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct ClassDeclarationSyntax final : SyntaxNode {
+    SyntaxToken classKeyword;
+    SyntaxToken identifierToken;
+    SyntaxToken openBraceToken;
+    std::vector<FieldDeclarationSyntax> fields;
+    SyntaxToken closeBraceToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ClassDeclaration; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
 struct FunctionDeclarationSyntax final : SyntaxNode {
     TypeSyntax returnType;
     SyntaxToken identifierToken;
@@ -308,6 +367,7 @@ struct ImportDeclarationSyntax final : SyntaxNode {
 struct CompilationUnitSyntax final : SyntaxNode {
     std::unique_ptr<ModuleDeclarationSyntax> moduleDeclaration;
     std::vector<ImportDeclarationSyntax> imports;
+    std::vector<ClassDeclarationSyntax> classes;
     std::vector<FunctionDeclarationSyntax> functions;
     SyntaxToken endOfFileToken;
 
@@ -333,6 +393,8 @@ private:
     void parseQualifiedName(
         std::vector<SyntaxToken>& nameParts,
         std::vector<SyntaxToken>& dotTokens);
+    [[nodiscard]] ClassDeclarationSyntax parseClassDeclaration();
+    [[nodiscard]] FieldDeclarationSyntax parseFieldDeclaration();
     [[nodiscard]] FunctionDeclarationSyntax parseFunctionDeclaration();
     [[nodiscard]] TypeSyntax parseType();
     [[nodiscard]] ParameterSyntax parseParameter();
@@ -347,7 +409,9 @@ private:
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseAssignmentExpression();
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseBinaryExpression(int parentPrecedence = 0);
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parsePrimaryExpression();
+    [[nodiscard]] std::unique_ptr<ExpressionSyntax> parsePostfixExpression();
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseCallExpression();
+    [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseNewObjectExpression();
     [[nodiscard]] bool isVariableDeclarationStart() const noexcept;
 
     const text::SourceText& source_;

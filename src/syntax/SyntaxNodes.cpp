@@ -32,6 +32,18 @@ text::TextSpan AssignmentExpressionSyntax::span() const noexcept {
     return combine(identifierToken.span, expression->span());
 }
 
+text::TextSpan MemberAccessExpressionSyntax::span() const noexcept {
+    return combine(receiver->span(), nameToken.span);
+}
+
+text::TextSpan MemberAssignmentExpressionSyntax::span() const noexcept {
+    return combine(receiver->span(), expression->span());
+}
+
+text::TextSpan NewObjectExpressionSyntax::span() const noexcept {
+    return combine(newKeyword.span, closeParenToken.span);
+}
+
 text::TextSpan ParenthesizedExpressionSyntax::span() const noexcept {
     return combine(openParenToken.span, closeParenToken.span);
 }
@@ -68,6 +80,14 @@ text::TextSpan ParameterSyntax::span() const noexcept {
     return combine(type.span(), identifierToken.span);
 }
 
+text::TextSpan FieldDeclarationSyntax::span() const noexcept {
+    return combine(type.span(), semicolonToken.span);
+}
+
+text::TextSpan ClassDeclarationSyntax::span() const noexcept {
+    return combine(classKeyword.span, closeBraceToken.span);
+}
+
 text::TextSpan FunctionDeclarationSyntax::span() const noexcept {
     return combine(returnType.span(), body.span());
 }
@@ -94,6 +114,9 @@ text::TextSpan CompilationUnitSyntax::span() const noexcept {
     }
     if (!imports.empty()) {
         return combine(imports.front().span(), endOfFileToken.span);
+    }
+    if (!classes.empty()) {
+        return combine(classes.front().span(), endOfFileToken.span);
     }
     if (!functions.empty()) {
         return combine(functions.front().span(), endOfFileToken.span);

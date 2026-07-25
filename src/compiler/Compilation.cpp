@@ -38,6 +38,8 @@ struct ModuleWork {
     std::string name;
     std::vector<ParsedUnit*> units;
     std::set<std::string> imports;
+    std::vector<semantic::TypeSymbol> types;
+    semantic::TypeSymbolMap visibleTypes;
     std::vector<semantic::FunctionSymbol> declarations;
     std::uint64_t sourceFingerprint = 0;
     std::uint64_t publicFingerprint = 0;
@@ -51,6 +53,32 @@ std::uint64_t combineFingerprint(
     seed ^= value + 0x9e3779b97f4a7c15ull +
         (seed << 6) + (seed >> 2);
     return seed;
+}
+
+void addVisibleType(
+    semantic::TypeSymbolMap& map,
+    const semantic::TypeSymbol& type,
+    bool includeSimpleName) {
+    map[semantic::canonicalTypeName(type)] = type;
+    if (includeSimpleName) {
+        map[type.name] = type;
+    }
+}
+
+std::string typeSignature(const semantic::TypeSymbol& type) {
+    std::ostringstream out;
+    out << semantic::canonicalTypeName(type) << '{';
+    for (const auto& field : type.fields) {
+        out << field.name << ':';
+        if (field.type == semantic::PrimitiveType::Object) {
+            out << field.typeName;
+        } else {
+            out << semantic::primitiveTypeName(field.type);
+        }
+        out << ';';
+    }
+    out << '}';
+    return out.str();
 }
 
 } // namespace
@@ -98,6 +126,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         units.push_back(std::move(unit));
     }
 
+    // Stable source order and class shells.
     for (auto& [moduleName, module] : modules) {
         std::sort(
             module.units.begin(),
@@ -107,17 +136,75 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             });
 
         std::uint64_t sourceFingerprint = 14695981039346656037ull;
-        std::unordered_set<std::string> functionKeys;
-
+        std::unordered_set<std::string> typeNames;
         for (const auto* unit : module.units) {
             sourceFingerprint = combineFingerprint(
                 sourceFingerprint,
                 unit->sourceFingerprint);
+            for (const auto& classSyntax : unit->syntaxTree->classes) {
+                auto type = semantic::declareTypeShell(moduleName, classSyntax);
+                if (!typeNames.insert(type.name).second) {
+                    result.diagnostics.report(
+                        "RS4004",
+                        "duplicate type '" + type.name + "'",
+                        classSyntax.identifierToken.span,
+                        diagnostics::DiagnosticSeverity::Error,
+                        unit->source->name());
+                    module.invalid = true;
+                    continue;
+                }
+                module.types.push_back(type);
+            }
+        }
+        module.sourceFingerprint = sourceFingerprint;
+    }
+
+    // Build visible type sets before resolving fields or function signatures.
+    for (auto& [moduleName, module] : modules) {
+        (void)moduleName;
+        for (const auto& type : module.types) {
+            addVisibleType(module.visibleTypes, type, true);
+        }
+        for (const auto& importedName : module.imports) {
+            const auto imported = modules.find(importedName);
+            if (imported == modules.end()) {
+                continue;
+            }
+            for (const auto& type : imported->second.types) {
+                addVisibleType(module.visibleTypes, type, true);
+            }
+        }
+    }
+
+    // Populate field layouts and declare function signatures.
+    for (auto& [moduleName, module] : modules) {
+        std::size_t typeIndex = 0;
+        std::unordered_set<std::string> functionKeys;
+        for (const auto* unit : module.units) {
+            for (const auto& classSyntax : unit->syntaxTree->classes) {
+                if (typeIndex >= module.types.size()) {
+                    module.invalid = true;
+                    continue;
+                }
+                if (!semantic::populateTypeFields(
+                        module.types[typeIndex],
+                        classSyntax,
+                        module.visibleTypes,
+                        result.diagnostics)) {
+                    module.invalid = true;
+                }
+                addVisibleType(
+                    module.visibleTypes,
+                    module.types[typeIndex],
+                    true);
+                ++typeIndex;
+            }
 
             for (const auto& functionSyntax : unit->syntaxTree->functions) {
                 auto symbol = semantic::declareFunctionSymbol(
                     moduleName,
                     functionSyntax,
+                    module.visibleTypes,
                     result.diagnostics);
                 const auto key = semantic::canonicalFunctionKey(symbol);
                 if (!functionKeys.insert(key).second) {
@@ -132,10 +219,12 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 module.declarations.push_back(std::move(symbol));
             }
         }
-        module.sourceFingerprint = sourceFingerprint;
 
         std::vector<std::string> signatures;
-        signatures.reserve(module.declarations.size());
+        signatures.reserve(module.declarations.size() + module.types.size());
+        for (const auto& type : module.types) {
+            signatures.push_back(typeSignature(type));
+        }
         for (const auto& function : module.declarations) {
             signatures.push_back(
                 semantic::canonicalFunctionSignature(function));
@@ -147,6 +236,24 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             publicSurface << signature << '\n';
         }
         module.publicFingerprint = stableFingerprint(publicSurface.str());
+    }
+
+    // Refresh visible type tables after all field layouts have been populated.
+    // The first pass intentionally used shells so recursive and cross-module
+    // references could resolve before descriptors were complete.
+    for (auto& [moduleName, module] : modules) {
+        (void)moduleName;
+        module.visibleTypes.clear();
+        for (const auto& type : module.types) {
+            addVisibleType(module.visibleTypes, type, true);
+        }
+        for (const auto& importedName : module.imports) {
+            const auto imported = modules.find(importedName);
+            if (imported == modules.end()) continue;
+            for (const auto& type : imported->second.types) {
+                addVisibleType(module.visibleTypes, type, true);
+            }
+        }
     }
 
     for (auto& [moduleName, module] : modules) {
@@ -180,12 +287,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         if (previous) {
             const auto cached = previous->modules.find(moduleName);
             if (cached != previous->modules.end() && !module.invalid &&
-                cached->second.sourceFingerprint ==
-                    module.sourceFingerprint &&
-                cached->second.publicFingerprint ==
-                    module.publicFingerprint &&
-                cached->second.dependencyFingerprint ==
-                    module.dependencyFingerprint) {
+                cached->second.sourceFingerprint == module.sourceFingerprint &&
+                cached->second.publicFingerprint == module.publicFingerprint &&
+                cached->second.dependencyFingerprint == module.dependencyFingerprint) {
                 buildInfo.reused = true;
                 result.modules.push_back(cached->second.module);
                 result.snapshot.modules[moduleName] = cached->second;
@@ -205,9 +309,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         }
         for (const auto& importedModule : module.imports) {
             const auto imported = modules.find(importedModule);
-            if (imported == modules.end()) {
-                continue;
-            }
+            if (imported == modules.end()) continue;
             for (const auto& function : imported->second.declarations) {
                 visibleFunctions[function.name].push_back(function);
             }
@@ -216,7 +318,29 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         semantic::ModuleBindingInput bindingInput;
         bindingInput.moduleName = moduleName;
         bindingInput.declarations = module.declarations;
+        {
+            std::unordered_map<semantic::SymbolId, semantic::TypeSymbol>
+                descriptorsById;
+            for (const auto& [visibleName, type] : module.visibleTypes) {
+                (void)visibleName;
+                descriptorsById.emplace(type.id, type);
+            }
+            bindingInput.types.reserve(descriptorsById.size());
+            for (auto& [typeId, type] : descriptorsById) {
+                (void)typeId;
+                bindingInput.types.push_back(std::move(type));
+            }
+            std::sort(
+                bindingInput.types.begin(),
+                bindingInput.types.end(),
+                [](const semantic::TypeSymbol& left,
+                   const semantic::TypeSymbol& right) {
+                    return semantic::canonicalTypeName(left) <
+                        semantic::canonicalTypeName(right);
+                });
+        }
         bindingInput.visibleFunctions = std::move(visibleFunctions);
+        bindingInput.visibleTypes = module.visibleTypes;
         for (const auto* unit : module.units) {
             bindingInput.units.push_back(unit->syntaxTree.get());
         }

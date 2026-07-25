@@ -104,10 +104,99 @@ bool expectType(
     return true;
 }
 
+const semantic::TypeSymbol* typeDescriptor(
+    const bytecode::Module& module,
+    std::uint32_t index) {
+    return index < module.types.size() ? &module.types[index] : nullptr;
+}
+
+bool expectObject(
+    State& state,
+    const Value& value,
+    const semantic::TypeSymbol& type,
+    bool allowNull,
+    const std::string& context) {
+    if (std::holds_alternative<NullObject>(value)) {
+        if (allowNull) return true;
+        return fail(state, ErrorCode::NullReference,
+            context + " attempted to dereference null");
+    }
+    const auto* reference = std::get_if<ObjectRef>(&value);
+    if (!reference || reference->kind != ObjectKind::Record) {
+        return fail(state, ErrorCode::TypeMismatch,
+            context + " expected object '" + semantic::canonicalTypeName(type) + "'");
+    }
+    if (!state.heap || !state.heap->isAlive(*reference)) {
+        return fail(state, ErrorCode::InvalidObjectReference,
+            context + " contains an invalid managed object reference");
+    }
+    const auto actual = state.heap->objectTypeId(*reference);
+    if (!actual || *actual != type.id) {
+        return fail(state, ErrorCode::TypeMismatch,
+            context + " expected object '" + semantic::canonicalTypeName(type) + "'");
+    }
+    return true;
+}
+
+bool expectSignatureType(
+    State& state,
+    const Value& value,
+    semantic::PrimitiveType type,
+    semantic::SymbolId typeId,
+    const std::string& context) {
+    if (!expectType(state, value, type, context)) return false;
+    if (type != semantic::PrimitiveType::Object ||
+        std::holds_alternative<NullObject>(value) ||
+        typeId == 0) {
+        return true;
+    }
+    const auto* reference = std::get_if<ObjectRef>(&value);
+    const auto actual = reference && state.heap
+        ? state.heap->objectTypeId(*reference)
+        : std::optional<semantic::SymbolId>{};
+    if (!actual || *actual != typeId) {
+        return fail(state, ErrorCode::TypeMismatch,
+            context + " has the wrong runtime object type");
+    }
+    return true;
+}
+
+semantic::SymbolId typeIdAt(
+    const std::vector<semantic::SymbolId>& typeIds,
+    std::size_t index) noexcept {
+    return index < typeIds.size() ? typeIds[index] : 0;
+}
+
+Value defaultFieldValue(semantic::PrimitiveType type) {
+    switch (type) {
+    case semantic::PrimitiveType::Bool: return false;
+    case semantic::PrimitiveType::Int: return std::int64_t{0};
+    case semantic::PrimitiveType::String: return NullString{};
+    case semantic::PrimitiveType::Object: return NullObject{};
+    case semantic::PrimitiveType::Null: return std::monostate{};
+    case semantic::PrimitiveType::Void:
+    case semantic::PrimitiveType::Error:
+        break;
+    }
+    return std::monostate{};
+}
+
 
 bool valuesEqual(State& state, const Value& left, const Value& right, bool& equal) {
     if (valueType(left) != valueType(right)) {
         equal = false;
+        return true;
+    }
+    if (valueType(left) == semantic::PrimitiveType::Object) {
+        const auto validate = [&](const Value& value) {
+            const auto* reference = std::get_if<ObjectRef>(&value);
+            return !reference || (state.heap && state.heap->isAlive(*reference));
+        };
+        if (!validate(left) || !validate(right)) {
+            return fail(state, ErrorCode::InvalidObjectReference,
+                "object equality encountered an invalid managed reference");
+        }
+        equal = left == right;
         return true;
     }
     if (valueType(left) != semantic::PrimitiveType::String) {
@@ -182,6 +271,21 @@ bool executeCall(
         arguments.push_back(registers[operand]);
     }
 
+    if (arguments.size() != reference.parameterTypes.size()) {
+        return fail(state, ErrorCode::InvalidProgram,
+            "call argument count does not match its reference");
+    }
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        if (!expectSignatureType(
+                state,
+                arguments[index],
+                reference.parameterTypes[index],
+                typeIdAt(reference.parameterTypeIds, index),
+                "call argument")) {
+            return false;
+        }
+    }
+
     const auto found = state.functions->find(reference.symbolId);
     if (found != state.functions->end()) {
         return executeFunction(state, found->second, arguments, result);
@@ -202,6 +306,14 @@ bool executeCall(
         }
         state.error.stackTrace = state.stack;
         std::reverse(state.error.stackTrace.begin(), state.error.stackTrace.end());
+        return false;
+    }
+    if (!expectSignatureType(
+            state,
+            *externalResult,
+            reference.returnType,
+            reference.returnTypeId,
+            "external return value")) {
         return false;
     }
     result = std::move(*externalResult);
@@ -280,6 +392,115 @@ bool executeInstruction(
         if (!value || !expectType(state, *value, semantic::PrimitiveType::Null, "conversion")) return false;
         return storeResult(NullString{});
     }
+    case bytecode::Opcode::ConvertNullToObject: {
+        const auto* value = operand(0);
+        if (!value || !expectType(state, *value, semantic::PrimitiveType::Null, "conversion")) return false;
+        return storeResult(NullObject{});
+    }
+    case bytecode::Opcode::NewObject: {
+        const auto* type = typeDescriptor(module, instruction.typeIndex);
+        if (!type || !state.heap) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "object allocation references an invalid type or heap");
+        }
+        std::vector<Value> fields;
+        std::vector<std::size_t> referenceFields;
+        fields.reserve(type->fields.size());
+        for (std::size_t index = 0; index < type->fields.size(); ++index) {
+            const auto fieldType = type->fields[index].type;
+            fields.push_back(defaultFieldValue(fieldType));
+            if (fieldType == semantic::PrimitiveType::String ||
+                fieldType == semantic::PrimitiveType::Object) {
+                referenceFields.push_back(index);
+            }
+        }
+        RuntimeError allocationError;
+        const auto reference = state.heap->allocateObject(
+            type->id,
+            std::move(fields),
+            std::move(referenceFields),
+            &allocationError);
+        if (!reference) {
+            return fail(state,
+                allocationError.code == ErrorCode::None
+                    ? ErrorCode::OutOfMemory
+                    : allocationError.code,
+                allocationError.message.empty()
+                    ? "managed object allocation failed"
+                    : allocationError.message);
+        }
+        return storeResult(*reference);
+    }
+    case bytecode::Opcode::CheckNotNull: {
+        const auto* value = operand(0);
+        const auto* type = typeDescriptor(module, instruction.typeIndex);
+        if (!value || !type || !expectObject(state, *value, *type, false, "field access")) {
+            return false;
+        }
+        return storeResult(*value);
+    }
+    case bytecode::Opcode::LoadField: {
+        const auto* receiver = operand(0);
+        const auto* type = typeDescriptor(module, instruction.typeIndex);
+        if (!receiver || !type ||
+            instruction.index >= type->fields.size() ||
+            !expectObject(state, *receiver, *type, false, "field load")) {
+            return false;
+        }
+        const auto reference = std::get<ObjectRef>(*receiver);
+        const auto value = state.heap->fieldGet(reference, instruction.index);
+        if (!value) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "field load references an invalid field slot");
+        }
+        const auto& field = type->fields[instruction.index];
+        if (!expectSignatureType(
+                state,
+                *value,
+                field.type,
+                field.type == semantic::PrimitiveType::Object
+                    ? semantic::stableTypeId(field.typeName)
+                    : 0,
+                "field load value")) {
+            return false;
+        }
+        return storeResult(*value);
+    }
+    case bytecode::Opcode::StoreField: {
+        const auto* receiver = operand(0);
+        const auto* value = operand(1);
+        const auto* type = typeDescriptor(module, instruction.typeIndex);
+        if (!receiver || !value || !type ||
+            instruction.index >= type->fields.size() ||
+            !expectObject(state, *receiver, *type, false, "field store") ||
+            !expectSignatureType(
+                state,
+                *value,
+                type->fields[instruction.index].type,
+                type->fields[instruction.index].type ==
+                        semantic::PrimitiveType::Object
+                    ? semantic::stableTypeId(
+                          type->fields[instruction.index].typeName)
+                    : 0,
+                "field store value")) {
+            return false;
+        }
+        RuntimeError fieldError;
+        if (!state.heap->fieldSet(
+                std::get<ObjectRef>(*receiver),
+                instruction.index,
+                *value,
+                &fieldError)) {
+            return fail(state,
+                fieldError.code == ErrorCode::None
+                    ? ErrorCode::InvalidProgram
+                    : fieldError.code,
+                fieldError.message.empty()
+                    ? "field store failed"
+                    : fieldError.message);
+        }
+        return true;
+    }
     case bytecode::Opcode::Call: {
         Value callResult;
         if (!executeCall(state, module, instruction, registers, callResult)) return false;
@@ -351,7 +572,14 @@ bool executeFunction(
         return fail(state, ErrorCode::InvalidArguments, "argument count does not match function signature");
     }
     for (std::size_t index = 0; index < arguments.size(); ++index) {
-        if (!expectType(state, arguments[index], function.parameterTypes[index], "argument")) return false;
+        if (!expectSignatureType(
+                state,
+                arguments[index],
+                function.parameterTypes[index],
+                typeIdAt(function.parameterTypeIds, index),
+                "argument")) {
+            return false;
+        }
     }
 
     state.stack.push_back(location.module->name + "::" + function.name);
@@ -390,6 +618,15 @@ bool executeFunction(
             if (terminator.value >= registers.size()) {
                 state.stack.pop_back();
                 return fail(state, ErrorCode::InvalidProgram, "return register is invalid");
+            }
+            if (!expectSignatureType(
+                    state,
+                    registers[terminator.value],
+                    function.returnType,
+                    function.returnTypeId,
+                    "return value")) {
+                state.stack.pop_back();
+                return false;
             }
             result = registers[terminator.value];
             emitTrace(state, TraceEventKind::FunctionExit,
@@ -573,6 +810,7 @@ const char* errorCodeName(ErrorCode code) noexcept {
     case ErrorCode::ExternalFunctionUnresolved: return "external-function-unresolved";
     case ErrorCode::DuplicateSymbol: return "duplicate-symbol";
     case ErrorCode::InvalidObjectReference: return "invalid-object-reference";
+    case ErrorCode::NullReference: return "null-reference";
     case ErrorCode::OutOfMemory: return "out-of-memory";
     case ErrorCode::InvalidProgram: return "invalid-program";
     }
@@ -582,13 +820,15 @@ const char* errorCodeName(ErrorCode code) noexcept {
 semantic::PrimitiveType valueType(const Value& value) noexcept {
     if (std::holds_alternative<std::monostate>(value)) return semantic::PrimitiveType::Null;
     if (std::holds_alternative<NullString>(value)) return semantic::PrimitiveType::String;
+    if (std::holds_alternative<NullObject>(value)) return semantic::PrimitiveType::Object;
     if (std::holds_alternative<bool>(value)) return semantic::PrimitiveType::Bool;
     if (std::holds_alternative<std::int64_t>(value)) return semantic::PrimitiveType::Int;
     if (std::holds_alternative<std::string>(value)) return semantic::PrimitiveType::String;
     const auto& reference = std::get<ObjectRef>(value);
-    return reference.kind == ObjectKind::String
-        ? semantic::PrimitiveType::String
-        : semantic::PrimitiveType::Error;
+    if (reference.kind == ObjectKind::String) {
+        return semantic::PrimitiveType::String;
+    }
+    return semantic::PrimitiveType::Object;
 }
 
 std::string valueToString(const Value& value) {
@@ -598,6 +838,7 @@ std::string valueToString(const Value& value) {
 std::string valueToString(const Value& value, const ManagedHeap* heap) {
     if (std::holds_alternative<std::monostate>(value)) return "null";
     if (std::holds_alternative<NullString>(value)) return "null";
+    if (std::holds_alternative<NullObject>(value)) return "null";
     if (std::holds_alternative<bool>(value)) return std::get<bool>(value) ? "true" : "false";
     if (std::holds_alternative<std::int64_t>(value)) return std::to_string(std::get<std::int64_t>(value));
     if (std::holds_alternative<std::string>(value)) return std::get<std::string>(value);

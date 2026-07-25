@@ -1,5 +1,8 @@
 # RealScript Typed MIR 规范
 
+> Phase 3B 已实现 `new.object`、`check.notnull`、`load.field`、`store.field` 与精确 Object TypeId；具体边界见 [OBJECT_MODEL_V0.md](OBJECT_MODEL_V0.md)。
+
+
 - 规范版本：Draft v0.1
 - `mir_version`：0.1
 - 状态：逻辑格式草案，文本和二进制序列化尚未冻结

@@ -1,4 +1,4 @@
-rsbc 0.1 module Demo.Bytecode
+rsbc 0.2 module Demo.Bytecode
 
 references:
   ref0 @Demo.Bytecode::twice[0x48d2886689d9cb5f](int) -> int

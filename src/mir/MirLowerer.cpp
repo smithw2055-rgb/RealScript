@@ -21,6 +21,7 @@ bool isLiteralTrue(const semantic::BoundExpression& expression) {
 Module Lowerer::lower(const semantic::SemanticModel& model) {
     Module result;
     result.name = model.moduleName;
+    result.types = model.types;
     for (const auto& function : model.functions) {
         result.functions.push_back(lowerFunction(function));
     }
@@ -33,12 +34,19 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
     result.moduleName = function.symbol.moduleName;
     result.name = function.symbol.name;
     result.returnType = function.symbol.returnType;
+    result.returnTypeId = function.symbol.returnType == semantic::PrimitiveType::Object
+        ? semantic::stableTypeId(function.symbol.returnTypeName)
+        : 0;
     result.localTypes.assign(
         function.variableCount,
         semantic::PrimitiveType::Error);
 
     for (const auto& parameter : function.symbol.parameters) {
         result.parameterTypes.push_back(parameter.type);
+        result.parameterTypeIds.push_back(
+            parameter.type == semantic::PrimitiveType::Object
+                ? semantic::stableTypeId(parameter.typeName)
+                : 0);
         result.localTypes.at(parameter.index) = parameter.type;
     }
 

@@ -50,6 +50,7 @@ std::size_t ShadowStack::frameCount() const noexcept { return frames_.size(); }
 struct ManagedHeap::Impl {
     struct Header {
         ObjectKind kind = ObjectKind::Record;
+        semantic::SymbolId typeId = 0;
         bool marked = false;
         std::size_t sizeBytes = 0;
     };
@@ -57,6 +58,7 @@ struct ManagedHeap::Impl {
     struct HeapObject {
         Header header;
         std::variant<std::string, std::vector<Value>> payload;
+        std::vector<std::size_t> referenceFields;
     };
 
     struct Slot {
@@ -105,7 +107,9 @@ struct ManagedHeap::Impl {
 
     [[nodiscard]] std::optional<ObjectRef> allocate(
         ObjectKind kind,
+        semantic::SymbolId typeId,
         std::variant<std::string, std::vector<Value>> payload,
+        std::vector<std::size_t> referenceFields,
         std::size_t sizeBytes,
         RuntimeError* error) {
         if (sizeBytes == std::numeric_limits<std::size_t>::max() ||
@@ -133,9 +137,11 @@ struct ManagedHeap::Impl {
 
         auto object = std::make_unique<HeapObject>();
         object->header.kind = kind;
+        object->header.typeId = typeId;
         object->header.marked = phase != GcPhase::Idle;
         object->header.sizeBytes = sizeBytes;
         object->payload = std::move(payload);
+        object->referenceFields = std::move(referenceFields);
         auto& slot = slots[slotIndex];
         slot.object = std::move(object);
         const ObjectRef reference{slotIndex, slot.generation, kind};
@@ -189,7 +195,13 @@ struct ManagedHeap::Impl {
         const auto* object = get(reference);
         if (!object || object->header.kind == ObjectKind::String) return;
         const auto& values = std::get<std::vector<Value>>(object->payload);
-        for (const auto& value : values) markValue(value);
+        if (object->header.kind == ObjectKind::Array) {
+            for (const auto& value : values) markValue(value);
+            return;
+        }
+        for (const auto index : object->referenceFields) {
+            if (index < values.size()) markValue(values[index]);
+        }
     }
 
     void writeBarrier(ObjectRef owner, const Value& value) {
@@ -229,7 +241,7 @@ std::optional<ObjectRef> ManagedHeap::allocateString(
     std::string value,
     RuntimeError* error) {
     const auto size = sizeof(Impl::HeapObject) + value.size();
-    return impl_->allocate(ObjectKind::String, std::move(value), size, error);
+    return impl_->allocate(ObjectKind::String, 0, std::move(value), {}, size, error);
 }
 
 std::optional<ObjectRef> ManagedHeap::allocateArray(
@@ -244,7 +256,9 @@ std::optional<ObjectRef> ManagedHeap::allocateArray(
     std::vector<Value> values(length, std::move(initialValue));
     return impl_->allocate(
         ObjectKind::Array,
+        0,
         std::move(values),
+        {},
         sizeof(Impl::HeapObject) + storage,
         error);
 }
@@ -258,9 +272,50 @@ std::optional<ObjectRef> ManagedHeap::allocateRecord(
         return std::nullopt;
     }
     std::vector<Value> fields(fieldCount);
+    std::vector<std::size_t> referenceFields(fieldCount);
+    for (std::size_t index = 0; index < fieldCount; ++index) {
+        referenceFields[index] = index;
+    }
     return impl_->allocate(
         ObjectKind::Record,
+        0,
         std::move(fields),
+        std::move(referenceFields),
+        sizeof(Impl::HeapObject) + storage,
+        error);
+}
+
+std::optional<ObjectRef> ManagedHeap::allocateObject(
+    semantic::SymbolId typeId,
+    std::vector<Value> fields,
+    std::vector<std::size_t> referenceFields,
+    RuntimeError* error) {
+    const auto storage = estimateValueStorage(fields.size());
+    if (typeId == 0) {
+        setHeapError(error, ErrorCode::InvalidArguments,
+            "managed object type ID must be non-zero");
+        return std::nullopt;
+    }
+    if (storage == std::numeric_limits<std::size_t>::max()) {
+        setHeapError(error, ErrorCode::OutOfMemory, "managed object is too large");
+        return std::nullopt;
+    }
+    for (const auto index : referenceFields) {
+        if (index >= fields.size()) {
+            setHeapError(error, ErrorCode::InvalidArguments,
+                "managed object reference field is out of range");
+            return std::nullopt;
+        }
+    }
+    std::sort(referenceFields.begin(), referenceFields.end());
+    referenceFields.erase(
+        std::unique(referenceFields.begin(), referenceFields.end()),
+        referenceFields.end());
+    return impl_->allocate(
+        ObjectKind::Record,
+        typeId,
+        std::move(fields),
+        std::move(referenceFields),
         sizeof(Impl::HeapObject) + storage,
         error);
 }
@@ -311,6 +366,16 @@ bool ManagedHeap::arraySet(
     return true;
 }
 
+std::optional<semantic::SymbolId> ManagedHeap::objectTypeId(
+    ObjectRef reference) const {
+    const auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Record ||
+        object->header.typeId == 0) {
+        return std::nullopt;
+    }
+    return object->header.typeId;
+}
+
 std::optional<std::size_t> ManagedHeap::fieldCount(ObjectRef reference) const {
     const auto* object = impl_->get(reference);
     if (!object || object->header.kind != ObjectKind::Record) return std::nullopt;
@@ -342,7 +407,12 @@ bool ManagedHeap::fieldSet(
             "managed field index is out of range");
         return false;
     }
-    impl_->writeBarrier(reference, value);
+    if (std::binary_search(
+            object->referenceFields.begin(),
+            object->referenceFields.end(),
+            index)) {
+        impl_->writeBarrier(reference, value);
+    }
     fields[index] = std::move(value);
     return true;
 }

@@ -21,12 +21,18 @@ std::size_t expectedOperandCount(const Instruction& instruction) noexcept {
     case Opcode::ConstantString:
     case Opcode::ConstantNull:
     case Opcode::LoadLocal:
+    case Opcode::NewObject:
         return 0;
     case Opcode::StoreLocal:
     case Opcode::ConvertNullToString:
+    case Opcode::ConvertNullToObject:
+    case Opcode::CheckNotNull:
+    case Opcode::LoadField:
     case Opcode::NegateInt:
     case Opcode::LogicalNot:
         return 1;
+    case Opcode::StoreField:
+        return 2;
     case Opcode::Call:
         return instruction.parameterTypes.size();
     default:
@@ -34,8 +40,23 @@ std::size_t expectedOperandCount(const Instruction& instruction) noexcept {
     }
 }
 
+bool validTypeIdentity(
+    semantic::PrimitiveType type,
+    semantic::SymbolId typeId) noexcept {
+    return type == semantic::PrimitiveType::Object
+        ? typeId != 0
+        : typeId == 0;
+}
+
+semantic::SymbolId typeIdAt(
+    const std::vector<semantic::SymbolId>& typeIds,
+    std::size_t index) noexcept {
+    return index < typeIds.size() ? typeIds[index] : 0;
+}
+
 bool definesValue(const Instruction& instruction) noexcept {
-    if (instruction.opcode == Opcode::StoreLocal) {
+    if (instruction.opcode == Opcode::StoreLocal ||
+        instruction.opcode == Opcode::StoreField) {
         return false;
     }
     return instruction.opcode != Opcode::Call ||
@@ -49,7 +70,46 @@ bool verifyModule(
     diagnostics::DiagnosticBag& diagnostics) {
     const auto initialCount = diagnostics.items().size();
 
+    std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> types;
+    for (const auto& type : module.types) {
+        if (type.id == 0 || !types.emplace(type.id, &type).second) {
+            diagnostics.report("RS3040", "duplicate or invalid MIR type descriptor", {});
+        }
+        for (const auto& field : type.fields) {
+            if (field.type == semantic::PrimitiveType::Void ||
+                field.type == semantic::PrimitiveType::Null ||
+                field.type == semantic::PrimitiveType::Error) {
+                diagnostics.report("RS3041", "invalid MIR field type", {});
+            }
+        }
+    }
+
     for (const auto& function : module.functions) {
+        if (!validTypeIdentity(function.returnType, function.returnTypeId)) {
+            diagnostics.report(
+                "RS3048",
+                "MIR function has an invalid return type identity",
+                {});
+        }
+        if (!function.parameterTypeIds.empty() &&
+            function.parameterTypeIds.size() != function.parameterTypes.size()) {
+            diagnostics.report(
+                "RS3049",
+                "MIR function parameter type ID count is invalid",
+                {});
+        }
+        for (std::size_t parameter = 0;
+             parameter < function.parameterTypes.size();
+             ++parameter) {
+            if (!validTypeIdentity(
+                    function.parameterTypes[parameter],
+                    typeIdAt(function.parameterTypeIds, parameter))) {
+                diagnostics.report(
+                    "RS3050",
+                    "MIR function has an invalid parameter type identity",
+                    {});
+            }
+        }
         if (function.blocks.empty()) {
             diagnostics.report(
                 "RS3000",
@@ -370,6 +430,65 @@ bool verifyModule(
                             "invalid null-to-string conversion",
                             instruction.sourceSpan);
                     }
+                } else if (instruction.opcode == Opcode::ConvertNullToObject &&
+                           operandCountIsValid) {
+                    if (instruction.resultType != semantic::PrimitiveType::Object ||
+                        valueType(instruction.operands.front()) !=
+                            semantic::PrimitiveType::Null) {
+                        diagnostics.report(
+                            "RS3042",
+                            "invalid null-to-object conversion",
+                            instruction.sourceSpan);
+                    }
+                } else if (instruction.opcode == Opcode::NewObject) {
+                    if (instruction.resultType != semantic::PrimitiveType::Object ||
+                        types.find(instruction.typeId) == types.end()) {
+                        diagnostics.report(
+                            "RS3043",
+                            "invalid object allocation descriptor",
+                            instruction.sourceSpan);
+                    }
+                } else if (instruction.opcode == Opcode::CheckNotNull &&
+                           operandCountIsValid) {
+                    if (instruction.resultType != semantic::PrimitiveType::Object ||
+                        valueType(instruction.operands.front()) !=
+                            semantic::PrimitiveType::Object ||
+                        types.find(instruction.typeId) == types.end()) {
+                        diagnostics.report(
+                            "RS3044",
+                            "invalid object null check",
+                            instruction.sourceSpan);
+                    }
+                } else if ((instruction.opcode == Opcode::LoadField ||
+                            instruction.opcode == Opcode::StoreField) &&
+                           operandCountIsValid) {
+                    const auto type = types.find(instruction.typeId);
+                    if (type == types.end() ||
+                        instruction.fieldIndex >= type->second->fields.size() ||
+                        valueType(instruction.operands[0]) !=
+                            semantic::PrimitiveType::Object) {
+                        diagnostics.report(
+                            "RS3045",
+                            "invalid MIR field access",
+                            instruction.sourceSpan);
+                    } else {
+                        const auto fieldType =
+                            type->second->fields[instruction.fieldIndex].type;
+                        if (instruction.opcode == Opcode::LoadField &&
+                            instruction.resultType != fieldType) {
+                            diagnostics.report(
+                                "RS3046",
+                                "MIR field load type mismatch",
+                                instruction.sourceSpan);
+                        }
+                        if (instruction.opcode == Opcode::StoreField &&
+                            valueType(instruction.operands[1]) != fieldType) {
+                            diagnostics.report(
+                                "RS3047",
+                                "MIR field store type mismatch",
+                                instruction.sourceSpan);
+                        }
+                    }
                 } else if (instruction.opcode == Opcode::Call) {
                     if (instruction.symbolId == 0) {
                         diagnostics.report(
@@ -384,6 +503,22 @@ bool verifyModule(
                             "MIR call signature argument count mismatch",
                             instruction.sourceSpan);
                     }
+                    if (!instruction.parameterTypeIds.empty() &&
+                        instruction.parameterTypeIds.size() !=
+                            instruction.parameterTypes.size()) {
+                        diagnostics.report(
+                            "RS3051",
+                            "MIR call type ID count mismatch",
+                            instruction.sourceSpan);
+                    }
+                    if (!validTypeIdentity(
+                            instruction.resultType,
+                            instruction.resultTypeId)) {
+                        diagnostics.report(
+                            "RS3052",
+                            "MIR call result type identity is invalid",
+                            instruction.sourceSpan);
+                    }
                     for (std::size_t argumentIndex = 0;
                          argumentIndex < instruction.parameterTypes.size() &&
                          argumentIndex < instruction.operands.size();
@@ -393,6 +528,16 @@ bool verifyModule(
                             diagnostics.report(
                                 "RS3033",
                                 "MIR call argument type mismatch",
+                                instruction.sourceSpan);
+                        }
+                        if (!validTypeIdentity(
+                                instruction.parameterTypes[argumentIndex],
+                                typeIdAt(
+                                    instruction.parameterTypeIds,
+                                    argumentIndex))) {
+                            diagnostics.report(
+                                "RS3053",
+                                "MIR call argument type identity is invalid",
                                 instruction.sourceSpan);
                         }
                     }

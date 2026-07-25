@@ -132,7 +132,7 @@ Phase 3A does not implement:
 
 ## Next slice
 
-Phase 3B should add:
+Phase 3B is now implemented in [PHASE_3B.md](PHASE_3B.md). Its planned scope was:
 
 1. runtime type descriptors and field layouts;
 2. object and array allocation/access MIR and bytecode;

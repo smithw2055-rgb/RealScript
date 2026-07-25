@@ -24,6 +24,11 @@ enum class Opcode {
     LoadLocal,
     StoreLocal,
     ConvertNullToString,
+    ConvertNullToObject,
+    NewObject,
+    CheckNotNull,
+    LoadField,
+    StoreField,
     Call,
     NegateInt,
     LogicalNot,
@@ -43,15 +48,19 @@ enum class Opcode {
 struct Instruction {
     ValueId result = -1;
     semantic::PrimitiveType resultType = semantic::PrimitiveType::Void;
+    semantic::SymbolId resultTypeId = 0;
     Opcode opcode = Opcode::ConstantInt;
     std::vector<ValueId> operands;
     std::size_t localIndex = 0;
+    semantic::SymbolId typeId = 0;
+    std::size_t fieldIndex = 0;
     std::int64_t integerImmediate = 0;
     bool boolImmediate = false;
     std::string stringImmediate;
     semantic::SymbolId symbolId = 0;
     std::string symbolName;
     std::vector<semantic::PrimitiveType> parameterTypes;
+    std::vector<semantic::SymbolId> parameterTypeIds;
     text::TextSpan sourceSpan;
 };
 
@@ -91,13 +100,16 @@ struct Function {
     std::string moduleName;
     std::string name;
     semantic::PrimitiveType returnType = semantic::PrimitiveType::Error;
+    semantic::SymbolId returnTypeId = 0;
     std::vector<semantic::PrimitiveType> parameterTypes;
+    std::vector<semantic::SymbolId> parameterTypeIds;
     std::vector<semantic::PrimitiveType> localTypes;
     std::vector<BasicBlock> blocks;
 };
 
 struct Module {
     std::string name;
+    std::vector<semantic::TypeSymbol> types;
     std::vector<Function> functions;
 };
 
