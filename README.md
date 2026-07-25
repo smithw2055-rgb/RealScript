@@ -8,7 +8,7 @@ RealScript 是一门面向现代游戏引擎的嵌入式强类型脚本语言与
 
 ## 当前可运行能力
 
-Phase 1A–2B 已经实现：
+Phase 1A–2C 已经实现：
 
 - 无外部依赖的 C++17/CMake 工程；
 - `SourceText`、`TextSpan` 和 CRLF/LF 行列映射；
@@ -280,3 +280,29 @@ RealScript 组合参考 AngelScript 的嵌入与调试接口、Luau 的 VM 性�
 ## License
 
 许可证尚未确定。在许可证文件提交前，请勿假定本仓库代码或文档可用于再分发。
+
+
+## Phase 2C 嵌入接口
+
+Phase 2C 增加可复用的链接镜像、宿主绑定注册表和执行观察接口：
+
+```cpp
+auto image = runtime::ProgramImage::link(std::move(modules), error);
+auto sharedImage = std::make_shared<runtime::ProgramImage>(std::move(*image));
+auto bindings = std::make_shared<runtime::BindingRegistry>();
+bindings->bind("Host::log", hostLogFunction);
+
+runtime::EngineRuntime runtime(sharedImage);
+runtime.setBindings(bindings);
+
+runtime::ExecutionOptions options;
+options.trace = [](const runtime::TraceEvent& event) {
+    // 记录函数、指令、分支和外部调用
+};
+auto result = runtime.invoke("Game.Main::main", {}, options);
+```
+
+详细说明：
+
+- [Phase 2C — Linking, Observability and Embedding](docs/roadmap/PHASE_2C.md)
+- [Embedding and Observability Draft v0.1](docs/spec/EMBEDDING_AND_OBSERVABILITY_V0.md)

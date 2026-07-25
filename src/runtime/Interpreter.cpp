@@ -18,17 +18,31 @@ struct FunctionLocation {
 struct State {
     Limits limits;
     std::uint64_t executed = 0;
+    RuntimeStatistics statistics;
     RuntimeError error;
     std::vector<std::string> stack;
     const std::unordered_map<semantic::SymbolId, FunctionLocation>* functions = nullptr;
     const ExternalFunction* externalResolver = nullptr;
+    const TraceSink* trace = nullptr;
 };
+
+void emitTrace(State& state, TraceEventKind kind, std::string operation = {}) {
+    if (!state.trace || !*state.trace) return;
+    TraceEvent event;
+    event.kind = kind;
+    event.function = state.stack.empty() ? std::string{} : state.stack.back();
+    event.operation = std::move(operation);
+    event.instructionIndex = state.executed;
+    event.callDepth = state.stack.size();
+    (*state.trace)(event);
+}
 
 bool fail(State& state, ErrorCode code, std::string message) {
     state.error.code = code;
     state.error.message = std::move(message);
     state.error.stackTrace = state.stack;
     std::reverse(state.error.stackTrace.begin(), state.error.stackTrace.end());
+    emitTrace(state, TraceEventKind::RuntimeError, state.error.message);
     return false;
 }
 
@@ -38,6 +52,7 @@ bool consume(State& state) {
             "instruction budget exceeded");
     }
     ++state.executed;
+    state.statistics.instructionsExecuted = state.executed;
     return true;
 }
 
@@ -107,6 +122,8 @@ bool executeCall(
             "external function '" + reference.name + "' is unresolved");
     }
     RuntimeError externalError;
+    ++state.statistics.externalCalls;
+    emitTrace(state, TraceEventKind::ExternalCall, reference.name);
     auto externalResult = (*state.externalResolver)(reference, arguments, externalError);
     if (!externalResult) {
         state.error = std::move(externalError);
@@ -130,6 +147,7 @@ bool executeInstruction(
     std::vector<Value>& locals,
     std::vector<Value>& registers) {
     if (!consume(state)) return false;
+    emitTrace(state, TraceEventKind::Instruction, bytecode::opcodeName(instruction.opcode));
     auto operand = [&](std::size_t index) -> const Value* {
         if (index >= instruction.operands.size() || instruction.operands[index] >= registers.size()) {
             fail(state, ErrorCode::InvalidProgram, "instruction operand register is invalid");
@@ -249,6 +267,9 @@ bool executeFunction(
     }
 
     state.stack.push_back(location.module->name + "::" + function.name);
+    ++state.statistics.functionCalls;
+    state.statistics.maximumCallDepth = std::max(state.statistics.maximumCallDepth, state.stack.size());
+    emitTrace(state, TraceEventKind::FunctionEnter);
     std::vector<Value> locals(function.localTypes.size());
     std::vector<Value> registers(function.registerTypes.size());
     const bytecode::BasicBlock* block = findBlock(function, 0);
@@ -272,6 +293,7 @@ bool executeFunction(
         const auto& terminator = block->terminator;
         if (terminator.kind == bytecode::TerminatorKind::ReturnVoid) {
             result = std::monostate{};
+            emitTrace(state, TraceEventKind::FunctionExit);
             state.stack.pop_back();
             return true;
         }
@@ -281,6 +303,7 @@ bool executeFunction(
                 return fail(state, ErrorCode::InvalidProgram, "return register is invalid");
             }
             result = registers[terminator.value];
+            emitTrace(state, TraceEventKind::FunctionExit, valueToString(result));
             state.stack.pop_back();
             return true;
         }
@@ -302,6 +325,8 @@ bool executeFunction(
             return fail(state, ErrorCode::InvalidProgram, "block has invalid terminator");
         }
 
+        ++state.statistics.branchesTaken;
+        emitTrace(state, TraceEventKind::Branch, "bb" + std::to_string(target));
         const auto* next = findBlock(function, target);
         if (!next || next->parameters.size() != edgeArguments->size()) {
             state.stack.pop_back();
@@ -332,14 +357,39 @@ bool executeFunction(
 Interpreter::Interpreter(std::vector<bytecode::Module> modules)
     : modules_(std::move(modules)) {}
 
+Interpreter::Interpreter(std::shared_ptr<const ProgramImage> program)
+    : program_(std::move(program)) {
+    if (program_) modules_ = program_->modules();
+}
+
 void Interpreter::setExternalResolver(ExternalFunction resolver) {
     externalResolver_ = std::move(resolver);
+}
+
+void Interpreter::setBindingRegistry(std::shared_ptr<const BindingRegistry> bindings) {
+    bindings_ = std::move(bindings);
+    if (!bindings_) return;
+    externalResolver_ = [bindings = bindings_](
+        const bytecode::FunctionReference& reference,
+        const std::vector<Value>& arguments,
+        RuntimeError& error) {
+        return bindings->invoke(reference, arguments, error);
+    };
 }
 
 ExecutionResult Interpreter::invoke(
     semantic::SymbolId symbolId,
     const std::vector<Value>& arguments,
     Limits limits) const {
+    ExecutionOptions options;
+    options.limits = limits;
+    return invoke(symbolId, arguments, std::move(options));
+}
+
+ExecutionResult Interpreter::invoke(
+    semantic::SymbolId symbolId,
+    const std::vector<Value>& arguments,
+    ExecutionOptions options) const {
     std::unordered_map<semantic::SymbolId, FunctionLocation> functions;
     for (const auto& module : modules_) {
         diagnostics::DiagnosticBag diagnostics;
@@ -365,13 +415,14 @@ ExecutionResult Interpreter::invoke(
         missing.error.message = "entry function was not found";
         return missing;
     }
-    State state{limits, 0, {}, {}, &functions, &externalResolver_};
+    State state{options.limits, 0, {}, {}, {}, &functions, &externalResolver_, &options.trace};
     Value value;
     ExecutionResult execution;
     execution.succeeded = executeFunction(state, found->second, arguments, value);
     execution.value = std::move(value);
     execution.error = std::move(state.error);
     execution.instructionsExecuted = state.executed;
+    execution.statistics = state.statistics;
     return execution;
 }
 
@@ -379,10 +430,19 @@ ExecutionResult Interpreter::invoke(
     const std::string& qualifiedName,
     const std::vector<Value>& arguments,
     Limits limits) const {
+    ExecutionOptions options;
+    options.limits = limits;
+    return invoke(qualifiedName, arguments, std::move(options));
+}
+
+ExecutionResult Interpreter::invoke(
+    const std::string& qualifiedName,
+    const std::vector<Value>& arguments,
+    ExecutionOptions options) const {
     for (const auto& module : modules_) {
         for (const auto& function : module.functions) {
             if (module.name + "::" + function.name == qualifiedName) {
-                return invoke(function.symbolId, arguments, limits);
+                return invoke(function.symbolId, arguments, std::move(options));
             }
         }
     }
@@ -403,6 +463,7 @@ const char* errorCodeName(ErrorCode code) noexcept {
     case ErrorCode::InstructionBudgetExceeded: return "instruction-budget-exceeded";
     case ErrorCode::RecursionLimitExceeded: return "recursion-limit-exceeded";
     case ErrorCode::ExternalFunctionUnresolved: return "external-function-unresolved";
+    case ErrorCode::DuplicateSymbol: return "duplicate-symbol";
     case ErrorCode::InvalidProgram: return "invalid-program";
     }
     return "unknown";
