@@ -1,0 +1,30 @@
+name: Export Phase 3C Source
+
+on:
+  pull_request:
+    branches:
+      - agent/arrays-native-handles-heap-diagnostics
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Phase 3C branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/arrays-native-handles-heap-diagnostics
+      - name: Create source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --exclude=.git --exclude=build --exclude='build-*' -czf "$RUNNER_TEMP/realscript-phase3c-source.tar.gz" .
+      - name: Upload source archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: realscript-phase3c-source
+          path: ${{ runner.temp }}/realscript-phase3c-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
