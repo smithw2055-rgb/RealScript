@@ -16,13 +16,15 @@ bool validRegisterType(semantic::PrimitiveType type) noexcept {
     return type == semantic::PrimitiveType::Bool ||
         type == semantic::PrimitiveType::Int ||
         type == semantic::PrimitiveType::String ||
-        type == semantic::PrimitiveType::Null;
+        type == semantic::PrimitiveType::Null ||
+        type == semantic::PrimitiveType::Object;
 }
 
 bool validStorageType(semantic::PrimitiveType type) noexcept {
     return type == semantic::PrimitiveType::Bool ||
         type == semantic::PrimitiveType::Int ||
-        type == semantic::PrimitiveType::String;
+        type == semantic::PrimitiveType::String ||
+        type == semantic::PrimitiveType::Object;
 }
 
 bool validReturnType(semantic::PrimitiveType type) noexcept {

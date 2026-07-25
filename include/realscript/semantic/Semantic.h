@@ -21,6 +21,7 @@ enum class PrimitiveType {
     Int,
     String,
     Null,
+    Object,
 };
 
 [[nodiscard]] const char* primitiveTypeName(PrimitiveType type) noexcept;

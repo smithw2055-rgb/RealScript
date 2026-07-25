@@ -147,6 +147,7 @@ std::uint8_t encodeType(semantic::PrimitiveType type) {
     case semantic::PrimitiveType::Int: return 2;
     case semantic::PrimitiveType::String: return 3;
     case semantic::PrimitiveType::Null: return 4;
+    case semantic::PrimitiveType::Object: return 5;
     case semantic::PrimitiveType::Error:
         break;
     }
@@ -160,6 +161,7 @@ bool decodeType(std::uint8_t tag, semantic::PrimitiveType& type) {
     case 2: type = semantic::PrimitiveType::Int; return true;
     case 3: type = semantic::PrimitiveType::String; return true;
     case 4: type = semantic::PrimitiveType::Null; return true;
+    case 5: type = semantic::PrimitiveType::Object; return true;
     default: return false;
     }
 }

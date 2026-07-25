@@ -574,3 +574,7 @@ GC 调度、任务唤醒和事件分发必须使用稳定计数和顺序。
 - 热重载成功、拒绝和回滚；
 - 确定性状态哈希和回放；
 - 调试器查看优化前后局部变量。
+
+## Phase 3A implementation note
+
+The current implementation now provides stable generation-checked object handles, managed string/array/record objects, exact interpreter roots and an incremental non-moving mark/sweep collector. Source-level object construction, serialized GC maps and automatic scheduling remain outside this implemented profile.

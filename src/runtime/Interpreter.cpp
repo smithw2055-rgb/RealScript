@@ -24,6 +24,7 @@ struct State {
     const std::unordered_map<semantic::SymbolId, FunctionLocation>* functions = nullptr;
     const ExternalFunction* externalResolver = nullptr;
     const TraceSink* trace = nullptr;
+    ManagedHeap* heap = nullptr;
 };
 
 void emitTrace(State& state, TraceEventKind kind, std::string operation = {}) {
@@ -272,6 +273,13 @@ bool executeFunction(
     emitTrace(state, TraceEventKind::FunctionEnter);
     std::vector<Value> locals(function.localTypes.size());
     std::vector<Value> registers(function.registerTypes.size());
+    std::optional<ManagedHeap::RootScope> roots;
+    if (state.heap) {
+        roots.emplace(*state.heap);
+        roots->add(arguments);
+        roots->add(locals);
+        roots->add(registers);
+    }
     const bytecode::BasicBlock* block = findBlock(function, 0);
     if (!block) {
         state.stack.pop_back();
@@ -355,16 +363,23 @@ bool executeFunction(
 } // namespace
 
 Interpreter::Interpreter(std::vector<bytecode::Module> modules)
-    : modules_(std::move(modules)) {}
+    : modules_(std::move(modules)), heap_(std::make_shared<ManagedHeap>()) {}
 
 Interpreter::Interpreter(std::shared_ptr<const ProgramImage> program)
-    : program_(std::move(program)) {
+    : program_(std::move(program)), heap_(std::make_shared<ManagedHeap>()) {
     if (program_) modules_ = program_->modules();
 }
 
 void Interpreter::setExternalResolver(ExternalFunction resolver) {
     externalResolver_ = std::move(resolver);
 }
+
+
+void Interpreter::setManagedHeap(std::shared_ptr<ManagedHeap> heap) {
+    heap_ = heap ? std::move(heap) : std::make_shared<ManagedHeap>();
+}
+
+std::shared_ptr<ManagedHeap> Interpreter::managedHeap() const noexcept { return heap_; }
 
 void Interpreter::setBindingRegistry(std::shared_ptr<const BindingRegistry> bindings) {
     bindings_ = std::move(bindings);
@@ -415,7 +430,7 @@ ExecutionResult Interpreter::invoke(
         missing.error.message = "entry function was not found";
         return missing;
     }
-    State state{options.limits, 0, {}, {}, {}, &functions, &externalResolver_, &options.trace};
+    State state{options.limits, 0, {}, {}, {}, &functions, &externalResolver_, &options.trace, heap_.get()};
     Value value;
     ExecutionResult execution;
     execution.succeeded = executeFunction(state, found->second, arguments, value);
@@ -474,6 +489,7 @@ semantic::PrimitiveType valueType(const Value& value) noexcept {
     if (std::holds_alternative<NullString>(value)) return semantic::PrimitiveType::String;
     if (std::holds_alternative<bool>(value)) return semantic::PrimitiveType::Bool;
     if (std::holds_alternative<std::int64_t>(value)) return semantic::PrimitiveType::Int;
+    if (std::holds_alternative<ObjectRef>(value)) return semantic::PrimitiveType::Object;
     return semantic::PrimitiveType::String;
 }
 
@@ -482,6 +498,10 @@ std::string valueToString(const Value& value) {
     if (std::holds_alternative<NullString>(value)) return "null";
     if (std::holds_alternative<bool>(value)) return std::get<bool>(value) ? "true" : "false";
     if (std::holds_alternative<std::int64_t>(value)) return std::to_string(std::get<std::int64_t>(value));
+    if (const auto* reference = std::get_if<ObjectRef>(&value)) {
+        return "object@" + std::to_string(reference->slot) + ":" +
+            std::to_string(reference->generation);
+    }
     return std::get<std::string>(value);
 }
 

@@ -24,6 +24,7 @@ const char* primitiveTypeName(PrimitiveType type) noexcept {
     case PrimitiveType::Int: return "int";
     case PrimitiveType::String: return "string";
     case PrimitiveType::Null: return "null";
+    case PrimitiveType::Object: return "object";
     }
     return "<unknown>";
 }

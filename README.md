@@ -4,7 +4,7 @@ RealScript 是一门面向现代游戏引擎的嵌入式强类型脚本语言与
 
 它采用接近 C# 的表达方式，以 C++17 游戏引擎为主要宿主，长期目标包括：快速字节码解释、C++17 AOT、可选 LLVM ORC JIT、源码级调试、热重载、沙箱 Mod，以及固定 Tick 的确定性模拟。
 
-> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端、Phase 2A 类型化字节码工具链和 Phase 2B 解释器基线已经完成。语言、字节码和 ABI 尚未冻结。
+> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端、Phase 2A–2C 执行运行时和 Phase 3A 托管堆/GC 基线已经完成。语言、字节码和 ABI 尚未冻结。
 
 ## 当前可运行能力
 
@@ -29,6 +29,9 @@ Phase 1A–2C 已经实现：
 - 模块源码、公有签名和依赖指纹；
 - 基于上一轮 `BuildSnapshot` 的模块级语义/MIR 复用；
 - 类型化寄存器字节码、函数引用表和块参数；
+- 字节码解释器、链接镜像、宿主绑定、Trace 与运行统计；
+- generation 检查的 `ObjectRef`、托管 String/Array/Record；
+- 解释器精确根、三色 Mark/Sweep、增量预算与写屏障；
 - `.rsbc` 0.1 Section 容器、确定性编码和防御性解码；
 - 字节码反汇编器与语义验证器；
 - 类型化寄存器解释器、调用帧和跨模块调用；
@@ -237,6 +240,7 @@ include/realscript/
   mir/           多基本块 Typed MIR、Lowerer 和 Verifier
   compiler/      多文件 Compilation、模块图和增量快照
   bytecode/      类型化寄存器字节码、Codec、Verifier 和 Disassembler
+  runtime/       链接、解释器、托管堆、GC、Binding 和可观测性
 src/              对应实现
 tools/rsc/        编译器命令行
 tests/fixtures/   源码 conformance fixtures
@@ -254,10 +258,14 @@ docs/roadmap/     实现切片和路线图
 - [运行时模型规范 Draft v0.1](docs/spec/RUNTIME_MODEL.md)
 - [字节码与原生 ABI 规范 Draft v0.1](docs/spec/BYTECODE_AND_ABI.md)
 - [`.rsbc` 0.1 物理格式](docs/spec/BYTECODE_FORMAT_V0.md)
+- [托管堆与 GC Draft v0.1](docs/spec/MANAGED_HEAP_GC_V0.md)
 - [Phase 1A 实现说明](docs/roadmap/PHASE_1A.md)
 - [Phase 1B 实现说明](docs/roadmap/PHASE_1B.md)
 - [Phase 1C 实现说明](docs/roadmap/PHASE_1C.md)
 - [Phase 2A 实现说明](docs/roadmap/PHASE_2A.md)
+- [Phase 2B 实现说明](docs/roadmap/PHASE_2B.md)
+- [Phase 2C 实现说明](docs/roadmap/PHASE_2C.md)
+- [Phase 3A 实现说明](docs/roadmap/PHASE_3A.md)
 
 ## 路线图
 
@@ -267,8 +275,10 @@ docs/roadmap/     实现切片和路线图
 - [x] Phase 1B：赋值、控制流、流分析、多块 MIR、块参数和验证器；
 - [x] Phase 1C：函数调用、重载、模块符号和增量编译；
 - [x] Phase 2A：类型化寄存器字节码、编码器、反汇编器和验证器；
-- [ ] Phase 2B：解释器、调用栈、异常基线和执行预算；
-- [ ] Phase 3：对象模型、GC 和 C++ Native Binding；
+- [x] Phase 2B：解释器、调用栈、运行时错误和执行预算；
+- [x] Phase 2C：链接镜像、宿主绑定、可观测性和嵌入门面；
+- [x] Phase 3A：托管对象引用、精确根和增量 Mark/Sweep；
+- [ ] Phase 3B：源码对象/数组、GC Map、Host Handle 和自动调度；
 - [ ] Phase 4：DAP、LSP 和热重载；
 - [ ] Phase 5：C++17 AOT；
 - [ ] Phase 6：确定性、性能优化和可选 JIT。
@@ -306,3 +316,25 @@ auto result = runtime.invoke("Game.Main::main", {}, options);
 
 - [Phase 2C — Linking, Observability and Embedding](docs/roadmap/PHASE_2C.md)
 - [Embedding and Observability Draft v0.1](docs/spec/EMBEDDING_AND_OBSERVABILITY_V0.md)
+
+
+## Phase 3A 托管堆
+
+引擎侧可共享运行时托管堆，并用精确根保护宿主临时值：
+
+```cpp
+auto heap = runtime.managedHeap();
+auto object = heap->allocateRecord(2);
+runtime::Value root = object;
+
+{
+    runtime::ManagedHeap::RootScope roots(*heap);
+    roots.add(root);
+    heap->requestCollection();
+    while (heap->collectionInProgress()) {
+        heap->step(64);
+    }
+}
+```
+
+解释器会自动把函数参数、寄存器和 Local Slot 注册为精确根。

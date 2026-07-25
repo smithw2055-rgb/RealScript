@@ -84,7 +84,7 @@ std::optional<semantic::SymbolId> ProgramImage::findFunction(const std::string& 
 }
 
 EngineRuntime::EngineRuntime(std::shared_ptr<const ProgramImage> program)
-    : program_(std::move(program)) {}
+    : program_(std::move(program)), heap_(std::make_shared<ManagedHeap>()) {}
 
 void EngineRuntime::setBindings(std::shared_ptr<const BindingRegistry> bindings) {
     bindings_ = std::move(bindings);
@@ -102,10 +102,13 @@ ExecutionResult EngineRuntime::invoke(
     }
     Interpreter interpreter(program_);
     interpreter.setBindingRegistry(bindings_);
+    interpreter.setManagedHeap(heap_);
     return interpreter.invoke(qualifiedName, arguments, std::move(options));
 }
 
 const ProgramImage& EngineRuntime::program() const noexcept { return *program_; }
+
+std::shared_ptr<ManagedHeap> EngineRuntime::managedHeap() const noexcept { return heap_; }
 
 const char* traceEventKindName(TraceEventKind kind) noexcept {
     switch (kind) {

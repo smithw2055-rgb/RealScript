@@ -66,8 +66,9 @@ The loader rejects missing, duplicate, out-of-range, header-overlapping or mutua
 | 2 | `int` |
 | 3 | `string` |
 | 4 | `null` |
+| 5 | `object` |
 
-`Error` is never serializable. `void` is valid only where a signature permits it; value registers and parameters cannot have type `void`.
+`object` is the managed-reference carrier introduced by Phase 3A. `Error` is never serializable. `void` is valid only where a signature permits it; value registers and parameters cannot have type `void`.
 
 A type vector is encoded as:
 
