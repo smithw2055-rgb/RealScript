@@ -1,0 +1,71 @@
+name: Apply Phase 3A Patch
+
+on:
+  pull_request:
+    branches:
+      - agent/managed-heap-incremental-gc
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Phase 3A branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/managed-heap-incremental-gc
+          fetch-depth: 0
+
+      - name: Verify and apply patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .phase3a.patch.* > /tmp/phase3a.patch.b64
+          echo "b5a69110c5ee32dedb70dc25627f9c00fedd83764a54f6e99c60f0d15774808b  /tmp/phase3a.patch.b64" | sha256sum --check
+          base64 --decode /tmp/phase3a.patch.b64 > /tmp/phase3a.patch.gz
+          echo "c0a8285ca5782ba7026cb9e2f5c1538ad7d382009cfc54bdd1a439d9a43187f1  /tmp/phase3a.patch.gz" | sha256sum --check
+          gzip -dc /tmp/phase3a.patch.gz > /tmp/phase3a.patch
+          patch -p1 < /tmp/phase3a.patch
+          test -f src/runtime/ManagedHeap.cpp
+          test -f tests/phase3a_tests.cpp
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DREALSCRIPT_BUILD_TESTS=ON
+          -DREALSCRIPT_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build --config Debug
+
+      - name: Test
+        run: ctest --test-dir build -C Debug --output-on-failure
+
+      - name: Check formatting
+        run: git diff --check
+
+      - name: Commit Phase 3A sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            CMakeLists.txt README.md \
+            include/realscript/semantic/Semantic.h \
+            include/realscript/runtime/Runtime.h \
+            src/semantic/Symbols.cpp \
+            src/bytecode/BytecodeCodec.cpp \
+            src/bytecode/BytecodeVerifier.cpp \
+            src/runtime/Interpreter.cpp \
+            src/runtime/RuntimeServices.cpp \
+            src/runtime/ManagedHeap.cpp \
+            tests/phase3a_tests.cpp \
+            docs/spec/BYTECODE_FORMAT_V0.md \
+            docs/spec/MANAGED_HEAP_GC_V0.md \
+            docs/spec/RUNTIME_MODEL.md \
+            docs/roadmap/PHASE_3A.md
+          git commit -m "Add managed heap and incremental GC"
+          git push origin HEAD:agent/managed-heap-incremental-gc
