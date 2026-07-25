@@ -1,3 +1,4 @@
+#include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/mir/Mir.h"
@@ -24,9 +25,67 @@ std::string readFile(const std::string& path) {
     return content.str();
 }
 
+std::vector<std::uint8_t> readBinaryFile(const std::string& path) {
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    if (!stream) {
+        throw std::runtime_error("cannot open input file: " + path);
+    }
+    const auto end = stream.tellg();
+    if (end < 0) {
+        throw std::runtime_error("cannot determine input size: " + path);
+    }
+    const auto size = static_cast<std::size_t>(end);
+    std::vector<std::uint8_t> bytes(size);
+    stream.seekg(0, std::ios::beg);
+    if (size != 0) {
+        stream.read(
+            reinterpret_cast<char*>(bytes.data()),
+            static_cast<std::streamsize>(size));
+    }
+    if (!stream) {
+        throw std::runtime_error("cannot read input file: " + path);
+    }
+    return bytes;
+}
+
+void writeBinaryFile(
+    const std::string& path,
+    const std::vector<std::uint8_t>& bytes) {
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    if (!stream) {
+        throw std::runtime_error("cannot open output file: " + path);
+    }
+    stream.write(
+        reinterpret_cast<const char*>(bytes.data()),
+        static_cast<std::streamsize>(bytes.size()));
+    if (!stream) {
+        throw std::runtime_error("cannot write output file: " + path);
+    }
+}
+
 void printUsage() {
     std::cerr
-        << "usage: rsc <file.rs>... [--check|--tokens|--mir|--symbols]\n";
+        << "usage: rsc <file.rs>... "
+           "[--check|--tokens|--mir|--symbols|--bytecode]\n"
+        << "       rsc <file.rs>... --emit-bytecode <module.rsbc>\n"
+        << "       rsc <module.rsbc> --disassemble\n";
+}
+
+void printDiagnostics(
+    const realscript::diagnostics::DiagnosticBag& diagnostics) {
+    for (const auto& diagnostic : diagnostics.items()) {
+        std::cerr
+            << (diagnostic.sourceName.empty()
+                ? "<compilation>"
+                : diagnostic.sourceName)
+            << ": "
+            << (diagnostic.severity ==
+                    realscript::diagnostics::DiagnosticSeverity::Error
+                ? "error"
+                : "warning")
+            << ' ' << diagnostic.code << ": "
+            << diagnostic.message << '\n';
+    }
 }
 
 } // namespace
@@ -38,10 +97,18 @@ int main(int argc, char** argv) {
     }
 
     std::string mode = "--check";
+    std::string outputPath;
     std::vector<std::string> paths;
-    for (int i = 1; i < argc; ++i) {
-        const std::string argument = argv[i];
-        if (argument.rfind("--", 0) == 0) {
+    for (int index = 1; index < argc; ++index) {
+        const std::string argument = argv[index];
+        if (argument == "--emit-bytecode") {
+            mode = argument;
+            if (index + 1 >= argc) {
+                printUsage();
+                return 2;
+            }
+            outputPath = argv[++index];
+        } else if (argument.rfind("--", 0) == 0) {
             mode = argument;
         } else {
             paths.push_back(argument);
@@ -81,13 +148,64 @@ int main(int argc, char** argv) {
             return diagnostics.hasErrors() ? 1 : 0;
         }
 
+        if (mode == "--disassemble") {
+            if (paths.size() != 1) {
+                std::cerr << "--disassemble accepts exactly one .rsbc file\n";
+                return 2;
+            }
+            realscript::bytecode::Module module;
+            realscript::diagnostics::DiagnosticBag diagnostics;
+            if (realscript::bytecode::decodeModule(
+                    readBinaryFile(paths.front()),
+                    module,
+                    diagnostics)) {
+                (void)realscript::bytecode::verifyModule(module, diagnostics);
+            }
+            if (!diagnostics.hasErrors()) {
+                std::cout << realscript::bytecode::disassembleModule(module);
+            }
+            printDiagnostics(diagnostics);
+            return diagnostics.hasErrors() ? 1 : 0;
+        }
+
         realscript::compiler::Compilation compilation;
         for (const auto& path : paths) {
             compilation.addSource({path, readFile(path)});
         }
-        const auto result = compilation.build();
+        auto result = compilation.build();
 
-        if (mode == "--mir") {
+        if (!result.diagnostics.hasErrors() &&
+            (mode == "--bytecode" || mode == "--emit-bytecode")) {
+            std::vector<realscript::bytecode::Module> modules;
+            realscript::bytecode::Lowerer lowerer;
+            for (const auto& mirModule : result.modules) {
+                auto module = lowerer.lower(mirModule);
+                (void)realscript::bytecode::verifyModule(
+                    module,
+                    result.diagnostics);
+                modules.push_back(std::move(module));
+            }
+
+            if (!result.diagnostics.hasErrors()) {
+                if (mode == "--bytecode") {
+                    for (const auto& module : modules) {
+                        std::cout << realscript::bytecode::disassembleModule(module)
+                            << '\n';
+                    }
+                } else {
+                    if (modules.size() != 1) {
+                        result.diagnostics.report(
+                            "RS5200",
+                            "--emit-bytecode requires exactly one compiled module",
+                            {});
+                    } else {
+                        writeBinaryFile(
+                            outputPath,
+                            realscript::bytecode::encodeModule(modules.front()));
+                    }
+                }
+            }
+        } else if (mode == "--mir") {
             for (const auto& module : result.modules) {
                 std::cout << realscript::mir::printModule(module);
             }
@@ -104,19 +222,7 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        for (const auto& diagnostic : result.diagnostics.items()) {
-            std::cerr
-                << (diagnostic.sourceName.empty()
-                    ? "<compilation>"
-                    : diagnostic.sourceName)
-                << ": "
-                << (diagnostic.severity ==
-                        realscript::diagnostics::DiagnosticSeverity::Error
-                    ? "error"
-                    : "warning")
-                << ' ' << diagnostic.code << ": "
-                << diagnostic.message << '\n';
-        }
+        printDiagnostics(result.diagnostics);
         return result.diagnostics.hasErrors() ? 1 : 0;
     } catch (const std::exception& error) {
         std::cerr << "rsc: " << error.what() << '\n';

@@ -1,0 +1,93 @@
+rsbc 0.1 module Demo.Bytecode
+
+references:
+  ref0 @Demo.Bytecode::twice[0x48d2886689d9cb5f](int) -> int
+  ref1 @Demo.Bytecode::choose[0xf98d09db54a197aa](string) -> string
+
+func @twice[0x48d2886689d9cb5f](int) -> int {
+  registers [r0:int, r1:int, r2:int, r3:int]
+  locals [0:int]
+bb0:
+  r0:int = param 0
+  store.local 0, r0
+  r1:int = load.local 0
+  r2:int = const.i32 2
+  r3:int = mul.i32 r1, r2
+  ret r3
+}
+
+func @clamp[0x60679850407a6fcd](int, int) -> int {
+  registers [r0:int, r1:int, r2:int, r3:int, r4:int, r5:int, r6:bool, r7:int, r8:int, r9:int, r10:int]
+  locals [0:int, 1:int, 2:int]
+bb0:
+  r0:int = param 0
+  store.local 0, r0
+  r1:int = param 1
+  store.local 1, r1
+  r2:int = load.local 0
+  r3:int = call ref0 @Demo.Bytecode::twice(r2)
+  store.local 2, r3
+  jmp bb1
+bb1:
+  r4:int = load.local 2
+  r5:int = load.local 1
+  r6:bool = gt.i32 r4, r5
+  br r6, bb2, bb3
+bb2:
+  r7:int = load.local 2
+  r8:int = const.i32 1
+  r9:int = sub.i32 r7, r8
+  store.local 2, r9
+  jmp bb1
+bb3:
+  r10:int = load.local 2
+  ret r10
+}
+
+func @guarded[0x4ae8ca86b2b42df5](bool, int) -> bool {
+  registers [r0:bool, r1:int, r2:bool, r3:bool, r4:bool, r5:int, r6:int, r7:bool]
+  locals [0:bool, 1:int]
+bb0:
+  r0:bool = param 0
+  store.local 0, r0
+  r1:int = param 1
+  store.local 1, r1
+  r2:bool = load.local 0
+  r4:bool = const.bool false
+  br r2, bb1, bb2(r4)
+bb1:
+  r5:int = load.local 1
+  r6:int = const.i32 0
+  r7:bool = gt.i32 r5, r6
+  jmp bb2(r7)
+bb2(r3:bool):
+  ret r3
+}
+
+func @choose[0xf98d09db54a197aa](string) -> string {
+  registers [r0:string, r1:string]
+  locals [0:string]
+bb0:
+  r0:string = param 0
+  store.local 0, r0
+  r1:string = load.local 0
+  ret r1
+}
+
+func @nilValue[0xbf17e3781413764c]() -> string {
+  registers [r0:null, r1:string, r2:string]
+  locals []
+bb0:
+  r0:null = const.null
+  r1:string = conv.null.string r0
+  r2:string = call ref1 @Demo.Bytecode::choose(r1)
+  ret r2
+}
+
+func @greeting[0x7614cca20ce40f13]() -> string {
+  registers [r0:string]
+  locals []
+bb0:
+  r0:string = const.string "hello"
+  ret r0
+}

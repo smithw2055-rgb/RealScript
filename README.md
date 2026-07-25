@@ -4,11 +4,11 @@ RealScript 是一门面向现代游戏引擎的嵌入式强类型脚本语言与
 
 它采用接近 C# 的表达方式，以 C++17 游戏引擎为主要宿主，长期目标包括：快速字节码解释、C++17 AOT、可选 LLVM ORC JIT、源码级调试、热重载、沙箱 Mod，以及固定 Tick 的确定性模拟。
 
-> 当前状态：Draft v0.1 规范基线与 Phase 1A–1C 编译器前端已经完成。语言、字节码和 ABI 尚未冻结。
+> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端和 Phase 2A 类型化字节码工具链已经完成。语言、字节码和 ABI 尚未冻结。
 
 ## 当前可运行能力
 
-Phase 1A–1C 已经实现：
+Phase 1A–2A 已经实现：
 
 - 无外部依赖的 C++17/CMake 工程；
 - `SourceText`、`TextSpan` 和 CRLF/LF 行列映射；
@@ -28,15 +28,19 @@ Phase 1A–1C 已经实现：
 - 直接调用、转换、类型、目标块、支配关系和终结指令 MIR 验证；
 - 模块源码、公有签名和依赖指纹；
 - 基于上一轮 `BuildSnapshot` 的模块级语义/MIR 复用；
-- `rsc` Token、检查、MIR 和 Symbol 输出模式；
+- 类型化寄存器字节码、函数引用表和块参数；
+- `.rsbc` 0.1 Section 容器、确定性编码和防御性解码；
+- 字节码反汇编器与语义验证器；
+- `rsc` Token、检查、MIR、Symbol、Bytecode 和二进制输出模式；
 - Linux/Windows GitHub Actions 构建；
-- 24 项前端、控制流、模块、调用和增量编译测试。
+- 前端、控制流、模块、调用、增量编译和字节码测试。
 
 实现边界见：
 
 - [Phase 1A — C++17 Language Foundation](docs/roadmap/PHASE_1A.md)
 - [Phase 1B — Control Flow and Multi-Block MIR](docs/roadmap/PHASE_1B.md)
 - [Phase 1C — Calls, Modules and Incremental Compilation](docs/roadmap/PHASE_1C.md)
+- [Phase 2A — Typed Register Bytecode](docs/roadmap/PHASE_2A.md)
 
 ## 快速开始
 
@@ -114,6 +118,16 @@ Game.Main::main 0x...
 ret %result
 ```
 
+生成并检查类型化字节码：
+
+```bash
+rsc math.rs --bytecode
+rsc math.rs --emit-bytecode math.rsbc
+rsc math.rsbc --disassemble
+```
+
+`.rsbc` 在执行前必须先通过物理解码检查和字节码语义验证。Phase 2A 只建立格式、Lowerer、Codec、Disassembler 和 Verifier，解释器从 Phase 2B 开始。
+
 ## Phase 1C 的符号与增量模型
 
 ### 稳定函数身份
@@ -148,6 +162,14 @@ Phase 1C 的转换排序刻意保持较小：
 
 当前增量层复用语义和 MIR 结果，Lexer/Parser 的语法树缓存将在后续增量前端切片中补充。
 
+## Phase 2A 的字节码边界
+
+字节码保留多基本块、类型化寄存器、显式局部槽位和边参数。MIR `ValueId` 直接映射到寄存器，调用通过带签名的函数引用表索引表达。
+
+`.rsbc` 0.1 使用 little-endian 固定宽度整数和四个 Section：字符串、函数引用、函数元数据和代码。编码器不写入时间戳、裸地址或平台结构体填充，因此同一模块能够稳定地产生相同字节。
+
+Decoder 负责文件边界、Section、计数和 Tag；Verifier 继续检查类型、定义支配、分支参数、调用和返回。两层都成功前不得进入执行器。
+
 ## 当前实现限制
 
 尚未实现：
@@ -159,7 +181,7 @@ Phase 1C 的转换排序刻意保持较小：
 - `break`、`continue`、`for`、`foreach`、`switch`；
 - 异常和协程；
 - 增量语法树与持久化构建缓存；
-- 字节码生成、VM 和原生 AOT。
+- 字节码 VM、异常/GC 信息和原生 AOT。
 
 未实现能力会得到明确诊断，不会使用占位运行时行为假装支持。
 
@@ -202,6 +224,7 @@ include/realscript/
   semantic/      类型、Symbol、Bound Tree、Binder 和 Flow Analysis
   mir/           多基本块 Typed MIR、Lowerer 和 Verifier
   compiler/      多文件 Compilation、模块图和增量快照
+  bytecode/      类型化寄存器字节码、Codec、Verifier 和 Disassembler
 src/              对应实现
 tools/rsc/        编译器命令行
 tests/fixtures/   源码 conformance fixtures
@@ -218,9 +241,11 @@ docs/roadmap/     实现切片和路线图
 - [Typed MIR 规范 Draft v0.1](docs/spec/MIR_SPEC.md)
 - [运行时模型规范 Draft v0.1](docs/spec/RUNTIME_MODEL.md)
 - [字节码与原生 ABI 规范 Draft v0.1](docs/spec/BYTECODE_AND_ABI.md)
+- [`.rsbc` 0.1 物理格式](docs/spec/BYTECODE_FORMAT_V0.md)
 - [Phase 1A 实现说明](docs/roadmap/PHASE_1A.md)
 - [Phase 1B 实现说明](docs/roadmap/PHASE_1B.md)
 - [Phase 1C 实现说明](docs/roadmap/PHASE_1C.md)
+- [Phase 2A 实现说明](docs/roadmap/PHASE_2A.md)
 
 ## 路线图
 
@@ -229,7 +254,7 @@ docs/roadmap/     实现切片和路线图
 - [x] Phase 1A：C++17 工程、Lexer、Parser、Binder 和单块 MIR；
 - [x] Phase 1B：赋值、控制流、流分析、多块 MIR、块参数和验证器；
 - [x] Phase 1C：函数调用、重载、模块符号和增量编译；
-- [ ] Phase 2A：类型化寄存器字节码、编码器、反汇编器和验证器；
+- [x] Phase 2A：类型化寄存器字节码、编码器、反汇编器和验证器；
 - [ ] Phase 2B：解释器、调用栈、异常基线和执行预算；
 - [ ] Phase 3：对象模型、GC 和 C++ Native Binding；
 - [ ] Phase 4：DAP、LSP 和热重载；

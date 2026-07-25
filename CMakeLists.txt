@@ -22,6 +22,11 @@ add_library(realscript_frontend STATIC
     src/mir/MirVerifier.cpp
     src/mir/MirPrinter.cpp
     src/compiler/Compilation.cpp
+    src/bytecode/BytecodeFacts.cpp
+    src/bytecode/BytecodeLowerer.cpp
+    src/bytecode/BytecodeVerifier.cpp
+    src/bytecode/BytecodeDisassembler.cpp
+    src/bytecode/BytecodeCodec.cpp
 )
 
 add_library(RealScript::Frontend ALIAS realscript_frontend)
@@ -66,4 +71,13 @@ if(REALSCRIPT_BUILD_TESTS)
     target_link_libraries(realscript_phase1c_tests PRIVATE RealScript::Frontend)
     target_compile_features(realscript_phase1c_tests PRIVATE cxx_std_17)
     add_test(NAME realscript.phase1c COMMAND realscript_phase1c_tests)
+
+    add_executable(realscript_phase2a_tests tests/phase2a_tests.cpp)
+    target_link_libraries(realscript_phase2a_tests PRIVATE RealScript::Frontend)
+    target_compile_features(realscript_phase2a_tests PRIVATE cxx_std_17)
+    target_compile_definitions(
+        realscript_phase2a_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    add_test(NAME realscript.phase2a COMMAND realscript_phase2a_tests)
 endif()

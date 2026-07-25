@@ -3,7 +3,7 @@
 - 规范版本：Draft v0.1
 - `bytecode_format_version`：0.1
 - `runtime_abi_version`：0.1
-- 状态：逻辑结构和安全约束已定义，最终物理编码尚未冻结
+- 状态：逻辑结构和安全约束已定义；Phase 2A 物理编码已实现但尚未冻结
 
 ## 1. 范围
 
@@ -17,7 +17,7 @@
 - Native Binding 与 Native Thunk；
 - 版本、热重载和跨平台兼容规则。
 
-字节码物理编码可以在 v0.1 实现期间调整，但不得削弱本文规定的验证与语义要求。
+字节码物理编码可以在 v0.1 实现期间调整，但不得削弱本文规定的验证与语义要求。Phase 2A 当前实现的精确物理布局见 [BYTECODE_FORMAT_V0.md](BYTECODE_FORMAT_V0.md)。本文后续较完整的 Header、Section 和 Runtime 表设计仍代表稳定格式的演进目标，不应被误解为已经全部进入 Phase 2A 文件。
 
 ## 2. 设计原则
 

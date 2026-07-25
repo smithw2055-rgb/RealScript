@@ -42,7 +42,8 @@ RealScript 不允许以 C++ 未定义行为作为脚本语义。所有可观察�
 | [LANGUAGE_SPEC.md](LANGUAGE_SPEC.md) | 源文件、模块、类型、转换、表达式、语句、对象、泛型、异常、协程、属性和确定性约束 | Draft v0.1 |
 | [MIR_SPEC.md](MIR_SPEC.md) | Typed MIR、控制流、类型规则、检查、异常区、序列点和优化合法性 | Draft v0.1 |
 | [RUNTIME_MODEL.md](RUNTIME_MODEL.md) | 值与对象模型、GC、字符串、数组、句柄、任务、线程、调试、预算和热重载 | Draft v0.1 |
-| [BYTECODE_AND_ABI.md](BYTECODE_AND_ABI.md) | 字节码模块、验证器、调用约定、Runtime C ABI、Native Thunk 和版本兼容 | Draft v0.1 |
+| [BYTECODE_AND_ABI.md](BYTECODE_AND_ABI.md) | 字节码逻辑模型、验证器、调用约定、Runtime C ABI、Native Thunk 和版本兼容 | Draft v0.1 |
+| [BYTECODE_FORMAT_V0.md](BYTECODE_FORMAT_V0.md) | Phase 2A 已实现的 `.rsbc` 0.1 物理编码、Section、指令记录和安全边界 | Implemented Draft v0.1 |
 | [../ENGINE_DESIGN.md](../ENGINE_DESIGN.md) | 总体架构、参考项目、性能目标和实施路线 | Draft v0.1 |
 
 ## 4. 符合性档位
@@ -132,7 +133,7 @@ RealScript 分离以下版本号：
 - Unicode 标识符是否进入首个稳定版本；
 - 整数运算在 Debug 构建下的默认 checked 策略；
 - 引用类型泛型共享代码与完全单态化的边界；
-- 字节码物理编码宽度；
+- `.rsbc` 0.1 已实现物理编码是否直接演进为首个稳定格式；
 - 异常过滤器和 `finally` 的首版范围；
 - `async` 的取消和结构化并发 API；
 - 热重载中活动协程状态迁移的支持等级；
