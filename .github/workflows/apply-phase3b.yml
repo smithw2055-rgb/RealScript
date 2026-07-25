@@ -1,0 +1,100 @@
+name: Apply Phase 3B Bundle
+
+on:
+  pull_request:
+    branches:
+      - agent/object-model-bytecode
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Phase 3B branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/object-model-bytecode
+          fetch-depth: 0
+
+      - name: Verify and extract bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .phase3b.seg.* > /tmp/phase3b.tar.gz.b64
+          echo "2134d373f1614c81f55632a0ce1249f1b691b417c2046f193ec7b220166403fb  /tmp/phase3b.tar.gz.b64" | sha256sum --check
+          base64 --decode /tmp/phase3b.tar.gz.b64 > /tmp/phase3b.tar.gz
+          echo "2648a401ad5c4c753465e7ca67c9d909ca04a195c9af8e448dffe8f7c72889bf  /tmp/phase3b.tar.gz" | sha256sum --check
+          tar -xzf /tmp/phase3b.tar.gz
+          test -f docs/spec/OBJECT_MODEL_V0.md
+          test -f docs/roadmap/PHASE_3B.md
+          test -f tests/phase3b_tests.cpp
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DREALSCRIPT_BUILD_TESTS=ON
+          -DREALSCRIPT_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build --config Debug
+
+      - name: Test
+        run: ctest --test-dir build -C Debug --output-on-failure
+
+      - name: Check formatting
+        run: git diff --check
+
+      - name: Commit Phase 3B sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            CMakeLists.txt \
+            README.md \
+            tests/phase3b_tests.cpp \
+            tests/phase2a_tests.cpp \
+            docs/spec/README.md \
+            docs/spec/BYTECODE_FORMAT_V0.md \
+            docs/spec/BYTECODE_AND_ABI.md \
+            docs/spec/LANGUAGE_SPEC.md \
+            docs/spec/RUNTIME_MODEL.md \
+            docs/spec/MIR_SPEC.md \
+            docs/spec/OBJECT_MODEL_V0.md \
+            docs/roadmap/PHASE_2A.md \
+            docs/roadmap/PHASE_3A.md \
+            docs/roadmap/PHASE_3B.md \
+            tests/snapshots/phase2a.rsbc.hex.txt \
+            tests/snapshots/phase2a.bytecode.txt \
+            src/syntax/Parser.cpp \
+            src/syntax/SyntaxFacts.cpp \
+            src/syntax/SyntaxNodes.cpp \
+            src/runtime/ManagedHeap.cpp \
+            src/runtime/Interpreter.cpp \
+            src/semantic/SemanticExpressions.cpp \
+            src/semantic/FlowAnalysis.cpp \
+            src/semantic/SemanticBinding.cpp \
+            src/semantic/Symbols.cpp \
+            src/compiler/Compilation.cpp \
+            src/bytecode/BytecodeCodec.cpp \
+            src/bytecode/BytecodeFacts.cpp \
+            src/bytecode/BytecodeVerifier.cpp \
+            src/bytecode/BytecodeLowerer.cpp \
+            src/bytecode/BytecodeDisassembler.cpp \
+            src/mir/MirFacts.cpp \
+            src/mir/MirExpressions.cpp \
+            src/mir/MirPrinter.cpp \
+            src/mir/MirLowerer.cpp \
+            src/mir/MirVerifier.cpp \
+            include/realscript/syntax/Syntax.h \
+            include/realscript/runtime/Runtime.h \
+            include/realscript/semantic/Semantic.h \
+            include/realscript/bytecode/Bytecode.h \
+            include/realscript/mir/Mir.h
+          git status --short
+          git commit -m "Add language-visible object model and bytecode"
+          git push origin HEAD:agent/object-model-bytecode
