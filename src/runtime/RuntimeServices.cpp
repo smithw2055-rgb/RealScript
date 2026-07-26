@@ -113,18 +113,34 @@ ExecutionResult EngineRuntime::invoke(
     const std::string& qualifiedName,
     const std::vector<Value>& arguments,
     ExecutionOptions options) const {
-    if (!program_) {
+    auto program = programSnapshot();
+    if (!program) {
         ExecutionResult result;
         result.error.code = ErrorCode::InvalidProgram;
         result.error.message = "runtime has no linked program image";
         return result;
     }
-    Interpreter interpreter(program_, heap_);
+    Interpreter interpreter(std::move(program), heap_);
     interpreter.setBindingRegistry(bindings_);
     return interpreter.invoke(qualifiedName, arguments, std::move(options));
 }
 
-const ProgramImage& EngineRuntime::program() const noexcept { return *program_; }
+const ProgramImage& EngineRuntime::program() const noexcept {
+    std::lock_guard<std::mutex> lock(programMutex_);
+    return *program_;
+}
+
+std::shared_ptr<const ProgramImage> EngineRuntime::programSnapshot() const noexcept {
+    std::lock_guard<std::mutex> lock(programMutex_);
+    return program_;
+}
+
+void EngineRuntime::replaceProgram(std::shared_ptr<const ProgramImage> program) {
+    if (!program) return;
+    std::lock_guard<std::mutex> lock(programMutex_);
+    if (program_) retiredPrograms_.push_back(program_);
+    program_ = std::move(program);
+}
 
 const char* traceEventKindName(TraceEventKind kind) noexcept {
     switch (kind) {

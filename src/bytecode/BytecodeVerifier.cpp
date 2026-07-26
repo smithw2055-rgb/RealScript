@@ -1,5 +1,6 @@
 #include "realscript/bytecode/Bytecode.h"
 
+#include <algorithm>
 #include <deque>
 #include <unordered_map>
 #include <unordered_set>
@@ -11,6 +12,33 @@ struct Definition {
     BlockId block = 0;
     std::int64_t instructionIndex = -1;
 };
+
+
+bool validSourceFile(const debug::SourceFileInfo& source) noexcept {
+    if (source.path.empty() || source.lineStarts.empty() ||
+        source.lineStarts.front() != 0) return false;
+    for (std::size_t index = 1; index < source.lineStarts.size(); ++index) {
+        if (source.lineStarts[index] <= source.lineStarts[index - 1]) return false;
+    }
+    return true;
+}
+
+bool validSourceRange(
+    const debug::SourceRange& range,
+    const std::unordered_map<
+        debug::SourceFileId,
+        const debug::SourceFileInfo*>& sources) noexcept {
+    const auto found = sources.find(range.fileId);
+    if (found == sources.end()) return false;
+    const auto& source = *found->second;
+    if (range.start.line >= source.lineStarts.size() ||
+        range.end.line >= source.lineStarts.size()) return false;
+    if (range.start.line > range.end.line ||
+        (range.start.line == range.end.line &&
+         range.start.column > range.end.column)) return false;
+    return debug::offsetAt(source, range.start) == range.span.start &&
+        debug::offsetAt(source, range.end) == range.span.end();
+}
 
 bool validRegisterType(semantic::PrimitiveType type) noexcept {
     return type == semantic::PrimitiveType::Bool ||
@@ -183,7 +211,7 @@ bool verifyModule(
     diagnostics::DiagnosticBag& diagnostics) {
     const auto initialCount = diagnostics.items().size();
 
-    if (module.version.major != 0 || module.version.minor != 4) {
+    if (module.version.major != 0 || module.version.minor != 5) {
         diagnostics.report(
             "RS5100",
             "unsupported in-memory bytecode version",
@@ -191,6 +219,19 @@ bool verifyModule(
     }
     if (module.name.empty()) {
         diagnostics.report("RS5101", "bytecode module name is empty", {});
+    }
+
+    std::unordered_map<debug::SourceFileId, const debug::SourceFileInfo*> sourceFiles;
+    std::unordered_set<std::string> sourcePaths;
+    for (const auto& source : module.sourceFiles) {
+        if (!validSourceFile(source) ||
+            !sourcePaths.insert(source.path).second ||
+            !sourceFiles.emplace(source.id, &source).second) {
+            diagnostics.report(
+                "RS5160",
+                "duplicate or invalid debug source file",
+                {});
+        }
     }
 
     std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> typeDescriptors;
@@ -354,6 +395,73 @@ bool verifyModule(
     for (const auto& function : module.functions) {
         if (function.name.empty()) {
             diagnostics.report("RS5108", "bytecode function name is empty", {});
+        }
+        const bool hasDebugInfo = !function.debugInfo.sourceName.empty() ||
+            !function.debugInfo.sequencePoints.empty() ||
+            !function.debugInfo.locals.empty() ||
+            function.debugInfo.declaration.valid() ||
+            function.debugInfo.body.valid();
+        if (hasDebugInfo &&
+            (sourceFiles.find(function.debugInfo.sourceFileId) == sourceFiles.end() ||
+             (function.debugInfo.declaration.valid() &&
+              !validSourceRange(function.debugInfo.declaration, sourceFiles)) ||
+             (function.debugInfo.body.valid() &&
+              !validSourceRange(function.debugInfo.body, sourceFiles)))) {
+            diagnostics.report(
+                "RS5161",
+                "function debug info references an invalid source range",
+                {});
+        }
+        std::unordered_set<std::uint64_t> sequenceKeys;
+        for (const auto& point : function.debugInfo.sequencePoints) {
+            const auto foundBlock = std::find_if(
+                function.blocks.begin(), function.blocks.end(),
+                [&](const BasicBlock& block) { return block.id == point.blockId; });
+            const bool validPosition = foundBlock != function.blocks.end() &&
+                (point.terminator
+                    ? point.instructionIndex == foundBlock->instructions.size()
+                    : point.instructionIndex < foundBlock->instructions.size());
+            const auto key = (static_cast<std::uint64_t>(point.blockId) << 33) |
+                (static_cast<std::uint64_t>(point.instructionIndex) << 1) |
+                (point.terminator ? 1ull : 0ull);
+            if (!validPosition ||
+                !validSourceRange(point.range, sourceFiles) ||
+                !sequenceKeys.insert(key).second) {
+                diagnostics.report(
+                    "RS5162",
+                    "invalid or duplicate bytecode sequence point",
+                    {});
+            }
+        }
+        std::unordered_set<std::uint32_t> localSlots;
+        for (const auto& local : function.debugInfo.locals) {
+            const bool slotValid = local.slot < function.localTypes.size();
+            const auto expectedType = slotValid
+                ? function.localTypes[local.slot]
+                : semantic::PrimitiveType::Error;
+            const auto expectedTypeId = slotValid
+                ? typeIdAt(function.localTypeIds, local.slot)
+                : semantic::SymbolId{0};
+            if (local.name.empty() || !slotValid ||
+                local.type != expectedType || local.typeId != expectedTypeId ||
+                (local.parameter && local.slot >= function.parameterTypes.size()) ||
+                !validSourceRange(local.declaration, sourceFiles) ||
+                !validSourceRange(local.scope, sourceFiles) ||
+                (!local.parameter &&
+                 (local.declaration.span.start < local.scope.span.start ||
+                  local.declaration.span.end() > local.scope.span.end())) ||
+                !localSlots.insert(local.slot).second) {
+                diagnostics.report(
+                    "RS5163",
+                    "invalid local-variable debug metadata for '" + local.name +
+                        "' (slot=" + std::to_string(local.slot) +
+                        ", parameter=" + (local.parameter ? "true" : "false") +
+                        ", declaration=" + std::to_string(local.declaration.span.start) +
+                        ":" + std::to_string(local.declaration.span.length) +
+                        ", scope=" + std::to_string(local.scope.span.start) +
+                        ":" + std::to_string(local.scope.span.length) + ")",
+                    {});
+            }
         }
         if (!validReturnType(function.returnType) ||
             !validDescriptorIdentity(function.returnType, function.returnTypeId, typeDescriptors)) {

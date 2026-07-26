@@ -1,5 +1,6 @@
 #pragma once
 
+#include "realscript/debug/DebugInfo.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/mir/Mir.h"
 #include "realscript/semantic/Semantic.h"
@@ -18,7 +19,7 @@ constexpr Register InvalidRegister = std::numeric_limits<Register>::max();
 
 struct Version {
     std::uint16_t major = 0;
-    std::uint16_t minor = 4;
+    std::uint16_t minor = 5;
 };
 
 enum class Opcode : std::uint8_t {
@@ -148,11 +149,13 @@ struct Function {
     std::vector<semantic::PrimitiveType> registerTypes;
     std::vector<semantic::SymbolId> registerTypeIds;
     std::vector<BasicBlock> blocks;
+    debug::FunctionDebugInfo debugInfo;
 };
 
 struct Module {
     Version version;
     std::string name;
+    std::vector<debug::SourceFileInfo> sourceFiles;
     std::vector<semantic::TypeSymbol> types;
     std::vector<FunctionReference> functionReferences;
     std::vector<Function> functions;

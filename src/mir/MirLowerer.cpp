@@ -36,6 +36,9 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
         ? function.symbol.name
         : function.symbol.ownerTypeName + "." + function.symbol.name;
     result.returnType = function.symbol.returnType;
+    result.debugInfo.sourceName = function.symbol.sourceName;
+    result.debugInfo.declaration.span = function.symbol.declarationSpan;
+    result.debugInfo.body.span = function.body ? function.body->span : function.symbol.bodySpan;
     result.returnTypeId =
         semantic::isExactType(function.symbol.returnType)
         ? semantic::stableTypeId(function.symbol.returnTypeName)
@@ -44,6 +47,22 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
         function.variableCount,
         semantic::PrimitiveType::Error);
     result.localTypeIds.assign(function.variableCount, 0);
+
+    for (const auto& variable : function.variables) {
+        debug::LocalVariableInfo local;
+        local.name = variable.name;
+        local.slot = static_cast<std::uint32_t>(variable.index);
+        local.type = variable.type;
+        local.typeId = semantic::isExactType(variable.type)
+            ? semantic::stableTypeId(variable.typeName)
+            : 0;
+        local.parameter = variable.parameter;
+        local.declaration.span = variable.declarationSpan;
+        local.scope.span = variable.scopeSpan.empty()
+            ? (function.body ? function.body->span : function.symbol.bodySpan)
+            : variable.scopeSpan;
+        result.debugInfo.locals.push_back(std::move(local));
+    }
 
     for (const auto& parameter : function.symbol.parameters) {
         result.parameterTypes.push_back(parameter.type);
@@ -86,6 +105,34 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
     if (hasCurrentBlock() && !currentBlockTerminated() &&
         function.symbol.returnType == semantic::PrimitiveType::Void) {
         emitReturn(std::nullopt, function.body->span);
+    }
+
+    for (const auto& basicBlock : result.blocks) {
+        for (std::size_t instructionIndex = 0;
+             instructionIndex < basicBlock.instructions.size();
+             ++instructionIndex) {
+            const auto& instruction = basicBlock.instructions[instructionIndex];
+            if (instruction.sourceSpan.empty()) continue;
+            debug::SequencePoint point;
+            point.blockId = basicBlock.id;
+            point.instructionIndex = static_cast<std::uint32_t>(instructionIndex);
+            point.range.span = instruction.sourceSpan;
+            const auto duplicate = !result.debugInfo.sequencePoints.empty() &&
+                result.debugInfo.sequencePoints.back().range.span.start == point.range.span.start &&
+                result.debugInfo.sequencePoints.back().range.span.length == point.range.span.length;
+            if (!duplicate) result.debugInfo.sequencePoints.push_back(std::move(point));
+        }
+        if (!basicBlock.terminator.sourceSpan.empty()) {
+            debug::SequencePoint point;
+            point.blockId = basicBlock.id;
+            point.instructionIndex = static_cast<std::uint32_t>(basicBlock.instructions.size());
+            point.terminator = true;
+            point.range.span = basicBlock.terminator.sourceSpan;
+            const auto duplicate = !result.debugInfo.sequencePoints.empty() &&
+                result.debugInfo.sequencePoints.back().range.span.start == point.range.span.start &&
+                result.debugInfo.sequencePoints.back().range.span.length == point.range.span.length;
+            if (!duplicate) result.debugInfo.sequencePoints.push_back(std::move(point));
+        }
     }
 
     currentFunction_ = nullptr;

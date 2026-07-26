@@ -4,7 +4,7 @@ RealScript 是一门面向现代游戏引擎的嵌入式强类型脚本语言与
 
 它采用接近 C# 的表达方式，以 C++17 游戏引擎为主要宿主，长期目标包括：快速字节码解释、C++17 AOT、可选 LLVM ORC JIT、源码级调试、热重载、沙箱 Mod，以及固定 Tick 的确定性模拟。
 
-> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端、Phase 2A–2C 字节码运行时，以及 Phase 3A–3E 对象、数组、精确 GC、Native Handle、成员模型与值类型已经完成。语言、字节码、对象 ABI 和 GC 策略尚未冻结。
+> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端、Phase 2A–2C 字节码运行时，以及 Phase 3A–3E 对象、数组、精确 GC、Native Handle、成员模型与值类型，以及 Phase 4 调试器、LSP 与函数体热重载已经完成。语言、字节码、对象 ABI 和 GC 策略尚未冻结。
 
 ## 当前可运行能力
 
@@ -29,7 +29,7 @@ Phase 1A–3E 已经实现：
 - 模块源码、公有签名和依赖指纹；
 - 基于上一轮 `BuildSnapshot` 的模块级语义/MIR 复用；
 - 类型化寄存器字节码、函数引用表和块参数；
-- `.rsbc` 0.4 Section 容器、class/struct/enum 描述符、精确 Local/Register/Block TypeId、确定性编码和防御性解码；
+- `.rsbc` 0.5 Section 容器、class/struct/enum 描述符、精确 TypeId、源码/序列点/局部变量调试表、确定性编码和防御性解码；
 - 字节码反汇编器与语义验证器；
 - 类型化寄存器解释器、调用帧和跨模块调用；
 - Checked Arithmetic Trap、运行时错误和脚本栈；
@@ -68,6 +68,7 @@ Phase 1A–3E 已经实现：
 - [Phase 3C — Arrays, Native Handles and Heap Diagnostics](docs/roadmap/PHASE_3C.md)
 - [Phase 3D — Methods, Constructors and Properties](docs/roadmap/PHASE_3D.md)
 - [Phase 3E — Numeric Values, Enums and Structs](docs/roadmap/PHASE_3E.md)
+- [Phase 4 — Debugging, Language Services and Hot Reload](docs/roadmap/PHASE_4.md)
 
 ## 快速开始
 
@@ -201,7 +202,7 @@ Phase 1C 的转换排序刻意保持较小：
 
 字节码保留多基本块、类型化寄存器、显式局部槽位和边参数。MIR `ValueId` 直接映射到寄存器，调用通过带签名的函数引用表索引表达。
 
-`.rsbc` 0.4 使用 little-endian 固定宽度整数和五个 Section：字符串、类型描述符、函数引用、函数元数据和代码。0.4 在数组/句柄与精确 TypeId 基线上增加 class/struct/enum descriptor kind、enum 成员、synthetic field、f64 immediate、成员调用签名和 struct/long/double 指令。编码器不写入时间戳、裸地址或平台结构体填充，因此同一模块能够稳定地产生相同字节。
+`.rsbc` 0.5 使用 little-endian 固定宽度整数和六个 Section：字符串、类型描述符、函数引用、函数元数据、代码和调试信息。0.5 在 0.4 成员/值类型模型上增加源码表、行映射、Sequence Point、局部变量与词法作用域。编码器不写入时间戳、裸地址或平台结构体填充，因此同一模块能够稳定地产生相同字节。
 
 Decoder 负责文件边界、Section、计数和 Tag；Verifier 继续检查类型、定义支配、分支参数、调用和返回。两层都成功前不得进入执行器。
 
@@ -261,8 +262,13 @@ include/realscript/
   compiler/      多文件 Compilation、模块图和增量快照
   bytecode/      类型化寄存器字节码、Codec、Verifier 和 Disassembler
   runtime/       ProgramImage、Interpreter、ManagedHeap 和宿主嵌入
+  debug/         Debug Info、DebugSession 和 DAP
+  tooling/       JSON、LanguageService 和 LSP
+  hot_reload/    ProgramImage 兼容性分析与原子替换
 src/              对应实现
 tools/rsc/        编译器命令行
+tools/rsdebug/    DAP 调试适配器
+tools/rslsp/      LSP 语言服务器
 tests/fixtures/   源码 conformance fixtures
 tests/snapshots/  MIR snapshots
 docs/spec/        Draft v0.1 规范
@@ -277,12 +283,13 @@ docs/roadmap/     实现切片和路线图
 - [Typed MIR 规范 Draft v0.1](docs/spec/MIR_SPEC.md)
 - [运行时模型规范 Draft v0.1](docs/spec/RUNTIME_MODEL.md)
 - [字节码与原生 ABI 规范 Draft v0.1](docs/spec/BYTECODE_AND_ABI.md)
-- [`.rsbc` 0.4 物理格式](docs/spec/BYTECODE_FORMAT_V0.md)
+- [`.rsbc` 0.5 物理格式](docs/spec/BYTECODE_FORMAT_V0.md)
 - [Embedding and Observability Draft v0.1](docs/spec/EMBEDDING_AND_OBSERVABILITY_V0.md)
 - [Managed Heap and GC Implemented Draft v0.1](docs/spec/MANAGED_HEAP_GC_V0.md)
 - [Arrays, Native Handles and Heap Diagnostics Draft v0.1](docs/spec/ARRAYS_NATIVE_HANDLES_HEAP_DIAGNOSTICS_V0.md)
 - [Methods, Constructors and Properties Draft v0.1](docs/spec/MEMBERS_PROPERTIES_V0.md)
 - [Numeric, Enum and Struct Values Draft v0.1](docs/spec/NUMERIC_ENUM_STRUCT_V0.md)
+- [Debug Information, Tooling and Hot Reload Draft v0.1](docs/spec/DEBUG_TOOLING_HOT_RELOAD_V0.md)
 - [Phase 1A 实现说明](docs/roadmap/PHASE_1A.md)
 - [Phase 1B 实现说明](docs/roadmap/PHASE_1B.md)
 - [Phase 1C 实现说明](docs/roadmap/PHASE_1C.md)
@@ -294,6 +301,7 @@ docs/roadmap/     实现切片和路线图
 - [Phase 3C 实现说明](docs/roadmap/PHASE_3C.md)
 - [Phase 3D 实现说明](docs/roadmap/PHASE_3D.md)
 - [Phase 3E 实现说明](docs/roadmap/PHASE_3E.md)
+- [Phase 4 实现说明](docs/roadmap/PHASE_4.md)
 
 ## 路线图
 
@@ -310,7 +318,7 @@ docs/roadmap/     实现切片和路线图
 - [x] Phase 3C：数组、Native Handle、Heap Snapshot 和泄漏诊断；
 - [x] Phase 3D：方法、构造函数、属性和直接成员调用；
 - [x] Phase 3E：long/double、enum、struct 和复制值语义；
-- [ ] Phase 4：DAP、LSP 和热重载；
+- [x] Phase 4：Debug Info、DAP、LSP 和函数体热重载；
 - [ ] Phase 5：C++17 AOT；
 - [ ] Phase 6：确定性、性能优化和可选 JIT。
 
@@ -400,7 +408,7 @@ int main()
 }
 ```
 
-每个类拥有由规范名称生成的稳定 TypeId。`.rsbc` 0.4 保存有序字段布局和精确对象签名；解释器在函数入口、返回、Null Check 和字段访问处验证运行时 TypeId。GC 只扫描描述符中的 `string` 与 class 引用字段。
+每个类拥有由规范名称生成的稳定 TypeId。`.rsbc` 0.5 保存有序字段布局和精确对象签名；解释器在函数入口、返回、Null Check 和字段访问处验证运行时 TypeId。GC 只扫描描述符中的 `string` 与 class 引用字段。
 
 详细说明：
 
@@ -408,11 +416,12 @@ int main()
 - [Phase 3C — Arrays, Native Handles and Heap Diagnostics](docs/roadmap/PHASE_3C.md)
 - [Phase 3D — Methods, Constructors and Properties](docs/roadmap/PHASE_3D.md)
 - [Phase 3E — Numeric Values, Enums and Structs](docs/roadmap/PHASE_3E.md)
+- [Phase 4 — Debugging, Language Services and Hot Reload](docs/roadmap/PHASE_4.md)
 - [Object Model Implemented Draft v0.1](docs/spec/OBJECT_MODEL_V0.md)
 
 ## Phase 3C 数组、Native Handle 与堆诊断
 
-Phase 3C 将固定长度数组贯穿源码、Typed MIR、`.rsbc` 0.4 当前生产格式、验证器、解释器和精确 GC：
+Phase 3C 将固定长度数组贯穿源码、Typed MIR、`.rsbc` 0.5 当前生产格式、验证器、解释器和精确 GC：
 
 ```csharp
 module Game.Arrays;
@@ -440,6 +449,7 @@ int main()
 - [Phase 3C — Arrays, Native Handles and Heap Diagnostics](docs/roadmap/PHASE_3C.md)
 - [Phase 3D — Methods, Constructors and Properties](docs/roadmap/PHASE_3D.md)
 - [Phase 3E — Numeric Values, Enums and Structs](docs/roadmap/PHASE_3E.md)
+- [Phase 4 — Debugging, Language Services and Hot Reload](docs/roadmap/PHASE_4.md)
 - [Arrays, Native Handles and Heap Diagnostics — Implemented Draft v0.1](docs/spec/ARRAYS_NATIVE_HANDLES_HEAP_DIAGNOSTICS_V0.md)
 
 
@@ -476,3 +486,17 @@ struct Vector2
 `struct` 使用 exact TypeId 和复制值语义；局部字段更新采用写时复制，嵌套 managed reference 参与精确 GC 扫描。Phase 3E 的 canonical numeric types 为 checked `int`、checked `long` 与 IEEE binary64 `double`。
 
 详细说明：[Phase 3E](docs/roadmap/PHASE_3E.md) 与 [值类型实现规范](docs/spec/NUMERIC_ENUM_STRUCT_V0.md)。
+
+
+## Phase 4 调试、语言服务与热重载
+
+Phase 4 将源码位置和符号信息提升为正式运行时元数据：`.rsbc` 0.5 保存源码文件、行映射、函数范围、Sequence Point、参数、局部变量及词法作用域。`DebugSession` 在独立线程运行解释器，并在断点、暂停或单步位置安全阻塞，使 DAP 客户端能够读取栈帧和变量。
+
+```bash
+rsdebug game.rs common.rs   # stdin/stdout DAP
+rslsp                       # stdin/stdout LSP
+```
+
+`LanguageService` 复用 Compilation 与 BuildSnapshot，提供诊断、补全、悬停、定义、引用、重命名和文档符号。Hot Reload 首版只允许函数体与调试信息变化；模块集合、类型布局、枚举值、函数集合和签名变化会被拒绝。活动调用继续持有旧 ProgramImage，新调用原子地看到新镜像。
+
+详细说明：[Phase 4](docs/roadmap/PHASE_4.md) 与 [Debug/Tooling/Hot Reload 实现规范](docs/spec/DEBUG_TOOLING_HOT_RELOAD_V0.md)。

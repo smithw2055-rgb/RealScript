@@ -126,6 +126,24 @@ semantic::TypeSymbol* findOwnType(ModuleWork& module, const std::string& name) {
     return nullptr;
 }
 
+
+
+debug::SourceFileInfo makeSourceFileInfo(
+    const text::SourceText& source,
+    debug::SourceFileId id) {
+    debug::SourceFileInfo info;
+    info.id = id;
+    info.path = source.name();
+    info.contentHash = stableFingerprint(source.content());
+    info.lineStarts.push_back(0);
+    for (std::size_t index = 0; index < source.content().size(); ++index) {
+        if (source.content()[index] == '\n') {
+            info.lineStarts.push_back(static_cast<std::uint32_t>(index + 1));
+        }
+    }
+    return info;
+}
+
 void appendParameters(
     semantic::FunctionBindingInput& binding,
     const std::vector<syntax::ParameterSyntax>& parameters) {
@@ -195,19 +213,34 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         for (const auto* unit : module.units) {
             sourceFingerprint = combineFingerprint(sourceFingerprint, unit->sourceFingerprint);
             for (const auto& node : unit->syntaxTree->classes) {
+                const auto before = module.types.size();
                 addShell(node, [](const std::string& name, const auto& syntaxNode) {
                     return semantic::declareTypeShell(name, syntaxNode);
                 });
+                if (module.types.size() != before) {
+                    module.types.back().sourceName = unit->source->name();
+                    module.types.back().declarationSpan = node.identifierToken.span;
+                }
             }
             for (const auto& node : unit->syntaxTree->structs) {
+                const auto before = module.types.size();
                 addShell(node, [](const std::string& name, const auto& syntaxNode) {
                     return semantic::declareTypeShell(name, syntaxNode);
                 });
+                if (module.types.size() != before) {
+                    module.types.back().sourceName = unit->source->name();
+                    module.types.back().declarationSpan = node.identifierToken.span;
+                }
             }
             for (const auto& node : unit->syntaxTree->enums) {
+                const auto before = module.types.size();
                 addShell(node, [](const std::string& name, const auto& syntaxNode) {
                     return semantic::declareTypeShell(name, syntaxNode);
                 });
+                if (module.types.size() != before) {
+                    module.types.back().sourceName = unit->source->name();
+                    module.types.back().declarationSpan = node.identifierToken.span;
+                }
             }
         }
         module.sourceFingerprint = sourceFingerprint;
@@ -227,6 +260,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 if (!type || !semantic::populateTypeFields(
                         *type, node, module.visibleTypes, result.diagnostics)) {
                     module.invalid = true;
+                } else {
+                    type->sourceName = unit->source->name();
+                    for (auto& field : type->fields) field.sourceName = unit->source->name();
                 }
             }
             for (const auto& node : unit->syntaxTree->structs) {
@@ -234,6 +270,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 if (!type || !semantic::populateTypeFields(
                         *type, node, module.visibleTypes, result.diagnostics)) {
                     module.invalid = true;
+                } else {
+                    type->sourceName = unit->source->name();
+                    for (auto& field : type->fields) field.sourceName = unit->source->name();
                 }
             }
             for (const auto& node : unit->syntaxTree->enums) {
@@ -241,6 +280,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 if (!type || !semantic::populateEnumMembers(
                         *type, node, result.diagnostics)) {
                     module.invalid = true;
+                } else {
+                    type->sourceName = unit->source->name();
+                    for (auto& member : type->enumMembers) member.sourceName = unit->source->name();
                 }
             }
         }
@@ -272,6 +314,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 semantic::FunctionBindingInput binding;
                 binding.symbol = semantic::declareFunctionSymbol(
                     moduleName, functionSyntax, module.visibleTypes, result.diagnostics);
+                binding.sourceName = unit->source->name();
+                binding.symbol.sourceName = binding.sourceName;
                 binding.body = &functionSyntax.body;
                 appendParameters(binding, functionSyntax.parameters);
                 addBinding(std::move(binding), functionSyntax.identifierToken.span);
@@ -306,6 +350,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         binding.symbol = semantic::declareFunctionSymbol(
                             moduleName, methodSyntax, module.visibleTypes,
                             result.diagnostics, &owner);
+                        binding.sourceName = unit->source->name();
+                        binding.symbol.sourceName = binding.sourceName;
                         binding.body = &methodSyntax.body;
                         if (!binding.symbol.staticMethod) {
                             binding.parameterNames.push_back("this");
@@ -320,6 +366,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         binding.symbol = semantic::declareConstructorSymbol(
                             moduleName, constructorSyntax, owner,
                             module.visibleTypes, result.diagnostics);
+                        binding.sourceName = unit->source->name();
+                        binding.symbol.sourceName = binding.sourceName;
                         binding.body = &constructorSyntax.body;
                         binding.parameterNames.push_back("this");
                         binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
@@ -344,6 +392,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         auto property = semantic::declarePropertySymbol(
                             moduleName, propertySyntax, owner,
                             module.visibleTypes, result.diagnostics);
+                        property.sourceName = unit->source->name();
+                        if (property.getter) property.getter->sourceName = unit->source->name();
+                        if (property.setter) property.setter->sourceName = unit->source->name();
                         const bool getterAuto = propertySyntax.getter &&
                             propertySyntax.getter->semicolonToken.has_value();
                         const bool setterAuto = propertySyntax.setter &&
@@ -369,17 +420,23 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         }
                         if (autoProperty) {
                             property.backingFieldIndex = owner.fields.size();
-                            owner.fields.push_back({
-                                "$" + property.name,
-                                property.type,
-                                property.typeName,
-                                owner.fields.size(),
-                                true,
-                            });
+                            semantic::FieldSymbol backing;
+                            backing.name = "$" + property.name;
+                            backing.type = property.type;
+                            backing.typeName = property.typeName;
+                            backing.index = owner.fields.size();
+                            backing.synthetic = true;
+                            backing.sourceName = unit->source->name();
+                            backing.declarationSpan = propertySyntax.identifierToken.span;
+                            backing.id = semantic::stableTypeId(
+                                semantic::canonicalTypeName(owner) +
+                                "::field:" + backing.name);
+                            owner.fields.push_back(std::move(backing));
                         }
                         if (property.getter) {
                             semantic::FunctionBindingInput binding;
                             binding.symbol = *property.getter;
+                            binding.sourceName = unit->source->name();
                             binding.body = propertySyntax.getter->body.get();
                             if (!binding.symbol.staticMethod) {
                                 binding.parameterNames.push_back("this");
@@ -395,6 +452,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         if (property.setter) {
                             semantic::FunctionBindingInput binding;
                             binding.symbol = *property.setter;
+                            binding.sourceName = unit->source->name();
                             binding.body = propertySyntax.setter->body.get();
                             if (!binding.symbol.staticMethod) {
                                 binding.parameterNames.push_back("this");
@@ -530,6 +588,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 cached->second.dependencyFingerprint == module.dependencyFingerprint) {
                 buildInfo.reused = true;
                 result.modules.push_back(cached->second.module);
+                result.symbols.insert(result.symbols.end(),
+                    cached->second.symbols.begin(), cached->second.symbols.end());
                 result.snapshot.modules[moduleName] = cached->second;
                 result.buildInfo.push_back(buildInfo);
                 continue;
@@ -579,6 +639,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         diagnostics::DiagnosticBag moduleDiagnostics;
         semantic::Binder binder(moduleDiagnostics);
         auto semanticModel = binder.bindModule(bindingInput);
+        result.symbols.insert(result.symbols.end(),
+            semanticModel.occurrences.begin(), semanticModel.occurrences.end());
         if (moduleDiagnostics.hasErrors()) {
             result.diagnostics.append(moduleDiagnostics);
             result.buildInfo.push_back(buildInfo);
@@ -587,6 +649,16 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
 
         mir::Lowerer lowerer;
         auto mirModule = lowerer.lower(semanticModel);
+        mirModule.sourceFiles.reserve(module.units.size());
+        for (std::size_t sourceIndex = 0; sourceIndex < module.units.size(); ++sourceIndex) {
+            mirModule.sourceFiles.push_back(makeSourceFileInfo(
+                *module.units[sourceIndex]->source,
+                static_cast<debug::SourceFileId>(sourceIndex)));
+        }
+        for (auto& function : mirModule.functions) {
+            debug::finalizeFunctionDebugInfo(
+                function.debugInfo, mirModule.sourceFiles);
+        }
         (void)mir::verifyModule(mirModule, moduleDiagnostics);
         result.diagnostics.append(moduleDiagnostics);
         if (!moduleDiagnostics.hasErrors()) {
@@ -596,6 +668,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 module.publicFingerprint,
                 module.dependencyFingerprint,
                 mirModule,
+                semanticModel.occurrences,
             };
         }
         result.buildInfo.push_back(buildInfo);

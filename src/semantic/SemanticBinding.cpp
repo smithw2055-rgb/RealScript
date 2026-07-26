@@ -117,7 +117,16 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
                     (propertySyntax.setter && propertySyntax.setter->semicolonToken);
                 if (autoProperty) {
                     property.backingFieldIndex = owner.fields.size();
-                    owner.fields.push_back({"$" + property.name, property.type, property.typeName, owner.fields.size(), true});
+                    FieldSymbol backing;
+                    backing.name = "$" + property.name;
+                    backing.type = property.type;
+                    backing.typeName = property.typeName;
+                    backing.index = owner.fields.size();
+                    backing.synthetic = true;
+                    backing.declarationSpan = propertySyntax.identifierToken.span;
+                    backing.id = stableTypeId(canonicalTypeName(owner) +
+                        "::field:" + backing.name);
+                    owner.fields.push_back(std::move(backing));
                 }
                 if (property.getter) {
                     FunctionBindingInput binding;
@@ -162,6 +171,7 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
 
 SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
     visibleFunctions_ = input.visibleFunctions;
+    occurrences_.clear();
     visibleTypes_ = input.visibleTypes;
 
     SemanticModel result;
@@ -172,6 +182,7 @@ SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
         for (const auto& binding : input.functionBindings) {
             result.functions.push_back(bindFunction(binding));
         }
+        result.occurrences = occurrences_;
         return result;
     }
 
@@ -192,6 +203,7 @@ SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
             result.functions.push_back(bindFunction(binding));
         }
     }
+    result.occurrences = occurrences_;
     return result;
 }
 
@@ -200,7 +212,14 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     result.symbol = input.symbol;
 
     scopes_.clear();
-    pushScope();
+    scopeSpans_.clear();
+    allVariables_.clear();
+    pushScope(input.body ? input.body->span() : input.symbol.bodySpan);
+    currentSourceName_ = input.sourceName.empty()
+        ? input.symbol.sourceName
+        : input.sourceName;
+    currentFunctionId_ = input.symbol.id;
+    result.symbol.sourceName = currentSourceName_;
     currentReturnType_ = input.symbol.returnType;
     currentReturnTypeName_ = input.symbol.returnTypeName;
     nextVariableIndex_ = input.symbol.parameters.size();
@@ -216,6 +235,11 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
         auto parameter = input.symbol.parameters[i];
         if (i < input.parameterNames.size()) parameter.name = input.parameterNames[i];
         const auto span = i < input.parameterSpans.size() ? input.parameterSpans[i] : text::TextSpan{};
+        parameter.declarationSpan = span;
+        if (parameter.id == 0) {
+            parameter.id = stableTypeId(std::to_string(currentFunctionId_) +
+                "::local:" + std::to_string(parameter.index) + ":" + parameter.name);
+        }
         (void)declareVariable(parameter, span);
         result.symbol.parameters[i].name = parameter.name;
     }
@@ -298,6 +322,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
         result.body->statements.push_back(std::move(statement));
     }
     result.variableCount = nextVariableIndex_;
+    result.variables = allVariables_;
 
     if (result.symbol.returnType != PrimitiveType::Void &&
         result.symbol.returnType != PrimitiveType::Error &&
@@ -312,6 +337,9 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     currentOwnerType_.reset();
     currentStaticMethod_ = false;
     currentConstructor_ = false;
+    currentSourceName_.clear();
+    currentFunctionId_ = 0;
+    allVariables_.clear();
     return result;
 }
 
@@ -319,7 +347,7 @@ std::unique_ptr<BoundBlockStatement> Binder::bindBlockStatement(
     const syntax::BlockStatementSyntax& syntaxTree,
     bool createScope) {
     if (createScope) {
-        pushScope();
+        pushScope(syntaxTree.span());
     }
 
     auto result = std::make_unique<BoundBlockStatement>();
@@ -336,7 +364,7 @@ std::unique_ptr<BoundBlockStatement> Binder::bindBlockStatement(
 
 std::unique_ptr<BoundStatement> Binder::bindEmbeddedStatement(
     const syntax::StatementSyntax& syntaxTree) {
-    pushScope();
+    pushScope(syntaxTree.span());
     auto result = bindStatement(syntaxTree);
     popScope();
     return result;
@@ -446,13 +474,15 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
     auto result = std::make_unique<BoundVariableDeclarationStatement>();
     result->span = syntaxTree.span();
     std::string declaredTypeName;
-    result->variable = {
-        syntaxTree.identifierToken.text,
-        bindType(syntaxTree.type, false, &declaredTypeName),
-        declaredTypeName,
-        nextVariableIndex_++,
-        false,
-    };
+    result->variable.name = syntaxTree.identifierToken.text;
+    result->variable.type = bindType(syntaxTree.type, false, &declaredTypeName);
+    result->variable.typeName = declaredTypeName;
+    result->variable.index = nextVariableIndex_++;
+    result->variable.parameter = false;
+    result->variable.declarationSpan = syntaxTree.identifierToken.span;
+    result->variable.id = stableTypeId(std::to_string(currentFunctionId_) +
+        "::local:" + std::to_string(result->variable.index) + ":" +
+        result->variable.name);
 
     (void)declareVariable(result->variable, syntaxTree.identifierToken.span);
     if (syntaxTree.initializer) {
@@ -612,6 +642,14 @@ const VariableSymbol* Binder::lookupVariable(
 
 bool Binder::declareVariable(VariableSymbol variable, text::TextSpan span) {
     auto& scope = scopes_.back();
+    variable.declarationSpan = span;
+    if (variable.scopeSpan.empty() && !scopeSpans_.empty()) {
+        variable.scopeSpan = scopeSpans_.back();
+    }
+    if (variable.id == 0) {
+        variable.id = stableTypeId(std::to_string(currentFunctionId_) +
+            "::local:" + std::to_string(variable.index) + ":" + variable.name);
+    }
     if (scope.find(variable.name) != scope.end()) {
         diagnostics_.report(
             "RS2202",
@@ -619,16 +657,30 @@ bool Binder::declareVariable(VariableSymbol variable, text::TextSpan span) {
             span);
         return false;
     }
+    allVariables_.push_back(variable);
+    SymbolOccurrence occurrence;
+    occurrence.id = variable.id;
+    occurrence.kind = variable.parameter ? SymbolKind::Parameter : SymbolKind::Local;
+    occurrence.name = variable.name;
+    occurrence.detail = isExactType(variable.type) && !variable.typeName.empty()
+        ? variable.typeName
+        : primitiveTypeName(variable.type);
+    occurrence.sourceName = currentSourceName_;
+    occurrence.span = span;
+    occurrence.definition = true;
+    occurrences_.push_back(std::move(occurrence));
     scope.emplace(variable.name, std::move(variable));
     return true;
 }
 
-void Binder::pushScope() {
+void Binder::pushScope(text::TextSpan span) {
     scopes_.emplace_back();
+    scopeSpans_.push_back(span);
 }
 
 void Binder::popScope() {
     scopes_.pop_back();
+    scopeSpans_.pop_back();
 }
 
 std::unique_ptr<BoundErrorExpression> Binder::makeError(

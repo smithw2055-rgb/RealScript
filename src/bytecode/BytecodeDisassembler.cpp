@@ -39,6 +39,15 @@ std::string disassembleModule(const Module& module) {
     out << "rsbc " << module.version.major << '.' << module.version.minor
         << " module " << module.name << "\n";
 
+    if (!module.sourceFiles.empty()) {
+        out << "\nsources:\n";
+        for (const auto& source : module.sourceFiles) {
+            out << "  source" << source.id << " `" << source.path
+                << "` hash=0x" << std::hex << source.contentHash << std::dec
+                << " lines=" << source.lineStarts.size() << '\n';
+        }
+    }
+
     if (!module.types.empty()) {
         out << "\ntypes:\n";
         for (std::size_t index = 0; index < module.types.size(); ++index) {
@@ -128,6 +137,20 @@ std::string disassembleModule(const Module& module) {
                     : 0);
         }
         out << "]\n";
+        if (!function.debugInfo.sequencePoints.empty() ||
+            !function.debugInfo.locals.empty()) {
+            out << "  debug source" << function.debugInfo.sourceFileId
+                << " points=" << function.debugInfo.sequencePoints.size()
+                << " locals=" << function.debugInfo.locals.size() << "\n";
+            for (const auto& local : function.debugInfo.locals) {
+                out << "    local " << local.slot << ' ' << local.name
+                    << (local.parameter ? " parameter" : "")
+                    << " scope=" << local.scope.start.line + 1 << ':'
+                    << local.scope.start.column + 1 << '-'
+                    << local.scope.end.line + 1 << ':'
+                    << local.scope.end.column + 1 << "\n";
+            }
+        }
 
         for (const auto& block : function.blocks) {
             out << "bb" << block.id;

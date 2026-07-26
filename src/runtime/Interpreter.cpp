@@ -1,5 +1,6 @@
 #include "realscript/runtime/Runtime.h"
 
+#include "realscript/debug/Debugger.h"
 #include "realscript/diagnostics/Diagnostic.h"
 
 #include <algorithm>
@@ -26,6 +27,8 @@ struct State {
     const ExternalFunction* externalResolver = nullptr;
     const TraceSink* trace = nullptr;
     ManagedHeap* heap = nullptr;
+    debug::DebugController* debugger = nullptr;
+    std::vector<debug::DebugFrameView> debugFrames;
     ShadowStack shadowStack;
 };
 
@@ -45,6 +48,20 @@ public:
 
 private:
     ShadowStack& shadowStack_;
+};
+
+class DebugFrameScope {
+public:
+    DebugFrameScope(State& state, debug::DebugFrameView view)
+        : state_(state) {
+        state_.debugFrames.push_back(std::move(view));
+    }
+    ~DebugFrameScope() { state_.debugFrames.pop_back(); }
+    DebugFrameScope(const DebugFrameScope&) = delete;
+    DebugFrameScope& operator=(const DebugFrameScope&) = delete;
+
+private:
+    State& state_;
 };
 
 void emitTrace(State& state, TraceEventKind kind, std::string operation = {}) {
@@ -358,6 +375,40 @@ const bytecode::BasicBlock* findBlock(
         if (block.id == id) return &block;
     }
     return nullptr;
+}
+
+const debug::SequencePoint* findSequencePoint(
+    const bytecode::Function& function,
+    bytecode::BlockId blockId,
+    std::uint32_t instructionIndex,
+    bool terminator) {
+    for (const auto& point : function.debugInfo.sequencePoints) {
+        if (point.blockId == blockId &&
+            point.instructionIndex == instructionIndex &&
+            point.terminator == terminator) {
+            return &point;
+        }
+    }
+    return nullptr;
+}
+
+bool debugSequencePoint(
+    State& state,
+    const bytecode::Module& /*module*/,
+    const bytecode::Function& function,
+    bytecode::BlockId blockId,
+    std::uint32_t instructionIndex,
+    bool terminator) {
+    if (!state.debugger) return true;
+    const auto* point = findSequencePoint(
+        function, blockId, instructionIndex, terminator);
+    if (!point) return true;
+    state.debugFrames.back().point = point;
+    if (!state.debugger->onSequencePoint(state.debugFrames, state.heap)) {
+        return fail(state, ErrorCode::ExecutionTerminated,
+            "execution terminated by debugger");
+    }
+    return true;
 }
 
 bool executeFunction(
@@ -1031,6 +1082,14 @@ bool executeFunction(
     std::vector<Value> locals(function.localTypes.size());
     std::vector<Value> registers(function.registerTypes.size());
     ShadowFrameScope roots(state.shadowStack, &arguments, &locals, &registers);
+    DebugFrameScope debugFrame(state, debug::DebugFrameView{
+        location.module,
+        &function,
+        nullptr,
+        &arguments,
+        &locals,
+        &registers,
+    });
     const bytecode::BasicBlock* block = findBlock(function, 0);
     if (!block) {
         state.stack.pop_back();
@@ -1038,14 +1097,23 @@ bool executeFunction(
     }
 
     while (true) {
-        for (const auto& instruction : block->instructions) {
-            if (!executeInstruction(state, *location.module, function, instruction,
+        for (std::size_t instructionIndex = 0;
+             instructionIndex < block->instructions.size();
+             ++instructionIndex) {
+            const auto& instruction = block->instructions[instructionIndex];
+            if (!debugSequencePoint(
+                    state, *location.module, function, block->id,
+                    static_cast<std::uint32_t>(instructionIndex), false) ||
+                !executeInstruction(state, *location.module, function, instruction,
                     arguments, locals, registers)) {
                 state.stack.pop_back();
                 return false;
             }
         }
-        if (!consume(state)) {
+        if (!debugSequencePoint(
+                state, *location.module, function, block->id,
+                static_cast<std::uint32_t>(block->instructions.size()), true) ||
+            !consume(state)) {
             state.stack.pop_back();
             return false;
         }
@@ -1203,6 +1271,11 @@ ExecutionResult Interpreter::invoke(
     state.externalResolver = &externalResolver_;
     state.trace = &options.trace;
     state.heap = heap_.get();
+    state.debugger = options.debugger.get();
+    if (state.debugger) {
+        if (program_) state.debugger->bindProgram(*program_);
+        else state.debugger->bindModules(modules_);
+    }
     Value value;
     ExecutionResult execution;
     execution.succeeded = executeFunction(state, found->second, arguments, value);
@@ -1257,6 +1330,7 @@ const char* errorCodeName(ErrorCode code) noexcept {
     case ErrorCode::IndexOutOfRange: return "index-out-of-range";
     case ErrorCode::OutOfMemory: return "out-of-memory";
     case ErrorCode::InvalidProgram: return "invalid-program";
+    case ErrorCode::ExecutionTerminated: return "execution-terminated";
     }
     return "unknown";
 }
