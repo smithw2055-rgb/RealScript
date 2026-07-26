@@ -15,7 +15,7 @@ source arrays
 exact array types and element operations
     │
     ▼
-Typed MIR / .rsbc 0.3 introduction (current producer: 0.4) / verifier / interpreter
+Typed MIR / .rsbc 0.3 introduction (current producer: 0.5) / verifier / interpreter
     │
     ├── precise GC edges and write barriers
     ├── generation-safe native resource handles
@@ -89,7 +89,7 @@ The MIR verifier checks receiver type, index type, element type, exact reference
 
 ## `.rsbc` 0.3 introduction
 
-Phase 3C advanced the physical bytecode version from 0.2 to 0.3. The current Phase 3E producer emits 0.4 while retaining the array and handle model introduced here.
+Phase 3C advanced the physical bytecode version from 0.2 to 0.3. The current Phase 4 producer emits 0.5 while retaining the array and handle model introduced here.
 
 Version 0.3 adds:
 
@@ -171,7 +171,7 @@ The Phase 3C target covers:
 - array fields, parameters and returns;
 - default values and exact array TypeIds;
 - null, negative length and bounds failures;
-- MIR/bytecode generation and canonical 0.3 round trips at introduction time (current snapshots use 0.4);
+- MIR/bytecode generation and canonical 0.3 round trips at introduction time (current snapshots use 0.5);
 - verifier rejection of corrupted element metadata;
 - object-array GC retention and write barriers;
 - RAII persistent roots, snapshots and retaining paths;

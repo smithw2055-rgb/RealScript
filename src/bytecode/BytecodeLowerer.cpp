@@ -116,6 +116,7 @@ std::string referenceKey(const mir::Instruction& instruction) {
 Module Lowerer::lower(const mir::Module& source) const {
     Module result;
     result.name = source.name;
+    result.sourceFiles = source.sourceFiles;
     result.types = source.types;
 
     std::unordered_map<std::string, std::uint32_t> referenceIndices;
@@ -136,6 +137,7 @@ Module Lowerer::lower(const mir::Module& source) const {
         function.parameterTypeIds = sourceFunction.parameterTypeIds;
         function.localTypes = sourceFunction.localTypes;
         function.localTypeIds = sourceFunction.localTypeIds;
+        function.debugInfo = sourceFunction.debugInfo;
 
         mir::ValueId maximumValue = -1;
         for (const auto& sourceBlock : sourceFunction.blocks) {

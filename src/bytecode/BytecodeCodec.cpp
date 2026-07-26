@@ -15,7 +15,8 @@ constexpr std::uint32_t SectionTypes = 2;
 constexpr std::uint32_t SectionReferences = 3;
 constexpr std::uint32_t SectionFunctions = 4;
 constexpr std::uint32_t SectionCode = 5;
-constexpr std::uint32_t SectionCount = 5;
+constexpr std::uint32_t SectionDebug = 6;
+constexpr std::uint32_t SectionCount = 6;
 
 class Writer {
 public:
@@ -270,6 +271,27 @@ bool readRegisters(Reader& reader, std::vector<Register>& values) {
     return reader.valid();
 }
 
+void writeRange(Writer& writer, const debug::SourceRange& range) {
+    writer.u32(range.fileId);
+    writer.u64(static_cast<std::uint64_t>(range.span.start));
+    writer.u64(static_cast<std::uint64_t>(range.span.length));
+    writer.u32(static_cast<std::uint32_t>(range.start.line));
+    writer.u32(static_cast<std::uint32_t>(range.start.column));
+    writer.u32(static_cast<std::uint32_t>(range.end.line));
+    writer.u32(static_cast<std::uint32_t>(range.end.column));
+}
+
+bool readRange(Reader& reader, debug::SourceRange& range) {
+    range.fileId = reader.u32();
+    range.span.start = static_cast<std::size_t>(reader.u64());
+    range.span.length = static_cast<std::size_t>(reader.u64());
+    range.start.line = reader.u32();
+    range.start.column = reader.u32();
+    range.end.line = reader.u32();
+    range.end.column = reader.u32();
+    return reader.valid();
+}
+
 struct SectionEntry {
     std::uint32_t kind = 0;
     std::uint32_t offset = 0;
@@ -308,9 +330,11 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         }
         for (const auto& member : type.enumMembers) strings.add(member.name);
     }
+    for (const auto& source : module.sourceFiles) strings.add(source.path);
     for (const auto& reference : module.functionReferences) strings.add(reference.name);
     for (const auto& function : module.functions) {
         strings.add(function.name);
+        for (const auto& local : function.debugInfo.locals) strings.add(local.name);
         for (const auto& block : function.blocks) {
             for (const auto& instruction : block.instructions) {
                 if (instruction.opcode == Opcode::ConstantString) {
@@ -424,6 +448,41 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         functionSection.u32(codeRanges[index].second);
     }
 
+    Writer debugSection;
+    debugSection.u32(static_cast<std::uint32_t>(module.sourceFiles.size()));
+    for (const auto& source : module.sourceFiles) {
+        debugSection.u32(source.id);
+        debugSection.u32(strings.indexOf(source.path));
+        debugSection.u64(source.contentHash);
+        debugSection.u32(static_cast<std::uint32_t>(source.lineStarts.size()));
+        for (const auto start : source.lineStarts) debugSection.u32(start);
+    }
+    debugSection.u32(static_cast<std::uint32_t>(module.functions.size()));
+    for (const auto& function : module.functions) {
+        debugSection.u64(function.symbolId);
+        const auto& info = function.debugInfo;
+        debugSection.u32(info.sourceFileId);
+        writeRange(debugSection, info.declaration);
+        writeRange(debugSection, info.body);
+        debugSection.u32(static_cast<std::uint32_t>(info.sequencePoints.size()));
+        for (const auto& point : info.sequencePoints) {
+            debugSection.u32(point.blockId);
+            debugSection.u32(point.instructionIndex);
+            debugSection.u8(point.terminator ? 1 : 0);
+            writeRange(debugSection, point.range);
+        }
+        debugSection.u32(static_cast<std::uint32_t>(info.locals.size()));
+        for (const auto& local : info.locals) {
+            debugSection.u32(strings.indexOf(local.name));
+            debugSection.u32(local.slot);
+            debugSection.u8(encodeType(local.type));
+            debugSection.u64(local.typeId);
+            debugSection.u8(local.parameter ? 1 : 0);
+            writeRange(debugSection, local.declaration);
+            writeRange(debugSection, local.scope);
+        }
+    }
+
     Writer writer;
     writer.bytes("RSBC", 4);
     writer.u16(module.version.major);
@@ -444,6 +503,7 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
             {SectionReferences, &referenceSection},
             {SectionFunctions, &functionSection},
             {SectionCode, &codeSection},
+            {SectionDebug, &debugSection},
         }};
 
     for (std::size_t index = 0; index < sections.size(); ++index) {
@@ -481,7 +541,7 @@ bool decodeModule(
         diagnostics.report("RS5003", "truncated bytecode header", {});
         return false;
     }
-    if (module.version.major != 0 || module.version.minor != 4) {
+    if (module.version.major != 0 || module.version.minor != 5) {
         diagnostics.report("RS5001", "unsupported bytecode version", {});
         return false;
     }
@@ -509,6 +569,7 @@ bool decodeModule(
              SectionReferences,
              SectionFunctions,
              SectionCode,
+             SectionDebug,
          }) {
         if (sections.find(kind) == sections.end()) {
             diagnostics.report("RS5002", "missing required bytecode section", {});
@@ -841,6 +902,117 @@ bool decodeModule(
             return false;
         }
         module.functions.push_back(std::move(record.function));
+    }
+
+    {
+        const auto section = sections.at(SectionDebug);
+        Reader reader(bytes, section.offset, section.size);
+        const auto sourceCount = reader.u32();
+        if (!reader.valid() || sourceCount > reader.remaining() / 20 + 1) {
+            diagnostics.report("RS5003", "invalid debug source-file count", {});
+            return false;
+        }
+        module.sourceFiles.reserve(sourceCount);
+        for (std::uint32_t index = 0; index < sourceCount; ++index) {
+            debug::SourceFileInfo source;
+            source.id = reader.u32();
+            const auto pathIndex = reader.u32();
+            if (!validStringIndex(pathIndex, strings, diagnostics,
+                    "invalid debug source-file path index")) {
+                return false;
+            }
+            source.path = strings[pathIndex];
+            source.contentHash = reader.u64();
+            const auto lineCount = reader.u32();
+            if (!reader.valid() || lineCount > reader.remaining() / 4) {
+                diagnostics.report("RS5003", "invalid debug line-start count", {});
+                return false;
+            }
+            source.lineStarts.reserve(lineCount);
+            for (std::uint32_t line = 0; line < lineCount; ++line) {
+                source.lineStarts.push_back(reader.u32());
+            }
+            module.sourceFiles.push_back(std::move(source));
+        }
+        std::unordered_map<semantic::SymbolId, Function*> functionsById;
+        for (auto& function : module.functions) {
+            functionsById.emplace(function.symbolId, &function);
+        }
+        const auto functionCount = reader.u32();
+        if (!reader.valid() || functionCount != module.functions.size()) {
+            diagnostics.report("RS5003", "debug function table does not match function metadata", {});
+            return false;
+        }
+        for (std::uint32_t index = 0; index < functionCount; ++index) {
+            const auto symbolId = reader.u64();
+            const auto found = functionsById.find(symbolId);
+            if (found == functionsById.end()) {
+                diagnostics.report("RS5007", "debug info references an unknown function", {});
+                return false;
+            }
+            auto& info = found->second->debugInfo;
+            info.sourceFileId = reader.u32();
+            if (!readRange(reader, info.declaration) ||
+                !readRange(reader, info.body)) {
+                diagnostics.report("RS5003", "truncated function debug range", {});
+                return false;
+            }
+            const auto pointCount = reader.u32();
+            if (!reader.valid() || pointCount > reader.remaining() / 45 + 1) {
+                diagnostics.report("RS5003", "invalid sequence-point count", {});
+                return false;
+            }
+            info.sequencePoints.reserve(pointCount);
+            for (std::uint32_t pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
+                debug::SequencePoint point;
+                point.blockId = reader.u32();
+                point.instructionIndex = reader.u32();
+                point.terminator = reader.u8() != 0;
+                if (!readRange(reader, point.range)) {
+                    diagnostics.report("RS5003", "truncated sequence point", {});
+                    return false;
+                }
+                info.sequencePoints.push_back(std::move(point));
+            }
+            const auto localCount = reader.u32();
+            if (!reader.valid() || localCount > reader.remaining() / 90 + 1) {
+                diagnostics.report("RS5003", "invalid local-debug count", {});
+                return false;
+            }
+            info.locals.reserve(localCount);
+            for (std::uint32_t localIndex = 0; localIndex < localCount; ++localIndex) {
+                debug::LocalVariableInfo local;
+                const auto nameIndex = reader.u32();
+                if (!validStringIndex(nameIndex, strings, diagnostics,
+                        "invalid local-debug name index")) {
+                    return false;
+                }
+                local.name = strings[nameIndex];
+                local.slot = reader.u32();
+                if (!decodeType(reader.u8(), local.type)) {
+                    diagnostics.report("RS5004", "invalid local-debug type", {});
+                    return false;
+                }
+                local.typeId = reader.u64();
+                local.parameter = reader.u8() != 0;
+                if (!readRange(reader, local.declaration) ||
+                    !readRange(reader, local.scope)) {
+                    diagnostics.report("RS5003", "truncated local-debug range", {});
+                    return false;
+                }
+                info.locals.push_back(std::move(local));
+            }
+            for (const auto& source : module.sourceFiles) {
+                if (source.id == info.sourceFileId) {
+                    info.sourceName = source.path;
+                    break;
+                }
+            }
+        }
+        if (!reader.valid() || !reader.empty()) {
+            diagnostics.report("RS5003", "invalid debug information section", {});
+            return false;
+        }
     }
     return true;
 }

@@ -74,6 +74,9 @@ struct VariableSymbol {
     std::string typeName;
     std::size_t index = 0;
     bool parameter = false;
+    text::TextSpan declarationSpan;
+    text::TextSpan scopeSpan;
+    SymbolId id = 0;
 };
 
 struct FieldSymbol {
@@ -82,6 +85,9 @@ struct FieldSymbol {
     std::string typeName;
     std::size_t index = 0;
     bool synthetic = false;
+    std::string sourceName;
+    text::TextSpan declarationSpan;
+    SymbolId id = 0;
 };
 
 struct FunctionSymbol {
@@ -98,6 +104,9 @@ struct FunctionSymbol {
     bool constructor = false;
     bool propertyGetter = false;
     bool propertySetter = false;
+    std::string sourceName;
+    text::TextSpan declarationSpan;
+    text::TextSpan bodySpan;
 };
 
 struct PropertySymbol {
@@ -108,11 +117,17 @@ struct PropertySymbol {
     std::optional<FunctionSymbol> getter;
     std::optional<FunctionSymbol> setter;
     std::size_t backingFieldIndex = std::numeric_limits<std::size_t>::max();
+    std::string sourceName;
+    text::TextSpan declarationSpan;
+    SymbolId id = 0;
 };
 
 struct EnumMemberSymbol {
     std::string name;
     std::int64_t value = 0;
+    std::string sourceName;
+    text::TextSpan declarationSpan;
+    SymbolId id = 0;
 };
 
 struct TypeSymbol {
@@ -125,6 +140,29 @@ struct TypeSymbol {
     std::vector<FunctionSymbol> constructors;
     std::vector<PropertySymbol> properties;
     std::vector<EnumMemberSymbol> enumMembers;
+    std::string sourceName;
+    text::TextSpan declarationSpan;
+};
+
+enum class SymbolKind {
+    Module,
+    Type,
+    Field,
+    EnumMember,
+    Function,
+    Property,
+    Parameter,
+    Local,
+};
+
+struct SymbolOccurrence {
+    SymbolId id = 0;
+    SymbolKind kind = SymbolKind::Local;
+    std::string name;
+    std::string detail;
+    std::string sourceName;
+    text::TextSpan span;
+    bool definition = false;
 };
 
 using TypeSymbolMap = std::unordered_map<std::string, TypeSymbol>;
@@ -182,6 +220,7 @@ using FunctionOverloadMap =
 
 struct FunctionBindingInput {
     FunctionSymbol symbol;
+    std::string sourceName;
     const syntax::BlockStatementSyntax* body = nullptr;
     std::vector<std::string> parameterNames;
     std::vector<text::TextSpan> parameterSpans;
@@ -481,12 +520,14 @@ struct BoundFunction {
     FunctionSymbol symbol;
     std::unique_ptr<BoundBlockStatement> body;
     std::size_t variableCount = 0;
+    std::vector<VariableSymbol> variables;
 };
 
 struct SemanticModel {
     std::string moduleName;
     std::vector<TypeSymbol> types;
     std::vector<BoundFunction> functions;
+    std::vector<SymbolOccurrence> occurrences;
 };
 
 class Binder {
@@ -560,13 +601,14 @@ private:
     [[nodiscard]] const VariableSymbol* lookupVariable(
         const std::string& name) const noexcept;
     bool declareVariable(VariableSymbol variable, text::TextSpan span);
-    void pushScope();
+    void pushScope(text::TextSpan span = {});
     void popScope();
     [[nodiscard]] std::unique_ptr<BoundErrorExpression> makeError(
         text::TextSpan span) const;
 
     diagnostics::DiagnosticBag& diagnostics_;
     std::vector<std::unordered_map<std::string, VariableSymbol>> scopes_;
+    std::vector<text::TextSpan> scopeSpans_;
     PrimitiveType currentReturnType_ = PrimitiveType::Error;
     std::string currentReturnTypeName_;
     std::size_t nextVariableIndex_ = 0;
@@ -575,6 +617,10 @@ private:
     std::optional<TypeSymbol> currentOwnerType_;
     bool currentStaticMethod_ = false;
     bool currentConstructor_ = false;
+    std::string currentSourceName_;
+    SymbolId currentFunctionId_ = 0;
+    std::vector<VariableSymbol> allVariables_;
+    std::vector<SymbolOccurrence> occurrences_;
 };
 
 } // namespace realscript::semantic

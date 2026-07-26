@@ -102,8 +102,8 @@ void testMethodsConstructorsAndProperties() {
     auto modules = compile({{"objects.rs", objectSource}});
     require(modules.size() == 1, "expected one Phase 3D module");
     require(modules.front().version.major == 0 &&
-            modules.front().version.minor == 4,
-        "Phase 3D must use .rsbc 0.4");
+            modules.front().version.minor == 5,
+        "Phase 3D must use .rsbc 0.5");
     const auto disassembly = realscript::bytecode::disassembleModule(modules.front());
     require(disassembly.find("Counter..ctor") != std::string::npos,
         "constructor was not emitted as a stable member function");

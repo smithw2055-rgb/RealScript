@@ -1,5 +1,6 @@
 #pragma once
 
+#include "realscript/debug/DebugInfo.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/semantic/Semantic.h"
 #include "realscript/text/Text.h"
@@ -141,10 +142,12 @@ struct Function {
     std::vector<semantic::PrimitiveType> localTypes;
     std::vector<semantic::SymbolId> localTypeIds;
     std::vector<BasicBlock> blocks;
+    debug::FunctionDebugInfo debugInfo;
 };
 
 struct Module {
     std::string name;
+    std::vector<debug::SourceFileInfo> sourceFiles;
     std::vector<semantic::TypeSymbol> types;
     std::vector<Function> functions;
 };

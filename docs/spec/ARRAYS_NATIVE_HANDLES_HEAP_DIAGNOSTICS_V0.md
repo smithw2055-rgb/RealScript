@@ -1,7 +1,7 @@
 # Arrays, Native Handles and Heap Diagnostics — Implemented Draft v0.1
 
 - implementation slice: Phase 3C
-- bytecode introduced in: `.rsbc` 0.3; current producer: `.rsbc` 0.4
+- bytecode introduced in: `.rsbc` 0.3; current producer: `.rsbc` 0.5
 - status: implemented draft; source, ABI and binary compatibility are not frozen
 
 ## 1. Scope
@@ -120,4 +120,4 @@ Object and root ordering is deterministic. `toText()` is suitable for fixtures a
 
 ## 11. Compatibility
 
-Arrays were introduced in `.rsbc` 0.3. The current 0.4 producer is not binary compatible with 0.3 or 0.2 and rejects any different version. Source and runtime interfaces remain draft and may change before the first stable release.
+Arrays were introduced in `.rsbc` 0.3. The current 0.5 producer is not binary compatible with 0.3 or 0.2 and rejects any different version. Source and runtime interfaces remain draft and may change before the first stable release.

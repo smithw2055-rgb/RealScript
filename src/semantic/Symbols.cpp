@@ -87,26 +87,28 @@ bool populateFields(
                 fieldSyntax.type.span());
             valid = false;
         }
-        type.fields.push_back({
-            fieldSyntax.identifierToken.text,
-            resolved.type,
-            resolved.name,
-            type.fields.size(),
-            false,
-        });
+        FieldSymbol field;
+        field.name = fieldSyntax.identifierToken.text;
+        field.type = resolved.type;
+        field.typeName = resolved.name;
+        field.index = type.fields.size();
+        field.synthetic = false;
+        field.declarationSpan = fieldSyntax.identifierToken.span;
+        field.id = fnv1a(canonicalTypeName(type) + "::field:" + field.name);
+        type.fields.push_back(std::move(field));
     }
     return valid;
 }
 
 void appendImplicitThis(FunctionSymbol& result, const TypeSymbol& owner) {
     if (result.staticMethod) return;
-    result.parameters.push_back({
-        "this",
-        typeKindPrimitive(owner.kind),
-        canonicalTypeName(owner),
-        0,
-        true,
-    });
+    VariableSymbol self;
+    self.name = "this";
+    self.type = typeKindPrimitive(owner.kind);
+    self.typeName = canonicalTypeName(owner);
+    self.index = 0;
+    self.parameter = true;
+    result.parameters.push_back(std::move(self));
 }
 
 void appendSyntaxParameters(
@@ -122,13 +124,14 @@ void appendSyntaxParameters(
                 "invalid parameter type '" + parameterSyntax.type.name.text + "'",
                 parameterSyntax.type.span());
         }
-        result.parameters.push_back({
-            parameterSyntax.identifierToken.text,
-            parameterType.type,
-            parameterType.name,
-            result.parameters.size(),
-            true,
-        });
+        VariableSymbol parameter;
+        parameter.name = parameterSyntax.identifierToken.text;
+        parameter.type = parameterType.type;
+        parameter.typeName = parameterType.name;
+        parameter.index = result.parameters.size();
+        parameter.parameter = true;
+        parameter.declarationSpan = parameterSyntax.identifierToken.span;
+        result.parameters.push_back(std::move(parameter));
     }
 }
 
@@ -259,6 +262,7 @@ TypeSymbol declareTypeShell(
     result.moduleName = moduleName;
     result.name = syntaxTree.identifierToken.text;
     result.id = stableTypeId(result);
+    result.declarationSpan = syntaxTree.identifierToken.span;
     return result;
 }
 
@@ -270,6 +274,7 @@ TypeSymbol declareTypeShell(
     result.moduleName = moduleName;
     result.name = syntaxTree.identifierToken.text;
     result.id = stableTypeId(result);
+    result.declarationSpan = syntaxTree.identifierToken.span;
     return result;
 }
 
@@ -281,6 +286,7 @@ TypeSymbol declareTypeShell(
     result.moduleName = moduleName;
     result.name = syntaxTree.identifierToken.text;
     result.id = stableTypeId(result);
+    result.declarationSpan = syntaxTree.identifierToken.span;
     return result;
 }
 
@@ -332,7 +338,12 @@ bool populateEnumMembers(
             valid = false;
         }
 
-        type.enumMembers.push_back({member.identifierToken.text, value});
+        EnumMemberSymbol symbol;
+        symbol.name = member.identifierToken.text;
+        symbol.value = value;
+        symbol.declarationSpan = member.identifierToken.span;
+        symbol.id = fnv1a(canonicalTypeName(type) + "::enum:" + symbol.name);
+        type.enumMembers.push_back(std::move(symbol));
         implicitValueAvailable =
             value != std::numeric_limits<std::int64_t>::max();
         if (implicitValueAvailable) nextValue = value + 1;
@@ -384,6 +395,12 @@ FunctionSymbol declareFunctionSymbol(
     }
     appendSyntaxParameters(result, syntaxTree.parameters, visibleTypes, diagnostics);
     result.id = stableFunctionId(result);
+    result.declarationSpan = syntaxTree.identifierToken.span;
+    result.bodySpan = syntaxTree.body.span();
+    for (auto& parameter : result.parameters) {
+        parameter.id = fnv1a(std::to_string(result.id) + "::local:" +
+            std::to_string(parameter.index) + ":" + parameter.name);
+    }
     return result;
 }
 
@@ -409,6 +426,12 @@ FunctionSymbol declareConstructorSymbol(
     appendImplicitThis(result, owner);
     appendSyntaxParameters(result, syntaxTree.parameters, visibleTypes, diagnostics);
     result.id = stableFunctionId(result);
+    result.declarationSpan = syntaxTree.identifierToken.span;
+    result.bodySpan = syntaxTree.body.span();
+    for (auto& parameter : result.parameters) {
+        parameter.id = fnv1a(std::to_string(result.id) + "::local:" +
+            std::to_string(parameter.index) + ":" + parameter.name);
+    }
     return result;
 }
 
@@ -420,6 +443,8 @@ PropertySymbol declarePropertySymbol(
     diagnostics::DiagnosticBag& diagnostics) {
     PropertySymbol result;
     result.name = syntaxTree.identifierToken.text;
+    result.declarationSpan = syntaxTree.identifierToken.span;
+    result.id = fnv1a(canonicalTypeName(owner) + "::property:" + result.name);
     result.staticProperty = syntaxTree.staticKeyword.has_value();
     const auto resolved = resolveType(syntaxTree.type, visibleTypes, false);
     result.type = resolved.type;
@@ -440,6 +465,12 @@ PropertySymbol declarePropertySymbol(
         getter.propertyGetter = true;
         appendImplicitThis(getter, owner);
         getter.id = stableFunctionId(getter);
+        getter.declarationSpan = syntaxTree.identifierToken.span;
+        getter.bodySpan = syntaxTree.getter->span();
+        for (auto& parameter : getter.parameters) {
+            parameter.id = fnv1a(std::to_string(getter.id) + "::local:" +
+                std::to_string(parameter.index) + ":" + parameter.name);
+        }
         result.getter = std::move(getter);
     }
     if (syntaxTree.setter) {
@@ -453,8 +484,21 @@ PropertySymbol declarePropertySymbol(
         setter.staticMethod = result.staticProperty;
         setter.propertySetter = true;
         appendImplicitThis(setter, owner);
-        setter.parameters.push_back({"value", result.type, result.typeName, setter.parameters.size(), true});
+        VariableSymbol valueParameter;
+        valueParameter.name = "value";
+        valueParameter.type = result.type;
+        valueParameter.typeName = result.typeName;
+        valueParameter.index = setter.parameters.size();
+        valueParameter.parameter = true;
+        valueParameter.declarationSpan = syntaxTree.identifierToken.span;
+        setter.parameters.push_back(std::move(valueParameter));
         setter.id = stableFunctionId(setter);
+        setter.declarationSpan = syntaxTree.identifierToken.span;
+        setter.bodySpan = syntaxTree.setter->span();
+        for (auto& parameter : setter.parameters) {
+            parameter.id = fnv1a(std::to_string(setter.id) + "::local:" +
+                std::to_string(parameter.index) + ":" + parameter.name);
+        }
         result.setter = std::move(setter);
     }
     if (!result.getter && !result.setter) {

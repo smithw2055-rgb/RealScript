@@ -7,12 +7,15 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <variant>
 #include <vector>
+
+namespace realscript::debug { class DebugController; }
 
 namespace realscript::runtime {
 
@@ -148,6 +151,7 @@ enum class ErrorCode {
     IndexOutOfRange,
     OutOfMemory,
     InvalidProgram,
+    ExecutionTerminated,
 };
 
 struct RuntimeError {
@@ -421,6 +425,7 @@ using TraceSink = std::function<void(const TraceEvent&)>;
 struct ExecutionOptions {
     Limits limits;
     TraceSink trace;
+    std::shared_ptr<debug::DebugController> debugger;
 };
 
 struct ExecutionResult {
@@ -524,9 +529,13 @@ public:
         const std::vector<Value>& arguments = {},
         ExecutionOptions options = {}) const;
     [[nodiscard]] const ProgramImage& program() const noexcept;
+    [[nodiscard]] std::shared_ptr<const ProgramImage> programSnapshot() const noexcept;
+    void replaceProgram(std::shared_ptr<const ProgramImage> program);
 
 private:
+    mutable std::mutex programMutex_;
     std::shared_ptr<const ProgramImage> program_;
+    std::vector<std::shared_ptr<const ProgramImage>> retiredPrograms_;
     std::shared_ptr<const BindingRegistry> bindings_;
     std::shared_ptr<ManagedHeap> heap_;
     std::shared_ptr<NativeHandleRegistry> nativeHandles_;

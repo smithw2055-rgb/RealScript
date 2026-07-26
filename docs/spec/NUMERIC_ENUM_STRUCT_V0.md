@@ -1,7 +1,7 @@
 # Numeric, Enum and Struct Values — Implemented Draft v0.1
 
 - implementation slice: Phase 3E
-- bytecode dependency: `.rsbc` 0.4
+- bytecode introduced in: `.rsbc` 0.4; current producer: `.rsbc` 0.5
 - status: implemented draft; value ABI is not frozen
 
 ## 1. Canonical numeric values
@@ -34,4 +34,4 @@ Constructors may update their local `this` and return the resulting struct. Dire
 
 ## 7. Compatibility
 
-The `.rsbc 0.4` representation is not compatible with 0.3. Struct layout, native ABI passing and boxing policy remain draft.
+The `.rsbc 0.4` value model is retained by the current 0.5 producer and was not compatible with 0.3. Struct layout, native ABI passing and boxing policy remain draft.

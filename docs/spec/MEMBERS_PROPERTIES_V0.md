@@ -1,7 +1,7 @@
 # Methods, Constructors and Properties — Implemented Draft v0.1
 
 - implementation slice: Phase 3D
-- bytecode dependency: `.rsbc` 0.4
+- bytecode introduced in: `.rsbc` 0.4; current producer: `.rsbc` 0.5
 - dispatch model: direct, statically resolved
 - status: implemented draft; member ABI is not frozen
 

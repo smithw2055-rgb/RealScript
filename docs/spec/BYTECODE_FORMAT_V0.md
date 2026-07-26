@@ -1,15 +1,15 @@
-# RealScript `.rsbc` Physical Format — Implemented Draft v0.4
+# RealScript `.rsbc` Physical Format — Implemented Draft v0.5
 
-- `bytecode_format_version`: 0.4
-- implementation slices: Phase 2A–3E
+- `bytecode_format_version`: 0.5
+- implementation slices: Phase 2A–4
 - byte order: little-endian
 - status: implemented draft; binary compatibility is not frozen
 
 ## 1. Scope
 
-This document records the physical encoding currently produced and consumed by RealScript. Version 0.4 extends the Phase 3C typed-register format with direct member-call signatures, type-descriptor kinds, enum metadata, struct values and `long`/`double` operations.
+This document records the physical encoding currently produced and consumed by RealScript. Version 0.5 retains the Phase 3D–3E member/value format and adds deterministic source files, line maps, sequence points, local-variable metadata and lexical scopes for debugger and tooling integration.
 
-The encoder is deterministic and the decoder accepts exactly version 0.4. It never infers the layout of another version.
+The encoder is deterministic and the decoder accepts exactly version 0.5. It never infers the layout of another version.
 
 ## 2. Scalars
 
@@ -28,9 +28,9 @@ The decoder reads fields byte-by-byte and never casts input bytes to a host C++ 
 offset  size  field
 0       4     magic = "RSBC"
 4       2     major = 0
-6       2     minor = 4
+6       2     minor = 5
 8       4     flags = 0
-12      4     section_count = 5
+12      4     section_count = 6
 16      ...   section directory
 ```
 
@@ -43,6 +43,7 @@ Each directory entry contains `kind:u32`, `offset:u32`, `size:u32`.
 | 3 | `FUNCTION_REFERENCES` | direct-call signatures and stable SymbolIds |
 | 4 | `FUNCTIONS` | function, local, register and code-range metadata |
 | 5 | `CODE` | blocks, instructions and terminators |
+| 6 | `DEBUG` | source files, line maps, sequence points, parameters, locals and scopes |
 
 Missing, duplicate, overlapping or out-of-range sections are rejected.
 
@@ -193,7 +194,35 @@ Object, array and Phase 2A–3C primitive/control-flow operations remain availab
 
 The terminator record contains kind, condition/value registers, jump/true and false targets, and both edge-argument vectors. Kinds are jump, conditional branch, value return and void return.
 
-## 12. Verifier requirements
+
+## 12. Debug section
+
+```text
+source_count: u32
+repeat source_count:
+  source_file_id: u32
+  path_string: u32
+  content_hash: u64
+  line_start_count: u32
+  line_starts[]: u32
+
+function_debug_count: u32
+repeat function_debug_count:
+  function_symbol_id: u64
+  source_file_id: u32
+  declaration_range: SourceRange
+  body_range: SourceRange
+  sequence_point_count: u32
+  sequence_points[]
+  local_count: u32
+  locals[]
+```
+
+A `SourceRange` stores SourceFileId, byte span and zero-based start/end line positions. A sequence point stores block, instruction position, terminator flag and SourceRange. A local stores name, slot, type, exact TypeId, parameter flag, declaration range and lexical scope range.
+
+SourceFileIds are module-local. Line starts are serialized so a decoded module does not need source contents to bind breakpoints or render locations.
+
+## 13. Verifier requirements
 
 Before execution, the verifier checks at least:
 
@@ -207,12 +236,14 @@ Before execution, the verifier checks at least:
 - object/struct descriptor and field indices;
 - array receiver, index and element metadata;
 - numeric conversion and typed operation categories;
-- direct-call arguments/results, returns and reachability.
+- direct-call arguments/results, returns and reachability;
+- source-file identity, line maps, sequence-point targets and duplicate locations;
+- local slots, exact local TypeIds, parameter flags and source/scope references.
 
 Malformed bytecode is rejected before execution.
 
-## 13. Canonical behavior and compatibility
+## 14. Canonical behavior and compatibility
 
 For the same verified module, encoding is byte-for-byte deterministic. The encoder writes no timestamps, native addresses or platform structure padding.
 
-Version 0.4 is not binary compatible with 0.3 because type descriptors and instruction records changed. Future incompatible changes must advance the version and remain fail-closed.
+Version 0.5 is not binary compatible with 0.4 because the physical section directory and debug tables changed. The 0.4 member/value instruction and descriptor model is retained. Future incompatible changes must advance the version and remain fail-closed.

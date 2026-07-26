@@ -8,6 +8,13 @@ option(REALSCRIPT_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 add_library(realscript_frontend STATIC
     src/text/Text.cpp
     src/diagnostics/Diagnostic.cpp
+    src/debug/DebugInfo.cpp
+    src/debug/Debugger.cpp
+    src/debug/DapServer.cpp
+    src/hot_reload/HotReload.cpp
+    src/tooling/Json.cpp
+    src/tooling/LanguageService.cpp
+    src/tooling/LspServer.cpp
     src/syntax/SyntaxFacts.cpp
     src/syntax/Lexer.cpp
     src/syntax/SyntaxNodes.cpp
@@ -57,6 +64,14 @@ endif()
 add_executable(rsc tools/rsc/main.cpp)
 target_link_libraries(rsc PRIVATE RealScript::Frontend)
 target_compile_features(rsc PRIVATE cxx_std_17)
+
+add_executable(rsdebug tools/rsdebug/main.cpp)
+target_link_libraries(rsdebug PRIVATE RealScript::Frontend)
+target_compile_features(rsdebug PRIVATE cxx_std_17)
+
+add_executable(rslsp tools/rslsp/main.cpp)
+target_link_libraries(rslsp PRIVATE RealScript::Frontend)
+target_compile_features(rslsp PRIVATE cxx_std_17)
 
 if(REALSCRIPT_BUILD_TESTS)
     enable_testing()
@@ -118,4 +133,9 @@ if(REALSCRIPT_BUILD_TESTS)
     target_link_libraries(realscript_phase3e_tests PRIVATE RealScript::Frontend)
     target_compile_features(realscript_phase3e_tests PRIVATE cxx_std_17)
     add_test(NAME realscript.phase3e COMMAND realscript_phase3e_tests)
+
+    add_executable(realscript_phase4_tests tests/phase4_tests.cpp)
+    target_link_libraries(realscript_phase4_tests PRIVATE RealScript::Frontend)
+    target_compile_features(realscript_phase4_tests PRIVATE cxx_std_17)
+    add_test(NAME realscript.phase4 COMMAND realscript_phase4_tests)
 endif()

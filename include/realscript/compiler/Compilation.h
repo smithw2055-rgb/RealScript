@@ -29,6 +29,7 @@ struct CachedModule {
     std::uint64_t publicFingerprint = 0;
     std::uint64_t dependencyFingerprint = 0;
     mir::Module module;
+    std::vector<semantic::SymbolOccurrence> symbols;
 };
 
 struct BuildSnapshot {
@@ -39,6 +40,7 @@ struct BuildResult {
     std::vector<mir::Module> modules;
     std::vector<ModuleBuildInfo> buildInfo;
     diagnostics::DiagnosticBag diagnostics;
+    std::vector<semantic::SymbolOccurrence> symbols;
     BuildSnapshot snapshot;
 };
 

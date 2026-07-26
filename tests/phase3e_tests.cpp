@@ -142,8 +142,8 @@ void testNumericEnumAndStructExecution() {
     auto modules = compile({{"values.rs", valueSource}});
     require(modules.size() == 1, "expected one Phase 3E module");
     const auto& module = modules.front();
-    require(module.version.major == 0 && module.version.minor == 4,
-        "Phase 3E must use .rsbc 0.4");
+    require(module.version.major == 0 && module.version.minor == 5,
+        "Phase 3E must use .rsbc 0.5");
 
     bool foundStruct = false;
     bool foundEnum = false;
