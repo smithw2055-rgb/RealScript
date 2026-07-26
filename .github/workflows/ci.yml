@@ -21,20 +21,29 @@ jobs:
 
       - name: Configure
         run: >-
+          python tools/ci/run_and_capture.py configure.log --
           cmake -S . -B build
           -DREALSCRIPT_BUILD_TESTS=ON
           -DREALSCRIPT_WARNINGS_AS_ERRORS=ON
 
       - name: Build
-        run: cmake --build build --config Debug
+        run: >-
+          python tools/ci/run_and_capture.py build.log --
+          cmake --build build --config Debug
 
       - name: Test
-        run: ctest --test-dir build -C Debug --output-on-failure
+        run: >-
+          python tools/ci/run_and_capture.py test.log --
+          ctest --test-dir build -C Debug --output-on-failure
 
-      - name: Upload CTest failure log
+      - name: Upload CI failure logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ctest-log-${{ matrix.os }}
-          path: build/Testing/Temporary/LastTest.log
+          name: ci-log-${{ matrix.os }}
+          path: |
+            configure.log
+            build.log
+            test.log
+            build/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
