@@ -1,0 +1,27 @@
+name: Phase 3C Source Export
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  export-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Package source
+        run: git archive --format=zip --output=realscript-phase3c-source.zip HEAD
+
+      - name: Upload source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: realscript-phase3c-source
+          path: realscript-phase3c-source.zip
+          retention-days: 1
+          if-no-files-found: error
