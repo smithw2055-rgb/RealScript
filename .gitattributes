@@ -1,0 +1,7 @@
+# Keep compiler inputs, snapshots, and generated debug metadata deterministic
+# across Linux and Windows checkouts.
+* text=auto eol=lf
+
+# Preserve conventional Windows line endings for native command scripts.
+*.bat text eol=crlf
+*.cmd text eol=crlf
