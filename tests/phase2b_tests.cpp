@@ -99,6 +99,7 @@ void testExternalResolver() {
     reference.name = "Host::increment";
     reference.returnType = realscript::semantic::PrimitiveType::Int;
     reference.parameterTypes = {realscript::semantic::PrimitiveType::Int};
+    reference.parameterTypeIds = {0};
     module.functionReferences.push_back(reference);
 
     realscript::bytecode::Function function;
@@ -106,6 +107,7 @@ void testExternalResolver() {
     function.name = "main";
     function.returnType = realscript::semantic::PrimitiveType::Int;
     function.registerTypes = {realscript::semantic::PrimitiveType::Int, realscript::semantic::PrimitiveType::Int};
+    function.registerTypeIds = {0, 0};
     realscript::bytecode::BasicBlock block;
     block.id = 0;
     realscript::bytecode::Instruction constant;
@@ -153,6 +155,7 @@ void testUnresolvedExternal() {
     function.name = "main";
     function.returnType = realscript::semantic::PrimitiveType::Int;
     function.registerTypes = {realscript::semantic::PrimitiveType::Int};
+    function.registerTypeIds = {0};
     realscript::bytecode::BasicBlock block; block.id = 0;
     realscript::bytecode::Instruction call; call.opcode = realscript::bytecode::Opcode::Call; call.result = 0; call.index = 0;
     block.instructions.push_back(call); block.terminator.kind = realscript::bytecode::TerminatorKind::ReturnValue; block.terminator.value = 0;

@@ -58,6 +58,7 @@ void testBindingRegistryByName() {
     function.name = "main";
     function.returnType = realscript::semantic::PrimitiveType::Int;
     function.registerTypes = {realscript::semantic::PrimitiveType::Int};
+    function.registerTypeIds = {0};
     realscript::bytecode::BasicBlock block; block.id = 0;
     realscript::bytecode::Instruction call;
     call.opcode = realscript::bytecode::Opcode::Call;

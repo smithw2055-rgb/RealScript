@@ -1,7 +1,12 @@
 #include "realscript/runtime/Runtime.h"
 
 #include <algorithm>
+#include <atomic>
+#include <deque>
 #include <limits>
+#include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace realscript::runtime {
@@ -18,6 +23,31 @@ std::size_t estimateValueStorage(std::size_t count) {
         return std::numeric_limits<std::size_t>::max();
     }
     return count * sizeof(Value);
+}
+
+std::uint64_t nextIdentity(std::atomic<std::uint64_t>& next) noexcept {
+    auto value = next.fetch_add(1, std::memory_order_relaxed);
+    if (value == 0) value = next.fetch_add(1, std::memory_order_relaxed);
+    return value;
+}
+
+std::uint64_t nextHeapId() noexcept {
+    static std::atomic<std::uint64_t> next{1};
+    return nextIdentity(next);
+}
+
+std::uint64_t nextRegistryId() noexcept {
+    static std::atomic<std::uint64_t> next{1};
+    return nextIdentity(next);
+}
+
+const char* objectKindName(ObjectKind kind) noexcept {
+    switch (kind) {
+    case ObjectKind::String: return "string";
+    case ObjectKind::Array: return "array";
+    case ObjectKind::Record: return "record";
+    }
+    return "unknown";
 }
 
 } // namespace
@@ -51,6 +81,8 @@ struct ManagedHeap::Impl {
     struct Header {
         ObjectKind kind = ObjectKind::Record;
         semantic::SymbolId typeId = 0;
+        semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
+        semantic::SymbolId elementTypeId = 0;
         bool marked = false;
         std::size_t sizeBytes = 0;
     };
@@ -67,7 +99,8 @@ struct ManagedHeap::Impl {
     };
 
     explicit Impl(HeapConfig value)
-        : config(value), nextCollectionThreshold(value.initialCollectionThresholdBytes) {
+        : config(value), heapId(nextHeapId()),
+          nextCollectionThreshold(value.initialCollectionThresholdBytes) {
         if (config.initialCollectionThresholdBytes == 0) {
             config.initialCollectionThresholdBytes = 1;
             nextCollectionThreshold = 1;
@@ -78,6 +111,7 @@ struct ManagedHeap::Impl {
     }
 
     HeapConfig config;
+    std::uint64_t heapId = 0;
     std::vector<Slot> slots;
     std::vector<std::uint32_t> freeSlots;
     std::vector<ObjectRef> markStack;
@@ -90,7 +124,8 @@ struct ManagedHeap::Impl {
     GcStatistics statistics;
 
     [[nodiscard]] HeapObject* get(ObjectRef reference) noexcept {
-        if (!reference.valid() || reference.slot >= slots.size()) return nullptr;
+        if (!reference.valid() || reference.heapId != heapId ||
+            reference.slot >= slots.size()) return nullptr;
         auto& slot = slots[reference.slot];
         if (!slot.object || slot.generation != reference.generation ||
             slot.object->header.kind != reference.kind) return nullptr;
@@ -98,7 +133,8 @@ struct ManagedHeap::Impl {
     }
 
     [[nodiscard]] const HeapObject* get(ObjectRef reference) const noexcept {
-        if (!reference.valid() || reference.slot >= slots.size()) return nullptr;
+        if (!reference.valid() || reference.heapId != heapId ||
+            reference.slot >= slots.size()) return nullptr;
         const auto& slot = slots[reference.slot];
         if (!slot.object || slot.generation != reference.generation ||
             slot.object->header.kind != reference.kind) return nullptr;
@@ -108,6 +144,8 @@ struct ManagedHeap::Impl {
     [[nodiscard]] std::optional<ObjectRef> allocate(
         ObjectKind kind,
         semantic::SymbolId typeId,
+        semantic::PrimitiveType elementType,
+        semantic::SymbolId elementTypeId,
         std::variant<std::string, std::vector<Value>> payload,
         std::vector<std::size_t> referenceFields,
         std::size_t sizeBytes,
@@ -138,13 +176,15 @@ struct ManagedHeap::Impl {
         auto object = std::make_unique<HeapObject>();
         object->header.kind = kind;
         object->header.typeId = typeId;
+        object->header.elementType = elementType;
+        object->header.elementTypeId = elementTypeId;
         object->header.marked = phase != GcPhase::Idle;
         object->header.sizeBytes = sizeBytes;
         object->payload = std::move(payload);
         object->referenceFields = std::move(referenceFields);
         auto& slot = slots[slotIndex];
         slot.object = std::move(object);
-        const ObjectRef reference{slotIndex, slot.generation, kind};
+        const ObjectRef reference{slotIndex, slot.generation, kind, heapId};
 
         ++statistics.objectsAllocated;
         statistics.bytesAllocated += sizeBytes;
@@ -241,13 +281,52 @@ std::optional<ObjectRef> ManagedHeap::allocateString(
     std::string value,
     RuntimeError* error) {
     const auto size = sizeof(Impl::HeapObject) + value.size();
-    return impl_->allocate(ObjectKind::String, 0, std::move(value), {}, size, error);
+    return impl_->allocate(
+        ObjectKind::String, 0, semantic::PrimitiveType::Error, 0,
+        std::move(value), {}, size, error);
 }
 
 std::optional<ObjectRef> ManagedHeap::allocateArray(
     std::size_t length,
     Value initialValue,
     RuntimeError* error) {
+    auto elementType = valueType(initialValue);
+    if (elementType == semantic::PrimitiveType::Null) {
+        elementType = semantic::PrimitiveType::Error;
+    }
+    return allocateTypedArray(
+        0, elementType, 0, length, std::move(initialValue), error);
+}
+
+std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
+    semantic::SymbolId arrayTypeId,
+    semantic::PrimitiveType elementType,
+    semantic::SymbolId elementTypeId,
+    std::size_t length,
+    Value initialValue,
+    RuntimeError* error) {
+    const bool validElement = elementType == semantic::PrimitiveType::Error ||
+        elementType == semantic::PrimitiveType::Bool ||
+        elementType == semantic::PrimitiveType::Int ||
+        elementType == semantic::PrimitiveType::String ||
+        elementType == semantic::PrimitiveType::Object ||
+        elementType == semantic::PrimitiveType::Array ||
+        elementType == semantic::PrimitiveType::Handle;
+    if (!validElement ||
+        ((elementType == semantic::PrimitiveType::Object ||
+          elementType == semantic::PrimitiveType::Array)
+            ? elementTypeId == 0
+            : elementTypeId != 0)) {
+        setHeapError(error, ErrorCode::InvalidArguments,
+            "managed array element type metadata is invalid");
+        return std::nullopt;
+    }
+    if (elementType != semantic::PrimitiveType::Error &&
+        valueType(initialValue) != elementType) {
+        setHeapError(error, ErrorCode::TypeMismatch,
+            "managed array initial value does not match its element type");
+        return std::nullopt;
+    }
     const auto storage = estimateValueStorage(length);
     if (storage == std::numeric_limits<std::size_t>::max()) {
         setHeapError(error, ErrorCode::OutOfMemory, "managed array is too large");
@@ -256,7 +335,9 @@ std::optional<ObjectRef> ManagedHeap::allocateArray(
     std::vector<Value> values(length, std::move(initialValue));
     return impl_->allocate(
         ObjectKind::Array,
-        0,
+        arrayTypeId,
+        elementType,
+        elementTypeId,
         std::move(values),
         {},
         sizeof(Impl::HeapObject) + storage,
@@ -278,6 +359,8 @@ std::optional<ObjectRef> ManagedHeap::allocateRecord(
     }
     return impl_->allocate(
         ObjectKind::Record,
+        0,
+        semantic::PrimitiveType::Error,
         0,
         std::move(fields),
         std::move(referenceFields),
@@ -314,6 +397,8 @@ std::optional<ObjectRef> ManagedHeap::allocateObject(
     return impl_->allocate(
         ObjectKind::Record,
         typeId,
+        semantic::PrimitiveType::Error,
+        0,
         std::move(fields),
         std::move(referenceFields),
         sizeof(Impl::HeapObject) + storage,
@@ -334,6 +419,27 @@ std::optional<std::size_t> ManagedHeap::arrayLength(ObjectRef reference) const {
     const auto* object = impl_->get(reference);
     if (!object || object->header.kind != ObjectKind::Array) return std::nullopt;
     return std::get<std::vector<Value>>(object->payload).size();
+}
+
+std::optional<semantic::SymbolId> ManagedHeap::arrayTypeId(
+    ObjectRef reference) const {
+    const auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array) return std::nullopt;
+    return object->header.typeId;
+}
+
+std::optional<semantic::PrimitiveType> ManagedHeap::arrayElementType(
+    ObjectRef reference) const {
+    const auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array) return std::nullopt;
+    return object->header.elementType;
+}
+
+std::optional<semantic::SymbolId> ManagedHeap::arrayElementTypeId(
+    ObjectRef reference) const {
+    const auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array) return std::nullopt;
+    return object->header.elementTypeId;
 }
 
 std::optional<Value> ManagedHeap::arrayGet(ObjectRef reference, std::size_t index) const {
@@ -357,9 +463,42 @@ bool ManagedHeap::arraySet(
     }
     auto& values = std::get<std::vector<Value>>(object->payload);
     if (index >= values.size()) {
-        setHeapError(error, ErrorCode::InvalidArguments,
+        setHeapError(error, ErrorCode::IndexOutOfRange,
             "managed array index is out of range");
         return false;
+    }
+    const auto expected = object->header.elementType;
+    if (expected != semantic::PrimitiveType::Error && valueType(value) != expected) {
+        setHeapError(error, ErrorCode::TypeMismatch,
+            "managed array element type mismatch");
+        return false;
+    }
+    if (expected == semantic::PrimitiveType::Object &&
+        !std::holds_alternative<NullObject>(value)) {
+        const auto* child = std::get_if<ObjectRef>(&value);
+        const auto actual = child ? objectTypeId(*child) : std::nullopt;
+        if (!actual || *actual != object->header.elementTypeId) {
+            setHeapError(error, ErrorCode::TypeMismatch,
+                "managed array object element type mismatch");
+            return false;
+        }
+    } else if (expected == semantic::PrimitiveType::Array &&
+               !std::holds_alternative<NullArray>(value)) {
+        const auto* child = std::get_if<ObjectRef>(&value);
+        const auto actual = child ? arrayTypeId(*child) : std::nullopt;
+        if (!actual || *actual != object->header.elementTypeId) {
+            setHeapError(error, ErrorCode::TypeMismatch,
+                "managed array nested array type mismatch");
+            return false;
+        }
+    } else if (expected == semantic::PrimitiveType::Handle) {
+        const auto* handle = std::get_if<NativeHandle>(&value);
+        if (!handle || (object->header.elementTypeId != 0 &&
+                        handle->typeId != object->header.elementTypeId)) {
+            setHeapError(error, ErrorCode::TypeMismatch,
+                "managed array native handle type mismatch");
+            return false;
+        }
     }
     impl_->writeBarrier(reference, value);
     values[index] = std::move(value);
@@ -437,6 +576,11 @@ bool ManagedHeap::removePersistentRoot(RootToken token) noexcept {
     return impl_->persistentRoots.erase(token) != 0;
 }
 
+PersistentRoot ManagedHeap::retain(ObjectRef reference) {
+    const auto token = addPersistentRoot(reference);
+    return PersistentRoot(token == 0 ? nullptr : this, token, reference);
+}
+
 void ManagedHeap::requestCollection() noexcept { impl_->requested = true; }
 bool ManagedHeap::collectionRequested() const noexcept { return impl_->requested; }
 GcPhase ManagedHeap::phase() const noexcept { return impl_->phase; }
@@ -500,11 +644,19 @@ std::size_t ManagedHeap::step(
 }
 
 void ManagedHeap::collectFull(const ShadowStack& shadowStack) {
+    const auto drainCollection = [&]() {
+        while (impl_->phase != GcPhase::Idle || impl_->requested) {
+            const auto budget = std::max<std::size_t>(64, impl_->slots.size() + 1);
+            (void)step(shadowStack, budget);
+        }
+    };
+
+    // Objects allocated during an incremental cycle are kept alive until that
+    // cycle finishes. Drain it first, then start a fresh cycle so collectFull()
+    // observes the complete heap as it exists at the call boundary.
+    if (impl_->phase != GcPhase::Idle) drainCollection();
     requestCollection();
-    while (impl_->phase != GcPhase::Idle || impl_->requested) {
-        const auto budget = std::max<std::size_t>(64, impl_->slots.size() + 1);
-        (void)step(shadowStack, budget);
-    }
+    drainCollection();
 }
 
 const GcStatistics& ManagedHeap::statistics() const noexcept {
@@ -515,6 +667,326 @@ std::size_t ManagedHeap::liveObjects() const noexcept {
 }
 std::size_t ManagedHeap::liveBytes() const noexcept {
     return impl_->statistics.liveBytes;
+}
+
+std::uint64_t ManagedHeap::heapId() const noexcept { return impl_->heapId; }
+
+HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
+    HeapSnapshot result;
+    result.heapId = impl_->heapId;
+    result.statistics = impl_->statistics;
+    result.objects.reserve(impl_->statistics.liveObjects);
+    for (std::size_t slotIndex = 0; slotIndex < impl_->slots.size(); ++slotIndex) {
+        const auto& slot = impl_->slots[slotIndex];
+        if (!slot.object) continue;
+        const auto& object = *slot.object;
+        HeapObjectInfo info;
+        info.reference = {
+            static_cast<std::uint32_t>(slotIndex),
+            slot.generation,
+            object.header.kind,
+            impl_->heapId,
+        };
+        info.kind = object.header.kind;
+        info.typeId = object.header.typeId;
+        info.elementType = object.header.elementType;
+        info.elementTypeId = object.header.elementTypeId;
+        info.sizeBytes = object.header.sizeBytes;
+        if (object.header.kind != ObjectKind::String) {
+            const auto& values = std::get<std::vector<Value>>(object.payload);
+            info.valueCount = values.size();
+            const auto addEdge = [&](std::size_t index) {
+                if (index >= values.size()) return;
+                if (const auto* target = std::get_if<ObjectRef>(&values[index]);
+                    target && impl_->get(*target)) {
+                    info.edges.push_back({
+                        *target,
+                        (object.header.kind == ObjectKind::Array ? "element[" : "field[") +
+                            std::to_string(index) + "]",
+                    });
+                }
+            };
+            if (object.header.kind == ObjectKind::Array) {
+                for (std::size_t index = 0; index < values.size(); ++index) {
+                    addEdge(index);
+                }
+            } else {
+                for (const auto index : object.referenceFields) addEdge(index);
+            }
+        }
+        result.objects.push_back(std::move(info));
+    }
+    for (const auto& [token, reference] : impl_->persistentRoots) {
+        result.roots.push_back({token, reference, "persistent"});
+    }
+    if (shadowStack) {
+        std::uint64_t index = 0;
+        shadowStack->visitRoots([&](const Value& value) {
+            if (const auto* reference = std::get_if<ObjectRef>(&value);
+                reference && impl_->get(*reference)) {
+                result.roots.push_back({index++, *reference, "shadow"});
+            }
+        });
+    }
+    std::sort(result.objects.begin(), result.objects.end(),
+        [](const HeapObjectInfo& left, const HeapObjectInfo& right) {
+            return left.reference.slot < right.reference.slot;
+        });
+    std::sort(result.roots.begin(), result.roots.end(),
+        [](const HeapRootInfo& left, const HeapRootInfo& right) {
+            if (left.kind != right.kind) return left.kind < right.kind;
+            return left.token < right.token;
+        });
+    return result;
+}
+
+std::vector<ObjectRef> ManagedHeap::retainingPath(
+    ObjectRef target,
+    const ShadowStack* shadowStack) const {
+    if (!isAlive(target)) return {};
+    const auto image = snapshot(shadowStack);
+    std::unordered_map<std::uint32_t, const HeapObjectInfo*> objects;
+    for (const auto& object : image.objects) {
+        objects.emplace(object.reference.slot, &object);
+    }
+    std::deque<ObjectRef> queue;
+    std::unordered_map<std::uint32_t, ObjectRef> parent;
+    std::unordered_set<std::uint32_t> visited;
+    for (const auto& root : image.roots) {
+        if (visited.insert(root.reference.slot).second) {
+            queue.push_back(root.reference);
+            parent.emplace(root.reference.slot, ObjectRef{});
+        }
+    }
+    while (!queue.empty()) {
+        const auto current = queue.front();
+        queue.pop_front();
+        if (current == target) {
+            std::vector<ObjectRef> path;
+            auto cursor = current;
+            while (cursor.valid()) {
+                path.push_back(cursor);
+                const auto found = parent.find(cursor.slot);
+                if (found == parent.end()) break;
+                cursor = found->second;
+            }
+            std::reverse(path.begin(), path.end());
+            return path;
+        }
+        const auto found = objects.find(current.slot);
+        if (found == objects.end()) continue;
+        for (const auto& edge : found->second->edges) {
+            if (visited.insert(edge.target.slot).second) {
+                parent.emplace(edge.target.slot, current);
+                queue.push_back(edge.target);
+            }
+        }
+    }
+    return {};
+}
+
+std::string ManagedHeap::leakSummary() const {
+    const auto image = snapshot();
+    std::size_t strings = 0;
+    std::size_t arrays = 0;
+    std::size_t records = 0;
+    for (const auto& object : image.objects) {
+        switch (object.kind) {
+        case ObjectKind::String: ++strings; break;
+        case ObjectKind::Array: ++arrays; break;
+        case ObjectKind::Record: ++records; break;
+        }
+    }
+    std::ostringstream out;
+    out << "heap " << image.heapId << ": " << image.objects.size()
+        << " live objects, " << image.statistics.liveBytes << " bytes, "
+        << image.roots.size() << " persistent roots"
+        << " [string=" << strings << ", array=" << arrays
+        << ", record=" << records << ']';
+    if (!image.roots.empty()) {
+        out << "\nroots:";
+        for (const auto& root : image.roots) {
+            out << "\n  #" << root.token << " -> " << root.reference.slot
+                << ':' << root.reference.generation;
+        }
+    }
+    return out.str();
+}
+
+std::string HeapSnapshot::toText() const {
+    std::ostringstream out;
+    out << "heap " << heapId << " objects=" << objects.size()
+        << " bytes=" << statistics.liveBytes << " roots=" << roots.size() << '\n';
+    for (const auto& root : roots) {
+        out << "root " << root.kind << '#' << root.token << " -> o"
+            << root.reference.slot << ':' << root.reference.generation << '\n';
+    }
+    for (const auto& object : objects) {
+        out << 'o' << object.reference.slot << ':' << object.reference.generation
+            << ' ' << objectKindName(object.kind) << " bytes=" << object.sizeBytes;
+        if (object.typeId != 0) out << " type=0x" << std::hex << object.typeId << std::dec;
+        if (object.kind == ObjectKind::Array) {
+            out << " element=" << semantic::primitiveTypeName(object.elementType)
+                << " count=" << object.valueCount;
+            if (object.elementTypeId != 0) {
+                out << " elementType=0x" << std::hex << object.elementTypeId << std::dec;
+            }
+        }
+        out << '\n';
+        for (const auto& edge : object.edges) {
+            out << "  " << edge.label << " -> o" << edge.target.slot << ':'
+                << edge.target.generation << '\n';
+        }
+    }
+    return out.str();
+}
+
+PersistentRoot::PersistentRoot(
+    ManagedHeap* heap,
+    ManagedHeap::RootToken token,
+    ObjectRef reference)
+    : heap_(heap), token_(token), reference_(reference) {}
+
+PersistentRoot::~PersistentRoot() { reset(); }
+
+PersistentRoot::PersistentRoot(PersistentRoot&& other) noexcept
+    : heap_(other.heap_), token_(other.token_), reference_(other.reference_) {
+    other.heap_ = nullptr;
+    other.token_ = 0;
+    other.reference_ = {};
+}
+
+PersistentRoot& PersistentRoot::operator=(PersistentRoot&& other) noexcept {
+    if (this == &other) return *this;
+    reset();
+    heap_ = other.heap_;
+    token_ = other.token_;
+    reference_ = other.reference_;
+    other.heap_ = nullptr;
+    other.token_ = 0;
+    other.reference_ = {};
+    return *this;
+}
+
+bool PersistentRoot::valid() const noexcept {
+    return heap_ && token_ != 0 && heap_->isAlive(reference_);
+}
+
+ObjectRef PersistentRoot::reference() const noexcept { return reference_; }
+
+bool PersistentRoot::update(ObjectRef reference) {
+    if (!heap_ || token_ == 0 || !heap_->updatePersistentRoot(token_, reference)) {
+        return false;
+    }
+    reference_ = reference;
+    return true;
+}
+
+void PersistentRoot::reset() noexcept {
+    if (heap_ && token_ != 0) (void)heap_->removePersistentRoot(token_);
+    heap_ = nullptr;
+    token_ = 0;
+    reference_ = {};
+}
+
+NativeHandleRegistry::NativeHandleRegistry()
+    : registryId_(nextRegistryId()) {}
+
+NativeHandle NativeHandleRegistry::create(
+    semantic::SymbolId typeId,
+    std::shared_ptr<void> resource,
+    std::string debugNameValue) {
+    if (typeId == 0 || !resource) return {};
+    std::uint32_t slotIndex = 0;
+    if (!freeSlots_.empty()) {
+        slotIndex = freeSlots_.back();
+        freeSlots_.pop_back();
+    } else {
+        if (slots_.size() >= static_cast<std::size_t>(NativeHandle::InvalidSlot)) {
+            return {};
+        }
+        slotIndex = static_cast<std::uint32_t>(slots_.size());
+        slots_.push_back({});
+    }
+    auto& slot = slots_[slotIndex];
+    slot.resource = std::move(resource);
+    slot.typeId = typeId;
+    slot.debugName = std::move(debugNameValue);
+    return {slotIndex, slot.generation, typeId, registryId_};
+}
+
+std::shared_ptr<void> NativeHandleRegistry::resolve(
+    NativeHandle handle,
+    semantic::SymbolId expectedTypeId,
+    RuntimeError* error) const {
+    if (!handle.valid() || handle.registryId != registryId_ ||
+        handle.slot >= slots_.size()) {
+        setHeapError(error, ErrorCode::InvalidNativeHandle,
+            "native handle is invalid");
+        return {};
+    }
+    const auto& slot = slots_[handle.slot];
+    if (!slot.resource || slot.generation != handle.generation ||
+        slot.typeId != handle.typeId) {
+        setHeapError(error, ErrorCode::InvalidNativeHandle,
+            "native handle is stale");
+        return {};
+    }
+    if (expectedTypeId != 0 && slot.typeId != expectedTypeId) {
+        setHeapError(error, ErrorCode::TypeMismatch,
+            "native handle type does not match the expected host type");
+        return {};
+    }
+    return slot.resource;
+}
+
+bool NativeHandleRegistry::isAlive(NativeHandle handle) const noexcept {
+    return handle.valid() && handle.registryId == registryId_ &&
+        handle.slot < slots_.size() &&
+        slots_[handle.slot].resource &&
+        slots_[handle.slot].generation == handle.generation &&
+        slots_[handle.slot].typeId == handle.typeId;
+}
+
+bool NativeHandleRegistry::release(NativeHandle handle) noexcept {
+    if (!isAlive(handle)) return false;
+    auto& slot = slots_[handle.slot];
+    slot.resource.reset();
+    slot.typeId = 0;
+    slot.debugName.clear();
+    ++slot.generation;
+    if (slot.generation == 0) slot.generation = 1;
+    freeSlots_.push_back(handle.slot);
+    return true;
+}
+
+void NativeHandleRegistry::clear() noexcept {
+    freeSlots_.clear();
+    for (std::size_t index = 0; index < slots_.size(); ++index) {
+        auto& slot = slots_[index];
+        if (slot.resource) {
+            slot.resource.reset();
+            slot.typeId = 0;
+            slot.debugName.clear();
+            ++slot.generation;
+            if (slot.generation == 0) slot.generation = 1;
+        }
+        freeSlots_.push_back(static_cast<std::uint32_t>(index));
+    }
+}
+
+std::size_t NativeHandleRegistry::liveCount() const noexcept {
+    return static_cast<std::size_t>(std::count_if(
+        slots_.begin(), slots_.end(),
+        [](const Slot& slot) { return static_cast<bool>(slot.resource); }));
+}
+
+std::uint64_t NativeHandleRegistry::registryId() const noexcept {
+    return registryId_;
+}
+
+std::string NativeHandleRegistry::debugName(NativeHandle handle) const {
+    return isAlive(handle) ? slots_[handle.slot].debugName : std::string{};
 }
 
 } // namespace realscript::runtime

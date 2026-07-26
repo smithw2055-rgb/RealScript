@@ -184,6 +184,8 @@ SyntaxToken Lexer::nextToken() {
     case ')': return single(SyntaxKind::CloseParenToken);
     case '{': return single(SyntaxKind::OpenBraceToken);
     case '}': return single(SyntaxKind::CloseBraceToken);
+    case '[': return single(SyntaxKind::OpenBracketToken);
+    case ']': return single(SyntaxKind::CloseBracketToken);
     case ',': return single(SyntaxKind::CommaToken);
     case '.': return single(SyntaxKind::DotToken);
     case ':': return single(SyntaxKind::ColonToken);

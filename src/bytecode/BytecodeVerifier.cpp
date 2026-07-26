@@ -17,6 +17,8 @@ bool validRegisterType(semantic::PrimitiveType type) noexcept {
         type == semantic::PrimitiveType::Int ||
         type == semantic::PrimitiveType::String ||
         type == semantic::PrimitiveType::Object ||
+        type == semantic::PrimitiveType::Array ||
+        type == semantic::PrimitiveType::Handle ||
         type == semantic::PrimitiveType::Null;
 }
 
@@ -24,7 +26,9 @@ bool validStorageType(semantic::PrimitiveType type) noexcept {
     return type == semantic::PrimitiveType::Bool ||
         type == semantic::PrimitiveType::Int ||
         type == semantic::PrimitiveType::String ||
-        type == semantic::PrimitiveType::Object;
+        type == semantic::PrimitiveType::Object ||
+        type == semantic::PrimitiveType::Array ||
+        type == semantic::PrimitiveType::Handle;
 }
 
 bool validReturnType(semantic::PrimitiveType type) noexcept {
@@ -35,7 +39,8 @@ bool validReturnType(semantic::PrimitiveType type) noexcept {
 bool validTypeIdentity(
     semantic::PrimitiveType type,
     semantic::SymbolId typeId) noexcept {
-    return type == semantic::PrimitiveType::Object
+    return (type == semantic::PrimitiveType::Object ||
+            type == semantic::PrimitiveType::Array)
         ? typeId != 0
         : typeId == 0;
 }
@@ -50,7 +55,8 @@ bool instructionDefinesValue(
     const Instruction& instruction,
     const Module& module) noexcept {
     if (instruction.opcode == Opcode::StoreLocal ||
-        instruction.opcode == Opcode::StoreField) {
+        instruction.opcode == Opcode::StoreField ||
+        instruction.opcode == Opcode::StoreElement) {
         return false;
     }
     if (instruction.opcode == Opcode::Call &&
@@ -76,13 +82,19 @@ std::size_t expectedOperandCount(
     case Opcode::StoreLocal:
     case Opcode::ConvertNullToString:
     case Opcode::ConvertNullToObject:
+    case Opcode::ConvertNullToArray:
+    case Opcode::NewArray:
     case Opcode::CheckNotNull:
+    case Opcode::ArrayLength:
     case Opcode::LoadField:
     case Opcode::NegateInt:
     case Opcode::LogicalNot:
         return 1;
+    case Opcode::LoadElement:
     case Opcode::StoreField:
         return 2;
+    case Opcode::StoreElement:
+        return 3;
     case Opcode::Call:
         return instruction.index < module.functionReferences.size()
             ? module.functionReferences[instruction.index].parameterTypes.size()
@@ -99,7 +111,7 @@ bool verifyModule(
     diagnostics::DiagnosticBag& diagnostics) {
     const auto initialCount = diagnostics.items().size();
 
-    if (module.version.major != 0 || module.version.minor != 2) {
+    if (module.version.major != 0 || module.version.minor != 3) {
         diagnostics.report(
             "RS5100",
             "unsupported in-memory bytecode version",
@@ -122,9 +134,11 @@ bool verifyModule(
             const auto& field = type.fields[fieldIndex];
             if (field.index != fieldIndex || field.name.empty() ||
                 !validStorageType(field.type) ||
-                (field.type == semantic::PrimitiveType::Object &&
+                ((field.type == semantic::PrimitiveType::Object ||
+                  field.type == semantic::PrimitiveType::Array) &&
                     field.typeName.empty()) ||
-                (field.type != semantic::PrimitiveType::Object &&
+                ((field.type != semantic::PrimitiveType::Object &&
+                  field.type != semantic::PrimitiveType::Array) &&
                     !field.typeName.empty())) {
                 diagnostics.report(
                     "RS5151",
@@ -174,8 +188,7 @@ bool verifyModule(
                 "bytecode function reference has an invalid return type identity",
                 {});
         }
-        if (!reference.parameterTypeIds.empty() &&
-            reference.parameterTypeIds.size() != reference.parameterTypes.size()) {
+        if (reference.parameterTypeIds.size() != reference.parameterTypes.size()) {
             diagnostics.report(
                 "RS5106",
                 "bytecode function reference type ID count is invalid",
@@ -220,8 +233,7 @@ bool verifyModule(
                 "bytecode function has an invalid return type identity",
                 {});
         }
-        if (!function.parameterTypeIds.empty() &&
-            function.parameterTypeIds.size() != function.parameterTypes.size()) {
+        if (function.parameterTypeIds.size() != function.parameterTypes.size()) {
             diagnostics.report(
                 "RS5110",
                 "bytecode function parameter type ID count is invalid",
@@ -241,16 +253,38 @@ bool verifyModule(
                     {});
             }
         }
-        for (const auto type : function.localTypes) {
-            if (!validStorageType(type)) {
+        if (function.localTypeIds.size() != function.localTypes.size()) {
+            diagnostics.report(
+                "RS5111",
+                "bytecode function local type ID count is invalid",
+                {});
+        }
+        for (std::size_t local = 0; local < function.localTypes.size(); ++local) {
+            const auto type = function.localTypes[local];
+            if (!validStorageType(type) ||
+                !validTypeIdentity(
+                     type,
+                     typeIdAt(function.localTypeIds, local))) {
                 diagnostics.report(
                     "RS5111",
-                    "bytecode function has an invalid local type",
+                    "bytecode function has an invalid local type identity",
                     {});
             }
         }
-        for (const auto type : function.registerTypes) {
-            if (!validRegisterType(type)) {
+        if (function.registerTypeIds.size() != function.registerTypes.size()) {
+            diagnostics.report(
+                "RS5112",
+                "bytecode function register type ID count is invalid",
+                {});
+        }
+        for (std::size_t registerIndex = 0;
+             registerIndex < function.registerTypes.size();
+             ++registerIndex) {
+            const auto type = function.registerTypes[registerIndex];
+            if (!validRegisterType(type) ||
+                !validTypeIdentity(
+                     type,
+                     typeIdAt(function.registerTypeIds, registerIndex))) {
                 diagnostics.report(
                     "RS5112",
                     "bytecode function has an invalid or unassigned register type",
@@ -273,7 +307,10 @@ bool verifyModule(
             }
             for (const auto& parameter : block.parameters) {
                 if (parameter.target >= function.registerTypes.size() ||
-                    parameter.type != function.registerTypes[parameter.target]) {
+                    parameter.type != function.registerTypes[parameter.target] ||
+                    parameter.typeId !=
+                        typeIdAt(function.registerTypeIds, parameter.target) ||
+                    !validTypeIdentity(parameter.type, parameter.typeId)) {
                     diagnostics.report(
                         "RS5115",
                         "bytecode block parameter type does not match register table",
@@ -416,6 +453,11 @@ bool verifyModule(
                 ? function.registerTypes[value]
                 : semantic::PrimitiveType::Error;
         };
+        const auto registerTypeId = [&](Register value) {
+            return value < function.registerTypeIds.size()
+                ? function.registerTypeIds[value]
+                : semantic::SymbolId{0};
+        };
         const auto checkUse = [&](
             Register value,
             BlockId useBlock,
@@ -476,7 +518,9 @@ bool verifyModule(
             for (std::size_t index = 0; index < arguments.size(); ++index) {
                 checkUse(arguments[index], from, useIndex);
                 if (registerType(arguments[index]) !=
-                    targetBlock->second->parameters[index].type) {
+                        targetBlock->second->parameters[index].type ||
+                    registerTypeId(arguments[index]) !=
+                        targetBlock->second->parameters[index].typeId) {
                     diagnostics.report(
                         "RS5126",
                         "bytecode branch argument type does not match block parameter",
@@ -506,7 +550,9 @@ bool verifyModule(
                 switch (instruction.opcode) {
                 case Opcode::LoadParameter:
                     if (instruction.index >= function.parameterTypes.size() ||
-                        resultType != function.parameterTypes[instruction.index]) {
+                        resultType != function.parameterTypes[instruction.index] ||
+                        registerTypeId(instruction.result) !=
+                            typeIdAt(function.parameterTypeIds, instruction.index)) {
                         diagnostics.report(
                             "RS5128",
                             "invalid bytecode parameter load",
@@ -535,7 +581,9 @@ bool verifyModule(
                     break;
                 case Opcode::LoadLocal:
                     if (instruction.index >= function.localTypes.size() ||
-                        resultType != function.localTypes[instruction.index]) {
+                        resultType != function.localTypes[instruction.index] ||
+                        registerTypeId(instruction.result) !=
+                            typeIdAt(function.localTypeIds, instruction.index)) {
                         diagnostics.report("RS5133", "invalid bytecode local load", {});
                     }
                     break;
@@ -543,7 +591,9 @@ bool verifyModule(
                     if (instruction.index >= function.localTypes.size() ||
                         instruction.operands.size() != 1 ||
                         registerType(instruction.operands.front()) !=
-                            function.localTypes[instruction.index]) {
+                            function.localTypes[instruction.index] ||
+                        registerTypeId(instruction.operands.front()) !=
+                            typeIdAt(function.localTypeIds, instruction.index)) {
                         diagnostics.report("RS5134", "invalid bytecode local store", {});
                     }
                     break;
@@ -569,6 +619,18 @@ bool verifyModule(
                             {});
                     }
                     break;
+                case Opcode::ConvertNullToArray:
+                    if (instruction.operands.size() != 1 ||
+                        registerType(instruction.operands.front()) !=
+                            semantic::PrimitiveType::Null ||
+                        resultType != semantic::PrimitiveType::Array ||
+                        registerTypeId(instruction.result) == 0) {
+                        diagnostics.report(
+                            "RS5159",
+                            "invalid null-to-array bytecode conversion",
+                            {});
+                    }
+                    break;
                 case Opcode::NewObject:
                     if (instruction.typeIndex >= module.types.size() ||
                         resultType != semantic::PrimitiveType::Object) {
@@ -578,6 +640,78 @@ bool verifyModule(
                             {});
                     }
                     break;
+                case Opcode::NewArray: {
+                    const auto validElement =
+                        instruction.elementType == semantic::PrimitiveType::Bool ||
+                        instruction.elementType == semantic::PrimitiveType::Int ||
+                        instruction.elementType == semantic::PrimitiveType::String ||
+                        instruction.elementType == semantic::PrimitiveType::Object ||
+                        instruction.elementType == semantic::PrimitiveType::Handle;
+                    if (instruction.operands.size() != 1 ||
+                        registerType(instruction.operands.front()) !=
+                            semantic::PrimitiveType::Int ||
+                        resultType != semantic::PrimitiveType::Array ||
+                        registerTypeId(instruction.result) == 0 ||
+                        !validElement ||
+                        !validTypeIdentity(
+                            instruction.elementType, instruction.elementTypeId)) {
+                        diagnostics.report(
+                            "RS5160",
+                            "invalid bytecode array allocation",
+                            {});
+                    }
+                    break;
+                }
+                case Opcode::ArrayLength:
+                    if (instruction.operands.size() != 1 ||
+                        registerType(instruction.operands.front()) !=
+                            semantic::PrimitiveType::Array ||
+                        resultType != semantic::PrimitiveType::Int) {
+                        diagnostics.report(
+                            "RS5161",
+                            "invalid bytecode array length",
+                            {});
+                    }
+                    break;
+                case Opcode::LoadElement:
+                case Opcode::StoreElement: {
+                    const auto validElement =
+                        instruction.elementType == semantic::PrimitiveType::Bool ||
+                        instruction.elementType == semantic::PrimitiveType::Int ||
+                        instruction.elementType == semantic::PrimitiveType::String ||
+                        instruction.elementType == semantic::PrimitiveType::Object ||
+                        instruction.elementType == semantic::PrimitiveType::Handle;
+                    const bool commonValid = validElement &&
+                        validTypeIdentity(
+                            instruction.elementType, instruction.elementTypeId) &&
+                        instruction.operands.size() >= 2 &&
+                        registerType(instruction.operands[0]) ==
+                            semantic::PrimitiveType::Array &&
+                        registerType(instruction.operands[1]) ==
+                            semantic::PrimitiveType::Int;
+                    if (instruction.opcode == Opcode::LoadElement) {
+                        if (!commonValid || instruction.operands.size() != 2 ||
+                            resultType != instruction.elementType ||
+                            registerTypeId(instruction.result) !=
+                                instruction.elementTypeId) {
+                            diagnostics.report(
+                                "RS5162",
+                                "invalid bytecode array element load",
+                                {});
+                        }
+                    } else if (!commonValid || instruction.operands.size() != 3 ||
+                               registerType(instruction.operands[2]) !=
+                                   instruction.elementType ||
+                               registerTypeId(instruction.operands[2]) !=
+                                   instruction.elementTypeId ||
+                               instruction.result != InvalidRegister) {
+                        diagnostics.report(
+                            "RS5163",
+                            "invalid bytecode array element store",
+                            {});
+                    }
+                    break;
+                }
                 case Opcode::CheckNotNull:
                     if (instruction.typeIndex >= module.types.size() ||
                         instruction.operands.size() != 1 ||
@@ -653,7 +787,9 @@ bool verifyModule(
                             reference.parameterTypes.size());
                         for (std::size_t argument = 0; argument < count; ++argument) {
                             if (registerType(instruction.operands[argument]) !=
-                                reference.parameterTypes[argument]) {
+                                    reference.parameterTypes[argument] ||
+                                registerTypeId(instruction.operands[argument]) !=
+                                    typeIdAt(reference.parameterTypeIds, argument)) {
                                 diagnostics.report(
                                     "RS5138",
                                     "bytecode call argument type does not match reference",
@@ -668,7 +804,9 @@ bool verifyModule(
                                     {});
                             }
                         } else if (instruction.result == InvalidRegister ||
-                                   resultType != reference.returnType) {
+                                   resultType != reference.returnType ||
+                                   registerTypeId(instruction.result) !=
+                                       reference.returnTypeId) {
                             diagnostics.report(
                                 "RS5140",
                                 "bytecode call result does not match reference",
@@ -767,7 +905,9 @@ bool verifyModule(
             case TerminatorKind::ReturnValue:
                 checkUse(block.terminator.value, block.id, useIndex);
                 if (function.returnType == semantic::PrimitiveType::Void ||
-                    registerType(block.terminator.value) != function.returnType) {
+                    registerType(block.terminator.value) != function.returnType ||
+                    registerTypeId(block.terminator.value) !=
+                        function.returnTypeId) {
                     diagnostics.report(
                         "RS5148",
                         "bytecode return value does not match function",

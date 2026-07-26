@@ -93,7 +93,7 @@ conv.null.object
 
 `check.notnull` also validates the runtime TypeId. Field instructions carry an owner type descriptor index and a field index.
 
-The physical bytecode format advances to `.rsbc` 0.2 and adds a `TYPES` section. Function metadata and function references serialize exact object TypeIds.
+This slice originally advanced the physical bytecode format to `.rsbc` 0.2 and added a `TYPES` section. The current Phase 3C producer emits `.rsbc` 0.3, retaining these object descriptors while adding arrays, handles and exact register TypeIds.
 
 ## Runtime semantics
 

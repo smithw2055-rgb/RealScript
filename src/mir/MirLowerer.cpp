@@ -34,20 +34,29 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
     result.moduleName = function.symbol.moduleName;
     result.name = function.symbol.name;
     result.returnType = function.symbol.returnType;
-    result.returnTypeId = function.symbol.returnType == semantic::PrimitiveType::Object
+    result.returnTypeId =
+        (function.symbol.returnType == semantic::PrimitiveType::Object ||
+         function.symbol.returnType == semantic::PrimitiveType::Array)
         ? semantic::stableTypeId(function.symbol.returnTypeName)
         : 0;
     result.localTypes.assign(
         function.variableCount,
         semantic::PrimitiveType::Error);
+    result.localTypeIds.assign(function.variableCount, 0);
 
     for (const auto& parameter : function.symbol.parameters) {
         result.parameterTypes.push_back(parameter.type);
         result.parameterTypeIds.push_back(
-            parameter.type == semantic::PrimitiveType::Object
+            (parameter.type == semantic::PrimitiveType::Object ||
+             parameter.type == semantic::PrimitiveType::Array)
                 ? semantic::stableTypeId(parameter.typeName)
                 : 0);
         result.localTypes.at(parameter.index) = parameter.type;
+        result.localTypeIds.at(parameter.index) =
+            (parameter.type == semantic::PrimitiveType::Object ||
+             parameter.type == semantic::PrimitiveType::Array)
+                ? semantic::stableTypeId(parameter.typeName)
+                : 0;
     }
 
     currentFunction_ = &result;
@@ -64,8 +73,14 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
             parameter.type,
             {},
             {});
-        block(*currentBlockId_).instructions.back().integerImmediate =
-            static_cast<std::int64_t>(i);
+        auto& parameterInstruction =
+            block(*currentBlockId_).instructions.back();
+        parameterInstruction.integerImmediate = static_cast<std::int64_t>(i);
+        parameterInstruction.resultTypeId =
+            (parameter.type == semantic::PrimitiveType::Object ||
+             parameter.type == semantic::PrimitiveType::Array)
+                ? semantic::stableTypeId(parameter.typeName)
+                : 0;
         emitStoreLocal(parameter.index, value, {});
     }
 
@@ -96,6 +111,11 @@ void Lowerer::collectLocalTypes(const semantic::BoundStatement& statement) {
                 statement);
         currentFunction_->localTypes.at(declaration.variable.index) =
             declaration.variable.type;
+        currentFunction_->localTypeIds.at(declaration.variable.index) =
+            (declaration.variable.type == semantic::PrimitiveType::Object ||
+             declaration.variable.type == semantic::PrimitiveType::Array)
+                ? semantic::stableTypeId(declaration.variable.typeName)
+                : 0;
         return;
     }
     case semantic::BoundNodeKind::IfStatement: {

@@ -20,7 +20,7 @@ struct ResolvedType {
     std::string name;
 };
 
-ResolvedType resolveType(
+ResolvedType resolveNamedType(
     const std::string& name,
     const TypeSymbolMap& visibleTypes,
     bool allowVoid) {
@@ -38,8 +38,24 @@ ResolvedType resolveType(
     return {};
 }
 
+ResolvedType resolveType(
+    const syntax::TypeSyntax& syntaxTree,
+    const TypeSymbolMap& visibleTypes,
+    bool allowVoid) {
+    const auto element = resolveNamedType(
+        syntaxTree.name.text, visibleTypes, allowVoid && !syntaxTree.isArray());
+    if (element.type == PrimitiveType::Error) return {};
+    if (!syntaxTree.isArray()) return element;
+    if (element.type == PrimitiveType::Void) return {};
+    return {PrimitiveType::Array, arrayTypeName(element.type, element.name)};
+}
+
 std::string displayType(PrimitiveType type, const std::string& name) {
-    return type == PrimitiveType::Object ? name : primitiveTypeName(type);
+    return (type == PrimitiveType::Object ||
+            type == PrimitiveType::Array ||
+            type == PrimitiveType::Handle) && !name.empty()
+        ? name
+        : primitiveTypeName(type);
 }
 
 } // namespace
@@ -52,6 +68,8 @@ const char* primitiveTypeName(PrimitiveType type) noexcept {
     case PrimitiveType::Int: return "int";
     case PrimitiveType::String: return "string";
     case PrimitiveType::Object: return "object";
+    case PrimitiveType::Array: return "array";
+    case PrimitiveType::Handle: return "handle";
     case PrimitiveType::Null: return "null";
     }
     return "<unknown>";
@@ -62,11 +80,46 @@ PrimitiveType resolvePrimitiveType(const std::string& name) noexcept {
     if (name == "bool") return PrimitiveType::Bool;
     if (name == "int") return PrimitiveType::Int;
     if (name == "string") return PrimitiveType::String;
+    if (name == "handle") return PrimitiveType::Handle;
     return PrimitiveType::Error;
 }
 
 bool isNumericType(PrimitiveType type) noexcept {
     return type == PrimitiveType::Int;
+}
+
+bool isReferenceType(PrimitiveType type) noexcept {
+    return type == PrimitiveType::String ||
+        type == PrimitiveType::Object ||
+        type == PrimitiveType::Array;
+}
+
+std::string arrayTypeName(
+    PrimitiveType elementType,
+    const std::string& elementTypeName) {
+    const auto base = elementType == PrimitiveType::Object
+        ? elementTypeName
+        : std::string(primitiveTypeName(elementType));
+    return base.empty() ? std::string{} : base + "[]";
+}
+
+bool decodeArrayTypeName(
+    const std::string& name,
+    PrimitiveType& elementType,
+    std::string& elementTypeName) {
+    if (name.size() < 3 || name.substr(name.size() - 2) != "[]") {
+        return false;
+    }
+    const auto base = name.substr(0, name.size() - 2);
+    const auto primitive = resolvePrimitiveType(base);
+    if (primitive != PrimitiveType::Error && primitive != PrimitiveType::Void) {
+        elementType = primitive;
+        elementTypeName.clear();
+        return true;
+    }
+    elementType = PrimitiveType::Object;
+    elementTypeName = base;
+    return !base.empty();
 }
 
 ConversionKind classifyConversion(
@@ -84,6 +137,9 @@ ConversionKind classifyConversion(
     if (from == PrimitiveType::Null && to == PrimitiveType::Object) {
         return ConversionKind::NullToObject;
     }
+    if (from == PrimitiveType::Null && to == PrimitiveType::Array) {
+        return ConversionKind::NullToArray;
+    }
     return ConversionKind::None;
 }
 
@@ -92,6 +148,7 @@ int conversionRank(PrimitiveType from, PrimitiveType to) noexcept {
     case ConversionKind::Identity: return 0;
     case ConversionKind::NullToString:
     case ConversionKind::NullToObject:
+    case ConversionKind::NullToArray:
         return 1;
     case ConversionKind::None: return -1;
     }
@@ -141,7 +198,7 @@ bool populateTypeFields(
             valid = false;
         }
         const auto resolved = resolveType(
-            fieldSyntax.type.name.text,
+            fieldSyntax.type,
             visibleTypes,
             false);
         if (resolved.type == PrimitiveType::Error) {
@@ -193,7 +250,7 @@ FunctionSymbol declareFunctionSymbol(
     result.name = syntaxTree.identifierToken.text;
 
     const auto returnType = resolveType(
-        syntaxTree.returnType.name.text,
+        syntaxTree.returnType,
         visibleTypes,
         true);
     result.returnType = returnType.type;
@@ -208,7 +265,7 @@ FunctionSymbol declareFunctionSymbol(
     for (std::size_t index = 0; index < syntaxTree.parameters.size(); ++index) {
         const auto& parameterSyntax = syntaxTree.parameters[index];
         const auto parameterType = resolveType(
-            parameterSyntax.type.name.text,
+            parameterSyntax.type,
             visibleTypes,
             false);
         if (parameterType.type == PrimitiveType::Error) {

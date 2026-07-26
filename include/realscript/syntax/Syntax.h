@@ -39,6 +39,8 @@ enum class SyntaxKind {
     CloseParenToken,
     OpenBraceToken,
     CloseBraceToken,
+    OpenBracketToken,
+    CloseBracketToken,
     CommaToken,
     DotToken,
     ColonToken,
@@ -67,6 +69,7 @@ enum class SyntaxKind {
     FloatKeyword,
     DoubleKeyword,
     StringKeyword,
+    HandleKeyword,
     VoidKeyword,
 
     CompilationUnit,
@@ -89,10 +92,13 @@ enum class SyntaxKind {
     BinaryExpression,
     AssignmentExpression,
     MemberAssignmentExpression,
+    ElementAssignmentExpression,
     ParenthesizedExpression,
     CallExpression,
     MemberAccessExpression,
+    ElementAccessExpression,
     NewObjectExpression,
+    NewArrayExpression,
 };
 
 using TokenValue = std::variant<std::monostate, std::int64_t, double, bool, std::string>;
@@ -143,9 +149,14 @@ struct StatementSyntax : SyntaxNode {};
 
 struct TypeSyntax final : SyntaxNode {
     SyntaxToken name;
+    std::optional<SyntaxToken> openBracketToken;
+    std::optional<SyntaxToken> closeBracketToken;
 
+    [[nodiscard]] bool isArray() const noexcept {
+        return openBracketToken.has_value() && closeBracketToken.has_value();
+    }
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::TypeName; }
-    [[nodiscard]] text::TextSpan span() const noexcept override { return name.span; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
 struct LiteralExpressionSyntax final : ExpressionSyntax {
@@ -218,6 +229,29 @@ struct MemberAccessExpressionSyntax final : ExpressionSyntax {
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
+
+struct ElementAccessExpressionSyntax final : ExpressionSyntax {
+    std::unique_ptr<ExpressionSyntax> receiver;
+    SyntaxToken openBracketToken;
+    std::unique_ptr<ExpressionSyntax> index;
+    SyntaxToken closeBracketToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ElementAccessExpression; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct ElementAssignmentExpressionSyntax final : ExpressionSyntax {
+    std::unique_ptr<ExpressionSyntax> receiver;
+    SyntaxToken openBracketToken;
+    std::unique_ptr<ExpressionSyntax> index;
+    SyntaxToken closeBracketToken;
+    SyntaxToken equalsToken;
+    std::unique_ptr<ExpressionSyntax> expression;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ElementAssignmentExpression; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
 struct MemberAssignmentExpressionSyntax final : ExpressionSyntax {
     std::unique_ptr<ExpressionSyntax> receiver;
     SyntaxToken dotToken;
@@ -236,6 +270,18 @@ struct NewObjectExpressionSyntax final : ExpressionSyntax {
     SyntaxToken closeParenToken;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::NewObjectExpression; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+
+struct NewArrayExpressionSyntax final : ExpressionSyntax {
+    SyntaxToken newKeyword;
+    TypeSyntax elementType;
+    SyntaxToken openBracketToken;
+    std::unique_ptr<ExpressionSyntax> length;
+    SyntaxToken closeBracketToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::NewArrayExpression; }
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
@@ -411,7 +457,7 @@ private:
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parsePrimaryExpression();
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parsePostfixExpression();
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseCallExpression();
-    [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseNewObjectExpression();
+    [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseNewExpression();
     [[nodiscard]] bool isVariableDeclarationStart() const noexcept;
 
     const text::SourceText& source_;

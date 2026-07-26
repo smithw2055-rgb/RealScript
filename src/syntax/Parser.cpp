@@ -100,6 +100,11 @@ TypeSyntax Parser::parseType() {
     } else {
         result.name = match(SyntaxKind::IdentifierToken);
     }
+    if (current().kind == SyntaxKind::OpenBracketToken &&
+        peek(1).kind == SyntaxKind::CloseBracketToken) {
+        result.openBracketToken = nextToken();
+        result.closeBracketToken = nextToken();
+    }
     return result;
 }
 
@@ -269,6 +274,19 @@ std::unique_ptr<ExpressionSyntax> Parser::parseAssignmentExpression() {
         return result;
     }
 
+    if (left->kind() == SyntaxKind::ElementAccessExpression) {
+        auto element = std::unique_ptr<ElementAccessExpressionSyntax>(
+            static_cast<ElementAccessExpressionSyntax*>(left.release()));
+        auto result = std::make_unique<ElementAssignmentExpressionSyntax>();
+        result->receiver = std::move(element->receiver);
+        result->openBracketToken = std::move(element->openBracketToken);
+        result->index = std::move(element->index);
+        result->closeBracketToken = std::move(element->closeBracketToken);
+        result->equalsToken = nextToken();
+        result->expression = parseAssignmentExpression();
+        return result;
+    }
+
     if (left->kind() == SyntaxKind::MemberAccessExpression) {
         auto member = std::unique_ptr<MemberAccessExpressionSyntax>(
             static_cast<MemberAccessExpressionSyntax*>(left.release()));
@@ -312,29 +330,60 @@ std::unique_ptr<ExpressionSyntax> Parser::parseBinaryExpression(int parentPreced
 
 std::unique_ptr<ExpressionSyntax> Parser::parsePostfixExpression() {
     auto expression = parsePrimaryExpression();
-    while (current().kind == SyntaxKind::DotToken) {
-        auto member = std::make_unique<MemberAccessExpressionSyntax>();
-        member->receiver = std::move(expression);
-        member->dotToken = nextToken();
-        member->nameToken = match(SyntaxKind::IdentifierToken);
-        expression = std::move(member);
+    for (;;) {
+        if (current().kind == SyntaxKind::DotToken) {
+            auto member = std::make_unique<MemberAccessExpressionSyntax>();
+            member->receiver = std::move(expression);
+            member->dotToken = nextToken();
+            member->nameToken = match(SyntaxKind::IdentifierToken);
+            expression = std::move(member);
+            continue;
+        }
+        if (current().kind == SyntaxKind::OpenBracketToken) {
+            auto element = std::make_unique<ElementAccessExpressionSyntax>();
+            element->receiver = std::move(expression);
+            element->openBracketToken = nextToken();
+            element->index = parseExpression();
+            element->closeBracketToken = match(SyntaxKind::CloseBracketToken);
+            expression = std::move(element);
+            continue;
+        }
+        break;
     }
     return expression;
 }
 
-std::unique_ptr<ExpressionSyntax> Parser::parseNewObjectExpression() {
-    auto result = std::make_unique<NewObjectExpressionSyntax>();
-    result->newKeyword = match(SyntaxKind::NewKeyword);
-    result->type = parseType();
-    result->openParenToken = match(SyntaxKind::OpenParenToken);
-    result->closeParenToken = match(SyntaxKind::CloseParenToken);
+std::unique_ptr<ExpressionSyntax> Parser::parseNewExpression() {
+    const auto newKeyword = match(SyntaxKind::NewKeyword);
+    TypeSyntax type;
+    if (isIdentifierLike(current().kind)) {
+        type.name = nextToken();
+    } else {
+        type.name = match(SyntaxKind::IdentifierToken);
+    }
+
+    if (current().kind == SyntaxKind::OpenParenToken) {
+        auto result = std::make_unique<NewObjectExpressionSyntax>();
+        result->newKeyword = newKeyword;
+        result->type = std::move(type);
+        result->openParenToken = nextToken();
+        result->closeParenToken = match(SyntaxKind::CloseParenToken);
+        return result;
+    }
+
+    auto result = std::make_unique<NewArrayExpressionSyntax>();
+    result->newKeyword = newKeyword;
+    result->elementType = std::move(type);
+    result->openBracketToken = match(SyntaxKind::OpenBracketToken);
+    result->length = parseExpression();
+    result->closeBracketToken = match(SyntaxKind::CloseBracketToken);
     return result;
 }
 
 std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
     switch (current().kind) {
     case SyntaxKind::NewKeyword:
-        return parseNewObjectExpression();
+        return parseNewExpression();
     case SyntaxKind::OpenParenToken: {
         auto result = std::make_unique<ParenthesizedExpressionSyntax>();
         result->openParenToken = nextToken();
@@ -388,8 +437,14 @@ bool Parser::isVariableDeclarationStart() const noexcept {
     if (!isIdentifierLike(current().kind)) {
         return false;
     }
-    return peek(1).kind == SyntaxKind::IdentifierToken &&
-        (peek(2).kind == SyntaxKind::EqualsToken || peek(2).kind == SyntaxKind::SemicolonToken);
+    std::size_t offset = 1;
+    if (peek(offset).kind == SyntaxKind::OpenBracketToken &&
+        peek(offset + 1).kind == SyntaxKind::CloseBracketToken) {
+        offset += 2;
+    }
+    return peek(offset).kind == SyntaxKind::IdentifierToken &&
+        (peek(offset + 1).kind == SyntaxKind::EqualsToken ||
+         peek(offset + 1).kind == SyntaxKind::SemicolonToken);
 }
 
 } // namespace realscript::syntax

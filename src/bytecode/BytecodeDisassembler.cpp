@@ -11,7 +11,8 @@ void printSignatureType(
     semantic::PrimitiveType type,
     semantic::SymbolId typeId) {
     out << semantic::primitiveTypeName(type);
-    if (type == semantic::PrimitiveType::Object && typeId != 0) {
+    if ((type == semantic::PrimitiveType::Object ||
+         type == semantic::PrimitiveType::Array) && typeId != 0) {
         out << "[0x" << std::hex << typeId << std::dec << ']';
     }
 }
@@ -50,7 +51,8 @@ std::string disassembleModule(const Module& module) {
                 if (fieldIndex != 0) out << ", ";
                 const auto& field = type.fields[fieldIndex];
                 out << field.name << ':'
-                    << (field.type == semantic::PrimitiveType::Object
+                    << ((field.type == semantic::PrimitiveType::Object ||
+                          field.type == semantic::PrimitiveType::Array)
                         ? field.typeName
                         : semantic::primitiveTypeName(field.type));
             }
@@ -77,8 +79,9 @@ std::string disassembleModule(const Module& module) {
                         ? reference.parameterTypeIds[parameter]
                         : 0);
             }
-            out << ") -> " << semantic::primitiveTypeName(reference.returnType)
-                << '\n';
+            out << ") -> ";
+            printSignatureType(out, reference.returnType, reference.returnTypeId);
+            out << '\n';
         }
     }
 
@@ -96,24 +99,35 @@ std::string disassembleModule(const Module& module) {
                     ? function.parameterTypeIds[index]
                     : 0);
         }
-        out << ") -> " << semantic::primitiveTypeName(function.returnType)
-            << " {\n";
+        out << ") -> ";
+        printSignatureType(out, function.returnType, function.returnTypeId);
+        out << " {\n";
 
         out << "  registers [";
         for (std::size_t index = 0; index < function.registerTypes.size(); ++index) {
             if (index != 0) {
                 out << ", ";
             }
-            out << 'r' << index << ':'
-                << semantic::primitiveTypeName(function.registerTypes[index]);
+            out << 'r' << index << ':';
+            printSignatureType(
+                out,
+                function.registerTypes[index],
+                index < function.registerTypeIds.size()
+                    ? function.registerTypeIds[index]
+                    : 0);
         }
         out << "]\n  locals [";
         for (std::size_t index = 0; index < function.localTypes.size(); ++index) {
             if (index != 0) {
                 out << ", ";
             }
-            out << index << ':'
-                << semantic::primitiveTypeName(function.localTypes[index]);
+            out << index << ':';
+            printSignatureType(
+                out,
+                function.localTypes[index],
+                index < function.localTypeIds.size()
+                    ? function.localTypeIds[index]
+                    : 0);
         }
         out << "]\n";
 
@@ -125,8 +139,11 @@ std::string disassembleModule(const Module& module) {
                     if (index != 0) {
                         out << ", ";
                     }
-                    out << 'r' << block.parameters[index].target << ':'
-                        << semantic::primitiveTypeName(block.parameters[index].type);
+                    out << 'r' << block.parameters[index].target << ':';
+                    printSignatureType(
+                        out,
+                        block.parameters[index].type,
+                        block.parameters[index].typeId);
                 }
                 out << ')';
             }
@@ -135,10 +152,14 @@ std::string disassembleModule(const Module& module) {
             for (const auto& instruction : block.instructions) {
                 out << "  ";
                 if (instruction.result != InvalidRegister) {
-                    out << 'r' << instruction.result << ':'
-                        << semantic::primitiveTypeName(
-                            function.registerTypes[instruction.result])
-                        << " = ";
+                    out << 'r' << instruction.result << ':';
+                    printSignatureType(
+                        out,
+                        function.registerTypes[instruction.result],
+                        instruction.result < function.registerTypeIds.size()
+                            ? function.registerTypeIds[instruction.result]
+                            : 0);
+                    out << " = ";
                 }
                 out << opcodeName(instruction.opcode);
                 switch (instruction.opcode) {
@@ -163,6 +184,26 @@ std::string disassembleModule(const Module& module) {
                     break;
                 case Opcode::NewObject:
                     out << " type" << instruction.typeIndex;
+                    break;
+                case Opcode::NewArray:
+                    out << ' ' << semantic::primitiveTypeName(instruction.elementType)
+                        << "[r" << instruction.operands.front() << "]";
+                    if (instruction.elementTypeId != 0) {
+                        out << "[0x" << std::hex << instruction.elementTypeId
+                            << std::dec << ']';
+                    }
+                    break;
+                case Opcode::ArrayLength:
+                    out << " r" << instruction.operands.front();
+                    break;
+                case Opcode::LoadElement:
+                    out << " r" << instruction.operands[0] << "[r"
+                        << instruction.operands[1] << ']';
+                    break;
+                case Opcode::StoreElement:
+                    out << " r" << instruction.operands[0] << "[r"
+                        << instruction.operands[1] << "], r"
+                        << instruction.operands[2];
                     break;
                 case Opcode::CheckNotNull:
                     out << " type" << instruction.typeIndex << ", r"

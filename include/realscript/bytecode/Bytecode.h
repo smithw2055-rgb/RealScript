@@ -18,7 +18,7 @@ constexpr Register InvalidRegister = std::numeric_limits<Register>::max();
 
 struct Version {
     std::uint16_t major = 0;
-    std::uint16_t minor = 2;
+    std::uint16_t minor = 3;
 };
 
 enum class Opcode : std::uint8_t {
@@ -31,8 +31,13 @@ enum class Opcode : std::uint8_t {
     StoreLocal,
     ConvertNullToString,
     ConvertNullToObject,
+    ConvertNullToArray,
     NewObject,
+    NewArray,
     CheckNotNull,
+    ArrayLength,
+    LoadElement,
+    StoreElement,
     LoadField,
     StoreField,
     Call,
@@ -66,6 +71,8 @@ struct Instruction {
     std::vector<Register> operands;
     std::uint32_t index = 0;
     std::uint32_t typeIndex = 0;
+    semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
+    semantic::SymbolId elementTypeId = 0;
     std::int64_t integerImmediate = 0;
     bool boolImmediate = false;
     std::string stringImmediate;
@@ -74,6 +81,7 @@ struct Instruction {
 struct BlockParameter {
     Register target = InvalidRegister;
     semantic::PrimitiveType type = semantic::PrimitiveType::Error;
+    semantic::SymbolId typeId = 0;
 };
 
 enum class TerminatorKind : std::uint8_t {
@@ -109,7 +117,9 @@ struct Function {
     std::vector<semantic::PrimitiveType> parameterTypes;
     std::vector<semantic::SymbolId> parameterTypeIds;
     std::vector<semantic::PrimitiveType> localTypes;
+    std::vector<semantic::SymbolId> localTypeIds;
     std::vector<semantic::PrimitiveType> registerTypes;
+    std::vector<semantic::SymbolId> registerTypeIds;
     std::vector<BasicBlock> blocks;
 };
 

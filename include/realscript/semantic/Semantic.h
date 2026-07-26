@@ -21,18 +21,29 @@ enum class PrimitiveType {
     Int,
     String,
     Object,
+    Array,
+    Handle,
     Null,
 };
 
 [[nodiscard]] const char* primitiveTypeName(PrimitiveType type) noexcept;
 [[nodiscard]] PrimitiveType resolvePrimitiveType(const std::string& name) noexcept;
 [[nodiscard]] bool isNumericType(PrimitiveType type) noexcept;
+[[nodiscard]] bool isReferenceType(PrimitiveType type) noexcept;
+[[nodiscard]] std::string arrayTypeName(
+    PrimitiveType elementType,
+    const std::string& elementTypeName = {});
+[[nodiscard]] bool decodeArrayTypeName(
+    const std::string& name,
+    PrimitiveType& elementType,
+    std::string& elementTypeName);
 
 enum class ConversionKind {
     None,
     Identity,
     NullToString,
     NullToObject,
+    NullToArray,
 };
 
 [[nodiscard]] ConversionKind classifyConversion(
@@ -116,8 +127,12 @@ enum class BoundNodeKind {
     ConversionExpression,
     CallExpression,
     NewObjectExpression,
+    NewArrayExpression,
+    ArrayLengthExpression,
+    ElementAccessExpression,
     MemberAccessExpression,
     MemberAssignmentExpression,
+    ElementAssignmentExpression,
     BlockStatement,
     ReturnStatement,
     IfStatement,
@@ -232,6 +247,33 @@ struct BoundNewObjectExpression final : BoundExpression {
     }
 };
 
+
+struct BoundNewArrayExpression final : BoundExpression {
+    PrimitiveType elementType = PrimitiveType::Error;
+    std::string elementTypeName;
+    std::unique_ptr<BoundExpression> length;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::NewArrayExpression;
+    }
+};
+
+struct BoundArrayLengthExpression final : BoundExpression {
+    std::unique_ptr<BoundExpression> receiver;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::ArrayLengthExpression;
+    }
+};
+
+struct BoundElementAccessExpression final : BoundExpression {
+    std::unique_ptr<BoundExpression> receiver;
+    std::unique_ptr<BoundExpression> index;
+    PrimitiveType elementType = PrimitiveType::Error;
+    std::string elementTypeName;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::ElementAccessExpression;
+    }
+};
+
 struct BoundMemberAccessExpression final : BoundExpression {
     std::unique_ptr<BoundExpression> receiver;
     TypeSymbol ownerType;
@@ -248,6 +290,18 @@ struct BoundMemberAssignmentExpression final : BoundExpression {
     std::unique_ptr<BoundExpression> expression;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::MemberAssignmentExpression;
+    }
+};
+
+
+struct BoundElementAssignmentExpression final : BoundExpression {
+    std::unique_ptr<BoundExpression> receiver;
+    std::unique_ptr<BoundExpression> index;
+    std::unique_ptr<BoundExpression> expression;
+    PrimitiveType elementType = PrimitiveType::Error;
+    std::string elementTypeName;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::ElementAssignmentExpression;
     }
 };
 
@@ -353,10 +407,16 @@ private:
         const syntax::CallExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindNewObjectExpression(
         const syntax::NewObjectExpressionSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundExpression> bindNewArrayExpression(
+        const syntax::NewArrayExpressionSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundExpression> bindElementAccessExpression(
+        const syntax::ElementAccessExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindMemberAccessExpression(
         const syntax::MemberAccessExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindMemberAssignmentExpression(
         const syntax::MemberAssignmentExpressionSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundExpression> bindElementAssignmentExpression(
+        const syntax::ElementAssignmentExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> convertExpression(
         std::unique_ptr<BoundExpression> expression,
         PrimitiveType target,

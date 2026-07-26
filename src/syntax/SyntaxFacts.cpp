@@ -31,6 +31,8 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(CloseParenToken);
         RS_KIND(OpenBraceToken);
         RS_KIND(CloseBraceToken);
+        RS_KIND(OpenBracketToken);
+        RS_KIND(CloseBracketToken);
         RS_KIND(CommaToken);
         RS_KIND(DotToken);
         RS_KIND(ColonToken);
@@ -58,6 +60,7 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(FloatKeyword);
         RS_KIND(DoubleKeyword);
         RS_KIND(StringKeyword);
+        RS_KIND(HandleKeyword);
         RS_KIND(VoidKeyword);
         RS_KIND(CompilationUnit);
         RS_KIND(ModuleDeclaration);
@@ -79,10 +82,13 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(BinaryExpression);
         RS_KIND(AssignmentExpression);
         RS_KIND(MemberAssignmentExpression);
+        RS_KIND(ElementAssignmentExpression);
         RS_KIND(ParenthesizedExpression);
         RS_KIND(CallExpression);
         RS_KIND(MemberAccessExpression);
+        RS_KIND(ElementAccessExpression);
         RS_KIND(NewObjectExpression);
+        RS_KIND(NewArrayExpression);
 #undef RS_KIND
     }
     return "UnknownSyntaxKind";
@@ -113,6 +119,7 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"float", SyntaxKind::FloatKeyword},
         {"double", SyntaxKind::DoubleKeyword},
         {"string", SyntaxKind::StringKeyword},
+        {"handle", SyntaxKind::HandleKeyword},
         {"void", SyntaxKind::VoidKeyword},
     };
     const auto it = keywords.find(textValue);
@@ -170,6 +177,7 @@ bool isPrimitiveTypeKeyword(SyntaxKind kind) noexcept {
     case SyntaxKind::FloatKeyword:
     case SyntaxKind::DoubleKeyword:
     case SyntaxKind::StringKeyword:
+    case SyntaxKind::HandleKeyword:
     case SyntaxKind::VoidKeyword:
         return true;
     default:
