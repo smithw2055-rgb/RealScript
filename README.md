@@ -1,90 +1,31 @@
 # RealScript
 
-RealScript 是一门面向现代游戏引擎的嵌入式强类型脚本语言与运行时。
+**English** | [简体中文](README.zh-CN.md)
 
-它采用接近 C# 的表达方式，以 C++17 游戏引擎为主要宿主，长期目标包括：快速字节码解释、C++17 AOT、可选原生 JIT（当前为外部 C++ 工具链路径，未来可接 LLVM ORC）、源码级调试、热重载、沙箱 Mod，以及固定 Tick 的确定性模拟。
+RealScript is an embedded, strongly typed scripting language and runtime designed for modern game engines. It uses a C#-inspired syntax and targets C++17 hosts through a verified bytecode interpreter, deterministic C++17 AOT generation, and an optional native toolchain JIT.
 
-> 当前状态：Draft v0.1 规范基线，以及 Phase 1–6 编译器、字节码运行时、对象与值模型、调试/LSP/热重载、C++17 AOT、确定性执行、MIR 优化、Profile、Benchmark 与可选工具链 JIT 已经完成。语言、字节码、对象 ABI 和 GC 策略尚未冻结。
+> **Project status:** the planned Phase 1–6 technical roadmap is complete and forms the RealScript v0.1 alpha baseline. The source language, `.rsbc` format, object ABI, native module ABI, and GC contracts are still draft specifications and are not yet frozen for long-term compatibility.
 
-## 当前可运行能力
+## Highlights
 
-Phase 1A–6 已经实现：
+- Dependency-free C++17 and CMake foundation.
+- Lexer, parser, binder, flow analysis, stable diagnostics, and incremental module compilation.
+- Verified multi-block Typed MIR with explicit locals, block parameters, and O0/O1/O2 optimization levels.
+- Typed register bytecode, deterministic `.rsbc` 0.5 encoding, disassembly, defensive decoding, and strict verification.
+- Bytecode interpreter with structured errors, script stacks, instruction budgets, recursion budgets, and runtime statistics.
+- Classes, constructors, methods, properties, arrays, enums, structs, strings, native handles, and exact type identities.
+- Precise shadow-stack roots, generation-checked `ObjectRef` handles, incremental mark/sweep GC, write barriers, heap snapshots, retaining paths, and leak summaries.
+- DAP debugger, LSP language server, source-level debug information, and body-only hot reload.
+- Deterministic C++17 AOT generation, reusable CMake integration, and a C11/C++ native module query ABI.
+- Strict, Record, and Replay execution modes with stable execution digests and host-binding determinism policies.
+- Per-function profiling, stable benchmark output, and the `rsbench` CLI.
+- Optional external C++17 toolchain JIT with shared-library loading, ABI validation, and content-addressed caching.
+- Interpreter/AOT/JIT differential validation.
+- Ubuntu and Windows Server 2025 / Visual Studio 2026 GitHub Actions coverage.
 
-- 无外部依赖的 C++17/CMake 工程；
-- `SourceText`、`TextSpan` 和 CRLF/LF 行列映射；
-- 稳定诊断编号和错误累积；
-- Lexer、注释、字符串和数值 Token；
-- `module`、`import` 和 C# 风格函数解析；
-- Pratt 表达式解析与右结合赋值；
-- `if` / `else`、`while` 和可变局部变量；
-- `void`、`bool`、`int`、`long`、`double`、`string` 基础类型；
-- 确定赋值与全路径返回分析；
-- 函数预声明、前向调用和直接递归所需的符号基础；
-- 同名函数重载和基础转换排序；
-- 同模块多文件聚合及跨模块 `import`；
-- 与源码顺序无关的稳定 `SymbolId`；
-- 多基本块 Typed MIR、显式局部槽位和块参数；
-- `&&` / `||` 短路控制流；
-- 直接调用、转换、类型、目标块、支配关系和终结指令 MIR 验证；
-- 模块源码、公有签名和依赖指纹；
-- 基于上一轮 `BuildSnapshot` 的模块级语义/MIR 复用；
-- 类型化寄存器字节码、函数引用表和块参数；
-- `.rsbc` 0.5 Section 容器、class/struct/enum 描述符、精确 TypeId、源码/序列点/局部变量调试表、确定性编码和防御性解码；
-- 字节码反汇编器与语义验证器；
-- 类型化寄存器解释器、调用帧和跨模块调用；
-- Checked Arithmetic Trap、运行时错误和脚本栈；
-- 指令预算、递归预算与外部函数解析边界；
-- 可复用 `ProgramImage`、`BindingRegistry`、Trace 和运行统计；
-- `ObjectRef` 代际句柄、String/Array/Record 托管对象；
-- 精确 Shadow Stack 根、持久根和增量 Mark/Sweep；
-- 写屏障、GC 工作预算、回收统计和托管字符串字面量；
-- 模块级 `class`、稳定 TypeId 和声明顺序字段布局；
-- `new Type()`、字段读写、对象 Null Check 和身份相等；
-- 对象 MIR/Bytecode、精确引用字段图和运行时签名 TypeId 校验；
-- `T[]`、`new T[length]`、元素读写、`.length` 和数组身份相等；
-- 数组 MIR/Bytecode、边界检查、精确元素 TypeId 与数组写屏障；
-- `handle` 传递、Native Handle 注册表身份与代际安全和宿主 TypeId 校验；
-- 跨堆 `ObjectRef` 隔离、RAII 持久根、Heap Snapshot、Retaining Path 和泄漏摘要；
-- 类实例/静态方法、隐式 `this`、构造函数重载和直接成员调用；
-- 显式属性、class 自动属性、稳定 accessor SymbolId 和 null receiver 检查；
-- `enum` 精确类型身份、显式/递增成员值和同类型相等；
-- `struct` 构造、只读实例方法、getter 属性、局部字段更新和复制值语义；
-- struct 数组、嵌套托管引用精确扫描和递归值布局诊断；
-- `int -> long -> double` 数值提升、checked 整数和 IEEE binary64 运算；
-- Typed MIR 到确定性 C++17 的原生 AOT 生成；
-- AOT 对象、数组、struct、enum、数值、字符串、调用、预算和精确 GC 语义；
-- C11/C++ 兼容的 Native Module 查询 ABI、稳定函数表和内容哈希；
-- 类型化 Native Thunk、CMake AOT 目标和解释器/AOT 差分测试；
-- O0/O1/O2 Typed MIR 优化、常量/分支折叠、不可达块清理和保守 DCE；
-- Strict/Record/Replay 确定性执行、稳定摘要和 Host Binding 确定性策略；
-- Interpreter/AOT/JIT 统一 Trace 顺序与逐函数 Profile；
-- 外部 C++17 工具链 JIT、共享库动态加载、C ABI 验证和内容哈希缓存；
-- `rsbench` 稳定基准输出、优化统计、语义摘要和 JSON Profile；
-- `rsc` Token、检查、MIR、Symbol、Bytecode 和二进制输出模式；
-- `rsaot` C++17 生成器、`rsbench` 基准工具、`rsdebug` DAP 适配器和 `rslsp` 语言服务器；
-- Linux/Windows GitHub Actions 构建；
-- 前端、控制流、模块、调用、增量编译、字节码与 AOT 差分测试。
+## Quick Start
 
-实现边界见：
-
-- [Phase 1A — C++17 Language Foundation](docs/roadmap/PHASE_1A.md)
-- [Phase 1B — Control Flow and Multi-Block MIR](docs/roadmap/PHASE_1B.md)
-- [Phase 1C — Calls, Modules and Incremental Compilation](docs/roadmap/PHASE_1C.md)
-- [Phase 2A — Typed Register Bytecode](docs/roadmap/PHASE_2A.md)
-- [Phase 2B — Bytecode Interpreter and Runtime Baseline](docs/roadmap/PHASE_2B.md)
-- [Phase 2C — Linking, Observability and Embedding](docs/roadmap/PHASE_2C.md)
-- [Phase 3A — Managed Heap and Precise GC Baseline](docs/roadmap/PHASE_3A.md)
-- [Phase 3B — Language-visible Object Model and Fields](docs/roadmap/PHASE_3B.md)
-- [Phase 3C — Arrays, Native Handles and Heap Diagnostics](docs/roadmap/PHASE_3C.md)
-- [Phase 3D — Methods, Constructors and Properties](docs/roadmap/PHASE_3D.md)
-- [Phase 3E — Numeric Values, Enums and Structs](docs/roadmap/PHASE_3E.md)
-- [Phase 4 — Debugging, Language Services and Hot Reload](docs/roadmap/PHASE_4.md)
-- [Phase 5 — C++17 AOT Backend](docs/roadmap/PHASE_5.md)
-- [Phase 6 — Determinism, Optimization, Profiling and Optional JIT](docs/roadmap/PHASE_6.md)
-
-## 快速开始
-
-### 构建
+### Build and test
 
 ```bash
 cmake -S . -B build \
@@ -94,9 +35,9 @@ cmake --build build --config Debug
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-### 多文件模块示例
+### Compile multiple source files
 
-`math.rs`：
+`math.rs`:
 
 ```csharp
 module Game.Math;
@@ -105,14 +46,9 @@ int twice(int value)
 {
     return value * 2;
 }
-
-string choose(string value)
-{
-    return value;
-}
 ```
 
-`main.rs`：
+`main.rs`:
 
 ```csharp
 module Game.Main;
@@ -124,472 +60,207 @@ int main()
 }
 ```
 
-同时检查多个源文件：
+Compile, inspect MIR, and list stable symbols:
 
 ```bash
 rsc math.rs main.rs
-```
-
-打印并验证 Typed MIR：
-
-```bash
 rsc math.rs main.rs --mir
-```
-
-查看稳定函数符号：
-
-```bash
 rsc math.rs main.rs --symbols
 ```
 
-输出示意：
-
-```text
-Game.Math::twice 0x...
-Game.Math::choose 0x...
-Game.Main::main 0x...
-```
-
-函数调用在 MIR 中通过稳定 `SymbolId` 表达：
-
-```text
-%argument:int = const.i32 21
-%result:int = call @Game.Math::twice[0x...](%argument)
-ret %result
-```
-
-生成并检查类型化字节码：
+Run an entry function:
 
 ```bash
-rsc math.rs --bytecode
-rsc math.rs --emit-bytecode math.rsbc
-rsc math.rsbc --disassemble
+rsc math.rs main.rs --run Game.Main::main
 ```
 
-`.rsbc` 在执行前必须先通过物理解码检查和字节码语义验证。
+Run with optimization, deterministic execution, profiling, and a stable digest:
 
-### 生成 C++17 AOT 程序
+```bash
+rsc math.rs main.rs \
+  --run Game.Main::main \
+  --opt-level 2 \
+  --deterministic \
+  --profile \
+  --digest
+```
+
+### Bytecode
+
+```bash
+rsc math.rs main.rs --bytecode
+rsc math.rs main.rs --emit-bytecode game.rsbc
+rsc game.rsbc --disassemble
+```
+
+A `.rsbc` module must pass physical decoding and semantic verification before execution.
+
+### C++17 AOT
 
 ```bash
 rsaot \
   --output-dir build/generated/game \
   --program-name GameScripts \
+  --opt-level 2 \
+  --opt-report \
   math.rs main.rs
 ```
 
-输出包含生成头文件、C++17 源码和确定性 manifest。生成源码直接执行 Typed MIR 控制流，不嵌入字节码解释器。
+The generator emits a header, C++17 source, source-map metadata, and a deterministic manifest. Generated code executes verified Typed MIR directly; it does not embed the bytecode interpreter.
 
-CMake 工程可以直接创建原生 AOT 库：
+CMake projects can create a native AOT library directly:
 
 ```cmake
 include(cmake/RealScriptAot.cmake)
 
 realscript_add_aot_library(GameScriptsAot
     PROGRAM_NAME GameScripts
+    OPT_LEVEL 2
     SOURCES math.rs main.rs
 )
 
 target_link_libraries(game PRIVATE GameScriptsAot)
 ```
 
-宿主可以使用生成头文件中的 `ProgramDescriptor`，或通过稳定 C ABI `rs_module_query_v1` 查询内容哈希和原生函数表。
-
-执行无参数入口函数：
+### Benchmarking
 
 ```bash
-rsc game.rs --run Game.Main::main
+rsbench \
+  --entry Game.Main::main \
+  --warmup 20 \
+  --iterations 1000 \
+  --opt-level 2 \
+  --json \
+  math.rs main.rs
 ```
 
-Phase 2B 已加入类型化寄存器解释器、函数调用、分支参数、预算与结构化运行时错误。
+### Debugger and language server
 
-## Phase 1C 的符号与增量模型
-
-### 稳定函数身份
-
-函数的首版规范键为：
-
-```text
-<module>::<name>(<parameter-types>)
+```bash
+rsdebug game.rs common.rs   # Debug Adapter Protocol over stdin/stdout
+rslsp                       # Language Server Protocol over stdin/stdout
 ```
 
-返回类型不参与重载身份，因此不能只通过返回类型声明两个重载。`SymbolId` 由规范键稳定散列得到，不依赖源码顺序、内存地址或本次进程。
+## Command-Line Tools
 
-### 重载解析
+| Tool | Purpose |
+|---|---|
+| `rsc` | Compile, validate, inspect MIR/bytecode, run scripts, and emit profiles/digests. |
+| `rsaot` | Generate deterministic C++17 AOT sources and manifests. |
+| `rsdebug` | Source-level DAP debug adapter. |
+| `rslsp` | LSP language server. |
+| `rsbench` | Deterministic benchmark and profile runner. |
 
-Phase 1C 的转换排序刻意保持较小：
-
-1. 精确类型匹配；
-2. `null → string`；
-3. 其他转换不可用。
-
-这足以建立可验证的候选选择框架，同时避免在完整数值类型尚未实现时过早冻结提升规则。
-
-### 模块增量复用
-
-每个模块记录三类指纹：
-
-- `sourceFingerprint`：模块全部源文件的路径和内容；
-- `publicFingerprint`：排序后的函数公有签名；
-- `dependencyFingerprint`：直接导入模块的公有指纹。
-
-源码实现发生变化时，仅重建该模块；如果公有签名未变，依赖模块可以复用上一轮 MIR。公有签名变化时，直接依赖模块会失效并重新绑定。
-
-当前增量层复用语义和 MIR 结果，Lexer/Parser 的语法树缓存将在后续增量前端切片中补充。
-
-## Phase 2A 的字节码边界
-
-字节码保留多基本块、类型化寄存器、显式局部槽位和边参数。MIR `ValueId` 直接映射到寄存器，调用通过带签名的函数引用表索引表达。
-
-`.rsbc` 0.5 使用 little-endian 固定宽度整数和六个 Section：字符串、类型描述符、函数引用、函数元数据、代码和调试信息。0.5 在 0.4 成员/值类型模型上增加源码表、行映射、Sequence Point、局部变量与词法作用域。编码器不写入时间戳、裸地址或平台结构体填充，因此同一模块能够稳定地产生相同字节。
-
-Decoder 负责文件边界、Section、计数和 Tag；Verifier 继续检查类型、定义支配、分支参数、调用和返回。两层都成功前不得进入执行器。
-
-## 当前实现限制
-
-尚未实现：
-
-- `interface`、继承、virtual/abstract 分派、访问控制和命名导入；
-- `byte`/`short`/无符号整数、binary32 `float`、`char` 和用户定义转换；
-- `ref`/`out`、可变 struct receiver、装箱和 nullable value；
-- 泛型和运行时构造未知泛型实例；
-- `break`、`continue`、`for`、`foreach`、`switch`；
-- 异常和协程；
-- 增量语法树与持久化构建缓存；
-- 异常表、协程状态、优化 AOT stack map 和原生调试变量位置。
-
-未实现能力会得到明确诊断，不会使用占位运行时行为假装支持。
-
-## 目标架构
+## Architecture
 
 ```text
-RealScript Source Files
-        │
-        ▼
+RealScript source files
+        |
+        v
 Lexer / Parser / Syntax Trees
-        │
-        ▼
+        |
+        v
 Compilation / Module Graph / Symbol Predeclaration
-        │
-        ▼
+        |
+        v
 Binder / Overload Resolution / Flow Analysis
-        │
-        ▼
-Verified Multi-Block Typed MIR
-        │
-        ├────────► Register Bytecode ─► Bytecode VM
-        ├────────► Generated C++17 ───► Platform AOT Compiler
-        └────────► LLVM IR ───────────► Optional ORC JIT
+        |
+        v
+Verified multi-block Typed MIR
+        |
+        +--------> Register bytecode -----> Bytecode VM
+        +--------> Generated C++17 -------> Platform AOT compiler
+        +--------> Toolchain JIT ---------> Shared native module
 
-Shared Runtime ABI / Metadata / GC / Bindings / Debug Info
-        │
-        ▼
-C++17 Game Engine
+Shared type system / runtime services / metadata / GC / bindings / debug info
+        |
+        v
+C++17 game engine
 ```
 
-解释、AOT 和 JIT 必须共享类型系统、MIR、运行时 ABI 和差分测试。任何后端都不得直接绕过 MIR 解释 AST。
+All execution backends share the same type system, verified MIR semantics, runtime contracts, and differential tests. A backend must not bypass MIR and reinterpret the source AST independently.
 
-## 代码结构
+## Source Layout
 
 ```text
 include/realscript/
-  text/          SourceText 和 TextSpan
-  diagnostics/   稳定诊断模型
-  syntax/        Token、AST、Lexer 和 Parser
-  semantic/      类型、Symbol、Bound Tree、Binder 和 Flow Analysis
-  mir/           多基本块 Typed MIR、Lowerer 和 Verifier
-  compiler/      多文件 Compilation、模块图和增量快照
-  bytecode/      类型化寄存器字节码、Codec、Verifier 和 Disassembler
-  runtime/       ProgramImage、Interpreter、ManagedHeap 和宿主嵌入
-  debug/         Debug Info、DebugSession 和 DAP
-  tooling/       JSON、LanguageService 和 LSP
-  hot_reload/    ProgramImage 兼容性分析与原子替换
-  aot_cpp/       C++17 生成器、AOT Runtime 和公共 C ABI
-  optimization/  Typed MIR 优化器和优化统计
-  jit/           可选 C++ 工具链 JIT 与动态模块生命周期
-src/              对应实现
-tools/rsc/        编译器命令行
-tools/rsdebug/    DAP 调试适配器
-tools/rslsp/      LSP 语言服务器
-tools/rsaot/      C++17 AOT 生成器
-tools/rsbench/    确定性性能与 Profile 基准工具
-cmake/             可复用 AOT 构建集成
-tests/fixtures/   源码 conformance fixtures
-tests/snapshots/  MIR snapshots
-docs/spec/        Draft v0.1 规范
-docs/roadmap/     实现切片和路线图
+  text/          SourceText and TextSpan
+  diagnostics/   Stable diagnostics
+  syntax/        Tokens, AST, lexer, and parser
+  semantic/      Types, symbols, bound trees, binder, and flow analysis
+  mir/           Multi-block Typed MIR, lowering, printing, and verification
+  compiler/      Multi-file compilation, module graph, and incremental snapshots
+  bytecode/      Register bytecode, codec, verifier, and disassembler
+  runtime/       ProgramImage, interpreter, execution services, and managed heap
+  debug/         Debug metadata, debug sessions, and DAP
+  tooling/       JSON, language services, and LSP
+  hot_reload/    ProgramImage compatibility analysis and atomic replacement
+  aot_cpp/       C++17 generator, AOT runtime, and public C ABI
+  optimization/  Typed MIR optimizer and optimization statistics
+  jit/           Optional toolchain JIT and dynamic module lifetime
+src/              Implementations
+tools/rsc/        Compiler and runtime CLI
+tools/rsaot/      C++17 AOT generator
+tools/rsdebug/    DAP adapter
+tools/rslsp/      LSP server
+tools/rsbench/    Benchmark and profile tool
+cmake/             Reusable AOT integration
+tests/             Conformance, regression, differential, and integration tests
+docs/en/           Default English documentation
+docs/spec/         Detailed Chinese specification set
+docs/roadmap/      Detailed Chinese implementation roadmap
 ```
 
-## 文档
+## Documentation
 
-- [总体架构设计](docs/ENGINE_DESIGN.md)
-- [规范文档索引](docs/spec/README.md)
-- [语言规范 Draft v0.1](docs/spec/LANGUAGE_SPEC.md)
-- [Typed MIR 规范 Draft v0.1](docs/spec/MIR_SPEC.md)
-- [运行时模型规范 Draft v0.1](docs/spec/RUNTIME_MODEL.md)
-- [字节码与原生 ABI 规范 Draft v0.1](docs/spec/BYTECODE_AND_ABI.md)
-- [`.rsbc` 0.5 物理格式](docs/spec/BYTECODE_FORMAT_V0.md)
-- [Embedding and Observability Draft v0.1](docs/spec/EMBEDDING_AND_OBSERVABILITY_V0.md)
-- [Managed Heap and GC Implemented Draft v0.1](docs/spec/MANAGED_HEAP_GC_V0.md)
-- [Arrays, Native Handles and Heap Diagnostics Draft v0.1](docs/spec/ARRAYS_NATIVE_HANDLES_HEAP_DIAGNOSTICS_V0.md)
-- [Methods, Constructors and Properties Draft v0.1](docs/spec/MEMBERS_PROPERTIES_V0.md)
-- [Numeric, Enum and Struct Values Draft v0.1](docs/spec/NUMERIC_ENUM_STRUCT_V0.md)
-- [Debug Information, Tooling and Hot Reload Draft v0.1](docs/spec/DEBUG_TOOLING_HOT_RELOAD_V0.md)
-- [C++17 AOT Backend and Native Module ABI Draft v0.1](docs/spec/CXX17_AOT_V0.md)
-- [Determinism, Optimization, Profiling and Optional JIT Draft v0.1](docs/spec/DETERMINISM_OPTIMIZATION_JIT_V0.md)
-- [Phase 1A 实现说明](docs/roadmap/PHASE_1A.md)
-- [Phase 1B 实现说明](docs/roadmap/PHASE_1B.md)
-- [Phase 1C 实现说明](docs/roadmap/PHASE_1C.md)
-- [Phase 2A 实现说明](docs/roadmap/PHASE_2A.md)
-- [Phase 2B 实现说明](docs/roadmap/PHASE_2B.md)
-- [Phase 2C 实现说明](docs/roadmap/PHASE_2C.md)
-- [Phase 3A 实现说明](docs/roadmap/PHASE_3A.md)
-- [Phase 3B 实现说明](docs/roadmap/PHASE_3B.md)
-- [Phase 3C 实现说明](docs/roadmap/PHASE_3C.md)
-- [Phase 3D 实现说明](docs/roadmap/PHASE_3D.md)
-- [Phase 3E 实现说明](docs/roadmap/PHASE_3E.md)
-- [Phase 4 实现说明](docs/roadmap/PHASE_4.md)
-- [Phase 5 实现说明](docs/roadmap/PHASE_5.md)
-- [Phase 6 实现说明](docs/roadmap/PHASE_6.md)
+The default documentation language is English:
 
-## 路线图
+- [Documentation home](docs/README.md)
+- [English documentation library](docs/en/README.md)
+- [Getting started](docs/en/GETTING_STARTED.md)
+- [Architecture](docs/en/ARCHITECTURE.md)
+- [Language and type system](docs/en/LANGUAGE_AND_TYPE_SYSTEM.md)
+- [Compilation, MIR, and bytecode](docs/en/COMPILATION_AND_BYTECODE.md)
+- [Runtime, GC, and embedding](docs/en/RUNTIME_GC_AND_EMBEDDING.md)
+- [Debugging, tooling, and hot reload](docs/en/DEBUGGING_TOOLING_AND_HOT_RELOAD.md)
+- [AOT, JIT, and performance](docs/en/AOT_JIT_AND_PERFORMANCE.md)
+- [Determinism and replay](docs/en/DETERMINISM_AND_REPLAY.md)
+- [Project status and roadmap](docs/en/PROJECT_STATUS_AND_ROADMAP.md)
 
-- [x] 总体语言和运行时方向；
-- [x] Draft v0.1 语言、MIR、运行时、字节码与 ABI 规范；
-- [x] Phase 1A：C++17 工程、Lexer、Parser、Binder 和单块 MIR；
-- [x] Phase 1B：赋值、控制流、流分析、多块 MIR、块参数和验证器；
-- [x] Phase 1C：函数调用、重载、模块符号和增量编译；
-- [x] Phase 2A：类型化寄存器字节码、编码器、反汇编器和验证器；
-- [x] Phase 2B：解释器、调用栈、运行时错误和执行预算；
-- [x] Phase 2C：链接镜像、宿主绑定、Trace 和嵌入门面；
-- [x] Phase 3A：托管引用、精确根和增量 Mark/Sweep；
-- [x] Phase 3B：class、对象字段、类型描述符和对象 Bytecode；
-- [x] Phase 3C：数组、Native Handle、Heap Snapshot 和泄漏诊断；
-- [x] Phase 3D：方法、构造函数、属性和直接成员调用；
-- [x] Phase 3E：long/double、enum、struct 和复制值语义；
-- [x] Phase 4：Debug Info、DAP、LSP 和函数体热重载；
-- [x] Phase 5：C++17 AOT、Native Module ABI、Source Map 和差分测试；
-- [x] Phase 6：确定性 Record/Replay、MIR 优化、Profile、Benchmark 和可选工具链 JIT。
+Chinese documentation remains available:
 
-## 主要参考方向
+- [Chinese documentation home](docs/zh-CN/README.md)
+- [Chinese architecture design](docs/ENGINE_DESIGN.md)
+- [Chinese specification index](docs/spec/README.md)
+- [Chinese phase roadmap](docs/roadmap/PHASE_1A.md)
 
-RealScript 组合参考 AngelScript 的嵌入与调试接口、Luau 的 VM 性能工程、Unity IL2CPP 的 C++ AOT 路径、LLVM ORC 的可选 JIT，以及 DAP/LSP 的编辑器协议。
+## Completed Roadmap
+
+- [x] Phase 1: language frontend, control flow, calls, modules, and incremental compilation.
+- [x] Phase 2: typed register bytecode, interpreter, linking, observability, and embedding.
+- [x] Phase 3: managed heap, precise GC, objects, arrays, native handles, members, and value types.
+- [x] Phase 4: debug information, DAP, LSP, and body-only hot reload.
+- [x] Phase 5: C++17 AOT, native module ABI, source maps, and differential testing.
+- [x] Phase 6: deterministic record/replay, MIR optimization, profiling, benchmarking, and optional toolchain JIT.
+
+## Stability and Deliberate Limits
+
+RealScript v0.1 is an alpha technical baseline, not a frozen 1.0 language or binary platform.
+
+The following remain intentionally unfrozen:
+
+- source-language compatibility;
+- `.rsbc` bytecode compatibility;
+- object and native module ABI compatibility;
+- GC and embedding contracts;
+- cross-toolchain distribution of precompiled AOT modules.
+
+Notable features that are not implemented include inheritance, interfaces, virtual dispatch, generics, exceptions, coroutines, `ref`/`out`, direct machine-code JIT generation, OSR, PGO, and a fixed-tick deterministic standard library. Unsupported capabilities produce explicit diagnostics rather than placeholder runtime behavior.
+
+## Design References
+
+RealScript combines ideas from AngelScript's embedding and debugging model, Luau's VM performance engineering, Unity IL2CPP's C++ AOT workflow, native JIT toolchains, and the DAP/LSP editor protocols.
 
 ## License
 
-许可证尚未确定。在许可证文件提交前，请勿假定本仓库代码或文档可用于再分发。
-
-
-## Phase 2C 嵌入接口
-
-Phase 2C 增加可复用的链接镜像、宿主绑定注册表和执行观察接口：
-
-```cpp
-auto image = runtime::ProgramImage::link(std::move(modules), error);
-auto sharedImage = std::make_shared<runtime::ProgramImage>(std::move(*image));
-auto bindings = std::make_shared<runtime::BindingRegistry>();
-bindings->bind("Host::log", hostLogFunction);
-
-runtime::EngineRuntime runtime(sharedImage);
-runtime.setBindings(bindings);
-
-runtime::ExecutionOptions options;
-options.trace = [](const runtime::TraceEvent& event) {
-    // 记录函数、指令、分支和外部调用
-};
-auto result = runtime.invoke("Game.Main::main", {}, options);
-```
-
-详细说明：
-
-- [Phase 2C — Linking, Observability and Embedding](docs/roadmap/PHASE_2C.md)
-- [Embedding and Observability Draft v0.1](docs/spec/EMBEDDING_AND_OBSERVABILITY_V0.md)
-
-
-## Phase 3A 托管堆与精确 GC
-
-Phase 3A 建立非移动托管堆，并将脚本字符串字面量迁移为代际 `ObjectRef`：
-
-```cpp
-runtime::EngineRuntime runtime(sharedImage);
-auto heap = runtime.heap();
-
-auto array = heap->allocateArray(4);
-auto text = heap->allocateString("hello");
-heap->arraySet(*array, 0, *text);
-
-const auto root = heap->addPersistentRoot(*array);
-heap->requestCollection();
-// 解释器会在指令 safepoint 按 gcWorkBudget 分步执行 GC
-heap->removePersistentRoot(root);
-```
-
-活动解释器帧通过 Shadow Stack 精确登记参数、Local 和 Register。Array/Record 写入执行写屏障；旧 `ObjectRef` 通过 generation 检查拒绝复用后的悬空访问。
-
-详细说明：
-
-- [Phase 3A — Managed Heap and Precise GC Baseline](docs/roadmap/PHASE_3A.md)
-- [Managed Heap and GC Implemented Draft v0.1](docs/spec/MANAGED_HEAP_GC_V0.md)
-- [Arrays, Native Handles and Heap Diagnostics Draft v0.1](docs/spec/ARRAYS_NATIVE_HANDLES_HEAP_DIAGNOSTICS_V0.md)
-- [Methods, Constructors and Properties Draft v0.1](docs/spec/MEMBERS_PROPERTIES_V0.md)
-- [Numeric, Enum and Struct Values Draft v0.1](docs/spec/NUMERIC_ENUM_STRUCT_V0.md)
-
-
-## Phase 3B 语言可见对象模型
-
-Phase 3B 将 `class`、`new` 和字段访问贯穿源码、Typed MIR、`.rsbc` 与解释器：
-
-```csharp
-module Game.Objects;
-
-class Point
-{
-    int x;
-    int y;
-}
-
-int main()
-{
-    Point point = new Point();
-    point.x = 40;
-    point.y = 2;
-    return point.x + point.y;
-}
-```
-
-每个类拥有由规范名称生成的稳定 TypeId。`.rsbc` 0.5 保存有序字段布局和精确对象签名；解释器在函数入口、返回、Null Check 和字段访问处验证运行时 TypeId。GC 只扫描描述符中的 `string` 与 class 引用字段。
-
-详细说明：
-
-- [Phase 3B — Language-visible Object Model and Fields](docs/roadmap/PHASE_3B.md)
-- [Phase 3C — Arrays, Native Handles and Heap Diagnostics](docs/roadmap/PHASE_3C.md)
-- [Phase 3D — Methods, Constructors and Properties](docs/roadmap/PHASE_3D.md)
-- [Phase 3E — Numeric Values, Enums and Structs](docs/roadmap/PHASE_3E.md)
-- [Phase 4 — Debugging, Language Services and Hot Reload](docs/roadmap/PHASE_4.md)
-- [Object Model Implemented Draft v0.1](docs/spec/OBJECT_MODEL_V0.md)
-
-## Phase 3C 数组、Native Handle 与堆诊断
-
-Phase 3C 将固定长度数组贯穿源码、Typed MIR、`.rsbc` 0.5 当前生产格式、验证器、解释器和精确 GC：
-
-```csharp
-module Game.Arrays;
-
-class Item { int value; }
-
-int main()
-{
-    Item[] items = new Item[2];
-    Item item = new Item();
-    item.value = 42;
-    items[0] = item;
-    return items[0].value + items.length;
-}
-```
-
-数组保存精确 Array TypeId 和元素类型信息；null、负长度和越界访问产生结构化运行时错误。class/array 元素写入执行类型验证和 GC 写屏障。
-
-宿主资源通过 `NativeHandleRegistry` 暴露为代际安全、带 TypeId 的 opaque `handle`，不会把裸 C++ 指针放入脚本值。`ObjectRef` 同时携带 HeapId，防止跨 Runtime/Heap 误用。
-
-`PersistentRoot` 可保留任意运行时 `Value`，包括内部含有托管引用的 `StructValue`；跨 Heap 的嵌套引用会被递归拒绝。`HeapSnapshot`、`retainingPath()` 和 `leakSummary()` 为引擎嵌入、压力测试和关闭期泄漏检查提供可观测边界。
-
-详细说明：
-
-- [Phase 3C — Arrays, Native Handles and Heap Diagnostics](docs/roadmap/PHASE_3C.md)
-- [Phase 3D — Methods, Constructors and Properties](docs/roadmap/PHASE_3D.md)
-- [Phase 3E — Numeric Values, Enums and Structs](docs/roadmap/PHASE_3E.md)
-- [Phase 4 — Debugging, Language Services and Hot Reload](docs/roadmap/PHASE_4.md)
-- [Arrays, Native Handles and Heap Diagnostics — Implemented Draft v0.1](docs/spec/ARRAYS_NATIVE_HANDLES_HEAP_DIAGNOSTICS_V0.md)
-
-
-## Phase 3D 方法、构造函数与属性
-
-```csharp
-class Counter
-{
-    int value;
-    Counter(int initial) { this.value = initial; }
-    int Add(int amount) { value = value + amount; return value; }
-    int Value { get { return value; } set { this.value = value; } }
-}
-```
-
-实例成员使用精确 owner TypeId 的隐式 `this` 参数，并复用普通 direct-call ABI。类实例调用在进入函数前执行 null/TypeId 检查；自动属性生成标记为 synthetic 的确定性 backing field。
-
-详细说明：[Phase 3D](docs/roadmap/PHASE_3D.md) 与 [成员模型实现规范](docs/spec/MEMBERS_PROPERTIES_V0.md)。
-
-## Phase 3E 数值、枚举与结构体
-
-```csharp
-enum Team { Neutral, Player = 5, Enemy }
-
-struct Vector2
-{
-    double x;
-    double y;
-    Vector2(double x, double y) { this.x = x; this.y = y; }
-    double LengthSquared() { return x * x + y * y; }
-}
-```
-
-`struct` 使用 exact TypeId 和复制值语义；局部字段更新采用写时复制，嵌套 managed reference 参与精确 GC 扫描。Phase 3E 的 canonical numeric types 为 checked `int`、checked `long` 与 IEEE binary64 `double`。
-
-详细说明：[Phase 3E](docs/roadmap/PHASE_3E.md) 与 [值类型实现规范](docs/spec/NUMERIC_ENUM_STRUCT_V0.md)。
-
-
-## Phase 4 调试、语言服务与热重载
-
-Phase 4 将源码位置和符号信息提升为正式运行时元数据：`.rsbc` 0.5 保存源码文件、行映射、函数范围、Sequence Point、参数、局部变量及词法作用域。`DebugSession` 在独立线程运行解释器，并在断点、暂停或单步位置安全阻塞，使 DAP 客户端能够读取栈帧和变量。
-
-```bash
-rsdebug game.rs common.rs   # stdin/stdout DAP
-rslsp                       # stdin/stdout LSP
-```
-
-`LanguageService` 复用 Compilation 与 BuildSnapshot，提供诊断、补全、悬停、定义、引用、重命名和文档符号。Hot Reload 首版只允许函数体与调试信息变化；模块集合、类型布局、枚举值、函数集合和签名变化会被拒绝。活动调用继续持有旧 ProgramImage，新调用原子地看到新镜像。
-
-详细说明：[Phase 4](docs/roadmap/PHASE_4.md) 与 [Debug/Tooling/Hot Reload 实现规范](docs/spec/DEBUG_TOOLING_HOT_RELOAD_V0.md)。
-
-
-## Phase 5 C++17 AOT 发布后端
-
-Phase 5 将通过验证的 Typed MIR 直接生成为规则化 C++17。生成函数维护参数、局部变量和寄存器 Shadow Stack 根，并通过 `AotRuntime` 执行 checked arithmetic、null/bounds check、对象/数组/struct 操作、宿主调用、预算和增量 GC safepoint。
-
-```bash
-rsaot --output-dir build/generated/game \
-  --program-name GameScripts game.rs common.rs
-```
-
-原生产物提供两种嵌入边界：
-
-- C++ `ProgramDescriptor` / `Program`，用于同 SDK 静态链接；
-- C11/C++ 兼容的 `rs_module_query_v1`，用于 ABI 版本协商、内容哈希和稳定函数表发现。
-
-生成结果带确定性 manifest、源码 `#line` 与 Source Map。解释器/AOT 差分测试覆盖成功结果、溢出、除零、空引用、数组越界、负长度、调用栈、指令预算和递归预算。
-
-详细说明：[Phase 5](docs/roadmap/PHASE_5.md) 与 [C++17 AOT 实现规范](docs/spec/CXX17_AOT_V0.md)。
-
-
-## Phase 6 确定性、优化与可选 JIT
-
-Phase 6 在不建立第二套语义的前提下，为 Interpreter、C++17 AOT 和可选 JIT 增加共同的优化、确定性与性能观测层。
-
-```bash
-rsc game.rs --run Game.Main::main \
-  --opt-level 2 --deterministic --profile --digest
-
-rsaot --output-dir generated \
-  --program-name GameScripts \
-  --opt-level 2 --opt-report \
-  game.rs common.rs
-
-rsbench --entry Game.Main::main \
-  --warmup 20 --iterations 1000 \
-  --opt-level 2 --json \
-  game.rs common.rs
-```
-
-`optimization::Optimizer` 在验证后的 Typed MIR 上执行 O0/O1/O2 变换，并在前后重新运行 MIR Verifier。`DeterminismMode` 提供 Strict、Record 和 Replay；宿主绑定必须声明 `Deterministic`、`Recordable` 或 `NonDeterministic`。执行结果携带稳定摘要，`ProfileCollector` 以稳定函数顺序统计调用、指令、分支、外部调用、GC 与错误。
-
-`jit::ToolchainJit` 复用 Phase 5 C++17 生成器，将内容哈希对应的源码编译成共享库，通过 `rs_module_query_v1` 完成 ABI 协商和 Descriptor 验证，并安全缓存与加载。它是可选 same-SDK 执行路径，不会让外部编译器成为 Interpreter/AOT 的必需依赖。
-
-详细说明：[Phase 6](docs/roadmap/PHASE_6.md) 与 [确定性/优化/JIT 实现规范](docs/spec/DETERMINISM_OPTIMIZATION_JIT_V0.md)。
+A license has not yet been selected. Do not assume that the code or documentation may be redistributed until a license file is committed.
