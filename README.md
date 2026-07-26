@@ -4,11 +4,11 @@ RealScript 是一门面向现代游戏引擎的嵌入式强类型脚本语言与
 
 它采用接近 C# 的表达方式，以 C++17 游戏引擎为主要宿主，长期目标包括：快速字节码解释、C++17 AOT、可选 LLVM ORC JIT、源码级调试、热重载、沙箱 Mod，以及固定 Tick 的确定性模拟。
 
-> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端、Phase 2A–2C 字节码运行时，以及 Phase 3A–3C 对象、数组、精确 GC、Native Handle 与堆诊断已经完成。语言、字节码、对象 ABI 和 GC 策略尚未冻结。
+> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端、Phase 2A–2C 字节码运行时，以及 Phase 3A–3E 对象、数组、精确 GC、Native Handle、成员模型与值类型已经完成。语言、字节码、对象 ABI 和 GC 策略尚未冻结。
 
 ## 当前可运行能力
 
-Phase 1A–3C 已经实现：
+Phase 1A–3E 已经实现：
 
 - 无外部依赖的 C++17/CMake 工程；
 - `SourceText`、`TextSpan` 和 CRLF/LF 行列映射；
@@ -17,7 +17,7 @@ Phase 1A–3C 已经实现：
 - `module`、`import` 和 C# 风格函数解析；
 - Pratt 表达式解析与右结合赋值；
 - `if` / `else`、`while` 和可变局部变量；
-- `void`、`bool`、`int`、`string` 基础类型；
+- `void`、`bool`、`int`、`long`、`double`、`string` 基础类型；
 - 确定赋值与全路径返回分析；
 - 函数预声明、前向调用和直接递归所需的符号基础；
 - 同名函数重载和基础转换排序；
@@ -29,7 +29,7 @@ Phase 1A–3C 已经实现：
 - 模块源码、公有签名和依赖指纹；
 - 基于上一轮 `BuildSnapshot` 的模块级语义/MIR 复用；
 - 类型化寄存器字节码、函数引用表和块参数；
-- `.rsbc` 0.3 Section 容器、类型描述符、精确 Local/Register/Block TypeId、确定性编码和防御性解码；
+- `.rsbc` 0.4 Section 容器、class/struct/enum 描述符、精确 Local/Register/Block TypeId、确定性编码和防御性解码；
 - 字节码反汇编器与语义验证器；
 - 类型化寄存器解释器、调用帧和跨模块调用；
 - Checked Arithmetic Trap、运行时错误和脚本栈；
@@ -45,6 +45,12 @@ Phase 1A–3C 已经实现：
 - 数组 MIR/Bytecode、边界检查、精确元素 TypeId 与数组写屏障；
 - `handle` 传递、Native Handle 注册表身份与代际安全和宿主 TypeId 校验；
 - 跨堆 `ObjectRef` 隔离、RAII 持久根、Heap Snapshot、Retaining Path 和泄漏摘要；
+- 类实例/静态方法、隐式 `this`、构造函数重载和直接成员调用；
+- 显式属性、class 自动属性、稳定 accessor SymbolId 和 null receiver 检查；
+- `enum` 精确类型身份、显式/递增成员值和同类型相等；
+- `struct` 构造、只读实例方法、getter 属性、局部字段更新和复制值语义；
+- struct 数组、嵌套托管引用精确扫描和递归值布局诊断；
+- `int -> long -> double` 数值提升、checked 整数和 IEEE binary64 运算；
 - `rsc` Token、检查、MIR、Symbol、Bytecode 和二进制输出模式；
 - Linux/Windows GitHub Actions 构建；
 - 前端、控制流、模块、调用、增量编译和字节码测试。
@@ -60,6 +66,8 @@ Phase 1A–3C 已经实现：
 - [Phase 3A — Managed Heap and Precise GC Baseline](docs/roadmap/PHASE_3A.md)
 - [Phase 3B — Language-visible Object Model and Fields](docs/roadmap/PHASE_3B.md)
 - [Phase 3C — Arrays, Native Handles and Heap Diagnostics](docs/roadmap/PHASE_3C.md)
+- [Phase 3D — Methods, Constructors and Properties](docs/roadmap/PHASE_3D.md)
+- [Phase 3E — Numeric Values, Enums and Structs](docs/roadmap/PHASE_3E.md)
 
 ## 快速开始
 
@@ -193,7 +201,7 @@ Phase 1C 的转换排序刻意保持较小：
 
 字节码保留多基本块、类型化寄存器、显式局部槽位和边参数。MIR `ValueId` 直接映射到寄存器，调用通过带签名的函数引用表索引表达。
 
-`.rsbc` 0.3 使用 little-endian 固定宽度整数和五个 Section：字符串、类型描述符、函数引用、函数元数据和代码。0.3 增加 array/handle 类型标签、Local/Register/Block TypeId 表及数组元素元数据。编码器不写入时间戳、裸地址或平台结构体填充，因此同一模块能够稳定地产生相同字节。
+`.rsbc` 0.4 使用 little-endian 固定宽度整数和五个 Section：字符串、类型描述符、函数引用、函数元数据和代码。0.4 在数组/句柄与精确 TypeId 基线上增加 class/struct/enum descriptor kind、enum 成员、synthetic field、f64 immediate、成员调用签名和 struct/long/double 指令。编码器不写入时间戳、裸地址或平台结构体填充，因此同一模块能够稳定地产生相同字节。
 
 Decoder 负责文件边界、Section、计数和 Tag；Verifier 继续检查类型、定义支配、分支参数、调用和返回。两层都成功前不得进入执行器。
 
@@ -201,14 +209,13 @@ Decoder 负责文件边界、Section、计数和 Tag；Verifier 继续检查类�
 
 尚未实现：
 
-- `struct`、`interface`、`enum`；
-- 构造函数、成员函数、继承、访问控制和命名导入；
-- 完整数值类型、数值提升和用户定义转换；
+- `interface`、继承、virtual/abstract 分派、访问控制和命名导入；
+- `byte`/`short`/无符号整数、binary32 `float`、`char` 和用户定义转换；
+- `ref`/`out`、可变 struct receiver、装箱和 nullable value；
 - 泛型和运行时构造未知泛型实例；
 - `break`、`continue`、`for`、`foreach`、`switch`；
 - 异常和协程；
 - 增量语法树与持久化构建缓存；
-- 成员方法、构造函数、属性及相应调用模型；
 - 异常表、协程状态、调试 GC Map 和原生 AOT。
 
 未实现能力会得到明确诊断，不会使用占位运行时行为假装支持。
@@ -270,10 +277,12 @@ docs/roadmap/     实现切片和路线图
 - [Typed MIR 规范 Draft v0.1](docs/spec/MIR_SPEC.md)
 - [运行时模型规范 Draft v0.1](docs/spec/RUNTIME_MODEL.md)
 - [字节码与原生 ABI 规范 Draft v0.1](docs/spec/BYTECODE_AND_ABI.md)
-- [`.rsbc` 0.3 物理格式](docs/spec/BYTECODE_FORMAT_V0.md)
+- [`.rsbc` 0.4 物理格式](docs/spec/BYTECODE_FORMAT_V0.md)
 - [Embedding and Observability Draft v0.1](docs/spec/EMBEDDING_AND_OBSERVABILITY_V0.md)
 - [Managed Heap and GC Implemented Draft v0.1](docs/spec/MANAGED_HEAP_GC_V0.md)
 - [Arrays, Native Handles and Heap Diagnostics Draft v0.1](docs/spec/ARRAYS_NATIVE_HANDLES_HEAP_DIAGNOSTICS_V0.md)
+- [Methods, Constructors and Properties Draft v0.1](docs/spec/MEMBERS_PROPERTIES_V0.md)
+- [Numeric, Enum and Struct Values Draft v0.1](docs/spec/NUMERIC_ENUM_STRUCT_V0.md)
 - [Phase 1A 实现说明](docs/roadmap/PHASE_1A.md)
 - [Phase 1B 实现说明](docs/roadmap/PHASE_1B.md)
 - [Phase 1C 实现说明](docs/roadmap/PHASE_1C.md)
@@ -283,6 +292,8 @@ docs/roadmap/     实现切片和路线图
 - [Phase 3A 实现说明](docs/roadmap/PHASE_3A.md)
 - [Phase 3B 实现说明](docs/roadmap/PHASE_3B.md)
 - [Phase 3C 实现说明](docs/roadmap/PHASE_3C.md)
+- [Phase 3D 实现说明](docs/roadmap/PHASE_3D.md)
+- [Phase 3E 实现说明](docs/roadmap/PHASE_3E.md)
 
 ## 路线图
 
@@ -297,6 +308,8 @@ docs/roadmap/     实现切片和路线图
 - [x] Phase 3A：托管引用、精确根和增量 Mark/Sweep；
 - [x] Phase 3B：class、对象字段、类型描述符和对象 Bytecode；
 - [x] Phase 3C：数组、Native Handle、Heap Snapshot 和泄漏诊断；
+- [x] Phase 3D：方法、构造函数、属性和直接成员调用；
+- [x] Phase 3E：long/double、enum、struct 和复制值语义；
 - [ ] Phase 4：DAP、LSP 和热重载；
 - [ ] Phase 5：C++17 AOT；
 - [ ] Phase 6：确定性、性能优化和可选 JIT。
@@ -361,6 +374,8 @@ heap->removePersistentRoot(root);
 - [Phase 3A — Managed Heap and Precise GC Baseline](docs/roadmap/PHASE_3A.md)
 - [Managed Heap and GC Implemented Draft v0.1](docs/spec/MANAGED_HEAP_GC_V0.md)
 - [Arrays, Native Handles and Heap Diagnostics Draft v0.1](docs/spec/ARRAYS_NATIVE_HANDLES_HEAP_DIAGNOSTICS_V0.md)
+- [Methods, Constructors and Properties Draft v0.1](docs/spec/MEMBERS_PROPERTIES_V0.md)
+- [Numeric, Enum and Struct Values Draft v0.1](docs/spec/NUMERIC_ENUM_STRUCT_V0.md)
 
 
 ## Phase 3B 语言可见对象模型
@@ -385,17 +400,19 @@ int main()
 }
 ```
 
-每个类拥有由规范名称生成的稳定 TypeId。`.rsbc` 0.3 保存有序字段布局和精确对象签名；解释器在函数入口、返回、Null Check 和字段访问处验证运行时 TypeId。GC 只扫描描述符中的 `string` 与 class 引用字段。
+每个类拥有由规范名称生成的稳定 TypeId。`.rsbc` 0.4 保存有序字段布局和精确对象签名；解释器在函数入口、返回、Null Check 和字段访问处验证运行时 TypeId。GC 只扫描描述符中的 `string` 与 class 引用字段。
 
 详细说明：
 
 - [Phase 3B — Language-visible Object Model and Fields](docs/roadmap/PHASE_3B.md)
 - [Phase 3C — Arrays, Native Handles and Heap Diagnostics](docs/roadmap/PHASE_3C.md)
+- [Phase 3D — Methods, Constructors and Properties](docs/roadmap/PHASE_3D.md)
+- [Phase 3E — Numeric Values, Enums and Structs](docs/roadmap/PHASE_3E.md)
 - [Object Model Implemented Draft v0.1](docs/spec/OBJECT_MODEL_V0.md)
 
 ## Phase 3C 数组、Native Handle 与堆诊断
 
-Phase 3C 将固定长度数组贯穿源码、Typed MIR、`.rsbc` 0.3、验证器、解释器和精确 GC：
+Phase 3C 将固定长度数组贯穿源码、Typed MIR、`.rsbc` 0.4 当前生产格式、验证器、解释器和精确 GC：
 
 ```csharp
 module Game.Arrays;
@@ -416,9 +433,46 @@ int main()
 
 宿主资源通过 `NativeHandleRegistry` 暴露为代际安全、带 TypeId 的 opaque `handle`，不会把裸 C++ 指针放入脚本值。`ObjectRef` 同时携带 HeapId，防止跨 Runtime/Heap 误用。
 
-`PersistentRoot`、`HeapSnapshot`、`retainingPath()` 和 `leakSummary()` 为引擎嵌入、压力测试和关闭期泄漏检查提供可观测边界。
+`PersistentRoot` 可保留任意运行时 `Value`，包括内部含有托管引用的 `StructValue`；跨 Heap 的嵌套引用会被递归拒绝。`HeapSnapshot`、`retainingPath()` 和 `leakSummary()` 为引擎嵌入、压力测试和关闭期泄漏检查提供可观测边界。
 
 详细说明：
 
 - [Phase 3C — Arrays, Native Handles and Heap Diagnostics](docs/roadmap/PHASE_3C.md)
+- [Phase 3D — Methods, Constructors and Properties](docs/roadmap/PHASE_3D.md)
+- [Phase 3E — Numeric Values, Enums and Structs](docs/roadmap/PHASE_3E.md)
 - [Arrays, Native Handles and Heap Diagnostics — Implemented Draft v0.1](docs/spec/ARRAYS_NATIVE_HANDLES_HEAP_DIAGNOSTICS_V0.md)
+
+
+## Phase 3D 方法、构造函数与属性
+
+```csharp
+class Counter
+{
+    int value;
+    Counter(int initial) { this.value = initial; }
+    int Add(int amount) { value = value + amount; return value; }
+    int Value { get { return value; } set { this.value = value; } }
+}
+```
+
+实例成员使用精确 owner TypeId 的隐式 `this` 参数，并复用普通 direct-call ABI。类实例调用在进入函数前执行 null/TypeId 检查；自动属性生成标记为 synthetic 的确定性 backing field。
+
+详细说明：[Phase 3D](docs/roadmap/PHASE_3D.md) 与 [成员模型实现规范](docs/spec/MEMBERS_PROPERTIES_V0.md)。
+
+## Phase 3E 数值、枚举与结构体
+
+```csharp
+enum Team { Neutral, Player = 5, Enemy }
+
+struct Vector2
+{
+    double x;
+    double y;
+    Vector2(double x, double y) { this.x = x; this.y = y; }
+    double LengthSquared() { return x * x + y * y; }
+}
+```
+
+`struct` 使用 exact TypeId 和复制值语义；局部字段更新采用写时复制，嵌套 managed reference 参与精确 GC 扫描。Phase 3E 的 canonical numeric types 为 checked `int`、checked `long` 与 IEEE binary64 `double`。
+
+详细说明：[Phase 3E](docs/roadmap/PHASE_3E.md) 与 [值类型实现规范](docs/spec/NUMERIC_ENUM_STRUCT_V0.md)。

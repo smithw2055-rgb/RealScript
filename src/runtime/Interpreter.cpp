@@ -3,6 +3,7 @@
 #include "realscript/diagnostics/Diagnostic.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <unordered_map>
 #include <utility>
@@ -110,6 +111,23 @@ const semantic::TypeSymbol* typeDescriptor(
     return index < module.types.size() ? &module.types[index] : nullptr;
 }
 
+const semantic::TypeSymbol* typeDescriptorById(
+    const bytecode::Module& module,
+    semantic::SymbolId id) {
+    for (const auto& type : module.types) {
+        if (type.id == id) return &type;
+    }
+    return nullptr;
+}
+
+semantic::SymbolId exactTypeId(
+    semantic::PrimitiveType type,
+    const std::string& typeName) {
+    return semantic::isExactType(type) && !typeName.empty()
+        ? semantic::stableTypeId(typeName)
+        : 0;
+}
+
 bool expectObject(
     State& state,
     const Value& value,
@@ -167,10 +185,23 @@ bool expectSignatureType(
         }
     } else if (type == semantic::PrimitiveType::Handle && typeId != 0) {
         const auto* handle = std::get_if<NativeHandle>(&value);
-        if (!handle || (!handle->valid() && handle->typeId != 0) ||
-            (handle->valid() && handle->typeId != typeId)) {
+        if (!handle || (handle->valid() && handle->typeId != typeId) ||
+            (!handle->valid() && handle->typeId != 0 && handle->typeId != typeId)) {
             return fail(state, ErrorCode::TypeMismatch,
                 context + " has the wrong native handle type");
+        }
+    } else if (type == semantic::PrimitiveType::Struct) {
+        const auto* structure = std::get_if<StructValue>(&value);
+        if (!structure || typeId == 0 || structure->typeId != typeId ||
+            !structure->storage) {
+            return fail(state, ErrorCode::TypeMismatch,
+                context + " has the wrong struct type");
+        }
+    } else if (type == semantic::PrimitiveType::Enum) {
+        const auto* enumeration = std::get_if<EnumValue>(&value);
+        if (!enumeration || typeId == 0 || enumeration->typeId != typeId) {
+            return fail(state, ErrorCode::TypeMismatch,
+                context + " has the wrong enum type");
         }
     }
     return true;
@@ -182,14 +213,39 @@ semantic::SymbolId typeIdAt(
     return index < typeIds.size() ? typeIds[index] : 0;
 }
 
-Value defaultFieldValue(semantic::PrimitiveType type) {
+Value defaultValue(
+    const bytecode::Module& module,
+    semantic::PrimitiveType type,
+    semantic::SymbolId typeId,
+    std::size_t depth = 0) {
     switch (type) {
     case semantic::PrimitiveType::Bool: return false;
     case semantic::PrimitiveType::Int: return std::int64_t{0};
+    case semantic::PrimitiveType::Long: return LongValue{};
+    case semantic::PrimitiveType::Double: return 0.0;
     case semantic::PrimitiveType::String: return NullString{};
     case semantic::PrimitiveType::Object: return NullObject{};
     case semantic::PrimitiveType::Array: return NullArray{};
-    case semantic::PrimitiveType::Handle: return NativeHandle{};
+    case semantic::PrimitiveType::Handle: {
+        NativeHandle handle;
+        handle.typeId = typeId;
+        return handle;
+    }
+    case semantic::PrimitiveType::Enum: return EnumValue{typeId, 0};
+    case semantic::PrimitiveType::Struct: {
+        if (depth > 64) return StructValue{};
+        const auto* descriptor = typeDescriptorById(module, typeId);
+        if (!descriptor || descriptor->kind != semantic::TypeKind::Struct) {
+            return StructValue{};
+        }
+        auto storage = std::make_shared<StructStorage>();
+        storage->fields.reserve(descriptor->fields.size());
+        for (const auto& field : descriptor->fields) {
+            storage->fields.push_back(defaultValue(
+                module, field.type, exactTypeId(field.type, field.typeName), depth + 1));
+        }
+        return StructValue{typeId, std::move(storage)};
+    }
     case semantic::PrimitiveType::Null: return std::monostate{};
     case semantic::PrimitiveType::Void:
     case semantic::PrimitiveType::Error:
@@ -252,6 +308,46 @@ bool checkedIntResult(State& state, std::int64_t value, Value& output) {
         return fail(state, ErrorCode::IntegerOverflow, "integer arithmetic overflow");
     }
     output = value;
+    return true;
+}
+
+
+bool checkedLongAdd(State& state, std::int64_t left, std::int64_t right, Value& output) {
+    if ((right > 0 && left > std::numeric_limits<std::int64_t>::max() - right) ||
+        (right < 0 && left < std::numeric_limits<std::int64_t>::min() - right)) {
+        return fail(state, ErrorCode::IntegerOverflow, "long arithmetic overflow");
+    }
+    output = LongValue{left + right};
+    return true;
+}
+
+bool checkedLongSubtract(State& state, std::int64_t left, std::int64_t right, Value& output) {
+    if ((right < 0 && left > std::numeric_limits<std::int64_t>::max() + right) ||
+        (right > 0 && left < std::numeric_limits<std::int64_t>::min() + right)) {
+        return fail(state, ErrorCode::IntegerOverflow, "long arithmetic overflow");
+    }
+    output = LongValue{left - right};
+    return true;
+}
+
+bool checkedLongMultiply(State& state, std::int64_t left, std::int64_t right, Value& output) {
+    if (left == 0 || right == 0) {
+        output = LongValue{};
+        return true;
+    }
+    const auto minimum = std::numeric_limits<std::int64_t>::min();
+    const auto maximum = std::numeric_limits<std::int64_t>::max();
+    bool overflow = false;
+    if (left > 0) {
+        overflow = right > 0 ? left > maximum / right : right < minimum / left;
+    } else {
+        overflow = right > 0 ? left < minimum / right :
+            (left != 0 && right < maximum / left);
+    }
+    if (overflow) {
+        return fail(state, ErrorCode::IntegerOverflow, "long arithmetic overflow");
+    }
+    output = LongValue{left * right};
     return true;
 }
 
@@ -368,8 +464,24 @@ bool executeInstruction(
         if (instruction.index >= arguments.size())
             return fail(state, ErrorCode::InvalidProgram, "parameter index is invalid");
         return storeResult(arguments[instruction.index]);
-    case bytecode::Opcode::ConstantInt:
+    case bytecode::Opcode::ConstantInt: {
+        if (instruction.result >= function.registerTypes.size()) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "constant result type metadata is missing");
+        }
+        const auto resultType = function.registerTypes[instruction.result];
+        if (resultType == semantic::PrimitiveType::Long) {
+            return storeResult(LongValue{instruction.integerImmediate});
+        }
+        if (resultType == semantic::PrimitiveType::Enum) {
+            return storeResult(EnumValue{
+                typeIdAt(function.registerTypeIds, instruction.result),
+                instruction.integerImmediate});
+        }
         return storeResult(instruction.integerImmediate);
+    }
+    case bytecode::Opcode::ConstantDouble:
+        return storeResult(instruction.doubleImmediate);
     case bytecode::Opcode::ConstantBool:
         return storeResult(instruction.boolImmediate);
     case bytecode::Opcode::ConstantString: {
@@ -421,6 +533,24 @@ bool executeInstruction(
         if (!value || !expectType(state, *value, semantic::PrimitiveType::Null, "conversion")) return false;
         return storeResult(NullArray{});
     }
+    case bytecode::Opcode::ConvertIntToLong: {
+        const auto* value = operand(0);
+        if (!value || !expectType(state, *value, semantic::PrimitiveType::Int,
+                "numeric conversion")) return false;
+        return storeResult(LongValue{std::get<std::int64_t>(*value)});
+    }
+    case bytecode::Opcode::ConvertIntToDouble: {
+        const auto* value = operand(0);
+        if (!value || !expectType(state, *value, semantic::PrimitiveType::Int,
+                "numeric conversion")) return false;
+        return storeResult(static_cast<double>(std::get<std::int64_t>(*value)));
+    }
+    case bytecode::Opcode::ConvertLongToDouble: {
+        const auto* value = operand(0);
+        if (!value || !expectType(state, *value, semantic::PrimitiveType::Long,
+                "numeric conversion")) return false;
+        return storeResult(static_cast<double>(std::get<LongValue>(*value).value));
+    }
     case bytecode::Opcode::NewArray: {
         const auto* lengthValue = operand(0);
         if (!lengthValue ||
@@ -448,7 +578,7 @@ bool executeInstruction(
             instruction.elementType,
             instruction.elementTypeId,
             static_cast<std::size_t>(length),
-            defaultFieldValue(instruction.elementType),
+            defaultValue(module, instruction.elementType, instruction.elementTypeId),
             &allocationError);
         if (!reference) {
             return fail(state,
@@ -472,10 +602,13 @@ bool executeInstruction(
         fields.reserve(type->fields.size());
         for (std::size_t index = 0; index < type->fields.size(); ++index) {
             const auto fieldType = type->fields[index].type;
-            fields.push_back(defaultFieldValue(fieldType));
+            fields.push_back(defaultValue(
+                module, fieldType,
+                exactTypeId(fieldType, type->fields[index].typeName)));
             if (fieldType == semantic::PrimitiveType::String ||
                 fieldType == semantic::PrimitiveType::Object ||
-                fieldType == semantic::PrimitiveType::Array) {
+                fieldType == semantic::PrimitiveType::Array ||
+                fieldType == semantic::PrimitiveType::Struct) {
                 referenceFields.push_back(index);
             }
         }
@@ -495,6 +628,20 @@ bool executeInstruction(
                     : allocationError.message);
         }
         return storeResult(*reference);
+    }
+    case bytecode::Opcode::NewStruct: {
+        const auto* type = typeDescriptor(module, instruction.typeIndex);
+        if (!type || type->kind != semantic::TypeKind::Struct) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "struct allocation references an invalid type descriptor");
+        }
+        auto storage = std::make_shared<StructStorage>();
+        storage->fields.reserve(type->fields.size());
+        for (const auto& field : type->fields) {
+            storage->fields.push_back(defaultValue(
+                module, field.type, exactTypeId(field.type, field.typeName)));
+        }
+        return storeResult(StructValue{type->id, std::move(storage)});
     }
     case bytecode::Opcode::ArrayLength: {
         const auto* receiver = operand(0);
@@ -636,10 +783,7 @@ bool executeInstruction(
                 state,
                 *value,
                 field.type,
-                (field.type == semantic::PrimitiveType::Object ||
-                 field.type == semantic::PrimitiveType::Array)
-                    ? semantic::stableTypeId(field.typeName)
-                    : 0,
+                exactTypeId(field.type, field.typeName),
                 "field load value")) {
             return false;
         }
@@ -656,13 +800,9 @@ bool executeInstruction(
                 state,
                 *value,
                 type->fields[instruction.index].type,
-                (type->fields[instruction.index].type ==
-                        semantic::PrimitiveType::Object ||
-                 type->fields[instruction.index].type ==
-                        semantic::PrimitiveType::Array)
-                    ? semantic::stableTypeId(
-                          type->fields[instruction.index].typeName)
-                    : 0,
+                exactTypeId(
+                    type->fields[instruction.index].type,
+                    type->fields[instruction.index].typeName),
                 "field store value")) {
             return false;
         }
@@ -682,6 +822,52 @@ bool executeInstruction(
         }
         return true;
     }
+    case bytecode::Opcode::LoadStructField: {
+        const auto* receiver = operand(0);
+        const auto* type = typeDescriptor(module, instruction.typeIndex);
+        if (!receiver || !type || type->kind != semantic::TypeKind::Struct ||
+            instruction.index >= type->fields.size() ||
+            !expectSignatureType(state, *receiver, semantic::PrimitiveType::Struct,
+                type->id, "struct field load")) {
+            return false;
+        }
+        const auto& structure = std::get<StructValue>(*receiver);
+        if (!structure.storage || instruction.index >= structure.storage->fields.size()) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "struct field load references an invalid field slot");
+        }
+        const auto& field = type->fields[instruction.index];
+        const auto& value = structure.storage->fields[instruction.index];
+        if (!expectSignatureType(state, value, field.type,
+                exactTypeId(field.type, field.typeName), "struct field load value")) {
+            return false;
+        }
+        return storeResult(value);
+    }
+    case bytecode::Opcode::StoreStructField: {
+        const auto* receiver = operand(0);
+        const auto* value = operand(1);
+        const auto* type = typeDescriptor(module, instruction.typeIndex);
+        if (!receiver || !value || !type || type->kind != semantic::TypeKind::Struct ||
+            instruction.index >= type->fields.size() ||
+            !expectSignatureType(state, *receiver, semantic::PrimitiveType::Struct,
+                type->id, "struct field store")) {
+            return false;
+        }
+        const auto& field = type->fields[instruction.index];
+        if (!expectSignatureType(state, *value, field.type,
+                exactTypeId(field.type, field.typeName), "struct field store value")) {
+            return false;
+        }
+        const auto& structure = std::get<StructValue>(*receiver);
+        if (!structure.storage || instruction.index >= structure.storage->fields.size()) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "struct field store references an invalid field slot");
+        }
+        auto storage = std::make_shared<StructStorage>(*structure.storage);
+        storage->fields[instruction.index] = *value;
+        return storeResult(StructValue{type->id, std::move(storage)});
+    }
     case bytecode::Opcode::Call: {
         Value callResult;
         if (!executeCall(state, module, instruction, registers, callResult)) return false;
@@ -694,6 +880,22 @@ bool executeInstruction(
         Value output;
         if (!checkedIntResult(state, -std::get<std::int64_t>(*value), output)) return false;
         return storeResult(std::move(output));
+    }
+    case bytecode::Opcode::NegateLong: {
+        const auto* value = operand(0);
+        if (!value || !expectType(state, *value, semantic::PrimitiveType::Long,
+                "negation")) return false;
+        const auto number = std::get<LongValue>(*value).value;
+        if (number == std::numeric_limits<std::int64_t>::min()) {
+            return fail(state, ErrorCode::IntegerOverflow, "long negation overflow");
+        }
+        return storeResult(LongValue{-number});
+    }
+    case bytecode::Opcode::NegateDouble: {
+        const auto* value = operand(0);
+        if (!value || !expectType(state, *value, semantic::PrimitiveType::Double,
+                "negation")) return false;
+        return storeResult(-std::get<double>(*value));
     }
     case bytecode::Opcode::LogicalNot: {
         const auto* value = operand(0);
@@ -713,11 +915,70 @@ bool executeInstruction(
         if (!valuesEqual(state, *left, *right, equal)) return false;
         return storeResult(instruction.opcode == bytecode::Opcode::Equal ? equal : !equal);
     }
+    const auto isLongOpcode = instruction.opcode >= bytecode::Opcode::AddLong &&
+        instruction.opcode <= bytecode::Opcode::GreaterOrEqualLong;
+    const auto isDoubleOpcode = instruction.opcode >= bytecode::Opcode::AddDouble &&
+        instruction.opcode <= bytecode::Opcode::GreaterOrEqualDouble;
+    Value output;
+    if (isLongOpcode) {
+        if (!expectType(state, *left, semantic::PrimitiveType::Long, "binary operation") ||
+            !expectType(state, *right, semantic::PrimitiveType::Long, "binary operation")) {
+            return false;
+        }
+        const auto a = std::get<LongValue>(*left).value;
+        const auto b = std::get<LongValue>(*right).value;
+        switch (instruction.opcode) {
+        case bytecode::Opcode::AddLong:
+            return checkedLongAdd(state, a, b, output) && storeResult(output);
+        case bytecode::Opcode::SubtractLong:
+            return checkedLongSubtract(state, a, b, output) && storeResult(output);
+        case bytecode::Opcode::MultiplyLong:
+            return checkedLongMultiply(state, a, b, output) && storeResult(output);
+        case bytecode::Opcode::DivideLong:
+            if (b == 0) return fail(state, ErrorCode::DivisionByZero, "division by zero");
+            if (a == std::numeric_limits<std::int64_t>::min() && b == -1) {
+                return fail(state, ErrorCode::IntegerOverflow, "long division overflow");
+            }
+            return storeResult(LongValue{a / b});
+        case bytecode::Opcode::RemainderLong:
+            if (b == 0) return fail(state, ErrorCode::DivisionByZero, "remainder by zero");
+            if (a == std::numeric_limits<std::int64_t>::min() && b == -1) {
+                return storeResult(LongValue{});
+            }
+            return storeResult(LongValue{a % b});
+        case bytecode::Opcode::LessLong: return storeResult(a < b);
+        case bytecode::Opcode::LessOrEqualLong: return storeResult(a <= b);
+        case bytecode::Opcode::GreaterLong: return storeResult(a > b);
+        case bytecode::Opcode::GreaterOrEqualLong: return storeResult(a >= b);
+        default: break;
+        }
+    }
+    if (isDoubleOpcode) {
+        if (!expectType(state, *left, semantic::PrimitiveType::Double, "binary operation") ||
+            !expectType(state, *right, semantic::PrimitiveType::Double, "binary operation")) {
+            return false;
+        }
+        const auto a = std::get<double>(*left);
+        const auto b = std::get<double>(*right);
+        switch (instruction.opcode) {
+        case bytecode::Opcode::AddDouble: return storeResult(a + b);
+        case bytecode::Opcode::SubtractDouble: return storeResult(a - b);
+        case bytecode::Opcode::MultiplyDouble: return storeResult(a * b);
+        case bytecode::Opcode::DivideDouble:
+            // Floating-point division follows IEEE 754. Zero divisors produce
+            // infinities or NaN rather than an integer-style runtime trap.
+            return storeResult(a / b);
+        case bytecode::Opcode::LessDouble: return storeResult(a < b);
+        case bytecode::Opcode::LessOrEqualDouble: return storeResult(a <= b);
+        case bytecode::Opcode::GreaterDouble: return storeResult(a > b);
+        case bytecode::Opcode::GreaterOrEqualDouble: return storeResult(a >= b);
+        default: break;
+        }
+    }
     if (!expectType(state, *left, semantic::PrimitiveType::Int, "binary operation") ||
         !expectType(state, *right, semantic::PrimitiveType::Int, "binary operation")) return false;
     const auto a = std::get<std::int64_t>(*left);
     const auto b = std::get<std::int64_t>(*right);
-    Value output;
     switch (instruction.opcode) {
     case bytecode::Opcode::AddInt: return checkedIntResult(state, a + b, output) && storeResult(output);
     case bytecode::Opcode::SubtractInt: return checkedIntResult(state, a - b, output) && storeResult(output);
@@ -1007,6 +1268,10 @@ semantic::PrimitiveType valueType(const Value& value) noexcept {
     if (std::holds_alternative<NullArray>(value)) return semantic::PrimitiveType::Array;
     if (std::holds_alternative<bool>(value)) return semantic::PrimitiveType::Bool;
     if (std::holds_alternative<std::int64_t>(value)) return semantic::PrimitiveType::Int;
+    if (std::holds_alternative<LongValue>(value)) return semantic::PrimitiveType::Long;
+    if (std::holds_alternative<double>(value)) return semantic::PrimitiveType::Double;
+    if (std::holds_alternative<EnumValue>(value)) return semantic::PrimitiveType::Enum;
+    if (std::holds_alternative<StructValue>(value)) return semantic::PrimitiveType::Struct;
     if (std::holds_alternative<std::string>(value)) return semantic::PrimitiveType::String;
     if (std::holds_alternative<NativeHandle>(value)) return semantic::PrimitiveType::Handle;
     const auto& reference = std::get<ObjectRef>(value);
@@ -1026,6 +1291,16 @@ std::string valueToString(const Value& value, const ManagedHeap* heap) {
     if (std::holds_alternative<NullArray>(value)) return "null";
     if (std::holds_alternative<bool>(value)) return std::get<bool>(value) ? "true" : "false";
     if (std::holds_alternative<std::int64_t>(value)) return std::to_string(std::get<std::int64_t>(value));
+    if (const auto* number = std::get_if<LongValue>(&value)) return std::to_string(number->value);
+    if (const auto* number = std::get_if<double>(&value)) return std::to_string(*number);
+    if (const auto* enumeration = std::get_if<EnumValue>(&value)) {
+        return "<enum:type=0x" + std::to_string(enumeration->typeId) + ":" +
+            std::to_string(enumeration->value) + ">";
+    }
+    if (const auto* structure = std::get_if<StructValue>(&value)) {
+        return "<struct:type=0x" + std::to_string(structure->typeId) + ":fields=" +
+            std::to_string(structure->storage ? structure->storage->fields.size() : 0) + ">";
+    }
     if (std::holds_alternative<std::string>(value)) return std::get<std::string>(value);
     if (const auto* handle = std::get_if<NativeHandle>(&value)) {
         return handle->valid()

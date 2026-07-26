@@ -22,33 +22,140 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
         input.visibleTypes[canonicalTypeName(type)] = type;
         input.types.push_back(type);
     }
-    for (std::size_t index = 0; index < syntaxTree.classes.size(); ++index) {
-        (void)populateTypeFields(
-            input.types[index],
-            syntaxTree.classes[index],
-            input.visibleTypes,
-            diagnostics_);
-        input.visibleTypes[input.types[index].name] = input.types[index];
-        input.visibleTypes[canonicalTypeName(input.types[index])] = input.types[index];
+    for (const auto& structSyntax : syntaxTree.structs) {
+        auto type = declareTypeShell(input.moduleName, structSyntax);
+        input.visibleTypes[type.name] = type;
+        input.visibleTypes[canonicalTypeName(type)] = type;
+        input.types.push_back(type);
+    }
+    for (const auto& enumSyntax : syntaxTree.enums) {
+        auto type = declareTypeShell(input.moduleName, enumSyntax);
+        input.visibleTypes[type.name] = type;
+        input.visibleTypes[canonicalTypeName(type)] = type;
+        input.types.push_back(type);
+    }
+
+    std::size_t typeIndex = 0;
+    for (const auto& classSyntax : syntaxTree.classes) {
+        (void)populateTypeFields(input.types[typeIndex], classSyntax, input.visibleTypes, diagnostics_);
+        input.visibleTypes[input.types[typeIndex].name] = input.types[typeIndex];
+        input.visibleTypes[canonicalTypeName(input.types[typeIndex])] = input.types[typeIndex];
+        ++typeIndex;
+    }
+    for (const auto& structSyntax : syntaxTree.structs) {
+        (void)populateTypeFields(input.types[typeIndex], structSyntax, input.visibleTypes, diagnostics_);
+        input.visibleTypes[input.types[typeIndex].name] = input.types[typeIndex];
+        input.visibleTypes[canonicalTypeName(input.types[typeIndex])] = input.types[typeIndex];
+        ++typeIndex;
+    }
+    for (const auto& enumSyntax : syntaxTree.enums) {
+        (void)populateEnumMembers(input.types[typeIndex], enumSyntax, diagnostics_);
+        input.visibleTypes[input.types[typeIndex].name] = input.types[typeIndex];
+        input.visibleTypes[canonicalTypeName(input.types[typeIndex])] = input.types[typeIndex];
+        ++typeIndex;
     }
 
     std::unordered_set<std::string> functionKeys;
-    for (const auto& functionSyntax : syntaxTree.functions) {
-        auto symbol = declareFunctionSymbol(
-            input.moduleName,
-            functionSyntax,
-            input.visibleTypes,
-            diagnostics_);
-        const auto key = canonicalFunctionKey(symbol);
+    auto addBinding = [&](FunctionBindingInput binding) {
+        const auto key = canonicalFunctionKey(binding.symbol);
         if (!functionKeys.insert(key).second) {
-            diagnostics_.report(
-                "RS2000",
-                "function overload '" + key + "' is already declared",
-                functionSyntax.identifierToken.span);
+            diagnostics_.report("RS2000", "function overload '" + key + "' is already declared", {});
         }
-        input.visibleFunctions[symbol.name].push_back(symbol);
-        input.declarations.push_back(std::move(symbol));
+        input.visibleFunctions[binding.symbol.name].push_back(binding.symbol);
+        input.declarations.push_back(binding.symbol);
+        input.functionBindings.push_back(std::move(binding));
+    };
+
+    for (const auto& functionSyntax : syntaxTree.functions) {
+        FunctionBindingInput binding;
+        binding.symbol = declareFunctionSymbol(input.moduleName, functionSyntax, input.visibleTypes, diagnostics_);
+        binding.body = &functionSyntax.body;
+        for (const auto& parameter : functionSyntax.parameters) {
+            binding.parameterNames.push_back(parameter.identifierToken.text);
+            binding.parameterSpans.push_back(parameter.identifierToken.span);
+        }
+        addBinding(std::move(binding));
     }
+
+    auto addMembers = [&](auto const& declarations) {
+        for (const auto& typeSyntax : declarations) {
+            const auto found = input.visibleTypes.find(typeSyntax.identifierToken.text);
+            if (found == input.visibleTypes.end()) continue;
+            auto owner = found->second;
+            for (const auto& methodSyntax : typeSyntax.methods) {
+                FunctionBindingInput binding;
+                binding.symbol = declareFunctionSymbol(input.moduleName, methodSyntax, input.visibleTypes, diagnostics_, &owner);
+                binding.body = &methodSyntax.body;
+                if (!binding.symbol.staticMethod) {
+                    binding.parameterNames.push_back("this");
+                    binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                }
+                for (const auto& parameter : methodSyntax.parameters) {
+                    binding.parameterNames.push_back(parameter.identifierToken.text);
+                    binding.parameterSpans.push_back(parameter.identifierToken.span);
+                }
+                owner.methods.push_back(binding.symbol);
+                addBinding(std::move(binding));
+            }
+            for (const auto& ctorSyntax : typeSyntax.constructors) {
+                FunctionBindingInput binding;
+                binding.symbol = declareConstructorSymbol(input.moduleName, ctorSyntax, owner, input.visibleTypes, diagnostics_);
+                binding.body = &ctorSyntax.body;
+                binding.parameterNames.push_back("this");
+                binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                for (const auto& parameter : ctorSyntax.parameters) {
+                    binding.parameterNames.push_back(parameter.identifierToken.text);
+                    binding.parameterSpans.push_back(parameter.identifierToken.span);
+                }
+                owner.constructors.push_back(binding.symbol);
+                addBinding(std::move(binding));
+            }
+            for (const auto& propertySyntax : typeSyntax.properties) {
+                auto property = declarePropertySymbol(input.moduleName, propertySyntax, owner, input.visibleTypes, diagnostics_);
+                const bool autoProperty =
+                    (propertySyntax.getter && propertySyntax.getter->semicolonToken) ||
+                    (propertySyntax.setter && propertySyntax.setter->semicolonToken);
+                if (autoProperty) {
+                    property.backingFieldIndex = owner.fields.size();
+                    owner.fields.push_back({"$" + property.name, property.type, property.typeName, owner.fields.size(), true});
+                }
+                if (property.getter) {
+                    FunctionBindingInput binding;
+                    binding.symbol = *property.getter;
+                    binding.body = propertySyntax.getter->body.get();
+                    if (!binding.symbol.staticMethod) {
+                        binding.parameterNames.push_back("this");
+                        binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                    }
+                    binding.syntheticAutoGetter = propertySyntax.getter->semicolonToken.has_value();
+                    if (autoProperty) binding.syntheticField = owner.fields[property.backingFieldIndex];
+                    addBinding(std::move(binding));
+                }
+                if (property.setter) {
+                    FunctionBindingInput binding;
+                    binding.symbol = *property.setter;
+                    binding.body = propertySyntax.setter->body.get();
+                    if (!binding.symbol.staticMethod) {
+                        binding.parameterNames.push_back("this");
+                        binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                    }
+                    binding.parameterNames.push_back("value");
+                    binding.parameterSpans.push_back(propertySyntax.identifierToken.span);
+                    binding.syntheticAutoSetter = propertySyntax.setter->semicolonToken.has_value();
+                    if (autoProperty) binding.syntheticField = owner.fields[property.backingFieldIndex];
+                    addBinding(std::move(binding));
+                }
+                owner.properties.push_back(std::move(property));
+            }
+            for (auto& type : input.types) {
+                if (type.id == owner.id) type = owner;
+            }
+            input.visibleTypes[owner.name] = owner;
+            input.visibleTypes[canonicalTypeName(owner)] = owner;
+        }
+    };
+    addMembers(syntaxTree.classes);
+    addMembers(syntaxTree.structs);
 
     return bindModule(input);
 }
@@ -61,47 +168,135 @@ SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
     result.moduleName = input.moduleName;
     result.types = input.types;
 
+    if (!input.functionBindings.empty()) {
+        for (const auto& binding : input.functionBindings) {
+            result.functions.push_back(bindFunction(binding));
+        }
+        return result;
+    }
+
     std::size_t declarationIndex = 0;
     for (const auto* unit : input.units) {
         for (const auto& functionSyntax : unit->functions) {
             if (declarationIndex >= input.declarations.size()) {
-                diagnostics_.report(
-                    "RS2009",
-                    "function declaration table is incomplete",
-                    functionSyntax.identifierToken.span);
+                diagnostics_.report("RS2009", "function declaration table is incomplete", functionSyntax.identifierToken.span);
                 continue;
             }
-            result.functions.push_back(bindFunction(
-                functionSyntax,
-                input.declarations[declarationIndex++]));
+            FunctionBindingInput binding;
+            binding.symbol = input.declarations[declarationIndex++];
+            binding.body = &functionSyntax.body;
+            for (const auto& parameter : functionSyntax.parameters) {
+                binding.parameterNames.push_back(parameter.identifierToken.text);
+                binding.parameterSpans.push_back(parameter.identifierToken.span);
+            }
+            result.functions.push_back(bindFunction(binding));
         }
     }
-
     return result;
 }
 
-BoundFunction Binder::bindFunction(
-    const syntax::FunctionDeclarationSyntax& syntaxTree,
-    const FunctionSymbol& symbol) {
+BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     BoundFunction result;
-    result.symbol = symbol;
+    result.symbol = input.symbol;
 
     scopes_.clear();
     pushScope();
-    currentReturnType_ = symbol.returnType;
-    currentReturnTypeName_ = symbol.returnTypeName;
-    nextVariableIndex_ = symbol.parameters.size();
+    currentReturnType_ = input.symbol.returnType;
+    currentReturnTypeName_ = input.symbol.returnTypeName;
+    nextVariableIndex_ = input.symbol.parameters.size();
+    currentStaticMethod_ = input.symbol.staticMethod;
+    currentConstructor_ = input.symbol.constructor;
+    currentOwnerType_.reset();
+    if (!input.symbol.ownerTypeName.empty()) {
+        const auto found = visibleTypes_.find(input.symbol.ownerTypeName);
+        if (found != visibleTypes_.end()) currentOwnerType_ = found->second;
+    }
 
-    for (std::size_t i = 0; i < symbol.parameters.size(); ++i) {
-        auto parameter = symbol.parameters[i];
-        parameter.name = syntaxTree.parameters[i].identifierToken.text;
-        (void)declareVariable(
-            parameter,
-            syntaxTree.parameters[i].identifierToken.span);
+    for (std::size_t i = 0; i < input.symbol.parameters.size(); ++i) {
+        auto parameter = input.symbol.parameters[i];
+        if (i < input.parameterNames.size()) parameter.name = input.parameterNames[i];
+        const auto span = i < input.parameterSpans.size() ? input.parameterSpans[i] : text::TextSpan{};
+        (void)declareVariable(parameter, span);
         result.symbol.parameters[i].name = parameter.name;
     }
 
-    result.body = bindBlockStatement(syntaxTree.body, false);
+    if (input.syntheticAutoGetter || input.syntheticAutoSetter) {
+        result.body = std::make_unique<BoundBlockStatement>();
+        if (!currentOwnerType_ || input.symbol.staticMethod) {
+            diagnostics_.report("RS2462", "auto properties require an instance owner", {});
+        } else {
+            const auto* thisVariable = lookupVariable("this");
+            if (input.syntheticAutoGetter) {
+                auto receiver = std::make_unique<BoundVariableExpression>();
+                receiver->type = thisVariable->type;
+                receiver->typeName = thisVariable->typeName;
+                receiver->variable = *thisVariable;
+                std::unique_ptr<BoundExpression> access;
+                if (currentOwnerType_->kind == TypeKind::Struct) {
+                    auto structureAccess = std::make_unique<BoundStructFieldAccessExpression>();
+                    structureAccess->type = input.syntheticField.type;
+                    structureAccess->typeName = input.syntheticField.typeName;
+                    structureAccess->receiver = std::move(receiver);
+                    structureAccess->ownerType = *currentOwnerType_;
+                    structureAccess->field = input.syntheticField;
+                    access = std::move(structureAccess);
+                } else {
+                    auto memberAccess = std::make_unique<BoundMemberAccessExpression>();
+                    memberAccess->type = input.syntheticField.type;
+                    memberAccess->typeName = input.syntheticField.typeName;
+                    memberAccess->receiver = std::move(receiver);
+                    memberAccess->ownerType = *currentOwnerType_;
+                    memberAccess->field = input.syntheticField;
+                    access = std::move(memberAccess);
+                }
+                auto statement = std::make_unique<BoundReturnStatement>();
+                statement->expression = std::move(access);
+                result.body->statements.push_back(std::move(statement));
+            } else {
+                const auto* valueVariable = lookupVariable("value");
+                if (currentOwnerType_->kind == TypeKind::Struct) {
+                    diagnostics_.report(
+                        "RS2486",
+                        "struct properties cannot declare setters in the Phase 3E value model",
+                        {});
+                } else {
+                    auto receiver = std::make_unique<BoundVariableExpression>();
+                    receiver->type = thisVariable->type;
+                    receiver->typeName = thisVariable->typeName;
+                    receiver->variable = *thisVariable;
+                    auto assignment = std::make_unique<BoundMemberAssignmentExpression>();
+                    assignment->type = input.syntheticField.type;
+                    assignment->typeName = input.syntheticField.typeName;
+                    assignment->receiver = std::move(receiver);
+                    assignment->ownerType = *currentOwnerType_;
+                    assignment->field = input.syntheticField;
+                    auto value = std::make_unique<BoundVariableExpression>();
+                    value->type = valueVariable->type;
+                    value->typeName = valueVariable->typeName;
+                    value->variable = *valueVariable;
+                    assignment->expression = std::move(value);
+                    auto statement = std::make_unique<BoundExpressionStatement>();
+                    statement->expression = std::move(assignment);
+                    result.body->statements.push_back(std::move(statement));
+                }
+            }
+        }
+    } else if (input.body) {
+        result.body = bindBlockStatement(*input.body, false);
+    } else {
+        result.body = std::make_unique<BoundBlockStatement>();
+    }
+    if (input.symbol.constructor &&
+        input.symbol.returnType == PrimitiveType::Struct) {
+        const auto* thisVariable = lookupVariable("this");
+        auto statement = std::make_unique<BoundReturnStatement>();
+        auto expression = std::make_unique<BoundVariableExpression>();
+        expression->type = thisVariable->type;
+        expression->typeName = thisVariable->typeName;
+        expression->variable = *thisVariable;
+        statement->expression = std::move(expression);
+        result.body->statements.push_back(std::move(statement));
+    }
     result.variableCount = nextVariableIndex_;
 
     if (result.symbol.returnType != PrimitiveType::Void &&
@@ -109,12 +304,14 @@ BoundFunction Binder::bindFunction(
         detail::canReachFunctionEnd(result, diagnostics_)) {
         diagnostics_.report(
             "RS2001",
-            "not all control-flow paths in function '" +
-                result.symbol.name + "' return a value",
-            syntaxTree.identifierToken.span);
+            "not all control-flow paths in function '" + result.symbol.name + "' return a value",
+            {});
     }
 
     popScope();
+    currentOwnerType_.reset();
+    currentStaticMethod_ = false;
+    currentConstructor_ = false;
     return result;
 }
 
@@ -209,9 +406,7 @@ std::unique_ptr<BoundStatement> Binder::bindReturnStatement(
         "return value",
         currentReturnTypeName_);
     if (result->expression &&
-        (currentReturnType_ == PrimitiveType::Object ||
-         currentReturnType_ == PrimitiveType::Array ||
-         currentReturnType_ == PrimitiveType::Handle)) {
+        isExactType(currentReturnType_)) {
         result->expression->typeName = currentReturnTypeName_;
     }
     return result;
@@ -268,9 +463,7 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
             "initializer",
             result->variable.typeName);
         if (result->initializer &&
-            (result->variable.type == PrimitiveType::Object ||
-             result->variable.type == PrimitiveType::Array ||
-             result->variable.type == PrimitiveType::Handle)) {
+            isExactType(result->variable.type)) {
             if (!result->initializer->typeName.empty() &&
                 result->initializer->typeName != result->variable.typeName) {
                 diagnostics_.report(
@@ -302,6 +495,9 @@ std::unique_ptr<BoundExpression> Binder::bindExpression(
     case syntax::SyntaxKind::NameExpression:
         return bindNameExpression(
             static_cast<const syntax::NameExpressionSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::ThisExpression:
+        return bindThisExpression(
+            static_cast<const syntax::ThisExpressionSyntax&>(syntaxTree));
     case syntax::SyntaxKind::UnaryExpression:
         return bindUnaryExpression(
             static_cast<const syntax::UnaryExpressionSyntax&>(syntaxTree));
@@ -318,6 +514,9 @@ std::unique_ptr<BoundExpression> Binder::bindExpression(
     case syntax::SyntaxKind::CallExpression:
         return bindCallExpression(
             static_cast<const syntax::CallExpressionSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::MemberCallExpression:
+        return bindMemberCallExpression(
+            static_cast<const syntax::MemberCallExpressionSyntax&>(syntaxTree));
     case syntax::SyntaxKind::NewObjectExpression:
         return bindNewObjectExpression(
             static_cast<const syntax::NewObjectExpressionSyntax&>(syntaxTree));
@@ -355,7 +554,11 @@ PrimitiveType Binder::bindType(
     if (baseType == PrimitiveType::Error) {
         const auto found = visibleTypes_.find(syntaxTree.name.text);
         if (found != visibleTypes_.end()) {
-            baseType = PrimitiveType::Object;
+            baseType = found->second.kind == TypeKind::Class
+                ? PrimitiveType::Object
+                : found->second.kind == TypeKind::Struct
+                    ? PrimitiveType::Struct
+                    : PrimitiveType::Enum;
             baseTypeName = canonicalTypeName(found->second);
         } else {
             diagnostics_.report(
@@ -388,6 +591,8 @@ PrimitiveType Binder::bindType(
     }
     if (typeName &&
         (baseType == PrimitiveType::Object ||
+         baseType == PrimitiveType::Struct ||
+         baseType == PrimitiveType::Enum ||
          baseType == PrimitiveType::Handle)) {
         *typeName = baseTypeName;
     }

@@ -1,6 +1,6 @@
 # RealScript 字节码与原生 ABI 规范
 
-> 当前 `.rsbc` 0.3 的类型描述符、对象/数组指令、精确引用签名和 Local/Register/Block TypeId 编码见 [BYTECODE_FORMAT_V0.md](BYTECODE_FORMAT_V0.md)、[OBJECT_MODEL_V0.md](OBJECT_MODEL_V0.md) 与 [ARRAYS_NATIVE_HANDLES_HEAP_DIAGNOSTICS_V0.md](ARRAYS_NATIVE_HANDLES_HEAP_DIAGNOSTICS_V0.md)。
+> 当前 `.rsbc` 0.4 的 class/struct/enum 类型描述符、对象/数组/值指令、成员调用签名和精确 Local/Register/Block TypeId 编码见 [BYTECODE_FORMAT_V0.md](BYTECODE_FORMAT_V0.md) 及 Phase 3B–3E Implemented Draft 文档。
 
 
 - 规范版本：Draft v0.1

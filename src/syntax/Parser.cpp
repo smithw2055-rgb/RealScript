@@ -55,6 +55,10 @@ CompilationUnitSyntax Parser::parseCompilationUnit() {
         const auto before = position_;
         if (current().kind == SyntaxKind::ClassKeyword) {
             result.classes.push_back(parseClassDeclaration());
+        } else if (current().kind == SyntaxKind::StructKeyword) {
+            result.structs.push_back(parseStructDeclaration());
+        } else if (current().kind == SyntaxKind::EnumKeyword) {
+            result.enums.push_back(parseEnumDeclaration());
         } else {
             result.functions.push_back(parseFunctionDeclaration());
         }
@@ -115,39 +119,104 @@ ParameterSyntax Parser::parseParameter() {
     return result;
 }
 
-FieldDeclarationSyntax Parser::parseFieldDeclaration() {
+FieldDeclarationSyntax Parser::parseFieldDeclaration(
+    TypeSyntax type,
+    SyntaxToken identifier) {
     FieldDeclarationSyntax result;
-    result.type = parseType();
-    result.identifierToken = match(SyntaxKind::IdentifierToken);
+    result.type = std::move(type);
+    result.identifierToken = std::move(identifier);
     result.semicolonToken = match(SyntaxKind::SemicolonToken);
     return result;
 }
 
-ClassDeclarationSyntax Parser::parseClassDeclaration() {
-    ClassDeclarationSyntax result;
-    result.classKeyword = match(SyntaxKind::ClassKeyword);
+void Parser::parseArgumentList(
+    std::vector<std::unique_ptr<ExpressionSyntax>>& arguments,
+    std::vector<SyntaxToken>& commaTokens,
+    SyntaxToken& closeParenToken) {
+    if (current().kind != SyntaxKind::CloseParenToken &&
+        current().kind != SyntaxKind::EndOfFileToken) {
+        arguments.push_back(parseExpression());
+        while (current().kind == SyntaxKind::CommaToken) {
+            commaTokens.push_back(nextToken());
+            arguments.push_back(parseExpression());
+        }
+    }
+    closeParenToken = match(SyntaxKind::CloseParenToken);
+}
+
+ConstructorDeclarationSyntax Parser::parseConstructorDeclaration() {
+    ConstructorDeclarationSyntax result;
     result.identifierToken = match(SyntaxKind::IdentifierToken);
+    result.openParenToken = match(SyntaxKind::OpenParenToken);
+    if (current().kind != SyntaxKind::CloseParenToken &&
+        current().kind != SyntaxKind::EndOfFileToken) {
+        result.parameters.push_back(parseParameter());
+        while (current().kind == SyntaxKind::CommaToken) {
+            result.commaTokens.push_back(nextToken());
+            result.parameters.push_back(parseParameter());
+        }
+    }
+    result.closeParenToken = match(SyntaxKind::CloseParenToken);
+    result.body = parseBlockStatement();
+    return result;
+}
+
+AccessorDeclarationSyntax Parser::parseAccessorDeclaration() {
+    AccessorDeclarationSyntax result;
+    if (current().kind == SyntaxKind::GetKeyword ||
+        current().kind == SyntaxKind::SetKeyword) {
+        result.keyword = nextToken();
+    } else {
+        result.keyword = match(SyntaxKind::GetKeyword);
+    }
+    if (current().kind == SyntaxKind::SemicolonToken) {
+        result.semicolonToken = nextToken();
+    } else {
+        result.body = std::make_unique<BlockStatementSyntax>(parseBlockStatement());
+    }
+    return result;
+}
+
+PropertyDeclarationSyntax Parser::parsePropertyDeclaration(
+    std::optional<SyntaxToken> staticKeyword,
+    TypeSyntax type,
+    SyntaxToken identifier) {
+    PropertyDeclarationSyntax result;
+    result.staticKeyword = std::move(staticKeyword);
+    result.type = std::move(type);
+    result.identifierToken = std::move(identifier);
     result.openBraceToken = match(SyntaxKind::OpenBraceToken);
     while (current().kind != SyntaxKind::CloseBraceToken &&
            current().kind != SyntaxKind::EndOfFileToken) {
-        const auto before = position_;
-        result.fields.push_back(parseFieldDeclaration());
-        if (before == position_) {
-            diagnostics_.report(
-                "RS1103",
-                "parser made no progress while reading a class field",
-                current().span);
-            nextToken();
+        auto accessor = std::make_unique<AccessorDeclarationSyntax>(
+            parseAccessorDeclaration());
+        if (accessor->keyword.kind == SyntaxKind::GetKeyword) {
+            if (result.getter) {
+                diagnostics_.report("RS1104", "duplicate get accessor", accessor->keyword.span);
+            } else {
+                result.getter = std::move(accessor);
+            }
+        } else {
+            if (result.setter) {
+                diagnostics_.report("RS1105", "duplicate set accessor", accessor->keyword.span);
+            } else {
+                result.setter = std::move(accessor);
+            }
         }
     }
     result.closeBraceToken = match(SyntaxKind::CloseBraceToken);
     return result;
 }
 
-FunctionDeclarationSyntax Parser::parseFunctionDeclaration() {
+FunctionDeclarationSyntax Parser::parseFunctionDeclaration(
+    std::optional<SyntaxToken> staticKeyword,
+    std::optional<TypeSyntax> returnType,
+    std::optional<SyntaxToken> identifier) {
     FunctionDeclarationSyntax result;
-    result.returnType = parseType();
-    result.identifierToken = match(SyntaxKind::IdentifierToken);
+    result.staticKeyword = std::move(staticKeyword);
+    result.returnType = returnType ? std::move(*returnType) : parseType();
+    result.identifierToken = identifier ? std::move(*identifier) :
+        match(SyntaxKind::IdentifierToken);
     result.openParenToken = match(SyntaxKind::OpenParenToken);
 
     if (current().kind != SyntaxKind::CloseParenToken &&
@@ -161,6 +230,119 @@ FunctionDeclarationSyntax Parser::parseFunctionDeclaration() {
 
     result.closeParenToken = match(SyntaxKind::CloseParenToken);
     result.body = parseBlockStatement();
+    return result;
+}
+
+ClassDeclarationSyntax Parser::parseClassDeclaration() {
+    ClassDeclarationSyntax result;
+    result.classKeyword = match(SyntaxKind::ClassKeyword);
+    result.identifierToken = match(SyntaxKind::IdentifierToken);
+    const auto typeName = result.identifierToken.text;
+    result.openBraceToken = match(SyntaxKind::OpenBraceToken);
+    while (current().kind != SyntaxKind::CloseBraceToken &&
+           current().kind != SyntaxKind::EndOfFileToken) {
+        const auto before = position_;
+        std::optional<SyntaxToken> staticKeyword;
+        if (current().kind == SyntaxKind::StaticKeyword) {
+            staticKeyword = nextToken();
+        }
+        if (!staticKeyword && current().kind == SyntaxKind::IdentifierToken &&
+            current().text == typeName && peek(1).kind == SyntaxKind::OpenParenToken) {
+            result.constructors.push_back(parseConstructorDeclaration());
+        } else {
+            auto type = parseType();
+            auto identifier = match(SyntaxKind::IdentifierToken);
+            if (current().kind == SyntaxKind::OpenParenToken) {
+                result.methods.push_back(parseFunctionDeclaration(
+                    std::move(staticKeyword), std::move(type), std::move(identifier)));
+            } else if (current().kind == SyntaxKind::OpenBraceToken) {
+                result.properties.push_back(parsePropertyDeclaration(
+                    std::move(staticKeyword), std::move(type), std::move(identifier)));
+            } else {
+                if (staticKeyword) {
+                    diagnostics_.report("RS1106", "static fields are not supported", staticKeyword->span);
+                }
+                result.fields.push_back(parseFieldDeclaration(
+                    std::move(type), std::move(identifier)));
+            }
+        }
+        if (before == position_) {
+            diagnostics_.report("RS1103", "parser made no progress while reading a class member", current().span);
+            nextToken();
+        }
+    }
+    result.closeBraceToken = match(SyntaxKind::CloseBraceToken);
+    return result;
+}
+
+StructDeclarationSyntax Parser::parseStructDeclaration() {
+    StructDeclarationSyntax result;
+    result.structKeyword = match(SyntaxKind::StructKeyword);
+    result.identifierToken = match(SyntaxKind::IdentifierToken);
+    const auto typeName = result.identifierToken.text;
+    result.openBraceToken = match(SyntaxKind::OpenBraceToken);
+    while (current().kind != SyntaxKind::CloseBraceToken &&
+           current().kind != SyntaxKind::EndOfFileToken) {
+        const auto before = position_;
+        std::optional<SyntaxToken> staticKeyword;
+        if (current().kind == SyntaxKind::StaticKeyword) staticKeyword = nextToken();
+        if (!staticKeyword && current().kind == SyntaxKind::IdentifierToken &&
+            current().text == typeName && peek(1).kind == SyntaxKind::OpenParenToken) {
+            result.constructors.push_back(parseConstructorDeclaration());
+        } else {
+            auto type = parseType();
+            auto identifier = match(SyntaxKind::IdentifierToken);
+            if (current().kind == SyntaxKind::OpenParenToken) {
+                result.methods.push_back(parseFunctionDeclaration(
+                    std::move(staticKeyword), std::move(type), std::move(identifier)));
+            } else if (current().kind == SyntaxKind::OpenBraceToken) {
+                result.properties.push_back(parsePropertyDeclaration(
+                    std::move(staticKeyword), std::move(type), std::move(identifier)));
+            } else {
+                if (staticKeyword) diagnostics_.report("RS1106", "static fields are not supported", staticKeyword->span);
+                result.fields.push_back(parseFieldDeclaration(std::move(type), std::move(identifier)));
+            }
+        }
+        if (before == position_) {
+            diagnostics_.report("RS1103", "parser made no progress while reading a struct member", current().span);
+            nextToken();
+        }
+    }
+    result.closeBraceToken = match(SyntaxKind::CloseBraceToken);
+    return result;
+}
+
+EnumDeclarationSyntax Parser::parseEnumDeclaration() {
+    EnumDeclarationSyntax result;
+    result.enumKeyword = match(SyntaxKind::EnumKeyword);
+    result.identifierToken = match(SyntaxKind::IdentifierToken);
+    result.openBraceToken = match(SyntaxKind::OpenBraceToken);
+    while (current().kind != SyntaxKind::CloseBraceToken &&
+           current().kind != SyntaxKind::EndOfFileToken) {
+        EnumMemberDeclarationSyntax member;
+        member.identifierToken = match(SyntaxKind::IdentifierToken);
+        if (current().kind == SyntaxKind::EqualsToken) {
+            member.equalsToken = nextToken();
+            if (current().kind == SyntaxKind::MinusToken) {
+                const auto minus = nextToken();
+                auto value = match(SyntaxKind::IntegerLiteralToken);
+                value.text = "-" + value.text;
+                if (std::holds_alternative<std::int64_t>(value.value)) {
+                    value.value = -std::get<std::int64_t>(value.value);
+                }
+                value.span = text::TextSpan::fromBounds(minus.span.start, value.span.end());
+                member.valueToken = std::move(value);
+            } else {
+                member.valueToken = match(SyntaxKind::IntegerLiteralToken);
+            }
+        }
+        if (current().kind == SyntaxKind::CommaToken) member.commaToken = nextToken();
+        result.members.push_back(std::move(member));
+        if (!result.members.back().commaToken && current().kind != SyntaxKind::CloseBraceToken) {
+            diagnostics_.report("RS1107", "expected comma between enum members", current().span);
+        }
+    }
+    result.closeBraceToken = match(SyntaxKind::CloseBraceToken);
     return result;
 }
 
@@ -332,11 +514,23 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePostfixExpression() {
     auto expression = parsePrimaryExpression();
     for (;;) {
         if (current().kind == SyntaxKind::DotToken) {
-            auto member = std::make_unique<MemberAccessExpressionSyntax>();
-            member->receiver = std::move(expression);
-            member->dotToken = nextToken();
-            member->nameToken = match(SyntaxKind::IdentifierToken);
-            expression = std::move(member);
+            const auto dot = nextToken();
+            const auto name = match(SyntaxKind::IdentifierToken);
+            if (current().kind == SyntaxKind::OpenParenToken) {
+                auto call = std::make_unique<MemberCallExpressionSyntax>();
+                call->receiver = std::move(expression);
+                call->dotToken = dot;
+                call->nameToken = name;
+                call->openParenToken = nextToken();
+                parseArgumentList(call->arguments, call->commaTokens, call->closeParenToken);
+                expression = std::move(call);
+            } else {
+                auto member = std::make_unique<MemberAccessExpressionSyntax>();
+                member->receiver = std::move(expression);
+                member->dotToken = dot;
+                member->nameToken = name;
+                expression = std::move(member);
+            }
             continue;
         }
         if (current().kind == SyntaxKind::OpenBracketToken) {
@@ -356,18 +550,15 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePostfixExpression() {
 std::unique_ptr<ExpressionSyntax> Parser::parseNewExpression() {
     const auto newKeyword = match(SyntaxKind::NewKeyword);
     TypeSyntax type;
-    if (isIdentifierLike(current().kind)) {
-        type.name = nextToken();
-    } else {
-        type.name = match(SyntaxKind::IdentifierToken);
-    }
+    if (isIdentifierLike(current().kind)) type.name = nextToken();
+    else type.name = match(SyntaxKind::IdentifierToken);
 
     if (current().kind == SyntaxKind::OpenParenToken) {
         auto result = std::make_unique<NewObjectExpressionSyntax>();
         result->newKeyword = newKeyword;
         result->type = std::move(type);
         result->openParenToken = nextToken();
-        result->closeParenToken = match(SyntaxKind::CloseParenToken);
+        parseArgumentList(result->arguments, result->commaTokens, result->closeParenToken);
         return result;
     }
 
@@ -384,6 +575,11 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
     switch (current().kind) {
     case SyntaxKind::NewKeyword:
         return parseNewExpression();
+    case SyntaxKind::ThisKeyword: {
+        auto result = std::make_unique<ThisExpressionSyntax>();
+        result->thisKeyword = nextToken();
+        return result;
+    }
     case SyntaxKind::OpenParenToken: {
         auto result = std::make_unique<ParenthesizedExpressionSyntax>();
         result->openParenToken = nextToken();
@@ -421,15 +617,7 @@ std::unique_ptr<ExpressionSyntax> Parser::parseCallExpression() {
     auto result = std::make_unique<CallExpressionSyntax>();
     result->identifierToken = match(SyntaxKind::IdentifierToken);
     result->openParenToken = match(SyntaxKind::OpenParenToken);
-    if (current().kind != SyntaxKind::CloseParenToken &&
-        current().kind != SyntaxKind::EndOfFileToken) {
-        result->arguments.push_back(parseExpression());
-        while (current().kind == SyntaxKind::CommaToken) {
-            result->commaTokens.push_back(nextToken());
-            result->arguments.push_back(parseExpression());
-        }
-    }
-    result->closeParenToken = match(SyntaxKind::CloseParenToken);
+    parseArgumentList(result->arguments, result->commaTokens, result->closeParenToken);
     return result;
 }
 

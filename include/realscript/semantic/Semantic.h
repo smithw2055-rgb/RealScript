@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -19,17 +21,29 @@ enum class PrimitiveType {
     Void,
     Bool,
     Int,
+    Long,
+    Double,
     String,
     Object,
+    Struct,
+    Enum,
     Array,
     Handle,
     Null,
 };
 
+enum class TypeKind {
+    Class,
+    Struct,
+    Enum,
+};
+
 [[nodiscard]] const char* primitiveTypeName(PrimitiveType type) noexcept;
 [[nodiscard]] PrimitiveType resolvePrimitiveType(const std::string& name) noexcept;
 [[nodiscard]] bool isNumericType(PrimitiveType type) noexcept;
+[[nodiscard]] bool isIntegralType(PrimitiveType type) noexcept;
 [[nodiscard]] bool isReferenceType(PrimitiveType type) noexcept;
+[[nodiscard]] bool isExactType(PrimitiveType type) noexcept;
 [[nodiscard]] std::string arrayTypeName(
     PrimitiveType elementType,
     const std::string& elementTypeName = {});
@@ -44,6 +58,9 @@ enum class ConversionKind {
     NullToString,
     NullToObject,
     NullToArray,
+    IntToLong,
+    IntToDouble,
+    LongToDouble,
 };
 
 [[nodiscard]] ConversionKind classifyConversion(
@@ -64,16 +81,55 @@ struct FieldSymbol {
     PrimitiveType type = PrimitiveType::Error;
     std::string typeName;
     std::size_t index = 0;
+    bool synthetic = false;
+};
+
+struct FunctionSymbol {
+    SymbolId id = 0;
+    std::string moduleName;
+    std::string name;
+    std::string ownerTypeName;
+    SymbolId ownerTypeId = 0;
+    PrimitiveType returnType = PrimitiveType::Error;
+    std::string returnTypeName;
+    std::vector<VariableSymbol> parameters;
+    bool method = false;
+    bool staticMethod = false;
+    bool constructor = false;
+    bool propertyGetter = false;
+    bool propertySetter = false;
+};
+
+struct PropertySymbol {
+    std::string name;
+    PrimitiveType type = PrimitiveType::Error;
+    std::string typeName;
+    bool staticProperty = false;
+    std::optional<FunctionSymbol> getter;
+    std::optional<FunctionSymbol> setter;
+    std::size_t backingFieldIndex = std::numeric_limits<std::size_t>::max();
+};
+
+struct EnumMemberSymbol {
+    std::string name;
+    std::int64_t value = 0;
 };
 
 struct TypeSymbol {
     SymbolId id = 0;
+    TypeKind kind = TypeKind::Class;
     std::string moduleName;
     std::string name;
     std::vector<FieldSymbol> fields;
+    std::vector<FunctionSymbol> methods;
+    std::vector<FunctionSymbol> constructors;
+    std::vector<PropertySymbol> properties;
+    std::vector<EnumMemberSymbol> enumMembers;
 };
 
 using TypeSymbolMap = std::unordered_map<std::string, TypeSymbol>;
+using FunctionOverloadMap =
+    std::unordered_map<std::string, std::vector<FunctionSymbol>>;
 
 [[nodiscard]] std::string canonicalTypeName(const TypeSymbol& type);
 [[nodiscard]] SymbolId stableTypeId(const TypeSymbol& type);
@@ -81,20 +137,26 @@ using TypeSymbolMap = std::unordered_map<std::string, TypeSymbol>;
 [[nodiscard]] TypeSymbol declareTypeShell(
     const std::string& moduleName,
     const syntax::ClassDeclarationSyntax& syntax);
+[[nodiscard]] TypeSymbol declareTypeShell(
+    const std::string& moduleName,
+    const syntax::StructDeclarationSyntax& syntax);
+[[nodiscard]] TypeSymbol declareTypeShell(
+    const std::string& moduleName,
+    const syntax::EnumDeclarationSyntax& syntax);
 [[nodiscard]] bool populateTypeFields(
     TypeSymbol& type,
     const syntax::ClassDeclarationSyntax& syntax,
     const TypeSymbolMap& visibleTypes,
     diagnostics::DiagnosticBag& diagnostics);
-
-struct FunctionSymbol {
-    SymbolId id = 0;
-    std::string moduleName;
-    std::string name;
-    PrimitiveType returnType = PrimitiveType::Error;
-    std::string returnTypeName;
-    std::vector<VariableSymbol> parameters;
-};
+[[nodiscard]] bool populateTypeFields(
+    TypeSymbol& type,
+    const syntax::StructDeclarationSyntax& syntax,
+    const TypeSymbolMap& visibleTypes,
+    diagnostics::DiagnosticBag& diagnostics);
+[[nodiscard]] bool populateEnumMembers(
+    TypeSymbol& type,
+    const syntax::EnumDeclarationSyntax& syntax,
+    diagnostics::DiagnosticBag& diagnostics);
 
 [[nodiscard]] std::string canonicalFunctionKey(const FunctionSymbol& function);
 [[nodiscard]] std::string canonicalFunctionSignature(const FunctionSymbol& function);
@@ -103,15 +165,36 @@ struct FunctionSymbol {
     const std::string& moduleName,
     const syntax::FunctionDeclarationSyntax& syntax,
     const TypeSymbolMap& visibleTypes,
+    diagnostics::DiagnosticBag& diagnostics,
+    const TypeSymbol* owner = nullptr);
+[[nodiscard]] FunctionSymbol declareConstructorSymbol(
+    const std::string& moduleName,
+    const syntax::ConstructorDeclarationSyntax& syntax,
+    const TypeSymbol& owner,
+    const TypeSymbolMap& visibleTypes,
+    diagnostics::DiagnosticBag& diagnostics);
+[[nodiscard]] PropertySymbol declarePropertySymbol(
+    const std::string& moduleName,
+    const syntax::PropertyDeclarationSyntax& syntax,
+    const TypeSymbol& owner,
+    const TypeSymbolMap& visibleTypes,
     diagnostics::DiagnosticBag& diagnostics);
 
-using FunctionOverloadMap =
-    std::unordered_map<std::string, std::vector<FunctionSymbol>>;
+struct FunctionBindingInput {
+    FunctionSymbol symbol;
+    const syntax::BlockStatementSyntax* body = nullptr;
+    std::vector<std::string> parameterNames;
+    std::vector<text::TextSpan> parameterSpans;
+    bool syntheticAutoGetter = false;
+    bool syntheticAutoSetter = false;
+    FieldSymbol syntheticField;
+};
 
 struct ModuleBindingInput {
     std::string moduleName;
     std::vector<const syntax::CompilationUnitSyntax*> units;
     std::vector<FunctionSymbol> declarations;
+    std::vector<FunctionBindingInput> functionBindings;
     std::vector<TypeSymbol> types;
     FunctionOverloadMap visibleFunctions;
     TypeSymbolMap visibleTypes;
@@ -127,11 +210,15 @@ enum class BoundNodeKind {
     ConversionExpression,
     CallExpression,
     NewObjectExpression,
+    NewStructExpression,
+    StructFieldAccessExpression,
+    StructFieldAssignmentExpression,
     NewArrayExpression,
     ArrayLengthExpression,
     ElementAccessExpression,
     MemberAccessExpression,
     MemberAssignmentExpression,
+    PropertyAssignmentExpression,
     ElementAssignmentExpression,
     BlockStatement,
     ReturnStatement,
@@ -242,8 +329,38 @@ struct BoundCallExpression final : BoundExpression {
 
 struct BoundNewObjectExpression final : BoundExpression {
     TypeSymbol objectType;
+    std::optional<FunctionSymbol> constructor;
+    std::vector<std::unique_ptr<BoundExpression>> arguments;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::NewObjectExpression;
+    }
+};
+
+struct BoundNewStructExpression final : BoundExpression {
+    TypeSymbol structType;
+    std::optional<FunctionSymbol> constructor;
+    std::vector<std::unique_ptr<BoundExpression>> arguments;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::NewStructExpression;
+    }
+};
+
+struct BoundStructFieldAccessExpression final : BoundExpression {
+    std::unique_ptr<BoundExpression> receiver;
+    TypeSymbol ownerType;
+    FieldSymbol field;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::StructFieldAccessExpression;
+    }
+};
+
+struct BoundStructFieldAssignmentExpression final : BoundExpression {
+    VariableSymbol variable;
+    TypeSymbol ownerType;
+    FieldSymbol field;
+    std::unique_ptr<BoundExpression> expression;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::StructFieldAssignmentExpression;
     }
 };
 
@@ -290,6 +407,15 @@ struct BoundMemberAssignmentExpression final : BoundExpression {
     std::unique_ptr<BoundExpression> expression;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::MemberAssignmentExpression;
+    }
+};
+
+struct BoundPropertyAssignmentExpression final : BoundExpression {
+    FunctionSymbol setter;
+    std::vector<std::unique_ptr<BoundExpression>> arguments;
+    std::unique_ptr<BoundExpression> assignedValue;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::PropertyAssignmentExpression;
     }
 };
 
@@ -372,8 +498,7 @@ public:
 
 private:
     [[nodiscard]] BoundFunction bindFunction(
-        const syntax::FunctionDeclarationSyntax& syntax,
-        const FunctionSymbol& symbol);
+        const FunctionBindingInput& input);
     [[nodiscard]] std::unique_ptr<BoundBlockStatement> bindBlockStatement(
         const syntax::BlockStatementSyntax& syntax,
         bool createScope);
@@ -397,6 +522,8 @@ private:
         const syntax::LiteralExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindNameExpression(
         const syntax::NameExpressionSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundExpression> bindThisExpression(
+        const syntax::ThisExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindUnaryExpression(
         const syntax::UnaryExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindBinaryExpression(
@@ -405,6 +532,8 @@ private:
         const syntax::AssignmentExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindCallExpression(
         const syntax::CallExpressionSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundExpression> bindMemberCallExpression(
+        const syntax::MemberCallExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindNewObjectExpression(
         const syntax::NewObjectExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindNewArrayExpression(
@@ -443,6 +572,9 @@ private:
     std::size_t nextVariableIndex_ = 0;
     FunctionOverloadMap visibleFunctions_;
     TypeSymbolMap visibleTypes_;
+    std::optional<TypeSymbol> currentOwnerType_;
+    bool currentStaticMethod_ = false;
+    bool currentConstructor_ = false;
 };
 
 } // namespace realscript::semantic

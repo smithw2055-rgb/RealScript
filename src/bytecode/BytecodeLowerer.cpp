@@ -21,6 +21,7 @@ Opcode lowerOpcode(mir::Opcode opcode) {
     switch (opcode) {
     case mir::Opcode::Parameter: return Opcode::LoadParameter;
     case mir::Opcode::ConstantInt: return Opcode::ConstantInt;
+    case mir::Opcode::ConstantDouble: return Opcode::ConstantDouble;
     case mir::Opcode::ConstantBool: return Opcode::ConstantBool;
     case mir::Opcode::ConstantString: return Opcode::ConstantString;
     case mir::Opcode::ConstantNull: return Opcode::ConstantNull;
@@ -29,7 +30,11 @@ Opcode lowerOpcode(mir::Opcode opcode) {
     case mir::Opcode::ConvertNullToString: return Opcode::ConvertNullToString;
     case mir::Opcode::ConvertNullToObject: return Opcode::ConvertNullToObject;
     case mir::Opcode::ConvertNullToArray: return Opcode::ConvertNullToArray;
+    case mir::Opcode::ConvertIntToLong: return Opcode::ConvertIntToLong;
+    case mir::Opcode::ConvertIntToDouble: return Opcode::ConvertIntToDouble;
+    case mir::Opcode::ConvertLongToDouble: return Opcode::ConvertLongToDouble;
     case mir::Opcode::NewObject: return Opcode::NewObject;
+    case mir::Opcode::NewStruct: return Opcode::NewStruct;
     case mir::Opcode::NewArray: return Opcode::NewArray;
     case mir::Opcode::CheckNotNull: return Opcode::CheckNotNull;
     case mir::Opcode::ArrayLength: return Opcode::ArrayLength;
@@ -37,8 +42,12 @@ Opcode lowerOpcode(mir::Opcode opcode) {
     case mir::Opcode::StoreElement: return Opcode::StoreElement;
     case mir::Opcode::LoadField: return Opcode::LoadField;
     case mir::Opcode::StoreField: return Opcode::StoreField;
+    case mir::Opcode::LoadStructField: return Opcode::LoadStructField;
+    case mir::Opcode::StoreStructField: return Opcode::StoreStructField;
     case mir::Opcode::Call: return Opcode::Call;
     case mir::Opcode::NegateInt: return Opcode::NegateInt;
+    case mir::Opcode::NegateLong: return Opcode::NegateLong;
+    case mir::Opcode::NegateDouble: return Opcode::NegateDouble;
     case mir::Opcode::LogicalNot: return Opcode::LogicalNot;
     case mir::Opcode::AddInt: return Opcode::AddInt;
     case mir::Opcode::SubtractInt: return Opcode::SubtractInt;
@@ -51,6 +60,23 @@ Opcode lowerOpcode(mir::Opcode opcode) {
     case mir::Opcode::LessOrEqualInt: return Opcode::LessOrEqualInt;
     case mir::Opcode::GreaterInt: return Opcode::GreaterInt;
     case mir::Opcode::GreaterOrEqualInt: return Opcode::GreaterOrEqualInt;
+    case mir::Opcode::AddLong: return Opcode::AddLong;
+    case mir::Opcode::SubtractLong: return Opcode::SubtractLong;
+    case mir::Opcode::MultiplyLong: return Opcode::MultiplyLong;
+    case mir::Opcode::DivideLong: return Opcode::DivideLong;
+    case mir::Opcode::RemainderLong: return Opcode::RemainderLong;
+    case mir::Opcode::LessLong: return Opcode::LessLong;
+    case mir::Opcode::LessOrEqualLong: return Opcode::LessOrEqualLong;
+    case mir::Opcode::GreaterLong: return Opcode::GreaterLong;
+    case mir::Opcode::GreaterOrEqualLong: return Opcode::GreaterOrEqualLong;
+    case mir::Opcode::AddDouble: return Opcode::AddDouble;
+    case mir::Opcode::SubtractDouble: return Opcode::SubtractDouble;
+    case mir::Opcode::MultiplyDouble: return Opcode::MultiplyDouble;
+    case mir::Opcode::DivideDouble: return Opcode::DivideDouble;
+    case mir::Opcode::LessDouble: return Opcode::LessDouble;
+    case mir::Opcode::LessOrEqualDouble: return Opcode::LessOrEqualDouble;
+    case mir::Opcode::GreaterDouble: return Opcode::GreaterDouble;
+    case mir::Opcode::GreaterOrEqualDouble: return Opcode::GreaterOrEqualDouble;
     }
     throw std::logic_error("unsupported MIR opcode in bytecode lowerer");
 }
@@ -155,14 +181,20 @@ Module Lowerer::lower(const mir::Module& source) const {
                         ? sourceInstruction.integerImmediate
                         : sourceInstruction.localIndex);
                 if (sourceInstruction.opcode == mir::Opcode::LoadField ||
-                    sourceInstruction.opcode == mir::Opcode::StoreField) {
+                    sourceInstruction.opcode == mir::Opcode::StoreField ||
+                    sourceInstruction.opcode == mir::Opcode::NewStruct ||
+                    sourceInstruction.opcode == mir::Opcode::LoadStructField ||
+                    sourceInstruction.opcode == mir::Opcode::StoreStructField) {
                     instruction.index = static_cast<std::uint32_t>(
                         sourceInstruction.fieldIndex);
                 }
                 if (sourceInstruction.opcode == mir::Opcode::NewObject ||
                     sourceInstruction.opcode == mir::Opcode::CheckNotNull ||
                     sourceInstruction.opcode == mir::Opcode::LoadField ||
-                    sourceInstruction.opcode == mir::Opcode::StoreField) {
+                    sourceInstruction.opcode == mir::Opcode::StoreField ||
+                    sourceInstruction.opcode == mir::Opcode::NewStruct ||
+                    sourceInstruction.opcode == mir::Opcode::LoadStructField ||
+                    sourceInstruction.opcode == mir::Opcode::StoreStructField) {
                     const auto foundType = typeIndices.find(sourceInstruction.typeId);
                     if (foundType == typeIndices.end()) {
                         throw std::logic_error(
@@ -173,6 +205,7 @@ Module Lowerer::lower(const mir::Module& source) const {
                 instruction.elementType = sourceInstruction.elementType;
                 instruction.elementTypeId = sourceInstruction.elementTypeId;
                 instruction.integerImmediate = sourceInstruction.integerImmediate;
+                instruction.doubleImmediate = sourceInstruction.doubleImmediate;
                 instruction.boolImmediate = sourceInstruction.boolImmediate;
                 instruction.stringImmediate = sourceInstruction.stringImmediate;
 

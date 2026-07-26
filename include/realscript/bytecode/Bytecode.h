@@ -18,12 +18,13 @@ constexpr Register InvalidRegister = std::numeric_limits<Register>::max();
 
 struct Version {
     std::uint16_t major = 0;
-    std::uint16_t minor = 3;
+    std::uint16_t minor = 4;
 };
 
 enum class Opcode : std::uint8_t {
     LoadParameter,
     ConstantInt,
+    ConstantDouble,
     ConstantBool,
     ConstantString,
     ConstantNull,
@@ -32,7 +33,11 @@ enum class Opcode : std::uint8_t {
     ConvertNullToString,
     ConvertNullToObject,
     ConvertNullToArray,
+    ConvertIntToLong,
+    ConvertIntToDouble,
+    ConvertLongToDouble,
     NewObject,
+    NewStruct,
     NewArray,
     CheckNotNull,
     ArrayLength,
@@ -40,8 +45,12 @@ enum class Opcode : std::uint8_t {
     StoreElement,
     LoadField,
     StoreField,
+    LoadStructField,
+    StoreStructField,
     Call,
     NegateInt,
+    NegateLong,
+    NegateDouble,
     LogicalNot,
     AddInt,
     SubtractInt,
@@ -54,6 +63,23 @@ enum class Opcode : std::uint8_t {
     LessOrEqualInt,
     GreaterInt,
     GreaterOrEqualInt,
+    AddLong,
+    SubtractLong,
+    MultiplyLong,
+    DivideLong,
+    RemainderLong,
+    LessLong,
+    LessOrEqualLong,
+    GreaterLong,
+    GreaterOrEqualLong,
+    AddDouble,
+    SubtractDouble,
+    MultiplyDouble,
+    DivideDouble,
+    LessDouble,
+    LessOrEqualDouble,
+    GreaterDouble,
+    GreaterOrEqualDouble,
 };
 
 struct FunctionReference {
@@ -74,6 +100,7 @@ struct Instruction {
     semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
     semantic::SymbolId elementTypeId = 0;
     std::int64_t integerImmediate = 0;
+    double doubleImmediate = 0.0;
     bool boolImmediate = false;
     std::string stringImmediate;
 };

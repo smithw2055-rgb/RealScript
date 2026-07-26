@@ -8,11 +8,11 @@ bb0:
   %1:int = param 1
   store.local 1, %1
   %2:int = load.local 0
-  %3:int = const.i32 0
+  %3:int = const.int 0
   %4:bool = lt.i32 %2, %3
   br %4, bb1, bb2
 bb1:
-  %5:int = const.i32 0
+  %5:int = const.int 0
   store.local 2, %5
   jmp bb3
 bb2:
@@ -28,7 +28,7 @@ bb4:
   br %9, bb5, bb6
 bb5:
   %10:int = load.local 2
-  %11:int = const.i32 1
+  %11:int = const.int 1
   %12:int = sub.i32 %10, %11
   store.local 2, %12
   jmp bb4
@@ -49,7 +49,7 @@ bb0:
   br %2, bb1, bb2(%4)
 bb1:
   %5:int = load.local 1
-  %6:int = const.i32 0
+  %6:int = const.int 0
   %7:bool = gt.i32 %5, %6
   jmp bb2(%7)
 bb2(%3:bool):

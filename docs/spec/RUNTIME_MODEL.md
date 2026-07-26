@@ -1,6 +1,6 @@
 # RealScript 运行时模型规范
 
-> Phase 3B 的语言可见对象、运行时 TypeId 和精确字段引用图见 [OBJECT_MODEL_V0.md](OBJECT_MODEL_V0.md)。
+> Phase 3B–3E 的语言可见对象、成员调用、数组、enum、struct 值和精确嵌套引用图见 Implemented Draft 文档。
 
 
 - 规范版本：Draft v0.1

@@ -1,6 +1,6 @@
 # RealScript Typed MIR 规范
 
-> Phase 3B 已实现 `new.object`、`check.notnull`、`load.field`、`store.field` 与精确 Object TypeId；具体边界见 [OBJECT_MODEL_V0.md](OBJECT_MODEL_V0.md)。
+> Phase 3B–3E 已实现 object/array/struct 操作、direct member call、long/double typed operations 与精确 Object/Array/Struct/Enum TypeId；具体边界见对应 Implemented Draft 文档。
 
 
 - 规范版本：Draft v0.1

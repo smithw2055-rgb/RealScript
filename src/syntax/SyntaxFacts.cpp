@@ -44,6 +44,12 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(ElseKeyword);
         RS_KIND(WhileKeyword);
         RS_KIND(ClassKeyword);
+        RS_KIND(StructKeyword);
+        RS_KIND(EnumKeyword);
+        RS_KIND(StaticKeyword);
+        RS_KIND(GetKeyword);
+        RS_KIND(SetKeyword);
+        RS_KIND(ThisKeyword);
         RS_KIND(NewKeyword);
         RS_KIND(TrueKeyword);
         RS_KIND(FalseKeyword);
@@ -65,7 +71,13 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(CompilationUnit);
         RS_KIND(ModuleDeclaration);
         RS_KIND(ClassDeclaration);
+        RS_KIND(StructDeclaration);
+        RS_KIND(EnumDeclaration);
+        RS_KIND(EnumMemberDeclaration);
         RS_KIND(FieldDeclaration);
+        RS_KIND(ConstructorDeclaration);
+        RS_KIND(PropertyDeclaration);
+        RS_KIND(AccessorDeclaration);
         RS_KIND(ImportDeclaration);
         RS_KIND(FunctionDeclaration);
         RS_KIND(Parameter);
@@ -85,6 +97,8 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(ElementAssignmentExpression);
         RS_KIND(ParenthesizedExpression);
         RS_KIND(CallExpression);
+        RS_KIND(MemberCallExpression);
+        RS_KIND(ThisExpression);
         RS_KIND(MemberAccessExpression);
         RS_KIND(ElementAccessExpression);
         RS_KIND(NewObjectExpression);
@@ -103,6 +117,12 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"else", SyntaxKind::ElseKeyword},
         {"while", SyntaxKind::WhileKeyword},
         {"class", SyntaxKind::ClassKeyword},
+        {"struct", SyntaxKind::StructKeyword},
+        {"enum", SyntaxKind::EnumKeyword},
+        {"static", SyntaxKind::StaticKeyword},
+        {"get", SyntaxKind::GetKeyword},
+        {"set", SyntaxKind::SetKeyword},
+        {"this", SyntaxKind::ThisKeyword},
         {"new", SyntaxKind::NewKeyword},
         {"true", SyntaxKind::TrueKeyword},
         {"false", SyntaxKind::FalseKeyword},

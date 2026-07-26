@@ -15,8 +15,12 @@ struct Definition {
 bool validRegisterType(semantic::PrimitiveType type) noexcept {
     return type == semantic::PrimitiveType::Bool ||
         type == semantic::PrimitiveType::Int ||
+        type == semantic::PrimitiveType::Long ||
+        type == semantic::PrimitiveType::Double ||
         type == semantic::PrimitiveType::String ||
         type == semantic::PrimitiveType::Object ||
+        type == semantic::PrimitiveType::Struct ||
+        type == semantic::PrimitiveType::Enum ||
         type == semantic::PrimitiveType::Array ||
         type == semantic::PrimitiveType::Handle ||
         type == semantic::PrimitiveType::Null;
@@ -25,8 +29,12 @@ bool validRegisterType(semantic::PrimitiveType type) noexcept {
 bool validStorageType(semantic::PrimitiveType type) noexcept {
     return type == semantic::PrimitiveType::Bool ||
         type == semantic::PrimitiveType::Int ||
+        type == semantic::PrimitiveType::Long ||
+        type == semantic::PrimitiveType::Double ||
         type == semantic::PrimitiveType::String ||
         type == semantic::PrimitiveType::Object ||
+        type == semantic::PrimitiveType::Struct ||
+        type == semantic::PrimitiveType::Enum ||
         type == semantic::PrimitiveType::Array ||
         type == semantic::PrimitiveType::Handle;
 }
@@ -40,9 +48,64 @@ bool validTypeIdentity(
     semantic::PrimitiveType type,
     semantic::SymbolId typeId) noexcept {
     return (type == semantic::PrimitiveType::Object ||
+            type == semantic::PrimitiveType::Struct ||
+            type == semantic::PrimitiveType::Enum ||
             type == semantic::PrimitiveType::Array)
         ? typeId != 0
         : typeId == 0;
+}
+
+semantic::TypeKind expectedTypeKind(semantic::PrimitiveType type) noexcept {
+    switch (type) {
+    case semantic::PrimitiveType::Object: return semantic::TypeKind::Class;
+    case semantic::PrimitiveType::Struct: return semantic::TypeKind::Struct;
+    case semantic::PrimitiveType::Enum: return semantic::TypeKind::Enum;
+    default: return semantic::TypeKind::Class;
+    }
+}
+
+bool validDescriptorIdentity(
+    semantic::PrimitiveType type,
+    semantic::SymbolId typeId,
+    const std::unordered_map<
+        semantic::SymbolId,
+        const semantic::TypeSymbol*>& descriptors) noexcept {
+    if (!validTypeIdentity(type, typeId)) return false;
+    if (type != semantic::PrimitiveType::Object &&
+        type != semantic::PrimitiveType::Struct &&
+        type != semantic::PrimitiveType::Enum) {
+        return true;
+    }
+    const auto found = descriptors.find(typeId);
+    return found != descriptors.end() &&
+        found->second->kind == expectedTypeKind(type);
+}
+
+semantic::SymbolId fieldTypeId(const semantic::FieldSymbol& field) noexcept {
+    return semantic::isExactType(field.type)
+        ? semantic::stableTypeId(field.typeName)
+        : semantic::SymbolId{0};
+}
+
+semantic::SymbolId arrayTypeId(
+    semantic::PrimitiveType elementType,
+    semantic::SymbolId elementTypeId,
+    const std::unordered_map<
+        semantic::SymbolId,
+        const semantic::TypeSymbol*>& descriptors) {
+    std::string exactElementName;
+    if (elementType == semantic::PrimitiveType::Object ||
+        elementType == semantic::PrimitiveType::Struct ||
+        elementType == semantic::PrimitiveType::Enum) {
+        const auto found = descriptors.find(elementTypeId);
+        if (found == descriptors.end() ||
+            found->second->kind != expectedTypeKind(elementType)) {
+            return 0;
+        }
+        exactElementName = semantic::canonicalTypeName(*found->second);
+    }
+    const auto name = semantic::arrayTypeName(elementType, exactElementName);
+    return semantic::stableTypeId(name);
 }
 
 semantic::SymbolId typeIdAt(
@@ -73,25 +136,34 @@ std::size_t expectedOperandCount(
     switch (instruction.opcode) {
     case Opcode::LoadParameter:
     case Opcode::ConstantInt:
+    case Opcode::ConstantDouble:
     case Opcode::ConstantBool:
     case Opcode::ConstantString:
     case Opcode::ConstantNull:
     case Opcode::LoadLocal:
     case Opcode::NewObject:
+    case Opcode::NewStruct:
         return 0;
     case Opcode::StoreLocal:
     case Opcode::ConvertNullToString:
     case Opcode::ConvertNullToObject:
     case Opcode::ConvertNullToArray:
+    case Opcode::ConvertIntToLong:
+    case Opcode::ConvertIntToDouble:
+    case Opcode::ConvertLongToDouble:
     case Opcode::NewArray:
     case Opcode::CheckNotNull:
     case Opcode::ArrayLength:
     case Opcode::LoadField:
+    case Opcode::LoadStructField:
     case Opcode::NegateInt:
+    case Opcode::NegateLong:
+    case Opcode::NegateDouble:
     case Opcode::LogicalNot:
         return 1;
     case Opcode::LoadElement:
     case Opcode::StoreField:
+    case Opcode::StoreStructField:
         return 2;
     case Opcode::StoreElement:
         return 3;
@@ -111,7 +183,7 @@ bool verifyModule(
     diagnostics::DiagnosticBag& diagnostics) {
     const auto initialCount = diagnostics.items().size();
 
-    if (module.version.major != 0 || module.version.minor != 3) {
+    if (module.version.major != 0 || module.version.minor != 4) {
         diagnostics.report(
             "RS5100",
             "unsupported in-memory bytecode version",
@@ -124,22 +196,78 @@ bool verifyModule(
     std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> typeDescriptors;
     for (const auto& type : module.types) {
         if (type.id == 0 || type.name.empty() ||
+            type.id != semantic::stableTypeId(semantic::canonicalTypeName(type)) ||
             !typeDescriptors.emplace(type.id, &type).second) {
             diagnostics.report(
                 "RS5150",
                 "duplicate or invalid bytecode type descriptor",
                 {});
         }
+    }
+
+    for (const auto& type : module.types) {
+        std::unordered_set<std::string> fieldNames;
+        std::unordered_set<std::string> enumMemberNames;
+        if (type.kind == semantic::TypeKind::Enum) {
+            if (!type.fields.empty()) {
+                diagnostics.report(
+                    "RS5151",
+                    "enum bytecode descriptor cannot contain fields",
+                    {});
+            }
+            for (const auto& member : type.enumMembers) {
+                if (member.name.empty() || !enumMemberNames.insert(member.name).second) {
+                    diagnostics.report(
+                        "RS5151",
+                        "invalid or duplicate bytecode enum member",
+                        {});
+                }
+            }
+        } else if (!type.enumMembers.empty()) {
+            diagnostics.report(
+                "RS5151",
+                "non-enum bytecode descriptor cannot contain enum members",
+                {});
+        }
+
         for (std::size_t fieldIndex = 0; fieldIndex < type.fields.size(); ++fieldIndex) {
             const auto& field = type.fields[fieldIndex];
+            bool exactTypeValid = true;
+            if (field.type == semantic::PrimitiveType::Object ||
+                field.type == semantic::PrimitiveType::Struct ||
+                field.type == semantic::PrimitiveType::Enum) {
+                const auto fieldTypeId = semantic::stableTypeId(field.typeName);
+                exactTypeValid = validDescriptorIdentity(
+                    field.type,
+                    fieldTypeId,
+                    typeDescriptors);
+            } else if (field.type == semantic::PrimitiveType::Array) {
+                semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
+                std::string elementTypeName;
+                exactTypeValid = semantic::decodeArrayTypeName(
+                    field.typeName,
+                    elementType,
+                    elementTypeName);
+                if (exactTypeValid && !elementTypeName.empty()) {
+                    exactTypeValid = typeDescriptors.find(
+                        semantic::stableTypeId(elementTypeName)) !=
+                        typeDescriptors.end();
+                }
+            }
             if (field.index != fieldIndex || field.name.empty() ||
+                !fieldNames.insert(field.name).second ||
                 !validStorageType(field.type) ||
                 ((field.type == semantic::PrimitiveType::Object ||
+                  field.type == semantic::PrimitiveType::Struct ||
+                  field.type == semantic::PrimitiveType::Enum ||
                   field.type == semantic::PrimitiveType::Array) &&
                     field.typeName.empty()) ||
                 ((field.type != semantic::PrimitiveType::Object &&
+                  field.type != semantic::PrimitiveType::Struct &&
+                  field.type != semantic::PrimitiveType::Enum &&
                   field.type != semantic::PrimitiveType::Array) &&
-                    !field.typeName.empty())) {
+                    !field.typeName.empty()) ||
+                !exactTypeValid) {
                 diagnostics.report(
                     "RS5151",
                     "invalid bytecode field descriptor",
@@ -182,7 +310,7 @@ bool verifyModule(
             references[reference.symbolId] = &reference;
         }
         if (!validReturnType(reference.returnType) ||
-            !validTypeIdentity(reference.returnType, reference.returnTypeId)) {
+            !validDescriptorIdentity(reference.returnType, reference.returnTypeId, typeDescriptors)) {
             diagnostics.report(
                 "RS5105",
                 "bytecode function reference has an invalid return type identity",
@@ -199,9 +327,10 @@ bool verifyModule(
              ++parameter) {
             const auto type = reference.parameterTypes[parameter];
             if (!validStorageType(type) ||
-                !validTypeIdentity(
+                !validDescriptorIdentity(
                     type,
-                    typeIdAt(reference.parameterTypeIds, parameter))) {
+                    typeIdAt(reference.parameterTypeIds, parameter),
+                    typeDescriptors)) {
                 diagnostics.report(
                     "RS5106",
                     "bytecode function reference has an invalid parameter type identity",
@@ -227,7 +356,7 @@ bool verifyModule(
             diagnostics.report("RS5108", "bytecode function name is empty", {});
         }
         if (!validReturnType(function.returnType) ||
-            !validTypeIdentity(function.returnType, function.returnTypeId)) {
+            !validDescriptorIdentity(function.returnType, function.returnTypeId, typeDescriptors)) {
             diagnostics.report(
                 "RS5109",
                 "bytecode function has an invalid return type identity",
@@ -244,9 +373,10 @@ bool verifyModule(
              ++parameter) {
             const auto type = function.parameterTypes[parameter];
             if (!validStorageType(type) ||
-                !validTypeIdentity(
+                !validDescriptorIdentity(
                     type,
-                    typeIdAt(function.parameterTypeIds, parameter))) {
+                    typeIdAt(function.parameterTypeIds, parameter),
+                    typeDescriptors)) {
                 diagnostics.report(
                     "RS5110",
                     "bytecode function has an invalid parameter type identity",
@@ -262,9 +392,10 @@ bool verifyModule(
         for (std::size_t local = 0; local < function.localTypes.size(); ++local) {
             const auto type = function.localTypes[local];
             if (!validStorageType(type) ||
-                !validTypeIdentity(
+                !validDescriptorIdentity(
                      type,
-                     typeIdAt(function.localTypeIds, local))) {
+                     typeIdAt(function.localTypeIds, local),
+                     typeDescriptors)) {
                 diagnostics.report(
                     "RS5111",
                     "bytecode function has an invalid local type identity",
@@ -282,9 +413,10 @@ bool verifyModule(
              ++registerIndex) {
             const auto type = function.registerTypes[registerIndex];
             if (!validRegisterType(type) ||
-                !validTypeIdentity(
+                !validDescriptorIdentity(
                      type,
-                     typeIdAt(function.registerTypeIds, registerIndex))) {
+                     typeIdAt(function.registerTypeIds, registerIndex),
+                     typeDescriptors)) {
                 diagnostics.report(
                     "RS5112",
                     "bytecode function has an invalid or unassigned register type",
@@ -310,7 +442,7 @@ bool verifyModule(
                     parameter.type != function.registerTypes[parameter.target] ||
                     parameter.typeId !=
                         typeIdAt(function.registerTypeIds, parameter.target) ||
-                    !validTypeIdentity(parameter.type, parameter.typeId)) {
+                    !validDescriptorIdentity(parameter.type, parameter.typeId, typeDescriptors)) {
                     diagnostics.report(
                         "RS5115",
                         "bytecode block parameter type does not match register table",
@@ -560,8 +692,15 @@ bool verifyModule(
                     }
                     break;
                 case Opcode::ConstantInt:
-                    if (resultType != semantic::PrimitiveType::Int) {
-                        diagnostics.report("RS5129", "const.i32 must produce int", {});
+                    if (resultType != semantic::PrimitiveType::Int &&
+                        resultType != semantic::PrimitiveType::Long &&
+                        resultType != semantic::PrimitiveType::Enum) {
+                        diagnostics.report("RS5129", "integer constant has invalid result type", {});
+                    }
+                    break;
+                case Opcode::ConstantDouble:
+                    if (resultType != semantic::PrimitiveType::Double) {
+                        diagnostics.report("RS5129", "floating constant must produce double", {});
                     }
                     break;
                 case Opcode::ConstantBool:
@@ -631,30 +770,73 @@ bool verifyModule(
                             {});
                     }
                     break;
+                case Opcode::ConvertIntToLong:
+                    if (instruction.operands.size() != 1 ||
+                        registerType(instruction.operands.front()) != semantic::PrimitiveType::Int ||
+                        resultType != semantic::PrimitiveType::Long) {
+                        diagnostics.report("RS5164", "invalid int-to-long conversion", {});
+                    }
+                    break;
+                case Opcode::ConvertIntToDouble:
+                    if (instruction.operands.size() != 1 ||
+                        registerType(instruction.operands.front()) != semantic::PrimitiveType::Int ||
+                        resultType != semantic::PrimitiveType::Double) {
+                        diagnostics.report("RS5165", "invalid int-to-double conversion", {});
+                    }
+                    break;
+                case Opcode::ConvertLongToDouble:
+                    if (instruction.operands.size() != 1 ||
+                        registerType(instruction.operands.front()) != semantic::PrimitiveType::Long ||
+                        resultType != semantic::PrimitiveType::Double) {
+                        diagnostics.report("RS5166", "invalid long-to-double conversion", {});
+                    }
+                    break;
                 case Opcode::NewObject:
                     if (instruction.typeIndex >= module.types.size() ||
-                        resultType != semantic::PrimitiveType::Object) {
+                        module.types[instruction.typeIndex].kind != semantic::TypeKind::Class ||
+                        resultType != semantic::PrimitiveType::Object ||
+                        registerTypeId(instruction.result) !=
+                            module.types[instruction.typeIndex].id) {
                         diagnostics.report(
                             "RS5153",
                             "invalid bytecode object allocation",
                             {});
                     }
                     break;
+                case Opcode::NewStruct:
+                    if (instruction.typeIndex >= module.types.size() ||
+                        module.types[instruction.typeIndex].kind != semantic::TypeKind::Struct ||
+                        resultType != semantic::PrimitiveType::Struct ||
+                        registerTypeId(instruction.result) != module.types[instruction.typeIndex].id) {
+                        diagnostics.report("RS5167", "invalid bytecode struct construction", {});
+                    }
+                    break;
                 case Opcode::NewArray: {
                     const auto validElement =
                         instruction.elementType == semantic::PrimitiveType::Bool ||
                         instruction.elementType == semantic::PrimitiveType::Int ||
+                        instruction.elementType == semantic::PrimitiveType::Long ||
+                        instruction.elementType == semantic::PrimitiveType::Double ||
                         instruction.elementType == semantic::PrimitiveType::String ||
                         instruction.elementType == semantic::PrimitiveType::Object ||
+                        instruction.elementType == semantic::PrimitiveType::Struct ||
+                        instruction.elementType == semantic::PrimitiveType::Enum ||
                         instruction.elementType == semantic::PrimitiveType::Handle;
+                    const auto expectedArrayTypeId = arrayTypeId(
+                        instruction.elementType,
+                        instruction.elementTypeId,
+                        typeDescriptors);
                     if (instruction.operands.size() != 1 ||
                         registerType(instruction.operands.front()) !=
                             semantic::PrimitiveType::Int ||
                         resultType != semantic::PrimitiveType::Array ||
-                        registerTypeId(instruction.result) == 0 ||
+                        registerTypeId(instruction.result) != expectedArrayTypeId ||
+                        expectedArrayTypeId == 0 ||
                         !validElement ||
-                        !validTypeIdentity(
-                            instruction.elementType, instruction.elementTypeId)) {
+                        !validDescriptorIdentity(
+                            instruction.elementType,
+                            instruction.elementTypeId,
+                            typeDescriptors)) {
                         diagnostics.report(
                             "RS5160",
                             "invalid bytecode array allocation",
@@ -678,15 +860,28 @@ bool verifyModule(
                     const auto validElement =
                         instruction.elementType == semantic::PrimitiveType::Bool ||
                         instruction.elementType == semantic::PrimitiveType::Int ||
+                        instruction.elementType == semantic::PrimitiveType::Long ||
+                        instruction.elementType == semantic::PrimitiveType::Double ||
                         instruction.elementType == semantic::PrimitiveType::String ||
                         instruction.elementType == semantic::PrimitiveType::Object ||
+                        instruction.elementType == semantic::PrimitiveType::Struct ||
+                        instruction.elementType == semantic::PrimitiveType::Enum ||
                         instruction.elementType == semantic::PrimitiveType::Handle;
+                    const auto expectedArrayTypeId = arrayTypeId(
+                        instruction.elementType,
+                        instruction.elementTypeId,
+                        typeDescriptors);
                     const bool commonValid = validElement &&
-                        validTypeIdentity(
-                            instruction.elementType, instruction.elementTypeId) &&
+                        expectedArrayTypeId != 0 &&
+                        validDescriptorIdentity(
+                            instruction.elementType,
+                            instruction.elementTypeId,
+                            typeDescriptors) &&
                         instruction.operands.size() >= 2 &&
                         registerType(instruction.operands[0]) ==
                             semantic::PrimitiveType::Array &&
+                        registerTypeId(instruction.operands[0]) ==
+                            expectedArrayTypeId &&
                         registerType(instruction.operands[1]) ==
                             semantic::PrimitiveType::Int;
                     if (instruction.opcode == Opcode::LoadElement) {
@@ -714,10 +909,16 @@ bool verifyModule(
                 }
                 case Opcode::CheckNotNull:
                     if (instruction.typeIndex >= module.types.size() ||
+                        module.types[instruction.typeIndex].kind !=
+                            semantic::TypeKind::Class ||
                         instruction.operands.size() != 1 ||
                         registerType(instruction.operands.front()) !=
                             semantic::PrimitiveType::Object ||
-                        resultType != semantic::PrimitiveType::Object) {
+                        registerTypeId(instruction.operands.front()) !=
+                            module.types[instruction.typeIndex].id ||
+                        resultType != semantic::PrimitiveType::Object ||
+                        registerTypeId(instruction.result) !=
+                            module.types[instruction.typeIndex].id) {
                         diagnostics.report(
                             "RS5154",
                             "invalid bytecode object null check",
@@ -735,32 +936,70 @@ bool verifyModule(
                     }
                     {
                         const auto& type = module.types[instruction.typeIndex];
-                        if (instruction.index >= type.fields.size() ||
+                        if (type.kind != semantic::TypeKind::Class ||
+                            instruction.index >= type.fields.size() ||
                             instruction.operands.empty() ||
                             registerType(instruction.operands[0]) !=
-                                semantic::PrimitiveType::Object) {
+                                semantic::PrimitiveType::Object ||
+                            registerTypeId(instruction.operands[0]) != type.id) {
                             diagnostics.report(
                                 "RS5156",
                                 "invalid bytecode field access",
                                 {});
                             break;
                         }
-                        const auto fieldType = type.fields[instruction.index].type;
+                        const auto& field = type.fields[instruction.index];
+                        const auto expectedFieldTypeId = fieldTypeId(field);
                         if (instruction.opcode == Opcode::LoadField) {
                             if (instruction.operands.size() != 1 ||
-                                resultType != fieldType) {
+                                resultType != field.type ||
+                                registerTypeId(instruction.result) !=
+                                    expectedFieldTypeId) {
                                 diagnostics.report(
                                     "RS5157",
                                     "bytecode field load type mismatch",
                                     {});
                             }
                         } else if (instruction.operands.size() != 2 ||
-                                   registerType(instruction.operands[1]) != fieldType ||
+                                   registerType(instruction.operands[1]) != field.type ||
+                                   registerTypeId(instruction.operands[1]) !=
+                                       expectedFieldTypeId ||
                                    instruction.result != InvalidRegister) {
                             diagnostics.report(
                                 "RS5158",
                                 "bytecode field store type mismatch",
                                 {});
+                        }
+                    }
+                    break;
+                case Opcode::LoadStructField:
+                case Opcode::StoreStructField:
+                    if (instruction.typeIndex >= module.types.size() ||
+                        module.types[instruction.typeIndex].kind != semantic::TypeKind::Struct) {
+                        diagnostics.report("RS5168", "struct field access references invalid descriptor", {});
+                        break;
+                    }
+                    {
+                        const auto& type = module.types[instruction.typeIndex];
+                        if (instruction.index >= type.fields.size() || instruction.operands.empty() ||
+                            registerType(instruction.operands[0]) != semantic::PrimitiveType::Struct ||
+                            registerTypeId(instruction.operands[0]) != type.id) {
+                            diagnostics.report("RS5169", "invalid struct field access", {});
+                            break;
+                        }
+                        const auto& field = type.fields[instruction.index];
+                        const auto expectedFieldTypeId = fieldTypeId(field);
+                        if (instruction.opcode == Opcode::LoadStructField) {
+                            if (instruction.operands.size() != 1 || resultType != field.type ||
+                                registerTypeId(instruction.result) != expectedFieldTypeId) {
+                                diagnostics.report("RS5170", "struct field load type mismatch", {});
+                            }
+                        } else if (instruction.operands.size() != 2 ||
+                                   registerType(instruction.operands[1]) != field.type ||
+                                   registerTypeId(instruction.operands[1]) != expectedFieldTypeId ||
+                                   resultType != semantic::PrimitiveType::Struct ||
+                                   registerTypeId(instruction.result) != type.id) {
+                            diagnostics.report("RS5171", "struct field store type mismatch", {});
                         }
                     }
                     break;
@@ -815,13 +1054,20 @@ bool verifyModule(
                     }
                     break;
                 case Opcode::NegateInt:
+                case Opcode::NegateLong:
+                case Opcode::NegateDouble: {
+                    const auto expected = instruction.opcode == Opcode::NegateInt
+                        ? semantic::PrimitiveType::Int
+                        : instruction.opcode == Opcode::NegateLong
+                            ? semantic::PrimitiveType::Long
+                            : semantic::PrimitiveType::Double;
                     if (instruction.operands.size() != 1 ||
-                        registerType(instruction.operands.front()) !=
-                            semantic::PrimitiveType::Int ||
-                        resultType != semantic::PrimitiveType::Int) {
-                        diagnostics.report("RS5141", "invalid integer negation", {});
+                        registerType(instruction.operands.front()) != expected ||
+                        resultType != expected) {
+                        diagnostics.report("RS5141", "invalid numeric negation", {});
                     }
                     break;
+                }
                 case Opcode::LogicalNot:
                     if (instruction.operands.size() != 1 ||
                         registerType(instruction.operands.front()) !=
@@ -844,6 +1090,29 @@ bool verifyModule(
                         diagnostics.report("RS5143", "invalid integer arithmetic", {});
                     }
                     break;
+                case Opcode::AddLong:
+                case Opcode::SubtractLong:
+                case Opcode::MultiplyLong:
+                case Opcode::DivideLong:
+                case Opcode::RemainderLong:
+                    if (instruction.operands.size() != 2 ||
+                        registerType(instruction.operands[0]) != semantic::PrimitiveType::Long ||
+                        registerType(instruction.operands[1]) != semantic::PrimitiveType::Long ||
+                        resultType != semantic::PrimitiveType::Long) {
+                        diagnostics.report("RS5172", "invalid long arithmetic", {});
+                    }
+                    break;
+                case Opcode::AddDouble:
+                case Opcode::SubtractDouble:
+                case Opcode::MultiplyDouble:
+                case Opcode::DivideDouble:
+                    if (instruction.operands.size() != 2 ||
+                        registerType(instruction.operands[0]) != semantic::PrimitiveType::Double ||
+                        registerType(instruction.operands[1]) != semantic::PrimitiveType::Double ||
+                        resultType != semantic::PrimitiveType::Double) {
+                        diagnostics.report("RS5173", "invalid double arithmetic", {});
+                    }
+                    break;
                 case Opcode::LessInt:
                 case Opcode::LessOrEqualInt:
                 case Opcode::GreaterInt:
@@ -855,6 +1124,28 @@ bool verifyModule(
                             semantic::PrimitiveType::Int ||
                         resultType != semantic::PrimitiveType::Bool) {
                         diagnostics.report("RS5144", "invalid integer comparison", {});
+                    }
+                    break;
+                case Opcode::LessLong:
+                case Opcode::LessOrEqualLong:
+                case Opcode::GreaterLong:
+                case Opcode::GreaterOrEqualLong:
+                    if (instruction.operands.size() != 2 ||
+                        registerType(instruction.operands[0]) != semantic::PrimitiveType::Long ||
+                        registerType(instruction.operands[1]) != semantic::PrimitiveType::Long ||
+                        resultType != semantic::PrimitiveType::Bool) {
+                        diagnostics.report("RS5174", "invalid long comparison", {});
+                    }
+                    break;
+                case Opcode::LessDouble:
+                case Opcode::LessOrEqualDouble:
+                case Opcode::GreaterDouble:
+                case Opcode::GreaterOrEqualDouble:
+                    if (instruction.operands.size() != 2 ||
+                        registerType(instruction.operands[0]) != semantic::PrimitiveType::Double ||
+                        registerType(instruction.operands[1]) != semantic::PrimitiveType::Double ||
+                        resultType != semantic::PrimitiveType::Bool) {
+                        diagnostics.report("RS5175", "invalid double comparison", {});
                     }
                     break;
                 case Opcode::Equal:

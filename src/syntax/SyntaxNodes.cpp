@@ -70,6 +70,10 @@ text::TextSpan CallExpressionSyntax::span() const noexcept {
     return combine(identifierToken.span, closeParenToken.span);
 }
 
+text::TextSpan MemberCallExpressionSyntax::span() const noexcept {
+    return combine(receiver->span(), closeParenToken.span);
+}
+
 text::TextSpan ReturnStatementSyntax::span() const noexcept {
     return combine(returnKeyword.span, semicolonToken.span);
 }
@@ -102,8 +106,35 @@ text::TextSpan FieldDeclarationSyntax::span() const noexcept {
     return combine(type.span(), semicolonToken.span);
 }
 
+text::TextSpan ConstructorDeclarationSyntax::span() const noexcept {
+    return combine(identifierToken.span, body.span());
+}
+
+text::TextSpan AccessorDeclarationSyntax::span() const noexcept {
+    if (body) return combine(keyword.span, body->span());
+    return semicolonToken ? combine(keyword.span, semicolonToken->span) : keyword.span;
+}
+
+text::TextSpan PropertyDeclarationSyntax::span() const noexcept {
+    return combine(type.span(), closeBraceToken.span);
+}
+
 text::TextSpan ClassDeclarationSyntax::span() const noexcept {
     return combine(classKeyword.span, closeBraceToken.span);
+}
+
+text::TextSpan StructDeclarationSyntax::span() const noexcept {
+    return combine(structKeyword.span, closeBraceToken.span);
+}
+
+text::TextSpan EnumMemberDeclarationSyntax::span() const noexcept {
+    if (commaToken) return combine(identifierToken.span, commaToken->span);
+    if (valueToken) return combine(identifierToken.span, valueToken->span);
+    return identifierToken.span;
+}
+
+text::TextSpan EnumDeclarationSyntax::span() const noexcept {
+    return combine(enumKeyword.span, closeBraceToken.span);
 }
 
 text::TextSpan FunctionDeclarationSyntax::span() const noexcept {
@@ -135,6 +166,12 @@ text::TextSpan CompilationUnitSyntax::span() const noexcept {
     }
     if (!classes.empty()) {
         return combine(classes.front().span(), endOfFileToken.span);
+    }
+    if (!structs.empty()) {
+        return combine(structs.front().span(), endOfFileToken.span);
+    }
+    if (!enums.empty()) {
+        return combine(enums.front().span(), endOfFileToken.span);
     }
     if (!functions.empty()) {
         return combine(functions.front().span(), endOfFileToken.span);
