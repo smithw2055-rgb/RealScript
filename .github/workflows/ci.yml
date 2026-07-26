@@ -30,3 +30,11 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build -C Debug --output-on-failure
+
+      - name: Upload CTest failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-log-${{ matrix.os }}
+          path: build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
