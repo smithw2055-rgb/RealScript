@@ -267,6 +267,11 @@ public:
     [[nodiscard]] const runtime::RuntimeError& error() const noexcept;
     [[nodiscard]] const runtime::RuntimeStatistics& statistics() const noexcept;
     [[nodiscard]] std::uint64_t instructionsExecuted() const noexcept;
+    [[nodiscard]] bool finalizeDeterminism(
+        bool succeeded,
+        const runtime::Value& value);
+    [[nodiscard]] std::uint64_t determinismDigest() const noexcept;
+    [[nodiscard]] std::size_t replayEntriesConsumed() const noexcept;
 
 private:
     friend class FrameScope;
@@ -281,6 +286,7 @@ private:
     runtime::ExecutionOptions options_;
     runtime::RuntimeError error_;
     runtime::RuntimeStatistics statistics_;
+    runtime::DeterminismSession determinism_;
     std::uint64_t executed_ = 0;
     std::vector<std::string> stack_;
     runtime::ShadowStack shadowStack_;

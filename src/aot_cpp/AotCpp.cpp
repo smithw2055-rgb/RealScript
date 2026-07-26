@@ -479,12 +479,18 @@ GeneratedProgram CppGenerator::generate(
     header.line();
     header.line("#include \"realscript/aot_cpp/AotRuntime.h\"");
     header.line();
+    header.line("#if defined(_WIN32) && defined(REALSCRIPT_AOT_BUILD_SHARED_MODULE)");
+    header.line("#define REALSCRIPT_AOT_MODULE_EXPORT __declspec(dllexport)");
+    header.line("#else");
+    header.line("#define REALSCRIPT_AOT_MODULE_EXPORT");
+    header.line("#endif");
+    header.line();
     header.line("namespace " + options.cppNamespace + " {");
     header.line("[[nodiscard]] const realscript::aot::ProgramDescriptor& " +
         options.programName + "Program() noexcept;");
     header.line("} // namespace " + options.cppNamespace);
     header.line();
-    header.line("extern \"C\" RsStatusV1 " + options.querySymbol + "(");
+    header.line("extern \"C\" REALSCRIPT_AOT_MODULE_EXPORT RsStatusV1 " + options.querySymbol + "(");
     header.line("    const RsRuntimeApiV1* runtime_api,");
     header.line("    RsModuleExportsV1* out_exports);");
     generated.header = header.str();
@@ -997,7 +1003,7 @@ GeneratedProgram CppGenerator::generate(
     source.line();
     source.line("} // namespace " + options.cppNamespace);
     source.line();
-    source.line("extern \"C\" RsStatusV1 " + options.querySymbol + "(");
+    source.line("extern \"C\" REALSCRIPT_AOT_MODULE_EXPORT RsStatusV1 " + options.querySymbol + "(");
     source.line("    const RsRuntimeApiV1* runtime_api,");
     source.line("    RsModuleExportsV1* out_exports) {");
     source.line("    if (!runtime_api || !out_exports ||");

@@ -25,7 +25,10 @@ struct State {
     std::vector<std::string> stack;
     const std::unordered_map<semantic::SymbolId, FunctionLocation>* functions = nullptr;
     const ExternalFunction* externalResolver = nullptr;
+    const BindingRegistry* bindings = nullptr;
     const TraceSink* trace = nullptr;
+    ProfileCollector* profile = nullptr;
+    DeterminismSession determinism;
     ManagedHeap* heap = nullptr;
     debug::DebugController* debugger = nullptr;
     std::vector<debug::DebugFrameView> debugFrames;
@@ -65,14 +68,15 @@ private:
 };
 
 void emitTrace(State& state, TraceEventKind kind, std::string operation = {}) {
-    if (!state.trace || !*state.trace) return;
     TraceEvent event;
     event.kind = kind;
     event.function = state.stack.empty() ? std::string{} : state.stack.back();
     event.operation = std::move(operation);
     event.instructionIndex = state.executed;
     event.callDepth = state.stack.size();
-    (*state.trace)(event);
+    state.determinism.observe(event);
+    if (state.profile) state.profile->record(event);
+    if (state.trace && *state.trace) (*state.trace)(event);
 }
 
 bool fail(State& state, ErrorCode code, std::string message) {
@@ -84,13 +88,16 @@ bool fail(State& state, ErrorCode code, std::string message) {
     return false;
 }
 
-bool consume(State& state) {
+bool consume(State& state, std::string_view operation = {}) {
     if (state.executed >= state.limits.instructionBudget) {
         return fail(state, ErrorCode::InstructionBudgetExceeded,
             "instruction budget exceeded");
     }
     ++state.executed;
     state.statistics.instructionsExecuted = state.executed;
+    if (!operation.empty()) {
+        emitTrace(state, TraceEventKind::Instruction, std::string(operation));
+    }
     if (state.heap && state.limits.gcWorkBudget != 0) {
         const auto work = state.heap->step(
             state.shadowStack,
@@ -455,15 +462,21 @@ bool executeCall(
     if (found != state.functions->end()) {
         return executeFunction(state, found->second, arguments, result);
     }
-    if (!*state.externalResolver) {
-        return fail(state, ErrorCode::ExternalFunctionUnresolved,
-            "external function '" + reference.name + "' is unresolved");
-    }
     RuntimeError externalError;
     ++state.statistics.externalCalls;
     emitTrace(state, TraceEventKind::ExternalCall, reference.name);
-    auto externalResult = (*state.externalResolver)(reference, arguments, externalError);
-    if (!externalResult) {
+    std::optional<Value> externalResult;
+    const ExternalFunction* fallback =
+        state.externalResolver && *state.externalResolver
+        ? state.externalResolver
+        : nullptr;
+    if (!state.determinism.invokeExternal(
+            state.bindings,
+            fallback,
+            reference,
+            arguments,
+            externalResult,
+            externalError)) {
         state.error = std::move(externalError);
         if (state.error.code == ErrorCode::None) {
             state.error.code = ErrorCode::ExternalFunctionUnresolved;
@@ -493,8 +506,7 @@ bool executeInstruction(
     const std::vector<Value>& arguments,
     std::vector<Value>& locals,
     std::vector<Value>& registers) {
-    if (!consume(state)) return false;
-    emitTrace(state, TraceEventKind::Instruction, bytecode::opcodeName(instruction.opcode));
+    if (!consume(state, bytecode::opcodeName(instruction.opcode))) return false;
     auto operand = [&](std::size_t index) -> const Value* {
         if (index >= instruction.operands.size() || instruction.operands[index] >= registers.size()) {
             fail(state, ErrorCode::InvalidProgram, "instruction operand register is invalid");
@@ -1113,14 +1125,15 @@ bool executeFunction(
         if (!debugSequencePoint(
                 state, *location.module, function, block->id,
                 static_cast<std::uint32_t>(block->instructions.size()), true) ||
-            !consume(state)) {
+            !consume(state, bytecode::terminatorName(block->terminator.kind))) {
             state.stack.pop_back();
             return false;
         }
         const auto& terminator = block->terminator;
         if (terminator.kind == bytecode::TerminatorKind::ReturnVoid) {
             result = std::monostate{};
-            emitTrace(state, TraceEventKind::FunctionExit);
+            emitTrace(state, TraceEventKind::FunctionExit,
+                valueToString(result, state.heap));
             state.stack.pop_back();
             return true;
         }
@@ -1218,13 +1231,6 @@ std::shared_ptr<ManagedHeap> Interpreter::heap() const noexcept { return heap_; 
 
 void Interpreter::setBindingRegistry(std::shared_ptr<const BindingRegistry> bindings) {
     bindings_ = std::move(bindings);
-    if (!bindings_) return;
-    externalResolver_ = [bindings = bindings_](
-        const bytecode::FunctionReference& reference,
-        const std::vector<Value>& arguments,
-        RuntimeError& error) {
-        return bindings->invoke(reference, arguments, error);
-    };
 }
 
 ExecutionResult Interpreter::invoke(
@@ -1269,7 +1275,10 @@ ExecutionResult Interpreter::invoke(
     state.limits = options.limits;
     state.functions = &functions;
     state.externalResolver = &externalResolver_;
+    state.bindings = bindings_.get();
     state.trace = &options.trace;
+    state.profile = options.profile.get();
+    state.determinism = DeterminismSession(options.determinism);
     state.heap = heap_.get();
     state.debugger = options.debugger.get();
     if (state.debugger) {
@@ -1279,10 +1288,17 @@ ExecutionResult Interpreter::invoke(
     Value value;
     ExecutionResult execution;
     execution.succeeded = executeFunction(state, found->second, arguments, value);
+    execution.succeeded = state.determinism.finish(
+        execution.succeeded,
+        value,
+        state.error,
+        state.statistics);
     execution.value = std::move(value);
     execution.error = std::move(state.error);
     execution.instructionsExecuted = state.executed;
     execution.statistics = state.statistics;
+    execution.determinismDigest = state.determinism.digest();
+    execution.replayEntriesConsumed = state.determinism.replayEntriesConsumed();
     return execution;
 }
 
@@ -1331,6 +1347,8 @@ const char* errorCodeName(ErrorCode code) noexcept {
     case ErrorCode::OutOfMemory: return "out-of-memory";
     case ErrorCode::InvalidProgram: return "invalid-program";
     case ErrorCode::ExecutionTerminated: return "execution-terminated";
+    case ErrorCode::DeterminismViolation: return "determinism-violation";
+    case ErrorCode::ReplayMismatch: return "replay-mismatch";
     }
     return "unknown";
 }

@@ -140,6 +140,7 @@ include(cmake/RealScriptAot.cmake)
 
 realscript_add_aot_library(GameScriptsAot
     PROGRAM_NAME GameScripts
+    OPT_LEVEL 2
     SOURCES
         scripts/game.rs
         scripts/common.rs
@@ -194,8 +195,8 @@ Phase 5 does not yet add:
 - async state machines or coroutines;
 - optimized native debugger variable locations;
 - precompiled binary portability across unrelated C++ toolchains;
-- shared-library loading/unloading lifecycle hooks;
+- cross-toolchain shared-library lifecycle and hot-unload guarantees;
 - link-time whole-program optimization or profile-guided optimization;
-- a separate LLVM backend.
+- direct LLVM machine-code generation.
 
-These are language/runtime or Phase 6 optimization extensions. They do not prevent the current C++17 backend from serving as the release backend for the language subset implemented through Phase 5.
+Phase 6 adds MIR optimization, deterministic profiling and an optional external-toolchain JIT; direct LLVM generation and speculative tiering remain future extensions. They do not prevent the current C++17 backend from serving as the release backend for the language subset implemented through Phase 5.

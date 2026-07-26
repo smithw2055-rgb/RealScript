@@ -2,13 +2,13 @@
 
 RealScript 是一门面向现代游戏引擎的嵌入式强类型脚本语言与运行时。
 
-它采用接近 C# 的表达方式，以 C++17 游戏引擎为主要宿主，长期目标包括：快速字节码解释、C++17 AOT、可选 LLVM ORC JIT、源码级调试、热重载、沙箱 Mod，以及固定 Tick 的确定性模拟。
+它采用接近 C# 的表达方式，以 C++17 游戏引擎为主要宿主，长期目标包括：快速字节码解释、C++17 AOT、可选原生 JIT（当前为外部 C++ 工具链路径，未来可接 LLVM ORC）、源码级调试、热重载、沙箱 Mod，以及固定 Tick 的确定性模拟。
 
-> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端、Phase 2A–2C 字节码运行时、Phase 3A–3E 对象与值模型、Phase 4 调试/LSP/热重载，以及 Phase 5 C++17 AOT 发布后端已经完成。语言、字节码、对象 ABI 和 GC 策略尚未冻结。
+> 当前状态：Draft v0.1 规范基线，以及 Phase 1–6 编译器、字节码运行时、对象与值模型、调试/LSP/热重载、C++17 AOT、确定性执行、MIR 优化、Profile、Benchmark 与可选工具链 JIT 已经完成。语言、字节码、对象 ABI 和 GC 策略尚未冻结。
 
 ## 当前可运行能力
 
-Phase 1A–5 已经实现：
+Phase 1A–6 已经实现：
 
 - 无外部依赖的 C++17/CMake 工程；
 - `SourceText`、`TextSpan` 和 CRLF/LF 行列映射；
@@ -55,8 +55,13 @@ Phase 1A–5 已经实现：
 - AOT 对象、数组、struct、enum、数值、字符串、调用、预算和精确 GC 语义；
 - C11/C++ 兼容的 Native Module 查询 ABI、稳定函数表和内容哈希；
 - 类型化 Native Thunk、CMake AOT 目标和解释器/AOT 差分测试；
+- O0/O1/O2 Typed MIR 优化、常量/分支折叠、不可达块清理和保守 DCE；
+- Strict/Record/Replay 确定性执行、稳定摘要和 Host Binding 确定性策略；
+- Interpreter/AOT/JIT 统一 Trace 顺序与逐函数 Profile；
+- 外部 C++17 工具链 JIT、共享库动态加载、C ABI 验证和内容哈希缓存；
+- `rsbench` 稳定基准输出、优化统计、语义摘要和 JSON Profile；
 - `rsc` Token、检查、MIR、Symbol、Bytecode 和二进制输出模式；
-- `rsaot` C++17 生成器、`rsdebug` DAP 适配器和 `rslsp` 语言服务器；
+- `rsaot` C++17 生成器、`rsbench` 基准工具、`rsdebug` DAP 适配器和 `rslsp` 语言服务器；
 - Linux/Windows GitHub Actions 构建；
 - 前端、控制流、模块、调用、增量编译、字节码与 AOT 差分测试。
 
@@ -75,6 +80,7 @@ Phase 1A–5 已经实现：
 - [Phase 3E — Numeric Values, Enums and Structs](docs/roadmap/PHASE_3E.md)
 - [Phase 4 — Debugging, Language Services and Hot Reload](docs/roadmap/PHASE_4.md)
 - [Phase 5 — C++17 AOT Backend](docs/roadmap/PHASE_5.md)
+- [Phase 6 — Determinism, Optimization, Profiling and Optional JIT](docs/roadmap/PHASE_6.md)
 
 ## 快速开始
 
@@ -298,11 +304,14 @@ include/realscript/
   tooling/       JSON、LanguageService 和 LSP
   hot_reload/    ProgramImage 兼容性分析与原子替换
   aot_cpp/       C++17 生成器、AOT Runtime 和公共 C ABI
+  optimization/  Typed MIR 优化器和优化统计
+  jit/           可选 C++ 工具链 JIT 与动态模块生命周期
 src/              对应实现
 tools/rsc/        编译器命令行
 tools/rsdebug/    DAP 调试适配器
 tools/rslsp/      LSP 语言服务器
 tools/rsaot/      C++17 AOT 生成器
+tools/rsbench/    确定性性能与 Profile 基准工具
 cmake/             可复用 AOT 构建集成
 tests/fixtures/   源码 conformance fixtures
 tests/snapshots/  MIR snapshots
@@ -326,6 +335,7 @@ docs/roadmap/     实现切片和路线图
 - [Numeric, Enum and Struct Values Draft v0.1](docs/spec/NUMERIC_ENUM_STRUCT_V0.md)
 - [Debug Information, Tooling and Hot Reload Draft v0.1](docs/spec/DEBUG_TOOLING_HOT_RELOAD_V0.md)
 - [C++17 AOT Backend and Native Module ABI Draft v0.1](docs/spec/CXX17_AOT_V0.md)
+- [Determinism, Optimization, Profiling and Optional JIT Draft v0.1](docs/spec/DETERMINISM_OPTIMIZATION_JIT_V0.md)
 - [Phase 1A 实现说明](docs/roadmap/PHASE_1A.md)
 - [Phase 1B 实现说明](docs/roadmap/PHASE_1B.md)
 - [Phase 1C 实现说明](docs/roadmap/PHASE_1C.md)
@@ -339,6 +349,7 @@ docs/roadmap/     实现切片和路线图
 - [Phase 3E 实现说明](docs/roadmap/PHASE_3E.md)
 - [Phase 4 实现说明](docs/roadmap/PHASE_4.md)
 - [Phase 5 实现说明](docs/roadmap/PHASE_5.md)
+- [Phase 6 实现说明](docs/roadmap/PHASE_6.md)
 
 ## 路线图
 
@@ -357,7 +368,7 @@ docs/roadmap/     实现切片和路线图
 - [x] Phase 3E：long/double、enum、struct 和复制值语义；
 - [x] Phase 4：Debug Info、DAP、LSP 和函数体热重载；
 - [x] Phase 5：C++17 AOT、Native Module ABI、Source Map 和差分测试；
-- [ ] Phase 6：确定性、性能优化和可选 JIT。
+- [x] Phase 6：确定性 Record/Replay、MIR 优化、Profile、Benchmark 和可选工具链 JIT。
 
 ## 主要参考方向
 
@@ -556,3 +567,29 @@ rsaot --output-dir build/generated/game \
 生成结果带确定性 manifest、源码 `#line` 与 Source Map。解释器/AOT 差分测试覆盖成功结果、溢出、除零、空引用、数组越界、负长度、调用栈、指令预算和递归预算。
 
 详细说明：[Phase 5](docs/roadmap/PHASE_5.md) 与 [C++17 AOT 实现规范](docs/spec/CXX17_AOT_V0.md)。
+
+
+## Phase 6 确定性、优化与可选 JIT
+
+Phase 6 在不建立第二套语义的前提下，为 Interpreter、C++17 AOT 和可选 JIT 增加共同的优化、确定性与性能观测层。
+
+```bash
+rsc game.rs --run Game.Main::main \
+  --opt-level 2 --deterministic --profile --digest
+
+rsaot --output-dir generated \
+  --program-name GameScripts \
+  --opt-level 2 --opt-report \
+  game.rs common.rs
+
+rsbench --entry Game.Main::main \
+  --warmup 20 --iterations 1000 \
+  --opt-level 2 --json \
+  game.rs common.rs
+```
+
+`optimization::Optimizer` 在验证后的 Typed MIR 上执行 O0/O1/O2 变换，并在前后重新运行 MIR Verifier。`DeterminismMode` 提供 Strict、Record 和 Replay；宿主绑定必须声明 `Deterministic`、`Recordable` 或 `NonDeterministic`。执行结果携带稳定摘要，`ProfileCollector` 以稳定函数顺序统计调用、指令、分支、外部调用、GC 与错误。
+
+`jit::ToolchainJit` 复用 Phase 5 C++17 生成器，将内容哈希对应的源码编译成共享库，通过 `rs_module_query_v1` 完成 ABI 协商和 Descriptor 验证，并安全缓存与加载。它是可选 same-SDK 执行路径，不会让外部编译器成为 Interpreter/AOT 的必需依赖。
+
+详细说明：[Phase 6](docs/roadmap/PHASE_6.md) 与 [确定性/优化/JIT 实现规范](docs/spec/DETERMINISM_OPTIMIZATION_JIT_V0.md)。
