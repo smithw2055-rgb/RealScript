@@ -119,8 +119,8 @@ void testLanguageArrays() {
     auto modules = compile({{"arrays.rs", arraySource}});
     require(modules.size() == 1, "expected one array module");
     const auto& module = modules.front();
-    require(module.version.major == 0 && module.version.minor == 3,
-        "Phase 3C bytecode must use format 0.3");
+    require(module.version.major == 0 && module.version.minor == 4,
+        "Phase 3C bytecode must use format 0.4");
     const auto text = realscript::bytecode::disassembleModule(module);
     require(text.find("new.array int") != std::string::npos,
         "array allocation bytecode is missing");

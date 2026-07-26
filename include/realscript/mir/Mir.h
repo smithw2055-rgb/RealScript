@@ -18,6 +18,7 @@ using BlockId = std::uint32_t;
 enum class Opcode {
     Parameter,
     ConstantInt,
+    ConstantDouble,
     ConstantBool,
     ConstantString,
     ConstantNull,
@@ -26,7 +27,11 @@ enum class Opcode {
     ConvertNullToString,
     ConvertNullToObject,
     ConvertNullToArray,
+    ConvertIntToLong,
+    ConvertIntToDouble,
+    ConvertLongToDouble,
     NewObject,
+    NewStruct,
     NewArray,
     CheckNotNull,
     ArrayLength,
@@ -34,8 +39,12 @@ enum class Opcode {
     StoreElement,
     LoadField,
     StoreField,
+    LoadStructField,
+    StoreStructField,
     Call,
     NegateInt,
+    NegateLong,
+    NegateDouble,
     LogicalNot,
     AddInt,
     SubtractInt,
@@ -48,6 +57,23 @@ enum class Opcode {
     LessOrEqualInt,
     GreaterInt,
     GreaterOrEqualInt,
+    AddLong,
+    SubtractLong,
+    MultiplyLong,
+    DivideLong,
+    RemainderLong,
+    LessLong,
+    LessOrEqualLong,
+    GreaterLong,
+    GreaterOrEqualLong,
+    AddDouble,
+    SubtractDouble,
+    MultiplyDouble,
+    DivideDouble,
+    LessDouble,
+    LessOrEqualDouble,
+    GreaterDouble,
+    GreaterOrEqualDouble,
 };
 
 struct Instruction {
@@ -62,6 +88,7 @@ struct Instruction {
     semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
     semantic::SymbolId elementTypeId = 0;
     std::int64_t integerImmediate = 0;
+    double doubleImmediate = 0.0;
     bool boolImmediate = false;
     std::string stringImmediate;
     semantic::SymbolId symbolId = 0;

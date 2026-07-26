@@ -18,11 +18,13 @@ std::size_t expectedOperandCount(const Instruction& instruction) noexcept {
     switch (instruction.opcode) {
     case Opcode::Parameter:
     case Opcode::ConstantInt:
+    case Opcode::ConstantDouble:
     case Opcode::ConstantBool:
     case Opcode::ConstantString:
     case Opcode::ConstantNull:
     case Opcode::LoadLocal:
     case Opcode::NewObject:
+    case Opcode::NewStruct:
         return 0;
     case Opcode::NewArray:
         return 1;
@@ -30,13 +32,20 @@ std::size_t expectedOperandCount(const Instruction& instruction) noexcept {
     case Opcode::ConvertNullToString:
     case Opcode::ConvertNullToObject:
     case Opcode::ConvertNullToArray:
+    case Opcode::ConvertIntToLong:
+    case Opcode::ConvertIntToDouble:
+    case Opcode::ConvertLongToDouble:
     case Opcode::CheckNotNull:
     case Opcode::ArrayLength:
     case Opcode::LoadField:
+    case Opcode::LoadStructField:
     case Opcode::NegateInt:
+    case Opcode::NegateLong:
+    case Opcode::NegateDouble:
     case Opcode::LogicalNot:
         return 1;
     case Opcode::StoreField:
+    case Opcode::StoreStructField:
     case Opcode::LoadElement:
         return 2;
     case Opcode::StoreElement:
@@ -48,14 +57,13 @@ std::size_t expectedOperandCount(const Instruction& instruction) noexcept {
     }
 }
 
+
 bool validTypeIdentity(
     semantic::PrimitiveType type,
     semantic::SymbolId typeId) noexcept {
-    return (type == semantic::PrimitiveType::Object ||
-            type == semantic::PrimitiveType::Array)
-        ? typeId != 0
-        : typeId == 0;
+    return semantic::isExactType(type) ? typeId != 0 : typeId == 0;
 }
+
 
 semantic::SymbolId typeIdAt(
     const std::vector<semantic::SymbolId>& typeIds,
@@ -421,11 +429,18 @@ bool verifyModule(
                             instruction.sourceSpan);
                     }
                 } else if (instruction.opcode == Opcode::ConstantInt &&
-                           instruction.resultType !=
-                               semantic::PrimitiveType::Int) {
+                           instruction.resultType != semantic::PrimitiveType::Int &&
+                           instruction.resultType != semantic::PrimitiveType::Long &&
+                           instruction.resultType != semantic::PrimitiveType::Enum) {
                     diagnostics.report(
                         "RS3026",
-                        "const.i32 must produce int",
+                        "integer constant must produce int, long, or enum",
+                        instruction.sourceSpan);
+                } else if (instruction.opcode == Opcode::ConstantDouble &&
+                           instruction.resultType != semantic::PrimitiveType::Double) {
+                    diagnostics.report(
+                        "RS3063",
+                        "const.f64 must produce double",
                         instruction.sourceSpan);
                 } else if (instruction.opcode == Opcode::ConstantBool &&
                            instruction.resultType !=
@@ -509,6 +524,23 @@ bool verifyModule(
                             "invalid null-to-array conversion",
                             instruction.sourceSpan);
                     }
+                } else if ((instruction.opcode == Opcode::ConvertIntToLong ||
+                            instruction.opcode == Opcode::ConvertIntToDouble ||
+                            instruction.opcode == Opcode::ConvertLongToDouble) &&
+                           operandCountIsValid) {
+                    const auto sourceType = valueType(instruction.operands.front());
+                    const bool valid =
+                        (instruction.opcode == Opcode::ConvertIntToLong &&
+                         sourceType == semantic::PrimitiveType::Int &&
+                         instruction.resultType == semantic::PrimitiveType::Long) ||
+                        (instruction.opcode == Opcode::ConvertIntToDouble &&
+                         sourceType == semantic::PrimitiveType::Int &&
+                         instruction.resultType == semantic::PrimitiveType::Double) ||
+                        (instruction.opcode == Opcode::ConvertLongToDouble &&
+                         sourceType == semantic::PrimitiveType::Long &&
+                         instruction.resultType == semantic::PrimitiveType::Double);
+                    if (!valid) diagnostics.report(
+                        "RS3064", "invalid numeric conversion", instruction.sourceSpan);
                 } else if (instruction.opcode == Opcode::NewArray &&
                            operandCountIsValid) {
                     if (instruction.resultType != semantic::PrimitiveType::Array ||
@@ -517,8 +549,11 @@ bool verifyModule(
                             semantic::PrimitiveType::Int ||
                         instruction.elementType == semantic::PrimitiveType::Error ||
                         instruction.elementType == semantic::PrimitiveType::Void ||
-                        instruction.elementType == semantic::PrimitiveType::Array ||
-                        (instruction.elementType == semantic::PrimitiveType::Object &&
+                        (semantic::isExactType(instruction.elementType) &&
+                         instruction.elementTypeId == 0) ||
+                        ((instruction.elementType == semantic::PrimitiveType::Object ||
+                          instruction.elementType == semantic::PrimitiveType::Struct ||
+                          instruction.elementType == semantic::PrimitiveType::Enum) &&
                          types.find(instruction.elementTypeId) == types.end())) {
                         diagnostics.report(
                             "RS3054",
@@ -544,32 +579,47 @@ bool verifyModule(
                             semantic::PrimitiveType::Int ||
                         instruction.elementType == semantic::PrimitiveType::Error ||
                         instruction.elementType == semantic::PrimitiveType::Void ||
-                        (instruction.elementType == semantic::PrimitiveType::Object &&
+                        (semantic::isExactType(instruction.elementType) &&
+                         instruction.elementTypeId == 0) ||
+                        ((instruction.elementType == semantic::PrimitiveType::Object ||
+                          instruction.elementType == semantic::PrimitiveType::Struct ||
+                          instruction.elementType == semantic::PrimitiveType::Enum) &&
                          types.find(instruction.elementTypeId) == types.end())) {
                         diagnostics.report(
                             "RS3056",
                             "invalid MIR array element access",
                             instruction.sourceSpan);
                     } else if (instruction.opcode == Opcode::LoadElement &&
-                               instruction.resultType != instruction.elementType) {
+                               (instruction.resultType != instruction.elementType ||
+                                instruction.resultTypeId != instruction.elementTypeId)) {
                         diagnostics.report(
                             "RS3057",
                             "MIR array element load type mismatch",
                             instruction.sourceSpan);
                     } else if (instruction.opcode == Opcode::StoreElement &&
-                               valueType(instruction.operands[2]) !=
-                                   instruction.elementType) {
+                               (valueType(instruction.operands[2]) != instruction.elementType ||
+                                valueTypeId(instruction.operands[2]) != instruction.elementTypeId)) {
                         diagnostics.report(
                             "RS3058",
                             "MIR array element store type mismatch",
                             instruction.sourceSpan);
                     }
-                } else if (instruction.opcode == Opcode::NewObject) {
-                    if (instruction.resultType != semantic::PrimitiveType::Object ||
-                        types.find(instruction.typeId) == types.end()) {
+                } else if (instruction.opcode == Opcode::NewObject ||
+                           instruction.opcode == Opcode::NewStruct) {
+                    const auto foundType = types.find(instruction.typeId);
+                    const auto expected = instruction.opcode == Opcode::NewStruct
+                        ? semantic::PrimitiveType::Struct
+                        : semantic::PrimitiveType::Object;
+                    const auto expectedKind = instruction.opcode == Opcode::NewStruct
+                        ? semantic::TypeKind::Struct
+                        : semantic::TypeKind::Class;
+                    if (instruction.resultType != expected ||
+                        instruction.resultTypeId != instruction.typeId ||
+                        foundType == types.end() ||
+                        foundType->second->kind != expectedKind) {
                         diagnostics.report(
                             "RS3043",
-                            "invalid object allocation descriptor",
+                            "invalid MIR named-type allocation",
                             instruction.sourceSpan);
                     }
                 } else if (instruction.opcode == Opcode::CheckNotNull &&
@@ -584,33 +634,41 @@ bool verifyModule(
                             instruction.sourceSpan);
                     }
                 } else if ((instruction.opcode == Opcode::LoadField ||
-                            instruction.opcode == Opcode::StoreField) &&
+                            instruction.opcode == Opcode::StoreField ||
+                            instruction.opcode == Opcode::LoadStructField ||
+                            instruction.opcode == Opcode::StoreStructField) &&
                            operandCountIsValid) {
-                    const auto type = types.find(instruction.typeId);
-                    if (type == types.end() ||
-                        instruction.fieldIndex >= type->second->fields.size() ||
-                        valueType(instruction.operands[0]) !=
-                            semantic::PrimitiveType::Object) {
-                        diagnostics.report(
-                            "RS3045",
-                            "invalid MIR field access",
-                            instruction.sourceSpan);
+                    const auto foundType = types.find(instruction.typeId);
+                    const bool structure = instruction.opcode == Opcode::LoadStructField ||
+                        instruction.opcode == Opcode::StoreStructField;
+                    const auto receiverType = structure
+                        ? semantic::PrimitiveType::Struct
+                        : semantic::PrimitiveType::Object;
+                    if (foundType == types.end() ||
+                        instruction.fieldIndex >= foundType->second->fields.size() ||
+                        valueType(instruction.operands[0]) != receiverType ||
+                        valueTypeId(instruction.operands[0]) != instruction.typeId) {
+                        diagnostics.report("RS3045", "invalid MIR field access", instruction.sourceSpan);
                     } else {
-                        const auto fieldType =
-                            type->second->fields[instruction.fieldIndex].type;
-                        if (instruction.opcode == Opcode::LoadField &&
-                            instruction.resultType != fieldType) {
-                            diagnostics.report(
-                                "RS3046",
-                                "MIR field load type mismatch",
-                                instruction.sourceSpan);
+                        const auto& field = foundType->second->fields[instruction.fieldIndex];
+                        const auto fieldTypeId = semantic::isExactType(field.type) &&
+                                !field.typeName.empty()
+                            ? semantic::stableTypeId(field.typeName)
+                            : 0;
+                        const bool load = instruction.opcode == Opcode::LoadField ||
+                            instruction.opcode == Opcode::LoadStructField;
+                        if (load && (instruction.resultType != field.type ||
+                                     instruction.resultTypeId != fieldTypeId)) {
+                            diagnostics.report("RS3046", "MIR field load type mismatch", instruction.sourceSpan);
                         }
-                        if (instruction.opcode == Opcode::StoreField &&
-                            valueType(instruction.operands[1]) != fieldType) {
-                            diagnostics.report(
-                                "RS3047",
-                                "MIR field store type mismatch",
-                                instruction.sourceSpan);
+                        if (!load && (valueType(instruction.operands[1]) != field.type ||
+                                      valueTypeId(instruction.operands[1]) != fieldTypeId)) {
+                            diagnostics.report("RS3047", "MIR field store type mismatch", instruction.sourceSpan);
+                        }
+                        if (instruction.opcode == Opcode::StoreStructField &&
+                            (instruction.resultType != semantic::PrimitiveType::Struct ||
+                             instruction.resultTypeId != instruction.typeId)) {
+                            diagnostics.report("RS3065", "MIR struct field store must return the updated struct", instruction.sourceSpan);
                         }
                     }
                 } else if (instruction.opcode == Opcode::Call) {
@@ -678,63 +736,65 @@ bool verifyModule(
                             "value MIR call has no result",
                             instruction.sourceSpan);
                     }
-                } else if (instruction.opcode == Opcode::NegateInt &&
+                } else if ((instruction.opcode == Opcode::NegateInt ||
+                            instruction.opcode == Opcode::NegateLong ||
+                            instruction.opcode == Opcode::NegateDouble) &&
                            operandCountIsValid) {
-                    if (instruction.resultType != semantic::PrimitiveType::Int ||
-                        valueType(instruction.operands.front()) !=
-                            semantic::PrimitiveType::Int) {
-                        diagnostics.report(
-                            "RS3017",
-                            "invalid integer negation types",
-                            instruction.sourceSpan);
+                    const auto expected = instruction.opcode == Opcode::NegateInt
+                        ? semantic::PrimitiveType::Int
+                        : instruction.opcode == Opcode::NegateLong
+                            ? semantic::PrimitiveType::Long
+                            : semantic::PrimitiveType::Double;
+                    if (instruction.resultType != expected ||
+                        valueType(instruction.operands.front()) != expected) {
+                        diagnostics.report("RS3017", "invalid numeric negation types", instruction.sourceSpan);
                     }
                 } else if (instruction.opcode == Opcode::LogicalNot &&
                            operandCountIsValid) {
                     if (instruction.resultType != semantic::PrimitiveType::Bool ||
-                        valueType(instruction.operands.front()) !=
-                            semantic::PrimitiveType::Bool) {
-                        diagnostics.report(
-                            "RS3018",
-                            "invalid logical negation types",
-                            instruction.sourceSpan);
+                        valueType(instruction.operands.front()) != semantic::PrimitiveType::Bool) {
+                        diagnostics.report("RS3018", "invalid logical negation types", instruction.sourceSpan);
                     }
-                } else if ((instruction.opcode == Opcode::AddInt ||
-                            instruction.opcode == Opcode::SubtractInt ||
-                            instruction.opcode == Opcode::MultiplyInt ||
-                            instruction.opcode == Opcode::DivideInt ||
-                            instruction.opcode == Opcode::RemainderInt) &&
+                } else if (((instruction.opcode >= Opcode::AddInt &&
+                              instruction.opcode <= Opcode::RemainderInt) ||
+                             (instruction.opcode >= Opcode::AddLong &&
+                              instruction.opcode <= Opcode::RemainderLong) ||
+                             (instruction.opcode >= Opcode::AddDouble &&
+                              instruction.opcode <= Opcode::DivideDouble)) &&
                            operandCountIsValid) {
-                    if (instruction.resultType != semantic::PrimitiveType::Int ||
-                        valueType(instruction.operands[0]) !=
-                            semantic::PrimitiveType::Int ||
-                        valueType(instruction.operands[1]) !=
-                            semantic::PrimitiveType::Int) {
-                        diagnostics.report(
-                            "RS3019",
-                            "invalid integer arithmetic types",
-                            instruction.sourceSpan);
+                    const auto expected = instruction.opcode <= Opcode::RemainderInt
+                        ? semantic::PrimitiveType::Int
+                        : instruction.opcode <= Opcode::RemainderLong
+                            ? semantic::PrimitiveType::Long
+                            : semantic::PrimitiveType::Double;
+                    if (instruction.resultType != expected ||
+                        valueType(instruction.operands[0]) != expected ||
+                        valueType(instruction.operands[1]) != expected) {
+                        diagnostics.report("RS3019", "invalid numeric arithmetic types", instruction.sourceSpan);
                     }
-                } else if ((instruction.opcode == Opcode::LessInt ||
-                            instruction.opcode == Opcode::LessOrEqualInt ||
-                            instruction.opcode == Opcode::GreaterInt ||
-                            instruction.opcode == Opcode::GreaterOrEqualInt) &&
+                } else if (((instruction.opcode >= Opcode::LessInt &&
+                              instruction.opcode <= Opcode::GreaterOrEqualInt) ||
+                             (instruction.opcode >= Opcode::LessLong &&
+                              instruction.opcode <= Opcode::GreaterOrEqualLong) ||
+                             (instruction.opcode >= Opcode::LessDouble &&
+                              instruction.opcode <= Opcode::GreaterOrEqualDouble)) &&
                            operandCountIsValid) {
+                    const auto expected = instruction.opcode <= Opcode::GreaterOrEqualInt
+                        ? semantic::PrimitiveType::Int
+                        : instruction.opcode <= Opcode::GreaterOrEqualLong
+                            ? semantic::PrimitiveType::Long
+                            : semantic::PrimitiveType::Double;
                     if (instruction.resultType != semantic::PrimitiveType::Bool ||
-                        valueType(instruction.operands[0]) !=
-                            semantic::PrimitiveType::Int ||
-                        valueType(instruction.operands[1]) !=
-                            semantic::PrimitiveType::Int) {
-                        diagnostics.report(
-                            "RS3020",
-                            "invalid integer comparison types",
-                            instruction.sourceSpan);
+                        valueType(instruction.operands[0]) != expected ||
+                        valueType(instruction.operands[1]) != expected) {
+                        diagnostics.report("RS3020", "invalid numeric comparison types", instruction.sourceSpan);
                     }
                 } else if ((instruction.opcode == Opcode::Equal ||
                             instruction.opcode == Opcode::NotEqual) &&
                            operandCountIsValid) {
                     if (instruction.resultType != semantic::PrimitiveType::Bool ||
-                        valueType(instruction.operands[0]) !=
-                            valueType(instruction.operands[1])) {
+                        valueType(instruction.operands[0]) != valueType(instruction.operands[1]) ||
+                        valueTypeId(instruction.operands[0]) != valueTypeId(instruction.operands[1])) {
                         diagnostics.report(
                             "RS3021",
                             "invalid equality comparison types",
@@ -791,7 +851,8 @@ bool verifyModule(
                     terminatorUseIndex,
                     terminator.sourceSpan);
                 if (function.returnType == semantic::PrimitiveType::Void ||
-                    valueType(terminator.value) != function.returnType) {
+                    valueType(terminator.value) != function.returnType ||
+                    valueTypeId(terminator.value) != function.returnTypeId) {
                     diagnostics.report(
                         "RS3024",
                         "MIR return value type does not match function",

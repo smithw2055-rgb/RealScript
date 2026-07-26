@@ -11,8 +11,7 @@ void printSignatureType(
     semantic::PrimitiveType type,
     semantic::SymbolId typeId) {
     out << semantic::primitiveTypeName(type);
-    if ((type == semantic::PrimitiveType::Object ||
-         type == semantic::PrimitiveType::Array) && typeId != 0) {
+    if (semantic::isExactType(type) && typeId != 0) {
         out << "[0x" << std::hex << typeId << std::dec << ']';
     }
 }
@@ -51,8 +50,7 @@ std::string disassembleModule(const Module& module) {
                 if (fieldIndex != 0) out << ", ";
                 const auto& field = type.fields[fieldIndex];
                 out << field.name << ':'
-                    << ((field.type == semantic::PrimitiveType::Object ||
-                          field.type == semantic::PrimitiveType::Array)
+                    << (semantic::isExactType(field.type)
                         ? field.typeName
                         : semantic::primitiveTypeName(field.type));
             }
@@ -174,6 +172,10 @@ std::string disassembleModule(const Module& module) {
                 case Opcode::ConstantInt:
                     out << ' ' << instruction.integerImmediate;
                     break;
+                case Opcode::ConstantDouble:
+                    out << ' ' << std::setprecision(17)
+                        << instruction.doubleImmediate;
+                    break;
                 case Opcode::ConstantBool:
                     out << ' ' << (instruction.boolImmediate ? "true" : "false");
                     break;
@@ -183,6 +185,7 @@ std::string disassembleModule(const Module& module) {
                 case Opcode::ConstantNull:
                     break;
                 case Opcode::NewObject:
+                case Opcode::NewStruct:
                     out << " type" << instruction.typeIndex;
                     break;
                 case Opcode::NewArray:
@@ -210,11 +213,13 @@ std::string disassembleModule(const Module& module) {
                         << instruction.operands.front();
                     break;
                 case Opcode::LoadField:
+                case Opcode::LoadStructField:
                     out << " type" << instruction.typeIndex << '.'
                         << instruction.index << ", r"
                         << instruction.operands.front();
                     break;
                 case Opcode::StoreField:
+                case Opcode::StoreStructField:
                     out << " type" << instruction.typeIndex << '.'
                         << instruction.index << ", r"
                         << instruction.operands[0] << ", r"

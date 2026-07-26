@@ -1,6 +1,6 @@
 # RealScript 语言规范
 
-> Phase 3B 已实现的最小 `class`、`new`、字段访问、对象 null 与身份相等边界见 [OBJECT_MODEL_V0.md](OBJECT_MODEL_V0.md)。构造函数、方法、继承与接口仍属于后续实现。
+> Phase 3B–3E 已实现 class 字段、数组、direct-dispatch 方法、构造函数、属性、`long`/`double`、enum 与 struct 值语义。实现边界见 [OBJECT_MODEL_V0.md](OBJECT_MODEL_V0.md)、[MEMBERS_PROPERTIES_V0.md](MEMBERS_PROPERTIES_V0.md) 与 [NUMERIC_ENUM_STRUCT_V0.md](NUMERIC_ENUM_STRUCT_V0.md)。继承、接口、泛型和 `ref` 语义仍属于后续实现。
 
 
 - 规范版本：Draft v0.1

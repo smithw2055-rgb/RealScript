@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -34,6 +35,12 @@ public:
         }
     }
     void i64(std::int64_t value) { u64(static_cast<std::uint64_t>(value)); }
+    void f64(double value) {
+        std::uint64_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(value), "unexpected double size");
+        std::memcpy(&bits, &value, sizeof(bits));
+        u64(bits);
+    }
     void bytes(const char* values, std::size_t count) {
         data_.insert(data_.end(), values, values + count);
     }
@@ -98,6 +105,13 @@ public:
         return result;
     }
     std::int64_t i64() { return static_cast<std::int64_t>(u64()); }
+    double f64() {
+        const auto bits = u64();
+        double value = 0.0;
+        static_assert(sizeof(bits) == sizeof(value), "unexpected double size");
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
     std::string string(std::size_t count) {
         if (!require(count)) return {};
         const auto* begin = reinterpret_cast<const char*>(data_.data() + position_);
@@ -128,6 +142,10 @@ std::uint8_t encodeType(semantic::PrimitiveType type) {
     case semantic::PrimitiveType::Null: return 5;
     case semantic::PrimitiveType::Array: return 6;
     case semantic::PrimitiveType::Handle: return 7;
+    case semantic::PrimitiveType::Long: return 8;
+    case semantic::PrimitiveType::Double: return 9;
+    case semantic::PrimitiveType::Struct: return 10;
+    case semantic::PrimitiveType::Enum: return 11;
     case semantic::PrimitiveType::Error: break;
     }
     throw std::logic_error("invalid type in bytecode encoder");
@@ -143,6 +161,10 @@ bool decodeType(std::uint8_t tag, semantic::PrimitiveType& type) {
     case 5: type = semantic::PrimitiveType::Null; return true;
     case 6: type = semantic::PrimitiveType::Array; return true;
     case 7: type = semantic::PrimitiveType::Handle; return true;
+    case 8: type = semantic::PrimitiveType::Long; return true;
+    case 9: type = semantic::PrimitiveType::Double; return true;
+    case 10: type = semantic::PrimitiveType::Struct; return true;
+    case 11: type = semantic::PrimitiveType::Enum; return true;
     default: return false;
     }
 }
@@ -284,6 +306,7 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
             strings.add(field.name);
             if (!field.typeName.empty()) strings.add(field.typeName);
         }
+        for (const auto& member : type.enumMembers) strings.add(member.name);
     }
     for (const auto& reference : module.functionReferences) strings.add(reference.name);
     for (const auto& function : module.functions) {
@@ -308,6 +331,7 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
     typeSection.u32(static_cast<std::uint32_t>(module.types.size()));
     for (const auto& type : module.types) {
         typeSection.u64(type.id);
+        typeSection.u8(static_cast<std::uint8_t>(type.kind));
         typeSection.u32(strings.indexOf(type.moduleName));
         typeSection.u32(strings.indexOf(type.name));
         typeSection.u32(static_cast<std::uint32_t>(type.fields.size()));
@@ -318,6 +342,12 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
                 ? InvalidIndex
                 : strings.indexOf(field.typeName));
             typeSection.u32(static_cast<std::uint32_t>(field.index));
+            typeSection.u8(field.synthetic ? 1 : 0);
+        }
+        typeSection.u32(static_cast<std::uint32_t>(type.enumMembers.size()));
+        for (const auto& member : type.enumMembers) {
+            typeSection.u32(strings.indexOf(member.name));
+            typeSection.i64(member.value);
         }
     }
 
@@ -355,6 +385,7 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
                 codeSection.u8(encodeOptionalType(instruction.elementType));
                 codeSection.u64(instruction.elementTypeId);
                 codeSection.i64(instruction.integerImmediate);
+                codeSection.f64(instruction.doubleImmediate);
                 codeSection.u8(instruction.boolImmediate ? 1 : 0);
                 codeSection.u32(
                     instruction.opcode == Opcode::ConstantString
@@ -450,7 +481,7 @@ bool decodeModule(
         diagnostics.report("RS5003", "truncated bytecode header", {});
         return false;
     }
-    if (module.version.major != 0 || module.version.minor != 3) {
+    if (module.version.major != 0 || module.version.minor != 4) {
         diagnostics.report("RS5001", "unsupported bytecode version", {});
         return false;
     }
@@ -550,6 +581,12 @@ bool decodeModule(
         for (std::uint32_t index = 0; index < count; ++index) {
             semantic::TypeSymbol type;
             type.id = reader.u64();
+            const auto kind = reader.u8();
+            if (kind > static_cast<std::uint8_t>(semantic::TypeKind::Enum)) {
+                diagnostics.report("RS5004", "invalid type descriptor kind", {});
+                return false;
+            }
+            type.kind = static_cast<semantic::TypeKind>(kind);
             const auto moduleNameIndex = reader.u32();
             const auto nameIndex = reader.u32();
             if (!validStringIndex(moduleNameIndex, strings, diagnostics,
@@ -587,7 +624,25 @@ bool decodeModule(
                     field.typeName = strings[typeNameIndex];
                 }
                 field.index = reader.u32();
+                field.synthetic = reader.u8() != 0;
                 type.fields.push_back(std::move(field));
+            }
+            const auto enumCount = reader.u32();
+            if (!reader.valid() || enumCount > reader.remaining() / 12) {
+                diagnostics.report("RS5003", "truncated enum member descriptor list", {});
+                return false;
+            }
+            type.enumMembers.reserve(enumCount);
+            for (std::uint32_t memberIndex = 0; memberIndex < enumCount; ++memberIndex) {
+                semantic::EnumMemberSymbol member;
+                const auto memberNameIndex = reader.u32();
+                if (!validStringIndex(memberNameIndex, strings, diagnostics,
+                        "invalid enum member name string index")) {
+                    return false;
+                }
+                member.name = strings[memberNameIndex];
+                member.value = reader.i64();
+                type.enumMembers.push_back(std::move(member));
             }
             module.types.push_back(std::move(type));
         }
@@ -730,7 +785,7 @@ bool decodeModule(
                  ++instructionIndex) {
                 Instruction instruction;
                 const auto opcode = reader.u8();
-                if (opcode > static_cast<std::uint8_t>(Opcode::GreaterOrEqualInt)) {
+                if (opcode > static_cast<std::uint8_t>(Opcode::GreaterOrEqualDouble)) {
                     diagnostics.report("RS5005", "invalid bytecode opcode", {});
                     return false;
                 }
@@ -748,6 +803,7 @@ bool decodeModule(
                 }
                 instruction.elementTypeId = reader.u64();
                 instruction.integerImmediate = reader.i64();
+                instruction.doubleImmediate = reader.f64();
                 instruction.boolImmediate = reader.u8() != 0;
                 const auto stringIndex = reader.u32();
                 if (instruction.opcode == Opcode::ConstantString) {

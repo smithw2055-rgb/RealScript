@@ -1,4 +1,4 @@
-rsbc 0.3 module Demo.Bytecode
+rsbc 0.4 module Demo.Bytecode
 
 references:
   ref0 @Demo.Bytecode::twice[0x48d2886689d9cb5f](int) -> int
@@ -11,7 +11,7 @@ bb0:
   r0:int = param 0
   store.local 0, r0
   r1:int = load.local 0
-  r2:int = const.i32 2
+  r2:int = const.int 2
   r3:int = mul.i32 r1, r2
   ret r3
 }
@@ -35,7 +35,7 @@ bb1:
   br r6, bb2, bb3
 bb2:
   r7:int = load.local 2
-  r8:int = const.i32 1
+  r8:int = const.int 1
   r9:int = sub.i32 r7, r8
   store.local 2, r9
   jmp bb1
@@ -57,7 +57,7 @@ bb0:
   br r2, bb1, bb2(r4)
 bb1:
   r5:int = load.local 1
-  r6:int = const.i32 0
+  r6:int = const.int 0
   r7:bool = gt.i32 r5, r6
   jmp bb2(r7)
 bb2(r3:bool):

@@ -61,8 +61,8 @@ void testTypeDescriptorAndObjectBytecode() {
     auto modules = compile({{"point.rs", pointSource}});
     require(modules.size() == 1, "expected one object module");
     const auto& module = modules.front();
-    require(module.version.major == 0 && module.version.minor == 3,
-        "object bytecode must use format 0.3");
+    require(module.version.major == 0 && module.version.minor == 4,
+        "object bytecode must use format 0.4");
     require(module.types.size() == 1, "class descriptor was not emitted");
     const auto& type = module.types.front();
     require(type.name == "Point" && type.fields.size() == 2,

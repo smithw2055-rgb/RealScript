@@ -1,7 +1,7 @@
 # Arrays, Native Handles and Heap Diagnostics — Implemented Draft v0.1
 
 - implementation slice: Phase 3C
-- bytecode dependency: `.rsbc` 0.3
+- bytecode introduced in: `.rsbc` 0.3; current producer: `.rsbc` 0.4
 - status: implemented draft; source, ABI and binary compatibility are not frozen
 
 ## 1. Scope
@@ -89,9 +89,9 @@ Precise roots have two sources:
 - interpreter `ShadowStack` frames containing argument, local and register vectors;
 - persistent roots registered by the embedding host.
 
-`PersistentRoot` is move-only and unregisters its token on destruction or `reset()`. Updating a root requires a live object from the same heap.
+`PersistentRoot` is move-only and unregisters its token on destruction or `reset()`. A persistent root stores a runtime `Value`, not only an `ObjectRef`; nested `StructValue` fields are scanned recursively. Creating or updating a root validates every nested managed reference and rejects values that contain references from another heap.
 
-A host must retain every managed object that outlives the native call or interpreter invocation that produced it.
+A host must retain every managed value containing references that outlives the native call or interpreter invocation that produced it.
 
 ## 8. Incremental collection and full collection
 
@@ -120,4 +120,4 @@ Object and root ordering is deterministic. `toText()` is suitable for fixtures a
 
 ## 11. Compatibility
 
-`.rsbc` 0.3 is not binary compatible with 0.2. A 0.3 decoder must reject any different version. Source and runtime interfaces remain draft and may change before the first stable release.
+Arrays were introduced in `.rsbc` 0.3. The current 0.4 producer is not binary compatible with 0.3 or 0.2 and rejects any different version. Source and runtime interfaces remain draft and may change before the first stable release.

@@ -115,7 +115,7 @@ struct ManagedHeap::Impl {
     std::vector<Slot> slots;
     std::vector<std::uint32_t> freeSlots;
     std::vector<ObjectRef> markStack;
-    std::unordered_map<RootToken, ObjectRef> persistentRoots;
+    std::unordered_map<RootToken, Value> persistentRoots;
     RootToken nextRootToken = 1;
     GcPhase phase = GcPhase::Idle;
     bool requested = false;
@@ -211,13 +211,51 @@ struct ManagedHeap::Impl {
         markStack.push_back(reference);
     }
 
+    void markValue(
+        const Value& value,
+        std::unordered_set<const StructStorage*>& visitedStructs) {
+        if (const auto* reference = std::get_if<ObjectRef>(&value)) {
+            mark(*reference);
+            return;
+        }
+        if (const auto* structure = std::get_if<StructValue>(&value);
+            structure && structure->storage &&
+            visitedStructs.insert(structure->storage.get()).second) {
+            for (const auto& field : structure->storage->fields) {
+                markValue(field, visitedStructs);
+            }
+        }
+    }
+
     void markValue(const Value& value) {
-        if (const auto* reference = std::get_if<ObjectRef>(&value)) mark(*reference);
+        std::unordered_set<const StructStorage*> visitedStructs;
+        markValue(value, visitedStructs);
+    }
+
+    [[nodiscard]] bool validRootValue(
+        const Value& value,
+        std::unordered_set<const StructStorage*>& visitedStructs) const {
+        if (const auto* reference = std::get_if<ObjectRef>(&value)) {
+            return get(*reference) != nullptr;
+        }
+        if (const auto* structure = std::get_if<StructValue>(&value)) {
+            if (structure->typeId == 0 || !structure->storage) return false;
+            if (!visitedStructs.insert(structure->storage.get()).second) return true;
+            for (const auto& field : structure->storage->fields) {
+                if (!validRootValue(field, visitedStructs)) return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool validRootValue(const Value& value) const {
+        std::unordered_set<const StructStorage*> visitedStructs;
+        return validRootValue(value, visitedStructs);
     }
 
     void markRoots(const ShadowStack& shadowStack) {
         shadowStack.visitRoots([&](const Value& value) { markValue(value); });
-        for (const auto& entry : persistentRoots) mark(entry.second);
+        for (const auto& entry : persistentRoots) markValue(entry.second);
     }
 
     void startCollection(const ShadowStack& shadowStack) {
@@ -308,13 +346,16 @@ std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
     const bool validElement = elementType == semantic::PrimitiveType::Error ||
         elementType == semantic::PrimitiveType::Bool ||
         elementType == semantic::PrimitiveType::Int ||
+        elementType == semantic::PrimitiveType::Long ||
+        elementType == semantic::PrimitiveType::Double ||
         elementType == semantic::PrimitiveType::String ||
         elementType == semantic::PrimitiveType::Object ||
+        elementType == semantic::PrimitiveType::Struct ||
+        elementType == semantic::PrimitiveType::Enum ||
         elementType == semantic::PrimitiveType::Array ||
         elementType == semantic::PrimitiveType::Handle;
     if (!validElement ||
-        ((elementType == semantic::PrimitiveType::Object ||
-          elementType == semantic::PrimitiveType::Array)
+        (semantic::isExactType(elementType)
             ? elementTypeId == 0
             : elementTypeId != 0)) {
         setHeapError(error, ErrorCode::InvalidArguments,
@@ -491,6 +532,21 @@ bool ManagedHeap::arraySet(
                 "managed array nested array type mismatch");
             return false;
         }
+    } else if (expected == semantic::PrimitiveType::Struct) {
+        const auto* structure = std::get_if<StructValue>(&value);
+        if (!structure || structure->typeId != object->header.elementTypeId ||
+            !structure->storage) {
+            setHeapError(error, ErrorCode::TypeMismatch,
+                "managed array struct element type mismatch");
+            return false;
+        }
+    } else if (expected == semantic::PrimitiveType::Enum) {
+        const auto* enumeration = std::get_if<EnumValue>(&value);
+        if (!enumeration || enumeration->typeId != object->header.elementTypeId) {
+            setHeapError(error, ErrorCode::TypeMismatch,
+                "managed array enum element type mismatch");
+            return false;
+        }
     } else if (expected == semantic::PrimitiveType::Handle) {
         const auto* handle = std::get_if<NativeHandle>(&value);
         if (!handle || (object->header.elementTypeId != 0 &&
@@ -557,18 +613,28 @@ bool ManagedHeap::fieldSet(
 }
 
 ManagedHeap::RootToken ManagedHeap::addPersistentRoot(ObjectRef reference) {
-    if (!isAlive(reference)) return 0;
+    return addPersistentRoot(Value{reference});
+}
+
+ManagedHeap::RootToken ManagedHeap::addPersistentRoot(Value value) {
+    if (!impl_->validRootValue(value)) return 0;
     auto token = impl_->nextRootToken++;
     if (token == 0) token = impl_->nextRootToken++;
-    impl_->persistentRoots.emplace(token, reference);
+    impl_->persistentRoots.emplace(token, std::move(value));
     return token;
 }
 
-bool ManagedHeap::updatePersistentRoot(RootToken token, ObjectRef reference) {
-    if (token == 0 || !isAlive(reference)) return false;
+bool ManagedHeap::updatePersistentRoot(
+    RootToken token,
+    ObjectRef reference) {
+    return updatePersistentRoot(token, Value{reference});
+}
+
+bool ManagedHeap::updatePersistentRoot(RootToken token, Value value) {
+    if (token == 0 || !impl_->validRootValue(value)) return false;
     const auto found = impl_->persistentRoots.find(token);
     if (found == impl_->persistentRoots.end()) return false;
-    found->second = reference;
+    found->second = std::move(value);
     return true;
 }
 
@@ -577,8 +643,12 @@ bool ManagedHeap::removePersistentRoot(RootToken token) noexcept {
 }
 
 PersistentRoot ManagedHeap::retain(ObjectRef reference) {
-    const auto token = addPersistentRoot(reference);
-    return PersistentRoot(token == 0 ? nullptr : this, token, reference);
+    return retain(Value{reference});
+}
+
+PersistentRoot ManagedHeap::retain(Value value) {
+    const auto token = addPersistentRoot(value);
+    return PersistentRoot(token == 0 ? nullptr : this, token, std::move(value));
 }
 
 void ManagedHeap::requestCollection() noexcept { impl_->requested = true; }
@@ -697,14 +767,28 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
             info.valueCount = values.size();
             const auto addEdge = [&](std::size_t index) {
                 if (index >= values.size()) return;
-                if (const auto* target = std::get_if<ObjectRef>(&values[index]);
-                    target && impl_->get(*target)) {
-                    info.edges.push_back({
-                        *target,
-                        (object.header.kind == ObjectKind::Array ? "element[" : "field[") +
-                            std::to_string(index) + "]",
-                    });
-                }
+                std::unordered_set<const StructStorage*> visitedStructs;
+                const auto addValueEdges = [&](const auto& self,
+                                               const Value& value,
+                                               const std::string& label) -> void {
+                    if (const auto* target = std::get_if<ObjectRef>(&value);
+                        target && impl_->get(*target)) {
+                        info.edges.push_back({*target, label});
+                        return;
+                    }
+                    if (const auto* structure = std::get_if<StructValue>(&value);
+                        structure && structure->storage &&
+                        visitedStructs.insert(structure->storage.get()).second) {
+                        for (std::size_t field = 0;
+                             field < structure->storage->fields.size(); ++field) {
+                            self(self, structure->storage->fields[field],
+                                label + ".struct[" + std::to_string(field) + "]");
+                        }
+                    }
+                };
+                addValueEdges(addValueEdges, values[index],
+                    (object.header.kind == ObjectKind::Array ? "element[" : "field[") +
+                        std::to_string(index) + "]");
             };
             if (object.header.kind == ObjectKind::Array) {
                 for (std::size_t index = 0; index < values.size(); ++index) {
@@ -716,16 +800,33 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
         }
         result.objects.push_back(std::move(info));
     }
-    for (const auto& [token, reference] : impl_->persistentRoots) {
-        result.roots.push_back({token, reference, "persistent"});
+    const auto appendRoots = [&](const Value& value,
+                                 std::uint64_t token,
+                                 const std::string& kind) {
+        std::unordered_set<const StructStorage*> visitedStructs;
+        const auto addRoots = [&](const auto& self, const Value& current) -> void {
+            if (const auto* reference = std::get_if<ObjectRef>(&current);
+                reference && impl_->get(*reference)) {
+                result.roots.push_back({token, *reference, kind});
+                return;
+            }
+            if (const auto* structure = std::get_if<StructValue>(&current);
+                structure && structure->storage &&
+                visitedStructs.insert(structure->storage.get()).second) {
+                for (const auto& field : structure->storage->fields) {
+                    self(self, field);
+                }
+            }
+        };
+        addRoots(addRoots, value);
+    };
+    for (const auto& [token, value] : impl_->persistentRoots) {
+        appendRoots(value, token, "persistent");
     }
     if (shadowStack) {
         std::uint64_t index = 0;
         shadowStack->visitRoots([&](const Value& value) {
-            if (const auto* reference = std::get_if<ObjectRef>(&value);
-                reference && impl_->get(*reference)) {
-                result.roots.push_back({index++, *reference, "shadow"});
-            }
+            appendRoots(value, index++, "shadow");
         });
     }
     std::sort(result.objects.begin(), result.objects.end(),
@@ -841,19 +942,13 @@ std::string HeapSnapshot::toText() const {
     return out.str();
 }
 
-PersistentRoot::PersistentRoot(
-    ManagedHeap* heap,
-    ManagedHeap::RootToken token,
-    ObjectRef reference)
-    : heap_(heap), token_(token), reference_(reference) {}
-
 PersistentRoot::~PersistentRoot() { reset(); }
 
 PersistentRoot::PersistentRoot(PersistentRoot&& other) noexcept
-    : heap_(other.heap_), token_(other.token_), reference_(other.reference_) {
+    : heap_(other.heap_), token_(other.token_), value_(std::move(other.value_)) {
     other.heap_ = nullptr;
     other.token_ = 0;
-    other.reference_ = {};
+    other.value_ = {};
 }
 
 PersistentRoot& PersistentRoot::operator=(PersistentRoot&& other) noexcept {
@@ -861,24 +956,34 @@ PersistentRoot& PersistentRoot::operator=(PersistentRoot&& other) noexcept {
     reset();
     heap_ = other.heap_;
     token_ = other.token_;
-    reference_ = other.reference_;
+    value_ = std::move(other.value_);
     other.heap_ = nullptr;
     other.token_ = 0;
-    other.reference_ = {};
+    other.value_ = {};
     return *this;
 }
 
 bool PersistentRoot::valid() const noexcept {
-    return heap_ && token_ != 0 && heap_->isAlive(reference_);
+    return heap_ && token_ != 0;
 }
 
-ObjectRef PersistentRoot::reference() const noexcept { return reference_; }
+ObjectRef PersistentRoot::reference() const noexcept {
+    const auto* reference = std::get_if<ObjectRef>(&value_);
+    return reference ? *reference : ObjectRef{};
+}
+
+const Value& PersistentRoot::value() const noexcept { return value_; }
 
 bool PersistentRoot::update(ObjectRef reference) {
-    if (!heap_ || token_ == 0 || !heap_->updatePersistentRoot(token_, reference)) {
+    return update(Value{reference});
+}
+
+bool PersistentRoot::update(Value value) {
+    if (!heap_ || token_ == 0 ||
+        !heap_->updatePersistentRoot(token_, value)) {
         return false;
     }
-    reference_ = reference;
+    value_ = std::move(value);
     return true;
 }
 
@@ -886,8 +991,14 @@ void PersistentRoot::reset() noexcept {
     if (heap_ && token_ != 0) (void)heap_->removePersistentRoot(token_);
     heap_ = nullptr;
     token_ = 0;
-    reference_ = {};
+    value_ = {};
 }
+
+PersistentRoot::PersistentRoot(
+    ManagedHeap* heap,
+    ManagedHeap::RootToken token,
+    Value value)
+    : heap_(heap), token_(token), value_(std::move(value)) {}
 
 NativeHandleRegistry::NativeHandleRegistry()
     : registryId_(nextRegistryId()) {}

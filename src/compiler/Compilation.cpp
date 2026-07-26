@@ -5,10 +5,12 @@
 #include "realscript/text/Text.h"
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -41,6 +43,7 @@ struct ModuleWork {
     std::vector<semantic::TypeSymbol> types;
     semantic::TypeSymbolMap visibleTypes;
     std::vector<semantic::FunctionSymbol> declarations;
+    std::vector<semantic::FunctionBindingInput> functionBindings;
     std::uint64_t sourceFingerprint = 0;
     std::uint64_t publicFingerprint = 0;
     std::uint64_t dependencyFingerprint = 0;
@@ -60,25 +63,76 @@ void addVisibleType(
     const semantic::TypeSymbol& type,
     bool includeSimpleName) {
     map[semantic::canonicalTypeName(type)] = type;
-    if (includeSimpleName) {
-        map[type.name] = type;
+    if (includeSimpleName) map[type.name] = type;
+}
+
+void refreshVisibleTypes(
+    std::map<std::string, ModuleWork>& modules,
+    ModuleWork& module) {
+    module.visibleTypes.clear();
+    for (const auto& type : module.types) addVisibleType(module.visibleTypes, type, true);
+    for (const auto& importedName : module.imports) {
+        const auto imported = modules.find(importedName);
+        if (imported == modules.end()) continue;
+        for (const auto& type : imported->second.types) {
+            addVisibleType(module.visibleTypes, type, true);
+        }
     }
+}
+
+std::string fieldTypeSignature(const semantic::FieldSymbol& field) {
+    if (semantic::isExactType(field.type) && !field.typeName.empty()) {
+        return field.typeName;
+    }
+    return semantic::primitiveTypeName(field.type);
 }
 
 std::string typeSignature(const semantic::TypeSymbol& type) {
     std::ostringstream out;
-    out << semantic::canonicalTypeName(type) << '{';
+    out << static_cast<int>(type.kind) << ':' << semantic::canonicalTypeName(type) << '{';
     for (const auto& field : type.fields) {
-        out << field.name << ':';
-        if (field.type == semantic::PrimitiveType::Object) {
-            out << field.typeName;
+        out << field.name << ':' << fieldTypeSignature(field)
+            << (field.synthetic ? ":synthetic" : "") << ';';
+    }
+    for (const auto& constructor : type.constructors) {
+        out << "ctor:" << semantic::canonicalFunctionSignature(constructor) << ';';
+    }
+    for (const auto& method : type.methods) {
+        out << "method:" << (method.staticMethod ? "static:" : "instance:")
+            << semantic::canonicalFunctionSignature(method) << ';';
+    }
+    for (const auto& property : type.properties) {
+        out << "property:" << property.name << ':';
+        if (semantic::isExactType(property.type) && !property.typeName.empty()) {
+            out << property.typeName;
         } else {
-            out << semantic::primitiveTypeName(field.type);
+            out << semantic::primitiveTypeName(property.type);
         }
-        out << ';';
+        out << ':' << (property.staticProperty ? "static:" : "instance:")
+            << (property.getter.has_value() ? 'g' : '-')
+            << (property.setter.has_value() ? 's' : '-') << ';';
+    }
+    for (const auto& member : type.enumMembers) {
+        out << "enum:" << member.name << '=' << member.value << ';';
     }
     out << '}';
     return out.str();
+}
+
+semantic::TypeSymbol* findOwnType(ModuleWork& module, const std::string& name) {
+    for (auto& type : module.types) {
+        if (type.name == name) return &type;
+    }
+    return nullptr;
+}
+
+void appendParameters(
+    semantic::FunctionBindingInput& binding,
+    const std::vector<syntax::ParameterSyntax>& parameters) {
+    for (const auto& parameter : parameters) {
+        binding.parameterNames.push_back(parameter.identifierToken.text);
+        binding.parameterSpans.push_back(parameter.identifierToken.span);
+    }
 }
 
 } // namespace
@@ -90,34 +144,24 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
 
     for (const auto& sourceFile : sources_) {
         auto unit = std::make_unique<ParsedUnit>();
-        unit->source = std::make_unique<text::SourceText>(
-            sourceFile.content,
-            sourceFile.path);
-
+        unit->source = std::make_unique<text::SourceText>(sourceFile.content, sourceFile.path);
         diagnostics::DiagnosticBag parseDiagnostics;
         syntax::Parser parser(*unit->source, parseDiagnostics);
-        unit->syntaxTree =
-            std::make_unique<syntax::CompilationUnitSyntax>(
-                parser.parseCompilationUnit());
+        unit->syntaxTree = std::make_unique<syntax::CompilationUnitSyntax>(
+            parser.parseCompilationUnit());
         unit->moduleName = unit->syntaxTree->moduleDeclaration
             ? unit->syntaxTree->moduleDeclaration->fullName()
             : "$global";
-        unit->sourceFingerprint = stableFingerprint(
-            sourceFile.path + "\n" + sourceFile.content);
-
+        unit->sourceFingerprint = stableFingerprint(sourceFile.path + "\n" + sourceFile.content);
         for (const auto& import : unit->syntaxTree->imports) {
             unit->imports.push_back(import.fullName());
         }
         for (const auto& diagnostic : parseDiagnostics.items()) {
             result.diagnostics.report(
-                diagnostic.code,
-                diagnostic.message,
-                diagnostic.span,
-                diagnostic.severity,
-                sourceFile.path);
+                diagnostic.code, diagnostic.message, diagnostic.span,
+                diagnostic.severity, sourceFile.path);
         }
         unit->invalid = parseDiagnostics.hasErrors();
-
         auto& module = modules[unit->moduleName];
         module.name = unit->moduleName;
         module.units.push_back(unit.get());
@@ -126,134 +170,331 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         units.push_back(std::move(unit));
     }
 
-    // Stable source order and class shells.
-    for (auto& [moduleName, module] : modules) {
-        std::sort(
-            module.units.begin(),
-            module.units.end(),
+    // Stable source order and named-type shells.
+    for (auto& moduleEntry : modules) {
+        const auto& moduleName = moduleEntry.first;
+        auto& module = moduleEntry.second;
+        std::sort(module.units.begin(), module.units.end(),
             [](const ParsedUnit* left, const ParsedUnit* right) {
                 return left->source->name() < right->source->name();
             });
-
         std::uint64_t sourceFingerprint = 14695981039346656037ull;
         std::unordered_set<std::string> typeNames;
+        const auto addShell = [&](auto const& syntaxNode, auto declare) {
+            auto type = declare(moduleName, syntaxNode);
+            if (!typeNames.insert(type.name).second) {
+                result.diagnostics.report(
+                    "RS4004", "duplicate type '" + type.name + "'",
+                    syntaxNode.identifierToken.span,
+                    diagnostics::DiagnosticSeverity::Error);
+                module.invalid = true;
+                return;
+            }
+            module.types.push_back(std::move(type));
+        };
         for (const auto* unit : module.units) {
-            sourceFingerprint = combineFingerprint(
-                sourceFingerprint,
-                unit->sourceFingerprint);
-            for (const auto& classSyntax : unit->syntaxTree->classes) {
-                auto type = semantic::declareTypeShell(moduleName, classSyntax);
-                if (!typeNames.insert(type.name).second) {
-                    result.diagnostics.report(
-                        "RS4004",
-                        "duplicate type '" + type.name + "'",
-                        classSyntax.identifierToken.span,
-                        diagnostics::DiagnosticSeverity::Error,
-                        unit->source->name());
-                    module.invalid = true;
-                    continue;
-                }
-                module.types.push_back(type);
+            sourceFingerprint = combineFingerprint(sourceFingerprint, unit->sourceFingerprint);
+            for (const auto& node : unit->syntaxTree->classes) {
+                addShell(node, [](const std::string& name, const auto& syntaxNode) {
+                    return semantic::declareTypeShell(name, syntaxNode);
+                });
+            }
+            for (const auto& node : unit->syntaxTree->structs) {
+                addShell(node, [](const std::string& name, const auto& syntaxNode) {
+                    return semantic::declareTypeShell(name, syntaxNode);
+                });
+            }
+            for (const auto& node : unit->syntaxTree->enums) {
+                addShell(node, [](const std::string& name, const auto& syntaxNode) {
+                    return semantic::declareTypeShell(name, syntaxNode);
+                });
             }
         }
         module.sourceFingerprint = sourceFingerprint;
     }
 
-    // Build visible type sets before resolving fields or function signatures.
+    for (auto& [name, module] : modules) {
+        (void)name;
+        refreshVisibleTypes(modules, module);
+    }
+
+    // Resolve all field layouts and enum values before declaring member signatures.
     for (auto& [moduleName, module] : modules) {
         (void)moduleName;
-        for (const auto& type : module.types) {
-            addVisibleType(module.visibleTypes, type, true);
-        }
-        for (const auto& importedName : module.imports) {
-            const auto imported = modules.find(importedName);
-            if (imported == modules.end()) {
-                continue;
+        for (const auto* unit : module.units) {
+            for (const auto& node : unit->syntaxTree->classes) {
+                auto* type = findOwnType(module, node.identifierToken.text);
+                if (!type || !semantic::populateTypeFields(
+                        *type, node, module.visibleTypes, result.diagnostics)) {
+                    module.invalid = true;
+                }
             }
-            for (const auto& type : imported->second.types) {
-                addVisibleType(module.visibleTypes, type, true);
+            for (const auto& node : unit->syntaxTree->structs) {
+                auto* type = findOwnType(module, node.identifierToken.text);
+                if (!type || !semantic::populateTypeFields(
+                        *type, node, module.visibleTypes, result.diagnostics)) {
+                    module.invalid = true;
+                }
+            }
+            for (const auto& node : unit->syntaxTree->enums) {
+                auto* type = findOwnType(module, node.identifierToken.text);
+                if (!type || !semantic::populateEnumMembers(
+                        *type, node, result.diagnostics)) {
+                    module.invalid = true;
+                }
             }
         }
     }
+    for (auto& [name, module] : modules) {
+        (void)name;
+        refreshVisibleTypes(modules, module);
+    }
 
-    // Populate field layouts and declare function signatures.
-    for (auto& [moduleName, module] : modules) {
-        std::size_t typeIndex = 0;
+    // Declare free functions, methods, constructors and properties.
+    for (auto& moduleEntry : modules) {
+        const auto& moduleName = moduleEntry.first;
+        auto& module = moduleEntry.second;
         std::unordered_set<std::string> functionKeys;
+        auto addBinding = [&](semantic::FunctionBindingInput binding,
+                              text::TextSpan span) {
+            const auto key = semantic::canonicalFunctionKey(binding.symbol);
+            if (!functionKeys.insert(key).second) {
+                result.diagnostics.report(
+                    "RS4002", "duplicate function overload '" + key + "'", span);
+                module.invalid = true;
+            }
+            module.declarations.push_back(binding.symbol);
+            module.functionBindings.push_back(std::move(binding));
+        };
+
         for (const auto* unit : module.units) {
-            for (const auto& classSyntax : unit->syntaxTree->classes) {
-                if (typeIndex >= module.types.size()) {
-                    module.invalid = true;
-                    continue;
-                }
-                if (!semantic::populateTypeFields(
-                        module.types[typeIndex],
-                        classSyntax,
-                        module.visibleTypes,
-                        result.diagnostics)) {
-                    module.invalid = true;
-                }
-                addVisibleType(
-                    module.visibleTypes,
-                    module.types[typeIndex],
-                    true);
-                ++typeIndex;
+            for (const auto& functionSyntax : unit->syntaxTree->functions) {
+                semantic::FunctionBindingInput binding;
+                binding.symbol = semantic::declareFunctionSymbol(
+                    moduleName, functionSyntax, module.visibleTypes, result.diagnostics);
+                binding.body = &functionSyntax.body;
+                appendParameters(binding, functionSyntax.parameters);
+                addBinding(std::move(binding), functionSyntax.identifierToken.span);
             }
 
-            for (const auto& functionSyntax : unit->syntaxTree->functions) {
-                auto symbol = semantic::declareFunctionSymbol(
-                    moduleName,
-                    functionSyntax,
-                    module.visibleTypes,
-                    result.diagnostics);
-                const auto key = semantic::canonicalFunctionKey(symbol);
-                if (!functionKeys.insert(key).second) {
-                    result.diagnostics.report(
-                        "RS4002",
-                        "duplicate function overload '" + key + "'",
-                        functionSyntax.identifierToken.span,
-                        diagnostics::DiagnosticSeverity::Error,
-                        unit->source->name());
-                    module.invalid = true;
+            const auto addMembers = [&](auto const& declarations) {
+                for (const auto& typeSyntax : declarations) {
+                    auto* ownerPointer = findOwnType(module, typeSyntax.identifierToken.text);
+                    if (!ownerPointer) {
+                        module.invalid = true;
+                        continue;
+                    }
+                    auto owner = *ownerPointer;
+                    std::unordered_set<std::string> fieldNames;
+                    std::unordered_set<std::string> methodNames;
+                    std::unordered_set<std::string> propertyNames;
+                    for (const auto& field : owner.fields) {
+                        fieldNames.insert(field.name);
+                    }
+                    for (const auto& methodSyntax : typeSyntax.methods) {
+                        if (fieldNames.find(methodSyntax.identifierToken.text) !=
+                            fieldNames.end()) {
+                            result.diagnostics.report(
+                                "RS2464",
+                                "method '" + methodSyntax.identifierToken.text +
+                                    "' conflicts with a field of the same name",
+                                methodSyntax.identifierToken.span);
+                            module.invalid = true;
+                        }
+                        methodNames.insert(methodSyntax.identifierToken.text);
+                        semantic::FunctionBindingInput binding;
+                        binding.symbol = semantic::declareFunctionSymbol(
+                            moduleName, methodSyntax, module.visibleTypes,
+                            result.diagnostics, &owner);
+                        binding.body = &methodSyntax.body;
+                        if (!binding.symbol.staticMethod) {
+                            binding.parameterNames.push_back("this");
+                            binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                        }
+                        appendParameters(binding, methodSyntax.parameters);
+                        owner.methods.push_back(binding.symbol);
+                        addBinding(std::move(binding), methodSyntax.identifierToken.span);
+                    }
+                    for (const auto& constructorSyntax : typeSyntax.constructors) {
+                        semantic::FunctionBindingInput binding;
+                        binding.symbol = semantic::declareConstructorSymbol(
+                            moduleName, constructorSyntax, owner,
+                            module.visibleTypes, result.diagnostics);
+                        binding.body = &constructorSyntax.body;
+                        binding.parameterNames.push_back("this");
+                        binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                        appendParameters(binding, constructorSyntax.parameters);
+                        owner.constructors.push_back(binding.symbol);
+                        addBinding(std::move(binding), constructorSyntax.identifierToken.span);
+                    }
+                    for (const auto& propertySyntax : typeSyntax.properties) {
+                        if (!propertyNames.insert(
+                                propertySyntax.identifierToken.text).second ||
+                            fieldNames.find(propertySyntax.identifierToken.text) !=
+                                fieldNames.end() ||
+                            methodNames.find(propertySyntax.identifierToken.text) !=
+                                methodNames.end()) {
+                            result.diagnostics.report(
+                                "RS2464",
+                                "property '" + propertySyntax.identifierToken.text +
+                                    "' conflicts with another member",
+                                propertySyntax.identifierToken.span);
+                            module.invalid = true;
+                        }
+                        auto property = semantic::declarePropertySymbol(
+                            moduleName, propertySyntax, owner,
+                            module.visibleTypes, result.diagnostics);
+                        const bool getterAuto = propertySyntax.getter &&
+                            propertySyntax.getter->semicolonToken.has_value();
+                        const bool setterAuto = propertySyntax.setter &&
+                            propertySyntax.setter->semicolonToken.has_value();
+                        const bool getterExplicit = propertySyntax.getter &&
+                            propertySyntax.getter->body != nullptr;
+                        const bool setterExplicit = propertySyntax.setter &&
+                            propertySyntax.setter->body != nullptr;
+                        const bool autoProperty = getterAuto || setterAuto;
+                        if (autoProperty && (getterExplicit || setterExplicit)) {
+                            result.diagnostics.report(
+                                "RS2463",
+                                "property accessors cannot mix auto and explicit bodies",
+                                propertySyntax.identifierToken.span);
+                            module.invalid = true;
+                        }
+                        if (autoProperty && property.staticProperty) {
+                            result.diagnostics.report(
+                                "RS2462",
+                                "auto properties require an instance owner",
+                                propertySyntax.identifierToken.span);
+                            module.invalid = true;
+                        }
+                        if (autoProperty) {
+                            property.backingFieldIndex = owner.fields.size();
+                            owner.fields.push_back({
+                                "$" + property.name,
+                                property.type,
+                                property.typeName,
+                                owner.fields.size(),
+                                true,
+                            });
+                        }
+                        if (property.getter) {
+                            semantic::FunctionBindingInput binding;
+                            binding.symbol = *property.getter;
+                            binding.body = propertySyntax.getter->body.get();
+                            if (!binding.symbol.staticMethod) {
+                                binding.parameterNames.push_back("this");
+                                binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                            }
+                            binding.syntheticAutoGetter =
+                                propertySyntax.getter->semicolonToken.has_value();
+                            if (autoProperty) {
+                                binding.syntheticField = owner.fields[property.backingFieldIndex];
+                            }
+                            addBinding(std::move(binding), propertySyntax.identifierToken.span);
+                        }
+                        if (property.setter) {
+                            semantic::FunctionBindingInput binding;
+                            binding.symbol = *property.setter;
+                            binding.body = propertySyntax.setter->body.get();
+                            if (!binding.symbol.staticMethod) {
+                                binding.parameterNames.push_back("this");
+                                binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                            }
+                            binding.parameterNames.push_back("value");
+                            binding.parameterSpans.push_back(propertySyntax.identifierToken.span);
+                            binding.syntheticAutoSetter =
+                                propertySyntax.setter->semicolonToken.has_value();
+                            if (autoProperty) {
+                                binding.syntheticField = owner.fields[property.backingFieldIndex];
+                            }
+                            addBinding(std::move(binding), propertySyntax.identifierToken.span);
+                        }
+                        owner.properties.push_back(std::move(property));
+                    }
+                    *ownerPointer = std::move(owner);
                 }
-                module.declarations.push_back(std::move(symbol));
-            }
+            };
+            addMembers(unit->syntaxTree->classes);
+            addMembers(unit->syntaxTree->structs);
         }
 
         std::vector<std::string> signatures;
         signatures.reserve(module.declarations.size() + module.types.size());
-        for (const auto& type : module.types) {
-            signatures.push_back(typeSignature(type));
-        }
+        for (const auto& type : module.types) signatures.push_back(typeSignature(type));
         for (const auto& function : module.declarations) {
-            signatures.push_back(
-                semantic::canonicalFunctionSignature(function));
+            signatures.push_back(semantic::canonicalFunctionSignature(function));
         }
         std::sort(signatures.begin(), signatures.end());
-
         std::ostringstream publicSurface;
-        for (const auto& signature : signatures) {
-            publicSurface << signature << '\n';
-        }
+        for (const auto& signature : signatures) publicSurface << signature << '\n';
         module.publicFingerprint = stableFingerprint(publicSurface.str());
     }
 
-    // Refresh visible type tables after all field layouts have been populated.
-    // The first pass intentionally used shells so recursive and cross-module
-    // references could resolve before descriptors were complete.
-    for (auto& [moduleName, module] : modules) {
-        (void)moduleName;
-        module.visibleTypes.clear();
-        for (const auto& type : module.types) {
-            addVisibleType(module.visibleTypes, type, true);
-        }
-        for (const auto& importedName : module.imports) {
-            const auto imported = modules.find(importedName);
-            if (imported == modules.end()) continue;
-            for (const auto& type : imported->second.types) {
-                addVisibleType(module.visibleTypes, type, true);
+    // Reject recursive value-type layouts before lowering. A struct must have a
+    // finite inline representation; reference fields may be recursive, value
+    // fields may not.
+    {
+        struct StructOwner {
+            ModuleWork* module = nullptr;
+            const semantic::TypeSymbol* type = nullptr;
+        };
+        std::unordered_map<std::string, StructOwner> structs;
+        for (auto& [moduleName, module] : modules) {
+            (void)moduleName;
+            for (const auto& type : module.types) {
+                if (type.kind == semantic::TypeKind::Struct) {
+                    structs.emplace(
+                        semantic::canonicalTypeName(type),
+                        StructOwner{&module, &type});
+                }
             }
         }
+        std::unordered_map<std::string, int> colors;
+        std::unordered_set<std::string> reported;
+        std::vector<std::string> stack;
+        std::function<void(const std::string&)> visit = [&](const std::string& name) {
+            const auto found = structs.find(name);
+            if (found == structs.end()) return;
+            colors[name] = 1;
+            stack.push_back(name);
+            for (const auto& field : found->second.type->fields) {
+                if (field.type != semantic::PrimitiveType::Struct ||
+                    field.typeName.empty()) {
+                    continue;
+                }
+                const auto color = colors[field.typeName];
+                if (color == 0) {
+                    visit(field.typeName);
+                } else if (color == 1 && reported.insert(field.typeName).second) {
+                    std::ostringstream cycle;
+                    auto begin = std::find(stack.begin(), stack.end(), field.typeName);
+                    for (auto current = begin; current != stack.end(); ++current) {
+                        if (current != begin) cycle << " -> ";
+                        cycle << *current;
+                    }
+                    if (begin != stack.end()) cycle << " -> " << field.typeName;
+                    result.diagnostics.report(
+                        "RS2487",
+                        "recursive struct layout is not allowed: " + cycle.str(),
+                        {});
+                    found->second.module->invalid = true;
+                    const auto target = structs.find(field.typeName);
+                    if (target != structs.end()) target->second.module->invalid = true;
+                }
+            }
+            stack.pop_back();
+            colors[name] = 2;
+        };
+        for (const auto& [name, owner] : structs) {
+            (void)owner;
+            if (colors[name] == 0) visit(name);
+        }
+    }
+
+    // Member tables are part of the visible type descriptors.
+    for (auto& [name, module] : modules) {
+        (void)name;
+        refreshVisibleTypes(modules, module);
     }
 
     for (auto& [moduleName, module] : modules) {
@@ -262,10 +503,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             const auto imported = modules.find(importedModule);
             if (imported == modules.end()) {
                 result.diagnostics.report(
-                    "RS4001",
-                    "module '" + moduleName + "' imports missing module '" +
-                        importedModule + "'",
-                    {});
+                    "RS4001", "module '" + moduleName + "' imports missing module '" +
+                        importedModule + "'", {});
                 module.invalid = true;
                 continue;
             }
@@ -283,7 +522,6 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             module.dependencyFingerprint,
             false,
         };
-
         if (previous) {
             const auto cached = previous->modules.find(moduleName);
             if (cached != previous->modules.end() && !module.invalid &&
@@ -297,7 +535,6 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 continue;
             }
         }
-
         if (module.invalid) {
             result.buildInfo.push_back(buildInfo);
             continue;
@@ -318,9 +555,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         semantic::ModuleBindingInput bindingInput;
         bindingInput.moduleName = moduleName;
         bindingInput.declarations = module.declarations;
+        bindingInput.functionBindings = module.functionBindings;
         {
-            std::unordered_map<semantic::SymbolId, semantic::TypeSymbol>
-                descriptorsById;
+            std::unordered_map<semantic::SymbolId, semantic::TypeSymbol> descriptorsById;
             for (const auto& [visibleName, type] : module.visibleTypes) {
                 (void)visibleName;
                 descriptorsById.emplace(type.id, type);
@@ -330,20 +567,14 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 (void)typeId;
                 bindingInput.types.push_back(std::move(type));
             }
-            std::sort(
-                bindingInput.types.begin(),
-                bindingInput.types.end(),
-                [](const semantic::TypeSymbol& left,
-                   const semantic::TypeSymbol& right) {
-                    return semantic::canonicalTypeName(left) <
-                        semantic::canonicalTypeName(right);
+            std::sort(bindingInput.types.begin(), bindingInput.types.end(),
+                [](const semantic::TypeSymbol& left, const semantic::TypeSymbol& right) {
+                    return semantic::canonicalTypeName(left) < semantic::canonicalTypeName(right);
                 });
         }
         bindingInput.visibleFunctions = std::move(visibleFunctions);
         bindingInput.visibleTypes = module.visibleTypes;
-        for (const auto* unit : module.units) {
-            bindingInput.units.push_back(unit->syntaxTree.get());
-        }
+        for (const auto* unit : module.units) bindingInput.units.push_back(unit->syntaxTree.get());
 
         diagnostics::DiagnosticBag moduleDiagnostics;
         semantic::Binder binder(moduleDiagnostics);

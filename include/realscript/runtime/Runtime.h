@@ -81,6 +81,30 @@ struct NativeHandle {
     }
 };
 
+struct LongValue {
+    std::int64_t value = 0;
+    friend constexpr bool operator==(LongValue left, LongValue right) noexcept {
+        return left.value == right.value;
+    }
+};
+
+struct EnumValue {
+    semantic::SymbolId typeId = 0;
+    std::int64_t value = 0;
+    friend constexpr bool operator==(EnumValue left, EnumValue right) noexcept {
+        return left.typeId == right.typeId && left.value == right.value;
+    }
+};
+
+struct StructStorage;
+
+struct StructValue {
+    semantic::SymbolId typeId = 0;
+    std::shared_ptr<const StructStorage> storage;
+
+    friend bool operator==(const StructValue& left, const StructValue& right);
+};
+
 using Value = std::variant<
     std::monostate,
     NullString,
@@ -88,9 +112,24 @@ using Value = std::variant<
     NullArray,
     bool,
     std::int64_t,
+    LongValue,
+    double,
+    EnumValue,
+    StructValue,
     std::string,
     ObjectRef,
     NativeHandle>;
+
+struct StructStorage {
+    std::vector<Value> fields;
+};
+
+inline bool operator==(const StructValue& left, const StructValue& right) {
+    if (left.typeId != right.typeId) return false;
+    if (left.storage == right.storage) return true;
+    if (!left.storage || !right.storage) return false;
+    return left.storage->fields == right.storage->fields;
+}
 
 enum class ErrorCode {
     None,
@@ -254,9 +293,12 @@ public:
         RuntimeError* error = nullptr);
 
     [[nodiscard]] RootToken addPersistentRoot(ObjectRef reference);
+    [[nodiscard]] RootToken addPersistentRoot(Value value);
     bool updatePersistentRoot(RootToken token, ObjectRef reference);
+    bool updatePersistentRoot(RootToken token, Value value);
     bool removePersistentRoot(RootToken token) noexcept;
     [[nodiscard]] PersistentRoot retain(ObjectRef reference);
+    [[nodiscard]] PersistentRoot retain(Value value);
 
     void requestCollection() noexcept;
     [[nodiscard]] bool collectionRequested() const noexcept;
@@ -292,16 +334,18 @@ public:
 
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] ObjectRef reference() const noexcept;
+    [[nodiscard]] const Value& value() const noexcept;
     bool update(ObjectRef reference);
+    bool update(Value value);
     void reset() noexcept;
 
 private:
     friend class ManagedHeap;
-    PersistentRoot(ManagedHeap* heap, ManagedHeap::RootToken token, ObjectRef reference);
+    PersistentRoot(ManagedHeap* heap, ManagedHeap::RootToken token, Value value);
 
     ManagedHeap* heap_ = nullptr;
     ManagedHeap::RootToken token_ = 0;
-    ObjectRef reference_{};
+    Value value_{};
 };
 
 class NativeHandleRegistry {

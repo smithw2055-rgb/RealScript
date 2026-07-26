@@ -6,159 +6,142 @@
 namespace realscript::mir {
 
 ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
+    auto emitCallInstruction = [&](const semantic::FunctionSymbol& function,
+                                   semantic::PrimitiveType resultType,
+                                   const std::string& resultTypeName,
+                                   std::vector<ValueId> arguments,
+                                   text::TextSpan span) -> ValueId {
+        Instruction instruction;
+        instruction.resultType = resultType;
+        instruction.opcode = Opcode::Call;
+        instruction.operands = std::move(arguments);
+        instruction.symbolId = function.id;
+        instruction.symbolName = function.moduleName + "::" +
+            (function.ownerTypeName.empty()
+                ? function.name
+                : function.ownerTypeName + "." + function.name);
+        instruction.resultTypeId = semantic::isExactType(resultType)
+            ? semantic::stableTypeId(resultTypeName)
+            : 0;
+        for (const auto& parameter : function.parameters) {
+            instruction.parameterTypes.push_back(parameter.type);
+            instruction.parameterTypeIds.push_back(
+                semantic::isExactType(parameter.type)
+                    ? semantic::stableTypeId(parameter.typeName)
+                    : 0);
+        }
+        instruction.sourceSpan = span;
+        if (resultType != semantic::PrimitiveType::Void) {
+            instruction.result = nextValueId_++;
+        }
+        block(*currentBlockId_).instructions.push_back(std::move(instruction));
+        return block(*currentBlockId_).instructions.back().result;
+    };
+
     switch (expression.kind()) {
     case semantic::BoundNodeKind::LiteralExpression: {
-        const auto& literal =
-            static_cast<const semantic::BoundLiteralExpression&>(expression);
-        if (literal.type == semantic::PrimitiveType::Int) {
-            const auto value = emitValue(
-                Opcode::ConstantInt,
-                literal.type,
-                {},
-                expression.span);
-            block(*currentBlockId_).instructions.back().integerImmediate =
-                std::get<std::int64_t>(literal.value);
+        const auto& literal = static_cast<const semantic::BoundLiteralExpression&>(expression);
+        if (literal.type == semantic::PrimitiveType::Int ||
+            literal.type == semantic::PrimitiveType::Long ||
+            literal.type == semantic::PrimitiveType::Enum) {
+            const auto value = emitValue(Opcode::ConstantInt, literal.type, {}, expression.span);
+            auto& instruction = block(*currentBlockId_).instructions.back();
+            instruction.integerImmediate = std::get<std::int64_t>(literal.value);
+            instruction.resultTypeId = literal.type == semantic::PrimitiveType::Enum
+                ? semantic::stableTypeId(literal.typeName)
+                : 0;
+            return value;
+        }
+        if (literal.type == semantic::PrimitiveType::Double) {
+            const auto value = emitValue(Opcode::ConstantDouble, literal.type, {}, expression.span);
+            block(*currentBlockId_).instructions.back().doubleImmediate =
+                std::get<double>(literal.value);
             return value;
         }
         if (literal.type == semantic::PrimitiveType::Bool) {
-            const auto value = emitValue(
-                Opcode::ConstantBool,
-                literal.type,
-                {},
-                expression.span);
-            block(*currentBlockId_).instructions.back().boolImmediate =
-                std::get<bool>(literal.value);
+            const auto value = emitValue(Opcode::ConstantBool, literal.type, {}, expression.span);
+            block(*currentBlockId_).instructions.back().boolImmediate = std::get<bool>(literal.value);
             return value;
         }
         if (literal.type == semantic::PrimitiveType::String) {
-            const auto value = emitValue(
-                Opcode::ConstantString,
-                literal.type,
-                {},
-                expression.span);
-            block(*currentBlockId_).instructions.back().stringImmediate =
-                std::get<std::string>(literal.value);
+            const auto value = emitValue(Opcode::ConstantString, literal.type, {}, expression.span);
+            block(*currentBlockId_).instructions.back().stringImmediate = std::get<std::string>(literal.value);
             return value;
         }
         if (literal.type == semantic::PrimitiveType::Null) {
-            return emitValue(
-                Opcode::ConstantNull,
-                literal.type,
-                {},
-                expression.span);
+            return emitValue(Opcode::ConstantNull, literal.type, {}, expression.span);
         }
-        throw std::logic_error(
-            "unsupported literal type in Phase 1C MIR lowerer");
+        throw std::logic_error("unsupported literal type in MIR lowerer");
     }
     case semantic::BoundNodeKind::VariableExpression: {
-        const auto& variable =
-            static_cast<const semantic::BoundVariableExpression&>(expression);
-        const auto value = emitValue(
-            Opcode::LoadLocal,
-            variable.type,
-            {},
-            expression.span);
+        const auto& variable = static_cast<const semantic::BoundVariableExpression&>(expression);
+        const auto value = emitValue(Opcode::LoadLocal, variable.type, {}, expression.span);
         auto& instruction = block(*currentBlockId_).instructions.back();
         instruction.localIndex = variable.variable.index;
-        instruction.resultTypeId =
-            (variable.type == semantic::PrimitiveType::Object ||
-             variable.type == semantic::PrimitiveType::Array)
+        instruction.resultTypeId = semantic::isExactType(variable.type)
             ? semantic::stableTypeId(variable.variable.typeName)
             : 0;
         return value;
     }
     case semantic::BoundNodeKind::AssignmentExpression: {
-        const auto& assignment =
-            static_cast<const semantic::BoundAssignmentExpression&>(expression);
+        const auto& assignment = static_cast<const semantic::BoundAssignmentExpression&>(expression);
         const auto value = lowerExpression(*assignment.expression);
-        emitStoreLocal(
-            assignment.variable.index,
-            value,
-            expression.span);
+        emitStoreLocal(assignment.variable.index, value, expression.span);
         return value;
     }
     case semantic::BoundNodeKind::ConversionExpression: {
-        const auto& conversion =
-            static_cast<const semantic::BoundConversionExpression&>(expression);
+        const auto& conversion = static_cast<const semantic::BoundConversionExpression&>(expression);
         const auto operand = lowerExpression(*conversion.expression);
         switch (conversion.conversion) {
         case semantic::ConversionKind::Identity:
             return operand;
         case semantic::ConversionKind::NullToString:
-            return emitValue(
-                Opcode::ConvertNullToString,
-                conversion.type,
-                {operand},
-                expression.span);
+            return emitValue(Opcode::ConvertNullToString, conversion.type, {operand}, expression.span);
         case semantic::ConversionKind::NullToObject: {
-            const auto value = emitValue(
-                Opcode::ConvertNullToObject,
-                conversion.type,
-                {operand},
-                expression.span);
-            block(*currentBlockId_).instructions.back().resultTypeId =
-                semantic::stableTypeId(conversion.typeName);
+            const auto value = emitValue(Opcode::ConvertNullToObject, conversion.type, {operand}, expression.span);
+            block(*currentBlockId_).instructions.back().resultTypeId = semantic::stableTypeId(conversion.typeName);
             return value;
         }
         case semantic::ConversionKind::NullToArray: {
-            const auto value = emitValue(
-                Opcode::ConvertNullToArray,
-                conversion.type,
-                {operand},
-                expression.span);
-            block(*currentBlockId_).instructions.back().resultTypeId =
-                semantic::stableTypeId(conversion.typeName);
+            const auto value = emitValue(Opcode::ConvertNullToArray, conversion.type, {operand}, expression.span);
+            block(*currentBlockId_).instructions.back().resultTypeId = semantic::stableTypeId(conversion.typeName);
             return value;
         }
+        case semantic::ConversionKind::IntToLong:
+            return emitValue(Opcode::ConvertIntToLong, conversion.type, {operand}, expression.span);
+        case semantic::ConversionKind::IntToDouble:
+            return emitValue(Opcode::ConvertIntToDouble, conversion.type, {operand}, expression.span);
+        case semantic::ConversionKind::LongToDouble:
+            return emitValue(Opcode::ConvertLongToDouble, conversion.type, {operand}, expression.span);
         case semantic::ConversionKind::None:
             break;
         }
         throw std::logic_error("invalid bound conversion reached MIR lowering");
     }
     case semantic::BoundNodeKind::NewArrayExpression: {
-        const auto& allocation =
-            static_cast<const semantic::BoundNewArrayExpression&>(expression);
+        const auto& allocation = static_cast<const semantic::BoundNewArrayExpression&>(expression);
         const auto length = lowerExpression(*allocation.length);
-        const auto value = emitValue(
-            Opcode::NewArray,
-            semantic::PrimitiveType::Array,
-            {length},
-            expression.span);
+        const auto value = emitValue(Opcode::NewArray, semantic::PrimitiveType::Array, {length}, expression.span);
         auto& instruction = block(*currentBlockId_).instructions.back();
         instruction.resultTypeId = semantic::stableTypeId(allocation.typeName);
         instruction.elementType = allocation.elementType;
-        instruction.elementTypeId =
-            (allocation.elementType == semantic::PrimitiveType::Object ||
-             allocation.elementType == semantic::PrimitiveType::Array)
+        instruction.elementTypeId = semantic::isExactType(allocation.elementType)
             ? semantic::stableTypeId(allocation.elementTypeName)
             : 0;
         instruction.symbolName = allocation.typeName;
         return value;
     }
     case semantic::BoundNodeKind::ArrayLengthExpression: {
-        const auto& length =
-            static_cast<const semantic::BoundArrayLengthExpression&>(expression);
-        const auto receiver = lowerExpression(*length.receiver);
-        return emitValue(
-            Opcode::ArrayLength,
-            semantic::PrimitiveType::Int,
-            {receiver},
-            expression.span);
+        const auto& length = static_cast<const semantic::BoundArrayLengthExpression&>(expression);
+        return emitValue(Opcode::ArrayLength, semantic::PrimitiveType::Int,
+            {lowerExpression(*length.receiver)}, expression.span);
     }
     case semantic::BoundNodeKind::ElementAccessExpression: {
-        const auto& access =
-            static_cast<const semantic::BoundElementAccessExpression&>(expression);
-        const auto receiver = lowerExpression(*access.receiver);
-        const auto index = lowerExpression(*access.index);
-        const auto value = emitValue(
-            Opcode::LoadElement,
-            access.elementType,
-            {receiver, index},
-            expression.span);
+        const auto& access = static_cast<const semantic::BoundElementAccessExpression&>(expression);
+        const auto value = emitValue(Opcode::LoadElement, access.elementType,
+            {lowerExpression(*access.receiver), lowerExpression(*access.index)}, expression.span);
         auto& instruction = block(*currentBlockId_).instructions.back();
-        instruction.resultTypeId =
-            (access.elementType == semantic::PrimitiveType::Object ||
-             access.elementType == semantic::PrimitiveType::Array)
+        instruction.resultTypeId = semantic::isExactType(access.elementType)
             ? semantic::stableTypeId(access.elementTypeName)
             : 0;
         instruction.elementType = access.elementType;
@@ -166,8 +149,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         return value;
     }
     case semantic::BoundNodeKind::ElementAssignmentExpression: {
-        const auto& assignment =
-            static_cast<const semantic::BoundElementAssignmentExpression&>(expression);
+        const auto& assignment = static_cast<const semantic::BoundElementAssignmentExpression&>(expression);
         const auto receiver = lowerExpression(*assignment.receiver);
         const auto index = lowerExpression(*assignment.index);
         const auto value = lowerExpression(*assignment.expression);
@@ -176,9 +158,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         store.opcode = Opcode::StoreElement;
         store.operands = {receiver, index, value};
         store.elementType = assignment.elementType;
-        store.elementTypeId =
-            (assignment.elementType == semantic::PrimitiveType::Object ||
-             assignment.elementType == semantic::PrimitiveType::Array)
+        store.elementTypeId = semantic::isExactType(assignment.elementType)
             ? semantic::stableTypeId(assignment.elementTypeName)
             : 0;
         store.sourceSpan = expression.span;
@@ -186,42 +166,50 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         return value;
     }
     case semantic::BoundNodeKind::NewObjectExpression: {
-        const auto& allocation =
-            static_cast<const semantic::BoundNewObjectExpression&>(expression);
-        const auto value = emitValue(
-            Opcode::NewObject,
-            semantic::PrimitiveType::Object,
-            {},
-            expression.span);
+        const auto& allocation = static_cast<const semantic::BoundNewObjectExpression&>(expression);
+        const auto value = emitValue(Opcode::NewObject, semantic::PrimitiveType::Object, {}, expression.span);
         auto& instruction = block(*currentBlockId_).instructions.back();
         instruction.typeId = allocation.objectType.id;
         instruction.resultTypeId = allocation.objectType.id;
         instruction.symbolName = semantic::canonicalTypeName(allocation.objectType);
+        if (allocation.constructor) {
+            std::vector<ValueId> arguments{value};
+            for (const auto& argument : allocation.arguments) arguments.push_back(lowerExpression(*argument));
+            (void)emitCallInstruction(*allocation.constructor, semantic::PrimitiveType::Void, {}, std::move(arguments), expression.span);
+        }
+        return value;
+    }
+    case semantic::BoundNodeKind::NewStructExpression: {
+        const auto& allocation = static_cast<const semantic::BoundNewStructExpression&>(expression);
+        auto value = emitValue(Opcode::NewStruct, semantic::PrimitiveType::Struct, {}, expression.span);
+        auto& instruction = block(*currentBlockId_).instructions.back();
+        instruction.typeId = allocation.structType.id;
+        instruction.resultTypeId = allocation.structType.id;
+        instruction.symbolName = semantic::canonicalTypeName(allocation.structType);
+        if (allocation.constructor) {
+            std::vector<ValueId> arguments{value};
+            for (const auto& argument : allocation.arguments) arguments.push_back(lowerExpression(*argument));
+            value = emitCallInstruction(
+                *allocation.constructor,
+                semantic::PrimitiveType::Struct,
+                semantic::canonicalTypeName(allocation.structType),
+                std::move(arguments),
+                expression.span);
+        }
         return value;
     }
     case semantic::BoundNodeKind::MemberAccessExpression: {
-        const auto& member =
-            static_cast<const semantic::BoundMemberAccessExpression&>(expression);
+        const auto& member = static_cast<const semantic::BoundMemberAccessExpression&>(expression);
         const auto receiver = lowerExpression(*member.receiver);
-        const auto checked = emitValue(
-            Opcode::CheckNotNull,
-            semantic::PrimitiveType::Object,
-            {receiver},
-            member.receiver->span);
+        const auto checked = emitValue(Opcode::CheckNotNull, semantic::PrimitiveType::Object, {receiver}, member.receiver->span);
         auto& check = block(*currentBlockId_).instructions.back();
         check.typeId = member.ownerType.id;
         check.resultTypeId = member.ownerType.id;
         check.symbolName = semantic::canonicalTypeName(member.ownerType);
-        const auto value = emitValue(
-            Opcode::LoadField,
-            member.field.type,
-            {checked},
-            expression.span);
+        const auto value = emitValue(Opcode::LoadField, member.field.type, {checked}, expression.span);
         auto& instruction = block(*currentBlockId_).instructions.back();
         instruction.typeId = member.ownerType.id;
-        instruction.resultTypeId =
-            (member.field.type == semantic::PrimitiveType::Object ||
-             member.field.type == semantic::PrimitiveType::Array)
+        instruction.resultTypeId = semantic::isExactType(member.field.type)
             ? semantic::stableTypeId(member.field.typeName)
             : 0;
         instruction.fieldIndex = member.field.index;
@@ -229,20 +217,13 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         return value;
     }
     case semantic::BoundNodeKind::MemberAssignmentExpression: {
-        const auto& assignment =
-            static_cast<const semantic::BoundMemberAssignmentExpression&>(expression);
+        const auto& assignment = static_cast<const semantic::BoundMemberAssignmentExpression&>(expression);
         const auto receiver = lowerExpression(*assignment.receiver);
-        const auto checked = emitValue(
-            Opcode::CheckNotNull,
-            semantic::PrimitiveType::Object,
-            {receiver},
-            assignment.receiver->span);
-        block(*currentBlockId_).instructions.back().typeId =
-            assignment.ownerType.id;
-        block(*currentBlockId_).instructions.back().resultTypeId =
-            assignment.ownerType.id;
-        block(*currentBlockId_).instructions.back().symbolName =
-            semantic::canonicalTypeName(assignment.ownerType);
+        const auto checked = emitValue(Opcode::CheckNotNull, semantic::PrimitiveType::Object, {receiver}, assignment.receiver->span);
+        auto& check = block(*currentBlockId_).instructions.back();
+        check.typeId = assignment.ownerType.id;
+        check.resultTypeId = assignment.ownerType.id;
+        check.symbolName = semantic::canonicalTypeName(assignment.ownerType);
         const auto value = lowerExpression(*assignment.expression);
         Instruction store;
         store.resultType = semantic::PrimitiveType::Void;
@@ -255,132 +236,144 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         block(*currentBlockId_).instructions.push_back(std::move(store));
         return value;
     }
-    case semantic::BoundNodeKind::CallExpression: {
-        const auto& call =
-            static_cast<const semantic::BoundCallExpression&>(expression);
-        std::vector<ValueId> arguments;
-        arguments.reserve(call.arguments.size());
-        for (const auto& argument : call.arguments) {
-            arguments.push_back(lowerExpression(*argument));
-        }
-
-        Instruction instruction;
-        instruction.resultType = call.type;
-        instruction.opcode = Opcode::Call;
-        instruction.operands = std::move(arguments);
-        instruction.symbolId = call.function.id;
-        instruction.symbolName =
-            call.function.moduleName + "::" + call.function.name;
-        instruction.resultTypeId =
-            (call.type == semantic::PrimitiveType::Object ||
-             call.type == semantic::PrimitiveType::Array)
-            ? semantic::stableTypeId(call.function.returnTypeName)
+    case semantic::BoundNodeKind::StructFieldAccessExpression: {
+        const auto& member = static_cast<const semantic::BoundStructFieldAccessExpression&>(expression);
+        const auto value = emitValue(Opcode::LoadStructField, member.field.type,
+            {lowerExpression(*member.receiver)}, expression.span);
+        auto& instruction = block(*currentBlockId_).instructions.back();
+        instruction.typeId = member.ownerType.id;
+        instruction.fieldIndex = member.field.index;
+        instruction.resultTypeId = semantic::isExactType(member.field.type)
+            ? semantic::stableTypeId(member.field.typeName)
             : 0;
-        for (const auto& parameter : call.function.parameters) {
-            instruction.parameterTypes.push_back(parameter.type);
-            instruction.parameterTypeIds.push_back(
-                (parameter.type == semantic::PrimitiveType::Object ||
-                 parameter.type == semantic::PrimitiveType::Array)
-                    ? semantic::stableTypeId(parameter.typeName)
-                    : 0);
+        instruction.symbolName = semantic::canonicalTypeName(member.ownerType);
+        return value;
+    }
+    case semantic::BoundNodeKind::StructFieldAssignmentExpression: {
+        const auto& assignment = static_cast<const semantic::BoundStructFieldAssignmentExpression&>(expression);
+        const auto current = emitValue(Opcode::LoadLocal, semantic::PrimitiveType::Struct, {}, expression.span);
+        auto& load = block(*currentBlockId_).instructions.back();
+        load.localIndex = assignment.variable.index;
+        load.resultTypeId = assignment.ownerType.id;
+        const auto assigned = lowerExpression(*assignment.expression);
+        const auto updated = emitValue(Opcode::StoreStructField, semantic::PrimitiveType::Struct,
+            {current, assigned}, expression.span);
+        auto& store = block(*currentBlockId_).instructions.back();
+        store.typeId = assignment.ownerType.id;
+        store.resultTypeId = assignment.ownerType.id;
+        store.fieldIndex = assignment.field.index;
+        store.symbolName = semantic::canonicalTypeName(assignment.ownerType);
+        emitStoreLocal(assignment.variable.index, updated, expression.span);
+        return assigned;
+    }
+    case semantic::BoundNodeKind::PropertyAssignmentExpression: {
+        const auto& assignment = static_cast<const semantic::BoundPropertyAssignmentExpression&>(expression);
+        std::vector<ValueId> arguments;
+        for (std::size_t index = 0; index < assignment.arguments.size(); ++index) {
+            auto value = lowerExpression(*assignment.arguments[index]);
+            if (index == 0 && assignment.setter.method &&
+                !assignment.setter.staticMethod &&
+                assignment.arguments[index]->type == semantic::PrimitiveType::Object) {
+                value = emitValue(
+                    Opcode::CheckNotNull,
+                    semantic::PrimitiveType::Object,
+                    {value},
+                    assignment.arguments[index]->span);
+                auto& check = block(*currentBlockId_).instructions.back();
+                check.typeId = assignment.setter.ownerTypeId;
+                check.resultTypeId = assignment.setter.ownerTypeId;
+                check.symbolName = assignment.setter.moduleName + "::" +
+                    assignment.setter.ownerTypeName;
+            }
+            arguments.push_back(value);
         }
-        instruction.sourceSpan = expression.span;
-
-        if (call.type != semantic::PrimitiveType::Void) {
-            instruction.result = nextValueId_++;
+        const auto assigned = lowerExpression(*assignment.assignedValue);
+        arguments.push_back(assigned);
+        (void)emitCallInstruction(assignment.setter, semantic::PrimitiveType::Void, {}, std::move(arguments), expression.span);
+        return assigned;
+    }
+    case semantic::BoundNodeKind::CallExpression: {
+        const auto& call = static_cast<const semantic::BoundCallExpression&>(expression);
+        std::vector<ValueId> arguments;
+        for (std::size_t index = 0; index < call.arguments.size(); ++index) {
+            auto value = lowerExpression(*call.arguments[index]);
+            if (index == 0 && call.function.method &&
+                !call.function.staticMethod &&
+                call.arguments[index]->type == semantic::PrimitiveType::Object) {
+                value = emitValue(
+                    Opcode::CheckNotNull,
+                    semantic::PrimitiveType::Object,
+                    {value},
+                    call.arguments[index]->span);
+                auto& check = block(*currentBlockId_).instructions.back();
+                check.typeId = call.function.ownerTypeId;
+                check.resultTypeId = call.function.ownerTypeId;
+                check.symbolName = call.function.moduleName + "::" +
+                    call.function.ownerTypeName;
+            }
+            arguments.push_back(value);
         }
-        block(*currentBlockId_).instructions.push_back(std::move(instruction));
-        return block(*currentBlockId_).instructions.back().result;
+        return emitCallInstruction(call.function, call.type, call.function.returnTypeName, std::move(arguments), expression.span);
     }
     case semantic::BoundNodeKind::UnaryExpression: {
-        const auto& unary =
-            static_cast<const semantic::BoundUnaryExpression&>(expression);
+        const auto& unary = static_cast<const semantic::BoundUnaryExpression&>(expression);
         const auto operand = lowerExpression(*unary.operand);
         switch (unary.operatorKind) {
         case semantic::BoundUnaryOperatorKind::Identity:
             return operand;
         case semantic::BoundUnaryOperatorKind::Negation:
             return emitValue(
-                Opcode::NegateInt,
-                unary.type,
-                {operand},
-                expression.span);
+                unary.type == semantic::PrimitiveType::Int ? Opcode::NegateInt :
+                unary.type == semantic::PrimitiveType::Long ? Opcode::NegateLong : Opcode::NegateDouble,
+                unary.type, {operand}, expression.span);
         case semantic::BoundUnaryOperatorKind::LogicalNegation:
-            return emitValue(
-                Opcode::LogicalNot,
-                unary.type,
-                {operand},
-                expression.span);
+            return emitValue(Opcode::LogicalNot, unary.type, {operand}, expression.span);
         }
         break;
     }
     case semantic::BoundNodeKind::BinaryExpression: {
-        const auto& binary =
-            static_cast<const semantic::BoundBinaryExpression&>(expression);
-        if (binary.operatorKind ==
-                semantic::BoundBinaryOperatorKind::LogicalAnd ||
-            binary.operatorKind ==
-                semantic::BoundBinaryOperatorKind::LogicalOr) {
+        const auto& binary = static_cast<const semantic::BoundBinaryExpression&>(expression);
+        if (binary.operatorKind == semantic::BoundBinaryOperatorKind::LogicalAnd ||
+            binary.operatorKind == semantic::BoundBinaryOperatorKind::LogicalOr) {
             return lowerShortCircuit(binary);
         }
-
         const auto left = lowerExpression(*binary.left);
         const auto right = lowerExpression(*binary.right);
-        Opcode opcode = Opcode::AddInt;
+        const auto numericType = binary.left->type;
+        Opcode opcode = Opcode::Equal;
+        const bool isLong = numericType == semantic::PrimitiveType::Long;
+        const bool isDouble = numericType == semantic::PrimitiveType::Double;
         switch (binary.operatorKind) {
         case semantic::BoundBinaryOperatorKind::Addition:
-            opcode = Opcode::AddInt;
-            break;
+            opcode = isDouble ? Opcode::AddDouble : isLong ? Opcode::AddLong : Opcode::AddInt; break;
         case semantic::BoundBinaryOperatorKind::Subtraction:
-            opcode = Opcode::SubtractInt;
-            break;
+            opcode = isDouble ? Opcode::SubtractDouble : isLong ? Opcode::SubtractLong : Opcode::SubtractInt; break;
         case semantic::BoundBinaryOperatorKind::Multiplication:
-            opcode = Opcode::MultiplyInt;
-            break;
+            opcode = isDouble ? Opcode::MultiplyDouble : isLong ? Opcode::MultiplyLong : Opcode::MultiplyInt; break;
         case semantic::BoundBinaryOperatorKind::Division:
-            opcode = Opcode::DivideInt;
-            break;
+            opcode = isDouble ? Opcode::DivideDouble : isLong ? Opcode::DivideLong : Opcode::DivideInt; break;
         case semantic::BoundBinaryOperatorKind::Remainder:
-            opcode = Opcode::RemainderInt;
-            break;
-        case semantic::BoundBinaryOperatorKind::Equals:
-            opcode = Opcode::Equal;
-            break;
-        case semantic::BoundBinaryOperatorKind::NotEquals:
-            opcode = Opcode::NotEqual;
-            break;
+            opcode = isLong ? Opcode::RemainderLong : Opcode::RemainderInt; break;
+        case semantic::BoundBinaryOperatorKind::Equals: opcode = Opcode::Equal; break;
+        case semantic::BoundBinaryOperatorKind::NotEquals: opcode = Opcode::NotEqual; break;
         case semantic::BoundBinaryOperatorKind::Less:
-            opcode = Opcode::LessInt;
-            break;
+            opcode = isDouble ? Opcode::LessDouble : isLong ? Opcode::LessLong : Opcode::LessInt; break;
         case semantic::BoundBinaryOperatorKind::LessOrEquals:
-            opcode = Opcode::LessOrEqualInt;
-            break;
+            opcode = isDouble ? Opcode::LessOrEqualDouble : isLong ? Opcode::LessOrEqualLong : Opcode::LessOrEqualInt; break;
         case semantic::BoundBinaryOperatorKind::Greater:
-            opcode = Opcode::GreaterInt;
-            break;
+            opcode = isDouble ? Opcode::GreaterDouble : isLong ? Opcode::GreaterLong : Opcode::GreaterInt; break;
         case semantic::BoundBinaryOperatorKind::GreaterOrEquals:
-            opcode = Opcode::GreaterOrEqualInt;
-            break;
+            opcode = isDouble ? Opcode::GreaterOrEqualDouble : isLong ? Opcode::GreaterOrEqualLong : Opcode::GreaterOrEqualInt; break;
         case semantic::BoundBinaryOperatorKind::LogicalAnd:
         case semantic::BoundBinaryOperatorKind::LogicalOr:
-            throw std::logic_error(
-                "short-circuit operator reached eager MIR lowering");
-        default:
-            throw std::logic_error(
-                "unsupported binary operator reached MIR lowering");
+            throw std::logic_error("short-circuit operator reached eager MIR lowering");
         }
-        return emitValue(
-            opcode,
-            binary.type,
-            {left, right},
-            expression.span);
+        return emitValue(opcode, binary.type, {left, right}, expression.span);
     }
     default:
         break;
     }
-
-    throw std::logic_error(
-        "unsupported bound expression in Phase 1C MIR lowerer");
+    throw std::logic_error("unsupported bound expression in MIR lowerer");
 }
 
 ValueId Lowerer::lowerShortCircuit(

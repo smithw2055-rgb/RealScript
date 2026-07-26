@@ -11,8 +11,7 @@ void printSignatureType(
     semantic::PrimitiveType type,
     semantic::SymbolId typeId) {
     out << semantic::primitiveTypeName(type);
-    if ((type == semantic::PrimitiveType::Object ||
-         type == semantic::PrimitiveType::Array) && typeId != 0) {
+    if (semantic::isExactType(type) && typeId != 0) {
         out << "[0x" << std::hex << typeId << std::dec << ']';
     }
 }
@@ -104,6 +103,9 @@ std::string printModule(const Module& module) {
                 if (instruction.opcode == Opcode::Parameter ||
                     instruction.opcode == Opcode::ConstantInt) {
                     out << ' ' << instruction.integerImmediate;
+                } else if (instruction.opcode == Opcode::ConstantDouble) {
+                    out << ' ' << std::setprecision(17)
+                        << instruction.doubleImmediate;
                 } else if (instruction.opcode == Opcode::ConstantBool) {
                     out << ' ' << (instruction.boolImmediate ? "true" : "false");
                 } else if (instruction.opcode == Opcode::ConstantString) {
@@ -126,14 +128,17 @@ std::string printModule(const Module& module) {
                     out << " %" << instruction.operands[0] << ", %"
                         << instruction.operands[1] << ", %"
                         << instruction.operands[2];
-                } else if (instruction.opcode == Opcode::NewObject) {
+                } else if (instruction.opcode == Opcode::NewObject ||
+                           instruction.opcode == Opcode::NewStruct) {
                     out << " @" << instruction.symbolName << "[0x"
                         << std::hex << instruction.typeId << std::dec << "]";
-                } else if (instruction.opcode == Opcode::LoadField) {
+                } else if (instruction.opcode == Opcode::LoadField ||
+                           instruction.opcode == Opcode::LoadStructField) {
                     out << " @" << instruction.symbolName << '.'
                         << instruction.fieldIndex << ", %"
                         << instruction.operands.front();
-                } else if (instruction.opcode == Opcode::StoreField) {
+                } else if (instruction.opcode == Opcode::StoreField ||
+                           instruction.opcode == Opcode::StoreStructField) {
                     out << " @" << instruction.symbolName << '.'
                         << instruction.fieldIndex << ", %"
                         << instruction.operands[0] << ", %"
