@@ -53,6 +53,15 @@ if(MSVC)
         src/aot_cpp/AotCpp.cpp
         PROPERTIES COMPILE_OPTIONS "/wd4267"
     )
+
+    # MSVC treats repeated if-initializer names across one else-if chain as
+    # C4456 even though each value is scoped to its mutually exclusive branch.
+    # Keep /W4 /WX globally and suppress only these two reviewed units.
+    set_source_files_properties(
+        src/optimization/Optimizer.cpp
+        src/runtime/ExecutionServices.cpp
+        PROPERTIES COMPILE_OPTIONS "/wd4456"
+    )
 endif()
 
 add_library(RealScript::Frontend ALIAS realscript_frontend)
