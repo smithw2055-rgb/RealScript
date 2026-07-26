@@ -560,6 +560,12 @@ ABI minor 版本只能追加向后兼容字段；破坏现有字段语义、顺�
 
 ## 17. AOT 模块接口
 
+> Phase 5 implemented profile: [CXX17_AOT_V0.md](CXX17_AOT_V0.md).
+> The initial profile provides a C11-compatible discovery/function-entry ABI
+> and a same-SDK C++ AOT runtime support layer. The larger service table and
+> independently distributed cross-toolchain binary profile below remain the
+> long-term ABI target.
+
 生成的 AOT 模块导出单一入口：
 
 ```cpp

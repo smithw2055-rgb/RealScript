@@ -194,7 +194,7 @@ private:
         skip();
         if (position_ < text_.size() && text_[position_] == ']') {
             ++position_;
-            return Json(std::move(values));
+            return std::optional<Json>(std::in_place, std::move(values));
         }
         while (position_ < text_.size()) {
             auto value = parseValue(error, depth + 1);
@@ -203,7 +203,7 @@ private:
             skip();
             if (position_ < text_.size() && text_[position_] == ']') {
                 ++position_;
-                return Json(std::move(values));
+                return std::optional<Json>(std::in_place, std::move(values));
             }
             if (position_ >= text_.size() || text_[position_] != ',') {
                 error = "expected comma in JSON array";
@@ -221,7 +221,7 @@ private:
         skip();
         if (position_ < text_.size() && text_[position_] == '}') {
             ++position_;
-            return Json(std::move(values));
+            return std::optional<Json>(std::in_place, std::move(values));
         }
         while (position_ < text_.size()) {
             skip();
@@ -242,7 +242,7 @@ private:
             skip();
             if (position_ < text_.size() && text_[position_] == '}') {
                 ++position_;
-                return Json(std::move(values));
+                return std::optional<Json>(std::in_place, std::move(values));
             }
             if (position_ >= text_.size() || text_[position_] != ',') {
                 error = "expected comma in JSON object";
@@ -265,10 +265,13 @@ Json::Json(bool value) noexcept : value_(value) {}
 Json::Json(int value) noexcept : value_(static_cast<double>(value)) {}
 Json::Json(std::int64_t value) noexcept : value_(static_cast<double>(value)) {}
 Json::Json(double value) noexcept : value_(value) {}
-Json::Json(std::string value) : value_(std::move(value)) {}
+Json::Json(std::string value)
+    : value_(std::in_place_type<std::string>, std::move(value)) {}
 Json::Json(const char* value) : value_(std::string(value ? value : "")) {}
-Json::Json(Array value) : value_(std::move(value)) {}
-Json::Json(Object value) : value_(std::move(value)) {}
+Json::Json(Array value)
+    : value_(std::in_place_type<Array>, std::move(value)) {}
+Json::Json(Object value)
+    : value_(std::in_place_type<Object>, std::move(value)) {}
 
 bool Json::isNull() const noexcept { return std::holds_alternative<std::nullptr_t>(value_); }
 bool Json::isBool() const noexcept { return std::holds_alternative<bool>(value_); }

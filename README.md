@@ -4,11 +4,11 @@ RealScript 是一门面向现代游戏引擎的嵌入式强类型脚本语言与
 
 它采用接近 C# 的表达方式，以 C++17 游戏引擎为主要宿主，长期目标包括：快速字节码解释、C++17 AOT、可选 LLVM ORC JIT、源码级调试、热重载、沙箱 Mod，以及固定 Tick 的确定性模拟。
 
-> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端、Phase 2A–2C 字节码运行时，以及 Phase 3A–3E 对象、数组、精确 GC、Native Handle、成员模型与值类型，以及 Phase 4 调试器、LSP 与函数体热重载已经完成。语言、字节码、对象 ABI 和 GC 策略尚未冻结。
+> 当前状态：Draft v0.1 规范基线、Phase 1A–1C 编译器前端、Phase 2A–2C 字节码运行时、Phase 3A–3E 对象与值模型、Phase 4 调试/LSP/热重载，以及 Phase 5 C++17 AOT 发布后端已经完成。语言、字节码、对象 ABI 和 GC 策略尚未冻结。
 
 ## 当前可运行能力
 
-Phase 1A–3E 已经实现：
+Phase 1A–5 已经实现：
 
 - 无外部依赖的 C++17/CMake 工程；
 - `SourceText`、`TextSpan` 和 CRLF/LF 行列映射；
@@ -51,9 +51,14 @@ Phase 1A–3E 已经实现：
 - `struct` 构造、只读实例方法、getter 属性、局部字段更新和复制值语义；
 - struct 数组、嵌套托管引用精确扫描和递归值布局诊断；
 - `int -> long -> double` 数值提升、checked 整数和 IEEE binary64 运算；
+- Typed MIR 到确定性 C++17 的原生 AOT 生成；
+- AOT 对象、数组、struct、enum、数值、字符串、调用、预算和精确 GC 语义；
+- C11/C++ 兼容的 Native Module 查询 ABI、稳定函数表和内容哈希；
+- 类型化 Native Thunk、CMake AOT 目标和解释器/AOT 差分测试；
 - `rsc` Token、检查、MIR、Symbol、Bytecode 和二进制输出模式；
+- `rsaot` C++17 生成器、`rsdebug` DAP 适配器和 `rslsp` 语言服务器；
 - Linux/Windows GitHub Actions 构建；
-- 前端、控制流、模块、调用、增量编译和字节码测试。
+- 前端、控制流、模块、调用、增量编译、字节码与 AOT 差分测试。
 
 实现边界见：
 
@@ -69,6 +74,7 @@ Phase 1A–3E 已经实现：
 - [Phase 3D — Methods, Constructors and Properties](docs/roadmap/PHASE_3D.md)
 - [Phase 3E — Numeric Values, Enums and Structs](docs/roadmap/PHASE_3E.md)
 - [Phase 4 — Debugging, Language Services and Hot Reload](docs/roadmap/PHASE_4.md)
+- [Phase 5 — C++17 AOT Backend](docs/roadmap/PHASE_5.md)
 
 ## 快速开始
 
@@ -156,6 +162,32 @@ rsc math.rsbc --disassemble
 
 `.rsbc` 在执行前必须先通过物理解码检查和字节码语义验证。
 
+### 生成 C++17 AOT 程序
+
+```bash
+rsaot \
+  --output-dir build/generated/game \
+  --program-name GameScripts \
+  math.rs main.rs
+```
+
+输出包含生成头文件、C++17 源码和确定性 manifest。生成源码直接执行 Typed MIR 控制流，不嵌入字节码解释器。
+
+CMake 工程可以直接创建原生 AOT 库：
+
+```cmake
+include(cmake/RealScriptAot.cmake)
+
+realscript_add_aot_library(GameScriptsAot
+    PROGRAM_NAME GameScripts
+    SOURCES math.rs main.rs
+)
+
+target_link_libraries(game PRIVATE GameScriptsAot)
+```
+
+宿主可以使用生成头文件中的 `ProgramDescriptor`，或通过稳定 C ABI `rs_module_query_v1` 查询内容哈希和原生函数表。
+
 执行无参数入口函数：
 
 ```bash
@@ -217,7 +249,7 @@ Decoder 负责文件边界、Section、计数和 Tag；Verifier 继续检查类�
 - `break`、`continue`、`for`、`foreach`、`switch`；
 - 异常和协程；
 - 增量语法树与持久化构建缓存；
-- 异常表、协程状态、调试 GC Map 和原生 AOT。
+- 异常表、协程状态、优化 AOT stack map 和原生调试变量位置。
 
 未实现能力会得到明确诊断，不会使用占位运行时行为假装支持。
 
@@ -265,10 +297,13 @@ include/realscript/
   debug/         Debug Info、DebugSession 和 DAP
   tooling/       JSON、LanguageService 和 LSP
   hot_reload/    ProgramImage 兼容性分析与原子替换
+  aot_cpp/       C++17 生成器、AOT Runtime 和公共 C ABI
 src/              对应实现
 tools/rsc/        编译器命令行
 tools/rsdebug/    DAP 调试适配器
 tools/rslsp/      LSP 语言服务器
+tools/rsaot/      C++17 AOT 生成器
+cmake/             可复用 AOT 构建集成
 tests/fixtures/   源码 conformance fixtures
 tests/snapshots/  MIR snapshots
 docs/spec/        Draft v0.1 规范
@@ -290,6 +325,7 @@ docs/roadmap/     实现切片和路线图
 - [Methods, Constructors and Properties Draft v0.1](docs/spec/MEMBERS_PROPERTIES_V0.md)
 - [Numeric, Enum and Struct Values Draft v0.1](docs/spec/NUMERIC_ENUM_STRUCT_V0.md)
 - [Debug Information, Tooling and Hot Reload Draft v0.1](docs/spec/DEBUG_TOOLING_HOT_RELOAD_V0.md)
+- [C++17 AOT Backend and Native Module ABI Draft v0.1](docs/spec/CXX17_AOT_V0.md)
 - [Phase 1A 实现说明](docs/roadmap/PHASE_1A.md)
 - [Phase 1B 实现说明](docs/roadmap/PHASE_1B.md)
 - [Phase 1C 实现说明](docs/roadmap/PHASE_1C.md)
@@ -302,6 +338,7 @@ docs/roadmap/     实现切片和路线图
 - [Phase 3D 实现说明](docs/roadmap/PHASE_3D.md)
 - [Phase 3E 实现说明](docs/roadmap/PHASE_3E.md)
 - [Phase 4 实现说明](docs/roadmap/PHASE_4.md)
+- [Phase 5 实现说明](docs/roadmap/PHASE_5.md)
 
 ## 路线图
 
@@ -319,7 +356,7 @@ docs/roadmap/     实现切片和路线图
 - [x] Phase 3D：方法、构造函数、属性和直接成员调用；
 - [x] Phase 3E：long/double、enum、struct 和复制值语义；
 - [x] Phase 4：Debug Info、DAP、LSP 和函数体热重载；
-- [ ] Phase 5：C++17 AOT；
+- [x] Phase 5：C++17 AOT、Native Module ABI、Source Map 和差分测试；
 - [ ] Phase 6：确定性、性能优化和可选 JIT。
 
 ## 主要参考方向
@@ -500,3 +537,22 @@ rslsp                       # stdin/stdout LSP
 `LanguageService` 复用 Compilation 与 BuildSnapshot，提供诊断、补全、悬停、定义、引用、重命名和文档符号。Hot Reload 首版只允许函数体与调试信息变化；模块集合、类型布局、枚举值、函数集合和签名变化会被拒绝。活动调用继续持有旧 ProgramImage，新调用原子地看到新镜像。
 
 详细说明：[Phase 4](docs/roadmap/PHASE_4.md) 与 [Debug/Tooling/Hot Reload 实现规范](docs/spec/DEBUG_TOOLING_HOT_RELOAD_V0.md)。
+
+
+## Phase 5 C++17 AOT 发布后端
+
+Phase 5 将通过验证的 Typed MIR 直接生成为规则化 C++17。生成函数维护参数、局部变量和寄存器 Shadow Stack 根，并通过 `AotRuntime` 执行 checked arithmetic、null/bounds check、对象/数组/struct 操作、宿主调用、预算和增量 GC safepoint。
+
+```bash
+rsaot --output-dir build/generated/game \
+  --program-name GameScripts game.rs common.rs
+```
+
+原生产物提供两种嵌入边界：
+
+- C++ `ProgramDescriptor` / `Program`，用于同 SDK 静态链接；
+- C11/C++ 兼容的 `rs_module_query_v1`，用于 ABI 版本协商、内容哈希和稳定函数表发现。
+
+生成结果带确定性 manifest、源码 `#line` 与 Source Map。解释器/AOT 差分测试覆盖成功结果、溢出、除零、空引用、数组越界、负长度、调用栈、指令预算和递归预算。
+
+详细说明：[Phase 5](docs/roadmap/PHASE_5.md) 与 [C++17 AOT 实现规范](docs/spec/CXX17_AOT_V0.md)。

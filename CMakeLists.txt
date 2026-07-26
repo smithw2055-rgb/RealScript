@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(RealScript VERSION 0.1.0 LANGUAGES CXX)
+project(RealScript VERSION 0.1.0 LANGUAGES C CXX)
 
 option(REALSCRIPT_BUILD_TESTS "Build RealScript conformance tests" ON)
 option(REALSCRIPT_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
@@ -8,6 +8,8 @@ option(REALSCRIPT_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 add_library(realscript_frontend STATIC
     src/text/Text.cpp
     src/diagnostics/Diagnostic.cpp
+    src/aot_cpp/AotRuntime.cpp
+    src/aot_cpp/AotCpp.cpp
     src/debug/DebugInfo.cpp
     src/debug/Debugger.cpp
     src/debug/DapServer.cpp
@@ -40,6 +42,8 @@ add_library(realscript_frontend STATIC
 )
 
 add_library(RealScript::Frontend ALIAS realscript_frontend)
+add_library(RealScript::Runtime ALIAS realscript_frontend)
+add_library(RealScript::AotSupport ALIAS realscript_frontend)
 
 target_include_directories(realscript_frontend
     PUBLIC
@@ -72,6 +76,12 @@ target_compile_features(rsdebug PRIVATE cxx_std_17)
 add_executable(rslsp tools/rslsp/main.cpp)
 target_link_libraries(rslsp PRIVATE RealScript::Frontend)
 target_compile_features(rslsp PRIVATE cxx_std_17)
+
+add_executable(rsaot tools/rsaot/main.cpp)
+target_link_libraries(rsaot PRIVATE RealScript::Frontend)
+target_compile_features(rsaot PRIVATE cxx_std_17)
+
+include(cmake/RealScriptAot.cmake)
 
 if(REALSCRIPT_BUILD_TESTS)
     enable_testing()
@@ -138,4 +148,61 @@ if(REALSCRIPT_BUILD_TESTS)
     target_link_libraries(realscript_phase4_tests PRIVATE RealScript::Frontend)
     target_compile_features(realscript_phase4_tests PRIVATE cxx_std_17)
     add_test(NAME realscript.phase4 COMMAND realscript_phase4_tests)
+
+
+    add_executable(realscript_phase5_tests tests/phase5_tests.cpp)
+    target_link_libraries(realscript_phase5_tests PRIVATE RealScript::Frontend)
+    target_compile_features(realscript_phase5_tests PRIVATE cxx_std_17)
+    target_compile_definitions(
+        realscript_phase5_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    add_test(NAME realscript.phase5.generator COMMAND realscript_phase5_tests)
+
+    add_executable(realscript_phase5_abi_c_test tests/phase5_abi_c_test.c)
+    target_include_directories(
+        realscript_phase5_abi_c_test
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    set_target_properties(
+        realscript_phase5_abi_c_test
+        PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED YES C_EXTENSIONS NO
+    )
+    if(MSVC)
+        target_compile_options(realscript_phase5_abi_c_test PRIVATE /W4)
+        if(REALSCRIPT_WARNINGS_AS_ERRORS)
+            target_compile_options(realscript_phase5_abi_c_test PRIVATE /WX)
+        endif()
+    else()
+        target_compile_options(
+            realscript_phase5_abi_c_test PRIVATE -Wall -Wextra -Wpedantic
+        )
+        if(REALSCRIPT_WARNINGS_AS_ERRORS)
+            target_compile_options(realscript_phase5_abi_c_test PRIVATE -Werror)
+        endif()
+    endif()
+    add_test(NAME realscript.phase5.abi-c COMMAND realscript_phase5_abi_c_test)
+
+    set(REALSCRIPT_PHASE5_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase5")
+    realscript_add_aot_library(
+        realscript_phase5_generated
+        PROGRAM_NAME Phase5Fixture
+        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE5_GENERATED_DIR}"
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rs"
+    )
+
+    add_executable(realscript_phase5_aot_tests tests/phase5_aot_tests.cpp)
+    target_link_libraries(
+        realscript_phase5_aot_tests
+        PRIVATE realscript_phase5_generated RealScript::Frontend
+    )
+    target_compile_features(realscript_phase5_aot_tests PRIVATE cxx_std_17)
+    target_compile_definitions(
+        realscript_phase5_aot_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    add_test(NAME realscript.phase5.aot COMMAND realscript_phase5_aot_tests)
 endif()

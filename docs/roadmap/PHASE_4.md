@@ -121,4 +121,4 @@ Phase 4 does not yet add:
 - type-layout migration or additive-field hot reload;
 - replacement of currently active frames.
 
-These are extensions of the established interfaces rather than prerequisites for Phase 5 AOT.
+These are extensions of the established interfaces. Phase 5 consumes the stable MIR, runtime semantics and source metadata established here.

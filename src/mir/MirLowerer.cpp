@@ -251,15 +251,17 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
 
         setCurrentBlock(thenBlock);
         lowerStatement(*ifStatement.thenStatement);
-        const auto thenEnd = hasCurrentBlock() && !currentBlockTerminated()
-            ? currentBlockId_
-            : std::optional<BlockId>{};
+        std::optional<BlockId> thenEnd;
+        if (hasCurrentBlock() && !currentBlockTerminated()) {
+            thenEnd = currentBlockId_;
+        }
 
         setCurrentBlock(elseBlock);
         lowerStatement(*ifStatement.elseStatement);
-        const auto elseEnd = hasCurrentBlock() && !currentBlockTerminated()
-            ? currentBlockId_
-            : std::optional<BlockId>{};
+        std::optional<BlockId> elseEnd;
+        if (hasCurrentBlock() && !currentBlockTerminated()) {
+            elseEnd = currentBlockId_;
+        }
 
         if (!thenEnd && !elseEnd) {
             clearCurrentBlock();

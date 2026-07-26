@@ -550,6 +550,11 @@ struct VmFrame
 
 ## 9. C++17 AOT 后端
 
+> 实现状态：Phase 5 已完成首个 same-SDK C++17 AOT 发布后端，包含
+> Typed MIR 直译、AOT Runtime、C11 查询 ABI、类型化 Native Thunk、
+> Source Map、CMake 集成和解释器/AOT 差分测试。跨编译器预编译二进制
+> 分发、异常 unwind、泛型和 virtual dispatch 仍属于后续扩展。
+
 ### 9.1 管线
 
 ```text
@@ -1462,7 +1467,7 @@ rsdebug --dap-port=4711 --runtime=127.0.0.1:4712
 
 验收：修改函数和兼容字段后无需重启进程。
 
-### Slice 7：C++17 AOT
+### Slice 7：C++17 AOT（Phase 5 已完成）
 
 - MIR 到 C++17；
 - Runtime C ABI；

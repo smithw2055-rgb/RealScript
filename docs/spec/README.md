@@ -51,6 +51,7 @@ RealScript 不允许以 C++ 未定义行为作为脚本语义。所有可观察�
 | [MEMBERS_PROPERTIES_V0.md](MEMBERS_PROPERTIES_V0.md) | Phase 3D 方法、构造函数、属性与 direct-dispatch 调用约定 | Implemented Draft v0.1 |
 | [NUMERIC_ENUM_STRUCT_V0.md](NUMERIC_ENUM_STRUCT_V0.md) | Phase 3E long/double、enum、struct 值语义与精确嵌套引用 | Implemented Draft v0.1 |
 | [DEBUG_TOOLING_HOT_RELOAD_V0.md](DEBUG_TOOLING_HOT_RELOAD_V0.md) | Phase 4 `.rsbc` 调试信息、DAP、LSP 与函数体热重载 | Implemented Draft v0.1 |
+| [CXX17_AOT_V0.md](CXX17_AOT_V0.md) | Phase 5 C++17 生成器、AOT Runtime、C ABI、Native Thunk、Source Map 与差分测试 | Implemented Draft v0.1 |
 | [../ENGINE_DESIGN.md](../ENGINE_DESIGN.md) | 总体架构、参考项目、性能目标和实施路线 | Draft v0.1 |
 
 ## 4. 符合性档位
@@ -141,6 +142,7 @@ RealScript 分离以下版本号：
 - 整数运算在 Debug 构建下的默认 checked 策略；
 - 引用类型泛型共享代码与完全单态化的边界；
 - `.rsbc` 0.5 已实现物理编码是否直接演进为首个稳定格式；
+- AOT same-SDK profile 何时扩展为完整跨编译器二进制分发 ABI；
 - 异常过滤器和 `finally` 的首版范围；
 - `async` 的取消和结构化并发 API；
 - 热重载中活动协程状态迁移的支持等级；
