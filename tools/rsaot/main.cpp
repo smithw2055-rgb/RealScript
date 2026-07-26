@@ -2,6 +2,7 @@
 #include "realscript/aot_cpp/AotRuntime.h"
 #include "realscript/compiler/Compilation.h"
 #include "realscript/diagnostics/Diagnostic.h"
+#include "realscript/optimization/Optimizer.h"
 
 #include <filesystem>
 #include <fstream>
@@ -73,6 +74,9 @@ int main(int argc, char** argv) {
 
     std::filesystem::path outputDirectory = ".";
     realscript::aot::GenerationOptions options;
+    realscript::optimization::Options optimizationOptions;
+    optimizationOptions.level = realscript::optimization::Level::Aggressive;
+    bool optimizationReport = false;
     std::vector<std::string> sources;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
@@ -98,6 +102,14 @@ int main(int argc, char** argv) {
             options.cppNamespace = requireValue("--namespace");
         } else if (argument == "--query-symbol") {
             options.querySymbol = requireValue("--query-symbol");
+        } else if (argument == "--opt-level") {
+            const auto level = requireValue("--opt-level");
+            if (level == "0") optimizationOptions.level = realscript::optimization::Level::None;
+            else if (level == "1") optimizationOptions.level = realscript::optimization::Level::Basic;
+            else if (level == "2") optimizationOptions.level = realscript::optimization::Level::Aggressive;
+            else throw std::runtime_error("--opt-level must be 0, 1, or 2");
+        } else if (argument == "--opt-report") {
+            optimizationReport = true;
         } else if (argument == "--no-line-directives") {
             options.emitLineDirectives = false;
         } else if (argument.rfind("--", 0) == 0) {
@@ -122,8 +134,21 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        realscript::optimization::Optimizer optimizer;
+        auto optimized = optimizer.optimize(
+            std::move(build.modules), build.diagnostics, optimizationOptions);
+        if (build.diagnostics.hasErrors()) {
+            printDiagnostics(build.diagnostics);
+            return 1;
+        }
+        if (optimizationReport) {
+            std::cerr << realscript::optimization::levelName(optimizationOptions.level)
+                << ' ' << realscript::optimization::formatStatistics(
+                    optimized.statistics) << '\n';
+        }
+
         realscript::aot::CppGenerator generator;
-        auto generated = generator.generate(build.modules, build.diagnostics, options);
+        auto generated = generator.generate(optimized.modules, build.diagnostics, options);
         if (build.diagnostics.hasErrors()) {
             printDiagnostics(build.diagnostics);
             return 1;

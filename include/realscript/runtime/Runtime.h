@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -152,6 +153,8 @@ enum class ErrorCode {
     OutOfMemory,
     InvalidProgram,
     ExecutionTerminated,
+    DeterminismViolation,
+    ReplayMismatch,
 };
 
 struct RuntimeError {
@@ -387,6 +390,47 @@ private:
     std::vector<std::uint32_t> freeSlots_;
 };
 
+enum class DeterminismMode : std::uint8_t {
+    Off,
+    Strict,
+    Record,
+    Replay,
+};
+
+enum class BindingDeterminism : std::uint8_t {
+    Deterministic,
+    Recordable,
+    NonDeterministic,
+};
+
+struct ExternalCallRecord {
+    semantic::SymbolId symbolId = 0;
+    std::string name;
+    std::uint64_t argumentHash = 0;
+    bool succeeded = false;
+    Value result;
+    ErrorCode errorCode = ErrorCode::None;
+    std::string errorMessage;
+};
+
+class ReplayLog {
+public:
+    void append(ExternalCallRecord record);
+    [[nodiscard]] std::vector<ExternalCallRecord> entries() const;
+    [[nodiscard]] std::size_t size() const;
+    void clear();
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<ExternalCallRecord> entries_;
+};
+
+struct DeterminismOptions {
+    DeterminismMode mode = DeterminismMode::Off;
+    std::shared_ptr<ReplayLog> replayLog;
+    bool canonicalizeFloatingPoint = true;
+};
+
 struct Limits {
     std::uint64_t instructionBudget = 1'000'000;
     std::size_t recursionLimit = 256;
@@ -422,9 +466,40 @@ struct TraceEvent {
 
 using TraceSink = std::function<void(const TraceEvent&)>;
 
+struct FunctionProfile {
+    std::string function;
+    std::uint64_t calls = 0;
+    std::uint64_t returns = 0;
+    std::uint64_t instructions = 0;
+    std::uint64_t branches = 0;
+    std::uint64_t externalCalls = 0;
+    std::uint64_t gcSteps = 0;
+    std::uint64_t runtimeErrors = 0;
+    std::size_t maximumCallDepth = 0;
+};
+
+struct ExecutionProfile {
+    std::vector<FunctionProfile> functions;
+    std::uint64_t totalEvents = 0;
+};
+
+class ProfileCollector {
+public:
+    void record(const TraceEvent& event);
+    [[nodiscard]] ExecutionProfile snapshot() const;
+    void reset();
+
+private:
+    mutable std::mutex mutex_;
+    std::map<std::string, FunctionProfile> functions_;
+    std::uint64_t totalEvents_ = 0;
+};
+
 struct ExecutionOptions {
     Limits limits;
     TraceSink trace;
+    std::shared_ptr<ProfileCollector> profile;
+    DeterminismOptions determinism;
     std::shared_ptr<debug::DebugController> debugger;
 };
 
@@ -434,6 +509,8 @@ struct ExecutionResult {
     RuntimeError error;
     std::uint64_t instructionsExecuted = 0;
     RuntimeStatistics statistics;
+    std::uint64_t determinismDigest = 0;
+    std::size_t replayEntriesConsumed = 0;
 };
 
 using ExternalFunction = std::function<std::optional<Value>(
@@ -441,19 +518,66 @@ using ExternalFunction = std::function<std::optional<Value>(
     const std::vector<Value>&,
     RuntimeError&)>;
 
+struct ResolvedBinding {
+    const ExternalFunction* function = nullptr;
+    BindingDeterminism determinism = BindingDeterminism::Deterministic;
+};
+
 class BindingRegistry {
 public:
-    bool bind(semantic::SymbolId symbolId, ExternalFunction function);
-    bool bind(const std::string& canonicalName, ExternalFunction function);
+    bool bind(
+        semantic::SymbolId symbolId,
+        ExternalFunction function,
+        BindingDeterminism determinism = BindingDeterminism::Deterministic);
+    bool bind(
+        const std::string& canonicalName,
+        ExternalFunction function,
+        BindingDeterminism determinism = BindingDeterminism::Deterministic);
     [[nodiscard]] std::optional<Value> invoke(
         const bytecode::FunctionReference& reference,
         const std::vector<Value>& arguments,
         RuntimeError& error) const;
+    [[nodiscard]] std::optional<ResolvedBinding> resolve(
+        const bytecode::FunctionReference& reference) const;
     [[nodiscard]] std::size_t size() const noexcept;
 
 private:
-    std::unordered_map<semantic::SymbolId, ExternalFunction> bySymbol_;
-    std::unordered_map<std::string, ExternalFunction> byName_;
+    struct Entry {
+        ExternalFunction function;
+        BindingDeterminism determinism = BindingDeterminism::Deterministic;
+    };
+    std::unordered_map<semantic::SymbolId, Entry> bySymbol_;
+    std::unordered_map<std::string, Entry> byName_;
+};
+
+class DeterminismSession {
+public:
+    explicit DeterminismSession(DeterminismOptions options = {});
+    ~DeterminismSession();
+    DeterminismSession(DeterminismSession&&) noexcept;
+    DeterminismSession& operator=(DeterminismSession&&) noexcept;
+    DeterminismSession(const DeterminismSession&) = delete;
+    DeterminismSession& operator=(const DeterminismSession&) = delete;
+
+    void observe(const TraceEvent& event);
+    [[nodiscard]] bool invokeExternal(
+        const BindingRegistry* bindings,
+        const ExternalFunction* fallback,
+        const bytecode::FunctionReference& reference,
+        const std::vector<Value>& arguments,
+        std::optional<Value>& result,
+        RuntimeError& error);
+    [[nodiscard]] bool finish(
+        bool succeeded,
+        const Value& value,
+        RuntimeError& error,
+        const RuntimeStatistics& statistics);
+    [[nodiscard]] std::uint64_t digest() const noexcept;
+    [[nodiscard]] std::size_t replayEntriesConsumed() const noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 class ProgramImage {
@@ -546,5 +670,11 @@ private:
 [[nodiscard]] semantic::PrimitiveType valueType(const Value& value) noexcept;
 [[nodiscard]] std::string valueToString(const Value& value);
 [[nodiscard]] std::string valueToString(const Value& value, const ManagedHeap* heap);
+[[nodiscard]] std::uint64_t stableValueHash(const Value& value) noexcept;
+[[nodiscard]] bool isReplayStableValue(const Value& value) noexcept;
+[[nodiscard]] const char* determinismModeName(DeterminismMode mode) noexcept;
+[[nodiscard]] const char* bindingDeterminismName(BindingDeterminism determinism) noexcept;
+[[nodiscard]] std::string formatProfile(const ExecutionProfile& profile);
+[[nodiscard]] std::string profileToJson(const ExecutionProfile& profile);
 
 } // namespace realscript::runtime

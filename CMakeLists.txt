@@ -4,12 +4,15 @@ project(RealScript VERSION 0.1.0 LANGUAGES C CXX)
 
 option(REALSCRIPT_BUILD_TESTS "Build RealScript conformance tests" ON)
 option(REALSCRIPT_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+option(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS "Run external C++ toolchain JIT integration tests" ON)
 
 add_library(realscript_frontend STATIC
     src/text/Text.cpp
     src/diagnostics/Diagnostic.cpp
     src/aot_cpp/AotRuntime.cpp
     src/aot_cpp/AotCpp.cpp
+    src/optimization/Optimizer.cpp
+    src/jit/Jit.cpp
     src/debug/DebugInfo.cpp
     src/debug/Debugger.cpp
     src/debug/DapServer.cpp
@@ -38,6 +41,7 @@ add_library(realscript_frontend STATIC
     src/bytecode/BytecodeCodec.cpp
     src/runtime/Interpreter.cpp
     src/runtime/RuntimeServices.cpp
+    src/runtime/ExecutionServices.cpp
     src/runtime/ManagedHeap.cpp
 )
 
@@ -48,6 +52,15 @@ if(MSVC)
     set_source_files_properties(
         src/aot_cpp/AotCpp.cpp
         PROPERTIES COMPILE_OPTIONS "/wd4267"
+    )
+
+    # MSVC treats repeated if-initializer names across one else-if chain as
+    # C4456 even though each value is scoped to its mutually exclusive branch.
+    # Keep /W4 /WX globally and suppress only these two reviewed units.
+    set_source_files_properties(
+        src/optimization/Optimizer.cpp
+        src/runtime/ExecutionServices.cpp
+        PROPERTIES COMPILE_OPTIONS "/wd4456"
     )
 endif()
 
@@ -62,6 +75,11 @@ target_include_directories(realscript_frontend
 )
 
 target_compile_features(realscript_frontend PUBLIC cxx_std_17)
+
+if(CMAKE_DL_LIBS)
+    target_link_libraries(realscript_frontend PUBLIC ${CMAKE_DL_LIBS})
+endif()
+set_target_properties(realscript_frontend PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(MSVC)
     target_compile_options(realscript_frontend PRIVATE /W4 /permissive-)
@@ -90,6 +108,10 @@ target_compile_features(rslsp PRIVATE cxx_std_17)
 add_executable(rsaot tools/rsaot/main.cpp)
 target_link_libraries(rsaot PRIVATE RealScript::Frontend)
 target_compile_features(rsaot PRIVATE cxx_std_17)
+
+add_executable(rsbench tools/rsbench/main.cpp)
+target_link_libraries(rsbench PRIVATE RealScript::Frontend)
+target_compile_features(rsbench PRIVATE cxx_std_17)
 
 include(cmake/RealScriptAot.cmake)
 
@@ -198,6 +220,7 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase5_generated
         PROGRAM_NAME Phase5Fixture
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE5_GENERATED_DIR}"
+        OPT_LEVEL 0
         SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rs"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rs"
@@ -214,4 +237,61 @@ if(REALSCRIPT_BUILD_TESTS)
         PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     )
     add_test(NAME realscript.phase5.aot COMMAND realscript_phase5_aot_tests)
+
+    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS AND NOT MSVC)
+        add_executable(realscript_phase6_jit_tests tests/phase6_jit_tests.cpp)
+        target_link_libraries(realscript_phase6_jit_tests PRIVATE RealScript::Frontend)
+        target_compile_features(realscript_phase6_jit_tests PRIVATE cxx_std_17)
+        target_compile_definitions(
+            realscript_phase6_jit_tests
+            PRIVATE
+                REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+                REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
+                REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
+                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/jit-cache"
+        )
+        add_test(NAME realscript.phase6.jit COMMAND realscript_phase6_jit_tests)
+    endif()
+
+    add_executable(realscript_phase6_tests tests/phase6_tests.cpp)
+    target_link_libraries(realscript_phase6_tests PRIVATE RealScript::Frontend)
+    target_compile_features(realscript_phase6_tests PRIVATE cxx_std_17)
+    add_test(NAME realscript.phase6.core COMMAND realscript_phase6_tests)
+
+    add_executable(realscript_phase6_aot_tests tests/phase6_aot_tests.cpp)
+    target_link_libraries(
+        realscript_phase6_aot_tests
+        PRIVATE realscript_phase5_generated RealScript::Frontend
+    )
+    target_compile_features(realscript_phase6_aot_tests PRIVATE cxx_std_17)
+    target_compile_definitions(
+        realscript_phase6_aot_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    add_test(NAME realscript.phase6.aot COMMAND realscript_phase6_aot_tests)
+
+    add_test(
+        NAME realscript.phase6.cli-smoke
+        COMMAND rsc
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rs"
+            --run Phase5.App::main
+            --opt-level 2
+            --deterministic
+            --digest
+            --profile
+    )
+
+    add_test(
+        NAME realscript.phase6.benchmark-smoke
+        COMMAND rsbench
+            --entry Phase5.App::main
+            --iterations 3
+            --warmup 1
+            --opt-level 2
+            --json
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rs"
+    )
 endif()

@@ -2,6 +2,7 @@
 #include "realscript/compiler/Compilation.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/mir/Mir.h"
+#include "realscript/optimization/Optimizer.h"
 #include "realscript/runtime/Runtime.h"
 #include "realscript/syntax/Syntax.h"
 #include "realscript/text/Text.h"
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -100,6 +102,12 @@ int main(int argc, char** argv) {
 
     std::string mode = "--check";
     std::string outputPath;
+    realscript::optimization::Options optimizationOptions;
+    optimizationOptions.level = realscript::optimization::Level::None;
+    bool optimizationReport = false;
+    bool deterministic = false;
+    bool profile = false;
+    bool printDigest = false;
     std::vector<std::string> paths;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
@@ -110,6 +118,27 @@ int main(int argc, char** argv) {
                 return 2;
             }
             outputPath = argv[++index];
+        } else if (argument == "--opt-level") {
+            if (index + 1 >= argc) {
+                printUsage();
+                return 2;
+            }
+            const std::string level = argv[++index];
+            if (level == "0") optimizationOptions.level = realscript::optimization::Level::None;
+            else if (level == "1") optimizationOptions.level = realscript::optimization::Level::Basic;
+            else if (level == "2") optimizationOptions.level = realscript::optimization::Level::Aggressive;
+            else {
+                std::cerr << "--opt-level must be 0, 1, or 2\n";
+                return 2;
+            }
+        } else if (argument == "--opt-report") {
+            optimizationReport = true;
+        } else if (argument == "--deterministic") {
+            deterministic = true;
+        } else if (argument == "--profile") {
+            profile = true;
+        } else if (argument == "--digest") {
+            printDigest = true;
         } else if (argument.rfind("--", 0) == 0) {
             mode = argument;
         } else {
@@ -175,6 +204,23 @@ int main(int argc, char** argv) {
             compilation.addSource({path, readFile(path)});
         }
         auto result = compilation.build();
+        if (!result.diagnostics.hasErrors() &&
+            optimizationOptions.level != realscript::optimization::Level::None) {
+            realscript::optimization::Optimizer optimizer;
+            auto optimized = optimizer.optimize(
+                std::move(result.modules), result.diagnostics, optimizationOptions);
+            result.modules = std::move(optimized.modules);
+            if (optimizationReport) {
+                std::cerr << realscript::optimization::levelName(
+                    optimizationOptions.level) << ' '
+                    << realscript::optimization::formatStatistics(
+                        optimized.statistics) << '\n';
+            }
+        } else if (optimizationReport) {
+            std::cerr << "O0 functions=0 iterations=0 constants-folded=0 "
+                "local-loads-folded=0 branches-folded=0 "
+                "instructions-removed=0 blocks-removed=0\n";
+        }
 
         if (!result.diagnostics.hasErrors() && mode == "--run") {
             std::vector<realscript::bytecode::Module> modules;
@@ -186,11 +232,29 @@ int main(int argc, char** argv) {
             }
             if (!result.diagnostics.hasErrors()) {
                 realscript::runtime::Interpreter interpreter(std::move(modules));
-                const auto execution = interpreter.invoke(outputPath);
+                realscript::runtime::ExecutionOptions executionOptions;
+                if (deterministic) {
+                    executionOptions.determinism.mode =
+                        realscript::runtime::DeterminismMode::Strict;
+                }
+                if (profile) {
+                    executionOptions.profile =
+                        std::make_shared<realscript::runtime::ProfileCollector>();
+                }
+                const auto execution = interpreter.invoke(
+                    outputPath, {}, executionOptions);
                 if (execution.succeeded) {
                     std::cout << realscript::runtime::valueToString(
                         execution.value,
                         interpreter.heap().get()) << '\n';
+                    if (printDigest || deterministic) {
+                        std::cerr << "determinism-digest="
+                            << execution.determinismDigest << '\n';
+                    }
+                    if (executionOptions.profile) {
+                        std::cerr << realscript::runtime::formatProfile(
+                            executionOptions.profile->snapshot());
+                    }
                 } else {
                     std::cerr << "runtime error "
                         << realscript::runtime::errorCodeName(execution.error.code)

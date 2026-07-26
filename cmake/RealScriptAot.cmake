@@ -11,6 +11,7 @@ function(realscript_add_aot_library target)
         CPP_NAMESPACE
         QUERY_SYMBOL
         OUTPUT_DIRECTORY
+        OPT_LEVEL
     )
     set(multi_value_args SOURCES)
     cmake_parse_arguments(
@@ -42,6 +43,13 @@ function(realscript_add_aot_library target)
         set(RSAOT_OUTPUT_DIRECTORY
             "${CMAKE_CURRENT_BINARY_DIR}/generated/${target}")
     endif()
+    if(NOT DEFINED RSAOT_OPT_LEVEL OR RSAOT_OPT_LEVEL STREQUAL "")
+        set(RSAOT_OPT_LEVEL 0)
+    endif()
+    if(NOT RSAOT_OPT_LEVEL MATCHES "^[012]$")
+        message(FATAL_ERROR
+            "realscript_add_aot_library(${target}) OPT_LEVEL must be 0, 1, or 2")
+    endif()
 
     set(aot_sources)
     foreach(source IN LISTS RSAOT_SOURCES)
@@ -68,6 +76,7 @@ function(realscript_add_aot_library target)
     set(generator_arguments
         --output-dir "${RSAOT_OUTPUT_DIRECTORY}"
         --program-name "${RSAOT_PROGRAM_NAME}"
+        --opt-level "${RSAOT_OPT_LEVEL}"
     )
     if(RSAOT_CPP_NAMESPACE)
         list(APPEND generator_arguments

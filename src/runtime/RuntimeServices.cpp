@@ -6,24 +6,47 @@
 
 namespace realscript::runtime {
 
-bool BindingRegistry::bind(semantic::SymbolId symbolId, ExternalFunction function) {
+bool BindingRegistry::bind(
+    semantic::SymbolId symbolId,
+    ExternalFunction function,
+    BindingDeterminism determinism) {
     if (symbolId == 0 || !function) return false;
-    return bySymbol_.emplace(symbolId, std::move(function)).second;
+    return bySymbol_.emplace(
+        symbolId,
+        Entry{std::move(function), determinism}).second;
 }
 
-bool BindingRegistry::bind(const std::string& canonicalName, ExternalFunction function) {
+bool BindingRegistry::bind(
+    const std::string& canonicalName,
+    ExternalFunction function,
+    BindingDeterminism determinism) {
     if (canonicalName.empty() || !function) return false;
-    return byName_.emplace(canonicalName, std::move(function)).second;
+    return byName_.emplace(
+        canonicalName,
+        Entry{std::move(function), determinism}).second;
+}
+
+std::optional<ResolvedBinding> BindingRegistry::resolve(
+    const bytecode::FunctionReference& reference) const {
+    const auto bySymbol = bySymbol_.find(reference.symbolId);
+    if (bySymbol != bySymbol_.end()) {
+        return ResolvedBinding{&bySymbol->second.function, bySymbol->second.determinism};
+    }
+    const auto byName = byName_.find(reference.name);
+    if (byName != byName_.end()) {
+        return ResolvedBinding{&byName->second.function, byName->second.determinism};
+    }
+    return std::nullopt;
 }
 
 std::optional<Value> BindingRegistry::invoke(
     const bytecode::FunctionReference& reference,
     const std::vector<Value>& arguments,
     RuntimeError& error) const {
-    const auto bySymbol = bySymbol_.find(reference.symbolId);
-    if (bySymbol != bySymbol_.end()) return bySymbol->second(reference, arguments, error);
-    const auto byName = byName_.find(reference.name);
-    if (byName != byName_.end()) return byName->second(reference, arguments, error);
+    const auto resolved = resolve(reference);
+    if (resolved && resolved->function) {
+        return (*resolved->function)(reference, arguments, error);
+    }
     error.code = ErrorCode::ExternalFunctionUnresolved;
     error.message = "external function '" + reference.name + "' is not registered";
     return std::nullopt;

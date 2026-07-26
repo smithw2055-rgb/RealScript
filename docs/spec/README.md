@@ -52,6 +52,7 @@ RealScript 不允许以 C++ 未定义行为作为脚本语义。所有可观察�
 | [NUMERIC_ENUM_STRUCT_V0.md](NUMERIC_ENUM_STRUCT_V0.md) | Phase 3E long/double、enum、struct 值语义与精确嵌套引用 | Implemented Draft v0.1 |
 | [DEBUG_TOOLING_HOT_RELOAD_V0.md](DEBUG_TOOLING_HOT_RELOAD_V0.md) | Phase 4 `.rsbc` 调试信息、DAP、LSP 与函数体热重载 | Implemented Draft v0.1 |
 | [CXX17_AOT_V0.md](CXX17_AOT_V0.md) | Phase 5 C++17 生成器、AOT Runtime、C ABI、Native Thunk、Source Map 与差分测试 | Implemented Draft v0.1 |
+| [DETERMINISM_OPTIMIZATION_JIT_V0.md](DETERMINISM_OPTIMIZATION_JIT_V0.md) | Phase 6 确定性 Record/Replay、MIR 优化、Profile、Benchmark 与可选工具链 JIT | Implemented Draft v0.1 |
 | [../ENGINE_DESIGN.md](../ENGINE_DESIGN.md) | 总体架构、参考项目、性能目标和实施路线 | Draft v0.1 |
 
 ## 4. 符合性档位

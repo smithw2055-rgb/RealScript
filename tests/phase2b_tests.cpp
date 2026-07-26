@@ -5,6 +5,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -114,17 +115,17 @@ void testExternalResolver() {
     constant.opcode = realscript::bytecode::Opcode::ConstantInt;
     constant.result = 0;
     constant.integerImmediate = 41;
-    block.instructions.push_back(constant);
+    block.instructions.push_back(std::move(constant));
     realscript::bytecode::Instruction call;
     call.opcode = realscript::bytecode::Opcode::Call;
     call.result = 1;
     call.index = 0;
     call.operands = {0};
-    block.instructions.push_back(call);
+    block.instructions.push_back(std::move(call));
     block.terminator.kind = realscript::bytecode::TerminatorKind::ReturnValue;
     block.terminator.value = 1;
-    function.blocks.push_back(block);
-    module.functions.push_back(function);
+    function.blocks.push_back(std::move(block));
+    module.functions.push_back(std::move(function));
 
     realscript::runtime::Interpreter interpreter({module});
     interpreter.setExternalResolver([](const auto&, const auto& args, auto&) -> std::optional<realscript::runtime::Value> {
@@ -158,8 +159,8 @@ void testUnresolvedExternal() {
     function.registerTypeIds = {0};
     realscript::bytecode::BasicBlock block; block.id = 0;
     realscript::bytecode::Instruction call; call.opcode = realscript::bytecode::Opcode::Call; call.result = 0; call.index = 0;
-    block.instructions.push_back(call); block.terminator.kind = realscript::bytecode::TerminatorKind::ReturnValue; block.terminator.value = 0;
-    function.blocks.push_back(block); module.functions.push_back(function);
+    block.instructions.push_back(std::move(call)); block.terminator.kind = realscript::bytecode::TerminatorKind::ReturnValue; block.terminator.value = 0;
+    function.blocks.push_back(std::move(block)); module.functions.push_back(function);
     realscript::runtime::Interpreter interpreter({module});
     const auto result = interpreter.invoke(realscript::semantic::SymbolId{2});
     require(!result.succeeded, "unresolved external must fail");

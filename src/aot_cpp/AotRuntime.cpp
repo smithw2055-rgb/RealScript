@@ -151,7 +151,8 @@ ExecutionContext::ExecutionContext(
     : program_(&program),
       heap_(heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>()),
       bindings_(std::move(bindings)),
-      options_(std::move(options)) {
+      options_(std::move(options)),
+      determinism_(options_.determinism) {
     for (std::uint32_t index = 0; index < program.typeCount; ++index) {
         const auto& type = program.types[index];
         types_.emplace(type.id, &type);
@@ -177,14 +178,15 @@ const FunctionDescriptor* ExecutionContext::findFunction(
 void ExecutionContext::emitTrace(
     runtime::TraceEventKind kind,
     std::string operation) {
-    if (!options_.trace) return;
     runtime::TraceEvent event;
     event.kind = kind;
     event.function = stack_.empty() ? std::string{} : stack_.back();
     event.operation = std::move(operation);
     event.instructionIndex = executed_;
     event.callDepth = stack_.size();
-    options_.trace(event);
+    determinism_.observe(event);
+    if (options_.profile) options_.profile->record(event);
+    if (options_.trace) options_.trace(event);
 }
 
 bool ExecutionContext::fail(
@@ -488,8 +490,14 @@ bool ExecutionContext::call(
     runtime::RuntimeError externalError;
     ++statistics_.externalCalls;
     emitTrace(runtime::TraceEventKind::ExternalCall, reference.name);
-    auto externalResult = bindings_->invoke(reference, values, externalError);
-    if (!externalResult) {
+    std::optional<runtime::Value> externalResult;
+    if (!determinism_.invokeExternal(
+            bindings_.get(),
+            nullptr,
+            reference,
+            values,
+            externalResult,
+            externalError)) {
         error_ = std::move(externalError);
         if (error_.code == runtime::ErrorCode::None) {
             error_.code = runtime::ErrorCode::ExternalFunctionUnresolved;
@@ -1187,6 +1195,20 @@ std::uint64_t ExecutionContext::instructionsExecuted() const noexcept {
     return executed_;
 }
 
+bool ExecutionContext::finalizeDeterminism(
+    bool succeeded,
+    const runtime::Value& value) {
+    return determinism_.finish(succeeded, value, error_, statistics_);
+}
+
+std::uint64_t ExecutionContext::determinismDigest() const noexcept {
+    return determinism_.digest();
+}
+
+std::size_t ExecutionContext::replayEntriesConsumed() const noexcept {
+    return determinism_.replayEntriesConsumed();
+}
+
 Program::Program(const ProgramDescriptor& descriptor)
     : descriptor_(&descriptor),
       heap_(std::make_shared<runtime::ManagedHeap>()) {
@@ -1346,10 +1368,14 @@ runtime::ExecutionResult Program::invoke(
         arguments.data(),
         arguments.size(),
         value);
+    execution.succeeded = context.finalizeDeterminism(
+        execution.succeeded, value);
     execution.value = std::move(value);
     execution.error = context.error();
     execution.instructionsExecuted = context.instructionsExecuted();
     execution.statistics = context.statistics();
+    execution.determinismDigest = context.determinismDigest();
+    execution.replayEntriesConsumed = context.replayEntriesConsumed();
     return execution;
 }
 
