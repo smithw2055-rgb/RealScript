@@ -208,7 +208,10 @@ std::unique_ptr<BoundStatement> Binder::bindReturnStatement(
         syntaxTree.expression->span(),
         "return value",
         currentReturnTypeName_);
-    if (result->expression && currentReturnType_ == PrimitiveType::Object) {
+    if (result->expression &&
+        (currentReturnType_ == PrimitiveType::Object ||
+         currentReturnType_ == PrimitiveType::Array ||
+         currentReturnType_ == PrimitiveType::Handle)) {
         result->expression->typeName = currentReturnTypeName_;
     }
     return result;
@@ -264,7 +267,10 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
             syntaxTree.initializer->span(),
             "initializer",
             result->variable.typeName);
-        if (result->initializer && result->variable.type == PrimitiveType::Object) {
+        if (result->initializer &&
+            (result->variable.type == PrimitiveType::Object ||
+             result->variable.type == PrimitiveType::Array ||
+             result->variable.type == PrimitiveType::Handle)) {
             if (!result->initializer->typeName.empty() &&
                 result->initializer->typeName != result->variable.typeName) {
                 diagnostics_.report(
@@ -315,12 +321,21 @@ std::unique_ptr<BoundExpression> Binder::bindExpression(
     case syntax::SyntaxKind::NewObjectExpression:
         return bindNewObjectExpression(
             static_cast<const syntax::NewObjectExpressionSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::NewArrayExpression:
+        return bindNewArrayExpression(
+            static_cast<const syntax::NewArrayExpressionSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::ElementAccessExpression:
+        return bindElementAccessExpression(
+            static_cast<const syntax::ElementAccessExpressionSyntax&>(syntaxTree));
     case syntax::SyntaxKind::MemberAccessExpression:
         return bindMemberAccessExpression(
             static_cast<const syntax::MemberAccessExpressionSyntax&>(syntaxTree));
     case syntax::SyntaxKind::MemberAssignmentExpression:
         return bindMemberAssignmentExpression(
             static_cast<const syntax::MemberAssignmentExpressionSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::ElementAssignmentExpression:
+        return bindElementAssignmentExpression(
+            static_cast<const syntax::ElementAssignmentExpressionSyntax&>(syntaxTree));
     default:
         diagnostics_.report(
             "RS2199",
@@ -335,27 +350,48 @@ PrimitiveType Binder::bindType(
     bool allowVoid,
     std::string* typeName) {
     if (typeName) typeName->clear();
-    const auto primitive = resolvePrimitiveType(syntaxTree.name.text);
-    if (primitive != PrimitiveType::Error) {
-        if (primitive == PrimitiveType::Void && !allowVoid) {
+    PrimitiveType baseType = resolvePrimitiveType(syntaxTree.name.text);
+    std::string baseTypeName;
+    if (baseType == PrimitiveType::Error) {
+        const auto found = visibleTypes_.find(syntaxTree.name.text);
+        if (found != visibleTypes_.end()) {
+            baseType = PrimitiveType::Object;
+            baseTypeName = canonicalTypeName(found->second);
+        } else {
             diagnostics_.report(
-                "RS2201",
-                "void is not valid in this type position",
+                "RS2200",
+                "unknown type '" + syntaxTree.name.text + "'",
                 syntaxTree.span());
             return PrimitiveType::Error;
         }
-        return primitive;
     }
-    const auto found = visibleTypes_.find(syntaxTree.name.text);
-    if (found != visibleTypes_.end()) {
-        if (typeName) *typeName = canonicalTypeName(found->second);
-        return PrimitiveType::Object;
+
+    if (syntaxTree.isArray()) {
+        if (baseType == PrimitiveType::Void ||
+            baseType == PrimitiveType::Array) {
+            diagnostics_.report(
+                "RS2201",
+                "invalid array element type",
+                syntaxTree.span());
+            return PrimitiveType::Error;
+        }
+        if (typeName) *typeName = arrayTypeName(baseType, baseTypeName);
+        return PrimitiveType::Array;
     }
-    diagnostics_.report(
-        "RS2200",
-        "unknown type '" + syntaxTree.name.text + "'",
-        syntaxTree.span());
-    return PrimitiveType::Error;
+
+    if (baseType == PrimitiveType::Void && !allowVoid) {
+        diagnostics_.report(
+            "RS2201",
+            "void is not valid in this type position",
+            syntaxTree.span());
+        return PrimitiveType::Error;
+    }
+    if (typeName &&
+        (baseType == PrimitiveType::Object ||
+         baseType == PrimitiveType::Handle)) {
+        *typeName = baseTypeName;
+    }
+    return baseType;
 }
 
 const VariableSymbol* Binder::lookupVariable(

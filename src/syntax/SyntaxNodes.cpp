@@ -20,6 +20,12 @@ std::string joinQualifiedName(const std::vector<SyntaxToken>& parts) {
 
 } // namespace
 
+text::TextSpan TypeSyntax::span() const noexcept {
+    return closeBracketToken
+        ? combine(name.span, closeBracketToken->span)
+        : name.span;
+}
+
 text::TextSpan UnaryExpressionSyntax::span() const noexcept {
     return combine(operatorToken.span, operand->span());
 }
@@ -36,12 +42,24 @@ text::TextSpan MemberAccessExpressionSyntax::span() const noexcept {
     return combine(receiver->span(), nameToken.span);
 }
 
+text::TextSpan ElementAccessExpressionSyntax::span() const noexcept {
+    return combine(receiver->span(), closeBracketToken.span);
+}
+
+text::TextSpan ElementAssignmentExpressionSyntax::span() const noexcept {
+    return combine(receiver->span(), expression->span());
+}
+
 text::TextSpan MemberAssignmentExpressionSyntax::span() const noexcept {
     return combine(receiver->span(), expression->span());
 }
 
 text::TextSpan NewObjectExpressionSyntax::span() const noexcept {
     return combine(newKeyword.span, closeParenToken.span);
+}
+
+text::TextSpan NewArrayExpressionSyntax::span() const noexcept {
+    return combine(newKeyword.span, closeBracketToken.span);
 }
 
 text::TextSpan ParenthesizedExpressionSyntax::span() const noexcept {

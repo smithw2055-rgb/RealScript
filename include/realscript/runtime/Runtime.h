@@ -24,6 +24,10 @@ struct NullObject {
     friend constexpr bool operator==(NullObject, NullObject) noexcept { return true; }
 };
 
+struct NullArray {
+    friend constexpr bool operator==(NullArray, NullArray) noexcept { return true; }
+};
+
 enum class ObjectKind : std::uint8_t {
     String,
     Array,
@@ -36,17 +40,43 @@ struct ObjectRef {
     std::uint32_t slot = InvalidSlot;
     std::uint32_t generation = 0;
     ObjectKind kind = ObjectKind::Record;
+    std::uint64_t heapId = 0;
 
     [[nodiscard]] constexpr bool valid() const noexcept {
-        return slot != InvalidSlot && generation != 0;
+        return slot != InvalidSlot && generation != 0 && heapId != 0;
     }
 
     friend constexpr bool operator==(ObjectRef left, ObjectRef right) noexcept {
         return left.slot == right.slot &&
             left.generation == right.generation &&
-            left.kind == right.kind;
+            left.kind == right.kind &&
+            left.heapId == right.heapId;
     }
     friend constexpr bool operator!=(ObjectRef left, ObjectRef right) noexcept {
+        return !(left == right);
+    }
+};
+
+struct NativeHandle {
+    static constexpr std::uint32_t InvalidSlot = 0xffffffffu;
+
+    std::uint32_t slot = InvalidSlot;
+    std::uint32_t generation = 0;
+    semantic::SymbolId typeId = 0;
+    std::uint64_t registryId = 0;
+
+    [[nodiscard]] constexpr bool valid() const noexcept {
+        return slot != InvalidSlot && generation != 0 &&
+            typeId != 0 && registryId != 0;
+    }
+
+    friend constexpr bool operator==(NativeHandle left, NativeHandle right) noexcept {
+        return left.slot == right.slot &&
+            left.generation == right.generation &&
+            left.typeId == right.typeId &&
+            left.registryId == right.registryId;
+    }
+    friend constexpr bool operator!=(NativeHandle left, NativeHandle right) noexcept {
         return !(left == right);
     }
 };
@@ -55,10 +85,12 @@ using Value = std::variant<
     std::monostate,
     NullString,
     NullObject,
+    NullArray,
     bool,
     std::int64_t,
     std::string,
-    ObjectRef>;
+    ObjectRef,
+    NativeHandle>;
 
 enum class ErrorCode {
     None,
@@ -72,7 +104,9 @@ enum class ErrorCode {
     ExternalFunctionUnresolved,
     DuplicateSymbol,
     InvalidObjectReference,
+    InvalidNativeHandle,
     NullReference,
+    IndexOutOfRange,
     OutOfMemory,
     InvalidProgram,
 };
@@ -107,6 +141,39 @@ struct GcStatistics {
     std::size_t liveBytes = 0;
     std::size_t peakLiveBytes = 0;
 };
+
+struct HeapEdge {
+    ObjectRef target;
+    std::string label;
+};
+
+struct HeapObjectInfo {
+    ObjectRef reference;
+    ObjectKind kind = ObjectKind::Record;
+    semantic::SymbolId typeId = 0;
+    semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
+    semantic::SymbolId elementTypeId = 0;
+    std::size_t sizeBytes = 0;
+    std::size_t valueCount = 0;
+    std::vector<HeapEdge> edges;
+};
+
+struct HeapRootInfo {
+    std::uint64_t token = 0;
+    ObjectRef reference;
+    std::string kind;
+};
+
+struct HeapSnapshot {
+    std::uint64_t heapId = 0;
+    GcStatistics statistics;
+    std::vector<HeapObjectInfo> objects;
+    std::vector<HeapRootInfo> roots;
+
+    [[nodiscard]] std::string toText() const;
+};
+
+class PersistentRoot;
 
 class ShadowStack {
 public:
@@ -145,6 +212,13 @@ public:
         std::size_t length,
         Value initialValue = {},
         RuntimeError* error = nullptr);
+    [[nodiscard]] std::optional<ObjectRef> allocateTypedArray(
+        semantic::SymbolId arrayTypeId,
+        semantic::PrimitiveType elementType,
+        semantic::SymbolId elementTypeId,
+        std::size_t length,
+        Value initialValue,
+        RuntimeError* error = nullptr);
     [[nodiscard]] std::optional<ObjectRef> allocateRecord(
         std::size_t fieldCount,
         RuntimeError* error = nullptr);
@@ -157,6 +231,12 @@ public:
     [[nodiscard]] bool isAlive(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<std::string_view> stringView(ObjectRef reference) const;
     [[nodiscard]] std::optional<std::size_t> arrayLength(ObjectRef reference) const;
+    [[nodiscard]] std::optional<semantic::SymbolId> arrayTypeId(
+        ObjectRef reference) const;
+    [[nodiscard]] std::optional<semantic::PrimitiveType> arrayElementType(
+        ObjectRef reference) const;
+    [[nodiscard]] std::optional<semantic::SymbolId> arrayElementTypeId(
+        ObjectRef reference) const;
     [[nodiscard]] std::optional<Value> arrayGet(ObjectRef reference, std::size_t index) const;
     bool arraySet(
         ObjectRef reference,
@@ -176,6 +256,7 @@ public:
     [[nodiscard]] RootToken addPersistentRoot(ObjectRef reference);
     bool updatePersistentRoot(RootToken token, ObjectRef reference);
     bool removePersistentRoot(RootToken token) noexcept;
+    [[nodiscard]] PersistentRoot retain(ObjectRef reference);
 
     void requestCollection() noexcept;
     [[nodiscard]] bool collectionRequested() const noexcept;
@@ -186,10 +267,76 @@ public:
     [[nodiscard]] const GcStatistics& statistics() const noexcept;
     [[nodiscard]] std::size_t liveObjects() const noexcept;
     [[nodiscard]] std::size_t liveBytes() const noexcept;
+    [[nodiscard]] std::uint64_t heapId() const noexcept;
+    [[nodiscard]] HeapSnapshot snapshot(
+        const ShadowStack* shadowStack = nullptr) const;
+    [[nodiscard]] std::vector<ObjectRef> retainingPath(
+        ObjectRef target,
+        const ShadowStack* shadowStack = nullptr) const;
+    [[nodiscard]] std::string leakSummary() const;
 
 private:
+    friend class PersistentRoot;
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+class PersistentRoot {
+public:
+    PersistentRoot() = default;
+    ~PersistentRoot();
+    PersistentRoot(PersistentRoot&& other) noexcept;
+    PersistentRoot& operator=(PersistentRoot&& other) noexcept;
+    PersistentRoot(const PersistentRoot&) = delete;
+    PersistentRoot& operator=(const PersistentRoot&) = delete;
+
+    [[nodiscard]] bool valid() const noexcept;
+    [[nodiscard]] ObjectRef reference() const noexcept;
+    bool update(ObjectRef reference);
+    void reset() noexcept;
+
+private:
+    friend class ManagedHeap;
+    PersistentRoot(ManagedHeap* heap, ManagedHeap::RootToken token, ObjectRef reference);
+
+    ManagedHeap* heap_ = nullptr;
+    ManagedHeap::RootToken token_ = 0;
+    ObjectRef reference_{};
+};
+
+class NativeHandleRegistry {
+public:
+    NativeHandleRegistry();
+    NativeHandleRegistry(const NativeHandleRegistry&) = delete;
+    NativeHandleRegistry& operator=(const NativeHandleRegistry&) = delete;
+    NativeHandleRegistry(NativeHandleRegistry&&) = delete;
+    NativeHandleRegistry& operator=(NativeHandleRegistry&&) = delete;
+
+    [[nodiscard]] NativeHandle create(
+        semantic::SymbolId typeId,
+        std::shared_ptr<void> resource,
+        std::string debugName = {});
+    [[nodiscard]] std::shared_ptr<void> resolve(
+        NativeHandle handle,
+        semantic::SymbolId expectedTypeId = 0,
+        RuntimeError* error = nullptr) const;
+    [[nodiscard]] bool isAlive(NativeHandle handle) const noexcept;
+    bool release(NativeHandle handle) noexcept;
+    void clear() noexcept;
+    [[nodiscard]] std::size_t liveCount() const noexcept;
+    [[nodiscard]] std::uint64_t registryId() const noexcept;
+    [[nodiscard]] std::string debugName(NativeHandle handle) const;
+
+private:
+    struct Slot {
+        std::shared_ptr<void> resource;
+        semantic::SymbolId typeId = 0;
+        std::uint32_t generation = 1;
+        std::string debugName;
+    };
+    std::uint64_t registryId_ = 0;
+    std::vector<Slot> slots_;
+    std::vector<std::uint32_t> freeSlots_;
 };
 
 struct Limits {
@@ -326,6 +473,8 @@ public:
     void setBindings(std::shared_ptr<const BindingRegistry> bindings);
     void setHeap(std::shared_ptr<ManagedHeap> heap);
     [[nodiscard]] std::shared_ptr<ManagedHeap> heap() const noexcept;
+    void setNativeHandles(std::shared_ptr<NativeHandleRegistry> handles);
+    [[nodiscard]] std::shared_ptr<NativeHandleRegistry> nativeHandles() const noexcept;
     [[nodiscard]] ExecutionResult invoke(
         const std::string& qualifiedName,
         const std::vector<Value>& arguments = {},
@@ -336,6 +485,7 @@ private:
     std::shared_ptr<const ProgramImage> program_;
     std::shared_ptr<const BindingRegistry> bindings_;
     std::shared_ptr<ManagedHeap> heap_;
+    std::shared_ptr<NativeHandleRegistry> nativeHandles_;
 };
 
 [[nodiscard]] const char* errorCodeName(ErrorCode code) noexcept;

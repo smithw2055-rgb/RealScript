@@ -13,8 +13,13 @@ const char* opcodeName(Opcode opcode) noexcept {
     case Opcode::StoreLocal: return "store.local";
     case Opcode::ConvertNullToString: return "conv.null.string";
     case Opcode::ConvertNullToObject: return "conv.null.object";
+    case Opcode::ConvertNullToArray: return "conv.null.array";
     case Opcode::NewObject: return "new.object";
+    case Opcode::NewArray: return "new.array";
     case Opcode::CheckNotNull: return "check.notnull";
+    case Opcode::ArrayLength: return "array.length";
+    case Opcode::LoadElement: return "load.element";
+    case Opcode::StoreElement: return "store.element";
     case Opcode::LoadField: return "load.field";
     case Opcode::StoreField: return "store.field";
     case Opcode::Call: return "call";

@@ -11,6 +11,7 @@ struct Definition {
     BlockId block = 0;
     std::int64_t instructionIndex = -1;
     semantic::PrimitiveType type = semantic::PrimitiveType::Error;
+    semantic::SymbolId typeId = 0;
 };
 
 std::size_t expectedOperandCount(const Instruction& instruction) noexcept {
@@ -23,16 +24,23 @@ std::size_t expectedOperandCount(const Instruction& instruction) noexcept {
     case Opcode::LoadLocal:
     case Opcode::NewObject:
         return 0;
+    case Opcode::NewArray:
+        return 1;
     case Opcode::StoreLocal:
     case Opcode::ConvertNullToString:
     case Opcode::ConvertNullToObject:
+    case Opcode::ConvertNullToArray:
     case Opcode::CheckNotNull:
+    case Opcode::ArrayLength:
     case Opcode::LoadField:
     case Opcode::NegateInt:
     case Opcode::LogicalNot:
         return 1;
     case Opcode::StoreField:
+    case Opcode::LoadElement:
         return 2;
+    case Opcode::StoreElement:
+        return 3;
     case Opcode::Call:
         return instruction.parameterTypes.size();
     default:
@@ -43,7 +51,8 @@ std::size_t expectedOperandCount(const Instruction& instruction) noexcept {
 bool validTypeIdentity(
     semantic::PrimitiveType type,
     semantic::SymbolId typeId) noexcept {
-    return type == semantic::PrimitiveType::Object
+    return (type == semantic::PrimitiveType::Object ||
+            type == semantic::PrimitiveType::Array)
         ? typeId != 0
         : typeId == 0;
 }
@@ -56,7 +65,8 @@ semantic::SymbolId typeIdAt(
 
 bool definesValue(const Instruction& instruction) noexcept {
     if (instruction.opcode == Opcode::StoreLocal ||
-        instruction.opcode == Opcode::StoreField) {
+        instruction.opcode == Opcode::StoreField ||
+        instruction.opcode == Opcode::StoreElement) {
         return false;
     }
     return instruction.opcode != Opcode::Call ||
@@ -91,8 +101,7 @@ bool verifyModule(
                 "MIR function has an invalid return type identity",
                 {});
         }
-        if (!function.parameterTypeIds.empty() &&
-            function.parameterTypeIds.size() != function.parameterTypes.size()) {
+        if (function.parameterTypeIds.size() != function.parameterTypes.size()) {
             diagnostics.report(
                 "RS3049",
                 "MIR function parameter type ID count is invalid",
@@ -107,6 +116,22 @@ bool verifyModule(
                 diagnostics.report(
                     "RS3050",
                     "MIR function has an invalid parameter type identity",
+                    {});
+            }
+        }
+        if (function.localTypeIds.size() != function.localTypes.size()) {
+            diagnostics.report(
+                "RS3059",
+                "MIR function local type ID count is invalid",
+                {});
+        }
+        for (std::size_t local = 0; local < function.localTypes.size(); ++local) {
+            if (!validTypeIdentity(
+                    function.localTypes[local],
+                    typeIdAt(function.localTypeIds, local))) {
+                diagnostics.report(
+                    "RS3060",
+                    "MIR function has an invalid local type identity",
                     {});
             }
         }
@@ -130,10 +155,21 @@ bool verifyModule(
             }
 
             for (const auto& parameter : basicBlock.parameters) {
+                if (!validTypeIdentity(parameter.type, parameter.typeId)) {
+                    diagnostics.report(
+                        "RS3061",
+                        "MIR block parameter has an invalid type identity",
+                        {});
+                }
                 if (parameter.value < 0 ||
                     !definitions.emplace(
                         parameter.value,
-                        Definition{basicBlock.id, -1, parameter.type}).second) {
+                        Definition{
+                            basicBlock.id,
+                            -1,
+                            parameter.type,
+                            parameter.typeId,
+                        }).second) {
                     diagnostics.report(
                         "RS3003",
                         "duplicate or invalid MIR value id",
@@ -144,6 +180,14 @@ bool verifyModule(
             for (std::size_t i = 0; i < basicBlock.instructions.size(); ++i) {
                 const auto& instruction = basicBlock.instructions[i];
                 if (definesValue(instruction)) {
+                    if (!validTypeIdentity(
+                            instruction.resultType,
+                            instruction.resultTypeId)) {
+                        diagnostics.report(
+                            "RS3062",
+                            "MIR instruction has an invalid result type identity",
+                            instruction.sourceSpan);
+                    }
                     if (instruction.result < 0 ||
                         !definitions.emplace(
                             instruction.result,
@@ -151,6 +195,7 @@ bool verifyModule(
                                 basicBlock.id,
                                 static_cast<std::int64_t>(i),
                                 instruction.resultType,
+                                instruction.resultTypeId,
                             }).second) {
                         diagnostics.report(
                             "RS3003",
@@ -178,6 +223,10 @@ bool verifyModule(
             return found == definitions.end()
                 ? semantic::PrimitiveType::Error
                 : found->second.type;
+        };
+        const auto valueTypeId = [&](ValueId value) {
+            const auto found = definitions.find(value);
+            return found == definitions.end() ? 0 : found->second.typeId;
         };
 
         std::unordered_map<BlockId, std::vector<BlockId>> successors;
@@ -327,7 +376,8 @@ bool verifyModule(
                     static_cast<std::int64_t>(
                         blocks.at(from)->instructions.size()),
                     span);
-                if (valueType(arguments[i]) != parameters[i].type) {
+                if (valueType(arguments[i]) != parameters[i].type ||
+                    valueTypeId(arguments[i]) != parameters[i].typeId) {
                     diagnostics.report(
                         "RS3011",
                         "MIR branch argument type does not match block parameter",
@@ -362,7 +412,9 @@ bool verifyModule(
                     if (instruction.integerImmediate < 0 ||
                         parameterIndex >= function.parameterTypes.size() ||
                         instruction.resultType !=
-                            function.parameterTypes[parameterIndex]) {
+                            function.parameterTypes[parameterIndex] ||
+                        instruction.resultTypeId !=
+                            typeIdAt(function.parameterTypeIds, parameterIndex)) {
                         diagnostics.report(
                             "RS3013",
                             "invalid MIR parameter instruction",
@@ -404,16 +456,22 @@ bool verifyModule(
                             "MIR local index is outside the function local table",
                             instruction.sourceSpan);
                     } else if (instruction.opcode == Opcode::LoadLocal &&
-                               instruction.resultType !=
-                                   function.localTypes[instruction.localIndex]) {
+                               (instruction.resultType !=
+                                    function.localTypes[instruction.localIndex] ||
+                                instruction.resultTypeId !=
+                                    typeIdAt(function.localTypeIds,
+                                        instruction.localIndex))) {
                         diagnostics.report(
                             "RS3015",
                             "MIR local load type does not match local table",
                             instruction.sourceSpan);
                     } else if (instruction.opcode == Opcode::StoreLocal &&
                                operandCountIsValid &&
-                               valueType(instruction.operands.front()) !=
-                                   function.localTypes[instruction.localIndex]) {
+                               (valueType(instruction.operands.front()) !=
+                                    function.localTypes[instruction.localIndex] ||
+                                valueTypeId(instruction.operands.front()) !=
+                                    typeIdAt(function.localTypeIds,
+                                        instruction.localIndex))) {
                         diagnostics.report(
                             "RS3016",
                             "MIR local store type does not match local table",
@@ -438,6 +496,72 @@ bool verifyModule(
                         diagnostics.report(
                             "RS3042",
                             "invalid null-to-object conversion",
+                            instruction.sourceSpan);
+                    }
+                } else if (instruction.opcode == Opcode::ConvertNullToArray &&
+                           operandCountIsValid) {
+                    if (instruction.resultType != semantic::PrimitiveType::Array ||
+                        instruction.resultTypeId == 0 ||
+                        valueType(instruction.operands.front()) !=
+                            semantic::PrimitiveType::Null) {
+                        diagnostics.report(
+                            "RS3053",
+                            "invalid null-to-array conversion",
+                            instruction.sourceSpan);
+                    }
+                } else if (instruction.opcode == Opcode::NewArray &&
+                           operandCountIsValid) {
+                    if (instruction.resultType != semantic::PrimitiveType::Array ||
+                        instruction.resultTypeId == 0 ||
+                        valueType(instruction.operands.front()) !=
+                            semantic::PrimitiveType::Int ||
+                        instruction.elementType == semantic::PrimitiveType::Error ||
+                        instruction.elementType == semantic::PrimitiveType::Void ||
+                        instruction.elementType == semantic::PrimitiveType::Array ||
+                        (instruction.elementType == semantic::PrimitiveType::Object &&
+                         types.find(instruction.elementTypeId) == types.end())) {
+                        diagnostics.report(
+                            "RS3054",
+                            "invalid MIR array allocation",
+                            instruction.sourceSpan);
+                    }
+                } else if (instruction.opcode == Opcode::ArrayLength &&
+                           operandCountIsValid) {
+                    if (instruction.resultType != semantic::PrimitiveType::Int ||
+                        valueType(instruction.operands.front()) !=
+                            semantic::PrimitiveType::Array) {
+                        diagnostics.report(
+                            "RS3055",
+                            "invalid MIR array length",
+                            instruction.sourceSpan);
+                    }
+                } else if ((instruction.opcode == Opcode::LoadElement ||
+                            instruction.opcode == Opcode::StoreElement) &&
+                           operandCountIsValid) {
+                    if (valueType(instruction.operands[0]) !=
+                            semantic::PrimitiveType::Array ||
+                        valueType(instruction.operands[1]) !=
+                            semantic::PrimitiveType::Int ||
+                        instruction.elementType == semantic::PrimitiveType::Error ||
+                        instruction.elementType == semantic::PrimitiveType::Void ||
+                        (instruction.elementType == semantic::PrimitiveType::Object &&
+                         types.find(instruction.elementTypeId) == types.end())) {
+                        diagnostics.report(
+                            "RS3056",
+                            "invalid MIR array element access",
+                            instruction.sourceSpan);
+                    } else if (instruction.opcode == Opcode::LoadElement &&
+                               instruction.resultType != instruction.elementType) {
+                        diagnostics.report(
+                            "RS3057",
+                            "MIR array element load type mismatch",
+                            instruction.sourceSpan);
+                    } else if (instruction.opcode == Opcode::StoreElement &&
+                               valueType(instruction.operands[2]) !=
+                                   instruction.elementType) {
+                        diagnostics.report(
+                            "RS3058",
+                            "MIR array element store type mismatch",
                             instruction.sourceSpan);
                     }
                 } else if (instruction.opcode == Opcode::NewObject) {
@@ -503,8 +627,7 @@ bool verifyModule(
                             "MIR call signature argument count mismatch",
                             instruction.sourceSpan);
                     }
-                    if (!instruction.parameterTypeIds.empty() &&
-                        instruction.parameterTypeIds.size() !=
+                    if (instruction.parameterTypeIds.size() !=
                             instruction.parameterTypes.size()) {
                         diagnostics.report(
                             "RS3051",

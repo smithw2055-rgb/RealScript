@@ -9,7 +9,8 @@ namespace {
 
 bool definesValue(const mir::Instruction& instruction) noexcept {
     if (instruction.opcode == mir::Opcode::StoreLocal ||
-        instruction.opcode == mir::Opcode::StoreField) {
+        instruction.opcode == mir::Opcode::StoreField ||
+        instruction.opcode == mir::Opcode::StoreElement) {
         return false;
     }
     return instruction.opcode != mir::Opcode::Call ||
@@ -27,8 +28,13 @@ Opcode lowerOpcode(mir::Opcode opcode) {
     case mir::Opcode::StoreLocal: return Opcode::StoreLocal;
     case mir::Opcode::ConvertNullToString: return Opcode::ConvertNullToString;
     case mir::Opcode::ConvertNullToObject: return Opcode::ConvertNullToObject;
+    case mir::Opcode::ConvertNullToArray: return Opcode::ConvertNullToArray;
     case mir::Opcode::NewObject: return Opcode::NewObject;
+    case mir::Opcode::NewArray: return Opcode::NewArray;
     case mir::Opcode::CheckNotNull: return Opcode::CheckNotNull;
+    case mir::Opcode::ArrayLength: return Opcode::ArrayLength;
+    case mir::Opcode::LoadElement: return Opcode::LoadElement;
+    case mir::Opcode::StoreElement: return Opcode::StoreElement;
     case mir::Opcode::LoadField: return Opcode::LoadField;
     case mir::Opcode::StoreField: return Opcode::StoreField;
     case mir::Opcode::Call: return Opcode::Call;
@@ -103,6 +109,7 @@ Module Lowerer::lower(const mir::Module& source) const {
         function.parameterTypes = sourceFunction.parameterTypes;
         function.parameterTypeIds = sourceFunction.parameterTypeIds;
         function.localTypes = sourceFunction.localTypes;
+        function.localTypeIds = sourceFunction.localTypeIds;
 
         mir::ValueId maximumValue = -1;
         for (const auto& sourceBlock : sourceFunction.blocks) {
@@ -118,14 +125,20 @@ Module Lowerer::lower(const mir::Module& source) const {
         function.registerTypes.assign(
             maximumValue < 0 ? 0 : static_cast<std::size_t>(maximumValue + 1),
             semantic::PrimitiveType::Error);
+        function.registerTypeIds.assign(function.registerTypes.size(), 0);
 
         for (const auto& sourceBlock : sourceFunction.blocks) {
             BasicBlock block;
             block.id = sourceBlock.id;
             for (const auto& parameter : sourceBlock.parameters) {
                 const auto target = static_cast<Register>(parameter.value);
-                block.parameters.push_back({target, parameter.type});
+                block.parameters.push_back({
+                    target,
+                    parameter.type,
+                    parameter.typeId,
+                });
                 function.registerTypes.at(target) = parameter.type;
+                function.registerTypeIds.at(target) = parameter.typeId;
             }
 
             for (const auto& sourceInstruction : sourceBlock.instructions) {
@@ -157,6 +170,8 @@ Module Lowerer::lower(const mir::Module& source) const {
                     }
                     instruction.typeIndex = foundType->second;
                 }
+                instruction.elementType = sourceInstruction.elementType;
+                instruction.elementTypeId = sourceInstruction.elementTypeId;
                 instruction.integerImmediate = sourceInstruction.integerImmediate;
                 instruction.boolImmediate = sourceInstruction.boolImmediate;
                 instruction.stringImmediate = sourceInstruction.stringImmediate;
@@ -186,6 +201,8 @@ Module Lowerer::lower(const mir::Module& source) const {
                 if (instruction.result != InvalidRegister) {
                     function.registerTypes.at(instruction.result) =
                         sourceInstruction.resultType;
+                    function.registerTypeIds.at(instruction.result) =
+                        sourceInstruction.resultTypeId;
                 }
                 block.instructions.push_back(std::move(instruction));
             }

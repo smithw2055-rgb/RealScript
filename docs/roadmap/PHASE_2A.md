@@ -54,10 +54,10 @@ Function references are deduplicated by stable symbol identity, name and full si
 
 ## `.rsbc` container
 
-The Phase 2A v0.1 container established the original shape. Phase 3B advances the implemented format to 0.2 by adding type descriptors and exact object TypeIds. The shared container uses:
+The Phase 2A v0.1 container established the original shape. Phase 3B advanced the format to 0.2 with object descriptors; Phase 3C advances the implemented format to 0.3 with array/handle tags, exact register TypeIds and array instruction metadata. The shared container uses:
 
 - `RSBC` magic;
-- a versioned bytecode header (currently 0.2);
+- a versioned bytecode header (currently 0.3);
 - little-endian fixed-width scalar fields;
 - a section directory;
 - string, function-reference, function metadata and code sections;

@@ -25,8 +25,13 @@ enum class Opcode {
     StoreLocal,
     ConvertNullToString,
     ConvertNullToObject,
+    ConvertNullToArray,
     NewObject,
+    NewArray,
     CheckNotNull,
+    ArrayLength,
+    LoadElement,
+    StoreElement,
     LoadField,
     StoreField,
     Call,
@@ -54,6 +59,8 @@ struct Instruction {
     std::size_t localIndex = 0;
     semantic::SymbolId typeId = 0;
     std::size_t fieldIndex = 0;
+    semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
+    semantic::SymbolId elementTypeId = 0;
     std::int64_t integerImmediate = 0;
     bool boolImmediate = false;
     std::string stringImmediate;
@@ -67,6 +74,7 @@ struct Instruction {
 struct BlockParameter {
     ValueId value = -1;
     semantic::PrimitiveType type = semantic::PrimitiveType::Error;
+    semantic::SymbolId typeId = 0;
 };
 
 enum class TerminatorKind {
@@ -104,6 +112,7 @@ struct Function {
     std::vector<semantic::PrimitiveType> parameterTypes;
     std::vector<semantic::SymbolId> parameterTypeIds;
     std::vector<semantic::PrimitiveType> localTypes;
+    std::vector<semantic::SymbolId> localTypeIds;
     std::vector<BasicBlock> blocks;
 };
 
@@ -128,7 +137,8 @@ private:
     [[nodiscard]] BlockId createBlock();
     [[nodiscard]] ValueId addBlockParameter(
         BlockId block,
-        semantic::PrimitiveType type);
+        semantic::PrimitiveType type,
+        semantic::SymbolId typeId = 0);
     [[nodiscard]] BasicBlock& block(BlockId id);
     [[nodiscard]] const BasicBlock& block(BlockId id) const;
     [[nodiscard]] bool hasCurrentBlock() const noexcept;

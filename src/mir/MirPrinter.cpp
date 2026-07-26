@@ -11,7 +11,8 @@ void printSignatureType(
     semantic::PrimitiveType type,
     semantic::SymbolId typeId) {
     out << semantic::primitiveTypeName(type);
-    if (type == semantic::PrimitiveType::Object && typeId != 0) {
+    if ((type == semantic::PrimitiveType::Object ||
+         type == semantic::PrimitiveType::Array) && typeId != 0) {
         out << "[0x" << std::hex << typeId << std::dec << ']';
     }
 }
@@ -53,15 +54,20 @@ std::string printModule(const Module& module) {
                     ? function.parameterTypeIds[i]
                     : 0);
         }
-        out << ") -> " << semantic::primitiveTypeName(function.returnType)
-            << " {\n";
+        out << ") -> ";
+        printSignatureType(out, function.returnType, function.returnTypeId);
+        out << " {\n";
 
         out << "  locals [";
         for (std::size_t i = 0; i < function.localTypes.size(); ++i) {
             if (i != 0) {
                 out << ", ";
             }
-            out << i << ':' << semantic::primitiveTypeName(function.localTypes[i]);
+            out << i << ':';
+            printSignatureType(
+                out,
+                function.localTypes[i],
+                i < function.localTypeIds.size() ? function.localTypeIds[i] : 0);
         }
         out << "]\n";
 
@@ -73,9 +79,11 @@ std::string printModule(const Module& module) {
                     if (i != 0) {
                         out << ", ";
                     }
-                    out << '%' << basicBlock.parameters[i].value << ':'
-                        << semantic::primitiveTypeName(
-                            basicBlock.parameters[i].type);
+                    out << '%' << basicBlock.parameters[i].value << ':';
+                    printSignatureType(
+                        out,
+                        basicBlock.parameters[i].type,
+                        basicBlock.parameters[i].typeId);
                 }
                 out << ')';
             }
@@ -84,9 +92,12 @@ std::string printModule(const Module& module) {
             for (const auto& instruction : basicBlock.instructions) {
                 out << "  ";
                 if (instruction.result >= 0) {
-                    out << '%' << instruction.result << ':'
-                        << semantic::primitiveTypeName(instruction.resultType)
-                        << " = ";
+                    out << '%' << instruction.result << ':';
+                    printSignatureType(
+                        out,
+                        instruction.resultType,
+                        instruction.resultTypeId);
+                    out << " = ";
                 }
                 out << opcodeName(instruction.opcode);
 
@@ -102,6 +113,19 @@ std::string printModule(const Module& module) {
                 } else if (instruction.opcode == Opcode::StoreLocal) {
                     out << ' ' << instruction.localIndex << ", %"
                         << instruction.operands.front();
+                } else if (instruction.opcode == Opcode::NewArray) {
+                    out << ' ' << semantic::primitiveTypeName(
+                        instruction.elementType) << ", %"
+                        << instruction.operands.front();
+                } else if (instruction.opcode == Opcode::ArrayLength) {
+                    out << " %" << instruction.operands.front();
+                } else if (instruction.opcode == Opcode::LoadElement) {
+                    out << " %" << instruction.operands[0] << ", %"
+                        << instruction.operands[1];
+                } else if (instruction.opcode == Opcode::StoreElement) {
+                    out << " %" << instruction.operands[0] << ", %"
+                        << instruction.operands[1] << ", %"
+                        << instruction.operands[2];
                 } else if (instruction.opcode == Opcode::NewObject) {
                     out << " @" << instruction.symbolName << "[0x"
                         << std::hex << instruction.typeId << std::dec << "]";

@@ -145,18 +145,33 @@ bool expectSignatureType(
     semantic::SymbolId typeId,
     const std::string& context) {
     if (!expectType(state, value, type, context)) return false;
-    if (type != semantic::PrimitiveType::Object ||
-        std::holds_alternative<NullObject>(value) ||
-        typeId == 0) {
-        return true;
-    }
-    const auto* reference = std::get_if<ObjectRef>(&value);
-    const auto actual = reference && state.heap
-        ? state.heap->objectTypeId(*reference)
-        : std::optional<semantic::SymbolId>{};
-    if (!actual || *actual != typeId) {
-        return fail(state, ErrorCode::TypeMismatch,
-            context + " has the wrong runtime object type");
+    if (type == semantic::PrimitiveType::Object) {
+        if (std::holds_alternative<NullObject>(value) || typeId == 0) return true;
+        const auto* reference = std::get_if<ObjectRef>(&value);
+        const auto actual = reference && state.heap
+            ? state.heap->objectTypeId(*reference)
+            : std::optional<semantic::SymbolId>{};
+        if (!actual || *actual != typeId) {
+            return fail(state, ErrorCode::TypeMismatch,
+                context + " has the wrong runtime object type");
+        }
+    } else if (type == semantic::PrimitiveType::Array) {
+        if (std::holds_alternative<NullArray>(value) || typeId == 0) return true;
+        const auto* reference = std::get_if<ObjectRef>(&value);
+        const auto actual = reference && state.heap
+            ? state.heap->arrayTypeId(*reference)
+            : std::optional<semantic::SymbolId>{};
+        if (!actual || *actual != typeId) {
+            return fail(state, ErrorCode::TypeMismatch,
+                context + " has the wrong runtime array type");
+        }
+    } else if (type == semantic::PrimitiveType::Handle && typeId != 0) {
+        const auto* handle = std::get_if<NativeHandle>(&value);
+        if (!handle || (!handle->valid() && handle->typeId != 0) ||
+            (handle->valid() && handle->typeId != typeId)) {
+            return fail(state, ErrorCode::TypeMismatch,
+                context + " has the wrong native handle type");
+        }
     }
     return true;
 }
@@ -173,6 +188,8 @@ Value defaultFieldValue(semantic::PrimitiveType type) {
     case semantic::PrimitiveType::Int: return std::int64_t{0};
     case semantic::PrimitiveType::String: return NullString{};
     case semantic::PrimitiveType::Object: return NullObject{};
+    case semantic::PrimitiveType::Array: return NullArray{};
+    case semantic::PrimitiveType::Handle: return NativeHandle{};
     case semantic::PrimitiveType::Null: return std::monostate{};
     case semantic::PrimitiveType::Void:
     case semantic::PrimitiveType::Error:
@@ -187,14 +204,15 @@ bool valuesEqual(State& state, const Value& left, const Value& right, bool& equa
         equal = false;
         return true;
     }
-    if (valueType(left) == semantic::PrimitiveType::Object) {
+    if (valueType(left) == semantic::PrimitiveType::Object ||
+        valueType(left) == semantic::PrimitiveType::Array) {
         const auto validate = [&](const Value& value) {
             const auto* reference = std::get_if<ObjectRef>(&value);
             return !reference || (state.heap && state.heap->isAlive(*reference));
         };
         if (!validate(left) || !validate(right)) {
             return fail(state, ErrorCode::InvalidObjectReference,
-                "object equality encountered an invalid managed reference");
+                "reference equality encountered an invalid managed reference");
         }
         equal = left == right;
         return true;
@@ -323,6 +341,7 @@ bool executeCall(
 bool executeInstruction(
     State& state,
     const bytecode::Module& module,
+    const bytecode::Function& function,
     const bytecode::Instruction& instruction,
     const std::vector<Value>& arguments,
     std::vector<Value>& locals,
@@ -397,6 +416,51 @@ bool executeInstruction(
         if (!value || !expectType(state, *value, semantic::PrimitiveType::Null, "conversion")) return false;
         return storeResult(NullObject{});
     }
+    case bytecode::Opcode::ConvertNullToArray: {
+        const auto* value = operand(0);
+        if (!value || !expectType(state, *value, semantic::PrimitiveType::Null, "conversion")) return false;
+        return storeResult(NullArray{});
+    }
+    case bytecode::Opcode::NewArray: {
+        const auto* lengthValue = operand(0);
+        if (!lengthValue ||
+            !expectType(state, *lengthValue, semantic::PrimitiveType::Int,
+                "array length") ||
+            !state.heap) {
+            return false;
+        }
+        const auto length = std::get<std::int64_t>(*lengthValue);
+        if (length < 0) {
+            return fail(state, ErrorCode::IndexOutOfRange,
+                "array length cannot be negative");
+        }
+        if (static_cast<std::uint64_t>(length) >
+            static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+            return fail(state, ErrorCode::OutOfMemory, "array length is too large");
+        }
+        if (instruction.result >= function.registerTypeIds.size()) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "array allocation result type metadata is missing");
+        }
+        RuntimeError allocationError;
+        const auto reference = state.heap->allocateTypedArray(
+            function.registerTypeIds[instruction.result],
+            instruction.elementType,
+            instruction.elementTypeId,
+            static_cast<std::size_t>(length),
+            defaultFieldValue(instruction.elementType),
+            &allocationError);
+        if (!reference) {
+            return fail(state,
+                allocationError.code == ErrorCode::None
+                    ? ErrorCode::OutOfMemory
+                    : allocationError.code,
+                allocationError.message.empty()
+                    ? "managed array allocation failed"
+                    : allocationError.message);
+        }
+        return storeResult(*reference);
+    }
     case bytecode::Opcode::NewObject: {
         const auto* type = typeDescriptor(module, instruction.typeIndex);
         if (!type || !state.heap) {
@@ -410,7 +474,8 @@ bool executeInstruction(
             const auto fieldType = type->fields[index].type;
             fields.push_back(defaultFieldValue(fieldType));
             if (fieldType == semantic::PrimitiveType::String ||
-                fieldType == semantic::PrimitiveType::Object) {
+                fieldType == semantic::PrimitiveType::Object ||
+                fieldType == semantic::PrimitiveType::Array) {
                 referenceFields.push_back(index);
             }
         }
@@ -430,6 +495,119 @@ bool executeInstruction(
                     : allocationError.message);
         }
         return storeResult(*reference);
+    }
+    case bytecode::Opcode::ArrayLength: {
+        const auto* receiver = operand(0);
+        if (!receiver) return false;
+        if (std::holds_alternative<NullArray>(*receiver)) {
+            return fail(state, ErrorCode::NullReference,
+                "array length attempted to dereference null");
+        }
+        if (!expectType(state, *receiver, semantic::PrimitiveType::Array,
+                "array length")) {
+            return false;
+        }
+        const auto* reference = std::get_if<ObjectRef>(receiver);
+        const auto length = reference && state.heap
+            ? state.heap->arrayLength(*reference)
+            : std::optional<std::size_t>{};
+        if (!length || *length >
+                static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+            return fail(state, ErrorCode::InvalidObjectReference,
+                "array length references an invalid managed array");
+        }
+        return storeResult(static_cast<std::int64_t>(*length));
+    }
+    case bytecode::Opcode::LoadElement: {
+        const auto* receiver = operand(0);
+        const auto* indexValue = operand(1);
+        if (!receiver || !indexValue) return false;
+        if (std::holds_alternative<NullArray>(*receiver)) {
+            return fail(state, ErrorCode::NullReference,
+                "array element load attempted to dereference null");
+        }
+        if (!expectType(state, *receiver, semantic::PrimitiveType::Array,
+                "array element load") ||
+            !expectType(state, *indexValue, semantic::PrimitiveType::Int,
+                "array index")) {
+            return false;
+        }
+        const auto index = std::get<std::int64_t>(*indexValue);
+        const auto reference = std::get<ObjectRef>(*receiver);
+        const auto length = state.heap->arrayLength(reference);
+        if (!length) {
+            return fail(state, ErrorCode::InvalidObjectReference,
+                "array element load references an invalid managed array");
+        }
+        if (index < 0 || static_cast<std::uint64_t>(index) >= *length) {
+            return fail(state, ErrorCode::IndexOutOfRange,
+                "array element index is out of range");
+        }
+        const auto elementType = state.heap->arrayElementType(reference);
+        const auto elementTypeId = state.heap->arrayElementTypeId(reference);
+        if (!elementType || !elementTypeId ||
+            *elementType != instruction.elementType ||
+            *elementTypeId != instruction.elementTypeId) {
+            return fail(state, ErrorCode::TypeMismatch,
+                "array element metadata does not match the bytecode operation");
+        }
+        const auto value = state.heap->arrayGet(
+            reference, static_cast<std::size_t>(index));
+        if (!value || !expectSignatureType(
+                state, *value, instruction.elementType,
+                instruction.elementTypeId, "array element value")) {
+            return false;
+        }
+        return storeResult(*value);
+    }
+    case bytecode::Opcode::StoreElement: {
+        const auto* receiver = operand(0);
+        const auto* indexValue = operand(1);
+        const auto* value = operand(2);
+        if (!receiver || !indexValue || !value) return false;
+        if (std::holds_alternative<NullArray>(*receiver)) {
+            return fail(state, ErrorCode::NullReference,
+                "array element store attempted to dereference null");
+        }
+        if (!expectType(state, *receiver, semantic::PrimitiveType::Array,
+                "array element store") ||
+            !expectType(state, *indexValue, semantic::PrimitiveType::Int,
+                "array index") ||
+            !expectSignatureType(state, *value, instruction.elementType,
+                instruction.elementTypeId, "array element store value")) {
+            return false;
+        }
+        const auto index = std::get<std::int64_t>(*indexValue);
+        const auto reference = std::get<ObjectRef>(*receiver);
+        const auto length = state.heap->arrayLength(reference);
+        if (!length) {
+            return fail(state, ErrorCode::InvalidObjectReference,
+                "array element store references an invalid managed array");
+        }
+        if (index < 0 || static_cast<std::uint64_t>(index) >= *length) {
+            return fail(state, ErrorCode::IndexOutOfRange,
+                "array element index is out of range");
+        }
+        const auto elementType = state.heap->arrayElementType(reference);
+        const auto elementTypeId = state.heap->arrayElementTypeId(reference);
+        if (!elementType || !elementTypeId ||
+            *elementType != instruction.elementType ||
+            *elementTypeId != instruction.elementTypeId) {
+            return fail(state, ErrorCode::TypeMismatch,
+                "array element metadata does not match the bytecode operation");
+        }
+        RuntimeError arrayError;
+        if (!state.heap->arraySet(
+                reference, static_cast<std::size_t>(index), *value, &arrayError)) {
+            return fail(state,
+                arrayError.code == ErrorCode::None
+                    ? ErrorCode::InvalidProgram
+                    : arrayError.code,
+                arrayError.message.empty()
+                    ? "array element store failed"
+                    : arrayError.message);
+        }
+        return true;
     }
     case bytecode::Opcode::CheckNotNull: {
         const auto* value = operand(0);
@@ -458,7 +636,8 @@ bool executeInstruction(
                 state,
                 *value,
                 field.type,
-                field.type == semantic::PrimitiveType::Object
+                (field.type == semantic::PrimitiveType::Object ||
+                 field.type == semantic::PrimitiveType::Array)
                     ? semantic::stableTypeId(field.typeName)
                     : 0,
                 "field load value")) {
@@ -477,8 +656,10 @@ bool executeInstruction(
                 state,
                 *value,
                 type->fields[instruction.index].type,
-                type->fields[instruction.index].type ==
-                        semantic::PrimitiveType::Object
+                (type->fields[instruction.index].type ==
+                        semantic::PrimitiveType::Object ||
+                 type->fields[instruction.index].type ==
+                        semantic::PrimitiveType::Array)
                     ? semantic::stableTypeId(
                           type->fields[instruction.index].typeName)
                     : 0,
@@ -597,7 +778,7 @@ bool executeFunction(
 
     while (true) {
         for (const auto& instruction : block->instructions) {
-            if (!executeInstruction(state, *location.module, instruction,
+            if (!executeInstruction(state, *location.module, function, instruction,
                     arguments, locals, registers)) {
                 state.stack.pop_back();
                 return false;
@@ -810,7 +991,9 @@ const char* errorCodeName(ErrorCode code) noexcept {
     case ErrorCode::ExternalFunctionUnresolved: return "external-function-unresolved";
     case ErrorCode::DuplicateSymbol: return "duplicate-symbol";
     case ErrorCode::InvalidObjectReference: return "invalid-object-reference";
+    case ErrorCode::InvalidNativeHandle: return "invalid-native-handle";
     case ErrorCode::NullReference: return "null-reference";
+    case ErrorCode::IndexOutOfRange: return "index-out-of-range";
     case ErrorCode::OutOfMemory: return "out-of-memory";
     case ErrorCode::InvalidProgram: return "invalid-program";
     }
@@ -821,13 +1004,14 @@ semantic::PrimitiveType valueType(const Value& value) noexcept {
     if (std::holds_alternative<std::monostate>(value)) return semantic::PrimitiveType::Null;
     if (std::holds_alternative<NullString>(value)) return semantic::PrimitiveType::String;
     if (std::holds_alternative<NullObject>(value)) return semantic::PrimitiveType::Object;
+    if (std::holds_alternative<NullArray>(value)) return semantic::PrimitiveType::Array;
     if (std::holds_alternative<bool>(value)) return semantic::PrimitiveType::Bool;
     if (std::holds_alternative<std::int64_t>(value)) return semantic::PrimitiveType::Int;
     if (std::holds_alternative<std::string>(value)) return semantic::PrimitiveType::String;
+    if (std::holds_alternative<NativeHandle>(value)) return semantic::PrimitiveType::Handle;
     const auto& reference = std::get<ObjectRef>(value);
-    if (reference.kind == ObjectKind::String) {
-        return semantic::PrimitiveType::String;
-    }
+    if (reference.kind == ObjectKind::String) return semantic::PrimitiveType::String;
+    if (reference.kind == ObjectKind::Array) return semantic::PrimitiveType::Array;
     return semantic::PrimitiveType::Object;
 }
 
@@ -839,16 +1023,27 @@ std::string valueToString(const Value& value, const ManagedHeap* heap) {
     if (std::holds_alternative<std::monostate>(value)) return "null";
     if (std::holds_alternative<NullString>(value)) return "null";
     if (std::holds_alternative<NullObject>(value)) return "null";
+    if (std::holds_alternative<NullArray>(value)) return "null";
     if (std::holds_alternative<bool>(value)) return std::get<bool>(value) ? "true" : "false";
     if (std::holds_alternative<std::int64_t>(value)) return std::to_string(std::get<std::int64_t>(value));
     if (std::holds_alternative<std::string>(value)) return std::get<std::string>(value);
+    if (const auto* handle = std::get_if<NativeHandle>(&value)) {
+        return handle->valid()
+            ? "<handle:" + std::to_string(handle->slot) + ":" +
+                std::to_string(handle->generation) + ":registry=" +
+                std::to_string(handle->registryId) + ":type=0x" +
+                std::to_string(handle->typeId) + ">"
+            : "null";
+    }
     const auto reference = std::get<ObjectRef>(value);
     if (heap) {
         const auto text = heap->stringView(reference);
         if (text) return std::string(*text);
     }
-    return "<object:" + std::to_string(reference.slot) + ":" +
-        std::to_string(reference.generation) + ">";
+    const auto kind = reference.kind == ObjectKind::Array ? "array" : "object";
+    return "<" + std::string(kind) + ":" + std::to_string(reference.slot) + ":" +
+        std::to_string(reference.generation) + ":heap=" +
+        std::to_string(reference.heapId) + ">";
 }
 
 } // namespace realscript::runtime

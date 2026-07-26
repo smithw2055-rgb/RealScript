@@ -1,7 +1,7 @@
 # RealScript Object Model — Implemented Draft v0.1
 
 - implementation slice: Phase 3B
-- bytecode dependency: `.rsbc` 0.2
+- bytecode introduced in: `.rsbc` 0.2; current producer: `.rsbc` 0.3
 - allocation model: managed non-moving Record objects
 - status: implemented draft; object ABI is not frozen
 

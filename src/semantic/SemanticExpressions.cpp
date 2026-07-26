@@ -6,11 +6,13 @@
 namespace realscript::semantic {
 namespace {
 
-bool sameObjectType(
+bool sameReferenceType(
     const BoundExpression& expression,
+    PrimitiveType targetType,
     const std::string& targetTypeName) {
-    return expression.type != PrimitiveType::Object ||
-        targetTypeName.empty() ||
+    if (expression.type != targetType) return false;
+    return targetTypeName.empty() ||
+        expression.typeName.empty() ||
         expression.typeName == targetTypeName;
 }
 
@@ -211,13 +213,18 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
                 goto invalidOperator;
             }
         }
-        if (left->type == PrimitiveType::Object &&
-            right->type == PrimitiveType::Object &&
+        if ((left->type == PrimitiveType::Object ||
+             left->type == PrimitiveType::Array ||
+             left->type == PrimitiveType::Handle) &&
+            left->type == right->type &&
             !left->typeName.empty() && !right->typeName.empty() &&
             left->typeName != right->typeName) {
             goto invalidOperator;
         }
-        if (left->type == PrimitiveType::Object && right->type == PrimitiveType::Object) {
+        if ((left->type == PrimitiveType::Object ||
+             left->type == PrimitiveType::Array ||
+             left->type == PrimitiveType::Handle) &&
+            left->type == right->type) {
             if (left->typeName.empty()) left->typeName = right->typeName;
             if (right->typeName.empty()) right->typeName = left->typeName;
         }
@@ -319,9 +326,14 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
                 arguments[i]->type,
                 candidate.parameters[i].type);
             if (rank < 0 ||
-                (candidate.parameters[i].type == PrimitiveType::Object &&
-                 arguments[i]->type == PrimitiveType::Object &&
-                 !sameObjectType(*arguments[i], candidate.parameters[i].typeName))) {
+                ((candidate.parameters[i].type == PrimitiveType::Object ||
+                  candidate.parameters[i].type == PrimitiveType::Array ||
+                  candidate.parameters[i].type == PrimitiveType::Handle) &&
+                 arguments[i]->type == candidate.parameters[i].type &&
+                 !sameReferenceType(
+                     *arguments[i],
+                     candidate.parameters[i].type,
+                     candidate.parameters[i].typeName))) {
                 applicable = false;
                 break;
             }
@@ -375,6 +387,35 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
     return result;
 }
 
+std::unique_ptr<BoundExpression> Binder::bindNewArrayExpression(
+    const syntax::NewArrayExpressionSyntax& syntaxTree) {
+    std::string elementTypeName;
+    const auto elementType = bindType(
+        syntaxTree.elementType, false, &elementTypeName);
+    if (elementType == PrimitiveType::Error ||
+        elementType == PrimitiveType::Void ||
+        elementType == PrimitiveType::Array) {
+        diagnostics_.report(
+            "RS2420",
+            "array element type is not supported",
+            syntaxTree.elementType.span());
+        return makeError(syntaxTree.span());
+    }
+    auto length = convertExpression(
+        bindExpression(*syntaxTree.length),
+        PrimitiveType::Int,
+        syntaxTree.length->span(),
+        "array length");
+    auto result = std::make_unique<BoundNewArrayExpression>();
+    result->span = syntaxTree.span();
+    result->type = PrimitiveType::Array;
+    result->typeName = arrayTypeName(elementType, elementTypeName);
+    result->elementType = elementType;
+    result->elementTypeName = std::move(elementTypeName);
+    result->length = std::move(length);
+    return result;
+}
+
 std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
     const syntax::NewObjectExpressionSyntax& syntaxTree) {
     const auto found = visibleTypes_.find(syntaxTree.type.name.text);
@@ -396,6 +437,14 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
 std::unique_ptr<BoundExpression> Binder::bindMemberAccessExpression(
     const syntax::MemberAccessExpressionSyntax& syntaxTree) {
     auto receiver = bindExpression(*syntaxTree.receiver);
+    if (receiver->type == PrimitiveType::Array &&
+        syntaxTree.nameToken.text == "length") {
+        auto result = std::make_unique<BoundArrayLengthExpression>();
+        result->span = syntaxTree.span();
+        result->type = PrimitiveType::Int;
+        result->receiver = std::move(receiver);
+        return result;
+    }
     if (receiver->type != PrimitiveType::Object || receiver->typeName.empty()) {
         diagnostics_.report(
             "RS2404",
@@ -427,6 +476,42 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAccessExpression(
     result->receiver = std::move(receiver);
     result->ownerType = type->second;
     result->field = *field;
+    return result;
+}
+
+std::unique_ptr<BoundExpression> Binder::bindElementAccessExpression(
+    const syntax::ElementAccessExpressionSyntax& syntaxTree) {
+    auto receiver = bindExpression(*syntaxTree.receiver);
+    if (receiver->type != PrimitiveType::Array || receiver->typeName.empty()) {
+        diagnostics_.report(
+            "RS2421",
+            "element access requires an array",
+            syntaxTree.receiver->span());
+        return makeError(syntaxTree.span());
+    }
+    PrimitiveType elementType = PrimitiveType::Error;
+    std::string elementTypeName;
+    if (!decodeArrayTypeName(
+            receiver->typeName, elementType, elementTypeName)) {
+        diagnostics_.report(
+            "RS2422",
+            "array element descriptor is invalid",
+            syntaxTree.receiver->span());
+        return makeError(syntaxTree.span());
+    }
+    auto index = convertExpression(
+        bindExpression(*syntaxTree.index),
+        PrimitiveType::Int,
+        syntaxTree.index->span(),
+        "array index");
+    auto result = std::make_unique<BoundElementAccessExpression>();
+    result->span = syntaxTree.span();
+    result->type = elementType;
+    result->typeName = elementTypeName;
+    result->receiver = std::move(receiver);
+    result->index = std::move(index);
+    result->elementType = elementType;
+    result->elementTypeName = std::move(elementTypeName);
     return result;
 }
 
@@ -474,6 +559,49 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
     return result;
 }
 
+std::unique_ptr<BoundExpression> Binder::bindElementAssignmentExpression(
+    const syntax::ElementAssignmentExpressionSyntax& syntaxTree) {
+    auto receiver = bindExpression(*syntaxTree.receiver);
+    if (receiver->type != PrimitiveType::Array || receiver->typeName.empty()) {
+        diagnostics_.report(
+            "RS2421",
+            "element assignment requires an array",
+            syntaxTree.receiver->span());
+        return makeError(syntaxTree.span());
+    }
+    PrimitiveType elementType = PrimitiveType::Error;
+    std::string elementTypeName;
+    if (!decodeArrayTypeName(
+            receiver->typeName, elementType, elementTypeName)) {
+        diagnostics_.report(
+            "RS2422",
+            "array element descriptor is invalid",
+            syntaxTree.receiver->span());
+        return makeError(syntaxTree.span());
+    }
+    auto index = convertExpression(
+        bindExpression(*syntaxTree.index),
+        PrimitiveType::Int,
+        syntaxTree.index->span(),
+        "array index");
+    auto value = convertExpression(
+        bindExpression(*syntaxTree.expression),
+        elementType,
+        syntaxTree.expression->span(),
+        "array element assignment",
+        elementTypeName);
+    auto result = std::make_unique<BoundElementAssignmentExpression>();
+    result->span = syntaxTree.span();
+    result->type = elementType;
+    result->typeName = elementTypeName;
+    result->receiver = std::move(receiver);
+    result->index = std::move(index);
+    result->expression = std::move(value);
+    result->elementType = elementType;
+    result->elementTypeName = std::move(elementTypeName);
+    return result;
+}
+
 std::unique_ptr<BoundExpression> Binder::convertExpression(
     std::unique_ptr<BoundExpression> expression,
     PrimitiveType target,
@@ -488,12 +616,14 @@ std::unique_ptr<BoundExpression> Binder::convertExpression(
         return expression;
     }
 
-    if (target == PrimitiveType::Object &&
-        expression->type == PrimitiveType::Object &&
-        !sameObjectType(*expression, targetTypeName)) {
+    if ((target == PrimitiveType::Object ||
+         target == PrimitiveType::Array ||
+         target == PrimitiveType::Handle) &&
+        expression->type == target &&
+        !sameReferenceType(*expression, target, targetTypeName)) {
         diagnostics_.report(
             "RS2410",
-            "cannot convert object type '" + expression->typeName +
+            "cannot convert reference type '" + expression->typeName +
                 "' to '" + targetTypeName + "' for " + context,
             span);
         return makeError(span);
@@ -510,7 +640,10 @@ std::unique_ptr<BoundExpression> Binder::convertExpression(
         return makeError(span);
     }
     if (conversion == ConversionKind::Identity) {
-        if (target == PrimitiveType::Object && !targetTypeName.empty()) {
+        if ((target == PrimitiveType::Object ||
+             target == PrimitiveType::Array ||
+             target == PrimitiveType::Handle) &&
+            !targetTypeName.empty()) {
             expression->typeName = std::move(targetTypeName);
         }
         return expression;

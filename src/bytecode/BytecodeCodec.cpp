@@ -126,6 +126,8 @@ std::uint8_t encodeType(semantic::PrimitiveType type) {
     case semantic::PrimitiveType::String: return 3;
     case semantic::PrimitiveType::Object: return 4;
     case semantic::PrimitiveType::Null: return 5;
+    case semantic::PrimitiveType::Array: return 6;
+    case semantic::PrimitiveType::Handle: return 7;
     case semantic::PrimitiveType::Error: break;
     }
     throw std::logic_error("invalid type in bytecode encoder");
@@ -139,8 +141,22 @@ bool decodeType(std::uint8_t tag, semantic::PrimitiveType& type) {
     case 3: type = semantic::PrimitiveType::String; return true;
     case 4: type = semantic::PrimitiveType::Object; return true;
     case 5: type = semantic::PrimitiveType::Null; return true;
+    case 6: type = semantic::PrimitiveType::Array; return true;
+    case 7: type = semantic::PrimitiveType::Handle; return true;
     default: return false;
     }
+}
+
+std::uint8_t encodeOptionalType(semantic::PrimitiveType type) {
+    return type == semantic::PrimitiveType::Error ? 0xffu : encodeType(type);
+}
+
+bool decodeOptionalType(std::uint8_t tag, semantic::PrimitiveType& type) {
+    if (tag == 0xffu) {
+        type = semantic::PrimitiveType::Error;
+        return true;
+    }
+    return decodeType(tag, type);
 }
 
 class StringPool {
@@ -327,6 +343,7 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
             for (const auto& parameter : block.parameters) {
                 codeSection.u32(parameter.target);
                 codeSection.u8(encodeType(parameter.type));
+                codeSection.u64(parameter.typeId);
             }
             codeSection.u32(static_cast<std::uint32_t>(block.instructions.size()));
             for (const auto& instruction : block.instructions) {
@@ -335,6 +352,8 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
                 writeRegisters(codeSection, instruction.operands);
                 codeSection.u32(instruction.index);
                 codeSection.u32(instruction.typeIndex);
+                codeSection.u8(encodeOptionalType(instruction.elementType));
+                codeSection.u64(instruction.elementTypeId);
                 codeSection.i64(instruction.integerImmediate);
                 codeSection.u8(instruction.boolImmediate ? 1 : 0);
                 codeSection.u32(
@@ -367,7 +386,9 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         writeTypes(functionSection, function.parameterTypes);
         writeTypeIds(functionSection, function.parameterTypeIds);
         writeTypes(functionSection, function.localTypes);
+        writeTypeIds(functionSection, function.localTypeIds);
         writeTypes(functionSection, function.registerTypes);
+        writeTypeIds(functionSection, function.registerTypeIds);
         functionSection.u32(codeRanges[index].first);
         functionSection.u32(codeRanges[index].second);
     }
@@ -429,7 +450,7 @@ bool decodeModule(
         diagnostics.report("RS5003", "truncated bytecode header", {});
         return false;
     }
-    if (module.version.major != 0 || module.version.minor != 2) {
+    if (module.version.major != 0 || module.version.minor != 3) {
         diagnostics.report("RS5001", "unsupported bytecode version", {});
         return false;
     }
@@ -637,7 +658,9 @@ bool decodeModule(
             if (!readTypes(reader, record.function.parameterTypes, diagnostics) ||
                 !readTypeIds(reader, record.function.parameterTypeIds, diagnostics) ||
                 !readTypes(reader, record.function.localTypes, diagnostics) ||
-                !readTypes(reader, record.function.registerTypes, diagnostics)) {
+                !readTypeIds(reader, record.function.localTypeIds, diagnostics) ||
+                !readTypes(reader, record.function.registerTypes, diagnostics) ||
+                !readTypeIds(reader, record.function.registerTypeIds, diagnostics)) {
                 diagnostics.report("RS5004", "invalid function type metadata", {});
                 return false;
             }
@@ -682,7 +705,7 @@ bool decodeModule(
             BasicBlock block;
             block.id = reader.u32();
             const auto parameterCount = reader.u32();
-            if (!reader.valid() || parameterCount > reader.remaining() / 5) {
+            if (!reader.valid() || parameterCount > reader.remaining() / 13) {
                 diagnostics.report("RS5003", "invalid block parameter count", {});
                 return false;
             }
@@ -693,11 +716,12 @@ bool decodeModule(
                     diagnostics.report("RS5004", "invalid block parameter type", {});
                     return false;
                 }
+                value.typeId = reader.u64();
                 block.parameters.push_back(value);
             }
 
             const auto instructionCount = reader.u32();
-            if (!reader.valid() || instructionCount > reader.remaining() / 30 + 1) {
+            if (!reader.valid() || instructionCount > reader.remaining() / 39 + 1) {
                 diagnostics.report("RS5003", "invalid bytecode instruction count", {});
                 return false;
             }
@@ -718,6 +742,11 @@ bool decodeModule(
                 }
                 instruction.index = reader.u32();
                 instruction.typeIndex = reader.u32();
+                if (!decodeOptionalType(reader.u8(), instruction.elementType)) {
+                    diagnostics.report("RS5004", "invalid instruction element type", {});
+                    return false;
+                }
+                instruction.elementTypeId = reader.u64();
                 instruction.integerImmediate = reader.i64();
                 instruction.boolImmediate = reader.u8() != 0;
                 const auto stringIndex = reader.u32();

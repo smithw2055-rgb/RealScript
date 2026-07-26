@@ -85,7 +85,8 @@ std::optional<semantic::SymbolId> ProgramImage::findFunction(const std::string& 
 
 EngineRuntime::EngineRuntime(std::shared_ptr<const ProgramImage> program)
     : program_(std::move(program)),
-      heap_(std::make_shared<ManagedHeap>()) {}
+      heap_(std::make_shared<ManagedHeap>()),
+      nativeHandles_(std::make_shared<NativeHandleRegistry>()) {}
 
 void EngineRuntime::setBindings(std::shared_ptr<const BindingRegistry> bindings) {
     bindings_ = std::move(bindings);
@@ -96,6 +97,17 @@ void EngineRuntime::setHeap(std::shared_ptr<ManagedHeap> heap) {
 }
 
 std::shared_ptr<ManagedHeap> EngineRuntime::heap() const noexcept { return heap_; }
+
+void EngineRuntime::setNativeHandles(
+    std::shared_ptr<NativeHandleRegistry> handles) {
+    nativeHandles_ = handles
+        ? std::move(handles)
+        : std::make_shared<NativeHandleRegistry>();
+}
+
+std::shared_ptr<NativeHandleRegistry> EngineRuntime::nativeHandles() const noexcept {
+    return nativeHandles_;
+}
 
 ExecutionResult EngineRuntime::invoke(
     const std::string& qualifiedName,
