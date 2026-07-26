@@ -41,6 +41,16 @@ add_library(realscript_frontend STATIC
     src/runtime/ManagedHeap.cpp
 )
 
+# AOT source-map coordinates are ABI-defined uint32_t while parser source
+# positions use size_t. The conversion is intentional and covered by the
+# generator/source-map tests, so suppress C4267 only for this translation unit.
+if(MSVC)
+    set_source_files_properties(
+        src/aot_cpp/AotCpp.cpp
+        PROPERTIES COMPILE_OPTIONS "/wd4267"
+    )
+endif()
+
 add_library(RealScript::Frontend ALIAS realscript_frontend)
 add_library(RealScript::Runtime ALIAS realscript_frontend)
 add_library(RealScript::AotSupport ALIAS realscript_frontend)
@@ -148,7 +158,6 @@ if(REALSCRIPT_BUILD_TESTS)
     target_link_libraries(realscript_phase4_tests PRIVATE RealScript::Frontend)
     target_compile_features(realscript_phase4_tests PRIVATE cxx_std_17)
     add_test(NAME realscript.phase4 COMMAND realscript_phase4_tests)
-
 
     add_executable(realscript_phase5_tests tests/phase5_tests.cpp)
     target_link_libraries(realscript_phase5_tests PRIVATE RealScript::Frontend)
