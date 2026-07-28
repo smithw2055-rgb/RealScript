@@ -23,6 +23,7 @@
 #include <vector>
 
 namespace realscript::game {
+
 namespace detail {
 
 enum class ScriptTypeCategory {
@@ -50,6 +51,7 @@ struct FunctionDeclaration {
     std::string name;
     ScriptTypeRef returnType;
     std::vector<ParameterDeclaration> parameters;
+    std::string body;
 };
 
 struct PropertyDeclaration {
@@ -57,6 +59,8 @@ struct PropertyDeclaration {
     ScriptTypeRef type;
     bool getter = false;
     bool setter = false;
+    std::string getterBody;
+    std::string setterBody;
 };
 
 struct NativeTypeDeclaration {
@@ -86,6 +90,7 @@ struct GameApiState {
     std::unordered_map<std::type_index, std::size_t> nativeTypeByCppType;
     std::map<std::string, ModuleDeclaration> modules;
     std::unordered_set<std::string> bindingNames;
+    std::unordered_set<std::string> declarationNames;
     std::vector<std::string> errors;
 };
 
