@@ -20,7 +20,7 @@ C++ game objects / ECS / scene graph
        RealScript ProgramImage
 ```
 
-`GameApi` generates ordinary RealScript declarations for host modules. These declarations participate in parsing, type checking, member lookup, metadata, and bytecode generation. Before linking, generated placeholder function bodies are removed, so calls resolve through `BindingRegistry` instead of executing the placeholders. This keeps one compiler pipeline and avoids a second handwritten binding language.
+`GameApi` generates ordinary RealScript declarations for host modules. These declarations participate in parsing, type checking, member lookup, metadata, MIR, and bytecode generation. Script-visible functions, methods, and property accessors remain as ordinary wrapper functions in the linked program image. Only hidden native trampoline bodies are removed before linking, causing those calls to resolve through `BindingRegistry`. This keeps one compiler pipeline, lets scripts and C++ hosts invoke the same public symbols, and avoids a second handwritten binding language.
 
 ## Register C++ functions and classes
 
@@ -46,7 +46,7 @@ api.function(
 
 The initial binding surface supports `void`, `bool`, integral, floating-point, `std::string`, `std::string_view`, `std::shared_ptr<T>`, and `T*` for registered native object types. Free functions, const/non-const member functions, properties, and all existing determinism policies are supported.
 
-Bindings use stable names:
+Scripts use stable public names:
 
 ```text
 Engine.Game::ClampDamage
@@ -55,7 +55,7 @@ Engine.Game::Character.get_Health
 Engine.Game::Character.set_Health
 ```
 
-Native objects are exposed through generated script wrappers containing a generation-checked `NativeHandle`. Binding trampolines verify wrapper type, registry identity, generation, and C++ type before invocation.
+Generated `__rs_native_*` trampoline names are internal implementation details and should not be referenced by game scripts. Native objects are exposed through generated script wrappers containing a generation-checked `NativeHandle`. Binding trampolines verify wrapper type, registry identity, generation, and C++ type before invocation.
 
 ## Compile scripts
 
