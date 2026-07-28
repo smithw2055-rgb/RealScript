@@ -2,6 +2,7 @@
 
 #include "realscript/diagnostics/Diagnostic.h"
 
+#include <algorithm>
 #include <sstream>
 #include <utility>
 
@@ -48,7 +49,9 @@ void writeFunction(
     const char* indent) {
     out << indent << function.returnType.sourceName << ' ' << function.name << '(';
     writeParameters(out, function.parameters);
-    out << ") { " << dummyReturn(function.returnType) << " }\n";
+    out << ") { "
+        << (function.body.empty() ? dummyReturn(function.returnType) : function.body)
+        << " }\n";
 }
 
 } // namespace
@@ -86,10 +89,18 @@ std::vector<compiler::SourceFile> GameApi::generatedSources() const {
             for (const auto& property : type.properties) {
                 out << "    " << property.type.sourceName << ' ' << property.name << "\n    {\n";
                 if (property.getter) {
-                    out << "        get { " << dummyReturn(property.type) << " }\n";
+                    out << "        get { "
+                        << (property.getterBody.empty()
+                            ? dummyReturn(property.type)
+                            : property.getterBody)
+                        << " }\n";
                 }
                 if (property.setter) {
-                    out << "        set { return; }\n";
+                    out << "        set { "
+                        << (property.setterBody.empty()
+                            ? std::string{"return;"}
+                            : property.setterBody)
+                        << " }\n";
                 }
                 out << "    }\n";
             }
@@ -111,6 +122,10 @@ std::set<std::string> GameApi::nativeModules() const {
     std::set<std::string> result;
     for (const auto& entry : state_->modules) result.insert(entry.first);
     return result;
+}
+
+const std::unordered_set<std::string>& GameApi::nativeBindingNames() const noexcept {
+    return state_->bindingNames;
 }
 
 bool GameApi::valid() const noexcept { return state_->errors.empty(); }
@@ -144,17 +159,25 @@ GameCompileResult GameScriptCompiler::compile(
     if (result.diagnostics.hasErrors()) return result;
 
     const auto nativeModules = api_.nativeModules();
+    const auto& nativeBindings = api_.nativeBindingNames();
     bytecode::Lowerer lowerer;
     std::vector<bytecode::Module> modules;
     modules.reserve(build.modules.size());
     for (const auto& mirModule : build.modules) {
         auto module = lowerer.lower(mirModule);
         if (nativeModules.find(module.name) != nativeModules.end()) {
-            // Generated declarations describe the host API to the compiler. Their
-            // bodies are deliberately removed so calls cross the native binding
-            // boundary rather than executing the placeholder implementations.
-            module.functions.clear();
-            module.functionReferences.clear();
+            // Generated declarations describe the host API to the compiler. Only
+            // binding trampolines are removed; script-visible void wrappers stay
+            // in the image and adapt the VM's current external-return contract.
+            module.functions.erase(
+                std::remove_if(
+                    module.functions.begin(),
+                    module.functions.end(),
+                    [&](const bytecode::Function& function) {
+                        return nativeBindings.find(
+                            module.name + "::" + function.name) != nativeBindings.end();
+                    }),
+                module.functions.end());
         }
         modules.push_back(std::move(module));
     }
