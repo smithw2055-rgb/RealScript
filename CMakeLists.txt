@@ -43,6 +43,12 @@ add_library(realscript_frontend STATIC
     src/runtime/RuntimeServices.cpp
     src/runtime/ExecutionServices.cpp
     src/runtime/ManagedHeap.cpp
+    src/game/GameApi.cpp
+    src/game/ScriptObjectRuntime.cpp
+    src/game/ScriptInvokeRuntime.cpp
+    src/game/ScriptValueRuntime.cpp
+    src/game/SceneLifecycleRuntime.cpp
+    src/game/SceneEventRuntime.cpp
 )
 
 # AOT source-map coordinates are ABI-defined uint32_t while parser source
@@ -270,6 +276,11 @@ if(REALSCRIPT_BUILD_TESTS)
         PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     )
     add_test(NAME realscript.phase6.aot COMMAND realscript_phase6_aot_tests)
+
+    add_executable(realscript_phase7_tests tests/phase7_tests.cpp)
+    target_link_libraries(realscript_phase7_tests PRIVATE RealScript::Frontend)
+    target_compile_features(realscript_phase7_tests PRIVATE cxx_std_17)
+    add_test(NAME realscript.phase7.game-sdk COMMAND realscript_phase7_tests)
 
     add_test(
         NAME realscript.phase6.cli-smoke
