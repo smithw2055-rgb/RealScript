@@ -72,6 +72,12 @@ void testTypedHostBindingsAndScriptObjects() {
     auto compiled = compiler.compile({{"controller.rs", controllerSource}});
     require(compiled.succeeded(),
         "game script compilation failed:\n" + diagnosticsText(compiled.diagnostics));
+    for (const auto& module : compiled.modules) {
+        for (const auto& function : module.functions) {
+            require(function.name != "__rs_native_Character_set_Health",
+                "native property setter trampoline remained in the program image");
+        }
+    }
 
     realscript::game::ScriptRuntime runtime(compiled.program);
     realscript::runtime::RuntimeError error;
@@ -104,9 +110,14 @@ void testTypedHostBindingsAndScriptObjects() {
     require(runtime.setMember(
         *character, "Health", std::int64_t{64}, error),
         "native property setter failed: " + error.message);
+    require(nativeCharacter->health == 64,
+        "native property setter left health at " +
+        std::to_string(nativeCharacter->health));
     const auto health = runtime.getMember(*character, "Health", error);
-    require(health.has_value() && std::get<std::int64_t>(*health) == 64,
-        "native property getter returned the wrong value");
+    require(health.has_value(), "native property getter returned no value: " + error.message);
+    require(std::get<std::int64_t>(*health) == 64,
+        "native property getter returned " +
+        std::to_string(std::get<std::int64_t>(*health)));
 }
 
 const char* sceneSource = R"(
