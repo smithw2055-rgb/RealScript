@@ -103,58 +103,48 @@ public:
         }
         auto sharedCallable = std::make_shared<CallableType>(std::move(callable));
         auto state = state_;
-        if constexpr (std::is_void_v<typename Traits::Return>) {
-            const auto nativeName = "__rs_native_" + name;
-            const auto bindingName = moduleName + "::" + nativeName;
-            if (!state_->bindingNames.insert(bindingName).second) {
-                state_->errors.push_back("duplicate native binding '" + bindingName + "'");
-                return false;
-            }
-            std::string body = nativeName + "(";
-            for (std::size_t index = 0; index < parameters->size(); ++index) {
-                if (index != 0) body += ", ";
-                body += (*parameters)[index].name;
-            }
-            body += "); return;";
-            module.functions.push_back(detail::FunctionDeclaration{
-                name, *returnType, *parameters, std::move(body)});
-            module.functions.push_back(detail::FunctionDeclaration{
-                nativeName,
-                detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int},
-                *parameters,
-                {}});
-            return state_->bindings->bind(
-                bindingName,
-                [state, sharedCallable](const auto&, const auto& arguments, auto& error) {
-                    const auto invoked = detail::invokeFree<CallableType, Traits>(
-                        state,
-                        *sharedCallable,
-                        arguments,
-                        error,
-                        std::make_index_sequence<Traits::Arity>{});
-                    if (!invoked) return std::optional<runtime::Value>{};
-                    return std::optional<runtime::Value>{std::int64_t{0}};
-                },
-                determinism);
-        } else {
-            if (!state_->bindingNames.insert(publicName).second) {
-                state_->errors.push_back("duplicate native binding '" + publicName + "'");
-                return false;
-            }
-            module.functions.push_back(detail::FunctionDeclaration{
-                name, *returnType, *parameters, {}});
-            return state_->bindings->bind(
-                publicName,
-                [state, sharedCallable](const auto&, const auto& arguments, auto& error) {
-                    return detail::invokeFree<CallableType, Traits>(
-                        state,
-                        *sharedCallable,
-                        arguments,
-                        error,
-                        std::make_index_sequence<Traits::Arity>{});
-                },
-                determinism);
+        const auto nativeName = "__rs_native_" + name;
+        const auto bindingName = moduleName + "::" + nativeName;
+        if (!state_->bindingNames.insert(bindingName).second) {
+            state_->errors.push_back("duplicate native binding '" + bindingName + "'");
+            return false;
         }
+
+        std::string call = nativeName + "(";
+        for (std::size_t index = 0; index < parameters->size(); ++index) {
+            if (index != 0) call += ", ";
+            call += (*parameters)[index].name;
+        }
+        call += ")";
+        const auto wrapperBody = std::is_void_v<typename Traits::Return>
+            ? call + "; return;"
+            : "return " + call + ";";
+        module.functions.push_back(detail::FunctionDeclaration{
+            name, *returnType, *parameters, wrapperBody});
+        module.functions.push_back(detail::FunctionDeclaration{
+            nativeName,
+            std::is_void_v<typename Traits::Return>
+                ? detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int}
+                : *returnType,
+            *parameters,
+            {}});
+        return state_->bindings->bind(
+            bindingName,
+            [state, sharedCallable](const auto&, const auto& arguments, auto& error) {
+                const auto invoked = detail::invokeFree<CallableType, Traits>(
+                    state,
+                    *sharedCallable,
+                    arguments,
+                    error,
+                    std::make_index_sequence<Traits::Arity>{});
+                if (!invoked) return std::optional<runtime::Value>{};
+                if constexpr (std::is_void_v<typename Traits::Return>) {
+                    return std::optional<runtime::Value>{std::int64_t{0}};
+                } else {
+                    return invoked;
+                }
+            },
+            determinism);
     }
 
     [[nodiscard]] std::vector<compiler::SourceFile> generatedSources() const;
@@ -212,64 +202,55 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::method(
         detail::collectImports(module, parameter.type);
     }
     auto state = state_;
-    if constexpr (std::is_void_v<typename Traits::Return>) {
-        const auto nativeName = "__rs_native_" + type.name + "_" + name;
-        const auto bindingName = type.moduleName + "::" + nativeName;
-        if (!state_->bindingNames.insert(bindingName).second) {
-            state_->errors.push_back("duplicate native binding '" + bindingName + "'");
-            return *this;
-        }
-        std::vector<detail::ParameterDeclaration> nativeParameters;
-        nativeParameters.push_back({
-            detail::ScriptTypeRef{
-                type.name,
-                type.moduleName,
-                detail::ScriptTypeCategory::NativeObject},
-            "self"});
-        nativeParameters.insert(
-            nativeParameters.end(), parameters->begin(), parameters->end());
-        std::string body = nativeName + "(this";
-        for (const auto& parameter : *parameters) {
-            body += ", " + parameter.name;
-        }
-        body += "); return;";
-        type.methods.push_back(detail::FunctionDeclaration{
-            name, *returnType, *parameters, std::move(body)});
-        module.functions.push_back(detail::FunctionDeclaration{
-            nativeName,
-            detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int},
-            std::move(nativeParameters),
-            {}});
-        state_->bindings->bind(
-            bindingName,
-            [state](const auto&, const auto& arguments, auto& error) {
-                const auto invoked = detail::invokeMethod<Method, Traits>(
-                    state,
-                    arguments,
-                    error,
-                    std::make_index_sequence<Traits::Arity>{});
-                if (!invoked) return std::optional<runtime::Value>{};
-                return std::optional<runtime::Value>{std::int64_t{0}};
-            },
-            determinism);
-    } else {
-        if (!state_->bindingNames.insert(publicName).second) {
-            state_->errors.push_back("duplicate native binding '" + publicName + "'");
-            return *this;
-        }
-        type.methods.push_back(detail::FunctionDeclaration{
-            name, *returnType, *parameters, {}});
-        state_->bindings->bind(
-            publicName,
-            [state](const auto&, const auto& arguments, auto& error) {
-                return detail::invokeMethod<Method, Traits>(
-                    state,
-                    arguments,
-                    error,
-                    std::make_index_sequence<Traits::Arity>{});
-            },
-            determinism);
+    const auto nativeName = "__rs_native_" + type.name + "_" + name;
+    const auto bindingName = type.moduleName + "::" + nativeName;
+    if (!state_->bindingNames.insert(bindingName).second) {
+        state_->errors.push_back("duplicate native binding '" + bindingName + "'");
+        return *this;
     }
+
+    std::vector<detail::ParameterDeclaration> nativeParameters;
+    nativeParameters.push_back({
+        detail::ScriptTypeRef{
+            type.name,
+            type.moduleName,
+            detail::ScriptTypeCategory::NativeObject},
+        "self"});
+    nativeParameters.insert(
+        nativeParameters.end(), parameters->begin(), parameters->end());
+    std::string call = nativeName + "(this";
+    for (const auto& parameter : *parameters) {
+        call += ", " + parameter.name;
+    }
+    call += ")";
+    const auto wrapperBody = std::is_void_v<typename Traits::Return>
+        ? call + "; return;"
+        : "return " + call + ";";
+    type.methods.push_back(detail::FunctionDeclaration{
+        name, *returnType, *parameters, wrapperBody});
+    module.functions.push_back(detail::FunctionDeclaration{
+        nativeName,
+        std::is_void_v<typename Traits::Return>
+            ? detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int}
+            : *returnType,
+        std::move(nativeParameters),
+        {}});
+    state_->bindings->bind(
+        bindingName,
+        [state](const auto&, const auto& arguments, auto& error) {
+            const auto invoked = detail::invokeMethod<Method, Traits>(
+                state,
+                arguments,
+                error,
+                std::make_index_sequence<Traits::Arity>{});
+            if (!invoked) return std::optional<runtime::Value>{};
+            if constexpr (std::is_void_v<typename Traits::Return>) {
+                return std::optional<runtime::Value>{std::int64_t{0}};
+            } else {
+                return invoked;
+            }
+        },
+        determinism);
     return *this;
 }
 
@@ -294,16 +275,36 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::property(
             type.moduleName + "::" + type.name + "." + name + "'");
         return *this;
     }
-    const auto bindingName = type.moduleName + "::" + type.name + ".get_" + name;
-    if (!state_->declarationNames.insert(bindingName).second ||
-        !state_->bindingNames.insert(bindingName).second) {
+    const auto publicName = type.moduleName + "::" + type.name + ".get_" + name;
+    if (!state_->declarationNames.insert(publicName).second) {
+        state_->errors.push_back("duplicate native declaration '" + publicName + "'");
+        return *this;
+    }
+
+    const auto nativeName = "__rs_native_" + type.name + "_get_" + name;
+    const auto bindingName = type.moduleName + "::" + nativeName;
+    if (!state_->bindingNames.insert(bindingName).second) {
         state_->errors.push_back("duplicate native binding '" + bindingName + "'");
         return *this;
     }
 
     auto& module = state_->modules[type.moduleName];
     detail::collectImports(module, *typeRef);
-    type.properties.push_back(detail::PropertyDeclaration{name, *typeRef, true, false, {}, {}});
+    type.properties.push_back(detail::PropertyDeclaration{
+        name,
+        *typeRef,
+        true,
+        false,
+        "return " + nativeName + "(this);",
+        {}});
+    module.functions.push_back(detail::FunctionDeclaration{
+        nativeName,
+        *typeRef,
+        {{detail::ScriptTypeRef{
+            type.name,
+            type.moduleName,
+            detail::ScriptTypeCategory::NativeObject}, "self"}},
+        {}});
     auto state = state_;
     state_->bindings->bind(
         bindingName,
@@ -349,41 +350,48 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::property(
             type.moduleName + "::" + type.name + "." + name + "'");
         return *this;
     }
-    const auto getterBinding = type.moduleName + "::" + type.name + ".get_" + name;
+    const auto getterPublicName = type.moduleName + "::" + type.name + ".get_" + name;
     const auto setterPublicName = type.moduleName + "::" + type.name + ".set_" + name;
-    if (!state_->declarationNames.insert(getterBinding).second ||
-        !state_->declarationNames.insert(setterPublicName).second ||
-        state_->bindingNames.find(getterBinding) != state_->bindingNames.end()) {
-        state_->errors.push_back("duplicate native property binding for '" + name + "'");
+    if (!state_->declarationNames.insert(getterPublicName).second ||
+        !state_->declarationNames.insert(setterPublicName).second) {
+        state_->errors.push_back("duplicate native property declaration for '" + name + "'");
         return *this;
     }
-    state_->bindingNames.insert(getterBinding);
 
-    const auto nativeName = "__rs_native_" + type.name + "_set_" + name;
-    const auto setterBinding = type.moduleName + "::" + nativeName;
-    if (!state_->bindingNames.insert(setterBinding).second) {
+    const auto getterNativeName = "__rs_native_" + type.name + "_get_" + name;
+    const auto setterNativeName = "__rs_native_" + type.name + "_set_" + name;
+    const auto getterBinding = type.moduleName + "::" + getterNativeName;
+    const auto setterBinding = type.moduleName + "::" + setterNativeName;
+    if (!state_->bindingNames.insert(getterBinding).second ||
+        !state_->bindingNames.insert(setterBinding).second) {
         state_->errors.push_back("duplicate native property binding for '" + name + "'");
         return *this;
     }
 
     auto& module = state_->modules[type.moduleName];
     detail::collectImports(module, *getterType);
-    const auto setterBody = nativeName + "(this, value); return;";
+    const auto getterBody = "return " + getterNativeName + "(this);";
+    const auto setterBody = setterNativeName + "(this, value); return;";
     type.properties.push_back(detail::PropertyDeclaration{
-        name, *getterType, true, true, {}, setterBody});
-    std::vector<detail::ParameterDeclaration> setterParameters;
-    setterParameters.push_back({
+        name, *getterType, true, true, getterBody, setterBody});
+
+    const detail::ParameterDeclaration receiver{
         detail::ScriptTypeRef{
             type.name,
             type.moduleName,
             detail::ScriptTypeCategory::NativeObject},
-        "self"});
-    setterParameters.push_back({*setterType, "value"});
+        "self"};
     module.functions.push_back(detail::FunctionDeclaration{
-        nativeName,
-        detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int},
-        std::move(setterParameters),
+        getterNativeName,
+        *getterType,
+        {receiver},
         {}});
+    module.functions.push_back(detail::FunctionDeclaration{
+        setterNativeName,
+        detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int},
+        {receiver, detail::ParameterDeclaration{*setterType, "value"}},
+        {}});
+
     auto state = state_;
     state_->bindings->bind(
         getterBinding,
