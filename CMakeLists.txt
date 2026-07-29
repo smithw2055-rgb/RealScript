@@ -100,6 +100,7 @@ if(MSVC)
     set_source_files_properties(
         src/optimization/Optimizer.cpp
         src/runtime/ExecutionServices.cpp
+        src/game/GameProductization.cpp
         PROPERTIES COMPILE_OPTIONS "/wd4456"
     )
     target_compile_options(realscript_frontend PRIVATE /W4 /permissive-)
