@@ -1,3 +1,4 @@
+#include "realscript/game/GameBytecodeObjects.h"
 #include "realscript/game/GameProductization.h"
 
 #include <cstdint>
@@ -50,6 +51,11 @@ class PersistentState
     bool enabled;
     string label;
 
+    void OnStart()
+    {
+        count = 1;
+    }
+
     int Add(int value)
     {
         count = count + value;
@@ -68,6 +74,16 @@ class NativeHolder
 }
 )";
 
+std::vector<std::vector<std::uint8_t>> encodedModules(
+    const std::vector<realscript::bytecode::Module>& modules) {
+    std::vector<std::vector<std::uint8_t>> encoded;
+    encoded.reserve(modules.size());
+    for (const auto& module : modules) {
+        encoded.push_back(realscript::bytecode::encodeModule(module));
+    }
+    return encoded;
+}
+
 void testBytecodePackageLoadingAndIdentity() {
     auto api = makeApi();
     realscript::game::GameScriptCompiler compiler(api);
@@ -75,13 +91,8 @@ void testBytecodePackageLoadingAndIdentity() {
     require(compiled.succeeded(),
         "compile failed:\n" + diagnosticsText(compiled.diagnostics));
 
-    std::vector<std::vector<std::uint8_t>> encoded;
-    for (const auto& module : compiled.modules) {
-        encoded.push_back(realscript::bytecode::encodeModule(module));
-    }
-
     realscript::game::GameProgramLoader loader(api);
-    auto loaded = loader.loadBytecodeModules(encoded);
+    auto loaded = loader.loadBytecodeModules(encodedModules(compiled.modules));
     require(loaded.succeeded(),
         "bytecode package load failed:\n" + diagnosticsText(loaded.diagnostics));
     require(loaded.package.programContentHash ==
@@ -110,6 +121,42 @@ void testBytecodePackageLoadingAndIdentity() {
         "loaded bytecode instance method invocation failed");
 }
 
+void testBytecodeObjectMetadataRehydration() {
+    auto api = makeApi();
+    realscript::game::GameScriptCompiler compiler(api);
+    auto compiled = compiler.compile({{"state.rs", source}});
+    require(compiled.succeeded(),
+        "object metadata fixture compile failed:\n" +
+        diagnosticsText(compiled.diagnostics));
+
+    auto loaded = realscript::game::loadGameObjectBytecodeModules(
+        api, encodedModules(compiled.modules));
+    require(loaded.succeeded(),
+        "game object bytecode load failed:\n" +
+        diagnosticsText(loaded.diagnostics));
+
+    auto runtime = loaded.package.createRuntime();
+    const auto type = runtime.findType("Product.State::PersistentState");
+    require(type.has_value(), "rehydrated type was not found");
+    const auto onStart = runtime.findMethod(*type, "OnStart", 0);
+    const auto add = runtime.findMethod(*type, "Add", 1);
+    require(onStart.has_value(), "OnStart method metadata was not rehydrated");
+    require(add.has_value(), "Add method metadata was not rehydrated");
+
+    realscript::runtime::RuntimeError error;
+    auto object = runtime.createObject(*type, {}, error);
+    require(object.has_value(),
+        "failed to create rehydrated object: " + error.message);
+    const auto started = runtime.invoke(*object, *onStart);
+    require(started.succeeded,
+        "rehydrated OnStart failed: " + started.error.message);
+    const auto result = runtime.invoke(*object, *add, {std::int64_t{4}});
+    require(result.succeeded,
+        "rehydrated Add failed: " + result.error.message);
+    require(std::get<std::int64_t>(result.value) == 5,
+        "rehydrated method returned the wrong value");
+}
+
 void testRestrictedScriptStateRoundTrip() {
     auto api = makeApi();
     realscript::game::GameScriptCompiler compiler(api);
@@ -120,7 +167,8 @@ void testRestrictedScriptStateRoundTrip() {
     realscript::runtime::RuntimeError error;
     auto original = runtime.createObject(
         "Product.State::PersistentState", error);
-    require(original.has_value(), "failed to create state object: " + error.message);
+    require(original.has_value(),
+        "failed to create state object: " + error.message);
     require(runtime.setMember(*original, "count", std::int64_t{42}, error),
         "failed to set count: " + error.message);
     require(runtime.setMember(*original, "enabled", true, error),
@@ -195,6 +243,8 @@ int main() {
 
     run("bytecode package loading and identity",
         testBytecodePackageLoadingAndIdentity);
+    run("bytecode object metadata rehydration",
+        testBytecodeObjectMetadataRehydration);
     run("restricted script state round trip",
         testRestrictedScriptStateRoundTrip);
     run("native handles rejected from persistent state",
