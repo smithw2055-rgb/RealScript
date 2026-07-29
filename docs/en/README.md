@@ -10,13 +10,15 @@ This library describes the RealScript v0.1 alpha technical baseline in English. 
 2. [Architecture](ARCHITECTURE.md)
 3. [Language and Type System](LANGUAGE_AND_TYPE_SYSTEM.md)
 4. [Game Scripting SDK](GAME_SCRIPTING_SDK.md)
-5. [Project Status and Roadmap](PROJECT_STATUS_AND_ROADMAP.md)
+5. [SDK Productization](PRODUCTIZATION.md)
+6. [Project Status and Roadmap](PROJECT_STATUS_AND_ROADMAP.md)
 
 ## Compiler and Execution Pipeline
 
 - [Compilation, MIR, and Bytecode](COMPILATION_AND_BYTECODE.md)
 - [Runtime, GC, and Embedding](RUNTIME_GC_AND_EMBEDDING.md)
 - [Game Scripting SDK](GAME_SCRIPTING_SDK.md)
+- [SDK Productization](PRODUCTIZATION.md)
 - [AOT, JIT, and Performance](AOT_JIT_AND_PERFORMANCE.md)
 
 ## Developer Tools
