@@ -13,6 +13,66 @@ semantic::SymbolId exactTypeId(
         : 0;
 }
 
+std::string canonicalTypeNameForId(
+    const runtime::ProgramImage& program,
+    semantic::SymbolId typeId) {
+    if (typeId == 0) return {};
+    for (const auto& module : program.modules()) {
+        for (const auto& type : module.types) {
+            if (type.id == typeId) return semantic::canonicalTypeName(type);
+        }
+    }
+    return {};
+}
+
+std::optional<ScriptMethod> reflectedBytecodeMethod(
+    const runtime::ProgramImage& program,
+    const ScriptType& type,
+    const std::string& name,
+    std::size_t visibleArity) {
+    const auto encodedName = type.descriptor.name + "." + name;
+    for (const auto& module : program.modules()) {
+        for (const auto& function : module.functions) {
+            if (function.name != encodedName ||
+                function.parameterTypes.empty() ||
+                function.parameterTypes.size() !=
+                    function.parameterTypeIds.size() ||
+                function.parameterTypeIds.front() != type.descriptor.id ||
+                function.parameterTypes.size() - 1u != visibleArity) {
+                continue;
+            }
+
+            semantic::FunctionSymbol descriptor;
+            descriptor.id = function.symbolId;
+            descriptor.moduleName = module.name;
+            descriptor.name = name;
+            descriptor.ownerTypeName = type.descriptor.name;
+            descriptor.ownerTypeId = type.descriptor.id;
+            descriptor.returnType = function.returnType;
+            descriptor.returnTypeName = canonicalTypeNameForId(
+                program, function.returnTypeId);
+            descriptor.method = true;
+            descriptor.staticMethod = false;
+            descriptor.parameters.reserve(function.parameterTypes.size());
+            for (std::size_t index = 0;
+                 index < function.parameterTypes.size(); ++index) {
+                semantic::VariableSymbol parameter;
+                parameter.name = index == 0
+                    ? "this"
+                    : "arg" + std::to_string(index - 1u);
+                parameter.type = function.parameterTypes[index];
+                parameter.typeName = canonicalTypeNameForId(
+                    program, function.parameterTypeIds[index]);
+                parameter.index = index;
+                parameter.parameter = true;
+                descriptor.parameters.push_back(std::move(parameter));
+            }
+            return ScriptMethod{std::move(descriptor)};
+        }
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 ScriptRuntime::ScriptRuntime(const GameProgram& program)
@@ -67,7 +127,14 @@ std::optional<ScriptMethod> ScriptRuntime::findMethod(
             if (candidate.visibleArity() == visibleArity) return candidate;
         }
     }
-    return std::nullopt;
+    // Bytecode format 0.5 preserved class layout but did not persist the
+    // TypeSymbol method lists. Productized .rsbc modules still retain each
+    // lowered function's owner-qualified name, receiver TypeId and signature,
+    // which is sufficient to reconstruct an instance method descriptor without
+    // changing the bytecode wire format or invalidating existing modules.
+    return program_
+        ? reflectedBytecodeMethod(*program_, type, name, visibleArity)
+        : std::nullopt;
 }
 
 std::optional<ScriptMethod> ScriptRuntime::findConstructor(
