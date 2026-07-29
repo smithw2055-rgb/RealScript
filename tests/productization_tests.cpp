@@ -49,6 +49,12 @@ class PersistentState
     int count;
     bool enabled;
     string label;
+
+    int Add(int value)
+    {
+        count = count + value;
+        return count;
+    }
 }
 
 class NativeHolder
@@ -87,6 +93,21 @@ void testBytecodePackageLoadingAndIdentity() {
     require(loaded.package.createRuntime().program()->moduleCount() ==
             compiled.modules.size(),
         "loaded runtime module count is incorrect");
+
+    auto runtime = loaded.package.createRuntime();
+    realscript::runtime::RuntimeError error;
+    auto state = runtime.createObject(
+        "Product.State::PersistentState", error);
+    require(state.has_value(),
+        "loaded bytecode type could not be instantiated: " + error.message);
+    const auto method = runtime.findMethod(state->type(), "Add", 1);
+    require(method.has_value() && method->instance(),
+        "loaded bytecode instance method reflection is unavailable");
+    const auto invoked = runtime.invoke(
+        *state, *method, {std::int64_t{7}});
+    require(invoked.succeeded &&
+            std::get<std::int64_t>(invoked.value) == 7,
+        "loaded bytecode instance method invocation failed");
 }
 
 void testRestrictedScriptStateRoundTrip() {
