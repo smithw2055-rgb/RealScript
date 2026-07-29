@@ -83,7 +83,7 @@ struct ScriptObjectState {
     ScriptStatePolicy policy = {});
 
 bool restoreScriptObject(
-    const ScriptRuntime& runtime,
+    ScriptRuntime& runtime,
     ScriptObject& object,
     const ScriptObjectState& state,
     runtime::RuntimeError& error,
