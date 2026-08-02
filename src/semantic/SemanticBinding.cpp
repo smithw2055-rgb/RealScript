@@ -485,7 +485,11 @@ std::unique_ptr<BoundStatement> Binder::bindWhileStatement(
         PrimitiveType::Bool,
         syntaxTree.condition->span(),
         "while condition");
+    ++loopDepth_;
+    ++breakableDepth_;
     result->body = bindEmbeddedStatement(*syntaxTree.body);
+    --breakableDepth_;
+    --loopDepth_;
     return result;
 }
 

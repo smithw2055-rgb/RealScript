@@ -3,6 +3,35 @@
 #include <stdexcept>
 
 namespace realscript::mir {
+namespace {
+
+bool isLiteralTrue(const semantic::BoundExpression& expression) {
+    if (expression.kind() != semantic::BoundNodeKind::LiteralExpression ||
+        expression.type != semantic::PrimitiveType::Bool) {
+        return false;
+    }
+    const auto& literal =
+        static_cast<const semantic::BoundLiteralExpression&>(expression);
+    return std::holds_alternative<bool>(literal.value) &&
+        std::get<bool>(literal.value);
+}
+
+bool hasIncomingEdge(const Function& function, BlockId target) {
+    for (const auto& block : function.blocks) {
+        const auto& terminator = block.terminator;
+        if (terminator.kind == TerminatorKind::Jump &&
+            terminator.target == target) {
+            return true;
+        }
+        if (terminator.kind == TerminatorKind::Branch &&
+            (terminator.target == target || terminator.falseTarget == target)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
 
 Module Lowerer::lower(const semantic::SemanticModel& model) {
     Module result; result.name = model.moduleName; result.types = model.types;
@@ -195,29 +224,92 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
     }
     case semantic::BoundNodeKind::WhileStatement: {
         const auto& value = static_cast<const semantic::BoundWhileStatement&>(statement);
-        const auto conditionBlock = createBlock(), bodyBlock = createBlock(), exitBlock = createBlock();
-        emitJump(conditionBlock, {}, statement.span); setCurrentBlock(conditionBlock);
+        const auto conditionBlock = createBlock();
+        const auto bodyBlock = createBlock();
+        const auto exitBlock = createBlock();
+        emitJump(conditionBlock, {}, statement.span);
+        setCurrentBlock(conditionBlock);
         const auto condition = lowerExpression(*value.condition);
-        emitBranch(condition, bodyBlock, exitBlock, {}, {}, value.condition->span);
-        breakTargets_.push_back(exitBlock); continueTargets_.push_back(conditionBlock);
-        setCurrentBlock(bodyBlock); lowerStatement(*value.body);
-        continueTargets_.pop_back(); breakTargets_.pop_back();
-        if (hasCurrentBlock() && !currentBlockTerminated()) emitJump(conditionBlock, {}, value.body->span);
-        setCurrentBlock(exitBlock); return;
+        const auto constantTrue = isLiteralTrue(*value.condition);
+        if (constantTrue) {
+            emitJump(bodyBlock, {}, value.condition->span);
+        } else {
+            emitBranch(
+                condition,
+                bodyBlock,
+                exitBlock,
+                {},
+                {},
+                value.condition->span);
+        }
+        breakTargets_.push_back(exitBlock);
+        continueTargets_.push_back(conditionBlock);
+        setCurrentBlock(bodyBlock);
+        lowerStatement(*value.body);
+        continueTargets_.pop_back();
+        breakTargets_.pop_back();
+        if (hasCurrentBlock() && !currentBlockTerminated()) {
+            emitJump(conditionBlock, {}, value.body->span);
+        }
+        if (constantTrue && !hasIncomingEdge(*currentFunction_, exitBlock)) {
+            setCurrentBlock(exitBlock);
+            emitJump(exitBlock, {}, statement.span);
+            clearCurrentBlock();
+        } else {
+            setCurrentBlock(exitBlock);
+        }
+        return;
     }
     case semantic::BoundNodeKind::ForStatement: {
         const auto& value = static_cast<const semantic::BoundForStatement&>(statement);
         if (value.initializer) lowerStatement(*value.initializer);
         if (!hasCurrentBlock() || currentBlockTerminated()) return;
-        const auto conditionBlock = createBlock(), bodyBlock = createBlock(), incrementBlock = createBlock(), exitBlock = createBlock();
-        emitJump(conditionBlock, {}, statement.span); setCurrentBlock(conditionBlock);
-        emitBranch(lowerExpression(*value.condition), bodyBlock, exitBlock, {}, {}, value.condition->span);
-        breakTargets_.push_back(exitBlock); continueTargets_.push_back(incrementBlock);
-        setCurrentBlock(bodyBlock); lowerStatement(*value.body);
-        if (hasCurrentBlock() && !currentBlockTerminated()) emitJump(incrementBlock, {}, value.body->span);
-        setCurrentBlock(incrementBlock); if (value.increment) (void)lowerExpression(*value.increment);
-        if (!currentBlockTerminated()) emitJump(conditionBlock, {}, value.increment ? value.increment->span : statement.span);
-        continueTargets_.pop_back(); breakTargets_.pop_back(); setCurrentBlock(exitBlock); return;
+        const auto conditionBlock = createBlock();
+        const auto bodyBlock = createBlock();
+        const auto incrementBlock = createBlock();
+        const auto exitBlock = createBlock();
+        emitJump(conditionBlock, {}, statement.span);
+        setCurrentBlock(conditionBlock);
+        const auto condition = lowerExpression(*value.condition);
+        const auto constantTrue = isLiteralTrue(*value.condition);
+        if (constantTrue) {
+            emitJump(bodyBlock, {}, value.condition->span);
+        } else {
+            emitBranch(
+                condition,
+                bodyBlock,
+                exitBlock,
+                {},
+                {},
+                value.condition->span);
+        }
+        breakTargets_.push_back(exitBlock);
+        continueTargets_.push_back(incrementBlock);
+        setCurrentBlock(bodyBlock);
+        lowerStatement(*value.body);
+        if (hasCurrentBlock() && !currentBlockTerminated()) {
+            emitJump(incrementBlock, {}, value.body->span);
+        }
+        setCurrentBlock(incrementBlock);
+        if (value.increment) {
+            (void)lowerExpression(*value.increment);
+        }
+        if (!currentBlockTerminated()) {
+            emitJump(
+                conditionBlock,
+                {},
+                value.increment ? value.increment->span : statement.span);
+        }
+        continueTargets_.pop_back();
+        breakTargets_.pop_back();
+        if (constantTrue && !hasIncomingEdge(*currentFunction_, exitBlock)) {
+            setCurrentBlock(exitBlock);
+            emitJump(exitBlock, {}, statement.span);
+            clearCurrentBlock();
+        } else {
+            setCurrentBlock(exitBlock);
+        }
+        return;
     }
     case semantic::BoundNodeKind::ForeachStatement: {
         const auto& value = static_cast<const semantic::BoundForeachStatement&>(statement);
@@ -244,14 +336,41 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
     }
     case semantic::BoundNodeKind::DoWhileStatement: {
         const auto& value = static_cast<const semantic::BoundDoWhileStatement&>(statement);
-        const auto bodyBlock = createBlock(), conditionBlock = createBlock(), exitBlock = createBlock();
+        const auto bodyBlock = createBlock();
+        const auto conditionBlock = createBlock();
+        const auto exitBlock = createBlock();
         emitJump(bodyBlock, {}, statement.span);
-        breakTargets_.push_back(exitBlock); continueTargets_.push_back(conditionBlock);
-        setCurrentBlock(bodyBlock); lowerStatement(*value.body);
-        if (hasCurrentBlock() && !currentBlockTerminated()) emitJump(conditionBlock, {}, value.body->span);
+        breakTargets_.push_back(exitBlock);
+        continueTargets_.push_back(conditionBlock);
+        setCurrentBlock(bodyBlock);
+        lowerStatement(*value.body);
+        if (hasCurrentBlock() && !currentBlockTerminated()) {
+            emitJump(conditionBlock, {}, value.body->span);
+        }
         setCurrentBlock(conditionBlock);
-        emitBranch(lowerExpression(*value.condition), bodyBlock, exitBlock, {}, {}, value.condition->span);
-        continueTargets_.pop_back(); breakTargets_.pop_back(); setCurrentBlock(exitBlock); return;
+        const auto condition = lowerExpression(*value.condition);
+        const auto constantTrue = isLiteralTrue(*value.condition);
+        if (constantTrue) {
+            emitJump(bodyBlock, {}, value.condition->span);
+        } else {
+            emitBranch(
+                condition,
+                bodyBlock,
+                exitBlock,
+                {},
+                {},
+                value.condition->span);
+        }
+        continueTargets_.pop_back();
+        breakTargets_.pop_back();
+        if (constantTrue && !hasIncomingEdge(*currentFunction_, exitBlock)) {
+            setCurrentBlock(exitBlock);
+            emitJump(exitBlock, {}, statement.span);
+            clearCurrentBlock();
+        } else {
+            setCurrentBlock(exitBlock);
+        }
+        return;
     }
     case semantic::BoundNodeKind::SwitchStatement: {
         const auto& value = static_cast<const semantic::BoundSwitchStatement&>(statement);
