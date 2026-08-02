@@ -38,33 +38,38 @@ std::string referenceDefaultValue(const std::string& type) {
     return "null";
 }
 
-void lowerReferenceParameters(std::vector<Token>& tokens, Context& context) {
+void collectReferenceParameterDeclarations(
+    const std::vector<Token>& tokens,
+    Context& context) {
     if (!context.options.referenceParameters) return;
 
-    struct ParameterInfo {
-        std::string modifier;
-        std::string type;
-        std::string name;
-    };
-    struct FunctionInfo {
-        std::string name;
-        std::vector<ParameterInfo> parameters;
-    };
-
-    std::map<std::pair<std::string, std::size_t>, FunctionInfo> functions;
     for (std::size_t open = 1; open + 1 < tokens.size(); ++open) {
-        if (!symbol(tokens[open], "(") || tokens[open - 1].kind != TokenKind::Identifier ||
-            isControlInvocationName(tokens[open - 1].text)) continue;
+        if (!symbol(tokens[open], "(") ||
+            tokens[open - 1].kind != TokenKind::Identifier ||
+            isControlInvocationName(tokens[open - 1].text)) {
+            continue;
+        }
         const auto close = matching(tokens, open, "(", ")");
-        if (close >= tokens.size() || close + 1 >= tokens.size() || !symbol(tokens[close + 1], "{")) continue;
-        FunctionInfo info;
+        if (close >= tokens.size() || close + 1 >= tokens.size() ||
+            !symbol(tokens[close + 1], "{")) {
+            continue;
+        }
+
+        ReferenceFunctionInfo info;
         info.name = tokens[open - 1].text;
-        const auto parameters = splitTopLevel(tokens, open + 1, close, ",");
+        bool hasReferenceParameter = false;
+        auto parameters = splitTopLevel(tokens, open + 1, close, ",");
+        if (parameters.size() == 1 && parameters.front().empty()) {
+            parameters.clear();
+        }
         for (const auto& parameter : parameters) {
-            ParameterInfo item;
+            ReferenceParameterInfo item;
             std::size_t cursor = 0;
-            if (!parameter.empty() && (word(parameter[0], "ref") || word(parameter[0], "out") || word(parameter[0], "in"))) {
+            if (!parameter.empty() &&
+                (word(parameter[0], "ref") || word(parameter[0], "out") ||
+                 word(parameter[0], "in"))) {
                 item.modifier = parameter[0].text;
+                hasReferenceParameter = true;
                 cursor = 1;
             }
             if (parameter.size() >= cursor + 2) {
@@ -73,5 +78,40 @@ void lowerReferenceParameters(std::vector<Token>& tokens, Context& context) {
             }
             info.parameters.push_back(std::move(item));
         }
+        if (!hasReferenceParameter) continue;
+
         const auto key = std::make_pair(info.name, info.parameters.size());
-        if (functions.find(key) == functions.end()) functions.emplace(key, std::move(info));
+        const auto existing = context.referenceFunctions.find(key);
+        if (existing == context.referenceFunctions.end()) {
+            context.referenceFunctions.emplace(key, std::move(info));
+            continue;
+        }
+
+        bool compatible = existing->second.parameters.size() == info.parameters.size();
+        for (std::size_t parameter = 0;
+             compatible && parameter < info.parameters.size(); ++parameter) {
+            compatible =
+                existing->second.parameters[parameter].modifier ==
+                    info.parameters[parameter].modifier &&
+                existing->second.parameters[parameter].type ==
+                    info.parameters[parameter].type;
+        }
+        if (!compatible) {
+            context.error(
+                "RS8704",
+                "reference-parameter overloads with the same name and arity are ambiguous for '" +
+                    info.name + "'",
+                tokens[open - 1].offset);
+        }
+    }
+}
+
+void lowerReferenceParameters(std::vector<Token>& tokens, Context& context) {
+    if (!context.options.referenceParameters) return;
+
+    using ParameterInfo = ReferenceParameterInfo;
+    using FunctionInfo = ReferenceFunctionInfo;
+    auto functions = context.referenceFunctions;
+
+    // Kept as a scope boundary because the continuation lives in Part09.
+    {
