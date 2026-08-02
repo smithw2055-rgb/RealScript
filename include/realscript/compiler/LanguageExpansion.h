@@ -1,0 +1,75 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace realscript::compiler {
+
+enum class LanguageExpansionSeverity {
+    Warning,
+    Error,
+};
+
+struct LanguageExpansionDiagnostic {
+    std::string code;
+    std::string message;
+    std::size_t offset = 0;
+    LanguageExpansionSeverity severity = LanguageExpansionSeverity::Error;
+};
+
+struct LanguageAttributeArgument {
+    std::string name;
+    std::string value;
+};
+
+struct LanguageAttributeRecord {
+    std::string target;
+    std::string name;
+    std::vector<LanguageAttributeArgument> arguments;
+};
+
+struct LanguageInterfaceImplementation {
+    std::string typeName;
+    std::vector<std::string> interfaces;
+};
+
+struct LanguageGenericInstantiation {
+    std::string genericName;
+    std::vector<std::string> arguments;
+    std::string generatedName;
+};
+
+struct LanguageExpansionOptions {
+    bool structuredControlFlow = true;
+    bool delegatesLambdasEvents = true;
+    bool interfaces = true;
+    bool sourceAttributes = true;
+    bool generics = true;
+    bool deterministicCoroutines = true;
+    bool referenceParameters = true;
+    bool valueTypeAliases = true;
+};
+
+struct LanguageExpansionResult {
+    std::string content;
+    std::vector<LanguageExpansionDiagnostic> diagnostics;
+    std::vector<LanguageAttributeRecord> attributes;
+    std::vector<LanguageInterfaceImplementation> interfaces;
+    std::vector<LanguageGenericInstantiation> genericInstantiations;
+    bool changed = false;
+
+    [[nodiscard]] bool succeeded() const noexcept;
+};
+
+[[nodiscard]] LanguageExpansionResult expandLanguageSource(
+    const std::string& path,
+    const std::string& content,
+    LanguageExpansionOptions options = {});
+
+[[nodiscard]] const char* languageExpansionSeverityName(
+    LanguageExpansionSeverity severity) noexcept;
+
+} // namespace realscript::compiler
