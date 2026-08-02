@@ -424,12 +424,25 @@ std::uint64_t stableGameplayValueHash(const GameplayValue& value) noexcept {
 
 EventSequence DeterministicEventQueue::enqueue(GameplayEvent event) {
     if (event.topic.empty() || nextSequence_ == 0) return 0;
+
     if (event.sequence == 0) {
+        if (nextSequence_ == std::numeric_limits<EventSequence>::max()) return 0;
         event.sequence = nextSequence_++;
     } else {
-        if (event.sequence >= nextSequence_) nextSequence_ = event.sequence + 1;
-        if (nextSequence_ == 0) return 0;
+        const auto duplicate = std::find_if(
+            events_.begin(), events_.end(),
+            [&](const auto& entry) {
+                return entry.second.sequence == event.sequence;
+            });
+        if (duplicate != events_.end()) return 0;
+        if (event.sequence >= nextSequence_) {
+            if (event.sequence == std::numeric_limits<EventSequence>::max()) {
+                return 0;
+            }
+            nextSequence_ = event.sequence + 1;
+        }
     }
+
     const EventKey key{event.dueTick, event.sequence};
     if (!events_.emplace(key, std::move(event)).second) return 0;
     return key.sequence;
@@ -476,9 +489,12 @@ DeterministicEventQueue::State DeterministicEventQueue::snapshot() const {
 bool DeterministicEventQueue::restore(const State& state) {
     if (state.nextSequence == 0) return false;
     std::map<EventKey, GameplayEvent> events;
+    std::unordered_set<EventSequence> sequences;
+    sequences.reserve(state.events.size());
     EventSequence maximumSequence = 0;
     for (const auto& event : state.events) {
         if (event.sequence == 0 || event.topic.empty() ||
+            !sequences.insert(event.sequence).second ||
             !events.emplace(
                 EventKey{event.dueTick, event.sequence}, event).second) {
             return false;
