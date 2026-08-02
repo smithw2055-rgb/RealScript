@@ -34,13 +34,20 @@ Text/token rewriting alone does not satisfy this definition.
 
 ## Phase 18 — native Phase 11–17 compiler features
 
-### 18A — structured control flow
+### 18A — structured control flow — complete
 
-- Native syntax/Bound/MIR for `for`, `foreach`, `do/while`, `break`, `continue`, and `switch`.
-- Explicit break/continue labels in Bound trees and MIR.
-- Single evaluation of switch expressions.
-- Enumerator protocol as a compiler-known contract, initially covering arrays and built-in collections.
-- Precise flow analysis and unreachable-code diagnostics.
+Implemented and validated:
+
+- native syntax, Bound nodes, and MIR for `for`, `foreach`, `do/while`, `break`, `continue`, and `switch`;
+- explicit break/continue target stacks in MIR lowering;
+- single evaluation of switch expressions through a compiler-owned typed local;
+- native array and indexed-collection `foreach`;
+- precise definite-assignment and all-path-return behavior;
+- stable original-source debug metadata for compiler-owned locals;
+- constant infinite loops without synthetic reachable exits;
+- malformed loop-control diagnostics;
+- `LanguageExpansionOptions::structuredControlFlow` disabled by default;
+- all Phase 1–18A tests passing on Ubuntu and Windows with warnings as errors.
 
 ### 18B — delegates, lambdas, and events
 
