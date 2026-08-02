@@ -25,6 +25,104 @@ struct PreparedExpansionSource {
     LanguageExpansionResult preliminary;
 };
 
+void collectGenericDeclarationsWithInterfaces(
+    std::vector<Token>& tokens,
+    Context& context) {
+    if (!context.options.generics) return;
+    std::vector<std::pair<std::size_t, std::size_t>> remove;
+    int braceDepth = 0;
+    for (std::size_t index = 0; index + 3 < tokens.size();) {
+        if (symbol(tokens[index], "{")) {
+            ++braceDepth;
+            ++index;
+            continue;
+        }
+        if (symbol(tokens[index], "}")) {
+            --braceDepth;
+            ++index;
+            continue;
+        }
+
+        if (braceDepth == 0 &&
+            (word(tokens[index], "class") || word(tokens[index], "struct")) &&
+            tokens[index + 1].kind == TokenKind::Identifier &&
+            symbol(tokens[index + 2], "<")) {
+            const auto angleClose = matching(tokens, index + 2, "<", ">");
+            if (angleClose >= tokens.size()) {
+                ++index;
+                continue;
+            }
+            std::size_t bodyOpen = angleClose + 1;
+            while (bodyOpen < tokens.size() &&
+                   !symbol(tokens[bodyOpen], "{") &&
+                   !symbol(tokens[bodyOpen], ";")) {
+                ++bodyOpen;
+            }
+            if (bodyOpen >= tokens.size() || !symbol(tokens[bodyOpen], "{")) {
+                ++index;
+                continue;
+            }
+            const auto bodyClose = matching(tokens, bodyOpen, "{", "}");
+            if (bodyClose >= tokens.size()) break;
+
+            GenericDecl declaration;
+            declaration.kind = GenericDecl::Kind::Type;
+            declaration.name = tokens[index + 1].text;
+            declaration.parameters = parseTypeParameterNames(
+                tokens, index + 2, angleClose);
+            declaration.tokens.assign(
+                tokens.begin() + static_cast<std::ptrdiff_t>(index),
+                tokens.begin() + static_cast<std::ptrdiff_t>(bodyClose + 1));
+            context.generics[declaration.name] = std::move(declaration);
+            remove.push_back({index, bodyClose + 1});
+            index = bodyClose + 1;
+            continue;
+        }
+
+        if (braceDepth == 0 && tokens[index].kind == TokenKind::Identifier &&
+            index + 1 < tokens.size() && symbol(tokens[index + 1], "<")) {
+            const auto angleClose = matching(tokens, index + 1, "<", ">");
+            if (angleClose < tokens.size() && angleClose + 1 < tokens.size() &&
+                symbol(tokens[angleClose + 1], "(")) {
+                const auto parameterClose = matching(
+                    tokens, angleClose + 1, "(", ")");
+                if (parameterClose < tokens.size() &&
+                    parameterClose + 1 < tokens.size() &&
+                    symbol(tokens[parameterClose + 1], "{")) {
+                    std::size_t declarationStart = index;
+                    while (declarationStart > 0 &&
+                           !symbol(tokens[declarationStart - 1], ";") &&
+                           !symbol(tokens[declarationStart - 1], "}")) {
+                        --declarationStart;
+                    }
+                    const auto bodyClose = matching(
+                        tokens, parameterClose + 1, "{", "}");
+                    if (bodyClose >= tokens.size()) break;
+                    GenericDecl declaration;
+                    declaration.kind = GenericDecl::Kind::Function;
+                    declaration.name = tokens[index].text;
+                    declaration.parameters = parseTypeParameterNames(
+                        tokens, index + 1, angleClose);
+                    declaration.tokens.assign(
+                        tokens.begin() + static_cast<std::ptrdiff_t>(declarationStart),
+                        tokens.begin() + static_cast<std::ptrdiff_t>(bodyClose + 1));
+                    context.generics[declaration.name] = std::move(declaration);
+                    remove.push_back({declarationStart, bodyClose + 1});
+                    index = bodyClose + 1;
+                    continue;
+                }
+            }
+        }
+        ++index;
+    }
+
+    if (!remove.empty()) {
+        std::sort(remove.begin(), remove.end());
+        tokens = removeRanges(tokens, remove);
+        context.result.changed = true;
+    }
+}
+
 void collectExpansionDeclarations(
     PreparedExpansionSource& source,
     Context& context) {
@@ -36,7 +134,7 @@ void collectExpansionDeclarations(
     extractAttributes(source.tokens, context);
     extractDelegates(source.tokens, context);
     extractInterfaces(source.tokens, context);
-    collectGenericDeclarations(source.tokens, context);
+    collectGenericDeclarationsWithInterfaces(source.tokens, context);
 
     source.preliminary = std::move(context.result);
 }
@@ -276,16 +374,10 @@ std::vector<LanguageExpansionResult> expandLanguageSources(
     Context context;
     context.options = options;
 
-    // Pass one removes and records declarations that must be visible to sibling
-    // files. This makes interfaces, delegates, and generic declarations module-
-    // compilation features instead of accidental single-file features.
     for (const auto index : order) {
         collectExpansionDeclarations(prepared[index], context);
     }
 
-    // Pass two performs executable lowering. Generated specializations and ref
-    // wrappers are emitted once in stable path order, preventing duplicate type
-    // declarations when several files use the same language feature.
     std::set<std::string> emittedGenericNames;
     std::set<std::string> emittedReferenceTypes;
     for (const auto index : order) {
