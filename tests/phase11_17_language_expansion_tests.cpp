@@ -1,3 +1,4 @@
+#include "realscript/aot_cpp/AotCpp.h"
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
 #include "realscript/game/Gameplay.h"
@@ -376,6 +377,8 @@ void testExpansionMetadata() {
         "module Meta; [Replicated(channel = \"state\")] class Unit { int health; }");
     require(expansion.succeeded(), "metadata expansion failed");
     require(expansion.attributes.size() == 1, "source attribute was not captured");
+    require(expansion.attributes.front().target == "Meta::Unit",
+        "source attribute target was not module-qualified");
     require(expansion.attributes.front().name == "Replicated",
         "source attribute name changed");
     require(expansion.attributes.front().arguments.size() == 1,
@@ -400,6 +403,48 @@ void testExpansionOptionsRefreshExistingSources() {
         "changing expansion options did not rebuild existing sources");
 }
 
+void testAotGenerationFromExpandedSource() {
+    const char* source = R"(
+module ExpandedAot;
+
+T Identity<T>(T value)
+{
+    return value;
+}
+
+int main()
+{
+    List<int> values = new List<int>(4);
+    for (int index = 0; index < 3; index = index + 1)
+    {
+        values.Add(index + 1);
+    }
+    int total = 0;
+    foreach (int value in values)
+    {
+        total = total + value;
+    }
+    return Identity<int>(total);
+}
+)";
+
+    realscript::compiler::Compilation compilation({{"expanded_aot.rs", source}});
+    auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "expanded AOT source failed to compile:\n" +
+        diagnosticsText(build.diagnostics));
+
+    realscript::diagnostics::DiagnosticBag diagnostics;
+    realscript::aot::CppGenerator generator;
+    realscript::aot::GenerationOptions options;
+    options.programName = "Phase11To17Expanded";
+    const auto generated = generator.generate(build.modules, diagnostics, options);
+    require(!diagnostics.hasErrors() && generated.contentHash != 0 &&
+            generated.source.find("Phase11To17ExpandedProgram") !=
+                std::string::npos,
+        "expanded MIR did not generate deterministic C++17 AOT source");
+}
+
 void testPhase16DeterministicSequence() {
     realscript::game::GameApi api;
     auto host = std::make_shared<realscript::game::GameplayHost>(30, 5, 7);
@@ -410,6 +455,7 @@ void testPhase16DeterministicSequence() {
 module SequenceDemo;
 import RealScript.Game;
 
+[Behavior(category = "combat")]
 class Behavior
 {
     int total;
@@ -434,6 +480,12 @@ class Behavior
     const auto compiled = compiler.compile({{"sequence.rs", source}});
     require(compiled.succeeded(),
         "sequence source compilation failed:\n" + diagnosticsText(compiled.diagnostics));
+    require(compiled.languageMetadata.attributes.size() == 1 &&
+            compiled.languageMetadata.attributes.front().target ==
+                "SequenceDemo::Behavior",
+        "GameCompileResult did not retain source attributes");
+    require(compiled.program.languageMetadata().attributes.size() == 1,
+        "GameProgram did not retain source attributes");
 
     realscript::game::ScriptRuntime scripts(compiled.program);
     realscript::game::SceneScriptRuntime scene(scripts);
@@ -474,6 +526,7 @@ int main() {
     run("cross-module imports and isolation", testCrossModuleImportsAndIsolation);
     run("source attribute metadata", testExpansionMetadata);
     run("expansion options refresh", testExpansionOptionsRefreshExistingSources);
+    run("AOT generation from expanded source", testAotGenerationFromExpandedSource);
     run("phase 16 deterministic sequence", testPhase16DeterministicSequence);
     return failures == 0 ? 0 : 1;
 }
