@@ -4,6 +4,17 @@
 
 namespace realscript::game {
 
+struct GameLanguageMetadata {
+    std::vector<compiler::LanguageAttributeRecord> attributes;
+    std::vector<compiler::LanguageInterfaceImplementation> interfaces;
+    std::vector<compiler::LanguageGenericInstantiation> genericInstantiations;
+
+    [[nodiscard]] bool empty() const noexcept {
+        return attributes.empty() && interfaces.empty() &&
+            genericInstantiations.empty();
+    }
+};
+
 class GameProgram {
 public:
     GameProgram() = default;
@@ -21,6 +32,9 @@ public:
     [[nodiscard]] std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles() const noexcept {
         return nativeHandles_;
     }
+    [[nodiscard]] const GameLanguageMetadata& languageMetadata() const noexcept {
+        return languageMetadata_;
+    }
 
 private:
     friend class GameScriptCompiler;
@@ -28,12 +42,14 @@ private:
     std::shared_ptr<const runtime::BindingRegistry> bindings_;
     std::shared_ptr<runtime::ManagedHeap> heap_;
     std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles_;
+    GameLanguageMetadata languageMetadata_;
 };
 
 struct GameCompileResult {
     GameProgram program;
     std::vector<bytecode::Module> modules;
     diagnostics::DiagnosticBag diagnostics;
+    GameLanguageMetadata languageMetadata;
 
     [[nodiscard]] bool succeeded() const noexcept {
         return program.valid() && !diagnostics.hasErrors();

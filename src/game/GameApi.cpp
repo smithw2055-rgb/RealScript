@@ -54,6 +54,56 @@ void writeFunction(
         << " }\n";
 }
 
+void collectLanguageMetadata(
+    GameLanguageMetadata& metadata,
+    const std::vector<compiler::LanguageExpansionResult>& expansions) {
+    for (const auto& expansion : expansions) {
+        metadata.attributes.insert(
+            metadata.attributes.end(),
+            expansion.attributes.begin(),
+            expansion.attributes.end());
+        metadata.interfaces.insert(
+            metadata.interfaces.end(),
+            expansion.interfaces.begin(),
+            expansion.interfaces.end());
+        metadata.genericInstantiations.insert(
+            metadata.genericInstantiations.end(),
+            expansion.genericInstantiations.begin(),
+            expansion.genericInstantiations.end());
+    }
+
+    std::stable_sort(
+        metadata.attributes.begin(), metadata.attributes.end(),
+        [](const auto& left, const auto& right) {
+            if (left.target != right.target) return left.target < right.target;
+            return left.name < right.name;
+        });
+    std::sort(
+        metadata.interfaces.begin(), metadata.interfaces.end(),
+        [](const auto& left, const auto& right) {
+            return left.typeName < right.typeName;
+        });
+    std::sort(
+        metadata.genericInstantiations.begin(),
+        metadata.genericInstantiations.end(),
+        [](const auto& left, const auto& right) {
+            if (left.generatedName != right.generatedName) {
+                return left.generatedName < right.generatedName;
+            }
+            return left.genericName < right.genericName;
+        });
+    metadata.genericInstantiations.erase(
+        std::unique(
+            metadata.genericInstantiations.begin(),
+            metadata.genericInstantiations.end(),
+            [](const auto& left, const auto& right) {
+                return left.generatedName == right.generatedName &&
+                    left.genericName == right.genericName &&
+                    left.arguments == right.arguments;
+            }),
+        metadata.genericInstantiations.end());
+}
+
 } // namespace
 
 GameApi::GameApi()
@@ -153,6 +203,9 @@ GameCompileResult GameScriptCompiler::compile(
         compilation.addSource(std::move(source));
     }
     for (const auto& source : sources) compilation.addSource(source);
+    collectLanguageMetadata(
+        result.languageMetadata,
+        compilation.languageExpansions());
 
     auto build = compilation.build();
     result.diagnostics.append(build.diagnostics);
@@ -166,9 +219,6 @@ GameCompileResult GameScriptCompiler::compile(
     for (const auto& mirModule : build.modules) {
         auto module = lowerer.lower(mirModule);
         if (nativeModules.find(module.name) != nativeModules.end()) {
-            // Generated declarations describe the host API to the compiler. Only
-            // binding trampolines are removed; script-visible void wrappers stay
-            // in the image and adapt the VM's current external-return contract.
             module.functions.erase(
                 std::remove_if(
                     module.functions.begin(),
@@ -195,6 +245,7 @@ GameCompileResult GameScriptCompiler::compile(
     result.program.bindings_ = api_.bindings();
     result.program.heap_ = api_.heap();
     result.program.nativeHandles_ = api_.nativeHandles();
+    result.program.languageMetadata_ = result.languageMetadata;
     return result;
 }
 
