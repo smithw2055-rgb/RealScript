@@ -207,6 +207,17 @@ struct GenericDecl {
     std::vector<Token> tokens;
 };
 
+struct ReferenceParameterInfo {
+    std::string modifier;
+    std::string type;
+    std::string name;
+};
+
+struct ReferenceFunctionInfo {
+    std::string name;
+    std::vector<ReferenceParameterInfo> parameters;
+};
+
 struct Context {
     std::string path;
     LanguageExpansionOptions options;
@@ -214,6 +225,8 @@ struct Context {
     std::map<std::string, InterfaceInfo> interfaces;
     std::map<std::string, DelegateInfo> delegates;
     std::map<std::string, GenericDecl> generics;
+    std::map<std::pair<std::string, std::size_t>, ReferenceFunctionInfo>
+        referenceFunctions;
     std::set<std::string> generatedRefTypes;
     std::uint64_t counter = 0;
 
