@@ -48,12 +48,14 @@ struct BuildResult {
 class Compilation {
 public:
     Compilation() = default;
-    explicit Compilation(std::vector<SourceFile> sources) {
-        for (auto& source : sources) addSource(std::move(source));
+    explicit Compilation(std::vector<SourceFile> sources)
+        : sourceInputs_(std::move(sources)) {
+        refreshLanguageExpansions();
     }
 
     void setLanguageExpansionOptions(LanguageExpansionOptions options) {
         expansionOptions_ = options;
+        refreshLanguageExpansions();
     }
 
     [[nodiscard]] const LanguageExpansionOptions& languageExpansionOptions() const noexcept {
@@ -61,10 +63,8 @@ public:
     }
 
     void addSource(SourceFile source) {
-        auto expansion = expandLanguageSource(source.path, source.content, expansionOptions_);
-        source.content = expansion.content;
-        languageExpansions_.push_back(std::move(expansion));
-        sources_.push_back(std::move(source));
+        sourceInputs_.push_back(std::move(source));
+        refreshLanguageExpansions();
     }
 
     [[nodiscard]] const std::vector<LanguageExpansionResult>& languageExpansions() const noexcept {
@@ -75,7 +75,28 @@ public:
         const BuildSnapshot* previous = nullptr) const;
 
 private:
+    void refreshLanguageExpansions() {
+        std::vector<LanguageExpansionSource> inputs;
+        inputs.reserve(sourceInputs_.size());
+        for (const auto& source : sourceInputs_) {
+            inputs.push_back(LanguageExpansionSource{source.path, source.content});
+        }
+
+        languageExpansions_ = expandLanguageSources(inputs, expansionOptions_);
+        sources_.clear();
+        sources_.reserve(sourceInputs_.size());
+        for (std::size_t index = 0; index < sourceInputs_.size(); ++index) {
+            const auto& input = sourceInputs_[index];
+            const auto content = index < languageExpansions_.size() &&
+                    !languageExpansions_[index].content.empty()
+                ? languageExpansions_[index].content
+                : input.content;
+            sources_.push_back(SourceFile{input.path, content});
+        }
+    }
+
     LanguageExpansionOptions expansionOptions_;
+    std::vector<SourceFile> sourceInputs_;
     std::vector<SourceFile> sources_;
     std::vector<LanguageExpansionResult> languageExpansions_;
 };
