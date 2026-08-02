@@ -2,32 +2,32 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-RealScript is an embedded, strongly typed scripting language and runtime designed for modern game engines. It uses a C#-inspired syntax and targets C++17 hosts through a verified bytecode interpreter, deterministic C++17 AOT generation, and an optional native toolchain JIT.
+RealScript is an embedded, strongly typed scripting language and runtime for modern C++17 game engines. It uses a C#-inspired syntax and provides a verified bytecode interpreter, deterministic C++17 AOT generation, an optional external-toolchain JIT, source-level debugging, language tooling, hot reload, typed game bindings, and fixed-tick gameplay services.
 
-> **Project status:** the Phase 1–6 compiler/runtime roadmap, Phase 7 Game Scripting SDK, and Phase 8–10 deterministic gameplay runtime are complete and form the RealScript v0.1 alpha integration baseline. The source language, `.rsbc` format, object ABI, native module ABI, gameplay-state format, and GC contracts remain draft and are not frozen for long-term compatibility.
+> **Project status:** Phase 1–10 provides the compiler/runtime, Game Scripting SDK, and deterministic gameplay runtime. Phase 11–17 adds a bounded C#-style gameplay-language profile with multi-file/module expansion, structured control flow, events/lambdas, compile-time interfaces, source attributes, explicit generics, deterministic sequences, and restricted reference parameters. The language, expansion profile, `.rsbc`, object/Game SDK ABIs, metadata, gameplay-state format, and GC contracts remain draft.
 
 ## Highlights
 
 - Dependency-free C++17 and CMake foundation.
-- Lexer, parser, binder, flow analysis, stable diagnostics, and incremental module compilation.
-- Verified multi-block Typed MIR with explicit locals, block parameters, and O0/O1/O2 optimization levels.
-- Typed register bytecode, deterministic `.rsbc` 0.5 encoding, disassembly, defensive decoding, and strict verification.
-- Bytecode interpreter with structured errors, script stacks, instruction budgets, recursion budgets, and runtime statistics.
+- Lexer, parser, binder, flow analysis, diagnostics, multi-file modules, imports, and incremental snapshots.
+- Verified multi-block Typed MIR with O0/O1/O2 optimization.
+- Typed register bytecode, deterministic `.rsbc` 0.5 encoding, strict verification, and structured runtime errors.
 - Classes, constructors, methods, properties, arrays, enums, structs, strings, native handles, and exact type identities.
-- Precise shadow-stack roots, generation-checked `ObjectRef` handles, incremental mark/sweep GC, write barriers, heap snapshots, retaining paths, and leak summaries.
-- DAP debugger, LSP language server, source-level debug information, and body-only hot reload.
-- Deterministic C++17 AOT generation, reusable CMake integration, and a C11/C++ native module query ABI.
-- Strict, Record, and Replay execution modes with stable execution digests and host-binding determinism policies.
-- Typed C++ game bindings, rooted script objects, scene lifecycle callbacks, events, triggers, and SDK productization.
-- Generation-checked gameplay entities, fixed ticks, PCG random streams, deterministic timers/events, script contracts, metadata, and fixed-step scene driving.
-- Versioned `RSGS` gameplay snapshots with defensive limits and stable state-hash verification for save, replay, and rollback integration.
-- Per-function profiling, stable benchmark output, the `rsbench` CLI, and optional external-toolchain JIT.
-- Interpreter/AOT/JIT differential validation.
-- Ubuntu and Windows Server 2025 / Visual Studio 2026 GitHub Actions coverage.
+- Precise roots, generation-checked references, incremental mark/sweep GC, write barriers, heap snapshots, and leak diagnostics.
+- DAP debugger, LSP language server, source metadata, and body-only hot reload.
+- Deterministic C++17 AOT, native module ABI, record/replay, profiling, benchmarking, and optional toolchain JIT.
+- Typed C++ Game SDK, rooted script objects, scene lifecycle, events, triggers, bytecode package loading, and installable SDK targets.
+- Fixed ticks, generation-checked gameplay entities, PCG random streams, deterministic timers/events, gameplay snapshots, and `RSGS` save/replay/rollback state.
+- Phase 11 structured control flow: `for`, array/fixed-collection `foreach`, `do/while`, `break`, `continue`, and equality-based `switch`.
+- Phase 12 deterministic class-local events, method groups, and bounded lambdas.
+- Phase 13 interface declarations and compile-time implementation contracts.
+- Phase 14 source attributes retained through `Compilation`, `GameCompileResult`, and `GameProgram`.
+- Phase 15 explicit deterministic generic specialization and fixed-capacity collection profiles.
+- Phase 16 `sequence` / `yield wait_ticks` lowering through the fixed-tick gameplay runtime.
+- Phase 17 restricted standalone `ref`, `out`, and `in` calls plus current-runtime value aliases.
+- Ubuntu and Windows Server 2025 / Visual Studio 2026 warnings-as-errors CI.
 
-## Quick Start
-
-### Build and test
+## Build and test
 
 ```bash
 cmake -S . -B build \
@@ -37,7 +37,7 @@ cmake --build build --config Debug
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-### Compile multiple source files
+## Basic script
 
 `math.rs`:
 
@@ -62,21 +62,14 @@ int main()
 }
 ```
 
-Compile, inspect MIR, and list stable symbols:
-
 ```bash
 rsc math.rs main.rs
 rsc math.rs main.rs --mir
 rsc math.rs main.rs --symbols
-```
-
-Run an entry function:
-
-```bash
 rsc math.rs main.rs --run Game.Main::main
 ```
 
-Run with optimization, deterministic execution, profiling, and a stable digest:
+Run with deterministic execution, profiling, and a stable digest:
 
 ```bash
 rsc math.rs main.rs \
@@ -87,17 +80,77 @@ rsc math.rs main.rs \
   --digest
 ```
 
-### Bytecode
+## Phase 11–17 gameplay-language example
 
-```bash
-rsc math.rs main.rs --bytecode
-rsc math.rs main.rs --emit-bytecode game.rsbc
-rsc game.rsbc --disassemble
+```csharp
+module Game.Combat;
+
+delegate void DamageHandler(int amount);
+
+interface IDamageReader
+{
+    int ReadDamage();
+}
+
+[Serializable(version = 1)]
+class DamageAccumulator<T> : IDamageReader
+{
+    T marker;
+    int total;
+    event DamageHandler Damaged;
+
+    void Add(int amount)
+    {
+        total = total + amount;
+    }
+
+    int ReadDamage()
+    {
+        return total;
+    }
+
+    int Run(int[] values)
+    {
+        Damaged += Add;
+        Damaged += value => total = total + value;
+
+        List<int> accepted = new List<int>(16);
+        foreach (int value in values)
+        {
+            if (value < 0) continue;
+            accepted.Add(value);
+            Damaged(value);
+        }
+
+        switch (accepted.Count())
+        {
+            case 0:
+                return 0;
+            default:
+                return total;
+        }
+    }
+}
 ```
 
-A `.rsbc` module must pass physical decoding and semantic verification before execution.
+Extended source is normalized in deterministic module/path order and then passes through the ordinary parser, binder, Typed MIR, bytecode/interpreter, optimizer, AOT generator, and optional JIT pipeline.
 
-### C++17 AOT
+## Deterministic sequence example
+
+```csharp
+sequence Attack(long target)
+{
+    PlayWindup();
+    yield wait_ticks(12);
+    SpawnProjectile();
+    yield wait_ticks(6);
+    Finish();
+}
+```
+
+Sequence callbacks are scheduled through `GameplayHost` and `TickScheduler`, so they participate in fixed-tick ordering, snapshot, replay, and rollback state. Durable state across yields belongs in script object fields.
+
+## C++17 AOT
 
 ```bash
 rsaot \
@@ -108,9 +161,9 @@ rsaot \
   math.rs main.rs
 ```
 
-The generator emits a header, C++17 source, source-map metadata, and a deterministic manifest. Generated code executes verified Typed MIR directly; it does not embed the bytecode interpreter.
+The generator emits deterministic C++17 source, a header, source metadata, and a manifest. Generated code executes verified Typed MIR directly and does not embed the bytecode interpreter.
 
-CMake projects can create a native AOT library directly:
+CMake projects can create an AOT library directly:
 
 ```cmake
 include(cmake/RealScriptAot.cmake)
@@ -124,7 +177,7 @@ realscript_add_aot_library(GameScriptsAot
 target_link_libraries(game PRIVATE GameScriptsAot)
 ```
 
-### Game SDK and deterministic gameplay runtime
+## Game SDK and gameplay runtime
 
 ```cpp
 #include "realscript/game/Gameplay.h"
@@ -133,40 +186,24 @@ realscript::game::GameApi api;
 auto gameplay = std::make_shared<realscript::game::GameplayHost>(60, 1234, 7);
 realscript::game::installGameplayBindings(api, gameplay);
 
-// Compile scripts with GameScriptCompiler, attach them through
-// SceneScriptRuntime, then drive deterministic ticks with SceneGameplayDriver.
+realscript::game::GameScriptCompiler compiler(api);
+auto compiled = compiler.compile(sources);
+
+// Source attributes and interface/generic expansion metadata remain available.
+const auto& metadata = compiled.program.languageMetadata();
 ```
 
-Gameplay scheduling state can be encoded with `encodeGameplayHostState()` and restored with `restoreGameplayHostState()`. Script object fields use the existing `ScriptObjectState` productization API; an engine rollback frame should combine both state domains.
+Use `SceneScriptRuntime` for lifecycle/event dispatch and `SceneGameplayDriver` for fixed-tick execution. Gameplay scheduling state uses `encodeGameplayHostState()` / `restoreGameplayHostState()`; script object fields use `ScriptObjectState`. An engine rollback frame should combine both state domains.
 
-### Benchmarking
-
-```bash
-rsbench \
-  --entry Game.Main::main \
-  --warmup 20 \
-  --iterations 1000 \
-  --opt-level 2 \
-  --json \
-  math.rs main.rs
-```
-
-### Debugger and language server
-
-```bash
-rsdebug game.rs common.rs   # Debug Adapter Protocol over stdin/stdout
-rslsp                       # Language Server Protocol over stdin/stdout
-```
-
-## Command-Line Tools
+## Command-line tools
 
 | Tool | Purpose |
 |---|---|
 | `rsc` | Compile, validate, inspect MIR/bytecode, run scripts, and emit profiles/digests. |
 | `rsaot` | Generate deterministic C++17 AOT sources and manifests. |
-| `rsdebug` | Source-level DAP debug adapter. |
-| `rslsp` | LSP language server. |
-| `rsbench` | Deterministic benchmark and profile tool. |
+| `rsdebug` | Source-level Debug Adapter Protocol server. |
+| `rslsp` | Language Server Protocol server. |
+| `rsbench` | Deterministic benchmark and profile runner. |
 
 ## Architecture
 
@@ -174,13 +211,13 @@ rslsp                       # Language Server Protocol over stdin/stdout
 RealScript source files
         |
         v
+Optional Phase 11–17 deterministic language expansion
+        |
+        v
 Lexer / Parser / Syntax Trees
         |
         v
-Compilation / Module Graph / Symbol Predeclaration
-        |
-        v
-Binder / Overload Resolution / Flow Analysis
+Compilation / Module Graph / Binder / Flow Analysis
         |
         v
 Verified multi-block Typed MIR
@@ -189,7 +226,7 @@ Verified multi-block Typed MIR
         +--------> Generated C++17 -------> Platform AOT compiler
         +--------> Toolchain JIT ---------> Shared native module
 
-Shared type system / runtime services / metadata / GC / bindings / debug info
+Shared type system / runtime services / metadata / GC / bindings
         |
         v
 Game Scripting SDK / deterministic gameplay runtime
@@ -198,98 +235,46 @@ Game Scripting SDK / deterministic gameplay runtime
 C++17 game engine
 ```
 
-All execution backends share the same type system, verified MIR semantics, runtime contracts, and differential tests. A backend must not bypass MIR and reinterpret the source AST independently. Gameplay services remain outside the execution backend so interpreter, AOT, and JIT scripts use the same fixed-tick semantics.
-
-## Source Layout
-
-```text
-include/realscript/
-  text/          SourceText and TextSpan
-  diagnostics/   Stable diagnostics
-  syntax/        Tokens, AST, lexer, and parser
-  semantic/      Types, symbols, bound trees, binder, and flow analysis
-  mir/           Multi-block Typed MIR, lowering, printing, and verification
-  compiler/      Multi-file compilation, module graph, and incremental snapshots
-  bytecode/      Register bytecode, codec, verifier, and disassembler
-  runtime/       ProgramImage, interpreter, execution services, and managed heap
-  game/          Host bindings, script objects, scene runtime, gameplay and state codec
-  debug/         Debug metadata, debug sessions, and DAP
-  tooling/       JSON, language services, and LSP
-  hot_reload/    ProgramImage compatibility analysis and atomic replacement
-  aot_cpp/       C++17 generator, AOT runtime, and public C ABI
-  optimization/  Typed MIR optimizer and optimization statistics
-  jit/           Optional toolchain JIT and dynamic module lifetime
-src/              Implementations
-tools/rsc/        Compiler and runtime CLI
-tools/rsaot/      C++17 AOT generator
-tools/rsdebug/    DAP adapter
-tools/rslsp/      LSP server
-tools/rsbench/    Benchmark and profile tool
-cmake/             Reusable SDK and AOT integration
-tests/             Conformance, regression, differential, and integration tests
-docs/en/           Default English documentation
-docs/spec/         Detailed Chinese specification set
-docs/roadmap/      Implementation roadmap and phase notes
-```
-
 ## Documentation
 
-The default documentation language is English:
-
-- [Documentation home](docs/README.md)
 - [English documentation library](docs/en/README.md)
-- [Getting started](docs/en/GETTING_STARTED.md)
-- [Architecture](docs/en/ARCHITECTURE.md)
 - [Language and type system](docs/en/LANGUAGE_AND_TYPE_SYSTEM.md)
-- [Compilation, MIR, and bytecode](docs/en/COMPILATION_AND_BYTECODE.md)
-- [Runtime, GC, and embedding](docs/en/RUNTIME_GC_AND_EMBEDDING.md)
+- [Phase 11–17 language expansion profile](docs/en/LANGUAGE_EXPANSION_PHASE_11_17.md)
 - [Game Scripting SDK](docs/en/GAME_SCRIPTING_SDK.md)
 - [Deterministic gameplay runtime](docs/en/GAMEPLAY_RUNTIME.md)
 - [SDK productization](docs/en/PRODUCTIZATION.md)
-- [Debugging, tooling, and hot reload](docs/en/DEBUGGING_TOOLING_AND_HOT_RELOAD.md)
-- [AOT, JIT, and performance](docs/en/AOT_JIT_AND_PERFORMANCE.md)
-- [Determinism and replay](docs/en/DETERMINISM_AND_REPLAY.md)
 - [Project status and roadmap](docs/en/PROJECT_STATUS_AND_ROADMAP.md)
-
-Chinese documentation remains available:
-
 - [Chinese documentation home](docs/zh-CN/README.md)
-- [Chinese Game Scripting SDK](docs/zh-CN/GAME_SCRIPTING_SDK.md)
-- [Chinese deterministic gameplay runtime](docs/zh-CN/GAMEPLAY_RUNTIME.md)
-- [Chinese architecture design](docs/ENGINE_DESIGN.md)
-- [Chinese specification index](docs/spec/README.md)
+- [Chinese Phase 11–17 implementation profile](docs/roadmap/PHASE_11_17_LANGUAGE_EXPANSION.md)
 
-## Completed Roadmap
+## Completed roadmap
 
-- [x] Phase 1: language frontend, control flow, calls, modules, and incremental compilation.
-- [x] Phase 2: typed register bytecode, interpreter, linking, observability, and embedding.
-- [x] Phase 3: managed heap, precise GC, objects, arrays, native handles, members, and value types.
-- [x] Phase 4: debug information, DAP, LSP, and body-only hot reload.
-- [x] Phase 5: C++17 AOT, native module ABI, source maps, and differential testing.
-- [x] Phase 6: deterministic record/replay, MIR optimization, profiling, benchmarking, and optional toolchain JIT.
-- [x] Phase 7: typed Game Scripting SDK, script objects, scene lifecycle, events, and triggers.
-- [x] Phase 8: deterministic entities, fixed ticks, random streams, timers, events, snapshots, and stable hashes.
-- [x] Phase 9: script contracts, metadata, fixed-tick sequences, scene driver, and generated gameplay bindings.
-- [x] Phase 10: versioned gameplay-state codec for save, replay, and rollback integration.
+- [x] Phase 1–6: compiler, runtime, GC, tooling, AOT, determinism, optimization, and optional JIT.
+- [x] Phase 7: Game Scripting SDK and productization.
+- [x] Phase 8–10: deterministic gameplay runtime and state codec.
+- [x] Phase 11: structured control flow.
+- [x] Phase 12: bounded delegates, lambdas, and events.
+- [x] Phase 13: interface contracts.
+- [x] Phase 14: source metadata.
+- [x] Phase 15: explicit generics and fixed-capacity collections.
+- [x] Phase 16: deterministic sequences.
+- [x] Phase 17: restricted reference parameters and value aliases.
 
-## Stability and Deliberate Limits
+## Deliberate limits
 
-RealScript v0.1 is an alpha technical and integration baseline, not a frozen 1.0 language or binary platform.
+Phase 11–17 is a deterministic embedded game-language profile, not full CLR/C#:
 
-The following remain intentionally unfrozen:
-
-- source-language compatibility;
-- `.rsbc` bytecode compatibility;
-- object and native module ABI compatibility;
-- Game SDK and gameplay-state compatibility;
-- GC and embedding contracts;
-- cross-toolchain distribution of precompiled AOT modules.
-
-Notable features that remain unimplemented include inheritance, source-language interfaces and virtual dispatch, generics, exceptions, source-language coroutines/`async`, `ref`/`out`, complete `for`/`foreach`/`switch` syntax, source attributes, direct machine-code JIT generation, OSR, PGO, and a rollback networking protocol. The deterministic gameplay runtime supplies host-level contracts, metadata, sequences, snapshots, and fixed-tick services without pretending those source-language features already exist.
-
-## Design References
-
-RealScript combines ideas from AngelScript's embedding and debugging model, Luau's VM performance engineering, Unity IL2CPP's C++ AOT workflow, native JIT toolchains, and the DAP/LSP editor protocols.
+- no class inheritance or runtime interface/virtual dispatch;
+- delegates are not general first-class runtime values;
+- lambdas do not capture arbitrary locals into heap closure objects;
+- no inferred/open generics, constraints, variance, or automatically growing collections;
+- no pattern matching or general enumerator protocol;
+- sequences support `yield wait_ticks`, not general `Task`/threads/`async`;
+- no ref locals, ref returns, ref fields, ref indexers, or general reference lifetime analysis;
+- value aliases reuse current canonical runtime carriers rather than distinct exact ABI types;
+- source attributes are not yet serialized in `.rsbc`;
+- expanded generated code does not yet have complete exact source-map remapping;
+- exceptions, nullable values, boxing, direct machine-code JIT, OSR, PGO, and rollback networking remain future work.
 
 ## License
 
