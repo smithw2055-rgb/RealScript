@@ -1,225 +1,167 @@
 # Project Status and Roadmap
 
-[Documentation Home](README.md) | [Repository README](../../README.md)
+[Documentation Home](README.md) | [Repository README](../../README.md) | [Phase 11–17 Profile](LANGUAGE_EXPANSION_PHASE_11_17.md)
 
-The Phase 1–6 compiler and execution roadmap, Phase 7 Game Scripting SDK, and Phase 8–10 deterministic gameplay runtime are complete. RealScript now has a coherent v0.1 alpha integration baseline covering the source language, verified compiler pipeline, bytecode runtime, managed memory, debugging, editor tooling, AOT, deterministic execution, typed game-engine embedding, fixed-tick gameplay services, and versioned gameplay-state restoration.
+The Phase 1–10 compiler, Game SDK, and deterministic gameplay-runtime roadmap is complete. Phase 11–17 adds a bounded deterministic game-language profile that is integrated with multi-file/module compilation, Typed MIR, bytecode, the interpreter, C++17 AOT generation, and Game SDK metadata.
 
 ## Current Status
 
 RealScript should currently be described as:
 
-> A complete alpha reference implementation and game-engine integration baseline, not a frozen production 1.0 language or binary platform.
+> A complete alpha reference implementation and game-engine integration baseline with a bounded C#-style gameplay-language profile, not a frozen production 1.0 language or CLR-compatible platform.
 
 The implementation is suitable for:
 
-- architectural evaluation;
 - embedding in C++17 game and simulation engines;
 - gameplay, AI, ability, quest, and scene-script prototypes;
-- interpreter/AOT/JIT comparison;
-- debugger and language-server integration;
 - deterministic fixed-tick simulation;
 - save, replay, and rollback-state experiments;
+- interpreter/AOT/JIT comparison;
+- debugger and language-server integration;
+- editor metadata and Game SDK integration;
 - validation through a real host application.
 
 ## Completed Phases
 
-### Phase 1 — Language Frontend
+### Phase 1–6 — compiler and execution baseline
 
-- C++17/CMake foundation
-- text and diagnostics
-- lexer and parser
-- semantic binding
-- control flow and flow analysis
-- multi-block Typed MIR
-- functions, overloads, modules, imports, and incremental snapshots
+- lexer, parser, binder, flow analysis, and multi-file modules;
+- verified multi-block Typed MIR and O0/O1/O2 optimization;
+- deterministic register bytecode, verifier, interpreter, and embedding;
+- managed heap, precise roots, classes, arrays, members, enums, and structs;
+- DAP, LSP, debug metadata, and body-only hot reload;
+- deterministic C++17 AOT, native module ABI, profiling, record/replay, benchmark tooling, and optional external-toolchain JIT.
 
-### Phase 2 — Bytecode Runtime
+### Phase 7 — Game Scripting SDK and productization
 
-- typed register bytecode
-- deterministic codec and disassembler
-- defensive decoder and verifier
-- interpreter, calls, block arguments, and runtime errors
-- linking, native bindings, tracing, statistics, and embedding facade
+- compiler-visible typed C++ host APIs;
+- native functions, methods, properties, and generation-checked wrappers;
+- rooted script objects and scene lifecycle callbacks;
+- direct/queued/broadcast events and engine-owned triggers;
+- bytecode package loading, installable SDK targets, and script-object state serialization.
 
-### Phase 3 — Object and Memory Model
+### Phase 8–10 — deterministic gameplay runtime
 
-- non-moving managed heap
-- generation-checked object references
-- precise roots and incremental mark/sweep
-- classes, fields, arrays, and exact type descriptors
-- native handles and cross-heap ownership checks
-- methods, constructors, and properties
-- checked `long`, binary64 `double`, enums, and copy-semantic structs
-- heap snapshots, retaining paths, and leak summaries
+- generation-checked gameplay entities;
+- fixed ticks, PCG random streams, deterministic timers/events, snapshots, and stable hashes;
+- gameplay contracts, host metadata, fixed-step scene driving, and generated gameplay bindings;
+- versioned `RSGS` state encoding for save, replay, and rollback composition.
 
-### Phase 4 — Debugging and Tooling
+### Phase 11 — structured gameplay control flow
 
-- `.rsbc` source and debug metadata
-- sequence points, locals, parameters, and lexical scopes
-- DAP debug adapter
-- LSP language server
-- breakpoints, stepping, stack frames, scopes, and variables
-- diagnostics, completion, navigation, references, rename, and symbols
-- safe function-body hot reload
+- `for`, array/fixed-collection `foreach`, and `do/while`;
+- `break`, `continue`, and equality-based `switch/case/default`;
+- deterministic nested loop/switch lowering and diagnostics.
 
-### Phase 5 — C++17 AOT
+### Phase 12 — delegates, lambdas, and events
 
-- deterministic C++17 source generation
-- AOT support runtime
-- source maps and deterministic manifest
-- C11/C++ native module query ABI
-- typed native entries and descriptor validation
-- reusable CMake AOT integration
-- interpreter/AOT differential tests
+- delegate declarations as event signatures;
+- class-local deterministic events;
+- method groups, parenthesized lambdas, and single-parameter lambdas;
+- stable generated handler methods and subscription order.
 
-### Phase 6 — Determinism, Optimization, and JIT
+### Phase 13 — interface contracts
 
-- Strict, Record, and Replay execution
-- host-binding determinism policies
-- stable execution digests
-- O0/O1/O2 Typed MIR optimization
-- per-function profiles
-- `rsbench`
-- external C++ toolchain JIT
-- shared-library loading and content-addressed cache
-- interpreter/AOT/JIT differential validation
+- interface declarations and implementation lists;
+- compile-time method-name/arity validation;
+- implementation metadata for tools and the Game SDK.
 
-### Phase 7 — Game Scripting SDK and Productization
+### Phase 14 — source attributes
 
-- compiler-visible typed C++ host APIs
-- native functions, instance methods, and properties
-- generation-checked native object wrappers
-- rooted script-object creation and invocation
-- scene lifecycle callbacks
-- direct, queued, and broadcast events
-- engine-owned trigger conditions
-- bytecode package loading and object-metadata restoration
-- installable SDK targets and script-object state serialization
+- positional and named attribute arguments;
+- module-qualified targets;
+- metadata retained by `Compilation`, `GameCompileResult`, and `GameProgram`.
 
-### Phase 8 — Deterministic Gameplay Primitives
+### Phase 15 — explicit generics and collections
 
-- generation-checked gameplay `EntityId`
-- fixed-tick clock with catch-up limits
-- independent PCG random streams
-- deterministic timer scheduler
-- globally unique deterministic event identities
-- typed event arguments
-- snapshot, restore, and stable hashes
+- deterministic explicit monomorphization;
+- same-module cross-file sharing and imported-module visibility;
+- module isolation for same-name declarations;
+- fixed-capacity `List`, `Queue`, `Stack`, `Optional`, `HashSet`, and `Dictionary` profiles.
 
-### Phase 9 — Gameplay Scripting Runtime
+### Phase 16 — deterministic sequences
 
-- script callback timers
-- named event subscriptions
-- fixed-tick script sequences
-- interface-like `ScriptContract` validation
-- host-owned deterministic metadata
-- fixed-step `SceneGameplayDriver`
-- generated `RealScript.Game` host bindings
+- `sequence` methods;
+- `yield wait_ticks(...)` lowering to fixed-tick callbacks;
+- integration with `GameplayHost`, snapshots, replay, and rollback scheduling.
 
-### Phase 10 — Save, Replay, and Rollback State
+### Phase 17 — reference/value profile
 
-- versioned `RSGS` gameplay-state container
-- fixed-width little-endian encoding
-- canonical floating-point representation
-- defensive object, string, count, and byte limits
-- stable state-hash verification
-- gameplay-host snapshot and restoration helpers
-- composition boundary with `ScriptObjectState` for engine-level rollback frames
+- restricted standalone `ref`, `out`, and `in` calls;
+- declaring-module-owned exact wrapper types and deterministic writeback;
+- current-core aliases for smaller/unsigned numeric names, `float`, and `char`.
 
 ## Validation Baseline
 
-The compiler/runtime baseline has been exercised with:
+The repository matrix covers:
 
-- GCC 14.2 Debug with warnings as errors;
-- Clang 17 Debug with warnings as errors;
-- GCC Release optimization with warnings as errors;
-- AddressSanitizer and UndefinedBehaviorSanitizer;
-- Ubuntu GitHub Actions;
-- Windows Server 2025 / Visual Studio 2026 GitHub Actions;
-- generated C++ compilation;
-- C11 ABI-header compilation;
-- dynamic shared-library loading;
-- native ABI query and descriptor validation;
-- JIT cache reuse;
-- interpreter/AOT/JIT differential tests.
+- GCC/Clang/MSVC C++17 builds with warnings as errors;
+- Ubuntu and Windows GitHub Actions;
+- bytecode verification and interpreter execution;
+- generated C++17 AOT source and native AOT tests;
+- C11 native-module ABI validation;
+- optional toolchain JIT and interpreter/AOT/JIT differential tests;
+- Phase 7–10 Game SDK/gameplay-state integration;
+- Phase 11–17 single-file, cross-file, and cross-module execution;
+- module import/isolation, nested switch/loop behavior, fixed-collection enumeration, event lambdas, reference writeback, deterministic sequences, AOT generation, and Game SDK metadata retention.
 
-The repository test matrix now also includes Phase 7 Game SDK/productization tests and Phase 8–10 coverage for deterministic ordering, stale entity rejection, globally unique event identities, timer repetition, event delivery, sequence timing, contract validation, snapshot/hash stability, codec round trips, corruption rejection, and decode limits.
+## Explicit Profile Boundaries
+
+Phase 11–17 is a bounded game-language profile. It does not implement full CLR/C# semantics:
+
+- interfaces are compile-time contracts, not runtime interface values or virtual dispatch;
+- delegates are not general first-class runtime objects;
+- lambdas do not capture arbitrary locals into heap closure objects;
+- generics use explicit compile-time specialization without inference, open runtime generics, constraints, or variance;
+- collections are fixed-capacity and deterministic;
+- sequences support `yield wait_ticks`; durable cross-yield state belongs in object fields;
+- `ref/out/in` is restricted to standalone calls; no ref locals/returns/fields/indexers;
+- `byte`/`uint`/`float`/`char` names map to current canonical carriers rather than distinct runtime ABI identities;
+- attributes are available to source/Game SDK metadata but are not yet serialized into `.rsbc`;
+- expanded generated code does not yet have a complete exact source-map remapping layer.
 
 ## Unfrozen Compatibility Areas
 
-The following dimensions remain draft:
+The following remain draft:
 
-- source-language syntax and static semantics;
+- source language and language-expansion syntax;
 - MIR instruction set and verification rules;
-- `.rsbc` physical format;
-- runtime C/C++ ABI;
-- object descriptor and metadata schema;
-- debug-information schema;
+- `.rsbc` and `RSGS` physical formats;
+- object, Game SDK, metadata, and native module ABIs;
 - GC and embedding ownership contracts;
-- Game SDK source and binary contracts;
-- `RSGS` gameplay-state format;
 - cross-toolchain AOT module distribution.
 
-Projects integrating the alpha baseline should pin a specific RealScript revision or SDK version.
-
-## Deliberate Feature Limits
-
-The current baseline does not include:
-
-- inheritance and source-language interfaces;
-- virtual or abstract dispatch;
-- generics and generic collections;
-- exceptions and structured cleanup;
-- source-language `yield`, coroutines, or async tasks;
-- `ref` and `out` parameters;
-- complete `for`, `foreach`, `switch`, and pattern-matching syntax;
-- source attribute syntax;
-- cross-toolchain stable binary distribution;
-- direct machine-code JIT generation;
-- speculative optimization, deoptimization, OSR, or PGO;
-- a complete rollback networking, replication, or lockstep transport framework.
-
-The host-level contracts, metadata, sequences, fixed-tick services, and state codec are intentional runtime foundations for later language syntax and engine networking; they are not substitutes for claiming those features are already implemented.
+Projects integrating the alpha baseline should pin a specific revision and explicitly select the implemented gameplay-language profile.
 
 ## Recommended Next Stage
 
-The broad technical roadmap should now remain closed. The next work should be driven by integration into one real game engine rather than by adding another general-purpose compiler phase.
+The broad Phase 1–17 roadmap should now remain closed. The next work should be driven by integration into a real game engine:
 
-Recommended integration sequence:
+1. embed `GameApi`, `GameScriptCompiler`, `SceneScriptRuntime`, and `GameplayHost`;
+2. expose a capability-limited host API;
+3. build representative gameplay, AI, ability, quest, and mod scripts;
+4. combine gameplay and script-object state into engine rollback frames;
+5. validate interpreter and native AOT deployment;
+6. connect LSP/DAP and metadata to the editor;
+7. profile realistic workloads;
+8. freeze only contracts proven by integration.
 
-1. embed `GameApi`, `GameScriptCompiler`, and `SceneScriptRuntime` in a real C++17 engine;
-2. install a capability-limited gameplay API;
-3. drive scripts through `GameplayHost` and `SceneGameplayDriver`;
-4. combine `GameplayHost::State` and `ScriptObjectState` into an engine rollback frame;
-5. validate replay and rollback against real deterministic input streams;
-6. exercise interpreter and AOT deployment;
-7. connect LSP and DAP to the editor;
-8. validate hot reload during development;
-9. profile realistic workloads with `rsbench` and runtime counters;
-10. freeze only the contracts proven by actual integration.
+## Possible Future RFCs
 
-## Possible Future Work
+Future work may consider:
 
-Future RFCs may consider:
-
-- a stable v0.2 language subset;
-- inheritance, interfaces, and virtual dispatch;
-- generics and monomorphization policy;
-- exceptions and structured cleanup;
-- delegates, lambdas, and language-level events;
-- source attributes and editor metadata generation;
-- `for`, `foreach`, `switch`, and pattern matching;
-- coroutine state-machine lowering;
-- deterministic generic collections;
-- rollback networking and replication integration;
-- persistent incremental build caches;
-- advanced optimizer passes;
-- LLVM ORC or direct machine-code JIT;
-- cross-toolchain native distribution ABI;
-- package and dependency management.
-
-These items are not part of the completed Phase 1–10 integration baseline.
+- class inheritance and runtime interface/virtual dispatch;
+- first-class delegates and complete closure objects;
+- inferred/open generics, constraints, variance, and growable collections;
+- pattern matching and general enumerator protocols;
+- native coroutine state machines with persisted locals;
+- exact-width unsigned, binary32 `float`, and Unicode `char` identities;
+- complete reference lifetime semantics, exceptions, nullable values, and boxing;
+- precise source maps for generated expansion code;
+- `.rsbc` attribute metadata;
+- rollback networking and replication protocols;
+- direct machine-code JIT, OSR, PGO, and cross-toolchain distribution.
 
 ## Release Naming
 
-Until compatibility contracts are frozen, releases should use alpha or preview naming such as `v0.1.0-alpha`. Release notes should identify the exact commit and clearly state source, bytecode, SDK, gameplay-state, and ABI compatibility boundaries.
+Until compatibility contracts are frozen, releases should use alpha or preview naming such as `v0.1.0-alpha`. Release notes should identify the exact commit and explicitly state source, expansion-profile, bytecode, SDK, gameplay-state, and ABI boundaries.
