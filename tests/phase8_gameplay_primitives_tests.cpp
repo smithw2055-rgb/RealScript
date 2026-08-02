@@ -1,6 +1,7 @@
 #include "realscript/game/GameplayPrimitives.h"
 
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -91,6 +92,33 @@ void testSchedulerOrderingAndSnapshot() {
         "scheduler hash changed after restore");
 }
 
+void testEventSequenceIdentityIsGlobal() {
+    DeterministicEventQueue queue;
+    const auto first = queue.enqueue(
+        GameplayEvent{1, 7, 10, "first", {}});
+    require(first == 7, "explicit event sequence was not accepted");
+    require(queue.enqueue(
+        GameplayEvent{2, 7, 10, "duplicate", {}}) == 0,
+        "duplicate event sequence was accepted at another tick");
+    require(queue.size() == 1,
+        "duplicate event sequence changed the queue");
+
+    auto invalid = queue.snapshot();
+    invalid.nextSequence = 9;
+    invalid.events.push_back(GameplayEvent{3, 7, 10, "duplicate", {}});
+    DeterministicEventQueue restored;
+    require(!restored.restore(invalid),
+        "restore accepted duplicate event sequence identities");
+
+    require(queue.cancel(7), "event cancellation by sequence failed");
+    require(queue.size() == 0, "event cancellation left a duplicate behind");
+
+    const auto maximum = std::numeric_limits<EventSequence>::max();
+    require(queue.enqueue(
+        GameplayEvent{1, maximum, 10, "overflow", {}}) == 0,
+        "maximum event sequence allowed the next id to wrap");
+}
+
 void testEventOrderingAndAggregateState() {
     DeterministicGameplayRuntime runtime(30, 123, 5);
     const auto entity = runtime.entities().create();
@@ -133,6 +161,7 @@ int main() {
     run("fixed-tick clock", testFixedTickClockAndDropBudget);
     run("deterministic random stream", testDeterministicRandomStream);
     run("scheduler ordering and snapshot", testSchedulerOrderingAndSnapshot);
+    run("global event sequence identity", testEventSequenceIdentityIsGlobal);
     run("event ordering and aggregate state", testEventOrderingAndAggregateState);
     return failures == 0 ? 0 : 1;
 }
