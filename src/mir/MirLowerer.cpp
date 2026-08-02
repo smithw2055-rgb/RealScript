@@ -150,50 +150,10 @@ void Lowerer::collectLocalTypes(const semantic::BoundStatement& statement) {
     case semantic::BoundNodeKind::ForStatement: {
         const auto& value =
             static_cast<const semantic::BoundForStatement&>(statement);
-        if (value.initializer) lowerStatement(*value.initializer);
-        if (!hasCurrentBlock() || currentBlockTerminated()) return;
-        const auto constantTrue = isLiteralTrue(*value.condition);
-        const auto needsExit =
-            !constantTrue || containsBreakForCurrentTarget(*value.body);
-        const auto conditionBlock = createBlock();
-        const auto bodyBlock = createBlock();
-        const auto incrementBlock = createBlock();
-        const auto exitBlock = needsExit
-            ? std::optional<BlockId>{createBlock()}
-            : std::nullopt;
-        emitJump(conditionBlock, {}, statement.span);
-        setCurrentBlock(conditionBlock);
-        const auto condition = lowerExpression(*value.condition);
-        if (constantTrue) {
-            emitJump(bodyBlock, {}, value.condition->span);
-        } else {
-            emitBranch(
-                condition,
-                bodyBlock,
-                *exitBlock,
-                {},
-                {},
-                value.condition->span);
+        if (value.initializer) {
+            collectLocalTypes(*value.initializer);
         }
-        if (exitBlock) breakTargets_.push_back(*exitBlock);
-        continueTargets_.push_back(incrementBlock);
-        setCurrentBlock(bodyBlock);
-        lowerStatement(*value.body);
-        if (hasCurrentBlock() && !currentBlockTerminated()) {
-            emitJump(incrementBlock, {}, value.body->span);
-        }
-        setCurrentBlock(incrementBlock);
-        if (value.increment) (void)lowerExpression(*value.increment);
-        if (!currentBlockTerminated()) {
-            emitJump(
-                conditionBlock,
-                {},
-                value.increment ? value.increment->span : statement.span);
-        }
-        continueTargets_.pop_back();
-        if (exitBlock) breakTargets_.pop_back();
-        if (exitBlock) setCurrentBlock(*exitBlock);
-        else clearCurrentBlock();
+        collectLocalTypes(*value.body);
         return;
     }
     case semantic::BoundNodeKind::ForeachStatement: {
@@ -329,29 +289,34 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         return;
     }
     case semantic::BoundNodeKind::ForStatement: {
-        const auto& value = static_cast<const semantic::BoundForStatement&>(statement);
+        const auto& value =
+            static_cast<const semantic::BoundForStatement&>(statement);
         if (value.initializer) lowerStatement(*value.initializer);
         if (!hasCurrentBlock() || currentBlockTerminated()) return;
+        const auto constantTrue = isLiteralTrue(*value.condition);
+        const auto needsExit =
+            !constantTrue || containsBreakForCurrentTarget(*value.body);
         const auto conditionBlock = createBlock();
         const auto bodyBlock = createBlock();
         const auto incrementBlock = createBlock();
-        const auto exitBlock = createBlock();
+        const auto exitBlock = needsExit
+            ? std::optional<BlockId>{createBlock()}
+            : std::nullopt;
         emitJump(conditionBlock, {}, statement.span);
         setCurrentBlock(conditionBlock);
         const auto condition = lowerExpression(*value.condition);
-        const auto constantTrue = isLiteralTrue(*value.condition);
         if (constantTrue) {
             emitJump(bodyBlock, {}, value.condition->span);
         } else {
             emitBranch(
                 condition,
                 bodyBlock,
-                exitBlock,
+                *exitBlock,
                 {},
                 {},
                 value.condition->span);
         }
-        breakTargets_.push_back(exitBlock);
+        if (exitBlock) breakTargets_.push_back(*exitBlock);
         continueTargets_.push_back(incrementBlock);
         setCurrentBlock(bodyBlock);
         lowerStatement(*value.body);
@@ -369,14 +334,9 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 value.increment ? value.increment->span : statement.span);
         }
         continueTargets_.pop_back();
-        breakTargets_.pop_back();
-        if (constantTrue && !hasIncomingEdge(*currentFunction_, exitBlock)) {
-            setCurrentBlock(exitBlock);
-            emitJump(exitBlock, {}, statement.span);
-            clearCurrentBlock();
-        } else {
-            setCurrentBlock(exitBlock);
-        }
+        if (exitBlock) breakTargets_.pop_back();
+        if (exitBlock) setCurrentBlock(*exitBlock);
+        else clearCurrentBlock();
         return;
     }
     case semantic::BoundNodeKind::ForeachStatement: {
