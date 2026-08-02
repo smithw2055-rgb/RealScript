@@ -87,11 +87,12 @@ private:
         sources_.reserve(sourceInputs_.size());
         for (std::size_t index = 0; index < sourceInputs_.size(); ++index) {
             const auto& input = sourceInputs_[index];
-            const auto content = index < languageExpansions_.size() &&
-                    !languageExpansions_[index].content.empty()
-                ? languageExpansions_[index].content
-                : input.content;
-            sources_.push_back(SourceFile{input.path, content});
+            const auto useExpansion = index < languageExpansions_.size() &&
+                languageExpansions_[index].changed &&
+                !languageExpansions_[index].content.empty();
+            sources_.push_back(SourceFile{
+                input.path,
+                useExpansion ? languageExpansions_[index].content : input.content});
         }
     }
 
