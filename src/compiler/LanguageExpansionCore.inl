@@ -215,11 +215,13 @@ struct ReferenceParameterInfo {
 
 struct ReferenceFunctionInfo {
     std::string name;
+    std::string moduleName;
     std::vector<ReferenceParameterInfo> parameters;
 };
 
 struct Context {
     std::string path;
+    std::string moduleName;
     LanguageExpansionOptions options;
     LanguageExpansionResult result;
     std::map<std::string, InterfaceInfo> interfaces;
