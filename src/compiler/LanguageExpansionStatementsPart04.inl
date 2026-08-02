@@ -55,6 +55,7 @@ void lowerEvents(std::vector<Token>& tokens, Context& context) {
         DelegateInfo signature;
         std::vector<std::string> handlers;
         std::map<std::string, std::string> handlerFields;
+        std::map<std::size_t, std::string> lambdaHandlers;
         std::vector<Token> generatedMembers;
     };
 
