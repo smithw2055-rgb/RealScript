@@ -44,29 +44,69 @@
         const auto closeBrace = matching(tokens_, closeParen + 1, "{", "}");
         const auto expression = emit(tokens_, index + 2, closeParen);
         const auto breakFlag = context_.unique("__rs_switch_break_");
-        std::ostringstream out;
-        out << "{bool " << breakFlag << "=false;";
+
+        struct CaseInfo {
+            bool isDefault = false;
+            std::string value;
+            std::size_t begin = 0;
+            std::size_t end = 0;
+        };
+        std::vector<CaseInfo> cases;
         std::size_t cursor = closeParen + 2;
-        bool firstCase = true;
+        bool defaultSeen = false;
         while (cursor < closeBrace) {
-            bool isDefault = word(tokens_[cursor], "default");
-            if (!isDefault && !word(tokens_[cursor], "case")) { ++cursor; continue; }
+            const bool isDefault = word(tokens_[cursor], "default");
+            if (!isDefault && !word(tokens_[cursor], "case")) {
+                ++cursor;
+                continue;
+            }
+            if (isDefault && defaultSeen) {
+                context_.error("RS8205", "switch contains more than one default label", tokens_[cursor].offset);
+            }
+            defaultSeen = defaultSeen || isDefault;
             std::size_t colon = cursor + 1;
             while (colon < closeBrace && !symbol(tokens_[colon], ":")) ++colon;
+            if (colon >= closeBrace) {
+                context_.error("RS8206", "switch label is missing ':'", tokens_[cursor].offset);
+                break;
+            }
             std::size_t nextCase = colon + 1;
             int depth = 0;
             while (nextCase < closeBrace) {
                 if (symbol(tokens_[nextCase], "{")) ++depth;
                 else if (symbol(tokens_[nextCase], "}")) --depth;
-                if (depth == 0 && (word(tokens_[nextCase], "case") || word(tokens_[nextCase], "default"))) break;
+                if (depth == 0 &&
+                    (word(tokens_[nextCase], "case") ||
+                     word(tokens_[nextCase], "default"))) {
+                    break;
+                }
                 ++nextCase;
             }
-            const auto caseValue = isDefault ? std::string{} : emit(tokens_, cursor + 1, colon);
-            out << (firstCase ? "if(" : "else if(")
-                << (isDefault ? "true" : "(" + expression + ")== (" + caseValue + ")") << ")";
-            out << lowerBlockFromRange(colon + 1, nextCase, loop, breakFlag);
-            firstCase = false;
+            cases.push_back(CaseInfo{
+                isDefault,
+                isDefault ? std::string{} : emit(tokens_, cursor + 1, colon),
+                colon + 1,
+                nextCase});
             cursor = nextCase;
+        }
+
+        std::ostringstream out;
+        out << "{bool " << breakFlag << "=false;";
+        bool emitted = false;
+        for (const auto& item : cases) {
+            if (item.isDefault) continue;
+            out << (emitted ? "else if(" : "if(")
+                << "(" << expression << ")== (" << item.value << "))";
+            out << lowerBlockFromRange(item.begin, item.end, loop, breakFlag);
+            emitted = true;
+        }
+        const auto defaultCase = std::find_if(
+            cases.begin(), cases.end(),
+            [](const CaseInfo& value) { return value.isDefault; });
+        if (defaultCase != cases.end()) {
+            out << (emitted ? "else" : "if(true)");
+            out << lowerBlockFromRange(
+                defaultCase->begin, defaultCase->end, loop, breakFlag);
         }
         out << "}\n";
         context_.result.changed = true;
