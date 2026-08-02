@@ -9,6 +9,7 @@
 - [仓库中文 README](../../README.zh-CN.md)
 - [游戏脚本 SDK](GAME_SCRIPTING_SDK.md)
 - [确定性游戏运行时](GAMEPLAY_RUNTIME.md)
+- [Phase 11–17 游戏语言扩展 Profile](../roadmap/PHASE_11_17_LANGUAGE_EXPANSION.md)
 - [总体架构设计](../ENGINE_DESIGN.md)
 - [规范文档索引](../spec/README.md)
 
@@ -29,7 +30,7 @@
 - [C++17 AOT](../spec/CXX17_AOT_V0.md)
 - [确定性、优化与 JIT](../spec/DETERMINISM_OPTIMIZATION_JIT_V0.md)
 
-## Phase 1–10 实现说明
+## Phase 1–17 实现说明
 
 - [Phase 1A](../roadmap/PHASE_1A.md)
 - [Phase 1B](../roadmap/PHASE_1B.md)
@@ -46,7 +47,8 @@
 - [Phase 5](../roadmap/PHASE_5.md)
 - [Phase 6](../roadmap/PHASE_6.md)
 - [Phase 8–10 游戏运行时基础](../roadmap/PHASE_8_10_GAMEPLAY_RUNTIME.md)
+- [Phase 11–17 游戏语言扩展 Profile](../roadmap/PHASE_11_17_LANGUAGE_EXPANSION.md)
 
-Phase 7 的 Game SDK 与产品化接口见上方专题文档；Phase 8–10 覆盖固定 Tick、Gameplay Host、状态快照与 Rollback 集成基础。
+Phase 7 的 Game SDK 与产品化接口见上方专题文档；Phase 8–10 覆盖固定 Tick、Gameplay Host、状态快照与 Rollback；Phase 11–17 提供受限、确定性的 C# 风格游戏语言扩展，并明确保留运行时接口分派、完整闭包、开放泛型和完整引用语义等边界。
 
 英文文档按使用主题组织，中文文档按规范与历史实现阶段组织。两者描述同一个 v0.1 alpha 集成基线。
