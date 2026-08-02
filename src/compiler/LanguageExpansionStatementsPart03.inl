@@ -4,12 +4,51 @@
         const auto continueFlag = context_.unique("__rs_continue_");
         LoopContext loop{breakFlag, continueFlag, {}};
         const auto body = lowerStatement(closeParen + 1, end, &loop, {});
+
+        std::string collectionVariable;
+        std::string collectionType;
+        if (in + 2 == closeParen && tokens_[in + 1].kind == TokenKind::Identifier) {
+            collectionVariable = tokens_[in + 1].text;
+            for (std::size_t scan = index; scan > 1; --scan) {
+                const auto candidate = scan - 1;
+                if (tokens_[candidate].kind != TokenKind::Identifier ||
+                    tokens_[candidate].text != collectionVariable ||
+                    candidate == 0 ||
+                    tokens_[candidate - 1].kind != TokenKind::Identifier ||
+                    candidate + 1 >= tokens_.size() ||
+                    !(symbol(tokens_[candidate + 1], "=") ||
+                      symbol(tokens_[candidate + 1], ";"))) {
+                    continue;
+                }
+                collectionType = tokens_[candidate - 1].text;
+                break;
+            }
+        }
+        const bool indexedCollection =
+            collectionType.rfind("List__", 0) == 0 ||
+            collectionType.rfind("Queue__", 0) == 0 ||
+            collectionType.rfind("Stack__", 0) == 0 ||
+            collectionType.rfind("HashSet__", 0) == 0;
+
         std::ostringstream out;
-        out << "{" << type << "[] " << arrayName << "=" << collection << ";int " << indexName
-            << "=0;bool " << breakFlag << "=false;while(" << indexName << "<" << arrayName
-            << ".length&&!" << breakFlag << "){bool " << continueFlag << "=false;" << type << " "
-            << name << "=" << arrayName << "[" << indexName << "];" << body.first << "if(!" << breakFlag
-            << "){" << indexName << "=" << indexName << "+1;}}}\n";
+        if (indexedCollection) {
+            out << "{int " << indexName << "=0;bool " << breakFlag
+                << "=false;while(" << indexName << "<" << collectionVariable
+                << ".Count()&&!" << breakFlag << "){bool " << continueFlag
+                << "=false;" << type << " " << name << "="
+                << collectionVariable << ".Get(" << indexName << ");"
+                << body.first << "if(!" << breakFlag << "){" << indexName
+                << "=" << indexName << "+1;}}}\n";
+        } else {
+            out << "{" << type << "[] " << arrayName << "=" << collection
+                << ";int " << indexName << "=0;bool " << breakFlag
+                << "=false;while(" << indexName << "<" << arrayName
+                << ".length&&!" << breakFlag << "){bool " << continueFlag
+                << "=false;" << type << " " << name << "=" << arrayName
+                << "[" << indexName << "];" << body.first << "if(!"
+                << breakFlag << "){" << indexName << "=" << indexName
+                << "+1;}}}\n";
+        }
         context_.result.changed = true;
         return {out.str(), body.second};
     }
@@ -90,27 +129,27 @@
             cursor = nextCase;
         }
 
-        std::ostringstream out;
-        out << "{bool " << breakFlag << "=false;";
+        std::ostringstream switchOutput;
+        switchOutput << "{bool " << breakFlag << "=false;";
         bool emitted = false;
         for (const auto& item : cases) {
             if (item.isDefault) continue;
-            out << (emitted ? "else if(" : "if(")
+            switchOutput << (emitted ? "else if(" : "if(")
                 << "(" << expression << ")== (" << item.value << "))";
-            out << lowerBlockFromRange(item.begin, item.end, loop, breakFlag);
+            switchOutput << lowerBlockFromRange(item.begin, item.end, loop, breakFlag);
             emitted = true;
         }
         const auto defaultCase = std::find_if(
             cases.begin(), cases.end(),
             [](const CaseInfo& value) { return value.isDefault; });
         if (defaultCase != cases.end()) {
-            out << (emitted ? "else" : "if(true)");
-            out << lowerBlockFromRange(
+            switchOutput << (emitted ? "else" : "if(true)");
+            switchOutput << lowerBlockFromRange(
                 defaultCase->begin, defaultCase->end, loop, breakFlag);
         }
-        out << "}\n";
+        switchOutput << "}\n";
         context_.result.changed = true;
-        return {out.str(), closeBrace + 1};
+        return {switchOutput.str(), closeBrace + 1};
     }
 
     std::string lowerBlockFromRange(std::size_t begin, std::size_t end,
