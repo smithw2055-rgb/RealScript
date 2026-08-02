@@ -34,8 +34,10 @@
                 callArguments.push_back(lvalue);
                 continue;
             }
-            const auto wrapper = "__RsRef__" + sanitize(info.type);
-            context.generatedRefTypes.insert(wrapper + "|" + info.type);
+            const auto wrapper = referenceWrapperName(function->second, info.type);
+            if (function->second.moduleName == context.moduleName) {
+                context.generatedRefTypes.insert(wrapper + "|" + info.type);
+            }
             const auto temporary = context.unique(info.modifier == "out" ? "__rs_out_" : "__rs_ref_");
             lowered << wrapper << ' ' << temporary << "=new " << wrapper << '(';
             lowered << (info.modifier == "out" ? referenceDefaultValue(info.type) : lvalue) << ");";
