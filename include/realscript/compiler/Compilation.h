@@ -42,6 +42,7 @@ struct BuildResult {
     std::vector<ModuleBuildInfo> buildInfo;
     diagnostics::DiagnosticBag diagnostics;
     std::vector<semantic::SymbolOccurrence> symbols;
+    std::vector<LanguageInterfaceImplementation> nativeInterfaces;
     BuildSnapshot snapshot;
 };
 

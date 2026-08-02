@@ -208,6 +208,16 @@ GameCompileResult GameScriptCompiler::compile(
         compilation.languageExpansions());
 
     auto build = compilation.build();
+    result.languageMetadata.interfaces.insert(
+        result.languageMetadata.interfaces.end(),
+        build.nativeInterfaces.begin(),
+        build.nativeInterfaces.end());
+    std::stable_sort(
+        result.languageMetadata.interfaces.begin(),
+        result.languageMetadata.interfaces.end(),
+        [](const auto& left, const auto& right) {
+            return left.typeName < right.typeName;
+        });
     result.diagnostics.append(build.diagnostics);
     if (result.diagnostics.hasErrors()) return result;
 

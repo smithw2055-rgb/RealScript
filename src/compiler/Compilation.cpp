@@ -27,6 +27,33 @@ std::uint64_t stableFingerprint(const std::string& value) noexcept {
 
 namespace {
 
+struct InterfaceTypeRef {
+    semantic::PrimitiveType type = semantic::PrimitiveType::Error;
+    std::string typeName;
+};
+
+struct InterfaceMethodContract {
+    std::string name;
+    InterfaceTypeRef returnType;
+    std::vector<InterfaceTypeRef> parameters;
+    text::TextSpan declarationSpan;
+};
+
+struct InterfaceContract {
+    std::string moduleName;
+    std::string name;
+    std::string sourceName;
+    text::TextSpan declarationSpan;
+    std::vector<InterfaceMethodContract> methods;
+};
+
+struct InterfaceDeclarationInput {
+    const syntax::InterfaceDeclarationSyntax* syntax = nullptr;
+    std::string sourceName;
+};
+
+using InterfaceMap = std::map<std::string, InterfaceContract>;
+
 struct ParsedUnit {
     std::unique_ptr<text::SourceText> source;
     std::unique_ptr<syntax::CompilationUnitSyntax> syntaxTree;
@@ -42,6 +69,9 @@ struct ModuleWork {
     std::set<std::string> imports;
     std::vector<semantic::TypeSymbol> types;
     semantic::TypeSymbolMap visibleTypes;
+    std::vector<InterfaceDeclarationInput> interfaceInputs;
+    InterfaceMap interfaces;
+    InterfaceMap visibleInterfaces;
     std::vector<semantic::FunctionSymbol> declarations;
     std::vector<semantic::FunctionBindingInput> functionBindings;
     std::uint64_t sourceFingerprint = 0;
@@ -78,6 +108,110 @@ void refreshVisibleTypes(
             addVisibleType(module.visibleTypes, type, true);
         }
     }
+}
+
+std::string canonicalInterfaceName(
+    const std::string& moduleName,
+    const std::string& name) {
+    return moduleName.empty() ? name : moduleName + "::" + name;
+}
+
+void refreshVisibleInterfaces(
+    std::map<std::string, ModuleWork>& modules,
+    ModuleWork& module) {
+    module.visibleInterfaces.clear();
+    for (const auto& [name, contract] : module.interfaces) {
+        module.visibleInterfaces[name] = contract;
+        module.visibleInterfaces[
+            canonicalInterfaceName(contract.moduleName, contract.name)] = contract;
+    }
+    for (const auto& importedName : module.imports) {
+        const auto imported = modules.find(importedName);
+        if (imported == modules.end()) continue;
+        for (const auto& [name, contract] : imported->second.interfaces) {
+            module.visibleInterfaces[name] = contract;
+            module.visibleInterfaces[
+                canonicalInterfaceName(contract.moduleName, contract.name)] = contract;
+        }
+    }
+}
+
+InterfaceTypeRef resolveInterfaceType(
+    const syntax::TypeSyntax& syntaxTree,
+    const semantic::TypeSymbolMap& visibleTypes,
+    diagnostics::DiagnosticBag& diagnostics,
+    const std::string& sourceName,
+    bool allowVoid) {
+    InterfaceTypeRef result;
+    auto baseType = semantic::resolvePrimitiveType(syntaxTree.name.text);
+    std::string exactName;
+    if (baseType == semantic::PrimitiveType::Error) {
+        const auto found = visibleTypes.find(syntaxTree.name.text);
+        if (found == visibleTypes.end()) {
+            diagnostics.report(
+                "RS2470",
+                "unknown interface signature type '" + syntaxTree.name.text + "'",
+                syntaxTree.span(),
+                diagnostics::DiagnosticSeverity::Error,
+                sourceName);
+            return result;
+        }
+        baseType = found->second.kind == semantic::TypeKind::Class
+            ? semantic::PrimitiveType::Object
+            : found->second.kind == semantic::TypeKind::Struct
+                ? semantic::PrimitiveType::Struct
+                : semantic::PrimitiveType::Enum;
+        exactName = semantic::canonicalTypeName(found->second);
+    }
+    if (syntaxTree.isArray()) {
+        if (baseType == semantic::PrimitiveType::Void ||
+            baseType == semantic::PrimitiveType::Array) {
+            diagnostics.report(
+                "RS2470",
+                "invalid interface array type",
+                syntaxTree.span(),
+                diagnostics::DiagnosticSeverity::Error,
+                sourceName);
+            return result;
+        }
+        result.type = semantic::PrimitiveType::Array;
+        result.typeName = semantic::arrayTypeName(baseType, exactName);
+        return result;
+    }
+    if (baseType == semantic::PrimitiveType::Void && !allowVoid) {
+        diagnostics.report(
+            "RS2470",
+            "void is not valid for an interface parameter",
+            syntaxTree.span(),
+            diagnostics::DiagnosticSeverity::Error,
+            sourceName);
+        return result;
+    }
+    result.type = baseType;
+    if (semantic::isExactType(baseType)) result.typeName = exactName;
+    return result;
+}
+
+bool sameInterfaceType(
+    const InterfaceTypeRef& expected,
+    semantic::PrimitiveType actual,
+    const std::string& actualName) {
+    return expected.type == actual &&
+        (!semantic::isExactType(expected.type) ||
+         expected.typeName == actualName);
+}
+
+std::string interfaceMethodSignature(
+    const InterfaceMethodContract& method) {
+    std::ostringstream out;
+    out << method.name << '(';
+    for (const auto& parameter : method.parameters) {
+        out << semantic::primitiveTypeName(parameter.type) << '#'
+            << parameter.typeName << ';';
+    }
+    out << ")->" << semantic::primitiveTypeName(method.returnType.type)
+        << '#' << method.returnType.typeName;
+    return out.str();
 }
 
 std::string fieldTypeSignature(const semantic::FieldSymbol& field) {
@@ -242,6 +376,21 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     module.types.back().declarationSpan = node.identifierToken.span;
                 }
             }
+            for (const auto& node : unit->syntaxTree->interfaces) {
+                if (!typeNames.insert(node.identifierToken.text).second) {
+                    result.diagnostics.report(
+                        "RS4004",
+                        "duplicate type or interface '" +
+                            node.identifierToken.text + "'",
+                        node.identifierToken.span,
+                        diagnostics::DiagnosticSeverity::Error,
+                        unit->source->name());
+                    module.invalid = true;
+                    continue;
+                }
+                module.interfaceInputs.push_back(
+                    InterfaceDeclarationInput{&node, unit->source->name()});
+            }
         }
         module.sourceFingerprint = sourceFingerprint;
     }
@@ -249,6 +398,54 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     for (auto& [name, module] : modules) {
         (void)name;
         refreshVisibleTypes(modules, module);
+    }
+
+    // Resolve native interface contracts after all named type shells exist.
+    for (auto& [moduleName, module] : modules) {
+        for (const auto& input : module.interfaceInputs) {
+            if (!input.syntax) continue;
+            InterfaceContract contract;
+            contract.moduleName = moduleName;
+            contract.name = input.syntax->identifierToken.text;
+            contract.sourceName = input.sourceName;
+            contract.declarationSpan = input.syntax->identifierToken.span;
+            std::unordered_set<std::string> signatures;
+            for (const auto& methodSyntax : input.syntax->methods) {
+                InterfaceMethodContract method;
+                method.name = methodSyntax.identifierToken.text;
+                method.declarationSpan = methodSyntax.identifierToken.span;
+                method.returnType = resolveInterfaceType(
+                    methodSyntax.returnType,
+                    module.visibleTypes,
+                    result.diagnostics,
+                    input.sourceName,
+                    true);
+                for (const auto& parameter : methodSyntax.parameters) {
+                    method.parameters.push_back(resolveInterfaceType(
+                        parameter.type,
+                        module.visibleTypes,
+                        result.diagnostics,
+                        input.sourceName,
+                        false));
+                }
+                const auto signature = interfaceMethodSignature(method);
+                if (!signatures.insert(signature).second) {
+                    result.diagnostics.report(
+                        "RS2472",
+                        "duplicate interface method '" + signature + "'",
+                        methodSyntax.identifierToken.span,
+                        diagnostics::DiagnosticSeverity::Error,
+                        input.sourceName);
+                    module.invalid = true;
+                }
+                contract.methods.push_back(std::move(method));
+            }
+            module.interfaces[contract.name] = std::move(contract);
+        }
+    }
+    for (auto& [name, module] : modules) {
+        (void)name;
+        refreshVisibleInterfaces(modules, module);
     }
 
     // Resolve all field layouts and enum values before declaring member signatures.
@@ -476,9 +673,141 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             addMembers(unit->syntaxTree->structs);
         }
 
+        const auto validateInterfaces = [&](auto const& declarations) {
+            for (const auto& typeSyntax : declarations) {
+                auto* owner = findOwnType(module, typeSyntax.identifierToken.text);
+                if (!owner) continue;
+                LanguageInterfaceImplementation implementation;
+                implementation.typeName = semantic::canonicalTypeName(*owner);
+                std::unordered_set<std::string> implementedNames;
+                for (const auto& interfaceSyntax : typeSyntax.interfaces) {
+                    const auto found =
+                        module.visibleInterfaces.find(interfaceSyntax.name.text);
+                    if (found == module.visibleInterfaces.end()) {
+                        result.diagnostics.report(
+                            "RS2473",
+                            "unknown interface '" +
+                                interfaceSyntax.name.text + "'",
+                            interfaceSyntax.span(),
+                            diagnostics::DiagnosticSeverity::Error,
+                            owner->sourceName);
+                        module.invalid = true;
+                        continue;
+                    }
+                    const auto canonicalName = canonicalInterfaceName(
+                        found->second.moduleName,
+                        found->second.name);
+                    if (!implementedNames.insert(canonicalName).second) {
+                        result.diagnostics.report(
+                            "RS2474",
+                            "interface '" + canonicalName +
+                                "' is implemented more than once",
+                            interfaceSyntax.span(),
+                            diagnostics::DiagnosticSeverity::Error,
+                            owner->sourceName);
+                        module.invalid = true;
+                        continue;
+                    }
+                    implementation.interfaces.push_back(canonicalName);
+                    for (const auto& required : found->second.methods) {
+                        bool matched = false;
+                        for (const auto& candidate : owner->methods) {
+                            if (candidate.staticMethod ||
+                                candidate.name != required.name) {
+                                continue;
+                            }
+                            const auto parameterOffset =
+                                candidate.method && !candidate.staticMethod
+                                    ? std::size_t{1}
+                                    : std::size_t{0};
+                            if (candidate.parameters.size() < parameterOffset ||
+                                candidate.parameters.size() - parameterOffset !=
+                                    required.parameters.size()) {
+                                continue;
+                            }
+                            bool compatible = sameInterfaceType(
+                                required.returnType,
+                                candidate.returnType,
+                                candidate.returnTypeName);
+                            for (std::size_t parameter = 0;
+                                 compatible &&
+                                 parameter < required.parameters.size();
+                                 ++parameter) {
+                                const auto& actual = candidate.parameters[
+                                    parameter + parameterOffset];
+                                compatible = sameInterfaceType(
+                                    required.parameters[parameter],
+                                    actual.type,
+                                    actual.typeName);
+                            }
+                            if (compatible) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        if (!matched) {
+                            result.diagnostics.report(
+                                "RS2475",
+                                "type '" + implementation.typeName +
+                                    "' does not implement interface method '" +
+                                    canonicalName + "." +
+                                    interfaceMethodSignature(required) + "'",
+                                typeSyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                owner->sourceName);
+                            module.invalid = true;
+                        }
+                    }
+                }
+                if (!implementation.interfaces.empty()) {
+                    std::sort(
+                        implementation.interfaces.begin(),
+                        implementation.interfaces.end());
+                    result.nativeInterfaces.push_back(
+                        std::move(implementation));
+                }
+            }
+        };
+        validateInterfaces(
+            module.units.empty()
+                ? std::vector<syntax::ClassDeclarationSyntax>{}
+                : std::vector<syntax::ClassDeclarationSyntax>{});
+        for (const auto* unit : module.units) {
+            validateInterfaces(unit->syntaxTree->classes);
+            validateInterfaces(unit->syntaxTree->structs);
+        }
+
         std::vector<std::string> signatures;
-        signatures.reserve(module.declarations.size() + module.types.size());
-        for (const auto& type : module.types) signatures.push_back(typeSignature(type));
+        signatures.reserve(
+            module.declarations.size() + module.types.size() +
+            module.interfaces.size());
+        for (const auto& type : module.types) {
+            signatures.push_back(typeSignature(type));
+        }
+        for (const auto& [interfaceName, contract] : module.interfaces) {
+            (void)interfaceName;
+            std::ostringstream interfaceSignature;
+            interfaceSignature << "interface:"
+                << canonicalInterfaceName(contract.moduleName, contract.name)
+                << '{';
+            for (const auto& method : contract.methods) {
+                interfaceSignature << interfaceMethodSignature(method) << ';';
+            }
+            interfaceSignature << '}';
+            signatures.push_back(interfaceSignature.str());
+        }
+        for (const auto& implementation : result.nativeInterfaces) {
+            if (implementation.typeName.rfind(moduleName + "::", 0) != 0) {
+                continue;
+            }
+            std::ostringstream implementationSignature;
+            implementationSignature << "implements:"
+                << implementation.typeName << ':';
+            for (const auto& interfaceName : implementation.interfaces) {
+                implementationSignature << interfaceName << ',';
+            }
+            signatures.push_back(implementationSignature.str());
+        }
         for (const auto& function : module.declarations) {
             signatures.push_back(semantic::canonicalFunctionSignature(function));
         }
@@ -674,6 +1003,12 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         result.buildInfo.push_back(buildInfo);
     }
 
+    std::stable_sort(
+        result.nativeInterfaces.begin(),
+        result.nativeInterfaces.end(),
+        [](const auto& left, const auto& right) {
+            return left.typeName < right.typeName;
+        });
     return result;
 }
 

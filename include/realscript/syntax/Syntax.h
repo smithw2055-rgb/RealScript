@@ -64,6 +64,7 @@ enum class SyntaxKind {
     ClassKeyword,
     StructKeyword,
     EnumKeyword,
+    InterfaceKeyword,
     StaticKeyword,
     GetKeyword,
     SetKeyword,
@@ -93,6 +94,8 @@ enum class SyntaxKind {
     ClassDeclaration,
     StructDeclaration,
     EnumDeclaration,
+    InterfaceDeclaration,
+    InterfaceMethodDeclaration,
     EnumMemberDeclaration,
     FieldDeclaration,
     ConstructorDeclaration,
@@ -537,6 +540,9 @@ struct PropertyDeclarationSyntax final : SyntaxNode {
 struct ClassDeclarationSyntax final : SyntaxNode {
     SyntaxToken classKeyword;
     SyntaxToken identifierToken;
+    std::optional<SyntaxToken> colonToken;
+    std::vector<TypeSyntax> interfaces;
+    std::vector<SyntaxToken> interfaceCommaTokens;
     SyntaxToken openBraceToken;
     std::vector<FieldDeclarationSyntax> fields;
     std::vector<FunctionDeclarationSyntax> methods;
@@ -551,6 +557,9 @@ struct ClassDeclarationSyntax final : SyntaxNode {
 struct StructDeclarationSyntax final : SyntaxNode {
     SyntaxToken structKeyword;
     SyntaxToken identifierToken;
+    std::optional<SyntaxToken> colonToken;
+    std::vector<TypeSyntax> interfaces;
+    std::vector<SyntaxToken> interfaceCommaTokens;
     SyntaxToken openBraceToken;
     std::vector<FieldDeclarationSyntax> fields;
     std::vector<FunctionDeclarationSyntax> methods;
@@ -559,6 +568,34 @@ struct StructDeclarationSyntax final : SyntaxNode {
     SyntaxToken closeBraceToken;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::StructDeclaration; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct InterfaceMethodDeclarationSyntax final : SyntaxNode {
+    TypeSyntax returnType;
+    SyntaxToken identifierToken;
+    SyntaxToken openParenToken;
+    std::vector<ParameterSyntax> parameters;
+    std::vector<SyntaxToken> commaTokens;
+    SyntaxToken closeParenToken;
+    SyntaxToken semicolonToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::InterfaceMethodDeclaration;
+    }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct InterfaceDeclarationSyntax final : SyntaxNode {
+    SyntaxToken interfaceKeyword;
+    SyntaxToken identifierToken;
+    SyntaxToken openBraceToken;
+    std::vector<InterfaceMethodDeclarationSyntax> methods;
+    SyntaxToken closeBraceToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::InterfaceDeclaration;
+    }
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
@@ -625,6 +662,7 @@ struct CompilationUnitSyntax final : SyntaxNode {
     std::vector<ClassDeclarationSyntax> classes;
     std::vector<StructDeclarationSyntax> structs;
     std::vector<EnumDeclarationSyntax> enums;
+    std::vector<InterfaceDeclarationSyntax> interfaces;
     std::vector<FunctionDeclarationSyntax> functions;
     SyntaxToken endOfFileToken;
 
@@ -653,6 +691,12 @@ private:
     [[nodiscard]] ClassDeclarationSyntax parseClassDeclaration();
     [[nodiscard]] StructDeclarationSyntax parseStructDeclaration();
     [[nodiscard]] EnumDeclarationSyntax parseEnumDeclaration();
+    [[nodiscard]] InterfaceDeclarationSyntax parseInterfaceDeclaration();
+    [[nodiscard]] InterfaceMethodDeclarationSyntax parseInterfaceMethodDeclaration();
+    void parseInterfaceList(
+        std::optional<SyntaxToken>& colonToken,
+        std::vector<TypeSyntax>& interfaces,
+        std::vector<SyntaxToken>& commaTokens);
     [[nodiscard]] FieldDeclarationSyntax parseFieldDeclaration(TypeSyntax type, SyntaxToken identifier);
     [[nodiscard]] FunctionDeclarationSyntax parseFunctionDeclaration(
         std::optional<SyntaxToken> staticKeyword = std::nullopt,

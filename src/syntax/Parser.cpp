@@ -59,6 +59,8 @@ CompilationUnitSyntax Parser::parseCompilationUnit() {
             result.structs.push_back(parseStructDeclaration());
         } else if (current().kind == SyntaxKind::EnumKeyword) {
             result.enums.push_back(parseEnumDeclaration());
+        } else if (current().kind == SyntaxKind::InterfaceKeyword) {
+            result.interfaces.push_back(parseInterfaceDeclaration());
         } else {
             result.functions.push_back(parseFunctionDeclaration());
         }
@@ -238,6 +240,10 @@ ClassDeclarationSyntax Parser::parseClassDeclaration() {
     result.classKeyword = match(SyntaxKind::ClassKeyword);
     result.identifierToken = match(SyntaxKind::IdentifierToken);
     const auto typeName = result.identifierToken.text;
+    parseInterfaceList(
+        result.colonToken,
+        result.interfaces,
+        result.interfaceCommaTokens);
     result.openBraceToken = match(SyntaxKind::OpenBraceToken);
     while (current().kind != SyntaxKind::CloseBraceToken &&
            current().kind != SyntaxKind::EndOfFileToken) {
@@ -280,6 +286,10 @@ StructDeclarationSyntax Parser::parseStructDeclaration() {
     result.structKeyword = match(SyntaxKind::StructKeyword);
     result.identifierToken = match(SyntaxKind::IdentifierToken);
     const auto typeName = result.identifierToken.text;
+    parseInterfaceList(
+        result.colonToken,
+        result.interfaces,
+        result.interfaceCommaTokens);
     result.openBraceToken = match(SyntaxKind::OpenBraceToken);
     while (current().kind != SyntaxKind::CloseBraceToken &&
            current().kind != SyntaxKind::EndOfFileToken) {
@@ -305,6 +315,58 @@ StructDeclarationSyntax Parser::parseStructDeclaration() {
         }
         if (before == position_) {
             diagnostics_.report("RS1103", "parser made no progress while reading a struct member", current().span);
+            nextToken();
+        }
+    }
+    result.closeBraceToken = match(SyntaxKind::CloseBraceToken);
+    return result;
+}
+
+void Parser::parseInterfaceList(
+    std::optional<SyntaxToken>& colonToken,
+    std::vector<TypeSyntax>& interfaces,
+    std::vector<SyntaxToken>& commaTokens) {
+    if (current().kind != SyntaxKind::ColonToken) return;
+    colonToken = nextToken();
+    interfaces.push_back(parseType());
+    while (current().kind == SyntaxKind::CommaToken) {
+        commaTokens.push_back(nextToken());
+        interfaces.push_back(parseType());
+    }
+}
+
+InterfaceMethodDeclarationSyntax Parser::parseInterfaceMethodDeclaration() {
+    InterfaceMethodDeclarationSyntax result;
+    result.returnType = parseType();
+    result.identifierToken = match(SyntaxKind::IdentifierToken);
+    result.openParenToken = match(SyntaxKind::OpenParenToken);
+    if (current().kind != SyntaxKind::CloseParenToken &&
+        current().kind != SyntaxKind::EndOfFileToken) {
+        result.parameters.push_back(parseParameter());
+        while (current().kind == SyntaxKind::CommaToken) {
+            result.commaTokens.push_back(nextToken());
+            result.parameters.push_back(parseParameter());
+        }
+    }
+    result.closeParenToken = match(SyntaxKind::CloseParenToken);
+    result.semicolonToken = match(SyntaxKind::SemicolonToken);
+    return result;
+}
+
+InterfaceDeclarationSyntax Parser::parseInterfaceDeclaration() {
+    InterfaceDeclarationSyntax result;
+    result.interfaceKeyword = match(SyntaxKind::InterfaceKeyword);
+    result.identifierToken = match(SyntaxKind::IdentifierToken);
+    result.openBraceToken = match(SyntaxKind::OpenBraceToken);
+    while (current().kind != SyntaxKind::CloseBraceToken &&
+           current().kind != SyntaxKind::EndOfFileToken) {
+        const auto before = position_;
+        result.methods.push_back(parseInterfaceMethodDeclaration());
+        if (before == position_) {
+            diagnostics_.report(
+                "RS1111",
+                "parser made no progress while reading an interface member",
+                current().span);
             nextToken();
         }
     }

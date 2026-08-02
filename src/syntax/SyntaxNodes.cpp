@@ -157,6 +157,14 @@ text::TextSpan StructDeclarationSyntax::span() const noexcept {
     return combine(structKeyword.span, closeBraceToken.span);
 }
 
+text::TextSpan InterfaceMethodDeclarationSyntax::span() const noexcept {
+    return combine(returnType.span(), semicolonToken.span);
+}
+
+text::TextSpan InterfaceDeclarationSyntax::span() const noexcept {
+    return combine(interfaceKeyword.span, closeBraceToken.span);
+}
+
 text::TextSpan EnumMemberDeclarationSyntax::span() const noexcept {
     if (commaToken) return combine(identifierToken.span, commaToken->span);
     if (valueToken) return combine(identifierToken.span, valueToken->span);
@@ -202,6 +210,9 @@ text::TextSpan CompilationUnitSyntax::span() const noexcept {
     }
     if (!enums.empty()) {
         return combine(enums.front().span(), endOfFileToken.span);
+    }
+    if (!interfaces.empty()) {
+        return combine(interfaces.front().span(), endOfFileToken.span);
     }
     if (!functions.empty()) {
         return combine(functions.front().span(), endOfFileToken.span);

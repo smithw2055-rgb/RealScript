@@ -139,5 +139,8 @@ int main() {
     run("native infinite loop break", testNativeInfiniteLoopBreak);
     run("native control diagnostics", testNativeDiagnostics);
     run("structured control flow bypasses expansion", testNoStructuredSourceRewrite);
+    run("native interface contracts", testNativeInterfaceContracts);
+    run("native interface diagnostics", testNativeInterfaceDiagnostics);
+    run("interfaces bypass expansion", testInterfaceBypassesExpansion);
     return failures == 0 ? 0 : 1;
 }

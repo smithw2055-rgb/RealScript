@@ -45,7 +45,7 @@ struct LanguageGenericInstantiation {
 struct LanguageExpansionOptions {
     bool structuredControlFlow = false;
     bool delegatesLambdasEvents = true;
-    bool interfaces = true;
+    bool interfaces = false;
     bool sourceAttributes = true;
     bool generics = true;
     bool deterministicCoroutines = true;

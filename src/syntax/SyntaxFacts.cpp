@@ -55,6 +55,7 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(ClassKeyword);
         RS_KIND(StructKeyword);
         RS_KIND(EnumKeyword);
+        RS_KIND(InterfaceKeyword);
         RS_KIND(StaticKeyword);
         RS_KIND(GetKeyword);
         RS_KIND(SetKeyword);
@@ -82,6 +83,8 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(ClassDeclaration);
         RS_KIND(StructDeclaration);
         RS_KIND(EnumDeclaration);
+        RS_KIND(InterfaceDeclaration);
+        RS_KIND(InterfaceMethodDeclaration);
         RS_KIND(EnumMemberDeclaration);
         RS_KIND(FieldDeclaration);
         RS_KIND(ConstructorDeclaration);
@@ -144,6 +147,7 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"class", SyntaxKind::ClassKeyword},
         {"struct", SyntaxKind::StructKeyword},
         {"enum", SyntaxKind::EnumKeyword},
+        {"interface", SyntaxKind::InterfaceKeyword},
         {"static", SyntaxKind::StaticKeyword},
         {"get", SyntaxKind::GetKeyword},
         {"set", SyntaxKind::SetKeyword},
