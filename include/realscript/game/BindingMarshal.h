@@ -280,7 +280,7 @@ std::optional<std::vector<ParameterDeclaration>> makeParameters(
     std::vector<ParameterDeclaration> result;
     result.reserve(sizeof...(Indices));
     bool valid = true;
-    const auto append = [&](auto indexConstant) {
+    [[maybe_unused]] const auto append = [&](auto indexConstant) {
         constexpr std::size_t Index = decltype(indexConstant)::value;
         auto type = resolveScriptType<std::tuple_element_t<Index, Tuple>>(state);
         if (!type) {

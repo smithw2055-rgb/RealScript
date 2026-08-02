@@ -58,6 +58,10 @@ add_library(realscript_frontend STATIC
     src/game/SceneLifecycleRuntime.cpp
     src/game/SceneEventRuntime.cpp
     src/game/GameProductization.cpp
+    src/game/GameplayPrimitives.cpp
+    src/game/GameplayMetadata.cpp
+    src/game/GameplayScripting.cpp
+    src/game/GameplayStateCodec.cpp
 )
 set_target_properties(realscript_frontend PROPERTIES
     POSITION_INDEPENDENT_CODE ON
@@ -97,10 +101,13 @@ if(MSVC)
         src/aot_cpp/AotCpp.cpp
         PROPERTIES COMPILE_OPTIONS "/wd4267"
     )
+    # MSVC diagnoses repeated if-initializer names across mutually exclusive
+    # branches as C4456. These translation units intentionally use that pattern.
     set_source_files_properties(
         src/optimization/Optimizer.cpp
         src/runtime/ExecutionServices.cpp
         src/game/GameProductization.cpp
+        src/game/GameplayStateCodec.cpp
         PROPERTIES COMPILE_OPTIONS "/wd4456"
     )
     target_compile_options(realscript_frontend PRIVATE /W4 /permissive-)
@@ -256,6 +263,18 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_productization_tests
         realscript.productization
         tests/productization_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_phase8_gameplay_primitives_tests
+        realscript.phase8.gameplay-primitives
+        tests/phase8_gameplay_primitives_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_phase9_gameplay_scripting_tests
+        realscript.phase9.gameplay-scripting
+        tests/phase9_gameplay_scripting_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_phase10_gameplay_state_tests
+        realscript.phase10.gameplay-state
+        tests/phase10_gameplay_state_tests.cpp)
 
     add_test(
         NAME realscript.phase6.cli-smoke

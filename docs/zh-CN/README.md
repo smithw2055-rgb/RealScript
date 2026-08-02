@@ -7,6 +7,8 @@
 ## 中文入口
 
 - [仓库中文 README](../../README.zh-CN.md)
+- [游戏脚本 SDK](GAME_SCRIPTING_SDK.md)
+- [确定性游戏运行时](GAMEPLAY_RUNTIME.md)
 - [总体架构设计](../ENGINE_DESIGN.md)
 - [规范文档索引](../spec/README.md)
 
@@ -27,7 +29,7 @@
 - [C++17 AOT](../spec/CXX17_AOT_V0.md)
 - [确定性、优化与 JIT](../spec/DETERMINISM_OPTIMIZATION_JIT_V0.md)
 
-## Phase 1–6 实现说明
+## Phase 1–10 实现说明
 
 - [Phase 1A](../roadmap/PHASE_1A.md)
 - [Phase 1B](../roadmap/PHASE_1B.md)
@@ -43,5 +45,8 @@
 - [Phase 4](../roadmap/PHASE_4.md)
 - [Phase 5](../roadmap/PHASE_5.md)
 - [Phase 6](../roadmap/PHASE_6.md)
+- [Phase 8–10 游戏运行时基础](../roadmap/PHASE_8_10_GAMEPLAY_RUNTIME.md)
 
-英文文档按使用主题组织，中文文档按规范与历史实现阶段组织。两者描述同一个 v0.1 alpha 技术基线。
+Phase 7 的 Game SDK 与产品化接口见上方专题文档；Phase 8–10 覆盖固定 Tick、Gameplay Host、状态快照与 Rollback 集成基础。
+
+英文文档按使用主题组织，中文文档按规范与历史实现阶段组织。两者描述同一个 v0.1 alpha 集成基线。

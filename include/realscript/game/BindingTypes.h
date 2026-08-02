@@ -168,8 +168,9 @@ std::optional<ScriptTypeRef> resolveScriptType(
         if (found == state->nativeTypeByCppType.end()) return std::nullopt;
         const auto& type = state->nativeTypes[found->second];
         return ScriptTypeRef{type.name, type.moduleName, ScriptTypeCategory::NativeObject};
+    } else {
+        return std::nullopt;
     }
-    return std::nullopt;
 }
 
 inline void setInvalidArguments(
