@@ -25,7 +25,9 @@ jobs:
           fetch-depth: 0
 
       - name: Apply native reference migration
-        run: python tools/ci/apply_phase18_native_refs.py
+        run: |
+          python tools/ci/prepare_phase18_ref_docs.py
+          python tools/ci/apply_phase18_native_refs.py
 
       - name: Commit native reference migration
         run: |
