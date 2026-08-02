@@ -245,20 +245,26 @@ struct Context {
     }
 };
 
+void collectReferenceParameterDeclarations(
+    const std::vector<Token>& tokens,
+    Context& context);
+
 void rewriteValueAliases(std::vector<Token>& tokens, Context& context) {
-    if (!context.options.valueTypeAliases) return;
-    static const std::map<std::string, std::string> aliases = {
-        {"byte", "int"}, {"sbyte", "int"}, {"short", "int"}, {"ushort", "int"},
-        {"uint", "long"}, {"ulong", "long"}, {"float", "double"}, {"char", "int"}
-    };
-    for (auto& token : tokens) {
-        if (token.kind != TokenKind::Identifier) continue;
-        const auto found = aliases.find(token.text);
-        if (found != aliases.end()) {
-            token.text = found->second;
-            context.result.changed = true;
+    if (context.options.valueTypeAliases) {
+        static const std::map<std::string, std::string> aliases = {
+            {"byte", "int"}, {"sbyte", "int"}, {"short", "int"}, {"ushort", "int"},
+            {"uint", "long"}, {"ulong", "long"}, {"float", "double"}, {"char", "int"}
+        };
+        for (auto& token : tokens) {
+            if (token.kind != TokenKind::Identifier) continue;
+            const auto found = aliases.find(token.text);
+            if (found != aliases.end()) {
+                token.text = found->second;
+                context.result.changed = true;
+            }
         }
     }
+    collectReferenceParameterDeclarations(tokens, context);
 }
 
 std::vector<Token> removeRanges(const std::vector<Token>& tokens,
