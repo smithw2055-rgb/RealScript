@@ -14,13 +14,13 @@ Native as of Phase 18:
 
 - `for`, `foreach`, `do/while`, `break`, `continue`, and `switch`;
 - interface declarations and class/struct interface contract lists;
-- source Attribute Lists and positional/named Attribute Arguments.
+- source Attribute Lists and positional/named Attribute Arguments;
+- deterministic `sequence` declarations and top-level `yield wait_ticks` suspension points.
 
 Still using compatibility expansion during Phase 18 migration:
 
 - bounded delegates, lambdas, and class-local events;
 - generic declarations and explicit specializations;
-- deterministic `sequence` / `yield wait_ticks`;
 - restricted `ref`, `out`, and `in` calls;
 - value aliases that do not yet have exact runtime identities.
 
@@ -51,7 +51,7 @@ Currently available through the compatibility expansion path:
 - parenthesized and single-parameter lambdas;
 - field/`this` capture without arbitrary local closure objects.
 
-Native AST/Bound/MIR migration is the next Phase 18 slice. First-class delegate runtime values and heap closure objects belong to Phase 20.
+Native AST/Bound/MIR migration remains Phase 18 work. First-class delegate runtime values and heap closure objects belong to Phase 20.
 
 ## Native interface contracts
 
@@ -69,7 +69,7 @@ Interface-typed values and runtime interface dispatch are not part of Phase 18; 
 
 Implemented directly in Parser and Compilation:
 
-- Attribute Lists on types, interfaces, functions, fields, methods, constructors, properties, enum members, and interface methods;
+- Attribute Lists on types, interfaces, functions, fields, methods, constructors, properties, enum members, interface methods, and sequences;
 - positional and named argument token spans;
 - module-qualified canonical targets;
 - source file and offset retention;
@@ -89,9 +89,9 @@ Currently available through compatibility specialization:
 
 Native type-parameter/type-argument syntax and semantic specialization remain Phase 18 work.
 
-## Deterministic sequences
+## Native deterministic sequences
 
-Currently available through compatibility lowering:
+Implemented directly in Parser, Compilation, and Binder:
 
 ```csharp
 sequence Attack(long target)
@@ -102,7 +102,19 @@ sequence Attack(long target)
 }
 ```
 
-Callbacks use `GameplayHost` and `TickScheduler` and participate in fixed-tick replay/rollback state. Native sequence nodes and compiler-owned state-machine metadata remain Phase 18 work.
+The compiler creates an entry method, fixed-tick callback methods, and a typed target-handle field as compiler-owned semantic symbols. Each segment between top-level yields is bound independently. Schedule calls bind directly to imported `RealScript.Game.Schedule`; no script source is generated.
+
+Native sequence metadata is retained through `BuildResult`, `GameCompileResult`, and `GameProgram`. Callbacks continue to use `GameplayHost` and `TickScheduler`, preserving fixed-tick ordering and existing replay/rollback behavior.
+
+Current bounded limits remain:
+
+- exactly one `long target` parameter;
+- only top-level `yield wait_ticks(expression)`;
+- durable state must live in object fields;
+- sequence owners must be classes;
+- no `Task`, threads, arbitrary iterator values, or automatic persistence of locals.
+
+Complete local-persisting coroutine state machines, cancellation, nesting, and results belong to Phase 22.
 
 ## Restricted reference parameters and aliases
 
@@ -123,6 +135,7 @@ The native Phase 18 slices use the existing shared backend pipeline. Current cov
 - Binder and definite-assignment analysis;
 - Typed MIR and bytecode verification;
 - interpreter execution;
+- fixed-tick Game SDK sequence execution;
 - existing AOT/JIT integration through shared MIR;
 - Game SDK metadata retention;
 - Ubuntu and Windows warnings-as-errors CI.
@@ -131,7 +144,6 @@ The native Phase 18 slices use the existing shared backend pipeline. Current cov
 
 - native delegates, lambdas, and events;
 - native generic declarations, type arguments, and semantic specialization;
-- native deterministic sequence state machines;
 - native `ref`, `out`, and `in` symbols and MIR semantics;
 - exact source/tooling support for all migrated nodes;
 - `.rsbc` and AOT-manifest serialization of native language metadata;
