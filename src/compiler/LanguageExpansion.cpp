@@ -21,9 +21,73 @@ namespace {
 struct PreparedExpansionSource {
     std::string path;
     std::string originalContent;
+    std::string moduleName;
+    std::vector<std::string> imports;
     std::vector<Token> tokens;
     LanguageExpansionResult preliminary;
 };
+
+std::string qualifiedName(
+    const std::vector<Token>& tokens,
+    std::size_t begin,
+    std::size_t end) {
+    std::string result;
+    bool expectIdentifier = true;
+    for (std::size_t index = begin; index < end; ++index) {
+        if (tokens[index].kind == TokenKind::Identifier && expectIdentifier) {
+            result += tokens[index].text;
+            expectIdentifier = false;
+            continue;
+        }
+        if (symbol(tokens[index], ".") && !expectIdentifier) {
+            result.push_back('.');
+            expectIdentifier = true;
+            continue;
+        }
+        break;
+    }
+    if (result.empty() || expectIdentifier) return {};
+    return result;
+}
+
+std::string sourceModuleName(
+    const std::vector<Token>& tokens,
+    const std::string& path) {
+    for (std::size_t index = 0; index + 1 < tokens.size(); ++index) {
+        if (!word(tokens[index], "module")) continue;
+        std::size_t end = index + 1;
+        while (end < tokens.size() && !symbol(tokens[end], ";")) ++end;
+        const auto name = qualifiedName(tokens, index + 1, end);
+        if (!name.empty()) return name;
+        break;
+    }
+    return "$invalid$" + path;
+}
+
+std::vector<std::string> sourceImports(const std::vector<Token>& tokens) {
+    std::vector<std::string> result;
+    for (std::size_t index = 0; index + 1 < tokens.size(); ++index) {
+        if (!word(tokens[index], "import")) continue;
+        std::size_t end = index + 1;
+        while (end < tokens.size() &&
+               !symbol(tokens[end], ";") &&
+               !word(tokens[end], "as")) {
+            ++end;
+        }
+        const auto name = qualifiedName(tokens, index + 1, end);
+        if (!name.empty() &&
+            std::find(result.begin(), result.end(), name) == result.end()) {
+            result.push_back(name);
+        }
+    }
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+template <typename Map>
+void mergeDeclarations(Map& target, const Map& source) {
+    for (const auto& entry : source) target.emplace(entry.first, entry.second);
+}
 
 void collectGenericDeclarationsWithInterfaces(
     std::vector<Token>& tokens,
@@ -128,7 +192,7 @@ void collectExpansionDeclarations(
     Context& context) {
     context.path = source.path;
     context.result = {};
-    source.tokens = lex(source.originalContent);
+    if (source.tokens.empty()) source.tokens = lex(source.originalContent);
 
     rewriteValueAliases(source.tokens, context);
     extractAttributes(source.tokens, context);
@@ -357,35 +421,64 @@ std::vector<LanguageExpansionResult> expandLanguageSources(
     std::vector<PreparedExpansionSource> prepared;
     prepared.reserve(sources.size());
     for (const auto& source : sources) {
+        auto tokens = lex(source.content);
         prepared.push_back(PreparedExpansionSource{
-            source.path, source.content, {}, {}});
+            source.path,
+            source.content,
+            sourceModuleName(tokens, source.path),
+            sourceImports(tokens),
+            std::move(tokens),
+            {}});
     }
 
     std::vector<std::size_t> order(sources.size());
     std::iota(order.begin(), order.end(), std::size_t{0});
     std::stable_sort(order.begin(), order.end(),
         [&](std::size_t left, std::size_t right) {
+            if (prepared[left].moduleName != prepared[right].moduleName) {
+                return prepared[left].moduleName < prepared[right].moduleName;
+            }
             if (prepared[left].path != prepared[right].path) {
                 return prepared[left].path < prepared[right].path;
             }
             return left < right;
         });
 
-    Context context;
-    context.options = options;
-
+    std::map<std::string, Context> moduleContexts;
+    std::map<std::string, std::set<std::string>> moduleImports;
     for (const auto index : order) {
+        auto& context = moduleContexts[prepared[index].moduleName];
+        context.options = options;
+        moduleImports[prepared[index].moduleName].insert(
+            prepared[index].imports.begin(), prepared[index].imports.end());
         collectExpansionDeclarations(prepared[index], context);
     }
 
-    std::set<std::string> emittedGenericNames;
-    std::set<std::string> emittedReferenceTypes;
+    auto effectiveContexts = moduleContexts;
+    for (auto& [moduleName, context] : effectiveContexts) {
+        const auto imports = moduleImports.find(moduleName);
+        if (imports == moduleImports.end()) continue;
+        for (const auto& importedName : imports->second) {
+            const auto imported = moduleContexts.find(importedName);
+            if (imported == moduleContexts.end()) continue;
+            mergeDeclarations(context.interfaces, imported->second.interfaces);
+            mergeDeclarations(context.delegates, imported->second.delegates);
+            mergeDeclarations(context.generics, imported->second.generics);
+            mergeDeclarations(
+                context.referenceFunctions,
+                imported->second.referenceFunctions);
+        }
+    }
+
+    std::map<std::string, std::set<std::string>> emittedGenericNames;
+    std::map<std::string, std::set<std::string>> emittedReferenceTypes;
     for (const auto index : order) {
+        auto& context = effectiveContexts[prepared[index].moduleName];
         results[index] = finishExpansion(
             prepared[index],
             context,
-            emittedGenericNames,
-            emittedReferenceTypes);
+            emittedGenericNames[prepared[index].moduleName],
+            emittedReferenceTypes[prepared[index].moduleName]);
     }
     return results;
 }
