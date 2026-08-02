@@ -18,12 +18,23 @@ public:
         while (index < close) {
             const auto lowered = lowerStatement(index, close, loop, switchBreak);
             if (lowered.second <= index) break;
-            if (loop && !loop->breakFlag.empty()) {
-                out << "if(!" << loop->breakFlag;
-                if (!loop->continueFlag.empty()) out << "&&!" << loop->continueFlag;
+            const bool guardLoop = loop &&
+                (!loop->breakFlag.empty() || !loop->continueFlag.empty());
+            if (guardLoop || !switchBreak.empty()) {
+                out << "if(";
+                bool first = true;
+                const auto appendGuard = [&](const std::string& flag) {
+                    if (flag.empty()) return;
+                    if (!first) out << "&&";
+                    out << "!" << flag;
+                    first = false;
+                };
+                if (loop) {
+                    appendGuard(loop->breakFlag);
+                    appendGuard(loop->continueFlag);
+                }
+                appendGuard(switchBreak);
                 out << ")" << lowered.first;
-            } else if (!switchBreak.empty()) {
-                out << "if(!" << switchBreak << ")" << lowered.first;
             } else {
                 out << lowered.first;
             }
@@ -45,17 +56,25 @@ private:
         if (word(tokens_[index], "break")) {
             std::size_t next = index;
             while (next < end && !symbol(tokens_[next], ";")) ++next;
-            const auto flag = !switchBreak.empty() ? switchBreak : (loop ? loop->breakFlag : std::string{});
-            if (flag.empty()) context_.error("RS8201", "break is not inside a loop or switch", tokens_[index].offset);
+            const auto flag = !switchBreak.empty()
+                ? switchBreak
+                : (loop ? loop->breakFlag : std::string{});
+            if (flag.empty()) {
+                context_.error("RS8201", "break is not inside a loop or switch", tokens_[index].offset);
+                return {"{}\n", std::min(next + 1, end)};
+            }
             context_.result.changed = true;
             return {"{" + flag + "=true;}\n", std::min(next + 1, end)};
         }
         if (word(tokens_[index], "continue")) {
             std::size_t next = index;
             while (next < end && !symbol(tokens_[next], ";")) ++next;
-            if (!loop || loop->continueFlag.empty()) context_.error("RS8202", "continue is not inside a loop", tokens_[index].offset);
+            if (!loop || loop->continueFlag.empty()) {
+                context_.error("RS8202", "continue is not inside a loop", tokens_[index].offset);
+                return {"{}\n", std::min(next + 1, end)};
+            }
             context_.result.changed = true;
-            return {"{" + (loop ? loop->continueFlag : std::string{}) + "=true;}\n", std::min(next + 1, end)};
+            return {"{" + loop->continueFlag + "=true;}\n", std::min(next + 1, end)};
         }
         if (word(tokens_[index], "for")) return lowerFor(index, end, loop, switchBreak);
         if (word(tokens_[index], "foreach")) return lowerForeach(index, end, loop, switchBreak);
