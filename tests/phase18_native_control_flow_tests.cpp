@@ -250,6 +250,54 @@ void testInterfaceBypassesExpansion() {
         "native interfaces still used source expansion");
 }
 
+void testNativeAttributes() {
+    realscript::compiler::Compilation compilation({{"attributes.rs", R"(
+module Phase18.Attributes;
+[Serializable(version = 2), Editor(category = "combat")]
+class Unit
+{
+    [Replicated(channel = "state")]
+    int health;
+
+    [Command]
+    int Damage(int amount)
+    {
+        health = health - amount;
+        return health;
+    }
+}
+)"}});
+    const auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "native attributes failed to compile:\n" +
+            diagnosticsText(build.diagnostics));
+    require(build.nativeAttributes.size() == 4,
+        "native declaration attributes were not retained");
+    require(build.nativeAttributes.front().target ==
+            "Phase18.Attributes::Unit",
+        "native type attribute target was not canonical");
+    bool replicated = false;
+    bool command = false;
+    for (const auto& attribute : build.nativeAttributes) {
+        replicated = replicated ||
+            (attribute.name == "Replicated" &&
+             attribute.target.find("field:health") != std::string::npos);
+        command = command ||
+            (attribute.name == "Command" &&
+             attribute.target.find("method:Damage#1") != std::string::npos);
+    }
+    require(replicated && command,
+        "native member attribute targets were not retained");
+}
+
+void testAttributesBypassExpansion() {
+    const auto expansion = realscript::compiler::expandLanguageSource(
+        "attributes.rs",
+        "module Native; [Serializable] class Unit { int health; }");
+    require(!expansion.changed,
+        "native attributes still used source expansion");
+}
+
 } // namespace
 
 int main() {
@@ -273,5 +321,7 @@ int main() {
     run("native interface contracts", testNativeInterfaceContracts);
     run("native interface diagnostics", testNativeInterfaceDiagnostics);
     run("interfaces bypass expansion", testInterfaceBypassesExpansion);
+    run("native attributes", testNativeAttributes);
+    run("attributes bypass expansion", testAttributesBypassExpansion);
     return failures == 0 ? 0 : 1;
 }

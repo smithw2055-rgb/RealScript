@@ -89,6 +89,24 @@ void mergeDeclarations(Map& target, const Map& source) {
     for (const auto& entry : source) target.emplace(entry.first, entry.second);
 }
 
+std::size_t genericDeclarationStart(
+    const std::vector<Token>& tokens,
+    std::size_t declaration) {
+    auto start = declaration;
+    while (start > 0 && symbol(tokens[start - 1], "]")) {
+        auto cursor = start - 1;
+        int depth = 1;
+        while (cursor > 0 && depth != 0) {
+            --cursor;
+            if (symbol(tokens[cursor], "]")) ++depth;
+            else if (symbol(tokens[cursor], "[")) --depth;
+        }
+        if (depth != 0) break;
+        start = cursor;
+    }
+    return start;
+}
+
 void collectGenericDeclarationsWithInterfaces(
     std::vector<Token>& tokens,
     Context& context) {
@@ -129,16 +147,20 @@ void collectGenericDeclarationsWithInterfaces(
             const auto bodyClose = matching(tokens, bodyOpen, "{", "}");
             if (bodyClose >= tokens.size()) break;
 
+            const auto declarationStart =
+                genericDeclarationStart(tokens, index);
             GenericDecl declaration;
             declaration.kind = GenericDecl::Kind::Type;
             declaration.name = tokens[index + 1].text;
             declaration.parameters = parseTypeParameterNames(
                 tokens, index + 2, angleClose);
             declaration.tokens.assign(
-                tokens.begin() + static_cast<std::ptrdiff_t>(index),
-                tokens.begin() + static_cast<std::ptrdiff_t>(bodyClose + 1));
+                tokens.begin() +
+                    static_cast<std::ptrdiff_t>(declarationStart),
+                tokens.begin() +
+                    static_cast<std::ptrdiff_t>(bodyClose + 1));
             context.generics[declaration.name] = std::move(declaration);
-            remove.push_back({index, bodyClose + 1});
+            remove.push_back({declarationStart, bodyClose + 1});
             index = bodyClose + 1;
             continue;
         }

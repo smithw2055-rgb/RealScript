@@ -29,6 +29,8 @@ struct LanguageAttributeRecord {
     std::string target;
     std::string name;
     std::vector<LanguageAttributeArgument> arguments;
+    std::string sourceName;
+    std::size_t offset = 0;
 };
 
 struct LanguageInterfaceImplementation {
@@ -46,7 +48,7 @@ struct LanguageExpansionOptions {
     bool structuredControlFlow = false;
     bool delegatesLambdasEvents = true;
     bool interfaces = false;
-    bool sourceAttributes = true;
+    bool sourceAttributes = false;
     bool generics = true;
     bool deterministicCoroutines = true;
     bool referenceParameters = true;

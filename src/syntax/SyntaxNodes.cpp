@@ -9,6 +9,15 @@ text::TextSpan combine(text::TextSpan first, text::TextSpan last) noexcept {
     return text::TextSpan::fromBounds(first.start, last.end());
 }
 
+text::TextSpan declarationStart(
+    const std::vector<AttributeListSyntax>& attributes,
+    text::TextSpan fallback) noexcept {
+    return attributes.empty() ? fallback
+        : text::TextSpan::fromBounds(
+            attributes.front().span().start,
+            fallback.end());
+}
+
 std::string joinQualifiedName(const std::vector<SyntaxToken>& parts) {
     std::ostringstream out;
     for (std::size_t i = 0; i < parts.size(); ++i) {
@@ -19,6 +28,26 @@ std::string joinQualifiedName(const std::vector<SyntaxToken>& parts) {
 }
 
 } // namespace
+
+text::TextSpan AttributeArgumentSyntax::valueSpan() const noexcept {
+    if (valueTokens.empty()) return {};
+    return combine(valueTokens.front().span, valueTokens.back().span);
+}
+
+text::TextSpan AttributeArgumentSyntax::span() const noexcept {
+    const auto value = valueSpan();
+    if (nameToken) return combine(nameToken->span, value.empty() ? nameToken->span : value);
+    return value;
+}
+
+text::TextSpan AttributeSyntax::span() const noexcept {
+    return closeParenToken ? combine(nameToken.span, closeParenToken->span)
+                           : nameToken.span;
+}
+
+text::TextSpan AttributeListSyntax::span() const noexcept {
+    return combine(openBracketToken.span, closeBracketToken.span);
+}
 
 text::TextSpan TypeSyntax::span() const noexcept {
     return closeBracketToken
@@ -117,7 +146,7 @@ text::TextSpan SwitchStatementSyntax::span() const noexcept {
 }
 
 text::TextSpan VariableDeclarationStatementSyntax::span() const noexcept {
-    return combine(type.span(), semicolonToken.span);
+    return combine(declarationStart(attributes, type.span()), semicolonToken.span);
 }
 
 text::TextSpan ExpressionStatementSyntax::span() const noexcept {
@@ -137,7 +166,7 @@ text::TextSpan FieldDeclarationSyntax::span() const noexcept {
 }
 
 text::TextSpan ConstructorDeclarationSyntax::span() const noexcept {
-    return combine(identifierToken.span, body.span());
+    return combine(declarationStart(attributes, identifierToken.span), body.span());
 }
 
 text::TextSpan AccessorDeclarationSyntax::span() const noexcept {
@@ -146,37 +175,38 @@ text::TextSpan AccessorDeclarationSyntax::span() const noexcept {
 }
 
 text::TextSpan PropertyDeclarationSyntax::span() const noexcept {
-    return combine(type.span(), closeBraceToken.span);
+    return combine(declarationStart(attributes, type.span()), closeBraceToken.span);
 }
 
 text::TextSpan ClassDeclarationSyntax::span() const noexcept {
-    return combine(classKeyword.span, closeBraceToken.span);
+    return combine(declarationStart(attributes, classKeyword.span), closeBraceToken.span);
 }
 
 text::TextSpan StructDeclarationSyntax::span() const noexcept {
-    return combine(structKeyword.span, closeBraceToken.span);
+    return combine(declarationStart(attributes, structKeyword.span), closeBraceToken.span);
 }
 
 text::TextSpan InterfaceMethodDeclarationSyntax::span() const noexcept {
-    return combine(returnType.span(), semicolonToken.span);
+    return combine(declarationStart(attributes, returnType.span()), semicolonToken.span);
 }
 
 text::TextSpan InterfaceDeclarationSyntax::span() const noexcept {
-    return combine(interfaceKeyword.span, closeBraceToken.span);
+    return combine(declarationStart(attributes, interfaceKeyword.span), closeBraceToken.span);
 }
 
 text::TextSpan EnumMemberDeclarationSyntax::span() const noexcept {
-    if (commaToken) return combine(identifierToken.span, commaToken->span);
-    if (valueToken) return combine(identifierToken.span, valueToken->span);
-    return identifierToken.span;
+    text::TextSpan end = identifierToken.span;
+    if (commaToken) end = commaToken->span;
+    else if (valueToken) end = valueToken->span;
+    return combine(declarationStart(attributes, identifierToken.span), end);
 }
 
 text::TextSpan EnumDeclarationSyntax::span() const noexcept {
-    return combine(enumKeyword.span, closeBraceToken.span);
+    return combine(declarationStart(attributes, enumKeyword.span), closeBraceToken.span);
 }
 
 text::TextSpan FunctionDeclarationSyntax::span() const noexcept {
-    return combine(returnType.span(), body.span());
+    return combine(declarationStart(attributes, returnType.span()), body.span());
 }
 
 std::string ModuleDeclarationSyntax::fullName() const {

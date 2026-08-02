@@ -110,6 +110,50 @@ void refreshVisibleTypes(
     }
 }
 
+std::string attributeValueText(
+    const syntax::AttributeArgumentSyntax& argument,
+    const text::SourceText& source) {
+    const auto span = argument.valueSpan();
+    return span.empty() ? std::string{} : std::string(source.view(span));
+}
+
+void appendNativeAttributes(
+    std::vector<LanguageAttributeRecord>& output,
+    const std::vector<syntax::AttributeListSyntax>& lists,
+    const std::string& target,
+    const text::SourceText& source) {
+    for (const auto& list : lists) {
+        for (const auto& attribute : list.attributes) {
+            LanguageAttributeRecord record;
+            record.target = target;
+            record.name = attribute.nameToken.text;
+            record.sourceName = source.name();
+            record.offset = attribute.nameToken.span.start;
+            std::size_t positional = 0;
+            for (const auto& argument : attribute.arguments) {
+                LanguageAttributeArgument value;
+                value.name = argument.nameToken
+                    ? argument.nameToken->text
+                    : "arg" + std::to_string(positional++);
+                value.value = attributeValueText(argument, source);
+                record.arguments.push_back(std::move(value));
+            }
+            output.push_back(std::move(record));
+        }
+    }
+}
+
+std::string memberAttributeTarget(
+    const std::string& owner,
+    const std::string& kind,
+    const std::string& name,
+    std::size_t arity = 0) {
+    std::ostringstream out;
+    out << owner << "::" << kind << ':' << name;
+    if (kind == "method" || kind == "ctor") out << '#' << arity;
+    return out.str();
+}
+
 std::string canonicalInterfaceName(
     const std::string& moduleName,
     const std::string& name) {
@@ -673,6 +717,118 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             addMembers(unit->syntaxTree->structs);
         }
 
+        // Collect native source attributes from original syntax declarations.
+        for (const auto* unit : module.units) {
+            const auto collectTypeAttributes = [&](auto const& declarations) {
+                for (const auto& declaration : declarations) {
+                    const auto* owner =
+                        findOwnType(module, declaration.identifierToken.text);
+                    if (!owner) continue;
+                    const auto ownerName = semantic::canonicalTypeName(*owner);
+                    appendNativeAttributes(
+                        result.nativeAttributes,
+                        declaration.attributes,
+                        ownerName,
+                        *unit->source);
+                    for (const auto& field : declaration.fields) {
+                        appendNativeAttributes(
+                            result.nativeAttributes,
+                            field.attributes,
+                            memberAttributeTarget(
+                                ownerName, "field", field.identifierToken.text),
+                            *unit->source);
+                    }
+                    for (const auto& method : declaration.methods) {
+                        appendNativeAttributes(
+                            result.nativeAttributes,
+                            method.attributes,
+                            memberAttributeTarget(
+                                ownerName,
+                                "method",
+                                method.identifierToken.text,
+                                method.parameters.size()),
+                            *unit->source);
+                    }
+                    for (const auto& constructor : declaration.constructors) {
+                        appendNativeAttributes(
+                            result.nativeAttributes,
+                            constructor.attributes,
+                            memberAttributeTarget(
+                                ownerName,
+                                "ctor",
+                                declaration.identifierToken.text,
+                                constructor.parameters.size()),
+                            *unit->source);
+                    }
+                    for (const auto& property : declaration.properties) {
+                        appendNativeAttributes(
+                            result.nativeAttributes,
+                            property.attributes,
+                            memberAttributeTarget(
+                                ownerName,
+                                "property",
+                                property.identifierToken.text),
+                            *unit->source);
+                    }
+                }
+            };
+            collectTypeAttributes(unit->syntaxTree->classes);
+            collectTypeAttributes(unit->syntaxTree->structs);
+            for (const auto& enumeration : unit->syntaxTree->enums) {
+                const auto* owner =
+                    findOwnType(module, enumeration.identifierToken.text);
+                if (!owner) continue;
+                const auto ownerName = semantic::canonicalTypeName(*owner);
+                appendNativeAttributes(
+                    result.nativeAttributes,
+                    enumeration.attributes,
+                    ownerName,
+                    *unit->source);
+                for (const auto& member : enumeration.members) {
+                    appendNativeAttributes(
+                        result.nativeAttributes,
+                        member.attributes,
+                        memberAttributeTarget(
+                            ownerName,
+                            "enum",
+                            member.identifierToken.text),
+                        *unit->source);
+                }
+            }
+            for (const auto& interfaceSyntax : unit->syntaxTree->interfaces) {
+                const auto interfaceName = canonicalInterfaceName(
+                    moduleName,
+                    interfaceSyntax.identifierToken.text);
+                appendNativeAttributes(
+                    result.nativeAttributes,
+                    interfaceSyntax.attributes,
+                    interfaceName,
+                    *unit->source);
+                for (const auto& method : interfaceSyntax.methods) {
+                    appendNativeAttributes(
+                        result.nativeAttributes,
+                        method.attributes,
+                        memberAttributeTarget(
+                            interfaceName,
+                            "method",
+                            method.identifierToken.text,
+                            method.parameters.size()),
+                        *unit->source);
+                }
+            }
+            for (const auto& function : unit->syntaxTree->functions) {
+                appendNativeAttributes(
+                    result.nativeAttributes,
+                    function.attributes,
+                    memberAttributeTarget(
+                        moduleName,
+                        "function",
+                        function.identifierToken.text,
+                        function.parameters.size()),
+                    *unit->source);
+            }
+        }
+
         const auto validateInterfaces = [&](auto const& declarations) {
             for (const auto& typeSyntax : declarations) {
                 auto* owner = findOwnType(module, typeSyntax.identifierToken.text);
@@ -791,6 +947,20 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             }
             interfaceSignature << '}';
             signatures.push_back(interfaceSignature.str());
+        }
+        for (const auto& attribute : result.nativeAttributes) {
+            if (attribute.target.rfind(moduleName + "::", 0) != 0) {
+                continue;
+            }
+            std::ostringstream attributeSignature;
+            attributeSignature << "attribute:" << attribute.target
+                << ':' << attribute.name << '(';
+            for (const auto& argument : attribute.arguments) {
+                attributeSignature << argument.name << '='
+                    << argument.value << ',';
+            }
+            attributeSignature << ')';
+            signatures.push_back(attributeSignature.str());
         }
         for (const auto& implementation : result.nativeInterfaces) {
             if (implementation.typeName.rfind(moduleName + "::", 0) != 0) {
@@ -999,6 +1169,17 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         result.buildInfo.push_back(buildInfo);
     }
 
+    std::stable_sort(
+        result.nativeAttributes.begin(),
+        result.nativeAttributes.end(),
+        [](const auto& left, const auto& right) {
+            if (left.target != right.target) return left.target < right.target;
+            if (left.name != right.name) return left.name < right.name;
+            if (left.sourceName != right.sourceName) {
+                return left.sourceName < right.sourceName;
+            }
+            return left.offset < right.offset;
+        });
     std::stable_sort(
         result.nativeInterfaces.begin(),
         result.nativeInterfaces.end(),

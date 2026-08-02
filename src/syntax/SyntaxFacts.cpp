@@ -79,6 +79,9 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(HandleKeyword);
         RS_KIND(VoidKeyword);
         RS_KIND(CompilationUnit);
+        RS_KIND(AttributeList);
+        RS_KIND(Attribute);
+        RS_KIND(AttributeArgument);
         RS_KIND(ModuleDeclaration);
         RS_KIND(ClassDeclaration);
         RS_KIND(StructDeclaration);

@@ -375,16 +375,22 @@ int other()
 }
 
 void testExpansionMetadata() {
-    const auto expansion = realscript::compiler::expandLanguageSource(
+    realscript::compiler::Compilation compilation({{
         "metadata.rs",
-        "module Meta; [Replicated(channel = \"state\")] class Unit { int health; }");
-    require(expansion.succeeded(), "metadata expansion failed");
-    require(expansion.attributes.size() == 1, "source attribute was not captured");
-    require(expansion.attributes.front().target == "Meta::Unit",
+        "module Meta; [Replicated(channel = \"state\")] class Unit { int health; }"}});
+    const auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "native metadata compilation failed:\n" +
+            diagnosticsText(build.diagnostics));
+    require(build.nativeAttributes.size() == 1,
+        "native source attribute was not captured");
+    require(build.nativeAttributes.front().target == "Meta::Unit",
         "source attribute target was not module-qualified");
-    require(expansion.attributes.front().name == "Replicated",
+    require(build.nativeAttributes.front().name == "Replicated",
         "source attribute name changed");
-    require(expansion.attributes.front().arguments.size() == 1,
+    require(build.nativeAttributes.front().arguments.size() == 1 &&
+            build.nativeAttributes.front().arguments.front().name == "channel" &&
+            build.nativeAttributes.front().arguments.front().value == "\"state\"",
         "source attribute arguments were not captured");
 }
 
