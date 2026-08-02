@@ -38,8 +38,11 @@ std::vector<realscript::bytecode::Module> compileModules(
     for (const auto& mir : build.modules) {
         auto module = lowerer.lower(mir);
         realscript::diagnostics::DiagnosticBag diagnostics;
-        require(realscript::bytecode::verifyModule(module, diagnostics),
-            "extended bytecode verification failed:\n" + diagnosticsText(diagnostics));
+        const auto verified =
+            realscript::bytecode::verifyModule(module, diagnostics);
+        require(verified,
+            "extended bytecode verification failed:\n" +
+                diagnosticsText(diagnostics));
         modules.push_back(std::move(module));
     }
     return modules;

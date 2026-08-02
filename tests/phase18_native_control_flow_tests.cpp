@@ -27,7 +27,16 @@ realscript::runtime::ExecutionResult execute(const char* source) {
     require(!build.diagnostics.hasErrors(), "native source failed to compile:\n" + diagnosticsText(build.diagnostics));
     realscript::bytecode::Lowerer lowerer;
     std::vector<realscript::bytecode::Module> modules;
-    for (const auto& module : build.modules) modules.push_back(lowerer.lower(module));
+    for (const auto& sourceModule : build.modules) {
+        auto module = lowerer.lower(sourceModule);
+        realscript::diagnostics::DiagnosticBag diagnostics;
+        const auto verified =
+            realscript::bytecode::verifyModule(module, diagnostics);
+        require(verified,
+            "native bytecode verification failed:\n" +
+                diagnosticsText(diagnostics));
+        modules.push_back(std::move(module));
+    }
     realscript::runtime::Interpreter interpreter(std::move(modules));
     return interpreter.invoke("Phase18::main");
 }
