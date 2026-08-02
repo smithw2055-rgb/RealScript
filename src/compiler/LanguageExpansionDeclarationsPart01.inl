@@ -26,6 +26,9 @@ void extractAttributes(std::vector<Token>& tokens, Context& context) {
             targetIndex + 1 < tokens.size()) target = tokens[targetIndex + 1].text;
         else if (targetIndex + 1 < tokens.size() && tokens[targetIndex + 1].kind == TokenKind::Identifier)
             target = tokens[targetIndex + 1].text;
+        if (!context.moduleName.empty()) {
+            target = context.moduleName + "::" + target;
+        }
 
         auto attributes = splitTopLevel(tokens, index + 1, close, ",");
         for (const auto& attributeTokens : attributes) {
