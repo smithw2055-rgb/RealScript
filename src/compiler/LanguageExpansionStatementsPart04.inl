@@ -2,7 +2,14 @@
         while (index < end) {
             const auto statement = lowerStatement(index, end, loop, switchBreak);
             if (statement.second <= index) break;
-            out << "if(!" << switchBreak << ")" << statement.first;
+            out << "if(!" << switchBreak;
+            if (loop && !loop->breakFlag.empty()) {
+                out << "&&!" << loop->breakFlag;
+            }
+            if (loop && !loop->continueFlag.empty()) {
+                out << "&&!" << loop->continueFlag;
+            }
+            out << ")" << statement.first;
             index = statement.second;
         }
         out << "}\n";
