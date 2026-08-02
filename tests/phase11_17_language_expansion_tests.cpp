@@ -95,6 +95,13 @@ class Box<T> : ICounter
         {
             list.Add(item);
         }
+        foreach (int item in list)
+        {
+            if (item > 0)
+            {
+                total = total + item;
+            }
+        }
 
         switch (list.Count())
         {
@@ -140,8 +147,45 @@ int main()
     realscript::runtime::Interpreter interpreter(std::move(modules));
     const auto result = interpreter.invoke("Extended::main");
     require(result.succeeded, "extended main execution failed: " + result.error.message);
-    require(std::get<std::int64_t>(result.value) == 19,
+    require(std::get<std::int64_t>(result.value) == 23,
         "extended main returned the wrong result");
+}
+
+void testNestedSwitchControlFlow() {
+    const char* source = R"(
+module ControlEdges;
+
+int main()
+{
+    int total = 0;
+    int index = 0;
+    while (index < 4)
+    {
+        index = index + 1;
+        switch (index)
+        {
+            default:
+                total = total + 100;
+                break;
+            case 2:
+                continue;
+            case 3:
+                total = total + 3;
+                break;
+        }
+        total = total + 1;
+    }
+    return total;
+}
+)";
+
+    auto modules = compileModules({{"control_edges.rs", source}});
+    realscript::runtime::Interpreter interpreter(std::move(modules));
+    const auto result = interpreter.invoke("ControlEdges::main");
+    require(result.succeeded,
+        "nested switch execution failed: " + result.error.message);
+    require(std::get<std::int64_t>(result.value) == 206,
+        "nested switch/default/continue semantics were incorrect");
 }
 
 void testCrossFileDeclarationSharing() {
@@ -334,6 +378,7 @@ int main() {
     };
 
     run("phase 11-15 and 17 execution", testPhase11To15And17Execution);
+    run("nested switch control flow", testNestedSwitchControlFlow);
     run("cross-file declaration sharing", testCrossFileDeclarationSharing);
     run("source attribute metadata", testExpansionMetadata);
     run("expansion options refresh", testExpansionOptionsRefreshExistingSources);
