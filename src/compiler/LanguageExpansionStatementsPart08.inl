@@ -110,7 +110,6 @@ void lowerReferenceParameters(std::vector<Token>& tokens, Context& context) {
     if (!context.options.referenceParameters) return;
 
     using ParameterInfo = ReferenceParameterInfo;
-    using FunctionInfo = ReferenceFunctionInfo;
     auto functions = context.referenceFunctions;
 
     // Kept as a scope boundary because the continuation lives in Part09.
