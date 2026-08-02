@@ -22,28 +22,36 @@
                 const bool enable = symbol(body[cursor + 1], "+=");
                 std::string handler;
                 std::size_t endSite = cursor + 2;
-                if (endSite < body.size() && body[endSite].kind == TokenKind::Identifier) {
-                    handler = body[endSite].text;
-                    ++endSite;
-                } else if (endSite < body.size() && symbol(body[endSite], "(")) {
-                    const auto lambdaClose = matching(body, endSite, "(", ")");
-                    std::size_t lambdaBody = lambdaClose + 2;
-                    if (lambdaBody < body.size() && symbol(body[lambdaBody], "{"))
-                        endSite = matching(body, lambdaBody, "{", "}") + 1;
-                    else {
-                        endSite = lambdaBody;
-                        while (endSite < body.size() && !symbol(body[endSite], ";")) ++endSite;
-                    }
-                    for (const auto& candidate : info.handlers) {
-                        if (candidate.rfind("__rs_lambda_", 0) == 0 &&
-                            std::none_of(rewritten.begin(), rewritten.end(), [&](const Token& token) {
-                                return token.text.find(info.handlerFields[candidate]) != std::string::npos;
-                            })) {
-                            handler = candidate;
-                            break;
+
+                const auto lambda = info.lambdaHandlers.find(cursor);
+                if (lambda != info.lambdaHandlers.end()) {
+                    handler = lambda->second;
+                    if (endSite < body.size() && symbol(body[endSite], "(")) {
+                        const auto lambdaClose = matching(body, endSite, "(", ")");
+                        const auto lambdaBody = lambdaClose + 2;
+                        if (lambdaBody < body.size() && symbol(body[lambdaBody], "{")) {
+                            endSite = matching(body, lambdaBody, "{", "}") + 1;
+                        } else {
+                            endSite = lambdaBody;
+                            while (endSite < body.size() && !symbol(body[endSite], ";")) ++endSite;
+                        }
+                    } else if (endSite + 1 < body.size() &&
+                               body[endSite].kind == TokenKind::Identifier &&
+                               symbol(body[endSite + 1], "=>")) {
+                        const auto lambdaBody = endSite + 2;
+                        if (lambdaBody < body.size() && symbol(body[lambdaBody], "{")) {
+                            endSite = matching(body, lambdaBody, "{", "}") + 1;
+                        } else {
+                            endSite = lambdaBody;
+                            while (endSite < body.size() && !symbol(body[endSite], ";")) ++endSite;
                         }
                     }
+                } else if (endSite < body.size() &&
+                           body[endSite].kind == TokenKind::Identifier) {
+                    handler = body[endSite].text;
+                    ++endSite;
                 }
+
                 while (endSite < body.size() && !symbol(body[endSite], ";")) ++endSite;
                 if (endSite < body.size()) ++endSite;
                 const auto field = info.handlerFields.find(handler);
