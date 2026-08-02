@@ -49,18 +49,30 @@ Implemented and validated:
 - `LanguageExpansionOptions::structuredControlFlow` disabled by default;
 - all Phase 1–18A tests passing on Ubuntu and Windows with warnings as errors.
 
-### 18B — delegates, lambdas, and events
+### 18B — delegates, lambdas, and events — in progress
 
 - Native delegate/event declarations.
 - Lambda syntax trees and closure analysis.
 - Method-group conversion and deterministic event ordering.
 - First migration may retain bounded captures, but the AST and symbols must be native.
 
-### 18C — interface contracts and source attributes
+### 18C — interface contracts and source attributes — complete
 
-- Native interface and attribute declarations/usages.
-- Attribute binding and typed constant arguments.
-- Interface metadata in semantic models, bytecode, AOT manifests, and Game SDK outputs.
+Implemented and validated:
+
+- native `interface` declarations and class/struct implementation lists;
+- module/import-aware interface visibility;
+- exact method name, visible arity, parameter type, return type, and exact-type identity validation;
+- stable module-qualified interface implementation metadata in `BuildResult` and the Game SDK;
+- native Attribute List, Attribute, and Attribute Argument syntax nodes with original token spans;
+- declaration attributes on types, interfaces, functions, fields, methods, constructors, properties, enum members, and interface methods;
+- positional and named argument text retained from original source;
+- canonical metadata targets and source locations;
+- native attributes retained in `Compilation`, `GameCompileResult`, and `GameProgram`;
+- attributes and interface contracts included in public module fingerprints;
+- generic source expansion preserves native attribute token lists while generic specialization remains pending;
+- `LanguageExpansionOptions::interfaces` and `sourceAttributes` disabled by default;
+- Phase 1–18C tests passing on Ubuntu and Windows with warnings as errors.
 
 ### 18D — generics
 
