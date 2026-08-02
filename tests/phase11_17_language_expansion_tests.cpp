@@ -391,8 +391,8 @@ void testExpansionOptionsRefreshExistingSources() {
         "options.rs",
         "module Options; int main(){for(int i=0;i<1;i=i+1){}return 1;}"});
     require(compilation.languageExpansions().size() == 1 &&
-            compilation.languageExpansions().front().changed,
-        "default language expansion did not run");
+            !compilation.languageExpansions().front().changed,
+        "native control flow unexpectedly used source expansion");
 
     realscript::compiler::LanguageExpansionOptions options;
     options.structuredControlFlow = false;

@@ -3,16 +3,6 @@
 #include <stdexcept>
 
 namespace realscript::mir {
-namespace {
-
-bool isLiteralTrue(const semantic::BoundExpression& expression) {
-    if (expression.kind() != semantic::BoundNodeKind::LiteralExpression ||
-        expression.type != semantic::PrimitiveType::Bool) return false;
-    const auto& literal = static_cast<const semantic::BoundLiteralExpression&>(expression);
-    return std::holds_alternative<bool>(literal.value) && std::get<bool>(literal.value);
-}
-
-} // namespace
 
 Module Lowerer::lower(const semantic::SemanticModel& model) {
     Module result; result.name = model.moduleName; result.types = model.types;
@@ -115,7 +105,11 @@ void Lowerer::collectLocalTypes(const semantic::BoundStatement& statement) {
         collectLocalTypes(*static_cast<const semantic::BoundWhileStatement&>(statement).body); return;
     case semantic::BoundNodeKind::ForStatement: {
         const auto& value = static_cast<const semantic::BoundForStatement&>(statement);
-        if (value.initializer) collectLocalTypes(*value.initializer); collectLocalTypes(*value.body); return;
+        if (value.initializer) {
+            collectLocalTypes(*value.initializer);
+        }
+        collectLocalTypes(*value.body);
+        return;
     }
     case semantic::BoundNodeKind::ForeachStatement: {
         const auto& value = static_cast<const semantic::BoundForeachStatement&>(statement);
@@ -169,7 +163,13 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         emitJump(continueTargets_.back(), {}, statement.span); return;
     case semantic::BoundNodeKind::VariableDeclarationStatement: {
         const auto& value = static_cast<const semantic::BoundVariableDeclarationStatement&>(statement);
-        if (value.initializer) emitStoreLocal(value.variable.index, lowerExpression(*value.initializer), statement.span); return;
+        if (value.initializer) {
+            emitStoreLocal(
+                value.variable.index,
+                lowerExpression(*value.initializer),
+                statement.span);
+        }
+        return;
     }
     case semantic::BoundNodeKind::ExpressionStatement:
         (void)lowerExpression(*static_cast<const semantic::BoundExpressionStatement&>(statement).expression); return;
