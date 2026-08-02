@@ -49,7 +49,7 @@ Implemented and validated:
 - `LanguageExpansionOptions::structuredControlFlow` disabled by default;
 - all Phase 1–18A tests passing on Ubuntu and Windows with warnings as errors.
 
-### 18B — delegates, lambdas, and events — in progress
+### 18B — delegates, lambdas, and events — pending
 
 - Native delegate/event declarations.
 - Lambda syntax trees and closure analysis.
@@ -74,19 +74,30 @@ Implemented and validated:
 - `LanguageExpansionOptions::interfaces` and `sourceAttributes` disabled by default;
 - Phase 1–18C tests passing on Ubuntu and Windows with warnings as errors.
 
-### 18D — generics
+### 18D — generics — pending
 
 - Native type-parameter/type-argument syntax and symbols.
 - Generic construction and deterministic specialization after semantic binding.
 - Stable generic identity independent of generated source names.
 
-### 18E — deterministic sequences
+### 18E — deterministic sequences — complete
 
-- Native `sequence` and `yield wait_ticks` nodes.
-- Typed coroutine state-machine MIR with source sequence points.
-- Snapshot and rollback metadata owned by the compiled program.
+Implemented and validated:
 
-### 18F — reference modifiers and exact aliases
+- native `sequence` declaration and `yield wait_ticks(expression)` syntax nodes;
+- original source spans retained for sequence declarations and yield points;
+- compiler-owned entry method, callback methods, and target-handle field symbols;
+- each top-level yield segment is bound independently, so locals cannot silently cross suspension boundaries;
+- generated schedule calls bind directly to imported `RealScript.Game.Schedule` rather than generated script text;
+- fixed-tick callbacks continue to use `GameplayHost` and `TickScheduler` for replay/rollback behavior;
+- canonical sequence metadata is retained in `BuildResult`, `GameCompileResult`, and `GameProgram`;
+- invalid sequence signatures, missing scheduling APIs, nested/out-of-context yields, and non-class owners receive explicit diagnostics;
+- `LanguageExpansionOptions::deterministicCoroutines` disabled by default;
+- native sequence execution, metadata, error recovery, bytecode verification, and the full repository test matrix pass on Ubuntu and Windows with warnings as errors.
+
+Current bounded semantics remain unchanged: exactly one `long target` parameter, top-level `yield wait_ticks`, and durable state stored in object fields. Complete local-persisting coroutine state machines remain Phase 22.
+
+### 18F — reference modifiers and exact aliases — pending
 
 - Native `ref`, `out`, and `in` parameter/argument symbols.
 - Definite assignment and l-value checking.
