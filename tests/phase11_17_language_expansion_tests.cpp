@@ -377,7 +377,8 @@ int other()
 void testExpansionMetadata() {
     realscript::compiler::Compilation compilation({{
         "metadata.rs",
-        "module Meta; [Replicated(channel = \"state\")] class Unit { int health; }"}});
+        "module Meta; [Replicated(channel = \"state\")] "
+        "class Unit { int health; }"}});
     const auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
         "native metadata compilation failed:\n" +
@@ -389,8 +390,10 @@ void testExpansionMetadata() {
     require(build.nativeAttributes.front().name == "Replicated",
         "source attribute name changed");
     require(build.nativeAttributes.front().arguments.size() == 1 &&
-            build.nativeAttributes.front().arguments.front().name == "channel" &&
-            build.nativeAttributes.front().arguments.front().value == "\"state\"",
+            build.nativeAttributes.front().arguments.front().name ==
+                "channel" &&
+            build.nativeAttributes.front().arguments.front().value ==
+                "\"state\"",
         "source attribute arguments were not captured");
 }
 

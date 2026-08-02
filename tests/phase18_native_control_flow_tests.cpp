@@ -268,12 +268,15 @@ class Unit
 }
 )"}});
     const auto build = compilation.build();
-    require(!build.diagnostics.hasErrors(),
+    require(
+        !build.diagnostics.hasErrors(),
         "native attributes failed to compile:\n" +
             diagnosticsText(build.diagnostics));
-    require(build.nativeAttributes.size() == 4,
+    require(
+        build.nativeAttributes.size() == 4,
         "native declaration attributes were not retained");
-    require(build.nativeAttributes.front().target ==
+    require(
+        build.nativeAttributes.front().target ==
             "Phase18.Attributes::Unit",
         "native type attribute target was not canonical");
     bool replicated = false;
@@ -281,12 +284,15 @@ class Unit
     for (const auto& attribute : build.nativeAttributes) {
         replicated = replicated ||
             (attribute.name == "Replicated" &&
-             attribute.target.find("field:health") != std::string::npos);
+             attribute.target.find("field:health") !=
+                 std::string::npos);
         command = command ||
             (attribute.name == "Command" &&
-             attribute.target.find("method:Damage#1") != std::string::npos);
+             attribute.target.find("method:Damage#1") !=
+                 std::string::npos);
     }
-    require(replicated && command,
+    require(
+        replicated && command,
         "native member attribute targets were not retained");
 }
 
@@ -294,7 +300,8 @@ void testAttributesBypassExpansion() {
     const auto expansion = realscript::compiler::expandLanguageSource(
         "attributes.rs",
         "module Native; [Serializable] class Unit { int health; }");
-    require(!expansion.changed,
+    require(
+        !expansion.changed,
         "native attributes still used source expansion");
 }
 

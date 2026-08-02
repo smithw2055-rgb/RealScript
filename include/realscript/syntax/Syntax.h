@@ -220,83 +220,6 @@ struct AttributeListSyntax final : SyntaxNode {
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
-
-struct AttributeArgumentSyntax final : SyntaxNode {
-    std::optional<SyntaxToken> nameToken;
-    std::optional<SyntaxToken> equalsToken;
-    std::vector<SyntaxToken> valueTokens;
-
-    [[nodiscard]] SyntaxKind kind() const noexcept override {
-        return SyntaxKind::AttributeArgument;
-    }
-    [[nodiscard]] text::TextSpan valueSpan() const noexcept;
-    [[nodiscard]] text::TextSpan span() const noexcept override;
-};
-
-struct AttributeSyntax final : SyntaxNode {
-    SyntaxToken nameToken;
-    std::optional<SyntaxToken> openParenToken;
-    std::vector<AttributeArgumentSyntax> arguments;
-    std::vector<SyntaxToken> commaTokens;
-    std::optional<SyntaxToken> closeParenToken;
-
-    [[nodiscard]] SyntaxKind kind() const noexcept override {
-        return SyntaxKind::Attribute;
-    }
-    [[nodiscard]] text::TextSpan span() const noexcept override;
-};
-
-struct AttributeListSyntax final : SyntaxNode {
-    SyntaxToken openBracketToken;
-    std::vector<AttributeSyntax> attributes;
-    std::vector<SyntaxToken> commaTokens;
-    SyntaxToken closeBracketToken;
-
-    [[nodiscard]] SyntaxKind kind() const noexcept override {
-        return SyntaxKind::AttributeList;
-    }
-    [[nodiscard]] text::TextSpan span() const noexcept override;
-};
-
-
-struct AttributeArgumentSyntax final : SyntaxNode {
-    std::optional<SyntaxToken> nameToken;
-    std::optional<SyntaxToken> equalsToken;
-    std::vector<SyntaxToken> valueTokens;
-
-    [[nodiscard]] SyntaxKind kind() const noexcept override {
-        return SyntaxKind::AttributeArgument;
-    }
-    [[nodiscard]] text::TextSpan valueSpan() const noexcept;
-    [[nodiscard]] text::TextSpan span() const noexcept override;
-};
-
-struct AttributeSyntax final : SyntaxNode {
-    SyntaxToken nameToken;
-    std::optional<SyntaxToken> openParenToken;
-    std::vector<AttributeArgumentSyntax> arguments;
-    std::vector<SyntaxToken> commaTokens;
-    std::optional<SyntaxToken> closeParenToken;
-
-    [[nodiscard]] SyntaxKind kind() const noexcept override {
-        return SyntaxKind::Attribute;
-    }
-    [[nodiscard]] text::TextSpan span() const noexcept override;
-};
-
-struct AttributeListSyntax final : SyntaxNode {
-    SyntaxToken openBracketToken;
-    std::vector<AttributeSyntax> attributes;
-    std::vector<SyntaxToken> commaTokens;
-    SyntaxToken closeBracketToken;
-
-    [[nodiscard]] SyntaxKind kind() const noexcept override {
-        return SyntaxKind::AttributeList;
-    }
-    [[nodiscard]] text::TextSpan span() const noexcept override;
-};
-
-
 struct TypeSyntax final : SyntaxNode {
     SyntaxToken name;
     std::optional<SyntaxToken> openBracketToken;
@@ -611,8 +534,6 @@ struct ParameterSyntax final : SyntaxNode {
 
 struct FieldDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
     TypeSyntax type;
     SyntaxToken identifierToken;
     SyntaxToken semicolonToken;
@@ -624,8 +545,6 @@ struct FieldDeclarationSyntax final : SyntaxNode {
 struct FunctionDeclarationSyntax;
 
 struct ConstructorDeclarationSyntax final : SyntaxNode {
-    std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
     std::vector<AttributeListSyntax> attributes;
     SyntaxToken identifierToken;
     SyntaxToken openParenToken;
@@ -649,8 +568,6 @@ struct AccessorDeclarationSyntax final : SyntaxNode {
 
 struct PropertyDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
     std::optional<SyntaxToken> staticKeyword;
     TypeSyntax type;
     SyntaxToken identifierToken;
@@ -664,8 +581,6 @@ struct PropertyDeclarationSyntax final : SyntaxNode {
 };
 
 struct ClassDeclarationSyntax final : SyntaxNode {
-    std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
     std::vector<AttributeListSyntax> attributes;
     SyntaxToken classKeyword;
     SyntaxToken identifierToken;
@@ -685,8 +600,6 @@ struct ClassDeclarationSyntax final : SyntaxNode {
 
 struct StructDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
     SyntaxToken structKeyword;
     SyntaxToken identifierToken;
     std::optional<SyntaxToken> colonToken;
@@ -705,8 +618,6 @@ struct StructDeclarationSyntax final : SyntaxNode {
 
 struct InterfaceMethodDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
     TypeSyntax returnType;
     SyntaxToken identifierToken;
     SyntaxToken openParenToken;
@@ -723,8 +634,6 @@ struct InterfaceMethodDeclarationSyntax final : SyntaxNode {
 
 struct InterfaceDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
     SyntaxToken interfaceKeyword;
     SyntaxToken identifierToken;
     SyntaxToken openBraceToken;
@@ -739,8 +648,6 @@ struct InterfaceDeclarationSyntax final : SyntaxNode {
 
 struct EnumMemberDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
     SyntaxToken identifierToken;
     std::optional<SyntaxToken> equalsToken;
     std::optional<SyntaxToken> valueToken;
@@ -751,8 +658,6 @@ struct EnumMemberDeclarationSyntax final : SyntaxNode {
 };
 
 struct EnumDeclarationSyntax final : SyntaxNode {
-    std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
     std::vector<AttributeListSyntax> attributes;
     SyntaxToken enumKeyword;
     SyntaxToken identifierToken;
@@ -765,8 +670,6 @@ struct EnumDeclarationSyntax final : SyntaxNode {
 };
 
 struct FunctionDeclarationSyntax final : SyntaxNode {
-    std::vector<AttributeListSyntax> attributes;
-    std::vector<AttributeListSyntax> attributes;
     std::vector<AttributeListSyntax> attributes;
     std::optional<SyntaxToken> staticKeyword;
     TypeSyntax returnType;
@@ -854,7 +757,8 @@ private:
         std::vector<TypeSyntax>& interfaces,
         std::vector<SyntaxToken>& commaTokens);
     [[nodiscard]] FieldDeclarationSyntax parseFieldDeclaration(
-        TypeSyntax type, SyntaxToken identifier,
+        TypeSyntax type,
+        SyntaxToken identifier,
         std::vector<AttributeListSyntax> attributes);
     [[nodiscard]] FunctionDeclarationSyntax parseFunctionDeclaration(
         std::optional<SyntaxToken> staticKeyword = std::nullopt,

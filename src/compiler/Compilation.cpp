@@ -114,7 +114,9 @@ std::string attributeValueText(
     const syntax::AttributeArgumentSyntax& argument,
     const text::SourceText& source) {
     const auto span = argument.valueSpan();
-    return span.empty() ? std::string{} : std::string(source.view(span));
+    return span.empty()
+        ? std::string{}
+        : std::string(source.view(span));
 }
 
 void appendNativeAttributes(
@@ -150,7 +152,10 @@ std::string memberAttributeTarget(
     std::size_t arity = 0) {
     std::ostringstream out;
     out << owner << "::" << kind << ':' << name;
-    if (kind == "method" || kind == "ctor") out << '#' << arity;
+    if (kind == "method" || kind == "ctor" ||
+        kind == "function") {
+        out << '#' << arity;
+    }
     return out.str();
 }
 
@@ -717,7 +722,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             addMembers(unit->syntaxTree->structs);
         }
 
-        // Collect native source attributes from original syntax declarations.
+        // Collect native attributes from original syntax declarations.
         for (const auto* unit : module.units) {
             const auto collectTypeAttributes = [&](auto const& declarations) {
                 for (const auto& declaration : declarations) {
@@ -735,7 +740,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             result.nativeAttributes,
                             field.attributes,
                             memberAttributeTarget(
-                                ownerName, "field", field.identifierToken.text),
+                                ownerName,
+                                "field",
+                                field.identifierToken.text),
                             *unit->source);
                     }
                     for (const auto& method : declaration.methods) {
@@ -953,8 +960,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 continue;
             }
             std::ostringstream attributeSignature;
-            attributeSignature << "attribute:" << attribute.target
-                << ':' << attribute.name << '(';
+            attributeSignature << "attribute:"
+                << attribute.target << ':' << attribute.name << '(';
             for (const auto& argument : attribute.arguments) {
                 attributeSignature << argument.name << '='
                     << argument.value << ',';
@@ -1173,8 +1180,12 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         result.nativeAttributes.begin(),
         result.nativeAttributes.end(),
         [](const auto& left, const auto& right) {
-            if (left.target != right.target) return left.target < right.target;
-            if (left.name != right.name) return left.name < right.name;
+            if (left.target != right.target) {
+                return left.target < right.target;
+            }
+            if (left.name != right.name) {
+                return left.name < right.name;
+            }
             if (left.sourceName != right.sourceName) {
                 return left.sourceName < right.sourceName;
             }

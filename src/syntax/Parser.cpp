@@ -133,11 +133,14 @@ AttributeArgumentSyntax Parser::parseAttributeArgument() {
             break;
         }
         if (current().kind == SyntaxKind::OpenParenToken) ++parens;
-        else if (current().kind == SyntaxKind::CloseParenToken && parens > 0) --parens;
+        else if (current().kind == SyntaxKind::CloseParenToken &&
+                 parens > 0) --parens;
         else if (current().kind == SyntaxKind::OpenBracketToken) ++brackets;
-        else if (current().kind == SyntaxKind::CloseBracketToken && brackets > 0) --brackets;
+        else if (current().kind == SyntaxKind::CloseBracketToken &&
+                 brackets > 0) --brackets;
         else if (current().kind == SyntaxKind::OpenBraceToken) ++braces;
-        else if (current().kind == SyntaxKind::CloseBraceToken && braces > 0) --braces;
+        else if (current().kind == SyntaxKind::CloseBraceToken &&
+                 braces > 0) --braces;
         result.valueTokens.push_back(nextToken());
     }
     if (result.valueTokens.empty()) {
@@ -423,8 +426,7 @@ StructDeclarationSyntax Parser::parseStructDeclaration(
                     std::move(memberAttributes)));
             } else {
                 if (staticKeyword) diagnostics_.report("RS1106", "static fields are not supported", staticKeyword->span);
-                result.fields.push_back(parseFieldDeclaration(
-                    std::move(type),
+                result.fields.push_back(parseFieldDeclaration(std::move(type),
                     std::move(identifier),
                     std::move(memberAttributes)));
             }

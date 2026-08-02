@@ -216,8 +216,12 @@ GameCompileResult GameScriptCompiler::compile(
         result.languageMetadata.attributes.begin(),
         result.languageMetadata.attributes.end(),
         [](const auto& left, const auto& right) {
-            if (left.target != right.target) return left.target < right.target;
-            if (left.name != right.name) return left.name < right.name;
+            if (left.target != right.target) {
+                return left.target < right.target;
+            }
+            if (left.name != right.name) {
+                return left.name < right.name;
+            }
             if (left.sourceName != right.sourceName) {
                 return left.sourceName < right.sourceName;
             }
