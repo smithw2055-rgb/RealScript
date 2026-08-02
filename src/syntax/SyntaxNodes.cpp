@@ -86,6 +86,36 @@ text::TextSpan WhileStatementSyntax::span() const noexcept {
     return combine(whileKeyword.span, body->span());
 }
 
+text::TextSpan ForStatementSyntax::span() const noexcept {
+    return combine(forKeyword.span, body ? body->span() : closeParenToken.span);
+}
+
+text::TextSpan ForeachStatementSyntax::span() const noexcept {
+    return combine(foreachKeyword.span, body ? body->span() : closeParenToken.span);
+}
+
+text::TextSpan DoWhileStatementSyntax::span() const noexcept {
+    return combine(doKeyword.span, semicolonToken.span);
+}
+
+text::TextSpan BreakStatementSyntax::span() const noexcept {
+    return combine(breakKeyword.span, semicolonToken.span);
+}
+
+text::TextSpan ContinueStatementSyntax::span() const noexcept {
+    return combine(continueKeyword.span, semicolonToken.span);
+}
+
+text::TextSpan SwitchSectionSyntax::span() const noexcept {
+    const auto start = caseKeyword ? caseKeyword->span : defaultKeyword->span;
+    return statements.empty() ? combine(start, colonToken.span)
+                              : combine(start, statements.back()->span());
+}
+
+text::TextSpan SwitchStatementSyntax::span() const noexcept {
+    return combine(switchKeyword.span, closeBraceToken.span);
+}
+
 text::TextSpan VariableDeclarationStatementSyntax::span() const noexcept {
     return combine(type.span(), semicolonToken.span);
 }

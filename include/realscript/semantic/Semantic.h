@@ -263,6 +263,12 @@ enum class BoundNodeKind {
     ReturnStatement,
     IfStatement,
     WhileStatement,
+    ForStatement,
+    ForeachStatement,
+    DoWhileStatement,
+    BreakStatement,
+    ContinueStatement,
+    SwitchStatement,
     VariableDeclarationStatement,
     ExpressionStatement,
 };
@@ -501,6 +507,63 @@ struct BoundWhileStatement final : BoundStatement {
     }
 };
 
+struct BoundForStatement final : BoundStatement {
+    std::unique_ptr<BoundStatement> initializer;
+    std::unique_ptr<BoundExpression> condition;
+    std::unique_ptr<BoundExpression> increment;
+    std::unique_ptr<BoundStatement> body;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::ForStatement;
+    }
+};
+
+struct BoundForeachStatement final : BoundStatement {
+    VariableSymbol collectionVariable;
+    VariableSymbol indexVariable;
+    VariableSymbol iterationVariable;
+    std::unique_ptr<BoundExpression> collection;
+    std::unique_ptr<BoundExpression> count;
+    std::unique_ptr<BoundExpression> element;
+    std::unique_ptr<BoundStatement> body;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::ForeachStatement;
+    }
+};
+
+struct BoundDoWhileStatement final : BoundStatement {
+    std::unique_ptr<BoundStatement> body;
+    std::unique_ptr<BoundExpression> condition;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::DoWhileStatement;
+    }
+};
+
+struct BoundBreakStatement final : BoundStatement {
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::BreakStatement;
+    }
+};
+
+struct BoundContinueStatement final : BoundStatement {
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::ContinueStatement;
+    }
+};
+
+struct BoundSwitchSection {
+    std::unique_ptr<BoundExpression> label;
+    std::vector<std::unique_ptr<BoundStatement>> statements;
+    text::TextSpan span;
+};
+
+struct BoundSwitchStatement final : BoundStatement {
+    std::unique_ptr<BoundExpression> expression;
+    std::vector<BoundSwitchSection> sections;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::SwitchStatement;
+    }
+};
+
 struct BoundVariableDeclarationStatement final : BoundStatement {
     VariableSymbol variable;
     std::unique_ptr<BoundExpression> initializer;
@@ -553,6 +616,18 @@ private:
         const syntax::IfStatementSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundStatement> bindWhileStatement(
         const syntax::WhileStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindForStatement(
+        const syntax::ForStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindForeachStatement(
+        const syntax::ForeachStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindDoWhileStatement(
+        const syntax::DoWhileStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindBreakStatement(
+        const syntax::BreakStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindContinueStatement(
+        const syntax::ContinueStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindSwitchStatement(
+        const syntax::SwitchStatementSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundStatement> bindVariableDeclaration(
         const syntax::VariableDeclarationStatementSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundStatement> bindExpressionStatement(
@@ -621,6 +696,8 @@ private:
     SymbolId currentFunctionId_ = 0;
     std::vector<VariableSymbol> allVariables_;
     std::vector<SymbolOccurrence> occurrences_;
+    std::size_t loopDepth_ = 0;
+    std::size_t breakableDepth_ = 0;
 };
 
 } // namespace realscript::semantic

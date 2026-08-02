@@ -372,6 +372,18 @@ std::unique_ptr<StatementSyntax> Parser::parseStatement() {
         return parseIfStatement();
     case SyntaxKind::WhileKeyword:
         return parseWhileStatement();
+    case SyntaxKind::ForKeyword:
+        return parseForStatement();
+    case SyntaxKind::ForeachKeyword:
+        return parseForeachStatement();
+    case SyntaxKind::DoKeyword:
+        return parseDoWhileStatement();
+    case SyntaxKind::BreakKeyword:
+        return parseBreakStatement();
+    case SyntaxKind::ContinueKeyword:
+        return parseContinueStatement();
+    case SyntaxKind::SwitchKeyword:
+        return parseSwitchStatement();
     case SyntaxKind::OpenBraceToken:
         return std::make_unique<BlockStatementSyntax>(parseBlockStatement());
     default:
@@ -414,6 +426,106 @@ std::unique_ptr<StatementSyntax> Parser::parseWhileStatement() {
     result->condition = parseExpression();
     result->closeParenToken = match(SyntaxKind::CloseParenToken);
     result->body = parseStatement();
+    return result;
+}
+
+std::unique_ptr<StatementSyntax> Parser::parseForStatement() {
+    auto result = std::make_unique<ForStatementSyntax>();
+    result->forKeyword = match(SyntaxKind::ForKeyword);
+    result->openParenToken = match(SyntaxKind::OpenParenToken);
+    if (current().kind == SyntaxKind::SemicolonToken) {
+        result->firstSemicolonToken = nextToken();
+    } else if (isVariableDeclarationStart()) {
+        result->initializer = parseVariableDeclarationStatement();
+    } else {
+        result->initializer = parseExpressionStatement();
+    }
+    if (current().kind != SyntaxKind::SemicolonToken) {
+        result->condition = parseExpression();
+    }
+    result->secondSemicolonToken = match(SyntaxKind::SemicolonToken);
+    if (current().kind != SyntaxKind::CloseParenToken) {
+        result->increment = parseExpression();
+    }
+    result->closeParenToken = match(SyntaxKind::CloseParenToken);
+    result->body = parseStatement();
+    return result;
+}
+
+std::unique_ptr<StatementSyntax> Parser::parseForeachStatement() {
+    auto result = std::make_unique<ForeachStatementSyntax>();
+    result->foreachKeyword = match(SyntaxKind::ForeachKeyword);
+    result->openParenToken = match(SyntaxKind::OpenParenToken);
+    result->type = parseType();
+    result->identifierToken = match(SyntaxKind::IdentifierToken);
+    result->inKeyword = match(SyntaxKind::InKeyword);
+    result->collection = parseExpression();
+    result->closeParenToken = match(SyntaxKind::CloseParenToken);
+    result->body = parseStatement();
+    return result;
+}
+
+std::unique_ptr<StatementSyntax> Parser::parseDoWhileStatement() {
+    auto result = std::make_unique<DoWhileStatementSyntax>();
+    result->doKeyword = match(SyntaxKind::DoKeyword);
+    result->body = parseStatement();
+    result->whileKeyword = match(SyntaxKind::WhileKeyword);
+    result->openParenToken = match(SyntaxKind::OpenParenToken);
+    result->condition = parseExpression();
+    result->closeParenToken = match(SyntaxKind::CloseParenToken);
+    result->semicolonToken = match(SyntaxKind::SemicolonToken);
+    return result;
+}
+
+std::unique_ptr<StatementSyntax> Parser::parseBreakStatement() {
+    auto result = std::make_unique<BreakStatementSyntax>();
+    result->breakKeyword = match(SyntaxKind::BreakKeyword);
+    result->semicolonToken = match(SyntaxKind::SemicolonToken);
+    return result;
+}
+
+std::unique_ptr<StatementSyntax> Parser::parseContinueStatement() {
+    auto result = std::make_unique<ContinueStatementSyntax>();
+    result->continueKeyword = match(SyntaxKind::ContinueKeyword);
+    result->semicolonToken = match(SyntaxKind::SemicolonToken);
+    return result;
+}
+
+std::unique_ptr<StatementSyntax> Parser::parseSwitchStatement() {
+    auto result = std::make_unique<SwitchStatementSyntax>();
+    result->switchKeyword = match(SyntaxKind::SwitchKeyword);
+    result->openParenToken = match(SyntaxKind::OpenParenToken);
+    result->expression = parseExpression();
+    result->closeParenToken = match(SyntaxKind::CloseParenToken);
+    result->openBraceToken = match(SyntaxKind::OpenBraceToken);
+    bool defaultSeen = false;
+    while (current().kind != SyntaxKind::CloseBraceToken &&
+           current().kind != SyntaxKind::EndOfFileToken) {
+        SwitchSectionSyntax section;
+        if (current().kind == SyntaxKind::CaseKeyword) {
+            section.caseKeyword = nextToken();
+            section.label = parseExpression();
+        } else if (current().kind == SyntaxKind::DefaultKeyword) {
+            section.defaultKeyword = nextToken();
+            if (defaultSeen) {
+                diagnostics_.report("RS1110", "switch statement has more than one default label", section.defaultKeyword->span);
+            }
+            defaultSeen = true;
+        } else {
+            diagnostics_.report("RS1109", "expected case or default label", current().span);
+            nextToken();
+            continue;
+        }
+        section.colonToken = match(SyntaxKind::ColonToken);
+        while (current().kind != SyntaxKind::CaseKeyword &&
+               current().kind != SyntaxKind::DefaultKeyword &&
+               current().kind != SyntaxKind::CloseBraceToken &&
+               current().kind != SyntaxKind::EndOfFileToken) {
+            section.statements.push_back(parseStatement());
+        }
+        result->sections.push_back(std::move(section));
+    }
+    result->closeBraceToken = match(SyntaxKind::CloseBraceToken);
     return result;
 }
 

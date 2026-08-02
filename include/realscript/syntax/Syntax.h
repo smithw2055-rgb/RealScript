@@ -52,6 +52,15 @@ enum class SyntaxKind {
     IfKeyword,
     ElseKeyword,
     WhileKeyword,
+    ForKeyword,
+    ForeachKeyword,
+    InKeyword,
+    DoKeyword,
+    BreakKeyword,
+    ContinueKeyword,
+    SwitchKeyword,
+    CaseKeyword,
+    DefaultKeyword,
     ClassKeyword,
     StructKeyword,
     EnumKeyword,
@@ -96,6 +105,13 @@ enum class SyntaxKind {
     ReturnStatement,
     IfStatement,
     WhileStatement,
+    ForStatement,
+    ForeachStatement,
+    DoWhileStatement,
+    BreakStatement,
+    ContinueStatement,
+    SwitchSection,
+    SwitchStatement,
     VariableDeclarationStatement,
     ExpressionStatement,
     LiteralExpression,
@@ -354,6 +370,88 @@ struct WhileStatementSyntax final : StatementSyntax {
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
+struct ForStatementSyntax final : StatementSyntax {
+    SyntaxToken forKeyword;
+    SyntaxToken openParenToken;
+    std::unique_ptr<StatementSyntax> initializer;
+    std::optional<SyntaxToken> firstSemicolonToken;
+    std::unique_ptr<ExpressionSyntax> condition;
+    SyntaxToken secondSemicolonToken;
+    std::unique_ptr<ExpressionSyntax> increment;
+    SyntaxToken closeParenToken;
+    std::unique_ptr<StatementSyntax> body;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ForStatement; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct ForeachStatementSyntax final : StatementSyntax {
+    SyntaxToken foreachKeyword;
+    SyntaxToken openParenToken;
+    TypeSyntax type;
+    SyntaxToken identifierToken;
+    SyntaxToken inKeyword;
+    std::unique_ptr<ExpressionSyntax> collection;
+    SyntaxToken closeParenToken;
+    std::unique_ptr<StatementSyntax> body;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ForeachStatement; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct DoWhileStatementSyntax final : StatementSyntax {
+    SyntaxToken doKeyword;
+    std::unique_ptr<StatementSyntax> body;
+    SyntaxToken whileKeyword;
+    SyntaxToken openParenToken;
+    std::unique_ptr<ExpressionSyntax> condition;
+    SyntaxToken closeParenToken;
+    SyntaxToken semicolonToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::DoWhileStatement; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct BreakStatementSyntax final : StatementSyntax {
+    SyntaxToken breakKeyword;
+    SyntaxToken semicolonToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::BreakStatement; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct ContinueStatementSyntax final : StatementSyntax {
+    SyntaxToken continueKeyword;
+    SyntaxToken semicolonToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ContinueStatement; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct SwitchSectionSyntax final : SyntaxNode {
+    std::optional<SyntaxToken> caseKeyword;
+    std::optional<SyntaxToken> defaultKeyword;
+    std::unique_ptr<ExpressionSyntax> label;
+    SyntaxToken colonToken;
+    std::vector<std::unique_ptr<StatementSyntax>> statements;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::SwitchSection; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct SwitchStatementSyntax final : StatementSyntax {
+    SyntaxToken switchKeyword;
+    SyntaxToken openParenToken;
+    std::unique_ptr<ExpressionSyntax> expression;
+    SyntaxToken closeParenToken;
+    SyntaxToken openBraceToken;
+    std::vector<SwitchSectionSyntax> sections;
+    SyntaxToken closeBraceToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::SwitchStatement; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
 struct VariableDeclarationStatementSyntax final : StatementSyntax {
     TypeSyntax type;
     SyntaxToken identifierToken;
@@ -573,6 +671,12 @@ private:
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseReturnStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseIfStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseWhileStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseForStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseForeachStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseDoWhileStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseBreakStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseContinueStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseSwitchStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseVariableDeclarationStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseExpressionStatement();
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseExpression();

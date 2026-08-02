@@ -219,6 +219,8 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
         ? input.symbol.sourceName
         : input.sourceName;
     currentFunctionId_ = input.symbol.id;
+    loopDepth_ = 0;
+    breakableDepth_ = 0;
     result.symbol.sourceName = currentSourceName_;
     currentReturnType_ = input.symbol.returnType;
     currentReturnTypeName_ = input.symbol.returnTypeName;
@@ -386,6 +388,24 @@ std::unique_ptr<BoundStatement> Binder::bindStatement(
     case syntax::SyntaxKind::WhileStatement:
         return bindWhileStatement(
             static_cast<const syntax::WhileStatementSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::ForStatement:
+        return bindForStatement(
+            static_cast<const syntax::ForStatementSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::ForeachStatement:
+        return bindForeachStatement(
+            static_cast<const syntax::ForeachStatementSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::DoWhileStatement:
+        return bindDoWhileStatement(
+            static_cast<const syntax::DoWhileStatementSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::BreakStatement:
+        return bindBreakStatement(
+            static_cast<const syntax::BreakStatementSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::ContinueStatement:
+        return bindContinueStatement(
+            static_cast<const syntax::ContinueStatementSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::SwitchStatement:
+        return bindSwitchStatement(
+            static_cast<const syntax::SwitchStatementSyntax&>(syntaxTree));
     case syntax::SyntaxKind::VariableDeclarationStatement:
         return bindVariableDeclaration(
             static_cast<const syntax::VariableDeclarationStatementSyntax&>(syntaxTree));
@@ -466,6 +486,222 @@ std::unique_ptr<BoundStatement> Binder::bindWhileStatement(
         syntaxTree.condition->span(),
         "while condition");
     result->body = bindEmbeddedStatement(*syntaxTree.body);
+    return result;
+}
+
+std::unique_ptr<BoundStatement> Binder::bindForStatement(
+    const syntax::ForStatementSyntax& syntaxTree) {
+    pushScope(syntaxTree.span());
+    auto result = std::make_unique<BoundForStatement>();
+    result->span = syntaxTree.span();
+    if (syntaxTree.initializer) result->initializer = bindStatement(*syntaxTree.initializer);
+    if (syntaxTree.condition) {
+        result->condition = convertExpression(
+            bindExpression(*syntaxTree.condition), PrimitiveType::Bool,
+            syntaxTree.condition->span(), "for condition");
+    } else {
+        auto literal = std::make_unique<BoundLiteralExpression>();
+        literal->type = PrimitiveType::Bool;
+        literal->value = true;
+        literal->span = syntaxTree.forKeyword.span;
+        result->condition = std::move(literal);
+    }
+    if (syntaxTree.increment) result->increment = bindExpression(*syntaxTree.increment);
+    ++loopDepth_;
+    ++breakableDepth_;
+    result->body = bindEmbeddedStatement(*syntaxTree.body);
+    --breakableDepth_;
+    --loopDepth_;
+    popScope();
+    return result;
+}
+
+std::unique_ptr<BoundStatement> Binder::bindForeachStatement(
+    const syntax::ForeachStatementSyntax& syntaxTree) {
+    auto result = std::make_unique<BoundForeachStatement>();
+    result->span = syntaxTree.span();
+    result->collection = bindExpression(*syntaxTree.collection);
+
+    PrimitiveType elementType = PrimitiveType::Error;
+    std::string elementTypeName;
+    const TypeSymbol* collectionType = nullptr;
+    const FunctionSymbol* countMethod = nullptr;
+    const FunctionSymbol* getMethod = nullptr;
+    if (result->collection->type == PrimitiveType::Array) {
+        if (!decodeArrayTypeName(result->collection->typeName, elementType, elementTypeName)) {
+            diagnostics_.report("RS2210", "foreach array element type is invalid", syntaxTree.collection->span());
+        }
+    } else if (result->collection->type == PrimitiveType::Object) {
+        const auto found = visibleTypes_.find(result->collection->typeName);
+        if (found != visibleTypes_.end()) collectionType = &found->second;
+        if (collectionType) {
+            for (const auto& method : collectionType->methods) {
+                const auto visibleArity = method.parameters.size() -
+                    ((method.method && !method.staticMethod) ? 1u : 0u);
+                if (!method.staticMethod && method.name == "Count" && visibleArity == 0 &&
+                    method.returnType == PrimitiveType::Int) countMethod = &method;
+                if (!method.staticMethod && method.name == "Get" && visibleArity == 1 &&
+                    method.parameters.back().type == PrimitiveType::Int) getMethod = &method;
+            }
+        }
+        if (!countMethod || !getMethod) {
+            diagnostics_.report("RS2211", "foreach collection must provide Count() and Get(int)", syntaxTree.collection->span());
+        } else {
+            elementType = getMethod->returnType;
+            elementTypeName = getMethod->returnTypeName;
+        }
+    } else {
+        diagnostics_.report("RS2211", "foreach requires an array or indexed collection", syntaxTree.collection->span());
+    }
+
+    pushScope(syntaxTree.span());
+    result->collectionVariable.name = "$foreach_collection_" + std::to_string(nextVariableIndex_);
+    result->collectionVariable.type = result->collection->type;
+    result->collectionVariable.typeName = result->collection->typeName;
+    result->collectionVariable.index = nextVariableIndex_++;
+    result->collectionVariable.id = stableTypeId(std::to_string(currentFunctionId_) +
+        "::local:" + std::to_string(result->collectionVariable.index) + ":" +
+        result->collectionVariable.name);
+    (void)declareVariable(result->collectionVariable, {});
+
+    result->indexVariable.name = "$foreach_index_" + std::to_string(nextVariableIndex_);
+    result->indexVariable.type = PrimitiveType::Int;
+    result->indexVariable.index = nextVariableIndex_++;
+    result->indexVariable.id = stableTypeId(std::to_string(currentFunctionId_) +
+        "::local:" + std::to_string(result->indexVariable.index) + ":" +
+        result->indexVariable.name);
+    (void)declareVariable(result->indexVariable, {});
+
+    std::string declaredTypeName;
+    result->iterationVariable.name = syntaxTree.identifierToken.text;
+    result->iterationVariable.type = bindType(syntaxTree.type, false, &declaredTypeName);
+    result->iterationVariable.typeName = declaredTypeName;
+    result->iterationVariable.index = nextVariableIndex_++;
+    result->iterationVariable.declarationSpan = syntaxTree.identifierToken.span;
+    result->iterationVariable.id = stableTypeId(std::to_string(currentFunctionId_) +
+        "::local:" + std::to_string(result->iterationVariable.index) + ":" +
+        result->iterationVariable.name);
+    (void)declareVariable(result->iterationVariable, syntaxTree.identifierToken.span);
+
+    const auto variableExpression = [](const VariableSymbol& variable, text::TextSpan span) {
+        auto value = std::make_unique<BoundVariableExpression>();
+        value->type = variable.type;
+        value->typeName = variable.typeName;
+        value->variable = variable;
+        value->span = span;
+        return value;
+    };
+
+    if (result->collection->type == PrimitiveType::Array) {
+        auto count = std::make_unique<BoundArrayLengthExpression>();
+        count->type = PrimitiveType::Int;
+        count->span = syntaxTree.collection->span();
+        count->receiver = variableExpression(result->collectionVariable, syntaxTree.collection->span());
+        result->count = std::move(count);
+
+        auto element = std::make_unique<BoundElementAccessExpression>();
+        element->type = elementType;
+        element->typeName = elementTypeName;
+        element->elementType = elementType;
+        element->elementTypeName = elementTypeName;
+        element->span = syntaxTree.identifierToken.span;
+        element->receiver = variableExpression(result->collectionVariable, syntaxTree.collection->span());
+        element->index = variableExpression(result->indexVariable, syntaxTree.identifierToken.span);
+        result->element = std::move(element);
+    } else if (countMethod && getMethod) {
+        auto count = std::make_unique<BoundCallExpression>();
+        count->type = countMethod->returnType;
+        count->typeName = countMethod->returnTypeName;
+        count->function = *countMethod;
+        count->span = syntaxTree.collection->span();
+        count->arguments.push_back(variableExpression(result->collectionVariable, syntaxTree.collection->span()));
+        result->count = std::move(count);
+
+        auto element = std::make_unique<BoundCallExpression>();
+        element->type = getMethod->returnType;
+        element->typeName = getMethod->returnTypeName;
+        element->function = *getMethod;
+        element->span = syntaxTree.identifierToken.span;
+        element->arguments.push_back(variableExpression(result->collectionVariable, syntaxTree.collection->span()));
+        element->arguments.push_back(variableExpression(result->indexVariable, syntaxTree.identifierToken.span));
+        result->element = std::move(element);
+    } else {
+        result->count = makeError(syntaxTree.collection->span());
+        result->element = makeError(syntaxTree.identifierToken.span);
+    }
+
+    result->element = convertExpression(
+        std::move(result->element), result->iterationVariable.type,
+        syntaxTree.identifierToken.span, "foreach element",
+        result->iterationVariable.typeName);
+
+    ++loopDepth_;
+    ++breakableDepth_;
+    result->body = bindEmbeddedStatement(*syntaxTree.body);
+    --breakableDepth_;
+    --loopDepth_;
+    popScope();
+    return result;
+}
+
+std::unique_ptr<BoundStatement> Binder::bindDoWhileStatement(
+    const syntax::DoWhileStatementSyntax& syntaxTree) {
+    auto result = std::make_unique<BoundDoWhileStatement>();
+    result->span = syntaxTree.span();
+    ++loopDepth_;
+    ++breakableDepth_;
+    result->body = bindEmbeddedStatement(*syntaxTree.body);
+    --breakableDepth_;
+    --loopDepth_;
+    result->condition = convertExpression(
+        bindExpression(*syntaxTree.condition), PrimitiveType::Bool,
+        syntaxTree.condition->span(), "do/while condition");
+    return result;
+}
+
+std::unique_ptr<BoundStatement> Binder::bindBreakStatement(
+    const syntax::BreakStatementSyntax& syntaxTree) {
+    auto result = std::make_unique<BoundBreakStatement>();
+    result->span = syntaxTree.span();
+    if (breakableDepth_ == 0) {
+        diagnostics_.report("RS2212", "break is not inside a loop or switch", syntaxTree.span());
+    }
+    return result;
+}
+
+std::unique_ptr<BoundStatement> Binder::bindContinueStatement(
+    const syntax::ContinueStatementSyntax& syntaxTree) {
+    auto result = std::make_unique<BoundContinueStatement>();
+    result->span = syntaxTree.span();
+    if (loopDepth_ == 0) {
+        diagnostics_.report("RS2213", "continue is not inside a loop", syntaxTree.span());
+    }
+    return result;
+}
+
+std::unique_ptr<BoundStatement> Binder::bindSwitchStatement(
+    const syntax::SwitchStatementSyntax& syntaxTree) {
+    auto result = std::make_unique<BoundSwitchStatement>();
+    result->span = syntaxTree.span();
+    result->expression = bindExpression(*syntaxTree.expression);
+    ++breakableDepth_;
+    for (const auto& sourceSection : syntaxTree.sections) {
+        BoundSwitchSection section;
+        section.span = sourceSection.span();
+        if (sourceSection.label) {
+            section.label = convertExpression(
+                bindExpression(*sourceSection.label), result->expression->type,
+                sourceSection.label->span(), "switch case",
+                result->expression->typeName);
+        }
+        pushScope(sourceSection.span());
+        for (const auto& sourceStatement : sourceSection.statements) {
+            section.statements.push_back(bindStatement(*sourceStatement));
+        }
+        popScope();
+        result->sections.push_back(std::move(section));
+    }
+    --breakableDepth_;
     return result;
 }
 

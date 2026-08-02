@@ -201,6 +201,8 @@ private:
     Function* currentFunction_ = nullptr;
     std::optional<BlockId> currentBlockId_;
     ValueId nextValueId_ = 0;
+    std::vector<BlockId> breakTargets_;
+    std::vector<BlockId> continueTargets_;
 };
 
 [[nodiscard]] const char* opcodeName(Opcode opcode) noexcept;

@@ -43,6 +43,15 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(IfKeyword);
         RS_KIND(ElseKeyword);
         RS_KIND(WhileKeyword);
+        RS_KIND(ForKeyword);
+        RS_KIND(ForeachKeyword);
+        RS_KIND(InKeyword);
+        RS_KIND(DoKeyword);
+        RS_KIND(BreakKeyword);
+        RS_KIND(ContinueKeyword);
+        RS_KIND(SwitchKeyword);
+        RS_KIND(CaseKeyword);
+        RS_KIND(DefaultKeyword);
         RS_KIND(ClassKeyword);
         RS_KIND(StructKeyword);
         RS_KIND(EnumKeyword);
@@ -86,6 +95,13 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(ReturnStatement);
         RS_KIND(IfStatement);
         RS_KIND(WhileStatement);
+        RS_KIND(ForStatement);
+        RS_KIND(ForeachStatement);
+        RS_KIND(DoWhileStatement);
+        RS_KIND(BreakStatement);
+        RS_KIND(ContinueStatement);
+        RS_KIND(SwitchSection);
+        RS_KIND(SwitchStatement);
         RS_KIND(VariableDeclarationStatement);
         RS_KIND(ExpressionStatement);
         RS_KIND(LiteralExpression);
@@ -116,6 +132,15 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"if", SyntaxKind::IfKeyword},
         {"else", SyntaxKind::ElseKeyword},
         {"while", SyntaxKind::WhileKeyword},
+        {"for", SyntaxKind::ForKeyword},
+        {"foreach", SyntaxKind::ForeachKeyword},
+        {"in", SyntaxKind::InKeyword},
+        {"do", SyntaxKind::DoKeyword},
+        {"break", SyntaxKind::BreakKeyword},
+        {"continue", SyntaxKind::ContinueKeyword},
+        {"switch", SyntaxKind::SwitchKeyword},
+        {"case", SyntaxKind::CaseKeyword},
+        {"default", SyntaxKind::DefaultKeyword},
         {"class", SyntaxKind::ClassKeyword},
         {"struct", SyntaxKind::StructKeyword},
         {"enum", SyntaxKind::EnumKeyword},

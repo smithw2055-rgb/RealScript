@@ -280,6 +280,10 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase11_17_language_expansion_tests
         realscript.phase11-17.language-expansion
         tests/phase11_17_language_expansion_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_phase18_native_control_flow_tests
+        realscript.phase18.native-control-flow
+        tests/phase18_native_control_flow_tests.cpp)
 
     add_test(
         NAME realscript.phase6.cli-smoke
