@@ -1,0 +1,25 @@
+name: Phase 18A Foreach Debug Fix
+
+on:
+  push:
+    branches:
+      - agent/native-language-and-runtime-evolution
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: python tools/ci/apply_phase18a_foreach_debug_fix.py
+      - run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "Fix native foreach debug metadata"
+          git push origin HEAD:agent/native-language-and-runtime-evolution
