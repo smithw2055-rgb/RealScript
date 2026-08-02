@@ -563,18 +563,25 @@ std::unique_ptr<BoundStatement> Binder::bindForeachStatement(
     result->collectionVariable.type = result->collection->type;
     result->collectionVariable.typeName = result->collection->typeName;
     result->collectionVariable.index = nextVariableIndex_++;
+    result->collectionVariable.declarationSpan =
+        syntaxTree.foreachKeyword.span;
     result->collectionVariable.id = stableTypeId(std::to_string(currentFunctionId_) +
         "::local:" + std::to_string(result->collectionVariable.index) + ":" +
         result->collectionVariable.name);
-    (void)declareVariable(result->collectionVariable, {});
+    (void)declareVariable(
+        result->collectionVariable,
+        syntaxTree.foreachKeyword.span);
 
     result->indexVariable.name = "$foreach_index_" + std::to_string(nextVariableIndex_);
     result->indexVariable.type = PrimitiveType::Int;
     result->indexVariable.index = nextVariableIndex_++;
+    result->indexVariable.declarationSpan = syntaxTree.inKeyword.span;
     result->indexVariable.id = stableTypeId(std::to_string(currentFunctionId_) +
         "::local:" + std::to_string(result->indexVariable.index) + ":" +
         result->indexVariable.name);
-    (void)declareVariable(result->indexVariable, {});
+    (void)declareVariable(
+        result->indexVariable,
+        syntaxTree.inKeyword.span);
 
     std::string declaredTypeName;
     result->iterationVariable.name = syntaxTree.identifierToken.text;
