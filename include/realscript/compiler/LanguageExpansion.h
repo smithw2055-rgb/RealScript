@@ -53,6 +53,11 @@ struct LanguageExpansionOptions {
     bool valueTypeAliases = true;
 };
 
+struct LanguageExpansionSource {
+    std::string path;
+    std::string content;
+};
+
 struct LanguageExpansionResult {
     std::string content;
     std::vector<LanguageExpansionDiagnostic> diagnostics;
@@ -64,9 +69,16 @@ struct LanguageExpansionResult {
     [[nodiscard]] bool succeeded() const noexcept;
 };
 
+// Expand one source in isolation. Prefer expandLanguageSources() for a
+// Compilation so declarations in sibling files share delegate, interface, and
+// generic discovery while each result retains its own path and metadata.
 [[nodiscard]] LanguageExpansionResult expandLanguageSource(
     const std::string& path,
     const std::string& content,
+    LanguageExpansionOptions options = {});
+
+[[nodiscard]] std::vector<LanguageExpansionResult> expandLanguageSources(
+    const std::vector<LanguageExpansionSource>& sources,
     LanguageExpansionOptions options = {});
 
 [[nodiscard]] const char* languageExpansionSeverityName(
