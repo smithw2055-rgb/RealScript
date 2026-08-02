@@ -234,6 +234,26 @@ void Parser::parseArgumentList(
     closeParenToken = match(SyntaxKind::CloseParenToken);
 }
 
+SequenceDeclarationSyntax Parser::parseSequenceDeclaration(
+    std::vector<AttributeListSyntax> attributes) {
+    SequenceDeclarationSyntax result;
+    result.attributes = std::move(attributes);
+    result.sequenceKeyword = match(SyntaxKind::SequenceKeyword);
+    result.identifierToken = match(SyntaxKind::IdentifierToken);
+    result.openParenToken = match(SyntaxKind::OpenParenToken);
+    if (current().kind != SyntaxKind::CloseParenToken &&
+        current().kind != SyntaxKind::EndOfFileToken) {
+        result.parameters.push_back(parseParameter());
+        while (current().kind == SyntaxKind::CommaToken) {
+            result.commaTokens.push_back(nextToken());
+            result.parameters.push_back(parseParameter());
+        }
+    }
+    result.closeParenToken = match(SyntaxKind::CloseParenToken);
+    result.body = parseBlockStatement();
+    return result;
+}
+
 ConstructorDeclarationSyntax Parser::parseConstructorDeclaration(
     std::vector<AttributeListSyntax> attributes) {
     ConstructorDeclarationSyntax result;
@@ -349,7 +369,11 @@ ClassDeclarationSyntax Parser::parseClassDeclaration(
         if (current().kind == SyntaxKind::StaticKeyword) {
             staticKeyword = nextToken();
         }
-        if (!staticKeyword && current().kind == SyntaxKind::IdentifierToken &&
+        if (!staticKeyword &&
+            current().kind == SyntaxKind::SequenceKeyword) {
+            result.sequences.push_back(parseSequenceDeclaration(
+                std::move(memberAttributes)));
+        } else if (!staticKeyword && current().kind == SyntaxKind::IdentifierToken &&
             current().text == typeName && peek(1).kind == SyntaxKind::OpenParenToken) {
             result.constructors.push_back(parseConstructorDeclaration(
                 std::move(memberAttributes)));
@@ -405,7 +429,11 @@ StructDeclarationSyntax Parser::parseStructDeclaration(
         auto memberAttributes = parseAttributeLists();
         std::optional<SyntaxToken> staticKeyword;
         if (current().kind == SyntaxKind::StaticKeyword) staticKeyword = nextToken();
-        if (!staticKeyword && current().kind == SyntaxKind::IdentifierToken &&
+        if (!staticKeyword &&
+            current().kind == SyntaxKind::SequenceKeyword) {
+            result.sequences.push_back(parseSequenceDeclaration(
+                std::move(memberAttributes)));
+        } else if (!staticKeyword && current().kind == SyntaxKind::IdentifierToken &&
             current().text == typeName && peek(1).kind == SyntaxKind::OpenParenToken) {
             result.constructors.push_back(parseConstructorDeclaration(
                 std::move(memberAttributes)));
@@ -572,6 +600,8 @@ std::unique_ptr<StatementSyntax> Parser::parseStatement() {
         return parseContinueStatement();
     case SyntaxKind::SwitchKeyword:
         return parseSwitchStatement();
+    case SyntaxKind::YieldKeyword:
+        return parseYieldWaitStatement();
     case SyntaxKind::OpenBraceToken:
         return std::make_unique<BlockStatementSyntax>(parseBlockStatement());
     default:
@@ -714,6 +744,23 @@ std::unique_ptr<StatementSyntax> Parser::parseSwitchStatement() {
         result->sections.push_back(std::move(section));
     }
     result->closeBraceToken = match(SyntaxKind::CloseBraceToken);
+    return result;
+}
+
+std::unique_ptr<StatementSyntax> Parser::parseYieldWaitStatement() {
+    auto result = std::make_unique<YieldWaitStatementSyntax>();
+    result->yieldKeyword = match(SyntaxKind::YieldKeyword);
+    result->waitTicksToken = match(SyntaxKind::IdentifierToken);
+    if (result->waitTicksToken.text != "wait_ticks") {
+        diagnostics_.report(
+            "RS1113",
+            "yield currently supports only wait_ticks(expression)",
+            result->waitTicksToken.span);
+    }
+    result->openParenToken = match(SyntaxKind::OpenParenToken);
+    result->delay = parseExpression();
+    result->closeParenToken = match(SyntaxKind::CloseParenToken);
+    result->semicolonToken = match(SyntaxKind::SemicolonToken);
     return result;
 }
 

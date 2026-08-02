@@ -498,6 +498,18 @@ class Behavior
         "GameCompileResult did not retain source attributes");
     require(compiled.program.languageMetadata().attributes.size() == 1,
         "GameProgram did not retain source attributes");
+    require(compiled.languageMetadata.sequences.size() == 1 &&
+            compiled.languageMetadata.sequences.front().typeName ==
+                "SequenceDemo::Behavior" &&
+            compiled.languageMetadata.sequences.front().name == "Attack" &&
+            compiled.languageMetadata.sequences.front().callbacks.size() == 2,
+        "GameCompileResult did not retain native sequence metadata");
+    require(compiled.program.languageMetadata().sequences.size() == 1,
+        "GameProgram did not retain native sequence metadata");
+    const auto expansion = realscript::compiler::expandLanguageSource(
+        "native-sequence.rs", source);
+    require(!expansion.changed,
+        "sequence source still used expansion");
 
     realscript::game::ScriptRuntime scripts(compiled.program);
     realscript::game::SceneScriptRuntime scene(scripts);

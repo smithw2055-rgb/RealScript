@@ -263,6 +263,85 @@ std::string interfaceMethodSignature(
     return out.str();
 }
 
+semantic::VariableSymbol makeSequenceThisParameter(
+    const semantic::TypeSymbol& owner,
+    text::TextSpan span) {
+    semantic::VariableSymbol parameter;
+    parameter.name = "this";
+    parameter.type = owner.kind == semantic::TypeKind::Struct
+        ? semantic::PrimitiveType::Struct
+        : semantic::PrimitiveType::Object;
+    parameter.typeName = semantic::canonicalTypeName(owner);
+    parameter.index = 0;
+    parameter.parameter = true;
+    parameter.declarationSpan = span;
+    return parameter;
+}
+
+semantic::FunctionSymbol makeSequenceFunction(
+    const std::string& moduleName,
+    const semantic::TypeSymbol& owner,
+    const syntax::SequenceDeclarationSyntax& sequence,
+    std::string name,
+    bool entry,
+    const std::string& sourceName) {
+    semantic::FunctionSymbol result;
+    result.moduleName = moduleName;
+    result.name = std::move(name);
+    result.ownerTypeName = owner.name;
+    result.ownerTypeId = owner.id;
+    result.returnType = semantic::PrimitiveType::Void;
+    result.method = true;
+    result.sourceName = sourceName;
+    result.declarationSpan = sequence.identifierToken.span;
+    result.bodySpan = sequence.body.span();
+    result.parameters.push_back(makeSequenceThisParameter(
+        owner,
+        sequence.identifierToken.span));
+    if (entry && !sequence.parameters.empty()) {
+        semantic::VariableSymbol target;
+        target.name = sequence.parameters.front().identifierToken.text;
+        target.type = semantic::PrimitiveType::Long;
+        target.index = 1;
+        target.parameter = true;
+        target.declarationSpan =
+            sequence.parameters.front().identifierToken.span;
+        result.parameters.push_back(std::move(target));
+    }
+    result.id = semantic::stableFunctionId(result);
+    for (auto& parameter : result.parameters) {
+        parameter.id = semantic::stableTypeId(
+            std::to_string(result.id) + "::local:" +
+            std::to_string(parameter.index) + ":" + parameter.name);
+    }
+    return result;
+}
+
+std::vector<const syntax::YieldWaitStatementSyntax*> sequenceYields(
+    const syntax::SequenceDeclarationSyntax& sequence,
+    diagnostics::DiagnosticBag& diagnostics,
+    const std::string& sourceName) {
+    std::vector<const syntax::YieldWaitStatementSyntax*> result;
+    for (const auto& statement : sequence.body.statements) {
+        if (statement->kind() == syntax::SyntaxKind::YieldWaitStatement) {
+            result.push_back(
+                static_cast<const syntax::YieldWaitStatementSyntax*>(
+                    statement.get()));
+        }
+    }
+    if (sequence.parameters.size() != 1 ||
+        sequence.parameters.front().type.name.text != "long" ||
+        sequence.parameters.front().type.isArray()) {
+        diagnostics.report(
+            "RS2490",
+            "sequence must declare exactly one long target parameter",
+            sequence.identifierToken.span,
+            diagnostics::DiagnosticSeverity::Error,
+            sourceName);
+    }
+    return result;
+}
+
 std::string fieldTypeSignature(const semantic::FieldSymbol& field) {
     if (semantic::isExactType(field.type) && !field.typeName.empty()) {
         return field.typeName;
@@ -607,6 +686,138 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         owner.methods.push_back(binding.symbol);
                         addBinding(std::move(binding), methodSyntax.identifierToken.span);
                     }
+                    for (const auto& sequenceSyntax : typeSyntax.sequences) {
+                        if (owner.kind == semantic::TypeKind::Struct) {
+                            result.diagnostics.report(
+                                "RS2491",
+                                "sequence methods require a class owner",
+                                sequenceSyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
+                            module.invalid = true;
+                            continue;
+                        }
+                        if (fieldNames.find(sequenceSyntax.identifierToken.text) !=
+                                fieldNames.end() ||
+                            methodNames.find(sequenceSyntax.identifierToken.text) !=
+                                methodNames.end()) {
+                            result.diagnostics.report(
+                                "RS2464",
+                                "sequence '" + sequenceSyntax.identifierToken.text +
+                                    "' conflicts with another member",
+                                sequenceSyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
+                            module.invalid = true;
+                            continue;
+                        }
+                        methodNames.insert(sequenceSyntax.identifierToken.text);
+                        const auto yields = sequenceYields(
+                            sequenceSyntax,
+                            result.diagnostics,
+                            unit->source->name());
+                        if (sequenceSyntax.parameters.size() != 1 ||
+                            sequenceSyntax.parameters.front().type.name.text !=
+                                "long" ||
+                            sequenceSyntax.parameters.front().type.isArray()) {
+                            module.invalid = true;
+                            continue;
+                        }
+
+                        semantic::FieldSymbol targetField;
+                        targetField.name = "$sequence_target_" +
+                            sequenceSyntax.identifierToken.text;
+                        targetField.type = semantic::PrimitiveType::Long;
+                        targetField.index = owner.fields.size();
+                        targetField.synthetic = true;
+                        targetField.sourceName = unit->source->name();
+                        targetField.declarationSpan =
+                            sequenceSyntax.identifierToken.span;
+                        targetField.id = semantic::stableTypeId(
+                            semantic::canonicalTypeName(owner) +
+                            "::field:" + targetField.name);
+                        owner.fields.push_back(targetField);
+                        fieldNames.insert(targetField.name);
+
+                        std::vector<semantic::FunctionSymbol> callbacks;
+                        callbacks.reserve(yields.size());
+                        for (std::size_t callback = 0;
+                             callback < yields.size();
+                             ++callback) {
+                            callbacks.push_back(makeSequenceFunction(
+                                moduleName,
+                                owner,
+                                sequenceSyntax,
+                                "$sequence_" +
+                                    sequenceSyntax.identifierToken.text + "_" +
+                                    std::to_string(callback + 1),
+                                false,
+                                unit->source->name()));
+                        }
+
+                        auto entry = makeSequenceFunction(
+                            moduleName,
+                            owner,
+                            sequenceSyntax,
+                            sequenceSyntax.identifierToken.text,
+                            true,
+                            unit->source->name());
+                        semantic::FunctionBindingInput entryBinding;
+                        entryBinding.symbol = entry;
+                        entryBinding.sourceName = unit->source->name();
+                        entryBinding.parameterNames.push_back("this");
+                        entryBinding.parameterSpans.push_back(
+                            typeSyntax.identifierToken.span);
+                        entryBinding.parameterNames.push_back(
+                            sequenceSyntax.parameters.front()
+                                .identifierToken.text);
+                        entryBinding.parameterSpans.push_back(
+                            sequenceSyntax.parameters.front()
+                                .identifierToken.span);
+                        entryBinding.sequence = &sequenceSyntax;
+                        entryBinding.sequenceSegment = 0;
+                        entryBinding.sequenceTargetField = targetField;
+                        if (!callbacks.empty()) {
+                            entryBinding.sequenceNextCallback = callbacks.front();
+                        }
+                        owner.methods.push_back(entry);
+                        addBinding(
+                            std::move(entryBinding),
+                            sequenceSyntax.identifierToken.span);
+
+                        for (std::size_t callback = 0;
+                             callback < callbacks.size();
+                             ++callback) {
+                            semantic::FunctionBindingInput binding;
+                            binding.symbol = callbacks[callback];
+                            binding.sourceName = unit->source->name();
+                            binding.parameterNames.push_back("this");
+                            binding.parameterSpans.push_back(
+                                typeSyntax.identifierToken.span);
+                            binding.sequence = &sequenceSyntax;
+                            binding.sequenceSegment = callback + 1;
+                            binding.sequenceTargetField = targetField;
+                            if (callback + 1 < callbacks.size()) {
+                                binding.sequenceNextCallback =
+                                    callbacks[callback + 1];
+                            }
+                            owner.methods.push_back(callbacks[callback]);
+                            addBinding(
+                                std::move(binding),
+                                sequenceSyntax.identifierToken.span);
+                        }
+
+                        LanguageSequenceRecord record;
+                        record.typeName = semantic::canonicalTypeName(owner);
+                        record.name = sequenceSyntax.identifierToken.text;
+                        record.sourceName = unit->source->name();
+                        record.offset =
+                            sequenceSyntax.identifierToken.span.start;
+                        for (const auto& callback : callbacks) {
+                            record.callbacks.push_back(callback.name);
+                        }
+                        result.nativeSequences.push_back(std::move(record));
+                    }
                     for (const auto& constructorSyntax : typeSyntax.constructors) {
                         semantic::FunctionBindingInput binding;
                         binding.symbol = semantic::declareConstructorSymbol(
@@ -754,6 +965,17 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                                 "method",
                                 method.identifierToken.text,
                                 method.parameters.size()),
+                            *unit->source);
+                    }
+                    for (const auto& sequence : declaration.sequences) {
+                        appendNativeAttributes(
+                            result.nativeAttributes,
+                            sequence.attributes,
+                            memberAttributeTarget(
+                                ownerName,
+                                "method",
+                                sequence.identifierToken.text,
+                                sequence.parameters.size()),
                             *unit->source);
                     }
                     for (const auto& constructor : declaration.constructors) {
@@ -968,6 +1190,19 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             }
             attributeSignature << ')';
             signatures.push_back(attributeSignature.str());
+        }
+        for (const auto& sequence : result.nativeSequences) {
+            if (sequence.typeName.rfind(moduleName + "::", 0) != 0) {
+                continue;
+            }
+            std::ostringstream sequenceSignature;
+            sequenceSignature << "sequence:"
+                << sequence.typeName << ':' << sequence.name << '(';
+            for (const auto& callback : sequence.callbacks) {
+                sequenceSignature << callback << ',';
+            }
+            sequenceSignature << ')';
+            signatures.push_back(sequenceSignature.str());
         }
         for (const auto& implementation : result.nativeInterfaces) {
             if (implementation.typeName.rfind(moduleName + "::", 0) != 0) {
@@ -1190,6 +1425,15 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 return left.sourceName < right.sourceName;
             }
             return left.offset < right.offset;
+        });
+    std::stable_sort(
+        result.nativeSequences.begin(),
+        result.nativeSequences.end(),
+        [](const auto& left, const auto& right) {
+            if (left.typeName != right.typeName) {
+                return left.typeName < right.typeName;
+            }
+            return left.name < right.name;
         });
     std::stable_sort(
         result.nativeInterfaces.begin(),

@@ -52,6 +52,8 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(SwitchKeyword);
         RS_KIND(CaseKeyword);
         RS_KIND(DefaultKeyword);
+        RS_KIND(SequenceKeyword);
+        RS_KIND(YieldKeyword);
         RS_KIND(ClassKeyword);
         RS_KIND(StructKeyword);
         RS_KIND(EnumKeyword);
@@ -95,6 +97,7 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(AccessorDeclaration);
         RS_KIND(ImportDeclaration);
         RS_KIND(FunctionDeclaration);
+        RS_KIND(SequenceDeclaration);
         RS_KIND(Parameter);
         RS_KIND(TypeName);
         RS_KIND(BlockStatement);
@@ -108,6 +111,7 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(ContinueStatement);
         RS_KIND(SwitchSection);
         RS_KIND(SwitchStatement);
+        RS_KIND(YieldWaitStatement);
         RS_KIND(VariableDeclarationStatement);
         RS_KIND(ExpressionStatement);
         RS_KIND(LiteralExpression);
@@ -147,6 +151,8 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"switch", SyntaxKind::SwitchKeyword},
         {"case", SyntaxKind::CaseKeyword},
         {"default", SyntaxKind::DefaultKeyword},
+        {"sequence", SyntaxKind::SequenceKeyword},
+        {"yield", SyntaxKind::YieldKeyword},
         {"class", SyntaxKind::ClassKeyword},
         {"struct", SyntaxKind::StructKeyword},
         {"enum", SyntaxKind::EnumKeyword},

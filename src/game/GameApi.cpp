@@ -227,6 +227,19 @@ GameCompileResult GameScriptCompiler::compile(
             }
             return left.offset < right.offset;
         });
+    result.languageMetadata.sequences.insert(
+        result.languageMetadata.sequences.end(),
+        build.nativeSequences.begin(),
+        build.nativeSequences.end());
+    std::stable_sort(
+        result.languageMetadata.sequences.begin(),
+        result.languageMetadata.sequences.end(),
+        [](const auto& left, const auto& right) {
+            if (left.typeName != right.typeName) {
+                return left.typeName < right.typeName;
+            }
+            return left.name < right.name;
+        });
     result.languageMetadata.interfaces.insert(
         result.languageMetadata.interfaces.end(),
         build.nativeInterfaces.begin(),

@@ -44,13 +44,21 @@ struct LanguageGenericInstantiation {
     std::string generatedName;
 };
 
+struct LanguageSequenceRecord {
+    std::string typeName;
+    std::string name;
+    std::vector<std::string> callbacks;
+    std::string sourceName;
+    std::size_t offset = 0;
+};
+
 struct LanguageExpansionOptions {
     bool structuredControlFlow = false;
     bool delegatesLambdasEvents = true;
     bool interfaces = false;
     bool sourceAttributes = false;
     bool generics = true;
-    bool deterministicCoroutines = true;
+    bool deterministicCoroutines = false;
     bool referenceParameters = true;
     bool valueTypeAliases = true;
 };

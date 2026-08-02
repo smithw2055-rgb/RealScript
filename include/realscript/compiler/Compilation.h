@@ -44,6 +44,7 @@ struct BuildResult {
     std::vector<semantic::SymbolOccurrence> symbols;
     std::vector<LanguageAttributeRecord> nativeAttributes;
     std::vector<LanguageInterfaceImplementation> nativeInterfaces;
+    std::vector<LanguageSequenceRecord> nativeSequences;
     BuildSnapshot snapshot;
 };
 

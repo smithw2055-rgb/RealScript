@@ -151,6 +151,10 @@ text::TextSpan SwitchStatementSyntax::span() const noexcept {
     return combine(switchKeyword.span, closeBraceToken.span);
 }
 
+text::TextSpan YieldWaitStatementSyntax::span() const noexcept {
+    return combine(yieldKeyword.span, semicolonToken.span);
+}
+
 text::TextSpan VariableDeclarationStatementSyntax::span() const noexcept {
     return combine(type.span(), semicolonToken.span);
 }
@@ -237,6 +241,12 @@ text::TextSpan FunctionDeclarationSyntax::span() const noexcept {
 
 std::string ModuleDeclarationSyntax::fullName() const {
     return joinQualifiedName(nameParts);
+}
+
+text::TextSpan SequenceDeclarationSyntax::span() const noexcept {
+    return combine(
+        declarationStart(attributes, sequenceKeyword.span),
+        body.span());
 }
 
 text::TextSpan ModuleDeclarationSyntax::span() const noexcept {

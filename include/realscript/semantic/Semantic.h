@@ -227,6 +227,10 @@ struct FunctionBindingInput {
     bool syntheticAutoGetter = false;
     bool syntheticAutoSetter = false;
     FieldSymbol syntheticField;
+    const syntax::SequenceDeclarationSyntax* sequence = nullptr;
+    std::size_t sequenceSegment = 0;
+    FieldSymbol sequenceTargetField;
+    std::optional<FunctionSymbol> sequenceNextCallback;
 };
 
 struct ModuleBindingInput {
@@ -604,6 +608,13 @@ public:
 private:
     [[nodiscard]] BoundFunction bindFunction(
         const FunctionBindingInput& input);
+    [[nodiscard]] std::unique_ptr<BoundBlockStatement> bindSequenceSegment(
+        const FunctionBindingInput& input);
+    [[nodiscard]] std::unique_ptr<BoundExpression> makeSequenceFieldAccess(
+        const FieldSymbol& field, text::TextSpan span);
+    [[nodiscard]] std::unique_ptr<BoundExpression> makeVariableAccess(
+        const VariableSymbol& variable, text::TextSpan span);
+    [[nodiscard]] const FunctionSymbol* findScheduleFunction() const noexcept;
     [[nodiscard]] std::unique_ptr<BoundBlockStatement> bindBlockStatement(
         const syntax::BlockStatementSyntax& syntax,
         bool createScope);

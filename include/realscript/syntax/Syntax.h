@@ -61,6 +61,8 @@ enum class SyntaxKind {
     SwitchKeyword,
     CaseKeyword,
     DefaultKeyword,
+    SequenceKeyword,
+    YieldKeyword,
     ClassKeyword,
     StructKeyword,
     EnumKeyword,
@@ -105,6 +107,7 @@ enum class SyntaxKind {
     PropertyDeclaration,
     AccessorDeclaration,
     FunctionDeclaration,
+    SequenceDeclaration,
     Parameter,
     TypeName,
     BlockStatement,
@@ -118,6 +121,7 @@ enum class SyntaxKind {
     ContinueStatement,
     SwitchSection,
     SwitchStatement,
+    YieldWaitStatement,
     VariableDeclarationStatement,
     ExpressionStatement,
     LiteralExpression,
@@ -495,6 +499,20 @@ struct SwitchStatementSyntax final : StatementSyntax {
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
+struct YieldWaitStatementSyntax final : StatementSyntax {
+    SyntaxToken yieldKeyword;
+    SyntaxToken waitTicksToken;
+    SyntaxToken openParenToken;
+    std::unique_ptr<ExpressionSyntax> delay;
+    SyntaxToken closeParenToken;
+    SyntaxToken semicolonToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::YieldWaitStatement;
+    }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
 struct VariableDeclarationStatementSyntax final : StatementSyntax {
     TypeSyntax type;
     SyntaxToken identifierToken;
@@ -543,6 +561,7 @@ struct FieldDeclarationSyntax final : SyntaxNode {
 };
 
 struct FunctionDeclarationSyntax;
+struct SequenceDeclarationSyntax;
 
 struct ConstructorDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
@@ -590,6 +609,7 @@ struct ClassDeclarationSyntax final : SyntaxNode {
     SyntaxToken openBraceToken;
     std::vector<FieldDeclarationSyntax> fields;
     std::vector<FunctionDeclarationSyntax> methods;
+    std::vector<SequenceDeclarationSyntax> sequences;
     std::vector<ConstructorDeclarationSyntax> constructors;
     std::vector<PropertyDeclarationSyntax> properties;
     SyntaxToken closeBraceToken;
@@ -608,6 +628,7 @@ struct StructDeclarationSyntax final : SyntaxNode {
     SyntaxToken openBraceToken;
     std::vector<FieldDeclarationSyntax> fields;
     std::vector<FunctionDeclarationSyntax> methods;
+    std::vector<SequenceDeclarationSyntax> sequences;
     std::vector<ConstructorDeclarationSyntax> constructors;
     std::vector<PropertyDeclarationSyntax> properties;
     SyntaxToken closeBraceToken;
@@ -681,6 +702,22 @@ struct FunctionDeclarationSyntax final : SyntaxNode {
     BlockStatementSyntax body;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::FunctionDeclaration; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct SequenceDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
+    SyntaxToken sequenceKeyword;
+    SyntaxToken identifierToken;
+    SyntaxToken openParenToken;
+    std::vector<ParameterSyntax> parameters;
+    std::vector<SyntaxToken> commaTokens;
+    SyntaxToken closeParenToken;
+    BlockStatementSyntax body;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::SequenceDeclaration;
+    }
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
@@ -765,6 +802,8 @@ private:
         std::optional<TypeSyntax> returnType = std::nullopt,
         std::optional<SyntaxToken> identifier = std::nullopt,
         std::vector<AttributeListSyntax> attributes = {});
+    [[nodiscard]] SequenceDeclarationSyntax parseSequenceDeclaration(
+        std::vector<AttributeListSyntax> attributes);
     [[nodiscard]] ConstructorDeclarationSyntax parseConstructorDeclaration(
         std::vector<AttributeListSyntax> attributes);
     [[nodiscard]] PropertyDeclarationSyntax parsePropertyDeclaration(
@@ -786,6 +825,7 @@ private:
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseBreakStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseContinueStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseSwitchStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseYieldWaitStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseVariableDeclarationStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseExpressionStatement();
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseExpression();

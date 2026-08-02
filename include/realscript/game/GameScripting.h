@@ -8,10 +8,11 @@ struct GameLanguageMetadata {
     std::vector<compiler::LanguageAttributeRecord> attributes;
     std::vector<compiler::LanguageInterfaceImplementation> interfaces;
     std::vector<compiler::LanguageGenericInstantiation> genericInstantiations;
+    std::vector<compiler::LanguageSequenceRecord> sequences;
 
     [[nodiscard]] bool empty() const noexcept {
         return attributes.empty() && interfaces.empty() &&
-            genericInstantiations.empty();
+            genericInstantiations.empty() && sequences.empty();
     }
 };
 

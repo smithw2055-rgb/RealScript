@@ -305,6 +305,48 @@ void testAttributesBypassExpansion() {
         "native attributes still used source expansion");
 }
 
+void testNativeSequenceDiagnostics() {
+    realscript::compiler::Compilation compilation({{"bad-sequence.rs", R"(
+module Phase18.SequenceBad;
+class Behavior
+{
+    sequence Attack(int target)
+    {
+        yield wait_ticks(1);
+    }
+}
+)"}});
+    const auto build = compilation.build();
+    require(build.diagnostics.hasErrors(),
+        "invalid native sequence signature was accepted");
+    bool found = false;
+    for (const auto& diagnostic : build.diagnostics.items()) {
+        found = found || diagnostic.code == "RS2490";
+    }
+    require(found,
+        "invalid native sequence did not produce RS2490");
+}
+
+void testYieldOutsideSequenceDiagnostics() {
+    realscript::compiler::Compilation compilation({{"bad-yield.rs", R"(
+module Phase18.YieldBad;
+int main()
+{
+    yield wait_ticks(1);
+    return 0;
+}
+)"}});
+    const auto build = compilation.build();
+    require(build.diagnostics.hasErrors(),
+        "yield outside sequence was accepted");
+    bool found = false;
+    for (const auto& diagnostic : build.diagnostics.items()) {
+        found = found || diagnostic.code == "RS2494";
+    }
+    require(found,
+        "yield outside sequence did not produce RS2494");
+}
+
 } // namespace
 
 int main() {
@@ -330,5 +372,7 @@ int main() {
     run("interfaces bypass expansion", testInterfaceBypassesExpansion);
     run("native attributes", testNativeAttributes);
     run("attributes bypass expansion", testAttributesBypassExpansion);
+    run("native sequence diagnostics", testNativeSequenceDiagnostics);
+    run("yield outside sequence diagnostics", testYieldOutsideSequenceDiagnostics);
     return failures == 0 ? 0 : 1;
 }

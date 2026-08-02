@@ -307,6 +307,8 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                 }
             }
         }
+    } else if (input.sequence) {
+        result.body = bindSequenceSegment(input);
     } else if (input.body) {
         result.body = bindBlockStatement(*input.body, false);
     } else {
@@ -342,6 +344,172 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     currentSourceName_.clear();
     currentFunctionId_ = 0;
     allVariables_.clear();
+    return result;
+}
+
+std::unique_ptr<BoundExpression> Binder::makeVariableAccess(
+    const VariableSymbol& variable,
+    text::TextSpan span) {
+    auto result = std::make_unique<BoundVariableExpression>();
+    result->type = variable.type;
+    result->typeName = variable.typeName;
+    result->variable = variable;
+    result->span = span;
+    return result;
+}
+
+std::unique_ptr<BoundExpression> Binder::makeSequenceFieldAccess(
+    const FieldSymbol& field,
+    text::TextSpan span) {
+    if (!currentOwnerType_) return makeError(span);
+    const auto* receiver = lookupVariable("this");
+    if (!receiver) return makeError(span);
+    if (currentOwnerType_->kind == TypeKind::Struct) {
+        auto result = std::make_unique<BoundStructFieldAccessExpression>();
+        result->type = field.type;
+        result->typeName = field.typeName;
+        result->span = span;
+        result->receiver = makeVariableAccess(*receiver, span);
+        result->ownerType = *currentOwnerType_;
+        result->field = field;
+        return result;
+    }
+    auto result = std::make_unique<BoundMemberAccessExpression>();
+    result->type = field.type;
+    result->typeName = field.typeName;
+    result->span = span;
+    result->receiver = makeVariableAccess(*receiver, span);
+    result->ownerType = *currentOwnerType_;
+    result->field = field;
+    return result;
+}
+
+const FunctionSymbol* Binder::findScheduleFunction() const noexcept {
+    const auto found = visibleFunctions_.find("Schedule");
+    if (found == visibleFunctions_.end()) return nullptr;
+    for (const auto& candidate : found->second) {
+        if (candidate.method || candidate.parameters.size() != 3 ||
+            candidate.parameters[0].type != PrimitiveType::Long ||
+            candidate.parameters[1].type != PrimitiveType::String ||
+            candidate.parameters[2].type != PrimitiveType::Int) {
+            continue;
+        }
+        return &candidate;
+    }
+    return nullptr;
+}
+
+std::unique_ptr<BoundBlockStatement> Binder::bindSequenceSegment(
+    const FunctionBindingInput& input) {
+    auto result = std::make_unique<BoundBlockStatement>();
+    if (!input.sequence) return result;
+    result->span = input.sequence->body.span();
+
+    std::vector<std::size_t> yields;
+    for (std::size_t index = 0;
+         index < input.sequence->body.statements.size();
+         ++index) {
+        if (input.sequence->body.statements[index]->kind() ==
+            syntax::SyntaxKind::YieldWaitStatement) {
+            yields.push_back(index);
+        }
+    }
+    const auto segmentCount = yields.size() + 1;
+    if (input.sequenceSegment >= segmentCount) {
+        diagnostics_.report(
+            "RS2492",
+            "invalid compiler sequence segment",
+            input.sequence->identifierToken.span);
+        return result;
+    }
+
+    const auto begin = input.sequenceSegment == 0
+        ? std::size_t{0}
+        : yields[input.sequenceSegment - 1] + 1;
+    const auto end = input.sequenceSegment < yields.size()
+        ? yields[input.sequenceSegment]
+        : input.sequence->body.statements.size();
+
+    if (input.sequenceSegment == 0) {
+        const auto* receiver = lookupVariable("this");
+        const auto* target = input.sequence->parameters.empty()
+            ? nullptr
+            : lookupVariable(
+                input.sequence->parameters.front().identifierToken.text);
+        if (!receiver || !target || !currentOwnerType_) {
+            diagnostics_.report(
+                "RS2492",
+                "sequence entry parameters are incomplete",
+                input.sequence->identifierToken.span);
+        } else if (currentOwnerType_->kind == TypeKind::Struct) {
+            diagnostics_.report(
+                "RS2491",
+                "sequence methods require a class owner",
+                input.sequence->identifierToken.span);
+        } else {
+            auto assignment =
+                std::make_unique<BoundMemberAssignmentExpression>();
+            assignment->type = input.sequenceTargetField.type;
+            assignment->typeName = input.sequenceTargetField.typeName;
+            assignment->span = input.sequence->identifierToken.span;
+            assignment->receiver = makeVariableAccess(
+                *receiver,
+                input.sequence->identifierToken.span);
+            assignment->ownerType = *currentOwnerType_;
+            assignment->field = input.sequenceTargetField;
+            assignment->expression = makeVariableAccess(
+                *target,
+                input.sequence->parameters.front().identifierToken.span);
+            auto statement = std::make_unique<BoundExpressionStatement>();
+            statement->span = assignment->span;
+            statement->expression = std::move(assignment);
+            result->statements.push_back(std::move(statement));
+        }
+    }
+
+    for (std::size_t index = begin; index < end; ++index) {
+        result->statements.push_back(
+            bindStatement(*input.sequence->body.statements[index]));
+    }
+
+    if (input.sequenceSegment < yields.size()) {
+        const auto& yieldSyntax =
+            static_cast<const syntax::YieldWaitStatementSyntax&>(
+                *input.sequence->body.statements[yields[input.sequenceSegment]]);
+        const auto* schedule = findScheduleFunction();
+        if (!schedule || !input.sequenceNextCallback) {
+            diagnostics_.report(
+                "RS2493",
+                "sequence requires imported RealScript.Game.Schedule",
+                yieldSyntax.span());
+        } else {
+            auto call = std::make_unique<BoundCallExpression>();
+            call->type = schedule->returnType;
+            call->typeName = schedule->returnTypeName;
+            call->span = yieldSyntax.span();
+            call->function = *schedule;
+            call->arguments.push_back(makeSequenceFieldAccess(
+                input.sequenceTargetField,
+                yieldSyntax.span()));
+
+            auto callback = std::make_unique<BoundLiteralExpression>();
+            callback->type = PrimitiveType::String;
+            callback->span = yieldSyntax.waitTicksToken.span;
+            callback->value = input.sequenceNextCallback->name;
+            call->arguments.push_back(std::move(callback));
+
+            call->arguments.push_back(convertExpression(
+                bindExpression(*yieldSyntax.delay),
+                PrimitiveType::Int,
+                yieldSyntax.delay->span(),
+                "sequence wait_ticks delay"));
+
+            auto statement = std::make_unique<BoundExpressionStatement>();
+            statement->span = yieldSyntax.span();
+            statement->expression = std::move(call);
+            result->statements.push_back(std::move(statement));
+        }
+    }
     return result;
 }
 
@@ -406,6 +574,12 @@ std::unique_ptr<BoundStatement> Binder::bindStatement(
     case syntax::SyntaxKind::SwitchStatement:
         return bindSwitchStatement(
             static_cast<const syntax::SwitchStatementSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::YieldWaitStatement:
+        diagnostics_.report(
+            "RS2494",
+            "yield wait_ticks is valid only at sequence top level",
+            syntaxTree.span());
+        return std::make_unique<BoundExpressionStatement>();
     case syntax::SyntaxKind::VariableDeclarationStatement:
         return bindVariableDeclaration(
             static_cast<const syntax::VariableDeclarationStatementSyntax&>(syntaxTree));
