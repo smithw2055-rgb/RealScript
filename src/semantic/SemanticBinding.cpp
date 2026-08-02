@@ -574,12 +574,16 @@ std::unique_ptr<BoundStatement> Binder::bindStatement(
     case syntax::SyntaxKind::SwitchStatement:
         return bindSwitchStatement(
             static_cast<const syntax::SwitchStatementSyntax&>(syntaxTree));
-    case syntax::SyntaxKind::YieldWaitStatement:
+    case syntax::SyntaxKind::YieldWaitStatement: {
         diagnostics_.report(
             "RS2494",
             "yield wait_ticks is valid only at sequence top level",
             syntaxTree.span());
-        return std::make_unique<BoundExpressionStatement>();
+        auto result = std::make_unique<BoundExpressionStatement>();
+        result->span = syntaxTree.span();
+        result->expression = makeError(syntaxTree.span());
+        return result;
+    }
     case syntax::SyntaxKind::VariableDeclarationStatement:
         return bindVariableDeclaration(
             static_cast<const syntax::VariableDeclarationStatementSyntax&>(syntaxTree));
