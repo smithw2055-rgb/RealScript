@@ -42,6 +42,7 @@ add_library(realscript_frontend STATIC
     src/mir/MirVerifier.cpp
     src/mir/MirPrinter.cpp
     src/compiler/Compilation.cpp
+    src/compiler/LanguageExpansion.cpp
     src/bytecode/BytecodeFacts.cpp
     src/bytecode/BytecodeLowerer.cpp
     src/bytecode/BytecodeVerifier.cpp
@@ -275,6 +276,10 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase10_gameplay_state_tests
         realscript.phase10.gameplay-state
         tests/phase10_gameplay_state_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_phase11_17_language_expansion_tests
+        realscript.phase11-17.language-expansion
+        tests/phase11_17_language_expansion_tests.cpp)
 
     add_test(
         NAME realscript.phase6.cli-smoke
