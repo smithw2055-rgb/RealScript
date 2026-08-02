@@ -12,7 +12,8 @@
                         return (parts.size() == 1 && parts.front().empty()) ? std::size_t{0} : parts.size();
                     }());
                 const auto function = functions.find(key);
-                if (function != functions.end()) {
+                if (function != functions.end() &&
+                    function->second.moduleName == context.moduleName) {
                     declarations.push_back(tokens[index++]);
                     declarations.push_back(tokens[index++]);
                     const auto parts = splitTopLevel(tokens, index, close, ",");
@@ -20,7 +21,8 @@
                         if (parameter != 0) declarations.push_back({TokenKind::Symbol, ",", 0});
                         const auto& info = function->second.parameters[parameter];
                         if (info.modifier == "ref" || info.modifier == "out") {
-                            const auto wrapper = "__RsRef__" + sanitize(info.type);
+                            const auto wrapper = referenceWrapperName(
+                                function->second, info.type);
                             context.generatedRefTypes.insert(wrapper + "|" + info.type);
                             auto replacement = lex(wrapper + " " + info.name);
                             if (!replacement.empty() && replacement.back().kind == TokenKind::End) replacement.pop_back();
