@@ -29,6 +29,22 @@ void lowerFunctionBodies(std::vector<Token>& tokens, Context& context) {
             (symbol(tokens[index - 1], ")") || word(tokens[index - 1], "get") || word(tokens[index - 1], "set"))) {
             const auto close = matching(tokens, index, "{", "}");
             if (close >= tokens.size()) break;
+            const auto requiresLowering = std::any_of(
+                tokens.begin() + static_cast<std::ptrdiff_t>(index + 1),
+                tokens.begin() + static_cast<std::ptrdiff_t>(close),
+                [](const Token& token) {
+                    return word(token, "for") || word(token, "foreach") ||
+                        word(token, "do") || word(token, "break") ||
+                        word(token, "continue") || word(token, "switch");
+                });
+            if (!requiresLowering) {
+                output.insert(
+                    output.end(),
+                    tokens.begin() + static_cast<std::ptrdiff_t>(index),
+                    tokens.begin() + static_cast<std::ptrdiff_t>(close + 1));
+                index = close + 1;
+                continue;
+            }
             StatementLowerer lowerer(tokens, context);
             const auto text = lowerer.lowerBlock(index, close);
             auto replacement = lex(text);
