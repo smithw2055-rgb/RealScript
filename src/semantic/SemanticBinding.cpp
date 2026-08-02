@@ -688,6 +688,17 @@ std::unique_ptr<BoundStatement> Binder::bindSwitchStatement(
     auto result = std::make_unique<BoundSwitchStatement>();
     result->span = syntaxTree.span();
     result->expression = bindExpression(*syntaxTree.expression);
+    pushScope(syntaxTree.span());
+    result->valueVariable.name =
+        "$switch_value_" + std::to_string(nextVariableIndex_);
+    result->valueVariable.type = result->expression->type;
+    result->valueVariable.typeName = result->expression->typeName;
+    result->valueVariable.index = nextVariableIndex_++;
+    result->valueVariable.id = stableTypeId(
+        std::to_string(currentFunctionId_) +
+        "::local:" + std::to_string(result->valueVariable.index) + ":" +
+        result->valueVariable.name);
+    (void)declareVariable(result->valueVariable, syntaxTree.expression->span());
     ++breakableDepth_;
     for (const auto& sourceSection : syntaxTree.sections) {
         BoundSwitchSection section;
@@ -706,6 +717,7 @@ std::unique_ptr<BoundStatement> Binder::bindSwitchStatement(
         result->sections.push_back(std::move(section));
     }
     --breakableDepth_;
+    popScope();
     return result;
 }
 

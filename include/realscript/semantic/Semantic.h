@@ -557,6 +557,7 @@ struct BoundSwitchSection {
 };
 
 struct BoundSwitchStatement final : BoundStatement {
+    VariableSymbol valueVariable;
     std::unique_ptr<BoundExpression> expression;
     std::vector<BoundSwitchSection> sections;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {

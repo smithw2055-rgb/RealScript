@@ -16,19 +16,34 @@ bool isLiteralTrue(const semantic::BoundExpression& expression) {
         std::get<bool>(literal.value);
 }
 
-bool hasIncomingEdge(const Function& function, BlockId target) {
-    for (const auto& block : function.blocks) {
-        const auto& terminator = block.terminator;
-        if (terminator.kind == TerminatorKind::Jump &&
-            terminator.target == target) {
-            return true;
+bool containsBreakForCurrentTarget(
+    const semantic::BoundStatement& statement) {
+    switch (statement.kind()) {
+    case semantic::BoundNodeKind::BreakStatement:
+        return true;
+    case semantic::BoundNodeKind::BlockStatement:
+        for (const auto& child :
+             static_cast<const semantic::BoundBlockStatement&>(statement)
+                 .statements) {
+            if (containsBreakForCurrentTarget(*child)) return true;
         }
-        if (terminator.kind == TerminatorKind::Branch &&
-            (terminator.target == target || terminator.falseTarget == target)) {
-            return true;
-        }
+        return false;
+    case semantic::BoundNodeKind::IfStatement: {
+        const auto& value =
+            static_cast<const semantic::BoundIfStatement&>(statement);
+        return containsBreakForCurrentTarget(*value.thenStatement) ||
+            (value.elseStatement &&
+             containsBreakForCurrentTarget(*value.elseStatement));
     }
-    return false;
+    case semantic::BoundNodeKind::WhileStatement:
+    case semantic::BoundNodeKind::ForStatement:
+    case semantic::BoundNodeKind::ForeachStatement:
+    case semantic::BoundNodeKind::DoWhileStatement:
+    case semantic::BoundNodeKind::SwitchStatement:
+        return false;
+    default:
+        return false;
+    }
 }
 
 } // namespace
@@ -133,11 +148,52 @@ void Lowerer::collectLocalTypes(const semantic::BoundStatement& statement) {
     case semantic::BoundNodeKind::WhileStatement:
         collectLocalTypes(*static_cast<const semantic::BoundWhileStatement&>(statement).body); return;
     case semantic::BoundNodeKind::ForStatement: {
-        const auto& value = static_cast<const semantic::BoundForStatement&>(statement);
-        if (value.initializer) {
-            collectLocalTypes(*value.initializer);
+        const auto& value =
+            static_cast<const semantic::BoundForStatement&>(statement);
+        if (value.initializer) lowerStatement(*value.initializer);
+        if (!hasCurrentBlock() || currentBlockTerminated()) return;
+        const auto constantTrue = isLiteralTrue(*value.condition);
+        const auto needsExit =
+            !constantTrue || containsBreakForCurrentTarget(*value.body);
+        const auto conditionBlock = createBlock();
+        const auto bodyBlock = createBlock();
+        const auto incrementBlock = createBlock();
+        const auto exitBlock = needsExit
+            ? std::optional<BlockId>{createBlock()}
+            : std::nullopt;
+        emitJump(conditionBlock, {}, statement.span);
+        setCurrentBlock(conditionBlock);
+        const auto condition = lowerExpression(*value.condition);
+        if (constantTrue) {
+            emitJump(bodyBlock, {}, value.condition->span);
+        } else {
+            emitBranch(
+                condition,
+                bodyBlock,
+                *exitBlock,
+                {},
+                {},
+                value.condition->span);
         }
-        collectLocalTypes(*value.body);
+        if (exitBlock) breakTargets_.push_back(*exitBlock);
+        continueTargets_.push_back(incrementBlock);
+        setCurrentBlock(bodyBlock);
+        lowerStatement(*value.body);
+        if (hasCurrentBlock() && !currentBlockTerminated()) {
+            emitJump(incrementBlock, {}, value.body->span);
+        }
+        setCurrentBlock(incrementBlock);
+        if (value.increment) (void)lowerExpression(*value.increment);
+        if (!currentBlockTerminated()) {
+            emitJump(
+                conditionBlock,
+                {},
+                value.increment ? value.increment->span : statement.span);
+        }
+        continueTargets_.pop_back();
+        if (exitBlock) breakTargets_.pop_back();
+        if (exitBlock) setCurrentBlock(*exitBlock);
+        else clearCurrentBlock();
         return;
     }
     case semantic::BoundNodeKind::ForeachStatement: {
@@ -151,10 +207,22 @@ void Lowerer::collectLocalTypes(const semantic::BoundStatement& statement) {
     }
     case semantic::BoundNodeKind::DoWhileStatement:
         collectLocalTypes(*static_cast<const semantic::BoundDoWhileStatement&>(statement).body); return;
-    case semantic::BoundNodeKind::SwitchStatement:
-        for (const auto& section : static_cast<const semantic::BoundSwitchStatement&>(statement).sections)
-            for (const auto& child : section.statements) collectLocalTypes(*child);
+    case semantic::BoundNodeKind::SwitchStatement: {
+        const auto& value =
+            static_cast<const semantic::BoundSwitchStatement&>(statement);
+        currentFunction_->localTypes.at(value.valueVariable.index) =
+            value.valueVariable.type;
+        currentFunction_->localTypeIds.at(value.valueVariable.index) =
+            semantic::isExactType(value.valueVariable.type)
+                ? semantic::stableTypeId(value.valueVariable.typeName)
+                : 0;
+        for (const auto& section : value.sections) {
+            for (const auto& child : section.statements) {
+                collectLocalTypes(*child);
+            }
+        }
         return;
+    }
     default: return;
     }
 }
@@ -223,41 +291,41 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         setCurrentBlock(merge); return;
     }
     case semantic::BoundNodeKind::WhileStatement: {
-        const auto& value = static_cast<const semantic::BoundWhileStatement&>(statement);
+        const auto& value =
+            static_cast<const semantic::BoundWhileStatement&>(statement);
+        const auto constantTrue = isLiteralTrue(*value.condition);
+        const auto needsExit =
+            !constantTrue || containsBreakForCurrentTarget(*value.body);
         const auto conditionBlock = createBlock();
         const auto bodyBlock = createBlock();
-        const auto exitBlock = createBlock();
+        const auto exitBlock = needsExit
+            ? std::optional<BlockId>{createBlock()}
+            : std::nullopt;
         emitJump(conditionBlock, {}, statement.span);
         setCurrentBlock(conditionBlock);
         const auto condition = lowerExpression(*value.condition);
-        const auto constantTrue = isLiteralTrue(*value.condition);
         if (constantTrue) {
             emitJump(bodyBlock, {}, value.condition->span);
         } else {
             emitBranch(
                 condition,
                 bodyBlock,
-                exitBlock,
+                *exitBlock,
                 {},
                 {},
                 value.condition->span);
         }
-        breakTargets_.push_back(exitBlock);
+        if (exitBlock) breakTargets_.push_back(*exitBlock);
         continueTargets_.push_back(conditionBlock);
         setCurrentBlock(bodyBlock);
         lowerStatement(*value.body);
         continueTargets_.pop_back();
-        breakTargets_.pop_back();
+        if (exitBlock) breakTargets_.pop_back();
         if (hasCurrentBlock() && !currentBlockTerminated()) {
             emitJump(conditionBlock, {}, value.body->span);
         }
-        if (constantTrue && !hasIncomingEdge(*currentFunction_, exitBlock)) {
-            setCurrentBlock(exitBlock);
-            emitJump(exitBlock, {}, statement.span);
-            clearCurrentBlock();
-        } else {
-            setCurrentBlock(exitBlock);
-        }
+        if (exitBlock) setCurrentBlock(*exitBlock);
+        else clearCurrentBlock();
         return;
     }
     case semantic::BoundNodeKind::ForStatement: {
@@ -335,12 +403,18 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         continueTargets_.pop_back(); breakTargets_.pop_back(); setCurrentBlock(exitBlock); return;
     }
     case semantic::BoundNodeKind::DoWhileStatement: {
-        const auto& value = static_cast<const semantic::BoundDoWhileStatement&>(statement);
+        const auto& value =
+            static_cast<const semantic::BoundDoWhileStatement&>(statement);
+        const auto constantTrue = isLiteralTrue(*value.condition);
+        const auto needsExit =
+            !constantTrue || containsBreakForCurrentTarget(*value.body);
         const auto bodyBlock = createBlock();
         const auto conditionBlock = createBlock();
-        const auto exitBlock = createBlock();
+        const auto exitBlock = needsExit
+            ? std::optional<BlockId>{createBlock()}
+            : std::nullopt;
         emitJump(bodyBlock, {}, statement.span);
-        breakTargets_.push_back(exitBlock);
+        if (exitBlock) breakTargets_.push_back(*exitBlock);
         continueTargets_.push_back(conditionBlock);
         setCurrentBlock(bodyBlock);
         lowerStatement(*value.body);
@@ -349,32 +423,30 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         }
         setCurrentBlock(conditionBlock);
         const auto condition = lowerExpression(*value.condition);
-        const auto constantTrue = isLiteralTrue(*value.condition);
         if (constantTrue) {
             emitJump(bodyBlock, {}, value.condition->span);
         } else {
             emitBranch(
                 condition,
                 bodyBlock,
-                exitBlock,
+                *exitBlock,
                 {},
                 {},
                 value.condition->span);
         }
         continueTargets_.pop_back();
-        breakTargets_.pop_back();
-        if (constantTrue && !hasIncomingEdge(*currentFunction_, exitBlock)) {
-            setCurrentBlock(exitBlock);
-            emitJump(exitBlock, {}, statement.span);
-            clearCurrentBlock();
-        } else {
-            setCurrentBlock(exitBlock);
-        }
+        if (exitBlock) breakTargets_.pop_back();
+        if (exitBlock) setCurrentBlock(*exitBlock);
+        else clearCurrentBlock();
         return;
     }
     case semantic::BoundNodeKind::SwitchStatement: {
         const auto& value = static_cast<const semantic::BoundSwitchStatement&>(statement);
-        const auto switchValue = lowerExpression(*value.expression); const auto exitBlock = createBlock();
+        emitStoreLocal(
+            value.valueVariable.index,
+            lowerExpression(*value.expression),
+            value.expression->span);
+        const auto exitBlock = createBlock();
         std::vector<BlockId> sectionBlocks; sectionBlocks.reserve(value.sections.size());
         std::optional<std::size_t> defaultIndex;
         for (std::size_t i = 0; i < value.sections.size(); ++i) {
@@ -383,9 +455,14 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         for (std::size_t i = 0; i < value.sections.size(); ++i) {
             if (!value.sections[i].label) continue;
             const auto nextCheck = createBlock();
+            const auto switchValue =
+                emitLoadLocal(value.valueVariable, value.expression->span);
             const auto caseValue = lowerExpression(*value.sections[i].label);
-            const auto equal = emitValue(Opcode::Equal, semantic::PrimitiveType::Bool,
-                {switchValue, caseValue}, value.sections[i].span);
+            const auto equal = emitValue(
+                Opcode::Equal,
+                semantic::PrimitiveType::Bool,
+                {switchValue, caseValue},
+                value.sections[i].span);
             emitBranch(equal, sectionBlocks[i], nextCheck, {}, {}, value.sections[i].span);
             setCurrentBlock(nextCheck);
         }
