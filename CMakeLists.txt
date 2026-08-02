@@ -101,10 +101,13 @@ if(MSVC)
         src/aot_cpp/AotCpp.cpp
         PROPERTIES COMPILE_OPTIONS "/wd4267"
     )
+    # MSVC diagnoses repeated if-initializer names across mutually exclusive
+    # branches as C4456. These translation units intentionally use that pattern.
     set_source_files_properties(
         src/optimization/Optimizer.cpp
         src/runtime/ExecutionServices.cpp
         src/game/GameProductization.cpp
+        src/game/GameplayStateCodec.cpp
         PROPERTIES COMPILE_OPTIONS "/wd4456"
     )
     target_compile_options(realscript_frontend PRIVATE /W4 /permissive-)
