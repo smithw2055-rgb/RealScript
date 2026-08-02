@@ -1,5 +1,6 @@
 #pragma once
 
+#include "realscript/compiler/LanguageExpansion.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/mir/Mir.h"
 
@@ -47,18 +48,36 @@ struct BuildResult {
 class Compilation {
 public:
     Compilation() = default;
-    explicit Compilation(std::vector<SourceFile> sources)
-        : sources_(std::move(sources)) {}
+    explicit Compilation(std::vector<SourceFile> sources) {
+        for (auto& source : sources) addSource(std::move(source));
+    }
+
+    void setLanguageExpansionOptions(LanguageExpansionOptions options) {
+        expansionOptions_ = options;
+    }
+
+    [[nodiscard]] const LanguageExpansionOptions& languageExpansionOptions() const noexcept {
+        return expansionOptions_;
+    }
 
     void addSource(SourceFile source) {
+        auto expansion = expandLanguageSource(source.path, source.content, expansionOptions_);
+        source.content = expansion.content;
+        languageExpansions_.push_back(std::move(expansion));
         sources_.push_back(std::move(source));
+    }
+
+    [[nodiscard]] const std::vector<LanguageExpansionResult>& languageExpansions() const noexcept {
+        return languageExpansions_;
     }
 
     [[nodiscard]] BuildResult build(
         const BuildSnapshot* previous = nullptr) const;
 
 private:
+    LanguageExpansionOptions expansionOptions_;
     std::vector<SourceFile> sources_;
+    std::vector<LanguageExpansionResult> languageExpansions_;
 };
 
 [[nodiscard]] std::uint64_t stableFingerprint(
