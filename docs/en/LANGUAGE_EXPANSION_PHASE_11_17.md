@@ -1,113 +1,97 @@
-# Phase 11–17 Language Expansion Profile
+# Phase 11–18 Language Profile
 
 [Documentation Home](README.md) | [Language and Type System](LANGUAGE_AND_TYPE_SYSTEM.md) | [Gameplay Runtime](GAMEPLAY_RUNTIME.md)
 
-RealScript Phase 11–17 adds a bounded C#-style game-language profile on top of the existing verified compiler pipeline. Extended source is normalized before ordinary parsing and binding, then continues through the same semantic model, Typed MIR, bytecode verifier, interpreter, C++17 AOT generator, optimizer, debugger metadata, and optional toolchain JIT.
+RealScript originally introduced the Phase 11–17 C#-style gameplay profile through a deterministic source-expansion layer. Phase 18 is migrating those features into the native lexer, syntax tree, Binder, flow analysis, Typed MIR, bytecode, tooling metadata, AOT/JIT pipeline, and Game SDK.
 
-This is not CLR compatibility and is not a claim of full C# semantics. The profile deliberately favors deterministic, inspectable, AOT-friendly behavior for gameplay scripts.
+This remains an embedded deterministic game-language profile, not CLR compatibility.
 
-## Compilation model
+## Current compilation model
 
-A `Compilation` expands all source files in two deterministic passes:
+A `Compilation` still runs the compatibility expansion stage for features not yet migrated. Native features bypass that stage and preserve their original syntax nodes and source spans.
 
-1. discover module-local delegates, interfaces, generic declarations, source attributes, and reference-parameter signatures;
-2. lower executable constructs and emit generated specializations/support types in stable module/path order.
+Native as of Phase 18:
 
-Declarations are isolated by `module`. A source file sees declarations from its own module and directly imported modules. Generated generic specializations and `ref` wrapper types are emitted once per declaring module.
+- `for`, `foreach`, `do/while`, `break`, `continue`, and `switch`;
+- interface declarations and class/struct interface contract lists;
+- source Attribute Lists and positional/named Attribute Arguments.
 
-Ordinary Phase 1–10 source that does not use expansion syntax is preserved byte-for-byte, so existing source fingerprints, incremental snapshots, and debug coordinates do not change merely because the expansion layer is enabled.
+Still using compatibility expansion during Phase 18 migration:
 
-## Phase 11 — structured gameplay control flow
+- bounded delegates, lambdas, and class-local events;
+- generic declarations and explicit specializations;
+- deterministic `sequence` / `yield wait_ticks`;
+- restricted `ref`, `out`, and `in` calls;
+- value aliases that do not yet have exact runtime identities.
 
-Implemented:
+Declarations remain isolated by `module`; directly imported modules contribute visible interface and remaining expansion declarations.
+
+## Native structured control flow
+
+Implemented directly in the compiler:
 
 - `for`;
-- `foreach` over arrays and generated fixed-capacity `List<T>`, `Queue<T>`, `Stack<T>`, and `HashSet<T>` values;
+- `foreach` over arrays and indexed fixed-capacity collection profiles;
 - `do` / `while`;
 - loop `break` and `continue`;
 - equality-based `switch`, `case`, and `default`;
-- stable nested loop/switch behavior, including `continue` from inside a switch;
-- diagnostics for invalid loop control and malformed/duplicate switch labels.
+- nested loop/switch target semantics;
+- malformed loop-control diagnostics;
+- stable hidden-local debug metadata for foreach collections, indices, and switch discriminants.
 
-Deliberate limits:
+Switch cases do not fall through. Pattern matching, guards, and arbitrary enumerator protocols remain future work.
 
-- switch cases do not fall through;
-- no pattern matching, type cases, guards, or range cases;
-- `foreach` requires an array or a generated indexed collection; arbitrary enumerator protocols are not implemented.
+## Bounded delegates, lambdas, and events
 
-## Phase 12 — delegates, lambdas, and events
-
-Implemented:
+Currently available through the compatibility expansion path:
 
 - delegate declarations used as event signatures;
-- class-local event declarations;
-- deterministic method-group subscription and unsubscription;
-- parenthesized lambdas and single-parameter `value => expression` lambdas;
-- event invocation in deterministic subscription order;
-- generated instance methods for lambdas that use parameters, `this`, or object fields.
+- class-local events;
+- deterministic method-group subscription/removal;
+- parenthesized and single-parameter lambdas;
+- field/`this` capture without arbitrary local closure objects.
 
-Deliberate limits:
+Native AST/Bound/MIR migration is the next Phase 18 slice. First-class delegate runtime values and heap closure objects belong to Phase 20.
 
-- delegates are not first-class runtime values;
-- events are class-local lowered constructs, not reflection-visible CLR events;
-- lambdas do not capture arbitrary local variables into heap closure objects;
-- no delegate combination outside event lowering and no variance.
+## Native interface contracts
 
-## Phase 13 — interface contracts
-
-Implemented:
+Implemented directly in Parser and Compilation:
 
 - interface declarations;
 - class/struct implementation lists;
-- compile-time validation of required method name and visible arity;
-- interface implementation metadata retained by the language expansion result and Game SDK metadata.
+- module/import-aware visibility;
+- exact method-name, arity, parameter-type, return-type, and exact-type validation;
+- stable canonical implementation metadata in `BuildResult` and Game SDK outputs.
 
-Deliberate limits:
+Interface-typed values and runtime interface dispatch are not part of Phase 18; they belong to Phase 19.
 
-- no interface-typed locals, fields, parameters, or returns;
-- no interface method table or runtime interface dispatch;
-- no inheritance, default interface implementation, variance, or generic interface constraints.
+## Native source attributes
 
-This phase is an explicit compile-time gameplay contract, not CLR-style polymorphism.
+Implemented directly in Parser and Compilation:
 
-## Phase 14 — source attributes and metadata
+- Attribute Lists on types, interfaces, functions, fields, methods, constructors, properties, enum members, and interface methods;
+- positional and named argument token spans;
+- module-qualified canonical targets;
+- source file and offset retention;
+- public module fingerprint participation;
+- metadata retained through `Compilation`, `GameCompileResult`, and `GameProgram`.
 
-Implemented:
+Attributes remain metadata records rather than executable Attribute classes. `.rsbc` serialization of this metadata is part of Phase 18 closure.
 
-- declaration attributes such as `[Serializable]` and `[Replicated(channel = "state")]`;
-- positional and named argument capture;
-- stable module-qualified targets such as `Game.Combat::Unit`;
-- metadata retained by `Compilation::languageExpansions()`;
-- aggregated metadata exposed by `GameCompileResult::languageMetadata`;
-- successful game programs retain metadata through `GameProgram::languageMetadata()`.
+## Explicit generics and fixed-capacity collections
 
-Deliberate limits:
-
-- attributes are data records; attribute classes and executable constructors are not instantiated;
-- metadata is retained for source compilation and the Game SDK, but is not yet embedded in the `.rsbc` physical format;
-- generated declarations do not acquire user-source attributes unless explicitly generated by the host.
-
-## Phase 15 — explicit generics and fixed-capacity collections
-
-Implemented:
+Currently available through compatibility specialization:
 
 - explicit generic type and function instantiation;
-- deterministic monomorphization with stable generated names;
-- specializations shared across files in the same module;
-- imported generic declarations visible to importing modules while same-name declarations remain isolated by module;
-- built-in fixed-capacity `List<T>`, `Queue<T>`, `Stack<T>`, `HashSet<T>`, `Dictionary<K,V>`, and `Optional<T>` profiles;
-- deterministic indexed enumeration for collection `foreach`.
+- deterministic monomorphization;
+- cross-file/module isolation;
+- `List<T>`, `Queue<T>`, `Stack<T>`, `HashSet<T>`, `Dictionary<K,V>`, and `Optional<T>` fixed-capacity profiles.
 
-Deliberate limits:
+Native type-parameter/type-argument syntax and semantic specialization remain Phase 18 work.
 
-- no type inference for generic arguments;
-- no open generic runtime values, reflection construction, variance, or generic constraints;
-- collections use fixed capacities and explicit failure/return contracts rather than hidden allocation growth;
-- specialization is compile-time source expansion, not CLR shared-code generics.
+## Deterministic sequences
 
-## Phase 16 — deterministic sequences
-
-Implemented:
+Currently available through compatibility lowering:
 
 ```csharp
 sequence Attack(long target)
@@ -115,62 +99,42 @@ sequence Attack(long target)
     PlayWindup();
     yield wait_ticks(12);
     SpawnProjectile();
-    yield wait_ticks(6);
-    Finish();
 }
 ```
 
-A sequence is lowered into ordinary instance callbacks scheduled through `GameplayHost` and `TickScheduler`. The resulting callbacks participate in fixed-tick ordering, snapshots, replay, and rollback state.
+Callbacks use `GameplayHost` and `TickScheduler` and participate in fixed-tick replay/rollback state. Native sequence nodes and compiler-owned state-machine metadata remain Phase 18 work.
 
-Deliberate limits:
+## Restricted reference parameters and aliases
 
-- the entry parameter is the target entity handle used by gameplay scheduling;
-- only `yield wait_ticks(expression)` suspension is supported;
-- arbitrary locals are not persisted across yields; durable sequence state must be stored in object fields;
-- no `Task`, threads, general `async`/`await`, exception propagation across suspension, or arbitrary iterator values.
+Currently available through compatibility lowering:
 
-## Phase 17 — reference parameters and value aliases
+- standalone `ref`, `out`, and `in` calls;
+- copy-in/copy-out wrappers;
+- `out` initialization and `in` write diagnostics;
+- source aliases for small/unsigned integers, `float`, and `char` mapped onto current carriers.
 
-Implemented:
+Native parameter/argument modifiers remain Phase 18 work. Exact value identities and complete reference semantics belong to Phase 23.
 
-- restricted standalone `ref`, `out`, and `in` function calls;
-- deterministic generated wrapper types for `ref`/`out`, owned by the declaring module and reused by importing modules;
-- writeback after successful calls;
-- `out` default initialization and `in` assignment diagnostics;
-- source aliases `byte`, `sbyte`, `short`, `ushort`, `uint`, `ulong`, `float`, and `char` mapped onto the existing canonical runtime carriers.
+## Backend validation
 
-Deliberate limits:
+The native Phase 18 slices use the existing shared backend pipeline. Current coverage includes:
 
-- reference arguments must be stable l-values supported by the lowering profile;
-- no `ref` locals, `ref` returns, ref fields, ref indexers, scoped refs, span-like lifetime analysis, or mutable aliasing across suspension;
-- aliases do not create distinct ABI/runtime types: small integers and `char` map to `int`, unsigned wide integers map to `long`, and `float` maps to `double`;
-- no boxing/unboxing or nullable value types.
+- parser recovery and diagnostics;
+- Binder and definite-assignment analysis;
+- Typed MIR and bytecode verification;
+- interpreter execution;
+- existing AOT/JIT integration through shared MIR;
+- Game SDK metadata retention;
+- Ubuntu and Windows warnings-as-errors CI.
 
-## Backend and SDK integration
+## Remaining Phase 18 work
 
-After expansion, code uses the existing backend pipeline. Regression coverage includes:
+- native delegates, lambdas, and events;
+- native generic declarations, type arguments, and semantic specialization;
+- native deterministic sequence state machines;
+- native `ref`, `out`, and `in` symbols and MIR semantics;
+- exact source/tooling support for all migrated nodes;
+- `.rsbc` and AOT-manifest serialization of native language metadata;
+- removal of the compatibility `LanguageExpansion` implementation after differential closure.
 
-- interpreter execution of the complete bounded profile;
-- cross-file and cross-module declarations/imports;
-- module isolation for same-name generic declarations;
-- nested switch/loop semantics;
-- fixed-capacity collection enumeration;
-- deterministic sequence execution through the Game SDK;
-- C++17 AOT source generation from expanded MIR;
-- source attribute retention in `GameCompileResult` and `GameProgram`;
-- the full Phase 1–17 CTest matrix on Ubuntu and Windows with warnings as errors.
-
-## Remaining language work
-
-The profile intentionally leaves the following for future native compiler work:
-
-- class inheritance, virtual/abstract dispatch, and runtime interface values;
-- first-class delegates, full closure objects, and general event values;
-- inferred/open generics, constraints, variance, and growable standard collections;
-- pattern matching and enumerator protocols;
-- full coroutine state machines with persisted locals;
-- exact-width unsigned/`float`/`char` runtime identities;
-- full C# reference semantics, nullable values, boxing, and exceptions;
-- exact source maps for generated expansion code and `.rsbc` serialization of source attributes.
-
-These limits are explicit so game code can depend on deterministic implemented behavior rather than placeholder CLR-like semantics.
+The migration remains explicit so game code depends only on verified implemented behavior.
