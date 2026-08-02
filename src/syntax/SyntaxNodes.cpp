@@ -168,7 +168,9 @@ text::TextSpan BlockStatementSyntax::span() const noexcept {
 }
 
 text::TextSpan ParameterSyntax::span() const noexcept {
-    return combine(type.span(), identifierToken.span);
+    return combine(
+        modifierToken ? modifierToken->span : type.span(),
+        identifierToken.span);
 }
 
 text::TextSpan FieldDeclarationSyntax::span() const noexcept {

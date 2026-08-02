@@ -55,6 +55,8 @@ enum class SyntaxKind {
     ForKeyword,
     ForeachKeyword,
     InKeyword,
+    RefKeyword,
+    OutKeyword,
     DoKeyword,
     BreakKeyword,
     ContinueKeyword,
@@ -288,6 +290,7 @@ struct ParenthesizedExpressionSyntax final : ExpressionSyntax {
 struct CallExpressionSyntax final : ExpressionSyntax {
     SyntaxToken identifierToken;
     SyntaxToken openParenToken;
+    std::vector<std::optional<SyntaxToken>> argumentModifiers;
     std::vector<std::unique_ptr<ExpressionSyntax>> arguments;
     std::vector<SyntaxToken> commaTokens;
     SyntaxToken closeParenToken;
@@ -308,6 +311,7 @@ struct MemberCallExpressionSyntax final : ExpressionSyntax {
     SyntaxToken dotToken;
     SyntaxToken nameToken;
     SyntaxToken openParenToken;
+    std::vector<std::optional<SyntaxToken>> argumentModifiers;
     std::vector<std::unique_ptr<ExpressionSyntax>> arguments;
     std::vector<SyntaxToken> commaTokens;
     SyntaxToken closeParenToken;
@@ -542,6 +546,7 @@ struct BlockStatementSyntax final : StatementSyntax {
 };
 
 struct ParameterSyntax final : SyntaxNode {
+    std::optional<SyntaxToken> modifierToken;
     TypeSyntax type;
     SyntaxToken identifierToken;
 
@@ -837,6 +842,7 @@ private:
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseNewExpression();
     void parseArgumentList(
         std::vector<std::unique_ptr<ExpressionSyntax>>& arguments,
+        std::vector<std::optional<SyntaxToken>>* argumentModifiers,
         std::vector<SyntaxToken>& commaTokens,
         SyntaxToken& closeParenToken);
     [[nodiscard]] bool isVariableDeclarationStart() const noexcept;

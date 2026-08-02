@@ -24,10 +24,14 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             ? semantic::stableTypeId(resultTypeName)
             : 0;
         for (const auto& parameter : function.parameters) {
-            instruction.parameterTypes.push_back(parameter.type);
+            const auto storageType =
+                semantic::storageTypeOf(parameter);
+            const auto& storageTypeName =
+                semantic::storageTypeNameOf(parameter);
+            instruction.parameterTypes.push_back(storageType);
             instruction.parameterTypeIds.push_back(
-                semantic::isExactType(parameter.type)
-                    ? semantic::stableTypeId(parameter.typeName)
+                semantic::isExactType(storageType)
+                    ? semantic::stableTypeId(storageTypeName)
                     : 0);
         }
         instruction.sourceSpan = span;
@@ -291,6 +295,93 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         arguments.push_back(assigned);
         (void)emitCallInstruction(assignment.setter, semantic::PrimitiveType::Void, {}, std::move(arguments), expression.span);
         return assigned;
+    }
+    case semantic::BoundNodeKind::ReferenceCallExpression: {
+        const auto& call = static_cast<const
+            semantic::BoundReferenceCallExpression&>(expression);
+        std::vector<ValueId> arguments;
+        struct Writeback {
+            semantic::VariableSymbol variable;
+            semantic::TypeSymbol wrapperType;
+            semantic::FieldSymbol field;
+            ValueId wrapper = -1;
+        };
+        std::vector<Writeback> writebacks;
+        for (const auto& argument : call.arguments) {
+            if (argument.modifier ==
+                    semantic::ParameterModifier::None ||
+                argument.modifier ==
+                    semantic::ParameterModifier::In ||
+                argument.forwarded) {
+                arguments.push_back(
+                    lowerExpression(*argument.value));
+                continue;
+            }
+
+            const auto wrapper = emitValue(
+                Opcode::NewObject,
+                semantic::PrimitiveType::Object,
+                {},
+                expression.span);
+            auto& allocation =
+                block(*currentBlockId_).instructions.back();
+            allocation.typeId = argument.wrapperType.id;
+            allocation.resultTypeId = argument.wrapperType.id;
+            allocation.symbolName =
+                semantic::canonicalTypeName(argument.wrapperType);
+            if (argument.modifier ==
+                    semantic::ParameterModifier::Ref &&
+                argument.value) {
+                const auto initial =
+                    lowerExpression(*argument.value);
+                Instruction store;
+                store.resultType =
+                    semantic::PrimitiveType::Void;
+                store.opcode = Opcode::StoreField;
+                store.operands = {wrapper, initial};
+                store.typeId = argument.wrapperType.id;
+                store.fieldIndex = argument.valueField.index;
+                store.symbolName = semantic::canonicalTypeName(
+                    argument.wrapperType);
+                store.sourceSpan = expression.span;
+                block(*currentBlockId_).instructions.push_back(
+                    std::move(store));
+            }
+            arguments.push_back(wrapper);
+            writebacks.push_back(Writeback{
+                argument.variable,
+                argument.wrapperType,
+                argument.valueField,
+                wrapper});
+        }
+
+        const auto callResult = emitCallInstruction(
+            call.function,
+            call.type,
+            call.function.returnTypeName,
+            std::move(arguments),
+            expression.span);
+        for (const auto& writeback : writebacks) {
+            const auto value = emitValue(
+                Opcode::LoadField,
+                writeback.field.type,
+                {writeback.wrapper},
+                expression.span);
+            auto& load = block(
+                *currentBlockId_).instructions.back();
+            load.typeId = writeback.wrapperType.id;
+            load.resultTypeId = semantic::isExactType(
+                    writeback.field.type)
+                ? semantic::stableTypeId(
+                    writeback.field.typeName)
+                : 0;
+            load.fieldIndex = writeback.field.index;
+            load.symbolName = semantic::canonicalTypeName(
+                writeback.wrapperType);
+            emitStoreLocal(
+                writeback.variable.index, value, expression.span);
+        }
+        return callResult;
     }
     case semantic::BoundNodeKind::CallExpression: {
         const auto& call = static_cast<const semantic::BoundCallExpression&>(expression);

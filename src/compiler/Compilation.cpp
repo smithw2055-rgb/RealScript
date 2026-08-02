@@ -933,6 +933,50 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             addMembers(unit->syntaxTree->structs);
         }
 
+        // Materialize compiler-owned reference boxes. They are real runtime
+        // descriptors but synthetic source symbols, so they stay out of the
+        // public language surface and tooling occurrences.
+        for (const auto& declaration : module.declarations) {
+            for (const auto& parameter : declaration.parameters) {
+                if (parameter.modifier !=
+                        semantic::ParameterModifier::Ref &&
+                    parameter.modifier !=
+                        semantic::ParameterModifier::Out) {
+                    continue;
+                }
+                const auto canonicalName =
+                    semantic::storageTypeNameOf(parameter);
+                const auto prefix = moduleName.empty()
+                    ? std::string{}
+                    : moduleName + "::";
+                const auto simpleName =
+                    canonicalName.rfind(prefix, 0) == 0
+                        ? canonicalName.substr(prefix.size())
+                        : canonicalName;
+                if (findOwnType(module, simpleName)) continue;
+
+                semantic::TypeSymbol wrapper;
+                wrapper.kind = semantic::TypeKind::Class;
+                wrapper.synthetic = true;
+                wrapper.moduleName = moduleName;
+                wrapper.name = simpleName;
+                wrapper.id = semantic::stableTypeId(wrapper);
+
+                semantic::FieldSymbol valueField;
+                valueField.name = "Value";
+                valueField.type = parameter.type;
+                valueField.typeName = parameter.typeName;
+                valueField.index = 0;
+                valueField.synthetic = true;
+                valueField.id = semantic::stableTypeId(
+                    semantic::canonicalTypeName(wrapper) +
+                    "::field:Value");
+                wrapper.fields.push_back(std::move(valueField));
+                module.types.push_back(std::move(wrapper));
+            }
+        }
+        refreshVisibleTypes(modules, module);
+
         // Collect native attributes from original syntax declarations.
         for (const auto* unit : module.units) {
             const auto collectTypeAttributes = [&](auto const& declarations) {
@@ -1163,7 +1207,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             module.declarations.size() + module.types.size() +
             module.interfaces.size());
         for (const auto& type : module.types) {
-            signatures.push_back(typeSignature(type));
+            if (!type.synthetic) {
+                signatures.push_back(typeSignature(type));
+            }
         }
         for (const auto& [interfaceName, contract] : module.interfaces) {
             (void)interfaceName;

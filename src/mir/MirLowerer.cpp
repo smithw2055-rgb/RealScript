@@ -80,12 +80,19 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
         result.debugInfo.locals.push_back(std::move(local));
     }
     for (const auto& parameter : function.symbol.parameters) {
-        result.parameterTypes.push_back(parameter.type);
-        result.parameterTypeIds.push_back(semantic::isExactType(parameter.type)
-            ? semantic::stableTypeId(parameter.typeName) : 0);
-        result.localTypes.at(parameter.index) = parameter.type;
-        result.localTypeIds.at(parameter.index) = semantic::isExactType(parameter.type)
-            ? semantic::stableTypeId(parameter.typeName) : 0;
+        const auto storageType = semantic::storageTypeOf(parameter);
+        const auto& storageTypeName =
+            semantic::storageTypeNameOf(parameter);
+        result.parameterTypes.push_back(storageType);
+        result.parameterTypeIds.push_back(
+            semantic::isExactType(storageType)
+                ? semantic::stableTypeId(storageTypeName)
+                : 0);
+        result.localTypes.at(parameter.index) = storageType;
+        result.localTypeIds.at(parameter.index) =
+            semantic::isExactType(storageType)
+                ? semantic::stableTypeId(storageTypeName)
+                : 0;
     }
 
     currentFunction_ = &result; nextValueId_ = 0; breakTargets_.clear(); continueTargets_.clear();
@@ -93,11 +100,15 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
     const auto entry = createBlock(); setCurrentBlock(entry);
     for (std::size_t i = 0; i < function.symbol.parameters.size(); ++i) {
         const auto& parameter = function.symbol.parameters[i];
-        const auto value = emitValue(Opcode::Parameter, parameter.type, {}, {});
+        const auto storageType = semantic::storageTypeOf(parameter);
+        const auto& storageTypeName =
+            semantic::storageTypeNameOf(parameter);
+        const auto value = emitValue(
+            Opcode::Parameter, storageType, {}, {});
         auto& instruction = block(*currentBlockId_).instructions.back();
         instruction.integerImmediate = static_cast<std::int64_t>(i);
-        instruction.resultTypeId = semantic::isExactType(parameter.type)
-            ? semantic::stableTypeId(parameter.typeName) : 0;
+        instruction.resultTypeId = semantic::isExactType(storageType)
+            ? semantic::stableTypeId(storageTypeName) : 0;
         emitStoreLocal(parameter.index, value, {});
     }
     lowerStatement(*function.body);

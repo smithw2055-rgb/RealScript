@@ -45,6 +45,27 @@ ResolvedType resolveNamedType(
     return {};
 }
 
+ParameterModifier parameterModifier(
+    const std::optional<syntax::SyntaxToken>& token) noexcept {
+    if (!token) return ParameterModifier::None;
+    switch (token->kind) {
+    case syntax::SyntaxKind::RefKeyword: return ParameterModifier::Ref;
+    case syntax::SyntaxKind::OutKeyword: return ParameterModifier::Out;
+    case syntax::SyntaxKind::InKeyword: return ParameterModifier::In;
+    default: return ParameterModifier::None;
+    }
+}
+
+const char* parameterModifierName(ParameterModifier modifier) noexcept {
+    switch (modifier) {
+    case ParameterModifier::None: return "";
+    case ParameterModifier::Ref: return "ref ";
+    case ParameterModifier::Out: return "out ";
+    case ParameterModifier::In: return "in ";
+    }
+    return "";
+}
+
 ResolvedType resolveType(
     const syntax::TypeSyntax& syntaxTree,
     const TypeSymbolMap& visibleTypes,
@@ -107,6 +128,8 @@ void appendImplicitThis(FunctionSymbol& result, const TypeSymbol& owner) {
     self.type = typeKindPrimitive(owner.kind);
     self.typeName = canonicalTypeName(owner);
     self.index = 0;
+    self.storageType = self.type;
+    self.storageTypeName = self.typeName;
     self.parameter = true;
     result.parameters.push_back(std::move(self));
 }
@@ -117,20 +140,36 @@ void appendSyntaxParameters(
     const TypeSymbolMap& visibleTypes,
     diagnostics::DiagnosticBag& diagnostics) {
     for (const auto& parameterSyntax : parameters) {
-        const auto parameterType = resolveType(parameterSyntax.type, visibleTypes, false);
+        const auto parameterType = resolveType(
+            parameterSyntax.type, visibleTypes, false);
         if (parameterType.type == PrimitiveType::Error) {
             diagnostics.report(
                 "RS2201",
-                "invalid parameter type '" + parameterSyntax.type.name.text + "'",
+                "invalid parameter type '" +
+                    parameterSyntax.type.name.text + "'",
                 parameterSyntax.type.span());
         }
         VariableSymbol parameter;
         parameter.name = parameterSyntax.identifierToken.text;
         parameter.type = parameterType.type;
         parameter.typeName = parameterType.name;
+        parameter.modifier = parameterModifier(
+            parameterSyntax.modifierToken);
+        if (parameter.modifier == ParameterModifier::Ref ||
+            parameter.modifier == ParameterModifier::Out) {
+            parameter.storageType = PrimitiveType::Object;
+            parameter.storageTypeName = referenceWrapperTypeName(
+                result.moduleName,
+                parameter.type,
+                parameter.typeName);
+        } else {
+            parameter.storageType = parameter.type;
+            parameter.storageTypeName = parameter.typeName;
+        }
         parameter.index = result.parameters.size();
         parameter.parameter = true;
-        parameter.declarationSpan = parameterSyntax.identifierToken.span;
+        parameter.declarationSpan =
+            parameterSyntax.identifierToken.span;
         result.parameters.push_back(std::move(parameter));
     }
 }
@@ -254,6 +293,38 @@ SymbolId stableTypeId(const std::string& canonicalName) {
     return canonicalName.empty() ? 0 : fnv1a(canonicalName);
 }
 
+std::string referenceWrapperTypeName(
+    const std::string& moduleName,
+    PrimitiveType sourceType,
+    const std::string& sourceTypeName) {
+    std::string key = isExactType(sourceType) &&
+            !sourceTypeName.empty()
+        ? sourceTypeName
+        : primitiveTypeName(sourceType);
+    for (auto& character : key) {
+        const auto alphaNumeric =
+            (character >= 'a' && character <= 'z') ||
+            (character >= 'A' && character <= 'Z') ||
+            (character >= '0' && character <= '9') ||
+            character == '_';
+        if (!alphaNumeric) character = '_';
+    }
+    std::string moduleKey = moduleName.empty() ? "Global" : moduleName;
+    for (auto& character : moduleKey) {
+        const auto alphaNumeric =
+            (character >= 'a' && character <= 'z') ||
+            (character >= 'A' && character <= 'Z') ||
+            (character >= '0' && character <= '9') ||
+            character == '_';
+        if (!alphaNumeric) character = '_';
+    }
+    const auto simpleName =
+        "__RsRef__" + moduleKey + "__" + key;
+    return moduleName.empty()
+        ? simpleName
+        : moduleName + "::" + simpleName;
+}
+
 TypeSymbol declareTypeShell(
     const std::string& moduleName,
     const syntax::ClassDeclarationSyntax& syntaxTree) {
@@ -356,10 +427,17 @@ std::string canonicalFunctionKey(const FunctionSymbol& function) {
     out << function.moduleName << "::";
     if (!function.ownerTypeName.empty()) out << function.ownerTypeName << '.';
     out << function.name << '(';
-    const auto firstVisible = function.method && !function.staticMethod && !function.parameters.empty() ? 1u : 0u;
-    for (std::size_t i = firstVisible; i < function.parameters.size(); ++i) {
+    const auto firstVisible = function.method && !function.staticMethod &&
+            !function.parameters.empty()
+        ? 1u
+        : 0u;
+    for (std::size_t i = firstVisible;
+         i < function.parameters.size(); ++i) {
         if (i != firstVisible) out << ',';
-        out << displayType(function.parameters[i].type, function.parameters[i].typeName);
+        out << parameterModifierName(function.parameters[i].modifier)
+            << displayType(
+                function.parameters[i].type,
+                function.parameters[i].typeName);
     }
     out << ')';
     return out.str();
@@ -489,6 +567,8 @@ PropertySymbol declarePropertySymbol(
         valueParameter.type = result.type;
         valueParameter.typeName = result.typeName;
         valueParameter.index = setter.parameters.size();
+        valueParameter.storageType = valueParameter.type;
+        valueParameter.storageTypeName = valueParameter.typeName;
         valueParameter.parameter = true;
         valueParameter.declarationSpan = syntaxTree.identifierToken.span;
         setter.parameters.push_back(std::move(valueParameter));

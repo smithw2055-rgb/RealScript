@@ -58,6 +58,17 @@ PrimitiveType commonNumericType(PrimitiveType left, PrimitiveType right) noexcep
     return PrimitiveType::Int;
 }
 
+ParameterModifier syntaxModifier(
+    const std::optional<syntax::SyntaxToken>& token) noexcept {
+    if (!token) return ParameterModifier::None;
+    switch (token->kind) {
+    case syntax::SyntaxKind::RefKeyword: return ParameterModifier::Ref;
+    case syntax::SyntaxKind::OutKeyword: return ParameterModifier::Out;
+    case syntax::SyntaxKind::InKeyword: return ParameterModifier::In;
+    default: return ParameterModifier::None;
+    }
+}
+
 std::unique_ptr<BoundVariableExpression> variableExpression(
     const VariableSymbol& variable,
     text::TextSpan span = {}) {
@@ -66,6 +77,19 @@ std::unique_ptr<BoundVariableExpression> variableExpression(
     result->type = variable.type;
     result->typeName = variable.typeName;
     result->variable = variable;
+    return result;
+}
+
+std::unique_ptr<BoundVariableExpression> storageVariableExpression(
+    const VariableSymbol& variable,
+    text::TextSpan span = {}) {
+    auto result = std::make_unique<BoundVariableExpression>();
+    result->span = span;
+    result->type = storageTypeOf(variable);
+    result->typeName = storageTypeNameOf(variable);
+    result->variable = variable;
+    result->variable.type = result->type;
+    result->variable.typeName = result->typeName;
     return result;
 }
 
@@ -82,32 +106,50 @@ bool exactParameterMatch(
 const FunctionSymbol* selectBest(
     const std::vector<const FunctionSymbol*>& candidates,
     const std::vector<std::unique_ptr<BoundExpression>>& arguments,
+    const std::vector<std::optional<syntax::SyntaxToken>>* modifiers,
     bool& ambiguous) {
     const FunctionSymbol* best = nullptr;
     int bestScore = std::numeric_limits<int>::max();
     ambiguous = false;
     for (const auto* candidate : candidates) {
         const auto offset = visibleParameterOffset(*candidate);
-        if (candidate->parameters.size() != arguments.size() + offset) continue;
+        if (candidate->parameters.size() != arguments.size() + offset) {
+            continue;
+        }
         int score = 0;
         bool applicable = true;
         for (std::size_t i = 0; i < arguments.size(); ++i) {
             const auto& parameter = candidate->parameters[i + offset];
-            const auto rank = conversionRank(arguments[i]->type, parameter.type);
-            if (rank < 0 ||
-                (arguments[i]->type == parameter.type &&
-                 !exactParameterMatch(*arguments[i], parameter))) {
+            const auto suppliedModifier = modifiers && i < modifiers->size()
+                ? syntaxModifier((*modifiers)[i])
+                : ParameterModifier::None;
+            if (suppliedModifier != parameter.modifier) {
                 applicable = false;
                 break;
             }
-            score += rank;
+            if (parameter.modifier == ParameterModifier::None) {
+                const auto rank = conversionRank(
+                    arguments[i]->type, parameter.type);
+                if (rank < 0 ||
+                    (arguments[i]->type == parameter.type &&
+                     !exactParameterMatch(*arguments[i], parameter))) {
+                    applicable = false;
+                    break;
+                }
+                score += rank;
+            } else if (!exactParameterMatch(
+                           *arguments[i], parameter)) {
+                applicable = false;
+                break;
+            }
         }
         if (!applicable) continue;
         if (score < bestScore) {
             best = candidate;
             bestScore = score;
             ambiguous = false;
-        } else if (score == bestScore && best && best->id != candidate->id) {
+        } else if (score == bestScore && best &&
+                   best->id != candidate->id) {
             ambiguous = true;
         }
     }
@@ -164,7 +206,31 @@ std::unique_ptr<BoundExpression> Binder::bindThisExpression(
 
 std::unique_ptr<BoundExpression> Binder::bindNameExpression(
     const syntax::NameExpressionSyntax& syntaxTree) {
-    if (const auto* variable = lookupVariable(syntaxTree.identifierToken.text)) {
+    if (const auto* variable = lookupVariable(
+            syntaxTree.identifierToken.text)) {
+        if (variable->modifier == ParameterModifier::Ref ||
+            variable->modifier == ParameterModifier::Out) {
+            const auto wrapper = visibleTypes_.find(
+                storageTypeNameOf(*variable));
+            if (wrapper == visibleTypes_.end() ||
+                wrapper->second.fields.empty()) {
+                diagnostics_.report(
+                    "RS8705",
+                    "reference parameter storage descriptor is unavailable",
+                    syntaxTree.span());
+                return makeError(syntaxTree.span());
+            }
+            auto result =
+                std::make_unique<BoundMemberAccessExpression>();
+            result->span = syntaxTree.span();
+            result->type = variable->type;
+            result->typeName = variable->typeName;
+            result->receiver = storageVariableExpression(
+                *variable, syntaxTree.span());
+            result->ownerType = wrapper->second;
+            result->field = wrapper->second.fields.front();
+            return result;
+        }
         return variableExpression(*variable, syntaxTree.span());
     }
 
@@ -352,10 +418,44 @@ invalidOperator:
 
 std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
     const syntax::AssignmentExpressionSyntax& syntaxTree) {
-    if (const auto* variable = lookupVariable(syntaxTree.identifierToken.text)) {
+    if (const auto* variable = lookupVariable(
+            syntaxTree.identifierToken.text)) {
+        if (variable->modifier == ParameterModifier::In) {
+            diagnostics_.report(
+                "RS8702",
+                "cannot assign to in parameter '" +
+                    variable->name + "'",
+                syntaxTree.identifierToken.span);
+            return makeError(syntaxTree.span());
+        }
         auto value = convertExpression(
             bindExpression(*syntaxTree.expression), variable->type,
-            syntaxTree.expression->span(), "assignment", variable->typeName);
+            syntaxTree.expression->span(), "assignment",
+            variable->typeName);
+        if (variable->modifier == ParameterModifier::Ref ||
+            variable->modifier == ParameterModifier::Out) {
+            const auto wrapper = visibleTypes_.find(
+                storageTypeNameOf(*variable));
+            if (wrapper == visibleTypes_.end() ||
+                wrapper->second.fields.empty()) {
+                diagnostics_.report(
+                    "RS8705",
+                    "reference parameter storage descriptor is unavailable",
+                    syntaxTree.span());
+                return makeError(syntaxTree.span());
+            }
+            auto result =
+                std::make_unique<BoundMemberAssignmentExpression>();
+            result->span = syntaxTree.span();
+            result->type = variable->type;
+            result->typeName = variable->typeName;
+            result->receiver = storageVariableExpression(
+                *variable, syntaxTree.span());
+            result->ownerType = wrapper->second;
+            result->field = wrapper->second.fields.front();
+            result->expression = std::move(value);
+            return result;
+        }
         auto result = std::make_unique<BoundAssignmentExpression>();
         result->span = syntaxTree.span();
         result->type = variable->type;
@@ -441,68 +541,233 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
     return makeError(syntaxTree.span());
 }
 
+std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
+    const FunctionSymbol& function,
+    std::vector<std::unique_ptr<BoundExpression>> arguments,
+    const std::vector<std::unique_ptr<syntax::ExpressionSyntax>>&
+        syntaxArguments,
+    const std::vector<std::optional<syntax::SyntaxToken>>&
+        argumentModifiers,
+    std::unique_ptr<BoundExpression> receiver,
+    text::TextSpan span,
+    const std::string& context) {
+    const auto offset = visibleParameterOffset(function);
+    bool hasModifiers = false;
+    for (std::size_t index = offset;
+         index < function.parameters.size(); ++index) {
+        hasModifiers = hasModifiers ||
+            function.parameters[index].modifier !=
+                ParameterModifier::None;
+    }
+    if (!hasModifiers) {
+        auto result = std::make_unique<BoundCallExpression>();
+        result->span = span;
+        result->type = function.returnType;
+        result->typeName = function.returnTypeName;
+        result->function = function;
+        if (receiver) result->arguments.push_back(std::move(receiver));
+        for (std::size_t index = 0;
+             index < arguments.size(); ++index) {
+            const auto& parameter =
+                function.parameters[index + offset];
+            result->arguments.push_back(convertExpression(
+                std::move(arguments[index]),
+                parameter.type,
+                syntaxArguments[index]->span(),
+                context,
+                parameter.typeName));
+        }
+        return result;
+    }
+
+    auto result = std::make_unique<BoundReferenceCallExpression>();
+    result->span = span;
+    result->type = function.returnType;
+    result->typeName = function.returnTypeName;
+    result->function = function;
+    if (receiver) {
+        BoundReferenceCallArgument receiverArgument;
+        receiverArgument.value = std::move(receiver);
+        result->arguments.push_back(std::move(receiverArgument));
+    }
+
+    for (std::size_t index = 0;
+         index < arguments.size(); ++index) {
+        const auto& parameter = function.parameters[index + offset];
+        BoundReferenceCallArgument argument;
+        argument.modifier = parameter.modifier;
+        if (parameter.modifier == ParameterModifier::None) {
+            argument.value = convertExpression(
+                std::move(arguments[index]),
+                parameter.type,
+                syntaxArguments[index]->span(),
+                context,
+                parameter.typeName);
+            result->arguments.push_back(std::move(argument));
+            continue;
+        }
+
+        if (index >= argumentModifiers.size() ||
+            syntaxModifier(argumentModifiers[index]) !=
+                parameter.modifier ||
+            syntaxArguments[index]->kind() !=
+                syntax::SyntaxKind::NameExpression) {
+            diagnostics_.report(
+                "RS8703",
+                "reference argument must use the matching modifier "
+                "and name a variable",
+                syntaxArguments[index]->span());
+            argument.value = std::move(arguments[index]);
+            result->arguments.push_back(std::move(argument));
+            continue;
+        }
+
+        const auto& name = static_cast<
+            const syntax::NameExpressionSyntax&>(
+                *syntaxArguments[index]);
+        const auto* variable = lookupVariable(
+            name.identifierToken.text);
+        if (!variable) {
+            diagnostics_.report(
+                "RS8703",
+                "reference argument must name a local variable or "
+                "parameter",
+                syntaxArguments[index]->span());
+            argument.value = std::move(arguments[index]);
+            result->arguments.push_back(std::move(argument));
+            continue;
+        }
+        if (variable->modifier == ParameterModifier::In &&
+            parameter.modifier != ParameterModifier::In) {
+            diagnostics_.report(
+                "RS8703",
+                "an in parameter cannot be forwarded as ref or out",
+                syntaxArguments[index]->span());
+        }
+        argument.variable = *variable;
+        if (parameter.modifier == ParameterModifier::In) {
+            argument.value = std::move(arguments[index]);
+            result->arguments.push_back(std::move(argument));
+            continue;
+        }
+
+        const auto wrapper = visibleTypes_.find(
+            storageTypeNameOf(parameter));
+        if (wrapper == visibleTypes_.end() ||
+            wrapper->second.fields.empty()) {
+            diagnostics_.report(
+                "RS8705",
+                "reference argument storage descriptor is unavailable",
+                syntaxArguments[index]->span());
+            argument.value = std::move(arguments[index]);
+            result->arguments.push_back(std::move(argument));
+            continue;
+        }
+        argument.wrapperType = wrapper->second;
+        argument.valueField = wrapper->second.fields.front();
+        if (variable->modifier == ParameterModifier::Ref ||
+            variable->modifier == ParameterModifier::Out) {
+            if (storageTypeNameOf(*variable) !=
+                storageTypeNameOf(parameter)) {
+                diagnostics_.report(
+                    "RS8703",
+                    "forwarded reference parameter has an "
+                    "incompatible storage type",
+                    syntaxArguments[index]->span());
+            }
+            argument.forwarded = true;
+            argument.value = storageVariableExpression(
+                *variable, syntaxArguments[index]->span());
+        } else if (parameter.modifier == ParameterModifier::Ref) {
+            argument.value = std::move(arguments[index]);
+        }
+        result->arguments.push_back(std::move(argument));
+    }
+    return result;
+}
+
 std::unique_ptr<BoundExpression> Binder::bindCallExpression(
     const syntax::CallExpressionSyntax& syntaxTree) {
     std::vector<std::unique_ptr<BoundExpression>> arguments;
-    for (const auto& argument : syntaxTree.arguments) arguments.push_back(bindExpression(*argument));
+    for (const auto& argument : syntaxTree.arguments) {
+        arguments.push_back(bindExpression(*argument));
+    }
 
     std::vector<const FunctionSymbol*> candidates;
-    const auto globals = visibleFunctions_.find(syntaxTree.identifierToken.text);
+    const auto globals = visibleFunctions_.find(
+        syntaxTree.identifierToken.text);
     if (globals != visibleFunctions_.end()) {
         for (const auto& function : globals->second) {
             if (!function.method) candidates.push_back(&function);
         }
     }
-    bool implicitMethod = false;
     if (currentOwnerType_ && !currentStaticMethod_) {
-        auto methods = findMethods(*currentOwnerType_, syntaxTree.identifierToken.text, false);
-        candidates.insert(candidates.end(), methods.begin(), methods.end());
-        implicitMethod = !methods.empty();
+        auto methods = findMethods(
+            *currentOwnerType_,
+            syntaxTree.identifierToken.text,
+            false);
+        candidates.insert(
+            candidates.end(), methods.begin(), methods.end());
     }
 
     bool ambiguous = false;
-    const auto* best = selectBest(candidates, arguments, ambiguous);
+    const auto* best = selectBest(
+        candidates,
+        arguments,
+        &syntaxTree.argumentModifiers,
+        ambiguous);
     if (!best) {
-        diagnostics_.report("RS2107", "no applicable overload for function '" + syntaxTree.identifierToken.text + "'", syntaxTree.span());
+        diagnostics_.report(
+            "RS2107",
+            "no applicable overload for function '" +
+                syntaxTree.identifierToken.text + "'",
+            syntaxTree.span());
         return makeError(syntaxTree.span());
     }
     if (ambiguous) {
-        diagnostics_.report("RS2108", "call to function '" + syntaxTree.identifierToken.text + "' is ambiguous", syntaxTree.span());
+        diagnostics_.report(
+            "RS2108",
+            "call to function '" +
+                syntaxTree.identifierToken.text +
+                "' is ambiguous",
+            syntaxTree.span());
         return makeError(syntaxTree.span());
     }
 
-    auto result = std::make_unique<BoundCallExpression>();
-    result->span = syntaxTree.span();
-    result->type = best->returnType;
-    result->typeName = best->returnTypeName;
-    result->function = *best;
+    std::unique_ptr<BoundExpression> receiver;
     if (best->method && !best->staticMethod) {
         const auto* thisVariable = lookupVariable("this");
         if (!thisVariable) return makeError(syntaxTree.span());
-        result->arguments.push_back(variableExpression(*thisVariable, syntaxTree.span()));
+        receiver = variableExpression(
+            *thisVariable, syntaxTree.span());
     }
-    const auto offset = visibleParameterOffset(*best);
-    for (std::size_t i = 0; i < arguments.size(); ++i) {
-        result->arguments.push_back(convertExpression(
-            std::move(arguments[i]), best->parameters[i + offset].type,
-            syntaxTree.arguments[i]->span(), "argument",
-            best->parameters[i + offset].typeName));
-    }
-    (void)implicitMethod;
-    return result;
+    return bindSelectedCall(
+        *best,
+        std::move(arguments),
+        syntaxTree.arguments,
+        syntaxTree.argumentModifiers,
+        std::move(receiver),
+        syntaxTree.span(),
+        "argument");
 }
 
 std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
     const syntax::MemberCallExpressionSyntax& syntaxTree) {
     std::vector<std::unique_ptr<BoundExpression>> arguments;
-    for (const auto& argument : syntaxTree.arguments) arguments.push_back(bindExpression(*argument));
+    for (const auto& argument : syntaxTree.arguments) {
+        arguments.push_back(bindExpression(*argument));
+    }
 
     bool staticCall = false;
     TypeSymbol owner;
     std::unique_ptr<BoundExpression> receiver;
-    if (syntaxTree.receiver->kind() == syntax::SyntaxKind::NameExpression) {
-        const auto& name = static_cast<const syntax::NameExpressionSyntax&>(*syntaxTree.receiver);
-        const auto type = visibleTypes_.find(name.identifierToken.text);
+    if (syntaxTree.receiver->kind() ==
+        syntax::SyntaxKind::NameExpression) {
+        const auto& name = static_cast<
+            const syntax::NameExpressionSyntax&>(
+                *syntaxTree.receiver);
+        const auto type = visibleTypes_.find(
+            name.identifierToken.text);
         if (!lookupVariable(name.identifierToken.text) &&
             type != visibleTypes_.end()) {
             owner = type->second;
@@ -511,44 +776,62 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
     }
     if (!staticCall) {
         receiver = bindExpression(*syntaxTree.receiver);
-        if ((receiver->type != PrimitiveType::Object && receiver->type != PrimitiveType::Struct) || receiver->typeName.empty()) {
-            diagnostics_.report("RS2471", "member call requires a class or struct receiver", syntaxTree.receiver->span());
+        if ((receiver->type != PrimitiveType::Object &&
+             receiver->type != PrimitiveType::Struct) ||
+            receiver->typeName.empty()) {
+            diagnostics_.report(
+                "RS2471",
+                "member call requires a class or struct receiver",
+                syntaxTree.receiver->span());
             return makeError(syntaxTree.span());
         }
-        const auto type = visibleTypes_.find(receiver->typeName);
+        const auto type = visibleTypes_.find(
+            receiver->typeName);
         if (type == visibleTypes_.end()) {
-            diagnostics_.report("RS2405", "type descriptor '" + receiver->typeName + "' is unavailable", syntaxTree.receiver->span());
+            diagnostics_.report(
+                "RS2405",
+                "type descriptor '" + receiver->typeName +
+                    "' is unavailable",
+                syntaxTree.receiver->span());
             return makeError(syntaxTree.span());
         }
         owner = type->second;
     }
 
-    auto methods = findMethods(owner, syntaxTree.nameToken.text, staticCall);
+    auto methods = findMethods(
+        owner, syntaxTree.nameToken.text, staticCall);
     bool ambiguous = false;
-    const auto* best = selectBest(methods, arguments, ambiguous);
+    const auto* best = selectBest(
+        methods,
+        arguments,
+        &syntaxTree.argumentModifiers,
+        ambiguous);
     if (!best) {
-        diagnostics_.report("RS2472", "no applicable method '" + syntaxTree.nameToken.text + "' on type '" + canonicalTypeName(owner) + "'", syntaxTree.span());
+        diagnostics_.report(
+            "RS2472",
+            "no applicable method '" +
+                syntaxTree.nameToken.text +
+                "' on type '" + canonicalTypeName(owner) + "'",
+            syntaxTree.span());
         return makeError(syntaxTree.span());
     }
     if (ambiguous) {
-        diagnostics_.report("RS2473", "method call '" + syntaxTree.nameToken.text + "' is ambiguous", syntaxTree.span());
+        diagnostics_.report(
+            "RS2473",
+            "method call '" + syntaxTree.nameToken.text +
+                "' is ambiguous",
+            syntaxTree.span());
         return makeError(syntaxTree.span());
     }
 
-    auto result = std::make_unique<BoundCallExpression>();
-    result->span = syntaxTree.span();
-    result->type = best->returnType;
-    result->typeName = best->returnTypeName;
-    result->function = *best;
-    if (!staticCall) result->arguments.push_back(std::move(receiver));
-    const auto offset = visibleParameterOffset(*best);
-    for (std::size_t i = 0; i < arguments.size(); ++i) {
-        result->arguments.push_back(convertExpression(
-            std::move(arguments[i]), best->parameters[i + offset].type,
-            syntaxTree.arguments[i]->span(), "method argument",
-            best->parameters[i + offset].typeName));
-    }
-    return result;
+    return bindSelectedCall(
+        *best,
+        std::move(arguments),
+        syntaxTree.arguments,
+        syntaxTree.argumentModifiers,
+        std::move(receiver),
+        syntaxTree.span(),
+        "method argument");
 }
 
 std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
@@ -564,7 +847,7 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
     for (const auto& ctor : found->second.constructors) constructors.push_back(&ctor);
     bool ambiguous = false;
     const FunctionSymbol* best = nullptr;
-    if (!constructors.empty() || !arguments.empty()) best = selectBest(constructors, arguments, ambiguous);
+    if (!constructors.empty() || !arguments.empty()) best = selectBest(constructors, arguments, nullptr, ambiguous);
     const bool implicitStructDefault =
         found->second.kind == TypeKind::Struct && arguments.empty() && !best;
     if ((!arguments.empty() || !constructors.empty()) && !best &&

@@ -79,9 +79,27 @@ private:
         case BoundNodeKind::ConversionExpression:
             analyzeExpression(*static_cast<const BoundConversionExpression&>(expression).expression, assigned); return;
         case BoundNodeKind::CallExpression:
-            for (const auto& argument : static_cast<const BoundCallExpression&>(expression).arguments)
+            for (const auto& argument :
+                 static_cast<const BoundCallExpression&>(expression).arguments) {
                 analyzeExpression(*argument, assigned);
+            }
             return;
+        case BoundNodeKind::ReferenceCallExpression: {
+            const auto& call = static_cast<
+                const BoundReferenceCallExpression&>(expression);
+            for (const auto& argument : call.arguments) {
+                if (argument.value &&
+                    argument.modifier != ParameterModifier::Out) {
+                    analyzeExpression(*argument.value, assigned);
+                }
+                if (!argument.forwarded &&
+                    (argument.modifier == ParameterModifier::Ref ||
+                     argument.modifier == ParameterModifier::Out)) {
+                    assigned.insert(argument.variable.index);
+                }
+            }
+            return;
+        }
         case BoundNodeKind::UnaryExpression:
             analyzeExpression(*static_cast<const BoundUnaryExpression&>(expression).operand, assigned); return;
         case BoundNodeKind::BinaryExpression: {

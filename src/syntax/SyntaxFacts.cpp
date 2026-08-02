@@ -46,6 +46,8 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(ForKeyword);
         RS_KIND(ForeachKeyword);
         RS_KIND(InKeyword);
+        RS_KIND(RefKeyword);
+        RS_KIND(OutKeyword);
         RS_KIND(DoKeyword);
         RS_KIND(BreakKeyword);
         RS_KIND(ContinueKeyword);
@@ -145,6 +147,8 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"for", SyntaxKind::ForKeyword},
         {"foreach", SyntaxKind::ForeachKeyword},
         {"in", SyntaxKind::InKeyword},
+        {"ref", SyntaxKind::RefKeyword},
+        {"out", SyntaxKind::OutKeyword},
         {"do", SyntaxKind::DoKeyword},
         {"break", SyntaxKind::BreakKeyword},
         {"continue", SyntaxKind::ContinueKeyword},

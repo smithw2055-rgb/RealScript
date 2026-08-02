@@ -305,6 +305,66 @@ void testAttributesBypassExpansion() {
         "native attributes still used source expansion");
 }
 
+void testNativeReferenceParameters() {
+    const auto result = execute(R"(
+module Phase18;
+void Bump(ref int value, out int doubled, in int amount)
+{
+    value = value + amount;
+    doubled = value + value;
+}
+int main()
+{
+    int value = 1;
+    int doubled;
+    Bump(ref value, out doubled, in 2);
+    return value + doubled;
+}
+)");
+    require(
+        result.succeeded &&
+            std::get<std::int64_t>(result.value) == 9,
+        "native ref/out/in execution failed");
+}
+
+void testNativeReferenceDiagnostics() {
+    realscript::compiler::Compilation compilation({{
+        "bad-reference.rs",
+        R"(
+module Phase18.ReferenceBad;
+void Mutate(in int value)
+{
+    value = 4;
+}
+int main()
+{
+    int value = 1;
+    Mutate(in value);
+    return value;
+}
+)"}});
+    const auto build = compilation.build();
+    require(build.diagnostics.hasErrors(),
+        "assignment to in parameter was accepted");
+    bool found = false;
+    for (const auto& diagnostic : build.diagnostics.items()) {
+        found = found || diagnostic.code == "RS8702";
+    }
+    require(found,
+        "assignment to in parameter did not produce RS8702");
+}
+
+void testReferencesBypassExpansion() {
+    const auto expansion =
+        realscript::compiler::expandLanguageSource(
+            "references.rs",
+            "module Native; void Bump(ref int value){"
+            "value=value+1;} int main(){int value=1;"
+            "Bump(ref value);return value;}");
+    require(!expansion.changed,
+        "native reference parameters still used source expansion");
+}
+
 void testNativeSequenceDiagnostics() {
     realscript::compiler::Compilation compilation({{"bad-sequence.rs", R"(
 module Phase18.SequenceBad;
@@ -372,6 +432,9 @@ int main() {
     run("interfaces bypass expansion", testInterfaceBypassesExpansion);
     run("native attributes", testNativeAttributes);
     run("attributes bypass expansion", testAttributesBypassExpansion);
+    run("native reference parameters", testNativeReferenceParameters);
+    run("native reference diagnostics", testNativeReferenceDiagnostics);
+    run("references bypass expansion", testReferencesBypassExpansion);
     run("native sequence diagnostics", testNativeSequenceDiagnostics);
     run("yield outside sequence diagnostics", testYieldOutsideSequenceDiagnostics);
     return failures == 0 ? 0 : 1;

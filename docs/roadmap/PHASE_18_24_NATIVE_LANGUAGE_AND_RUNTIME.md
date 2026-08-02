@@ -97,12 +97,25 @@ Implemented and validated:
 
 Current bounded semantics remain unchanged: exactly one `long target` parameter, top-level `yield wait_ticks`, and durable state stored in object fields. Complete local-persisting coroutine state machines remain Phase 22.
 
-### 18F — reference modifiers and exact aliases — pending
+### 18F — reference modifiers and exact aliases — in progress
 
-- Native `ref`, `out`, and `in` parameter/argument symbols.
-- Definite assignment and l-value checking.
-- Remove generated wrapper classes from source-level metadata.
-- Exact-width value types are completed in Phase 23.
+Implemented and validated in the native reference slice:
+
+- native `ref`, `out`, and `in` parameter and argument tokens;
+- source-level function signatures retain modifiers and underlying types;
+- compiler-owned synthetic reference boxes use existing object/field/GC/bytecode support;
+- Binder reads and writes `ref`/`out` parameters through the internal `Value` field;
+- call sites perform typed copy-in/copy-out without generated source text;
+- forwarding of compatible `ref`/`out` parameters;
+- `out` arguments become definitely assigned after a successful call;
+- assignment to `in` parameters reports `RS8702`;
+- `LanguageExpansionOptions::referenceParameters` disabled by default.
+
+Still pending in 18F:
+
+- reference member/indexer l-values and complete alias analysis;
+- native exact-width aliases;
+- complete reference semantics, nullable values, and boxing in Phase 23.
 
 ### Phase 18 exit criteria
 

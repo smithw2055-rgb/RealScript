@@ -52,6 +52,13 @@ enum class TypeKind {
     PrimitiveType& elementType,
     std::string& elementTypeName);
 
+enum class ParameterModifier {
+    None,
+    Ref,
+    Out,
+    In,
+};
+
 enum class ConversionKind {
     None,
     Identity,
@@ -72,12 +79,29 @@ struct VariableSymbol {
     std::string name;
     PrimitiveType type = PrimitiveType::Error;
     std::string typeName;
+    PrimitiveType storageType = PrimitiveType::Error;
+    std::string storageTypeName;
+    ParameterModifier modifier = ParameterModifier::None;
     std::size_t index = 0;
     bool parameter = false;
     text::TextSpan declarationSpan;
     text::TextSpan scopeSpan;
     SymbolId id = 0;
 };
+
+[[nodiscard]] inline PrimitiveType storageTypeOf(
+    const VariableSymbol& variable) noexcept {
+    return variable.storageType == PrimitiveType::Error
+        ? variable.type
+        : variable.storageType;
+}
+
+[[nodiscard]] inline const std::string& storageTypeNameOf(
+    const VariableSymbol& variable) noexcept {
+    return variable.storageType == PrimitiveType::Error
+        ? variable.typeName
+        : variable.storageTypeName;
+}
 
 struct FieldSymbol {
     std::string name;
@@ -133,6 +157,7 @@ struct EnumMemberSymbol {
 struct TypeSymbol {
     SymbolId id = 0;
     TypeKind kind = TypeKind::Class;
+    bool synthetic = false;
     std::string moduleName;
     std::string name;
     std::vector<FieldSymbol> fields;
@@ -172,6 +197,10 @@ using FunctionOverloadMap =
 [[nodiscard]] std::string canonicalTypeName(const TypeSymbol& type);
 [[nodiscard]] SymbolId stableTypeId(const TypeSymbol& type);
 [[nodiscard]] SymbolId stableTypeId(const std::string& canonicalName);
+[[nodiscard]] std::string referenceWrapperTypeName(
+    const std::string& moduleName,
+    PrimitiveType sourceType,
+    const std::string& sourceTypeName = {});
 [[nodiscard]] TypeSymbol declareTypeShell(
     const std::string& moduleName,
     const syntax::ClassDeclarationSyntax& syntax);
@@ -252,6 +281,7 @@ enum class BoundNodeKind {
     AssignmentExpression,
     ConversionExpression,
     CallExpression,
+    ReferenceCallExpression,
     NewObjectExpression,
     NewStructExpression,
     StructFieldAccessExpression,
@@ -375,6 +405,23 @@ struct BoundCallExpression final : BoundExpression {
     }
 };
 
+
+struct BoundReferenceCallArgument {
+    ParameterModifier modifier = ParameterModifier::None;
+    std::unique_ptr<BoundExpression> value;
+    VariableSymbol variable;
+    TypeSymbol wrapperType;
+    FieldSymbol valueField;
+    bool forwarded = false;
+};
+
+struct BoundReferenceCallExpression final : BoundExpression {
+    FunctionSymbol function;
+    std::vector<BoundReferenceCallArgument> arguments;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::ReferenceCallExpression;
+    }
+};
 
 struct BoundNewObjectExpression final : BoundExpression {
     TypeSymbol objectType;
@@ -660,6 +707,14 @@ private:
         const syntax::AssignmentExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindCallExpression(
         const syntax::CallExpressionSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundExpression> bindSelectedCall(
+        const FunctionSymbol& function,
+        std::vector<std::unique_ptr<BoundExpression>> arguments,
+        const std::vector<std::unique_ptr<syntax::ExpressionSyntax>>& syntaxArguments,
+        const std::vector<std::optional<syntax::SyntaxToken>>& argumentModifiers,
+        std::unique_ptr<BoundExpression> receiver,
+        text::TextSpan span,
+        const std::string& context);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindMemberCallExpression(
         const syntax::MemberCallExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindNewObjectExpression(

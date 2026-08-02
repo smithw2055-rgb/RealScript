@@ -202,6 +202,11 @@ TypeSyntax Parser::parseType() {
 
 ParameterSyntax Parser::parseParameter() {
     ParameterSyntax result;
+    if (current().kind == SyntaxKind::RefKeyword ||
+        current().kind == SyntaxKind::OutKeyword ||
+        current().kind == SyntaxKind::InKeyword) {
+        result.modifierToken = nextToken();
+    }
     result.type = parseType();
     result.identifierToken = match(SyntaxKind::IdentifierToken);
     return result;
@@ -221,14 +226,25 @@ FieldDeclarationSyntax Parser::parseFieldDeclaration(
 
 void Parser::parseArgumentList(
     std::vector<std::unique_ptr<ExpressionSyntax>>& arguments,
+    std::vector<std::optional<SyntaxToken>>* argumentModifiers,
     std::vector<SyntaxToken>& commaTokens,
     SyntaxToken& closeParenToken) {
+    const auto parseArgument = [&]() {
+        std::optional<SyntaxToken> modifier;
+        if (current().kind == SyntaxKind::RefKeyword ||
+            current().kind == SyntaxKind::OutKeyword ||
+            current().kind == SyntaxKind::InKeyword) {
+            modifier = nextToken();
+        }
+        if (argumentModifiers) argumentModifiers->push_back(modifier);
+        arguments.push_back(parseExpression());
+    };
     if (current().kind != SyntaxKind::CloseParenToken &&
         current().kind != SyntaxKind::EndOfFileToken) {
-        arguments.push_back(parseExpression());
+        parseArgument();
         while (current().kind == SyntaxKind::CommaToken) {
             commaTokens.push_back(nextToken());
-            arguments.push_back(parseExpression());
+            parseArgument();
         }
     }
     closeParenToken = match(SyntaxKind::CloseParenToken);
@@ -869,7 +885,11 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePostfixExpression() {
                 call->dotToken = dot;
                 call->nameToken = name;
                 call->openParenToken = nextToken();
-                parseArgumentList(call->arguments, call->commaTokens, call->closeParenToken);
+                parseArgumentList(
+                    call->arguments,
+                    &call->argumentModifiers,
+                    call->commaTokens,
+                    call->closeParenToken);
                 expression = std::move(call);
             } else {
                 auto member = std::make_unique<MemberAccessExpressionSyntax>();
@@ -905,7 +925,9 @@ std::unique_ptr<ExpressionSyntax> Parser::parseNewExpression() {
         result->newKeyword = newKeyword;
         result->type = std::move(type);
         result->openParenToken = nextToken();
-        parseArgumentList(result->arguments, result->commaTokens, result->closeParenToken);
+        parseArgumentList(
+            result->arguments, nullptr, result->commaTokens,
+            result->closeParenToken);
         return result;
     }
 
@@ -964,7 +986,9 @@ std::unique_ptr<ExpressionSyntax> Parser::parseCallExpression() {
     auto result = std::make_unique<CallExpressionSyntax>();
     result->identifierToken = match(SyntaxKind::IdentifierToken);
     result->openParenToken = match(SyntaxKind::OpenParenToken);
-    parseArgumentList(result->arguments, result->commaTokens, result->closeParenToken);
+    parseArgumentList(
+        result->arguments, &result->argumentModifiers,
+        result->commaTokens, result->closeParenToken);
     return result;
 }
 

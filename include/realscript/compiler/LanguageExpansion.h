@@ -59,7 +59,7 @@ struct LanguageExpansionOptions {
     bool sourceAttributes = false;
     bool generics = true;
     bool deterministicCoroutines = false;
-    bool referenceParameters = true;
+    bool referenceParameters = false;
     bool valueTypeAliases = true;
 };
 
