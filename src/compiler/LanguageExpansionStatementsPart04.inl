@@ -84,7 +84,12 @@ void lowerEvents(std::vector<Token>& tokens, Context& context) {
         }
         output.push_back(tokens[index++]);
         output.push_back(tokens[index++]);
-        if (!symbol(tokens[index], "{")) continue;
+        while (index < tokens.size() && !symbol(tokens[index], "{")) {
+            output.push_back(tokens[index++]);
+        }
+        if (index >= tokens.size() || !symbol(tokens[index], "{")) {
+            continue;
+        }
         const auto open = index;
         const auto close = matching(tokens, open, "{", "}");
         if (close >= tokens.size()) break;

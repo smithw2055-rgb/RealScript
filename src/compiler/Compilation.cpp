@@ -768,10 +768,6 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 }
             }
         };
-        validateInterfaces(
-            module.units.empty()
-                ? std::vector<syntax::ClassDeclarationSyntax>{}
-                : std::vector<syntax::ClassDeclarationSyntax>{});
         for (const auto* unit : module.units) {
             validateInterfaces(unit->syntaxTree->classes);
             validateInterfaces(unit->syntaxTree->structs);
