@@ -1,0 +1,231 @@
+#include "realscript/bytecode/Bytecode.h"
+#include "realscript/compiler/Compilation.h"
+#include "realscript/game/Gameplay.h"
+#include "realscript/runtime/Runtime.h"
+
+#include <cstdint>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+void require(bool condition, const std::string& message) {
+    if (!condition) throw std::runtime_error(message);
+}
+
+std::string diagnosticsText(const realscript::diagnostics::DiagnosticBag& diagnostics) {
+    std::string result;
+    for (const auto& diagnostic : diagnostics.items()) {
+        if (!result.empty()) result.push_back('\n');
+        result += diagnostic.code + ": " + diagnostic.message;
+    }
+    return result;
+}
+
+std::vector<realscript::bytecode::Module> compileModules(
+    std::vector<realscript::compiler::SourceFile> files) {
+    realscript::compiler::Compilation compilation(std::move(files));
+    const auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "extended source compilation failed:\n" + diagnosticsText(build.diagnostics));
+    realscript::bytecode::Lowerer lowerer;
+    std::vector<realscript::bytecode::Module> modules;
+    for (const auto& mir : build.modules) {
+        auto module = lowerer.lower(mir);
+        realscript::diagnostics::DiagnosticBag diagnostics;
+        require(realscript::bytecode::verifyModule(module, diagnostics),
+            "extended bytecode verification failed:\n" + diagnosticsText(diagnostics));
+        modules.push_back(std::move(module));
+    }
+    return modules;
+}
+
+void testPhase11To15And17Execution() {
+    const char* source = R"(
+module Extended;
+
+delegate void ChangedHandler(int amount);
+
+interface ICounter
+{
+    int Read();
+}
+
+[Serializable(version = 2)]
+class Box<T> : ICounter
+{
+    T value;
+    int total;
+    event ChangedHandler Changed;
+
+    Box(T initial)
+    {
+        value = initial;
+        total = 0;
+    }
+
+    void OnChanged(int amount)
+    {
+        total = total + amount;
+    }
+
+    int Read()
+    {
+        return total;
+    }
+
+    int Run(int[] values)
+    {
+        Changed += OnChanged;
+        Changed += (int amount) => total = total + amount;
+
+        for (int index = 0; index < values.length; index = index + 1)
+        {
+            if (values[index] < 0) continue;
+            if (values[index] == 99) break;
+            Changed(values[index]);
+        }
+
+        List<int> list = new List<int>(8);
+        foreach (int item in values)
+        {
+            list.Add(item);
+        }
+
+        switch (list.Count())
+        {
+            case 3:
+                total = total + 1;
+                break;
+            default:
+                total = total + 100;
+                break;
+        }
+        return total;
+    }
+}
+
+T Identity<T>(T value)
+{
+    return value;
+}
+
+void Bump(ref int value, out int doubled, in int amount)
+{
+    value = value + amount;
+    doubled = value + value;
+}
+
+int main()
+{
+    int[] values = new int[3];
+    values[0] = 1;
+    values[1] = -2;
+    values[2] = 3;
+
+    Box<int> box = new Box<int>(0);
+    int result = box.Run(values);
+    int value = 1;
+    int doubled = 0;
+    Bump(ref value, out doubled, in 2);
+    return result + value + doubled + Identity<int>(1);
+}
+)";
+
+    auto modules = compileModules({{"extended.rs", source}});
+    realscript::runtime::Interpreter interpreter(std::move(modules));
+    const auto result = interpreter.invoke("Extended::main");
+    require(result.succeeded, "extended main execution failed: " + result.error.message);
+    require(std::get<std::int64_t>(result.value) == 19,
+        "extended main returned the wrong result");
+}
+
+void testExpansionMetadata() {
+    const auto expansion = realscript::compiler::expandLanguageSource(
+        "metadata.rs",
+        "module Meta; [Replicated(channel = \"state\")] class Unit { int health; }");
+    require(expansion.succeeded(), "metadata expansion failed");
+    require(expansion.attributes.size() == 1, "source attribute was not captured");
+    require(expansion.attributes.front().name == "Replicated",
+        "source attribute name changed");
+    require(expansion.attributes.front().arguments.size() == 1,
+        "source attribute arguments were not captured");
+}
+
+void testPhase16DeterministicSequence() {
+    realscript::game::GameApi api;
+    auto host = std::make_shared<realscript::game::GameplayHost>(30, 5, 7);
+    require(realscript::game::installGameplayBindings(api, host),
+        "gameplay bindings failed");
+
+    const char* source = R"(
+module SequenceDemo;
+import RealScript.Game;
+
+class Behavior
+{
+    int total;
+
+    sequence Attack(long target)
+    {
+        total = 1;
+        yield wait_ticks(1);
+        total = total + 2;
+        yield wait_ticks(1);
+        total = total + 3;
+    }
+
+    int Read()
+    {
+        return total;
+    }
+}
+)";
+
+    realscript::game::GameScriptCompiler compiler(api);
+    const auto compiled = compiler.compile({{"sequence.rs", source}});
+    require(compiled.succeeded(),
+        "sequence source compilation failed:\n" + diagnosticsText(compiled.diagnostics));
+
+    realscript::game::ScriptRuntime scripts(compiled.program);
+    realscript::game::SceneScriptRuntime scene(scripts);
+    require(scene.attach(10, "SequenceDemo::Behavior"),
+        "sequence behavior attachment failed");
+    scene.start();
+
+    const auto started = scene.invoke(10, "Attack", {realscript::runtime::LongValue{10}});
+    require(started.succeeded, "sequence start failed: " + started.error.message);
+
+    realscript::game::SceneGameplayDriver driver(scene, host);
+    const auto steps = driver.advanceTicks(2);
+    require(steps.size() == 2, "sequence driver did not advance two ticks");
+    require(driver.errors().empty(), "sequence driver recorded callback errors");
+
+    const auto read = scene.invoke(10, "Read");
+    require(read.succeeded && std::get<std::int64_t>(read.value) == 6,
+        "deterministic sequence produced the wrong state");
+}
+
+} // namespace
+
+int main() {
+    int failures = 0;
+    const auto run = [&](const char* name, auto test) {
+        try {
+            test();
+            std::cout << "[PASS] " << name << '\n';
+        } catch (const std::exception& error) {
+            ++failures;
+            std::cerr << "[FAIL] " << name << ": " << error.what() << '\n';
+        }
+    };
+
+    run("phase 11-15 and 17 execution", testPhase11To15And17Execution);
+    run("source attribute metadata", testExpansionMetadata);
+    run("phase 16 deterministic sequence", testPhase16DeterministicSequence);
+    return failures == 0 ? 0 : 1;
+}
