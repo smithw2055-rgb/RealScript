@@ -10,9 +10,13 @@
 #include <vector>
 
 namespace {
-void require(bool condition, const std::string& message) { if (!condition) throw std::runtime_error(message); }
 
-std::string diagnosticsText(const realscript::diagnostics::DiagnosticBag& diagnostics) {
+void require(bool condition, const std::string& message) {
+    if (!condition) throw std::runtime_error(message);
+}
+
+std::string diagnosticsText(
+    const realscript::diagnostics::DiagnosticBag& diagnostics) {
     std::string result;
     for (const auto& diagnostic : diagnostics.items()) {
         if (!result.empty()) result.push_back('\n');
@@ -24,7 +28,10 @@ std::string diagnosticsText(const realscript::diagnostics::DiagnosticBag& diagno
 realscript::runtime::ExecutionResult execute(const char* source) {
     realscript::compiler::Compilation compilation({{"phase18.rs", source}});
     const auto build = compilation.build();
-    require(!build.diagnostics.hasErrors(), "native source failed to compile:\n" + diagnosticsText(build.diagnostics));
+    require(
+        !build.diagnostics.hasErrors(),
+        "native source failed to compile:\n" +
+            diagnosticsText(build.diagnostics));
     realscript::bytecode::Lowerer lowerer;
     std::vector<realscript::bytecode::Module> modules;
     for (const auto& sourceModule : build.modules) {
@@ -32,7 +39,8 @@ realscript::runtime::ExecutionResult execute(const char* source) {
         realscript::diagnostics::DiagnosticBag diagnostics;
         const auto verified =
             realscript::bytecode::verifyModule(module, diagnostics);
-        require(verified,
+        require(
+            verified,
             "native bytecode verification failed:\n" +
                 diagnosticsText(diagnostics));
         modules.push_back(std::move(module));
@@ -82,8 +90,12 @@ int main()
 }
 )";
     const auto result = execute(source);
-    require(result.succeeded, "native control-flow execution failed: " + result.error.message);
-    require(std::get<std::int64_t>(result.value) == 32, "native control-flow result was incorrect");
+    require(
+        result.succeeded,
+        "native control-flow execution failed: " + result.error.message);
+    require(
+        std::get<std::int64_t>(result.value) == 32,
+        "native control-flow result was incorrect");
 }
 
 void testNativeInfiniteLoopBreak() {
@@ -98,7 +110,9 @@ int main()
     return 7;
 }
 )");
-    require(result.succeeded && std::get<std::int64_t>(result.value) == 7,
+    require(
+        result.succeeded &&
+            std::get<std::int64_t>(result.value) == 7,
         "break from an infinite loop did not reach the exit block");
 }
 
@@ -113,32 +127,149 @@ int main()
 }
 )"}});
     const auto build = compilation.build();
-    require(build.diagnostics.hasErrors(), "invalid native loop control was accepted");
-    bool breakFound = false, continueFound = false;
+    require(
+        build.diagnostics.hasErrors(),
+        "invalid native loop control was accepted");
+    bool breakFound = false;
+    bool continueFound = false;
     for (const auto& diagnostic : build.diagnostics.items()) {
         breakFound = breakFound || diagnostic.code == "RS2212";
         continueFound = continueFound || diagnostic.code == "RS2213";
     }
-    require(breakFound && continueFound, "native loop-control diagnostics were not preserved");
+    require(
+        breakFound && continueFound,
+        "native loop-control diagnostics were not preserved");
 }
 
 void testNoStructuredSourceRewrite() {
     const auto expansion = realscript::compiler::expandLanguageSource(
-        "native.rs", "module Native; int main(){for(int i=0;i<1;i=i+1){}return 1;}");
-    require(!expansion.changed, "native for statement still used source expansion");
+        "native.rs",
+        "module Native; int main(){for(int i=0;i<1;i=i+1){}return 1;}");
+    require(
+        !expansion.changed,
+        "native for statement still used source expansion");
 }
+
+void testNativeInterfaceContracts() {
+    const char* contracts = R"(
+module Phase18.Contracts;
+interface IReader
+{
+    int Read(int value);
 }
+)";
+    const char* app = R"(
+module Phase18.App;
+import Phase18.Contracts;
+class Reader : IReader
+{
+    int Read(int value)
+    {
+        return value + 1;
+    }
+}
+int main()
+{
+    Reader reader = new Reader();
+    return reader.Read(41);
+}
+)";
+    realscript::compiler::Compilation compilation({
+        {"contracts.rs", contracts},
+        {"app.rs", app},
+    });
+    const auto build = compilation.build();
+    require(
+        !build.diagnostics.hasErrors(),
+        "native interface contract failed:\n" +
+            diagnosticsText(build.diagnostics));
+    require(
+        build.nativeInterfaces.size() == 1,
+        "native interface implementation metadata was not retained");
+    require(
+        build.nativeInterfaces.front().typeName ==
+                "Phase18.App::Reader" &&
+            build.nativeInterfaces.front().interfaces.size() == 1 &&
+            build.nativeInterfaces.front().interfaces.front() ==
+                "Phase18.Contracts::IReader",
+        "native interface metadata identity was incorrect");
+
+    realscript::bytecode::Lowerer lowerer;
+    std::vector<realscript::bytecode::Module> modules;
+    for (const auto& sourceModule : build.modules) {
+        auto module = lowerer.lower(sourceModule);
+        realscript::diagnostics::DiagnosticBag diagnostics;
+        require(
+            realscript::bytecode::verifyModule(module, diagnostics),
+            "native interface bytecode verification failed");
+        modules.push_back(std::move(module));
+    }
+    realscript::runtime::Interpreter interpreter(std::move(modules));
+    const auto result = interpreter.invoke("Phase18.App::main");
+    require(
+        result.succeeded &&
+            std::get<std::int64_t>(result.value) == 42,
+        "native interface implementation did not execute");
+}
+
+void testNativeInterfaceDiagnostics() {
+    realscript::compiler::Compilation compilation({{"bad-interface.rs", R"(
+module Phase18.Bad;
+interface IReader
+{
+    int Read(int value);
+}
+class Reader : IReader
+{
+    long Read(int value)
+    {
+        return value;
+    }
+}
+)"}});
+    const auto build = compilation.build();
+    require(
+        build.diagnostics.hasErrors(),
+        "invalid native interface implementation was accepted");
+    bool found = false;
+    for (const auto& diagnostic : build.diagnostics.items()) {
+        found = found || diagnostic.code == "RS2475";
+    }
+    require(
+        found,
+        "native interface signature mismatch did not produce RS2475");
+}
+
+void testInterfaceBypassesExpansion() {
+    const auto expansion = realscript::compiler::expandLanguageSource(
+        "interface.rs",
+        "module Native; interface IRun { int Run(); } "
+        "class Runner : IRun { int Run(){return 1;} }");
+    require(
+        !expansion.changed,
+        "native interfaces still used source expansion");
+}
+
+} // namespace
 
 int main() {
     int failures = 0;
     const auto run = [&](const char* name, auto test) {
-        try { test(); std::cout << "[PASS] " << name << '\n'; }
-        catch (const std::exception& error) { ++failures; std::cerr << "[FAIL] " << name << ": " << error.what() << '\n'; }
+        try {
+            test();
+            std::cout << "[PASS] " << name << '\n';
+        } catch (const std::exception& error) {
+            ++failures;
+            std::cerr << "[FAIL] " << name << ": "
+                      << error.what() << '\n';
+        }
     };
     run("native structured control flow", testNativeControlFlowExecution);
     run("native infinite loop break", testNativeInfiniteLoopBreak);
     run("native control diagnostics", testNativeDiagnostics);
-    run("structured control flow bypasses expansion", testNoStructuredSourceRewrite);
+    run(
+        "structured control flow bypasses expansion",
+        testNoStructuredSourceRewrite);
     run("native interface contracts", testNativeInterfaceContracts);
     run("native interface diagnostics", testNativeInterfaceDiagnostics);
     run("interfaces bypass expansion", testInterfaceBypassesExpansion);
