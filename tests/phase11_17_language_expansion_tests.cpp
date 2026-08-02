@@ -81,7 +81,7 @@ class Box<T> : ICounter
     int Run(int[] values)
     {
         Changed += OnChanged;
-        Changed += (int amount) => total = total + amount;
+        Changed += amount => total = total + amount;
 
         for (int index = 0; index < values.length; index = index + 1)
         {
@@ -279,6 +279,97 @@ int Other()
         "multi-file expansion returned the wrong result");
 }
 
+void testCrossModuleImportsAndIsolation() {
+    const char* contracts = R"(
+module Shared.Contracts;
+
+delegate void ChangedHandler(int amount);
+
+interface IReader
+{
+    int Read();
+}
+
+T Identity<T>(T value)
+{
+    return value;
+}
+
+void Increment(ref int value)
+{
+    value = value + 1;
+}
+)";
+
+    const char* application = R"(
+module Imported.App;
+import Shared.Contracts;
+
+class Counter : IReader
+{
+    int total;
+    event ChangedHandler Changed;
+
+    void Add(int amount)
+    {
+        total = total + amount;
+    }
+
+    int Read()
+    {
+        return total;
+    }
+
+    int Run()
+    {
+        Changed += Add;
+        Changed(5);
+        return total;
+    }
+}
+
+int main()
+{
+    Counter counter = new Counter();
+    int value = 1;
+    Increment(ref value);
+    return counter.Run() + Identity<int>(2) + value;
+}
+)";
+
+    const char* isolated = R"(
+module Other.Contracts;
+
+T Identity<T>(T value)
+{
+    return value + value;
+}
+
+int other()
+{
+    return Identity<int>(3);
+}
+)";
+
+    auto modules = compileModules({
+        {"01_shared_contracts.rs", contracts},
+        {"02_imported_app.rs", application},
+        {"03_other_contracts.rs", isolated},
+    });
+    realscript::runtime::Interpreter interpreter(std::move(modules));
+    const auto imported = interpreter.invoke("Imported.App::main");
+    require(imported.succeeded,
+        "cross-module language expansion failed: " + imported.error.message);
+    require(std::get<std::int64_t>(imported.value) == 9,
+        "imported declarations produced the wrong result");
+
+    const auto other = interpreter.invoke("Other.Contracts::other");
+    require(other.succeeded,
+        "isolated generic module failed: " + other.error.message);
+    require(std::get<std::int64_t>(other.value) == 6,
+        "same-name generic declarations leaked across modules");
+}
+
 void testExpansionMetadata() {
     const auto expansion = realscript::compiler::expandLanguageSource(
         "metadata.rs",
@@ -380,6 +471,7 @@ int main() {
     run("phase 11-15 and 17 execution", testPhase11To15And17Execution);
     run("nested switch control flow", testNestedSwitchControlFlow);
     run("cross-file declaration sharing", testCrossFileDeclarationSharing);
+    run("cross-module imports and isolation", testCrossModuleImportsAndIsolation);
     run("source attribute metadata", testExpansionMetadata);
     run("expansion options refresh", testExpansionOptionsRefreshExistingSources);
     run("phase 16 deterministic sequence", testPhase16DeterministicSequence);
