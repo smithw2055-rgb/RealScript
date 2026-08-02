@@ -95,6 +95,104 @@ bool eraseGeneratedDeclaration(
     return false;
 }
 
+bool classHasMethod(
+    const std::vector<Token>& tokens,
+    std::size_t open,
+    std::size_t close,
+    const std::string& methodName) {
+    int depth = 0;
+    for (std::size_t index = open + 1; index + 1 < close; ++index) {
+        if (symbol(tokens[index], "{")) {
+            ++depth;
+            continue;
+        }
+        if (symbol(tokens[index], "}")) {
+            --depth;
+            continue;
+        }
+        if (depth == 0 && tokens[index].kind == TokenKind::Identifier &&
+            tokens[index].text == methodName && symbol(tokens[index + 1], "(")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<Token> collectionElementType(
+    const std::vector<Token>& tokens,
+    std::size_t open,
+    std::size_t close,
+    const std::string& fieldName) {
+    for (std::size_t index = open + 1; index < close; ++index) {
+        if (tokens[index].kind != TokenKind::Identifier ||
+            tokens[index].text != fieldName || index < 2 ||
+            !symbol(tokens[index - 1], "]")) {
+            continue;
+        }
+        std::size_t arrayOpen = index - 1;
+        int depth = 1;
+        while (arrayOpen > open + 1 && depth != 0) {
+            --arrayOpen;
+            if (symbol(tokens[arrayOpen], "]")) ++depth;
+            else if (symbol(tokens[arrayOpen], "[")) --depth;
+        }
+        if (depth != 0 || arrayOpen <= open + 1) return {};
+        return std::vector<Token>(
+            tokens.begin() + static_cast<std::ptrdiff_t>(open + 1),
+            tokens.begin() + static_cast<std::ptrdiff_t>(arrayOpen));
+    }
+    return {};
+}
+
+void addCollectionEnumerationHelpers(std::vector<Token>& tokens) {
+    for (std::size_t index = 0; index + 2 < tokens.size();) {
+        if (!word(tokens[index], "class") ||
+            tokens[index + 1].kind != TokenKind::Identifier) {
+            ++index;
+            continue;
+        }
+        const auto& name = tokens[index + 1].text;
+        const bool queue = name.rfind("Queue__", 0) == 0;
+        const bool stack = name.rfind("Stack__", 0) == 0;
+        const bool set = name.rfind("HashSet__", 0) == 0;
+        if (!queue && !stack && !set) {
+            ++index;
+            continue;
+        }
+        std::size_t open = index + 2;
+        while (open < tokens.size() && !symbol(tokens[open], "{")) ++open;
+        if (open >= tokens.size()) break;
+        const auto close = matching(tokens, open, "{", "}");
+        if (close >= tokens.size()) break;
+        if (classHasMethod(tokens, open, close, "Get")) {
+            index = close + 1;
+            continue;
+        }
+
+        const auto fieldName = set ? std::string{"values"} : std::string{"items"};
+        const auto typeTokens = collectionElementType(
+            tokens, open, close, fieldName);
+        if (typeTokens.empty()) {
+            index = close + 1;
+            continue;
+        }
+        const auto type = tokenText(typeTokens);
+        std::ostringstream method;
+        method << type << " Get(int index){return " << fieldName << '[';
+        if (queue) method << "(head+index)%" << fieldName << ".length";
+        else method << "index";
+        method << "];}";
+        auto generated = lex(method.str());
+        if (!generated.empty() && generated.back().kind == TokenKind::End) {
+            generated.pop_back();
+        }
+        tokens.insert(
+            tokens.begin() + static_cast<std::ptrdiff_t>(close),
+            generated.begin(), generated.end());
+        index = close + generated.size() + 1;
+    }
+}
+
 LanguageExpansionResult finishExpansion(
     PreparedExpansionSource& source,
     Context& context,
@@ -105,6 +203,7 @@ LanguageExpansionResult finishExpansion(
     context.generatedRefTypes.clear();
 
     instantiateGenerics(source.tokens, context);
+    addCollectionEnumerationHelpers(source.tokens);
 
     std::set<std::string> sourceGenericNames;
     for (const auto& instantiation : context.result.genericInstantiations) {
