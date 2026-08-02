@@ -38,10 +38,43 @@ std::string referenceDefaultValue(const std::string& type) {
     return "null";
 }
 
+std::string referenceModuleName(const std::vector<Token>& tokens) {
+    for (std::size_t index = 0; index + 1 < tokens.size(); ++index) {
+        if (!word(tokens[index], "module")) continue;
+        std::string name;
+        bool expectIdentifier = true;
+        for (std::size_t cursor = index + 1;
+             cursor < tokens.size() && !symbol(tokens[cursor], ";"); ++cursor) {
+            if (expectIdentifier &&
+                tokens[cursor].kind == TokenKind::Identifier) {
+                name += tokens[cursor].text;
+                expectIdentifier = false;
+            } else if (!expectIdentifier && symbol(tokens[cursor], ".")) {
+                name.push_back('.');
+                expectIdentifier = true;
+            } else {
+                return {};
+            }
+        }
+        return expectIdentifier ? std::string{} : name;
+    }
+    return {};
+}
+
+std::string referenceWrapperName(
+    const ReferenceFunctionInfo& function,
+    const std::string& type) {
+    const auto module = function.moduleName.empty()
+        ? std::string{"Global"}
+        : sanitize(function.moduleName);
+    return "__RsRef__" + module + "__" + sanitize(type);
+}
+
 void collectReferenceParameterDeclarations(
     const std::vector<Token>& tokens,
     Context& context) {
     if (!context.options.referenceParameters) return;
+    if (context.moduleName.empty()) context.moduleName = referenceModuleName(tokens);
 
     for (std::size_t open = 1; open + 1 < tokens.size(); ++open) {
         if (!symbol(tokens[open], "(") ||
@@ -57,6 +90,7 @@ void collectReferenceParameterDeclarations(
 
         ReferenceFunctionInfo info;
         info.name = tokens[open - 1].text;
+        info.moduleName = context.moduleName;
         bool hasReferenceParameter = false;
         auto parameters = splitTopLevel(tokens, open + 1, close, ",");
         if (parameters.size() == 1 && parameters.front().empty()) {
