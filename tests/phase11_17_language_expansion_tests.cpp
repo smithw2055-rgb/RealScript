@@ -144,6 +144,97 @@ int main()
         "extended main returned the wrong result");
 }
 
+void testCrossFileDeclarationSharing() {
+    const char* contracts = R"(
+module MultiFile;
+
+delegate void ChangedHandler(int amount);
+
+interface ICounter
+{
+    int Read();
+}
+
+T Identity<T>(T value)
+{
+    return value;
+}
+
+void Bump(ref int value)
+{
+    value = value + 1;
+}
+)";
+
+    const char* model = R"(
+module MultiFile;
+
+class Counter : ICounter
+{
+    int total;
+    event ChangedHandler Changed;
+
+    void OnChanged(int amount)
+    {
+        total = total + amount;
+    }
+
+    int Read()
+    {
+        return total;
+    }
+
+    int Run()
+    {
+        Changed += OnChanged;
+        Changed(5);
+        return total;
+    }
+}
+)";
+
+    const char* appA = R"(
+module MultiFile;
+
+int ApplyRef(int value)
+{
+    Bump(ref value);
+    return value;
+}
+
+int main()
+{
+    Counter counter = new Counter();
+    return counter.Run() + Identity<int>(2) + Identity<int>(3) +
+        ApplyRef(4) + Other();
+}
+)";
+
+    const char* appB = R"(
+module MultiFile;
+
+int Other()
+{
+    int value = 1;
+    Bump(ref value);
+    return Identity<int>(value);
+}
+)";
+
+    auto modules = compileModules({
+        {"01_contracts.rs", contracts},
+        {"02_model.rs", model},
+        {"03_app_a.rs", appA},
+        {"04_app_b.rs", appB},
+    });
+    realscript::runtime::Interpreter interpreter(std::move(modules));
+    const auto result = interpreter.invoke("MultiFile::main");
+    require(result.succeeded,
+        "multi-file expansion execution failed: " + result.error.message);
+    require(std::get<std::int64_t>(result.value) == 17,
+        "multi-file expansion returned the wrong result");
+}
+
 void testExpansionMetadata() {
     const auto expansion = realscript::compiler::expandLanguageSource(
         "metadata.rs",
@@ -154,6 +245,24 @@ void testExpansionMetadata() {
         "source attribute name changed");
     require(expansion.attributes.front().arguments.size() == 1,
         "source attribute arguments were not captured");
+}
+
+void testExpansionOptionsRefreshExistingSources() {
+    realscript::compiler::Compilation compilation;
+    compilation.addSource({
+        "options.rs",
+        "module Options; int main(){for(int i=0;i<1;i=i+1){}return 1;}"});
+    require(compilation.languageExpansions().size() == 1 &&
+            compilation.languageExpansions().front().changed,
+        "default language expansion did not run");
+
+    realscript::compiler::LanguageExpansionOptions options;
+    options.structuredControlFlow = false;
+    compilation.setLanguageExpansionOptions(options);
+    require(compilation.languageExpansions().size() == 1 &&
+            compilation.languageExpansions().front().content.find("for") !=
+                std::string::npos,
+        "changing expansion options did not rebuild existing sources");
 }
 
 void testPhase16DeterministicSequence() {
@@ -225,7 +334,9 @@ int main() {
     };
 
     run("phase 11-15 and 17 execution", testPhase11To15And17Execution);
+    run("cross-file declaration sharing", testCrossFileDeclarationSharing);
     run("source attribute metadata", testExpansionMetadata);
+    run("expansion options refresh", testExpansionOptionsRefreshExistingSources);
     run("phase 16 deterministic sequence", testPhase16DeterministicSequence);
     return failures == 0 ? 0 : 1;
 }
