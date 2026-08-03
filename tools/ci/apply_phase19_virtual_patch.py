@@ -7,6 +7,9 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+CORRECTION = ROOT / "tools" / "ci" / "fix_phase19_virtual_fragments.py"
+subprocess.run(["python", str(CORRECTION)], cwd=ROOT, check=True)
+
 PARTS = sorted((ROOT / "tools" / "ci").glob("phase19_virtual_patch_*.b64"))
 EXPECTED_SHA256 = "714bbe2cefae3fa4823bdecb7edb743d8854d93ea303d9016c9f792b6b5fe58d"
 EXPECTED_PARTS = [
@@ -51,6 +54,7 @@ patch_path.unlink()
 
 for path in PARTS:
     path.unlink()
+CORRECTION.unlink()
 
 standard_workflow = '''name: RealScript CI
 
