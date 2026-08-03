@@ -609,13 +609,30 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
 
         if (index >= argumentModifiers.size() ||
             syntaxModifier(argumentModifiers[index]) !=
-                parameter.modifier ||
-            syntaxArguments[index]->kind() !=
-                syntax::SyntaxKind::NameExpression) {
+                parameter.modifier) {
             diagnostics_.report(
                 "RS8703",
-                "reference argument must use the matching modifier "
-                "and name a variable",
+                "reference argument must use the matching modifier",
+                syntaxArguments[index]->span());
+            argument.value = std::move(arguments[index]);
+            result->arguments.push_back(std::move(argument));
+            continue;
+        }
+        if (parameter.modifier == ParameterModifier::In) {
+            argument.value = convertExpression(
+                std::move(arguments[index]),
+                parameter.type,
+                syntaxArguments[index]->span(),
+                context,
+                parameter.typeName);
+            result->arguments.push_back(std::move(argument));
+            continue;
+        }
+        if (syntaxArguments[index]->kind() !=
+            syntax::SyntaxKind::NameExpression) {
+            diagnostics_.report(
+                "RS8703",
+                "ref and out arguments must name a variable",
                 syntaxArguments[index]->span());
             argument.value = std::move(arguments[index]);
             result->arguments.push_back(std::move(argument));
@@ -645,11 +662,6 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
                 syntaxArguments[index]->span());
         }
         argument.variable = *variable;
-        if (parameter.modifier == ParameterModifier::In) {
-            argument.value = std::move(arguments[index]);
-            result->arguments.push_back(std::move(argument));
-            continue;
-        }
 
         const auto wrapper = visibleTypes_.find(
             storageTypeNameOf(parameter));

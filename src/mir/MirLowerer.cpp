@@ -72,8 +72,16 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
     for (const auto& variable : function.variables) {
         debug::LocalVariableInfo local;
         local.name = variable.name; local.slot = static_cast<std::uint32_t>(variable.index);
-        local.type = variable.type;
-        local.typeId = semantic::isExactType(variable.type) ? semantic::stableTypeId(variable.typeName) : 0;
+        const auto debugType = variable.parameter
+            ? semantic::storageTypeOf(variable)
+            : variable.type;
+        const auto& debugTypeName = variable.parameter
+            ? semantic::storageTypeNameOf(variable)
+            : variable.typeName;
+        local.type = debugType;
+        local.typeId = semantic::isExactType(debugType)
+            ? semantic::stableTypeId(debugTypeName)
+            : 0;
         local.parameter = variable.parameter; local.declaration.span = variable.declarationSpan;
         local.scope.span = variable.scopeSpan.empty() ? (function.body ? function.body->span : function.symbol.bodySpan)
                                                       : variable.scopeSpan;
