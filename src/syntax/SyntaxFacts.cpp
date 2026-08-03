@@ -66,6 +66,15 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(DelegateKeyword);
         RS_KIND(EventKeyword);
         RS_KIND(StaticKeyword);
+        RS_KIND(PublicKeyword);
+        RS_KIND(PrivateKeyword);
+        RS_KIND(ProtectedKeyword);
+        RS_KIND(InternalKeyword);
+        RS_KIND(AbstractKeyword);
+        RS_KIND(VirtualKeyword);
+        RS_KIND(OverrideKeyword);
+        RS_KIND(SealedKeyword);
+        RS_KIND(BaseKeyword);
         RS_KIND(GetKeyword);
         RS_KIND(SetKeyword);
         RS_KIND(ThisKeyword);
@@ -136,6 +145,7 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(CallExpression);
         RS_KIND(MemberCallExpression);
         RS_KIND(ThisExpression);
+        RS_KIND(BaseExpression);
         RS_KIND(MemberAccessExpression);
         RS_KIND(ElementAccessExpression);
         RS_KIND(NewObjectExpression);
@@ -173,6 +183,15 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"delegate", SyntaxKind::DelegateKeyword},
         {"event", SyntaxKind::EventKeyword},
         {"static", SyntaxKind::StaticKeyword},
+        {"public", SyntaxKind::PublicKeyword},
+        {"private", SyntaxKind::PrivateKeyword},
+        {"protected", SyntaxKind::ProtectedKeyword},
+        {"internal", SyntaxKind::InternalKeyword},
+        {"abstract", SyntaxKind::AbstractKeyword},
+        {"virtual", SyntaxKind::VirtualKeyword},
+        {"override", SyntaxKind::OverrideKeyword},
+        {"sealed", SyntaxKind::SealedKeyword},
+        {"base", SyntaxKind::BaseKeyword},
         {"get", SyntaxKind::GetKeyword},
         {"set", SyntaxKind::SetKeyword},
         {"this", SyntaxKind::ThisKeyword},
@@ -233,6 +252,23 @@ int binaryPrecedence(SyntaxKind kind) noexcept {
         return 1;
     default:
         return 0;
+    }
+}
+
+bool isDeclarationModifier(SyntaxKind kind) noexcept {
+    switch (kind) {
+    case SyntaxKind::StaticKeyword:
+    case SyntaxKind::PublicKeyword:
+    case SyntaxKind::PrivateKeyword:
+    case SyntaxKind::ProtectedKeyword:
+    case SyntaxKind::InternalKeyword:
+    case SyntaxKind::AbstractKeyword:
+    case SyntaxKind::VirtualKeyword:
+    case SyntaxKind::OverrideKeyword:
+    case SyntaxKind::SealedKeyword:
+        return true;
+    default:
+        return false;
     }
 }
 

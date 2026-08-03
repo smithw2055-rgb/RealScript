@@ -261,7 +261,7 @@ text::TextSpan EnumDeclarationSyntax::span() const noexcept {
 text::TextSpan FunctionDeclarationSyntax::span() const noexcept {
     return combine(
         declarationStart(attributes, returnType.span()),
-        body.span());
+        semicolonToken ? semicolonToken->span : body.span());
 }
 
 std::string ModuleDeclarationSyntax::fullName() const {

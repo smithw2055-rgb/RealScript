@@ -283,6 +283,10 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase18_native_control_flow_tests
         realscript.phase18.native-control-flow
         tests/phase18_native_control_flow_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_phase19_runtime_polymorphism_tests
+        realscript.phase19.runtime-polymorphism
+        tests/phase19_runtime_polymorphism_tests.cpp)
 
     add_test(
         NAME realscript.phase6.cli-smoke

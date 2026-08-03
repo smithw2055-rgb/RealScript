@@ -75,6 +75,15 @@ enum class SyntaxKind {
     DelegateKeyword,
     EventKeyword,
     StaticKeyword,
+    PublicKeyword,
+    PrivateKeyword,
+    ProtectedKeyword,
+    InternalKeyword,
+    AbstractKeyword,
+    VirtualKeyword,
+    OverrideKeyword,
+    SealedKeyword,
+    BaseKeyword,
     GetKeyword,
     SetKeyword,
     ThisKeyword,
@@ -146,6 +155,7 @@ enum class SyntaxKind {
     CallExpression,
     MemberCallExpression,
     ThisExpression,
+    BaseExpression,
     MemberAccessExpression,
     ElementAccessExpression,
     NewObjectExpression,
@@ -167,6 +177,7 @@ struct SyntaxToken {
 [[nodiscard]] int unaryPrecedence(SyntaxKind kind) noexcept;
 [[nodiscard]] int binaryPrecedence(SyntaxKind kind) noexcept;
 [[nodiscard]] bool isPrimitiveTypeKeyword(SyntaxKind kind) noexcept;
+[[nodiscard]] bool isDeclarationModifier(SyntaxKind kind) noexcept;
 
 class Lexer {
 public:
@@ -338,6 +349,13 @@ struct ThisExpressionSyntax final : ExpressionSyntax {
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ThisExpression; }
     [[nodiscard]] text::TextSpan span() const noexcept override { return thisKeyword.span; }
+};
+
+struct BaseExpressionSyntax final : ExpressionSyntax {
+    SyntaxToken baseKeyword;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::BaseExpression; }
+    [[nodiscard]] text::TextSpan span() const noexcept override { return baseKeyword.span; }
 };
 
 struct MemberCallExpressionSyntax final : ExpressionSyntax {
@@ -607,6 +625,7 @@ struct ParameterSyntax final : SyntaxNode {
 
 struct FieldDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
+    std::vector<SyntaxToken> modifiers;
     TypeSyntax type;
     SyntaxToken identifierToken;
     SyntaxToken semicolonToken;
@@ -620,6 +639,7 @@ struct SequenceDeclarationSyntax;
 
 struct EventDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
+    std::vector<SyntaxToken> modifiers;
     SyntaxToken eventKeyword;
     TypeSyntax delegateType;
     SyntaxToken identifierToken;
@@ -633,11 +653,18 @@ struct EventDeclarationSyntax final : SyntaxNode {
 
 struct ConstructorDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
+    std::vector<SyntaxToken> modifiers;
     SyntaxToken identifierToken;
     SyntaxToken openParenToken;
     std::vector<ParameterSyntax> parameters;
     std::vector<SyntaxToken> commaTokens;
     SyntaxToken closeParenToken;
+    std::optional<SyntaxToken> initializerColonToken;
+    std::optional<SyntaxToken> baseKeyword;
+    std::optional<SyntaxToken> initializerOpenParenToken;
+    std::vector<std::unique_ptr<ExpressionSyntax>> baseArguments;
+    std::vector<SyntaxToken> baseArgumentCommaTokens;
+    std::optional<SyntaxToken> initializerCloseParenToken;
     BlockStatementSyntax body;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ConstructorDeclaration; }
@@ -655,6 +682,7 @@ struct AccessorDeclarationSyntax final : SyntaxNode {
 
 struct PropertyDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
+    std::vector<SyntaxToken> modifiers;
     std::optional<SyntaxToken> staticKeyword;
     TypeSyntax type;
     SyntaxToken identifierToken;
@@ -669,6 +697,7 @@ struct PropertyDeclarationSyntax final : SyntaxNode {
 
 struct ClassDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
+    std::vector<SyntaxToken> modifiers;
     SyntaxToken classKeyword;
     SyntaxToken identifierToken;
     std::optional<SyntaxToken> typeParameterLessToken;
@@ -693,6 +722,7 @@ struct ClassDeclarationSyntax final : SyntaxNode {
 
 struct StructDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
+    std::vector<SyntaxToken> modifiers;
     SyntaxToken structKeyword;
     SyntaxToken identifierToken;
     std::optional<SyntaxToken> typeParameterLessToken;
@@ -717,6 +747,7 @@ struct StructDeclarationSyntax final : SyntaxNode {
 
 struct InterfaceMethodDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
+    std::vector<SyntaxToken> modifiers;
     TypeSyntax returnType;
     SyntaxToken identifierToken;
     SyntaxToken openParenToken;
@@ -733,6 +764,7 @@ struct InterfaceMethodDeclarationSyntax final : SyntaxNode {
 
 struct InterfaceDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
+    std::vector<SyntaxToken> modifiers;
     SyntaxToken interfaceKeyword;
     SyntaxToken identifierToken;
     SyntaxToken openBraceToken;
@@ -758,6 +790,7 @@ struct EnumMemberDeclarationSyntax final : SyntaxNode {
 
 struct EnumDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
+    std::vector<SyntaxToken> modifiers;
     SyntaxToken enumKeyword;
     SyntaxToken identifierToken;
     SyntaxToken openBraceToken;
@@ -770,6 +803,7 @@ struct EnumDeclarationSyntax final : SyntaxNode {
 
 struct FunctionDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
+    std::vector<SyntaxToken> modifiers;
     std::optional<SyntaxToken> staticKeyword;
     TypeSyntax returnType;
     SyntaxToken identifierToken;
@@ -781,14 +815,17 @@ struct FunctionDeclarationSyntax final : SyntaxNode {
     std::vector<ParameterSyntax> parameters;
     std::vector<SyntaxToken> commaTokens;
     SyntaxToken closeParenToken;
+    std::optional<SyntaxToken> semicolonToken;
     BlockStatementSyntax body;
 
+    [[nodiscard]] bool hasBody() const noexcept { return !semicolonToken.has_value(); }
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::FunctionDeclaration; }
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
 struct DelegateDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
+    std::vector<SyntaxToken> modifiers;
     SyntaxToken delegateKeyword;
     TypeSyntax returnType;
     SyntaxToken identifierToken;
@@ -806,6 +843,7 @@ struct DelegateDeclarationSyntax final : SyntaxNode {
 
 struct SequenceDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
+    std::vector<SyntaxToken> modifiers;
     SyntaxToken sequenceKeyword;
     SyntaxToken identifierToken;
     SyntaxToken openParenToken;
@@ -876,23 +914,31 @@ private:
         std::vector<SyntaxToken>& nameParts,
         std::vector<SyntaxToken>& dotTokens);
     [[nodiscard]] std::vector<AttributeListSyntax> parseAttributeLists();
+    [[nodiscard]] std::vector<SyntaxToken> parseModifiers();
     [[nodiscard]] AttributeListSyntax parseAttributeList();
     [[nodiscard]] AttributeSyntax parseAttribute();
     [[nodiscard]] AttributeArgumentSyntax parseAttributeArgument();
     [[nodiscard]] ClassDeclarationSyntax parseClassDeclaration(
-        std::vector<AttributeListSyntax> attributes);
+        std::vector<AttributeListSyntax> attributes,
+        std::vector<SyntaxToken> modifiers);
     [[nodiscard]] StructDeclarationSyntax parseStructDeclaration(
-        std::vector<AttributeListSyntax> attributes);
+        std::vector<AttributeListSyntax> attributes,
+        std::vector<SyntaxToken> modifiers);
     [[nodiscard]] EnumDeclarationSyntax parseEnumDeclaration(
-        std::vector<AttributeListSyntax> attributes);
+        std::vector<AttributeListSyntax> attributes,
+        std::vector<SyntaxToken> modifiers);
     [[nodiscard]] InterfaceDeclarationSyntax parseInterfaceDeclaration(
-        std::vector<AttributeListSyntax> attributes);
+        std::vector<AttributeListSyntax> attributes,
+        std::vector<SyntaxToken> modifiers);
     [[nodiscard]] InterfaceMethodDeclarationSyntax parseInterfaceMethodDeclaration(
-        std::vector<AttributeListSyntax> attributes);
+        std::vector<AttributeListSyntax> attributes,
+        std::vector<SyntaxToken> modifiers = {});
     [[nodiscard]] DelegateDeclarationSyntax parseDelegateDeclaration(
-        std::vector<AttributeListSyntax> attributes);
+        std::vector<AttributeListSyntax> attributes,
+        std::vector<SyntaxToken> modifiers);
     [[nodiscard]] EventDeclarationSyntax parseEventDeclaration(
-        std::vector<AttributeListSyntax> attributes);
+        std::vector<AttributeListSyntax> attributes,
+        std::vector<SyntaxToken> modifiers);
     void parseInterfaceList(
         std::optional<SyntaxToken>& colonToken,
         std::vector<TypeSyntax>& interfaces,
@@ -900,18 +946,21 @@ private:
     [[nodiscard]] FieldDeclarationSyntax parseFieldDeclaration(
         TypeSyntax type,
         SyntaxToken identifier,
-        std::vector<AttributeListSyntax> attributes);
+        std::vector<AttributeListSyntax> attributes,
+        std::vector<SyntaxToken> modifiers);
     [[nodiscard]] FunctionDeclarationSyntax parseFunctionDeclaration(
-        std::optional<SyntaxToken> staticKeyword = std::nullopt,
+        std::vector<SyntaxToken> modifiers = {},
         std::optional<TypeSyntax> returnType = std::nullopt,
         std::optional<SyntaxToken> identifier = std::nullopt,
         std::vector<AttributeListSyntax> attributes = {});
     [[nodiscard]] SequenceDeclarationSyntax parseSequenceDeclaration(
-        std::vector<AttributeListSyntax> attributes);
+        std::vector<AttributeListSyntax> attributes,
+        std::vector<SyntaxToken> modifiers);
     [[nodiscard]] ConstructorDeclarationSyntax parseConstructorDeclaration(
-        std::vector<AttributeListSyntax> attributes);
+        std::vector<AttributeListSyntax> attributes,
+        std::vector<SyntaxToken> modifiers);
     [[nodiscard]] PropertyDeclarationSyntax parsePropertyDeclaration(
-        std::optional<SyntaxToken> staticKeyword,
+        std::vector<SyntaxToken> modifiers,
         TypeSyntax type,
         SyntaxToken identifier,
         std::vector<AttributeListSyntax> attributes);
