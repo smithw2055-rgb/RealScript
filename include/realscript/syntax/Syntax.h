@@ -237,9 +237,16 @@ struct AttributeListSyntax final : SyntaxNode {
 
 struct TypeSyntax final : SyntaxNode {
     SyntaxToken name;
+    std::optional<SyntaxToken> lessToken;
+    std::vector<TypeSyntax> typeArguments;
+    std::vector<SyntaxToken> typeArgumentCommaTokens;
+    std::optional<SyntaxToken> greaterToken;
     std::optional<SyntaxToken> openBracketToken;
     std::optional<SyntaxToken> closeBracketToken;
 
+    [[nodiscard]] bool isGeneric() const noexcept {
+        return lessToken.has_value() && greaterToken.has_value();
+    }
     [[nodiscard]] bool isArray() const noexcept {
         return openBracketToken.has_value() && closeBracketToken.has_value();
     }
@@ -312,6 +319,10 @@ struct ParenthesizedExpressionSyntax final : ExpressionSyntax {
 
 struct CallExpressionSyntax final : ExpressionSyntax {
     SyntaxToken identifierToken;
+    std::optional<SyntaxToken> lessToken;
+    std::vector<TypeSyntax> typeArguments;
+    std::vector<SyntaxToken> typeArgumentCommaTokens;
+    std::optional<SyntaxToken> greaterToken;
     SyntaxToken openParenToken;
     std::vector<std::optional<SyntaxToken>> argumentModifiers;
     std::vector<std::unique_ptr<ExpressionSyntax>> arguments;
@@ -333,6 +344,10 @@ struct MemberCallExpressionSyntax final : ExpressionSyntax {
     std::unique_ptr<ExpressionSyntax> receiver;
     SyntaxToken dotToken;
     SyntaxToken nameToken;
+    std::optional<SyntaxToken> lessToken;
+    std::vector<TypeSyntax> typeArguments;
+    std::vector<SyntaxToken> typeArgumentCommaTokens;
+    std::optional<SyntaxToken> greaterToken;
     SyntaxToken openParenToken;
     std::vector<std::optional<SyntaxToken>> argumentModifiers;
     std::vector<std::unique_ptr<ExpressionSyntax>> arguments;
@@ -656,6 +671,10 @@ struct ClassDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
     SyntaxToken classKeyword;
     SyntaxToken identifierToken;
+    std::optional<SyntaxToken> typeParameterLessToken;
+    std::vector<SyntaxToken> typeParameters;
+    std::vector<SyntaxToken> typeParameterCommaTokens;
+    std::optional<SyntaxToken> typeParameterGreaterToken;
     std::optional<SyntaxToken> colonToken;
     std::vector<TypeSyntax> interfaces;
     std::vector<SyntaxToken> interfaceCommaTokens;
@@ -676,6 +695,10 @@ struct StructDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
     SyntaxToken structKeyword;
     SyntaxToken identifierToken;
+    std::optional<SyntaxToken> typeParameterLessToken;
+    std::vector<SyntaxToken> typeParameters;
+    std::vector<SyntaxToken> typeParameterCommaTokens;
+    std::optional<SyntaxToken> typeParameterGreaterToken;
     std::optional<SyntaxToken> colonToken;
     std::vector<TypeSyntax> interfaces;
     std::vector<SyntaxToken> interfaceCommaTokens;
@@ -750,6 +773,10 @@ struct FunctionDeclarationSyntax final : SyntaxNode {
     std::optional<SyntaxToken> staticKeyword;
     TypeSyntax returnType;
     SyntaxToken identifierToken;
+    std::optional<SyntaxToken> typeParameterLessToken;
+    std::vector<SyntaxToken> typeParameters;
+    std::vector<SyntaxToken> typeParameterCommaTokens;
+    std::optional<SyntaxToken> typeParameterGreaterToken;
     SyntaxToken openParenToken;
     std::vector<ParameterSyntax> parameters;
     std::vector<SyntaxToken> commaTokens;
@@ -890,6 +917,17 @@ private:
         std::vector<AttributeListSyntax> attributes);
     [[nodiscard]] AccessorDeclarationSyntax parseAccessorDeclaration();
     [[nodiscard]] TypeSyntax parseType();
+    void parseTypeArgumentList(
+        std::optional<SyntaxToken>& lessToken,
+        std::vector<TypeSyntax>& arguments,
+        std::vector<SyntaxToken>& commaTokens,
+        std::optional<SyntaxToken>& greaterToken);
+    void parseTypeParameterList(
+        std::optional<SyntaxToken>& lessToken,
+        std::vector<SyntaxToken>& parameters,
+        std::vector<SyntaxToken>& commaTokens,
+        std::optional<SyntaxToken>& greaterToken);
+    [[nodiscard]] bool isGenericCallStart() const noexcept;
     [[nodiscard]] ParameterSyntax parseParameter();
     [[nodiscard]] BlockStatementSyntax parseBlockStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseStatement();

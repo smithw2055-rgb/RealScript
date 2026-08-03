@@ -56,9 +56,13 @@ text::TextSpan AttributeListSyntax::span() const noexcept {
 }
 
 text::TextSpan TypeSyntax::span() const noexcept {
-    return closeBracketToken
-        ? combine(name.span, closeBracketToken->span)
-        : name.span;
+    if (closeBracketToken) {
+        return combine(name.span, closeBracketToken->span);
+    }
+    if (greaterToken) {
+        return combine(name.span, greaterToken->span);
+    }
+    return name.span;
 }
 
 text::TextSpan LambdaExpressionSyntax::span() const noexcept {

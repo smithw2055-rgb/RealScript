@@ -515,6 +515,51 @@ void testEventsBypassExpansion() {
         "native delegates/events still used source expansion");
 }
 
+void testNativeGenericSyntax() {
+    realscript::text::SourceText source(R"(
+module Phase18.Generics;
+class Pair<TLeft, TRight>
+{
+    TLeft left;
+    TRight right;
+}
+T Identity<T>(T value) { return value; }
+int main()
+{
+    Pair<int, List<string>> value =
+        new Pair<int, List<string>>();
+    return Identity<int>(1);
+}
+)", "generic-syntax.rs");
+    realscript::diagnostics::DiagnosticBag diagnostics;
+    realscript::syntax::Parser parser(source, diagnostics);
+    auto unit = parser.parseCompilationUnit();
+    require(!diagnostics.hasErrors(),
+        "native generic syntax failed to parse:
+" +
+            diagnosticsText(diagnostics));
+    require(unit.classes.size() == 1 &&
+            unit.classes.front().typeParameters.size() == 2 &&
+            unit.functions.size() == 2 &&
+            unit.functions.front().typeParameters.size() == 1,
+        "native generic declarations were not retained");
+    const auto& mainBody = unit.functions.back().body.statements;
+    const auto& declaration = static_cast<const
+        realscript::syntax::VariableDeclarationStatementSyntax&>(
+            *mainBody.front());
+    require(declaration.type.typeArguments.size() == 2 &&
+            declaration.type.typeArguments[1].typeArguments.size() == 1,
+        "nested native generic type arguments were not retained");
+    const auto& returned = static_cast<const
+        realscript::syntax::ReturnStatementSyntax&>(
+            *mainBody.back());
+    const auto& call = static_cast<const
+        realscript::syntax::CallExpressionSyntax&>(
+            *returned.expression);
+    require(call.typeArguments.size() == 1,
+        "native generic call arguments were not retained");
+}
+
 void testNativeSequenceDiagnostics() {
     realscript::compiler::Compilation compilation({{"bad-sequence.rs", R"(
 module Phase18.SequenceBad;
@@ -591,6 +636,7 @@ int main() {
     run("native event execution", testNativeEventsExecution);
     run("native event diagnostics", testNativeEventDiagnostics);
     run("events bypass expansion", testEventsBypassExpansion);
+    run("native generic syntax", testNativeGenericSyntax);
     run("native sequence diagnostics", testNativeSequenceDiagnostics);
     run("yield outside sequence diagnostics", testYieldOutsideSequenceDiagnostics);
     return failures == 0 ? 0 : 1;
