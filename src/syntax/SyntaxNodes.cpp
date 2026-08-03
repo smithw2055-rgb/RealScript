@@ -62,10 +62,12 @@ text::TextSpan TypeSyntax::span() const noexcept {
 }
 
 text::TextSpan LambdaExpressionSyntax::span() const noexcept {
-    return combine(
-        openParenToken ? openParenToken->span
-                       : parameterTokens.front().span,
-        body->span());
+    const auto start = openParenToken
+        ? openParenToken->span
+        : parameterTokens.empty()
+            ? arrowToken.span
+            : parameterTokens.front().span;
+    return combine(start, body->span());
 }
 
 text::TextSpan UnaryExpressionSyntax::span() const noexcept {

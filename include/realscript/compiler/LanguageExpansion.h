@@ -54,7 +54,7 @@ struct LanguageSequenceRecord {
 
 struct LanguageExpansionOptions {
     bool structuredControlFlow = false;
-    bool delegatesLambdasEvents = true;
+    bool delegatesLambdasEvents = false;
     bool interfaces = false;
     bool sourceAttributes = false;
     bool generics = true;

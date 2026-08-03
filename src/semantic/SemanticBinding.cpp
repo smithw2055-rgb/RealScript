@@ -307,6 +307,14 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                 }
             }
         }
+    } else if (input.eventLambda) {
+        result.body = std::make_unique<BoundBlockStatement>();
+        result.body->span = input.eventLambda->span();
+        auto statement = std::make_unique<BoundExpressionStatement>();
+        statement->span = input.eventLambda->body->span();
+        statement->expression = bindExpression(
+            *input.eventLambda->body);
+        result.body->statements.push_back(std::move(statement));
     } else if (input.sequence) {
         result.body = bindSequenceSegment(input);
     } else if (input.body) {
@@ -584,6 +592,9 @@ std::unique_ptr<BoundStatement> Binder::bindStatement(
         result->expression = makeError(syntaxTree.span());
         return result;
     }
+    case syntax::SyntaxKind::EventSubscriptionStatement:
+        return bindEventSubscriptionStatement(
+            static_cast<const syntax::EventSubscriptionStatementSyntax&>(syntaxTree));
     case syntax::SyntaxKind::VariableDeclarationStatement:
         return bindVariableDeclaration(
             static_cast<const syntax::VariableDeclarationStatementSyntax&>(syntaxTree));
@@ -903,6 +914,41 @@ std::unique_ptr<BoundStatement> Binder::bindSwitchStatement(
     }
     --breakableDepth_;
     popScope();
+    return result;
+}
+
+std::unique_ptr<BoundStatement>
+Binder::bindEventSubscriptionStatement(
+    const syntax::EventSubscriptionStatementSyntax& syntaxTree) {
+    auto result = std::make_unique<BoundEventSubscriptionStatement>();
+    result->span = syntaxTree.span();
+    if (!currentOwnerType_ || currentStaticMethod_) {
+        diagnostics_.report(
+            "RS8308",
+            "event subscriptions require an instance method",
+            syntaxTree.span());
+        return result;
+    }
+    const auto* thisVariable = lookupVariable("this");
+    if (!thisVariable) return result;
+    for (const auto& event : currentOwnerType_->events) {
+        if (event.name != syntaxTree.eventNameToken.text) continue;
+        for (const auto& subscription : event.subscriptions) {
+            if (subscription.span.start == syntaxTree.span().start &&
+                subscription.span.length == syntaxTree.span().length) {
+                result->ownerType = *currentOwnerType_;
+                result->receiver = makeVariableAccess(
+                    *thisVariable, syntaxTree.span());
+                result->enabledField = subscription.enabledField;
+                result->enabled = subscription.enabled;
+                return result;
+            }
+        }
+    }
+    diagnostics_.report(
+        "RS8309",
+        "event subscription was not resolved",
+        syntaxTree.span());
     return result;
 }
 

@@ -439,6 +439,82 @@ class Counter
         "native event lambda was not retained");
 }
 
+void testNativeEventsExecution() {
+    const auto result = execute(R"(
+module Phase18;
+delegate void ChangedHandler(int amount);
+class Counter
+{
+    event ChangedHandler Changed;
+    int total;
+
+    Counter()
+    {
+        Changed += OnChanged;
+        Changed += amount => total = total + amount;
+    }
+
+    void OnChanged(int amount)
+    {
+        total = total + amount;
+    }
+
+    int Run()
+    {
+        Changed(3);
+        Changed -= OnChanged;
+        Changed(2);
+        return total;
+    }
+}
+
+int main()
+{
+    Counter counter = new Counter();
+    return counter.Run();
+}
+)");
+    require(
+        result.succeeded &&
+            std::get<std::int64_t>(result.value) == 8,
+        "native event execution produced the wrong result");
+}
+
+void testNativeEventDiagnostics() {
+    realscript::compiler::Compilation compilation({{
+        "bad-events.rs",
+        R"(
+module Phase18.BadEvents;
+delegate void ChangedHandler(int amount);
+class Counter
+{
+    event ChangedHandler Changed;
+    void Wrong(string value) {}
+    void Run() { Changed += Wrong; }
+}
+)"}});
+    const auto build = compilation.build();
+    require(build.diagnostics.hasErrors(),
+        "invalid native event handler was accepted");
+    bool found = false;
+    for (const auto& diagnostic : build.diagnostics.items()) {
+        found = found || diagnostic.code == "RS8305";
+    }
+    require(found,
+        "invalid native event handler did not produce RS8305");
+}
+
+void testEventsBypassExpansion() {
+    const auto expansion =
+        realscript::compiler::expandLanguageSource(
+            "events.rs",
+            "module Native; delegate void D(int v); "
+            "class C{event D E;int x;void H(int v){x=x+v;}"
+            "void R(){E+=H;E(1);}}");
+    require(!expansion.changed,
+        "native delegates/events still used source expansion");
+}
+
 void testNativeSequenceDiagnostics() {
     realscript::compiler::Compilation compilation({{"bad-sequence.rs", R"(
 module Phase18.SequenceBad;
@@ -512,6 +588,9 @@ int main() {
     run("native value aliases", testNativeValueAliases);
     run("aliases bypass expansion", testAliasesBypassExpansion);
     run("native event syntax", testNativeEventSyntax);
+    run("native event execution", testNativeEventsExecution);
+    run("native event diagnostics", testNativeEventDiagnostics);
+    run("events bypass expansion", testEventsBypassExpansion);
     run("native sequence diagnostics", testNativeSequenceDiagnostics);
     run("yield outside sequence diagnostics", testYieldOutsideSequenceDiagnostics);
     return failures == 0 ? 0 : 1;

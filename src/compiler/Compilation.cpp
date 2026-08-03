@@ -54,6 +54,22 @@ struct InterfaceDeclarationInput {
 
 using InterfaceMap = std::map<std::string, InterfaceContract>;
 
+struct DelegateContract {
+    std::string moduleName;
+    std::string name;
+    std::string sourceName;
+    InterfaceTypeRef returnType;
+    std::vector<InterfaceTypeRef> parameters;
+    text::TextSpan declarationSpan;
+};
+
+struct DelegateDeclarationInput {
+    const syntax::DelegateDeclarationSyntax* syntax = nullptr;
+    std::string sourceName;
+};
+
+using DelegateMap = std::map<std::string, DelegateContract>;
+
 struct ParsedUnit {
     std::unique_ptr<text::SourceText> source;
     std::unique_ptr<syntax::CompilationUnitSyntax> syntaxTree;
@@ -72,6 +88,9 @@ struct ModuleWork {
     std::vector<InterfaceDeclarationInput> interfaceInputs;
     InterfaceMap interfaces;
     InterfaceMap visibleInterfaces;
+    std::vector<DelegateDeclarationInput> delegateInputs;
+    DelegateMap delegates;
+    DelegateMap visibleDelegates;
     std::vector<semantic::FunctionSymbol> declarations;
     std::vector<semantic::FunctionBindingInput> functionBindings;
     std::uint64_t sourceFingerprint = 0;
@@ -163,6 +182,32 @@ std::string canonicalInterfaceName(
     const std::string& moduleName,
     const std::string& name) {
     return moduleName.empty() ? name : moduleName + "::" + name;
+}
+
+std::string canonicalDelegateName(
+    const std::string& moduleName,
+    const std::string& name) {
+    return moduleName.empty() ? name : moduleName + "::" + name;
+}
+
+void refreshVisibleDelegates(
+    std::map<std::string, ModuleWork>& modules,
+    ModuleWork& module) {
+    module.visibleDelegates.clear();
+    for (const auto& [name, contract] : module.delegates) {
+        module.visibleDelegates[name] = contract;
+        module.visibleDelegates[
+            canonicalDelegateName(contract.moduleName, contract.name)] = contract;
+    }
+    for (const auto& importedName : module.imports) {
+        const auto imported = modules.find(importedName);
+        if (imported == modules.end()) continue;
+        for (const auto& [name, contract] : imported->second.delegates) {
+            module.visibleDelegates[name] = contract;
+            module.visibleDelegates[
+                canonicalDelegateName(contract.moduleName, contract.name)] = contract;
+        }
+    }
 }
 
 void refreshVisibleInterfaces(
@@ -342,6 +387,157 @@ std::vector<const syntax::YieldWaitStatementSyntax*> sequenceYields(
     return result;
 }
 
+void collectEventSubscriptions(
+    const syntax::StatementSyntax& statement,
+    std::vector<const syntax::EventSubscriptionStatementSyntax*>& output) {
+    switch (statement.kind()) {
+    case syntax::SyntaxKind::EventSubscriptionStatement:
+        output.push_back(static_cast<const
+            syntax::EventSubscriptionStatementSyntax*>(&statement));
+        return;
+    case syntax::SyntaxKind::BlockStatement:
+        for (const auto& child : static_cast<const
+             syntax::BlockStatementSyntax&>(statement).statements) {
+            collectEventSubscriptions(*child, output);
+        }
+        return;
+    case syntax::SyntaxKind::IfStatement: {
+        const auto& value = static_cast<const
+            syntax::IfStatementSyntax&>(statement);
+        collectEventSubscriptions(*value.thenStatement, output);
+        if (value.elseStatement) {
+            collectEventSubscriptions(*value.elseStatement, output);
+        }
+        return;
+    }
+    case syntax::SyntaxKind::WhileStatement:
+        collectEventSubscriptions(*static_cast<const
+            syntax::WhileStatementSyntax&>(statement).body, output);
+        return;
+    case syntax::SyntaxKind::ForStatement:
+        collectEventSubscriptions(*static_cast<const
+            syntax::ForStatementSyntax&>(statement).body, output);
+        return;
+    case syntax::SyntaxKind::ForeachStatement:
+        collectEventSubscriptions(*static_cast<const
+            syntax::ForeachStatementSyntax&>(statement).body, output);
+        return;
+    case syntax::SyntaxKind::DoWhileStatement:
+        collectEventSubscriptions(*static_cast<const
+            syntax::DoWhileStatementSyntax&>(statement).body, output);
+        return;
+    case syntax::SyntaxKind::SwitchStatement:
+        for (const auto& section : static_cast<const
+             syntax::SwitchStatementSyntax&>(statement).sections) {
+            for (const auto& child : section.statements) {
+                collectEventSubscriptions(*child, output);
+            }
+        }
+        return;
+    default:
+        return;
+    }
+}
+
+bool eventMethodMatches(
+    const semantic::FunctionSymbol& function,
+    const DelegateContract& contract) {
+    if (function.staticMethod ||
+        function.returnType != contract.returnType.type ||
+        (semantic::isExactType(function.returnType) &&
+         function.returnTypeName != contract.returnType.typeName)) {
+        return false;
+    }
+    const auto offset = function.method && !function.staticMethod
+        ? std::size_t{1}
+        : std::size_t{0};
+    if (function.parameters.size() != contract.parameters.size() + offset) {
+        return false;
+    }
+    for (std::size_t index = 0; index < contract.parameters.size(); ++index) {
+        const auto& parameter = function.parameters[index + offset];
+        if (parameter.modifier != semantic::ParameterModifier::None ||
+            parameter.type != contract.parameters[index].type ||
+            (semantic::isExactType(parameter.type) &&
+             parameter.typeName != contract.parameters[index].typeName)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+semantic::VariableSymbol makeEventThisParameter(
+    const semantic::TypeSymbol& owner,
+    text::TextSpan span) {
+    semantic::VariableSymbol parameter;
+    parameter.name = "this";
+    parameter.type = semantic::PrimitiveType::Object;
+    parameter.typeName = semantic::canonicalTypeName(owner);
+    parameter.storageType = parameter.type;
+    parameter.storageTypeName = parameter.typeName;
+    parameter.index = 0;
+    parameter.parameter = true;
+    parameter.declarationSpan = span;
+    return parameter;
+}
+
+semantic::FunctionSymbol makeEventLambdaFunction(
+    const std::string& moduleName,
+    const semantic::TypeSymbol& owner,
+    const DelegateContract& contract,
+    const syntax::LambdaExpressionSyntax& lambda,
+    const std::string& eventName,
+    std::size_t ordinal,
+    const std::string& sourceName,
+    diagnostics::DiagnosticBag& diagnostics) {
+    semantic::FunctionSymbol result;
+    result.moduleName = moduleName;
+    result.name = "$event_" + eventName + "_lambda_" +
+        std::to_string(ordinal);
+    result.ownerTypeName = owner.name;
+    result.ownerTypeId = owner.id;
+    result.returnType = contract.returnType.type;
+    result.returnTypeName = contract.returnType.typeName;
+    result.method = true;
+    result.synthetic = true;
+    result.sourceName = sourceName;
+    result.declarationSpan = lambda.arrowToken.span;
+    result.bodySpan = lambda.span();
+    result.parameters.push_back(makeEventThisParameter(
+        owner, lambda.span()));
+    if (lambda.parameterTokens.size() != contract.parameters.size()) {
+        diagnostics.report(
+            "RS8312",
+            "event lambda parameter count does not match delegate",
+            lambda.span(),
+            diagnostics::DiagnosticSeverity::Error,
+            sourceName);
+    }
+    for (std::size_t index = 0; index < contract.parameters.size(); ++index) {
+        semantic::VariableSymbol parameter;
+        parameter.name = index < lambda.parameterTokens.size()
+            ? lambda.parameterTokens[index].text
+            : "$arg" + std::to_string(index);
+        parameter.type = contract.parameters[index].type;
+        parameter.typeName = contract.parameters[index].typeName;
+        parameter.storageType = parameter.type;
+        parameter.storageTypeName = parameter.typeName;
+        parameter.index = result.parameters.size();
+        parameter.parameter = true;
+        parameter.declarationSpan = index < lambda.parameterTokens.size()
+            ? lambda.parameterTokens[index].span
+            : lambda.arrowToken.span;
+        result.parameters.push_back(std::move(parameter));
+    }
+    result.id = semantic::stableFunctionId(result);
+    for (auto& parameter : result.parameters) {
+        parameter.id = semantic::stableTypeId(
+            std::to_string(result.id) + "::local:" +
+            std::to_string(parameter.index) + ":" + parameter.name);
+    }
+    return result;
+}
+
 std::string fieldTypeSignature(const semantic::FieldSymbol& field) {
     if (semantic::isExactType(field.type) && !field.typeName.empty()) {
         return field.typeName;
@@ -362,6 +558,14 @@ std::string typeSignature(const semantic::TypeSymbol& type) {
     for (const auto& method : type.methods) {
         out << "method:" << (method.staticMethod ? "static:" : "instance:")
             << semantic::canonicalFunctionSignature(method) << ';';
+    }
+    for (const auto& event : type.events) {
+        out << "event:" << event.name << ':' << event.delegateName << '(';
+        for (const auto& parameter : event.parameters) {
+            out << semantic::primitiveTypeName(parameter.type) << '#'
+                << parameter.typeName << ';';
+        }
+        out << ");";
     }
     for (const auto& property : type.properties) {
         out << "property:" << property.name << ':';
@@ -519,6 +723,21 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 module.interfaceInputs.push_back(
                     InterfaceDeclarationInput{&node, unit->source->name()});
             }
+            for (const auto& node : unit->syntaxTree->delegates) {
+                if (!typeNames.insert(node.identifierToken.text).second) {
+                    result.diagnostics.report(
+                        "RS4004",
+                        "duplicate type or delegate '" +
+                            node.identifierToken.text + "'",
+                        node.identifierToken.span,
+                        diagnostics::DiagnosticSeverity::Error,
+                        unit->source->name());
+                    module.invalid = true;
+                    continue;
+                }
+                module.delegateInputs.push_back(
+                    DelegateDeclarationInput{&node, unit->source->name()});
+            }
         }
         module.sourceFingerprint = sourceFingerprint;
     }
@@ -574,6 +793,46 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     for (auto& [name, module] : modules) {
         (void)name;
         refreshVisibleInterfaces(modules, module);
+    }
+
+    // Resolve native delegate contracts after all named type shells exist.
+    for (auto& [moduleName, module] : modules) {
+        for (const auto& input : module.delegateInputs) {
+            if (!input.syntax) continue;
+            DelegateContract contract;
+            contract.moduleName = moduleName;
+            contract.name = input.syntax->identifierToken.text;
+            contract.sourceName = input.sourceName;
+            contract.declarationSpan = input.syntax->identifierToken.span;
+            contract.returnType = resolveInterfaceType(
+                input.syntax->returnType,
+                module.visibleTypes,
+                result.diagnostics,
+                input.sourceName,
+                true);
+            for (const auto& parameter : input.syntax->parameters) {
+                if (parameter.modifierToken) {
+                    result.diagnostics.report(
+                        "RS8311",
+                        "event delegates do not support ref, out, or in parameters",
+                        parameter.span(),
+                        diagnostics::DiagnosticSeverity::Error,
+                        input.sourceName);
+                    module.invalid = true;
+                }
+                contract.parameters.push_back(resolveInterfaceType(
+                    parameter.type,
+                    module.visibleTypes,
+                    result.diagnostics,
+                    input.sourceName,
+                    false));
+            }
+            module.delegates[contract.name] = std::move(contract);
+        }
+    }
+    for (auto& [name, module] : modules) {
+        (void)name;
+        refreshVisibleDelegates(modules, module);
     }
 
     // Resolve all field layouts and enum values before declaring member signatures.
@@ -926,6 +1185,315 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         }
                         owner.properties.push_back(std::move(property));
                     }
+                    if (!typeSyntax.events.empty()) {
+                        if (owner.kind == semantic::TypeKind::Struct) {
+                            result.diagnostics.report(
+                                "RS8315",
+                                "events require a class owner",
+                                typeSyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
+                            module.invalid = true;
+                        } else {
+                            std::unordered_map<std::string, std::size_t>
+                                eventIndices;
+                            for (const auto& eventSyntax : typeSyntax.events) {
+                                if (fieldNames.find(
+                                        eventSyntax.identifierToken.text) !=
+                                        fieldNames.end() ||
+                                    methodNames.find(
+                                        eventSyntax.identifierToken.text) !=
+                                        methodNames.end() ||
+                                    propertyNames.find(
+                                        eventSyntax.identifierToken.text) !=
+                                        propertyNames.end() ||
+                                    eventIndices.find(
+                                        eventSyntax.identifierToken.text) !=
+                                        eventIndices.end()) {
+                                    result.diagnostics.report(
+                                        "RS2464",
+                                        "event '" +
+                                            eventSyntax.identifierToken.text +
+                                            "' conflicts with another member",
+                                        eventSyntax.identifierToken.span,
+                                        diagnostics::DiagnosticSeverity::Error,
+                                        unit->source->name());
+                                    module.invalid = true;
+                                    continue;
+                                }
+                                const auto delegate =
+                                    module.visibleDelegates.find(
+                                        eventSyntax.delegateType.name.text);
+                                if (delegate ==
+                                    module.visibleDelegates.end()) {
+                                    result.diagnostics.report(
+                                        "RS8301",
+                                        "unknown event delegate '" +
+                                            eventSyntax.delegateType.name.text +
+                                            "'",
+                                        eventSyntax.delegateType.span(),
+                                        diagnostics::DiagnosticSeverity::Error,
+                                        unit->source->name());
+                                    module.invalid = true;
+                                    continue;
+                                }
+                                if (delegate->second.returnType.type !=
+                                    semantic::PrimitiveType::Void) {
+                                    result.diagnostics.report(
+                                        "RS8302",
+                                        "event delegate must return void",
+                                        eventSyntax.delegateType.span(),
+                                        diagnostics::DiagnosticSeverity::Error,
+                                        unit->source->name());
+                                    module.invalid = true;
+                                }
+                                semantic::EventSymbol event;
+                                event.name = eventSyntax.identifierToken.text;
+                                event.delegateName = canonicalDelegateName(
+                                    delegate->second.moduleName,
+                                    delegate->second.name);
+                                event.sourceName = unit->source->name();
+                                event.declarationSpan =
+                                    eventSyntax.identifierToken.span;
+                                event.id = semantic::stableTypeId(
+                                    semantic::canonicalTypeName(owner) +
+                                    "::event:" + event.name);
+                                for (std::size_t parameter = 0;
+                                     parameter <
+                                         delegate->second.parameters.size();
+                                     ++parameter) {
+                                    semantic::VariableSymbol value;
+                                    value.name = "$arg" +
+                                        std::to_string(parameter);
+                                    value.type = delegate->second
+                                        .parameters[parameter].type;
+                                    value.typeName = delegate->second
+                                        .parameters[parameter].typeName;
+                                    value.storageType = value.type;
+                                    value.storageTypeName = value.typeName;
+                                    value.index = parameter;
+                                    value.parameter = true;
+                                    event.parameters.push_back(
+                                        std::move(value));
+                                }
+                                eventIndices.emplace(
+                                    event.name,
+                                    owner.events.size());
+                                owner.events.push_back(std::move(event));
+                            }
+
+                            std::vector<const
+                                syntax::EventSubscriptionStatementSyntax*>
+                                subscriptions;
+                            for (const auto& method : typeSyntax.methods) {
+                                collectEventSubscriptions(
+                                    method.body, subscriptions);
+                            }
+                            for (const auto& constructor :
+                                 typeSyntax.constructors) {
+                                collectEventSubscriptions(
+                                    constructor.body, subscriptions);
+                            }
+                            for (const auto& property :
+                                 typeSyntax.properties) {
+                                if (property.getter &&
+                                    property.getter->body) {
+                                    collectEventSubscriptions(
+                                        *property.getter->body,
+                                        subscriptions);
+                                }
+                                if (property.setter &&
+                                    property.setter->body) {
+                                    collectEventSubscriptions(
+                                        *property.setter->body,
+                                        subscriptions);
+                                }
+                            }
+                            for (const auto& sequence :
+                                 typeSyntax.sequences) {
+                                collectEventSubscriptions(
+                                    sequence.body, subscriptions);
+                            }
+                            std::stable_sort(
+                                subscriptions.begin(),
+                                subscriptions.end(),
+                                [](const auto* left, const auto* right) {
+                                    return left->span().start <
+                                        right->span().start;
+                                });
+
+                            std::unordered_map<std::string,
+                                semantic::FieldSymbol> handlerSlots;
+                            std::size_t lambdaOrdinal = 0;
+                            for (const auto* subscription : subscriptions) {
+                                const auto foundEvent = eventIndices.find(
+                                    subscription->eventNameToken.text);
+                                if (foundEvent == eventIndices.end()) {
+                                    result.diagnostics.report(
+                                        "RS8303",
+                                        "unknown event '" +
+                                            subscription->eventNameToken.text +
+                                            "'",
+                                        subscription->eventNameToken.span,
+                                        diagnostics::DiagnosticSeverity::Error,
+                                        unit->source->name());
+                                    module.invalid = true;
+                                    continue;
+                                }
+                                auto& event = owner.events[
+                                    foundEvent->second];
+                                const auto delegate =
+                                    module.visibleDelegates.find(
+                                        event.delegateName);
+                                if (delegate ==
+                                    module.visibleDelegates.end()) {
+                                    module.invalid = true;
+                                    continue;
+                                }
+
+                                semantic::FunctionSymbol handler;
+                                std::string slotKey;
+                                if (subscription->handler->kind() ==
+                                    syntax::SyntaxKind::NameExpression) {
+                                    const auto& name = static_cast<const
+                                        syntax::NameExpressionSyntax&>(
+                                            *subscription->handler);
+                                    bool matched = false;
+                                    for (const auto& candidate :
+                                         owner.methods) {
+                                        if (candidate.name ==
+                                                name.identifierToken.text &&
+                                            eventMethodMatches(
+                                                candidate,
+                                                delegate->second)) {
+                                            if (matched) {
+                                                result.diagnostics.report(
+                                                    "RS8304",
+                                                    "event method group is ambiguous",
+                                                    name.span(),
+                                                    diagnostics::DiagnosticSeverity::Error,
+                                                    unit->source->name());
+                                                module.invalid = true;
+                                                break;
+                                            }
+                                            handler = candidate;
+                                            matched = true;
+                                        }
+                                    }
+                                    if (!matched) {
+                                        result.diagnostics.report(
+                                            "RS8305",
+                                            "event handler method does not match delegate",
+                                            name.span(),
+                                            diagnostics::DiagnosticSeverity::Error,
+                                            unit->source->name());
+                                        module.invalid = true;
+                                        continue;
+                                    }
+                                    slotKey = "method:" +
+                                        std::to_string(handler.id);
+                                } else if (subscription->handler->kind() ==
+                                    syntax::SyntaxKind::LambdaExpression) {
+                                    if (subscription->operatorToken.kind ==
+                                        syntax::SyntaxKind::MinusEqualsToken) {
+                                        result.diagnostics.report(
+                                            "RS8306",
+                                            "lambda event handlers cannot be removed in the bounded Phase 18 model",
+                                            subscription->span(),
+                                            diagnostics::DiagnosticSeverity::Error,
+                                            unit->source->name());
+                                        module.invalid = true;
+                                        continue;
+                                    }
+                                    const auto& lambda = static_cast<const
+                                        syntax::LambdaExpressionSyntax&>(
+                                            *subscription->handler);
+                                    handler = makeEventLambdaFunction(
+                                        moduleName,
+                                        owner,
+                                        delegate->second,
+                                        lambda,
+                                        event.name,
+                                        ++lambdaOrdinal,
+                                        unit->source->name(),
+                                        result.diagnostics);
+                                    semantic::FunctionBindingInput binding;
+                                    binding.symbol = handler;
+                                    binding.sourceName =
+                                        unit->source->name();
+                                    binding.eventLambda = &lambda;
+                                    binding.parameterNames.push_back("this");
+                                    binding.parameterSpans.push_back(
+                                        typeSyntax.identifierToken.span);
+                                    for (std::size_t parameter = 0;
+                                         parameter <
+                                             delegate->second.parameters.size();
+                                         ++parameter) {
+                                        binding.parameterNames.push_back(
+                                            parameter <
+                                                    lambda.parameterTokens.size()
+                                                ? lambda.parameterTokens[
+                                                    parameter].text
+                                                : "$arg" +
+                                                    std::to_string(parameter));
+                                        binding.parameterSpans.push_back(
+                                            parameter <
+                                                    lambda.parameterTokens.size()
+                                                ? lambda.parameterTokens[
+                                                    parameter].span
+                                                : lambda.arrowToken.span);
+                                    }
+                                    owner.methods.push_back(handler);
+                                    addBinding(
+                                        std::move(binding),
+                                        lambda.arrowToken.span);
+                                    slotKey = "lambda:" +
+                                        std::to_string(lambda.span().start);
+                                } else {
+                                    result.diagnostics.report(
+                                        "RS8307",
+                                        "event handler must be a method group or lambda",
+                                        subscription->handler->span(),
+                                        diagnostics::DiagnosticSeverity::Error,
+                                        unit->source->name());
+                                    module.invalid = true;
+                                    continue;
+                                }
+
+                                auto slot = handlerSlots.find(
+                                    event.name + ":" + slotKey);
+                                if (slot == handlerSlots.end()) {
+                                    semantic::FieldSymbol field;
+                                    field.name = "$event_" + event.name +
+                                        "_slot_" +
+                                        std::to_string(event.handlers.size());
+                                    field.type =
+                                        semantic::PrimitiveType::Bool;
+                                    field.index = owner.fields.size();
+                                    field.synthetic = true;
+                                    field.sourceName = unit->source->name();
+                                    field.declarationSpan =
+                                        subscription->eventNameToken.span;
+                                    field.id = semantic::stableTypeId(
+                                        semantic::canonicalTypeName(owner) +
+                                        "::field:" + field.name);
+                                    owner.fields.push_back(field);
+                                    event.handlers.push_back(
+                                        semantic::EventHandlerSymbol{
+                                            handler, field});
+                                    slot = handlerSlots.emplace(
+                                        event.name + ":" + slotKey,
+                                        field).first;
+                                }
+                                event.subscriptions.push_back(
+                                    semantic::EventSubscriptionSymbol{
+                                        subscription->span(),
+                                        slot->second,
+                                        subscription->operatorToken.kind ==
+                                            syntax::SyntaxKind::PlusEqualsToken});
+                            }
+                        }
+                    }
                     *ownerPointer = std::move(owner);
                 }
             };
@@ -1210,6 +1778,21 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             if (!type.synthetic) {
                 signatures.push_back(typeSignature(type));
             }
+        }
+        for (const auto& [delegateName, contract] : module.delegates) {
+            (void)delegateName;
+            std::ostringstream delegateSignature;
+            delegateSignature << "delegate:"
+                << canonicalDelegateName(contract.moduleName, contract.name)
+                << '(';
+            for (const auto& parameter : contract.parameters) {
+                delegateSignature << semantic::primitiveTypeName(
+                    parameter.type) << '#' << parameter.typeName << ';';
+            }
+            delegateSignature << ")->"
+                << semantic::primitiveTypeName(contract.returnType.type)
+                << '#' << contract.returnType.typeName;
+            signatures.push_back(delegateSignature.str());
         }
         for (const auto& [interfaceName, contract] : module.interfaces) {
             (void)interfaceName;

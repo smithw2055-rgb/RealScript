@@ -296,6 +296,60 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         (void)emitCallInstruction(assignment.setter, semantic::PrimitiveType::Void, {}, std::move(arguments), expression.span);
         return assigned;
     }
+    case semantic::BoundNodeKind::EventInvocationExpression: {
+        const auto& invocation = static_cast<const
+            semantic::BoundEventInvocationExpression&>(expression);
+        auto receiver = lowerExpression(*invocation.receiver);
+        receiver = emitValue(
+            Opcode::CheckNotNull,
+            semantic::PrimitiveType::Object,
+            {receiver},
+            invocation.receiver->span);
+        auto& receiverCheck =
+            block(*currentBlockId_).instructions.back();
+        receiverCheck.typeId = invocation.ownerType.id;
+        receiverCheck.resultTypeId = invocation.ownerType.id;
+        receiverCheck.symbolName = semantic::canonicalTypeName(
+            invocation.ownerType);
+        std::vector<ValueId> values;
+        for (const auto& argument : invocation.arguments) {
+            values.push_back(lowerExpression(*argument));
+        }
+        for (const auto& handler : invocation.event.handlers) {
+            const auto enabled = emitValue(
+                Opcode::LoadField,
+                semantic::PrimitiveType::Bool,
+                {receiver},
+                expression.span);
+            auto& load = block(*currentBlockId_).instructions.back();
+            load.typeId = invocation.ownerType.id;
+            load.fieldIndex = handler.enabledField.index;
+            load.symbolName = semantic::canonicalTypeName(
+                invocation.ownerType);
+            const auto callBlock = createBlock();
+            const auto nextBlock = createBlock();
+            emitBranch(
+                enabled,
+                callBlock,
+                nextBlock,
+                {},
+                {},
+                expression.span);
+            setCurrentBlock(callBlock);
+            std::vector<ValueId> arguments{receiver};
+            arguments.insert(
+                arguments.end(), values.begin(), values.end());
+            (void)emitCallInstruction(
+                handler.function,
+                semantic::PrimitiveType::Void,
+                {},
+                std::move(arguments),
+                expression.span);
+            emitJump(nextBlock, {}, expression.span);
+            setCurrentBlock(nextBlock);
+        }
+        return -1;
+    }
     case semantic::BoundNodeKind::ReferenceCallExpression: {
         const auto& call = static_cast<const
             semantic::BoundReferenceCallExpression&>(expression);

@@ -84,6 +84,15 @@ private:
                 analyzeExpression(*argument, assigned);
             }
             return;
+        case BoundNodeKind::EventInvocationExpression: {
+            const auto& event = static_cast<const
+                BoundEventInvocationExpression&>(expression);
+            analyzeExpression(*event.receiver, assigned);
+            for (const auto& argument : event.arguments) {
+                analyzeExpression(*argument, assigned);
+            }
+            return;
+        }
         case BoundNodeKind::ReferenceCallExpression: {
             const auto& call = static_cast<
                 const BoundReferenceCallExpression&>(expression);
@@ -152,6 +161,14 @@ private:
         }
         case BoundNodeKind::BreakStatement: state.exit = ExitKind::Break; return state;
         case BoundNodeKind::ContinueStatement: state.exit = ExitKind::Continue; return state;
+        case BoundNodeKind::EventSubscriptionStatement: {
+            const auto& subscription = static_cast<const
+                BoundEventSubscriptionStatement&>(statement);
+            if (subscription.receiver) {
+                analyzeExpression(*subscription.receiver, state.assigned);
+            }
+            return state;
+        }
         case BoundNodeKind::VariableDeclarationStatement: {
             const auto& value = static_cast<const BoundVariableDeclarationStatement&>(statement);
             if (value.initializer) { analyzeExpression(*value.initializer, state.assigned); state.assigned.insert(value.variable.index); }

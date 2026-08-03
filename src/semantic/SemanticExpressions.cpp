@@ -705,6 +705,46 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
         arguments.push_back(bindExpression(*argument));
     }
 
+    if (currentOwnerType_ && !currentStaticMethod_) {
+        for (const auto& event : currentOwnerType_->events) {
+            if (event.name != syntaxTree.identifierToken.text) continue;
+            auto result =
+                std::make_unique<BoundEventInvocationExpression>();
+            result->span = syntaxTree.span();
+            result->type = PrimitiveType::Void;
+            result->ownerType = *currentOwnerType_;
+            result->event = event;
+            const auto* thisVariable = lookupVariable("this");
+            if (!thisVariable) return makeError(syntaxTree.span());
+            result->receiver = variableExpression(
+                *thisVariable, syntaxTree.span());
+            if (arguments.size() != event.parameters.size()) {
+                diagnostics_.report(
+                    "RS8313",
+                    "event argument count does not match delegate",
+                    syntaxTree.span());
+            }
+            const auto count = std::min(
+                arguments.size(), event.parameters.size());
+            for (std::size_t index = 0; index < count; ++index) {
+                if (index < syntaxTree.argumentModifiers.size() &&
+                    syntaxTree.argumentModifiers[index]) {
+                    diagnostics_.report(
+                        "RS8314",
+                        "event arguments cannot use ref, out, or in",
+                        syntaxTree.arguments[index]->span());
+                }
+                result->arguments.push_back(convertExpression(
+                    std::move(arguments[index]),
+                    event.parameters[index].type,
+                    syntaxTree.arguments[index]->span(),
+                    "event argument",
+                    event.parameters[index].typeName));
+            }
+            return result;
+        }
+    }
+
     std::vector<const FunctionSymbol*> candidates;
     const auto globals = visibleFunctions_.find(
         syntaxTree.identifierToken.text);
