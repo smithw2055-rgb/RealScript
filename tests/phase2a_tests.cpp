@@ -104,7 +104,7 @@ realscript::bytecode::Module compileFixture() {
 
 void testLoweringAndVerification() {
     const auto module = compileFixture();
-    require(module.version.major == 0 && module.version.minor == 5,
+    require(module.version.major == 0 && module.version.minor == 6,
             "unexpected bytecode version");
     require(module.functions.size() == 6, "fixture function count changed");
     require(!module.functionReferences.empty(), "calls must create function references");
