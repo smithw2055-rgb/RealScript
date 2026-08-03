@@ -97,7 +97,7 @@ Implemented and validated:
 
 Current bounded semantics remain unchanged: exactly one `long target` parameter, top-level `yield wait_ticks`, and durable state stored in object fields. Complete local-persisting coroutine state machines remain Phase 22.
 
-### 18F — reference modifiers and exact aliases — in progress
+### 18F — reference modifiers and value aliases — complete
 
 Implemented and validated in the native reference slice:
 
@@ -111,11 +111,15 @@ Implemented and validated in the native reference slice:
 - assignment to `in` parameters reports `RS8702`;
 - `LanguageExpansionOptions::referenceParameters` disabled by default.
 
-Still pending in 18F:
+The bounded Phase 18F profile is complete:
 
-- reference member/indexer l-values and complete alias analysis;
-- native exact-width aliases;
-- complete reference semantics, nullable values, and boxing in Phase 23.
+- `byte`, `sbyte`, `short`, `ushort`, and `char` resolve natively to the checked `int` carrier;
+- `uint` and `ulong` resolve natively to the checked `long` carrier;
+- `float` resolves natively to the `double` carrier;
+- `LanguageExpansionOptions::valueTypeAliases` is disabled by default;
+- aliases preserve original source spans and no longer generate source text.
+
+Reference member/indexer l-values, exact-width identities, checked/unchecked conversions, nullable values, and boxing remain Phase 23 work.
 
 ### Phase 18 exit criteria
 

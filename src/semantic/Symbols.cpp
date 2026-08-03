@@ -198,9 +198,16 @@ const char* primitiveTypeName(PrimitiveType type) noexcept {
 PrimitiveType resolvePrimitiveType(const std::string& name) noexcept {
     if (name == "void") return PrimitiveType::Void;
     if (name == "bool") return PrimitiveType::Bool;
-    if (name == "int") return PrimitiveType::Int;
-    if (name == "long") return PrimitiveType::Long;
-    if (name == "double") return PrimitiveType::Double;
+    if (name == "int" || name == "byte" || name == "sbyte" ||
+        name == "short" || name == "ushort" || name == "char") {
+        return PrimitiveType::Int;
+    }
+    if (name == "long" || name == "uint" || name == "ulong") {
+        return PrimitiveType::Long;
+    }
+    if (name == "double" || name == "float") {
+        return PrimitiveType::Double;
+    }
     if (name == "string") return PrimitiveType::String;
     if (name == "handle") return PrimitiveType::Handle;
     return PrimitiveType::Error;

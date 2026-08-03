@@ -365,6 +365,38 @@ void testReferencesBypassExpansion() {
         "native reference parameters still used source expansion");
 }
 
+void testNativeValueAliases() {
+    const auto result = execute(R"(
+module Phase18;
+int main()
+{
+    byte a = 1;
+    sbyte b = 2;
+    short c = 3;
+    ushort d = 4;
+    char e = 5;
+    uint f = 6;
+    ulong g = 7;
+    float h = 8.5;
+    return a + b + c + d + e + f + g + h;
+}
+)");
+    require(
+        result.succeeded &&
+            std::get<double>(result.value) == 36.5,
+        "native value aliases produced the wrong result");
+}
+
+void testAliasesBypassExpansion() {
+    const auto expansion =
+        realscript::compiler::expandLanguageSource(
+            "aliases.rs",
+            "module Native; int main(){byte a=1;uint b=2;"
+            "float c=3.5;char d=4;return a+b+c+d;}");
+    require(!expansion.changed,
+        "native value aliases still used source expansion");
+}
+
 void testNativeSequenceDiagnostics() {
     realscript::compiler::Compilation compilation({{"bad-sequence.rs", R"(
 module Phase18.SequenceBad;
@@ -435,6 +467,8 @@ int main() {
     run("native reference parameters", testNativeReferenceParameters);
     run("native reference diagnostics", testNativeReferenceDiagnostics);
     run("references bypass expansion", testReferencesBypassExpansion);
+    run("native value aliases", testNativeValueAliases);
+    run("aliases bypass expansion", testAliasesBypassExpansion);
     run("native sequence diagnostics", testNativeSequenceDiagnostics);
     run("yield outside sequence diagnostics", testYieldOutsideSequenceDiagnostics);
     return failures == 0 ? 0 : 1;
