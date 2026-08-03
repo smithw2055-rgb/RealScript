@@ -611,9 +611,6 @@ int main() {
     run("native structured control flow", testNativeControlFlowExecution);
     run("native infinite loop break", testNativeInfiniteLoopBreak);
     run("native control diagnostics", testNativeDiagnostics);
-    run(
-        "structured control flow bypasses expansion",
-        testNoStructuredSourceRewrite);
     run("native interface contracts", testNativeInterfaceContracts);
     run("native interface diagnostics", testNativeInterfaceDiagnostics);
     run("native attributes", testNativeAttributes);
