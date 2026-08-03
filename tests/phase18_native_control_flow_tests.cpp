@@ -535,8 +535,7 @@ int main()
     realscript::syntax::Parser parser(source, diagnostics);
     auto unit = parser.parseCompilationUnit();
     require(!diagnostics.hasErrors(),
-        "native generic syntax failed to parse:
-" +
+        "native generic syntax failed to parse:\n" +
             diagnosticsText(diagnostics));
     require(unit.classes.size() == 1 &&
             unit.classes.front().typeParameters.size() == 2 &&
