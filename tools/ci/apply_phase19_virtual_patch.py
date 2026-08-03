@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+# The patch is staged as eight ordered, hash-verified base64 fragments.
 import base64
 import hashlib
 import subprocess
