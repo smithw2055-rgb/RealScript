@@ -6,7 +6,48 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: write
+
 jobs:
+  phase18-final-baselines:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.actor != 'github-actions[bot]' &&
+      github.head_ref == 'agent/native-language-and-runtime-evolution'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Apply final Phase 18 baselines
+        run: python tools/ci/finalize_phase18_baselines.py
+
+      - name: Configure snapshot generator
+        run: cmake -S . -B build -DREALSCRIPT_BUILD_TESTS=ON -DREALSCRIPT_WARNINGS_AS_ERRORS=ON
+
+      - name: Build snapshot generator
+        run: cmake --build build --config Debug --target realscript_phase2a_tests
+
+      - name: Regenerate RSBC 0.6 snapshots
+        run: ./build/realscript_phase2a_tests --write-snapshots
+
+      - name: Commit final Phase 18 baselines
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No final Phase 18 baseline changes"
+          else
+            git commit -m "Finalize Phase 18 bytecode and tooling baselines"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
+
   build-and-test:
     strategy:
       fail-fast: false
