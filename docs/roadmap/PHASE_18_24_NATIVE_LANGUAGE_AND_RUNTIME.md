@@ -32,7 +32,7 @@ Text/token rewriting alone does not satisfy this definition.
 - Generated hidden identifiers must never appear in user diagnostics, debugger frames, symbols, rename results, or public metadata.
 - All stable identities must be based on source declarations and canonical types, not generated source names.
 
-## Phase 18 — native Phase 11–17 compiler features
+## Phase 18 — native Phase 11–17 compiler features — complete
 
 ### 18A — structured control flow — complete
 
@@ -130,12 +130,14 @@ The bounded Phase 18F profile is complete:
 
 Reference member/indexer l-values, exact-width identities, checked/unchecked conversions, nullable values, and boxing remain Phase 23 work.
 
-### Phase 18 exit criteria
+### Phase 18 exit criteria — complete
 
-- `LanguageExpansionOptions` is no longer required for Phase 11–17 source.
-- `LanguageExpansion.cpp` and generated support declarations can be removed.
-- Interpreter/AOT/JIT result, digest, and profile differential tests pass.
-- LSP/DAP/hot reload operate on original source constructs.
+- `Compilation` consumes original source directly;
+- `LanguageExpansionOptions`, `LanguageExpansionResult`, and the expansion API are removed;
+- `LanguageExpansion.cpp` and all expansion `.inl` files are deleted;
+- native attributes, interfaces, generic instantiations, and sequences flow through `LanguageMetadata.h`;
+- Interpreter/AOT/JIT share the same native Syntax/Bound/MIR pipeline;
+- LSP/DAP/hot reload operate on original source constructs and stable compiler-owned synthetic symbols.
 
 ## Phase 19 — runtime polymorphism
 

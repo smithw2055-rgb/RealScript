@@ -1,30 +1,14 @@
-# Phase 11–18 Language Profile
+# Phase 11–18 Native Language Profile
 
 [Documentation Home](README.md) | [Language and Type System](LANGUAGE_AND_TYPE_SYSTEM.md) | [Gameplay Runtime](GAMEPLAY_RUNTIME.md)
 
-RealScript originally introduced the Phase 11–17 C#-style gameplay profile through a deterministic source-expansion layer. Phase 18 is migrating those features into the native lexer, syntax tree, Binder, flow analysis, Typed MIR, bytecode, tooling metadata, AOT/JIT pipeline, and Game SDK.
+RealScript Phase 18 compiles the C#-style gameplay profile directly through the native lexer, syntax tree, Binder, flow analysis, Typed MIR, bytecode, AOT/JIT pipeline, tooling metadata, and Game SDK.
 
 This remains an embedded deterministic game-language profile, not CLR compatibility.
 
-## Current compilation model
+## Compilation model
 
-A `Compilation` still runs the compatibility expansion stage for features not yet migrated. Native features bypass that stage and preserve their original syntax nodes and source spans.
-
-Native as of Phase 18:
-
-- `for`, `foreach`, `do/while`, `break`, `continue`, and `switch`;
-- interface declarations and class/struct interface contract lists;
-- source Attribute Lists and positional/named Attribute Arguments;
-- deterministic `sequence` declarations and top-level `yield wait_ticks` suspension points.
-
-Still using compatibility expansion during Phase 18 migration:
-
-- bounded delegates, lambdas, and class-local events;
-- generic declarations and explicit specializations;
-- restricted `ref`, `out`, and `in` calls;
-- value aliases that do not yet have exact runtime identities.
-
-Declarations remain isolated by `module`; directly imported modules contribute visible interface and remaining expansion declarations.
+A `Compilation` parses original source directly. There is no source expansion or compatibility preprocessing stage. Declarations remain isolated by `module`; directly imported modules contribute visible native declarations and contracts.
 
 ## Native structured control flow
 
@@ -43,7 +27,7 @@ Switch cases do not fall through. Pattern matching, guards, and arbitrary enumer
 
 ## Bounded delegates, lambdas, and events
 
-Currently available through the compatibility expansion path:
+Implemented directly in the compiler:
 
 - delegate declarations used as event signatures;
 - class-local events;
@@ -80,7 +64,7 @@ Attributes remain metadata records rather than executable Attribute classes. `.r
 
 ## Explicit generics and fixed-capacity collections
 
-Currently available through compatibility specialization:
+Implemented through compiler-owned explicit specialization:
 
 - explicit generic type and function instantiation;
 - deterministic monomorphization;
@@ -118,7 +102,7 @@ Complete local-persisting coroutine state machines, cancellation, nesting, and r
 
 ## Restricted reference parameters and aliases
 
-Currently available through compatibility lowering:
+Implemented through native sequence nodes and compiler-owned callbacks:
 
 - standalone `ref`, `out`, and `in` calls;
 - copy-in/copy-out wrappers;

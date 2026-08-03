@@ -168,7 +168,7 @@ C++17 game engine
 
 - [English documentation library](docs/en/README.md)
 - [Language and type system](docs/en/LANGUAGE_AND_TYPE_SYSTEM.md)
-- [Phase 11–18 language profile](docs/en/LANGUAGE_EXPANSION_PHASE_11_17.md)
+- [Phase 11–18 language profile](docs/en/NATIVE_LANGUAGE_PHASE_11_18.md)
 - [Phase 18–24 native roadmap](docs/roadmap/PHASE_18_24_NATIVE_LANGUAGE_AND_RUNTIME.md)
 - [Game Scripting SDK](docs/en/GAME_SCRIPTING_SDK.md)
 - [Deterministic gameplay runtime](docs/en/GAMEPLAY_RUNTIME.md)

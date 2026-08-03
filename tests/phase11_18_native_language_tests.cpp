@@ -32,7 +32,7 @@ std::vector<realscript::bytecode::Module> compileModules(
     realscript::compiler::Compilation compilation(std::move(files));
     const auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
-        "extended source compilation failed:\n" + diagnosticsText(build.diagnostics));
+        "native source compilation failed:\n" + diagnosticsText(build.diagnostics));
     realscript::bytecode::Lowerer lowerer;
     std::vector<realscript::bytecode::Module> modules;
     for (const auto& mir : build.modules) {
@@ -374,7 +374,7 @@ int other()
         "same-name generic declarations leaked across modules");
 }
 
-void testExpansionMetadata() {
+void testNativeMetadata() {
     realscript::compiler::Compilation compilation({{
         "metadata.rs",
         "module Meta; [Replicated(channel = \"state\")] "
@@ -397,25 +397,8 @@ void testExpansionMetadata() {
         "source attribute arguments were not captured");
 }
 
-void testExpansionOptionsRefreshExistingSources() {
-    realscript::compiler::Compilation compilation;
-    compilation.addSource({
-        "options.rs",
-        "module Options; int main(){for(int i=0;i<1;i=i+1){}return 1;}"});
-    require(compilation.languageExpansions().size() == 1 &&
-            !compilation.languageExpansions().front().changed,
-        "native control flow unexpectedly used source expansion");
 
-    realscript::compiler::LanguageExpansionOptions options;
-    options.structuredControlFlow = false;
-    compilation.setLanguageExpansionOptions(options);
-    require(compilation.languageExpansions().size() == 1 &&
-            compilation.languageExpansions().front().content.find("for") !=
-                std::string::npos,
-        "changing expansion options did not rebuild existing sources");
-}
-
-void testAotGenerationFromExpandedSource() {
+void testNativeAotGeneration() {
     const char* source = R"(
 module ExpandedAot;
 
@@ -443,7 +426,7 @@ int main()
     realscript::compiler::Compilation compilation({{"expanded_aot.rs", source}});
     auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
-        "expanded AOT source failed to compile:\n" +
+        "native AOT source failed to compile:\n" +
         diagnosticsText(build.diagnostics));
 
     realscript::diagnostics::DiagnosticBag diagnostics;
@@ -454,7 +437,7 @@ int main()
     require(!diagnostics.hasErrors() && generated.contentHash != 0 &&
             generated.source.find("Phase11To17ExpandedProgram") !=
                 std::string::npos,
-        "expanded MIR did not generate deterministic C++17 AOT source");
+        "native MIR did not generate deterministic C++17 AOT source");
 }
 
 void testPhase16DeterministicSequence() {
@@ -506,10 +489,6 @@ class Behavior
         "GameCompileResult did not retain native sequence metadata");
     require(compiled.program.languageMetadata().sequences.size() == 1,
         "GameProgram did not retain native sequence metadata");
-    const auto expansion = realscript::compiler::expandLanguageSource(
-        "native-sequence.rs", source);
-    require(!expansion.changed,
-        "sequence source still used expansion");
 
     realscript::game::ScriptRuntime scripts(compiled.program);
     realscript::game::SceneScriptRuntime scene(scripts);
@@ -548,9 +527,8 @@ int main() {
     run("nested switch control flow", testNestedSwitchControlFlow);
     run("cross-file declaration sharing", testCrossFileDeclarationSharing);
     run("cross-module imports and isolation", testCrossModuleImportsAndIsolation);
-    run("source attribute metadata", testExpansionMetadata);
-    run("expansion options refresh", testExpansionOptionsRefreshExistingSources);
-    run("AOT generation from expanded source", testAotGenerationFromExpandedSource);
+    run("native source metadata", testNativeMetadata);
+    run("AOT generation from native source", testNativeAotGeneration);
     run("phase 16 deterministic sequence", testPhase16DeterministicSequence);
     return failures == 0 ? 0 : 1;
 }

@@ -141,14 +141,6 @@ int main()
         "native loop-control diagnostics were not preserved");
 }
 
-void testNoStructuredSourceRewrite() {
-    const auto expansion = realscript::compiler::expandLanguageSource(
-        "native.rs",
-        "module Native; int main(){for(int i=0;i<1;i=i+1){}return 1;}");
-    require(
-        !expansion.changed,
-        "native for statement still used source expansion");
-}
 
 void testNativeInterfaceContracts() {
     const char* contracts = R"(
@@ -240,15 +232,6 @@ class Reader : IReader
         "native interface signature mismatch did not produce RS2475");
 }
 
-void testInterfaceBypassesExpansion() {
-    const auto expansion = realscript::compiler::expandLanguageSource(
-        "interface.rs",
-        "module Native; interface IRun { int Run(); } "
-        "class Runner : IRun { int Run(){return 1;} }");
-    require(
-        !expansion.changed,
-        "native interfaces still used source expansion");
-}
 
 void testNativeAttributes() {
     realscript::compiler::Compilation compilation({{"attributes.rs", R"(
@@ -296,14 +279,6 @@ class Unit
         "native member attribute targets were not retained");
 }
 
-void testAttributesBypassExpansion() {
-    const auto expansion = realscript::compiler::expandLanguageSource(
-        "attributes.rs",
-        "module Native; [Serializable] class Unit { int health; }");
-    require(
-        !expansion.changed,
-        "native attributes still used source expansion");
-}
 
 void testNativeReferenceParameters() {
     const auto result = execute(R"(
@@ -354,16 +329,6 @@ int main()
         "assignment to in parameter did not produce RS8702");
 }
 
-void testReferencesBypassExpansion() {
-    const auto expansion =
-        realscript::compiler::expandLanguageSource(
-            "references.rs",
-            "module Native; void Bump(ref int value){"
-            "value=value+1;} int main(){int value=1;"
-            "Bump(ref value);return value;}");
-    require(!expansion.changed,
-        "native reference parameters still used source expansion");
-}
 
 void testNativeValueAliases() {
     const auto result = execute(R"(
@@ -387,15 +352,6 @@ double main()
         "native value aliases produced the wrong result");
 }
 
-void testAliasesBypassExpansion() {
-    const auto expansion =
-        realscript::compiler::expandLanguageSource(
-            "aliases.rs",
-            "module Native; int main(){byte a=1;uint b=2;"
-            "float c=3.5;char d=4;return a+b+c+d;}");
-    require(!expansion.changed,
-        "native value aliases still used source expansion");
-}
 
 void testNativeEventSyntax() {
     realscript::text::SourceText source(R"(
@@ -504,16 +460,6 @@ class Counter
         "invalid native event handler did not produce RS8305");
 }
 
-void testEventsBypassExpansion() {
-    const auto expansion =
-        realscript::compiler::expandLanguageSource(
-            "events.rs",
-            "module Native; delegate void D(int v); "
-            "class C{event D E;int x;void H(int v){x=x+v;}"
-            "void R(){E+=H;E(1);}}");
-    require(!expansion.changed,
-        "native delegates/events still used source expansion");
-}
 
 void testNativeGenericSyntax() {
     realscript::text::SourceText source(R"(
@@ -605,15 +551,6 @@ int main()
         "native generic specialization produced the wrong result");
 }
 
-void testGenericsBypassExpansion() {
-    const auto expansion =
-        realscript::compiler::expandLanguageSource(
-            "generics.rs",
-            "module Native; T Id<T>(T v){return v;} "
-            "int main(){return Id<int>(3);}");
-    require(!expansion.changed,
-        "native generics still used source expansion");
-}
 
 void testNativeSequenceDiagnostics() {
     realscript::compiler::Compilation compilation({{"bad-sequence.rs", R"(
@@ -679,21 +616,15 @@ int main() {
         testNoStructuredSourceRewrite);
     run("native interface contracts", testNativeInterfaceContracts);
     run("native interface diagnostics", testNativeInterfaceDiagnostics);
-    run("interfaces bypass expansion", testInterfaceBypassesExpansion);
     run("native attributes", testNativeAttributes);
-    run("attributes bypass expansion", testAttributesBypassExpansion);
     run("native reference parameters", testNativeReferenceParameters);
     run("native reference diagnostics", testNativeReferenceDiagnostics);
-    run("references bypass expansion", testReferencesBypassExpansion);
     run("native value aliases", testNativeValueAliases);
-    run("aliases bypass expansion", testAliasesBypassExpansion);
     run("native event syntax", testNativeEventSyntax);
     run("native event execution", testNativeEventsExecution);
     run("native event diagnostics", testNativeEventDiagnostics);
-    run("events bypass expansion", testEventsBypassExpansion);
     run("native generic syntax", testNativeGenericSyntax);
     run("native generic specialization", testNativeGenericSpecialization);
-    run("generics bypass expansion", testGenericsBypassExpansion);
     run("native sequence diagnostics", testNativeSequenceDiagnostics);
     run("yield outside sequence diagnostics", testYieldOutsideSequenceDiagnostics);
     return failures == 0 ? 0 : 1;
