@@ -14,6 +14,7 @@ enum class ReloadIssueKind {
     TypeLayoutChanged,
     FunctionSetChanged,
     FunctionSignatureChanged,
+    LanguageMetadataChanged,
 };
 
 struct ReloadIssue {

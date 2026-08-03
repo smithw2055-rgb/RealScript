@@ -1,6 +1,6 @@
 #pragma once
 
-#include "realscript/compiler/LanguageExpansion.h"
+#include "realscript/compiler/LanguageMetadata.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/mir/Mir.h"
 
@@ -42,6 +42,10 @@ struct BuildResult {
     std::vector<ModuleBuildInfo> buildInfo;
     diagnostics::DiagnosticBag diagnostics;
     std::vector<semantic::SymbolOccurrence> symbols;
+    std::vector<LanguageAttributeRecord> nativeAttributes;
+    std::vector<LanguageInterfaceImplementation> nativeInterfaces;
+    std::vector<LanguageGenericInstantiation> nativeGenericInstantiations;
+    std::vector<LanguageSequenceRecord> nativeSequences;
     BuildSnapshot snapshot;
 };
 
@@ -49,57 +53,17 @@ class Compilation {
 public:
     Compilation() = default;
     explicit Compilation(std::vector<SourceFile> sources)
-        : sourceInputs_(std::move(sources)) {
-        refreshLanguageExpansions();
-    }
-
-    void setLanguageExpansionOptions(LanguageExpansionOptions options) {
-        expansionOptions_ = options;
-        refreshLanguageExpansions();
-    }
-
-    [[nodiscard]] const LanguageExpansionOptions& languageExpansionOptions() const noexcept {
-        return expansionOptions_;
-    }
+        : sources_(std::move(sources)) {}
 
     void addSource(SourceFile source) {
-        sourceInputs_.push_back(std::move(source));
-        refreshLanguageExpansions();
-    }
-
-    [[nodiscard]] const std::vector<LanguageExpansionResult>& languageExpansions() const noexcept {
-        return languageExpansions_;
+        sources_.push_back(std::move(source));
     }
 
     [[nodiscard]] BuildResult build(
         const BuildSnapshot* previous = nullptr) const;
 
 private:
-    void refreshLanguageExpansions() {
-        std::vector<LanguageExpansionSource> inputs;
-        inputs.reserve(sourceInputs_.size());
-        for (const auto& source : sourceInputs_) {
-            inputs.push_back(LanguageExpansionSource{source.path, source.content});
-        }
-
-        languageExpansions_ = expandLanguageSources(inputs, expansionOptions_);
-        sources_.clear();
-        sources_.reserve(sourceInputs_.size());
-        for (std::size_t index = 0; index < sourceInputs_.size(); ++index) {
-            const auto& input = sourceInputs_[index];
-            const auto useExpansion = index < languageExpansions_.size() &&
-                languageExpansions_[index].changed &&
-                !languageExpansions_[index].content.empty();
-            sources_.push_back(SourceFile{
-                input.path,
-                useExpansion ? languageExpansions_[index].content : input.content});
-        }
-    }
-
-    LanguageExpansionOptions expansionOptions_;
-    std::vector<SourceFile> sourceInputs_;
     std::vector<SourceFile> sources_;
-    std::vector<LanguageExpansionResult> languageExpansions_;
 };
 
 [[nodiscard]] std::uint64_t stableFingerprint(

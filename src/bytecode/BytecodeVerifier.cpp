@@ -211,7 +211,7 @@ bool verifyModule(
     diagnostics::DiagnosticBag& diagnostics) {
     const auto initialCount = diagnostics.items().size();
 
-    if (module.version.major != 0 || module.version.minor != 5) {
+    if (module.version.major != 0 || module.version.minor != 6) {
         diagnostics.report(
             "RS5100",
             "unsupported in-memory bytecode version",

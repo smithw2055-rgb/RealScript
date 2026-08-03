@@ -70,6 +70,63 @@ bool sameSignature(const bytecode::Function& left, const bytecode::Function& rig
         left.parameterTypeIds == right.parameterTypeIds;
 }
 
+bool sameLanguageMetadata(
+    const compiler::LanguageModuleMetadata& left,
+    const compiler::LanguageModuleMetadata& right) {
+    if (left.attributes.size() != right.attributes.size() ||
+        left.interfaces.size() != right.interfaces.size() ||
+        left.genericInstantiations.size() !=
+            right.genericInstantiations.size() ||
+        left.sequences.size() != right.sequences.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < left.attributes.size(); ++index) {
+        const auto& first = left.attributes[index];
+        const auto& second = right.attributes[index];
+        if (first.target != second.target || first.name != second.name ||
+            first.arguments.size() != second.arguments.size()) {
+            return false;
+        }
+        for (std::size_t argument = 0;
+             argument < first.arguments.size(); ++argument) {
+            if (first.arguments[argument].name !=
+                    second.arguments[argument].name ||
+                first.arguments[argument].value !=
+                    second.arguments[argument].value) {
+                return false;
+            }
+        }
+    }
+    for (std::size_t index = 0; index < left.interfaces.size(); ++index) {
+        if (left.interfaces[index].typeName !=
+                right.interfaces[index].typeName ||
+            left.interfaces[index].interfaces !=
+                right.interfaces[index].interfaces) {
+            return false;
+        }
+    }
+    for (std::size_t index = 0;
+         index < left.genericInstantiations.size(); ++index) {
+        const auto& first = left.genericInstantiations[index];
+        const auto& second = right.genericInstantiations[index];
+        if (first.genericName != second.genericName ||
+            first.arguments != second.arguments ||
+            first.generatedName != second.generatedName) {
+            return false;
+        }
+    }
+    for (std::size_t index = 0; index < left.sequences.size(); ++index) {
+        const auto& first = left.sequences[index];
+        const auto& second = right.sequences[index];
+        if (first.typeName != second.typeName ||
+            first.name != second.name ||
+            first.callbacks != second.callbacks) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void append(std::uint64_t& hash, std::uint64_t value) noexcept {
     hash ^= value;
     hash *= 1099511628211ull;
@@ -136,6 +193,23 @@ ReloadPlan prepare(
             {},
             "hot reload cannot add or remove modules",
         });
+    }
+    for (const auto& oldModule : oldModules) {
+        const auto replacement = std::find_if(
+            newModules.begin(), newModules.end(),
+            [&](const bytecode::Module& module) {
+                return module.name == oldModule.name;
+            });
+        if (replacement != newModules.end() &&
+            !sameLanguageMetadata(
+                oldModule.languageMetadata,
+                replacement->languageMetadata)) {
+            plan.issues.push_back({
+                ReloadIssueKind::LanguageMetadataChanged,
+                oldModule.name,
+                "language metadata changed during body-only hot reload",
+            });
+        }
     }
 
     const auto oldTypes = types(oldModules);
@@ -223,6 +297,7 @@ const char* reloadIssueKindName(ReloadIssueKind kind) noexcept {
     case ReloadIssueKind::TypeLayoutChanged: return "type-layout-changed";
     case ReloadIssueKind::FunctionSetChanged: return "function-set-changed";
     case ReloadIssueKind::FunctionSignatureChanged: return "function-signature-changed";
+    case ReloadIssueKind::LanguageMetadataChanged: return "language-metadata-changed";
     }
     return "unknown";
 }

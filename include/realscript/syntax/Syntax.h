@@ -21,7 +21,10 @@ enum class SyntaxKind {
     StringLiteralToken,
 
     PlusToken,
+    PlusEqualsToken,
     MinusToken,
+    MinusEqualsToken,
+    ArrowToken,
     StarToken,
     SlashToken,
     PercentToken,
@@ -52,9 +55,25 @@ enum class SyntaxKind {
     IfKeyword,
     ElseKeyword,
     WhileKeyword,
+    ForKeyword,
+    ForeachKeyword,
+    InKeyword,
+    RefKeyword,
+    OutKeyword,
+    DoKeyword,
+    BreakKeyword,
+    ContinueKeyword,
+    SwitchKeyword,
+    CaseKeyword,
+    DefaultKeyword,
+    SequenceKeyword,
+    YieldKeyword,
     ClassKeyword,
     StructKeyword,
     EnumKeyword,
+    InterfaceKeyword,
+    DelegateKeyword,
+    EventKeyword,
     StaticKeyword,
     GetKeyword,
     SetKeyword,
@@ -79,27 +98,45 @@ enum class SyntaxKind {
     VoidKeyword,
 
     CompilationUnit,
+    AttributeList,
+    Attribute,
+    AttributeArgument,
     ModuleDeclaration,
     ImportDeclaration,
     ClassDeclaration,
     StructDeclaration,
     EnumDeclaration,
+    InterfaceDeclaration,
+    InterfaceMethodDeclaration,
+    DelegateDeclaration,
+    EventDeclaration,
     EnumMemberDeclaration,
     FieldDeclaration,
     ConstructorDeclaration,
     PropertyDeclaration,
     AccessorDeclaration,
     FunctionDeclaration,
+    SequenceDeclaration,
     Parameter,
     TypeName,
     BlockStatement,
     ReturnStatement,
     IfStatement,
     WhileStatement,
+    ForStatement,
+    ForeachStatement,
+    DoWhileStatement,
+    BreakStatement,
+    ContinueStatement,
+    SwitchSection,
+    SwitchStatement,
+    YieldWaitStatement,
+    EventSubscriptionStatement,
     VariableDeclarationStatement,
     ExpressionStatement,
     LiteralExpression,
     NameExpression,
+    LambdaExpression,
     UnaryExpression,
     BinaryExpression,
     AssignmentExpression,
@@ -161,11 +198,55 @@ struct SyntaxNode {
 struct ExpressionSyntax : SyntaxNode {};
 struct StatementSyntax : SyntaxNode {};
 
+struct AttributeArgumentSyntax final : SyntaxNode {
+    std::optional<SyntaxToken> nameToken;
+    std::optional<SyntaxToken> equalsToken;
+    std::vector<SyntaxToken> valueTokens;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::AttributeArgument;
+    }
+    [[nodiscard]] text::TextSpan valueSpan() const noexcept;
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct AttributeSyntax final : SyntaxNode {
+    SyntaxToken nameToken;
+    std::optional<SyntaxToken> openParenToken;
+    std::vector<AttributeArgumentSyntax> arguments;
+    std::vector<SyntaxToken> commaTokens;
+    std::optional<SyntaxToken> closeParenToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::Attribute;
+    }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct AttributeListSyntax final : SyntaxNode {
+    SyntaxToken openBracketToken;
+    std::vector<AttributeSyntax> attributes;
+    std::vector<SyntaxToken> commaTokens;
+    SyntaxToken closeBracketToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::AttributeList;
+    }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
 struct TypeSyntax final : SyntaxNode {
     SyntaxToken name;
+    std::optional<SyntaxToken> lessToken;
+    std::vector<TypeSyntax> typeArguments;
+    std::vector<SyntaxToken> typeArgumentCommaTokens;
+    std::optional<SyntaxToken> greaterToken;
     std::optional<SyntaxToken> openBracketToken;
     std::optional<SyntaxToken> closeBracketToken;
 
+    [[nodiscard]] bool isGeneric() const noexcept {
+        return lessToken.has_value() && greaterToken.has_value();
+    }
     [[nodiscard]] bool isArray() const noexcept {
         return openBracketToken.has_value() && closeBracketToken.has_value();
     }
@@ -185,6 +266,20 @@ struct NameExpressionSyntax final : ExpressionSyntax {
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::NameExpression; }
     [[nodiscard]] text::TextSpan span() const noexcept override { return identifierToken.span; }
+};
+
+struct LambdaExpressionSyntax final : ExpressionSyntax {
+    std::optional<SyntaxToken> openParenToken;
+    std::vector<SyntaxToken> parameterTokens;
+    std::vector<SyntaxToken> commaTokens;
+    std::optional<SyntaxToken> closeParenToken;
+    SyntaxToken arrowToken;
+    std::unique_ptr<ExpressionSyntax> body;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::LambdaExpression;
+    }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
 struct UnaryExpressionSyntax final : ExpressionSyntax {
@@ -224,7 +319,12 @@ struct ParenthesizedExpressionSyntax final : ExpressionSyntax {
 
 struct CallExpressionSyntax final : ExpressionSyntax {
     SyntaxToken identifierToken;
+    std::optional<SyntaxToken> lessToken;
+    std::vector<TypeSyntax> typeArguments;
+    std::vector<SyntaxToken> typeArgumentCommaTokens;
+    std::optional<SyntaxToken> greaterToken;
     SyntaxToken openParenToken;
+    std::vector<std::optional<SyntaxToken>> argumentModifiers;
     std::vector<std::unique_ptr<ExpressionSyntax>> arguments;
     std::vector<SyntaxToken> commaTokens;
     SyntaxToken closeParenToken;
@@ -244,7 +344,12 @@ struct MemberCallExpressionSyntax final : ExpressionSyntax {
     std::unique_ptr<ExpressionSyntax> receiver;
     SyntaxToken dotToken;
     SyntaxToken nameToken;
+    std::optional<SyntaxToken> lessToken;
+    std::vector<TypeSyntax> typeArguments;
+    std::vector<SyntaxToken> typeArgumentCommaTokens;
+    std::optional<SyntaxToken> greaterToken;
     SyntaxToken openParenToken;
+    std::vector<std::optional<SyntaxToken>> argumentModifiers;
     std::vector<std::unique_ptr<ExpressionSyntax>> arguments;
     std::vector<SyntaxToken> commaTokens;
     SyntaxToken closeParenToken;
@@ -354,6 +459,114 @@ struct WhileStatementSyntax final : StatementSyntax {
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
+struct ForStatementSyntax final : StatementSyntax {
+    SyntaxToken forKeyword;
+    SyntaxToken openParenToken;
+    std::unique_ptr<StatementSyntax> initializer;
+    std::optional<SyntaxToken> firstSemicolonToken;
+    std::unique_ptr<ExpressionSyntax> condition;
+    SyntaxToken secondSemicolonToken;
+    std::unique_ptr<ExpressionSyntax> increment;
+    SyntaxToken closeParenToken;
+    std::unique_ptr<StatementSyntax> body;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ForStatement; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct ForeachStatementSyntax final : StatementSyntax {
+    SyntaxToken foreachKeyword;
+    SyntaxToken openParenToken;
+    TypeSyntax type;
+    SyntaxToken identifierToken;
+    SyntaxToken inKeyword;
+    std::unique_ptr<ExpressionSyntax> collection;
+    SyntaxToken closeParenToken;
+    std::unique_ptr<StatementSyntax> body;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ForeachStatement; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct DoWhileStatementSyntax final : StatementSyntax {
+    SyntaxToken doKeyword;
+    std::unique_ptr<StatementSyntax> body;
+    SyntaxToken whileKeyword;
+    SyntaxToken openParenToken;
+    std::unique_ptr<ExpressionSyntax> condition;
+    SyntaxToken closeParenToken;
+    SyntaxToken semicolonToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::DoWhileStatement; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct BreakStatementSyntax final : StatementSyntax {
+    SyntaxToken breakKeyword;
+    SyntaxToken semicolonToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::BreakStatement; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct ContinueStatementSyntax final : StatementSyntax {
+    SyntaxToken continueKeyword;
+    SyntaxToken semicolonToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ContinueStatement; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct SwitchSectionSyntax final : SyntaxNode {
+    std::optional<SyntaxToken> caseKeyword;
+    std::optional<SyntaxToken> defaultKeyword;
+    std::unique_ptr<ExpressionSyntax> label;
+    SyntaxToken colonToken;
+    std::vector<std::unique_ptr<StatementSyntax>> statements;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::SwitchSection; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct SwitchStatementSyntax final : StatementSyntax {
+    SyntaxToken switchKeyword;
+    SyntaxToken openParenToken;
+    std::unique_ptr<ExpressionSyntax> expression;
+    SyntaxToken closeParenToken;
+    SyntaxToken openBraceToken;
+    std::vector<SwitchSectionSyntax> sections;
+    SyntaxToken closeBraceToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::SwitchStatement; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct YieldWaitStatementSyntax final : StatementSyntax {
+    SyntaxToken yieldKeyword;
+    SyntaxToken waitTicksToken;
+    SyntaxToken openParenToken;
+    std::unique_ptr<ExpressionSyntax> delay;
+    SyntaxToken closeParenToken;
+    SyntaxToken semicolonToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::YieldWaitStatement;
+    }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct EventSubscriptionStatementSyntax final : StatementSyntax {
+    SyntaxToken eventNameToken;
+    SyntaxToken operatorToken;
+    std::unique_ptr<ExpressionSyntax> handler;
+    SyntaxToken semicolonToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::EventSubscriptionStatement;
+    }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
 struct VariableDeclarationStatementSyntax final : StatementSyntax {
     TypeSyntax type;
     SyntaxToken identifierToken;
@@ -383,6 +596,7 @@ struct BlockStatementSyntax final : StatementSyntax {
 };
 
 struct ParameterSyntax final : SyntaxNode {
+    std::optional<SyntaxToken> modifierToken;
     TypeSyntax type;
     SyntaxToken identifierToken;
 
@@ -392,6 +606,7 @@ struct ParameterSyntax final : SyntaxNode {
 
 
 struct FieldDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
     TypeSyntax type;
     SyntaxToken identifierToken;
     SyntaxToken semicolonToken;
@@ -401,8 +616,23 @@ struct FieldDeclarationSyntax final : SyntaxNode {
 };
 
 struct FunctionDeclarationSyntax;
+struct SequenceDeclarationSyntax;
+
+struct EventDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
+    SyntaxToken eventKeyword;
+    TypeSyntax delegateType;
+    SyntaxToken identifierToken;
+    SyntaxToken semicolonToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::EventDeclaration;
+    }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
 
 struct ConstructorDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
     SyntaxToken identifierToken;
     SyntaxToken openParenToken;
     std::vector<ParameterSyntax> parameters;
@@ -424,6 +654,7 @@ struct AccessorDeclarationSyntax final : SyntaxNode {
 };
 
 struct PropertyDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
     std::optional<SyntaxToken> staticKeyword;
     TypeSyntax type;
     SyntaxToken identifierToken;
@@ -437,11 +668,21 @@ struct PropertyDeclarationSyntax final : SyntaxNode {
 };
 
 struct ClassDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
     SyntaxToken classKeyword;
     SyntaxToken identifierToken;
+    std::optional<SyntaxToken> typeParameterLessToken;
+    std::vector<SyntaxToken> typeParameters;
+    std::vector<SyntaxToken> typeParameterCommaTokens;
+    std::optional<SyntaxToken> typeParameterGreaterToken;
+    std::optional<SyntaxToken> colonToken;
+    std::vector<TypeSyntax> interfaces;
+    std::vector<SyntaxToken> interfaceCommaTokens;
     SyntaxToken openBraceToken;
     std::vector<FieldDeclarationSyntax> fields;
+    std::vector<EventDeclarationSyntax> events;
     std::vector<FunctionDeclarationSyntax> methods;
+    std::vector<SequenceDeclarationSyntax> sequences;
     std::vector<ConstructorDeclarationSyntax> constructors;
     std::vector<PropertyDeclarationSyntax> properties;
     SyntaxToken closeBraceToken;
@@ -451,11 +692,21 @@ struct ClassDeclarationSyntax final : SyntaxNode {
 };
 
 struct StructDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
     SyntaxToken structKeyword;
     SyntaxToken identifierToken;
+    std::optional<SyntaxToken> typeParameterLessToken;
+    std::vector<SyntaxToken> typeParameters;
+    std::vector<SyntaxToken> typeParameterCommaTokens;
+    std::optional<SyntaxToken> typeParameterGreaterToken;
+    std::optional<SyntaxToken> colonToken;
+    std::vector<TypeSyntax> interfaces;
+    std::vector<SyntaxToken> interfaceCommaTokens;
     SyntaxToken openBraceToken;
     std::vector<FieldDeclarationSyntax> fields;
+    std::vector<EventDeclarationSyntax> events;
     std::vector<FunctionDeclarationSyntax> methods;
+    std::vector<SequenceDeclarationSyntax> sequences;
     std::vector<ConstructorDeclarationSyntax> constructors;
     std::vector<PropertyDeclarationSyntax> properties;
     SyntaxToken closeBraceToken;
@@ -464,7 +715,38 @@ struct StructDeclarationSyntax final : SyntaxNode {
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
+struct InterfaceMethodDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
+    TypeSyntax returnType;
+    SyntaxToken identifierToken;
+    SyntaxToken openParenToken;
+    std::vector<ParameterSyntax> parameters;
+    std::vector<SyntaxToken> commaTokens;
+    SyntaxToken closeParenToken;
+    SyntaxToken semicolonToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::InterfaceMethodDeclaration;
+    }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct InterfaceDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
+    SyntaxToken interfaceKeyword;
+    SyntaxToken identifierToken;
+    SyntaxToken openBraceToken;
+    std::vector<InterfaceMethodDeclarationSyntax> methods;
+    SyntaxToken closeBraceToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::InterfaceDeclaration;
+    }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
 struct EnumMemberDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
     SyntaxToken identifierToken;
     std::optional<SyntaxToken> equalsToken;
     std::optional<SyntaxToken> valueToken;
@@ -475,6 +757,7 @@ struct EnumMemberDeclarationSyntax final : SyntaxNode {
 };
 
 struct EnumDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
     SyntaxToken enumKeyword;
     SyntaxToken identifierToken;
     SyntaxToken openBraceToken;
@@ -486,9 +769,14 @@ struct EnumDeclarationSyntax final : SyntaxNode {
 };
 
 struct FunctionDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
     std::optional<SyntaxToken> staticKeyword;
     TypeSyntax returnType;
     SyntaxToken identifierToken;
+    std::optional<SyntaxToken> typeParameterLessToken;
+    std::vector<SyntaxToken> typeParameters;
+    std::vector<SyntaxToken> typeParameterCommaTokens;
+    std::optional<SyntaxToken> typeParameterGreaterToken;
     SyntaxToken openParenToken;
     std::vector<ParameterSyntax> parameters;
     std::vector<SyntaxToken> commaTokens;
@@ -496,6 +784,39 @@ struct FunctionDeclarationSyntax final : SyntaxNode {
     BlockStatementSyntax body;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::FunctionDeclaration; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct DelegateDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
+    SyntaxToken delegateKeyword;
+    TypeSyntax returnType;
+    SyntaxToken identifierToken;
+    SyntaxToken openParenToken;
+    std::vector<ParameterSyntax> parameters;
+    std::vector<SyntaxToken> commaTokens;
+    SyntaxToken closeParenToken;
+    SyntaxToken semicolonToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::DelegateDeclaration;
+    }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
+struct SequenceDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
+    SyntaxToken sequenceKeyword;
+    SyntaxToken identifierToken;
+    SyntaxToken openParenToken;
+    std::vector<ParameterSyntax> parameters;
+    std::vector<SyntaxToken> commaTokens;
+    SyntaxToken closeParenToken;
+    BlockStatementSyntax body;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::SequenceDeclaration;
+    }
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
@@ -527,6 +848,8 @@ struct CompilationUnitSyntax final : SyntaxNode {
     std::vector<ClassDeclarationSyntax> classes;
     std::vector<StructDeclarationSyntax> structs;
     std::vector<EnumDeclarationSyntax> enums;
+    std::vector<InterfaceDeclarationSyntax> interfaces;
+    std::vector<DelegateDeclarationSyntax> delegates;
     std::vector<FunctionDeclarationSyntax> functions;
     SyntaxToken endOfFileToken;
 
@@ -552,27 +875,74 @@ private:
     void parseQualifiedName(
         std::vector<SyntaxToken>& nameParts,
         std::vector<SyntaxToken>& dotTokens);
-    [[nodiscard]] ClassDeclarationSyntax parseClassDeclaration();
-    [[nodiscard]] StructDeclarationSyntax parseStructDeclaration();
-    [[nodiscard]] EnumDeclarationSyntax parseEnumDeclaration();
-    [[nodiscard]] FieldDeclarationSyntax parseFieldDeclaration(TypeSyntax type, SyntaxToken identifier);
+    [[nodiscard]] std::vector<AttributeListSyntax> parseAttributeLists();
+    [[nodiscard]] AttributeListSyntax parseAttributeList();
+    [[nodiscard]] AttributeSyntax parseAttribute();
+    [[nodiscard]] AttributeArgumentSyntax parseAttributeArgument();
+    [[nodiscard]] ClassDeclarationSyntax parseClassDeclaration(
+        std::vector<AttributeListSyntax> attributes);
+    [[nodiscard]] StructDeclarationSyntax parseStructDeclaration(
+        std::vector<AttributeListSyntax> attributes);
+    [[nodiscard]] EnumDeclarationSyntax parseEnumDeclaration(
+        std::vector<AttributeListSyntax> attributes);
+    [[nodiscard]] InterfaceDeclarationSyntax parseInterfaceDeclaration(
+        std::vector<AttributeListSyntax> attributes);
+    [[nodiscard]] InterfaceMethodDeclarationSyntax parseInterfaceMethodDeclaration(
+        std::vector<AttributeListSyntax> attributes);
+    [[nodiscard]] DelegateDeclarationSyntax parseDelegateDeclaration(
+        std::vector<AttributeListSyntax> attributes);
+    [[nodiscard]] EventDeclarationSyntax parseEventDeclaration(
+        std::vector<AttributeListSyntax> attributes);
+    void parseInterfaceList(
+        std::optional<SyntaxToken>& colonToken,
+        std::vector<TypeSyntax>& interfaces,
+        std::vector<SyntaxToken>& commaTokens);
+    [[nodiscard]] FieldDeclarationSyntax parseFieldDeclaration(
+        TypeSyntax type,
+        SyntaxToken identifier,
+        std::vector<AttributeListSyntax> attributes);
     [[nodiscard]] FunctionDeclarationSyntax parseFunctionDeclaration(
         std::optional<SyntaxToken> staticKeyword = std::nullopt,
         std::optional<TypeSyntax> returnType = std::nullopt,
-        std::optional<SyntaxToken> identifier = std::nullopt);
-    [[nodiscard]] ConstructorDeclarationSyntax parseConstructorDeclaration();
+        std::optional<SyntaxToken> identifier = std::nullopt,
+        std::vector<AttributeListSyntax> attributes = {});
+    [[nodiscard]] SequenceDeclarationSyntax parseSequenceDeclaration(
+        std::vector<AttributeListSyntax> attributes);
+    [[nodiscard]] ConstructorDeclarationSyntax parseConstructorDeclaration(
+        std::vector<AttributeListSyntax> attributes);
     [[nodiscard]] PropertyDeclarationSyntax parsePropertyDeclaration(
         std::optional<SyntaxToken> staticKeyword,
         TypeSyntax type,
-        SyntaxToken identifier);
+        SyntaxToken identifier,
+        std::vector<AttributeListSyntax> attributes);
     [[nodiscard]] AccessorDeclarationSyntax parseAccessorDeclaration();
     [[nodiscard]] TypeSyntax parseType();
+    void parseTypeArgumentList(
+        std::optional<SyntaxToken>& lessToken,
+        std::vector<TypeSyntax>& arguments,
+        std::vector<SyntaxToken>& commaTokens,
+        std::optional<SyntaxToken>& greaterToken);
+    void parseTypeParameterList(
+        std::optional<SyntaxToken>& lessToken,
+        std::vector<SyntaxToken>& parameters,
+        std::vector<SyntaxToken>& commaTokens,
+        std::optional<SyntaxToken>& greaterToken);
+    [[nodiscard]] bool isGenericCallStart() const noexcept;
     [[nodiscard]] ParameterSyntax parseParameter();
     [[nodiscard]] BlockStatementSyntax parseBlockStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseReturnStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseIfStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseWhileStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseForStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseForeachStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseDoWhileStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseBreakStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseContinueStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseSwitchStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseYieldWaitStatement();
+    [[nodiscard]] std::unique_ptr<StatementSyntax> parseEventSubscriptionStatement();
+    [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseEventHandler();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseVariableDeclarationStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseExpressionStatement();
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseExpression();
@@ -584,6 +954,7 @@ private:
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseNewExpression();
     void parseArgumentList(
         std::vector<std::unique_ptr<ExpressionSyntax>>& arguments,
+        std::vector<std::optional<SyntaxToken>>* argumentModifiers,
         std::vector<SyntaxToken>& commaTokens,
         SyntaxToken& closeParenToken);
     [[nodiscard]] bool isVariableDeclarationStart() const noexcept;

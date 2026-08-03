@@ -32,14 +32,17 @@ std::vector<realscript::bytecode::Module> compileModules(
     realscript::compiler::Compilation compilation(std::move(files));
     const auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
-        "extended source compilation failed:\n" + diagnosticsText(build.diagnostics));
+        "native source compilation failed:\n" + diagnosticsText(build.diagnostics));
     realscript::bytecode::Lowerer lowerer;
     std::vector<realscript::bytecode::Module> modules;
     for (const auto& mir : build.modules) {
         auto module = lowerer.lower(mir);
         realscript::diagnostics::DiagnosticBag diagnostics;
-        require(realscript::bytecode::verifyModule(module, diagnostics),
-            "extended bytecode verification failed:\n" + diagnosticsText(diagnostics));
+        const auto verified =
+            realscript::bytecode::verifyModule(module, diagnostics);
+        require(verified,
+            "extended bytecode verification failed:\n" +
+                diagnosticsText(diagnostics));
         modules.push_back(std::move(module));
     }
     return modules;
@@ -371,39 +374,31 @@ int other()
         "same-name generic declarations leaked across modules");
 }
 
-void testExpansionMetadata() {
-    const auto expansion = realscript::compiler::expandLanguageSource(
+void testNativeMetadata() {
+    realscript::compiler::Compilation compilation({{
         "metadata.rs",
-        "module Meta; [Replicated(channel = \"state\")] class Unit { int health; }");
-    require(expansion.succeeded(), "metadata expansion failed");
-    require(expansion.attributes.size() == 1, "source attribute was not captured");
-    require(expansion.attributes.front().target == "Meta::Unit",
+        "module Meta; [Replicated(channel = \"state\")] "
+        "class Unit { int health; }"}});
+    const auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "native metadata compilation failed:\n" +
+            diagnosticsText(build.diagnostics));
+    require(build.nativeAttributes.size() == 1,
+        "native source attribute was not captured");
+    require(build.nativeAttributes.front().target == "Meta::Unit",
         "source attribute target was not module-qualified");
-    require(expansion.attributes.front().name == "Replicated",
+    require(build.nativeAttributes.front().name == "Replicated",
         "source attribute name changed");
-    require(expansion.attributes.front().arguments.size() == 1,
+    require(build.nativeAttributes.front().arguments.size() == 1 &&
+            build.nativeAttributes.front().arguments.front().name ==
+                "channel" &&
+            build.nativeAttributes.front().arguments.front().value ==
+                "\"state\"",
         "source attribute arguments were not captured");
 }
 
-void testExpansionOptionsRefreshExistingSources() {
-    realscript::compiler::Compilation compilation;
-    compilation.addSource({
-        "options.rs",
-        "module Options; int main(){for(int i=0;i<1;i=i+1){}return 1;}"});
-    require(compilation.languageExpansions().size() == 1 &&
-            compilation.languageExpansions().front().changed,
-        "default language expansion did not run");
 
-    realscript::compiler::LanguageExpansionOptions options;
-    options.structuredControlFlow = false;
-    compilation.setLanguageExpansionOptions(options);
-    require(compilation.languageExpansions().size() == 1 &&
-            compilation.languageExpansions().front().content.find("for") !=
-                std::string::npos,
-        "changing expansion options did not rebuild existing sources");
-}
-
-void testAotGenerationFromExpandedSource() {
+void testNativeAotGeneration() {
     const char* source = R"(
 module ExpandedAot;
 
@@ -431,7 +426,7 @@ int main()
     realscript::compiler::Compilation compilation({{"expanded_aot.rs", source}});
     auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
-        "expanded AOT source failed to compile:\n" +
+        "native AOT source failed to compile:\n" +
         diagnosticsText(build.diagnostics));
 
     realscript::diagnostics::DiagnosticBag diagnostics;
@@ -442,7 +437,79 @@ int main()
     require(!diagnostics.hasErrors() && generated.contentHash != 0 &&
             generated.source.find("Phase11To17ExpandedProgram") !=
                 std::string::npos,
-        "expanded MIR did not generate deterministic C++17 AOT source");
+        "native MIR did not generate deterministic C++17 AOT source");
+}
+
+void testNativeMetadataArtifacts() {
+    const char* source = R"(
+module ArtifactMeta;
+
+interface IRead { int Read(); }
+
+[Serializable(version = 3)]
+class Box<T> : IRead
+{
+    T value;
+    Box(T initial) { value = initial; }
+    int Read() { return 1; }
+}
+
+T Identity<T>(T value) { return value; }
+
+int main()
+{
+    Box<int> value = new Box<int>(1);
+    return Identity<int>(value.Read());
+}
+)";
+
+    realscript::compiler::Compilation compilation({{"artifact_meta.rs", source}});
+    auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "metadata artifact source failed to compile:\n" +
+            diagnosticsText(build.diagnostics));
+    require(build.modules.size() == 1 &&
+            !build.modules.front().languageMetadata.attributes.empty() &&
+            !build.modules.front().languageMetadata.interfaces.empty() &&
+            build.modules.front().languageMetadata.genericInstantiations.size() >= 2,
+        "MIR module did not retain native language metadata");
+
+    realscript::bytecode::Lowerer lowerer;
+    const auto bytecode = lowerer.lower(build.modules.front());
+    require(bytecode.version.major == 0 && bytecode.version.minor == 6,
+        "native metadata did not advance the RSBC format to 0.6");
+    const auto bytes = realscript::bytecode::encodeModule(bytecode);
+    realscript::bytecode::Module decoded;
+    realscript::diagnostics::DiagnosticBag decodeDiagnostics;
+    require(realscript::bytecode::decodeModule(
+                bytes, decoded, decodeDiagnostics) &&
+            !decodeDiagnostics.hasErrors(),
+        "RSBC metadata round trip failed:\n" +
+            diagnosticsText(decodeDiagnostics));
+    require(decoded.languageMetadata.attributes.size() ==
+                bytecode.languageMetadata.attributes.size() &&
+            decoded.languageMetadata.interfaces.size() ==
+                bytecode.languageMetadata.interfaces.size() &&
+            decoded.languageMetadata.genericInstantiations.size() ==
+                bytecode.languageMetadata.genericInstantiations.size() &&
+            decoded.languageMetadata.attributes.front().name == "Serializable" &&
+            decoded.languageMetadata.genericInstantiations.front().generatedName.find("__int") !=
+                std::string::npos,
+        "decoded RSBC language metadata changed");
+
+    realscript::aot::CppGenerator generator;
+    realscript::aot::GenerationOptions options;
+    options.programName = "Phase18Metadata";
+    realscript::diagnostics::DiagnosticBag aotDiagnostics;
+    const auto generated = generator.generate(
+        build.modules, aotDiagnostics, options);
+    require(!aotDiagnostics.hasErrors() &&
+            generated.manifest.find("\"languageMetadata\"") !=
+                std::string::npos &&
+            generated.manifest.find("Serializable") != std::string::npos &&
+            generated.manifest.find("Box__int") != std::string::npos &&
+            generated.manifest.find("Identity__int") != std::string::npos,
+        "AOT manifest did not retain native language metadata");
 }
 
 void testPhase16DeterministicSequence() {
@@ -486,6 +553,14 @@ class Behavior
         "GameCompileResult did not retain source attributes");
     require(compiled.program.languageMetadata().attributes.size() == 1,
         "GameProgram did not retain source attributes");
+    require(compiled.languageMetadata.sequences.size() == 1 &&
+            compiled.languageMetadata.sequences.front().typeName ==
+                "SequenceDemo::Behavior" &&
+            compiled.languageMetadata.sequences.front().name == "Attack" &&
+            compiled.languageMetadata.sequences.front().callbacks.size() == 2,
+        "GameCompileResult did not retain native sequence metadata");
+    require(compiled.program.languageMetadata().sequences.size() == 1,
+        "GameProgram did not retain native sequence metadata");
 
     realscript::game::ScriptRuntime scripts(compiled.program);
     realscript::game::SceneScriptRuntime scene(scripts);
@@ -524,9 +599,9 @@ int main() {
     run("nested switch control flow", testNestedSwitchControlFlow);
     run("cross-file declaration sharing", testCrossFileDeclarationSharing);
     run("cross-module imports and isolation", testCrossModuleImportsAndIsolation);
-    run("source attribute metadata", testExpansionMetadata);
-    run("expansion options refresh", testExpansionOptionsRefreshExistingSources);
-    run("AOT generation from expanded source", testAotGenerationFromExpandedSource);
+    run("native source metadata", testNativeMetadata);
+    run("AOT generation from native source", testNativeAotGeneration);
+    run("native metadata artifacts", testNativeMetadataArtifacts);
     run("phase 16 deterministic sequence", testPhase16DeterministicSequence);
     return failures == 0 ? 0 : 1;
 }

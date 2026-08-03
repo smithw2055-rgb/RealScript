@@ -1,5 +1,6 @@
 #pragma once
 
+#include "realscript/compiler/LanguageMetadata.h"
 #include "realscript/debug/DebugInfo.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/semantic/Semantic.h"
@@ -147,6 +148,7 @@ struct Function {
 
 struct Module {
     std::string name;
+    compiler::LanguageModuleMetadata languageMetadata;
     std::vector<debug::SourceFileInfo> sourceFiles;
     std::vector<semantic::TypeSymbol> types;
     std::vector<Function> functions;
@@ -201,6 +203,8 @@ private:
     Function* currentFunction_ = nullptr;
     std::optional<BlockId> currentBlockId_;
     ValueId nextValueId_ = 0;
+    std::vector<BlockId> breakTargets_;
+    std::vector<BlockId> continueTargets_;
 };
 
 [[nodiscard]] const char* opcodeName(Opcode opcode) noexcept;

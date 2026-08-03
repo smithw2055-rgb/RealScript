@@ -142,10 +142,22 @@ std::optional<syntax::SyntaxToken> LanguageService::tokenAt(
 std::vector<DocumentSymbol> LanguageService::allDefinitions() const {
     std::vector<DocumentSymbol> symbols;
     std::unordered_set<semantic::SymbolId> seen;
+    std::unordered_set<std::string> generatedNames;
+    for (const auto& module : result_.modules) {
+        for (const auto& instance :
+             module.languageMetadata.genericInstantiations) {
+            generatedNames.insert(instance.generatedName);
+        }
+    }
     auto append = [&](semantic::SymbolId id, semantic::SymbolKind kind,
                       std::string name, std::string detail,
                       const std::string& path, text::TextSpan span) {
-        if (id == 0 || path.empty() || !seen.insert(id).second) return;
+        if (id == 0 || path.empty() ||
+            documents_.find(path) == documents_.end() ||
+            !identifier(name) || generatedNames.find(name) != generatedNames.end() ||
+            !seen.insert(id).second) {
+            return;
+        }
         symbols.push_back({id, kind, std::move(name), std::move(detail), {path, rangeFor(path, span)}});
     };
 
@@ -157,9 +169,11 @@ std::vector<DocumentSymbol> LanguageService::allDefinitions() const {
     }
     for (const auto& module : result_.modules) {
         for (const auto& type : module.types) {
+            if (type.synthetic) continue;
             append(type.id, semantic::SymbolKind::Type, type.name,
                 semantic::canonicalTypeName(type), type.sourceName, type.declarationSpan);
             for (const auto& field : type.fields) {
+                if (field.synthetic) continue;
                 append(field.id, semantic::SymbolKind::Field, field.name,
                     typeDetail(field.type, field.typeName), field.sourceName, field.declarationSpan);
             }
@@ -172,10 +186,12 @@ std::vector<DocumentSymbol> LanguageService::allDefinitions() const {
                     typeDetail(property.type, property.typeName), property.sourceName, property.declarationSpan);
             }
             for (const auto& method : type.methods) {
+                if (method.synthetic) continue;
                 append(method.id, semantic::SymbolKind::Function, method.name,
                     functionDetail(method), method.sourceName, method.declarationSpan);
             }
             for (const auto& constructor : type.constructors) {
+                if (constructor.synthetic) continue;
                 append(constructor.id, semantic::SymbolKind::Function, type.name,
                     functionDetail(constructor), constructor.sourceName, constructor.declarationSpan);
             }

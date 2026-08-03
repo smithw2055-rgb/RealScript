@@ -9,7 +9,7 @@ This library describes the RealScript v0.1 alpha technical baseline and the boun
 1. [Getting Started](GETTING_STARTED.md)
 2. [Architecture](ARCHITECTURE.md)
 3. [Language and Type System](LANGUAGE_AND_TYPE_SYSTEM.md)
-4. [Phase 11–17 Language Expansion Profile](LANGUAGE_EXPANSION_PHASE_11_17.md)
+4. [Phase 11–18 Native Language Profile](NATIVE_LANGUAGE_PHASE_11_18.md)
 5. [Game Scripting SDK](GAME_SCRIPTING_SDK.md)
 6. [Deterministic Gameplay Runtime](GAMEPLAY_RUNTIME.md)
 7. [SDK Productization](PRODUCTIZATION.md)
@@ -19,7 +19,7 @@ This library describes the RealScript v0.1 alpha technical baseline and the boun
 
 - [Compilation, MIR, and Bytecode](COMPILATION_AND_BYTECODE.md)
 - [Runtime, GC, and Embedding](RUNTIME_GC_AND_EMBEDDING.md)
-- [Phase 11–17 Language Expansion Profile](LANGUAGE_EXPANSION_PHASE_11_17.md)
+- [Phase 11–18 Native Language Profile](NATIVE_LANGUAGE_PHASE_11_18.md)
 - [Game Scripting SDK](GAME_SCRIPTING_SDK.md)
 - [Deterministic Gameplay Runtime](GAMEPLAY_RUNTIME.md)
 - [SDK Productization](PRODUCTIZATION.md)

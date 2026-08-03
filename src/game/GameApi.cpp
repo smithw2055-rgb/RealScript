@@ -54,55 +54,6 @@ void writeFunction(
         << " }\n";
 }
 
-void collectLanguageMetadata(
-    GameLanguageMetadata& metadata,
-    const std::vector<compiler::LanguageExpansionResult>& expansions) {
-    for (const auto& expansion : expansions) {
-        metadata.attributes.insert(
-            metadata.attributes.end(),
-            expansion.attributes.begin(),
-            expansion.attributes.end());
-        metadata.interfaces.insert(
-            metadata.interfaces.end(),
-            expansion.interfaces.begin(),
-            expansion.interfaces.end());
-        metadata.genericInstantiations.insert(
-            metadata.genericInstantiations.end(),
-            expansion.genericInstantiations.begin(),
-            expansion.genericInstantiations.end());
-    }
-
-    std::stable_sort(
-        metadata.attributes.begin(), metadata.attributes.end(),
-        [](const auto& left, const auto& right) {
-            if (left.target != right.target) return left.target < right.target;
-            return left.name < right.name;
-        });
-    std::sort(
-        metadata.interfaces.begin(), metadata.interfaces.end(),
-        [](const auto& left, const auto& right) {
-            return left.typeName < right.typeName;
-        });
-    std::sort(
-        metadata.genericInstantiations.begin(),
-        metadata.genericInstantiations.end(),
-        [](const auto& left, const auto& right) {
-            if (left.generatedName != right.generatedName) {
-                return left.generatedName < right.generatedName;
-            }
-            return left.genericName < right.genericName;
-        });
-    metadata.genericInstantiations.erase(
-        std::unique(
-            metadata.genericInstantiations.begin(),
-            metadata.genericInstantiations.end(),
-            [](const auto& left, const auto& right) {
-                return left.generatedName == right.generatedName &&
-                    left.genericName == right.genericName &&
-                    left.arguments == right.arguments;
-            }),
-        metadata.genericInstantiations.end());
-}
 
 } // namespace
 
@@ -203,11 +154,75 @@ GameCompileResult GameScriptCompiler::compile(
         compilation.addSource(std::move(source));
     }
     for (const auto& source : sources) compilation.addSource(source);
-    collectLanguageMetadata(
-        result.languageMetadata,
-        compilation.languageExpansions());
-
     auto build = compilation.build();
+    result.languageMetadata.genericInstantiations.insert(
+        result.languageMetadata.genericInstantiations.end(),
+        build.nativeGenericInstantiations.begin(),
+        build.nativeGenericInstantiations.end());
+    std::sort(
+        result.languageMetadata.genericInstantiations.begin(),
+        result.languageMetadata.genericInstantiations.end(),
+        [](const auto& left, const auto& right) {
+            if (left.generatedName != right.generatedName) {
+                return left.generatedName < right.generatedName;
+            }
+            if (left.genericName != right.genericName) {
+                return left.genericName < right.genericName;
+            }
+            return left.arguments < right.arguments;
+        });
+    result.languageMetadata.genericInstantiations.erase(
+        std::unique(
+            result.languageMetadata.genericInstantiations.begin(),
+            result.languageMetadata.genericInstantiations.end(),
+            [](const auto& left, const auto& right) {
+                return left.generatedName == right.generatedName &&
+                    left.genericName == right.genericName &&
+                    left.arguments == right.arguments;
+            }),
+        result.languageMetadata.genericInstantiations.end());
+    result.languageMetadata.attributes.insert(
+        result.languageMetadata.attributes.end(),
+        build.nativeAttributes.begin(),
+        build.nativeAttributes.end());
+    std::stable_sort(
+        result.languageMetadata.attributes.begin(),
+        result.languageMetadata.attributes.end(),
+        [](const auto& left, const auto& right) {
+            if (left.target != right.target) {
+                return left.target < right.target;
+            }
+            if (left.name != right.name) {
+                return left.name < right.name;
+            }
+            if (left.sourceName != right.sourceName) {
+                return left.sourceName < right.sourceName;
+            }
+            return left.offset < right.offset;
+        });
+    result.languageMetadata.sequences.insert(
+        result.languageMetadata.sequences.end(),
+        build.nativeSequences.begin(),
+        build.nativeSequences.end());
+    std::stable_sort(
+        result.languageMetadata.sequences.begin(),
+        result.languageMetadata.sequences.end(),
+        [](const auto& left, const auto& right) {
+            if (left.typeName != right.typeName) {
+                return left.typeName < right.typeName;
+            }
+            return left.name < right.name;
+        });
+    result.languageMetadata.interfaces.insert(
+        result.languageMetadata.interfaces.end(),
+        build.nativeInterfaces.begin(),
+        build.nativeInterfaces.end());
+    std::stable_sort(
+        result.languageMetadata.interfaces.begin(),
+        result.languageMetadata.interfaces.end(),
+        [](const auto& left, const auto& right) {
+            return left.typeName < right.typeName;
+        });
     result.diagnostics.append(build.diagnostics);
     if (result.diagnostics.hasErrors()) return result;
 

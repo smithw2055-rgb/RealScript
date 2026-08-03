@@ -175,8 +175,12 @@ SyntaxToken Lexer::nextToken() {
     };
 
     switch (current()) {
-    case '+': return single(SyntaxKind::PlusToken);
-    case '-': return single(SyntaxKind::MinusToken);
+    case '+': return peek(1) == '='
+        ? pair(SyntaxKind::PlusEqualsToken)
+        : single(SyntaxKind::PlusToken);
+    case '-': return peek(1) == '='
+        ? pair(SyntaxKind::MinusEqualsToken)
+        : single(SyntaxKind::MinusToken);
     case '*': return single(SyntaxKind::StarToken);
     case '/': return single(SyntaxKind::SlashToken);
     case '%': return single(SyntaxKind::PercentToken);
@@ -191,7 +195,10 @@ SyntaxToken Lexer::nextToken() {
     case ':': return single(SyntaxKind::ColonToken);
     case ';': return single(SyntaxKind::SemicolonToken);
     case '!': return peek(1) == '=' ? pair(SyntaxKind::BangEqualsToken) : single(SyntaxKind::BangToken);
-    case '=': return peek(1) == '=' ? pair(SyntaxKind::EqualsEqualsToken) : single(SyntaxKind::EqualsToken);
+    case '=':
+        if (peek(1) == '=') return pair(SyntaxKind::EqualsEqualsToken);
+        if (peek(1) == '>') return pair(SyntaxKind::ArrowToken);
+        return single(SyntaxKind::EqualsToken);
     case '<': return peek(1) == '=' ? pair(SyntaxKind::LessOrEqualsToken) : single(SyntaxKind::LessToken);
     case '>': return peek(1) == '=' ? pair(SyntaxKind::GreaterOrEqualsToken) : single(SyntaxKind::GreaterToken);
     case '&':

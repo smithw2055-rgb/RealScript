@@ -16,7 +16,8 @@ constexpr std::uint32_t SectionReferences = 3;
 constexpr std::uint32_t SectionFunctions = 4;
 constexpr std::uint32_t SectionCode = 5;
 constexpr std::uint32_t SectionDebug = 6;
-constexpr std::uint32_t SectionCount = 6;
+constexpr std::uint32_t SectionMetadata = 7;
+constexpr std::uint32_t SectionCount = 7;
 
 class Writer {
 public:
@@ -343,6 +344,31 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
             }
         }
     }
+    for (const auto& attribute : module.languageMetadata.attributes) {
+        strings.add(attribute.target);
+        strings.add(attribute.name);
+        strings.add(attribute.sourceName);
+        for (const auto& argument : attribute.arguments) {
+            strings.add(argument.name);
+            strings.add(argument.value);
+        }
+    }
+    for (const auto& implementation : module.languageMetadata.interfaces) {
+        strings.add(implementation.typeName);
+        for (const auto& name : implementation.interfaces) strings.add(name);
+    }
+    for (const auto& instantiation :
+         module.languageMetadata.genericInstantiations) {
+        strings.add(instantiation.genericName);
+        strings.add(instantiation.generatedName);
+        for (const auto& argument : instantiation.arguments) strings.add(argument);
+    }
+    for (const auto& sequence : module.languageMetadata.sequences) {
+        strings.add(sequence.typeName);
+        strings.add(sequence.name);
+        strings.add(sequence.sourceName);
+        for (const auto& callback : sequence.callbacks) strings.add(callback);
+    }
 
     Writer stringSection;
     stringSection.u32(static_cast<std::uint32_t>(strings.values().size()));
@@ -483,6 +509,55 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         }
     }
 
+    Writer metadataSection;
+    metadataSection.u32(static_cast<std::uint32_t>(
+        module.languageMetadata.attributes.size()));
+    for (const auto& attribute : module.languageMetadata.attributes) {
+        metadataSection.u32(strings.indexOf(attribute.target));
+        metadataSection.u32(strings.indexOf(attribute.name));
+        metadataSection.u32(strings.indexOf(attribute.sourceName));
+        metadataSection.u64(static_cast<std::uint64_t>(attribute.offset));
+        metadataSection.u32(static_cast<std::uint32_t>(attribute.arguments.size()));
+        for (const auto& argument : attribute.arguments) {
+            metadataSection.u32(strings.indexOf(argument.name));
+            metadataSection.u32(strings.indexOf(argument.value));
+        }
+    }
+    metadataSection.u32(static_cast<std::uint32_t>(
+        module.languageMetadata.interfaces.size()));
+    for (const auto& implementation : module.languageMetadata.interfaces) {
+        metadataSection.u32(strings.indexOf(implementation.typeName));
+        metadataSection.u32(static_cast<std::uint32_t>(
+            implementation.interfaces.size()));
+        for (const auto& name : implementation.interfaces) {
+            metadataSection.u32(strings.indexOf(name));
+        }
+    }
+    metadataSection.u32(static_cast<std::uint32_t>(
+        module.languageMetadata.genericInstantiations.size()));
+    for (const auto& instantiation :
+         module.languageMetadata.genericInstantiations) {
+        metadataSection.u32(strings.indexOf(instantiation.genericName));
+        metadataSection.u32(strings.indexOf(instantiation.generatedName));
+        metadataSection.u32(static_cast<std::uint32_t>(
+            instantiation.arguments.size()));
+        for (const auto& argument : instantiation.arguments) {
+            metadataSection.u32(strings.indexOf(argument));
+        }
+    }
+    metadataSection.u32(static_cast<std::uint32_t>(
+        module.languageMetadata.sequences.size()));
+    for (const auto& sequence : module.languageMetadata.sequences) {
+        metadataSection.u32(strings.indexOf(sequence.typeName));
+        metadataSection.u32(strings.indexOf(sequence.name));
+        metadataSection.u32(strings.indexOf(sequence.sourceName));
+        metadataSection.u64(static_cast<std::uint64_t>(sequence.offset));
+        metadataSection.u32(static_cast<std::uint32_t>(sequence.callbacks.size()));
+        for (const auto& callback : sequence.callbacks) {
+            metadataSection.u32(strings.indexOf(callback));
+        }
+    }
+
     Writer writer;
     writer.bytes("RSBC", 4);
     writer.u16(module.version.major);
@@ -504,6 +579,7 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
             {SectionFunctions, &functionSection},
             {SectionCode, &codeSection},
             {SectionDebug, &debugSection},
+            {SectionMetadata, &metadataSection},
         }};
 
     for (std::size_t index = 0; index < sections.size(); ++index) {
@@ -541,7 +617,7 @@ bool decodeModule(
         diagnostics.report("RS5003", "truncated bytecode header", {});
         return false;
     }
-    if (module.version.major != 0 || module.version.minor != 5) {
+    if (module.version.major != 0 || module.version.minor != 6) {
         diagnostics.report("RS5001", "unsupported bytecode version", {});
         return false;
     }
@@ -570,6 +646,7 @@ bool decodeModule(
              SectionFunctions,
              SectionCode,
              SectionDebug,
+             SectionMetadata,
          }) {
         if (sections.find(kind) == sections.end()) {
             diagnostics.report("RS5002", "missing required bytecode section", {});
@@ -629,6 +706,153 @@ bool decodeModule(
         return false;
     }
     module.name = strings.front();
+
+    {
+        const auto section = sections.at(SectionMetadata);
+        Reader reader(bytes, section.offset, section.size);
+        const auto readStringValue = [&](std::string& value,
+                                         const char* message) -> bool {
+            const auto index = reader.u32();
+            if (!reader.valid() ||
+                !validStringIndex(index, strings, diagnostics, message)) {
+                return false;
+            }
+            value = strings[index];
+            return true;
+        };
+
+        const auto attributeCount = reader.u32();
+        if (!reader.valid() || attributeCount > reader.remaining() / 4) {
+            diagnostics.report("RS5010", "truncated language attribute metadata", {});
+            return false;
+        }
+        for (std::uint32_t index = 0; index < attributeCount; ++index) {
+            compiler::LanguageAttributeRecord attribute;
+            if (!readStringValue(attribute.target,
+                    "invalid attribute target string index") ||
+                !readStringValue(attribute.name,
+                    "invalid attribute name string index") ||
+                !readStringValue(attribute.sourceName,
+                    "invalid attribute source string index")) {
+                return false;
+            }
+            attribute.offset = static_cast<std::size_t>(reader.u64());
+            const auto argumentCount = reader.u32();
+            if (!reader.valid() || argumentCount > reader.remaining() / 8) {
+                diagnostics.report("RS5010", "truncated attribute arguments", {});
+                return false;
+            }
+            for (std::uint32_t argument = 0;
+                 argument < argumentCount; ++argument) {
+                compiler::LanguageAttributeArgument value;
+                if (!readStringValue(value.name,
+                        "invalid attribute argument-name string index") ||
+                    !readStringValue(value.value,
+                        "invalid attribute argument-value string index")) {
+                    return false;
+                }
+                attribute.arguments.push_back(std::move(value));
+            }
+            module.languageMetadata.attributes.push_back(std::move(attribute));
+        }
+
+        const auto interfaceCount = reader.u32();
+        if (!reader.valid() || interfaceCount > reader.remaining() / 4) {
+            diagnostics.report("RS5010", "truncated interface metadata", {});
+            return false;
+        }
+        for (std::uint32_t index = 0; index < interfaceCount; ++index) {
+            compiler::LanguageInterfaceImplementation implementation;
+            if (!readStringValue(implementation.typeName,
+                    "invalid interface type-name string index")) {
+                return false;
+            }
+            const auto implementedCount = reader.u32();
+            if (!reader.valid() || implementedCount > reader.remaining() / 4) {
+                diagnostics.report("RS5010", "truncated implemented interfaces", {});
+                return false;
+            }
+            for (std::uint32_t implemented = 0;
+                 implemented < implementedCount; ++implemented) {
+                std::string name;
+                if (!readStringValue(name,
+                        "invalid implemented-interface string index")) {
+                    return false;
+                }
+                implementation.interfaces.push_back(std::move(name));
+            }
+            module.languageMetadata.interfaces.push_back(
+                std::move(implementation));
+        }
+
+        const auto genericCount = reader.u32();
+        if (!reader.valid() || genericCount > reader.remaining() / 4) {
+            diagnostics.report("RS5010", "truncated generic metadata", {});
+            return false;
+        }
+        for (std::uint32_t index = 0; index < genericCount; ++index) {
+            compiler::LanguageGenericInstantiation instantiation;
+            if (!readStringValue(instantiation.genericName,
+                    "invalid generic name string index") ||
+                !readStringValue(instantiation.generatedName,
+                    "invalid generic generated-name string index")) {
+                return false;
+            }
+            const auto argumentCount = reader.u32();
+            if (!reader.valid() || argumentCount > reader.remaining() / 4) {
+                diagnostics.report("RS5010", "truncated generic arguments", {});
+                return false;
+            }
+            for (std::uint32_t argument = 0;
+                 argument < argumentCount; ++argument) {
+                std::string value;
+                if (!readStringValue(value,
+                        "invalid generic argument string index")) {
+                    return false;
+                }
+                instantiation.arguments.push_back(std::move(value));
+            }
+            module.languageMetadata.genericInstantiations.push_back(
+                std::move(instantiation));
+        }
+
+        const auto sequenceCount = reader.u32();
+        if (!reader.valid() || sequenceCount > reader.remaining() / 4) {
+            diagnostics.report("RS5010", "truncated sequence metadata", {});
+            return false;
+        }
+        for (std::uint32_t index = 0; index < sequenceCount; ++index) {
+            compiler::LanguageSequenceRecord sequence;
+            if (!readStringValue(sequence.typeName,
+                    "invalid sequence type-name string index") ||
+                !readStringValue(sequence.name,
+                    "invalid sequence name string index") ||
+                !readStringValue(sequence.sourceName,
+                    "invalid sequence source string index")) {
+                return false;
+            }
+            sequence.offset = static_cast<std::size_t>(reader.u64());
+            const auto callbackCount = reader.u32();
+            if (!reader.valid() || callbackCount > reader.remaining() / 4) {
+                diagnostics.report("RS5010", "truncated sequence callbacks", {});
+                return false;
+            }
+            for (std::uint32_t callback = 0;
+                 callback < callbackCount; ++callback) {
+                std::string value;
+                if (!readStringValue(value,
+                        "invalid sequence callback string index")) {
+                    return false;
+                }
+                sequence.callbacks.push_back(std::move(value));
+            }
+            module.languageMetadata.sequences.push_back(std::move(sequence));
+        }
+        if (!reader.valid() || !reader.empty()) {
+            diagnostics.report("RS5010", "invalid language metadata section", {});
+            return false;
+        }
+    }
 
     {
         const auto section = sections.at(SectionTypes);

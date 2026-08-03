@@ -76,7 +76,7 @@ void testDebugMetadataRoundTrip() {
     auto modules = compile({{"debug.rs", debugSource}});
     require(modules.size() == 1, "expected one debug module");
     const auto& module = modules.front();
-    require(module.version.minor == 5, "Phase 4 must use .rsbc 0.5");
+    require(module.version.minor == 6, "Phase 18 must use .rsbc 0.6");
     require(module.sourceFiles.size() == 1 &&
             module.sourceFiles.front().path == "debug.rs",
         "debug source table is missing");
@@ -244,6 +244,38 @@ int main() { return twice(21); }
         "rename did not produce workspace edits");
     require(!service.documentSymbols("math.rs").empty(),
         "document symbols are missing");
+
+    service.open("native_tools.rs", R"(
+module Phase4.NativeTools;
+delegate void ChangedHandler(int amount);
+class Counter
+{
+    int total;
+    event ChangedHandler Changed;
+    void Add(int amount) { total = total + amount; }
+    int Run() { Changed += Add; Changed(3); return total; }
+}
+T Identity<T>(T value) { return value; }
+int main()
+{
+    Counter counter = new Counter();
+    return Identity<int>(counter.Run());
+}
+)");
+    require(service.diagnostics("native_tools.rs").empty(),
+        "native language tooling fixture produced diagnostics");
+    const auto nativeSymbols = service.documentSymbols("native_tools.rs");
+    require(!nativeSymbols.empty(),
+        "native language document symbols are missing");
+    require(std::all_of(
+            nativeSymbols.begin(), nativeSymbols.end(),
+            [](const auto& symbol) {
+                return symbol.name.find("$event_") == std::string::npos &&
+                    symbol.name.find("$sequence_") == std::string::npos &&
+                    symbol.name.find("__int") == std::string::npos;
+            }),
+        "LSP exposed compiler-owned native language symbols");
+
     service.update("app.rs", "module Phase4.App; int main() { return missing; }", 2);
     require(!service.diagnostics("app.rs").empty(),
         "language service did not publish semantic diagnostics after an update");
@@ -356,6 +388,55 @@ int main()
         {"seq", 4}, {"type", "request"}, {"command", "disconnect"},
     };
     (void)dap.handle(disconnect);
+
+    auto nativeProgram = link(compile({{"native_dap.rs", R"(
+module Phase4.NativeDap;
+delegate void ChangedHandler(int amount);
+class Counter
+{
+    int total;
+    event ChangedHandler Changed;
+    void Add(int amount) { total = total + amount; }
+    int Run() { Changed += Add; Changed(3); return total; }
+}
+T Identity<T>(T value) { return value; }
+int main()
+{
+    Counter counter = new Counter();
+    return Identity<int>(counter.Run());
+}
+)"}}));
+    realscript::debug::DapServer nativeDap(nativeProgram);
+    require(nativeDap.handle(initialize).find("success")->boolValue(),
+        "native DAP initialize failed");
+    realscript::tooling::Json nativeLaunch = realscript::tooling::Json::Object{
+        {"seq", 5}, {"type", "request"}, {"command", "launch"},
+        {"arguments", realscript::tooling::Json::Object{
+            {"function", "Phase4.NativeDap::main"}, {"stopOnEntry", true},
+        }},
+    };
+    std::ostringstream nativeEvents;
+    require(nativeDap.handle(nativeLaunch, &nativeEvents)
+            .find("success")->boolValue(),
+        "native DAP launch failed");
+    realscript::tooling::Json nativeStackRequest =
+        realscript::tooling::Json::Object{
+            {"seq", 6}, {"type", "request"},
+            {"command", "stackTrace"},
+            {"arguments", realscript::tooling::Json::Object{{"threadId", 1}}},
+        };
+    const auto nativeStack = nativeDap.handle(nativeStackRequest);
+    const auto& nativeFrames = nativeStack.find("body")
+        ->find("stackFrames")->arrayValue();
+    require(!nativeFrames.empty() && nativeFrames.front().find("name"),
+        "native DAP stackTrace returned no frame name");
+    const auto nativeFrameName =
+        nativeFrames.front().find("name")->stringValue();
+    require(nativeFrameName.find("main") != std::string::npos &&
+            nativeFrameName.find("$event_") == std::string::npos &&
+            nativeFrameName.find("__int") == std::string::npos,
+        "DAP exposed a compiler-owned native language frame");
+    (void)nativeDap.handle(disconnect);
 }
 
 void testHotReload() {
@@ -409,6 +490,29 @@ int read(Item item) { return item.value; }
                 return issue.kind == realscript::hot_reload::ReloadIssueKind::TypeLayoutChanged;
             }),
         "type-layout-changing hot reload was not rejected");
+
+    auto metadataInitial = compile({{"metadata_reload.rs", R"(
+module Phase4.MetadataReload;
+[Replicated(channel = "state")]
+class Item { int value; }
+int read(Item item) { return item.value; }
+)"}});
+    auto metadataProgram = link(metadataInitial);
+    auto metadataChanged = compile({{"metadata_reload.rs", R"(
+module Phase4.MetadataReload;
+[Replicated(channel = "effects")]
+class Item { int value; }
+int read(Item item) { return item.value; }
+)"}});
+    const auto metadataPlan = realscript::hot_reload::prepare(
+        *metadataProgram, std::move(metadataChanged));
+    require(!metadataPlan.compatible && std::any_of(
+            metadataPlan.issues.begin(), metadataPlan.issues.end(),
+            [](const auto& issue) {
+                return issue.kind ==
+                    realscript::hot_reload::ReloadIssueKind::LanguageMetadataChanged;
+            }),
+        "language-metadata-changing hot reload was not rejected");
 }
 
 } // namespace

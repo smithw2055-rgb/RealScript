@@ -52,6 +52,13 @@ enum class TypeKind {
     PrimitiveType& elementType,
     std::string& elementTypeName);
 
+enum class ParameterModifier {
+    None,
+    Ref,
+    Out,
+    In,
+};
+
 enum class ConversionKind {
     None,
     Identity,
@@ -72,12 +79,29 @@ struct VariableSymbol {
     std::string name;
     PrimitiveType type = PrimitiveType::Error;
     std::string typeName;
+    PrimitiveType storageType = PrimitiveType::Error;
+    std::string storageTypeName;
+    ParameterModifier modifier = ParameterModifier::None;
     std::size_t index = 0;
     bool parameter = false;
     text::TextSpan declarationSpan;
     text::TextSpan scopeSpan;
     SymbolId id = 0;
 };
+
+[[nodiscard]] inline PrimitiveType storageTypeOf(
+    const VariableSymbol& variable) noexcept {
+    return variable.storageType == PrimitiveType::Error
+        ? variable.type
+        : variable.storageType;
+}
+
+[[nodiscard]] inline const std::string& storageTypeNameOf(
+    const VariableSymbol& variable) noexcept {
+    return variable.storageType == PrimitiveType::Error
+        ? variable.typeName
+        : variable.storageTypeName;
+}
 
 struct FieldSymbol {
     std::string name;
@@ -104,9 +128,32 @@ struct FunctionSymbol {
     bool constructor = false;
     bool propertyGetter = false;
     bool propertySetter = false;
+    bool synthetic = false;
     std::string sourceName;
     text::TextSpan declarationSpan;
     text::TextSpan bodySpan;
+};
+
+struct EventHandlerSymbol {
+    FunctionSymbol function;
+    FieldSymbol enabledField;
+};
+
+struct EventSubscriptionSymbol {
+    text::TextSpan span;
+    FieldSymbol enabledField;
+    bool enabled = true;
+};
+
+struct EventSymbol {
+    SymbolId id = 0;
+    std::string name;
+    std::string delegateName;
+    std::vector<VariableSymbol> parameters;
+    std::vector<EventHandlerSymbol> handlers;
+    std::vector<EventSubscriptionSymbol> subscriptions;
+    std::string sourceName;
+    text::TextSpan declarationSpan;
 };
 
 struct PropertySymbol {
@@ -133,12 +180,14 @@ struct EnumMemberSymbol {
 struct TypeSymbol {
     SymbolId id = 0;
     TypeKind kind = TypeKind::Class;
+    bool synthetic = false;
     std::string moduleName;
     std::string name;
     std::vector<FieldSymbol> fields;
     std::vector<FunctionSymbol> methods;
     std::vector<FunctionSymbol> constructors;
     std::vector<PropertySymbol> properties;
+    std::vector<EventSymbol> events;
     std::vector<EnumMemberSymbol> enumMembers;
     std::string sourceName;
     text::TextSpan declarationSpan;
@@ -172,6 +221,10 @@ using FunctionOverloadMap =
 [[nodiscard]] std::string canonicalTypeName(const TypeSymbol& type);
 [[nodiscard]] SymbolId stableTypeId(const TypeSymbol& type);
 [[nodiscard]] SymbolId stableTypeId(const std::string& canonicalName);
+[[nodiscard]] std::string referenceWrapperTypeName(
+    const std::string& moduleName,
+    PrimitiveType sourceType,
+    const std::string& sourceTypeName = {});
 [[nodiscard]] TypeSymbol declareTypeShell(
     const std::string& moduleName,
     const syntax::ClassDeclarationSyntax& syntax);
@@ -227,6 +280,11 @@ struct FunctionBindingInput {
     bool syntheticAutoGetter = false;
     bool syntheticAutoSetter = false;
     FieldSymbol syntheticField;
+    const syntax::SequenceDeclarationSyntax* sequence = nullptr;
+    std::size_t sequenceSegment = 0;
+    FieldSymbol sequenceTargetField;
+    std::optional<FunctionSymbol> sequenceNextCallback;
+    const syntax::LambdaExpressionSyntax* eventLambda = nullptr;
 };
 
 struct ModuleBindingInput {
@@ -248,6 +306,8 @@ enum class BoundNodeKind {
     AssignmentExpression,
     ConversionExpression,
     CallExpression,
+    ReferenceCallExpression,
+    EventInvocationExpression,
     NewObjectExpression,
     NewStructExpression,
     StructFieldAccessExpression,
@@ -263,6 +323,13 @@ enum class BoundNodeKind {
     ReturnStatement,
     IfStatement,
     WhileStatement,
+    ForStatement,
+    ForeachStatement,
+    DoWhileStatement,
+    BreakStatement,
+    ContinueStatement,
+    SwitchStatement,
+    EventSubscriptionStatement,
     VariableDeclarationStatement,
     ExpressionStatement,
 };
@@ -365,6 +432,33 @@ struct BoundCallExpression final : BoundExpression {
     }
 };
 
+
+struct BoundReferenceCallArgument {
+    ParameterModifier modifier = ParameterModifier::None;
+    std::unique_ptr<BoundExpression> value;
+    VariableSymbol variable;
+    TypeSymbol wrapperType;
+    FieldSymbol valueField;
+    bool forwarded = false;
+};
+
+struct BoundReferenceCallExpression final : BoundExpression {
+    FunctionSymbol function;
+    std::vector<BoundReferenceCallArgument> arguments;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::ReferenceCallExpression;
+    }
+};
+
+struct BoundEventInvocationExpression final : BoundExpression {
+    TypeSymbol ownerType;
+    EventSymbol event;
+    std::unique_ptr<BoundExpression> receiver;
+    std::vector<std::unique_ptr<BoundExpression>> arguments;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::EventInvocationExpression;
+    }
+};
 
 struct BoundNewObjectExpression final : BoundExpression {
     TypeSymbol objectType;
@@ -501,6 +595,74 @@ struct BoundWhileStatement final : BoundStatement {
     }
 };
 
+struct BoundForStatement final : BoundStatement {
+    std::unique_ptr<BoundStatement> initializer;
+    std::unique_ptr<BoundExpression> condition;
+    std::unique_ptr<BoundExpression> increment;
+    std::unique_ptr<BoundStatement> body;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::ForStatement;
+    }
+};
+
+struct BoundForeachStatement final : BoundStatement {
+    VariableSymbol collectionVariable;
+    VariableSymbol indexVariable;
+    VariableSymbol iterationVariable;
+    std::unique_ptr<BoundExpression> collection;
+    std::unique_ptr<BoundExpression> count;
+    std::unique_ptr<BoundExpression> element;
+    std::unique_ptr<BoundStatement> body;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::ForeachStatement;
+    }
+};
+
+struct BoundDoWhileStatement final : BoundStatement {
+    std::unique_ptr<BoundStatement> body;
+    std::unique_ptr<BoundExpression> condition;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::DoWhileStatement;
+    }
+};
+
+struct BoundBreakStatement final : BoundStatement {
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::BreakStatement;
+    }
+};
+
+struct BoundContinueStatement final : BoundStatement {
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::ContinueStatement;
+    }
+};
+
+struct BoundSwitchSection {
+    std::unique_ptr<BoundExpression> label;
+    std::vector<std::unique_ptr<BoundStatement>> statements;
+    text::TextSpan span;
+};
+
+struct BoundSwitchStatement final : BoundStatement {
+    VariableSymbol valueVariable;
+    std::unique_ptr<BoundExpression> expression;
+    std::vector<BoundSwitchSection> sections;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::SwitchStatement;
+    }
+};
+
+struct BoundEventSubscriptionStatement final : BoundStatement {
+    TypeSymbol ownerType;
+    std::unique_ptr<BoundExpression> receiver;
+    FieldSymbol enabledField;
+    bool enabled = true;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::EventSubscriptionStatement;
+    }
+};
+
 struct BoundVariableDeclarationStatement final : BoundStatement {
     VariableSymbol variable;
     std::unique_ptr<BoundExpression> initializer;
@@ -540,6 +702,13 @@ public:
 private:
     [[nodiscard]] BoundFunction bindFunction(
         const FunctionBindingInput& input);
+    [[nodiscard]] std::unique_ptr<BoundBlockStatement> bindSequenceSegment(
+        const FunctionBindingInput& input);
+    [[nodiscard]] std::unique_ptr<BoundExpression> makeSequenceFieldAccess(
+        const FieldSymbol& field, text::TextSpan span);
+    [[nodiscard]] std::unique_ptr<BoundExpression> makeVariableAccess(
+        const VariableSymbol& variable, text::TextSpan span);
+    [[nodiscard]] const FunctionSymbol* findScheduleFunction() const noexcept;
     [[nodiscard]] std::unique_ptr<BoundBlockStatement> bindBlockStatement(
         const syntax::BlockStatementSyntax& syntax,
         bool createScope);
@@ -553,6 +722,20 @@ private:
         const syntax::IfStatementSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundStatement> bindWhileStatement(
         const syntax::WhileStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindForStatement(
+        const syntax::ForStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindForeachStatement(
+        const syntax::ForeachStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindDoWhileStatement(
+        const syntax::DoWhileStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindBreakStatement(
+        const syntax::BreakStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindContinueStatement(
+        const syntax::ContinueStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindSwitchStatement(
+        const syntax::SwitchStatementSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundStatement> bindEventSubscriptionStatement(
+        const syntax::EventSubscriptionStatementSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundStatement> bindVariableDeclaration(
         const syntax::VariableDeclarationStatementSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundStatement> bindExpressionStatement(
@@ -573,6 +756,14 @@ private:
         const syntax::AssignmentExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindCallExpression(
         const syntax::CallExpressionSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundExpression> bindSelectedCall(
+        const FunctionSymbol& function,
+        std::vector<std::unique_ptr<BoundExpression>> arguments,
+        const std::vector<std::unique_ptr<syntax::ExpressionSyntax>>& syntaxArguments,
+        const std::vector<std::optional<syntax::SyntaxToken>>& argumentModifiers,
+        std::unique_ptr<BoundExpression> receiver,
+        text::TextSpan span,
+        const std::string& context);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindMemberCallExpression(
         const syntax::MemberCallExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindNewObjectExpression(
@@ -621,6 +812,8 @@ private:
     SymbolId currentFunctionId_ = 0;
     std::vector<VariableSymbol> allVariables_;
     std::vector<SymbolOccurrence> occurrences_;
+    std::size_t loopDepth_ = 0;
+    std::size_t breakableDepth_ = 0;
 };
 
 } // namespace realscript::semantic

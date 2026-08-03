@@ -9,6 +9,16 @@ text::TextSpan combine(text::TextSpan first, text::TextSpan last) noexcept {
     return text::TextSpan::fromBounds(first.start, last.end());
 }
 
+text::TextSpan declarationStart(
+    const std::vector<AttributeListSyntax>& attributes,
+    text::TextSpan fallback) noexcept {
+    return attributes.empty()
+        ? fallback
+        : text::TextSpan::fromBounds(
+            attributes.front().span().start,
+            fallback.end());
+}
+
 std::string joinQualifiedName(const std::vector<SyntaxToken>& parts) {
     std::ostringstream out;
     for (std::size_t i = 0; i < parts.size(); ++i) {
@@ -20,10 +30,48 @@ std::string joinQualifiedName(const std::vector<SyntaxToken>& parts) {
 
 } // namespace
 
+text::TextSpan AttributeArgumentSyntax::valueSpan() const noexcept {
+    if (valueTokens.empty()) return {};
+    return combine(valueTokens.front().span, valueTokens.back().span);
+}
+
+text::TextSpan AttributeArgumentSyntax::span() const noexcept {
+    const auto value = valueSpan();
+    if (nameToken) {
+        return combine(
+            nameToken->span,
+            value.empty() ? nameToken->span : value);
+    }
+    return value;
+}
+
+text::TextSpan AttributeSyntax::span() const noexcept {
+    return closeParenToken
+        ? combine(nameToken.span, closeParenToken->span)
+        : nameToken.span;
+}
+
+text::TextSpan AttributeListSyntax::span() const noexcept {
+    return combine(openBracketToken.span, closeBracketToken.span);
+}
+
 text::TextSpan TypeSyntax::span() const noexcept {
-    return closeBracketToken
-        ? combine(name.span, closeBracketToken->span)
-        : name.span;
+    if (closeBracketToken) {
+        return combine(name.span, closeBracketToken->span);
+    }
+    if (greaterToken) {
+        return combine(name.span, greaterToken->span);
+    }
+    return name.span;
+}
+
+text::TextSpan LambdaExpressionSyntax::span() const noexcept {
+    const auto start = openParenToken
+        ? openParenToken->span
+        : parameterTokens.empty()
+            ? arrowToken.span
+            : parameterTokens.front().span;
+    return combine(start, body->span());
 }
 
 text::TextSpan UnaryExpressionSyntax::span() const noexcept {
@@ -86,6 +134,44 @@ text::TextSpan WhileStatementSyntax::span() const noexcept {
     return combine(whileKeyword.span, body->span());
 }
 
+text::TextSpan ForStatementSyntax::span() const noexcept {
+    return combine(forKeyword.span, body ? body->span() : closeParenToken.span);
+}
+
+text::TextSpan ForeachStatementSyntax::span() const noexcept {
+    return combine(foreachKeyword.span, body ? body->span() : closeParenToken.span);
+}
+
+text::TextSpan DoWhileStatementSyntax::span() const noexcept {
+    return combine(doKeyword.span, semicolonToken.span);
+}
+
+text::TextSpan BreakStatementSyntax::span() const noexcept {
+    return combine(breakKeyword.span, semicolonToken.span);
+}
+
+text::TextSpan ContinueStatementSyntax::span() const noexcept {
+    return combine(continueKeyword.span, semicolonToken.span);
+}
+
+text::TextSpan SwitchSectionSyntax::span() const noexcept {
+    const auto start = caseKeyword ? caseKeyword->span : defaultKeyword->span;
+    return statements.empty() ? combine(start, colonToken.span)
+                              : combine(start, statements.back()->span());
+}
+
+text::TextSpan SwitchStatementSyntax::span() const noexcept {
+    return combine(switchKeyword.span, closeBraceToken.span);
+}
+
+text::TextSpan YieldWaitStatementSyntax::span() const noexcept {
+    return combine(yieldKeyword.span, semicolonToken.span);
+}
+
+text::TextSpan EventSubscriptionStatementSyntax::span() const noexcept {
+    return combine(eventNameToken.span, semicolonToken.span);
+}
+
 text::TextSpan VariableDeclarationStatementSyntax::span() const noexcept {
     return combine(type.span(), semicolonToken.span);
 }
@@ -99,15 +185,27 @@ text::TextSpan BlockStatementSyntax::span() const noexcept {
 }
 
 text::TextSpan ParameterSyntax::span() const noexcept {
-    return combine(type.span(), identifierToken.span);
+    return combine(
+        modifierToken ? modifierToken->span : type.span(),
+        identifierToken.span);
 }
 
 text::TextSpan FieldDeclarationSyntax::span() const noexcept {
-    return combine(type.span(), semicolonToken.span);
+    return combine(
+        declarationStart(attributes, type.span()),
+        semicolonToken.span);
+}
+
+text::TextSpan EventDeclarationSyntax::span() const noexcept {
+    return combine(
+        declarationStart(attributes, eventKeyword.span),
+        semicolonToken.span);
 }
 
 text::TextSpan ConstructorDeclarationSyntax::span() const noexcept {
-    return combine(identifierToken.span, body.span());
+    return combine(
+        declarationStart(attributes, identifierToken.span),
+        body.span());
 }
 
 text::TextSpan AccessorDeclarationSyntax::span() const noexcept {
@@ -116,33 +214,70 @@ text::TextSpan AccessorDeclarationSyntax::span() const noexcept {
 }
 
 text::TextSpan PropertyDeclarationSyntax::span() const noexcept {
-    return combine(type.span(), closeBraceToken.span);
+    return combine(
+        declarationStart(attributes, type.span()),
+        closeBraceToken.span);
 }
 
 text::TextSpan ClassDeclarationSyntax::span() const noexcept {
-    return combine(classKeyword.span, closeBraceToken.span);
+    return combine(
+        declarationStart(attributes, classKeyword.span),
+        closeBraceToken.span);
 }
 
 text::TextSpan StructDeclarationSyntax::span() const noexcept {
-    return combine(structKeyword.span, closeBraceToken.span);
+    return combine(
+        declarationStart(attributes, structKeyword.span),
+        closeBraceToken.span);
+}
+
+text::TextSpan InterfaceMethodDeclarationSyntax::span() const noexcept {
+    return combine(
+        declarationStart(attributes, returnType.span()),
+        semicolonToken.span);
+}
+
+text::TextSpan InterfaceDeclarationSyntax::span() const noexcept {
+    return combine(
+        declarationStart(attributes, interfaceKeyword.span),
+        closeBraceToken.span);
 }
 
 text::TextSpan EnumMemberDeclarationSyntax::span() const noexcept {
-    if (commaToken) return combine(identifierToken.span, commaToken->span);
-    if (valueToken) return combine(identifierToken.span, valueToken->span);
-    return identifierToken.span;
+    text::TextSpan end = identifierToken.span;
+    if (commaToken) end = commaToken->span;
+    else if (valueToken) end = valueToken->span;
+    return combine(
+        declarationStart(attributes, identifierToken.span),
+        end);
 }
 
 text::TextSpan EnumDeclarationSyntax::span() const noexcept {
-    return combine(enumKeyword.span, closeBraceToken.span);
+    return combine(
+        declarationStart(attributes, enumKeyword.span),
+        closeBraceToken.span);
 }
 
 text::TextSpan FunctionDeclarationSyntax::span() const noexcept {
-    return combine(returnType.span(), body.span());
+    return combine(
+        declarationStart(attributes, returnType.span()),
+        body.span());
 }
 
 std::string ModuleDeclarationSyntax::fullName() const {
     return joinQualifiedName(nameParts);
+}
+
+text::TextSpan DelegateDeclarationSyntax::span() const noexcept {
+    return combine(
+        declarationStart(attributes, delegateKeyword.span),
+        semicolonToken.span);
+}
+
+text::TextSpan SequenceDeclarationSyntax::span() const noexcept {
+    return combine(
+        declarationStart(attributes, sequenceKeyword.span),
+        body.span());
 }
 
 text::TextSpan ModuleDeclarationSyntax::span() const noexcept {
@@ -172,6 +307,12 @@ text::TextSpan CompilationUnitSyntax::span() const noexcept {
     }
     if (!enums.empty()) {
         return combine(enums.front().span(), endOfFileToken.span);
+    }
+    if (!interfaces.empty()) {
+        return combine(interfaces.front().span(), endOfFileToken.span);
+    }
+    if (!delegates.empty()) {
+        return combine(delegates.front().span(), endOfFileToken.span);
     }
     if (!functions.empty()) {
         return combine(functions.front().span(), endOfFileToken.span);
