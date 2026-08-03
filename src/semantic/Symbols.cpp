@@ -213,6 +213,7 @@ bool isAssignable(
     const std::string& targetTypeName) noexcept {
     if (sourceTypeName.empty() || targetTypeName.empty()) return false;
     if (sourceTypeName == targetTypeName) return true;
+    const auto targetTypeId = stableTypeId(targetTypeName);
     auto currentName = sourceTypeName;
     std::unordered_set<SymbolId> visited;
     while (!currentName.empty()) {
@@ -220,6 +221,12 @@ bool isAssignable(
         if (found == visibleTypes.end() ||
             !visited.insert(found->second.id).second) {
             return false;
+        }
+        for (const auto& interfaceMap :
+             found->second.interfaceDispatchMaps) {
+            if (interfaceMap.interfaceTypeId == targetTypeId) {
+                return true;
+            }
         }
         if (found->second.baseTypeName == targetTypeName) return true;
         currentName = found->second.baseTypeName;
@@ -556,6 +563,48 @@ FunctionSymbol declareFunctionSymbol(
     result.bodySpan = syntaxTree.semicolonToken
         ? syntaxTree.semicolonToken->span
         : syntaxTree.body.span();
+    for (auto& parameter : result.parameters) {
+        parameter.id = fnv1a(std::to_string(result.id) + "::local:" +
+            std::to_string(parameter.index) + ":" + parameter.name);
+    }
+    return result;
+}
+
+FunctionSymbol declareFunctionSymbol(
+    const std::string& moduleName,
+    const syntax::InterfaceMethodDeclarationSyntax& syntaxTree,
+    const TypeSymbolMap& visibleTypes,
+    diagnostics::DiagnosticBag& diagnostics,
+    const TypeSymbol* owner) {
+    FunctionSymbol result;
+    result.moduleName = moduleName;
+    result.name = syntaxTree.identifierToken.text;
+    result.method = owner != nullptr;
+    result.staticMethod = false;
+    result.accessibility = accessibilityFromModifiers(
+        syntaxTree.modifiers);
+    if (owner) {
+        result.declaringTypeId = owner->id;
+        result.declaringTypeName = canonicalTypeName(*owner);
+        result.ownerTypeName = owner->name;
+        result.ownerTypeId = owner->id;
+        appendImplicitThis(result, *owner);
+    }
+    const auto returnType = resolveType(
+        syntaxTree.returnType, visibleTypes, true);
+    result.returnType = returnType.type;
+    result.returnTypeName = returnType.name;
+    if (result.returnType == PrimitiveType::Error) {
+        diagnostics.report(
+            "RS2200",
+            "unknown return type '" + syntaxTree.returnType.name.text + "'",
+            syntaxTree.returnType.span());
+    }
+    appendSyntaxParameters(
+        result, syntaxTree.parameters, visibleTypes, diagnostics);
+    result.id = stableFunctionId(result);
+    result.declarationSpan = syntaxTree.identifierToken.span;
+    result.bodySpan = syntaxTree.semicolonToken.span;
     for (auto& parameter : result.parameters) {
         parameter.id = fnv1a(std::to_string(result.id) + "::local:" +
             std::to_string(parameter.index) + ":" + parameter.name);

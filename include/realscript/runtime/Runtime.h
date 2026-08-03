@@ -221,6 +221,11 @@ struct HeapSnapshot {
 
 class PersistentRoot;
 
+enum class ArrayStoreTypePolicy {
+    Exact,
+    PrevalidatedAssignableObject,
+};
+
 class ShadowStack {
 public:
     void pushFrame(
@@ -288,7 +293,8 @@ public:
         ObjectRef reference,
         std::size_t index,
         Value value,
-        RuntimeError* error = nullptr);
+        RuntimeError* error = nullptr,
+        ArrayStoreTypePolicy typePolicy = ArrayStoreTypePolicy::Exact);
     [[nodiscard]] std::optional<std::size_t> fieldCount(ObjectRef reference) const;
     [[nodiscard]] std::optional<semantic::SymbolId> objectTypeId(
         ObjectRef reference) const;

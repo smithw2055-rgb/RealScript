@@ -1,7 +1,7 @@
 rsbc 0.6 module Demo.Bytecode
 
 sources:
-  source0 `phase2a.rs` hash=0x2980a757cb6e331d lines=37
+  source0 `phase2a.rs` hash=0x3ef88e3d00a87753 lines=37
 
 references:
   ref0 @Demo.Bytecode::twice[0x48d2886689d9cb5f](int) -> int

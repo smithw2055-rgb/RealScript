@@ -9,9 +9,10 @@ Tracking issue: #34. Development branch: `agent/phase19-runtime-polymorphism`.
 - **19A frontend and inheritance model:** implemented.
 - **19B base access and inherited runtime layout:** implemented for base identity, base-first fields, inherited member lookup, derived-to-base assignability, and statically bound `base` method calls.
 - **19C virtual dispatch:** implemented for `virtual`, `override`, `abstract`, and `sealed override`; stable slots execute through the interpreter, generated C++ AOT, and Toolchain JIT.
-- **Remaining:** base-constructor execution and full visibility enforcement, interface-typed values and dispatch, `.rsbc` persistence, save-state/Game SDK closure, and final LSP/DAP/debugger coverage.
+- **19D interface values and dispatch:** implemented for interface-typed storage, class-to-interface conversion, deterministic interface slots, inherited implementation maps, interpreter dispatch, generated C++ AOT, and Toolchain JIT.
+- **Remaining:** base-constructor execution and full visibility enforcement, `.rsbc` persistence, save-state/Game SDK closure, and final LSP/DAP/debugger coverage.
 
-The current virtual-dispatch profile keeps direct non-virtual and `base` calls statically bound. Dispatch metadata is present in semantic, MIR, in-memory bytecode, interpreter, AOT, JIT, verifier, printer, disassembler, content hashes, and hot-reload compatibility checks. Serialization into `.rsbc` remains part of 19E.
+Direct non-virtual and `base` calls remain statically bound. Interface values reuse managed object references and preserve their exact interface TypeId in semantic, MIR, and bytecode signatures. Virtual and interface dispatch metadata is present in the interpreter, AOT, JIT, verifiers, printers, disassembler, content hashes, and hot-reload compatibility checks. Serialization into `.rsbc` remains part of 19E.
 
 ## Scope
 
@@ -43,13 +44,17 @@ The current virtual-dispatch profile keeps direct non-virtual and `base` calls s
 
 ### 19D — interface values and dispatch
 
-- interface types in fields, locals, parameters, return values, arrays, and null comparisons;
-- implicit conversion from implementing class references to interface values;
-- deterministic interface method slots and implementation maps;
-- runtime interface call dispatch without reflection;
-- assignability checks used by conversion, invocation, save-state, and native bindings.
+Implemented:
 
-Struct interface contracts remain compile-time-only until Phase 23 boxing support.
+- interface descriptors participate in exact named-type identity for fields, locals, parameters, return values, arrays, and `null`;
+- implementing class references convert implicitly to interface values without wrapper allocation;
+- interface slots are assigned by canonical method signature, independently of source order and class virtual slots;
+- every class descriptor carries deterministic `(Interface TypeId, slot -> function SymbolId)` implementation maps, including inherited implementations;
+- interpreter, generated C++ AOT, and Toolchain JIT dispatch by the receiver's runtime class descriptor;
+- semantic, MIR, bytecode, and runtime assignability checks accept class-to-interface conversions only when a matching implementation map exists;
+- hot reload and AOT content hashes include interface descriptors, slots, maps, and call-site dispatch metadata.
+
+Struct interface contracts remain compile-time-only until Phase 23 boxing support. `.rsbc` persistence and save-state/Game SDK propagation remain in 19E.
 
 ### 19E — artifact and runtime closure
 

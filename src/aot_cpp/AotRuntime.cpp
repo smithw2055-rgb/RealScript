@@ -178,6 +178,14 @@ bool ExecutionContext::isAssignable(
     while (current != 0 && visited.insert(current).second) {
         const auto* type = findType(current);
         if (!type) return false;
+        for (std::uint32_t index = 0;
+             index < type->interfaceDispatchMapCount;
+             ++index) {
+            if (type->interfaceDispatchMaps &&
+                type->interfaceDispatchMaps[index].interfaceTypeId == expected) {
+                return true;
+            }
+        }
         if (type->baseTypeId == expected) return true;
         current = type->baseTypeId;
     }
@@ -474,6 +482,11 @@ bool ExecutionContext::call(
         }
     }
     auto targetSymbolId = signature.symbolId;
+    if (signature.virtualDispatch && signature.interfaceDispatch) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT call cannot combine virtual and interface dispatch");
+    }
     if (signature.virtualDispatch) {
         if (signature.virtualSlot ==
                 std::numeric_limits<std::uint32_t>::max() ||
@@ -512,14 +525,69 @@ bool ExecutionContext::call(
                 runtime::ErrorCode::InvalidProgram,
                 "AOT virtual call reached an abstract runtime slot");
         }
+    } else if (signature.interfaceDispatch) {
+        if (signature.interfaceTypeId == 0 ||
+            signature.interfaceSlot ==
+                std::numeric_limits<std::uint32_t>::max() ||
+            argumentCount == 0 ||
+            !signature.parameterTypes ||
+            signature.parameterTypes[0] !=
+                semantic::PrimitiveType::Object ||
+            typeIdAt(
+                signature.parameterTypeIds,
+                signature.parameterCount,
+                0) != signature.interfaceTypeId) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT interface call has an invalid receiver contract");
+        }
+        if (std::holds_alternative<runtime::NullObject>(arguments[0])) {
+            return fail(
+                runtime::ErrorCode::NullReference,
+                "AOT interface call attempted to dereference null");
+        }
+        const auto* receiver =
+            std::get_if<runtime::ObjectRef>(&arguments[0]);
+        const auto actualTypeId = receiver && heap_
+            ? heap_->objectTypeId(*receiver)
+            : std::optional<semantic::SymbolId>{};
+        const auto* actualType = actualTypeId
+            ? findType(*actualTypeId)
+            : nullptr;
+        const InterfaceDispatchDescriptor* implementation = nullptr;
+        if (actualType && actualType->interfaceDispatchMaps) {
+            for (std::uint32_t index = 0;
+                 index < actualType->interfaceDispatchMapCount;
+                 ++index) {
+                const auto& candidate =
+                    actualType->interfaceDispatchMaps[index];
+                if (candidate.interfaceTypeId ==
+                    signature.interfaceTypeId) {
+                    implementation = &candidate;
+                    break;
+                }
+            }
+        }
+        if (!implementation || !implementation->slots ||
+            signature.interfaceSlot >= implementation->slotCount) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT interface call slot is outside the runtime dispatch map");
+        }
+        targetSymbolId = implementation->slots[signature.interfaceSlot];
+        if (targetSymbolId == 0) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT interface call reached an unimplemented runtime slot");
+        }
     }
     if (findFunction(targetSymbolId)) {
         return invoke(targetSymbolId, arguments, argumentCount, result);
     }
-    if (signature.virtualDispatch) {
+    if (signature.virtualDispatch || signature.interfaceDispatch) {
         return fail(
             runtime::ErrorCode::InvalidProgram,
-            "AOT virtual dispatch target function is unavailable");
+            "AOT runtime dispatch target function is unavailable");
     }
     if (!bindings_) {
         return fail(
@@ -535,6 +603,9 @@ bool ExecutionContext::call(
     reference.returnTypeId = signature.returnTypeId;
     reference.virtualDispatch = signature.virtualDispatch;
     reference.virtualSlot = signature.virtualSlot;
+    reference.interfaceDispatch = signature.interfaceDispatch;
+    reference.interfaceTypeId = signature.interfaceTypeId;
+    reference.interfaceSlot = signature.interfaceSlot;
     if (signature.parameterCount != 0) {
         reference.parameterTypes.assign(
             signature.parameterTypes,
@@ -602,7 +673,8 @@ bool ExecutionContext::newObject(
     semantic::SymbolId typeId,
     runtime::Value& result) {
     const auto* type = findType(typeId);
-    if (!type || type->kind != semantic::TypeKind::Class) {
+    if (!type || type->kind != semantic::TypeKind::Class ||
+        type->interfaceType) {
         return fail(
             runtime::ErrorCode::InvalidProgram,
             "AOT object allocation references an invalid class descriptor");
@@ -828,7 +900,10 @@ bool ExecutionContext::storeElement(
             reference,
             static_cast<std::size_t>(numericIndex),
             value,
-            &arrayError)) {
+            &arrayError,
+            elementType == semantic::PrimitiveType::Object
+                ? runtime::ArrayStoreTypePolicy::PrevalidatedAssignableObject
+                : runtime::ArrayStoreTypePolicy::Exact)) {
         return fail(
             arrayError.code == runtime::ErrorCode::None
                 ? runtime::ErrorCode::InvalidProgram

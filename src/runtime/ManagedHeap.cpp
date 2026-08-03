@@ -495,7 +495,8 @@ bool ManagedHeap::arraySet(
     ObjectRef reference,
     std::size_t index,
     Value value,
-    RuntimeError* error) {
+    RuntimeError* error,
+    ArrayStoreTypePolicy typePolicy) {
     auto* object = impl_->get(reference);
     if (!object || object->header.kind != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference,
@@ -518,7 +519,9 @@ bool ManagedHeap::arraySet(
         !std::holds_alternative<NullObject>(value)) {
         const auto* child = std::get_if<ObjectRef>(&value);
         const auto actual = child ? objectTypeId(*child) : std::nullopt;
-        if (!actual || *actual != object->header.elementTypeId) {
+        if (!actual ||
+            (typePolicy == ArrayStoreTypePolicy::Exact &&
+             *actual != object->header.elementTypeId)) {
             setHeapError(error, ErrorCode::TypeMismatch,
                 "managed array object element type mismatch");
             return false;

@@ -93,6 +93,9 @@ struct FunctionReference {
     std::vector<semantic::SymbolId> parameterTypeIds;
     bool virtualDispatch = false;
     std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
+    bool interfaceDispatch = false;
+    semantic::SymbolId interfaceTypeId = 0;
+    std::uint32_t interfaceSlot = std::numeric_limits<std::uint32_t>::max();
 };
 
 struct Instruction {

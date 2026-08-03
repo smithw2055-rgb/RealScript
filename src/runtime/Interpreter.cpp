@@ -165,10 +165,35 @@ bool runtimeAssignable(
     while (current != 0 && visited.insert(current).second) {
         const auto found = state.types->find(current);
         if (found == state.types->end()) return false;
+        for (const auto& implementation :
+             found->second->interfaceDispatchMaps) {
+            if (implementation.interfaceTypeId == expected) return true;
+        }
         if (found->second->baseTypeId == expected) return true;
         current = found->second->baseTypeId;
     }
     return false;
+}
+
+const semantic::InterfaceDispatchMap* runtimeInterfaceMap(
+    const State& state,
+    semantic::SymbolId actual,
+    semantic::SymbolId interfaceTypeId) {
+    if (!state.types) return nullptr;
+    std::unordered_set<semantic::SymbolId> visited;
+    auto current = actual;
+    while (current != 0 && visited.insert(current).second) {
+        const auto found = state.types->find(current);
+        if (found == state.types->end()) return nullptr;
+        for (const auto& implementation :
+             found->second->interfaceDispatchMaps) {
+            if (implementation.interfaceTypeId == interfaceTypeId) {
+                return &implementation;
+            }
+        }
+        current = found->second->baseTypeId;
+    }
+    return nullptr;
 }
 
 bool expectObject(
@@ -478,6 +503,10 @@ bool executeCall(
     }
 
     auto targetSymbolId = reference.symbolId;
+    if (reference.virtualDispatch && reference.interfaceDispatch) {
+        return fail(state, ErrorCode::InvalidProgram,
+            "call cannot use virtual and interface dispatch together");
+    }
     if (reference.virtualDispatch) {
         if (reference.virtualSlot ==
                 std::numeric_limits<std::uint32_t>::max() ||
@@ -513,15 +542,52 @@ bool executeCall(
             return fail(state, ErrorCode::InvalidProgram,
                 "virtual call reached an abstract runtime slot");
         }
+    } else if (reference.interfaceDispatch) {
+        if (reference.interfaceTypeId == 0 ||
+            reference.interfaceSlot ==
+                std::numeric_limits<std::uint32_t>::max() ||
+            arguments.empty() ||
+            reference.parameterTypes.empty() ||
+            reference.parameterTypes.front() !=
+                semantic::PrimitiveType::Object ||
+            typeIdAt(reference.parameterTypeIds, 0) !=
+                reference.interfaceTypeId) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "interface call has an invalid receiver contract");
+        }
+        if (std::holds_alternative<NullObject>(arguments.front())) {
+            return fail(state, ErrorCode::NullReference,
+                "interface call attempted to dereference null");
+        }
+        const auto* receiver = std::get_if<ObjectRef>(&arguments.front());
+        const auto actualTypeId = receiver && state.heap
+            ? state.heap->objectTypeId(*receiver)
+            : std::optional<semantic::SymbolId>{};
+        if (!actualTypeId) {
+            return fail(state, ErrorCode::InvalidObjectReference,
+                "interface call receiver has no runtime type descriptor");
+        }
+        const auto* implementation = runtimeInterfaceMap(
+            state, *actualTypeId, reference.interfaceTypeId);
+        if (!implementation ||
+            reference.interfaceSlot >= implementation->slots.size()) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "interface call slot is outside the runtime dispatch map");
+        }
+        targetSymbolId = implementation->slots[reference.interfaceSlot];
+        if (targetSymbolId == 0) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "interface call reached an unimplemented runtime slot");
+        }
     }
 
     const auto found = state.functions->find(targetSymbolId);
     if (found != state.functions->end()) {
         return executeFunction(state, found->second, arguments, result);
     }
-    if (reference.virtualDispatch) {
+    if (reference.virtualDispatch || reference.interfaceDispatch) {
         return fail(state, ErrorCode::InvalidProgram,
-            "virtual dispatch target function is unavailable");
+            "runtime dispatch target function is unavailable");
     }
     RuntimeError externalError;
     ++state.statistics.externalCalls;
@@ -717,9 +783,9 @@ bool executeInstruction(
     }
     case bytecode::Opcode::NewObject: {
         const auto* type = typeDescriptor(module, instruction.typeIndex);
-        if (!type || !state.heap) {
+        if (!type || type->interfaceType || !state.heap) {
             return fail(state, ErrorCode::InvalidProgram,
-                "object allocation references an invalid type or heap");
+                "object allocation references an invalid class or heap");
         }
         std::vector<Value> fields;
         std::vector<std::size_t> referenceFields;
@@ -869,7 +935,13 @@ bool executeInstruction(
         }
         RuntimeError arrayError;
         if (!state.heap->arraySet(
-                reference, static_cast<std::size_t>(index), *value, &arrayError)) {
+                reference,
+                static_cast<std::size_t>(index),
+                *value,
+                &arrayError,
+                instruction.elementType == semantic::PrimitiveType::Object
+                    ? ArrayStoreTypePolicy::PrevalidatedAssignableObject
+                    : ArrayStoreTypePolicy::Exact)) {
             return fail(state,
                 arrayError.code == ErrorCode::None
                     ? ErrorCode::InvalidProgram

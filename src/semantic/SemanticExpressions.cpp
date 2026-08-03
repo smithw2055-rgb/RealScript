@@ -587,9 +587,13 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
     const std::string& context,
     bool forceStaticDispatch) {
     const auto offset = visibleParameterOffset(function);
+    const bool interfaceDispatch = receiver &&
+        function.method && !function.staticMethod &&
+        !forceStaticDispatch && function.interfaceMethod &&
+        function.interfaceSlot != std::numeric_limits<std::uint32_t>::max();
     const bool virtualDispatch = receiver &&
         function.method && !function.staticMethod &&
-        !forceStaticDispatch &&
+        !forceStaticDispatch && !interfaceDispatch &&
         function.virtualSlot != std::numeric_limits<std::uint32_t>::max();
     bool hasModifiers = false;
     for (std::size_t index = offset;
@@ -607,6 +611,13 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
         result->virtualDispatch = virtualDispatch;
         result->virtualSlot = virtualDispatch
             ? function.virtualSlot
+            : std::numeric_limits<std::uint32_t>::max();
+        result->interfaceDispatch = interfaceDispatch;
+        result->interfaceTypeId = interfaceDispatch
+            ? function.ownerTypeId
+            : 0;
+        result->interfaceSlot = interfaceDispatch
+            ? function.interfaceSlot
             : std::numeric_limits<std::uint32_t>::max();
         if (receiver) result->arguments.push_back(std::move(receiver));
         for (std::size_t index = 0;
@@ -631,6 +642,13 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
     result->virtualDispatch = virtualDispatch;
     result->virtualSlot = virtualDispatch
         ? function.virtualSlot
+        : std::numeric_limits<std::uint32_t>::max();
+    result->interfaceDispatch = interfaceDispatch;
+    result->interfaceTypeId = interfaceDispatch
+        ? function.ownerTypeId
+        : 0;
+    result->interfaceSlot = interfaceDispatch
+        ? function.interfaceSlot
         : std::numeric_limits<std::uint32_t>::max();
     if (receiver) {
         BoundReferenceCallArgument receiverArgument;
@@ -938,6 +956,14 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
     const auto found = visibleTypes_.find(syntaxTree.type.name.text);
     if (found == visibleTypes_.end() || found->second.kind == TypeKind::Enum) {
         diagnostics_.report("RS2403", "cannot allocate unknown or enum type '" + syntaxTree.type.name.text + "'", syntaxTree.type.span());
+        return makeError(syntaxTree.span());
+    }
+    if (found->second.interfaceType) {
+        diagnostics_.report(
+            "RS2530",
+            "cannot instantiate interface '" +
+                canonicalTypeName(found->second) + "'",
+            syntaxTree.type.span());
         return makeError(syntaxTree.span());
     }
     if (found->second.kind == TypeKind::Class && found->second.abstractType) {

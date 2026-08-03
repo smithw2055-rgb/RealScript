@@ -286,6 +286,188 @@ int main()
 #endif
 }
 
+void testInterfaceDispatchExecution() {
+    const char* source = R"(
+module Phase19.Interfaces;
+public interface IUnit
+{
+    public int Power();
+    public int Kind();
+}
+public class Marine : Unit
+{
+    public override int Power() { return 7; }
+}
+public class Unit : IUnit
+{
+    public virtual int Power() { return 1; }
+    public int Kind() { return 3; }
+}
+IUnit Identity(IUnit value)
+{
+    return value;
+}
+int Read(IUnit value)
+{
+    return value.Power() + value.Kind();
+}
+int main()
+{
+    IUnit value = new Marine();
+    IUnit[] values = new IUnit[1];
+    values[0] = value;
+    return Read(Identity(values[0]));
+}
+)";
+
+    realscript::compiler::Compilation compilation(
+        {{"interfaces.rs", source}});
+    auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "interface dispatch source failed to compile:\n" +
+            diagnosticsText(build.diagnostics));
+    require(build.modules.size() == 1,
+        "interface dispatch did not produce one module");
+
+    const auto interfaceId = realscript::semantic::stableTypeId(
+        "Phase19.Interfaces::IUnit");
+    const auto marineId = realscript::semantic::stableTypeId(
+        "Phase19.Interfaces::Marine");
+    const realscript::semantic::TypeSymbol* interfaceType = nullptr;
+    const realscript::semantic::TypeSymbol* marine = nullptr;
+    for (const auto& type : build.modules.front().types) {
+        if (type.id == interfaceId) interfaceType = &type;
+        if (type.id == marineId) marine = &type;
+    }
+    require(interfaceType && interfaceType->interfaceType &&
+            interfaceType->methods.size() == 2,
+        "interface type descriptor was not materialized");
+    const auto kind = std::find_if(
+        interfaceType->methods.begin(), interfaceType->methods.end(),
+        [](const auto& method) { return method.name == "Kind"; });
+    const auto power = std::find_if(
+        interfaceType->methods.begin(), interfaceType->methods.end(),
+        [](const auto& method) { return method.name == "Power"; });
+    require(kind != interfaceType->methods.end() &&
+            power != interfaceType->methods.end() &&
+            kind->interfaceSlot == 0 &&
+            power->interfaceSlot == 1,
+        "interface slots are not stable by canonical signature");
+
+    const realscript::semantic::InterfaceDispatchMap*
+        implementation = nullptr;
+    if (marine) {
+        const auto found = std::find_if(
+            marine->interfaceDispatchMaps.begin(),
+            marine->interfaceDispatchMaps.end(),
+            [&](const auto& map) {
+                return map.interfaceTypeId == interfaceId;
+            });
+        if (found != marine->interfaceDispatchMaps.end()) {
+            implementation = &*found;
+        }
+    }
+    require(marine && implementation &&
+            implementation->slots.size() == 2 &&
+            implementation->slots[0] != 0 &&
+            implementation->slots[1] != 0,
+        "derived class interface dispatch map is incomplete");
+
+    bool sawKind = false;
+    bool sawPower = false;
+    for (const auto& function : build.modules.front().functions) {
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (!instruction.interfaceDispatch) continue;
+                require(instruction.interfaceTypeId == interfaceId,
+                    "interface MIR call has the wrong interface type");
+                sawKind = sawKind || instruction.interfaceSlot == 0;
+                sawPower = sawPower || instruction.interfaceSlot == 1;
+            }
+        }
+    }
+    require(sawKind && sawPower,
+        "interface dispatch metadata did not reach MIR calls");
+
+    realscript::bytecode::Lowerer lowerer;
+    std::vector<realscript::bytecode::Module> modules;
+    modules.push_back(lowerer.lower(build.modules.front()));
+    const bool bytecodeInterface = std::any_of(
+        modules.front().functionReferences.begin(),
+        modules.front().functionReferences.end(),
+        [](const auto& reference) {
+            return reference.interfaceDispatch;
+        });
+    require(bytecodeInterface,
+        "interface dispatch metadata did not reach bytecode references");
+
+    realscript::runtime::Interpreter interpreter(modules);
+    const auto interpreted = interpreter.invoke(
+        "Phase19.Interfaces::main");
+    require(interpreted.succeeded &&
+            std::get<std::int64_t>(interpreted.value) == 10,
+        "interpreter interface dispatch returned the wrong result: " +
+            interpreted.error.message);
+
+    realscript::diagnostics::DiagnosticBag aotDiagnostics;
+    realscript::aot::CppGenerator generator;
+    realscript::aot::GenerationOptions options;
+    options.programName = "Phase19Interfaces";
+    const auto generated = generator.generate(
+        build.modules, aotDiagnostics, options);
+    require(!aotDiagnostics.hasErrors() &&
+            generated.source.find("_interfaceMaps") !=
+                std::string::npos &&
+            generated.source.find("CallSignature") !=
+                std::string::npos,
+        "AOT output did not retain interface dispatch metadata");
+
+#if defined(REALSCRIPT_PHASE19_JIT_COMPILER)
+    realscript::jit::ToolchainOptions jitOptions;
+    jitOptions.compiler = REALSCRIPT_PHASE19_JIT_COMPILER;
+    jitOptions.includeDirectory = REALSCRIPT_PHASE19_JIT_INCLUDE_DIR;
+    jitOptions.supportLibrary =
+        REALSCRIPT_PHASE19_JIT_SUPPORT_LIBRARY;
+    jitOptions.outputDirectory = REALSCRIPT_PHASE19_JIT_CACHE_DIR;
+    jitOptions.generation.programName = "Phase19InterfacesJit";
+    realscript::jit::ToolchainJit jit;
+    auto compiled = jit.compile(build.modules, jitOptions);
+    require(compiled.succeeded(),
+        compiled.error.empty()
+            ? "Phase 19 interface JIT compilation failed"
+            : compiled.error);
+    const auto jitResult = compiled.module->invoke(
+        "Phase19.Interfaces::main");
+    require(jitResult.succeeded &&
+            std::get<std::int64_t>(jitResult.value) == 10,
+        "JIT interface dispatch returned the wrong result: " +
+            jitResult.error.message);
+#endif
+}
+
+void testInterfaceDiagnostics() {
+    const auto compile = [](const char* source) {
+        realscript::compiler::Compilation compilation(
+            {{"invalid-interface.rs", source}});
+        return compilation.build();
+    };
+
+    auto allocation = compile(R"(
+interface IUnit { public int Kind(); }
+int main() { IUnit value = new IUnit(); return 0; }
+)");
+    require(hasDiagnostic(allocation.diagnostics, "RS2530"),
+        "interface allocation did not report RS2530");
+
+    auto conversion = compile(R"(
+interface IUnit { public int Kind(); }
+class Other { public int Kind() { return 1; } }
+int main() { IUnit value = new Other(); return value.Kind(); }
+)");
+    require(conversion.diagnostics.hasErrors(),
+        "class without an interface map converted to the interface type");
+}
+
 void testVirtualDiagnostics() {
     const auto compile = [](const char* source) {
         realscript::compiler::Compilation compilation({{"invalid.rs", source}});
@@ -329,6 +511,8 @@ int main() {
         testDuplicateModifier();
         testSingleInheritanceExecution();
         testVirtualDispatchExecution();
+        testInterfaceDispatchExecution();
+        testInterfaceDiagnostics();
         testVirtualDiagnostics();
         std::cout << "Phase 19 runtime polymorphism tests passed\n";
         return 0;

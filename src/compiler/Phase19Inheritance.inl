@@ -38,7 +38,8 @@ void resolvePhase19Inheritance(
                 const auto& candidate = declaration.interfaces.front();
                 const auto found = module.visibleTypes.find(candidate.name.text);
                 if (found == module.visibleTypes.end()) continue;
-                if (found->second.kind != semantic::TypeKind::Class) {
+                if (found->second.kind != semantic::TypeKind::Class ||
+                    found->second.interfaceType) {
                     continue;
                 }
                 if (found->second.id == type->id) {
@@ -71,7 +72,8 @@ void resolvePhase19Inheritance(
     std::unordered_map<semantic::SymbolId, int> colors;
     std::function<void(ModuleWork&, semantic::TypeSymbol&)> visit =
         [&](ModuleWork& module, semantic::TypeSymbol& type) {
-            if (type.kind != semantic::TypeKind::Class) return;
+            if (type.kind != semantic::TypeKind::Class ||
+                type.interfaceType) return;
             if (colors[type.id] == 2) return;
             if (colors[type.id] == 1) {
                 result.diagnostics.report(
@@ -115,7 +117,7 @@ void applyPhase19FieldLayouts(
     std::function<void(ModuleWork&, semantic::TypeSymbol&)> apply =
         [&](ModuleWork& module, semantic::TypeSymbol& type) {
             if (type.kind != semantic::TypeKind::Class ||
-                complete[type.id] == 2) return;
+                type.interfaceType || complete[type.id] == 2) return;
             if (complete[type.id] == 1) return;
             complete[type.id] = 1;
             if (!type.baseTypeName.empty()) {
@@ -298,7 +300,8 @@ void phase19ValidateConcreteType(
     const semantic::TypeSymbol& owner,
     ModuleWork& module,
     BuildResult& result) {
-    if (owner.kind != semantic::TypeKind::Class) return;
+    if (owner.kind != semantic::TypeKind::Class ||
+        owner.interfaceType) return;
     if (owner.abstractType && owner.sealedType) {
         result.diagnostics.report(
             "RS2522", "a class cannot be both abstract and sealed",

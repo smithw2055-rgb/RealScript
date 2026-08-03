@@ -47,6 +47,7 @@ std::string printModule(const Module& module) {
             out << " base[0x" << std::hex << type.baseTypeId
                 << std::dec << "]";
         }
+        if (type.interfaceType) out << " interface";
         if (type.abstractType) out << " abstract";
         if (type.sealedType) out << " sealed";
         if (!type.virtualDispatchTable.empty()) {
@@ -56,6 +57,18 @@ std::string printModule(const Module& module) {
                 if (slot != 0) out << ", ";
                 out << slot << "=0x" << std::hex
                     << type.virtualDispatchTable[slot] << std::dec;
+            }
+            out << ']';
+        }
+        for (const auto& interfaceMap :
+             type.interfaceDispatchMaps) {
+            out << " islots[0x" << std::hex
+                << interfaceMap.interfaceTypeId << std::dec << ':';
+            for (std::size_t slot = 0;
+                 slot < interfaceMap.slots.size(); ++slot) {
+                if (slot != 0) out << ", ";
+                out << slot << "=0x" << std::hex
+                    << interfaceMap.slots[slot] << std::dec;
             }
             out << ']';
         }
@@ -172,6 +185,11 @@ std::string printModule(const Module& module) {
                 } else if (instruction.opcode == Opcode::Call) {
                     if (instruction.virtualDispatch) {
                         out << " virtual[" << instruction.virtualSlot << "]";
+                    }
+                    if (instruction.interfaceDispatch) {
+                        out << " interface[0x" << std::hex
+                            << instruction.interfaceTypeId << std::dec
+                            << ':' << instruction.interfaceSlot << ']';
                     }
                     out << " @" << instruction.symbolName << "[0x"
                         << std::hex << instruction.symbolId << std::dec << "](";

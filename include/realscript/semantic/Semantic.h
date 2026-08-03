@@ -134,6 +134,8 @@ struct FunctionSymbol {
     bool abstractMethod = false;
     bool sealedMethod = false;
     std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
+    bool interfaceMethod = false;
+    std::uint32_t interfaceSlot = std::numeric_limits<std::uint32_t>::max();
     std::string moduleName;
     std::string name;
     std::string ownerTypeName;
@@ -201,11 +203,30 @@ struct EnumMemberSymbol {
     SymbolId id = 0;
 };
 
+struct InterfaceDispatchMap {
+    SymbolId interfaceTypeId = 0;
+    std::vector<SymbolId> slots;
+};
+
+[[nodiscard]] inline bool operator==(
+    const InterfaceDispatchMap& left,
+    const InterfaceDispatchMap& right) noexcept {
+    return left.interfaceTypeId == right.interfaceTypeId &&
+        left.slots == right.slots;
+}
+
+[[nodiscard]] inline bool operator!=(
+    const InterfaceDispatchMap& left,
+    const InterfaceDispatchMap& right) noexcept {
+    return !(left == right);
+}
+
 struct TypeSymbol {
     SymbolId id = 0;
     TypeKind kind = TypeKind::Class;
     Accessibility accessibility = Accessibility::Public;
     bool synthetic = false;
+    bool interfaceType = false;
     bool abstractType = false;
     bool sealedType = false;
     SymbolId baseTypeId = 0;
@@ -215,6 +236,7 @@ struct TypeSymbol {
     std::vector<FieldSymbol> fields;
     std::vector<FunctionSymbol> methods;
     std::vector<SymbolId> virtualDispatchTable;
+    std::vector<InterfaceDispatchMap> interfaceDispatchMaps;
     std::vector<FunctionSymbol> constructors;
     std::vector<PropertySymbol> properties;
     std::vector<EventSymbol> events;
@@ -298,6 +320,12 @@ using FunctionOverloadMap =
     const TypeSymbolMap& visibleTypes,
     diagnostics::DiagnosticBag& diagnostics,
     const TypeSymbol* owner = nullptr);
+[[nodiscard]] FunctionSymbol declareFunctionSymbol(
+    const std::string& moduleName,
+    const syntax::InterfaceMethodDeclarationSyntax& syntax,
+    const TypeSymbolMap& visibleTypes,
+    diagnostics::DiagnosticBag& diagnostics,
+    const TypeSymbol* owner);
 [[nodiscard]] FunctionSymbol declareConstructorSymbol(
     const std::string& moduleName,
     const syntax::ConstructorDeclarationSyntax& syntax,
@@ -468,6 +496,9 @@ struct BoundCallExpression final : BoundExpression {
     FunctionSymbol function;
     bool virtualDispatch = false;
     std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
+    bool interfaceDispatch = false;
+    SymbolId interfaceTypeId = 0;
+    std::uint32_t interfaceSlot = std::numeric_limits<std::uint32_t>::max();
     std::vector<std::unique_ptr<BoundExpression>> arguments;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::CallExpression;
@@ -488,6 +519,9 @@ struct BoundReferenceCallExpression final : BoundExpression {
     FunctionSymbol function;
     bool virtualDispatch = false;
     std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
+    bool interfaceDispatch = false;
+    SymbolId interfaceTypeId = 0;
+    std::uint32_t interfaceSlot = std::numeric_limits<std::uint32_t>::max();
     std::vector<BoundReferenceCallArgument> arguments;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::ReferenceCallExpression;

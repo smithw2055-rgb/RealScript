@@ -59,6 +59,7 @@ std::string disassembleModule(const Module& module) {
                 out << " base[0x" << std::hex << type.baseTypeId
                     << std::dec << "]";
             }
+            if (type.interfaceType) out << " interface";
             if (type.abstractType) out << " abstract";
             if (type.sealedType) out << " sealed";
             if (!type.virtualDispatchTable.empty()) {
@@ -68,6 +69,18 @@ std::string disassembleModule(const Module& module) {
                     if (slot != 0) out << ", ";
                     out << slot << "=0x" << std::hex
                         << type.virtualDispatchTable[slot] << std::dec;
+                }
+                out << ']';
+            }
+            for (const auto& interfaceMap :
+                 type.interfaceDispatchMaps) {
+                out << " islots[0x" << std::hex
+                    << interfaceMap.interfaceTypeId << std::dec << ':';
+                for (std::size_t slot = 0;
+                     slot < interfaceMap.slots.size(); ++slot) {
+                    if (slot != 0) out << ", ";
+                    out << slot << "=0x" << std::hex
+                        << interfaceMap.slots[slot] << std::dec;
                 }
                 out << ']';
             }
@@ -107,6 +120,11 @@ std::string disassembleModule(const Module& module) {
             printSignatureType(out, reference.returnType, reference.returnTypeId);
             if (reference.virtualDispatch) {
                 out << " virtual[" << reference.virtualSlot << "]";
+            }
+            if (reference.interfaceDispatch) {
+                out << " interface[0x" << std::hex
+                    << reference.interfaceTypeId << std::dec
+                    << ':' << reference.interfaceSlot << ']';
             }
             out << '\n';
         }

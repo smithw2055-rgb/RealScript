@@ -95,6 +95,10 @@ bool descriptorAssignable(
     while (current != 0 && visited.insert(current).second) {
         const auto found = descriptors.find(current);
         if (found == descriptors.end()) return false;
+        for (const auto& interfaceMap :
+             found->second->interfaceDispatchMaps) {
+            if (interfaceMap.interfaceTypeId == expected) return true;
+        }
         if (found->second->baseTypeId == expected) return true;
         current = found->second->baseTypeId;
     }
@@ -310,6 +314,15 @@ bool verifyModule(
                 "non-class bytecode type has a virtual dispatch table",
                 {});
         }
+        if (type.interfaceType &&
+            (!type.fields.empty() ||
+             !type.virtualDispatchTable.empty() ||
+             !type.interfaceDispatchMaps.empty())) {
+            diagnostics.report(
+                "RS5184",
+                "bytecode interface descriptor contains runtime class state",
+                {});
+        }
         if (!type.abstractType) {
             for (const auto symbolId : type.virtualDispatchTable) {
                 if (symbolId == 0) {
@@ -317,6 +330,28 @@ bool verifyModule(
                         "RS5181",
                         "concrete bytecode type has an abstract virtual slot",
                         {});
+                }
+            }
+        }
+        std::unordered_set<semantic::SymbolId> interfaceIds;
+        for (const auto& interfaceMap :
+             type.interfaceDispatchMaps) {
+            if (interfaceMap.interfaceTypeId == 0 ||
+                !interfaceIds.insert(
+                    interfaceMap.interfaceTypeId).second) {
+                diagnostics.report(
+                    "RS5185",
+                    "bytecode type has an invalid or duplicate interface map",
+                    {});
+            }
+            if (!type.abstractType) {
+                for (const auto symbolId : interfaceMap.slots) {
+                    if (symbolId == 0) {
+                        diagnostics.report(
+                            "RS5186",
+                            "concrete bytecode type has an abstract interface slot",
+                            {});
+                    }
                 }
             }
         }
@@ -429,6 +464,13 @@ bool verifyModule(
             }
         }
 
+        if (reference.virtualDispatch &&
+            reference.interfaceDispatch) {
+            diagnostics.report(
+                "RS5187",
+                "bytecode reference cannot use virtual and interface dispatch together",
+                {});
+        }
         if (reference.virtualDispatch) {
             const auto receiverTypeId =
                 typeIdAt(reference.parameterTypeIds, 0);
@@ -451,6 +493,35 @@ bool verifyModule(
             diagnostics.report(
                 "RS5183",
                 "static bytecode reference carries a virtual slot",
+                {});
+        }
+        if (reference.interfaceDispatch) {
+            const auto receiverTypeId =
+                typeIdAt(reference.parameterTypeIds, 0);
+            const auto receiver = typeDescriptors.find(
+                reference.interfaceTypeId);
+            if (reference.interfaceTypeId == 0 ||
+                reference.interfaceSlot ==
+                    std::numeric_limits<std::uint32_t>::max() ||
+                reference.parameterTypes.empty() ||
+                reference.parameterTypes.front() !=
+                    semantic::PrimitiveType::Object ||
+                receiverTypeId != reference.interfaceTypeId ||
+                receiver == typeDescriptors.end() ||
+                !receiver->second->interfaceType ||
+                reference.interfaceSlot >=
+                    receiver->second->methods.size()) {
+                diagnostics.report(
+                    "RS5188",
+                    "bytecode interface reference has an invalid slot contract",
+                    {});
+            }
+        } else if (reference.interfaceTypeId != 0 ||
+                   reference.interfaceSlot !=
+                       std::numeric_limits<std::uint32_t>::max()) {
+            diagnostics.report(
+                "RS5189",
+                "non-interface bytecode reference carries interface metadata",
                 {});
         }
 
@@ -979,6 +1050,7 @@ bool verifyModule(
                 case Opcode::NewObject:
                     if (instruction.typeIndex >= module.types.size() ||
                         module.types[instruction.typeIndex].kind != semantic::TypeKind::Class ||
+                        module.types[instruction.typeIndex].interfaceType ||
                         resultType != semantic::PrimitiveType::Object ||
                         registerTypeId(instruction.result) !=
                             module.types[instruction.typeIndex].id) {
@@ -1079,11 +1151,14 @@ bool verifyModule(
                                 "invalid bytecode array element load",
                                 {});
                         }
-                    } else if (!commonValid || instruction.operands.size() != 3 ||
-                               registerType(instruction.operands[2]) !=
-                                   instruction.elementType ||
-                               registerTypeId(instruction.operands[2]) !=
-                                   instruction.elementTypeId ||
+                    } else if (!commonValid ||
+                               instruction.operands.size() != 3 ||
+                               !compatibleType(
+                                   registerType(instruction.operands[2]),
+                                   registerTypeId(instruction.operands[2]),
+                                   instruction.elementType,
+                                   instruction.elementTypeId,
+                                   typeDescriptors) ||
                                instruction.result != InvalidRegister) {
                         diagnostics.report(
                             "RS5163",
@@ -1148,9 +1223,12 @@ bool verifyModule(
                                     {});
                             }
                         } else if (instruction.operands.size() != 2 ||
-                                   registerType(instruction.operands[1]) != field.type ||
-                                   registerTypeId(instruction.operands[1]) !=
-                                       expectedFieldTypeId ||
+                                   !compatibleType(
+                                       registerType(instruction.operands[1]),
+                                       registerTypeId(instruction.operands[1]),
+                                       field.type,
+                                       expectedFieldTypeId,
+                                       typeDescriptors) ||
                                    instruction.result != InvalidRegister) {
                             diagnostics.report(
                                 "RS5158",

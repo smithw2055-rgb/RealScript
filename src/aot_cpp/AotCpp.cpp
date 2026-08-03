@@ -326,9 +326,18 @@ std::string canonicalInput(
             value += "type-contract:" + semantic::canonicalTypeName(type) +
                 ":base=" + std::to_string(type.baseTypeId) +
                 ":abstract=" + (type.abstractType ? "1" : "0") +
-                ":sealed=" + (type.sealedType ? "1" : "0") + ":";
+                ":sealed=" + (type.sealedType ? "1" : "0") +
+                ":interface=" + (type.interfaceType ? "1" : "0") + ":";
             for (const auto symbolId : type.virtualDispatchTable) {
                 value += std::to_string(symbolId) + ";";
+            }
+            for (const auto& implementation : type.interfaceDispatchMaps) {
+                value += "iface#" +
+                    std::to_string(implementation.interfaceTypeId) + "[";
+                for (const auto symbolId : implementation.slots) {
+                    value += std::to_string(symbolId) + ";";
+                }
+                value += "]";
             }
             value += "\n";
         }
@@ -572,6 +581,39 @@ GeneratedProgram CppGenerator::generate(
             }
             source.line("};");
         }
+        for (std::size_t interfaceIndex = 0;
+             interfaceIndex < type.interfaceDispatchMaps.size();
+             ++interfaceIndex) {
+            const auto& implementation =
+                type.interfaceDispatchMaps[interfaceIndex];
+            if (implementation.slots.empty()) continue;
+            source.line("static constexpr semantic::SymbolId " +
+                view.cppName + "_interface_" +
+                std::to_string(interfaceIndex) + "_slots[] = {");
+            for (const auto symbolId : implementation.slots) {
+                source.line("    0x" + hexId(symbolId) + "ULL,");
+            }
+            source.line("};");
+        }
+        if (!type.interfaceDispatchMaps.empty()) {
+            source.line("static constexpr InterfaceDispatchDescriptor " +
+                view.cppName + "_interfaceMaps[] = {");
+            for (std::size_t interfaceIndex = 0;
+                 interfaceIndex < type.interfaceDispatchMaps.size();
+                 ++interfaceIndex) {
+                const auto& implementation =
+                    type.interfaceDispatchMaps[interfaceIndex];
+                source.line("    {0x" +
+                    hexId(implementation.interfaceTypeId) + "ULL, " +
+                    (implementation.slots.empty()
+                        ? std::string("nullptr")
+                        : view.cppName + "_interface_" +
+                            std::to_string(interfaceIndex) + "_slots") +
+                    ", " + std::to_string(implementation.slots.size()) +
+                    "u},");
+            }
+            source.line("};");
+        }
         if (!type.enumMembers.empty()) {
             source.line("static constexpr EnumMemberDescriptor " + view.cppName +
                 "_enumMembers[] = {");
@@ -600,6 +642,11 @@ GeneratedProgram CppGenerator::generate(
                     ? "nullptr"
                     : view.cppName + "_virtualSlots") +
                 ", " + std::to_string(type.virtualDispatchTable.size()) +
+                "u, " + (type.interfaceType ? "true" : "false") + ", " +
+                (type.interfaceDispatchMaps.empty()
+                    ? "nullptr"
+                    : view.cppName + "_interfaceMaps") +
+                ", " + std::to_string(type.interfaceDispatchMaps.size()) +
                 "u},");
         }
         source.line("};");
@@ -674,6 +721,10 @@ GeneratedProgram CppGenerator::generate(
         source.line(std::string("    ") +
             (instruction.virtualDispatch ? "true" : "false") + ",");
         source.line("    " + std::to_string(instruction.virtualSlot) + "u,");
+        source.line(std::string("    ") +
+            (instruction.interfaceDispatch ? "true" : "false") + ",");
+        source.line("    0x" + hexId(instruction.interfaceTypeId) + "ULL,");
+        source.line("    " + std::to_string(instruction.interfaceSlot) + "u,");
         source.line("};");
     }
     source.line();

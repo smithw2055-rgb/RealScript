@@ -25,6 +25,10 @@ bool descriptorAssignable(
     while (current != 0 && visited.insert(current).second) {
         const auto found = types.find(current);
         if (found == types.end()) return false;
+        for (const auto& interfaceMap :
+             found->second->interfaceDispatchMaps) {
+            if (interfaceMap.interfaceTypeId == expected) return true;
+        }
         if (found->second->baseTypeId == expected) return true;
         current = found->second->baseTypeId;
     }
@@ -131,6 +135,15 @@ bool verifyModule(
                 "non-class MIR type has a virtual dispatch table",
                 {});
         }
+        if (type.interfaceType &&
+            (!type.fields.empty() ||
+             !type.virtualDispatchTable.empty() ||
+             !type.interfaceDispatchMaps.empty())) {
+            diagnostics.report(
+                "RS3070",
+                "MIR interface descriptor contains runtime class state",
+                {});
+        }
         if (!type.abstractType) {
             for (const auto symbolId : type.virtualDispatchTable) {
                 if (symbolId == 0) {
@@ -138,6 +151,28 @@ bool verifyModule(
                         "RS3067",
                         "concrete MIR type has an abstract virtual slot",
                         {});
+                }
+            }
+        }
+        std::unordered_set<semantic::SymbolId> interfaceIds;
+        for (const auto& interfaceMap :
+             type.interfaceDispatchMaps) {
+            if (interfaceMap.interfaceTypeId == 0 ||
+                !interfaceIds.insert(
+                    interfaceMap.interfaceTypeId).second) {
+                diagnostics.report(
+                    "RS3071",
+                    "MIR type has an invalid or duplicate interface map",
+                    {});
+            }
+            if (!type.abstractType) {
+                for (const auto symbolId : interfaceMap.slots) {
+                    if (symbolId == 0) {
+                        diagnostics.report(
+                            "RS3072",
+                            "concrete MIR type has an abstract interface slot",
+                            {});
+                    }
                 }
             }
         }
@@ -647,8 +682,12 @@ bool verifyModule(
                             "MIR array element load type mismatch",
                             instruction.sourceSpan);
                     } else if (instruction.opcode == Opcode::StoreElement &&
-                               (valueType(instruction.operands[2]) != instruction.elementType ||
-                                valueTypeId(instruction.operands[2]) != instruction.elementTypeId)) {
+                               !compatibleType(
+                                   valueType(instruction.operands[2]),
+                                   valueTypeId(instruction.operands[2]),
+                                   instruction.elementType,
+                                   instruction.elementTypeId,
+                                   types)) {
                         diagnostics.report(
                             "RS3058",
                             "MIR array element store type mismatch",
@@ -666,7 +705,9 @@ bool verifyModule(
                     if (instruction.resultType != expected ||
                         instruction.resultTypeId != instruction.typeId ||
                         foundType == types.end() ||
-                        foundType->second->kind != expectedKind) {
+                        foundType->second->kind != expectedKind ||
+                        (instruction.opcode == Opcode::NewObject &&
+                         foundType->second->interfaceType)) {
                         diagnostics.report(
                             "RS3043",
                             "invalid MIR named-type allocation",
@@ -711,8 +752,12 @@ bool verifyModule(
                                      instruction.resultTypeId != fieldTypeId)) {
                             diagnostics.report("RS3046", "MIR field load type mismatch", instruction.sourceSpan);
                         }
-                        if (!load && (valueType(instruction.operands[1]) != field.type ||
-                                      valueTypeId(instruction.operands[1]) != fieldTypeId)) {
+                        if (!load && !compatibleType(
+                                valueType(instruction.operands[1]),
+                                valueTypeId(instruction.operands[1]),
+                                field.type,
+                                fieldTypeId,
+                                types)) {
                             diagnostics.report("RS3047", "MIR field store type mismatch", instruction.sourceSpan);
                         }
                         if (instruction.opcode == Opcode::StoreStructField &&
@@ -777,6 +822,13 @@ bool verifyModule(
                                 instruction.sourceSpan);
                         }
                     }
+                    if (instruction.virtualDispatch &&
+                        instruction.interfaceDispatch) {
+                        diagnostics.report(
+                            "RS3073",
+                            "MIR call cannot use virtual and interface dispatch together",
+                            instruction.sourceSpan);
+                    }
                     if (instruction.virtualDispatch) {
                         const auto receiverTypeId =
                             typeIdAt(instruction.parameterTypeIds, 0);
@@ -799,6 +851,35 @@ bool verifyModule(
                         diagnostics.report(
                             "RS3069",
                             "static MIR call carries a virtual slot",
+                            instruction.sourceSpan);
+                    }
+                    if (instruction.interfaceDispatch) {
+                        const auto receiverTypeId =
+                            typeIdAt(instruction.parameterTypeIds, 0);
+                        const auto receiverType = types.find(
+                            instruction.interfaceTypeId);
+                        if (instruction.interfaceTypeId == 0 ||
+                            instruction.interfaceSlot ==
+                                std::numeric_limits<std::uint32_t>::max() ||
+                            instruction.parameterTypes.empty() ||
+                            instruction.parameterTypes.front() !=
+                                semantic::PrimitiveType::Object ||
+                            receiverTypeId != instruction.interfaceTypeId ||
+                            receiverType == types.end() ||
+                            !receiverType->second->interfaceType ||
+                            instruction.interfaceSlot >=
+                                receiverType->second->methods.size()) {
+                            diagnostics.report(
+                                "RS3074",
+                                "MIR interface call has an invalid slot contract",
+                                instruction.sourceSpan);
+                        }
+                    } else if (instruction.interfaceTypeId != 0 ||
+                               instruction.interfaceSlot !=
+                                   std::numeric_limits<std::uint32_t>::max()) {
+                        diagnostics.report(
+                            "RS3075",
+                            "non-interface MIR call carries interface metadata",
                             instruction.sourceSpan);
                     }
                     if (instruction.resultType == semantic::PrimitiveType::Void &&

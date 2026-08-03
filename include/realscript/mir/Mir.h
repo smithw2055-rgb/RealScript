@@ -97,6 +97,9 @@ struct Instruction {
     semantic::SymbolId symbolId = 0;
     bool virtualDispatch = false;
     std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
+    bool interfaceDispatch = false;
+    semantic::SymbolId interfaceTypeId = 0;
+    std::uint32_t interfaceSlot = std::numeric_limits<std::uint32_t>::max();
     std::string symbolName;
     std::vector<semantic::PrimitiveType> parameterTypes;
     std::vector<semantic::SymbolId> parameterTypeIds;
