@@ -619,8 +619,14 @@ ValueId Lowerer::emitValue(
     std::vector<ValueId> operands,
     text::TextSpan sourceSpan) {
     if (!hasCurrentBlock() || currentBlockTerminated()) {
+        const auto functionName = currentFunction_
+            ? currentFunction_->name
+            : std::string{"<none>"};
         throw std::logic_error(
-            "cannot emit a value without an open MIR block");
+            "cannot emit MIR value '" +
+            std::string{opcodeName(opcode)} +
+            "' without an open block in function '" +
+            functionName + "'");
     }
 
     Instruction instruction;
