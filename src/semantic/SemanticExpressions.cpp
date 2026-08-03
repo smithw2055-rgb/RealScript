@@ -584,8 +584,13 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
         argumentModifiers,
     std::unique_ptr<BoundExpression> receiver,
     text::TextSpan span,
-    const std::string& context) {
+    const std::string& context,
+    bool forceStaticDispatch) {
     const auto offset = visibleParameterOffset(function);
+    const bool virtualDispatch = receiver &&
+        function.method && !function.staticMethod &&
+        !forceStaticDispatch &&
+        function.virtualSlot != std::numeric_limits<std::uint32_t>::max();
     bool hasModifiers = false;
     for (std::size_t index = offset;
          index < function.parameters.size(); ++index) {
@@ -599,6 +604,10 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
         result->type = function.returnType;
         result->typeName = function.returnTypeName;
         result->function = function;
+        result->virtualDispatch = virtualDispatch;
+        result->virtualSlot = virtualDispatch
+            ? function.virtualSlot
+            : std::numeric_limits<std::uint32_t>::max();
         if (receiver) result->arguments.push_back(std::move(receiver));
         for (std::size_t index = 0;
              index < arguments.size(); ++index) {
@@ -619,6 +628,10 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
     result->type = function.returnType;
     result->typeName = function.returnTypeName;
     result->function = function;
+    result->virtualDispatch = virtualDispatch;
+    result->virtualSlot = virtualDispatch
+        ? function.virtualSlot
+        : std::numeric_limits<std::uint32_t>::max();
     if (receiver) {
         BoundReferenceCallArgument receiverArgument;
         receiverArgument.value = std::move(receiver);
@@ -915,7 +928,9 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
         syntaxTree.argumentModifiers,
         std::move(receiver),
         syntaxTree.span(),
-        "method argument");
+        "method argument",
+        syntaxTree.receiver->kind() ==
+            syntax::SyntaxKind::BaseExpression);
 }
 
 std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
@@ -923,6 +938,14 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
     const auto found = visibleTypes_.find(syntaxTree.type.name.text);
     if (found == visibleTypes_.end() || found->second.kind == TypeKind::Enum) {
         diagnostics_.report("RS2403", "cannot allocate unknown or enum type '" + syntaxTree.type.name.text + "'", syntaxTree.type.span());
+        return makeError(syntaxTree.span());
+    }
+    if (found->second.kind == TypeKind::Class && found->second.abstractType) {
+        diagnostics_.report(
+            "RS2524",
+            "cannot instantiate abstract class '" +
+                canonicalTypeName(found->second) + "'",
+            syntaxTree.type.span());
         return makeError(syntaxTree.span());
     }
     std::vector<std::unique_ptr<BoundExpression>> arguments;

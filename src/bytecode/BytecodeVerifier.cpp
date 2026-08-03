@@ -101,6 +101,20 @@ bool descriptorAssignable(
     return false;
 }
 
+bool compatibleType(
+    semantic::PrimitiveType actualType,
+    semantic::SymbolId actualTypeId,
+    semantic::PrimitiveType expectedType,
+    semantic::SymbolId expectedTypeId,
+    const std::unordered_map<semantic::SymbolId,
+        const semantic::TypeSymbol*>& descriptors) noexcept {
+    if (actualType != expectedType) return false;
+    if (actualType == semantic::PrimitiveType::Object) {
+        return descriptorAssignable(actualTypeId, expectedTypeId, descriptors);
+    }
+    return actualTypeId == expectedTypeId;
+}
+
 semantic::TypeKind expectedTypeKind(semantic::PrimitiveType type) noexcept {
     switch (type) {
     case semantic::PrimitiveType::Object: return semantic::TypeKind::Class;
@@ -289,6 +303,24 @@ bool verifyModule(
                 {});
         }
 
+        if (type.kind != semantic::TypeKind::Class &&
+            !type.virtualDispatchTable.empty()) {
+            diagnostics.report(
+                "RS5180",
+                "non-class bytecode type has a virtual dispatch table",
+                {});
+        }
+        if (!type.abstractType) {
+            for (const auto symbolId : type.virtualDispatchTable) {
+                if (symbolId == 0) {
+                    diagnostics.report(
+                        "RS5181",
+                        "concrete bytecode type has an abstract virtual slot",
+                        {});
+                }
+            }
+        }
+
         for (std::size_t fieldIndex = 0; fieldIndex < type.fields.size(); ++fieldIndex) {
             const auto& field = type.fields[fieldIndex];
             bool exactTypeValid = true;
@@ -395,6 +427,31 @@ bool verifyModule(
                     "bytecode function reference has an invalid parameter type identity",
                     {});
             }
+        }
+
+        if (reference.virtualDispatch) {
+            const auto receiverTypeId =
+                typeIdAt(reference.parameterTypeIds, 0);
+            const auto receiver = typeDescriptors.find(receiverTypeId);
+            if (reference.virtualSlot ==
+                    std::numeric_limits<std::uint32_t>::max() ||
+                reference.parameterTypes.empty() ||
+                reference.parameterTypes.front() !=
+                    semantic::PrimitiveType::Object ||
+                receiver == typeDescriptors.end() ||
+                reference.virtualSlot >=
+                    receiver->second->virtualDispatchTable.size()) {
+                diagnostics.report(
+                    "RS5182",
+                    "bytecode virtual reference has an invalid slot contract",
+                    {});
+            }
+        } else if (reference.virtualSlot !=
+                std::numeric_limits<std::uint32_t>::max()) {
+            diagnostics.report(
+                "RS5183",
+                "static bytecode reference carries a virtual slot",
+                {});
         }
 
         const auto internal = internalFunctions.find(reference.symbolId);
@@ -855,10 +912,12 @@ bool verifyModule(
                 case Opcode::StoreLocal:
                     if (instruction.index >= function.localTypes.size() ||
                         instruction.operands.size() != 1 ||
-                        registerType(instruction.operands.front()) !=
-                            function.localTypes[instruction.index] ||
-                        registerTypeId(instruction.operands.front()) !=
-                            typeIdAt(function.localTypeIds, instruction.index)) {
+                        !compatibleType(
+                            registerType(instruction.operands.front()),
+                            registerTypeId(instruction.operands.front()),
+                            function.localTypes[instruction.index],
+                            typeIdAt(function.localTypeIds, instruction.index),
+                            typeDescriptors)) {
                         diagnostics.report("RS5134", "invalid bytecode local store", {});
                     }
                     break;
@@ -1153,10 +1212,12 @@ bool verifyModule(
                             instruction.operands.size(),
                             reference.parameterTypes.size());
                         for (std::size_t argument = 0; argument < count; ++argument) {
-                            if (registerType(instruction.operands[argument]) !=
-                                    reference.parameterTypes[argument] ||
-                                registerTypeId(instruction.operands[argument]) !=
-                                    typeIdAt(reference.parameterTypeIds, argument)) {
+                            if (!compatibleType(
+                                    registerType(instruction.operands[argument]),
+                                    registerTypeId(instruction.operands[argument]),
+                                    reference.parameterTypes[argument],
+                                    typeIdAt(reference.parameterTypeIds, argument),
+                                    typeDescriptors)) {
                                 diagnostics.report(
                                     "RS5138",
                                     "bytecode call argument type does not match reference",
@@ -1324,9 +1385,12 @@ bool verifyModule(
             case TerminatorKind::ReturnValue:
                 checkUse(block.terminator.value, block.id, useIndex);
                 if (function.returnType == semantic::PrimitiveType::Void ||
-                    registerType(block.terminator.value) != function.returnType ||
-                    registerTypeId(block.terminator.value) !=
-                        function.returnTypeId) {
+                    !compatibleType(
+                        registerType(block.terminator.value),
+                        registerTypeId(block.terminator.value),
+                        function.returnType,
+                        function.returnTypeId,
+                        typeDescriptors)) {
                     diagnostics.report(
                         "RS5148",
                         "bytecode return value does not match function",

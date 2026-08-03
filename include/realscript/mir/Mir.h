@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -94,6 +95,8 @@ struct Instruction {
     bool boolImmediate = false;
     std::string stringImmediate;
     semantic::SymbolId symbolId = 0;
+    bool virtualDispatch = false;
+    std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
     std::string symbolName;
     std::vector<semantic::PrimitiveType> parameterTypes;
     std::vector<semantic::SymbolId> parameterTypeIds;

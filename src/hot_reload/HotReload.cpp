@@ -53,6 +53,9 @@ bool sameType(const semantic::TypeSymbol& left, const semantic::TypeSymbol& righ
         left.baseTypeId != right.baseTypeId ||
         left.baseTypeName != right.baseTypeName ||
         left.moduleName != right.moduleName || left.name != right.name ||
+        left.abstractType != right.abstractType ||
+        left.sealedType != right.sealedType ||
+        left.virtualDispatchTable != right.virtualDispatchTable ||
         left.fields.size() != right.fields.size() ||
         left.enumMembers.size() != right.enumMembers.size()) return false;
     for (std::size_t index = 0; index < left.fields.size(); ++index) {
@@ -149,7 +152,11 @@ std::uint64_t functionBodyFingerprint(const bytecode::Module& module, const byte
             append(hash, instruction.index);
             if (instruction.opcode == bytecode::Opcode::Call &&
                 instruction.index < module.functionReferences.size()) {
-                append(hash, module.functionReferences[instruction.index].symbolId);
+                const auto& reference =
+                    module.functionReferences[instruction.index];
+                append(hash, reference.symbolId);
+                append(hash, reference.virtualDispatch ? 1 : 0);
+                append(hash, reference.virtualSlot);
             }
             append(hash, instruction.typeIndex);
             append(hash, static_cast<std::uint64_t>(instruction.elementType));

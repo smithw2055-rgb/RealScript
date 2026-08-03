@@ -981,7 +981,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 module.invalid = true;
             }
             module.declarations.push_back(binding.symbol);
-            module.functionBindings.push_back(std::move(binding));
+            if (!binding.symbol.abstractMethod) {
+                module.functionBindings.push_back(std::move(binding));
+            }
         };
 
         for (const auto* unit : module.units) {
@@ -1011,6 +1013,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             modules, owner.baseTypeName);
                         if (base) {
                             owner.methods = base->methods;
+                            owner.virtualDispatchTable =
+                                base->virtualDispatchTable;
                             owner.properties = base->properties;
                             owner.events = base->events;
                         }
@@ -1038,13 +1042,23 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             result.diagnostics, &owner);
                         binding.sourceName = unit->source->name();
                         binding.symbol.sourceName = binding.sourceName;
-                        binding.body = &methodSyntax.body;
+                        binding.body = methodSyntax.semicolonToken
+                            ? nullptr
+                            : &methodSyntax.body;
                         if (!binding.symbol.staticMethod) {
                             binding.parameterNames.push_back("this");
                             binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
                         }
                         appendParameters(binding, methodSyntax.parameters);
-                        owner.methods.push_back(binding.symbol);
+                        const auto inheritedIndex =
+                            phase19PrepareVirtualMethod(
+                                owner, binding.symbol, methodSyntax,
+                                module, result, unit->source->name());
+                        if (inheritedIndex) {
+                            owner.methods[*inheritedIndex] = binding.symbol;
+                        } else {
+                            owner.methods.push_back(binding.symbol);
+                        }
                         addBinding(std::move(binding), methodSyntax.identifierToken.span);
                     }
                     for (const auto& sequenceSyntax : typeSyntax.sequences) {
@@ -1596,6 +1610,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             }
                         }
                     }
+                    phase19ValidateConcreteType(owner, module, result);
                     *ownerPointer = std::move(owner);
                 }
             };

@@ -22,7 +22,7 @@
 namespace realscript::aot {
 
 constexpr std::uint32_t RuntimeAbiMajor = 1;
-constexpr std::uint32_t RuntimeAbiMinor = 0;
+constexpr std::uint32_t RuntimeAbiMinor = 1;
 constexpr std::uint32_t GeneratedModuleVersion = 1;
 
 struct FieldDescriptor {
@@ -48,6 +48,8 @@ struct TypeDescriptor {
     std::uint32_t fieldCount = 0;
     const EnumMemberDescriptor* enumMembers = nullptr;
     std::uint32_t enumMemberCount = 0;
+    const semantic::SymbolId* virtualDispatchTable = nullptr;
+    std::uint32_t virtualSlotCount = 0;
 };
 
 class ExecutionContext;
@@ -101,6 +103,8 @@ struct CallSignature {
     const semantic::PrimitiveType* parameterTypes = nullptr;
     const semantic::SymbolId* parameterTypeIds = nullptr;
     std::uint32_t parameterCount = 0;
+    bool virtualDispatch = false;
+    std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
 };
 
 enum class UnaryOperation : std::uint8_t {

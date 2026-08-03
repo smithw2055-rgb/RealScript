@@ -287,6 +287,16 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase19_runtime_polymorphism_tests
         realscript.phase19.runtime-polymorphism
         tests/phase19_runtime_polymorphism_tests.cpp)
+    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS AND NOT MSVC)
+        target_compile_definitions(
+            realscript_phase19_runtime_polymorphism_tests
+            PRIVATE
+                REALSCRIPT_PHASE19_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
+                REALSCRIPT_PHASE19_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
+                REALSCRIPT_PHASE19_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_PHASE19_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/phase19-jit-cache"
+        )
+    endif()
 
     add_test(
         NAME realscript.phase6.cli-smoke

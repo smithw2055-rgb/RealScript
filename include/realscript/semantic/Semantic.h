@@ -214,6 +214,7 @@ struct TypeSymbol {
     std::string name;
     std::vector<FieldSymbol> fields;
     std::vector<FunctionSymbol> methods;
+    std::vector<SymbolId> virtualDispatchTable;
     std::vector<FunctionSymbol> constructors;
     std::vector<PropertySymbol> properties;
     std::vector<EventSymbol> events;
@@ -465,6 +466,8 @@ struct BoundConversionExpression final : BoundExpression {
 
 struct BoundCallExpression final : BoundExpression {
     FunctionSymbol function;
+    bool virtualDispatch = false;
+    std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
     std::vector<std::unique_ptr<BoundExpression>> arguments;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::CallExpression;
@@ -483,6 +486,8 @@ struct BoundReferenceCallArgument {
 
 struct BoundReferenceCallExpression final : BoundExpression {
     FunctionSymbol function;
+    bool virtualDispatch = false;
+    std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
     std::vector<BoundReferenceCallArgument> arguments;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::ReferenceCallExpression;
@@ -804,7 +809,8 @@ private:
         const std::vector<std::optional<syntax::SyntaxToken>>& argumentModifiers,
         std::unique_ptr<BoundExpression> receiver,
         text::TextSpan span,
-        const std::string& context);
+        const std::string& context,
+        bool forceStaticDispatch = false);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindMemberCallExpression(
         const syntax::MemberCallExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindNewObjectExpression(

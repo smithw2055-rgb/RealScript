@@ -14,6 +14,37 @@ struct Definition {
     semantic::SymbolId typeId = 0;
 };
 
+bool descriptorAssignable(
+    semantic::SymbolId actual,
+    semantic::SymbolId expected,
+    const std::unordered_map<semantic::SymbolId,
+        const semantic::TypeSymbol*>& types) noexcept {
+    if (actual == expected) return true;
+    std::unordered_set<semantic::SymbolId> visited;
+    auto current = actual;
+    while (current != 0 && visited.insert(current).second) {
+        const auto found = types.find(current);
+        if (found == types.end()) return false;
+        if (found->second->baseTypeId == expected) return true;
+        current = found->second->baseTypeId;
+    }
+    return false;
+}
+
+bool compatibleType(
+    semantic::PrimitiveType actualType,
+    semantic::SymbolId actualTypeId,
+    semantic::PrimitiveType expectedType,
+    semantic::SymbolId expectedTypeId,
+    const std::unordered_map<semantic::SymbolId,
+        const semantic::TypeSymbol*>& types) noexcept {
+    if (actualType != expectedType) return false;
+    if (actualType == semantic::PrimitiveType::Object) {
+        return descriptorAssignable(actualTypeId, expectedTypeId, types);
+    }
+    return actualTypeId == expectedTypeId;
+}
+
 std::size_t expectedOperandCount(const Instruction& instruction) noexcept {
     switch (instruction.opcode) {
     case Opcode::Parameter:
@@ -92,6 +123,23 @@ bool verifyModule(
     for (const auto& type : module.types) {
         if (type.id == 0 || !types.emplace(type.id, &type).second) {
             diagnostics.report("RS3040", "duplicate or invalid MIR type descriptor", {});
+        }
+        if (type.kind != semantic::TypeKind::Class &&
+            !type.virtualDispatchTable.empty()) {
+            diagnostics.report(
+                "RS3066",
+                "non-class MIR type has a virtual dispatch table",
+                {});
+        }
+        if (!type.abstractType) {
+            for (const auto symbolId : type.virtualDispatchTable) {
+                if (symbolId == 0) {
+                    diagnostics.report(
+                        "RS3067",
+                        "concrete MIR type has an abstract virtual slot",
+                        {});
+                }
+            }
         }
         for (const auto& field : type.fields) {
             if (field.type == semantic::PrimitiveType::Void ||
@@ -482,11 +530,13 @@ bool verifyModule(
                             instruction.sourceSpan);
                     } else if (instruction.opcode == Opcode::StoreLocal &&
                                operandCountIsValid &&
-                               (valueType(instruction.operands.front()) !=
-                                    function.localTypes[instruction.localIndex] ||
-                                valueTypeId(instruction.operands.front()) !=
+                               !compatibleType(
+                                    valueType(instruction.operands.front()),
+                                    valueTypeId(instruction.operands.front()),
+                                    function.localTypes[instruction.localIndex],
                                     typeIdAt(function.localTypeIds,
-                                        instruction.localIndex))) {
+                                        instruction.localIndex),
+                                    types)) {
                         diagnostics.report(
                             "RS3016",
                             "MIR local store type does not match local table",
@@ -704,8 +754,13 @@ bool verifyModule(
                          argumentIndex < instruction.parameterTypes.size() &&
                          argumentIndex < instruction.operands.size();
                          ++argumentIndex) {
-                        if (valueType(instruction.operands[argumentIndex]) !=
-                            instruction.parameterTypes[argumentIndex]) {
+                        if (!compatibleType(
+                                valueType(instruction.operands[argumentIndex]),
+                                valueTypeId(instruction.operands[argumentIndex]),
+                                instruction.parameterTypes[argumentIndex],
+                                typeIdAt(instruction.parameterTypeIds,
+                                    argumentIndex),
+                                types)) {
                             diagnostics.report(
                                 "RS3033",
                                 "MIR call argument type mismatch",
@@ -721,6 +776,30 @@ bool verifyModule(
                                 "MIR call argument type identity is invalid",
                                 instruction.sourceSpan);
                         }
+                    }
+                    if (instruction.virtualDispatch) {
+                        const auto receiverTypeId =
+                            typeIdAt(instruction.parameterTypeIds, 0);
+                        const auto receiverType = types.find(receiverTypeId);
+                        if (instruction.virtualSlot ==
+                                std::numeric_limits<std::uint32_t>::max() ||
+                            instruction.parameterTypes.empty() ||
+                            instruction.parameterTypes.front() !=
+                                semantic::PrimitiveType::Object ||
+                            receiverType == types.end() ||
+                            instruction.virtualSlot >=
+                                receiverType->second->virtualDispatchTable.size()) {
+                            diagnostics.report(
+                                "RS3068",
+                                "MIR virtual call has an invalid slot contract",
+                                instruction.sourceSpan);
+                        }
+                    } else if (instruction.virtualSlot !=
+                            std::numeric_limits<std::uint32_t>::max()) {
+                        diagnostics.report(
+                            "RS3069",
+                            "static MIR call carries a virtual slot",
+                            instruction.sourceSpan);
                     }
                     if (instruction.resultType == semantic::PrimitiveType::Void &&
                         instruction.result >= 0) {
@@ -851,8 +930,12 @@ bool verifyModule(
                     terminatorUseIndex,
                     terminator.sourceSpan);
                 if (function.returnType == semantic::PrimitiveType::Void ||
-                    valueType(terminator.value) != function.returnType ||
-                    valueTypeId(terminator.value) != function.returnTypeId) {
+                    !compatibleType(
+                        valueType(terminator.value),
+                        valueTypeId(terminator.value),
+                        function.returnType,
+                        function.returnTypeId,
+                        types)) {
                     diagnostics.report(
                         "RS3024",
                         "MIR return value type does not match function",

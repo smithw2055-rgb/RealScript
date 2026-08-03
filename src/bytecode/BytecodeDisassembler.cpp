@@ -54,7 +54,24 @@ std::string disassembleModule(const Module& module) {
             const auto& type = module.types[index];
             out << "  type" << index << " @"
                 << semantic::canonicalTypeName(type) << "[0x"
-                << std::hex << type.id << std::dec << "] {";
+                << std::hex << type.id << std::dec << "]";
+            if (type.baseTypeId != 0) {
+                out << " base[0x" << std::hex << type.baseTypeId
+                    << std::dec << "]";
+            }
+            if (type.abstractType) out << " abstract";
+            if (type.sealedType) out << " sealed";
+            if (!type.virtualDispatchTable.empty()) {
+                out << " vslots[";
+                for (std::size_t slot = 0;
+                     slot < type.virtualDispatchTable.size(); ++slot) {
+                    if (slot != 0) out << ", ";
+                    out << slot << "=0x" << std::hex
+                        << type.virtualDispatchTable[slot] << std::dec;
+                }
+                out << ']';
+            }
+            out << " {";
             for (std::size_t fieldIndex = 0; fieldIndex < type.fields.size(); ++fieldIndex) {
                 if (fieldIndex != 0) out << ", ";
                 const auto& field = type.fields[fieldIndex];
@@ -88,6 +105,9 @@ std::string disassembleModule(const Module& module) {
             }
             out << ") -> ";
             printSignatureType(out, reference.returnType, reference.returnTypeId);
+            if (reference.virtualDispatch) {
+                out << " virtual[" << reference.virtualSlot << "]";
+            }
             out << '\n';
         }
     }

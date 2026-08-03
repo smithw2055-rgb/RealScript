@@ -10,12 +10,16 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                                    semantic::PrimitiveType resultType,
                                    const std::string& resultTypeName,
                                    std::vector<ValueId> arguments,
-                                   text::TextSpan span) -> ValueId {
+                                   text::TextSpan span,
+                                   bool virtualDispatch,
+                                   std::uint32_t virtualSlot) -> ValueId {
         Instruction instruction;
         instruction.resultType = resultType;
         instruction.opcode = Opcode::Call;
         instruction.operands = std::move(arguments);
         instruction.symbolId = function.id;
+        instruction.virtualDispatch = virtualDispatch;
+        instruction.virtualSlot = virtualSlot;
         instruction.symbolName = function.moduleName + "::" +
             (function.ownerTypeName.empty()
                 ? function.name
@@ -179,7 +183,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         if (allocation.constructor) {
             std::vector<ValueId> arguments{value};
             for (const auto& argument : allocation.arguments) arguments.push_back(lowerExpression(*argument));
-            (void)emitCallInstruction(*allocation.constructor, semantic::PrimitiveType::Void, {}, std::move(arguments), expression.span);
+            (void)emitCallInstruction(*allocation.constructor, semantic::PrimitiveType::Void, {}, std::move(arguments), expression.span, false, std::numeric_limits<std::uint32_t>::max());
         }
         return value;
     }
@@ -198,7 +202,9 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 semantic::PrimitiveType::Struct,
                 semantic::canonicalTypeName(allocation.structType),
                 std::move(arguments),
-                expression.span);
+                expression.span,
+                false,
+                std::numeric_limits<std::uint32_t>::max());
         }
         return value;
     }
@@ -293,7 +299,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         }
         const auto assigned = lowerExpression(*assignment.assignedValue);
         arguments.push_back(assigned);
-        (void)emitCallInstruction(assignment.setter, semantic::PrimitiveType::Void, {}, std::move(arguments), expression.span);
+        (void)emitCallInstruction(assignment.setter, semantic::PrimitiveType::Void, {}, std::move(arguments), expression.span, false, std::numeric_limits<std::uint32_t>::max());
         return assigned;
     }
     case semantic::BoundNodeKind::EventInvocationExpression: {
@@ -344,7 +350,9 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 semantic::PrimitiveType::Void,
                 {},
                 std::move(arguments),
-                expression.span);
+                expression.span,
+                false,
+                std::numeric_limits<std::uint32_t>::max());
             emitJump(nextBlock, {}, expression.span);
             setCurrentBlock(nextBlock);
         }
@@ -414,7 +422,9 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             call.type,
             call.function.returnTypeName,
             std::move(arguments),
-            expression.span);
+            expression.span,
+            call.virtualDispatch,
+            call.virtualSlot);
         for (const auto& writeback : writebacks) {
             const auto value = emitValue(
                 Opcode::LoadField,
@@ -458,7 +468,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             }
             arguments.push_back(value);
         }
-        return emitCallInstruction(call.function, call.type, call.function.returnTypeName, std::move(arguments), expression.span);
+        return emitCallInstruction(call.function, call.type, call.function.returnTypeName, std::move(arguments), expression.span, call.virtualDispatch, call.virtualSlot);
     }
     case semantic::BoundNodeKind::UnaryExpression: {
         const auto& unary = static_cast<const semantic::BoundUnaryExpression&>(expression);

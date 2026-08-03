@@ -1,33 +1,49 @@
 name: RealScript CI
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
 
-permissions:
-  contents: write
-
 jobs:
-  apply-phase19-virtual-dispatch:
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.actor != 'github-actions[bot]' &&
-      github.head_ref == 'agent/phase19-runtime-polymorphism'
-    runs-on: ubuntu-latest
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
 
     steps:
-      - name: Checkout Phase 19 branch
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          python tools/ci/run_and_capture.py configure.log --
+          cmake -S . -B build
+          -DREALSCRIPT_BUILD_TESTS=ON
+          -DREALSCRIPT_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: >-
+          python tools/ci/run_and_capture.py build.log --
+          cmake --build build --config Debug
+
+      - name: Test
+        run: >-
+          python tools/ci/run_and_capture.py test.log --
+          ctest --test-dir build -C Debug --output-on-failure
+
+      - name: Upload CI failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
         with:
-          ref: ${{ github.head_ref }}
-          fetch-depth: 0
-
-      - name: Apply validated virtual dispatch patch
-        run: python tools/ci/apply_phase19_virtual_patch.py
-
-      - name: Commit Phase 19 virtual dispatch
-        run: |
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add -A
-          git commit -m "Implement Phase 19 virtual dispatch"
-          git push origin HEAD:${{ github.head_ref }}
+          name: ci-log-${{ matrix.os }}
+          path: |
+            configure.log
+            build.log
+            test.log
+            build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore

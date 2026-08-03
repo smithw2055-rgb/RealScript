@@ -167,3 +167,160 @@ void applyPhase19FieldLayouts(
         refreshVisibleTypes(modules, module);
     }
 }
+
+std::size_t phase19VisibleParameterOffset(
+    const semantic::FunctionSymbol& function) noexcept {
+    return function.method && !function.staticMethod ? 1u : 0u;
+}
+
+bool phase19SameMethodSignature(
+    const semantic::FunctionSymbol& left,
+    const semantic::FunctionSymbol& right) {
+    if (left.name != right.name ||
+        left.staticMethod != right.staticMethod ||
+        left.returnType != right.returnType ||
+        left.returnTypeName != right.returnTypeName) {
+        return false;
+    }
+    const auto leftOffset = phase19VisibleParameterOffset(left);
+    const auto rightOffset = phase19VisibleParameterOffset(right);
+    if (left.parameters.size() - leftOffset !=
+        right.parameters.size() - rightOffset) {
+        return false;
+    }
+    for (std::size_t index = 0;
+         index < left.parameters.size() - leftOffset;
+         ++index) {
+        const auto& a = left.parameters[index + leftOffset];
+        const auto& b = right.parameters[index + rightOffset];
+        if (a.type != b.type || a.typeName != b.typeName ||
+            a.modifier != b.modifier) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<std::size_t> phase19PrepareVirtualMethod(
+    semantic::TypeSymbol& owner,
+    semantic::FunctionSymbol& method,
+    const syntax::FunctionDeclarationSyntax& syntaxTree,
+    ModuleWork& module,
+    BuildResult& result,
+    const std::string& sourceName) {
+    constexpr auto invalidSlot =
+        std::numeric_limits<std::uint32_t>::max();
+    const auto report = [&](const char* code, const std::string& message) {
+        result.diagnostics.report(
+            code, message, syntaxTree.identifierToken.span,
+            diagnostics::DiagnosticSeverity::Error, sourceName);
+        module.invalid = true;
+    };
+
+    const bool polymorphic = method.virtualMethod ||
+        method.overrideMethod || method.abstractMethod ||
+        method.sealedMethod;
+    if (owner.kind != semantic::TypeKind::Class && polymorphic) {
+        report("RS2510", "virtual method modifiers require a class owner");
+    }
+    if (method.staticMethod && polymorphic) {
+        report("RS2511", "static methods cannot be virtual, abstract, override, or sealed");
+    }
+    if (method.virtualMethod && method.overrideMethod) {
+        report("RS2512", "a method cannot be both virtual and override");
+    }
+    if (method.sealedMethod && !method.overrideMethod) {
+        report("RS2513", "sealed is valid only on an override method");
+    }
+    if (method.abstractMethod && method.sealedMethod) {
+        report("RS2514", "an abstract method cannot be sealed");
+    }
+    if (method.abstractMethod && !owner.abstractType) {
+        report("RS2515", "abstract methods require an abstract class");
+    }
+    if (method.abstractMethod && !syntaxTree.semicolonToken) {
+        report("RS2516", "abstract methods must end with ';'");
+    }
+    if (!method.abstractMethod && syntaxTree.semicolonToken) {
+        report("RS2517", "only abstract methods may omit a body");
+    }
+
+    std::optional<std::size_t> inheritedIndex;
+    for (std::size_t index = 0; index < owner.methods.size(); ++index) {
+        const auto& candidate = owner.methods[index];
+        if (candidate.declaringTypeId == owner.id ||
+            !phase19SameMethodSignature(candidate, method)) {
+            continue;
+        }
+        inheritedIndex = index;
+        break;
+    }
+
+    if (method.overrideMethod) {
+        if (!inheritedIndex) {
+            report("RS2518", "override method has no matching inherited method");
+            return std::nullopt;
+        }
+        const auto& inherited = owner.methods[*inheritedIndex];
+        if (!(inherited.virtualMethod || inherited.overrideMethod ||
+              inherited.abstractMethod) || inherited.virtualSlot == invalidSlot) {
+            report("RS2519", "override target is not virtual or abstract");
+            return inheritedIndex;
+        }
+        if (inherited.sealedMethod) {
+            report("RS2520", "cannot override a sealed method");
+            return inheritedIndex;
+        }
+        method.virtualMethod = true;
+        method.virtualSlot = inherited.virtualSlot;
+        if (owner.virtualDispatchTable.size() <= method.virtualSlot) {
+            owner.virtualDispatchTable.resize(
+                static_cast<std::size_t>(method.virtualSlot) + 1, 0);
+        }
+        owner.virtualDispatchTable[method.virtualSlot] =
+            method.abstractMethod ? 0 : method.id;
+        return inheritedIndex;
+    }
+
+    if (inheritedIndex) {
+        report("RS2521", "method hides an inherited member; use override");
+    }
+    if (method.virtualMethod || method.abstractMethod) {
+        method.virtualSlot = static_cast<std::uint32_t>(
+            owner.virtualDispatchTable.size());
+        owner.virtualDispatchTable.push_back(
+            method.abstractMethod ? 0 : method.id);
+    }
+    return std::nullopt;
+}
+
+void phase19ValidateConcreteType(
+    const semantic::TypeSymbol& owner,
+    ModuleWork& module,
+    BuildResult& result) {
+    if (owner.kind != semantic::TypeKind::Class) return;
+    if (owner.abstractType && owner.sealedType) {
+        result.diagnostics.report(
+            "RS2522", "a class cannot be both abstract and sealed",
+            owner.declarationSpan,
+            diagnostics::DiagnosticSeverity::Error,
+            owner.sourceName);
+        module.invalid = true;
+    }
+    if (owner.abstractType) return;
+    for (std::size_t slot = 0;
+         slot < owner.virtualDispatchTable.size(); ++slot) {
+        if (owner.virtualDispatchTable[slot] == 0) {
+            result.diagnostics.report(
+                "RS2523",
+                "non-abstract class '" +
+                    semantic::canonicalTypeName(owner) +
+                    "' does not implement virtual slot " +
+                    std::to_string(slot),
+                owner.declarationSpan,
+                diagnostics::DiagnosticSeverity::Error,
+                owner.sourceName);
+            module.invalid = true;
+        }
+    }
+}

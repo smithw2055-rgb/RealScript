@@ -322,6 +322,16 @@ std::string canonicalInput(
     std::string value = options.programName + "\n" + options.cppNamespace + "\n";
     for (const auto* module : ordered) {
         value += mir::printModule(*module);
+        for (const auto& type : module->types) {
+            value += "type-contract:" + semantic::canonicalTypeName(type) +
+                ":base=" + std::to_string(type.baseTypeId) +
+                ":abstract=" + (type.abstractType ? "1" : "0") +
+                ":sealed=" + (type.sealedType ? "1" : "0") + ":";
+            for (const auto symbolId : type.virtualDispatchTable) {
+                value += std::to_string(symbolId) + ";";
+            }
+            value += "\n";
+        }
         for (const auto& attribute : module->languageMetadata.attributes) {
             value += "attribute:" + attribute.target + ":" + attribute.name + ":" +
                 attribute.sourceName + ":" + std::to_string(attribute.offset) + "(";
@@ -554,6 +564,14 @@ GeneratedProgram CppGenerator::generate(
             }
             source.line("};");
         }
+        if (!type.virtualDispatchTable.empty()) {
+            source.line("static constexpr semantic::SymbolId " +
+                view.cppName + "_virtualSlots[] = {");
+            for (const auto symbolId : type.virtualDispatchTable) {
+                source.line("    0x" + hexId(symbolId) + "ULL,");
+            }
+            source.line("};");
+        }
         if (!type.enumMembers.empty()) {
             source.line("static constexpr EnumMemberDescriptor " + view.cppName +
                 "_enumMembers[] = {");
@@ -577,7 +595,12 @@ GeneratedProgram CppGenerator::generate(
                 (type.fields.empty() ? "nullptr" : view.cppName + "_fields") +
                 ", " + std::to_string(type.fields.size()) + "u, " +
                 (type.enumMembers.empty() ? "nullptr" : view.cppName + "_enumMembers") +
-                ", " + std::to_string(type.enumMembers.size()) + "u},");
+                ", " + std::to_string(type.enumMembers.size()) + "u, " +
+                (type.virtualDispatchTable.empty()
+                    ? "nullptr"
+                    : view.cppName + "_virtualSlots") +
+                ", " + std::to_string(type.virtualDispatchTable.size()) +
+                "u},");
         }
         source.line("};");
     }
@@ -648,6 +671,9 @@ GeneratedProgram CppGenerator::generate(
             ? std::string("nullptr")
             : prefix + "_typeIds") + ",");
         source.line("    " + std::to_string(instruction.parameterTypes.size()) + "u,");
+        source.line(std::string("    ") +
+            (instruction.virtualDispatch ? "true" : "false") + ",");
+        source.line("    " + std::to_string(instruction.virtualSlot) + "u,");
         source.line("};");
     }
     source.line();

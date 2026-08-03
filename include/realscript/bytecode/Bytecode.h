@@ -91,6 +91,8 @@ struct FunctionReference {
     semantic::SymbolId returnTypeId = 0;
     std::vector<semantic::PrimitiveType> parameterTypes;
     std::vector<semantic::SymbolId> parameterTypeIds;
+    bool virtualDispatch = false;
+    std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
 };
 
 struct Instruction {

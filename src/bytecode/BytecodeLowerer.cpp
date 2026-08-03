@@ -108,6 +108,8 @@ std::string referenceKey(const mir::Instruction& instruction) {
     result += semantic::primitiveTypeName(instruction.resultType);
     result.push_back('#');
     result += std::to_string(instruction.resultTypeId);
+    result += instruction.virtualDispatch ? ":virtual:" : ":static:";
+    result += std::to_string(instruction.virtualSlot);
     return result;
 }
 
@@ -228,6 +230,9 @@ Module Lowerer::lower(const mir::Module& source) const {
                         reference.parameterTypes = sourceInstruction.parameterTypes;
                         reference.parameterTypeIds =
                             sourceInstruction.parameterTypeIds;
+                        reference.virtualDispatch =
+                            sourceInstruction.virtualDispatch;
+                        reference.virtualSlot = sourceInstruction.virtualSlot;
                         result.functionReferences.push_back(std::move(reference));
                         referenceIndices.emplace(key, index);
                         instruction.index = index;

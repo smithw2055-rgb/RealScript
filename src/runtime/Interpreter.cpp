@@ -477,9 +477,51 @@ bool executeCall(
         }
     }
 
-    const auto found = state.functions->find(reference.symbolId);
+    auto targetSymbolId = reference.symbolId;
+    if (reference.virtualDispatch) {
+        if (reference.virtualSlot ==
+                std::numeric_limits<std::uint32_t>::max() ||
+            arguments.empty() ||
+            reference.parameterTypes.empty() ||
+            reference.parameterTypes.front() !=
+                semantic::PrimitiveType::Object) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "virtual call has an invalid receiver contract");
+        }
+        if (std::holds_alternative<NullObject>(arguments.front())) {
+            return fail(state, ErrorCode::NullReference,
+                "virtual call attempted to dereference null");
+        }
+        const auto* receiver = std::get_if<ObjectRef>(&arguments.front());
+        const auto actualTypeId = receiver && state.heap
+            ? state.heap->objectTypeId(*receiver)
+            : std::optional<semantic::SymbolId>{};
+        if (!actualTypeId || !state.types) {
+            return fail(state, ErrorCode::InvalidObjectReference,
+                "virtual call receiver has no runtime type descriptor");
+        }
+        const auto actualType = state.types->find(*actualTypeId);
+        if (actualType == state.types->end() ||
+            reference.virtualSlot >=
+                actualType->second->virtualDispatchTable.size()) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "virtual call slot is outside the runtime dispatch table");
+        }
+        targetSymbolId =
+            actualType->second->virtualDispatchTable[reference.virtualSlot];
+        if (targetSymbolId == 0) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "virtual call reached an abstract runtime slot");
+        }
+    }
+
+    const auto found = state.functions->find(targetSymbolId);
     if (found != state.functions->end()) {
         return executeFunction(state, found->second, arguments, result);
+    }
+    if (reference.virtualDispatch) {
+        return fail(state, ErrorCode::InvalidProgram,
+            "virtual dispatch target function is unavailable");
     }
     RuntimeError externalError;
     ++state.statistics.externalCalls;

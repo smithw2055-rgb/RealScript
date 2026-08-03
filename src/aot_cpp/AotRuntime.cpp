@@ -473,8 +473,53 @@ bool ExecutionContext::call(
             return false;
         }
     }
-    if (findFunction(signature.symbolId)) {
-        return invoke(signature.symbolId, arguments, argumentCount, result);
+    auto targetSymbolId = signature.symbolId;
+    if (signature.virtualDispatch) {
+        if (signature.virtualSlot ==
+                std::numeric_limits<std::uint32_t>::max() ||
+            argumentCount == 0 ||
+            !signature.parameterTypes ||
+            signature.parameterTypes[0] !=
+                semantic::PrimitiveType::Object) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT virtual call has an invalid receiver contract");
+        }
+        if (std::holds_alternative<runtime::NullObject>(arguments[0])) {
+            return fail(
+                runtime::ErrorCode::NullReference,
+                "AOT virtual call attempted to dereference null");
+        }
+        const auto* receiver =
+            std::get_if<runtime::ObjectRef>(&arguments[0]);
+        const auto actualTypeId = receiver && heap_
+            ? heap_->objectTypeId(*receiver)
+            : std::optional<semantic::SymbolId>{};
+        const auto* actualType = actualTypeId
+            ? findType(*actualTypeId)
+            : nullptr;
+        if (!actualType ||
+            signature.virtualSlot >= actualType->virtualSlotCount ||
+            !actualType->virtualDispatchTable) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT virtual call slot is outside the runtime dispatch table");
+        }
+        targetSymbolId =
+            actualType->virtualDispatchTable[signature.virtualSlot];
+        if (targetSymbolId == 0) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT virtual call reached an abstract runtime slot");
+        }
+    }
+    if (findFunction(targetSymbolId)) {
+        return invoke(targetSymbolId, arguments, argumentCount, result);
+    }
+    if (signature.virtualDispatch) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT virtual dispatch target function is unavailable");
     }
     if (!bindings_) {
         return fail(
@@ -488,6 +533,8 @@ bool ExecutionContext::call(
     reference.name = signature.name ? signature.name : "";
     reference.returnType = signature.returnType;
     reference.returnTypeId = signature.returnTypeId;
+    reference.virtualDispatch = signature.virtualDispatch;
+    reference.virtualSlot = signature.virtualSlot;
     if (signature.parameterCount != 0) {
         reference.parameterTypes.assign(
             signature.parameterTypes,
