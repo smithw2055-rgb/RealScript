@@ -541,8 +541,10 @@ ClassDeclarationSyntax Parser::parseClassDeclaration(
         } else {
             auto type = parseType();
             auto identifier = match(SyntaxKind::IdentifierToken);
+            const auto isAbstract = findModifier(
+                memberModifiers, SyntaxKind::AbstractKeyword).has_value();
             if (current().kind == SyntaxKind::OpenParenToken ||
-                current().kind == SyntaxKind::SemicolonToken) {
+                (isAbstract && current().kind == SyntaxKind::SemicolonToken)) {
                 result.methods.push_back(parseFunctionDeclaration(
                     std::move(memberModifiers), std::move(type),
                     std::move(identifier), std::move(memberAttributes)));
@@ -609,8 +611,10 @@ StructDeclarationSyntax Parser::parseStructDeclaration(
         } else {
             auto type = parseType();
             auto identifier = match(SyntaxKind::IdentifierToken);
+            const auto isAbstract = findModifier(
+                memberModifiers, SyntaxKind::AbstractKeyword).has_value();
             if (current().kind == SyntaxKind::OpenParenToken ||
-                current().kind == SyntaxKind::SemicolonToken) {
+                (isAbstract && current().kind == SyntaxKind::SemicolonToken)) {
                 result.methods.push_back(parseFunctionDeclaration(
                     std::move(memberModifiers), std::move(type),
                     std::move(identifier), std::move(memberAttributes)));
