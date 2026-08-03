@@ -6,7 +6,39 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: write
+
 jobs:
+  phase18-event-syntax-test-fix:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.actor != 'github-actions[bot]' &&
+      github.head_ref == 'agent/native-language-and-runtime-evolution'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Fix native event syntax test
+        run: python tools/ci/fix_phase18_event_syntax_test.py
+
+      - name: Commit native event syntax test fix
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No event syntax test changes"
+          else
+            git commit -m "Fix native Phase 18 event syntax test"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
+
   build-and-test:
     strategy:
       fail-fast: false
