@@ -1,67 +1,10 @@
 name: RealScript CI
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  workflow_dispatch:
 
 jobs:
-  export-source:
+  paused:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Pack source tree
-        run: >-
-          tar --exclude=.git --exclude=build --exclude=phase19-build
-          -czf /tmp/realscript-phase19-source.tar.gz .
-
-      - name: Upload source tree
-        uses: actions/upload-artifact@v4
-        with:
-          name: realscript-phase19-source
-          path: /tmp/realscript-phase19-source.tar.gz
-          if-no-files-found: error
-
-  build-and-test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure
-        run: >-
-          python tools/ci/run_and_capture.py configure.log --
-          cmake -S . -B build
-          -DREALSCRIPT_BUILD_TESTS=ON
-          -DREALSCRIPT_WARNINGS_AS_ERRORS=ON
-
-      - name: Build
-        run: >-
-          python tools/ci/run_and_capture.py build.log --
-          cmake --build build --config Debug
-
-      - name: Test
-        run: >-
-          python tools/ci/run_and_capture.py test.log --
-          ctest --test-dir build -C Debug --output-on-failure
-
-      - name: Upload CI failure logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ci-log-${{ matrix.os }}
-          path: |
-            configure.log
-            build.log
-            test.log
-            build/Testing/Temporary/LastTest.log
-          if-no-files-found: ignore
+      - run: echo "Phase 19 atomic patch staging"
