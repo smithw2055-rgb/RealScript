@@ -6,7 +6,7 @@ RealScript treats source locations and symbol information as runtime metadata. T
 
 ## Debug Information
 
-Compiler-produced `.rsbc` 0.5 modules include:
+Compiler-produced `.rsbc` 0.9 modules include:
 
 - source file IDs and paths;
 - source content fingerprints;

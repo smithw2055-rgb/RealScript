@@ -50,9 +50,17 @@ runtime::Value ScriptRuntime::defaultValue(
     std::unordered_set<semantic::SymbolId>& visiting) const {
     switch (type) {
     case semantic::PrimitiveType::Bool: return false;
+    case semantic::PrimitiveType::Byte: return runtime::ByteValue{};
+    case semantic::PrimitiveType::SByte: return runtime::SByteValue{};
+    case semantic::PrimitiveType::Short: return runtime::ShortValue{};
+    case semantic::PrimitiveType::UShort: return runtime::UShortValue{};
     case semantic::PrimitiveType::Int: return std::int64_t{0};
+    case semantic::PrimitiveType::UInt: return runtime::UIntValue{};
     case semantic::PrimitiveType::Long: return runtime::LongValue{};
+    case semantic::PrimitiveType::ULong: return runtime::ULongValue{};
+    case semantic::PrimitiveType::Float: return runtime::FloatValue{};
     case semantic::PrimitiveType::Double: return 0.0;
+    case semantic::PrimitiveType::Char: return runtime::CharValue{};
     case semantic::PrimitiveType::String: return runtime::NullString{};
     case semantic::PrimitiveType::Object: return runtime::NullObject{};
     case semantic::PrimitiveType::Array: return runtime::NullArray{};

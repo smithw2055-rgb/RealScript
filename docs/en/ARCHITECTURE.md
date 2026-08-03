@@ -87,7 +87,7 @@ The MIR verifier checks definition dominance, operand types, block arguments, co
 
 ### Bytecode
 
-The bytecode backend maps MIR values to typed registers and MIR locals to explicit local slots. `.rsbc` 0.5 uses deterministic fixed-width encoding and separate sections for strings, types, references, functions, code, and debug information.
+The bytecode backend maps MIR values to typed registers and MIR locals to explicit local slots. Current `.rsbc` 0.9 uses deterministic fixed-width encoding and separate sections for strings, types, references, functions, code, debug information, language metadata, and the object model. Exception regions are encoded with function bodies.
 
 A module is executable only after defensive decoding and semantic verification both succeed.
 
@@ -119,7 +119,7 @@ AOT and JIT are same-SDK paths. Cross-toolchain binary distribution is not froze
 
 ### Debugging and Tooling
 
-Debug information is a first-class part of `.rsbc` 0.5 and includes source files, ranges, sequence points, locals, parameters, and lexical scopes.
+Debug information is a first-class part of `.rsbc` 0.9 and includes source files, ranges, sequence points, locals, parameters, and lexical scopes.
 
 The DAP adapter and LSP server reuse compiler and runtime services rather than maintaining separate language models.
 
@@ -158,4 +158,4 @@ Changing one dimension does not automatically require changing every other dimen
 
 ## Current Architectural Boundaries
 
-The v0.1 alpha baseline does not freeze inheritance, interfaces, virtual dispatch, generics, exceptions, coroutines, cross-toolchain AOT distribution, or a direct machine-code JIT. These are future design areas rather than hidden partial implementations.
+The v0.1 Phase 24 alpha implements inheritance, runtime interfaces/virtual dispatch, compile-time generics, deterministic coroutine state machines, and script exceptions, but their source/artifact/ABI contracts are not frozen. Cross-toolchain AOT distribution and an in-process direct machine-code JIT remain future design areas. See the [compatibility matrix](CSHARP_COMPATIBILITY_MATRIX.md) for language boundaries.

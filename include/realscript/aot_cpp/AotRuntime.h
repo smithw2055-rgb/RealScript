@@ -59,6 +59,7 @@ struct TypeDescriptor {
     bool interfaceType = false;
     const InterfaceDispatchDescriptor* interfaceDispatchMaps = nullptr;
     std::uint32_t interfaceDispatchMapCount = 0;
+    bool delegateType = false;
 };
 
 class ExecutionContext;
@@ -190,9 +191,32 @@ public:
         const runtime::Value* arguments,
         std::size_t argumentCount,
         runtime::Value& result);
+    [[nodiscard]] bool newDelegate(
+        semantic::SymbolId delegateTypeId,
+        const CallSignature& signature,
+        const runtime::Value* target,
+        std::size_t targetCount,
+        runtime::Value& result);
+    [[nodiscard]] bool invokeDelegate(
+        semantic::SymbolId delegateTypeId,
+        const runtime::Value* arguments,
+        std::size_t argumentCount,
+        runtime::Value& result);
+    [[nodiscard]] bool combineDelegates(
+        semantic::SymbolId delegateTypeId,
+        const runtime::Value& left,
+        const runtime::Value& right,
+        bool remove,
+        runtime::Value& result);
 
     [[nodiscard]] bool consume(std::string_view operation);
     [[nodiscard]] bool branch(std::uint32_t blockId);
+    [[nodiscard]] bool throwScript(const runtime::Value& value);
+    [[nodiscard]] bool hasPendingException() const noexcept;
+    [[nodiscard]] bool pendingExceptionMatches(
+        semantic::SymbolId typeId) const;
+    [[nodiscard]] bool takePendingException(runtime::Value& value);
+    void reportUnhandledScriptException();
     [[nodiscard]] bool fail(runtime::ErrorCode code, std::string message);
     [[nodiscard]] bool expectType(
         const runtime::Value& value,
@@ -227,6 +251,13 @@ public:
     [[nodiscard]] bool checkNotNull(
         semantic::SymbolId typeId,
         const runtime::Value& receiver,
+        runtime::Value& result);
+    [[nodiscard]] bool typeOperation(
+        semantic::PrimitiveType sourceType,
+        semantic::PrimitiveType targetType,
+        semantic::SymbolId targetTypeId,
+        const runtime::Value& value,
+        bool safeCast,
         runtime::Value& result);
     [[nodiscard]] bool arrayLength(
         const runtime::Value& receiver,
@@ -266,14 +297,18 @@ public:
         runtime::Value& result);
     [[nodiscard]] bool convert(
         semantic::ConversionKind conversion,
+        semantic::PrimitiveType targetType,
+        bool checkedArithmetic,
         const runtime::Value& value,
         runtime::Value& result);
     [[nodiscard]] bool unary(
         UnaryOperation operation,
+        bool checkedArithmetic,
         const runtime::Value& value,
         runtime::Value& result);
     [[nodiscard]] bool binary(
         BinaryOperation operation,
+        bool checkedArithmetic,
         const runtime::Value& left,
         const runtime::Value& right,
         runtime::Value& result);
@@ -312,6 +347,7 @@ private:
     runtime::ShadowStack shadowStack_;
     std::unordered_map<semantic::SymbolId, const TypeDescriptor*> types_;
     std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> functions_;
+    std::optional<runtime::Value> pendingException_;
 };
 
 class Program {

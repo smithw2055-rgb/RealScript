@@ -48,6 +48,29 @@ bool sameField(const semantic::FieldSymbol& left, const semantic::FieldSymbol& r
         left.typeName == right.typeName && left.index == right.index;
 }
 
+bool sameMethodSignature(
+    const semantic::FunctionSymbol& left,
+    const semantic::FunctionSymbol& right) {
+    if (left.id != right.id || left.name != right.name ||
+        left.returnType != right.returnType ||
+        left.returnTypeName != right.returnTypeName ||
+        left.parameters.size() != right.parameters.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < left.parameters.size(); ++index) {
+        const auto& first = left.parameters[index];
+        const auto& second = right.parameters[index];
+        if (first.type != second.type ||
+            first.typeName != second.typeName ||
+            first.storageType != second.storageType ||
+            first.storageTypeName != second.storageTypeName ||
+            first.modifier != second.modifier) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool sameType(const semantic::TypeSymbol& left, const semantic::TypeSymbol& right) {
     if (left.id != right.id || left.kind != right.kind ||
         left.baseTypeId != right.baseTypeId ||
@@ -55,10 +78,12 @@ bool sameType(const semantic::TypeSymbol& left, const semantic::TypeSymbol& righ
         left.moduleName != right.moduleName || left.name != right.name ||
         left.abstractType != right.abstractType ||
         left.sealedType != right.sealedType ||
+        left.delegateType != right.delegateType ||
         left.interfaceType != right.interfaceType ||
         left.virtualDispatchTable != right.virtualDispatchTable ||
         left.interfaceDispatchMaps != right.interfaceDispatchMaps ||
         left.fields.size() != right.fields.size() ||
+        left.methods.size() != right.methods.size() ||
         left.enumMembers.size() != right.enumMembers.size()) return false;
     for (std::size_t index = 0; index < left.fields.size(); ++index) {
         if (!sameField(left.fields[index], right.fields[index])) return false;
@@ -66,6 +91,12 @@ bool sameType(const semantic::TypeSymbol& left, const semantic::TypeSymbol& righ
     for (std::size_t index = 0; index < left.enumMembers.size(); ++index) {
         if (left.enumMembers[index].name != right.enumMembers[index].name ||
             left.enumMembers[index].value != right.enumMembers[index].value) return false;
+    }
+    for (std::size_t index = 0; index < left.methods.size(); ++index) {
+        if (!sameMethodSignature(
+                left.methods[index], right.methods[index])) {
+            return false;
+        }
     }
     return true;
 }
@@ -127,6 +158,7 @@ bool sameLanguageMetadata(
         const auto& second = right.sequences[index];
         if (first.typeName != second.typeName ||
             first.name != second.name ||
+            first.resultTypeName != second.resultTypeName ||
             first.callbacks != second.callbacks) {
             return false;
         }
@@ -152,7 +184,8 @@ std::uint64_t functionBodyFingerprint(const bytecode::Module& module, const byte
             append(hash, static_cast<std::uint64_t>(instruction.opcode));
             append(hash, instruction.result);
             append(hash, instruction.index);
-            if (instruction.opcode == bytecode::Opcode::Call &&
+            if ((instruction.opcode == bytecode::Opcode::Call ||
+                 instruction.opcode == bytecode::Opcode::NewDelegate) &&
                 instruction.index < module.functionReferences.size()) {
                 const auto& reference =
                     module.functionReferences[instruction.index];
@@ -172,6 +205,7 @@ std::uint64_t functionBodyFingerprint(const bytecode::Module& module, const byte
             std::memcpy(&bits, &instruction.doubleImmediate, sizeof(bits));
             append(hash, bits);
             append(hash, instruction.boolImmediate ? 1 : 0);
+            append(hash, instruction.checkedArithmetic ? 1 : 0);
             for (const auto value : instruction.stringImmediate) append(hash, static_cast<unsigned char>(value));
             for (const auto operand : instruction.operands) append(hash, operand);
         }
@@ -182,6 +216,13 @@ std::uint64_t functionBodyFingerprint(const bytecode::Module& module, const byte
         append(hash, block.terminator.falseTarget);
         for (const auto argument : block.terminator.arguments) append(hash, argument);
         for (const auto argument : block.terminator.falseArguments) append(hash, argument);
+    }
+    for (const auto& handler : function.exceptionHandlers) {
+        append(hash, handler.catchTypeId);
+        append(hash, handler.handlerBlock);
+        append(hash, handler.exceptionLocal);
+        append(hash, handler.protectedBlocks.size());
+        for (const auto block : handler.protectedBlocks) append(hash, block);
     }
     return hash;
 }

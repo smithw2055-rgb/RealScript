@@ -33,6 +33,7 @@ struct LanguageGenericInstantiation {
 struct LanguageSequenceRecord {
     std::string typeName;
     std::string name;
+    std::string resultTypeName = "void";
     std::vector<std::string> callbacks;
     std::string sourceName;
     std::size_t offset = 0;

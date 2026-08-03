@@ -248,15 +248,120 @@ std::vector<CompletionItem> LanguageService::completion(
     (void)build();
     const auto token = tokenAt(path, position);
     const auto cursorOffset = token ? token->span.start : std::size_t{0};
+    std::string requesterModule;
+    semantic::SymbolId requesterTypeId = 0;
+    std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> types;
+    for (const auto& module : result_.modules) {
+        for (const auto& source : module.sourceFiles) {
+            if (source.path == path) requesterModule = module.name;
+        }
+        for (const auto& type : module.types) {
+            types[type.id] = &type;
+            const auto containsCursor = [&](const semantic::FunctionSymbol& fn) {
+                return fn.sourceName == path &&
+                    cursorOffset >= fn.bodySpan.start &&
+                    cursorOffset <= fn.bodySpan.end();
+            };
+            for (const auto& method : type.methods) {
+                if (containsCursor(method)) requesterTypeId = type.id;
+            }
+            for (const auto& constructor : type.constructors) {
+                if (containsCursor(constructor)) requesterTypeId = type.id;
+            }
+            for (const auto& property : type.properties) {
+                if ((property.getter && containsCursor(*property.getter)) ||
+                    (property.setter && containsCursor(*property.setter))) {
+                    requesterTypeId = type.id;
+                }
+            }
+        }
+    }
+    const auto derivesFrom = [&](semantic::SymbolId typeId,
+                                 semantic::SymbolId baseTypeId) {
+        std::unordered_set<semantic::SymbolId> visited;
+        while (typeId != 0 && visited.insert(typeId).second) {
+            if (typeId == baseTypeId) return true;
+            const auto found = types.find(typeId);
+            if (found == types.end()) break;
+            typeId = found->second->baseTypeId;
+        }
+        return false;
+    };
+    const auto accessAllowed = [&](semantic::Accessibility accessibility,
+                                   semantic::SymbolId declaringTypeId,
+                                   const std::string& moduleName) {
+        if (accessibility == semantic::Accessibility::Public) return true;
+        if (accessibility == semantic::Accessibility::Internal) {
+            return moduleName == requesterModule;
+        }
+        if (requesterTypeId == 0 || declaringTypeId == 0) return false;
+        if (accessibility == semantic::Accessibility::Private) {
+            return requesterTypeId == declaringTypeId;
+        }
+        return derivesFrom(requesterTypeId, declaringTypeId);
+    };
+    const auto symbolVisible = [&](semantic::SymbolId id) {
+        for (const auto& module : result_.modules) {
+            for (const auto& type : module.types) {
+                if (type.id == id) {
+                    return type.accessibility ==
+                            semantic::Accessibility::Public ||
+                        type.moduleName == requesterModule;
+                }
+                for (const auto& field : type.fields) {
+                    if (field.id == id) {
+                        return accessAllowed(
+                            field.accessibility,
+                            field.declaringTypeId,
+                            type.moduleName);
+                    }
+                }
+                for (const auto& method : type.methods) {
+                    if (method.id == id) {
+                        return accessAllowed(
+                            method.accessibility,
+                            method.declaringTypeId,
+                            method.moduleName);
+                    }
+                }
+                for (const auto& constructor : type.constructors) {
+                    if (constructor.id == id) {
+                        return accessAllowed(
+                            constructor.accessibility,
+                            constructor.declaringTypeId,
+                            constructor.moduleName);
+                    }
+                }
+                for (const auto& property : type.properties) {
+                    if (property.id == id) {
+                        return accessAllowed(
+                            property.accessibility,
+                            property.declaringTypeId,
+                            type.moduleName);
+                    }
+                }
+            }
+        }
+        return true;
+    };
     std::vector<CompletionItem> output;
     const std::vector<std::string> keywords = {
-        "module", "import", "class", "struct", "enum", "static", "return",
-        "if", "else", "while", "new", "this", "true", "false", "null",
-        "bool", "int", "long", "double", "string", "handle", "void",
+        "module", "import", "class", "struct", "enum", "interface",
+        "delegate", "event", "sequence", "yield", "wait_ticks", "static",
+        "public", "private", "protected", "internal", "abstract", "virtual",
+        "override", "sealed", "base", "return", "if", "else", "while",
+        "for", "foreach", "do", "break", "continue", "switch", "case",
+        "default", "when", "new", "this", "true", "false", "null", "var",
+        "ref", "out", "in", "params", "where", "is", "as", "typeof",
+        "checked", "unchecked", "throw", "try", "catch", "finally", "get",
+        "set", "bool", "byte", "sbyte", "short", "ushort", "int", "uint",
+        "long", "ulong", "float", "double", "char", "string", "handle",
+        "void",
     };
     for (const auto& keyword : keywords) output.push_back({keyword, "keyword", semantic::SymbolKind::Module});
     std::set<std::pair<std::string, std::string>> seen;
     for (const auto& symbol : allDefinitions()) {
+        if (!symbolVisible(symbol.id)) continue;
         if ((symbol.kind == semantic::SymbolKind::Local ||
              symbol.kind == semantic::SymbolKind::Parameter) &&
             (symbol.location.path != path ||

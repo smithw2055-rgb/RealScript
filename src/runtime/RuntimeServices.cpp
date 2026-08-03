@@ -74,7 +74,13 @@ std::optional<ProgramImage> ProgramImage::link(
         diagnostics::DiagnosticBag diagnostics;
         if (!bytecode::verifyModule(module, diagnostics)) {
             error.code = ErrorCode::InvalidProgram;
-            error.message = "bytecode verification failed while linking module '" + module.name + "'";
+            error.message =
+                "bytecode verification failed while linking module '" +
+                module.name + "'";
+            for (const auto& diagnostic : diagnostics.items()) {
+                error.message += "; " + diagnostic.code + ": " +
+                    diagnostic.message;
+            }
             return std::nullopt;
         }
         for (const auto& function : module.functions) {
@@ -84,11 +90,10 @@ std::optional<ProgramImage> ProgramImage::link(
                 error.message = "duplicate function SymbolId while linking '" + qualified + "'";
                 return std::nullopt;
             }
-            if (!names.emplace(qualified, function.symbolId).second) {
-                error.code = ErrorCode::DuplicateSymbol;
-                error.message = "duplicate qualified function name '" + qualified + "'";
-                return std::nullopt;
-            }
+            // Source-level overloads intentionally share a qualified display
+            // name. Calls and constructor invocations carry the stable SymbolId;
+            // the name index retains the first declaration for legacy lookup.
+            names.emplace(qualified, function.symbolId);
         }
     }
     return ProgramImage(std::move(modules));

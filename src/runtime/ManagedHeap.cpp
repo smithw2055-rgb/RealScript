@@ -345,9 +345,7 @@ std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
     RuntimeError* error) {
     const bool validElement = elementType == semantic::PrimitiveType::Error ||
         elementType == semantic::PrimitiveType::Bool ||
-        elementType == semantic::PrimitiveType::Int ||
-        elementType == semantic::PrimitiveType::Long ||
-        elementType == semantic::PrimitiveType::Double ||
+        semantic::isNumericType(elementType) ||
         elementType == semantic::PrimitiveType::String ||
         elementType == semantic::PrimitiveType::Object ||
         elementType == semantic::PrimitiveType::Struct ||
@@ -765,9 +763,13 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
         info.elementType = object.header.elementType;
         info.elementTypeId = object.header.elementTypeId;
         info.sizeBytes = object.header.sizeBytes;
-        if (object.header.kind != ObjectKind::String) {
+        if (object.header.kind == ObjectKind::String) {
+            info.stringValue = std::get<std::string>(object.payload);
+        } else {
             const auto& values = std::get<std::vector<Value>>(object.payload);
             info.valueCount = values.size();
+            info.values = values;
+            info.referenceFields = object.referenceFields;
             const auto addEdge = [&](std::size_t index) {
                 if (index >= values.size()) return;
                 std::unordered_set<const StructStorage*> visitedStructs;
@@ -842,6 +844,155 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
             return left.token < right.token;
         });
     return result;
+}
+
+bool ManagedHeap::restore(
+    const HeapSnapshot& snapshot,
+    RuntimeError* error) {
+    if (snapshot.heapId != impl_->heapId) {
+        setHeapError(error, ErrorCode::InvalidObjectReference,
+            "heap snapshot belongs to a different managed heap");
+        return false;
+    }
+    if (impl_->phase != GcPhase::Idle) {
+        setHeapError(error, ErrorCode::InvalidProgram,
+            "heap snapshot cannot be restored during collection");
+        return false;
+    }
+
+    std::size_t slotCount = 0;
+    std::size_t liveBytes = 0;
+    for (const auto& info : snapshot.objects) {
+        if (!info.reference.valid() ||
+            info.reference.heapId != impl_->heapId ||
+            info.reference.kind != info.kind ||
+            info.reference.slot == ObjectRef::InvalidSlot ||
+            info.sizeBytes > impl_->config.maximumHeapBytes ||
+            liveBytes > impl_->config.maximumHeapBytes - info.sizeBytes) {
+            setHeapError(error, ErrorCode::InvalidProgram,
+                "heap snapshot contains invalid object metadata");
+            return false;
+        }
+        liveBytes += info.sizeBytes;
+        slotCount = std::max(
+            slotCount,
+            static_cast<std::size_t>(info.reference.slot) + 1u);
+    }
+
+    std::vector<Impl::Slot> slots(slotCount);
+    std::unordered_map<std::uint32_t, const HeapObjectInfo*> infos;
+    for (const auto& info : snapshot.objects) {
+        if (!infos.emplace(info.reference.slot, &info).second) {
+            setHeapError(error, ErrorCode::InvalidProgram,
+                "heap snapshot contains duplicate object slots");
+            return false;
+        }
+        auto& slot = slots[info.reference.slot];
+        slot.generation = info.reference.generation;
+        auto object = std::make_unique<Impl::HeapObject>();
+        object->header.kind = info.kind;
+        object->header.typeId = info.typeId;
+        object->header.elementType = info.elementType;
+        object->header.elementTypeId = info.elementTypeId;
+        object->header.sizeBytes = info.sizeBytes;
+        if (info.kind == ObjectKind::String) {
+            if (!info.values.empty() || info.valueCount != 0) {
+                setHeapError(error, ErrorCode::InvalidProgram,
+                    "heap snapshot string payload is invalid");
+                return false;
+            }
+            object->payload = info.stringValue;
+        } else {
+            if (info.values.size() != info.valueCount) {
+                setHeapError(error, ErrorCode::InvalidProgram,
+                    "heap snapshot value count is invalid");
+                return false;
+            }
+            for (const auto field : info.referenceFields) {
+                if (field >= info.values.size()) {
+                    setHeapError(error, ErrorCode::InvalidProgram,
+                        "heap snapshot reference-field map is invalid");
+                    return false;
+                }
+            }
+            object->payload = info.values;
+            object->referenceFields = info.referenceFields;
+        }
+        slot.object = std::move(object);
+    }
+
+    const auto validValue = [&](const auto& self,
+                                const Value& value,
+                                std::unordered_set<const StructStorage*>&
+                                    visited) -> bool {
+        if (const auto* reference = std::get_if<ObjectRef>(&value)) {
+            const auto found = infos.find(reference->slot);
+            return reference->heapId == impl_->heapId &&
+                found != infos.end() &&
+                found->second->reference == *reference;
+        }
+        if (const auto* structure = std::get_if<StructValue>(&value);
+            structure && structure->storage &&
+            visited.insert(structure->storage.get()).second) {
+            for (const auto& field : structure->storage->fields) {
+                if (!self(self, field, visited)) return false;
+            }
+        }
+        return true;
+    };
+    for (const auto& info : snapshot.objects) {
+        for (const auto& value : info.values) {
+            std::unordered_set<const StructStorage*> visited;
+            if (!validValue(validValue, value, visited)) {
+                setHeapError(error, ErrorCode::InvalidProgram,
+                    "heap snapshot contains a dangling object reference");
+                return false;
+            }
+        }
+    }
+
+    std::unordered_map<RootToken, Value> roots;
+    RootToken nextRootToken = 1;
+    for (const auto& root : snapshot.roots) {
+        if (root.kind != "persistent") continue;
+        const auto found = infos.find(root.reference.slot);
+        if (root.token == 0 || found == infos.end() ||
+            found->second->reference != root.reference ||
+            !roots.emplace(root.token, root.reference).second) {
+            setHeapError(error, ErrorCode::InvalidProgram,
+                "heap snapshot contains invalid persistent roots");
+            return false;
+        }
+        nextRootToken = std::max(nextRootToken, root.token + 1u);
+    }
+
+    std::vector<std::uint32_t> freeSlots;
+    for (std::size_t index = 0; index < slots.size(); ++index) {
+        if (!slots[index].object) {
+            freeSlots.push_back(static_cast<std::uint32_t>(index));
+        }
+    }
+    impl_->slots = std::move(slots);
+    impl_->freeSlots = std::move(freeSlots);
+    impl_->persistentRoots = std::move(roots);
+    impl_->nextRootToken = nextRootToken;
+    impl_->markStack.clear();
+    impl_->requested = false;
+    impl_->sweepIndex = 0;
+    impl_->statistics = snapshot.statistics;
+    impl_->statistics.liveObjects = snapshot.objects.size();
+    impl_->statistics.liveBytes = liveBytes;
+    impl_->statistics.peakLiveBytes = std::max(
+        impl_->statistics.peakLiveBytes, liveBytes);
+    impl_->nextCollectionThreshold = std::max(
+        impl_->config.initialCollectionThresholdBytes,
+        std::min(
+            impl_->config.maximumHeapBytes,
+            liveBytes > impl_->config.maximumHeapBytes / 2u
+                ? impl_->config.maximumHeapBytes
+                : std::max<std::size_t>(1u, liveBytes * 2u)));
+    if (error) *error = {};
+    return true;
 }
 
 std::vector<ObjectRef> ManagedHeap::retainingPath(

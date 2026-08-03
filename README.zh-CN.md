@@ -4,14 +4,14 @@
 
 RealScript 是一门面向现代游戏引擎的嵌入式强类型脚本语言与运行时。它采用接近 C# 的语法，以 C++17 游戏引擎为主要宿主，同时提供解释器、C++17 AOT、可选原生 JIT、源码级调试、语言服务器、热重载和确定性执行能力。
 
-> 当前状态：Phase 1–10 编译器、Game SDK 与确定性 Gameplay Runtime 已完成；Phase 11–17 受限游戏语言扩展 Profile 也已贯通多文件/多模块编译、Bytecode、Interpreter、C++17 AOT 与 Game SDK 元数据。语言、Expansion Profile、`.rsbc`、对象 ABI、Native Module ABI、Gameplay 状态格式和 GC 契约仍处于 Draft 阶段。
+> 当前状态：Phase 1–24 已完成。原生编译器现已覆盖运行时多态、一等委托与闭包、可推断的编译期泛型与可增长集合、确定性协程状态机、精确值/引用语义、常用 C# 风格 Pattern/便利语法和结构化脚本异常。语言、`.rsbc`、对象 ABI、Native Module ABI、Gameplay 状态格式和 GC 契约仍处于 Draft 阶段。
 
 ## 已实现能力
 
 - Lexer、Parser、Binder、Flow Analysis 和稳定诊断；
 - 多文件模块、函数重载、递归、显式 import 和增量编译；
 - 多基本块 Typed MIR、验证器与 O0/O1/O2 优化；
-- `.rsbc` 0.5 类型化寄存器字节码、反汇编器与严格验证器；
+- `.rsbc` 0.9 类型化寄存器字节码（兼容读取 0.6–0.8）、反汇编器与严格验证器；
 - 字节码解释器、预算、结构化运行时错误和脚本调用栈；
 - class、构造函数、方法、属性、数组、enum、struct 和 Native Handle；
 - 精确 Shadow Stack、代际 `ObjectRef`、增量 Mark/Sweep、写屏障和堆诊断；
@@ -29,6 +29,13 @@ RealScript 是一门面向现代游戏引擎的嵌入式强类型脚本语言与
 - Phase 15：显式泛型特化和固定容量集合；
 - Phase 16：`sequence` 与 `yield wait_ticks` 确定性协程 Profile；
 - Phase 17：受限 `ref/out/in` 与基础值类型别名；
+- Phase 18：上述扩展全部迁入原生 Syntax/Bound/MIR/Bytecode/AOT 流水线；
+- Phase 19：单继承、运行时 Interface/Virtual 分派、可见性和稳定对象布局；
+- Phase 20：一等 Delegate、方法引用、共享可变捕获、堆闭包、多播和通用 Event 存储；
+- Phase 21：泛型推断/约束/成员/Interface/Delegate、可增长集合和 Enumerator；
+- Phase 22：可持久化局部与控制流的确定性 Sequence 状态机；
+- Phase 23：精确值类型、可变 Struct、ref 位置、Nullable 和 Boxing；
+- Phase 24：`var`、空/条件运算、初始化器、灵活参数、Pattern、Switch Expression 和结构化异常；
 - `rsbench` 基准工具和可选外部 C++ 工具链 JIT；
 - Ubuntu 与 Windows warnings-as-errors 全量 CI。
 
@@ -79,21 +86,27 @@ Gameplay 调度状态由 `encodeGameplayHostState()` / `restoreGameplayHostState
 - [游戏脚本 SDK](docs/zh-CN/GAME_SCRIPTING_SDK.md)
 - [确定性游戏运行时](docs/zh-CN/GAMEPLAY_RUNTIME.md)
 - [Phase 11–17 游戏语言扩展 Profile](docs/roadmap/PHASE_11_17_LANGUAGE_EXPANSION.md)
+- [Phase 18–24 原生语言与运行时路线图](docs/roadmap/PHASE_18_24_NATIVE_LANGUAGE_AND_RUNTIME.md)
+- [Phase 19 运行时多态](docs/roadmap/PHASE_19_RUNTIME_POLYMORPHISM.md)
+- [Phase 20 一等委托与闭包](docs/roadmap/PHASE_20_FIRST_CLASS_DELEGATES.md)
+- [Phase 21 完整泛型与集合](docs/roadmap/PHASE_21_COMPLETE_GENERICS_AND_COLLECTIONS.md)
+- [Phase 22 确定性协程状态机](docs/roadmap/PHASE_22_DETERMINISTIC_COROUTINE_STATE_MACHINES.md)
+- [Phase 23 完整值与引用语义](docs/roadmap/PHASE_23_COMPLETE_VALUE_AND_REFERENCE_SEMANTICS.md)
+- [Phase 24 语言完整性与结构化异常](docs/roadmap/PHASE_24_LANGUAGE_COMPLETENESS_AND_STRUCTURED_ERRORS.md)
+- [C# 风格特性兼容矩阵](docs/zh-CN/CSHARP_COMPATIBILITY_MATRIX.md)
 - [总体架构设计](docs/ENGINE_DESIGN.md)
 - [规范文档索引](docs/spec/README.md)
 
 ## 当前边界
 
-Phase 11–17 是面向游戏的受限 Profile，不是完整 CLR/C#：
+当前实现是面向游戏的强类型确定性语言，不是完整 CLR/C#。Phase 19–24 已解除旧 Profile 的多态、闭包、泛型/集合、协程、值/引用和结构化异常缺口；主要剩余边界是：
 
-- Interface 只做编译期实现校验，没有 Interface 类型值和虚分派；
-- Delegate/Event 不是通用一等对象，Lambda 不捕获任意局部变量；
-- 泛型要求显式类型参数，集合固定容量，无开放泛型、约束和协变/逆变；
-- Sequence 只支持 `yield wait_ticks`，跨 yield 的持久状态必须放在对象字段；
-- `ref/out/in` 仅支持受限独立调用，无 ref local/ref return/ref field；
-- `byte/uint/float/char` 等当前映射到已有 `int/long/double` 载体，并非独立 ABI 类型；
-- Attribute 尚未写入 `.rsbc`，展开代码尚无完整精确源码映射；
-- 继承、运行时多态、异常、完整闭包、Nullable、Boxing、直接机器码 JIT、OSR、PGO 与 Rollback 网络协议仍是后续工作。
+- 泛型采用编译期特化；不支持开放运行时泛型、协变/逆变和 CLR Reflection；
+- Sequence 是单线程 `yield wait_ticks` 确定性模型，不提供 `Task`、线程或通用 `async/await`；
+- 已支持 ref local/return/field/indexer，但无 unsafe 指针、ref struct、ref property 和完整逃逸分析；
+- 已支持脚本对象异常和确定性 `finally`，但无 Filter、`using`、原生异常互操作和异常跨协程暂停；
+- 无运算符重载、用户自定义转换、LINQ、`dynamic` 和完整 .NET BCL；
+- 直接进程内机器码 JIT、OSR、PGO 与 Rollback 网络协议仍是后续工作。
 
 ## License
 

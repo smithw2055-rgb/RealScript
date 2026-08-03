@@ -9,6 +9,8 @@
 - [仓库中文 README](../../README.zh-CN.md)
 - [游戏脚本 SDK](GAME_SCRIPTING_SDK.md)
 - [确定性游戏运行时](GAMEPLAY_RUNTIME.md)
+- [C# 风格特性兼容矩阵](CSHARP_COMPATIBILITY_MATRIX.md)
+- [Phase 18–24 原生语言与运行时路线图](../roadmap/PHASE_18_24_NATIVE_LANGUAGE_AND_RUNTIME.md)
 - [Phase 11–17 游戏语言扩展 Profile](../roadmap/PHASE_11_17_LANGUAGE_EXPANSION.md)
 - [总体架构设计](../ENGINE_DESIGN.md)
 - [规范文档索引](../spec/README.md)

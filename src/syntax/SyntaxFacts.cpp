@@ -39,6 +39,9 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(CommaToken);
         RS_KIND(DotToken);
         RS_KIND(ColonToken);
+        RS_KIND(QuestionToken);
+        RS_KIND(QuestionQuestionToken);
+        RS_KIND(QuestionDotToken);
         RS_KIND(SemicolonToken);
         RS_KIND(ModuleKeyword);
         RS_KIND(ImportKeyword);
@@ -51,6 +54,7 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(InKeyword);
         RS_KIND(RefKeyword);
         RS_KIND(OutKeyword);
+        RS_KIND(ParamsKeyword);
         RS_KIND(DoKeyword);
         RS_KIND(BreakKeyword);
         RS_KIND(ContinueKeyword);
@@ -82,6 +86,14 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(TrueKeyword);
         RS_KIND(FalseKeyword);
         RS_KIND(NullKeyword);
+        RS_KIND(IsKeyword);
+        RS_KIND(AsKeyword);
+        RS_KIND(TypeofKeyword);
+        RS_KIND(WhenKeyword);
+        RS_KIND(ThrowKeyword);
+        RS_KIND(TryKeyword);
+        RS_KIND(CatchKeyword);
+        RS_KIND(FinallyKeyword);
         RS_KIND(BoolKeyword);
         RS_KIND(ByteKeyword);
         RS_KIND(SByteKeyword);
@@ -113,6 +125,7 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(ConstructorDeclaration);
         RS_KIND(PropertyDeclaration);
         RS_KIND(AccessorDeclaration);
+        RS_KIND(GenericConstraintClause);
         RS_KIND(ImportDeclaration);
         RS_KIND(FunctionDeclaration);
         RS_KIND(SequenceDeclaration);
@@ -129,7 +142,11 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(ContinueStatement);
         RS_KIND(SwitchSection);
         RS_KIND(SwitchStatement);
+        RS_KIND(ThrowStatement);
+        RS_KIND(TryStatement);
+        RS_KIND(CatchClause);
         RS_KIND(YieldWaitStatement);
+        RS_KIND(YieldBreakStatement);
         RS_KIND(EventSubscriptionStatement);
         RS_KIND(VariableDeclarationStatement);
         RS_KIND(ExpressionStatement);
@@ -138,10 +155,16 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(LambdaExpression);
         RS_KIND(UnaryExpression);
         RS_KIND(BinaryExpression);
+        RS_KIND(TypeBinaryExpression);
+        RS_KIND(TypeOfExpression);
+        RS_KIND(SwitchExpression);
+        RS_KIND(SwitchExpressionArm);
+        RS_KIND(ConditionalExpression);
         RS_KIND(AssignmentExpression);
         RS_KIND(MemberAssignmentExpression);
         RS_KIND(ElementAssignmentExpression);
         RS_KIND(ParenthesizedExpression);
+        RS_KIND(CastExpression);
         RS_KIND(CallExpression);
         RS_KIND(MemberCallExpression);
         RS_KIND(ThisExpression);
@@ -168,6 +191,7 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"in", SyntaxKind::InKeyword},
         {"ref", SyntaxKind::RefKeyword},
         {"out", SyntaxKind::OutKeyword},
+        {"params", SyntaxKind::ParamsKeyword},
         {"do", SyntaxKind::DoKeyword},
         {"break", SyntaxKind::BreakKeyword},
         {"continue", SyntaxKind::ContinueKeyword},
@@ -199,6 +223,14 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"true", SyntaxKind::TrueKeyword},
         {"false", SyntaxKind::FalseKeyword},
         {"null", SyntaxKind::NullKeyword},
+        {"is", SyntaxKind::IsKeyword},
+        {"as", SyntaxKind::AsKeyword},
+        {"typeof", SyntaxKind::TypeofKeyword},
+        {"when", SyntaxKind::WhenKeyword},
+        {"throw", SyntaxKind::ThrowKeyword},
+        {"try", SyntaxKind::TryKeyword},
+        {"catch", SyntaxKind::CatchKeyword},
+        {"finally", SyntaxKind::FinallyKeyword},
         {"bool", SyntaxKind::BoolKeyword},
         {"byte", SyntaxKind::ByteKeyword},
         {"sbyte", SyntaxKind::SByteKeyword},

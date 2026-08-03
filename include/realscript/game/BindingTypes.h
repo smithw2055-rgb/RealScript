@@ -141,6 +141,22 @@ std::optional<ScriptTypeRef> resolveScriptType(
         return ScriptTypeRef{"void", {}, ScriptTypeCategory::Void};
     } else if constexpr (std::is_same_v<ValueType, bool>) {
         return ScriptTypeRef{"bool", {}, ScriptTypeCategory::Bool};
+    } else if constexpr (std::is_same_v<ValueType, std::uint8_t>) {
+        return ScriptTypeRef{"byte", {}, ScriptTypeCategory::Int};
+    } else if constexpr (std::is_same_v<ValueType, std::int8_t>) {
+        return ScriptTypeRef{"sbyte", {}, ScriptTypeCategory::Int};
+    } else if constexpr (std::is_same_v<ValueType, std::int16_t>) {
+        return ScriptTypeRef{"short", {}, ScriptTypeCategory::Int};
+    } else if constexpr (std::is_same_v<ValueType, std::uint16_t>) {
+        return ScriptTypeRef{"ushort", {}, ScriptTypeCategory::Int};
+    } else if constexpr (std::is_same_v<ValueType, char16_t>) {
+        return ScriptTypeRef{"char", {}, ScriptTypeCategory::Int};
+    } else if constexpr (std::is_same_v<ValueType, std::uint32_t>) {
+        return ScriptTypeRef{"uint", {}, ScriptTypeCategory::Long};
+    } else if constexpr (std::is_same_v<ValueType, std::uint64_t>) {
+        return ScriptTypeRef{"ulong", {}, ScriptTypeCategory::Long};
+    } else if constexpr (std::is_same_v<ValueType, float>) {
+        return ScriptTypeRef{"float", {}, ScriptTypeCategory::Double};
     } else if constexpr (
         std::is_integral_v<ValueType> &&
         !std::is_same_v<ValueType, bool> &&

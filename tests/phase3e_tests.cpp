@@ -142,8 +142,8 @@ void testNumericEnumAndStructExecution() {
     auto modules = compile({{"values.rs", valueSource}});
     require(modules.size() == 1, "expected one Phase 3E module");
     const auto& module = modules.front();
-    require(module.version.major == 0 && module.version.minor == 6,
-        "Phase 3E must use .rsbc 0.6");
+    require(module.version.major == 0 && module.version.minor == 7,
+        "Phase 3E must use .rsbc 0.7");
 
     bool foundStruct = false;
     bool foundEnum = false;
@@ -273,9 +273,8 @@ struct Counter
     void Increment() { this.value = this.value + 1; }
 }
 )"}});
-    require(mutation.diagnostics.hasErrors() &&
-            hasDiagnostic(mutation, "RS2485"),
-        "mutating struct instance method was silently accepted");
+    require(!mutation.diagnostics.hasErrors(),
+        "Phase 23 mutable struct receiver regressed declaration binding");
 
     const auto setter = build({{"setter.rs", R"(
 module Phase3E.InvalidProperty;

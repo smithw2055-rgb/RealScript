@@ -10,9 +10,10 @@ Tracking issue: #34. Development branch: `agent/phase19-runtime-polymorphism`.
 - **19B base access and inherited runtime layout:** implemented for base identity, base-first fields, inherited member lookup, derived-to-base assignability, and statically bound `base` method calls.
 - **19C virtual dispatch:** implemented for `virtual`, `override`, `abstract`, and `sealed override`; stable slots execute through the interpreter, generated C++ AOT, and Toolchain JIT.
 - **19D interface values and dispatch:** implemented for interface-typed storage, class-to-interface conversion, deterministic interface slots, inherited implementation maps, interpreter dispatch, generated C++ AOT, and Toolchain JIT.
-- **Remaining:** base-constructor execution and full visibility enforcement, `.rsbc` persistence, save-state/Game SDK closure, and final LSP/DAP/debugger coverage.
+- **19E artifact and runtime closure:** implemented for base-constructor execution, full visibility enforcement, `.rsbc` 0.7 object-model persistence, inherited save-state/Game SDK metadata, compiled AOT parity, and LSP/DAP/debugger surfaces.
+- **Phase status:** complete. The VS 18 2026 Release warnings-as-errors build and the current 37-target CTest matrix pass.
 
-Direct non-virtual and `base` calls remain statically bound. Interface values reuse managed object references and preserve their exact interface TypeId in semantic, MIR, and bytecode signatures. Virtual and interface dispatch metadata is present in the interpreter, AOT, JIT, verifiers, printers, disassembler, content hashes, and hot-reload compatibility checks. Serialization into `.rsbc` remains part of 19E.
+Direct non-virtual and `base` calls remain statically bound. Interface values reuse managed object references and preserve their exact interface TypeId in semantic, MIR, and bytecode signatures. Virtual and interface dispatch metadata is present in the interpreter, AOT, JIT, verifiers, printers, disassembler, content hashes, hot-reload compatibility checks, and `.rsbc` 0.7 artifacts. `.rsbc` 0.6 remains readable as a legacy format.
 
 ## Scope
 
@@ -54,18 +55,21 @@ Implemented:
 - semantic, MIR, bytecode, and runtime assignability checks accept class-to-interface conversions only when a matching implementation map exists;
 - hot reload and AOT content hashes include interface descriptors, slots, maps, and call-site dispatch metadata.
 
-Struct interface contracts remain compile-time-only until Phase 23 boxing support. `.rsbc` persistence and save-state/Game SDK propagation remain in 19E.
+Struct interface contracts remain compile-time-only until Phase 23 boxing support. Class interface maps and inherited object metadata are persisted in `.rsbc` 0.7 and consumed directly by the Game SDK.
 
 ### 19E — artifact and runtime closure
 
+Implemented and validated:
+
 - MIR and bytecode dispatch metadata for virtual and interface calls;
-- `.rsbc` object-model descriptors and versioned codec validation;
-- AOT/JIT execution parity;
-- inherited GC descriptors and save-state compatibility;
+- `.rsbc` 0.7 object-model descriptors, canonical round trips, legacy 0.6 reads, and corruption validation;
+- interpreter and compiled C++ AOT result parity on Windows, with Toolchain JIT coverage on supported non-MSVC hosts;
+- base constructors execute before derived constructor bodies, including implicit parameterless base calls;
+- inherited GC descriptors, object snapshots, and save-state-compatible field layouts;
 - hot reload rejects hierarchy, layout, slot, or interface-map changes;
-- Game SDK metadata exposes public object-model contracts;
-- debugger and DAP show user methods rather than dispatch thunks;
-- LSP completion, definition, rename, and diagnostics respect visibility and inheritance.
+- Game SDK metadata exposes inherited fields, constructors, methods, properties, and accessibility;
+- debugger and DAP retain original user functions and source sequence points without dispatch thunks;
+- LSP completion, definition, rename, and compiler diagnostics respect visibility and inheritance.
 
 ## Deterministic ABI rules
 

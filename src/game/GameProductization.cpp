@@ -23,6 +23,14 @@ enum class ValueTag : std::uint8_t {
     Enum,
     Struct,
     String,
+    Byte,
+    SByte,
+    Short,
+    UShort,
+    UInt,
+    ULong,
+    Float,
+    Char,
 };
 
 void fail(runtime::RuntimeError& error, runtime::ErrorCode code, std::string message) {
@@ -58,12 +66,20 @@ bool allowedValue(
     if (std::holds_alternative<std::monostate>(value) ||
         std::holds_alternative<runtime::NullString>(value) ||
         std::holds_alternative<bool>(value) ||
+        std::holds_alternative<runtime::ByteValue>(value) ||
+        std::holds_alternative<runtime::SByteValue>(value) ||
+        std::holds_alternative<runtime::ShortValue>(value) ||
+        std::holds_alternative<runtime::UShortValue>(value) ||
         std::holds_alternative<std::int64_t>(value) ||
+        std::holds_alternative<runtime::UIntValue>(value) ||
         std::holds_alternative<runtime::LongValue>(value) ||
+        std::holds_alternative<runtime::ULongValue>(value) ||
+        std::holds_alternative<runtime::CharValue>(value) ||
         std::holds_alternative<runtime::EnumValue>(value)) {
         return true;
     }
-    if (std::holds_alternative<double>(value)) return policy.allowDoubles;
+    if (std::holds_alternative<runtime::FloatValue>(value) ||
+        std::holds_alternative<double>(value)) return policy.allowDoubles;
     if (std::holds_alternative<std::string>(value)) return policy.allowStrings;
     const auto* structure = std::get_if<runtime::StructValue>(&value);
     if (!structure || !structure->storage) return false;
@@ -165,12 +181,36 @@ bool writeValue(
     } else if (const auto* item = std::get_if<bool>(&value)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Bool));
         writer.writeU8(*item ? 1u : 0u);
+    } else if (const auto* item = std::get_if<runtime::ByteValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::Byte));
+        writer.writeU8(item->value);
+    } else if (const auto* item = std::get_if<runtime::SByteValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::SByte));
+        writer.writeU8(static_cast<std::uint8_t>(item->value));
+    } else if (const auto* item = std::get_if<runtime::ShortValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::Short));
+        writer.writeU32(static_cast<std::uint16_t>(item->value));
+    } else if (const auto* item = std::get_if<runtime::UShortValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::UShort));
+        writer.writeU32(item->value);
     } else if (const auto* item = std::get_if<std::int64_t>(&value)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Int));
         writer.writeU64(static_cast<std::uint64_t>(*item));
     } else if (const auto* item = std::get_if<runtime::LongValue>(&value)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Long));
         writer.writeU64(static_cast<std::uint64_t>(item->value));
+    } else if (const auto* item = std::get_if<runtime::UIntValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::UInt));
+        writer.writeU32(item->value);
+    } else if (const auto* item = std::get_if<runtime::ULongValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::ULong));
+        writer.writeU64(item->value);
+    } else if (const auto* item = std::get_if<runtime::FloatValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::Float));
+        std::uint32_t bits = 0;
+        const auto normalized = item->value == 0.0f ? 0.0f : item->value;
+        std::memcpy(&bits, &normalized, sizeof(bits));
+        writer.writeU32(bits);
     } else if (const auto* item = std::get_if<double>(&value)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Double));
         writer.writeU64(canonicalDoubleBits(*item));
@@ -178,6 +218,9 @@ bool writeValue(
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Enum));
         writer.writeU64(item->typeId);
         writer.writeU64(static_cast<std::uint64_t>(item->value));
+    } else if (const auto* item = std::get_if<runtime::CharValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::Char));
+        writer.writeU32(item->value);
     } else if (const auto* item = std::get_if<runtime::StructValue>(&value)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Struct));
         writer.writeU64(item->typeId);
@@ -206,7 +249,7 @@ bool readValue(
 
     std::uint8_t rawTag = 0;
     if (!reader.readU8(rawTag) ||
-        rawTag > static_cast<std::uint8_t>(ValueTag::String)) {
+        rawTag > static_cast<std::uint8_t>(ValueTag::Char)) {
         return false;
     }
     const auto tag = static_cast<ValueTag>(rawTag);
@@ -226,6 +269,24 @@ bool readValue(
         value = item != 0;
         return true;
     }
+    case ValueTag::Byte: {
+        std::uint8_t item = 0;
+        if (!reader.readU8(item)) return false;
+        value = runtime::ByteValue{item};
+        return true;
+    }
+    case ValueTag::SByte: {
+        std::uint8_t item = 0;
+        if (!reader.readU8(item)) return false;
+        value = runtime::SByteValue{static_cast<std::int8_t>(item)};
+        return true;
+    }
+    case ValueTag::Short:
+        { std::uint32_t item = 0; if (!reader.readU32(item)) return false;
+          value = runtime::ShortValue{static_cast<std::int16_t>(item)}; return true; }
+    case ValueTag::UShort:
+        { std::uint32_t item = 0; if (!reader.readU32(item) || item > 0xffffU) return false;
+          value = runtime::UShortValue{static_cast<std::uint16_t>(item)}; return true; }
     case ValueTag::Int:
         if (!reader.readU64(first)) return false;
         value = static_cast<std::int64_t>(first);
@@ -234,6 +295,22 @@ bool readValue(
         if (!reader.readU64(first)) return false;
         value = runtime::LongValue{static_cast<std::int64_t>(first)};
         return true;
+    case ValueTag::UInt:
+        { std::uint32_t item = 0; if (!reader.readU32(item)) return false;
+          value = runtime::UIntValue{item}; return true; }
+    case ValueTag::ULong:
+        if (!reader.readU64(first)) return false;
+        value = runtime::ULongValue{first};
+        return true;
+    case ValueTag::Float: {
+        if (!policy.allowDoubles) return false;
+        std::uint32_t bits = 0;
+        if (!reader.readU32(bits)) return false;
+        float item = 0.0f;
+        std::memcpy(&item, &bits, sizeof(item));
+        value = runtime::FloatValue{item};
+        return true;
+    }
     case ValueTag::Double: {
         if (!policy.allowDoubles || !reader.readU64(first)) return false;
         double item = 0.0;
@@ -266,6 +343,12 @@ bool readValue(
         std::string item;
         if (!reader.readString(item)) return false;
         value = std::move(item);
+        return true;
+    }
+    case ValueTag::Char: {
+        std::uint32_t item = 0;
+        if (!reader.readU32(item) || item > 0xffffU) return false;
+        value = runtime::CharValue{static_cast<char16_t>(item)};
         return true;
     }
     }

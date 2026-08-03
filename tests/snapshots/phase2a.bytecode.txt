@@ -1,4 +1,4 @@
-rsbc 0.6 module Demo.Bytecode
+rsbc 0.7 module Demo.Bytecode
 
 sources:
   source0 `phase2a.rs` hash=0x3ef88e3d00a87753 lines=37

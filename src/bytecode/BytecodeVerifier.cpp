@@ -8,6 +8,30 @@
 namespace realscript::bytecode {
 namespace {
 
+bool isIntCarrier(semantic::PrimitiveType type) noexcept {
+    return type == semantic::PrimitiveType::Int ||
+        type == semantic::PrimitiveType::UInt;
+}
+
+bool isLongCarrier(semantic::PrimitiveType type) noexcept {
+    return type == semantic::PrimitiveType::Long ||
+        type == semantic::PrimitiveType::ULong;
+}
+
+bool isFloatCarrier(semantic::PrimitiveType type) noexcept {
+    return type == semantic::PrimitiveType::Float ||
+        type == semantic::PrimitiveType::Double;
+}
+
+bool supportsArithmeticMode(Opcode opcode) noexcept {
+    return opcode == Opcode::ConvertNumeric ||
+        opcode == Opcode::NegateInt || opcode == Opcode::NegateLong ||
+        opcode == Opcode::NegateDouble ||
+        (opcode >= Opcode::AddInt && opcode <= Opcode::RemainderInt) ||
+        (opcode >= Opcode::AddLong && opcode <= Opcode::RemainderLong) ||
+        (opcode >= Opcode::AddDouble && opcode <= Opcode::DivideDouble);
+}
+
 struct Definition {
     BlockId block = 0;
     std::int64_t instructionIndex = -1;
@@ -42,9 +66,7 @@ bool validSourceRange(
 
 bool validRegisterType(semantic::PrimitiveType type) noexcept {
     return type == semantic::PrimitiveType::Bool ||
-        type == semantic::PrimitiveType::Int ||
-        type == semantic::PrimitiveType::Long ||
-        type == semantic::PrimitiveType::Double ||
+        semantic::isNumericType(type) ||
         type == semantic::PrimitiveType::String ||
         type == semantic::PrimitiveType::Object ||
         type == semantic::PrimitiveType::Struct ||
@@ -56,9 +78,7 @@ bool validRegisterType(semantic::PrimitiveType type) noexcept {
 
 bool validStorageType(semantic::PrimitiveType type) noexcept {
     return type == semantic::PrimitiveType::Bool ||
-        type == semantic::PrimitiveType::Int ||
-        type == semantic::PrimitiveType::Long ||
-        type == semantic::PrimitiveType::Double ||
+        semantic::isNumericType(type) ||
         type == semantic::PrimitiveType::String ||
         type == semantic::PrimitiveType::Object ||
         type == semantic::PrimitiveType::Struct ||
@@ -75,12 +95,11 @@ bool validReturnType(semantic::PrimitiveType type) noexcept {
 bool validTypeIdentity(
     semantic::PrimitiveType type,
     semantic::SymbolId typeId) noexcept {
-    return (type == semantic::PrimitiveType::Object ||
-            type == semantic::PrimitiveType::Struct ||
+    return (type == semantic::PrimitiveType::Struct ||
             type == semantic::PrimitiveType::Enum ||
             type == semantic::PrimitiveType::Array)
         ? typeId != 0
-        : typeId == 0;
+        : type == semantic::PrimitiveType::Object || typeId == 0;
 }
 
 bool descriptorAssignable(
@@ -114,6 +133,8 @@ bool compatibleType(
         const semantic::TypeSymbol*>& descriptors) noexcept {
     if (actualType != expectedType) return false;
     if (actualType == semantic::PrimitiveType::Object) {
+        if (expectedTypeId == 0) return true;
+        if (actualTypeId == 0) return false;
         return descriptorAssignable(actualTypeId, expectedTypeId, descriptors);
     }
     return actualTypeId == expectedTypeId;
@@ -135,6 +156,9 @@ bool validDescriptorIdentity(
         semantic::SymbolId,
         const semantic::TypeSymbol*>& descriptors) noexcept {
     if (!validTypeIdentity(type, typeId)) return false;
+    if (type == semantic::PrimitiveType::Object && typeId == 0) {
+        return true;
+    }
     if (type != semantic::PrimitiveType::Object &&
         type != semantic::PrimitiveType::Struct &&
         type != semantic::PrimitiveType::Enum) {
@@ -191,6 +215,9 @@ bool instructionDefinesValue(
         return module.functionReferences[instruction.index].returnType !=
             semantic::PrimitiveType::Void;
     }
+    if (instruction.opcode == Opcode::InvokeDelegate) {
+        return instruction.result != InvalidRegister;
+    }
     return true;
 }
 
@@ -207,6 +234,7 @@ std::size_t expectedOperandCount(
     case Opcode::LoadLocal:
     case Opcode::NewObject:
     case Opcode::NewStruct:
+    case Opcode::ConstantTypeId:
         return 0;
     case Opcode::StoreLocal:
     case Opcode::ConvertNullToString:
@@ -215,6 +243,7 @@ std::size_t expectedOperandCount(
     case Opcode::ConvertIntToLong:
     case Opcode::ConvertIntToDouble:
     case Opcode::ConvertLongToDouble:
+    case Opcode::ConvertNumeric:
     case Opcode::NewArray:
     case Opcode::CheckNotNull:
     case Opcode::ArrayLength:
@@ -224,6 +253,8 @@ std::size_t expectedOperandCount(
     case Opcode::NegateLong:
     case Opcode::NegateDouble:
     case Opcode::LogicalNot:
+    case Opcode::IsType:
+    case Opcode::AsType:
         return 1;
     case Opcode::LoadElement:
     case Opcode::StoreField:
@@ -235,6 +266,9 @@ std::size_t expectedOperandCount(
         return instruction.index < module.functionReferences.size()
             ? module.functionReferences[instruction.index].parameterTypes.size()
             : instruction.operands.size();
+    case Opcode::NewDelegate:
+    case Opcode::InvokeDelegate:
+        return instruction.operands.size();
     default:
         return 2;
     }
@@ -247,7 +281,11 @@ bool verifyModule(
     diagnostics::DiagnosticBag& diagnostics) {
     const auto initialCount = diagnostics.items().size();
 
-    if (module.version.major != 0 || module.version.minor != 6) {
+    if (module.version.major != 0 ||
+        (module.version.minor != 6 &&
+         module.version.minor != 7 &&
+         module.version.minor != 8 &&
+         module.version.minor != 9)) {
         diagnostics.report(
             "RS5100",
             "unsupported in-memory bytecode version",
@@ -735,7 +773,6 @@ bool verifyModule(
                 }
             }
         }
-
         for (Register value = 0; value < function.registerTypes.size(); ++value) {
             if (definitions.find(value) == definitions.end()) {
                 diagnostics.report(
@@ -767,6 +804,35 @@ bool verifyModule(
             } else if (block.terminator.kind == TerminatorKind::Branch) {
                 addEdge(block.id, block.terminator.target);
                 addEdge(block.id, block.terminator.falseTarget);
+            }
+        }
+        for (const auto& handler : function.exceptionHandlers) {
+            if (blocks.find(handler.handlerBlock) == blocks.end() ||
+                handler.exceptionLocal >= function.localTypes.size() ||
+                function.localTypes[handler.exceptionLocal] !=
+                    semantic::PrimitiveType::Object ||
+                typeIdAt(function.localTypeIds, handler.exceptionLocal) !=
+                    handler.catchTypeId) {
+                diagnostics.report(
+                    "RS5175", "invalid bytecode exception handler target or local", {});
+                continue;
+            }
+            if (handler.catchTypeId != 0) {
+                const auto catchType = typeDescriptors.find(
+                    handler.catchTypeId);
+                if (catchType == typeDescriptors.end() ||
+                    catchType->second->kind != semantic::TypeKind::Class) {
+                    diagnostics.report(
+                        "RS5175", "invalid bytecode exception handler catch type", {});
+                }
+            }
+            for (const auto protectedBlock : handler.protectedBlocks) {
+                if (blocks.find(protectedBlock) == blocks.end()) {
+                    diagnostics.report(
+                        "RS5175", "invalid bytecode protected block", {});
+                } else {
+                    addEdge(protectedBlock, handler.handlerBlock);
+                }
             }
         }
 
@@ -903,10 +969,12 @@ bool verifyModule(
             }
             for (std::size_t index = 0; index < arguments.size(); ++index) {
                 checkUse(arguments[index], from, useIndex);
-                if (registerType(arguments[index]) !=
-                        targetBlock->second->parameters[index].type ||
-                    registerTypeId(arguments[index]) !=
-                        targetBlock->second->parameters[index].typeId) {
+                if (!compatibleType(
+                        registerType(arguments[index]),
+                        registerTypeId(arguments[index]),
+                        targetBlock->second->parameters[index].type,
+                        targetBlock->second->parameters[index].typeId,
+                        typeDescriptors)) {
                     diagnostics.report(
                         "RS5126",
                         "bytecode branch argument type does not match block parameter",
@@ -923,6 +991,13 @@ bool verifyModule(
                     diagnostics.report(
                         "RS5127",
                         "bytecode instruction has an invalid operand count",
+                        {});
+                }
+                if (!instruction.checkedArithmetic &&
+                    !supportsArithmeticMode(instruction.opcode)) {
+                    diagnostics.report(
+                        "RS5168",
+                        "unchecked mode is invalid for this bytecode opcode",
                         {});
                 }
                 for (const auto operand : instruction.operands) {
@@ -1047,10 +1122,52 @@ bool verifyModule(
                         diagnostics.report("RS5166", "invalid long-to-double conversion", {});
                     }
                     break;
+                case Opcode::ConvertNumeric:
+                    if (instruction.operands.size() != 1 ||
+                        !semantic::isNumericType(registerType(
+                            instruction.operands.front())) ||
+                        !semantic::isNumericType(resultType) ||
+                        registerType(instruction.operands.front()) == resultType) {
+                        diagnostics.report(
+                            "RS5167", "invalid numeric conversion", {});
+                    }
+                    break;
+                case Opcode::ConstantTypeId:
+                    if (!instruction.operands.empty() ||
+                        resultType != semantic::PrimitiveType::ULong) {
+                        diagnostics.report(
+                            "RS5173", "invalid typeof token", {});
+                    }
+                    break;
+                case Opcode::IsType:
+                case Opcode::AsType: {
+                    const auto operandType = instruction.operands.empty()
+                        ? semantic::PrimitiveType::Error
+                        : registerType(instruction.operands.front());
+                    const bool exactTarget = semantic::isExactType(
+                        instruction.elementType);
+                    const bool knownTarget = !exactTarget ||
+                        typeDescriptors.find(
+                            instruction.elementTypeId) !=
+                            typeDescriptors.end();
+                    if (!semantic::isReferenceType(operandType) ||
+                        !knownTarget ||
+                        (instruction.opcode == Opcode::IsType &&
+                         resultType != semantic::PrimitiveType::Bool) ||
+                        (instruction.opcode == Opcode::AsType &&
+                         (resultType != instruction.elementType ||
+                          !semantic::isReferenceType(
+                              instruction.elementType)))) {
+                        diagnostics.report(
+                            "RS5174", "invalid runtime type operation", {});
+                    }
+                    break;
+                }
                 case Opcode::NewObject:
                     if (instruction.typeIndex >= module.types.size() ||
                         module.types[instruction.typeIndex].kind != semantic::TypeKind::Class ||
                         module.types[instruction.typeIndex].interfaceType ||
+                        module.types[instruction.typeIndex].delegateType ||
                         resultType != semantic::PrimitiveType::Object ||
                         registerTypeId(instruction.result) !=
                             module.types[instruction.typeIndex].id) {
@@ -1320,17 +1437,146 @@ bool verifyModule(
                         }
                     }
                     break;
+                case Opcode::NewDelegate:
+                    if (instruction.typeIndex >= module.types.size() ||
+                        !module.types[instruction.typeIndex].delegateType ||
+                        instruction.index >=
+                            module.functionReferences.size() ||
+                        instruction.operands.size() > 1 ||
+                        resultType != semantic::PrimitiveType::Object ||
+                        registerTypeId(instruction.result) !=
+                            module.types[instruction.typeIndex].id) {
+                        diagnostics.report(
+                            "RS5180",
+                            "invalid bytecode delegate creation",
+                            {});
+                        break;
+                    }
+                    if (!instruction.operands.empty()) {
+                        const auto& reference =
+                            module.functionReferences[instruction.index];
+                        if (reference.parameterTypes.empty() ||
+                            !compatibleType(
+                                registerType(
+                                    instruction.operands.front()),
+                                registerTypeId(
+                                    instruction.operands.front()),
+                                reference.parameterTypes.front(),
+                                typeIdAt(
+                                    reference.parameterTypeIds, 0),
+                                typeDescriptors)) {
+                            diagnostics.report(
+                                "RS5181",
+                                "bytecode delegate receiver type mismatch",
+                                {});
+                        }
+                    }
+                    break;
+                case Opcode::InvokeDelegate: {
+                    if (instruction.typeIndex >= module.types.size() ||
+                        !module.types[instruction.typeIndex].delegateType ||
+                        instruction.operands.empty()) {
+                        diagnostics.report(
+                            "RS5182",
+                            "invalid bytecode delegate invocation",
+                            {});
+                        break;
+                    }
+                    const auto& type =
+                        module.types[instruction.typeIndex];
+                    const semantic::FunctionSymbol* invoke = nullptr;
+                    for (const auto& method : type.methods) {
+                        if (method.name == "Invoke") {
+                            invoke = &method;
+                            break;
+                        }
+                    }
+                    bool valid = invoke &&
+                        invoke->parameters.size() ==
+                            instruction.operands.size() &&
+                        registerType(instruction.operands.front()) ==
+                            semantic::PrimitiveType::Object &&
+                        registerTypeId(instruction.operands.front()) ==
+                            type.id;
+                    if (valid) {
+                        for (std::size_t argumentIndex = 1;
+                             argumentIndex < instruction.operands.size();
+                             ++argumentIndex) {
+                            const auto& parameter =
+                                invoke->parameters[argumentIndex];
+                            const auto parameterType =
+                                semantic::storageTypeOf(parameter);
+                            if (!compatibleType(
+                                    registerType(
+                                        instruction.operands[argumentIndex]),
+                                    registerTypeId(
+                                        instruction.operands[argumentIndex]),
+                                    parameterType,
+                                    semantic::isExactType(parameterType)
+                                        ? semantic::stableTypeId(
+                                            semantic::storageTypeNameOf(
+                                                parameter))
+                                        : 0,
+                                    typeDescriptors)) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    const auto expectedReturnTypeId = invoke &&
+                            semantic::isExactType(invoke->returnType)
+                        ? semantic::stableTypeId(invoke->returnTypeName)
+                        : 0;
+                    if (!valid || !invoke ||
+                        (invoke->returnType ==
+                                semantic::PrimitiveType::Void
+                            ? instruction.result != InvalidRegister
+                            : instruction.result == InvalidRegister ||
+                                resultType != invoke->returnType ||
+                                registerTypeId(instruction.result) !=
+                                    expectedReturnTypeId)) {
+                        diagnostics.report(
+                            "RS5182",
+                            "invalid bytecode delegate invocation",
+                            {});
+                    }
+                    break;
+                }
+                case Opcode::CombineDelegate:
+                case Opcode::RemoveDelegate:
+                    if (instruction.typeIndex >= module.types.size() ||
+                        !module.types[instruction.typeIndex].delegateType ||
+                        instruction.operands.size() != 2 ||
+                        registerType(instruction.operands[0]) !=
+                            semantic::PrimitiveType::Object ||
+                        registerTypeId(instruction.operands[0]) !=
+                            module.types[instruction.typeIndex].id ||
+                        registerType(instruction.operands[1]) !=
+                            semantic::PrimitiveType::Object ||
+                        registerTypeId(instruction.operands[1]) !=
+                            module.types[instruction.typeIndex].id ||
+                        resultType != semantic::PrimitiveType::Object ||
+                        registerTypeId(instruction.result) !=
+                            module.types[instruction.typeIndex].id) {
+                        diagnostics.report(
+                            "RS5183",
+                            "invalid bytecode delegate combination",
+                            {});
+                    }
+                    break;
                 case Opcode::NegateInt:
                 case Opcode::NegateLong:
                 case Opcode::NegateDouble: {
-                    const auto expected = instruction.opcode == Opcode::NegateInt
-                        ? semantic::PrimitiveType::Int
+                    const auto operandType = instruction.operands.empty()
+                        ? semantic::PrimitiveType::Error
+                        : registerType(instruction.operands.front());
+                    const bool carrierMatches = instruction.opcode == Opcode::NegateInt
+                        ? isIntCarrier(operandType)
                         : instruction.opcode == Opcode::NegateLong
-                            ? semantic::PrimitiveType::Long
-                            : semantic::PrimitiveType::Double;
+                            ? isLongCarrier(operandType)
+                            : isFloatCarrier(operandType);
                     if (instruction.operands.size() != 1 ||
-                        registerType(instruction.operands.front()) != expected ||
-                        resultType != expected) {
+                        !carrierMatches || resultType != operandType) {
                         diagnostics.report("RS5141", "invalid numeric negation", {});
                     }
                     break;
@@ -1349,11 +1595,9 @@ bool verifyModule(
                 case Opcode::DivideInt:
                 case Opcode::RemainderInt:
                     if (instruction.operands.size() != 2 ||
-                        registerType(instruction.operands[0]) !=
-                            semantic::PrimitiveType::Int ||
-                        registerType(instruction.operands[1]) !=
-                            semantic::PrimitiveType::Int ||
-                        resultType != semantic::PrimitiveType::Int) {
+                        !isIntCarrier(resultType) ||
+                        registerType(instruction.operands[0]) != resultType ||
+                        registerType(instruction.operands[1]) != resultType) {
                         diagnostics.report("RS5143", "invalid integer arithmetic", {});
                     }
                     break;
@@ -1363,9 +1607,9 @@ bool verifyModule(
                 case Opcode::DivideLong:
                 case Opcode::RemainderLong:
                     if (instruction.operands.size() != 2 ||
-                        registerType(instruction.operands[0]) != semantic::PrimitiveType::Long ||
-                        registerType(instruction.operands[1]) != semantic::PrimitiveType::Long ||
-                        resultType != semantic::PrimitiveType::Long) {
+                        !isLongCarrier(resultType) ||
+                        registerType(instruction.operands[0]) != resultType ||
+                        registerType(instruction.operands[1]) != resultType) {
                         diagnostics.report("RS5172", "invalid long arithmetic", {});
                     }
                     break;
@@ -1374,9 +1618,9 @@ bool verifyModule(
                 case Opcode::MultiplyDouble:
                 case Opcode::DivideDouble:
                     if (instruction.operands.size() != 2 ||
-                        registerType(instruction.operands[0]) != semantic::PrimitiveType::Double ||
-                        registerType(instruction.operands[1]) != semantic::PrimitiveType::Double ||
-                        resultType != semantic::PrimitiveType::Double) {
+                        !isFloatCarrier(resultType) ||
+                        registerType(instruction.operands[0]) != resultType ||
+                        registerType(instruction.operands[1]) != resultType) {
                         diagnostics.report("RS5173", "invalid double arithmetic", {});
                     }
                     break;
@@ -1385,10 +1629,9 @@ bool verifyModule(
                 case Opcode::GreaterInt:
                 case Opcode::GreaterOrEqualInt:
                     if (instruction.operands.size() != 2 ||
-                        registerType(instruction.operands[0]) !=
-                            semantic::PrimitiveType::Int ||
+                        !isIntCarrier(registerType(instruction.operands[0])) ||
                         registerType(instruction.operands[1]) !=
-                            semantic::PrimitiveType::Int ||
+                            registerType(instruction.operands[0]) ||
                         resultType != semantic::PrimitiveType::Bool) {
                         diagnostics.report("RS5144", "invalid integer comparison", {});
                     }
@@ -1398,8 +1641,8 @@ bool verifyModule(
                 case Opcode::GreaterLong:
                 case Opcode::GreaterOrEqualLong:
                     if (instruction.operands.size() != 2 ||
-                        registerType(instruction.operands[0]) != semantic::PrimitiveType::Long ||
-                        registerType(instruction.operands[1]) != semantic::PrimitiveType::Long ||
+                        !isLongCarrier(registerType(instruction.operands[0])) ||
+                        registerType(instruction.operands[1]) != registerType(instruction.operands[0]) ||
                         resultType != semantic::PrimitiveType::Bool) {
                         diagnostics.report("RS5174", "invalid long comparison", {});
                     }
@@ -1409,8 +1652,8 @@ bool verifyModule(
                 case Opcode::GreaterDouble:
                 case Opcode::GreaterOrEqualDouble:
                     if (instruction.operands.size() != 2 ||
-                        registerType(instruction.operands[0]) != semantic::PrimitiveType::Double ||
-                        registerType(instruction.operands[1]) != semantic::PrimitiveType::Double ||
+                        !isFloatCarrier(registerType(instruction.operands[0])) ||
+                        registerType(instruction.operands[1]) != registerType(instruction.operands[0]) ||
                         resultType != semantic::PrimitiveType::Bool) {
                         diagnostics.report("RS5175", "invalid double comparison", {});
                     }
@@ -1481,6 +1724,14 @@ bool verifyModule(
                         "RS5149",
                         "non-void bytecode function uses ret.void",
                         {});
+                }
+                break;
+            case TerminatorKind::Throw:
+                checkUse(block.terminator.value, block.id, useIndex);
+                if (registerType(block.terminator.value) !=
+                    semantic::PrimitiveType::Object) {
+                    diagnostics.report(
+                        "RS5176", "bytecode throw requires an object value", {});
                 }
                 break;
             }

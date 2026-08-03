@@ -72,6 +72,30 @@ std::optional<RemoveCvRef<T>> readValue(
     if constexpr (std::is_same_v<ValueType, bool>) {
         if (const auto* result = std::get_if<bool>(&value)) return *result;
         setTypeMismatch(error, "expected bool argument");
+    } else if constexpr (std::is_same_v<ValueType, std::uint8_t>) {
+        if (const auto* result = std::get_if<runtime::ByteValue>(&value)) return result->value;
+        setTypeMismatch(error, "expected byte argument");
+    } else if constexpr (std::is_same_v<ValueType, std::int8_t>) {
+        if (const auto* result = std::get_if<runtime::SByteValue>(&value)) return result->value;
+        setTypeMismatch(error, "expected sbyte argument");
+    } else if constexpr (std::is_same_v<ValueType, std::int16_t>) {
+        if (const auto* result = std::get_if<runtime::ShortValue>(&value)) return result->value;
+        setTypeMismatch(error, "expected short argument");
+    } else if constexpr (std::is_same_v<ValueType, std::uint16_t>) {
+        if (const auto* result = std::get_if<runtime::UShortValue>(&value)) return result->value;
+        setTypeMismatch(error, "expected ushort argument");
+    } else if constexpr (std::is_same_v<ValueType, char16_t>) {
+        if (const auto* result = std::get_if<runtime::CharValue>(&value)) return result->value;
+        setTypeMismatch(error, "expected char argument");
+    } else if constexpr (std::is_same_v<ValueType, std::uint32_t>) {
+        if (const auto* result = std::get_if<runtime::UIntValue>(&value)) return result->value;
+        setTypeMismatch(error, "expected uint argument");
+    } else if constexpr (std::is_same_v<ValueType, std::uint64_t>) {
+        if (const auto* result = std::get_if<runtime::ULongValue>(&value)) return result->value;
+        setTypeMismatch(error, "expected ulong argument");
+    } else if constexpr (std::is_same_v<ValueType, float>) {
+        if (const auto* result = std::get_if<runtime::FloatValue>(&value)) return result->value;
+        setTypeMismatch(error, "expected float argument");
     } else if constexpr (
         std::is_integral_v<ValueType> &&
         !std::is_same_v<ValueType, bool> &&
@@ -153,6 +177,22 @@ std::optional<runtime::Value> writeValue(
     using ValueType = RemoveCvRef<T>;
     if constexpr (std::is_same_v<ValueType, bool>) {
         return runtime::Value{static_cast<bool>(value)};
+    } else if constexpr (std::is_same_v<ValueType, std::uint8_t>) {
+        return runtime::Value{runtime::ByteValue{value}};
+    } else if constexpr (std::is_same_v<ValueType, std::int8_t>) {
+        return runtime::Value{runtime::SByteValue{value}};
+    } else if constexpr (std::is_same_v<ValueType, std::int16_t>) {
+        return runtime::Value{runtime::ShortValue{value}};
+    } else if constexpr (std::is_same_v<ValueType, std::uint16_t>) {
+        return runtime::Value{runtime::UShortValue{value}};
+    } else if constexpr (std::is_same_v<ValueType, char16_t>) {
+        return runtime::Value{runtime::CharValue{value}};
+    } else if constexpr (std::is_same_v<ValueType, std::uint32_t>) {
+        return runtime::Value{runtime::UIntValue{value}};
+    } else if constexpr (std::is_same_v<ValueType, std::uint64_t>) {
+        return runtime::Value{runtime::ULongValue{value}};
+    } else if constexpr (std::is_same_v<ValueType, float>) {
+        return runtime::Value{runtime::FloatValue{value}};
     } else if constexpr (
         std::is_integral_v<ValueType> &&
         !std::is_same_v<ValueType, bool> &&

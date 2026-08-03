@@ -4,6 +4,8 @@
 #include "realscript/aot_cpp/AotCpp.h"
 #include "realscript/jit/Jit.h"
 #include "realscript/runtime/Runtime.h"
+#include "realscript/game/GameBytecodeObjects.h"
+#include "realscript/tooling/LanguageService.h"
 #include "realscript/text/Text.h"
 
 #include <algorithm>
@@ -20,6 +22,11 @@ bool has(const std::vector<realscript::syntax::SyntaxToken>& values,
     return std::any_of(values.begin(), values.end(),
         [&](const auto& value) { return value.kind == kind; });
 }
+std::string diagnosticsText(
+    const realscript::diagnostics::DiagnosticBag& diagnostics);
+bool hasDiagnostic(
+    const realscript::diagnostics::DiagnosticBag& diagnostics,
+    const std::string& code);
 void testSyntax() {
     const char* source = R"(
 module Phase19.Syntax;
@@ -140,6 +147,53 @@ int main()
             result.error.message);
 }
 
+void testBaseConstructorExecution() {
+    const char* source = R"(
+module Phase19.Constructors;
+class Base
+{
+    protected int value;
+    protected Base(int initial) { value = initial; }
+    public int Read() { return value; }
+}
+class Derived : Base
+{
+    public Derived(int initial) : base(initial + 1)
+    {
+        value = value + 1;
+    }
+}
+int main()
+{
+    Derived value = new Derived(40);
+    return value.Read();
+}
+)";
+    realscript::compiler::Compilation compilation(
+        {{"base-constructor.rs", source}});
+    auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "base constructor source failed to compile:\n" +
+            diagnosticsText(build.diagnostics));
+    realscript::bytecode::Lowerer lowerer;
+    std::vector<realscript::bytecode::Module> modules;
+    modules.push_back(lowerer.lower(build.modules.front()));
+    realscript::runtime::Interpreter interpreter(std::move(modules));
+    const auto result = interpreter.invoke("Phase19.Constructors::main");
+    require(result.succeeded &&
+            std::get<std::int64_t>(result.value) == 42,
+        "base constructor did not execute before the derived body: " +
+            result.error.message);
+
+    realscript::compiler::Compilation invalid({{"invalid-base.rs", R"(
+class Base { protected Base(int initial) { } }
+class Derived : Base { public Derived() { } }
+)"}});
+    const auto invalidBuild = invalid.build();
+    require(hasDiagnostic(invalidBuild.diagnostics, "RS2532"),
+        "missing implicit base constructor did not report RS2532");
+}
+
 std::string diagnosticsText(
     const realscript::diagnostics::DiagnosticBag& diagnostics) {
     std::string result;
@@ -156,6 +210,60 @@ bool hasDiagnostic(
     return std::any_of(
         diagnostics.items().begin(), diagnostics.items().end(),
         [&](const auto& diagnostic) { return diagnostic.code == code; });
+}
+
+void testVisibilityDiagnostics() {
+    realscript::compiler::Compilation privateMember({{"private-member.rs", R"(
+class Box
+{
+    private int Secret() { return 7; }
+    public int Reveal() { return Secret(); }
+}
+int main()
+{
+    Box value = new Box();
+    return value.Secret();
+}
+)"}});
+    const auto privateBuild = privateMember.build();
+    require(hasDiagnostic(privateBuild.diagnostics, "RS2472"),
+        "private method access was not rejected");
+
+    realscript::compiler::Compilation privateConstructor(
+        {{"private-constructor.rs", R"(
+class Locked { private Locked() { } }
+int main() { Locked value = new Locked(); return 0; }
+)"}});
+    const auto constructorBuild = privateConstructor.build();
+    require(hasDiagnostic(constructorBuild.diagnostics, "RS2474"),
+        "private constructor access was not rejected");
+
+    realscript::compiler::Compilation protectedMember(
+        {{"protected-member.rs", R"(
+class Base { protected int value; }
+class Other
+{
+    public int Read(Base input) { return input.value; }
+}
+)"}});
+    const auto protectedBuild = protectedMember.build();
+    require(hasDiagnostic(protectedBuild.diagnostics, "RS2534"),
+        "protected field access from an unrelated type was not rejected");
+
+    realscript::compiler::Compilation internalType({
+        {"hidden.rs", R"(
+module Hidden;
+internal class HiddenType { public HiddenType() { } }
+)"},
+        {"consumer.rs", R"(
+module Consumer;
+import Hidden;
+int main() { HiddenType value = new HiddenType(); return 0; }
+)"},
+    });
+    const auto internalBuild = internalType.build();
+    require(hasDiagnostic(internalBuild.diagnostics, "RS2534"),
+        "internal type access across modules was not rejected");
 }
 
 void testVirtualDispatchExecution() {
@@ -445,6 +553,256 @@ int main()
 #endif
 }
 
+void testObjectModelBytecodeRoundTrip() {
+    const char* source = R"(
+module Phase19.Rsbc;
+public interface IUnit { public int Read(); }
+public abstract class Unit : IUnit
+{
+    public abstract int Read();
+}
+public sealed class Marine : Unit
+{
+    private int stored;
+    public Marine() { stored = 19; }
+    public int Value { get { return stored; } }
+    public override int Read() { return Value; }
+}
+int main()
+{
+    IUnit value = new Marine();
+    return value.Read();
+}
+)";
+    realscript::compiler::Compilation compilation({{"phase19-rsbc.rs", source}});
+    auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "Phase 19 RSBC source failed to compile:\n" +
+            diagnosticsText(build.diagnostics));
+
+    realscript::bytecode::Lowerer lowerer;
+    const auto module = lowerer.lower(build.modules.front());
+    require(module.version.major == 0 && module.version.minor == 7,
+        "Phase 19 object model did not advance RSBC to 0.7");
+    const auto encoded = realscript::bytecode::encodeModule(module);
+    realscript::bytecode::Module decoded;
+    realscript::diagnostics::DiagnosticBag diagnostics;
+    require(realscript::bytecode::decodeModule(
+            encoded, decoded, diagnostics),
+        "Phase 19 RSBC failed to decode:\n" + diagnosticsText(diagnostics));
+    require(realscript::bytecode::encodeModule(decoded) == encoded,
+        "Phase 19 RSBC round trip is not canonical");
+    const auto verified = realscript::bytecode::verifyModule(
+        decoded, diagnostics);
+    require(verified,
+        "decoded Phase 19 RSBC failed verification:\n" +
+            diagnosticsText(diagnostics));
+
+    auto corrupted = encoded;
+    const auto readU32 = [&](std::size_t offset) {
+        return static_cast<std::uint32_t>(corrupted[offset]) |
+            (static_cast<std::uint32_t>(corrupted[offset + 1]) << 8) |
+            (static_cast<std::uint32_t>(corrupted[offset + 2]) << 16) |
+            (static_cast<std::uint32_t>(corrupted[offset + 3]) << 24);
+    };
+    const auto objectModelOffset = readU32(16 + 7 * 12 + 4);
+    corrupted[objectModelOffset] = 0xffu;
+    corrupted[objectModelOffset + 1] = 0xffu;
+    corrupted[objectModelOffset + 2] = 0xffu;
+    corrupted[objectModelOffset + 3] = 0xffu;
+    realscript::bytecode::Module rejected;
+    realscript::diagnostics::DiagnosticBag corruptionDiagnostics;
+    require(!realscript::bytecode::decodeModule(
+            corrupted, rejected, corruptionDiagnostics) &&
+            hasDiagnostic(corruptionDiagnostics, "RS5004"),
+        "corrupted Phase 19 object-model section was accepted");
+
+    const auto marineId = realscript::semantic::stableTypeId(
+        "Phase19.Rsbc::Marine");
+    const auto marine = std::find_if(
+        decoded.types.begin(), decoded.types.end(),
+        [&](const auto& type) { return type.id == marineId; });
+    require(marine != decoded.types.end() && marine->sealedType &&
+            marine->baseTypeId != 0 &&
+            marine->fields.size() == 1 &&
+            marine->fields.front().accessibility ==
+                realscript::semantic::Accessibility::Private &&
+            marine->constructors.size() == 1 &&
+            marine->properties.size() == 1 &&
+            marine->virtualDispatchTable.size() == 1 &&
+            marine->interfaceDispatchMaps.size() == 1,
+        "decoded Phase 19 object-model descriptor is incomplete");
+    require(std::any_of(
+            decoded.functionReferences.begin(),
+            decoded.functionReferences.end(),
+            [](const auto& reference) {
+                return reference.interfaceDispatch &&
+                    reference.interfaceTypeId != 0 &&
+                    reference.interfaceSlot == 0;
+            }),
+        "decoded Phase 19 interface-call metadata is incomplete");
+
+    std::vector<realscript::bytecode::Module> modules;
+    modules.push_back(std::move(decoded));
+    realscript::runtime::Interpreter interpreter(std::move(modules));
+    const auto result = interpreter.invoke("Phase19.Rsbc::main");
+    require(result.succeeded &&
+            std::get<std::int64_t>(result.value) == 19,
+        "decoded Phase 19 RSBC dispatch returned the wrong result: " +
+            result.error.message);
+}
+
+void testGameSdkInheritedObjectClosure() {
+    realscript::game::GameApi api;
+    realscript::game::GameScriptCompiler compiler(api);
+    auto compiled = compiler.compile({{"phase19-game-sdk.rs", R"(
+module Phase19.GameSdk;
+class Base
+{
+    protected int baseValue;
+    protected Base(int value) { baseValue = value; }
+}
+class Derived : Base
+{
+    private int ownValue;
+    public Derived() : base(19) { ownValue = 23; }
+    public int Total { get { return baseValue + ownValue; } }
+    public int Read() { return Total; }
+}
+)"}});
+    require(compiled.succeeded(),
+        "Phase 19 Game SDK source failed to compile:\n" +
+            diagnosticsText(compiled.diagnostics));
+    std::vector<std::vector<std::uint8_t>> encoded;
+    for (const auto& module : compiled.modules) {
+        encoded.push_back(realscript::bytecode::encodeModule(module));
+    }
+    auto loaded = realscript::game::loadGameObjectBytecodeModules(
+        api, encoded);
+    require(loaded.succeeded(),
+        "Phase 19 Game SDK bytecode failed to load:\n" +
+            diagnosticsText(loaded.diagnostics));
+    auto runtime = loaded.package.createRuntime();
+    const auto type = runtime.findType("Phase19.GameSdk::Derived");
+    require(type.has_value() && type->descriptor.baseTypeId != 0 &&
+            type->descriptor.fields.size() == 2 &&
+            type->descriptor.constructors.size() == 1 &&
+            type->descriptor.properties.size() == 1,
+        "loaded Game SDK type lost inherited object metadata");
+    const auto method = runtime.findMethod(*type, "Read", 0);
+    require(method.has_value(),
+        "loaded Game SDK type lost its public method contract");
+    realscript::runtime::RuntimeError error;
+    auto object = runtime.createObject(*type, {}, error);
+    require(object.has_value(),
+        "loaded Game SDK object construction failed: " + error.message);
+    const auto invoked = runtime.invoke(*object, *method);
+    require(invoked.succeeded &&
+            std::get<std::int64_t>(invoked.value) == 42,
+        "loaded Game SDK inherited object returned the wrong result: " +
+            invoked.error.message);
+    const auto snapshot = realscript::game::snapshotScriptObject(
+        runtime, *object, error);
+    require(snapshot.has_value() && snapshot->fields.size() == 2,
+        "inherited script-object state did not retain both fields: " +
+            error.message);
+}
+
+void testLanguageToolingVisibilityAndInheritance() {
+    realscript::tooling::LanguageService service;
+    service.open("base-tools.rs", R"(
+module Phase19.Tools;
+class Base
+{
+    private int Secret() { return 1; }
+    protected int Shared() { return 2; }
+    public int Visible() { return 3; }
+}
+)" );
+    service.open("derived-tools.rs", R"(
+module Phase19.Tools;
+class Derived : Base
+{
+    int Run() { return Shared(); }
+}
+)" );
+    require(service.diagnostics("derived-tools.rs").empty(),
+        "inherited tooling fixture produced diagnostics");
+    const auto completion = service.completion(
+        "derived-tools.rs", {4, 24});
+    require(std::any_of(
+            completion.begin(), completion.end(),
+            [](const auto& item) { return item.label == "Shared"; }) &&
+            std::none_of(
+                completion.begin(), completion.end(),
+                [](const auto& item) { return item.label == "Secret"; }),
+        "LSP completion did not respect inherited visibility");
+    const auto definition = service.definition(
+        "derived-tools.rs", {4, 25});
+    require(definition && definition->path == "base-tools.rs",
+        "LSP definition did not resolve the inherited method");
+    const auto edits = service.rename(
+        "derived-tools.rs", {4, 25}, "SharedValue");
+    require(edits.size() == 2,
+        "LSP rename did not include the inherited definition and call");
+
+    service.open("internal-tools.rs", R"(
+module Phase19.HiddenTools;
+internal class HiddenType { }
+)" );
+    service.open("consumer-tools.rs", R"(
+module Phase19.ConsumerTools;
+import Phase19.HiddenTools;
+int main() { return 0; }
+)" );
+    const auto externalCompletion = service.completion(
+        "consumer-tools.rs", {3, 12});
+    require(std::none_of(
+            externalCompletion.begin(), externalCompletion.end(),
+            [](const auto& item) { return item.label == "HiddenType"; }),
+        "LSP completion exposed an internal type across modules");
+}
+
+void testDebuggerShowsRuntimeUserMethod() {
+    realscript::compiler::Compilation compilation({{"phase19-debug.rs", R"(
+module Phase19.Debug;
+interface IValue { public int Read(); }
+abstract class Base : IValue { public abstract int Read(); }
+class Derived : Base
+{
+    public override int Read()
+    {
+        return 19;
+    }
+}
+int main()
+{
+    IValue value = new Derived();
+    return value.Read();
+}
+)"}});
+    auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "Phase 19 debugger source failed to compile:\n" +
+            diagnosticsText(build.diagnostics));
+    realscript::bytecode::Lowerer lowerer;
+    bool sawDerivedUserMethod = false;
+    for (const auto& mir : build.modules) {
+        const auto module = lowerer.lower(mir);
+        for (const auto& function : module.functions) {
+            require(function.name.find("$dispatch") == std::string::npos,
+                "bytecode exposed a polymorphism dispatch helper as a function");
+            if (function.name.find("Derived.Read") != std::string::npos) {
+                sawDerivedUserMethod =
+                    function.debugInfo.sourceName == "phase19-debug.rs" &&
+                    !function.debugInfo.sequencePoints.empty();
+            }
+        }
+    }
+    require(sawDerivedUserMethod,
+        "runtime override did not retain user-source debugger metadata");
+}
+
 void testInterfaceDiagnostics() {
     const auto compile = [](const char* source) {
         realscript::compiler::Compilation compilation(
@@ -510,8 +868,14 @@ int main() {
         testSyntax();
         testDuplicateModifier();
         testSingleInheritanceExecution();
+        testBaseConstructorExecution();
+        testVisibilityDiagnostics();
         testVirtualDispatchExecution();
         testInterfaceDispatchExecution();
+        testObjectModelBytecodeRoundTrip();
+        testGameSdkInheritedObjectClosure();
+        testLanguageToolingVisibilityAndInheritance();
+        testDebuggerShowsRuntimeUserMethod();
         testInterfaceDiagnostics();
         testVirtualDiagnostics();
         std::cout << "Phase 19 runtime polymorphism tests passed\n";

@@ -2,18 +2,19 @@
 
 [Repository README](../../README.md) | [简体中文文档](../zh-CN/README.md)
 
-This library describes the RealScript v0.1 alpha technical baseline and the bounded Phase 11–17 gameplay-language profile. It is organized by subsystem and user workflow.
+This library describes the RealScript v0.1 alpha technical baseline through Phase 24. It is organized by subsystem and user workflow.
 
 ## New Users
 
 1. [Getting Started](GETTING_STARTED.md)
 2. [Architecture](ARCHITECTURE.md)
 3. [Language and Type System](LANGUAGE_AND_TYPE_SYSTEM.md)
-4. [Phase 11–18 Native Language Profile](NATIVE_LANGUAGE_PHASE_11_18.md)
-5. [Game Scripting SDK](GAME_SCRIPTING_SDK.md)
-6. [Deterministic Gameplay Runtime](GAMEPLAY_RUNTIME.md)
-7. [SDK Productization](PRODUCTIZATION.md)
-8. [Project Status and Roadmap](PROJECT_STATUS_AND_ROADMAP.md)
+4. [C#-Style Compatibility Matrix](CSHARP_COMPATIBILITY_MATRIX.md)
+5. [Phase 11–18 Native Language Profile](NATIVE_LANGUAGE_PHASE_11_18.md)
+6. [Game Scripting SDK](GAME_SCRIPTING_SDK.md)
+7. [Deterministic Gameplay Runtime](GAMEPLAY_RUNTIME.md)
+8. [SDK Productization](PRODUCTIZATION.md)
+9. [Project Status and Roadmap](PROJECT_STATUS_AND_ROADMAP.md)
 
 ## Compiler and Execution Pipeline
 
@@ -24,6 +25,8 @@ This library describes the RealScript v0.1 alpha technical baseline and the boun
 - [Deterministic Gameplay Runtime](GAMEPLAY_RUNTIME.md)
 - [SDK Productization](PRODUCTIZATION.md)
 - [AOT, JIT, and Performance](AOT_JIT_AND_PERFORMANCE.md)
+- [Phase 18–24 Native Roadmap](../roadmap/PHASE_18_24_NATIVE_LANGUAGE_AND_RUNTIME.md)
+- [Phase 24 Language Completeness and Structured Errors](../roadmap/PHASE_24_LANGUAGE_COMPLETENESS_AND_STRUCTURED_ERRORS.md)
 
 ## Developer Tools
 
@@ -42,4 +45,4 @@ The original detailed documents remain useful for implementation history and sub
 
 ## Versioning
 
-The current documentation describes the v0.1 alpha baseline plus an additive, bounded language profile. The source language, expansion profile, MIR, bytecode, runtime ABI, metadata, and debug-info formats use separate version dimensions. None should be assumed stable until explicitly frozen.
+The current documentation describes the v0.1 alpha implementation through Phase 24. The source language, MIR, bytecode, runtime ABI, metadata, and debug-info formats use separate version dimensions. None should be assumed stable until explicitly frozen.

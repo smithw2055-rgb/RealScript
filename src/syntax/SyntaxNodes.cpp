@@ -59,6 +59,9 @@ text::TextSpan TypeSyntax::span() const noexcept {
     if (closeBracketToken) {
         return combine(name.span, closeBracketToken->span);
     }
+    if (nullableToken) {
+        return combine(name.span, nullableToken->span);
+    }
     if (greaterToken) {
         return combine(name.span, greaterToken->span);
     }
@@ -82,6 +85,29 @@ text::TextSpan BinaryExpressionSyntax::span() const noexcept {
     return combine(left->span(), right->span());
 }
 
+text::TextSpan TypeBinaryExpressionSyntax::span() const noexcept {
+    return combine(expression->span(),
+        designationToken ? designationToken->span : type.span());
+}
+
+text::TextSpan TypeOfExpressionSyntax::span() const noexcept {
+    return combine(typeofKeyword.span, closeParenToken.span);
+}
+
+text::TextSpan SwitchExpressionArmSyntax::span() const noexcept {
+    const auto start = patternType ? patternType->span() :
+        (discardToken ? discardToken->span : label->span());
+    return combine(start, value ? value->span() : arrowToken.span);
+}
+
+text::TextSpan SwitchExpressionSyntax::span() const noexcept {
+    return combine(expression->span(), closeBraceToken.span);
+}
+
+text::TextSpan ConditionalExpressionSyntax::span() const noexcept {
+    return combine(condition->span(), whenFalse->span());
+}
+
 text::TextSpan AssignmentExpressionSyntax::span() const noexcept {
     return combine(identifierToken.span, expression->span());
 }
@@ -103,7 +129,22 @@ text::TextSpan MemberAssignmentExpressionSyntax::span() const noexcept {
 }
 
 text::TextSpan NewObjectExpressionSyntax::span() const noexcept {
-    return combine(newKeyword.span, closeParenToken.span);
+    return combine(newKeyword.span,
+        initializerCloseBraceToken
+            ? initializerCloseBraceToken->span
+            : closeParenToken.span);
+}
+
+text::TextSpan InitializerElementSyntax::span() const noexcept {
+    if (nameToken) {
+        return combine(nameToken->span,
+            expressions.empty() ? equalsToken->span : expressions.back()->span());
+    }
+    if (openBraceToken) {
+        return combine(openBraceToken->span,
+            closeBraceToken ? closeBraceToken->span : openBraceToken->span);
+    }
+    return expressions.empty() ? text::TextSpan{} : expressions.front()->span();
 }
 
 text::TextSpan NewArrayExpressionSyntax::span() const noexcept {
@@ -112,6 +153,10 @@ text::TextSpan NewArrayExpressionSyntax::span() const noexcept {
 
 text::TextSpan ParenthesizedExpressionSyntax::span() const noexcept {
     return combine(openParenToken.span, closeParenToken.span);
+}
+
+text::TextSpan CastExpressionSyntax::span() const noexcept {
+    return combine(openParenToken.span, expression->span());
 }
 
 text::TextSpan CallExpressionSyntax::span() const noexcept {
@@ -164,16 +209,38 @@ text::TextSpan SwitchStatementSyntax::span() const noexcept {
     return combine(switchKeyword.span, closeBraceToken.span);
 }
 
+text::TextSpan ThrowStatementSyntax::span() const noexcept {
+    return combine(throwKeyword.span, semicolonToken.span);
+}
+
+text::TextSpan CatchClauseSyntax::span() const noexcept {
+    return combine(catchKeyword.span, body.span());
+}
+
+text::TextSpan TryStatementSyntax::span() const noexcept {
+    return combine(tryKeyword.span,
+        finallyBody ? finallyBody->span() :
+        (!catches.empty() ? catches.back().span() : body.span()));
+}
+
 text::TextSpan YieldWaitStatementSyntax::span() const noexcept {
     return combine(yieldKeyword.span, semicolonToken.span);
 }
 
+text::TextSpan YieldBreakStatementSyntax::span() const noexcept {
+    return combine(yieldKeyword.span, semicolonToken.span);
+}
+
 text::TextSpan EventSubscriptionStatementSyntax::span() const noexcept {
-    return combine(eventNameToken.span, semicolonToken.span);
+    return combine(
+        receiver ? receiver->span() : eventNameToken.span,
+        semicolonToken.span);
 }
 
 text::TextSpan VariableDeclarationStatementSyntax::span() const noexcept {
-    return combine(type.span(), semicolonToken.span);
+    return combine(
+        refKeyword ? refKeyword->span : type.span(),
+        semicolonToken.span);
 }
 
 text::TextSpan ExpressionStatementSyntax::span() const noexcept {
@@ -186,8 +253,9 @@ text::TextSpan BlockStatementSyntax::span() const noexcept {
 
 text::TextSpan ParameterSyntax::span() const noexcept {
     return combine(
-        modifierToken ? modifierToken->span : type.span(),
-        identifierToken.span);
+        paramsKeyword ? paramsKeyword->span :
+            (modifierToken ? modifierToken->span : type.span()),
+        defaultValue ? defaultValue->span() : identifierToken.span);
 }
 
 text::TextSpan FieldDeclarationSyntax::span() const noexcept {
@@ -241,6 +309,12 @@ text::TextSpan InterfaceDeclarationSyntax::span() const noexcept {
     return combine(
         declarationStart(attributes, interfaceKeyword.span),
         closeBraceToken.span);
+}
+
+text::TextSpan GenericConstraintClauseSyntax::span() const noexcept {
+    return combine(
+        whereKeyword.span,
+        constraints.empty() ? colonToken.span : constraints.back().span);
 }
 
 text::TextSpan EnumMemberDeclarationSyntax::span() const noexcept {

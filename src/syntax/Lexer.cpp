@@ -193,6 +193,10 @@ SyntaxToken Lexer::nextToken() {
     case ',': return single(SyntaxKind::CommaToken);
     case '.': return single(SyntaxKind::DotToken);
     case ':': return single(SyntaxKind::ColonToken);
+    case '?':
+        if (peek(1) == '?') return pair(SyntaxKind::QuestionQuestionToken);
+        if (peek(1) == '.') return pair(SyntaxKind::QuestionDotToken);
+        return single(SyntaxKind::QuestionToken);
     case ';': return single(SyntaxKind::SemicolonToken);
     case '!': return peek(1) == '=' ? pair(SyntaxKind::BangEqualsToken) : single(SyntaxKind::BangToken);
     case '=':

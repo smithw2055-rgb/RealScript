@@ -18,6 +18,10 @@ const char* opcodeName(Opcode opcode) noexcept {
     case Opcode::ConvertIntToLong: return "conv.i32.i64";
     case Opcode::ConvertIntToDouble: return "conv.i32.f64";
     case Opcode::ConvertLongToDouble: return "conv.i64.f64";
+    case Opcode::ConvertNumeric: return "conv.numeric";
+    case Opcode::IsType: return "is.type";
+    case Opcode::AsType: return "as.type";
+    case Opcode::ConstantTypeId: return "const.typeid";
     case Opcode::NewObject: return "new.object";
     case Opcode::NewStruct: return "new.struct";
     case Opcode::NewArray: return "new.array";
@@ -62,6 +66,10 @@ const char* opcodeName(Opcode opcode) noexcept {
     case Opcode::LessOrEqualDouble: return "le.f64";
     case Opcode::GreaterDouble: return "gt.f64";
     case Opcode::GreaterOrEqualDouble: return "ge.f64";
+    case Opcode::NewDelegate: return "new.delegate";
+    case Opcode::InvokeDelegate: return "invoke.delegate";
+    case Opcode::CombineDelegate: return "combine.delegate";
+    case Opcode::RemoveDelegate: return "remove.delegate";
     }
     return "unknown";
 }
@@ -73,6 +81,7 @@ const char* terminatorName(TerminatorKind kind) noexcept {
     case TerminatorKind::Branch: return "br";
     case TerminatorKind::ReturnValue: return "ret";
     case TerminatorKind::ReturnVoid: return "ret.void";
+    case TerminatorKind::Throw: return "throw";
     }
     return "unknown";
 }

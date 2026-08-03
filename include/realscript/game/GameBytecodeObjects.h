@@ -117,9 +117,10 @@ inline void sortObjectMetadata(semantic::TypeSymbol& type) {
 
 } // namespace detail
 
-// RSBC 0.5 preserves executable function signatures and exact receiver type
-// identities, but its compact Type section predates Game SDK object-member
-// descriptors. Rebuild instance methods without changing the bytecode format.
+// RSBC 0.7 persists complete object-member descriptors. Legacy RSBC artifacts
+// through 0.6 preserve executable function signatures and exact receiver type
+// identities but predate those descriptors, so rebuild instance methods for
+// legacy modules without changing the bytecode format.
 // A candidate is accepted only when its recomputed method SymbolId equals the
 // encoded function SymbolId, so free functions that merely take an object as
 // their first parameter are not misclassified.

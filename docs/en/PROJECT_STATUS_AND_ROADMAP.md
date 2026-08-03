@@ -2,13 +2,13 @@
 
 [Documentation Home](README.md) | [Repository README](../../README.md) | [Phase 11–17 Profile](LANGUAGE_EXPANSION_PHASE_11_17.md)
 
-The Phase 1–10 compiler, Game SDK, and deterministic gameplay-runtime roadmap is complete. Phase 11–17 adds a bounded deterministic game-language profile that is integrated with multi-file/module compilation, Typed MIR, bytecode, the interpreter, C++17 AOT generation, and Game SDK metadata.
+The Phase 1–24 compiler, runtime, Game SDK, deterministic gameplay, and native language/runtime roadmap is complete. Phase 18 replaced the former Phase 11–17 source-expansion profile with native compiler constructs; Phases 19–24 then completed the planned polymorphism, closure, generic/collection, coroutine, value/reference, convenience/pattern, and structured-error slices.
 
 ## Current Status
 
 RealScript should currently be described as:
 
-> A complete alpha reference implementation and game-engine integration baseline with a bounded C#-style gameplay-language profile, not a frozen production 1.0 language or CLR-compatible platform.
+> A complete Phase 24 alpha reference implementation of a native, strongly typed, deterministic C#-style game language and engine-integration baseline—not a frozen production 1.0 language, CLR-compatible platform, or .NET standard library.
 
 The implementation is suitable for:
 
@@ -91,6 +91,23 @@ The implementation is suitable for:
 - declaring-module-owned exact wrapper types and deterministic writeback;
 - current-core aliases for smaller/unsigned numeric names, `float`, and `char`.
 
+### Phase 18–24 — native language/runtime completion
+
+- Phase 18 moved all former expansion features into native syntax, binding,
+  Typed MIR, bytecode/AOT, source metadata, tooling, and hot reload.
+- Phase 19 added visibility, single inheritance, base construction, and runtime
+  virtual/interface values and dispatch.
+- Phase 20 added first-class delegates, precise heap closures, shared captures,
+  multicast, events, snapshots, and backend parity.
+- Phase 21 added generic inference/members/constraints/interfaces/delegates,
+  deterministic specialization, growable collections, and enumerators.
+- Phase 22 added explicit snapshot-safe deterministic coroutine state machines
+  with nested control flow, cancellation, child sequences, and results.
+- Phase 23 added exact-width values, checked/unchecked conversion, mutable
+  structs, ref locations, nullable values, and boxing/unboxing.
+- Phase 24 added inference/null/type convenience, initializers, flexible
+  arguments, patterns/switch expressions, and deterministic script exceptions.
+
 ## Validation Baseline
 
 The repository matrix covers:
@@ -105,9 +122,11 @@ The repository matrix covers:
 - Phase 11–17 single-file, cross-file, and cross-module execution;
 - module import/isolation, nested switch/loop behavior, fixed-collection enumeration, event lambdas, reference writeback, deterministic sequences, AOT generation, and Game SDK metadata retention.
 
-## Explicit Profile Boundaries
+## Historical Phase 11–17 Profile Boundaries
 
-Phase 11–17 is a bounded game-language profile. It does not implement full CLR/C# semantics:
+The following list describes the closed Phase 11–17 baseline only. Its language
+gaps were addressed by native Phase 18 and the Phase 19–24 roadmap; it must not
+be read as the current compatibility matrix.
 
 - interfaces are compile-time contracts, not runtime interface values or virtual dispatch;
 - delegates are not general first-class runtime objects;
@@ -131,11 +150,13 @@ The following remain draft:
 - GC and embedding ownership contracts;
 - cross-toolchain AOT module distribution.
 
-Projects integrating the alpha baseline should pin a specific revision and explicitly select the implemented gameplay-language profile.
+Projects integrating the alpha baseline should pin a specific revision and use
+the [current C#-style compatibility matrix](CSHARP_COMPATIBILITY_MATRIX.md).
 
 ## Recommended Next Stage
 
-The broad Phase 1–17 roadmap should now remain closed. The next work should be driven by integration into a real game engine:
+Phases 1–24 are closed. The next work should be driven by integration, hardening,
+profiling, and explicit RFCs rather than assuming unimplemented CLR semantics:
 
 1. embed `GameApi`, `GameScriptCompiler`, `SceneScriptRuntime`, and `GameplayHost`;
 2. expose a capability-limited host API;
@@ -150,15 +171,12 @@ The broad Phase 1–17 roadmap should now remain closed. The next work should be
 
 Future work may consider:
 
-- class inheritance and runtime interface/virtual dispatch;
-- first-class delegates and complete closure objects;
-- inferred/open generics, constraints, variance, and growable collections;
-- pattern matching and general enumerator protocols;
-- native coroutine state machines with persisted locals;
-- exact-width unsigned, binary32 `float`, and Unicode `char` identities;
-- complete reference lifetime semantics, exceptions, nullable values, and boxing;
-- precise source maps for generated expansion code;
-- `.rsbc` attribute metadata;
+- open runtime generics, variance, reflection, and `dynamic`;
+- additional relational/property/list/recursive pattern families;
+- ref-struct/Span-style escape analysis, unsafe pointers, and ref properties;
+- catch filters, `using`, native exception interop, and exception-aware
+  coroutine suspension;
+- operators, user-defined conversions, and broader library APIs;
 - rollback networking and replication protocols;
 - direct machine-code JIT, OSR, PGO, and cross-toolchain distribution.
 

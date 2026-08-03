@@ -60,24 +60,30 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
     result.moduleName = function.symbol.moduleName;
     result.name = function.symbol.ownerTypeName.empty() ? function.symbol.name
         : function.symbol.ownerTypeName + "." + function.symbol.name;
-    result.returnType = function.symbol.returnType;
+    result.returnType = semantic::storageReturnTypeOf(function.symbol);
     result.debugInfo.sourceName = function.symbol.sourceName;
     result.debugInfo.declaration.span = function.symbol.declarationSpan;
     result.debugInfo.body.span = function.body ? function.body->span : function.symbol.bodySpan;
-    result.returnTypeId = semantic::isExactType(function.symbol.returnType)
-        ? semantic::stableTypeId(function.symbol.returnTypeName) : 0;
+    result.returnTypeId = semantic::isExactType(result.returnType)
+        ? semantic::stableTypeId(
+            semantic::storageReturnTypeNameOf(function.symbol)) : 0;
     result.localTypes.assign(function.variableCount, semantic::PrimitiveType::Error);
     result.localTypeIds.assign(function.variableCount, 0);
 
     for (const auto& variable : function.variables) {
+        const auto storageType = semantic::storageTypeOf(variable);
+        const auto& storageTypeName = semantic::storageTypeNameOf(variable);
+        if (variable.index < result.localTypes.size()) {
+            result.localTypes[variable.index] = storageType;
+            result.localTypeIds[variable.index] =
+                semantic::isExactType(storageType)
+                    ? semantic::stableTypeId(storageTypeName)
+                    : 0;
+        }
         debug::LocalVariableInfo local;
         local.name = variable.name; local.slot = static_cast<std::uint32_t>(variable.index);
-        const auto debugType = variable.parameter
-            ? semantic::storageTypeOf(variable)
-            : variable.type;
-        const auto& debugTypeName = variable.parameter
-            ? semantic::storageTypeNameOf(variable)
-            : variable.typeName;
+        const auto debugType = storageType;
+        const auto& debugTypeName = storageTypeName;
         local.type = debugType;
         local.typeId = semantic::isExactType(debugType)
             ? semantic::stableTypeId(debugTypeName)
@@ -103,7 +109,11 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
                 : 0;
     }
 
-    currentFunction_ = &result; nextValueId_ = 0; breakTargets_.clear(); continueTargets_.clear();
+    currentFunction_ = &result; nextValueId_ = 0;
+    breakTargets_.clear(); continueTargets_.clear();
+    breakFinalizerDepths_.clear(); continueFinalizerDepths_.clear();
+    finalizers_.clear();
+    exceptionCleanupBlocks_.clear();
     collectLocalTypes(*function.body);
     const auto entry = createBlock(); setCurrentBlock(entry);
     for (std::size_t i = 0; i < function.symbol.parameters.size(); ++i) {
@@ -157,9 +167,13 @@ void Lowerer::collectLocalTypes(const semantic::BoundStatement& statement) {
         return;
     case semantic::BoundNodeKind::VariableDeclarationStatement: {
         const auto& value = static_cast<const semantic::BoundVariableDeclarationStatement&>(statement);
-        currentFunction_->localTypes.at(value.variable.index) = value.variable.type;
-        currentFunction_->localTypeIds.at(value.variable.index) = semantic::isExactType(value.variable.type)
-            ? semantic::stableTypeId(value.variable.typeName) : 0;
+        const auto storageType = semantic::storageTypeOf(value.variable);
+        const auto& storageTypeName =
+            semantic::storageTypeNameOf(value.variable);
+        currentFunction_->localTypes.at(value.variable.index) = storageType;
+        currentFunction_->localTypeIds.at(value.variable.index) =
+            semantic::isExactType(storageType)
+                ? semantic::stableTypeId(storageTypeName) : 0;
         return;
     }
     case semantic::BoundNodeKind::IfStatement: {
@@ -204,6 +218,20 @@ void Lowerer::collectLocalTypes(const semantic::BoundStatement& statement) {
         }
         return;
     }
+    case semantic::BoundNodeKind::TryStatement: {
+        const auto& value = static_cast<const
+            semantic::BoundTryStatement&>(statement);
+        collectLocalTypes(*value.body);
+        for (const auto& clause : value.catches) {
+            currentFunction_->localTypes.at(clause.exceptionVariable.index) =
+                semantic::PrimitiveType::Object;
+            currentFunction_->localTypeIds.at(clause.exceptionVariable.index) =
+                clause.typeId;
+            collectLocalTypes(*clause.body);
+        }
+        if (value.finallyBody) collectLocalTypes(*value.finallyBody);
+        return;
+    }
     default: return;
     }
 }
@@ -222,6 +250,19 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         const auto value = emitValue(Opcode::ConstantInt, semantic::PrimitiveType::Int, {}, span);
         block(*currentBlockId_).instructions.back().integerImmediate = immediate; return value;
     };
+    const auto emitFinalizersUntil = [&](std::size_t depth) {
+        if (finalizers_.size() > depth && hasCurrentBlock() &&
+            !currentBlockTerminated()) {
+            const auto cleanup = createBlock();
+            emitJump(cleanup, {}, statement.span);
+            setCurrentBlock(cleanup);
+            exceptionCleanupBlocks_.push_back(cleanup);
+        }
+        for (std::size_t index = finalizers_.size(); index > depth; --index) {
+            lowerStatement(*finalizers_[index - 1]);
+            if (!hasCurrentBlock() || currentBlockTerminated()) break;
+        }
+    };
 
     switch (statement.kind()) {
     case semantic::BoundNodeKind::BlockStatement:
@@ -231,19 +272,138 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         return;
     case semantic::BoundNodeKind::ReturnStatement: {
         const auto& value = static_cast<const semantic::BoundReturnStatement&>(statement);
-        emitReturn(value.expression ? std::optional<ValueId>{lowerExpression(*value.expression)} : std::nullopt, statement.span); return;
+        const auto returned = value.expression
+            ? std::optional<ValueId>{lowerExpression(*value.expression)}
+            : std::nullopt;
+        emitFinalizersUntil(0);
+        if (hasCurrentBlock() && !currentBlockTerminated()) {
+            emitReturn(returned, statement.span);
+        }
+        return;
     }
     case semantic::BoundNodeKind::BreakStatement:
         if (breakTargets_.empty()) throw std::logic_error("unbound break reached MIR lowering");
-        emitJump(breakTargets_.back(), {}, statement.span); return;
+        emitFinalizersUntil(breakFinalizerDepths_.back());
+        if (hasCurrentBlock() && !currentBlockTerminated()) {
+            emitJump(breakTargets_.back(), {}, statement.span);
+        }
+        return;
     case semantic::BoundNodeKind::ContinueStatement:
         if (continueTargets_.empty()) throw std::logic_error("unbound continue reached MIR lowering");
-        emitJump(continueTargets_.back(), {}, statement.span); return;
+        emitFinalizersUntil(continueFinalizerDepths_.back());
+        if (hasCurrentBlock() && !currentBlockTerminated()) {
+            emitJump(continueTargets_.back(), {}, statement.span);
+        }
+        return;
+    case semantic::BoundNodeKind::ThrowStatement: {
+        const auto& value = static_cast<const
+            semantic::BoundThrowStatement&>(statement);
+        emitThrow(lowerExpression(*value.expression), statement.span);
+        return;
+    }
+    case semantic::BoundNodeKind::TryStatement: {
+        const auto& value = static_cast<const
+            semantic::BoundTryStatement&>(statement);
+        const auto tryEntry = createBlock();
+        emitJump(tryEntry, {}, statement.span);
+        const auto tryStart = currentFunction_->blocks.size() - 1;
+        const auto tryCleanupStart = exceptionCleanupBlocks_.size();
+        setCurrentBlock(tryEntry);
+        if (value.finallyBody) finalizers_.push_back(value.finallyBody.get());
+        lowerStatement(*value.body);
+        if (value.finallyBody) finalizers_.pop_back();
+        std::vector<BlockId> tryBlocks;
+        for (std::size_t index = tryStart;
+             index < currentFunction_->blocks.size(); ++index) {
+            const auto id = currentFunction_->blocks[index].id;
+            if (std::find(exceptionCleanupBlocks_.begin() +
+                              static_cast<std::ptrdiff_t>(tryCleanupStart),
+                          exceptionCleanupBlocks_.end(), id) ==
+                exceptionCleanupBlocks_.end()) {
+                tryBlocks.push_back(id);
+            }
+        }
+        const auto afterBlock = createBlock();
+        bool afterReachable = false;
+        if (hasCurrentBlock() && !currentBlockTerminated()) {
+            if (value.finallyBody) lowerStatement(*value.finallyBody);
+            if (hasCurrentBlock() && !currentBlockTerminated()) {
+                emitJump(afterBlock, {}, statement.span);
+                afterReachable = true;
+            }
+        }
+
+        std::vector<std::vector<BlockId>> catchBlocks;
+        for (const auto& clause : value.catches) {
+            const auto handlerBlock = createBlock();
+            currentFunction_->exceptionHandlers.push_back(ExceptionHandler{
+                tryBlocks, handlerBlock, clause.typeId,
+                clause.exceptionVariable.index});
+            const auto catchStart = currentFunction_->blocks.size() - 1;
+            const auto catchCleanupStart = exceptionCleanupBlocks_.size();
+            setCurrentBlock(handlerBlock);
+            if (value.finallyBody) finalizers_.push_back(value.finallyBody.get());
+            lowerStatement(*clause.body);
+            if (value.finallyBody) finalizers_.pop_back();
+            std::vector<BlockId> protectedCatch;
+            for (std::size_t index = catchStart;
+                 index < currentFunction_->blocks.size(); ++index) {
+                const auto id = currentFunction_->blocks[index].id;
+                if (std::find(exceptionCleanupBlocks_.begin() +
+                                  static_cast<std::ptrdiff_t>(catchCleanupStart),
+                              exceptionCleanupBlocks_.end(), id) ==
+                    exceptionCleanupBlocks_.end()) {
+                    protectedCatch.push_back(id);
+                }
+            }
+            catchBlocks.push_back(std::move(protectedCatch));
+            if (hasCurrentBlock() && !currentBlockTerminated()) {
+                if (value.finallyBody) lowerStatement(*value.finallyBody);
+                if (hasCurrentBlock() && !currentBlockTerminated()) {
+                    emitJump(afterBlock, {}, clause.span);
+                    afterReachable = true;
+                }
+            }
+        }
+        if (value.finallyBody && value.finallyExceptionVariable) {
+            const auto exceptionalFinally = createBlock();
+            currentFunction_->exceptionHandlers.push_back(ExceptionHandler{
+                tryBlocks, exceptionalFinally, 0,
+                value.finallyExceptionVariable->index});
+            for (const auto& protectedCatch : catchBlocks) {
+                currentFunction_->exceptionHandlers.push_back(ExceptionHandler{
+                    protectedCatch, exceptionalFinally, 0,
+                    value.finallyExceptionVariable->index});
+            }
+            setCurrentBlock(exceptionalFinally);
+            lowerStatement(*value.finallyBody);
+            if (hasCurrentBlock() && !currentBlockTerminated()) {
+                emitThrow(
+                    emitLoadLocal(
+                        *value.finallyExceptionVariable, statement.span),
+                    statement.span);
+            }
+        }
+        if (afterReachable) {
+            setCurrentBlock(afterBlock);
+        } else {
+            clearCurrentBlock();
+            currentFunction_->blocks.erase(
+                std::remove_if(
+                    currentFunction_->blocks.begin(),
+                    currentFunction_->blocks.end(),
+                    [&](const auto& candidate) {
+                        return candidate.id == afterBlock;
+                    }),
+                currentFunction_->blocks.end());
+        }
+        return;
+    }
     case semantic::BoundNodeKind::EventSubscriptionStatement: {
         const auto& subscription = static_cast<const
             semantic::BoundEventSubscriptionStatement&>(statement);
-        const auto receiver = lowerExpression(*subscription.receiver);
-        const auto checked = emitValue(
+        auto receiver = lowerExpression(*subscription.receiver);
+        receiver = emitValue(
             Opcode::CheckNotNull,
             semantic::PrimitiveType::Object,
             {receiver},
@@ -253,19 +413,34 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         check.resultTypeId = subscription.ownerType.id;
         check.symbolName = semantic::canonicalTypeName(
             subscription.ownerType);
-        const auto enabled = emitValue(
-            Opcode::ConstantBool,
-            semantic::PrimitiveType::Bool,
-            {},
-            statement.span);
-        block(*currentBlockId_).instructions.back().boolImmediate =
-            subscription.enabled;
+        const auto current = emitValue(
+            Opcode::LoadField,
+            semantic::PrimitiveType::Object,
+            {receiver}, statement.span);
+        auto& load = block(*currentBlockId_).instructions.back();
+        load.typeId = subscription.ownerType.id;
+        load.fieldIndex = subscription.event.storageField.index;
+        load.resultTypeId = subscription.delegateType.id;
+        load.symbolName = semantic::canonicalTypeName(
+            subscription.ownerType);
+        const auto handler = lowerExpression(*subscription.handler);
+        const auto combined = emitValue(
+            subscription.adding
+                ? Opcode::CombineDelegate
+                : Opcode::RemoveDelegate,
+            semantic::PrimitiveType::Object,
+            {current, handler}, statement.span);
+        auto& combine = block(*currentBlockId_).instructions.back();
+        combine.typeId = subscription.delegateType.id;
+        combine.resultTypeId = subscription.delegateType.id;
+        combine.symbolName = semantic::canonicalTypeName(
+            subscription.delegateType);
         Instruction store;
         store.resultType = semantic::PrimitiveType::Void;
         store.opcode = Opcode::StoreField;
-        store.operands = {checked, enabled};
+        store.operands = {receiver, combined};
         store.typeId = subscription.ownerType.id;
-        store.fieldIndex = subscription.enabledField.index;
+        store.fieldIndex = subscription.event.storageField.index;
         store.symbolName = semantic::canonicalTypeName(
             subscription.ownerType);
         store.sourceSpan = statement.span;
@@ -276,10 +451,38 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
     case semantic::BoundNodeKind::VariableDeclarationStatement: {
         const auto& value = static_cast<const semantic::BoundVariableDeclarationStatement&>(statement);
         if (value.initializer) {
-            emitStoreLocal(
-                value.variable.index,
-                lowerExpression(*value.initializer),
-                statement.span);
+            const auto initializer = lowerExpression(*value.initializer);
+            if (semantic::storageTypeOf(value.variable) !=
+                    value.variable.type &&
+                value.variable.modifier ==
+                    semantic::ParameterModifier::None) {
+                const auto cell = emitValue(
+                    Opcode::NewObject,
+                    semantic::PrimitiveType::Object,
+                    {}, statement.span);
+                auto& allocation =
+                    block(*currentBlockId_).instructions.back();
+                allocation.typeId = semantic::stableTypeId(
+                    semantic::storageTypeNameOf(value.variable));
+                allocation.resultTypeId = allocation.typeId;
+                allocation.symbolName =
+                    semantic::storageTypeNameOf(value.variable);
+                Instruction storeValue;
+                storeValue.resultType = semantic::PrimitiveType::Void;
+                storeValue.opcode = Opcode::StoreField;
+                storeValue.operands = {cell, initializer};
+                storeValue.typeId = allocation.typeId;
+                storeValue.fieldIndex = 0;
+                storeValue.symbolName = allocation.symbolName;
+                storeValue.sourceSpan = statement.span;
+                block(*currentBlockId_).instructions.push_back(
+                    std::move(storeValue));
+                emitStoreLocal(
+                    value.variable.index, cell, statement.span);
+            } else {
+                emitStoreLocal(
+                    value.variable.index, initializer, statement.span);
+            }
         }
         return;
     }
@@ -330,12 +533,12 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 {},
                 value.condition->span);
         }
-        if (exitBlock) breakTargets_.push_back(*exitBlock);
-        continueTargets_.push_back(conditionBlock);
+        if (exitBlock) { breakTargets_.push_back(*exitBlock); breakFinalizerDepths_.push_back(finalizers_.size()); }
+        continueTargets_.push_back(conditionBlock); continueFinalizerDepths_.push_back(finalizers_.size());
         setCurrentBlock(bodyBlock);
         lowerStatement(*value.body);
-        continueTargets_.pop_back();
-        if (exitBlock) breakTargets_.pop_back();
+        continueTargets_.pop_back(); continueFinalizerDepths_.pop_back();
+        if (exitBlock) { breakTargets_.pop_back(); breakFinalizerDepths_.pop_back(); }
         if (hasCurrentBlock() && !currentBlockTerminated()) {
             emitJump(conditionBlock, {}, value.body->span);
         }
@@ -371,8 +574,8 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 {},
                 value.condition->span);
         }
-        if (exitBlock) breakTargets_.push_back(*exitBlock);
-        continueTargets_.push_back(incrementBlock);
+        if (exitBlock) { breakTargets_.push_back(*exitBlock); breakFinalizerDepths_.push_back(finalizers_.size()); }
+        continueTargets_.push_back(incrementBlock); continueFinalizerDepths_.push_back(finalizers_.size());
         setCurrentBlock(bodyBlock);
         lowerStatement(*value.body);
         if (hasCurrentBlock() && !currentBlockTerminated()) {
@@ -388,8 +591,8 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 {},
                 value.increment ? value.increment->span : statement.span);
         }
-        continueTargets_.pop_back();
-        if (exitBlock) breakTargets_.pop_back();
+        continueTargets_.pop_back(); continueFinalizerDepths_.pop_back();
+        if (exitBlock) { breakTargets_.pop_back(); breakFinalizerDepths_.pop_back(); }
         if (exitBlock) setCurrentBlock(*exitBlock);
         else clearCurrentBlock();
         return;
@@ -400,22 +603,32 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         emitStoreLocal(value.indexVariable.index, emitInt(0, statement.span), statement.span);
         const auto conditionBlock = createBlock(), bodyBlock = createBlock(), incrementBlock = createBlock(), exitBlock = createBlock();
         emitJump(conditionBlock, {}, statement.span); setCurrentBlock(conditionBlock);
-        const auto index = emitLoadLocal(value.indexVariable, statement.span);
-        const auto count = lowerExpression(*value.count);
-        const auto condition = emitValue(Opcode::LessInt, semantic::PrimitiveType::Bool, {index, count}, statement.span);
+        ValueId condition = 0;
+        if (value.usesEnumerator) {
+            condition = lowerExpression(*value.count);
+        } else {
+            const auto index = emitLoadLocal(value.indexVariable, statement.span);
+            const auto count = lowerExpression(*value.count);
+            condition = emitValue(Opcode::LessInt, semantic::PrimitiveType::Bool,
+                {index, count}, statement.span);
+        }
         emitBranch(condition, bodyBlock, exitBlock, {}, {}, statement.span);
-        breakTargets_.push_back(exitBlock); continueTargets_.push_back(incrementBlock);
+        breakTargets_.push_back(exitBlock); breakFinalizerDepths_.push_back(finalizers_.size());
+        continueTargets_.push_back(incrementBlock); continueFinalizerDepths_.push_back(finalizers_.size());
         setCurrentBlock(bodyBlock);
         emitStoreLocal(value.iterationVariable.index, lowerExpression(*value.element), value.iterationVariable.declarationSpan);
         lowerStatement(*value.body);
         if (hasCurrentBlock() && !currentBlockTerminated()) emitJump(incrementBlock, {}, value.body->span);
         setCurrentBlock(incrementBlock);
-        const auto currentIndex = emitLoadLocal(value.indexVariable, statement.span);
-        const auto nextIndex = emitValue(Opcode::AddInt, semantic::PrimitiveType::Int,
-            {currentIndex, emitInt(1, statement.span)}, statement.span);
-        emitStoreLocal(value.indexVariable.index, nextIndex, statement.span);
+        if (!value.usesEnumerator) {
+            const auto currentIndex = emitLoadLocal(value.indexVariable, statement.span);
+            const auto nextIndex = emitValue(Opcode::AddInt, semantic::PrimitiveType::Int,
+                {currentIndex, emitInt(1, statement.span)}, statement.span);
+            emitStoreLocal(value.indexVariable.index, nextIndex, statement.span);
+        }
         emitJump(conditionBlock, {}, statement.span);
-        continueTargets_.pop_back(); breakTargets_.pop_back(); setCurrentBlock(exitBlock); return;
+        continueTargets_.pop_back(); continueFinalizerDepths_.pop_back();
+        breakTargets_.pop_back(); breakFinalizerDepths_.pop_back(); setCurrentBlock(exitBlock); return;
     }
     case semantic::BoundNodeKind::DoWhileStatement: {
         const auto& value =
@@ -429,8 +642,8 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
             ? std::optional<BlockId>{createBlock()}
             : std::nullopt;
         emitJump(bodyBlock, {}, statement.span);
-        if (exitBlock) breakTargets_.push_back(*exitBlock);
-        continueTargets_.push_back(conditionBlock);
+        if (exitBlock) { breakTargets_.push_back(*exitBlock); breakFinalizerDepths_.push_back(finalizers_.size()); }
+        continueTargets_.push_back(conditionBlock); continueFinalizerDepths_.push_back(finalizers_.size());
         setCurrentBlock(bodyBlock);
         lowerStatement(*value.body);
         if (hasCurrentBlock() && !currentBlockTerminated()) {
@@ -449,8 +662,8 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 {},
                 value.condition->span);
         }
-        continueTargets_.pop_back();
-        if (exitBlock) breakTargets_.pop_back();
+        continueTargets_.pop_back(); continueFinalizerDepths_.pop_back();
+        if (exitBlock) { breakTargets_.pop_back(); breakFinalizerDepths_.pop_back(); }
         if (exitBlock) setCurrentBlock(*exitBlock);
         else clearCurrentBlock();
         return;
@@ -462,35 +675,107 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
             lowerExpression(*value.expression),
             value.expression->span);
         const auto exitBlock = createBlock();
+        bool exitReachable = false;
         std::vector<BlockId> sectionBlocks; sectionBlocks.reserve(value.sections.size());
         std::optional<std::size_t> defaultIndex;
         for (std::size_t i = 0; i < value.sections.size(); ++i) {
-            sectionBlocks.push_back(createBlock()); if (!value.sections[i].label) defaultIndex = i;
+            sectionBlocks.push_back(createBlock());
+            if (!value.sections[i].label &&
+                value.sections[i].patternType ==
+                    semantic::PrimitiveType::Error) {
+                defaultIndex = i;
+            }
         }
         for (std::size_t i = 0; i < value.sections.size(); ++i) {
-            if (!value.sections[i].label) continue;
+            const auto& section = value.sections[i];
+            if (!section.label &&
+                section.patternType == semantic::PrimitiveType::Error) continue;
             const auto nextCheck = createBlock();
             const auto switchValue =
                 emitLoadLocal(value.valueVariable, value.expression->span);
-            const auto caseValue = lowerExpression(*value.sections[i].label);
-            const auto equal = emitValue(
-                Opcode::Equal,
-                semantic::PrimitiveType::Bool,
-                {switchValue, caseValue},
-                value.sections[i].span);
-            emitBranch(equal, sectionBlocks[i], nextCheck, {}, {}, value.sections[i].span);
+            ValueId matched = -1;
+            if (section.patternType != semantic::PrimitiveType::Error) {
+                matched = emitValue(
+                    Opcode::IsType, semantic::PrimitiveType::Bool,
+                    {switchValue}, section.span);
+                auto& test = block(*currentBlockId_).instructions.back();
+                test.elementType = section.patternType;
+                test.elementTypeId = section.patternTypeId;
+                test.parameterTypes = {value.expression->type};
+                test.symbolName = section.patternTypeName;
+                if (section.patternVariable) {
+                    const auto cast = emitValue(
+                        Opcode::AsType, section.patternType,
+                        {switchValue}, section.span);
+                    auto& asType = block(*currentBlockId_).instructions.back();
+                    asType.elementType = section.patternType;
+                    asType.elementTypeId = section.patternTypeId;
+                    asType.parameterTypes = {value.expression->type};
+                    asType.resultTypeId = section.patternTypeId;
+                    asType.symbolName = section.patternTypeName;
+                    emitStoreLocal(
+                        section.patternVariable->index, cast, section.span);
+                }
+            } else {
+                const auto caseValue = lowerExpression(*section.label);
+                matched = emitValue(
+                    Opcode::Equal, semantic::PrimitiveType::Bool,
+                    {switchValue, caseValue}, section.span);
+            }
+            if (section.guard) {
+                const auto guardBlock = createBlock();
+                emitBranch(
+                    matched, guardBlock, nextCheck, {}, {}, section.span);
+                setCurrentBlock(guardBlock);
+                const auto guard = lowerExpression(*section.guard);
+                emitBranch(
+                    guard, sectionBlocks[i], nextCheck,
+                    {}, {}, section.span);
+            } else {
+                emitBranch(
+                    matched, sectionBlocks[i], nextCheck,
+                    {}, {}, section.span);
+            }
             setCurrentBlock(nextCheck);
         }
-        emitJump(defaultIndex ? sectionBlocks[*defaultIndex] : exitBlock, {}, statement.span);
-        breakTargets_.push_back(exitBlock);
+        if (defaultIndex && value.sections[*defaultIndex].guard) {
+            const auto& fallback = value.sections[*defaultIndex];
+            const auto guard = lowerExpression(*fallback.guard);
+            emitBranch(
+                guard, sectionBlocks[*defaultIndex], exitBlock,
+                {}, {}, fallback.span);
+            exitReachable = true;
+        } else {
+            emitJump(defaultIndex ? sectionBlocks[*defaultIndex] : exitBlock, {}, statement.span);
+            exitReachable = !defaultIndex.has_value();
+        }
+        breakTargets_.push_back(exitBlock); breakFinalizerDepths_.push_back(finalizers_.size());
         for (std::size_t i = 0; i < value.sections.size(); ++i) {
             setCurrentBlock(sectionBlocks[i]);
             for (const auto& child : value.sections[i].statements) {
+                exitReachable = exitReachable ||
+                    containsBreakForCurrentTarget(*child);
                 lowerStatement(*child); if (!hasCurrentBlock() || currentBlockTerminated()) break;
             }
-            if (hasCurrentBlock() && !currentBlockTerminated()) emitJump(exitBlock, {}, value.sections[i].span);
+            if (hasCurrentBlock() && !currentBlockTerminated()) {
+                emitJump(exitBlock, {}, value.sections[i].span);
+                exitReachable = true;
+            }
         }
-        breakTargets_.pop_back(); setCurrentBlock(exitBlock); return;
+        breakTargets_.pop_back(); breakFinalizerDepths_.pop_back();
+        if (exitReachable) setCurrentBlock(exitBlock);
+        else {
+            clearCurrentBlock();
+            currentFunction_->blocks.erase(
+                std::remove_if(
+                    currentFunction_->blocks.begin(),
+                    currentFunction_->blocks.end(),
+                    [&](const auto& candidate) {
+                        return candidate.id == exitBlock;
+                    }),
+                currentFunction_->blocks.end());
+        }
+        return;
     }
     default: throw std::logic_error("unsupported bound statement in MIR lowerer");
     }
