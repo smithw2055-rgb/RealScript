@@ -1787,13 +1787,70 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             }
         }
 
+        const auto findInterfaceType =
+            [&](semantic::SymbolId interfaceTypeId)
+                -> const semantic::TypeSymbol* {
+                for (const auto& [name, type] : module.visibleTypes) {
+                    (void)name;
+                    if (type.id == interfaceTypeId && type.interfaceType) {
+                        return &type;
+                    }
+                }
+                return nullptr;
+            };
+        const auto findInterfaceContract =
+            [&](semantic::SymbolId interfaceTypeId)
+                -> const InterfaceContract* {
+                for (const auto& [name, contract] :
+                     module.visibleInterfaces) {
+                    (void)name;
+                    if (semantic::stableTypeId(canonicalInterfaceName(
+                            contract.moduleName, contract.name)) ==
+                        interfaceTypeId) {
+                        return &contract;
+                    }
+                }
+                return nullptr;
+            };
         const auto validateInterfaces = [&](auto const& declarations) {
-            for (const auto& typeSyntax : declarations) {
-                auto* owner = findOwnType(module, typeSyntax.identifierToken.text);
+            for (const auto& declaration : declarations) {
+                const auto& typeSyntax = declarationReference(declaration);
+                auto* owner = findOwnType(
+                    module, typeSyntax.identifierToken.text);
                 if (!owner) continue;
                 LanguageInterfaceImplementation implementation;
-                implementation.typeName = semantic::canonicalTypeName(*owner);
+                implementation.typeName =
+                    semantic::canonicalTypeName(*owner);
                 std::unordered_set<std::string> implementedNames;
+                std::map<
+                    semantic::SymbolId,
+                    std::pair<
+                        const InterfaceContract*,
+                        const semantic::TypeSymbol*>>
+                    runtimeContracts;
+
+                const auto inheritRuntimeContracts =
+                    [&](const semantic::TypeSymbol& source) {
+                        for (const auto& inherited :
+                             source.interfaceDispatchMaps) {
+                            const auto* contract = findInterfaceContract(
+                                inherited.interfaceTypeId);
+                            const auto* descriptor = findInterfaceType(
+                                inherited.interfaceTypeId);
+                            if (contract && descriptor) {
+                                runtimeContracts[
+                                    inherited.interfaceTypeId] = {
+                                    contract, descriptor};
+                            }
+                        }
+                    };
+                inheritRuntimeContracts(*owner);
+                if (!owner->baseTypeName.empty()) {
+                    const auto* base = phase19GlobalType(
+                        modules, owner->baseTypeName);
+                    if (base) inheritRuntimeContracts(*base);
+                }
+
                 for (std::size_t interfaceIndex = 0;
                      interfaceIndex < typeSyntax.interfaces.size();
                      ++interfaceIndex) {
@@ -1822,9 +1879,33 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         module.invalid = true;
                         continue;
                     }
-                    const auto canonicalName = canonicalInterfaceName(
-                        found->second.moduleName,
-                        found->second.name);
+
+                    const auto interfaceTypeId =
+                        semantic::stableTypeId(canonicalInterfaceName(
+                            found->second.moduleName, found->second.name));
+                    const auto* descriptor =
+                        findInterfaceType(interfaceTypeId);
+                    if (!descriptor) {
+                        result.diagnostics.report(
+                            "RS2531",
+                            "interface type descriptor '" +
+                                canonicalInterfaceName(
+                                    found->second.moduleName,
+                                    found->second.name) +
+                                "' is unavailable",
+                            interfaceSyntax.span(),
+                            diagnostics::DiagnosticSeverity::Error,
+                            owner->sourceName);
+                        module.invalid = true;
+                        continue;
+                    }
+                    runtimeContracts[interfaceTypeId] = {
+                        &found->second, descriptor};
+
+                    const auto canonicalName =
+                        canonicalInterfaceName(
+                            found->second.moduleName,
+                            found->second.name);
                     if (!implementedNames.insert(canonicalName).second) {
                         result.diagnostics.report(
                             "RS2474",
@@ -1837,8 +1918,23 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         continue;
                     }
                     implementation.interfaces.push_back(canonicalName);
-                    for (const auto& required : found->second.methods) {
-                        bool matched = false;
+                }
+
+                std::vector<semantic::InterfaceDispatchMap> dispatchMaps;
+                for (const auto& [interfaceTypeId, runtimeContract] :
+                     runtimeContracts) {
+                    const auto& contract = *runtimeContract.first;
+                    const auto& descriptor = *runtimeContract.second;
+                    semantic::InterfaceDispatchMap dispatchMap;
+                    dispatchMap.interfaceTypeId = interfaceTypeId;
+                    dispatchMap.slots.assign(
+                        descriptor.methods.size(), 0);
+
+                    for (std::size_t requiredIndex = 0;
+                         requiredIndex < contract.methods.size();
+                         ++requiredIndex) {
+                        const auto& required = contract.methods[requiredIndex];
+                        const semantic::FunctionSymbol* matched = nullptr;
                         for (const auto& candidate : owner->methods) {
                             if (candidate.staticMethod ||
                                 candidate.name != required.name) {
@@ -1861,32 +1957,72 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                                  compatible &&
                                  parameter < required.parameters.size();
                                  ++parameter) {
-                                const auto& actual = candidate.parameters[
-                                    parameter + parameterOffset];
+                                const auto& actual =
+                                    candidate.parameters[
+                                        parameter + parameterOffset];
                                 compatible = sameInterfaceType(
                                     required.parameters[parameter],
                                     actual.type,
                                     actual.typeName);
                             }
                             if (compatible) {
-                                matched = true;
+                                matched = &candidate;
                                 break;
                             }
                         }
-                        if (!matched) {
+
+                        const auto canonicalName = canonicalInterfaceName(
+                            contract.moduleName, contract.name);
+                        if (!matched ||
+                            (matched->abstractMethod &&
+                             !owner->abstractType)) {
                             result.diagnostics.report(
                                 "RS2475",
                                 "type '" + implementation.typeName +
                                     "' does not implement interface method '" +
                                     canonicalName + "." +
-                                    interfaceMethodSignature(required) + "'",
+                                    interfaceMethodSignature(required) +
+                                    "'",
                                 typeSyntax.identifierToken.span,
                                 diagnostics::DiagnosticSeverity::Error,
                                 owner->sourceName);
                             module.invalid = true;
+                            continue;
+                        }
+
+                            if (owner->kind ==
+                                semantic::TypeKind::Class &&
+                                requiredIndex < descriptor.methods.size()) {
+                            const auto slot =
+                                descriptor.methods[requiredIndex]
+                                    .interfaceSlot;
+                            if (slot >= dispatchMap.slots.size()) {
+                                result.diagnostics.report(
+                                    "RS2532",
+                                    "interface method slot is invalid for '" +
+                                        canonicalName + "'",
+                                    typeSyntax.identifierToken.span,
+                                    diagnostics::DiagnosticSeverity::Error,
+                                    owner->sourceName);
+                                module.invalid = true;
+                            } else {
+                                dispatchMap.slots[slot] = matched->abstractMethod
+                                    ? 0
+                                    : matched->id;
+                            }
                         }
                     }
+
+                    // Struct interface conformance remains compile-time-only
+                    // until Phase 23 introduces boxing.
+                    if (owner->kind == semantic::TypeKind::Class) {
+                        dispatchMaps.push_back(std::move(dispatchMap));
+                    }
                 }
+                if (owner->kind == semantic::TypeKind::Class) {
+                    owner->interfaceDispatchMaps = std::move(dispatchMaps);
+                }
+
                 if (!implementation.interfaces.empty()) {
                     std::sort(
                         implementation.interfaces.begin(),
@@ -1896,10 +2032,46 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 }
             }
         };
+        std::vector<const syntax::ClassDeclarationSyntax*>
+            classDeclarations;
+        std::vector<const syntax::StructDeclarationSyntax*>
+            structDeclarations;
         for (const auto* unit : module.units) {
-            validateInterfaces(unit->syntaxTree->classes);
-            validateInterfaces(unit->syntaxTree->structs);
+            for (const auto& declaration :
+                 unit->syntaxTree->classes) {
+                classDeclarations.push_back(&declaration);
+            }
+            for (const auto& declaration :
+                 unit->syntaxTree->structs) {
+                structDeclarations.push_back(&declaration);
+            }
         }
+        const auto classDepth =
+            [&](const syntax::ClassDeclarationSyntax* declaration) {
+                const auto* owner = findOwnType(
+                    module, declaration->identifierToken.text);
+                std::size_t depth = 0;
+                std::unordered_set<semantic::SymbolId> visited;
+                auto current = owner ? owner->baseTypeName : std::string{};
+                while (!current.empty()) {
+                    const auto* base = phase19GlobalType(modules, current);
+                    if (!base || !visited.insert(base->id).second) {
+                        break;
+                    }
+                    ++depth;
+                    current = base->baseTypeName;
+                }
+                return depth;
+            };
+        std::stable_sort(
+            classDeclarations.begin(),
+            classDeclarations.end(),
+            [&](const auto* left, const auto* right) {
+                return classDepth(left) < classDepth(right);
+            });
+        validateInterfaces(classDeclarations);
+        validateInterfaces(structDeclarations);
+        refreshVisibleTypes(modules, module);
 
         std::vector<std::string> signatures;
         signatures.reserve(
