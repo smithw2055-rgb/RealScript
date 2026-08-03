@@ -16,13 +16,13 @@ jobs:
       - name: Pack source tree
         run: >-
           tar --exclude=.git --exclude=build --exclude=phase19-build
-          -czf realscript-phase19-source.tar.gz .
+          -czf /tmp/realscript-phase19-source.tar.gz .
 
       - name: Upload source tree
         uses: actions/upload-artifact@v4
         with:
           name: realscript-phase19-source
-          path: realscript-phase19-source.tar.gz
+          path: /tmp/realscript-phase19-source.tar.gz
           if-no-files-found: error
 
   build-and-test:
