@@ -320,7 +320,37 @@ std::string canonicalInput(
         return left->name < right->name;
     });
     std::string value = options.programName + "\n" + options.cppNamespace + "\n";
-    for (const auto* module : ordered) value += mir::printModule(*module);
+    for (const auto* module : ordered) {
+        value += mir::printModule(*module);
+        for (const auto& attribute : module->languageMetadata.attributes) {
+            value += "attribute:" + attribute.target + ":" + attribute.name + ":" +
+                attribute.sourceName + ":" + std::to_string(attribute.offset) + "(";
+            for (const auto& argument : attribute.arguments) {
+                value += argument.name + "=" + argument.value + ";";
+            }
+            value += ")\n";
+        }
+        for (const auto& implementation : module->languageMetadata.interfaces) {
+            value += "interface:" + implementation.typeName + ":";
+            for (const auto& name : implementation.interfaces) value += name + ";";
+            value += "\n";
+        }
+        for (const auto& instantiation :
+             module->languageMetadata.genericInstantiations) {
+            value += "generic:" + instantiation.genericName + ":" +
+                instantiation.generatedName + ":";
+            for (const auto& argument : instantiation.arguments) {
+                value += argument + ";";
+            }
+            value += "\n";
+        }
+        for (const auto& sequence : module->languageMetadata.sequences) {
+            value += "sequence:" + sequence.typeName + ":" + sequence.name + ":" +
+                sequence.sourceName + ":" + std::to_string(sequence.offset) + ":";
+            for (const auto& callback : sequence.callbacks) value += callback + ";";
+            value += "\n";
+        }
+    }
     return value;
 }
 
@@ -1052,7 +1082,95 @@ GeneratedProgram CppGenerator::generate(
             << "\"}" << (index + 1 == functions.size() ? "" : ",") << '\n';
     }
     manifest << "  ],\n  \"typeCount\": " << types.size()
-        << ",\n  \"sourceMapCount\": " << sourceMap.size() << "\n}\n";
+        << ",\n  \"sourceMapCount\": " << sourceMap.size()
+        << ",\n  \"languageMetadata\": {\n";
+
+    manifest << "    \"attributes\": [";
+    bool firstMetadata = true;
+    for (const auto& module : modules) {
+        for (const auto& attribute : module.languageMetadata.attributes) {
+            if (!firstMetadata) manifest << ',';
+            firstMetadata = false;
+            manifest << "\n      {\"module\": \""
+                << jsonEscape(module.name) << "\", \"target\": \""
+                << jsonEscape(attribute.target) << "\", \"name\": \""
+                << jsonEscape(attribute.name) << "\", \"source\": \""
+                << jsonEscape(attribute.sourceName) << "\", \"offset\": "
+                << attribute.offset << ", \"arguments\": [";
+            for (std::size_t index = 0; index < attribute.arguments.size(); ++index) {
+                if (index != 0) manifest << ", ";
+                manifest << "{\"name\": \""
+                    << jsonEscape(attribute.arguments[index].name)
+                    << "\", \"value\": \""
+                    << jsonEscape(attribute.arguments[index].value) << "\"}";
+            }
+            manifest << "]}";
+        }
+    }
+    if (!firstMetadata) manifest << '\n';
+    manifest << "    ],\n    \"interfaces\": [";
+    firstMetadata = true;
+    for (const auto& module : modules) {
+        for (const auto& implementation : module.languageMetadata.interfaces) {
+            if (!firstMetadata) manifest << ',';
+            firstMetadata = false;
+            manifest << "\n      {\"module\": \""
+                << jsonEscape(module.name) << "\", \"type\": \""
+                << jsonEscape(implementation.typeName)
+                << "\", \"interfaces\": [";
+            for (std::size_t index = 0;
+                 index < implementation.interfaces.size(); ++index) {
+                if (index != 0) manifest << ", ";
+                manifest << '"' << jsonEscape(implementation.interfaces[index]) << '"';
+            }
+            manifest << "]}";
+        }
+    }
+    if (!firstMetadata) manifest << '\n';
+    manifest << "    ],\n    \"genericInstantiations\": [";
+    firstMetadata = true;
+    for (const auto& module : modules) {
+        for (const auto& instantiation :
+             module.languageMetadata.genericInstantiations) {
+            if (!firstMetadata) manifest << ',';
+            firstMetadata = false;
+            manifest << "\n      {\"module\": \""
+                << jsonEscape(module.name) << "\", \"generic\": \""
+                << jsonEscape(instantiation.genericName)
+                << "\", \"generated\": \""
+                << jsonEscape(instantiation.generatedName)
+                << "\", \"arguments\": [";
+            for (std::size_t index = 0;
+                 index < instantiation.arguments.size(); ++index) {
+                if (index != 0) manifest << ", ";
+                manifest << '"' << jsonEscape(instantiation.arguments[index]) << '"';
+            }
+            manifest << "]}";
+        }
+    }
+    if (!firstMetadata) manifest << '\n';
+    manifest << "    ],\n    \"sequences\": [";
+    firstMetadata = true;
+    for (const auto& module : modules) {
+        for (const auto& sequence : module.languageMetadata.sequences) {
+            if (!firstMetadata) manifest << ',';
+            firstMetadata = false;
+            manifest << "\n      {\"module\": \""
+                << jsonEscape(module.name) << "\", \"type\": \""
+                << jsonEscape(sequence.typeName) << "\", \"name\": \""
+                << jsonEscape(sequence.name) << "\", \"source\": \""
+                << jsonEscape(sequence.sourceName) << "\", \"offset\": "
+                << sequence.offset << ", \"callbacks\": [";
+            for (std::size_t index = 0;
+                 index < sequence.callbacks.size(); ++index) {
+                if (index != 0) manifest << ", ";
+                manifest << '"' << jsonEscape(sequence.callbacks[index]) << '"';
+            }
+            manifest << "]}";
+        }
+    }
+    if (!firstMetadata) manifest << '\n';
+    manifest << "    ]\n  }\n}\n";
     generated.manifest = manifest.str();
     return generated;
 }

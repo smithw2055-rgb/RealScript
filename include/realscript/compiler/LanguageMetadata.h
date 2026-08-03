@@ -38,4 +38,16 @@ struct LanguageSequenceRecord {
     std::size_t offset = 0;
 };
 
+struct LanguageModuleMetadata {
+    std::vector<LanguageAttributeRecord> attributes;
+    std::vector<LanguageInterfaceImplementation> interfaces;
+    std::vector<LanguageGenericInstantiation> genericInstantiations;
+    std::vector<LanguageSequenceRecord> sequences;
+
+    [[nodiscard]] bool empty() const noexcept {
+        return attributes.empty() && interfaces.empty() &&
+            genericInstantiations.empty() && sequences.empty();
+    }
+};
+
 } // namespace realscript::compiler

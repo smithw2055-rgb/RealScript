@@ -596,6 +596,85 @@ semantic::TypeSymbol* findOwnType(ModuleWork& module, const std::string& name) {
 
 
 
+LanguageModuleMetadata languageMetadataForModule(
+    const std::string& moduleName,
+    const mir::Module& module,
+    const BuildResult& result) {
+    LanguageModuleMetadata metadata;
+    const auto prefix = moduleName + "::";
+    for (const auto& attribute : result.nativeAttributes) {
+        if (attribute.target.rfind(prefix, 0) == 0) {
+            metadata.attributes.push_back(attribute);
+        }
+    }
+    for (const auto& implementation : result.nativeInterfaces) {
+        if (implementation.typeName.rfind(prefix, 0) == 0) {
+            metadata.interfaces.push_back(implementation);
+        }
+    }
+    for (const auto& sequence : result.nativeSequences) {
+        if (sequence.typeName.rfind(prefix, 0) == 0) {
+            metadata.sequences.push_back(sequence);
+        }
+    }
+    for (const auto& instantiation : result.nativeGenericInstantiations) {
+        bool emitted = false;
+        for (const auto& type : module.types) {
+            if (type.moduleName == moduleName &&
+                type.name == instantiation.generatedName) {
+                emitted = true;
+                break;
+            }
+        }
+        if (!emitted) {
+            for (const auto& function : module.functions) {
+                if (function.moduleName == moduleName &&
+                    function.name == instantiation.generatedName) {
+                    emitted = true;
+                    break;
+                }
+            }
+        }
+        if (emitted) metadata.genericInstantiations.push_back(instantiation);
+    }
+    std::stable_sort(
+        metadata.attributes.begin(), metadata.attributes.end(),
+        [](const auto& left, const auto& right) {
+            if (left.target != right.target) return left.target < right.target;
+            if (left.name != right.name) return left.name < right.name;
+            if (left.sourceName != right.sourceName) {
+                return left.sourceName < right.sourceName;
+            }
+            return left.offset < right.offset;
+        });
+    std::sort(
+        metadata.interfaces.begin(), metadata.interfaces.end(),
+        [](const auto& left, const auto& right) {
+            return left.typeName < right.typeName;
+        });
+    std::sort(
+        metadata.genericInstantiations.begin(),
+        metadata.genericInstantiations.end(),
+        [](const auto& left, const auto& right) {
+            if (left.generatedName != right.generatedName) {
+                return left.generatedName < right.generatedName;
+            }
+            if (left.genericName != right.genericName) {
+                return left.genericName < right.genericName;
+            }
+            return left.arguments < right.arguments;
+        });
+    std::stable_sort(
+        metadata.sequences.begin(), metadata.sequences.end(),
+        [](const auto& left, const auto& right) {
+            if (left.typeName != right.typeName) {
+                return left.typeName < right.typeName;
+            }
+            return left.name < right.name;
+        });
+    return metadata;
+}
+
 debug::SourceFileInfo makeSourceFileInfo(
     const text::SourceText& source,
     debug::SourceFileId id) {
@@ -2035,6 +2114,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             debug::finalizeFunctionDebugInfo(
                 function.debugInfo, mirModule.sourceFiles);
         }
+        mirModule.languageMetadata = languageMetadataForModule(
+            moduleName, mirModule, result);
         (void)mir::verifyModule(mirModule, moduleDiagnostics);
         result.diagnostics.append(moduleDiagnostics);
         if (!moduleDiagnostics.hasErrors()) {

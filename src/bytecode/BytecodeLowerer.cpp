@@ -116,6 +116,7 @@ std::string referenceKey(const mir::Instruction& instruction) {
 Module Lowerer::lower(const mir::Module& source) const {
     Module result;
     result.name = source.name;
+    result.languageMetadata = source.languageMetadata;
     result.sourceFiles = source.sourceFiles;
     result.types = source.types;
 

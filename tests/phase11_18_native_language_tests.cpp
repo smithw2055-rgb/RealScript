@@ -440,6 +440,78 @@ int main()
         "native MIR did not generate deterministic C++17 AOT source");
 }
 
+void testNativeMetadataArtifacts() {
+    const char* source = R"(
+module ArtifactMeta;
+
+interface IRead { int Read(); }
+
+[Serializable(version = 3)]
+class Box<T> : IRead
+{
+    T value;
+    Box(T initial) { value = initial; }
+    int Read() { return 1; }
+}
+
+T Identity<T>(T value) { return value; }
+
+int main()
+{
+    Box<int> value = new Box<int>(1);
+    return Identity<int>(value.Read());
+}
+)";
+
+    realscript::compiler::Compilation compilation({{"artifact_meta.rs", source}});
+    auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "metadata artifact source failed to compile:\n" +
+            diagnosticsText(build.diagnostics));
+    require(build.modules.size() == 1 &&
+            !build.modules.front().languageMetadata.attributes.empty() &&
+            !build.modules.front().languageMetadata.interfaces.empty() &&
+            build.modules.front().languageMetadata.genericInstantiations.size() >= 2,
+        "MIR module did not retain native language metadata");
+
+    realscript::bytecode::Lowerer lowerer;
+    const auto bytecode = lowerer.lower(build.modules.front());
+    require(bytecode.version.major == 0 && bytecode.version.minor == 6,
+        "native metadata did not advance the RSBC format to 0.6");
+    const auto bytes = realscript::bytecode::encodeModule(bytecode);
+    realscript::bytecode::Module decoded;
+    realscript::diagnostics::DiagnosticBag decodeDiagnostics;
+    require(realscript::bytecode::decodeModule(
+                bytes, decoded, decodeDiagnostics) &&
+            !decodeDiagnostics.hasErrors(),
+        "RSBC metadata round trip failed:\n" +
+            diagnosticsText(decodeDiagnostics));
+    require(decoded.languageMetadata.attributes.size() ==
+                bytecode.languageMetadata.attributes.size() &&
+            decoded.languageMetadata.interfaces.size() ==
+                bytecode.languageMetadata.interfaces.size() &&
+            decoded.languageMetadata.genericInstantiations.size() ==
+                bytecode.languageMetadata.genericInstantiations.size() &&
+            decoded.languageMetadata.attributes.front().name == "Serializable" &&
+            decoded.languageMetadata.genericInstantiations.front().generatedName.find("__int") !=
+                std::string::npos,
+        "decoded RSBC language metadata changed");
+
+    realscript::aot::CppGenerator generator;
+    realscript::aot::GenerationOptions options;
+    options.programName = "Phase18Metadata";
+    realscript::diagnostics::DiagnosticBag aotDiagnostics;
+    const auto generated = generator.generate(
+        build.modules, aotDiagnostics, options);
+    require(!aotDiagnostics.hasErrors() &&
+            generated.manifest.find("\"languageMetadata\"") !=
+                std::string::npos &&
+            generated.manifest.find("Serializable") != std::string::npos &&
+            generated.manifest.find("Box__int") != std::string::npos &&
+            generated.manifest.find("Identity__int") != std::string::npos,
+        "AOT manifest did not retain native language metadata");
+}
+
 void testPhase16DeterministicSequence() {
     realscript::game::GameApi api;
     auto host = std::make_shared<realscript::game::GameplayHost>(30, 5, 7);
@@ -529,6 +601,7 @@ int main() {
     run("cross-module imports and isolation", testCrossModuleImportsAndIsolation);
     run("native source metadata", testNativeMetadata);
     run("AOT generation from native source", testNativeAotGeneration);
+    run("native metadata artifacts", testNativeMetadataArtifacts);
     run("phase 16 deterministic sequence", testPhase16DeterministicSequence);
     return failures == 0 ? 0 : 1;
 }

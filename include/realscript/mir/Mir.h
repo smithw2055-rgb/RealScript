@@ -1,5 +1,6 @@
 #pragma once
 
+#include "realscript/compiler/LanguageMetadata.h"
 #include "realscript/debug/DebugInfo.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/semantic/Semantic.h"
@@ -147,6 +148,7 @@ struct Function {
 
 struct Module {
     std::string name;
+    compiler::LanguageModuleMetadata languageMetadata;
     std::vector<debug::SourceFileInfo> sourceFiles;
     std::vector<semantic::TypeSymbol> types;
     std::vector<Function> functions;
