@@ -622,11 +622,18 @@ ValueId Lowerer::emitValue(
         const auto functionName = currentFunction_
             ? currentFunction_->name
             : std::string{"<none>"};
+        const auto blockState = !hasCurrentBlock()
+            ? std::string{"none"}
+            : std::string{"bb"} + std::to_string(*currentBlockId_) +
+                ":" + terminatorName(
+                    block(*currentBlockId_).terminator.kind);
         throw std::logic_error(
             "cannot emit MIR value '" +
             std::string{opcodeName(opcode)} +
-            "' without an open block in function '" +
-            functionName + "'");
+            "' at span " + std::to_string(sourceSpan.start) +
+            ":" + std::to_string(sourceSpan.length) +
+            " with block " + blockState +
+            " in function '" + functionName + "'");
     }
 
     Instruction instruction;
