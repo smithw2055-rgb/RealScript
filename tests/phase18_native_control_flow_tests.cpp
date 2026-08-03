@@ -417,8 +417,7 @@ class Counter
     realscript::syntax::Parser parser(source, diagnostics);
     auto unit = parser.parseCompilationUnit();
     require(!diagnostics.hasErrors(),
-        "native event syntax failed to parse:
-" +
+        "native event syntax failed to parse:\n" +
             diagnosticsText(diagnostics));
     require(unit.delegates.size() == 1 &&
             unit.classes.size() == 1 &&
