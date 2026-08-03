@@ -49,12 +49,19 @@ Implemented and validated:
 - `LanguageExpansionOptions::structuredControlFlow` disabled by default;
 - all Phase 1–18A tests passing on Ubuntu and Windows with warnings as errors.
 
-### 18B — delegates, lambdas, and events — pending
+### 18B — delegates, lambdas, and events — complete for the bounded profile
 
-- Native delegate/event declarations.
-- Lambda syntax trees and closure analysis.
-- Method-group conversion and deterministic event ordering.
-- First migration may retain bounded captures, but the AST and symbols must be native.
+Implemented and validated:
+
+- native delegate and class-local event declarations;
+- native lambda syntax trees with original source spans;
+- exact method-group and lambda signature validation;
+- deterministic source-order subscription slots represented by compiler-owned fields;
+- field/`this`-capturing lambdas lowered to synthetic instance methods;
+- event invocation lowered through Typed MIR branches and ordinary calls;
+- synthetic slots and methods excluded from LSP/DAP user surfaces.
+
+First-class delegate values, arbitrary local captures, heap closures, and general event storage remain Phase 20 work.
 
 ### 18C — interface contracts and source attributes — complete
 
@@ -137,7 +144,9 @@ Reference member/indexer l-values, exact-width identities, checked/unchecked con
 - `LanguageExpansion.cpp` and all expansion `.inl` files are deleted;
 - native attributes, interfaces, generic instantiations, and sequences flow through `LanguageMetadata.h`;
 - Interpreter/AOT/JIT share the same native Syntax/Bound/MIR pipeline;
-- LSP/DAP/hot reload operate on original source constructs and stable compiler-owned synthetic symbols.
+- language metadata is module-scoped in MIR, persisted in `.rsbc` 0.6, and emitted in the AOT manifest;
+- LSP/DAP operate on original source constructs without exposing compiler-owned names;
+- hot reload rejects semantic language-metadata changes while permitting body-only edits.
 
 ## Phase 19 — runtime polymorphism
 
