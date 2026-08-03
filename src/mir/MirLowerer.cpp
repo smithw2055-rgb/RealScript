@@ -153,40 +153,8 @@ void Lowerer::collectLocalTypes(const semantic::BoundStatement& statement) {
         for (const auto& child : static_cast<const semantic::BoundBlockStatement&>(statement).statements)
             collectLocalTypes(*child);
         return;
-    case semantic::BoundNodeKind::EventSubscriptionStatement: {
-        const auto& subscription = static_cast<const
-            semantic::BoundEventSubscriptionStatement&>(statement);
-        const auto receiver = lowerExpression(*subscription.receiver);
-        const auto checked = emitValue(
-            Opcode::CheckNotNull,
-            semantic::PrimitiveType::Object,
-            {receiver},
-            statement.span);
-        auto& check = block(*currentBlockId_).instructions.back();
-        check.typeId = subscription.ownerType.id;
-        check.resultTypeId = subscription.ownerType.id;
-        check.symbolName = semantic::canonicalTypeName(
-            subscription.ownerType);
-        const auto enabled = emitValue(
-            Opcode::ConstantBool,
-            semantic::PrimitiveType::Bool,
-            {},
-            statement.span);
-        block(*currentBlockId_).instructions.back().boolImmediate =
-            subscription.enabled;
-        Instruction store;
-        store.resultType = semantic::PrimitiveType::Void;
-        store.opcode = Opcode::StoreField;
-        store.operands = {checked, enabled};
-        store.typeId = subscription.ownerType.id;
-        store.fieldIndex = subscription.enabledField.index;
-        store.symbolName = semantic::canonicalTypeName(
-            subscription.ownerType);
-        store.sourceSpan = statement.span;
-        block(*currentBlockId_).instructions.push_back(
-            std::move(store));
+    case semantic::BoundNodeKind::EventSubscriptionStatement:
         return;
-    }
     case semantic::BoundNodeKind::VariableDeclarationStatement: {
         const auto& value = static_cast<const semantic::BoundVariableDeclarationStatement&>(statement);
         currentFunction_->localTypes.at(value.variable.index) = value.variable.type;
@@ -271,6 +239,40 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
     case semantic::BoundNodeKind::ContinueStatement:
         if (continueTargets_.empty()) throw std::logic_error("unbound continue reached MIR lowering");
         emitJump(continueTargets_.back(), {}, statement.span); return;
+    case semantic::BoundNodeKind::EventSubscriptionStatement: {
+        const auto& subscription = static_cast<const
+            semantic::BoundEventSubscriptionStatement&>(statement);
+        const auto receiver = lowerExpression(*subscription.receiver);
+        const auto checked = emitValue(
+            Opcode::CheckNotNull,
+            semantic::PrimitiveType::Object,
+            {receiver},
+            statement.span);
+        auto& check = block(*currentBlockId_).instructions.back();
+        check.typeId = subscription.ownerType.id;
+        check.resultTypeId = subscription.ownerType.id;
+        check.symbolName = semantic::canonicalTypeName(
+            subscription.ownerType);
+        const auto enabled = emitValue(
+            Opcode::ConstantBool,
+            semantic::PrimitiveType::Bool,
+            {},
+            statement.span);
+        block(*currentBlockId_).instructions.back().boolImmediate =
+            subscription.enabled;
+        Instruction store;
+        store.resultType = semantic::PrimitiveType::Void;
+        store.opcode = Opcode::StoreField;
+        store.operands = {checked, enabled};
+        store.typeId = subscription.ownerType.id;
+        store.fieldIndex = subscription.enabledField.index;
+        store.symbolName = semantic::canonicalTypeName(
+            subscription.ownerType);
+        store.sourceSpan = statement.span;
+        block(*currentBlockId_).instructions.push_back(
+            std::move(store));
+        return;
+    }
     case semantic::BoundNodeKind::VariableDeclarationStatement: {
         const auto& value = static_cast<const semantic::BoundVariableDeclarationStatement&>(statement);
         if (value.initializer) {
