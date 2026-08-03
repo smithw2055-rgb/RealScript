@@ -4,6 +4,15 @@ Phase 19 builds on the fully native Phase 18 compiler pipeline. It introduces de
 
 Tracking issue: #34. Development branch: `agent/phase19-runtime-polymorphism`.
 
+## Implementation status
+
+- **19A frontend and inheritance model:** implemented.
+- **19B base access and inherited runtime layout:** implemented for base identity, base-first fields, inherited member lookup, derived-to-base assignability, and statically bound `base` method calls.
+- **19C virtual dispatch:** implemented for `virtual`, `override`, `abstract`, and `sealed override`; stable slots execute through the interpreter, generated C++ AOT, and Toolchain JIT.
+- **Remaining:** base-constructor execution and full visibility enforcement, interface-typed values and dispatch, `.rsbc` persistence, save-state/Game SDK closure, and final LSP/DAP/debugger coverage.
+
+The current virtual-dispatch profile keeps direct non-virtual and `base` calls statically bound. Dispatch metadata is present in semantic, MIR, in-memory bytecode, interpreter, AOT, JIT, verifier, printer, disassembler, content hashes, and hot-reload compatibility checks. Serialization into `.rsbc` remains part of 19E.
+
 ## Scope
 
 ### 19A — visibility and inheritance model
