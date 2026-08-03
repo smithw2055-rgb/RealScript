@@ -13,8 +13,11 @@ EXPECTED_SHA256 = "714bbe2cefae3fa4823bdecb7edb743d8854d93ea303d9016c9f792b6b5fe
 if len(PARTS) != 8:
     raise RuntimeError(f"expected 8 patch parts, found {len(PARTS)}")
 
-encoded = "".join(path.read_text(encoding="utf-8").strip() for path in PARTS)
-patch = base64.b64decode(encoded, validate=True)
+patch = b"".join(
+    base64.b64decode(
+        path.read_text(encoding="utf-8").strip(),
+        validate=True)
+    for path in PARTS)
 actual = hashlib.sha256(patch).hexdigest()
 if actual != EXPECTED_SHA256:
     raise RuntimeError(f"Phase 19 patch hash mismatch: {actual}")
