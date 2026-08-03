@@ -61,6 +61,13 @@ text::TextSpan TypeSyntax::span() const noexcept {
         : name.span;
 }
 
+text::TextSpan LambdaExpressionSyntax::span() const noexcept {
+    return combine(
+        openParenToken ? openParenToken->span
+                       : parameterTokens.front().span,
+        body->span());
+}
+
 text::TextSpan UnaryExpressionSyntax::span() const noexcept {
     return combine(operatorToken.span, operand->span());
 }
@@ -155,6 +162,10 @@ text::TextSpan YieldWaitStatementSyntax::span() const noexcept {
     return combine(yieldKeyword.span, semicolonToken.span);
 }
 
+text::TextSpan EventSubscriptionStatementSyntax::span() const noexcept {
+    return combine(eventNameToken.span, semicolonToken.span);
+}
+
 text::TextSpan VariableDeclarationStatementSyntax::span() const noexcept {
     return combine(type.span(), semicolonToken.span);
 }
@@ -176,6 +187,12 @@ text::TextSpan ParameterSyntax::span() const noexcept {
 text::TextSpan FieldDeclarationSyntax::span() const noexcept {
     return combine(
         declarationStart(attributes, type.span()),
+        semicolonToken.span);
+}
+
+text::TextSpan EventDeclarationSyntax::span() const noexcept {
+    return combine(
+        declarationStart(attributes, eventKeyword.span),
         semicolonToken.span);
 }
 
@@ -245,6 +262,12 @@ std::string ModuleDeclarationSyntax::fullName() const {
     return joinQualifiedName(nameParts);
 }
 
+text::TextSpan DelegateDeclarationSyntax::span() const noexcept {
+    return combine(
+        declarationStart(attributes, delegateKeyword.span),
+        semicolonToken.span);
+}
+
 text::TextSpan SequenceDeclarationSyntax::span() const noexcept {
     return combine(
         declarationStart(attributes, sequenceKeyword.span),
@@ -281,6 +304,9 @@ text::TextSpan CompilationUnitSyntax::span() const noexcept {
     }
     if (!interfaces.empty()) {
         return combine(interfaces.front().span(), endOfFileToken.span);
+    }
+    if (!delegates.empty()) {
+        return combine(delegates.front().span(), endOfFileToken.span);
     }
     if (!functions.empty()) {
         return combine(functions.front().span(), endOfFileToken.span);

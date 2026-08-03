@@ -397,6 +397,49 @@ void testAliasesBypassExpansion() {
         "native value aliases still used source expansion");
 }
 
+void testNativeEventSyntax() {
+    realscript::text::SourceText source(R"(
+module Phase18.Events;
+delegate void ChangedHandler(int amount);
+class Counter
+{
+    event ChangedHandler Changed;
+    int total;
+    void Run()
+    {
+        Changed += OnChanged;
+        Changed += amount => total = total + amount;
+    }
+    void OnChanged(int amount) { total = total + amount; }
+}
+)", "event-syntax.rs");
+    realscript::diagnostics::DiagnosticBag diagnostics;
+    realscript::syntax::Parser parser(source, diagnostics);
+    auto unit = parser.parseCompilationUnit();
+    require(!diagnostics.hasErrors(),
+        "native event syntax failed to parse:
+" +
+            diagnosticsText(diagnostics));
+    require(unit.delegates.size() == 1 &&
+            unit.classes.size() == 1 &&
+            unit.classes.front().events.size() == 1,
+        "native delegate or event declaration was not retained");
+    const auto& statements =
+        unit.classes.front().methods.front().body.statements;
+    require(statements.size() == 2 &&
+            statements[0]->kind() ==
+                realscript::syntax::SyntaxKind::EventSubscriptionStatement &&
+            statements[1]->kind() ==
+                realscript::syntax::SyntaxKind::EventSubscriptionStatement,
+        "native event subscription statements were not retained");
+    const auto& subscription = static_cast<const
+        realscript::syntax::EventSubscriptionStatementSyntax&>(
+            *statements[1]);
+    require(subscription.handler->kind() ==
+            realscript::syntax::SyntaxKind::LambdaExpression,
+        "native event lambda was not retained");
+}
+
 void testNativeSequenceDiagnostics() {
     realscript::compiler::Compilation compilation({{"bad-sequence.rs", R"(
 module Phase18.SequenceBad;
@@ -469,6 +512,7 @@ int main() {
     run("references bypass expansion", testReferencesBypassExpansion);
     run("native value aliases", testNativeValueAliases);
     run("aliases bypass expansion", testAliasesBypassExpansion);
+    run("native event syntax", testNativeEventSyntax);
     run("native sequence diagnostics", testNativeSequenceDiagnostics);
     run("yield outside sequence diagnostics", testYieldOutsideSequenceDiagnostics);
     return failures == 0 ? 0 : 1;

@@ -13,7 +13,10 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(FloatLiteralToken);
         RS_KIND(StringLiteralToken);
         RS_KIND(PlusToken);
+        RS_KIND(PlusEqualsToken);
         RS_KIND(MinusToken);
+        RS_KIND(MinusEqualsToken);
+        RS_KIND(ArrowToken);
         RS_KIND(StarToken);
         RS_KIND(SlashToken);
         RS_KIND(PercentToken);
@@ -60,6 +63,8 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(StructKeyword);
         RS_KIND(EnumKeyword);
         RS_KIND(InterfaceKeyword);
+        RS_KIND(DelegateKeyword);
+        RS_KIND(EventKeyword);
         RS_KIND(StaticKeyword);
         RS_KIND(GetKeyword);
         RS_KIND(SetKeyword);
@@ -92,6 +97,8 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(EnumDeclaration);
         RS_KIND(InterfaceDeclaration);
         RS_KIND(InterfaceMethodDeclaration);
+        RS_KIND(DelegateDeclaration);
+        RS_KIND(EventDeclaration);
         RS_KIND(EnumMemberDeclaration);
         RS_KIND(FieldDeclaration);
         RS_KIND(ConstructorDeclaration);
@@ -114,10 +121,12 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(SwitchSection);
         RS_KIND(SwitchStatement);
         RS_KIND(YieldWaitStatement);
+        RS_KIND(EventSubscriptionStatement);
         RS_KIND(VariableDeclarationStatement);
         RS_KIND(ExpressionStatement);
         RS_KIND(LiteralExpression);
         RS_KIND(NameExpression);
+        RS_KIND(LambdaExpression);
         RS_KIND(UnaryExpression);
         RS_KIND(BinaryExpression);
         RS_KIND(AssignmentExpression);
@@ -161,6 +170,8 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"struct", SyntaxKind::StructKeyword},
         {"enum", SyntaxKind::EnumKeyword},
         {"interface", SyntaxKind::InterfaceKeyword},
+        {"delegate", SyntaxKind::DelegateKeyword},
+        {"event", SyntaxKind::EventKeyword},
         {"static", SyntaxKind::StaticKeyword},
         {"get", SyntaxKind::GetKeyword},
         {"set", SyntaxKind::SetKeyword},
