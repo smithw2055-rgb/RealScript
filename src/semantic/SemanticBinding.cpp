@@ -1011,6 +1011,9 @@ std::unique_ptr<BoundExpression> Binder::bindExpression(
     case syntax::SyntaxKind::ThisExpression:
         return bindThisExpression(
             static_cast<const syntax::ThisExpressionSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::BaseExpression:
+        return bindBaseExpression(
+            static_cast<const syntax::BaseExpressionSyntax&>(syntaxTree));
     case syntax::SyntaxKind::UnaryExpression:
         return bindUnaryExpression(
             static_cast<const syntax::UnaryExpressionSyntax&>(syntaxTree));

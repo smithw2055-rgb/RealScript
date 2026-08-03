@@ -169,6 +169,21 @@ const TypeDescriptor* ExecutionContext::findType(
     return found == types_.end() ? nullptr : found->second;
 }
 
+bool ExecutionContext::isAssignable(
+    semantic::SymbolId actual,
+    semantic::SymbolId expected) const noexcept {
+    if (actual == expected) return true;
+    std::unordered_set<semantic::SymbolId> visited;
+    auto current = actual;
+    while (current != 0 && visited.insert(current).second) {
+        const auto* type = findType(current);
+        if (!type) return false;
+        if (type->baseTypeId == expected) return true;
+        current = type->baseTypeId;
+    }
+    return false;
+}
+
 const FunctionDescriptor* ExecutionContext::findFunction(
     semantic::SymbolId symbolId) const {
     const auto found = functions_.find(symbolId);
@@ -270,7 +285,7 @@ bool ExecutionContext::expectSignatureType(
         const auto actual = reference && heap_
             ? heap_->objectTypeId(*reference)
             : std::optional<semantic::SymbolId>{};
-        if (!actual || *actual != typeId) {
+        if (!actual || !isAssignable(*actual, typeId)) {
             return fail(
                 runtime::ErrorCode::TypeMismatch,
                 std::string(context) + " has the wrong runtime object type");

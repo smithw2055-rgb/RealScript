@@ -110,6 +110,10 @@ bool populateFields(
         }
         FieldSymbol field;
         field.name = fieldSyntax.identifierToken.text;
+        field.accessibility = accessibilityFromModifiers(
+            fieldSyntax.modifiers);
+        field.declaringTypeId = type.id;
+        field.declaringTypeName = canonicalTypeName(type);
         field.type = resolved.type;
         field.typeName = resolved.name;
         field.index = type.fields.size();
@@ -175,6 +179,53 @@ void appendSyntaxParameters(
 }
 
 } // namespace
+
+bool hasModifier(
+    const std::vector<syntax::SyntaxToken>& modifiers,
+    syntax::SyntaxKind kind) noexcept {
+    for (const auto& modifier : modifiers) {
+        if (modifier.kind == kind) return true;
+    }
+    return false;
+}
+
+Accessibility accessibilityFromModifiers(
+    const std::vector<syntax::SyntaxToken>& modifiers,
+    Accessibility fallback) noexcept {
+    if (hasModifier(modifiers, syntax::SyntaxKind::PrivateKeyword)) {
+        return Accessibility::Private;
+    }
+    if (hasModifier(modifiers, syntax::SyntaxKind::ProtectedKeyword)) {
+        return Accessibility::Protected;
+    }
+    if (hasModifier(modifiers, syntax::SyntaxKind::InternalKeyword)) {
+        return Accessibility::Internal;
+    }
+    if (hasModifier(modifiers, syntax::SyntaxKind::PublicKeyword)) {
+        return Accessibility::Public;
+    }
+    return fallback;
+}
+
+bool isAssignable(
+    const TypeSymbolMap& visibleTypes,
+    const std::string& sourceTypeName,
+    const std::string& targetTypeName) noexcept {
+    if (sourceTypeName.empty() || targetTypeName.empty()) return false;
+    if (sourceTypeName == targetTypeName) return true;
+    auto currentName = sourceTypeName;
+    std::unordered_set<SymbolId> visited;
+    while (!currentName.empty()) {
+        const auto found = visibleTypes.find(currentName);
+        if (found == visibleTypes.end() ||
+            !visited.insert(found->second.id).second) {
+            return false;
+        }
+        if (found->second.baseTypeName == targetTypeName) return true;
+        currentName = found->second.baseTypeName;
+    }
+    return false;
+}
 
 const char* primitiveTypeName(PrimitiveType type) noexcept {
     switch (type) {
@@ -337,6 +388,11 @@ TypeSymbol declareTypeShell(
     const syntax::ClassDeclarationSyntax& syntaxTree) {
     TypeSymbol result;
     result.kind = TypeKind::Class;
+    result.accessibility = accessibilityFromModifiers(syntaxTree.modifiers);
+    result.abstractType = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::AbstractKeyword);
+    result.sealedType = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::SealedKeyword);
     result.moduleName = moduleName;
     result.name = syntaxTree.identifierToken.text;
     result.id = stableTypeId(result);
@@ -349,6 +405,8 @@ TypeSymbol declareTypeShell(
     const syntax::StructDeclarationSyntax& syntaxTree) {
     TypeSymbol result;
     result.kind = TypeKind::Struct;
+    result.accessibility = accessibilityFromModifiers(syntaxTree.modifiers);
+    result.sealedType = true;
     result.moduleName = moduleName;
     result.name = syntaxTree.identifierToken.text;
     result.id = stableTypeId(result);
@@ -361,6 +419,8 @@ TypeSymbol declareTypeShell(
     const syntax::EnumDeclarationSyntax& syntaxTree) {
     TypeSymbol result;
     result.kind = TypeKind::Enum;
+    result.accessibility = accessibilityFromModifiers(syntaxTree.modifiers);
+    result.sealedType = true;
     result.moduleName = moduleName;
     result.name = syntaxTree.identifierToken.text;
     result.id = stableTypeId(result);
@@ -467,7 +527,19 @@ FunctionSymbol declareFunctionSymbol(
     result.name = syntaxTree.identifierToken.text;
     result.method = owner != nullptr;
     result.staticMethod = syntaxTree.staticKeyword.has_value();
+    result.accessibility = accessibilityFromModifiers(
+        syntaxTree.modifiers);
+    result.virtualMethod = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::VirtualKeyword);
+    result.overrideMethod = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::OverrideKeyword);
+    result.abstractMethod = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::AbstractKeyword);
+    result.sealedMethod = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::SealedKeyword);
     if (owner) {
+        result.declaringTypeId = owner->id;
+        result.declaringTypeName = canonicalTypeName(*owner);
         result.ownerTypeName = owner->name;
         result.ownerTypeId = owner->id;
         appendImplicitThis(result, *owner);
@@ -481,7 +553,9 @@ FunctionSymbol declareFunctionSymbol(
     appendSyntaxParameters(result, syntaxTree.parameters, visibleTypes, diagnostics);
     result.id = stableFunctionId(result);
     result.declarationSpan = syntaxTree.identifierToken.span;
-    result.bodySpan = syntaxTree.body.span();
+    result.bodySpan = syntaxTree.semicolonToken
+        ? syntaxTree.semicolonToken->span
+        : syntaxTree.body.span();
     for (auto& parameter : result.parameters) {
         parameter.id = fnv1a(std::to_string(result.id) + "::local:" +
             std::to_string(parameter.index) + ":" + parameter.name);
@@ -508,6 +582,10 @@ FunctionSymbol declareConstructorSymbol(
         : std::string{};
     result.method = true;
     result.constructor = true;
+    result.accessibility = accessibilityFromModifiers(
+        syntaxTree.modifiers);
+    result.declaringTypeId = owner.id;
+    result.declaringTypeName = canonicalTypeName(owner);
     appendImplicitThis(result, owner);
     appendSyntaxParameters(result, syntaxTree.parameters, visibleTypes, diagnostics);
     result.id = stableFunctionId(result);
@@ -528,6 +606,10 @@ PropertySymbol declarePropertySymbol(
     diagnostics::DiagnosticBag& diagnostics) {
     PropertySymbol result;
     result.name = syntaxTree.identifierToken.text;
+    result.accessibility = accessibilityFromModifiers(
+        syntaxTree.modifiers);
+    result.declaringTypeId = owner.id;
+    result.declaringTypeName = canonicalTypeName(owner);
     result.declarationSpan = syntaxTree.identifierToken.span;
     result.id = fnv1a(canonicalTypeName(owner) + "::property:" + result.name);
     result.staticProperty = syntaxTree.staticKeyword.has_value();

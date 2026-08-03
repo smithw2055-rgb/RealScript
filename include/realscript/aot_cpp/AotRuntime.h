@@ -41,6 +41,7 @@ struct EnumMemberDescriptor {
 struct TypeDescriptor {
     semantic::SymbolId id = 0;
     semantic::TypeKind kind = semantic::TypeKind::Class;
+    semantic::SymbolId baseTypeId = 0;
     const char* moduleName = nullptr;
     const char* name = nullptr;
     const FieldDescriptor* fields = nullptr;
@@ -278,6 +279,9 @@ private:
     [[nodiscard]] const TypeDescriptor* findType(semantic::SymbolId typeId) const;
     [[nodiscard]] const FunctionDescriptor* findFunction(
         semantic::SymbolId symbolId) const;
+    [[nodiscard]] bool isAssignable(
+        semantic::SymbolId actual,
+        semantic::SymbolId expected) const noexcept;
     void emitTrace(runtime::TraceEventKind kind, std::string operation = {});
 
     const ProgramDescriptor* program_ = nullptr;

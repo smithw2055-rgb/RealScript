@@ -83,6 +83,24 @@ bool validTypeIdentity(
         : typeId == 0;
 }
 
+bool descriptorAssignable(
+    semantic::SymbolId actual,
+    semantic::SymbolId expected,
+    const std::unordered_map<
+        semantic::SymbolId,
+        const semantic::TypeSymbol*>& descriptors) noexcept {
+    if (actual == expected) return true;
+    std::unordered_set<semantic::SymbolId> visited;
+    auto current = actual;
+    while (current != 0 && visited.insert(current).second) {
+        const auto found = descriptors.find(current);
+        if (found == descriptors.end()) return false;
+        if (found->second->baseTypeId == expected) return true;
+        current = found->second->baseTypeId;
+    }
+    return false;
+}
+
 semantic::TypeKind expectedTypeKind(semantic::PrimitiveType type) noexcept {
     switch (type) {
     case semantic::PrimitiveType::Object: return semantic::TypeKind::Class;
@@ -1022,8 +1040,10 @@ bool verifyModule(
                         instruction.operands.size() != 1 ||
                         registerType(instruction.operands.front()) !=
                             semantic::PrimitiveType::Object ||
-                        registerTypeId(instruction.operands.front()) !=
-                            module.types[instruction.typeIndex].id ||
+                        !descriptorAssignable(
+                            registerTypeId(instruction.operands.front()),
+                            module.types[instruction.typeIndex].id,
+                            typeDescriptors) ||
                         resultType != semantic::PrimitiveType::Object ||
                         registerTypeId(instruction.result) !=
                             module.types[instruction.typeIndex].id) {

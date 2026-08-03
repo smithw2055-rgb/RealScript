@@ -50,6 +50,8 @@ bool sameField(const semantic::FieldSymbol& left, const semantic::FieldSymbol& r
 
 bool sameType(const semantic::TypeSymbol& left, const semantic::TypeSymbol& right) {
     if (left.id != right.id || left.kind != right.kind ||
+        left.baseTypeId != right.baseTypeId ||
+        left.baseTypeName != right.baseTypeName ||
         left.moduleName != right.moduleName || left.name != right.name ||
         left.fields.size() != right.fields.size() ||
         left.enumMembers.size() != right.enumMembers.size()) return false;

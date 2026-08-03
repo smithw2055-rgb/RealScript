@@ -140,6 +140,8 @@ std::string attributeValueText(
         : std::string(source.view(span));
 }
 
+#include "Phase19Inheritance.inl"
+
 void appendNativeAttributes(
     std::vector<LanguageAttributeRecord>& output,
     const std::vector<syntax::AttributeListSyntax>& lists,
@@ -879,6 +881,11 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         (void)name;
         refreshVisibleInterfaces(modules, module);
     }
+    resolvePhase19Inheritance(modules, result);
+    for (auto& [name, module] : modules) {
+        (void)name;
+        refreshVisibleTypes(modules, module);
+    }
 
     // Resolve native delegate contracts after all named type shells exist.
     for (auto& [moduleName, module] : modules) {
@@ -958,10 +965,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             }
         }
     }
-    for (auto& [name, module] : modules) {
-        (void)name;
-        refreshVisibleTypes(modules, module);
-    }
+    applyPhase19FieldLayouts(modules, result);
 
     // Declare free functions, methods, constructors and properties.
     for (auto& moduleEntry : modules) {
@@ -1002,6 +1006,15 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         continue;
                     }
                     auto owner = *ownerPointer;
+                    if (!owner.baseTypeName.empty()) {
+                        const auto* base = phase19GlobalType(
+                            modules, owner.baseTypeName);
+                        if (base) {
+                            owner.methods = base->methods;
+                            owner.properties = base->properties;
+                            owner.events = base->events;
+                        }
+                    }
                     std::unordered_set<std::string> fieldNames;
                     std::unordered_set<std::string> methodNames;
                     std::unordered_set<std::string> propertyNames;
@@ -1766,7 +1779,21 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 LanguageInterfaceImplementation implementation;
                 implementation.typeName = semantic::canonicalTypeName(*owner);
                 std::unordered_set<std::string> implementedNames;
-                for (const auto& interfaceSyntax : typeSyntax.interfaces) {
+                for (std::size_t interfaceIndex = 0;
+                     interfaceIndex < typeSyntax.interfaces.size();
+                     ++interfaceIndex) {
+                    const auto& interfaceSyntax =
+                        typeSyntax.interfaces[interfaceIndex];
+                    if (interfaceIndex == 0 &&
+                        !owner->baseTypeName.empty()) {
+                        const auto candidate = module.visibleTypes.find(
+                            interfaceSyntax.name.text);
+                        if (candidate != module.visibleTypes.end() &&
+                            semantic::canonicalTypeName(candidate->second) ==
+                                owner->baseTypeName) {
+                            continue;
+                        }
+                    }
                     const auto found =
                         module.visibleInterfaces.find(interfaceSyntax.name.text);
                     if (found == module.visibleInterfaces.end()) {

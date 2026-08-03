@@ -570,7 +570,8 @@ GeneratedProgram CppGenerator::generate(
             (void)id;
             const auto& type = *view.type;
             source.line("    {0x" + hexId(type.id) + "ULL, " +
-                typeKindExpression(type.kind) + ", \"" +
+                typeKindExpression(type.kind) + ", 0x" +
+                hexId(type.baseTypeId) + "ULL, \"" +
                 escapeCppString(type.moduleName) + "\", \"" +
                 escapeCppString(type.name) + "\", " +
                 (type.fields.empty() ? "nullptr" : view.cppName + "_fields") +

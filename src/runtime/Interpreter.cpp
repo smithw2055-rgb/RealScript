@@ -7,6 +7,7 @@
 #include <cmath>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace realscript::runtime {
@@ -24,6 +25,7 @@ struct State {
     RuntimeError error;
     std::vector<std::string> stack;
     const std::unordered_map<semantic::SymbolId, FunctionLocation>* functions = nullptr;
+    const std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*>* types = nullptr;
     const ExternalFunction* externalResolver = nullptr;
     const BindingRegistry* bindings = nullptr;
     const TraceSink* trace = nullptr;
@@ -152,6 +154,23 @@ semantic::SymbolId exactTypeId(
         : 0;
 }
 
+bool runtimeAssignable(
+    const State& state,
+    semantic::SymbolId actual,
+    semantic::SymbolId expected) {
+    if (actual == expected) return true;
+    if (!state.types) return false;
+    std::unordered_set<semantic::SymbolId> visited;
+    auto current = actual;
+    while (current != 0 && visited.insert(current).second) {
+        const auto found = state.types->find(current);
+        if (found == state.types->end()) return false;
+        if (found->second->baseTypeId == expected) return true;
+        current = found->second->baseTypeId;
+    }
+    return false;
+}
+
 bool expectObject(
     State& state,
     const Value& value,
@@ -173,7 +192,7 @@ bool expectObject(
             context + " contains an invalid managed object reference");
     }
     const auto actual = state.heap->objectTypeId(*reference);
-    if (!actual || *actual != type.id) {
+    if (!actual || !runtimeAssignable(state, *actual, type.id)) {
         return fail(state, ErrorCode::TypeMismatch,
             context + " expected object '" + semantic::canonicalTypeName(type) + "'");
     }
@@ -193,7 +212,7 @@ bool expectSignatureType(
         const auto actual = reference && state.heap
             ? state.heap->objectTypeId(*reference)
             : std::optional<semantic::SymbolId>{};
-        if (!actual || *actual != typeId) {
+        if (!actual || !runtimeAssignable(state, *actual, typeId)) {
             return fail(state, ErrorCode::TypeMismatch,
                 context + " has the wrong runtime object type");
         }
@@ -1247,6 +1266,7 @@ ExecutionResult Interpreter::invoke(
     const std::vector<Value>& arguments,
     ExecutionOptions options) const {
     std::unordered_map<semantic::SymbolId, FunctionLocation> functions;
+    std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> types;
     for (const auto& module : modules_) {
         diagnostics::DiagnosticBag diagnostics;
         if (!bytecode::verifyModule(module, diagnostics)) {
@@ -1254,6 +1274,9 @@ ExecutionResult Interpreter::invoke(
             invalid.error.code = ErrorCode::InvalidProgram;
             invalid.error.message = "bytecode verification failed before execution";
             return invalid;
+        }
+        for (const auto& type : module.types) {
+            types.emplace(type.id, &type);
         }
         for (const auto& function : module.functions) {
             if (!functions.emplace(function.symbolId, FunctionLocation{&module, &function}).second) {
@@ -1274,6 +1297,7 @@ ExecutionResult Interpreter::invoke(
     State state;
     state.limits = options.limits;
     state.functions = &functions;
+    state.types = &types;
     state.externalResolver = &externalResolver_;
     state.bindings = bindings_.get();
     state.trace = &options.trace;

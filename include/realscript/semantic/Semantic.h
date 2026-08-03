@@ -38,6 +38,13 @@ enum class TypeKind {
     Enum,
 };
 
+enum class Accessibility {
+    Public,
+    Internal,
+    Protected,
+    Private,
+};
+
 [[nodiscard]] const char* primitiveTypeName(PrimitiveType type) noexcept;
 [[nodiscard]] PrimitiveType resolvePrimitiveType(const std::string& name) noexcept;
 [[nodiscard]] bool isNumericType(PrimitiveType type) noexcept;
@@ -105,6 +112,9 @@ struct VariableSymbol {
 
 struct FieldSymbol {
     std::string name;
+    Accessibility accessibility = Accessibility::Public;
+    SymbolId declaringTypeId = 0;
+    std::string declaringTypeName;
     PrimitiveType type = PrimitiveType::Error;
     std::string typeName;
     std::size_t index = 0;
@@ -116,6 +126,14 @@ struct FieldSymbol {
 
 struct FunctionSymbol {
     SymbolId id = 0;
+    Accessibility accessibility = Accessibility::Public;
+    SymbolId declaringTypeId = 0;
+    std::string declaringTypeName;
+    bool virtualMethod = false;
+    bool overrideMethod = false;
+    bool abstractMethod = false;
+    bool sealedMethod = false;
+    std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
     std::string moduleName;
     std::string name;
     std::string ownerTypeName;
@@ -147,6 +165,9 @@ struct EventSubscriptionSymbol {
 
 struct EventSymbol {
     SymbolId id = 0;
+    Accessibility accessibility = Accessibility::Public;
+    SymbolId declaringTypeId = 0;
+    std::string declaringTypeName;
     std::string name;
     std::string delegateName;
     std::vector<VariableSymbol> parameters;
@@ -158,6 +179,9 @@ struct EventSymbol {
 
 struct PropertySymbol {
     std::string name;
+    Accessibility accessibility = Accessibility::Public;
+    SymbolId declaringTypeId = 0;
+    std::string declaringTypeName;
     PrimitiveType type = PrimitiveType::Error;
     std::string typeName;
     bool staticProperty = false;
@@ -180,7 +204,12 @@ struct EnumMemberSymbol {
 struct TypeSymbol {
     SymbolId id = 0;
     TypeKind kind = TypeKind::Class;
+    Accessibility accessibility = Accessibility::Public;
     bool synthetic = false;
+    bool abstractType = false;
+    bool sealedType = false;
+    SymbolId baseTypeId = 0;
+    std::string baseTypeName;
     std::string moduleName;
     std::string name;
     std::vector<FieldSymbol> fields;
@@ -218,6 +247,16 @@ using TypeSymbolMap = std::unordered_map<std::string, TypeSymbol>;
 using FunctionOverloadMap =
     std::unordered_map<std::string, std::vector<FunctionSymbol>>;
 
+[[nodiscard]] bool hasModifier(
+    const std::vector<syntax::SyntaxToken>& modifiers,
+    syntax::SyntaxKind kind) noexcept;
+[[nodiscard]] Accessibility accessibilityFromModifiers(
+    const std::vector<syntax::SyntaxToken>& modifiers,
+    Accessibility fallback = Accessibility::Public) noexcept;
+[[nodiscard]] bool isAssignable(
+    const TypeSymbolMap& visibleTypes,
+    const std::string& sourceTypeName,
+    const std::string& targetTypeName) noexcept;
 [[nodiscard]] std::string canonicalTypeName(const TypeSymbol& type);
 [[nodiscard]] SymbolId stableTypeId(const TypeSymbol& type);
 [[nodiscard]] SymbolId stableTypeId(const std::string& canonicalName);
@@ -748,6 +787,8 @@ private:
         const syntax::NameExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindThisExpression(
         const syntax::ThisExpressionSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundExpression> bindBaseExpression(
+        const syntax::BaseExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindUnaryExpression(
         const syntax::UnaryExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindBinaryExpression(

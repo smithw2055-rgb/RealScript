@@ -10,11 +10,14 @@ namespace {
 bool sameExactType(
     const BoundExpression& expression,
     PrimitiveType targetType,
-    const std::string& targetTypeName) {
+    const std::string& targetTypeName,
+    const TypeSymbolMap& visibleTypes) {
     if (expression.type != targetType) return false;
     if (!isExactType(targetType)) return true;
     return targetTypeName.empty() || expression.typeName.empty() ||
-        expression.typeName == targetTypeName;
+        expression.typeName == targetTypeName ||
+        (targetType == PrimitiveType::Object &&
+         isAssignable(visibleTypes, expression.typeName, targetTypeName));
 }
 
 const FieldSymbol* findField(const TypeSymbol& type, const std::string& name) {
@@ -99,14 +102,17 @@ std::size_t visibleParameterOffset(const FunctionSymbol& function) noexcept {
 
 bool exactParameterMatch(
     const BoundExpression& expression,
-    const VariableSymbol& parameter) {
-    return sameExactType(expression, parameter.type, parameter.typeName);
+    const VariableSymbol& parameter,
+    const TypeSymbolMap& visibleTypes) {
+    return sameExactType(
+        expression, parameter.type, parameter.typeName, visibleTypes);
 }
 
 const FunctionSymbol* selectBest(
     const std::vector<const FunctionSymbol*>& candidates,
     const std::vector<std::unique_ptr<BoundExpression>>& arguments,
     const std::vector<std::optional<syntax::SyntaxToken>>* modifiers,
+    const TypeSymbolMap& visibleTypes,
     bool& ambiguous) {
     const FunctionSymbol* best = nullptr;
     int bestScore = std::numeric_limits<int>::max();
@@ -132,13 +138,13 @@ const FunctionSymbol* selectBest(
                     arguments[i]->type, parameter.type);
                 if (rank < 0 ||
                     (arguments[i]->type == parameter.type &&
-                     !exactParameterMatch(*arguments[i], parameter))) {
+                     !exactParameterMatch(*arguments[i], parameter, visibleTypes))) {
                     applicable = false;
                     break;
                 }
                 score += rank;
             } else if (!exactParameterMatch(
-                           *arguments[i], parameter)) {
+                           *arguments[i], parameter, visibleTypes)) {
                 applicable = false;
                 break;
             }
@@ -202,6 +208,34 @@ std::unique_ptr<BoundExpression> Binder::bindThisExpression(
         return makeError(syntaxTree.span());
     }
     return variableExpression(*variable, syntaxTree.span());
+}
+
+std::unique_ptr<BoundExpression> Binder::bindBaseExpression(
+    const syntax::BaseExpressionSyntax& syntaxTree) {
+    const auto* variable = lookupVariable("this");
+    if (!variable || currentStaticMethod_ || !currentOwnerType_ ||
+        currentOwnerType_->baseTypeName.empty()) {
+        diagnostics_.report(
+            "RS2504",
+            "'base' is not available in this context",
+            syntaxTree.span());
+        return makeError(syntaxTree.span());
+    }
+    const auto found = visibleTypes_.find(
+        currentOwnerType_->baseTypeName);
+    if (found == visibleTypes_.end()) {
+        diagnostics_.report(
+            "RS2505", "base type descriptor is unavailable",
+            syntaxTree.span());
+        return makeError(syntaxTree.span());
+    }
+    auto result = std::make_unique<BoundConversionExpression>();
+    result->span = syntaxTree.span();
+    result->type = PrimitiveType::Object;
+    result->typeName = currentOwnerType_->baseTypeName;
+    result->conversion = ConversionKind::Identity;
+    result->expression = variableExpression(*variable, syntaxTree.span());
+    return result;
 }
 
 std::unique_ptr<BoundExpression> Binder::bindNameExpression(
@@ -766,8 +800,7 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
     const auto* best = selectBest(
         candidates,
         arguments,
-        &syntaxTree.argumentModifiers,
-        ambiguous);
+        &syntaxTree.argumentModifiers, visibleTypes_, ambiguous);
     if (!best) {
         diagnostics_.report(
             "RS2107",
@@ -856,8 +889,7 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
     const auto* best = selectBest(
         methods,
         arguments,
-        &syntaxTree.argumentModifiers,
-        ambiguous);
+        &syntaxTree.argumentModifiers, visibleTypes_, ambiguous);
     if (!best) {
         diagnostics_.report(
             "RS2472",
@@ -899,7 +931,7 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
     for (const auto& ctor : found->second.constructors) constructors.push_back(&ctor);
     bool ambiguous = false;
     const FunctionSymbol* best = nullptr;
-    if (!constructors.empty() || !arguments.empty()) best = selectBest(constructors, arguments, nullptr, ambiguous);
+    if (!constructors.empty() || !arguments.empty()) best = selectBest(constructors, arguments, nullptr, visibleTypes_, ambiguous);
     const bool implicitStructDefault =
         found->second.kind == TypeKind::Struct && arguments.empty() && !best;
     if ((!arguments.empty() || !constructors.empty()) && !best &&
@@ -1295,7 +1327,8 @@ std::unique_ptr<BoundExpression> Binder::convertExpression(
     if (expression->type == PrimitiveType::Error || target == PrimitiveType::Error) return expression;
 
     if (isExactType(target) && expression->type == target &&
-        !sameExactType(*expression, target, targetTypeName)) {
+        !sameExactType(
+            *expression, target, targetTypeName, visibleTypes_)) {
         diagnostics_.report(
             "RS2410",
             "cannot convert exact type '" + expression->typeName +
