@@ -6,39 +6,7 @@ on:
       - main
   pull_request:
 
-permissions:
-  contents: write
-
 jobs:
-  phase18-generic-syntax:
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.actor != 'github-actions[bot]' &&
-      github.head_ref == 'agent/native-language-and-runtime-evolution'
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout PR head
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref }}
-          fetch-depth: 0
-
-      - name: Apply native generic syntax
-        run: python tools/ci/apply_phase18_generic_syntax.py
-
-      - name: Commit native generic syntax
-        run: |
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No native generic syntax changes"
-          else
-            git commit -m "Implement native Phase 18 generic syntax"
-            git push origin HEAD:${{ github.head_ref }}
-          fi
-
   build-and-test:
     strategy:
       fail-fast: false
