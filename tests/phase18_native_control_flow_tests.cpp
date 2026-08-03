@@ -559,6 +559,62 @@ int main()
         "native generic call arguments were not retained");
 }
 
+void testNativeGenericSpecialization() {
+    realscript::compiler::Compilation compilation({{
+        "native-generics.rs",
+        R"(
+module Phase18.NativeGenerics;
+class Box<T>
+{
+    T value;
+    Box(T initial) { value = initial; }
+    T Get() { return value; }
+}
+T Identity<T>(T value) { return value; }
+int main()
+{
+    Box<int> box = new Box<int>(Identity<int>(4));
+    List<int> values = new List<int>(2);
+    values.Add(box.Get());
+    values.Add(3);
+    return values.Get(0) + values.Get(1);
+}
+)"}});
+    const auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "native generic specialization failed:\n" +
+            diagnosticsText(build.diagnostics));
+    require(build.nativeGenericInstantiations.size() >= 3,
+        "native generic specialization metadata was not retained");
+
+    realscript::bytecode::Lowerer lowerer;
+    std::vector<realscript::bytecode::Module> modules;
+    for (const auto& sourceModule : build.modules) {
+        auto module = lowerer.lower(sourceModule);
+        realscript::diagnostics::DiagnosticBag diagnostics;
+        require(realscript::bytecode::verifyModule(module, diagnostics),
+            "native generic bytecode verification failed:\n" +
+                diagnosticsText(diagnostics));
+        modules.push_back(std::move(module));
+    }
+    realscript::runtime::Interpreter interpreter(std::move(modules));
+    const auto result = interpreter.invoke(
+        "Phase18.NativeGenerics::main");
+    require(result.succeeded &&
+            std::get<std::int64_t>(result.value) == 7,
+        "native generic specialization produced the wrong result");
+}
+
+void testGenericsBypassExpansion() {
+    const auto expansion =
+        realscript::compiler::expandLanguageSource(
+            "generics.rs",
+            "module Native; T Id<T>(T v){return v;} "
+            "int main(){return Id<int>(3);}");
+    require(!expansion.changed,
+        "native generics still used source expansion");
+}
+
 void testNativeSequenceDiagnostics() {
     realscript::compiler::Compilation compilation({{"bad-sequence.rs", R"(
 module Phase18.SequenceBad;
@@ -636,6 +692,8 @@ int main() {
     run("native event diagnostics", testNativeEventDiagnostics);
     run("events bypass expansion", testEventsBypassExpansion);
     run("native generic syntax", testNativeGenericSyntax);
+    run("native generic specialization", testNativeGenericSpecialization);
+    run("generics bypass expansion", testGenericsBypassExpansion);
     run("native sequence diagnostics", testNativeSequenceDiagnostics);
     run("yield outside sequence diagnostics", testYieldOutsideSequenceDiagnostics);
     return failures == 0 ? 0 : 1;

@@ -74,11 +74,20 @@ Implemented and validated:
 - `LanguageExpansionOptions::interfaces` and `sourceAttributes` disabled by default;
 - Phase 1–18C tests passing on Ubuntu and Windows with warnings as errors.
 
-### 18D — generics — pending
+### 18D — generics — complete for explicit bounded specialization
 
-- Native type-parameter/type-argument syntax and symbols.
-- Generic construction and deterministic specialization after semantic binding.
-- Stable generic identity independent of generated source names.
+Implemented and validated:
+
+- native type-parameter and nested type-argument syntax;
+- native explicit generic type/function call syntax;
+- compiler-owned specialization units without rewriting user source;
+- deterministic concrete names and stable specialization metadata;
+- user generic classes, structs, and free functions;
+- fixed-capacity `List`, `Queue`, `Stack`, `Optional`, `HashSet`, and `Dictionary` profiles;
+- cross-file/module explicit specialization and AOT/JIT reuse through normal MIR;
+- `LanguageExpansionOptions::generics` disabled by default.
+
+Inference, constraints, generic member methods, generic interfaces/delegates, and complete collection implementations remain Phase 21 work.
 
 ### 18E — deterministic sequences — complete
 

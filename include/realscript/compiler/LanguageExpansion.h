@@ -57,7 +57,7 @@ struct LanguageExpansionOptions {
     bool delegatesLambdasEvents = false;
     bool interfaces = false;
     bool sourceAttributes = false;
-    bool generics = true;
+    bool generics = false;
     bool deterministicCoroutines = false;
     bool referenceParameters = false;
     bool valueTypeAliases = false;

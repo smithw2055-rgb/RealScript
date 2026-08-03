@@ -99,6 +99,8 @@ struct ModuleWork {
     bool invalid = false;
 };
 
+#include "NativeGenerics.inl"
+
 std::uint64_t combineFingerprint(
     std::uint64_t seed,
     std::uint64_t value) noexcept {
@@ -654,6 +656,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         units.push_back(std::move(unit));
     }
 
+    specializeNativeGenerics(units, modules, result);
+
     // Stable source order and named-type shells.
     for (auto& moduleEntry : modules) {
         const auto& moduleName = moduleEntry.first;
@@ -679,6 +683,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         for (const auto* unit : module.units) {
             sourceFingerprint = combineFingerprint(sourceFingerprint, unit->sourceFingerprint);
             for (const auto& node : unit->syntaxTree->classes) {
+                if (!node.typeParameters.empty()) continue;
                 const auto before = module.types.size();
                 addShell(node, [](const std::string& name, const auto& syntaxNode) {
                     return semantic::declareTypeShell(name, syntaxNode);
@@ -689,6 +694,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 }
             }
             for (const auto& node : unit->syntaxTree->structs) {
+                if (!node.typeParameters.empty()) continue;
                 const auto before = module.types.size();
                 addShell(node, [](const std::string& name, const auto& syntaxNode) {
                     return semantic::declareTypeShell(name, syntaxNode);
@@ -840,6 +846,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         (void)moduleName;
         for (const auto* unit : module.units) {
             for (const auto& node : unit->syntaxTree->classes) {
+                if (!node.typeParameters.empty()) continue;
                 auto* type = findOwnType(module, node.identifierToken.text);
                 if (!type || !semantic::populateTypeFields(
                         *type, node, module.visibleTypes, result.diagnostics)) {
@@ -850,6 +857,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 }
             }
             for (const auto& node : unit->syntaxTree->structs) {
+                if (!node.typeParameters.empty()) continue;
                 auto* type = findOwnType(module, node.identifierToken.text);
                 if (!type || !semantic::populateTypeFields(
                         *type, node, module.visibleTypes, result.diagnostics)) {
@@ -895,6 +903,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
 
         for (const auto* unit : module.units) {
             for (const auto& functionSyntax : unit->syntaxTree->functions) {
+                if (!functionSyntax.typeParameters.empty()) continue;
                 semantic::FunctionBindingInput binding;
                 binding.symbol = semantic::declareFunctionSymbol(
                     moduleName, functionSyntax, module.visibleTypes, result.diagnostics);
@@ -907,6 +916,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
 
             const auto addMembers = [&](auto const& declarations) {
                 for (const auto& typeSyntax : declarations) {
+                    if (!typeSyntax.typeParameters.empty()) continue;
                     auto* ownerPointer = findOwnType(module, typeSyntax.identifierToken.text);
                     if (!ownerPointer) {
                         module.invalid = true;

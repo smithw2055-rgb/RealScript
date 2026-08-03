@@ -208,6 +208,32 @@ GameCompileResult GameScriptCompiler::compile(
         compilation.languageExpansions());
 
     auto build = compilation.build();
+    result.languageMetadata.genericInstantiations.insert(
+        result.languageMetadata.genericInstantiations.end(),
+        build.nativeGenericInstantiations.begin(),
+        build.nativeGenericInstantiations.end());
+    std::sort(
+        result.languageMetadata.genericInstantiations.begin(),
+        result.languageMetadata.genericInstantiations.end(),
+        [](const auto& left, const auto& right) {
+            if (left.generatedName != right.generatedName) {
+                return left.generatedName < right.generatedName;
+            }
+            if (left.genericName != right.genericName) {
+                return left.genericName < right.genericName;
+            }
+            return left.arguments < right.arguments;
+        });
+    result.languageMetadata.genericInstantiations.erase(
+        std::unique(
+            result.languageMetadata.genericInstantiations.begin(),
+            result.languageMetadata.genericInstantiations.end(),
+            [](const auto& left, const auto& right) {
+                return left.generatedName == right.generatedName &&
+                    left.genericName == right.genericName &&
+                    left.arguments == right.arguments;
+            }),
+        result.languageMetadata.genericInstantiations.end());
     result.languageMetadata.attributes.insert(
         result.languageMetadata.attributes.end(),
         build.nativeAttributes.begin(),
