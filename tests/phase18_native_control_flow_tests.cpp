@@ -368,7 +368,7 @@ void testReferencesBypassExpansion() {
 void testNativeValueAliases() {
     const auto result = execute(R"(
 module Phase18;
-int main()
+double main()
 {
     byte a = 1;
     sbyte b = 2;
