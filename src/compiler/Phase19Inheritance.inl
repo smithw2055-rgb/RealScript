@@ -273,6 +273,12 @@ std::optional<std::size_t> phase19PrepareVirtualMethod(
             report("RS2520", "cannot override a sealed method");
             return inheritedIndex;
         }
+        if (method.accessibility != inherited.accessibility) {
+            report(
+                "RS2525",
+                "override method must preserve inherited accessibility");
+            return inheritedIndex;
+        }
         method.virtualMethod = true;
         method.virtualSlot = inherited.virtualSlot;
         if (owner.virtualDispatchTable.size() <= method.virtualSlot) {
@@ -288,10 +294,16 @@ std::optional<std::size_t> phase19PrepareVirtualMethod(
         report("RS2521", "method hides an inherited member; use override");
     }
     if (method.virtualMethod || method.abstractMethod) {
-        method.virtualSlot = static_cast<std::uint32_t>(
-            owner.virtualDispatchTable.size());
-        owner.virtualDispatchTable.push_back(
-            method.abstractMethod ? 0 : method.id);
+        if (method.virtualSlot == invalidSlot) {
+            method.virtualSlot = static_cast<std::uint32_t>(
+                owner.virtualDispatchTable.size());
+        }
+        if (owner.virtualDispatchTable.size() <= method.virtualSlot) {
+            owner.virtualDispatchTable.resize(
+                static_cast<std::size_t>(method.virtualSlot) + 1, 0);
+        }
+        owner.virtualDispatchTable[method.virtualSlot] =
+            method.abstractMethod ? 0 : method.id;
     }
     return std::nullopt;
 }

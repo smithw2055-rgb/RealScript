@@ -1595,79 +1595,56 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     }
     applyPhase19FieldLayouts(modules, result);
 
-    // Declare free functions, methods, constructors and properties.
-    for (auto& moduleEntry : modules) {
-        const auto& moduleName = moduleEntry.first;
-        auto& module = moduleEntry.second;
-        std::unordered_set<std::string> functionKeys;
-        auto addBinding = [&](semantic::FunctionBindingInput binding,
-                              text::TextSpan span) {
-            const auto key = semantic::canonicalFunctionKey(binding.symbol);
-            if (!functionKeys.insert(key).second) {
-                result.diagnostics.report(
-                    "RS4002", "duplicate function overload '" + key + "'", span);
-                module.invalid = true;
-            }
-            module.declarations.push_back(binding.symbol);
-            if (!binding.symbol.abstractMethod) {
-                module.functionBindings.push_back(std::move(binding));
-            }
-        };
+    // Declare free functions before member signatures. Member declarations
+    // are then processed in one global inheritance order so file and module
+    // names cannot affect inherited metadata or dispatch-table construction.
+    std::map<std::string, std::unordered_set<std::string>> functionKeys;
+    const auto addBinding = [&](
+        ModuleWork& module,
+        semantic::FunctionBindingInput binding,
+        text::TextSpan span) {
+        const auto key = semantic::canonicalFunctionKey(binding.symbol);
+        auto& keys = functionKeys[module.name];
+        if (!keys.insert(key).second) {
+            result.diagnostics.report(
+                "RS4002", "duplicate function overload '" + key + "'", span);
+            module.invalid = true;
+        }
+        module.declarations.push_back(binding.symbol);
+        if (!binding.symbol.abstractMethod) {
+            module.functionBindings.push_back(std::move(binding));
+        }
+    };
 
+    for (auto& [moduleName, module] : modules) {
         for (const auto* unit : module.units) {
             for (const auto& functionSyntax : unit->syntaxTree->functions) {
                 if (!functionSyntax.typeParameters.empty()) continue;
                 semantic::FunctionBindingInput binding;
                 binding.symbol = semantic::declareFunctionSymbol(
-                    moduleName, functionSyntax, module.visibleTypes, result.diagnostics);
+                    moduleName, functionSyntax, module.visibleTypes,
+                    result.diagnostics);
                 binding.sourceName = unit->source->name();
                 binding.symbol.sourceName = binding.sourceName;
                 binding.body = &functionSyntax.body;
                 appendParameters(binding, functionSyntax.parameters);
-                addBinding(std::move(binding), functionSyntax.identifierToken.span);
+                addBinding(
+                    module, std::move(binding),
+                    functionSyntax.identifierToken.span);
             }
+        }
+    }
 
-            const auto addMembers = [&](auto const& declarations) {
-                std::vector<std::size_t> declarationOrder;
-                declarationOrder.reserve(declarations.size());
-                for (std::size_t index = 0;
-                     index < declarations.size(); ++index) {
-                    declarationOrder.push_back(index);
-                }
-                const auto declarationDepth = [&](std::size_t index) {
-                    const auto* owner = findOwnType(
-                        module,
-                        declarations[index].identifierToken.text);
-                    std::size_t depth = 0;
-                    std::unordered_set<semantic::SymbolId> visited;
-                    auto current = owner
-                        ? owner->baseTypeName
-                        : std::string{};
-                    while (!current.empty()) {
-                        const auto* base = phase19GlobalType(
-                            modules, current);
-                        if (!base || !visited.insert(base->id).second) {
-                            break;
-                        }
-                        ++depth;
-                        current = base->baseTypeName;
-                    }
-                    return depth;
-                };
-                std::stable_sort(
-                    declarationOrder.begin(), declarationOrder.end(),
-                    [&](std::size_t left, std::size_t right) {
-                        return declarationDepth(left) <
-                            declarationDepth(right);
-                    });
-                for (const auto declarationIndex : declarationOrder) {
-                    const auto& typeSyntax =
-                        declarations[declarationIndex];
-                    if (!typeSyntax.typeParameters.empty()) continue;
+    const auto processMembers = [&](
+        const auto& typeSyntax,
+        const ParsedUnit* unit,
+        const std::string& moduleName,
+        ModuleWork& module) {
+                    if (!typeSyntax.typeParameters.empty()) return;
                     auto* ownerPointer = findOwnType(module, typeSyntax.identifierToken.text);
                     if (!ownerPointer) {
                         module.invalid = true;
-                        continue;
+                        return;
                     }
                     auto owner = *ownerPointer;
                     if (!owner.baseTypeName.empty()) {
@@ -1689,6 +1666,38 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     for (const auto& field : owner.fields) {
                         fieldNames.insert(field.name);
                     }
+                    std::vector<std::pair<std::string, semantic::SymbolId>>
+                        newVirtualMethods;
+                    for (const auto& methodSyntax : typeSyntax.methods) {
+                        if (!methodSyntax.typeParameters.empty()) continue;
+                        diagnostics::DiagnosticBag ignoredDiagnostics;
+                        auto method = semantic::declareFunctionSymbol(
+                            moduleName, methodSyntax, module.visibleTypes,
+                            ignoredDiagnostics, &owner);
+                        if (!method.staticMethod && !method.overrideMethod &&
+                            (method.virtualMethod || method.abstractMethod)) {
+                            newVirtualMethods.emplace_back(
+                                semantic::canonicalFunctionSignature(method),
+                                method.id);
+                        }
+                    }
+                    std::sort(
+                        newVirtualMethods.begin(), newVirtualMethods.end(),
+                        [](const auto& left, const auto& right) {
+                            return left.first < right.first ||
+                                (left.first == right.first &&
+                                 left.second < right.second);
+                        });
+                    std::unordered_map<
+                        semantic::SymbolId, std::uint32_t> plannedVirtualSlots;
+                    auto nextVirtualSlot = static_cast<std::uint32_t>(
+                        owner.virtualDispatchTable.size());
+                    for (const auto& [signature, methodId] :
+                         newVirtualMethods) {
+                        (void)signature;
+                        plannedVirtualSlots.emplace(
+                            methodId, nextVirtualSlot++);
+                    }
                     for (const auto& methodSyntax : typeSyntax.methods) {
                         if (!methodSyntax.typeParameters.empty()) continue;
                         if (fieldNames.find(methodSyntax.identifierToken.text) !=
@@ -1705,6 +1714,13 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         binding.symbol = semantic::declareFunctionSymbol(
                             moduleName, methodSyntax, module.visibleTypes,
                             result.diagnostics, &owner);
+                        const auto plannedVirtualSlot =
+                            plannedVirtualSlots.find(binding.symbol.id);
+                        if (plannedVirtualSlot !=
+                            plannedVirtualSlots.end()) {
+                            binding.symbol.virtualSlot =
+                                plannedVirtualSlot->second;
+                        }
                         binding.sourceName = unit->source->name();
                         binding.symbol.sourceName = binding.sourceName;
                         binding.body = methodSyntax.semicolonToken
@@ -1724,7 +1740,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         } else {
                             owner.methods.push_back(binding.symbol);
                         }
-                        addBinding(std::move(binding), methodSyntax.identifierToken.span);
+                        addBinding(module, std::move(binding), methodSyntax.identifierToken.span);
                     }
                     std::unordered_set<std::string> ownerSequenceNames;
                     for (const auto& sequence : typeSyntax.sequences) {
@@ -1740,7 +1756,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                                 diagnostics::DiagnosticSeverity::Error,
                                 unit->source->name());
                             module.invalid = true;
-                            continue;
+                            return;
                         }
                         if (fieldNames.find(sequenceSyntax.identifierToken.text) !=
                                 fieldNames.end() ||
@@ -2332,7 +2348,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             entryBinding.sequenceNextCallback = callbacks.front();
                         }
                         owner.methods.push_back(entry);
-                        addBinding(
+                        addBinding(module, 
                             std::move(entryBinding),
                             sequenceSyntax.identifierToken.span);
 
@@ -2367,7 +2383,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                                     callbacks[callback + 1];
                             }
                             owner.methods.push_back(callbacks[callback]);
-                            addBinding(
+                            addBinding(module, 
                                 std::move(binding),
                                 sequenceSyntax.identifierToken.span);
                         }
@@ -2415,7 +2431,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             getterBinding.syntheticAutoGetter = true;
                             getterBinding.syntheticField = field;
                             owner.methods.push_back(getter);
-                            addBinding(
+                            addBinding(module, 
                                 std::move(getterBinding),
                                 sequenceSyntax.identifierToken.span);
                         };
@@ -2464,7 +2480,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             cancellationBinding.sequenceResultField =
                                 resultField;
                             owner.methods.push_back(cancellation);
-                            addBinding(
+                            addBinding(module, 
                                 std::move(cancellationBinding),
                                 sequenceSyntax.identifierToken.span);
                         }
@@ -2498,7 +2514,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
                         appendParameters(binding, constructorSyntax.parameters);
                         owner.constructors.push_back(binding.symbol);
-                        addBinding(std::move(binding), constructorSyntax.identifierToken.span);
+                        addBinding(module, std::move(binding), constructorSyntax.identifierToken.span);
                     }
                     for (const auto& propertySyntax : typeSyntax.properties) {
                         if (!propertyNames.insert(
@@ -2572,7 +2588,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             if (autoProperty) {
                                 binding.syntheticField = owner.fields[property.backingFieldIndex];
                             }
-                            addBinding(std::move(binding), propertySyntax.identifierToken.span);
+                            addBinding(module, std::move(binding), propertySyntax.identifierToken.span);
                         }
                         if (property.setter) {
                             semantic::FunctionBindingInput binding;
@@ -2590,7 +2606,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             if (autoProperty) {
                                 binding.syntheticField = owner.fields[property.backingFieldIndex];
                             }
-                            addBinding(std::move(binding), propertySyntax.identifierToken.span);
+                            addBinding(module, std::move(binding), propertySyntax.identifierToken.span);
                         }
                         owner.properties.push_back(std::move(property));
                     }
@@ -2886,7 +2902,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                                                 : lambda.arrowToken.span);
                                     }
                                     owner.methods.push_back(handler);
-                                    addBinding(
+                                    addBinding(module, 
                                         std::move(binding),
                                         lambda.arrowToken.span);
                                     slotKey = "lambda:" +
@@ -2938,11 +2954,79 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     }
                     phase19ValidateConcreteType(owner, module, result);
                     *ownerPointer = std::move(owner);
-                }
             };
-            addMembers(unit->syntaxTree->classes);
-            addMembers(unit->syntaxTree->structs);
+
+    struct MemberDeclarationWork {
+        std::size_t depth = 0;
+        std::string canonicalName;
+        std::string sourceName;
+        std::string moduleName;
+        ModuleWork* module = nullptr;
+        const ParsedUnit* unit = nullptr;
+        const syntax::ClassDeclarationSyntax* classSyntax = nullptr;
+        const syntax::StructDeclarationSyntax* structSyntax = nullptr;
+    };
+    const auto memberDepth = [&](const semantic::TypeSymbol& owner) {
+        std::size_t depth = 0;
+        std::unordered_set<semantic::SymbolId> visited;
+        auto current = owner.baseTypeName;
+        while (!current.empty()) {
+            const auto* base = phase19GlobalType(modules, current);
+            if (!base || !visited.insert(base->id).second) break;
+            ++depth;
+            current = base->baseTypeName;
         }
+        return depth;
+    };
+    std::vector<MemberDeclarationWork> memberDeclarations;
+    for (auto& [moduleName, module] : modules) {
+        for (const auto* unit : module.units) {
+            for (const auto& declaration : unit->syntaxTree->classes) {
+                if (!declaration.typeParameters.empty()) continue;
+                const auto* owner = findOwnType(
+                    module, declaration.identifierToken.text);
+                if (!owner) continue;
+                memberDeclarations.push_back({
+                    memberDepth(*owner),
+                    semantic::canonicalTypeName(*owner),
+                    unit->source->name(),
+                    moduleName, &module, unit, &declaration, nullptr});
+            }
+            for (const auto& declaration : unit->syntaxTree->structs) {
+                if (!declaration.typeParameters.empty()) continue;
+                const auto* owner = findOwnType(
+                    module, declaration.identifierToken.text);
+                if (!owner) continue;
+                memberDeclarations.push_back({
+                    0, semantic::canonicalTypeName(*owner),
+                    unit->source->name(),
+                    moduleName, &module, unit, nullptr, &declaration});
+            }
+        }
+    }
+    std::sort(
+        memberDeclarations.begin(), memberDeclarations.end(),
+        [](const auto& left, const auto& right) {
+            return std::tie(
+                       left.depth, left.canonicalName, left.sourceName) <
+                std::tie(
+                       right.depth, right.canonicalName, right.sourceName);
+        });
+    for (const auto& work : memberDeclarations) {
+        if (work.classSyntax) {
+            processMembers(
+                *work.classSyntax, work.unit,
+                work.moduleName, *work.module);
+        } else if (work.structSyntax) {
+            processMembers(
+                *work.structSyntax, work.unit,
+                work.moduleName, *work.module);
+        }
+    }
+
+    for (auto& moduleEntry : modules) {
+        const auto& moduleName = moduleEntry.first;
+        auto& module = moduleEntry.second;
 
         // Materialize compiler-owned reference boxes. They are real runtime
         // descriptors but synthetic source symbols, so they stay out of the

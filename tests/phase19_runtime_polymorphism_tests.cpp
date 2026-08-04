@@ -826,6 +826,105 @@ int main() { IUnit value = new Other(); return value.Kind(); }
         "class without an interface map converted to the interface type");
 }
 
+
+void testGlobalInheritanceDeclarationOrder() {
+    realscript::compiler::Compilation compilation({
+        {"a-derived.rs", R"(
+module Phase19.CrossFile;
+class Derived : Base
+{
+    public override int Read() { return 2; }
+}
+int main() { Base value = new Derived(); return value.Read(); }
+)"},
+        {"z-base.rs", R"(
+module Phase19.CrossFile;
+class Base
+{
+    public virtual int Read() { return 1; }
+}
+)"},
+        {"a-consumer.rs", R"(
+module Phase19.AConsumer;
+import Phase19.ZBase;
+public class CrossDerived : CrossBase
+{
+    public override int Read() { return 5; }
+}
+int main() { CrossBase value = new CrossDerived(); return value.Read(); }
+)"},
+        {"z-base-module.rs", R"(
+module Phase19.ZBase;
+public class CrossBase
+{
+    public virtual int Read() { return 3; }
+}
+)"},
+    });
+    auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "global inheritance declaration order failed:\n" +
+            diagnosticsText(build.diagnostics));
+
+    realscript::bytecode::Lowerer lowerer;
+    std::vector<realscript::bytecode::Module> modules;
+    for (const auto& module : build.modules) {
+        modules.push_back(lowerer.lower(module));
+    }
+    realscript::runtime::Interpreter interpreter(std::move(modules));
+    const auto sameModule = interpreter.invoke("Phase19.CrossFile::main");
+    require(sameModule.succeeded &&
+            std::get<std::int64_t>(sameModule.value) == 2,
+        "cross-file inheritance depended on source file order: " +
+            sameModule.error.message);
+    const auto crossModule = interpreter.invoke("Phase19.AConsumer::main");
+    require(crossModule.succeeded &&
+            std::get<std::int64_t>(crossModule.value) == 5,
+        "cross-module inheritance depended on module name order: " +
+            crossModule.error.message);
+}
+
+void testCanonicalVirtualSlotOrder() {
+    const auto slots = [](const char* source) {
+        realscript::compiler::Compilation compilation(
+            {{"virtual-order.rs", source}});
+        const auto build = compilation.build();
+        require(!build.diagnostics.hasErrors(),
+            "virtual-slot source failed to compile:\n" +
+                diagnosticsText(build.diagnostics));
+        std::map<std::string, std::uint32_t> result;
+        for (const auto& type : build.modules.front().types) {
+            if (type.name != "Base") continue;
+            for (const auto& method : type.methods) {
+                if (method.declaringTypeId == type.id &&
+                    method.virtualMethod) {
+                    result.emplace(method.name, method.virtualSlot);
+                }
+            }
+        }
+        return result;
+    };
+
+    const auto forward = slots(R"(
+class Base
+{
+    public virtual int Zeta() { return 2; }
+    public virtual int Alpha() { return 1; }
+}
+)");
+    const auto reverse = slots(R"(
+class Base
+{
+    public virtual int Alpha() { return 1; }
+    public virtual int Zeta() { return 2; }
+}
+)");
+    require(forward == reverse && forward.size() == 2,
+        "virtual slots changed when source declarations were reordered");
+    require(forward.at("Alpha") < forward.at("Zeta"),
+        "new virtual slots were not allocated by canonical signature");
+}
+
 void testVirtualDiagnostics() {
     const auto compile = [](const char* source) {
         realscript::compiler::Compilation compilation({{"invalid.rs", source}});
@@ -854,6 +953,13 @@ class Bad : Middle { public override int Run() { return 3; } }
     require(hasDiagnostic(sealed.diagnostics, "RS2520"),
         "override of a sealed method did not report RS2520");
 
+    auto narrowedVisibility = compile(R"(
+class Base { public virtual int Run() { return 1; } }
+class Bad : Base { private override int Run() { return 2; } }
+)");
+    require(hasDiagnostic(narrowedVisibility.diagnostics, "RS2525"),
+        "override accessibility change did not report RS2525");
+
     auto allocation = compile(R"(
 abstract class Base { public abstract int Run(); }
 int main() { Base value = new Base(); return 0; }
@@ -877,6 +983,8 @@ int main() {
         testLanguageToolingVisibilityAndInheritance();
         testDebuggerShowsRuntimeUserMethod();
         testInterfaceDiagnostics();
+        testGlobalInheritanceDeclarationOrder();
+        testCanonicalVirtualSlotOrder();
         testVirtualDiagnostics();
         std::cout << "Phase 19 runtime polymorphism tests passed\n";
         return 0;
