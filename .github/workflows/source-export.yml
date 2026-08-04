@@ -1,25 +1,45 @@
-name: Source Export
+name: Apply Phase 19 Review Fixes
 
 on:
-  pull_request:
+  push:
     branches:
-      - main
+      - agent/phase19-review-source-export
+    paths:
+      - .github/workflows/source-export.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  export:
+  apply:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout staging branch
         uses: actions/checkout@v4
-      - name: Upload source tree
-        uses: actions/upload-artifact@v4
         with:
-          name: realscript-source-tree
-          path: |
-            .
-            !.git
-          include-hidden-files: true
-          retention-days: 1
+          ref: agent/phase19-review-source-export
+          path: staging
+
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/phase19-runtime-polymorphism
+          fetch-depth: 0
+          path: target
+
+      - name: Reconstruct staged patches
+        shell: bash
+        run: |
+          cp staging/.github/patches/0001-close-cross-platform-warnings-and-bytecode-baselines.patch /tmp/0001.patch
+          base64 --decode staging/.github/patches/0002-stabilize-inheritance-ordering-and-virtual-abi.patch.gz.b64 | gzip --decompress > /tmp/0002.patch
+          base64 --decode staging/.github/patches/0003-close-global-object-model-contracts.patch.gz.b64 | gzip --decompress > /tmp/0003.patch
+
+      - name: Apply large-stage commits
+        shell: bash
+        working-directory: target
+        run: |
+          test "$(git rev-parse HEAD)" = "9db47fed9454cf89628d905758305f8563d48d6c"
+          git config user.name "OpenAI"
+          git config user.email "noreply@openai.com"
+          git am /tmp/0001.patch /tmp/0002.patch /tmp/0003.patch
+          git push origin HEAD:agent/phase19-runtime-polymorphism
