@@ -82,6 +82,20 @@ Implemented and validated:
 - Dispatch tables and interface maps are serialized into `.rsbc` and included in AOT content hashes and hot-reload fingerprints.
 - Compiler-generated thunks are synthetic and never appear in user-facing symbols or debugger frames.
 
+## Review closure validation
+
+The August 4, 2026 merge-review closure was validated from a clean local build with:
+
+```bash
+cmake -S . -B build-review \
+  -DREALSCRIPT_BUILD_TESTS=ON \
+  -DREALSCRIPT_WARNINGS_AS_ERRORS=ON
+cmake --build build-review
+ctest --test-dir build-review --output-on-failure
+```
+
+The Linux warnings-as-errors build completed and all 38 locally enabled CTest targets passed. The final merge decision still requires the repository Ubuntu and Windows jobs to pass on the published branch head.
+
 ## Explicit non-goals
 
 - multiple class inheritance;
