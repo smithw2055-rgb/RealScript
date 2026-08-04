@@ -1,5 +1,6 @@
 #include "realscript/mir/Mir.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace realscript::mir {

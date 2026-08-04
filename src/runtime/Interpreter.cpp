@@ -2161,6 +2161,7 @@ const char* errorCodeName(ErrorCode code) noexcept {
     case ErrorCode::ExecutionTerminated: return "execution-terminated";
     case ErrorCode::DeterminismViolation: return "determinism-violation";
     case ErrorCode::ReplayMismatch: return "replay-mismatch";
+    case ErrorCode::ScriptException: return "script-exception";
     }
     return "unknown";
 }
@@ -2256,14 +2257,18 @@ bool tryConvertNumeric(
         };
         switch (target) {
         case semantic::PrimitiveType::Byte:
-            if (!inRange(0, 255)) return false; break;
+            if (!inRange(0, 255)) return false;
+            break;
         case semantic::PrimitiveType::SByte:
-            if (!inRange(-128, 127)) return false; break;
+            if (!inRange(-128, 127)) return false;
+            break;
         case semantic::PrimitiveType::Short:
-            if (!inRange(-32768, 32767)) return false; break;
+            if (!inRange(-32768, 32767)) return false;
+            break;
         case semantic::PrimitiveType::UShort:
         case semantic::PrimitiveType::Char:
-            if (!inRange(0, 65535)) return false; break;
+            if (!inRange(0, 65535)) return false;
+            break;
         case semantic::PrimitiveType::Int:
             if (!inRange(
                     std::numeric_limits<std::int32_t>::min(),

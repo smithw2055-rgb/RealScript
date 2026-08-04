@@ -182,8 +182,8 @@ std::string binaryExpression(mir::Opcode opcode) {
 }
 
 bool isConversion(mir::Opcode opcode) {
-    return opcode >= mir::Opcode::ConvertNullToString &&
-        opcode <= mir::Opcode::ConvertLongToDouble ||
+    return (opcode >= mir::Opcode::ConvertNullToString &&
+            opcode <= mir::Opcode::ConvertLongToDouble) ||
         opcode == mir::Opcode::ConvertNumeric;
 }
 

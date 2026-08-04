@@ -1327,7 +1327,7 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
             left->type != PrimitiveType::Array) {
             diagnostics_.report(
                 "RS8905",
-                "left operand of '??' must be a nullable reference value",
+                "left operand of '" "??" "' must be a nullable reference value",
                 syntaxTree.left->span());
             return makeError(syntaxTree.span());
         }

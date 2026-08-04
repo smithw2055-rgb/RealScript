@@ -1,6 +1,7 @@
 #include "realscript/semantic/Semantic.h"
 #include "FlowAnalysis.h"
 
+#include <algorithm>
 #include <functional>
 #include <iterator>
 #include <unordered_set>

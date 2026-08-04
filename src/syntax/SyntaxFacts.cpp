@@ -171,6 +171,7 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(BaseExpression);
         RS_KIND(MemberAccessExpression);
         RS_KIND(ElementAccessExpression);
+        RS_KIND(InitializerElement);
         RS_KIND(NewObjectExpression);
         RS_KIND(NewArrayExpression);
 #undef RS_KIND
