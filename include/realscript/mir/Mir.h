@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -76,6 +77,14 @@ enum class Opcode {
     LessOrEqualDouble,
     GreaterDouble,
     GreaterOrEqualDouble,
+    NewDelegate,
+    InvokeDelegate,
+    CombineDelegate,
+    RemoveDelegate,
+    ConvertNumeric,
+    IsType,
+    AsType,
+    ConstantTypeId,
 };
 
 struct Instruction {
@@ -92,8 +101,14 @@ struct Instruction {
     std::int64_t integerImmediate = 0;
     double doubleImmediate = 0.0;
     bool boolImmediate = false;
+    bool checkedArithmetic = true;
     std::string stringImmediate;
     semantic::SymbolId symbolId = 0;
+    bool virtualDispatch = false;
+    std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
+    bool interfaceDispatch = false;
+    semantic::SymbolId interfaceTypeId = 0;
+    std::uint32_t interfaceSlot = std::numeric_limits<std::uint32_t>::max();
     std::string symbolName;
     std::vector<semantic::PrimitiveType> parameterTypes;
     std::vector<semantic::SymbolId> parameterTypeIds;
@@ -112,6 +127,7 @@ enum class TerminatorKind {
     Branch,
     ReturnValue,
     ReturnVoid,
+    Throw,
 };
 
 struct Terminator {
@@ -132,6 +148,13 @@ struct BasicBlock {
     Terminator terminator;
 };
 
+struct ExceptionHandler {
+    std::vector<BlockId> protectedBlocks;
+    BlockId handlerBlock = 0;
+    semantic::SymbolId catchTypeId = 0;
+    std::size_t exceptionLocal = 0;
+};
+
 struct Function {
     semantic::SymbolId symbolId = 0;
     std::string moduleName;
@@ -143,6 +166,7 @@ struct Function {
     std::vector<semantic::PrimitiveType> localTypes;
     std::vector<semantic::SymbolId> localTypeIds;
     std::vector<BasicBlock> blocks;
+    std::vector<ExceptionHandler> exceptionHandlers;
     debug::FunctionDebugInfo debugInfo;
 };
 
@@ -165,6 +189,10 @@ private:
     [[nodiscard]] ValueId lowerExpression(const semantic::BoundExpression& expression);
     [[nodiscard]] ValueId lowerShortCircuit(
         const semantic::BoundBinaryExpression& expression);
+    [[nodiscard]] ValueId lowerConditional(
+        const semantic::BoundConditionalExpression& expression);
+    [[nodiscard]] ValueId lowerNullCoalescing(
+        const semantic::BoundNullCoalescingExpression& expression);
 
     [[nodiscard]] BlockId createBlock();
     [[nodiscard]] ValueId addBlockParameter(
@@ -199,12 +227,17 @@ private:
         std::vector<ValueId> falseArguments,
         text::TextSpan sourceSpan);
     void emitReturn(std::optional<ValueId> value, text::TextSpan sourceSpan);
+    void emitThrow(ValueId value, text::TextSpan sourceSpan);
 
     Function* currentFunction_ = nullptr;
     std::optional<BlockId> currentBlockId_;
     ValueId nextValueId_ = 0;
     std::vector<BlockId> breakTargets_;
     std::vector<BlockId> continueTargets_;
+    std::vector<std::size_t> breakFinalizerDepths_;
+    std::vector<std::size_t> continueFinalizerDepths_;
+    std::vector<const semantic::BoundStatement*> finalizers_;
+    std::vector<BlockId> exceptionCleanupBlocks_;
 };
 
 [[nodiscard]] const char* opcodeName(Opcode opcode) noexcept;

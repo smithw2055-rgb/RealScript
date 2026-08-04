@@ -40,6 +40,43 @@ std::string printModule(const Module& module) {
         out << "module " << module.name << "\n\n";
     }
 
+    for (const auto& type : module.types) {
+        out << "type @" << semantic::canonicalTypeName(type)
+            << "[0x" << std::hex << type.id << std::dec << "]";
+        if (type.baseTypeId != 0) {
+            out << " base[0x" << std::hex << type.baseTypeId
+                << std::dec << "]";
+        }
+        if (type.interfaceType) out << " interface";
+        if (type.delegateType) out << " delegate";
+        if (type.abstractType) out << " abstract";
+        if (type.sealedType) out << " sealed";
+        if (!type.virtualDispatchTable.empty()) {
+            out << " vslots[";
+            for (std::size_t slot = 0;
+                 slot < type.virtualDispatchTable.size(); ++slot) {
+                if (slot != 0) out << ", ";
+                out << slot << "=0x" << std::hex
+                    << type.virtualDispatchTable[slot] << std::dec;
+            }
+            out << ']';
+        }
+        for (const auto& interfaceMap :
+             type.interfaceDispatchMaps) {
+            out << " islots[0x" << std::hex
+                << interfaceMap.interfaceTypeId << std::dec << ':';
+            for (std::size_t slot = 0;
+                 slot < interfaceMap.slots.size(); ++slot) {
+                if (slot != 0) out << ", ";
+                out << slot << "=0x" << std::hex
+                    << interfaceMap.slots[slot] << std::dec;
+            }
+            out << ']';
+        }
+        out << "\n";
+    }
+    if (!module.types.empty()) out << "\n";
+
     for (const auto& function : module.functions) {
         out << "func @" << function.name << "(";
         for (std::size_t i = 0; i < function.parameterTypes.size(); ++i) {
@@ -98,7 +135,8 @@ std::string printModule(const Module& module) {
                         instruction.resultTypeId);
                     out << " = ";
                 }
-                out << opcodeName(instruction.opcode);
+            out << opcodeName(instruction.opcode);
+            if (!instruction.checkedArithmetic) out << ".unchecked";
 
                 if (instruction.opcode == Opcode::Parameter ||
                     instruction.opcode == Opcode::ConstantInt) {
@@ -147,6 +185,14 @@ std::string printModule(const Module& module) {
                     out << " @" << instruction.symbolName << ", %"
                         << instruction.operands.front();
                 } else if (instruction.opcode == Opcode::Call) {
+                    if (instruction.virtualDispatch) {
+                        out << " virtual[" << instruction.virtualSlot << "]";
+                    }
+                    if (instruction.interfaceDispatch) {
+                        out << " interface[0x" << std::hex
+                            << instruction.interfaceTypeId << std::dec
+                            << ':' << instruction.interfaceSlot << ']';
+                    }
                     out << " @" << instruction.symbolName << "[0x"
                         << std::hex << instruction.symbolId << std::dec << "](";
                     for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
@@ -178,8 +224,21 @@ std::string printModule(const Module& module) {
                 printArguments(out, terminator.falseArguments);
             } else if (terminator.kind == TerminatorKind::ReturnValue) {
                 out << " %" << terminator.value;
+            } else if (terminator.kind == TerminatorKind::Throw) {
+                out << " %" << terminator.value;
             }
             out << '\n';
+        }
+        for (const auto& handler : function.exceptionHandlers) {
+            out << "  handler catch 0x" << std::hex
+                << handler.catchTypeId << std::dec << " [";
+            for (std::size_t index = 0;
+                 index < handler.protectedBlocks.size(); ++index) {
+                if (index != 0) out << ", ";
+                out << "bb" << handler.protectedBlocks[index];
+            }
+            out << "] -> bb" << handler.handlerBlock
+                << " local" << handler.exceptionLocal << '\n';
         }
         out << "}\n\n";
     }

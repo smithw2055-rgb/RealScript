@@ -20,7 +20,7 @@ constexpr Register InvalidRegister = std::numeric_limits<Register>::max();
 
 struct Version {
     std::uint16_t major = 0;
-    std::uint16_t minor = 6;
+    std::uint16_t minor = 7;
 };
 
 enum class Opcode : std::uint8_t {
@@ -82,6 +82,14 @@ enum class Opcode : std::uint8_t {
     LessOrEqualDouble,
     GreaterDouble,
     GreaterOrEqualDouble,
+    NewDelegate,
+    InvokeDelegate,
+    CombineDelegate,
+    RemoveDelegate,
+    ConvertNumeric,
+    IsType,
+    AsType,
+    ConstantTypeId,
 };
 
 struct FunctionReference {
@@ -91,6 +99,11 @@ struct FunctionReference {
     semantic::SymbolId returnTypeId = 0;
     std::vector<semantic::PrimitiveType> parameterTypes;
     std::vector<semantic::SymbolId> parameterTypeIds;
+    bool virtualDispatch = false;
+    std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
+    bool interfaceDispatch = false;
+    semantic::SymbolId interfaceTypeId = 0;
+    std::uint32_t interfaceSlot = std::numeric_limits<std::uint32_t>::max();
 };
 
 struct Instruction {
@@ -104,6 +117,7 @@ struct Instruction {
     std::int64_t integerImmediate = 0;
     double doubleImmediate = 0.0;
     bool boolImmediate = false;
+    bool checkedArithmetic = true;
     std::string stringImmediate;
 };
 
@@ -119,6 +133,7 @@ enum class TerminatorKind : std::uint8_t {
     Branch,
     ReturnValue,
     ReturnVoid,
+    Throw,
 };
 
 struct Terminator {
@@ -138,6 +153,13 @@ struct BasicBlock {
     Terminator terminator;
 };
 
+struct ExceptionHandler {
+    std::vector<BlockId> protectedBlocks;
+    BlockId handlerBlock = 0;
+    semantic::SymbolId catchTypeId = 0;
+    std::size_t exceptionLocal = 0;
+};
+
 struct Function {
     semantic::SymbolId symbolId = 0;
     std::string name;
@@ -150,6 +172,7 @@ struct Function {
     std::vector<semantic::PrimitiveType> registerTypes;
     std::vector<semantic::SymbolId> registerTypeIds;
     std::vector<BasicBlock> blocks;
+    std::vector<ExceptionHandler> exceptionHandlers;
     debug::FunctionDebugInfo debugInfo;
 };
 

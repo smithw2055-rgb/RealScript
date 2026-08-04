@@ -7,6 +7,7 @@
 #include <cmath>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace realscript::runtime {
@@ -24,6 +25,7 @@ struct State {
     RuntimeError error;
     std::vector<std::string> stack;
     const std::unordered_map<semantic::SymbolId, FunctionLocation>* functions = nullptr;
+    const std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*>* types = nullptr;
     const ExternalFunction* externalResolver = nullptr;
     const BindingRegistry* bindings = nullptr;
     const TraceSink* trace = nullptr;
@@ -33,6 +35,7 @@ struct State {
     debug::DebugController* debugger = nullptr;
     std::vector<debug::DebugFrameView> debugFrames;
     ShadowStack shadowStack;
+    std::optional<Value> pendingException;
 };
 
 class ShadowFrameScope {
@@ -152,6 +155,48 @@ semantic::SymbolId exactTypeId(
         : 0;
 }
 
+bool runtimeAssignable(
+    const State& state,
+    semantic::SymbolId actual,
+    semantic::SymbolId expected) {
+    if (actual == expected) return true;
+    if (!state.types) return false;
+    std::unordered_set<semantic::SymbolId> visited;
+    auto current = actual;
+    while (current != 0 && visited.insert(current).second) {
+        const auto found = state.types->find(current);
+        if (found == state.types->end()) return false;
+        for (const auto& implementation :
+             found->second->interfaceDispatchMaps) {
+            if (implementation.interfaceTypeId == expected) return true;
+        }
+        if (found->second->baseTypeId == expected) return true;
+        current = found->second->baseTypeId;
+    }
+    return false;
+}
+
+const semantic::InterfaceDispatchMap* runtimeInterfaceMap(
+    const State& state,
+    semantic::SymbolId actual,
+    semantic::SymbolId interfaceTypeId) {
+    if (!state.types) return nullptr;
+    std::unordered_set<semantic::SymbolId> visited;
+    auto current = actual;
+    while (current != 0 && visited.insert(current).second) {
+        const auto found = state.types->find(current);
+        if (found == state.types->end()) return nullptr;
+        for (const auto& implementation :
+             found->second->interfaceDispatchMaps) {
+            if (implementation.interfaceTypeId == interfaceTypeId) {
+                return &implementation;
+            }
+        }
+        current = found->second->baseTypeId;
+    }
+    return nullptr;
+}
+
 bool expectObject(
     State& state,
     const Value& value,
@@ -173,7 +218,7 @@ bool expectObject(
             context + " contains an invalid managed object reference");
     }
     const auto actual = state.heap->objectTypeId(*reference);
-    if (!actual || *actual != type.id) {
+    if (!actual || !runtimeAssignable(state, *actual, type.id)) {
         return fail(state, ErrorCode::TypeMismatch,
             context + " expected object '" + semantic::canonicalTypeName(type) + "'");
     }
@@ -193,7 +238,7 @@ bool expectSignatureType(
         const auto actual = reference && state.heap
             ? state.heap->objectTypeId(*reference)
             : std::optional<semantic::SymbolId>{};
-        if (!actual || *actual != typeId) {
+        if (!actual || !runtimeAssignable(state, *actual, typeId)) {
             return fail(state, ErrorCode::TypeMismatch,
                 context + " has the wrong runtime object type");
         }
@@ -244,9 +289,17 @@ Value defaultValue(
     std::size_t depth = 0) {
     switch (type) {
     case semantic::PrimitiveType::Bool: return false;
+    case semantic::PrimitiveType::Byte: return ByteValue{};
+    case semantic::PrimitiveType::SByte: return SByteValue{};
+    case semantic::PrimitiveType::Short: return ShortValue{};
+    case semantic::PrimitiveType::UShort: return UShortValue{};
     case semantic::PrimitiveType::Int: return std::int64_t{0};
+    case semantic::PrimitiveType::UInt: return UIntValue{};
     case semantic::PrimitiveType::Long: return LongValue{};
+    case semantic::PrimitiveType::ULong: return ULongValue{};
+    case semantic::PrimitiveType::Float: return FloatValue{};
     case semantic::PrimitiveType::Double: return 0.0;
+    case semantic::PrimitiveType::Char: return CharValue{};
     case semantic::PrimitiveType::String: return NullString{};
     case semantic::PrimitiveType::Object: return NullObject{};
     case semantic::PrimitiveType::Array: return NullArray{};
@@ -333,6 +386,22 @@ bool checkedIntResult(State& state, std::int64_t value, Value& output) {
     }
     output = value;
     return true;
+}
+
+std::int64_t wrapInt32(std::int64_t value) noexcept {
+    const auto bits = static_cast<std::uint32_t>(value);
+    return bits <= static_cast<std::uint32_t>(
+                       std::numeric_limits<std::int32_t>::max())
+        ? static_cast<std::int64_t>(bits)
+        : static_cast<std::int64_t>(bits) - (std::int64_t{1} << 32);
+}
+
+std::int64_t signedFromBits(std::uint64_t bits) noexcept {
+    return bits <= static_cast<std::uint64_t>(
+                       std::numeric_limits<std::int64_t>::max())
+        ? static_cast<std::int64_t>(bits)
+        : -1 - static_cast<std::int64_t>(
+            std::numeric_limits<std::uint64_t>::max() - bits);
 }
 
 
@@ -458,9 +527,92 @@ bool executeCall(
         }
     }
 
-    const auto found = state.functions->find(reference.symbolId);
+    auto targetSymbolId = reference.symbolId;
+    if (reference.virtualDispatch && reference.interfaceDispatch) {
+        return fail(state, ErrorCode::InvalidProgram,
+            "call cannot use virtual and interface dispatch together");
+    }
+    if (reference.virtualDispatch) {
+        if (reference.virtualSlot ==
+                std::numeric_limits<std::uint32_t>::max() ||
+            arguments.empty() ||
+            reference.parameterTypes.empty() ||
+            reference.parameterTypes.front() !=
+                semantic::PrimitiveType::Object) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "virtual call has an invalid receiver contract");
+        }
+        if (std::holds_alternative<NullObject>(arguments.front())) {
+            return fail(state, ErrorCode::NullReference,
+                "virtual call attempted to dereference null");
+        }
+        const auto* receiver = std::get_if<ObjectRef>(&arguments.front());
+        const auto actualTypeId = receiver && state.heap
+            ? state.heap->objectTypeId(*receiver)
+            : std::optional<semantic::SymbolId>{};
+        if (!actualTypeId || !state.types) {
+            return fail(state, ErrorCode::InvalidObjectReference,
+                "virtual call receiver has no runtime type descriptor");
+        }
+        const auto actualType = state.types->find(*actualTypeId);
+        if (actualType == state.types->end() ||
+            reference.virtualSlot >=
+                actualType->second->virtualDispatchTable.size()) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "virtual call slot is outside the runtime dispatch table");
+        }
+        targetSymbolId =
+            actualType->second->virtualDispatchTable[reference.virtualSlot];
+        if (targetSymbolId == 0) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "virtual call reached an abstract runtime slot");
+        }
+    } else if (reference.interfaceDispatch) {
+        if (reference.interfaceTypeId == 0 ||
+            reference.interfaceSlot ==
+                std::numeric_limits<std::uint32_t>::max() ||
+            arguments.empty() ||
+            reference.parameterTypes.empty() ||
+            reference.parameterTypes.front() !=
+                semantic::PrimitiveType::Object ||
+            typeIdAt(reference.parameterTypeIds, 0) !=
+                reference.interfaceTypeId) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "interface call has an invalid receiver contract");
+        }
+        if (std::holds_alternative<NullObject>(arguments.front())) {
+            return fail(state, ErrorCode::NullReference,
+                "interface call attempted to dereference null");
+        }
+        const auto* receiver = std::get_if<ObjectRef>(&arguments.front());
+        const auto actualTypeId = receiver && state.heap
+            ? state.heap->objectTypeId(*receiver)
+            : std::optional<semantic::SymbolId>{};
+        if (!actualTypeId) {
+            return fail(state, ErrorCode::InvalidObjectReference,
+                "interface call receiver has no runtime type descriptor");
+        }
+        const auto* implementation = runtimeInterfaceMap(
+            state, *actualTypeId, reference.interfaceTypeId);
+        if (!implementation ||
+            reference.interfaceSlot >= implementation->slots.size()) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "interface call slot is outside the runtime dispatch map");
+        }
+        targetSymbolId = implementation->slots[reference.interfaceSlot];
+        if (targetSymbolId == 0) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "interface call reached an unimplemented runtime slot");
+        }
+    }
+
+    const auto found = state.functions->find(targetSymbolId);
     if (found != state.functions->end()) {
         return executeFunction(state, found->second, arguments, result);
+    }
+    if (reference.virtualDispatch || reference.interfaceDispatch) {
+        return fail(state, ErrorCode::InvalidProgram,
+            "runtime dispatch target function is unavailable");
     }
     RuntimeError externalError;
     ++state.statistics.externalCalls;
@@ -495,6 +647,127 @@ bool executeCall(
         return false;
     }
     result = std::move(*externalResult);
+    return true;
+}
+
+std::int64_t delegateWord(std::uint64_t value, bool high) noexcept {
+    return static_cast<std::int64_t>(
+        static_cast<std::uint32_t>(high ? value >> 32u : value));
+}
+
+bool readDelegateId(
+    State& state,
+    ObjectRef reference,
+    std::size_t lowIndex,
+    semantic::SymbolId& value,
+    const char* context) {
+    const auto low = state.heap->fieldGet(reference, lowIndex);
+    const auto high = state.heap->fieldGet(reference, lowIndex + 1u);
+    const auto* lowValue = low ? std::get_if<std::int64_t>(&*low) : nullptr;
+    const auto* highValue = high ? std::get_if<std::int64_t>(&*high) : nullptr;
+    if (!lowValue || !highValue || *lowValue < 0 || *highValue < 0 ||
+        *lowValue > std::numeric_limits<std::uint32_t>::max() ||
+        *highValue > std::numeric_limits<std::uint32_t>::max()) {
+        return fail(state, ErrorCode::InvalidProgram, context);
+    }
+    value = static_cast<std::uint64_t>(
+        static_cast<std::uint32_t>(*lowValue)) |
+        (static_cast<std::uint64_t>(
+            static_cast<std::uint32_t>(*highValue)) << 32u);
+    return true;
+}
+
+bool flattenDelegate(
+    State& state,
+    semantic::SymbolId delegateTypeId,
+    const Value& value,
+    std::vector<Value>& leaves,
+    std::size_t depth = 0) {
+    if (std::holds_alternative<NullObject>(value)) return true;
+    if (depth > 1024) {
+        return fail(state, ErrorCode::InvalidProgram,
+            "delegate invocation list is too deep");
+    }
+    const auto* reference = std::get_if<ObjectRef>(&value);
+    const auto actualType = reference && state.heap
+        ? state.heap->objectTypeId(*reference)
+        : std::optional<semantic::SymbolId>{};
+    if (!reference || !actualType || *actualType != delegateTypeId ||
+        state.heap->fieldCount(*reference) != 8u) {
+        return fail(state, ErrorCode::TypeMismatch,
+            "delegate invocation list contains an incompatible value");
+    }
+    const auto flagsValue = state.heap->fieldGet(*reference, 3u);
+    const auto* flags = flagsValue
+        ? std::get_if<std::int64_t>(&*flagsValue)
+        : nullptr;
+    if (!flags || *flags < 0 || *flags > 4) {
+        return fail(state, ErrorCode::InvalidProgram,
+            "delegate invocation-list metadata is corrupt");
+    }
+    if (*flags != 4) {
+        leaves.push_back(value);
+        return true;
+    }
+    const auto left = state.heap->fieldGet(*reference, 0u);
+    const auto right = state.heap->fieldGet(*reference, 7u);
+    return left && right &&
+        flattenDelegate(
+            state, delegateTypeId, *left, leaves, depth + 1) &&
+        flattenDelegate(
+            state, delegateTypeId, *right, leaves, depth + 1);
+}
+
+bool sameDelegateLeaf(
+    State& state,
+    const Value& left,
+    const Value& right) {
+    const auto* leftRef = std::get_if<ObjectRef>(&left);
+    const auto* rightRef = std::get_if<ObjectRef>(&right);
+    if (!leftRef || !rightRef) return false;
+    for (std::size_t index = 0; index < 7u; ++index) {
+        const auto a = state.heap->fieldGet(*leftRef, index);
+        const auto b = state.heap->fieldGet(*rightRef, index);
+        if (!a || !b || !(*a == *b)) return false;
+    }
+    return true;
+}
+
+bool buildDelegateList(
+    State& state,
+    semantic::SymbolId delegateTypeId,
+    const std::vector<Value>& leaves,
+    Value& result) {
+    if (leaves.empty()) {
+        result = NullObject{};
+        return true;
+    }
+    result = leaves.front();
+    for (std::size_t index = 1; index < leaves.size(); ++index) {
+        std::vector<Value> fields{
+            result,
+            std::int64_t{0},
+            std::int64_t{0},
+            std::int64_t{4},
+            std::int64_t{0},
+            std::int64_t{0},
+            std::int64_t{0},
+            leaves[index],
+        };
+        RuntimeError error;
+        const auto allocated = state.heap->allocateObject(
+            delegateTypeId, std::move(fields), {0u, 7u}, &error);
+        if (!allocated) {
+            return fail(state,
+                error.code == ErrorCode::None
+                    ? ErrorCode::OutOfMemory
+                    : error.code,
+                error.message.empty()
+                    ? "delegate-list allocation failed"
+                    : error.message);
+        }
+        result = *allocated;
+    }
     return true;
 }
 
@@ -614,6 +887,75 @@ bool executeInstruction(
                 "numeric conversion")) return false;
         return storeResult(static_cast<double>(std::get<LongValue>(*value).value));
     }
+    case bytecode::Opcode::ConvertNumeric: {
+        const auto* value = operand(0);
+        if (!value || instruction.result == bytecode::InvalidRegister ||
+            instruction.result >= function.registerTypes.size()) {
+            return fail(
+                state, ErrorCode::InvalidProgram,
+                "numeric conversion metadata is invalid");
+        }
+        Value converted;
+        if (!tryConvertNumeric(
+                *value, function.registerTypes[instruction.result], converted,
+                instruction.checkedArithmetic)) {
+            return fail(
+                state, ErrorCode::IntegerOverflow,
+                "numeric conversion overflow");
+        }
+        return storeResult(std::move(converted));
+    }
+    case bytecode::Opcode::ConstantTypeId:
+        return storeResult(ULongValue{
+            static_cast<std::uint64_t>(instruction.integerImmediate)});
+    case bytecode::Opcode::IsType:
+    case bytecode::Opcode::AsType: {
+        const auto* value = operand(0);
+        if (!value || instruction.operands.front() >=
+                function.registerTypes.size()) {
+            return fail(
+                state, ErrorCode::InvalidProgram,
+                "runtime type operation metadata is invalid");
+        }
+        const auto sourceType = function.registerTypes[
+            instruction.operands.front()];
+        const bool nullValue =
+            std::holds_alternative<std::monostate>(*value) ||
+            std::holds_alternative<NullString>(*value) ||
+            std::holds_alternative<NullObject>(*value) ||
+            std::holds_alternative<NullArray>(*value);
+        bool matches = false;
+        if (!nullValue) {
+            if (instruction.elementType == semantic::PrimitiveType::Object) {
+                const auto* reference = std::get_if<ObjectRef>(value);
+                const auto actual = reference && state.heap
+                    ? state.heap->objectTypeId(*reference)
+                    : std::optional<semantic::SymbolId>{};
+                matches = actual && runtimeAssignable(
+                    state, *actual, instruction.elementTypeId);
+            } else if (instruction.elementType ==
+                       semantic::PrimitiveType::Array) {
+                const auto* reference = std::get_if<ObjectRef>(value);
+                const auto actual = reference && state.heap
+                    ? state.heap->arrayTypeId(*reference)
+                    : std::optional<semantic::SymbolId>{};
+                matches = actual && *actual == instruction.elementTypeId;
+            } else {
+                matches = sourceType == instruction.elementType;
+            }
+        }
+        if (instruction.opcode == bytecode::Opcode::IsType) {
+            return storeResult(matches);
+        }
+        if (matches) return storeResult(*value);
+        if (instruction.elementType == semantic::PrimitiveType::String) {
+            return storeResult(NullString{});
+        }
+        if (instruction.elementType == semantic::PrimitiveType::Array) {
+            return storeResult(NullArray{});
+        }
+        return storeResult(NullObject{});
+    }
     case bytecode::Opcode::NewArray: {
         const auto* lengthValue = operand(0);
         if (!lengthValue ||
@@ -656,9 +998,10 @@ bool executeInstruction(
     }
     case bytecode::Opcode::NewObject: {
         const auto* type = typeDescriptor(module, instruction.typeIndex);
-        if (!type || !state.heap) {
+        if (!type || type->interfaceType || type->delegateType ||
+            !state.heap) {
             return fail(state, ErrorCode::InvalidProgram,
-                "object allocation references an invalid type or heap");
+                "object allocation references an invalid class or heap");
         }
         std::vector<Value> fields;
         std::vector<std::size_t> referenceFields;
@@ -808,7 +1151,13 @@ bool executeInstruction(
         }
         RuntimeError arrayError;
         if (!state.heap->arraySet(
-                reference, static_cast<std::size_t>(index), *value, &arrayError)) {
+                reference,
+                static_cast<std::size_t>(index),
+                *value,
+                &arrayError,
+                instruction.elementType == semantic::PrimitiveType::Object
+                    ? ArrayStoreTypePolicy::PrevalidatedAssignableObject
+                    : ArrayStoreTypePolicy::Exact)) {
             return fail(state,
                 arrayError.code == ErrorCode::None
                     ? ErrorCode::InvalidProgram
@@ -931,6 +1280,292 @@ bool executeInstruction(
         storage->fields[instruction.index] = *value;
         return storeResult(StructValue{type->id, std::move(storage)});
     }
+    case bytecode::Opcode::NewDelegate: {
+        const auto* type = typeDescriptor(module, instruction.typeIndex);
+        if (!type || !type->delegateType || !state.heap ||
+            instruction.index >= module.functionReferences.size() ||
+            instruction.operands.size() > 1) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "delegate creation has invalid metadata");
+        }
+        const auto& reference = module.functionReferences[instruction.index];
+        Value target = NullObject{};
+        if (!instruction.operands.empty()) {
+            const auto* value = operand(0);
+            if (!value || reference.parameterTypes.empty() ||
+                !expectSignatureType(
+                    state, *value, reference.parameterTypes.front(),
+                    typeIdAt(reference.parameterTypeIds, 0),
+                    "delegate target")) {
+                return false;
+            }
+            target = *value;
+        } else if (!reference.parameterTypes.empty() &&
+                   (reference.virtualDispatch ||
+                    reference.interfaceDispatch)) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "delegate dispatch target has no receiver");
+        }
+        std::uint64_t flags = 0;
+        if (reference.virtualDispatch) flags |= 1u;
+        if (reference.interfaceDispatch) flags |= 2u;
+        std::vector<Value> fields{
+            std::move(target),
+            delegateWord(reference.symbolId, false),
+            delegateWord(reference.symbolId, true),
+            static_cast<std::int64_t>(flags),
+            static_cast<std::int64_t>(reference.virtualDispatch
+                ? reference.virtualSlot
+                : reference.interfaceDispatch
+                    ? reference.interfaceSlot
+                    : 0u),
+            delegateWord(reference.interfaceTypeId, false),
+            delegateWord(reference.interfaceTypeId, true),
+            NullObject{},
+        };
+        RuntimeError error;
+        const auto allocated = state.heap->allocateObject(
+            type->id, std::move(fields), {0u, 7u}, &error);
+        if (!allocated) {
+            return fail(state,
+                error.code == ErrorCode::None
+                    ? ErrorCode::OutOfMemory
+                    : error.code,
+                error.message.empty()
+                    ? "delegate allocation failed"
+                    : error.message);
+        }
+        return storeResult(*allocated);
+    }
+    case bytecode::Opcode::CombineDelegate:
+    case bytecode::Opcode::RemoveDelegate: {
+        const auto* type = typeDescriptor(module, instruction.typeIndex);
+        const auto* left = operand(0);
+        const auto* right = operand(1);
+        if (!type || !type->delegateType || !left || !right ||
+            !state.heap ||
+            !expectSignatureType(
+                state, *left, semantic::PrimitiveType::Object,
+                type->id, "delegate combination left operand") ||
+            !expectSignatureType(
+                state, *right, semantic::PrimitiveType::Object,
+                type->id, "delegate combination right operand")) {
+            return false;
+        }
+        std::vector<Value> leftLeaves;
+        std::vector<Value> rightLeaves;
+        if (!flattenDelegate(
+                state, type->id, *left, leftLeaves) ||
+            !flattenDelegate(
+                state, type->id, *right, rightLeaves)) {
+            return false;
+        }
+        if (instruction.opcode ==
+                bytecode::Opcode::CombineDelegate) {
+            leftLeaves.insert(
+                leftLeaves.end(),
+                rightLeaves.begin(), rightLeaves.end());
+        } else if (!rightLeaves.empty() &&
+                   rightLeaves.size() <= leftLeaves.size()) {
+            std::optional<std::size_t> removeAt;
+            for (std::size_t start = 0;
+                 start + rightLeaves.size() <= leftLeaves.size();
+                 ++start) {
+                bool matches = true;
+                for (std::size_t index = 0;
+                     index < rightLeaves.size(); ++index) {
+                    if (!sameDelegateLeaf(
+                            state,
+                            leftLeaves[start + index],
+                            rightLeaves[index])) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches) removeAt = start;
+            }
+            if (removeAt) {
+                leftLeaves.erase(
+                    leftLeaves.begin() +
+                        static_cast<std::ptrdiff_t>(*removeAt),
+                    leftLeaves.begin() +
+                        static_cast<std::ptrdiff_t>(
+                            *removeAt + rightLeaves.size()));
+            }
+        }
+        Value combined;
+        if (!buildDelegateList(
+                state, type->id, leftLeaves, combined)) {
+            return false;
+        }
+        return storeResult(std::move(combined));
+    }
+    case bytecode::Opcode::InvokeDelegate: {
+        const auto* type = typeDescriptor(module, instruction.typeIndex);
+        const auto* delegateValue = operand(0);
+        if (!type || !type->delegateType || !delegateValue ||
+            !state.heap) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "delegate invocation has invalid metadata");
+        }
+        if (std::holds_alternative<NullObject>(*delegateValue)) {
+            return fail(state, ErrorCode::NullReference,
+                "delegate invocation attempted to dereference null");
+        }
+        const auto* delegateRef = std::get_if<ObjectRef>(delegateValue);
+        const auto actualType = delegateRef
+            ? state.heap->objectTypeId(*delegateRef)
+            : std::optional<semantic::SymbolId>{};
+        if (!delegateRef || !actualType || *actualType != type->id ||
+            state.heap->fieldCount(*delegateRef) != 8u) {
+            return fail(state, ErrorCode::TypeMismatch,
+                "delegate invocation received an incompatible value");
+        }
+        const auto rootFlagsValue = state.heap->fieldGet(
+            *delegateRef, 3u);
+        const auto* rootFlags = rootFlagsValue
+            ? std::get_if<std::int64_t>(&*rootFlagsValue)
+            : nullptr;
+        if (rootFlags && *rootFlags == 4) {
+            std::vector<Value> leaves;
+            if (!flattenDelegate(
+                    state, type->id, *delegateValue, leaves)) {
+                return false;
+            }
+            Value lastResult;
+            for (const auto& leaf : leaves) {
+                auto nestedRegisters = registers;
+                nestedRegisters[instruction.operands.front()] = leaf;
+                if (!executeInstruction(
+                        state, module, function, instruction,
+                        arguments, locals, nestedRegisters)) {
+                    return false;
+                }
+                if (instruction.result !=
+                    bytecode::InvalidRegister) {
+                    lastResult = nestedRegisters[instruction.result];
+                }
+            }
+            if (instruction.result ==
+                bytecode::InvalidRegister) {
+                return true;
+            }
+            return storeResult(std::move(lastResult));
+        }
+        const semantic::FunctionSymbol* invoke = nullptr;
+        for (const auto& method : type->methods) {
+            if (method.name == "Invoke") {
+                invoke = &method;
+                break;
+            }
+        }
+        if (!invoke || invoke->parameters.empty() ||
+            instruction.operands.size() != invoke->parameters.size()) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "delegate invocation signature is invalid");
+        }
+        std::vector<Value> delegateArguments;
+        delegateArguments.reserve(instruction.operands.size());
+        for (std::size_t index = 1;
+             index < instruction.operands.size(); ++index) {
+            const auto* value = operand(index);
+            const auto& parameter = invoke->parameters[index];
+            const auto parameterType =
+                semantic::storageTypeOf(parameter);
+            if (!value || !expectSignatureType(
+                    state, *value, parameterType,
+                    exactTypeId(
+                        parameterType,
+                        semantic::storageTypeNameOf(parameter)),
+                    "delegate argument")) {
+                return false;
+            }
+            delegateArguments.push_back(*value);
+        }
+        semantic::SymbolId targetSymbolId = 0;
+        if (!readDelegateId(
+                state, *delegateRef, 1u, targetSymbolId,
+                "delegate callable identity is corrupt")) {
+            return false;
+        }
+        const auto target = state.heap->fieldGet(*delegateRef, 0u);
+        const auto flagsValue = state.heap->fieldGet(*delegateRef, 3u);
+        const auto slotValue = state.heap->fieldGet(*delegateRef, 4u);
+        const auto* flags = flagsValue
+            ? std::get_if<std::int64_t>(&*flagsValue)
+            : nullptr;
+        const auto* slot = slotValue
+            ? std::get_if<std::int64_t>(&*slotValue)
+            : nullptr;
+        if (!target || !flags || !slot || *flags < 0 || *flags > 3 ||
+            *slot < 0 ||
+            *slot > std::numeric_limits<std::uint32_t>::max()) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "delegate dispatch metadata is corrupt");
+        }
+        const bool virtualDispatch = (*flags & 1) != 0;
+        const bool interfaceDispatch = (*flags & 2) != 0;
+        if (virtualDispatch && interfaceDispatch) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "delegate dispatch modes conflict");
+        }
+        if (!std::holds_alternative<NullObject>(*target)) {
+            delegateArguments.insert(delegateArguments.begin(), *target);
+        }
+        if (virtualDispatch || interfaceDispatch) {
+            const auto* receiver = delegateArguments.empty()
+                ? nullptr
+                : std::get_if<ObjectRef>(&delegateArguments.front());
+            const auto runtimeType = receiver
+                ? state.heap->objectTypeId(*receiver)
+                : std::optional<semantic::SymbolId>{};
+            if (!runtimeType || !state.types) {
+                return fail(state, ErrorCode::InvalidObjectReference,
+                    "delegate receiver has no runtime type");
+            }
+            const auto foundType = state.types->find(*runtimeType);
+            if (foundType == state.types->end()) {
+                return fail(state, ErrorCode::InvalidProgram,
+                    "delegate receiver descriptor is unavailable");
+            }
+            const auto dispatchSlot = static_cast<std::uint32_t>(*slot);
+            if (virtualDispatch) {
+                if (dispatchSlot >=
+                    foundType->second->virtualDispatchTable.size()) {
+                    return fail(state, ErrorCode::InvalidProgram,
+                        "delegate virtual slot is invalid");
+                }
+                targetSymbolId = foundType->second
+                    ->virtualDispatchTable[dispatchSlot];
+            } else {
+                semantic::SymbolId interfaceTypeId = 0;
+                if (!readDelegateId(
+                        state, *delegateRef, 5u, interfaceTypeId,
+                        "delegate interface identity is corrupt")) {
+                    return false;
+                }
+                const auto* map = runtimeInterfaceMap(
+                    state, *runtimeType, interfaceTypeId);
+                if (!map || dispatchSlot >= map->slots.size()) {
+                    return fail(state, ErrorCode::InvalidProgram,
+                        "delegate interface slot is invalid");
+                }
+                targetSymbolId = map->slots[dispatchSlot];
+            }
+        }
+        const auto found = state.functions->find(targetSymbolId);
+        if (found == state.functions->end()) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "delegate target function is unavailable");
+        }
+        Value delegateResult;
+        if (!executeFunction(
+                state, found->second, delegateArguments, delegateResult)) {
+            return false;
+        }
+        if (instruction.result == bytecode::InvalidRegister) return true;
+        return storeResult(std::move(delegateResult));
+    }
     case bytecode::Opcode::Call: {
         Value callResult;
         if (!executeCall(state, module, instruction, registers, callResult)) return false;
@@ -941,7 +1576,12 @@ bool executeInstruction(
         const auto* value = operand(0);
         if (!value || !expectType(state, *value, semantic::PrimitiveType::Int, "negation")) return false;
         Value output;
-        if (!checkedIntResult(state, -std::get<std::int64_t>(*value), output)) return false;
+        const auto number = std::get<std::int64_t>(*value);
+        if (!instruction.checkedArithmetic &&
+            number == std::numeric_limits<std::int32_t>::min()) {
+            return storeResult(number);
+        }
+        if (!checkedIntResult(state, -number, output)) return false;
         return storeResult(std::move(output));
     }
     case bytecode::Opcode::NegateLong: {
@@ -950,12 +1590,16 @@ bool executeInstruction(
                 "negation")) return false;
         const auto number = std::get<LongValue>(*value).value;
         if (number == std::numeric_limits<std::int64_t>::min()) {
+            if (!instruction.checkedArithmetic) return storeResult(LongValue{number});
             return fail(state, ErrorCode::IntegerOverflow, "long negation overflow");
         }
         return storeResult(LongValue{-number});
     }
     case bytecode::Opcode::NegateDouble: {
         const auto* value = operand(0);
+        if (value && valueType(*value) == semantic::PrimitiveType::Float) {
+            return storeResult(FloatValue{-std::get<FloatValue>(*value).value});
+        }
         if (!value || !expectType(state, *value, semantic::PrimitiveType::Double,
                 "negation")) return false;
         return storeResult(-std::get<double>(*value));
@@ -984,6 +1628,38 @@ bool executeInstruction(
         instruction.opcode <= bytecode::Opcode::GreaterOrEqualDouble;
     Value output;
     if (isLongOpcode) {
+        if (valueType(*left) == semantic::PrimitiveType::ULong) {
+            if (!expectType(state, *right, semantic::PrimitiveType::ULong,
+                    "binary operation")) return false;
+            const auto a = std::get<ULongValue>(*left).value;
+            const auto b = std::get<ULongValue>(*right).value;
+            switch (instruction.opcode) {
+            case bytecode::Opcode::AddLong:
+                if (instruction.checkedArithmetic &&
+                    b > std::numeric_limits<std::uint64_t>::max() - a)
+                    return fail(state, ErrorCode::IntegerOverflow, "ulong addition overflow");
+                return storeResult(ULongValue{a + b});
+            case bytecode::Opcode::SubtractLong:
+                if (instruction.checkedArithmetic && a < b) return fail(state, ErrorCode::IntegerOverflow, "ulong subtraction overflow");
+                return storeResult(ULongValue{a - b});
+            case bytecode::Opcode::MultiplyLong:
+                if (instruction.checkedArithmetic && b != 0 &&
+                    a > std::numeric_limits<std::uint64_t>::max() / b)
+                    return fail(state, ErrorCode::IntegerOverflow, "ulong multiplication overflow");
+                return storeResult(ULongValue{a * b});
+            case bytecode::Opcode::DivideLong:
+                if (b == 0) return fail(state, ErrorCode::DivisionByZero, "division by zero");
+                return storeResult(ULongValue{a / b});
+            case bytecode::Opcode::RemainderLong:
+                if (b == 0) return fail(state, ErrorCode::DivisionByZero, "remainder by zero");
+                return storeResult(ULongValue{a % b});
+            case bytecode::Opcode::LessLong: return storeResult(a < b);
+            case bytecode::Opcode::LessOrEqualLong: return storeResult(a <= b);
+            case bytecode::Opcode::GreaterLong: return storeResult(a > b);
+            case bytecode::Opcode::GreaterOrEqualLong: return storeResult(a >= b);
+            default: break;
+            }
+        }
         if (!expectType(state, *left, semantic::PrimitiveType::Long, "binary operation") ||
             !expectType(state, *right, semantic::PrimitiveType::Long, "binary operation")) {
             return false;
@@ -992,10 +1668,25 @@ bool executeInstruction(
         const auto b = std::get<LongValue>(*right).value;
         switch (instruction.opcode) {
         case bytecode::Opcode::AddLong:
+            if (!instruction.checkedArithmetic) {
+                return storeResult(LongValue{signedFromBits(
+                    static_cast<std::uint64_t>(a) +
+                    static_cast<std::uint64_t>(b))});
+            }
             return checkedLongAdd(state, a, b, output) && storeResult(output);
         case bytecode::Opcode::SubtractLong:
+            if (!instruction.checkedArithmetic) {
+                return storeResult(LongValue{signedFromBits(
+                    static_cast<std::uint64_t>(a) -
+                    static_cast<std::uint64_t>(b))});
+            }
             return checkedLongSubtract(state, a, b, output) && storeResult(output);
         case bytecode::Opcode::MultiplyLong:
+            if (!instruction.checkedArithmetic) {
+                return storeResult(LongValue{signedFromBits(
+                    static_cast<std::uint64_t>(a) *
+                    static_cast<std::uint64_t>(b))});
+            }
             return checkedLongMultiply(state, a, b, output) && storeResult(output);
         case bytecode::Opcode::DivideLong:
             if (b == 0) return fail(state, ErrorCode::DivisionByZero, "division by zero");
@@ -1017,6 +1708,23 @@ bool executeInstruction(
         }
     }
     if (isDoubleOpcode) {
+        if (valueType(*left) == semantic::PrimitiveType::Float) {
+            if (!expectType(state, *right, semantic::PrimitiveType::Float,
+                    "binary operation")) return false;
+            const auto a = std::get<FloatValue>(*left).value;
+            const auto b = std::get<FloatValue>(*right).value;
+            switch (instruction.opcode) {
+            case bytecode::Opcode::AddDouble: return storeResult(FloatValue{a + b});
+            case bytecode::Opcode::SubtractDouble: return storeResult(FloatValue{a - b});
+            case bytecode::Opcode::MultiplyDouble: return storeResult(FloatValue{a * b});
+            case bytecode::Opcode::DivideDouble: return storeResult(FloatValue{a / b});
+            case bytecode::Opcode::LessDouble: return storeResult(a < b);
+            case bytecode::Opcode::LessOrEqualDouble: return storeResult(a <= b);
+            case bytecode::Opcode::GreaterDouble: return storeResult(a > b);
+            case bytecode::Opcode::GreaterOrEqualDouble: return storeResult(a >= b);
+            default: break;
+            }
+        }
         if (!expectType(state, *left, semantic::PrimitiveType::Double, "binary operation") ||
             !expectType(state, *right, semantic::PrimitiveType::Double, "binary operation")) {
             return false;
@@ -1038,14 +1746,52 @@ bool executeInstruction(
         default: break;
         }
     }
+    if (valueType(*left) == semantic::PrimitiveType::UInt) {
+        if (!expectType(state, *right, semantic::PrimitiveType::UInt,
+                "binary operation")) return false;
+        const auto a = std::get<UIntValue>(*left).value;
+        const auto b = std::get<UIntValue>(*right).value;
+        switch (instruction.opcode) {
+        case bytecode::Opcode::AddInt:
+            if (instruction.checkedArithmetic &&
+                b > std::numeric_limits<std::uint32_t>::max() - a)
+                return fail(state, ErrorCode::IntegerOverflow, "uint addition overflow");
+            return storeResult(UIntValue{static_cast<std::uint32_t>(a + b)});
+        case bytecode::Opcode::SubtractInt:
+            if (instruction.checkedArithmetic && a < b) return fail(state, ErrorCode::IntegerOverflow, "uint subtraction overflow");
+            return storeResult(UIntValue{static_cast<std::uint32_t>(a - b)});
+        case bytecode::Opcode::MultiplyInt:
+            if (instruction.checkedArithmetic && b != 0 &&
+                a > std::numeric_limits<std::uint32_t>::max() / b)
+                return fail(state, ErrorCode::IntegerOverflow, "uint multiplication overflow");
+            return storeResult(UIntValue{static_cast<std::uint32_t>(a * b)});
+        case bytecode::Opcode::DivideInt:
+            if (b == 0) return fail(state, ErrorCode::DivisionByZero, "division by zero");
+            return storeResult(UIntValue{static_cast<std::uint32_t>(a / b)});
+        case bytecode::Opcode::RemainderInt:
+            if (b == 0) return fail(state, ErrorCode::DivisionByZero, "remainder by zero");
+            return storeResult(UIntValue{static_cast<std::uint32_t>(a % b)});
+        case bytecode::Opcode::LessInt: return storeResult(a < b);
+        case bytecode::Opcode::LessOrEqualInt: return storeResult(a <= b);
+        case bytecode::Opcode::GreaterInt: return storeResult(a > b);
+        case bytecode::Opcode::GreaterOrEqualInt: return storeResult(a >= b);
+        default: break;
+        }
+    }
     if (!expectType(state, *left, semantic::PrimitiveType::Int, "binary operation") ||
         !expectType(state, *right, semantic::PrimitiveType::Int, "binary operation")) return false;
     const auto a = std::get<std::int64_t>(*left);
     const auto b = std::get<std::int64_t>(*right);
     switch (instruction.opcode) {
-    case bytecode::Opcode::AddInt: return checkedIntResult(state, a + b, output) && storeResult(output);
-    case bytecode::Opcode::SubtractInt: return checkedIntResult(state, a - b, output) && storeResult(output);
-    case bytecode::Opcode::MultiplyInt: return checkedIntResult(state, a * b, output) && storeResult(output);
+    case bytecode::Opcode::AddInt:
+        if (!instruction.checkedArithmetic) return storeResult(wrapInt32(a + b));
+        return checkedIntResult(state, a + b, output) && storeResult(output);
+    case bytecode::Opcode::SubtractInt:
+        if (!instruction.checkedArithmetic) return storeResult(wrapInt32(a - b));
+        return checkedIntResult(state, a - b, output) && storeResult(output);
+    case bytecode::Opcode::MultiplyInt:
+        if (!instruction.checkedArithmetic) return storeResult(wrapInt32(a * b));
+        return checkedIntResult(state, a * b, output) && storeResult(output);
     case bytecode::Opcode::DivideInt:
         if (b == 0) return fail(state, ErrorCode::DivisionByZero, "division by zero");
         if (a == std::numeric_limits<std::int32_t>::min() && b == -1)
@@ -1108,20 +1854,60 @@ bool executeFunction(
         return fail(state, ErrorCode::InvalidProgram, "entry block is missing");
     }
 
+    const auto routePendingException = [&](bytecode::BlockId protectedBlock) {
+        if (!state.pendingException ||
+            !std::holds_alternative<ObjectRef>(*state.pendingException)) {
+            return static_cast<const bytecode::BasicBlock*>(nullptr);
+        }
+        const auto reference = std::get<ObjectRef>(*state.pendingException);
+        const auto actual = state.heap->objectTypeId(reference);
+        if (!actual) return static_cast<const bytecode::BasicBlock*>(nullptr);
+        for (const auto& handler : function.exceptionHandlers) {
+            if (std::find(handler.protectedBlocks.begin(),
+                          handler.protectedBlocks.end(), protectedBlock) ==
+                handler.protectedBlocks.end()) {
+                continue;
+            }
+            if (handler.catchTypeId != 0 &&
+                !runtimeAssignable(state, *actual, handler.catchTypeId)) {
+                continue;
+            }
+            if (handler.exceptionLocal >= locals.size()) {
+                return static_cast<const bytecode::BasicBlock*>(nullptr);
+            }
+            locals[handler.exceptionLocal] = *state.pendingException;
+            state.pendingException.reset();
+            return findBlock(function, handler.handlerBlock);
+        }
+        return static_cast<const bytecode::BasicBlock*>(nullptr);
+    };
+
     while (true) {
+        bool exceptionTransferred = false;
         for (std::size_t instructionIndex = 0;
              instructionIndex < block->instructions.size();
              ++instructionIndex) {
             const auto& instruction = block->instructions[instructionIndex];
             if (!debugSequencePoint(
                     state, *location.module, function, block->id,
-                    static_cast<std::uint32_t>(instructionIndex), false) ||
-                !executeInstruction(state, *location.module, function, instruction,
+                    static_cast<std::uint32_t>(instructionIndex), false)) {
+                state.stack.pop_back();
+                return false;
+            }
+            if (!executeInstruction(state, *location.module, function, instruction,
                     arguments, locals, registers)) {
+                if (state.pendingException) {
+                    if (const auto* handler = routePendingException(block->id)) {
+                        block = handler;
+                        exceptionTransferred = true;
+                        break;
+                    }
+                }
                 state.stack.pop_back();
                 return false;
             }
         }
+        if (exceptionTransferred) continue;
         if (!debugSequencePoint(
                 state, *location.module, function, block->id,
                 static_cast<std::uint32_t>(block->instructions.size()), true) ||
@@ -1130,6 +1916,21 @@ bool executeFunction(
             return false;
         }
         const auto& terminator = block->terminator;
+        if (terminator.kind == bytecode::TerminatorKind::Throw) {
+            if (terminator.value >= registers.size() ||
+                !std::holds_alternative<ObjectRef>(registers[terminator.value])) {
+                state.stack.pop_back();
+                return fail(state, ErrorCode::NullReference,
+                    "throw requires a non-null script object");
+            }
+            state.pendingException = registers[terminator.value];
+            if (const auto* handler = routePendingException(block->id)) {
+                block = handler;
+                continue;
+            }
+            state.stack.pop_back();
+            return false;
+        }
         if (terminator.kind == bytecode::TerminatorKind::ReturnVoid) {
             result = std::monostate{};
             emitTrace(state, TraceEventKind::FunctionExit,
@@ -1247,6 +2048,7 @@ ExecutionResult Interpreter::invoke(
     const std::vector<Value>& arguments,
     ExecutionOptions options) const {
     std::unordered_map<semantic::SymbolId, FunctionLocation> functions;
+    std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> types;
     for (const auto& module : modules_) {
         diagnostics::DiagnosticBag diagnostics;
         if (!bytecode::verifyModule(module, diagnostics)) {
@@ -1254,6 +2056,9 @@ ExecutionResult Interpreter::invoke(
             invalid.error.code = ErrorCode::InvalidProgram;
             invalid.error.message = "bytecode verification failed before execution";
             return invalid;
+        }
+        for (const auto& type : module.types) {
+            types.emplace(type.id, &type);
         }
         for (const auto& function : module.functions) {
             if (!functions.emplace(function.symbolId, FunctionLocation{&module, &function}).second) {
@@ -1274,6 +2079,7 @@ ExecutionResult Interpreter::invoke(
     State state;
     state.limits = options.limits;
     state.functions = &functions;
+    state.types = &types;
     state.externalResolver = &externalResolver_;
     state.bindings = bindings_.get();
     state.trace = &options.trace;
@@ -1288,6 +2094,12 @@ ExecutionResult Interpreter::invoke(
     Value value;
     ExecutionResult execution;
     execution.succeeded = executeFunction(state, found->second, arguments, value);
+    if (!execution.succeeded && state.pendingException &&
+        state.error.code == ErrorCode::None) {
+        state.error.code = ErrorCode::ScriptException;
+        state.error.message = "unhandled script exception";
+        state.error.stackTrace = state.stack;
+    }
     execution.succeeded = state.determinism.finish(
         execution.succeeded,
         value,
@@ -1349,8 +2161,167 @@ const char* errorCodeName(ErrorCode code) noexcept {
     case ErrorCode::ExecutionTerminated: return "execution-terminated";
     case ErrorCode::DeterminismViolation: return "determinism-violation";
     case ErrorCode::ReplayMismatch: return "replay-mismatch";
+    case ErrorCode::ScriptException: return "script-exception";
     }
     return "unknown";
+}
+
+bool tryConvertNumeric(
+    const Value& value,
+    semantic::PrimitiveType target,
+    Value& result,
+    bool checkedArithmetic) noexcept {
+    long double number = 0.0L;
+    std::uint64_t integerBits = 0;
+    bool integerSource = true;
+    if (const auto* byteValue = std::get_if<ByteValue>(&value)) {
+        number = byteValue->value; integerBits = byteValue->value;
+    } else if (const auto* sbyteValue = std::get_if<SByteValue>(&value)) {
+        number = sbyteValue->value; integerBits = static_cast<std::uint64_t>(sbyteValue->value);
+    } else if (const auto* shortValue = std::get_if<ShortValue>(&value)) {
+        number = shortValue->value; integerBits = static_cast<std::uint64_t>(shortValue->value);
+    } else if (const auto* ushortValue = std::get_if<UShortValue>(&value)) {
+        number = ushortValue->value; integerBits = ushortValue->value;
+    } else if (const auto* intValue = std::get_if<std::int64_t>(&value)) {
+        number = static_cast<long double>(*intValue); integerBits = static_cast<std::uint64_t>(*intValue);
+    } else if (const auto* uintValue = std::get_if<UIntValue>(&value)) {
+        number = uintValue->value; integerBits = uintValue->value;
+    } else if (const auto* longValue = std::get_if<LongValue>(&value)) {
+        number = static_cast<long double>(longValue->value); integerBits = static_cast<std::uint64_t>(longValue->value);
+    } else if (const auto* ulongValue = std::get_if<ULongValue>(&value)) {
+        number = static_cast<long double>(ulongValue->value); integerBits = ulongValue->value;
+    }
+    else if (const auto* floatValue = std::get_if<FloatValue>(&value)) number = floatValue->value;
+    else if (const auto* doubleValue = std::get_if<double>(&value)) number = *doubleValue;
+    else if (const auto* charValue = std::get_if<CharValue>(&value)) {
+        number = charValue->value; integerBits = charValue->value;
+    }
+    else return false;
+    if (std::holds_alternative<FloatValue>(value) ||
+        std::holds_alternative<double>(value)) integerSource = false;
+
+    if (!checkedArithmetic && semantic::isIntegralType(target)) {
+        if (!integerSource) {
+            if (!std::isfinite(number)) integerBits = 0;
+            else {
+                const auto modulus = std::ldexp(1.0L,
+                    target == semantic::PrimitiveType::Byte ||
+                    target == semantic::PrimitiveType::SByte ? 8 :
+                    target == semantic::PrimitiveType::Short ||
+                    target == semantic::PrimitiveType::UShort ||
+                    target == semantic::PrimitiveType::Char ? 16 :
+                    target == semantic::PrimitiveType::Int ||
+                    target == semantic::PrimitiveType::UInt ? 32 : 64);
+                auto wrapped = std::fmod(std::trunc(number), modulus);
+                if (wrapped < 0) wrapped += modulus;
+                integerBits = static_cast<std::uint64_t>(wrapped);
+            }
+        }
+        switch (target) {
+        case semantic::PrimitiveType::Byte:
+            result = ByteValue{static_cast<std::uint8_t>(integerBits)}; return true;
+        case semantic::PrimitiveType::SByte: {
+            const auto bits = static_cast<std::uint8_t>(integerBits);
+            const auto signedValue = bits <= 0x7fU
+                ? static_cast<std::int16_t>(bits)
+                : static_cast<std::int16_t>(bits) - 0x100;
+            result = SByteValue{static_cast<std::int8_t>(signedValue)}; return true;
+        }
+        case semantic::PrimitiveType::Short: {
+            const auto bits = static_cast<std::uint16_t>(integerBits);
+            const auto signedValue = bits <= 0x7fffU
+                ? static_cast<std::int32_t>(bits)
+                : static_cast<std::int32_t>(bits) - 0x10000;
+            result = ShortValue{static_cast<std::int16_t>(signedValue)}; return true;
+        }
+        case semantic::PrimitiveType::UShort:
+            result = UShortValue{static_cast<std::uint16_t>(integerBits)}; return true;
+        case semantic::PrimitiveType::Char:
+            result = CharValue{static_cast<char16_t>(integerBits)}; return true;
+        case semantic::PrimitiveType::Int:
+            result = wrapInt32(static_cast<std::int64_t>(integerBits)); return true;
+        case semantic::PrimitiveType::UInt:
+            result = UIntValue{static_cast<std::uint32_t>(integerBits)}; return true;
+        case semantic::PrimitiveType::Long:
+            result = LongValue{signedFromBits(integerBits)}; return true;
+        case semantic::PrimitiveType::ULong:
+            result = ULongValue{integerBits}; return true;
+        default:
+            break;
+        }
+    }
+
+    if (checkedArithmetic) {
+        const auto inRange = [&](long double minimum, long double maximum) {
+            return std::isfinite(number) && number >= minimum && number <= maximum;
+        };
+        switch (target) {
+        case semantic::PrimitiveType::Byte:
+            if (!inRange(0, 255)) return false;
+            break;
+        case semantic::PrimitiveType::SByte:
+            if (!inRange(-128, 127)) return false;
+            break;
+        case semantic::PrimitiveType::Short:
+            if (!inRange(-32768, 32767)) return false;
+            break;
+        case semantic::PrimitiveType::UShort:
+        case semantic::PrimitiveType::Char:
+            if (!inRange(0, 65535)) return false;
+            break;
+        case semantic::PrimitiveType::Int:
+            if (!inRange(
+                    std::numeric_limits<std::int32_t>::min(),
+                    std::numeric_limits<std::int32_t>::max())) return false;
+            break;
+        case semantic::PrimitiveType::UInt:
+            if (!inRange(0, std::numeric_limits<std::uint32_t>::max())) return false;
+            break;
+        case semantic::PrimitiveType::Long:
+            if (!inRange(
+                    static_cast<long double>(std::numeric_limits<std::int64_t>::min()),
+                    static_cast<long double>(std::numeric_limits<std::int64_t>::max()))) return false;
+            break;
+        case semantic::PrimitiveType::ULong:
+            if (!inRange(0, static_cast<long double>(
+                    std::numeric_limits<std::uint64_t>::max()))) return false;
+            break;
+        case semantic::PrimitiveType::Float:
+            if (!inRange(
+                    -std::numeric_limits<float>::max(),
+                    std::numeric_limits<float>::max())) return false;
+            break;
+        default:
+            break;
+        }
+    }
+
+    switch (target) {
+    case semantic::PrimitiveType::Byte:
+        result = ByteValue{static_cast<std::uint8_t>(number)}; return true;
+    case semantic::PrimitiveType::SByte:
+        result = SByteValue{static_cast<std::int8_t>(number)}; return true;
+    case semantic::PrimitiveType::Short:
+        result = ShortValue{static_cast<std::int16_t>(number)}; return true;
+    case semantic::PrimitiveType::UShort:
+        result = UShortValue{static_cast<std::uint16_t>(number)}; return true;
+    case semantic::PrimitiveType::Int:
+        result = static_cast<std::int64_t>(number); return true;
+    case semantic::PrimitiveType::UInt:
+        result = UIntValue{static_cast<std::uint32_t>(number)}; return true;
+    case semantic::PrimitiveType::Long:
+        result = LongValue{static_cast<std::int64_t>(number)}; return true;
+    case semantic::PrimitiveType::ULong:
+        result = ULongValue{static_cast<std::uint64_t>(number)}; return true;
+    case semantic::PrimitiveType::Float:
+        result = FloatValue{static_cast<float>(number)}; return true;
+    case semantic::PrimitiveType::Double:
+        result = static_cast<double>(number); return true;
+    case semantic::PrimitiveType::Char:
+        result = CharValue{static_cast<char16_t>(number)}; return true;
+    default:
+        return false;
+    }
 }
 
 semantic::PrimitiveType valueType(const Value& value) noexcept {
@@ -1359,9 +2330,17 @@ semantic::PrimitiveType valueType(const Value& value) noexcept {
     if (std::holds_alternative<NullObject>(value)) return semantic::PrimitiveType::Object;
     if (std::holds_alternative<NullArray>(value)) return semantic::PrimitiveType::Array;
     if (std::holds_alternative<bool>(value)) return semantic::PrimitiveType::Bool;
+    if (std::holds_alternative<ByteValue>(value)) return semantic::PrimitiveType::Byte;
+    if (std::holds_alternative<SByteValue>(value)) return semantic::PrimitiveType::SByte;
+    if (std::holds_alternative<ShortValue>(value)) return semantic::PrimitiveType::Short;
+    if (std::holds_alternative<UShortValue>(value)) return semantic::PrimitiveType::UShort;
     if (std::holds_alternative<std::int64_t>(value)) return semantic::PrimitiveType::Int;
+    if (std::holds_alternative<UIntValue>(value)) return semantic::PrimitiveType::UInt;
     if (std::holds_alternative<LongValue>(value)) return semantic::PrimitiveType::Long;
+    if (std::holds_alternative<ULongValue>(value)) return semantic::PrimitiveType::ULong;
+    if (std::holds_alternative<FloatValue>(value)) return semantic::PrimitiveType::Float;
     if (std::holds_alternative<double>(value)) return semantic::PrimitiveType::Double;
+    if (std::holds_alternative<CharValue>(value)) return semantic::PrimitiveType::Char;
     if (std::holds_alternative<EnumValue>(value)) return semantic::PrimitiveType::Enum;
     if (std::holds_alternative<StructValue>(value)) return semantic::PrimitiveType::Struct;
     if (std::holds_alternative<std::string>(value)) return semantic::PrimitiveType::String;
@@ -1382,9 +2361,17 @@ std::string valueToString(const Value& value, const ManagedHeap* heap) {
     if (std::holds_alternative<NullObject>(value)) return "null";
     if (std::holds_alternative<NullArray>(value)) return "null";
     if (std::holds_alternative<bool>(value)) return std::get<bool>(value) ? "true" : "false";
+    if (const auto* number = std::get_if<ByteValue>(&value)) return std::to_string(number->value);
+    if (const auto* number = std::get_if<SByteValue>(&value)) return std::to_string(number->value);
+    if (const auto* number = std::get_if<ShortValue>(&value)) return std::to_string(number->value);
+    if (const auto* number = std::get_if<UShortValue>(&value)) return std::to_string(number->value);
     if (std::holds_alternative<std::int64_t>(value)) return std::to_string(std::get<std::int64_t>(value));
+    if (const auto* number = std::get_if<UIntValue>(&value)) return std::to_string(number->value);
     if (const auto* number = std::get_if<LongValue>(&value)) return std::to_string(number->value);
+    if (const auto* number = std::get_if<ULongValue>(&value)) return std::to_string(number->value);
+    if (const auto* number = std::get_if<FloatValue>(&value)) return std::to_string(number->value);
     if (const auto* number = std::get_if<double>(&value)) return std::to_string(*number);
+    if (const auto* character = std::get_if<CharValue>(&value)) return std::to_string(character->value);
     if (const auto* enumeration = std::get_if<EnumValue>(&value)) {
         return "<enum:type=0x" + std::to_string(enumeration->typeId) + ":" +
             std::to_string(enumeration->value) + ">";

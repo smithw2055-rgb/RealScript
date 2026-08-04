@@ -343,7 +343,8 @@ double main()
     uint f = 6;
     ulong g = 7;
     float h = 8.5;
-    return a + b + c + d + e + f + g + h;
+    return (double)a + (double)b + (double)c + (double)d +
+        (double)e + (double)f + (double)g + (double)h;
 }
 )");
     require(

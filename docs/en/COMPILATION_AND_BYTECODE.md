@@ -150,9 +150,9 @@ Bytecode functions retain:
 - basic blocks and terminators;
 - source debug metadata.
 
-## `.rsbc` 0.5
+## `.rsbc` 0.9
 
-The current physical format is deterministic, little-endian, and section based. It contains six logical areas:
+The current physical format is deterministic, little-endian, and section based. It contains eight logical areas:
 
 1. strings;
 2. type descriptors;
@@ -160,10 +160,15 @@ The current physical format is deterministic, little-endian, and section based. 
 4. function metadata;
 5. code;
 6. debug information.
+7. native language metadata;
+8. object-model and dispatch metadata.
 
 Encoding avoids timestamps, native addresses, compiler padding, and platform-dependent structure layouts.
 
-The format includes descriptors for classes, arrays, structs, enums, and native handles, plus exact local/register/block type metadata.
+The format includes descriptors for classes, interfaces, delegates, closures,
+arrays, structs, enums, and native handles; exact local/register/block type
+metadata; dispatch and specialization metadata; and per-function exception
+handler regions. The decoder retains legacy 0.6–0.8 support.
 
 ## Defensive Loading
 
@@ -197,7 +202,7 @@ No module may execute unless both stages succeed.
 
 ## Debug Information
 
-`.rsbc` 0.5 stores:
+`.rsbc` 0.9 stores:
 
 - source-file identities and content fingerprints;
 - line-start tables;

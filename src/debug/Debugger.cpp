@@ -214,7 +214,10 @@ DebugStop DebugController::capture(
         if (!view->module || !view->function) continue;
         DebugStackFrame frame;
         frame.id = frameId++;
-        frame.function = view->module->name + "::" + view->function->name;
+        const bool sourceLambda =
+            view->function->name.find("$lambda_") == 0;
+        frame.function = view->module->name + "::" +
+            (sourceLambda ? "<lambda>" : view->function->name);
         if (view->point) {
             frame.location = view->point->range;
             if (const auto* source = sourceFile(*view->module, view->point->range.fileId)) {
@@ -222,6 +225,9 @@ DebugStop DebugController::capture(
             }
         }
         for (const auto& local : view->function->debugInfo.locals) {
+            if (sourceLambda && local.parameter && local.name == "this") {
+                continue;
+            }
             const auto* values = view->locals;
             if (!values || local.slot >= values->size()) continue;
             if (!local.parameter && view->point) {

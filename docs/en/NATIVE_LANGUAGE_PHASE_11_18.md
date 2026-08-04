@@ -6,6 +6,13 @@ RealScript Phase 18 compiles the C#-style gameplay profile directly through the 
 
 This remains an embedded deterministic game-language profile, not CLR compatibility.
 
+> Historical scope note: this page records the Phase 18 migration boundary.
+> Phases 19–24 subsequently delivered runtime polymorphism, first-class
+> delegates/closures, inferred generics and growable collections, complete
+> deterministic state machines, value/reference semantics, patterns, and
+> structured exceptions. Use the current
+> [compatibility matrix](CSHARP_COMPATIBILITY_MATRIX.md) for present behavior.
+
 ## Compilation model
 
 A `Compilation` parses original source directly. There is no source expansion or compatibility preprocessing stage. Declarations remain isolated by `module`; directly imported modules contribute visible native declarations and contracts.

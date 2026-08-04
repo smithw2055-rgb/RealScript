@@ -45,6 +45,31 @@ void testDuplicateSymbolsRejected() {
     require(error.code == realscript::runtime::ErrorCode::DuplicateSymbol, "wrong duplicate error");
 }
 
+void testQualifiedOverloadsLinkBySymbolIdentity() {
+    auto modules = compile({{"overloads.rs", R"(
+module Demo;
+int Pick(int value) { return value; }
+int Pick(bool value) { if (value) return 2; return 0; }
+int main() { return Pick(1) + Pick(true); }
+)"}});
+    realscript::runtime::RuntimeError error;
+    auto image = realscript::runtime::ProgramImage::link(
+        std::move(modules), error);
+    require(image.has_value(),
+        "qualified overloads failed to link: " + error.message);
+    require(image->functionCount() == 3,
+        "qualified overload link dropped a symbol");
+    require(image->findFunction("Demo::Pick").has_value(),
+        "legacy overload name index is missing");
+    realscript::runtime::EngineRuntime runtime(
+        std::make_shared<realscript::runtime::ProgramImage>(
+            std::move(*image)));
+    const auto result = runtime.invoke("Demo::main");
+    require(result.succeeded &&
+            std::get<std::int64_t>(result.value) == 3,
+        "SymbolId-directed overload calls produced the wrong result");
+}
+
 void testBindingRegistryByName() {
     realscript::bytecode::Module module;
     module.name = "Demo";
@@ -135,6 +160,8 @@ int main() {
     };
     run("Program image links once", testProgramImageLinksOnce);
     run("Duplicate symbols rejected", testDuplicateSymbolsRejected);
+    run("Qualified overloads link by SymbolId",
+        testQualifiedOverloadsLinkBySymbolIdentity);
     run("Binding registry by name", testBindingRegistryByName);
     run("Trace and statistics", testTraceAndStatistics);
     run("Branch statistics deterministic", testBranchStatisticsDeterministic);

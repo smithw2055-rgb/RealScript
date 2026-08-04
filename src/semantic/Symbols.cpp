@@ -110,6 +110,10 @@ bool populateFields(
         }
         FieldSymbol field;
         field.name = fieldSyntax.identifierToken.text;
+        field.accessibility = accessibilityFromModifiers(
+            fieldSyntax.modifiers);
+        field.declaringTypeId = type.id;
+        field.declaringTypeName = canonicalTypeName(type);
         field.type = resolved.type;
         field.typeName = resolved.name;
         field.index = type.fields.size();
@@ -121,15 +125,25 @@ bool populateFields(
     return valid;
 }
 
-void appendImplicitThis(FunctionSymbol& result, const TypeSymbol& owner) {
+void appendImplicitThis(
+    FunctionSymbol& result,
+    const TypeSymbol& owner,
+    bool mutableStructReceiver = false) {
     if (result.staticMethod) return;
     VariableSymbol self;
     self.name = "this";
     self.type = typeKindPrimitive(owner.kind);
     self.typeName = canonicalTypeName(owner);
     self.index = 0;
-    self.storageType = self.type;
-    self.storageTypeName = self.typeName;
+    if (mutableStructReceiver && owner.kind == TypeKind::Struct) {
+        self.modifier = ParameterModifier::Ref;
+        self.storageType = PrimitiveType::Object;
+        self.storageTypeName = referenceWrapperTypeName(
+            result.moduleName, self.type, self.typeName);
+    } else {
+        self.storageType = self.type;
+        self.storageTypeName = self.typeName;
+    }
     self.parameter = true;
     result.parameters.push_back(std::move(self));
 }
@@ -139,7 +153,10 @@ void appendSyntaxParameters(
     const std::vector<syntax::ParameterSyntax>& parameters,
     const TypeSymbolMap& visibleTypes,
     diagnostics::DiagnosticBag& diagnostics) {
-    for (const auto& parameterSyntax : parameters) {
+    bool sawOptional = false;
+    for (std::size_t syntaxIndex = 0;
+         syntaxIndex < parameters.size(); ++syntaxIndex) {
+        const auto& parameterSyntax = parameters[syntaxIndex];
         const auto parameterType = resolveType(
             parameterSyntax.type, visibleTypes, false);
         if (parameterType.type == PrimitiveType::Error) {
@@ -155,6 +172,92 @@ void appendSyntaxParameters(
         parameter.typeName = parameterType.name;
         parameter.modifier = parameterModifier(
             parameterSyntax.modifierToken);
+        parameter.paramsArray = parameterSyntax.paramsKeyword.has_value();
+        if (parameter.paramsArray &&
+            (syntaxIndex + 1 != parameters.size() ||
+             parameter.type != PrimitiveType::Array ||
+             parameter.modifier != ParameterModifier::None)) {
+            diagnostics.report(
+                "RS8916",
+                "params must be the final unmodified array parameter",
+                parameterSyntax.span());
+        }
+        if (parameterSyntax.defaultValue) {
+            parameter.hasDefaultValue = true;
+            sawOptional = true;
+            const syntax::ExpressionSyntax* value =
+                parameterSyntax.defaultValue.get();
+            bool negative = false;
+            if (value->kind() == syntax::SyntaxKind::UnaryExpression) {
+                const auto& unary = static_cast<const
+                    syntax::UnaryExpressionSyntax&>(*value);
+                negative = unary.operatorToken.kind ==
+                    syntax::SyntaxKind::MinusToken;
+                value = unary.operand.get();
+            }
+            if (value && value->kind() ==
+                    syntax::SyntaxKind::LiteralExpression) {
+                const auto& literal = static_cast<const
+                    syntax::LiteralExpressionSyntax&>(*value).literalToken;
+                parameter.defaultValue = literal.value;
+                switch (literal.kind) {
+                case syntax::SyntaxKind::IntegerLiteralToken:
+                    parameter.defaultValueType = PrimitiveType::Int;
+                    if (negative && std::holds_alternative<std::int64_t>(
+                            parameter.defaultValue)) {
+                        parameter.defaultValue = -std::get<std::int64_t>(
+                            parameter.defaultValue);
+                    }
+                    break;
+                case syntax::SyntaxKind::FloatLiteralToken:
+                    parameter.defaultValueType = PrimitiveType::Double;
+                    if (negative && std::holds_alternative<double>(
+                            parameter.defaultValue)) {
+                        parameter.defaultValue = -std::get<double>(
+                            parameter.defaultValue);
+                    }
+                    break;
+                case syntax::SyntaxKind::StringLiteralToken:
+                    parameter.defaultValueType = PrimitiveType::String;
+                    break;
+                case syntax::SyntaxKind::TrueKeyword:
+                case syntax::SyntaxKind::FalseKeyword:
+                    parameter.defaultValueType = PrimitiveType::Bool;
+                    break;
+                case syntax::SyntaxKind::NullKeyword:
+                    parameter.defaultValueType = PrimitiveType::Null;
+                    break;
+                default:
+                    parameter.defaultValueType = PrimitiveType::Error;
+                    break;
+                }
+            }
+            if (parameter.defaultValueType == PrimitiveType::Error ||
+                parameter.paramsArray) {
+                diagnostics.report(
+                    "RS8917",
+                    "optional parameter default must be a literal constant and params cannot have a default",
+                    parameterSyntax.defaultValue->span());
+            } else {
+                const auto conversion = classifyConversion(
+                    parameter.defaultValueType, parameter.type);
+                const bool nullReference =
+                    parameter.defaultValueType == PrimitiveType::Null &&
+                    isReferenceType(parameter.type);
+                if (conversion == ConversionKind::None && !nullReference &&
+                    parameter.defaultValueType != parameter.type) {
+                    diagnostics.report(
+                        "RS8918",
+                        "optional parameter default is not convertible to its parameter type",
+                        parameterSyntax.defaultValue->span());
+                }
+            }
+        } else if (sawOptional && !parameter.paramsArray) {
+            diagnostics.report(
+                "RS8919",
+                "required parameter cannot follow an optional parameter",
+                parameterSyntax.span());
+        }
         if (parameter.modifier == ParameterModifier::Ref ||
             parameter.modifier == ParameterModifier::Out) {
             parameter.storageType = PrimitiveType::Object;
@@ -176,14 +279,76 @@ void appendSyntaxParameters(
 
 } // namespace
 
+bool hasModifier(
+    const std::vector<syntax::SyntaxToken>& modifiers,
+    syntax::SyntaxKind kind) noexcept {
+    for (const auto& modifier : modifiers) {
+        if (modifier.kind == kind) return true;
+    }
+    return false;
+}
+
+Accessibility accessibilityFromModifiers(
+    const std::vector<syntax::SyntaxToken>& modifiers,
+    Accessibility fallback) noexcept {
+    if (hasModifier(modifiers, syntax::SyntaxKind::PrivateKeyword)) {
+        return Accessibility::Private;
+    }
+    if (hasModifier(modifiers, syntax::SyntaxKind::ProtectedKeyword)) {
+        return Accessibility::Protected;
+    }
+    if (hasModifier(modifiers, syntax::SyntaxKind::InternalKeyword)) {
+        return Accessibility::Internal;
+    }
+    if (hasModifier(modifiers, syntax::SyntaxKind::PublicKeyword)) {
+        return Accessibility::Public;
+    }
+    return fallback;
+}
+
+bool isAssignable(
+    const TypeSymbolMap& visibleTypes,
+    const std::string& sourceTypeName,
+    const std::string& targetTypeName) noexcept {
+    if (sourceTypeName.empty() || targetTypeName.empty()) return false;
+    if (sourceTypeName == targetTypeName) return true;
+    const auto targetTypeId = stableTypeId(targetTypeName);
+    auto currentName = sourceTypeName;
+    std::unordered_set<SymbolId> visited;
+    while (!currentName.empty()) {
+        const auto found = visibleTypes.find(currentName);
+        if (found == visibleTypes.end() ||
+            !visited.insert(found->second.id).second) {
+            return false;
+        }
+        for (const auto& interfaceMap :
+             found->second.interfaceDispatchMaps) {
+            if (interfaceMap.interfaceTypeId == targetTypeId) {
+                return true;
+            }
+        }
+        if (found->second.baseTypeName == targetTypeName) return true;
+        currentName = found->second.baseTypeName;
+    }
+    return false;
+}
+
 const char* primitiveTypeName(PrimitiveType type) noexcept {
     switch (type) {
     case PrimitiveType::Error: return "<error>";
     case PrimitiveType::Void: return "void";
     case PrimitiveType::Bool: return "bool";
+    case PrimitiveType::Byte: return "byte";
+    case PrimitiveType::SByte: return "sbyte";
+    case PrimitiveType::Short: return "short";
+    case PrimitiveType::UShort: return "ushort";
     case PrimitiveType::Int: return "int";
+    case PrimitiveType::UInt: return "uint";
     case PrimitiveType::Long: return "long";
+    case PrimitiveType::ULong: return "ulong";
+    case PrimitiveType::Float: return "float";
     case PrimitiveType::Double: return "double";
+    case PrimitiveType::Char: return "char";
     case PrimitiveType::String: return "string";
     case PrimitiveType::Object: return "object";
     case PrimitiveType::Struct: return "struct";
@@ -198,29 +363,48 @@ const char* primitiveTypeName(PrimitiveType type) noexcept {
 PrimitiveType resolvePrimitiveType(const std::string& name) noexcept {
     if (name == "void") return PrimitiveType::Void;
     if (name == "bool") return PrimitiveType::Bool;
-    if (name == "int" || name == "byte" || name == "sbyte" ||
-        name == "short" || name == "ushort" || name == "char") {
-        return PrimitiveType::Int;
-    }
-    if (name == "long" || name == "uint" || name == "ulong") {
-        return PrimitiveType::Long;
-    }
-    if (name == "double" || name == "float") {
-        return PrimitiveType::Double;
-    }
+    if (name == "byte") return PrimitiveType::Byte;
+    if (name == "sbyte") return PrimitiveType::SByte;
+    if (name == "short") return PrimitiveType::Short;
+    if (name == "ushort") return PrimitiveType::UShort;
+    if (name == "int") return PrimitiveType::Int;
+    if (name == "uint") return PrimitiveType::UInt;
+    if (name == "long") return PrimitiveType::Long;
+    if (name == "ulong") return PrimitiveType::ULong;
+    if (name == "float") return PrimitiveType::Float;
+    if (name == "double") return PrimitiveType::Double;
+    if (name == "char") return PrimitiveType::Char;
     if (name == "string") return PrimitiveType::String;
     if (name == "handle") return PrimitiveType::Handle;
     return PrimitiveType::Error;
 }
 
 bool isNumericType(PrimitiveType type) noexcept {
-    return type == PrimitiveType::Int ||
-        type == PrimitiveType::Long ||
-        type == PrimitiveType::Double;
+    return isIntegralType(type) || isFloatingPointType(type);
 }
 
 bool isIntegralType(PrimitiveType type) noexcept {
-    return type == PrimitiveType::Int || type == PrimitiveType::Long;
+    return type == PrimitiveType::Byte ||
+        type == PrimitiveType::SByte ||
+        type == PrimitiveType::Short ||
+        type == PrimitiveType::UShort ||
+        type == PrimitiveType::Int ||
+        type == PrimitiveType::UInt ||
+        type == PrimitiveType::Long ||
+        type == PrimitiveType::ULong ||
+        type == PrimitiveType::Char;
+}
+
+bool isUnsignedIntegralType(PrimitiveType type) noexcept {
+    return type == PrimitiveType::Byte ||
+        type == PrimitiveType::UShort ||
+        type == PrimitiveType::UInt ||
+        type == PrimitiveType::ULong ||
+        type == PrimitiveType::Char;
+}
+
+bool isFloatingPointType(PrimitiveType type) noexcept {
+    return type == PrimitiveType::Float || type == PrimitiveType::Double;
 }
 
 bool isReferenceType(PrimitiveType type) noexcept {
@@ -272,6 +456,41 @@ ConversionKind classifyConversion(PrimitiveType from, PrimitiveType to) noexcept
     if (from == PrimitiveType::Int && to == PrimitiveType::Long) return ConversionKind::IntToLong;
     if (from == PrimitiveType::Int && to == PrimitiveType::Double) return ConversionKind::IntToDouble;
     if (from == PrimitiveType::Long && to == PrimitiveType::Double) return ConversionKind::LongToDouble;
+    const auto implicitNumeric = [](PrimitiveType source, PrimitiveType target) {
+        switch (source) {
+        case PrimitiveType::SByte:
+            return target == PrimitiveType::Short ||
+                target == PrimitiveType::Int || target == PrimitiveType::Long ||
+                target == PrimitiveType::Float || target == PrimitiveType::Double;
+        case PrimitiveType::Byte:
+            return target == PrimitiveType::Short || target == PrimitiveType::UShort ||
+                target == PrimitiveType::Int || target == PrimitiveType::UInt ||
+                target == PrimitiveType::Long || target == PrimitiveType::ULong ||
+                target == PrimitiveType::Float || target == PrimitiveType::Double;
+        case PrimitiveType::Short:
+            return target == PrimitiveType::Int || target == PrimitiveType::Long ||
+                target == PrimitiveType::Float || target == PrimitiveType::Double;
+        case PrimitiveType::UShort:
+        case PrimitiveType::Char:
+            return target == PrimitiveType::Int || target == PrimitiveType::UInt ||
+                target == PrimitiveType::Long || target == PrimitiveType::ULong ||
+                target == PrimitiveType::Float || target == PrimitiveType::Double;
+        case PrimitiveType::Int:
+            return target == PrimitiveType::Long || target == PrimitiveType::Float ||
+                target == PrimitiveType::Double;
+        case PrimitiveType::UInt:
+            return target == PrimitiveType::Long || target == PrimitiveType::ULong ||
+                target == PrimitiveType::Float || target == PrimitiveType::Double;
+        case PrimitiveType::Long:
+        case PrimitiveType::ULong:
+            return target == PrimitiveType::Float || target == PrimitiveType::Double;
+        case PrimitiveType::Float:
+            return target == PrimitiveType::Double;
+        default:
+            return false;
+        }
+    };
+    if (implicitNumeric(from, to)) return ConversionKind::Numeric;
     return ConversionKind::None;
 }
 
@@ -286,6 +505,8 @@ int conversionRank(PrimitiveType from, PrimitiveType to) noexcept {
     case ConversionKind::IntToDouble:
     case ConversionKind::LongToDouble:
         return 2;
+    case ConversionKind::Numeric:
+        return 3;
     case ConversionKind::None: return -1;
     }
     return -1;
@@ -337,6 +558,11 @@ TypeSymbol declareTypeShell(
     const syntax::ClassDeclarationSyntax& syntaxTree) {
     TypeSymbol result;
     result.kind = TypeKind::Class;
+    result.accessibility = accessibilityFromModifiers(syntaxTree.modifiers);
+    result.abstractType = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::AbstractKeyword);
+    result.sealedType = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::SealedKeyword);
     result.moduleName = moduleName;
     result.name = syntaxTree.identifierToken.text;
     result.id = stableTypeId(result);
@@ -349,6 +575,8 @@ TypeSymbol declareTypeShell(
     const syntax::StructDeclarationSyntax& syntaxTree) {
     TypeSymbol result;
     result.kind = TypeKind::Struct;
+    result.accessibility = accessibilityFromModifiers(syntaxTree.modifiers);
+    result.sealedType = true;
     result.moduleName = moduleName;
     result.name = syntaxTree.identifierToken.text;
     result.id = stableTypeId(result);
@@ -361,6 +589,8 @@ TypeSymbol declareTypeShell(
     const syntax::EnumDeclarationSyntax& syntaxTree) {
     TypeSymbol result;
     result.kind = TypeKind::Enum;
+    result.accessibility = accessibilityFromModifiers(syntaxTree.modifiers);
+    result.sealedType = true;
     result.moduleName = moduleName;
     result.name = syntaxTree.identifierToken.text;
     result.id = stableTypeId(result);
@@ -467,21 +697,83 @@ FunctionSymbol declareFunctionSymbol(
     result.name = syntaxTree.identifierToken.text;
     result.method = owner != nullptr;
     result.staticMethod = syntaxTree.staticKeyword.has_value();
+    result.accessibility = accessibilityFromModifiers(
+        syntaxTree.modifiers);
+    result.virtualMethod = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::VirtualKeyword);
+    result.overrideMethod = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::OverrideKeyword);
+    result.abstractMethod = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::AbstractKeyword);
+    result.sealedMethod = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::SealedKeyword);
     if (owner) {
+        result.declaringTypeId = owner->id;
+        result.declaringTypeName = canonicalTypeName(*owner);
         result.ownerTypeName = owner->name;
         result.ownerTypeId = owner->id;
-        appendImplicitThis(result, *owner);
+        appendImplicitThis(result, *owner, true);
     }
     const auto returnType = resolveType(syntaxTree.returnType, visibleTypes, true);
     result.returnType = returnType.type;
     result.returnTypeName = returnType.name;
+    if (syntaxTree.refReturnKeyword) {
+        result.returnModifier = ParameterModifier::Ref;
+        result.storageReturnType = PrimitiveType::Object;
+        result.storageReturnTypeName = referenceWrapperTypeName(
+            moduleName, result.returnType, result.returnTypeName);
+    }
     if (result.returnType == PrimitiveType::Error) {
         diagnostics.report("RS2200", "unknown return type '" + syntaxTree.returnType.name.text + "'", syntaxTree.returnType.span());
     }
     appendSyntaxParameters(result, syntaxTree.parameters, visibleTypes, diagnostics);
     result.id = stableFunctionId(result);
     result.declarationSpan = syntaxTree.identifierToken.span;
-    result.bodySpan = syntaxTree.body.span();
+    result.bodySpan = syntaxTree.semicolonToken
+        ? syntaxTree.semicolonToken->span
+        : syntaxTree.body.span();
+    for (auto& parameter : result.parameters) {
+        parameter.id = fnv1a(std::to_string(result.id) + "::local:" +
+            std::to_string(parameter.index) + ":" + parameter.name);
+    }
+    return result;
+}
+
+FunctionSymbol declareFunctionSymbol(
+    const std::string& moduleName,
+    const syntax::InterfaceMethodDeclarationSyntax& syntaxTree,
+    const TypeSymbolMap& visibleTypes,
+    diagnostics::DiagnosticBag& diagnostics,
+    const TypeSymbol* owner) {
+    FunctionSymbol result;
+    result.moduleName = moduleName;
+    result.name = syntaxTree.identifierToken.text;
+    result.method = owner != nullptr;
+    result.staticMethod = false;
+    result.accessibility = accessibilityFromModifiers(
+        syntaxTree.modifiers);
+    if (owner) {
+        result.declaringTypeId = owner->id;
+        result.declaringTypeName = canonicalTypeName(*owner);
+        result.ownerTypeName = owner->name;
+        result.ownerTypeId = owner->id;
+        appendImplicitThis(result, *owner);
+    }
+    const auto returnType = resolveType(
+        syntaxTree.returnType, visibleTypes, true);
+    result.returnType = returnType.type;
+    result.returnTypeName = returnType.name;
+    if (result.returnType == PrimitiveType::Error) {
+        diagnostics.report(
+            "RS2200",
+            "unknown return type '" + syntaxTree.returnType.name.text + "'",
+            syntaxTree.returnType.span());
+    }
+    appendSyntaxParameters(
+        result, syntaxTree.parameters, visibleTypes, diagnostics);
+    result.id = stableFunctionId(result);
+    result.declarationSpan = syntaxTree.identifierToken.span;
+    result.bodySpan = syntaxTree.semicolonToken.span;
     for (auto& parameter : result.parameters) {
         parameter.id = fnv1a(std::to_string(result.id) + "::local:" +
             std::to_string(parameter.index) + ":" + parameter.name);
@@ -508,6 +800,10 @@ FunctionSymbol declareConstructorSymbol(
         : std::string{};
     result.method = true;
     result.constructor = true;
+    result.accessibility = accessibilityFromModifiers(
+        syntaxTree.modifiers);
+    result.declaringTypeId = owner.id;
+    result.declaringTypeName = canonicalTypeName(owner);
     appendImplicitThis(result, owner);
     appendSyntaxParameters(result, syntaxTree.parameters, visibleTypes, diagnostics);
     result.id = stableFunctionId(result);
@@ -528,6 +824,10 @@ PropertySymbol declarePropertySymbol(
     diagnostics::DiagnosticBag& diagnostics) {
     PropertySymbol result;
     result.name = syntaxTree.identifierToken.text;
+    result.accessibility = accessibilityFromModifiers(
+        syntaxTree.modifiers);
+    result.declaringTypeId = owner.id;
+    result.declaringTypeName = canonicalTypeName(owner);
     result.declarationSpan = syntaxTree.identifierToken.span;
     result.id = fnv1a(canonicalTypeName(owner) + "::property:" + result.name);
     result.staticProperty = syntaxTree.staticKeyword.has_value();

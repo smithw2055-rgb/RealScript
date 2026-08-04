@@ -1,7 +1,6 @@
 #include "realscript/bytecode/Bytecode.h"
 
 #include <algorithm>
-#include <array>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
@@ -17,7 +16,21 @@ constexpr std::uint32_t SectionFunctions = 4;
 constexpr std::uint32_t SectionCode = 5;
 constexpr std::uint32_t SectionDebug = 6;
 constexpr std::uint32_t SectionMetadata = 7;
-constexpr std::uint32_t SectionCount = 7;
+constexpr std::uint32_t SectionObjectModel = 8;
+constexpr std::uint32_t LegacySectionCount = 7;
+constexpr std::uint32_t SectionCount = 8;
+
+bool hasObjectModelSection(const Version& version) noexcept {
+    return version.major == 0 && version.minor >= 7;
+}
+
+bool hasSequenceResultMetadata(const Version& version) noexcept {
+    return version.major == 0 && version.minor >= 8;
+}
+
+bool hasExceptionMetadata(const Version& version) noexcept {
+    return version.major == 0 && version.minor >= 9;
+}
 
 class Writer {
 public:
@@ -148,6 +161,14 @@ std::uint8_t encodeType(semantic::PrimitiveType type) {
     case semantic::PrimitiveType::Double: return 9;
     case semantic::PrimitiveType::Struct: return 10;
     case semantic::PrimitiveType::Enum: return 11;
+    case semantic::PrimitiveType::Byte: return 12;
+    case semantic::PrimitiveType::SByte: return 13;
+    case semantic::PrimitiveType::Short: return 14;
+    case semantic::PrimitiveType::UShort: return 15;
+    case semantic::PrimitiveType::UInt: return 16;
+    case semantic::PrimitiveType::ULong: return 17;
+    case semantic::PrimitiveType::Float: return 18;
+    case semantic::PrimitiveType::Char: return 19;
     case semantic::PrimitiveType::Error: break;
     }
     throw std::logic_error("invalid type in bytecode encoder");
@@ -167,6 +188,14 @@ bool decodeType(std::uint8_t tag, semantic::PrimitiveType& type) {
     case 9: type = semantic::PrimitiveType::Double; return true;
     case 10: type = semantic::PrimitiveType::Struct; return true;
     case 11: type = semantic::PrimitiveType::Enum; return true;
+    case 12: type = semantic::PrimitiveType::Byte; return true;
+    case 13: type = semantic::PrimitiveType::SByte; return true;
+    case 14: type = semantic::PrimitiveType::Short; return true;
+    case 15: type = semantic::PrimitiveType::UShort; return true;
+    case 16: type = semantic::PrimitiveType::UInt; return true;
+    case 17: type = semantic::PrimitiveType::ULong; return true;
+    case 18: type = semantic::PrimitiveType::Float; return true;
+    case 19: type = semantic::PrimitiveType::Char; return true;
     default: return false;
     }
 }
@@ -317,6 +346,279 @@ bool validStringIndex(
     return true;
 }
 
+void addVariableStrings(
+    StringPool& strings,
+    const semantic::VariableSymbol& variable) {
+    strings.add(variable.name);
+    strings.add(variable.typeName);
+    strings.add(variable.storageTypeName);
+}
+
+void addFunctionStrings(
+    StringPool& strings,
+    const semantic::FunctionSymbol& function) {
+    strings.add(function.declaringTypeName);
+    strings.add(function.moduleName);
+    strings.add(function.name);
+    strings.add(function.ownerTypeName);
+    strings.add(function.returnTypeName);
+    strings.add(function.sourceName);
+    for (const auto& parameter : function.parameters) {
+        addVariableStrings(strings, parameter);
+    }
+}
+
+void addPropertyStrings(
+    StringPool& strings,
+    const semantic::PropertySymbol& property) {
+    strings.add(property.name);
+    strings.add(property.declaringTypeName);
+    strings.add(property.typeName);
+    strings.add(property.sourceName);
+    if (property.getter) addFunctionStrings(strings, *property.getter);
+    if (property.setter) addFunctionStrings(strings, *property.setter);
+}
+
+void writeFunctionSymbol(
+    Writer& writer,
+    const StringPool& strings,
+    const semantic::FunctionSymbol& function) {
+    writer.u64(function.id);
+    writer.u8(static_cast<std::uint8_t>(function.accessibility));
+    writer.u64(function.declaringTypeId);
+    writer.u32(strings.indexOf(function.declaringTypeName));
+    std::uint8_t flags = 0;
+    if (function.virtualMethod) flags |= 0x01u;
+    if (function.overrideMethod) flags |= 0x02u;
+    if (function.abstractMethod) flags |= 0x04u;
+    if (function.sealedMethod) flags |= 0x08u;
+    if (function.interfaceMethod) flags |= 0x10u;
+    if (function.method) flags |= 0x20u;
+    if (function.staticMethod) flags |= 0x40u;
+    if (function.constructor) flags |= 0x80u;
+    writer.u8(flags);
+    std::uint8_t secondaryFlags = 0;
+    if (function.propertyGetter) secondaryFlags |= 0x01u;
+    if (function.propertySetter) secondaryFlags |= 0x02u;
+    if (function.synthetic) secondaryFlags |= 0x04u;
+    writer.u8(secondaryFlags);
+    writer.u32(function.virtualSlot);
+    writer.u32(function.interfaceSlot);
+    writer.u32(strings.indexOf(function.moduleName));
+    writer.u32(strings.indexOf(function.name));
+    writer.u32(strings.indexOf(function.ownerTypeName));
+    writer.u64(function.ownerTypeId);
+    writer.u8(encodeType(function.returnType));
+    writer.u32(strings.indexOf(function.returnTypeName));
+    writer.u32(strings.indexOf(function.sourceName));
+    writer.u32(static_cast<std::uint32_t>(function.parameters.size()));
+    for (const auto& parameter : function.parameters) {
+        writer.u32(strings.indexOf(parameter.name));
+        writer.u8(encodeType(parameter.type));
+        writer.u32(strings.indexOf(parameter.typeName));
+        writer.u8(encodeOptionalType(parameter.storageType));
+        writer.u32(strings.indexOf(parameter.storageTypeName));
+        writer.u8(static_cast<std::uint8_t>(parameter.modifier));
+        writer.u64(static_cast<std::uint64_t>(parameter.index));
+        writer.u8(parameter.parameter ? 1 : 0);
+        writer.u64(parameter.id);
+    }
+}
+
+bool readFunctionSymbol(
+    Reader& reader,
+    const std::vector<std::string>& strings,
+    semantic::FunctionSymbol& function,
+    diagnostics::DiagnosticBag& diagnostics) {
+    const auto readString = [&](std::string& value, const char* message) {
+        const auto index = reader.u32();
+        if (!validStringIndex(index, strings, diagnostics, message)) {
+            return false;
+        }
+        value = strings[index];
+        return true;
+    };
+
+    function.id = reader.u64();
+    const auto accessibility = reader.u8();
+    function.declaringTypeId = reader.u64();
+    if (!readString(
+            function.declaringTypeName,
+            "invalid method declaring-type string index")) {
+        return false;
+    }
+    const auto flags = reader.u8();
+    const auto secondaryFlags = reader.u8();
+    if (!reader.valid() ||
+        accessibility > static_cast<std::uint8_t>(
+            semantic::Accessibility::Private) ||
+        (secondaryFlags & 0xf8u) != 0) {
+        diagnostics.report("RS5004", "invalid method descriptor flags", {});
+        return false;
+    }
+    function.accessibility = static_cast<semantic::Accessibility>(
+        accessibility);
+    function.virtualMethod = (flags & 0x01u) != 0;
+    function.overrideMethod = (flags & 0x02u) != 0;
+    function.abstractMethod = (flags & 0x04u) != 0;
+    function.sealedMethod = (flags & 0x08u) != 0;
+    function.interfaceMethod = (flags & 0x10u) != 0;
+    function.method = (flags & 0x20u) != 0;
+    function.staticMethod = (flags & 0x40u) != 0;
+    function.constructor = (flags & 0x80u) != 0;
+    function.propertyGetter = (secondaryFlags & 0x01u) != 0;
+    function.propertySetter = (secondaryFlags & 0x02u) != 0;
+    function.synthetic = (secondaryFlags & 0x04u) != 0;
+    function.virtualSlot = reader.u32();
+    function.interfaceSlot = reader.u32();
+    if (!readString(function.moduleName, "invalid method module string index") ||
+        !readString(function.name, "invalid method name string index") ||
+        !readString(
+            function.ownerTypeName,
+            "invalid method owner-type string index")) {
+        return false;
+    }
+    function.ownerTypeId = reader.u64();
+    if (!decodeType(reader.u8(), function.returnType) ||
+        !readString(
+            function.returnTypeName,
+            "invalid method return type-name string index") ||
+        !readString(function.sourceName, "invalid method source string index")) {
+        diagnostics.report("RS5004", "invalid method return descriptor", {});
+        return false;
+    }
+
+    const auto parameterCount = reader.u32();
+    if (!reader.valid() || parameterCount > reader.remaining() / 35) {
+        diagnostics.report("RS5003", "truncated method parameter list", {});
+        return false;
+    }
+    function.parameters.reserve(parameterCount);
+    for (std::uint32_t index = 0; index < parameterCount; ++index) {
+        semantic::VariableSymbol parameter;
+        if (!readString(parameter.name, "invalid parameter name string index") ||
+            !decodeType(reader.u8(), parameter.type) ||
+            !readString(
+                parameter.typeName,
+                "invalid parameter type-name string index") ||
+            !decodeOptionalType(reader.u8(), parameter.storageType) ||
+            !readString(
+                parameter.storageTypeName,
+                "invalid parameter storage type-name string index")) {
+            diagnostics.report("RS5004", "invalid method parameter descriptor", {});
+            return false;
+        }
+        const auto modifier = reader.u8();
+        parameter.index = static_cast<std::size_t>(reader.u64());
+        const auto parameterFlag = reader.u8();
+        parameter.id = reader.u64();
+        if (!reader.valid() ||
+            modifier > static_cast<std::uint8_t>(
+                semantic::ParameterModifier::In) ||
+            parameterFlag > 1) {
+            diagnostics.report("RS5004", "invalid method parameter flags", {});
+            return false;
+        }
+        parameter.modifier = static_cast<semantic::ParameterModifier>(modifier);
+        parameter.parameter = parameterFlag != 0;
+        function.parameters.push_back(std::move(parameter));
+    }
+    return reader.valid();
+}
+
+void writePropertySymbol(
+    Writer& writer,
+    const StringPool& strings,
+    const semantic::PropertySymbol& property) {
+    writer.u32(strings.indexOf(property.name));
+    writer.u8(static_cast<std::uint8_t>(property.accessibility));
+    writer.u64(property.declaringTypeId);
+    writer.u32(strings.indexOf(property.declaringTypeName));
+    writer.u8(encodeType(property.type));
+    writer.u32(strings.indexOf(property.typeName));
+    writer.u8(property.staticProperty ? 1 : 0);
+    writer.u8(property.getter ? 1 : 0);
+    if (property.getter) {
+        writeFunctionSymbol(writer, strings, *property.getter);
+    }
+    writer.u8(property.setter ? 1 : 0);
+    if (property.setter) {
+        writeFunctionSymbol(writer, strings, *property.setter);
+    }
+    writer.u64(static_cast<std::uint64_t>(property.backingFieldIndex));
+    writer.u32(strings.indexOf(property.sourceName));
+    writer.u64(property.id);
+}
+
+bool readPropertySymbol(
+    Reader& reader,
+    const std::vector<std::string>& strings,
+    semantic::PropertySymbol& property,
+    diagnostics::DiagnosticBag& diagnostics) {
+    const auto readString = [&](std::string& value, const char* message) {
+        const auto index = reader.u32();
+        if (!validStringIndex(index, strings, diagnostics, message)) {
+            return false;
+        }
+        value = strings[index];
+        return true;
+    };
+    if (!readString(property.name, "invalid property name string index")) {
+        return false;
+    }
+    const auto accessibility = reader.u8();
+    property.declaringTypeId = reader.u64();
+    if (!readString(
+            property.declaringTypeName,
+            "invalid property declaring-type string index") ||
+        !decodeType(reader.u8(), property.type) ||
+        !readString(
+            property.typeName,
+            "invalid property type-name string index")) {
+        diagnostics.report("RS5004", "invalid property descriptor", {});
+        return false;
+    }
+    const auto staticProperty = reader.u8();
+    const auto hasGetter = reader.u8();
+    if (!reader.valid() ||
+        accessibility > static_cast<std::uint8_t>(
+            semantic::Accessibility::Private) ||
+        staticProperty > 1 || hasGetter > 1) {
+        diagnostics.report("RS5004", "invalid property flags", {});
+        return false;
+    }
+    property.accessibility = static_cast<semantic::Accessibility>(
+        accessibility);
+    property.staticProperty = staticProperty != 0;
+    if (hasGetter != 0) {
+        semantic::FunctionSymbol getter;
+        if (!readFunctionSymbol(reader, strings, getter, diagnostics)) {
+            return false;
+        }
+        property.getter = std::move(getter);
+    }
+    const auto hasSetter = reader.u8();
+    if (!reader.valid() || hasSetter > 1) {
+        diagnostics.report("RS5004", "invalid property setter flag", {});
+        return false;
+    }
+    if (hasSetter != 0) {
+        semantic::FunctionSymbol setter;
+        if (!readFunctionSymbol(reader, strings, setter, diagnostics)) {
+            return false;
+        }
+        property.setter = std::move(setter);
+    }
+    property.backingFieldIndex = static_cast<std::size_t>(reader.u64());
+    if (!readString(
+            property.sourceName,
+            "invalid property source string index")) {
+        return false;
+    }
+    property.id = reader.u64();
+    return reader.valid();
+}
+
 } // namespace
 
 std::vector<std::uint8_t> encodeModule(const Module& module) {
@@ -325,6 +627,20 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
     for (const auto& type : module.types) {
         strings.add(type.moduleName);
         strings.add(type.name);
+        if (!type.baseTypeName.empty()) strings.add(type.baseTypeName);
+        for (const auto& field : type.fields) {
+            strings.add(field.declaringTypeName);
+            strings.add(field.sourceName);
+        }
+        for (const auto& method : type.methods) {
+            addFunctionStrings(strings, method);
+        }
+        for (const auto& constructor : type.constructors) {
+            addFunctionStrings(strings, constructor);
+        }
+        for (const auto& property : type.properties) {
+            addPropertyStrings(strings, property);
+        }
         for (const auto& field : type.fields) {
             strings.add(field.name);
             if (!field.typeName.empty()) strings.add(field.typeName);
@@ -366,6 +682,9 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
     for (const auto& sequence : module.languageMetadata.sequences) {
         strings.add(sequence.typeName);
         strings.add(sequence.name);
+        if (hasSequenceResultMetadata(module.version)) {
+            strings.add(sequence.resultTypeName);
+        }
         strings.add(sequence.sourceName);
         for (const auto& callback : sequence.callbacks) strings.add(callback);
     }
@@ -412,6 +731,72 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         writeTypeIds(referenceSection, reference.parameterTypeIds);
     }
 
+    Writer objectModelSection;
+    objectModelSection.u32(static_cast<std::uint32_t>(module.types.size()));
+    for (const auto& type : module.types) {
+        objectModelSection.u64(type.id);
+        objectModelSection.u8(static_cast<std::uint8_t>(type.accessibility));
+        std::uint8_t flags = 0;
+        if (type.synthetic) flags |= 0x01u;
+        if (type.interfaceType) flags |= 0x02u;
+        if (type.abstractType) flags |= 0x04u;
+        if (type.sealedType) flags |= 0x08u;
+        if (type.delegateType) flags |= 0x10u;
+        objectModelSection.u8(flags);
+        objectModelSection.u64(type.baseTypeId);
+        objectModelSection.u32(type.baseTypeName.empty()
+            ? InvalidIndex
+            : strings.indexOf(type.baseTypeName));
+        objectModelSection.u32(static_cast<std::uint32_t>(type.fields.size()));
+        for (const auto& field : type.fields) {
+            objectModelSection.u8(static_cast<std::uint8_t>(
+                field.accessibility));
+            objectModelSection.u64(field.declaringTypeId);
+            objectModelSection.u32(strings.indexOf(field.declaringTypeName));
+            objectModelSection.u32(strings.indexOf(field.sourceName));
+            objectModelSection.u64(field.id);
+        }
+        objectModelSection.u32(static_cast<std::uint32_t>(type.methods.size()));
+        for (const auto& method : type.methods) {
+            writeFunctionSymbol(objectModelSection, strings, method);
+        }
+        objectModelSection.u32(static_cast<std::uint32_t>(
+            type.constructors.size()));
+        for (const auto& constructor : type.constructors) {
+            writeFunctionSymbol(objectModelSection, strings, constructor);
+        }
+        objectModelSection.u32(static_cast<std::uint32_t>(
+            type.properties.size()));
+        for (const auto& property : type.properties) {
+            writePropertySymbol(objectModelSection, strings, property);
+        }
+        objectModelSection.u32(static_cast<std::uint32_t>(
+            type.virtualDispatchTable.size()));
+        for (const auto symbolId : type.virtualDispatchTable) {
+            objectModelSection.u64(symbolId);
+        }
+        objectModelSection.u32(static_cast<std::uint32_t>(
+            type.interfaceDispatchMaps.size()));
+        for (const auto& map : type.interfaceDispatchMaps) {
+            objectModelSection.u64(map.interfaceTypeId);
+            objectModelSection.u32(static_cast<std::uint32_t>(map.slots.size()));
+            for (const auto symbolId : map.slots) {
+                objectModelSection.u64(symbolId);
+            }
+        }
+    }
+    objectModelSection.u32(static_cast<std::uint32_t>(
+        module.functionReferences.size()));
+    for (const auto& reference : module.functionReferences) {
+        std::uint8_t flags = 0;
+        if (reference.virtualDispatch) flags |= 0x01u;
+        if (reference.interfaceDispatch) flags |= 0x02u;
+        objectModelSection.u8(flags);
+        objectModelSection.u32(reference.virtualSlot);
+        objectModelSection.u64(reference.interfaceTypeId);
+        objectModelSection.u32(reference.interfaceSlot);
+    }
+
     Writer codeSection;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> codeRanges;
     for (const auto& function : module.functions) {
@@ -436,7 +821,9 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
                 codeSection.u64(instruction.elementTypeId);
                 codeSection.i64(instruction.integerImmediate);
                 codeSection.f64(instruction.doubleImmediate);
-                codeSection.u8(instruction.boolImmediate ? 1 : 0);
+                codeSection.u8(static_cast<std::uint8_t>(
+                    (instruction.boolImmediate ? 1u : 0u) |
+                    (instruction.checkedArithmetic ? 0u : 2u)));
                 codeSection.u32(
                     instruction.opcode == Opcode::ConstantString
                         ? strings.indexOf(instruction.stringImmediate)
@@ -449,6 +836,21 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
             codeSection.u32(block.terminator.falseTarget);
             writeRegisters(codeSection, block.terminator.arguments);
             writeRegisters(codeSection, block.terminator.falseArguments);
+        }
+        if (hasExceptionMetadata(module.version)) {
+            codeSection.u32(static_cast<std::uint32_t>(
+                function.exceptionHandlers.size()));
+            for (const auto& handler : function.exceptionHandlers) {
+                codeSection.u32(static_cast<std::uint32_t>(
+                    handler.protectedBlocks.size()));
+                for (const auto block : handler.protectedBlocks) {
+                    codeSection.u32(block);
+                }
+                codeSection.u32(handler.handlerBlock);
+                codeSection.u64(handler.catchTypeId);
+                codeSection.u32(static_cast<std::uint32_t>(
+                    handler.exceptionLocal));
+            }
         }
         codeRanges.push_back({
             offset,
@@ -550,6 +952,10 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
     for (const auto& sequence : module.languageMetadata.sequences) {
         metadataSection.u32(strings.indexOf(sequence.typeName));
         metadataSection.u32(strings.indexOf(sequence.name));
+        if (hasSequenceResultMetadata(module.version)) {
+            metadataSection.u32(strings.indexOf(
+                sequence.resultTypeName));
+        }
         metadataSection.u32(strings.indexOf(sequence.sourceName));
         metadataSection.u64(static_cast<std::uint64_t>(sequence.offset));
         metadataSection.u32(static_cast<std::uint32_t>(sequence.callbacks.size()));
@@ -563,16 +969,18 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
     writer.u16(module.version.major);
     writer.u16(module.version.minor);
     writer.u32(0);
-    writer.u32(SectionCount);
+    const auto sectionCount = hasObjectModelSection(module.version)
+        ? SectionCount
+        : LegacySectionCount;
+    writer.u32(sectionCount);
     const auto directoryOffset = writer.size();
-    for (std::uint32_t index = 0; index < SectionCount; ++index) {
+    for (std::uint32_t index = 0; index < sectionCount; ++index) {
         writer.u32(0);
         writer.u32(0);
         writer.u32(0);
     }
 
-    const std::array<std::pair<std::uint32_t, const Writer*>, SectionCount>
-        sections{{
+    std::vector<std::pair<std::uint32_t, const Writer*>> sections{
             {SectionStrings, &stringSection},
             {SectionTypes, &typeSection},
             {SectionReferences, &referenceSection},
@@ -580,7 +988,10 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
             {SectionCode, &codeSection},
             {SectionDebug, &debugSection},
             {SectionMetadata, &metadataSection},
-        }};
+        };
+    if (hasObjectModelSection(module.version)) {
+        sections.push_back({SectionObjectModel, &objectModelSection});
+    }
 
     for (std::size_t index = 0; index < sections.size(); ++index) {
         const auto offset = static_cast<std::uint32_t>(writer.size());
@@ -617,11 +1028,18 @@ bool decodeModule(
         diagnostics.report("RS5003", "truncated bytecode header", {});
         return false;
     }
-    if (module.version.major != 0 || module.version.minor != 6) {
+    if (module.version.major != 0 ||
+        (module.version.minor != 6 &&
+         module.version.minor != 7 &&
+         module.version.minor != 8 &&
+         module.version.minor != 9)) {
         diagnostics.report("RS5001", "unsupported bytecode version", {});
         return false;
     }
-    if (sectionCount != SectionCount) {
+    const auto expectedSectionCount = hasObjectModelSection(module.version)
+        ? SectionCount
+        : LegacySectionCount;
+    if (sectionCount != expectedSectionCount) {
         diagnostics.report("RS5002", "invalid bytecode section count", {});
         return false;
     }
@@ -639,7 +1057,7 @@ bool decodeModule(
             return false;
         }
     }
-    for (const auto kind : {
+    std::vector<std::uint32_t> requiredSections{
              SectionStrings,
              SectionTypes,
              SectionReferences,
@@ -647,14 +1065,18 @@ bool decodeModule(
              SectionCode,
              SectionDebug,
              SectionMetadata,
-         }) {
+         };
+    if (hasObjectModelSection(module.version)) {
+        requiredSections.push_back(SectionObjectModel);
+    }
+    for (const auto kind : requiredSections) {
         if (sections.find(kind) == sections.end()) {
             diagnostics.report("RS5002", "missing required bytecode section", {});
             return false;
         }
     }
 
-    const auto directoryEnd = static_cast<std::uint32_t>(16 + SectionCount * 12);
+    const auto directoryEnd = static_cast<std::uint32_t>(16 + sectionCount * 12);
     std::vector<SectionEntry> orderedSections;
     for (const auto& [kind, entry] : sections) {
         (void)kind;
@@ -826,8 +1248,15 @@ bool decodeModule(
             if (!readStringValue(sequence.typeName,
                     "invalid sequence type-name string index") ||
                 !readStringValue(sequence.name,
-                    "invalid sequence name string index") ||
-                !readStringValue(sequence.sourceName,
+                    "invalid sequence name string index")) {
+                return false;
+            }
+            if (hasSequenceResultMetadata(module.version) &&
+                !readStringValue(sequence.resultTypeName,
+                    "invalid sequence result-type string index")) {
+                return false;
+            }
+            if (!readStringValue(sequence.sourceName,
                     "invalid sequence source string index")) {
                 return false;
             }
@@ -971,6 +1400,205 @@ bool decodeModule(
         }
     }
 
+    if (hasObjectModelSection(module.version)) {
+        const auto section = sections.at(SectionObjectModel);
+        Reader reader(bytes, section.offset, section.size);
+        const auto typeCount = reader.u32();
+        if (!reader.valid() || typeCount != module.types.size()) {
+            diagnostics.report(
+                "RS5004", "object-model type count does not match type section", {});
+            return false;
+        }
+        for (std::uint32_t index = 0; index < typeCount; ++index) {
+            auto& type = module.types[index];
+            if (reader.u64() != type.id) {
+                diagnostics.report(
+                    "RS5004", "object-model type identity does not match type section", {});
+                return false;
+            }
+            const auto accessibility = reader.u8();
+            const auto flags = reader.u8();
+            if (!reader.valid() ||
+                accessibility > static_cast<std::uint8_t>(
+                    semantic::Accessibility::Private) ||
+                (flags & 0xe0u) != 0) {
+                diagnostics.report("RS5004", "invalid object-model type flags", {});
+                return false;
+            }
+            type.accessibility = static_cast<semantic::Accessibility>(
+                accessibility);
+            type.synthetic = (flags & 0x01u) != 0;
+            type.interfaceType = (flags & 0x02u) != 0;
+            type.abstractType = (flags & 0x04u) != 0;
+            type.sealedType = (flags & 0x08u) != 0;
+            type.delegateType = (flags & 0x10u) != 0;
+            type.baseTypeId = reader.u64();
+            const auto baseTypeNameIndex = reader.u32();
+            if (baseTypeNameIndex != InvalidIndex) {
+                if (!validStringIndex(
+                        baseTypeNameIndex, strings, diagnostics,
+                        "invalid base type-name string index")) {
+                    return false;
+                }
+                type.baseTypeName = strings[baseTypeNameIndex];
+            }
+
+            const auto fieldMetadataCount = reader.u32();
+            if (!reader.valid() ||
+                fieldMetadataCount != type.fields.size()) {
+                diagnostics.report(
+                    "RS5004",
+                    "object-model field count does not match type section",
+                    {});
+                return false;
+            }
+            for (std::uint32_t fieldIndex = 0;
+                 fieldIndex < fieldMetadataCount;
+                 ++fieldIndex) {
+                auto& field = type.fields[fieldIndex];
+                const auto fieldAccessibility = reader.u8();
+                field.declaringTypeId = reader.u64();
+                const auto declaringNameIndex = reader.u32();
+                const auto sourceNameIndex = reader.u32();
+                field.id = reader.u64();
+                if (!reader.valid() ||
+                    fieldAccessibility > static_cast<std::uint8_t>(
+                        semantic::Accessibility::Private) ||
+                    !validStringIndex(
+                        declaringNameIndex, strings, diagnostics,
+                        "invalid field declaring-type string index") ||
+                    !validStringIndex(
+                        sourceNameIndex, strings, diagnostics,
+                        "invalid field source string index")) {
+                    diagnostics.report(
+                        "RS5004", "invalid field object-model descriptor", {});
+                    return false;
+                }
+                field.accessibility = static_cast<semantic::Accessibility>(
+                    fieldAccessibility);
+                field.declaringTypeName = strings[declaringNameIndex];
+                field.sourceName = strings[sourceNameIndex];
+            }
+
+            const auto methodCount = reader.u32();
+            if (!reader.valid() || methodCount > reader.remaining() / 59) {
+                diagnostics.report("RS5003", "truncated method descriptor list", {});
+                return false;
+            }
+            type.methods.reserve(methodCount);
+            for (std::uint32_t methodIndex = 0;
+                 methodIndex < methodCount;
+                 ++methodIndex) {
+                semantic::FunctionSymbol method;
+                if (!readFunctionSymbol(
+                        reader, strings, method, diagnostics)) {
+                    return false;
+                }
+                type.methods.push_back(std::move(method));
+            }
+
+            const auto constructorCount = reader.u32();
+            if (!reader.valid() || constructorCount > reader.remaining() / 59) {
+                diagnostics.report(
+                    "RS5003", "truncated constructor descriptor list", {});
+                return false;
+            }
+            type.constructors.reserve(constructorCount);
+            for (std::uint32_t constructorIndex = 0;
+                 constructorIndex < constructorCount;
+                 ++constructorIndex) {
+                semantic::FunctionSymbol constructor;
+                if (!readFunctionSymbol(
+                        reader, strings, constructor, diagnostics)) {
+                    return false;
+                }
+                type.constructors.push_back(std::move(constructor));
+            }
+
+            const auto propertyCount = reader.u32();
+            if (!reader.valid() || propertyCount > reader.remaining() / 40) {
+                diagnostics.report(
+                    "RS5003", "truncated property descriptor list", {});
+                return false;
+            }
+            type.properties.reserve(propertyCount);
+            for (std::uint32_t propertyIndex = 0;
+                 propertyIndex < propertyCount;
+                 ++propertyIndex) {
+                semantic::PropertySymbol property;
+                if (!readPropertySymbol(
+                        reader, strings, property, diagnostics)) {
+                    return false;
+                }
+                type.properties.push_back(std::move(property));
+            }
+
+            const auto virtualCount = reader.u32();
+            if (!reader.valid() || virtualCount > reader.remaining() / 8) {
+                diagnostics.report(
+                    "RS5003", "truncated virtual dispatch table", {});
+                return false;
+            }
+            type.virtualDispatchTable.reserve(virtualCount);
+            for (std::uint32_t slot = 0; slot < virtualCount; ++slot) {
+                type.virtualDispatchTable.push_back(reader.u64());
+            }
+
+            const auto interfaceCount = reader.u32();
+            if (!reader.valid() || interfaceCount > reader.remaining() / 12) {
+                diagnostics.report(
+                    "RS5003", "truncated interface dispatch map list", {});
+                return false;
+            }
+            type.interfaceDispatchMaps.reserve(interfaceCount);
+            for (std::uint32_t mapIndex = 0;
+                 mapIndex < interfaceCount;
+                 ++mapIndex) {
+                semantic::InterfaceDispatchMap map;
+                map.interfaceTypeId = reader.u64();
+                const auto slotCount = reader.u32();
+                if (!reader.valid() || slotCount > reader.remaining() / 8) {
+                    diagnostics.report(
+                        "RS5003", "truncated interface dispatch slots", {});
+                    return false;
+                }
+                map.slots.reserve(slotCount);
+                for (std::uint32_t slot = 0; slot < slotCount; ++slot) {
+                    map.slots.push_back(reader.u64());
+                }
+                type.interfaceDispatchMaps.push_back(std::move(map));
+            }
+        }
+
+        const auto referenceCount = reader.u32();
+        if (!reader.valid() ||
+            referenceCount != module.functionReferences.size()) {
+            diagnostics.report(
+                "RS5004",
+                "object-model reference count does not match reference section",
+                {});
+            return false;
+        }
+        for (std::uint32_t index = 0; index < referenceCount; ++index) {
+            auto& reference = module.functionReferences[index];
+            const auto flags = reader.u8();
+            if (!reader.valid() || (flags & 0xfcu) != 0) {
+                diagnostics.report(
+                    "RS5004", "invalid object-model call dispatch flags", {});
+                return false;
+            }
+            reference.virtualDispatch = (flags & 0x01u) != 0;
+            reference.interfaceDispatch = (flags & 0x02u) != 0;
+            reference.virtualSlot = reader.u32();
+            reference.interfaceTypeId = reader.u64();
+            reference.interfaceSlot = reader.u32();
+        }
+        if (!reader.valid() || !reader.empty()) {
+            diagnostics.report("RS5003", "invalid object-model section", {});
+            return false;
+        }
+    }
+
     std::vector<FunctionRecord> records;
     {
         const auto section = sections.at(SectionFunctions);
@@ -1070,7 +1698,7 @@ bool decodeModule(
                  ++instructionIndex) {
                 Instruction instruction;
                 const auto opcode = reader.u8();
-                if (opcode > static_cast<std::uint8_t>(Opcode::GreaterOrEqualDouble)) {
+                if (opcode > static_cast<std::uint8_t>(Opcode::ConstantTypeId)) {
                     diagnostics.report("RS5005", "invalid bytecode opcode", {});
                     return false;
                 }
@@ -1089,7 +1717,14 @@ bool decodeModule(
                 instruction.elementTypeId = reader.u64();
                 instruction.integerImmediate = reader.i64();
                 instruction.doubleImmediate = reader.f64();
-                instruction.boolImmediate = reader.u8() != 0;
+                const auto arithmeticFlags = reader.u8();
+                if (arithmeticFlags > 3u) {
+                    diagnostics.report(
+                        "RS6016", "invalid instruction arithmetic flags", {});
+                    return false;
+                }
+                instruction.boolImmediate = (arithmeticFlags & 1u) != 0;
+                instruction.checkedArithmetic = (arithmeticFlags & 2u) == 0;
                 const auto stringIndex = reader.u32();
                 if (instruction.opcode == Opcode::ConstantString) {
                     if (!validStringIndex(stringIndex, strings, diagnostics,
@@ -1105,7 +1740,7 @@ bool decodeModule(
             }
 
             const auto terminator = reader.u8();
-            if (terminator > static_cast<std::uint8_t>(TerminatorKind::ReturnVoid)) {
+            if (terminator > static_cast<std::uint8_t>(TerminatorKind::Throw)) {
                 diagnostics.report("RS5006", "invalid bytecode terminator", {});
                 return false;
             }
@@ -1120,6 +1755,28 @@ bool decodeModule(
                 return false;
             }
             record.function.blocks.push_back(std::move(block));
+        }
+        if (hasExceptionMetadata(module.version)) {
+            const auto handlerCount = reader.u32();
+            if (!reader.valid() || handlerCount > reader.remaining() / 20 + 1) {
+                diagnostics.report("RS5003", "invalid exception handler count", {});
+                return false;
+            }
+            for (std::uint32_t index = 0; index < handlerCount; ++index) {
+                ExceptionHandler handler;
+                const auto protectedCount = reader.u32();
+                if (!reader.valid() || protectedCount > reader.remaining() / 4) {
+                    diagnostics.report("RS5003", "invalid protected block count", {});
+                    return false;
+                }
+                for (std::uint32_t block = 0; block < protectedCount; ++block) {
+                    handler.protectedBlocks.push_back(reader.u32());
+                }
+                handler.handlerBlock = reader.u32();
+                handler.catchTypeId = reader.u64();
+                handler.exceptionLocal = reader.u32();
+                record.function.exceptionHandlers.push_back(std::move(handler));
+            }
         }
         if (!reader.valid() || !reader.empty()) {
             diagnostics.report("RS5003", "invalid bytecode function body", {});

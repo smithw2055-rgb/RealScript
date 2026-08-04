@@ -75,9 +75,17 @@ std::string primitiveExpression(semantic::PrimitiveType type) {
         case semantic::PrimitiveType::Error: return "Error";
         case semantic::PrimitiveType::Void: return "Void";
         case semantic::PrimitiveType::Bool: return "Bool";
+        case semantic::PrimitiveType::Byte: return "Byte";
+        case semantic::PrimitiveType::SByte: return "SByte";
+        case semantic::PrimitiveType::Short: return "Short";
+        case semantic::PrimitiveType::UShort: return "UShort";
         case semantic::PrimitiveType::Int: return "Int";
+        case semantic::PrimitiveType::UInt: return "UInt";
         case semantic::PrimitiveType::Long: return "Long";
+        case semantic::PrimitiveType::ULong: return "ULong";
+        case semantic::PrimitiveType::Float: return "Float";
         case semantic::PrimitiveType::Double: return "Double";
+        case semantic::PrimitiveType::Char: return "Char";
         case semantic::PrimitiveType::String: return "String";
         case semantic::PrimitiveType::Object: return "Object";
         case semantic::PrimitiveType::Struct: return "Struct";
@@ -121,6 +129,8 @@ std::string conversionExpression(mir::Opcode opcode) {
         return "semantic::ConversionKind::IntToDouble";
     case mir::Opcode::ConvertLongToDouble:
         return "semantic::ConversionKind::LongToDouble";
+    case mir::Opcode::ConvertNumeric:
+        return "semantic::ConversionKind::Numeric";
     default:
         return "semantic::ConversionKind::None";
     }
@@ -172,8 +182,9 @@ std::string binaryExpression(mir::Opcode opcode) {
 }
 
 bool isConversion(mir::Opcode opcode) {
-    return opcode >= mir::Opcode::ConvertNullToString &&
-        opcode <= mir::Opcode::ConvertLongToDouble;
+    return (opcode >= mir::Opcode::ConvertNullToString &&
+            opcode <= mir::Opcode::ConvertLongToDouble) ||
+        opcode == mir::Opcode::ConvertNumeric;
 }
 
 bool isUnary(mir::Opcode opcode) {
@@ -322,6 +333,26 @@ std::string canonicalInput(
     std::string value = options.programName + "\n" + options.cppNamespace + "\n";
     for (const auto* module : ordered) {
         value += mir::printModule(*module);
+        for (const auto& type : module->types) {
+            value += "type-contract:" + semantic::canonicalTypeName(type) +
+                ":base=" + std::to_string(type.baseTypeId) +
+                ":abstract=" + (type.abstractType ? "1" : "0") +
+                ":sealed=" + (type.sealedType ? "1" : "0") +
+                ":delegate=" + (type.delegateType ? "1" : "0") +
+                ":interface=" + (type.interfaceType ? "1" : "0") + ":";
+            for (const auto symbolId : type.virtualDispatchTable) {
+                value += std::to_string(symbolId) + ";";
+            }
+            for (const auto& implementation : type.interfaceDispatchMaps) {
+                value += "iface#" +
+                    std::to_string(implementation.interfaceTypeId) + "[";
+                for (const auto symbolId : implementation.slots) {
+                    value += std::to_string(symbolId) + ";";
+                }
+                value += "]";
+            }
+            value += "\n";
+        }
         for (const auto& attribute : module->languageMetadata.attributes) {
             value += "attribute:" + attribute.target + ":" + attribute.name + ":" +
                 attribute.sourceName + ":" + std::to_string(attribute.offset) + "(";
@@ -346,7 +377,8 @@ std::string canonicalInput(
         }
         for (const auto& sequence : module->languageMetadata.sequences) {
             value += "sequence:" + sequence.typeName + ":" + sequence.name + ":" +
-                sequence.sourceName + ":" + std::to_string(sequence.offset) + ":";
+                sequence.resultTypeName + ":" + sequence.sourceName + ":" +
+                std::to_string(sequence.offset) + ":";
             for (const auto& callback : sequence.callbacks) value += callback + ";";
             value += "\n";
         }
@@ -491,7 +523,8 @@ GeneratedProgram CppGenerator::generate(
     for (const auto& view : functions) {
         for (const auto& block : view.function->blocks) {
             for (const auto& instruction : block.instructions) {
-                if (instruction.opcode == mir::Opcode::Call) {
+                if (instruction.opcode == mir::Opcode::Call ||
+                    instruction.opcode == mir::Opcode::NewDelegate) {
                     callSites.push_back(CallSite{callSites.size(), &instruction});
                 }
             }
@@ -554,6 +587,47 @@ GeneratedProgram CppGenerator::generate(
             }
             source.line("};");
         }
+        if (!type.virtualDispatchTable.empty()) {
+            source.line("static constexpr semantic::SymbolId " +
+                view.cppName + "_virtualSlots[] = {");
+            for (const auto symbolId : type.virtualDispatchTable) {
+                source.line("    0x" + hexId(symbolId) + "ULL,");
+            }
+            source.line("};");
+        }
+        for (std::size_t interfaceIndex = 0;
+             interfaceIndex < type.interfaceDispatchMaps.size();
+             ++interfaceIndex) {
+            const auto& implementation =
+                type.interfaceDispatchMaps[interfaceIndex];
+            if (implementation.slots.empty()) continue;
+            source.line("static constexpr semantic::SymbolId " +
+                view.cppName + "_interface_" +
+                std::to_string(interfaceIndex) + "_slots[] = {");
+            for (const auto symbolId : implementation.slots) {
+                source.line("    0x" + hexId(symbolId) + "ULL,");
+            }
+            source.line("};");
+        }
+        if (!type.interfaceDispatchMaps.empty()) {
+            source.line("static constexpr InterfaceDispatchDescriptor " +
+                view.cppName + "_interfaceMaps[] = {");
+            for (std::size_t interfaceIndex = 0;
+                 interfaceIndex < type.interfaceDispatchMaps.size();
+                 ++interfaceIndex) {
+                const auto& implementation =
+                    type.interfaceDispatchMaps[interfaceIndex];
+                source.line("    {0x" +
+                    hexId(implementation.interfaceTypeId) + "ULL, " +
+                    (implementation.slots.empty()
+                        ? std::string("nullptr")
+                        : view.cppName + "_interface_" +
+                            std::to_string(interfaceIndex) + "_slots") +
+                    ", " + std::to_string(implementation.slots.size()) +
+                    "u},");
+            }
+            source.line("};");
+        }
         if (!type.enumMembers.empty()) {
             source.line("static constexpr EnumMemberDescriptor " + view.cppName +
                 "_enumMembers[] = {");
@@ -570,13 +644,24 @@ GeneratedProgram CppGenerator::generate(
             (void)id;
             const auto& type = *view.type;
             source.line("    {0x" + hexId(type.id) + "ULL, " +
-                typeKindExpression(type.kind) + ", \"" +
+                typeKindExpression(type.kind) + ", 0x" +
+                hexId(type.baseTypeId) + "ULL, \"" +
                 escapeCppString(type.moduleName) + "\", \"" +
                 escapeCppString(type.name) + "\", " +
                 (type.fields.empty() ? "nullptr" : view.cppName + "_fields") +
                 ", " + std::to_string(type.fields.size()) + "u, " +
                 (type.enumMembers.empty() ? "nullptr" : view.cppName + "_enumMembers") +
-                ", " + std::to_string(type.enumMembers.size()) + "u},");
+                ", " + std::to_string(type.enumMembers.size()) + "u, " +
+                (type.virtualDispatchTable.empty()
+                    ? "nullptr"
+                    : view.cppName + "_virtualSlots") +
+                ", " + std::to_string(type.virtualDispatchTable.size()) +
+                "u, " + (type.interfaceType ? "true" : "false") + ", " +
+                (type.interfaceDispatchMaps.empty()
+                    ? "nullptr"
+                    : view.cppName + "_interfaceMaps") +
+                ", " + std::to_string(type.interfaceDispatchMaps.size()) +
+                "u, " + (type.delegateType ? "true" : "false") + "},");
         }
         source.line("};");
     }
@@ -638,8 +723,14 @@ GeneratedProgram CppGenerator::generate(
         source.line("static constexpr CallSignature " + prefix + "_signature{");
         source.line("    0x" + hexId(instruction.symbolId) + "ULL,");
         source.line("    \"" + escapeCppString(instruction.symbolName) + "\",");
-        source.line("    " + primitiveExpression(instruction.resultType) + ",");
-        source.line("    0x" + hexId(instruction.resultTypeId) + "ULL,");
+        source.line("    " + primitiveExpression(
+            instruction.opcode == mir::Opcode::NewDelegate
+                ? instruction.elementType
+                : instruction.resultType) + ",");
+        source.line("    0x" + hexId(
+            instruction.opcode == mir::Opcode::NewDelegate
+                ? instruction.elementTypeId
+                : instruction.resultTypeId) + "ULL,");
         source.line("    " + (instruction.parameterTypes.empty()
             ? std::string("nullptr")
             : prefix + "_types") + ",");
@@ -647,6 +738,13 @@ GeneratedProgram CppGenerator::generate(
             ? std::string("nullptr")
             : prefix + "_typeIds") + ",");
         source.line("    " + std::to_string(instruction.parameterTypes.size()) + "u,");
+        source.line(std::string("    ") +
+            (instruction.virtualDispatch ? "true" : "false") + ",");
+        source.line("    " + std::to_string(instruction.virtualSlot) + "u,");
+        source.line(std::string("    ") +
+            (instruction.interfaceDispatch ? "true" : "false") + ",");
+        source.line("    0x" + hexId(instruction.interfaceTypeId) + "ULL,");
+        source.line("    " + std::to_string(instruction.interfaceSlot) + "u,");
         source.line("};");
     }
     source.line();
@@ -663,6 +761,7 @@ GeneratedProgram CppGenerator::generate(
         source.line("    const runtime::Value* arguments,");
         source.line("    std::size_t argumentCount,");
         source.line("    runtime::Value& result) {");
+        source.line("    (void)result;");
         source.line("    std::vector<runtime::Value> argumentValues;");
         source.line("    if (argumentCount != 0) {");
         source.line("        argumentValues.assign(arguments, arguments + argumentCount);");
@@ -688,6 +787,25 @@ GeneratedProgram CppGenerator::generate(
         std::size_t functionCallIndex = 0;
         for (const auto& block : function.blocks) {
             source.line("        case " + std::to_string(block.id) + ": {");
+            const auto emitExceptionRoute = [&](const std::string& indent) {
+                for (const auto& handler : function.exceptionHandlers) {
+                    if (std::find(
+                            handler.protectedBlocks.begin(),
+                            handler.protectedBlocks.end(),
+                            block.id) == handler.protectedBlocks.end()) {
+                        continue;
+                    }
+                    source.line(indent + "if (context.pendingExceptionMatches(0x" +
+                        hexId(handler.catchTypeId) + "ULL)) {");
+                    source.line(indent + "    if (!context.takePendingException(locals[" +
+                        std::to_string(handler.exceptionLocal) +
+                        "])) return false;");
+                    source.line(indent + "    currentBlock = " +
+                        std::to_string(handler.handlerBlock) + "u;");
+                    source.line(indent + "    continue;");
+                    source.line(indent + "}");
+                }
+            };
             for (std::size_t instructionIndex = 0;
                  instructionIndex < block.instructions.size();
                  ++instructionIndex) {
@@ -753,6 +871,12 @@ GeneratedProgram CppGenerator::generate(
                 case mir::Opcode::ConstantNull:
                     source.line("            " + result + " = std::monostate{};");
                     break;
+                case mir::Opcode::ConstantTypeId:
+                    source.line("            " + result +
+                        " = runtime::ULongValue{0x" +
+                        hexId(static_cast<semantic::SymbolId>(
+                            instruction.integerImmediate)) + "ULL};");
+                    break;
                 case mir::Opcode::LoadLocal:
                     source.line("            " + result + " = locals[" +
                         std::to_string(instruction.localIndex) + "];");
@@ -787,6 +911,21 @@ GeneratedProgram CppGenerator::generate(
                     source.line("            if (!context.checkNotNull(0x" +
                         hexId(instruction.typeId) + "ULL, " + operand(0) + ", " +
                         result + ")) return false;");
+                    break;
+                case mir::Opcode::IsType:
+                case mir::Opcode::AsType:
+                    source.line("            if (!context.typeOperation(" +
+                        primitiveExpression(
+                            instruction.parameterTypes.empty()
+                                ? semantic::PrimitiveType::Error
+                                : instruction.parameterTypes.front()) +
+                        ", " + primitiveExpression(instruction.elementType) +
+                        ", 0x" + hexId(instruction.elementTypeId) + "ULL, " +
+                        operand(0) + ", " +
+                        (instruction.opcode == mir::Opcode::AsType
+                            ? "true"
+                            : "false") +
+                        ", " + result + ")) return false;");
                     break;
                 case mir::Opcode::ArrayLength:
                     source.line("            if (!context.arrayLength(" + operand(0) +
@@ -844,25 +983,82 @@ GeneratedProgram CppGenerator::generate(
                     source.line("            if (!context.call(call_" +
                         std::to_string(callId) + "_signature, " + pointer + ", " +
                         std::to_string(instruction.operands.size()) +
-                        "u, " + resultName + ")) return false;");
+                        "u, " + resultName + ")) {");
+                    source.line("                if (context.hasPendingException()) {");
+                    emitExceptionRoute("                    ");
+                    source.line("                }");
+                    source.line("                return false;");
+                    source.line("            }");
                     if (instruction.result >= 0) {
                         source.line("            " + result +
                             " = std::move(" + resultName + ");");
                     }
                     break;
                 }
+                case mir::Opcode::NewDelegate: {
+                    const auto callId = callIds.at(&instruction);
+                    const auto callIndex = functionCallIndex++;
+                    const auto name = "delegateTarget_" +
+                        std::to_string(callIndex);
+                    const auto pointer = arrayValues(
+                        instruction.operands, name, source, "            ");
+                    source.line("            if (!context.newDelegate(0x" +
+                        hexId(instruction.typeId) + "ULL, call_" +
+                        std::to_string(callId) + "_signature, " + pointer +
+                        ", " + std::to_string(instruction.operands.size()) +
+                        "u, " + result + ")) return false;");
+                    break;
+                }
+                case mir::Opcode::InvokeDelegate: {
+                    const auto callIndex = functionCallIndex++;
+                    const auto name = "delegateArguments_" +
+                        std::to_string(callIndex);
+                    const auto resultName = "delegateResult_" +
+                        std::to_string(callIndex);
+                    const auto pointer = arrayValues(
+                        instruction.operands, name, source, "            ");
+                    source.line("            runtime::Value " + resultName + ";");
+                    source.line("            if (!context.invokeDelegate(0x" +
+                        hexId(instruction.typeId) + "ULL, " + pointer + ", " +
+                        std::to_string(instruction.operands.size()) +
+                        "u, " + resultName + ")) {");
+                    source.line("                if (context.hasPendingException()) {");
+                    emitExceptionRoute("                    ");
+                    source.line("                }");
+                    source.line("                return false;");
+                    source.line("            }");
+                    if (instruction.result >= 0) {
+                        source.line("            " + result +
+                            " = std::move(" + resultName + ");");
+                    }
+                    break;
+                }
+                case mir::Opcode::CombineDelegate:
+                case mir::Opcode::RemoveDelegate:
+                    source.line("            if (!context.combineDelegates(0x" +
+                        hexId(instruction.typeId) + "ULL, " + operand(0) +
+                        ", " + operand(1) + ", " +
+                        (instruction.opcode == mir::Opcode::RemoveDelegate
+                            ? "true"
+                            : "false") +
+                        ", " + result + ")) return false;");
+                    break;
                 default:
                     if (isConversion(instruction.opcode)) {
                         source.line("            if (!context.convert(" +
                             conversionExpression(instruction.opcode) + ", " +
+                            primitiveExpression(instruction.resultType) + ", " +
+                            (instruction.checkedArithmetic ? "true" : "false") + ", " +
                             operand(0) + ", " + result + ")) return false;");
                     } else if (isUnary(instruction.opcode)) {
                         source.line("            if (!context.unary(" +
-                            unaryExpression(instruction.opcode) + ", " + operand(0) +
+                            unaryExpression(instruction.opcode) + ", " +
+                            (instruction.checkedArithmetic ? "true" : "false") + ", " + operand(0) +
                             ", " + result + ")) return false;");
                     } else if (isBinary(instruction.opcode)) {
                         source.line("            if (!context.binary(" +
-                            binaryExpression(instruction.opcode) + ", " + operand(0) +
+                            binaryExpression(instruction.opcode) + ", " +
+                            (instruction.checkedArithmetic ? "true" : "false") + ", " + operand(0) +
                             ", " + operand(1) + ", " + result +
                             ")) return false;");
                     } else {
@@ -927,6 +1123,18 @@ GeneratedProgram CppGenerator::generate(
                     "                ");
                 source.line("            }");
                 source.line("            continue;");
+                break;
+            case mir::TerminatorKind::Throw:
+                source.line("            if (!context.throwScript(" +
+                    valueExpression(block.terminator.value) + ")) {");
+                source.line("                if (context.hasPendingException()) {");
+                emitExceptionRoute("                    ");
+                source.line("                }");
+                source.line("                return false;");
+                source.line("            }");
+                source.line("            return context.fail("
+                    "runtime::ErrorCode::InvalidProgram, "
+                    "\"AOT throw unexpectedly returned\");");
                 break;
             case mir::TerminatorKind::None:
                 source.line("            return context.fail("
@@ -1158,7 +1366,9 @@ GeneratedProgram CppGenerator::generate(
             manifest << "\n      {\"module\": \""
                 << jsonEscape(module.name) << "\", \"type\": \""
                 << jsonEscape(sequence.typeName) << "\", \"name\": \""
-                << jsonEscape(sequence.name) << "\", \"source\": \""
+                << jsonEscape(sequence.name) << "\", \"resultType\": \""
+                << jsonEscape(sequence.resultTypeName)
+                << "\", \"source\": \""
                 << jsonEscape(sequence.sourceName) << "\", \"offset\": "
                 << sequence.offset << ", \"callbacks\": [";
             for (std::size_t index = 0;

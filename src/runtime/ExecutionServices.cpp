@@ -78,10 +78,33 @@ void hashValue(
     }
     if (const auto* v = std::get_if<bool>(&value)) {
         hashScalar(hash, *v);
+    } else if (const auto* v = std::get_if<ByteValue>(&value)) {
+        hashScalar(hash, v->value);
+    } else if (const auto* v = std::get_if<SByteValue>(&value)) {
+        hashScalar(hash, v->value);
+    } else if (const auto* v = std::get_if<ShortValue>(&value)) {
+        hashScalar(hash, v->value);
+    } else if (const auto* v = std::get_if<UShortValue>(&value)) {
+        hashScalar(hash, v->value);
     } else if (const auto* v = std::get_if<std::int64_t>(&value)) {
         hashScalar(hash, *v);
+    } else if (const auto* v = std::get_if<UIntValue>(&value)) {
+        hashScalar(hash, v->value);
     } else if (const auto* v = std::get_if<LongValue>(&value)) {
         hashScalar(hash, v->value);
+    } else if (const auto* v = std::get_if<ULongValue>(&value)) {
+        hashScalar(hash, v->value);
+    } else if (const auto* v = std::get_if<FloatValue>(&value)) {
+        std::uint32_t bits = 0;
+        if (canonicalizeFloatingPoint && std::isnan(v->value)) {
+            bits = 0x7fc00000U;
+        } else if (canonicalizeFloatingPoint && v->value == 0.0f) {
+            bits = 0;
+        } else {
+            static_assert(sizeof(bits) == sizeof(v->value), "float width changed");
+            std::memcpy(&bits, &v->value, sizeof(bits));
+        }
+        hashScalar(hash, bits);
     } else if (const auto* v = std::get_if<double>(&value)) {
         std::uint64_t bits = 0;
         if (canonicalizeFloatingPoint) {
@@ -91,6 +114,8 @@ void hashValue(
             std::memcpy(&bits, v, sizeof(bits));
         }
         hashScalar(hash, bits);
+    } else if (const auto* v = std::get_if<CharValue>(&value)) {
+        hashScalar(hash, v->value);
     } else if (const auto* v = std::get_if<EnumValue>(&value)) {
         hashScalar(hash, v->typeId);
         hashScalar(hash, v->value);

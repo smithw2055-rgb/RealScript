@@ -54,7 +54,38 @@ std::string disassembleModule(const Module& module) {
             const auto& type = module.types[index];
             out << "  type" << index << " @"
                 << semantic::canonicalTypeName(type) << "[0x"
-                << std::hex << type.id << std::dec << "] {";
+                << std::hex << type.id << std::dec << "]";
+            if (type.baseTypeId != 0) {
+                out << " base[0x" << std::hex << type.baseTypeId
+                    << std::dec << "]";
+            }
+            if (type.interfaceType) out << " interface";
+            if (type.delegateType) out << " delegate";
+            if (type.abstractType) out << " abstract";
+            if (type.sealedType) out << " sealed";
+            if (!type.virtualDispatchTable.empty()) {
+                out << " vslots[";
+                for (std::size_t slot = 0;
+                     slot < type.virtualDispatchTable.size(); ++slot) {
+                    if (slot != 0) out << ", ";
+                    out << slot << "=0x" << std::hex
+                        << type.virtualDispatchTable[slot] << std::dec;
+                }
+                out << ']';
+            }
+            for (const auto& interfaceMap :
+                 type.interfaceDispatchMaps) {
+                out << " islots[0x" << std::hex
+                    << interfaceMap.interfaceTypeId << std::dec << ':';
+                for (std::size_t slot = 0;
+                     slot < interfaceMap.slots.size(); ++slot) {
+                    if (slot != 0) out << ", ";
+                    out << slot << "=0x" << std::hex
+                        << interfaceMap.slots[slot] << std::dec;
+                }
+                out << ']';
+            }
+            out << " {";
             for (std::size_t fieldIndex = 0; fieldIndex < type.fields.size(); ++fieldIndex) {
                 if (fieldIndex != 0) out << ", ";
                 const auto& field = type.fields[fieldIndex];
@@ -88,6 +119,14 @@ std::string disassembleModule(const Module& module) {
             }
             out << ") -> ";
             printSignatureType(out, reference.returnType, reference.returnTypeId);
+            if (reference.virtualDispatch) {
+                out << " virtual[" << reference.virtualSlot << "]";
+            }
+            if (reference.interfaceDispatch) {
+                out << " interface[0x" << std::hex
+                    << reference.interfaceTypeId << std::dec
+                    << ':' << reference.interfaceSlot << ']';
+            }
             out << '\n';
         }
     }
@@ -182,7 +221,8 @@ std::string disassembleModule(const Module& module) {
                             : 0);
                     out << " = ";
                 }
-                out << opcodeName(instruction.opcode);
+            out << opcodeName(instruction.opcode);
+            if (!instruction.checkedArithmetic) out << ".unchecked";
                 switch (instruction.opcode) {
                 case Opcode::LoadParameter:
                 case Opcode::LoadLocal:
@@ -259,6 +299,24 @@ std::string disassembleModule(const Module& module) {
                     }
                     printRegisters(out, instruction.operands);
                     break;
+                case Opcode::NewDelegate:
+                    out << " type" << instruction.typeIndex;
+                    if (instruction.index <
+                        module.functionReferences.size()) {
+                        out << " ref" << instruction.index << " @"
+                            << module.functionReferences[
+                                instruction.index].name;
+                    } else {
+                        out << " ref" << instruction.index;
+                    }
+                    printRegisters(out, instruction.operands);
+                    break;
+                case Opcode::InvokeDelegate:
+                case Opcode::CombineDelegate:
+                case Opcode::RemoveDelegate:
+                    out << " type" << instruction.typeIndex;
+                    printRegisters(out, instruction.operands);
+                    break;
                 default:
                     for (std::size_t index = 0;
                          index < instruction.operands.size();
@@ -285,6 +343,7 @@ std::string disassembleModule(const Module& module) {
                 printRegisters(out, block.terminator.falseArguments);
                 break;
             case TerminatorKind::ReturnValue:
+            case TerminatorKind::Throw:
                 out << " r" << block.terminator.value;
                 break;
             case TerminatorKind::None:
@@ -292,6 +351,17 @@ std::string disassembleModule(const Module& module) {
                 break;
             }
             out << '\n';
+        }
+        for (const auto& handler : function.exceptionHandlers) {
+            out << "  handler catch 0x" << std::hex
+                << handler.catchTypeId << std::dec << " [";
+            for (std::size_t index = 0;
+                 index < handler.protectedBlocks.size(); ++index) {
+                if (index != 0) out << ", ";
+                out << "bb" << handler.protectedBlocks[index];
+            }
+            out << "] -> bb" << handler.handlerBlock
+                << " local" << handler.exceptionLocal << '\n';
         }
         out << "}\n";
     }

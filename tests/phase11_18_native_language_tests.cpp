@@ -476,8 +476,8 @@ int main()
 
     realscript::bytecode::Lowerer lowerer;
     const auto bytecode = lowerer.lower(build.modules.front());
-    require(bytecode.version.major == 0 && bytecode.version.minor == 6,
-        "native metadata did not advance the RSBC format to 0.6");
+    require(bytecode.version.major == 0 && bytecode.version.minor == 7,
+        "native object metadata did not advance the RSBC format to 0.7");
     const auto bytes = realscript::bytecode::encodeModule(bytecode);
     realscript::bytecode::Module decoded;
     realscript::diagnostics::DiagnosticBag decodeDiagnostics;
@@ -557,7 +557,8 @@ class Behavior
             compiled.languageMetadata.sequences.front().typeName ==
                 "SequenceDemo::Behavior" &&
             compiled.languageMetadata.sequences.front().name == "Attack" &&
-            compiled.languageMetadata.sequences.front().callbacks.size() == 2,
+            compiled.languageMetadata.sequences.front().callbacks.size() == 1 &&
+            compiled.languageMetadata.sequences.front().resultTypeName == "void",
         "GameCompileResult did not retain native sequence metadata");
     require(compiled.program.languageMetadata().sequences.size() == 1,
         "GameProgram did not retain native sequence metadata");

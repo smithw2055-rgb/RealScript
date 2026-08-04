@@ -86,9 +86,7 @@ bool validSignatureIdentity(
 
 bool validStorageType(semantic::PrimitiveType type) noexcept {
     return type == semantic::PrimitiveType::Bool ||
-        type == semantic::PrimitiveType::Int ||
-        type == semantic::PrimitiveType::Long ||
-        type == semantic::PrimitiveType::Double ||
+        semantic::isNumericType(type) ||
         type == semantic::PrimitiveType::String ||
         type == semantic::PrimitiveType::Object ||
         type == semantic::PrimitiveType::Struct ||
@@ -126,6 +124,22 @@ bool checkedLongMultiply(
     }
     output = runtime::LongValue{left * right};
     return true;
+}
+
+std::int64_t wrapInt32(std::int64_t value) noexcept {
+    const auto bits = static_cast<std::uint32_t>(value);
+    return bits <= static_cast<std::uint32_t>(
+                       std::numeric_limits<std::int32_t>::max())
+        ? static_cast<std::int64_t>(bits)
+        : static_cast<std::int64_t>(bits) - (std::int64_t{1} << 32);
+}
+
+std::int64_t signedFromBits(std::uint64_t bits) noexcept {
+    return bits <= static_cast<std::uint64_t>(
+                       std::numeric_limits<std::int64_t>::max())
+        ? static_cast<std::int64_t>(bits)
+        : -1 - static_cast<std::int64_t>(
+            std::numeric_limits<std::uint64_t>::max() - bits);
 }
 
 } // namespace
@@ -167,6 +181,29 @@ const TypeDescriptor* ExecutionContext::findType(
     semantic::SymbolId typeId) const {
     const auto found = types_.find(typeId);
     return found == types_.end() ? nullptr : found->second;
+}
+
+bool ExecutionContext::isAssignable(
+    semantic::SymbolId actual,
+    semantic::SymbolId expected) const noexcept {
+    if (actual == expected) return true;
+    std::unordered_set<semantic::SymbolId> visited;
+    auto current = actual;
+    while (current != 0 && visited.insert(current).second) {
+        const auto* type = findType(current);
+        if (!type) return false;
+        for (std::uint32_t index = 0;
+             index < type->interfaceDispatchMapCount;
+             ++index) {
+            if (type->interfaceDispatchMaps &&
+                type->interfaceDispatchMaps[index].interfaceTypeId == expected) {
+                return true;
+            }
+        }
+        if (type->baseTypeId == expected) return true;
+        current = type->baseTypeId;
+    }
+    return false;
 }
 
 const FunctionDescriptor* ExecutionContext::findFunction(
@@ -227,6 +264,46 @@ bool ExecutionContext::branch(std::uint32_t blockId) {
     return true;
 }
 
+bool ExecutionContext::throwScript(const runtime::Value& value) {
+    const auto* reference = std::get_if<runtime::ObjectRef>(&value);
+    if (!reference || !heap_ || !heap_->isAlive(*reference)) {
+        return fail(
+            runtime::ErrorCode::NullReference,
+            "throw requires a non-null script object");
+    }
+    pendingException_ = value;
+    return false;
+}
+
+bool ExecutionContext::hasPendingException() const noexcept {
+    return pendingException_.has_value();
+}
+
+bool ExecutionContext::pendingExceptionMatches(
+    semantic::SymbolId typeId) const {
+    if (!pendingException_) return false;
+    if (typeId == 0) return true;
+    const auto* reference = std::get_if<runtime::ObjectRef>(
+        &*pendingException_);
+    if (!reference || !heap_) return false;
+    const auto actual = heap_->objectTypeId(*reference);
+    return actual && isAssignable(*actual, typeId);
+}
+
+bool ExecutionContext::takePendingException(runtime::Value& value) {
+    if (!pendingException_) return false;
+    value = *pendingException_;
+    pendingException_.reset();
+    return true;
+}
+
+void ExecutionContext::reportUnhandledScriptException() {
+    if (!pendingException_ || error_.code != runtime::ErrorCode::None) return;
+    error_.code = runtime::ErrorCode::ScriptException;
+    error_.message = "unhandled script exception";
+    error_.stackTrace = stack_;
+}
+
 bool ExecutionContext::expectType(
     const runtime::Value& value,
     semantic::PrimitiveType type,
@@ -270,7 +347,7 @@ bool ExecutionContext::expectSignatureType(
         const auto actual = reference && heap_
             ? heap_->objectTypeId(*reference)
             : std::optional<semantic::SymbolId>{};
-        if (!actual || *actual != typeId) {
+        if (!actual || !isAssignable(*actual, typeId)) {
             return fail(
                 runtime::ErrorCode::TypeMismatch,
                 std::string(context) + " has the wrong runtime object type");
@@ -321,9 +398,17 @@ runtime::Value ExecutionContext::defaultValue(
     std::size_t depth) const {
     switch (type) {
     case semantic::PrimitiveType::Bool: return false;
+    case semantic::PrimitiveType::Byte: return runtime::ByteValue{};
+    case semantic::PrimitiveType::SByte: return runtime::SByteValue{};
+    case semantic::PrimitiveType::Short: return runtime::ShortValue{};
+    case semantic::PrimitiveType::UShort: return runtime::UShortValue{};
     case semantic::PrimitiveType::Int: return std::int64_t{0};
+    case semantic::PrimitiveType::UInt: return runtime::UIntValue{};
     case semantic::PrimitiveType::Long: return runtime::LongValue{};
+    case semantic::PrimitiveType::ULong: return runtime::ULongValue{};
+    case semantic::PrimitiveType::Float: return runtime::FloatValue{};
     case semantic::PrimitiveType::Double: return 0.0;
+    case semantic::PrimitiveType::Char: return runtime::CharValue{};
     case semantic::PrimitiveType::String: return runtime::NullString{};
     case semantic::PrimitiveType::Object: return runtime::NullObject{};
     case semantic::PrimitiveType::Array: return runtime::NullArray{};
@@ -458,8 +543,113 @@ bool ExecutionContext::call(
             return false;
         }
     }
-    if (findFunction(signature.symbolId)) {
-        return invoke(signature.symbolId, arguments, argumentCount, result);
+    auto targetSymbolId = signature.symbolId;
+    if (signature.virtualDispatch && signature.interfaceDispatch) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT call cannot combine virtual and interface dispatch");
+    }
+    if (signature.virtualDispatch) {
+        if (signature.virtualSlot ==
+                std::numeric_limits<std::uint32_t>::max() ||
+            argumentCount == 0 ||
+            !signature.parameterTypes ||
+            signature.parameterTypes[0] !=
+                semantic::PrimitiveType::Object) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT virtual call has an invalid receiver contract");
+        }
+        if (std::holds_alternative<runtime::NullObject>(arguments[0])) {
+            return fail(
+                runtime::ErrorCode::NullReference,
+                "AOT virtual call attempted to dereference null");
+        }
+        const auto* receiver =
+            std::get_if<runtime::ObjectRef>(&arguments[0]);
+        const auto actualTypeId = receiver && heap_
+            ? heap_->objectTypeId(*receiver)
+            : std::optional<semantic::SymbolId>{};
+        const auto* actualType = actualTypeId
+            ? findType(*actualTypeId)
+            : nullptr;
+        if (!actualType ||
+            signature.virtualSlot >= actualType->virtualSlotCount ||
+            !actualType->virtualDispatchTable) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT virtual call slot is outside the runtime dispatch table");
+        }
+        targetSymbolId =
+            actualType->virtualDispatchTable[signature.virtualSlot];
+        if (targetSymbolId == 0) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT virtual call reached an abstract runtime slot");
+        }
+    } else if (signature.interfaceDispatch) {
+        if (signature.interfaceTypeId == 0 ||
+            signature.interfaceSlot ==
+                std::numeric_limits<std::uint32_t>::max() ||
+            argumentCount == 0 ||
+            !signature.parameterTypes ||
+            signature.parameterTypes[0] !=
+                semantic::PrimitiveType::Object ||
+            typeIdAt(
+                signature.parameterTypeIds,
+                signature.parameterCount,
+                0) != signature.interfaceTypeId) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT interface call has an invalid receiver contract");
+        }
+        if (std::holds_alternative<runtime::NullObject>(arguments[0])) {
+            return fail(
+                runtime::ErrorCode::NullReference,
+                "AOT interface call attempted to dereference null");
+        }
+        const auto* receiver =
+            std::get_if<runtime::ObjectRef>(&arguments[0]);
+        const auto actualTypeId = receiver && heap_
+            ? heap_->objectTypeId(*receiver)
+            : std::optional<semantic::SymbolId>{};
+        const auto* actualType = actualTypeId
+            ? findType(*actualTypeId)
+            : nullptr;
+        const InterfaceDispatchDescriptor* implementation = nullptr;
+        if (actualType && actualType->interfaceDispatchMaps) {
+            for (std::uint32_t index = 0;
+                 index < actualType->interfaceDispatchMapCount;
+                 ++index) {
+                const auto& candidate =
+                    actualType->interfaceDispatchMaps[index];
+                if (candidate.interfaceTypeId ==
+                    signature.interfaceTypeId) {
+                    implementation = &candidate;
+                    break;
+                }
+            }
+        }
+        if (!implementation || !implementation->slots ||
+            signature.interfaceSlot >= implementation->slotCount) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT interface call slot is outside the runtime dispatch map");
+        }
+        targetSymbolId = implementation->slots[signature.interfaceSlot];
+        if (targetSymbolId == 0) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT interface call reached an unimplemented runtime slot");
+        }
+    }
+    if (findFunction(targetSymbolId)) {
+        return invoke(targetSymbolId, arguments, argumentCount, result);
+    }
+    if (signature.virtualDispatch || signature.interfaceDispatch) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT runtime dispatch target function is unavailable");
     }
     if (!bindings_) {
         return fail(
@@ -473,6 +663,11 @@ bool ExecutionContext::call(
     reference.name = signature.name ? signature.name : "";
     reference.returnType = signature.returnType;
     reference.returnTypeId = signature.returnTypeId;
+    reference.virtualDispatch = signature.virtualDispatch;
+    reference.virtualSlot = signature.virtualSlot;
+    reference.interfaceDispatch = signature.interfaceDispatch;
+    reference.interfaceTypeId = signature.interfaceTypeId;
+    reference.interfaceSlot = signature.interfaceSlot;
     if (signature.parameterCount != 0) {
         reference.parameterTypes.assign(
             signature.parameterTypes,
@@ -518,6 +713,405 @@ bool ExecutionContext::call(
     return true;
 }
 
+bool ExecutionContext::newDelegate(
+    semantic::SymbolId delegateTypeId,
+    const CallSignature& signature,
+    const runtime::Value* target,
+    std::size_t targetCount,
+    runtime::Value& result) {
+    const auto* delegateType = findType(delegateTypeId);
+    if (!delegateType || !delegateType->delegateType ||
+        targetCount > 1 || (targetCount != 0 && !target)) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT delegate creation has invalid metadata");
+    }
+    runtime::Value targetValue = runtime::NullObject{};
+    if (targetCount == 1) {
+        if (signature.parameterCount == 0 ||
+            !expectSignatureType(
+                target[0], signature.parameterTypes[0],
+                typeIdAt(
+                    signature.parameterTypeIds,
+                    signature.parameterCount, 0),
+                "delegate target")) {
+            return false;
+        }
+        targetValue = target[0];
+    } else if (signature.virtualDispatch ||
+               signature.interfaceDispatch) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT delegate dispatch target has no receiver");
+    }
+    const auto word = [](std::uint64_t value, bool high) {
+        return static_cast<std::int64_t>(
+            static_cast<std::uint32_t>(high ? value >> 32u : value));
+    };
+    std::uint64_t flags = 0;
+    if (signature.virtualDispatch) flags |= 1u;
+    if (signature.interfaceDispatch) flags |= 2u;
+    std::vector<runtime::Value> fields{
+        std::move(targetValue),
+        word(signature.symbolId, false),
+        word(signature.symbolId, true),
+        static_cast<std::int64_t>(flags),
+        static_cast<std::int64_t>(signature.virtualDispatch
+            ? signature.virtualSlot
+            : signature.interfaceDispatch
+                ? signature.interfaceSlot
+                : 0u),
+        word(signature.interfaceTypeId, false),
+        word(signature.interfaceTypeId, true),
+        runtime::NullObject{},
+    };
+    runtime::RuntimeError allocationError;
+    const auto reference = heap_->allocateObject(
+        delegateTypeId, std::move(fields), {0u, 7u},
+        &allocationError);
+    if (!reference) {
+        return fail(
+            allocationError.code == runtime::ErrorCode::None
+                ? runtime::ErrorCode::OutOfMemory
+                : allocationError.code,
+            allocationError.message.empty()
+                ? "AOT delegate allocation failed"
+                : allocationError.message);
+    }
+    result = *reference;
+    return true;
+}
+
+bool ExecutionContext::combineDelegates(
+    semantic::SymbolId delegateTypeId,
+    const runtime::Value& left,
+    const runtime::Value& right,
+    bool remove,
+    runtime::Value& result) {
+    const auto* delegateType = findType(delegateTypeId);
+    if (!delegateType || !delegateType->delegateType ||
+        !expectSignatureType(
+            left, semantic::PrimitiveType::Object,
+            delegateTypeId, "delegate combination left operand") ||
+        !expectSignatureType(
+            right, semantic::PrimitiveType::Object,
+            delegateTypeId, "delegate combination right operand")) {
+        return false;
+    }
+    const auto flatten = [&](const auto& self,
+                             const runtime::Value& value,
+                             std::vector<runtime::Value>& leaves,
+                             std::size_t depth) -> bool {
+        if (std::holds_alternative<runtime::NullObject>(value)) {
+            return true;
+        }
+        if (depth > 1024) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT delegate invocation list is too deep");
+        }
+        const auto* reference =
+            std::get_if<runtime::ObjectRef>(&value);
+        const auto type = reference
+            ? heap_->objectTypeId(*reference)
+            : std::optional<semantic::SymbolId>{};
+        const auto flagsValue = reference
+            ? heap_->fieldGet(*reference, 3u)
+            : std::optional<runtime::Value>{};
+        const auto* flags = flagsValue
+            ? std::get_if<std::int64_t>(&*flagsValue)
+            : nullptr;
+        if (!reference || !type || *type != delegateTypeId ||
+            heap_->fieldCount(*reference) != 8u || !flags ||
+            *flags < 0 || *flags > 4) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT delegate invocation-list metadata is corrupt");
+        }
+        if (*flags != 4) {
+            leaves.push_back(value);
+            return true;
+        }
+        const auto first = heap_->fieldGet(*reference, 0u);
+        const auto second = heap_->fieldGet(*reference, 7u);
+        return first && second &&
+            self(self, *first, leaves, depth + 1) &&
+            self(self, *second, leaves, depth + 1);
+    };
+    std::vector<runtime::Value> leftLeaves;
+    std::vector<runtime::Value> rightLeaves;
+    if (!flatten(flatten, left, leftLeaves, 0) ||
+        !flatten(flatten, right, rightLeaves, 0)) {
+        return false;
+    }
+    const auto sameLeaf = [&](const runtime::Value& a,
+                              const runtime::Value& b) {
+        const auto* aRef = std::get_if<runtime::ObjectRef>(&a);
+        const auto* bRef = std::get_if<runtime::ObjectRef>(&b);
+        if (!aRef || !bRef) return false;
+        for (std::size_t index = 0; index < 7u; ++index) {
+            const auto av = heap_->fieldGet(*aRef, index);
+            const auto bv = heap_->fieldGet(*bRef, index);
+            if (!av || !bv || !(*av == *bv)) return false;
+        }
+        return true;
+    };
+    if (!remove) {
+        leftLeaves.insert(
+            leftLeaves.end(), rightLeaves.begin(), rightLeaves.end());
+    } else if (!rightLeaves.empty() &&
+               rightLeaves.size() <= leftLeaves.size()) {
+        std::optional<std::size_t> removeAt;
+        for (std::size_t start = 0;
+             start + rightLeaves.size() <= leftLeaves.size(); ++start) {
+            bool matches = true;
+            for (std::size_t index = 0;
+                 index < rightLeaves.size(); ++index) {
+                if (!sameLeaf(
+                        leftLeaves[start + index], rightLeaves[index])) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) removeAt = start;
+        }
+        if (removeAt) {
+            leftLeaves.erase(
+                leftLeaves.begin() +
+                    static_cast<std::ptrdiff_t>(*removeAt),
+                leftLeaves.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        *removeAt + rightLeaves.size()));
+        }
+    }
+    if (leftLeaves.empty()) {
+        result = runtime::NullObject{};
+        return true;
+    }
+    result = leftLeaves.front();
+    for (std::size_t index = 1; index < leftLeaves.size(); ++index) {
+        std::vector<runtime::Value> fields{
+            result,
+            std::int64_t{0}, std::int64_t{0},
+            std::int64_t{4}, std::int64_t{0},
+            std::int64_t{0}, std::int64_t{0},
+            leftLeaves[index],
+        };
+        runtime::RuntimeError allocationError;
+        const auto allocated = heap_->allocateObject(
+            delegateTypeId, std::move(fields), {0u, 7u},
+            &allocationError);
+        if (!allocated) {
+            return fail(
+                allocationError.code == runtime::ErrorCode::None
+                    ? runtime::ErrorCode::OutOfMemory
+                    : allocationError.code,
+                allocationError.message.empty()
+                    ? "AOT delegate-list allocation failed"
+                    : allocationError.message);
+        }
+        result = *allocated;
+    }
+    return true;
+}
+
+bool ExecutionContext::invokeDelegate(
+    semantic::SymbolId delegateTypeId,
+    const runtime::Value* arguments,
+    std::size_t argumentCount,
+    runtime::Value& result) {
+    const auto* delegateType = findType(delegateTypeId);
+    if (!delegateType || !delegateType->delegateType ||
+        !arguments || argumentCount == 0) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT delegate invocation has invalid metadata");
+    }
+    if (std::holds_alternative<runtime::NullObject>(arguments[0])) {
+        return fail(
+            runtime::ErrorCode::NullReference,
+            "AOT delegate invocation attempted to dereference null");
+    }
+    const auto* delegateRef =
+        std::get_if<runtime::ObjectRef>(&arguments[0]);
+    const auto actualType = delegateRef
+        ? heap_->objectTypeId(*delegateRef)
+        : std::optional<semantic::SymbolId>{};
+    if (!delegateRef || !actualType || *actualType != delegateTypeId ||
+        heap_->fieldCount(*delegateRef) != 8u) {
+        return fail(
+            runtime::ErrorCode::TypeMismatch,
+            "AOT delegate invocation received an incompatible value");
+    }
+    const auto rootFlagsValue = heap_->fieldGet(*delegateRef, 3u);
+    const auto* rootFlags = rootFlagsValue
+        ? std::get_if<std::int64_t>(&*rootFlagsValue)
+        : nullptr;
+    if (rootFlags && *rootFlags == 4) {
+        std::vector<runtime::Value> leaves;
+        const auto flatten = [&](const auto& self,
+                                 const runtime::Value& value,
+                                 std::size_t depth) -> bool {
+            if (depth > 1024) return false;
+            const auto* reference =
+                std::get_if<runtime::ObjectRef>(&value);
+            const auto flagsValue = reference
+                ? heap_->fieldGet(*reference, 3u)
+                : std::optional<runtime::Value>{};
+            const auto* flags = flagsValue
+                ? std::get_if<std::int64_t>(&*flagsValue)
+                : nullptr;
+            if (!reference || !flags) return false;
+            if (*flags != 4) {
+                leaves.push_back(value);
+                return true;
+            }
+            const auto first = heap_->fieldGet(*reference, 0u);
+            const auto second = heap_->fieldGet(*reference, 7u);
+            return first && second &&
+                self(self, *first, depth + 1) &&
+                self(self, *second, depth + 1);
+        };
+        if (!flatten(flatten, arguments[0], 0)) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT delegate invocation list is corrupt");
+        }
+        std::vector<runtime::Value> nested(
+            arguments, arguments + argumentCount);
+        for (const auto& leaf : leaves) {
+            nested[0] = leaf;
+            if (!consume("invoke.delegate")) return false;
+            if (!invokeDelegate(
+                    delegateTypeId, nested.data(), nested.size(), result)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    const auto readId = [&](std::size_t lowIndex,
+                            semantic::SymbolId& value) {
+        const auto low = heap_->fieldGet(*delegateRef, lowIndex);
+        const auto high = heap_->fieldGet(*delegateRef, lowIndex + 1u);
+        const auto* lowValue = low
+            ? std::get_if<std::int64_t>(&*low)
+            : nullptr;
+        const auto* highValue = high
+            ? std::get_if<std::int64_t>(&*high)
+            : nullptr;
+        if (!lowValue || !highValue || *lowValue < 0 ||
+            *highValue < 0 ||
+            *lowValue > std::numeric_limits<std::uint32_t>::max() ||
+            *highValue > std::numeric_limits<std::uint32_t>::max()) {
+            return false;
+        }
+        value = static_cast<std::uint64_t>(
+            static_cast<std::uint32_t>(*lowValue)) |
+            (static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(*highValue)) << 32u);
+        return true;
+    };
+    semantic::SymbolId targetSymbolId = 0;
+    if (!readId(1u, targetSymbolId)) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT delegate callable identity is corrupt");
+    }
+    const auto target = heap_->fieldGet(*delegateRef, 0u);
+    const auto flagsValue = heap_->fieldGet(*delegateRef, 3u);
+    const auto slotValue = heap_->fieldGet(*delegateRef, 4u);
+    const auto* flags = flagsValue
+        ? std::get_if<std::int64_t>(&*flagsValue)
+        : nullptr;
+    const auto* slot = slotValue
+        ? std::get_if<std::int64_t>(&*slotValue)
+        : nullptr;
+    if (!target || !flags || !slot || *flags < 0 || *flags > 3 ||
+        *slot < 0 ||
+        *slot > std::numeric_limits<std::uint32_t>::max()) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT delegate dispatch metadata is corrupt");
+    }
+    std::vector<runtime::Value> values;
+    if (argumentCount > 1) {
+        values.assign(arguments + 1, arguments + argumentCount);
+    }
+    if (!std::holds_alternative<runtime::NullObject>(*target)) {
+        values.insert(values.begin(), *target);
+    }
+    const bool virtualDispatch = (*flags & 1) != 0;
+    const bool interfaceDispatch = (*flags & 2) != 0;
+    if (virtualDispatch && interfaceDispatch) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT delegate dispatch modes conflict");
+    }
+    if (virtualDispatch || interfaceDispatch) {
+        const auto* receiver = values.empty()
+            ? nullptr
+            : std::get_if<runtime::ObjectRef>(&values.front());
+        const auto runtimeTypeId = receiver
+            ? heap_->objectTypeId(*receiver)
+            : std::optional<semantic::SymbolId>{};
+        const auto* runtimeType = runtimeTypeId
+            ? findType(*runtimeTypeId)
+            : nullptr;
+        if (!runtimeType) {
+            return fail(
+                runtime::ErrorCode::InvalidObjectReference,
+                "AOT delegate receiver has no runtime type");
+        }
+        const auto dispatchSlot = static_cast<std::uint32_t>(*slot);
+        if (virtualDispatch) {
+            if (!runtimeType->virtualDispatchTable ||
+                dispatchSlot >= runtimeType->virtualSlotCount) {
+                return fail(
+                    runtime::ErrorCode::InvalidProgram,
+                    "AOT delegate virtual slot is invalid");
+            }
+            targetSymbolId =
+                runtimeType->virtualDispatchTable[dispatchSlot];
+        } else {
+            semantic::SymbolId interfaceTypeId = 0;
+            if (!readId(5u, interfaceTypeId)) {
+                return fail(
+                    runtime::ErrorCode::InvalidProgram,
+                    "AOT delegate interface identity is corrupt");
+            }
+            const InterfaceDispatchDescriptor* map = nullptr;
+            if (runtimeType->interfaceDispatchMaps) {
+                for (std::uint32_t index = 0;
+                     index < runtimeType->interfaceDispatchMapCount;
+                     ++index) {
+                    const auto& candidate =
+                        runtimeType->interfaceDispatchMaps[index];
+                    if (candidate.interfaceTypeId == interfaceTypeId) {
+                        map = &candidate;
+                        break;
+                    }
+                }
+            }
+            if (!map || !map->slots || dispatchSlot >= map->slotCount) {
+                return fail(
+                    runtime::ErrorCode::InvalidProgram,
+                    "AOT delegate interface slot is invalid");
+            }
+            targetSymbolId = map->slots[dispatchSlot];
+        }
+    }
+    if (!findFunction(targetSymbolId)) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT delegate target function is unavailable");
+    }
+    return invoke(
+        targetSymbolId,
+        values.empty() ? nullptr : values.data(),
+        values.size(),
+        result);
+}
+
 bool ExecutionContext::constantString(
     std::string_view value,
     runtime::Value& result) {
@@ -540,7 +1134,8 @@ bool ExecutionContext::newObject(
     semantic::SymbolId typeId,
     runtime::Value& result) {
     const auto* type = findType(typeId);
-    if (!type || type->kind != semantic::TypeKind::Class) {
+    if (!type || type->kind != semantic::TypeKind::Class ||
+        type->interfaceType || type->delegateType) {
         return fail(
             runtime::ErrorCode::InvalidProgram,
             "AOT object allocation references an invalid class descriptor");
@@ -645,6 +1240,52 @@ bool ExecutionContext::checkNotNull(
         return false;
     }
     result = receiver;
+    return true;
+}
+
+bool ExecutionContext::typeOperation(
+    semantic::PrimitiveType sourceType,
+    semantic::PrimitiveType targetType,
+    semantic::SymbolId targetTypeId,
+    const runtime::Value& value,
+    bool safeCast,
+    runtime::Value& result) {
+    const bool nullValue =
+        std::holds_alternative<std::monostate>(value) ||
+        std::holds_alternative<runtime::NullString>(value) ||
+        std::holds_alternative<runtime::NullObject>(value) ||
+        std::holds_alternative<runtime::NullArray>(value);
+    bool matches = false;
+    if (!nullValue) {
+        if (targetType == semantic::PrimitiveType::Object) {
+            const auto* reference = std::get_if<runtime::ObjectRef>(&value);
+            const auto actual = reference && heap_
+                ? heap_->objectTypeId(*reference)
+                : std::optional<semantic::SymbolId>{};
+            matches = actual && isAssignable(*actual, targetTypeId);
+        } else if (targetType == semantic::PrimitiveType::Array) {
+            const auto* reference = std::get_if<runtime::ObjectRef>(&value);
+            const auto actual = reference && heap_
+                ? heap_->arrayTypeId(*reference)
+                : std::optional<semantic::SymbolId>{};
+            matches = actual && *actual == targetTypeId;
+        } else {
+            matches = sourceType == targetType;
+        }
+    }
+    if (!safeCast) {
+        result = matches;
+        return true;
+    }
+    if (matches) {
+        result = value;
+    } else if (targetType == semantic::PrimitiveType::String) {
+        result = runtime::NullString{};
+    } else if (targetType == semantic::PrimitiveType::Array) {
+        result = runtime::NullArray{};
+    } else {
+        result = runtime::NullObject{};
+    }
     return true;
 }
 
@@ -766,7 +1407,10 @@ bool ExecutionContext::storeElement(
             reference,
             static_cast<std::size_t>(numericIndex),
             value,
-            &arrayError)) {
+            &arrayError,
+            elementType == semantic::PrimitiveType::Object
+                ? runtime::ArrayStoreTypePolicy::PrevalidatedAssignableObject
+                : runtime::ArrayStoreTypePolicy::Exact)) {
         return fail(
             arrayError.code == runtime::ErrorCode::None
                 ? runtime::ErrorCode::InvalidProgram
@@ -923,6 +1567,8 @@ bool ExecutionContext::storeStructField(
 
 bool ExecutionContext::convert(
     semantic::ConversionKind conversion,
+    semantic::PrimitiveType targetType,
+    bool checkedArithmetic,
     const runtime::Value& value,
     runtime::Value& result) {
     switch (conversion) {
@@ -965,6 +1611,12 @@ bool ExecutionContext::convert(
         }
         result = static_cast<double>(std::get<runtime::LongValue>(value).value);
         return true;
+    case semantic::ConversionKind::Numeric:
+        if (runtime::tryConvertNumeric(
+                value, targetType, result, checkedArithmetic)) return true;
+        return fail(
+            runtime::ErrorCode::IntegerOverflow,
+            "numeric conversion overflow");
     case semantic::ConversionKind::None:
         break;
     }
@@ -975,12 +1627,19 @@ bool ExecutionContext::convert(
 
 bool ExecutionContext::unary(
     UnaryOperation operation,
+    bool checkedArithmetic,
     const runtime::Value& value,
     runtime::Value& result) {
     switch (operation) {
     case UnaryOperation::NegateInt:
         if (!expectType(value, semantic::PrimitiveType::Int, "negation")) {
             return false;
+        }
+        if (!checkedArithmetic &&
+            std::get<std::int64_t>(value) ==
+                std::numeric_limits<std::int32_t>::min()) {
+            result = std::get<std::int64_t>(value);
+            return true;
         }
         return checkedIntResult(*this, -std::get<std::int64_t>(value), result);
     case UnaryOperation::NegateLong: {
@@ -989,6 +1648,10 @@ bool ExecutionContext::unary(
         }
         const auto number = std::get<runtime::LongValue>(value).value;
         if (number == std::numeric_limits<std::int64_t>::min()) {
+            if (!checkedArithmetic) {
+                result = runtime::LongValue{number};
+                return true;
+            }
             return fail(
                 runtime::ErrorCode::IntegerOverflow,
                 "long negation overflow");
@@ -997,6 +1660,11 @@ bool ExecutionContext::unary(
         return true;
     }
     case UnaryOperation::NegateDouble:
+        if (runtime::valueType(value) == semantic::PrimitiveType::Float) {
+            result = runtime::FloatValue{
+                -std::get<runtime::FloatValue>(value).value};
+            return true;
+        }
         if (!expectType(value, semantic::PrimitiveType::Double, "negation")) {
             return false;
         }
@@ -1014,6 +1682,7 @@ bool ExecutionContext::unary(
 
 bool ExecutionContext::binary(
     BinaryOperation operation,
+    bool checkedArithmetic,
     const runtime::Value& left,
     const runtime::Value& right,
     runtime::Value& result) {
@@ -1071,6 +1740,38 @@ bool ExecutionContext::binary(
         operation >= BinaryOperation::AddDouble &&
         operation <= BinaryOperation::GreaterOrEqualDouble;
     if (longOperation) {
+        if (runtime::valueType(left) == semantic::PrimitiveType::ULong) {
+            if (!expectType(right, semantic::PrimitiveType::ULong,
+                    "binary operation")) return false;
+            const auto a = std::get<runtime::ULongValue>(left).value;
+            const auto b = std::get<runtime::ULongValue>(right).value;
+            switch (operation) {
+            case BinaryOperation::AddLong:
+                if (checkedArithmetic &&
+                    b > std::numeric_limits<std::uint64_t>::max() - a)
+                    return fail(runtime::ErrorCode::IntegerOverflow, "ulong addition overflow");
+                result = runtime::ULongValue{a + b}; return true;
+            case BinaryOperation::SubtractLong:
+                if (checkedArithmetic && a < b) return fail(runtime::ErrorCode::IntegerOverflow, "ulong subtraction overflow");
+                result = runtime::ULongValue{a - b}; return true;
+            case BinaryOperation::MultiplyLong:
+                if (checkedArithmetic && b != 0 &&
+                    a > std::numeric_limits<std::uint64_t>::max() / b)
+                    return fail(runtime::ErrorCode::IntegerOverflow, "ulong multiplication overflow");
+                result = runtime::ULongValue{a * b}; return true;
+            case BinaryOperation::DivideLong:
+                if (b == 0) return fail(runtime::ErrorCode::DivisionByZero, "division by zero");
+                result = runtime::ULongValue{a / b}; return true;
+            case BinaryOperation::RemainderLong:
+                if (b == 0) return fail(runtime::ErrorCode::DivisionByZero, "remainder by zero");
+                result = runtime::ULongValue{a % b}; return true;
+            case BinaryOperation::LessLong: result = a < b; return true;
+            case BinaryOperation::LessOrEqualLong: result = a <= b; return true;
+            case BinaryOperation::GreaterLong: result = a > b; return true;
+            case BinaryOperation::GreaterOrEqualLong: result = a >= b; return true;
+            default: break;
+            }
+        }
         if (!expectType(left, semantic::PrimitiveType::Long, "binary operation") ||
             !expectType(right, semantic::PrimitiveType::Long, "binary operation")) {
             return false;
@@ -1079,10 +1780,28 @@ bool ExecutionContext::binary(
         const auto b = std::get<runtime::LongValue>(right).value;
         switch (operation) {
         case BinaryOperation::AddLong:
+            if (!checkedArithmetic) {
+                result = runtime::LongValue{signedFromBits(
+                    static_cast<std::uint64_t>(a) +
+                    static_cast<std::uint64_t>(b))};
+                return true;
+            }
             return checkedLongAdd(*this, a, b, result);
         case BinaryOperation::SubtractLong:
+            if (!checkedArithmetic) {
+                result = runtime::LongValue{signedFromBits(
+                    static_cast<std::uint64_t>(a) -
+                    static_cast<std::uint64_t>(b))};
+                return true;
+            }
             return checkedLongSubtract(*this, a, b, result);
         case BinaryOperation::MultiplyLong:
+            if (!checkedArithmetic) {
+                result = runtime::LongValue{signedFromBits(
+                    static_cast<std::uint64_t>(a) *
+                    static_cast<std::uint64_t>(b))};
+                return true;
+            }
             return checkedLongMultiply(*this, a, b, result);
         case BinaryOperation::DivideLong:
             if (b == 0) {
@@ -1112,6 +1831,23 @@ bool ExecutionContext::binary(
         }
     }
     if (doubleOperation) {
+        if (runtime::valueType(left) == semantic::PrimitiveType::Float) {
+            if (!expectType(right, semantic::PrimitiveType::Float,
+                    "binary operation")) return false;
+            const auto a = std::get<runtime::FloatValue>(left).value;
+            const auto b = std::get<runtime::FloatValue>(right).value;
+            switch (operation) {
+            case BinaryOperation::AddDouble: result = runtime::FloatValue{a + b}; return true;
+            case BinaryOperation::SubtractDouble: result = runtime::FloatValue{a - b}; return true;
+            case BinaryOperation::MultiplyDouble: result = runtime::FloatValue{a * b}; return true;
+            case BinaryOperation::DivideDouble: result = runtime::FloatValue{a / b}; return true;
+            case BinaryOperation::LessDouble: result = a < b; return true;
+            case BinaryOperation::LessOrEqualDouble: result = a <= b; return true;
+            case BinaryOperation::GreaterDouble: result = a > b; return true;
+            case BinaryOperation::GreaterOrEqualDouble: result = a >= b; return true;
+            default: break;
+            }
+        }
         if (!expectType(left, semantic::PrimitiveType::Double, "binary operation") ||
             !expectType(right, semantic::PrimitiveType::Double, "binary operation")) {
             return false;
@@ -1130,6 +1866,38 @@ bool ExecutionContext::binary(
         default: break;
         }
     }
+    if (runtime::valueType(left) == semantic::PrimitiveType::UInt) {
+        if (!expectType(right, semantic::PrimitiveType::UInt,
+                "binary operation")) return false;
+        const auto a = std::get<runtime::UIntValue>(left).value;
+        const auto b = std::get<runtime::UIntValue>(right).value;
+        switch (operation) {
+        case BinaryOperation::AddInt:
+            if (checkedArithmetic &&
+                b > std::numeric_limits<std::uint32_t>::max() - a)
+                return fail(runtime::ErrorCode::IntegerOverflow, "uint addition overflow");
+            result = runtime::UIntValue{static_cast<std::uint32_t>(a + b)}; return true;
+        case BinaryOperation::SubtractInt:
+            if (checkedArithmetic && a < b) return fail(runtime::ErrorCode::IntegerOverflow, "uint subtraction overflow");
+            result = runtime::UIntValue{static_cast<std::uint32_t>(a - b)}; return true;
+        case BinaryOperation::MultiplyInt:
+            if (checkedArithmetic && b != 0 &&
+                a > std::numeric_limits<std::uint32_t>::max() / b)
+                return fail(runtime::ErrorCode::IntegerOverflow, "uint multiplication overflow");
+            result = runtime::UIntValue{static_cast<std::uint32_t>(a * b)}; return true;
+        case BinaryOperation::DivideInt:
+            if (b == 0) return fail(runtime::ErrorCode::DivisionByZero, "division by zero");
+            result = runtime::UIntValue{static_cast<std::uint32_t>(a / b)}; return true;
+        case BinaryOperation::RemainderInt:
+            if (b == 0) return fail(runtime::ErrorCode::DivisionByZero, "remainder by zero");
+            result = runtime::UIntValue{static_cast<std::uint32_t>(a % b)}; return true;
+        case BinaryOperation::LessInt: result = a < b; return true;
+        case BinaryOperation::LessOrEqualInt: result = a <= b; return true;
+        case BinaryOperation::GreaterInt: result = a > b; return true;
+        case BinaryOperation::GreaterOrEqualInt: result = a >= b; return true;
+        default: break;
+        }
+    }
     if (!expectType(left, semantic::PrimitiveType::Int, "binary operation") ||
         !expectType(right, semantic::PrimitiveType::Int, "binary operation")) {
         return false;
@@ -1138,10 +1906,13 @@ bool ExecutionContext::binary(
     const auto b = std::get<std::int64_t>(right);
     switch (operation) {
     case BinaryOperation::AddInt:
+        if (!checkedArithmetic) { result = wrapInt32(a + b); return true; }
         return checkedIntResult(*this, a + b, result);
     case BinaryOperation::SubtractInt:
+        if (!checkedArithmetic) { result = wrapInt32(a - b); return true; }
         return checkedIntResult(*this, a - b, result);
     case BinaryOperation::MultiplyInt:
+        if (!checkedArithmetic) { result = wrapInt32(a * b); return true; }
         return checkedIntResult(*this, a * b, result);
     case BinaryOperation::DivideInt:
         if (b == 0) {
@@ -1304,7 +2075,6 @@ Program::Program(const ProgramDescriptor& descriptor)
             moduleName.empty() ||
             moduleNames.count(std::string(moduleName)) == 0 ||
             !functionIds.insert(function.symbolId).second ||
-            !names_.emplace(function.name, function.symbolId).second ||
             !validReturnType(function.returnType) ||
             !validSignatureIdentity(function.returnType, function.returnTypeId) ||
             (requiresDescriptor(function.returnType) &&
@@ -1313,6 +2083,10 @@ Program::Program(const ProgramDescriptor& descriptor)
              (!function.parameterTypes || !function.parameterTypeIds))) {
             throw std::invalid_argument("AOT program contains an invalid function table");
         }
+        // Overloads intentionally share a qualified source name. Calls emitted
+        // by the compiler use SymbolId; the name-only embedding convenience API
+        // retains the first deterministic descriptor.
+        names_.try_emplace(function.name, function.symbolId);
         for (std::uint32_t parameter = 0;
              parameter < function.parameterCount;
              ++parameter) {
@@ -1368,6 +2142,9 @@ runtime::ExecutionResult Program::invoke(
         arguments.data(),
         arguments.size(),
         value);
+    if (!execution.succeeded && context.hasPendingException()) {
+        context.reportUnhandledScriptException();
+    }
     execution.succeeded = context.finalizeDeterminism(
         execution.succeeded, value);
     execution.value = std::move(value);

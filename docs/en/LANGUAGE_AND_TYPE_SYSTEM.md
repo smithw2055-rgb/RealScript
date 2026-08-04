@@ -2,7 +2,7 @@
 
 [Documentation Home](README.md) | [Architecture](ARCHITECTURE.md)
 
-RealScript v0.1 provides a compact C#-inspired language designed for embedding in C++17 game engines. The current language is intentionally smaller than C# and prioritizes explicit, verifiable semantics.
+RealScript v0.1 provides a compact C#-inspired language designed for embedding in C++17 game engines. This page describes the native Phase 24 implementation. The language is intentionally smaller than C# and prioritizes explicit, verifiable, deterministic semantics. For an exact supported/partial/unsupported inventory, see the [C#-style compatibility matrix](CSHARP_COMPATIBILITY_MATRIX.md).
 
 ## Source Files and Modules
 
@@ -48,19 +48,23 @@ The implemented primitive model includes:
 
 - `void`
 - `bool`
-- checked 32-bit `int`
-- checked 64-bit `long`
-- IEEE 754 binary64 `double`
+- exact `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, and `ulong`
+- IEEE 754 binary32 `float` and binary64 `double`
+- exact `char`
 - managed `string`
 - opaque native `handle`
 
 Numeric widening currently includes:
 
 ```text
-int -> long -> double
+smaller integers -> wider compatible integers -> float/double
 ```
 
-Integer arithmetic traps on overflow. Floating-point operations follow binary64 semantics, with deterministic mode canonicalizing NaN payloads and signed zero for hashing and replay comparisons.
+Integral arithmetic and narrowing conversions are checked by default;
+`checked(...)` and `unchecked(...)` select trapping or wrapping behavior.
+Floating-point values preserve binary32/binary64 identity, with deterministic
+mode canonicalizing NaN payloads and signed zero for hashing and replay
+comparisons.
 
 ## Variables and Control Flow
 
@@ -87,7 +91,7 @@ int sum(int limit)
 }
 ```
 
-Implemented statements include blocks, local declarations, expression statements, assignments, `if`/`else`, `while`, and `return`.
+Implemented statements include blocks, inferred or explicit local declarations, expression statements, assignments, `if`/`else`, `while`, `for`, `foreach`, `do/while`, `break`, `continue`, switch statements, `return`, `throw`, and `try/catch/finally`.
 
 The compiler performs definite-assignment and all-path-return analysis.
 
@@ -125,7 +129,10 @@ Classes provide:
 - null receiver checks;
 - exact owner-type validation.
 
-Inheritance, interfaces, virtual dispatch, and access modifiers are not implemented.
+Classes support single inheritance, base constructor calls and `base` member
+access, runtime interface values, deterministic virtual/interface dispatch,
+`abstract`/`virtual`/`override`/`sealed`, and
+`public`/`internal`/`protected`/`private` accessibility.
 
 ## Properties
 
@@ -206,7 +213,9 @@ Structs provide deterministic field layouts and copy value semantics. They may a
 
 Local field updates use copy-on-write storage internally. Managed references nested inside structs participate in precise GC scanning.
 
-The current ordinary struct instance receiver is read-only. Mutating instance methods, `ref this`, boxing, and nullable value types are future work.
+Struct instance methods may mutate the original location through implicit or
+explicit ref `this`. Ref locals/returns/fields/indexers, nullable value types,
+and exact boxing/unboxing are supported by MIR, bytecode, GC, bindings, and AOT.
 
 ## Null Values
 
@@ -236,18 +245,53 @@ Stale, wrong-type, and cross-registry handles are rejected.
 
 The compiler collects candidates by name and applies conversion ranking. The implemented conversion set is intentionally small and deterministic. Ambiguous or invalid calls produce diagnostics instead of runtime dispatch.
 
+## Delegates, Generics, and Collections
+
+Delegates are exact first-class values. Static, instance, virtual, and interface
+method groups can create delegates; lambdas use precise heap closures and shared
+mutable capture cells. Multicast combination/removal and delegate-backed events
+preserve source order.
+
+Generics use deterministic compile-time specialization. Type inference, generic
+member methods, `class`/`struct`/`new()` constraints, generic interfaces, and
+generic delegates are supported. Growable deterministic collections implement
+the native `GetEnumerator`/`MoveNext`/`Current` protocol used by `foreach`.
+
+## Expressions and Patterns
+
+Phase 24 includes `var`, lazy `?:` and `??`, null-conditional `?.`, `is`, `as`,
+`typeof`, object/struct/collection initializers, and optional/named/`params`
+arguments with source-order evaluation. Constant, null, type, and discard
+patterns support variables and `when` guards in switch statements and exhaustive
+switch expressions.
+
+## Deterministic Sequences
+
+`sequence` and `yield wait_ticks(...)` compile to explicit single-threaded state
+machines. Locals and control-flow position survive yields; nesting,
+cancellation, results, snapshots, replay, rollback, hot reload, and C++17 AOT
+share the same fixed-tick model.
+
+## Script Exceptions
+
+`throw`, rethrow, typed/catch-all clauses, and `try/catch/finally` use explicit
+MIR and bytecode exception regions. A thrown value is a non-null script class
+object. `finally` runs for normal completion, script exception propagation,
+`return`, `break`, and `continue`. Host/runtime faults remain structured runtime
+errors rather than catchable script objects.
+
 ## Unsupported Language Features
 
-The v0.1 baseline does not implement:
+The Phase 24 implementation deliberately does not provide:
 
-- inheritance and interfaces;
-- virtual or abstract dispatch;
-- generics;
-- exceptions;
-- coroutines or `async`;
-- `ref` and `out`;
-- `break`, `continue`, `for`, `foreach`, and `switch`;
-- unsigned integer types, `float`, `char`, or user-defined conversions;
-- mutable struct instance receivers and boxing.
+- multiple class inheritance or default interface implementations;
+- open runtime generics, variance, reflection, or `dynamic`;
+- relational/property/list/recursive pattern families;
+- `Task`, threads, or general `async`/`await`;
+- unsafe pointers, ref structs, ref properties, or full byref escape analysis;
+- exception filters, `using`, native exception interop, or exception unwinding
+  serialized across sequence suspension;
+- operator overloads, user-defined conversions, LINQ, or the .NET base-class
+  library.
 
 Unsupported syntax or semantics receive explicit diagnostics.

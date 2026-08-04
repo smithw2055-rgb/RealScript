@@ -283,6 +283,181 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase18_native_control_flow_tests
         realscript.phase18.native-control-flow
         tests/phase18_native_control_flow_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_phase19_runtime_polymorphism_tests
+        realscript.phase19.runtime-polymorphism
+        tests/phase19_runtime_polymorphism_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_phase20_delegate_tests
+        realscript.phase20.delegates
+        tests/phase20_delegate_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_phase21_generics_collections_tests
+        realscript.phase21.generics-collections
+        tests/phase21_generics_collections_tests.cpp)
+    target_compile_definitions(
+        realscript_phase21_generics_collections_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    realscript_add_cpp_test(
+        realscript_phase22_coroutine_tests
+        realscript.phase22.coroutines
+        tests/phase22_coroutine_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_phase23_value_semantics_tests
+        realscript.phase23.value-semantics
+        tests/phase23_value_semantics_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_phase24_language_completeness_tests
+        realscript.phase24.language-completeness
+        tests/phase24_language_completeness_tests.cpp)
+    set(REALSCRIPT_PHASE20_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase20")
+    realscript_add_aot_library(
+        realscript_phase20_generated
+        PROGRAM_NAME Phase20Aot
+        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE20_GENERATED_DIR}"
+        OPT_LEVEL 0
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase20_aot.rs"
+    )
+    add_executable(
+        realscript_phase20_aot_tests tests/phase20_aot_tests.cpp)
+    target_link_libraries(
+        realscript_phase20_aot_tests
+        PRIVATE realscript_phase20_generated RealScript::Full)
+    target_compile_features(
+        realscript_phase20_aot_tests PRIVATE cxx_std_17)
+    target_compile_definitions(
+        realscript_phase20_aot_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME realscript.phase20.aot
+        COMMAND realscript_phase20_aot_tests)
+    set(REALSCRIPT_PHASE21_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase21")
+    realscript_add_aot_library(
+        realscript_phase21_generated
+        PROGRAM_NAME Phase21Aot
+        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE21_GENERATED_DIR}"
+        OPT_LEVEL 0
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase21_aot.rs"
+    )
+    add_executable(
+        realscript_phase21_aot_tests tests/phase21_aot_tests.cpp)
+    target_link_libraries(
+        realscript_phase21_aot_tests
+        PRIVATE realscript_phase21_generated RealScript::Full)
+    target_compile_features(
+        realscript_phase21_aot_tests PRIVATE cxx_std_17)
+    target_compile_definitions(
+        realscript_phase21_aot_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME realscript.phase21.aot
+        COMMAND realscript_phase21_aot_tests)
+    set(REALSCRIPT_PHASE22_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase22")
+    realscript_add_aot_library(
+        realscript_phase22_generated
+        PROGRAM_NAME Phase22Aot
+        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE22_GENERATED_DIR}"
+        OPT_LEVEL 0
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase22_aot.rs"
+    )
+    add_executable(
+        realscript_phase22_aot_tests tests/phase22_aot_tests.cpp)
+    target_link_libraries(
+        realscript_phase22_aot_tests
+        PRIVATE realscript_phase22_generated RealScript::Full)
+    target_compile_features(
+        realscript_phase22_aot_tests PRIVATE cxx_std_17)
+    target_compile_definitions(
+        realscript_phase22_aot_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME realscript.phase22.aot
+        COMMAND realscript_phase22_aot_tests)
+    set(REALSCRIPT_PHASE23_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase23")
+    realscript_add_aot_library(
+        realscript_phase23_generated
+        PROGRAM_NAME Phase23Aot
+        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE23_GENERATED_DIR}"
+        OPT_LEVEL 0
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase23_aot.rs"
+    )
+    add_executable(
+        realscript_phase23_aot_tests tests/phase23_aot_tests.cpp)
+    target_link_libraries(
+        realscript_phase23_aot_tests
+        PRIVATE realscript_phase23_generated RealScript::Full)
+    target_compile_features(
+        realscript_phase23_aot_tests PRIVATE cxx_std_17)
+    target_compile_definitions(
+        realscript_phase23_aot_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME realscript.phase23.aot
+        COMMAND realscript_phase23_aot_tests)
+    set(REALSCRIPT_PHASE24_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase24")
+    realscript_add_aot_library(
+        realscript_phase24_generated
+        PROGRAM_NAME Phase24Aot
+        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE24_GENERATED_DIR}"
+        OPT_LEVEL 0
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase24_aot.rs"
+    )
+    add_executable(
+        realscript_phase24_aot_tests tests/phase24_aot_tests.cpp)
+    target_link_libraries(
+        realscript_phase24_aot_tests
+        PRIVATE realscript_phase24_generated RealScript::Full)
+    target_compile_features(
+        realscript_phase24_aot_tests PRIVATE cxx_std_17)
+    target_compile_definitions(
+        realscript_phase24_aot_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME realscript.phase24.aot
+        COMMAND realscript_phase24_aot_tests)
+    set(REALSCRIPT_PHASE19_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase19")
+    realscript_add_aot_library(
+        realscript_phase19_generated
+        PROGRAM_NAME Phase19Aot
+        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE19_GENERATED_DIR}"
+        OPT_LEVEL 0
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase19_aot.rs"
+    )
+    add_executable(
+        realscript_phase19_aot_tests tests/phase19_aot_tests.cpp)
+    target_link_libraries(
+        realscript_phase19_aot_tests
+        PRIVATE realscript_phase19_generated RealScript::Full)
+    target_compile_features(
+        realscript_phase19_aot_tests PRIVATE cxx_std_17)
+    target_compile_definitions(
+        realscript_phase19_aot_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME realscript.phase19.aot
+        COMMAND realscript_phase19_aot_tests)
+    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS AND NOT MSVC)
+        target_compile_definitions(
+            realscript_phase19_runtime_polymorphism_tests
+            PRIVATE
+                REALSCRIPT_PHASE19_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
+                REALSCRIPT_PHASE19_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
+                REALSCRIPT_PHASE19_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_PHASE19_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/phase19-jit-cache"
+        )
+    endif()
 
     add_test(
         NAME realscript.phase6.cli-smoke

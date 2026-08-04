@@ -76,7 +76,7 @@ void testDebugMetadataRoundTrip() {
     auto modules = compile({{"debug.rs", debugSource}});
     require(modules.size() == 1, "expected one debug module");
     const auto& module = modules.front();
-    require(module.version.minor == 6, "Phase 18 must use .rsbc 0.6");
+    require(module.version.minor == 7, "Phase 19 must use .rsbc 0.7");
     require(module.sourceFiles.size() == 1 &&
             module.sourceFiles.front().path == "debug.rs",
         "debug source table is missing");

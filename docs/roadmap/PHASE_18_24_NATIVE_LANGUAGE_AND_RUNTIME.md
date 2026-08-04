@@ -144,11 +144,11 @@ Reference member/indexer l-values, exact-width identities, checked/unchecked con
 - `LanguageExpansion.cpp` and all expansion `.inl` files are deleted;
 - native attributes, interfaces, generic instantiations, and sequences flow through `LanguageMetadata.h`;
 - Interpreter/AOT/JIT share the same native Syntax/Bound/MIR pipeline;
-- language metadata is module-scoped in MIR, persisted in `.rsbc` 0.6, and emitted in the AOT manifest;
+- language metadata is module-scoped in MIR, persisted in `.rsbc` 0.7 (with legacy 0.6 decode support), and emitted in the AOT manifest;
 - LSP/DAP operate on original source constructs without exposing compiler-owned names;
 - hot reload rejects semantic language-metadata changes while permitting body-only edits.
 
-## Phase 19 — runtime polymorphism
+## Phase 19 — runtime polymorphism — complete
 
 - `public`, `internal`, `protected`, and `private` visibility.
 - Interface-typed values, conversions, and deterministic dispatch tables.
@@ -156,7 +156,10 @@ Reference member/indexer l-values, exact-width identities, checked/unchecked con
 - Stable inherited field/method layouts and verifier checks.
 - Save-state and hot-reload compatibility rules for hierarchy changes.
 
-## Phase 20 — first-class delegates and closures
+The delivered implementation and validation matrix are recorded in
+[PHASE_19_RUNTIME_POLYMORPHISM.md](PHASE_19_RUNTIME_POLYMORPHISM.md).
+
+## Phase 20 — first-class delegates and closures — complete
 
 - Delegate runtime values and method references.
 - Heap closure objects with precise GC descriptors.
@@ -164,7 +167,10 @@ Reference member/indexer l-values, exact-width identities, checked/unchecked con
 - Delegate parameters, returns, combination, removal, and general event storage.
 - Snapshot, replay, and hot-reload policies for closures/subscriptions.
 
-## Phase 21 — complete generics and collections
+The delivered implementation and validation matrix are recorded in
+[PHASE_20_FIRST_CLASS_DELEGATES.md](PHASE_20_FIRST_CLASS_DELEGATES.md).
+
+## Phase 21 — complete generics and collections — complete
 
 - Generic inference, generic member methods, constraints, and generic interfaces/delegates.
 - Deterministic specialization cache shared across modules and backends.
@@ -172,14 +178,20 @@ Reference member/indexer l-values, exact-width identities, checked/unchecked con
 - Native enumerator protocol and `foreach` lowering.
 - Deterministic allocation/capacity policies and failure behavior.
 
-## Phase 22 — complete deterministic coroutine state machines
+The delivered implementation and validation matrix are recorded in
+[PHASE_21_COMPLETE_GENERICS_AND_COLLECTIONS.md](PHASE_21_COMPLETE_GENERICS_AND_COLLECTIONS.md).
+
+## Phase 22 — complete deterministic coroutine state machines — complete
 
 - Persist locals, temporaries, and control-flow position across yields.
 - Loops, branches, nested sequences, `yield break`, cancellation, and return results.
 - Snapshot/restore/rollback and hot-reload state migration.
 - Deterministic gameplay profiles do not use thread-based `Task` execution.
 
-## Phase 23 — complete value and reference semantics
+The delivered implementation and validation matrix are recorded in
+[PHASE_22_DETERMINISTIC_COROUTINE_STATE_MACHINES.md](PHASE_22_DETERMINISTIC_COROUTINE_STATE_MACHINES.md).
+
+## Phase 23 — complete value and reference semantics — complete
 
 - Exact `byte`, `sbyte`, `short`, `ushort`, `uint`, `ulong`, `float`, and `char` identities.
 - Checked/unchecked operations and conversions across all backends.
@@ -187,13 +199,22 @@ Reference member/indexer l-values, exact-width identities, checked/unchecked con
 - Nullable value types and boxing/unboxing.
 - GC, verifier, native binding, AOT ABI, and bytecode support.
 
-## Phase 24 — language completeness and structured errors
+The delivered implementation and validation matrix are recorded in
+[PHASE_23_COMPLETE_VALUE_AND_REFERENCE_SEMANTICS.md](PHASE_23_COMPLETE_VALUE_AND_REFERENCE_SEMANTICS.md).
+
+## Phase 24 — language completeness and structured errors — complete
 
 - `var`, conditional/null operators, `is`, `as`, `typeof`, object/collection initializers.
 - Optional, named, and `params` arguments.
 - Pattern matching and switch expressions.
 - Exceptions, `throw`, `try/catch/finally`, and deterministic cleanup semantics.
 - Complete LSP/DAP/hot-reload behavior and a published C#-feature compatibility matrix.
+
+The delivered implementation and validation matrix are recorded in
+[PHASE_24_LANGUAGE_COMPLETENESS_AND_STRUCTURED_ERRORS.md](PHASE_24_LANGUAGE_COMPLETENESS_AND_STRUCTURED_ERRORS.md).
+The current C#-style surface is published in
+[English](../en/CSHARP_COMPATIBILITY_MATRIX.md) and
+[简体中文](../zh-CN/CSHARP_COMPATIBILITY_MATRIX.md).
 
 ## Validation required for every merge
 

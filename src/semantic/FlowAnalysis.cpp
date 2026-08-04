@@ -78,12 +78,53 @@ private:
         }
         case BoundNodeKind::ConversionExpression:
             analyzeExpression(*static_cast<const BoundConversionExpression&>(expression).expression, assigned); return;
-        case BoundNodeKind::CallExpression:
-            for (const auto& argument :
-                 static_cast<const BoundCallExpression&>(expression).arguments) {
-                analyzeExpression(*argument, assigned);
+        case BoundNodeKind::DelegateCreationExpression: {
+            const auto& creation = static_cast<const
+                BoundDelegateCreationExpression&>(expression);
+            if (creation.receiver) {
+                analyzeExpression(*creation.receiver, assigned);
+            }
+            for (const auto& capture : creation.captures) {
+                analyzeExpression(*capture, assigned);
             }
             return;
+        }
+        case BoundNodeKind::DelegateInvocationExpression: {
+            const auto& invocation = static_cast<const
+                BoundDelegateInvocationExpression&>(expression);
+            analyzeExpression(*invocation.delegate, assigned);
+            for (const auto& argument : invocation.arguments) {
+                if (argument.value) {
+                    analyzeExpression(*argument.value, assigned);
+                }
+                if (argument.modifier == ParameterModifier::Out &&
+                    argument.variable.id != 0) {
+                    assigned.insert(argument.variable.index);
+                }
+            }
+            return;
+        }
+        case BoundNodeKind::DelegateCombinationExpression: {
+            const auto& combination = static_cast<const
+                BoundDelegateCombinationExpression&>(expression);
+            analyzeExpression(*combination.left, assigned);
+            analyzeExpression(*combination.right, assigned);
+            return;
+        }
+        case BoundNodeKind::CallExpression:
+        {
+            const auto& call = static_cast<const
+                BoundCallExpression&>(expression);
+            for (std::size_t index = 0; index < call.arguments.size(); ++index) {
+                if (call.nullConditional && index != 0) {
+                    auto conditional = assigned;
+                    analyzeExpression(*call.arguments[index], conditional);
+                } else {
+                    analyzeExpression(*call.arguments[index], assigned);
+                }
+            }
+            return;
+        }
         case BoundNodeKind::EventInvocationExpression: {
             const auto& event = static_cast<const
                 BoundEventInvocationExpression&>(expression);
@@ -118,6 +159,93 @@ private:
                 value.operatorKind == BoundBinaryOperatorKind::LogicalOr) {
                 auto copy = assigned; analyzeExpression(*value.right, copy);
             } else analyzeExpression(*value.right, assigned);
+            return;
+        }
+        case BoundNodeKind::ConditionalExpression: {
+            const auto& value = static_cast<const
+                BoundConditionalExpression&>(expression);
+            analyzeExpression(*value.condition, assigned);
+            auto whenTrue = assigned;
+            auto whenFalse = assigned;
+            analyzeExpression(*value.whenTrue, whenTrue);
+            analyzeExpression(*value.whenFalse, whenFalse);
+            assigned = intersectAssigned(whenTrue, whenFalse);
+            return;
+        }
+        case BoundNodeKind::NullCoalescingExpression: {
+            const auto& value = static_cast<const
+                BoundNullCoalescingExpression&>(expression);
+            analyzeExpression(*value.left, assigned);
+            auto fallback = assigned;
+            analyzeExpression(*value.right, fallback);
+            return;
+        }
+        case BoundNodeKind::TypeBinaryExpression:
+        {
+            const auto& type = static_cast<const
+                BoundTypeBinaryExpression&>(expression);
+            analyzeExpression(*type.expression, assigned);
+            if (type.patternVariable) {
+                assigned.insert(type.patternVariable->index);
+            }
+            return;
+        }
+        case BoundNodeKind::TypeOfExpression:
+            return;
+        case BoundNodeKind::SwitchExpression: {
+            const auto& value = static_cast<const
+                BoundSwitchExpression&>(expression);
+            analyzeExpression(*value.expression, assigned);
+            AssignedSet merged;
+            bool first = true;
+            for (const auto& arm : value.arms) {
+                auto armAssigned = assigned;
+                if (arm.label) analyzeExpression(*arm.label, armAssigned);
+                if (arm.patternVariable) {
+                    armAssigned.insert(arm.patternVariable->index);
+                }
+                if (arm.guard) analyzeExpression(*arm.guard, armAssigned);
+                analyzeExpression(*arm.value, armAssigned);
+                merged = first ? std::move(armAssigned)
+                               : intersectAssigned(merged, armAssigned);
+                first = false;
+            }
+            if (!first) assigned = std::move(merged);
+            return;
+        }
+        case BoundNodeKind::NewObjectExpression: {
+            const auto& value = static_cast<const
+                BoundNewObjectExpression&>(expression);
+            for (const auto& argument : value.arguments) {
+                analyzeExpression(*argument, assigned);
+            }
+            for (const auto& initializer : value.initializers) {
+                for (const auto& argument : initializer.arguments) {
+                    analyzeExpression(*argument, assigned);
+                }
+            }
+            return;
+        }
+        case BoundNodeKind::NewStructExpression: {
+            const auto& value = static_cast<const
+                BoundNewStructExpression&>(expression);
+            for (const auto& argument : value.arguments) {
+                analyzeExpression(*argument, assigned);
+            }
+            for (const auto& initializer : value.initializers) {
+                for (const auto& argument : initializer.arguments) {
+                    analyzeExpression(*argument, assigned);
+                }
+            }
+            return;
+        }
+        case BoundNodeKind::NewArrayExpression: {
+            const auto& value = static_cast<const
+                BoundNewArrayExpression&>(expression);
+            analyzeExpression(*value.length, assigned);
+            for (const auto& item : value.initialValues) {
+                analyzeExpression(*item, assigned);
+            }
             return;
         }
         case BoundNodeKind::MemberAccessExpression:
@@ -161,11 +289,51 @@ private:
         }
         case BoundNodeKind::BreakStatement: state.exit = ExitKind::Break; return state;
         case BoundNodeKind::ContinueStatement: state.exit = ExitKind::Continue; return state;
+        case BoundNodeKind::ThrowStatement: {
+            const auto& value = static_cast<const BoundThrowStatement&>(statement);
+            analyzeExpression(*value.expression, state.assigned);
+            state.exit = ExitKind::Return;
+            return state;
+        }
+        case BoundNodeKind::TryStatement: {
+            const auto& value = static_cast<const BoundTryStatement&>(statement);
+            std::vector<State> paths;
+            paths.push_back(analyzeStatement(
+                *value.body, {state.assigned, ExitKind::None}));
+            for (const auto& clause : value.catches) {
+                auto catchAssigned = state.assigned;
+                catchAssigned.insert(clause.exceptionVariable.index);
+                paths.push_back(analyzeStatement(
+                    *clause.body,
+                    {std::move(catchAssigned), ExitKind::None}));
+            }
+            State merged = paths.front();
+            for (std::size_t index = 1; index < paths.size(); ++index) {
+                if (merged.exit == ExitKind::None &&
+                    paths[index].exit == ExitKind::None) {
+                    merged.assigned = intersectAssigned(
+                        merged.assigned, paths[index].assigned);
+                } else if (merged.exit != paths[index].exit) {
+                    merged.exit = ExitKind::None;
+                }
+            }
+            if (value.finallyBody) {
+                auto finalState = analyzeStatement(
+                    *value.finallyBody,
+                    {merged.assigned, ExitKind::None});
+                if (finalState.exit != ExitKind::None) return finalState;
+                merged.assigned = std::move(finalState.assigned);
+            }
+            return merged;
+        }
         case BoundNodeKind::EventSubscriptionStatement: {
             const auto& subscription = static_cast<const
                 BoundEventSubscriptionStatement&>(statement);
             if (subscription.receiver) {
                 analyzeExpression(*subscription.receiver, state.assigned);
+            }
+            if (subscription.handler) {
+                analyzeExpression(*subscription.handler, state.assigned);
             }
             return state;
         }
@@ -234,8 +402,21 @@ private:
             AssignedSet merged;
             bool first = true;
             for (const auto& section : value.sections) {
-                if (section.label) analyzeExpression(*section.label, state.assigned); else hasDefault = true;
-                auto sectionState = analyzeBlock(section.statements, {state.assigned, ExitKind::None});
+                auto sectionAssigned = state.assigned;
+                if (section.label) {
+                    analyzeExpression(*section.label, sectionAssigned);
+                } else if (section.patternType == PrimitiveType::Error) {
+                    hasDefault = true;
+                }
+                if (section.patternVariable) {
+                    sectionAssigned.insert(section.patternVariable->index);
+                }
+                if (section.guard) {
+                    analyzeExpression(*section.guard, sectionAssigned);
+                }
+                auto sectionState = analyzeBlock(
+                    section.statements,
+                    {std::move(sectionAssigned), ExitKind::None});
                 if (sectionState.exit == ExitKind::Break) sectionState.exit = ExitKind::None;
                 if (sectionState.exit == ExitKind::None) {
                     hasReachable = true;

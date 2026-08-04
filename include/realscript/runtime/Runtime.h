@@ -92,6 +92,55 @@ struct LongValue {
     }
 };
 
+struct ByteValue {
+    std::uint8_t value = 0;
+    friend constexpr bool operator==(ByteValue left, ByteValue right) noexcept {
+        return left.value == right.value;
+    }
+};
+struct SByteValue {
+    std::int8_t value = 0;
+    friend constexpr bool operator==(SByteValue left, SByteValue right) noexcept {
+        return left.value == right.value;
+    }
+};
+struct ShortValue {
+    std::int16_t value = 0;
+    friend constexpr bool operator==(ShortValue left, ShortValue right) noexcept {
+        return left.value == right.value;
+    }
+};
+struct UShortValue {
+    std::uint16_t value = 0;
+    friend constexpr bool operator==(UShortValue left, UShortValue right) noexcept {
+        return left.value == right.value;
+    }
+};
+struct UIntValue {
+    std::uint32_t value = 0;
+    friend constexpr bool operator==(UIntValue left, UIntValue right) noexcept {
+        return left.value == right.value;
+    }
+};
+struct ULongValue {
+    std::uint64_t value = 0;
+    friend constexpr bool operator==(ULongValue left, ULongValue right) noexcept {
+        return left.value == right.value;
+    }
+};
+struct FloatValue {
+    float value = 0.0f;
+    friend constexpr bool operator==(FloatValue left, FloatValue right) noexcept {
+        return left.value == right.value;
+    }
+};
+struct CharValue {
+    char16_t value = 0;
+    friend constexpr bool operator==(CharValue left, CharValue right) noexcept {
+        return left.value == right.value;
+    }
+};
+
 struct EnumValue {
     semantic::SymbolId typeId = 0;
     std::int64_t value = 0;
@@ -115,9 +164,17 @@ using Value = std::variant<
     NullObject,
     NullArray,
     bool,
+    ByteValue,
+    SByteValue,
+    ShortValue,
+    UShortValue,
     std::int64_t,
+    UIntValue,
     LongValue,
+    ULongValue,
+    FloatValue,
     double,
+    CharValue,
     EnumValue,
     StructValue,
     std::string,
@@ -155,6 +212,7 @@ enum class ErrorCode {
     ExecutionTerminated,
     DeterminismViolation,
     ReplayMismatch,
+    ScriptException,
 };
 
 struct RuntimeError {
@@ -201,6 +259,9 @@ struct HeapObjectInfo {
     semantic::SymbolId elementTypeId = 0;
     std::size_t sizeBytes = 0;
     std::size_t valueCount = 0;
+    std::string stringValue;
+    std::vector<Value> values;
+    std::vector<std::size_t> referenceFields;
     std::vector<HeapEdge> edges;
 };
 
@@ -220,6 +281,11 @@ struct HeapSnapshot {
 };
 
 class PersistentRoot;
+
+enum class ArrayStoreTypePolicy {
+    Exact,
+    PrevalidatedAssignableObject,
+};
 
 class ShadowStack {
 public:
@@ -288,7 +354,8 @@ public:
         ObjectRef reference,
         std::size_t index,
         Value value,
-        RuntimeError* error = nullptr);
+        RuntimeError* error = nullptr,
+        ArrayStoreTypePolicy typePolicy = ArrayStoreTypePolicy::Exact);
     [[nodiscard]] std::optional<std::size_t> fieldCount(ObjectRef reference) const;
     [[nodiscard]] std::optional<semantic::SymbolId> objectTypeId(
         ObjectRef reference) const;
@@ -319,6 +386,9 @@ public:
     [[nodiscard]] std::uint64_t heapId() const noexcept;
     [[nodiscard]] HeapSnapshot snapshot(
         const ShadowStack* shadowStack = nullptr) const;
+    bool restore(
+        const HeapSnapshot& snapshot,
+        RuntimeError* error = nullptr);
     [[nodiscard]] std::vector<ObjectRef> retainingPath(
         ObjectRef target,
         const ShadowStack* shadowStack = nullptr) const;
@@ -668,6 +738,11 @@ private:
 [[nodiscard]] const char* errorCodeName(ErrorCode code) noexcept;
 [[nodiscard]] const char* traceEventKindName(TraceEventKind kind) noexcept;
 [[nodiscard]] semantic::PrimitiveType valueType(const Value& value) noexcept;
+[[nodiscard]] bool tryConvertNumeric(
+    const Value& value,
+    semantic::PrimitiveType target,
+    Value& result,
+    bool checkedArithmetic = true) noexcept;
 [[nodiscard]] std::string valueToString(const Value& value);
 [[nodiscard]] std::string valueToString(const Value& value, const ManagedHeap* heap);
 [[nodiscard]] std::uint64_t stableValueHash(const Value& value) noexcept;

@@ -13,7 +13,8 @@ bool definesValue(const mir::Instruction& instruction) noexcept {
         instruction.opcode == mir::Opcode::StoreElement) {
         return false;
     }
-    return instruction.opcode != mir::Opcode::Call ||
+    return (instruction.opcode != mir::Opcode::Call &&
+            instruction.opcode != mir::Opcode::InvokeDelegate) ||
         instruction.resultType != semantic::PrimitiveType::Void;
 }
 
@@ -77,6 +78,14 @@ Opcode lowerOpcode(mir::Opcode opcode) {
     case mir::Opcode::LessOrEqualDouble: return Opcode::LessOrEqualDouble;
     case mir::Opcode::GreaterDouble: return Opcode::GreaterDouble;
     case mir::Opcode::GreaterOrEqualDouble: return Opcode::GreaterOrEqualDouble;
+    case mir::Opcode::NewDelegate: return Opcode::NewDelegate;
+    case mir::Opcode::InvokeDelegate: return Opcode::InvokeDelegate;
+    case mir::Opcode::CombineDelegate: return Opcode::CombineDelegate;
+    case mir::Opcode::RemoveDelegate: return Opcode::RemoveDelegate;
+    case mir::Opcode::ConvertNumeric: return Opcode::ConvertNumeric;
+    case mir::Opcode::IsType: return Opcode::IsType;
+    case mir::Opcode::AsType: return Opcode::AsType;
+    case mir::Opcode::ConstantTypeId: return Opcode::ConstantTypeId;
     }
     throw std::logic_error("unsupported MIR opcode in bytecode lowerer");
 }
@@ -88,6 +97,7 @@ TerminatorKind lowerTerminator(mir::TerminatorKind kind) {
     case mir::TerminatorKind::Branch: return TerminatorKind::Branch;
     case mir::TerminatorKind::ReturnValue: return TerminatorKind::ReturnValue;
     case mir::TerminatorKind::ReturnVoid: return TerminatorKind::ReturnVoid;
+    case mir::TerminatorKind::Throw: return TerminatorKind::Throw;
     }
     throw std::logic_error("unsupported MIR terminator in bytecode lowerer");
 }
@@ -105,9 +115,21 @@ std::string referenceKey(const mir::Instruction& instruction) {
         result.push_back(',');
     }
     result += ")->";
-    result += semantic::primitiveTypeName(instruction.resultType);
+    const auto returnType = instruction.opcode == mir::Opcode::NewDelegate
+        ? instruction.elementType
+        : instruction.resultType;
+    const auto returnTypeId = instruction.opcode == mir::Opcode::NewDelegate
+        ? instruction.elementTypeId
+        : instruction.resultTypeId;
+    result += semantic::primitiveTypeName(returnType);
     result.push_back('#');
-    result += std::to_string(instruction.resultTypeId);
+    result += std::to_string(returnTypeId);
+    result += instruction.virtualDispatch ? ":virtual:" : ":static:";
+    result += std::to_string(instruction.virtualSlot);
+    result += instruction.interfaceDispatch ? ":interface:" : ":direct:";
+    result += std::to_string(instruction.interfaceTypeId);
+    result.push_back(':');
+    result += std::to_string(instruction.interfaceSlot);
     return result;
 }
 
@@ -117,6 +139,21 @@ Module Lowerer::lower(const mir::Module& source) const {
     Module result;
     result.name = source.name;
     result.languageMetadata = source.languageMetadata;
+    if (std::any_of(
+            result.languageMetadata.sequences.begin(),
+            result.languageMetadata.sequences.end(),
+            [](const compiler::LanguageSequenceRecord& sequence) {
+                return sequence.resultTypeName != "void";
+            })) {
+        result.version.minor = 8;
+    }
+    if (std::any_of(
+            source.functions.begin(), source.functions.end(),
+            [](const mir::Function& function) {
+                return !function.exceptionHandlers.empty();
+            })) {
+        result.version.minor = 9;
+    }
     result.sourceFiles = source.sourceFiles;
     result.types = source.types;
 
@@ -192,6 +229,10 @@ Module Lowerer::lower(const mir::Module& source) const {
                         sourceInstruction.fieldIndex);
                 }
                 if (sourceInstruction.opcode == mir::Opcode::NewObject ||
+                    sourceInstruction.opcode == mir::Opcode::NewDelegate ||
+                    sourceInstruction.opcode == mir::Opcode::InvokeDelegate ||
+                    sourceInstruction.opcode == mir::Opcode::CombineDelegate ||
+                    sourceInstruction.opcode == mir::Opcode::RemoveDelegate ||
                     sourceInstruction.opcode == mir::Opcode::CheckNotNull ||
                     sourceInstruction.opcode == mir::Opcode::LoadField ||
                     sourceInstruction.opcode == mir::Opcode::StoreField ||
@@ -210,9 +251,12 @@ Module Lowerer::lower(const mir::Module& source) const {
                 instruction.integerImmediate = sourceInstruction.integerImmediate;
                 instruction.doubleImmediate = sourceInstruction.doubleImmediate;
                 instruction.boolImmediate = sourceInstruction.boolImmediate;
+                instruction.checkedArithmetic =
+                    sourceInstruction.checkedArithmetic;
                 instruction.stringImmediate = sourceInstruction.stringImmediate;
 
-                if (sourceInstruction.opcode == mir::Opcode::Call) {
+                if (sourceInstruction.opcode == mir::Opcode::Call ||
+                    sourceInstruction.opcode == mir::Opcode::NewDelegate) {
                     const auto key = referenceKey(sourceInstruction);
                     const auto found = referenceIndices.find(key);
                     if (found != referenceIndices.end()) {
@@ -223,11 +267,26 @@ Module Lowerer::lower(const mir::Module& source) const {
                         FunctionReference reference;
                         reference.symbolId = sourceInstruction.symbolId;
                         reference.name = sourceInstruction.symbolName;
-                        reference.returnType = sourceInstruction.resultType;
-                        reference.returnTypeId = sourceInstruction.resultTypeId;
+                        reference.returnType =
+                            sourceInstruction.opcode == mir::Opcode::NewDelegate
+                                ? sourceInstruction.elementType
+                                : sourceInstruction.resultType;
+                        reference.returnTypeId =
+                            sourceInstruction.opcode == mir::Opcode::NewDelegate
+                                ? sourceInstruction.elementTypeId
+                                : sourceInstruction.resultTypeId;
                         reference.parameterTypes = sourceInstruction.parameterTypes;
                         reference.parameterTypeIds =
                             sourceInstruction.parameterTypeIds;
+                        reference.virtualDispatch =
+                            sourceInstruction.virtualDispatch;
+                        reference.virtualSlot = sourceInstruction.virtualSlot;
+                        reference.interfaceDispatch =
+                            sourceInstruction.interfaceDispatch;
+                        reference.interfaceTypeId =
+                            sourceInstruction.interfaceTypeId;
+                        reference.interfaceSlot =
+                            sourceInstruction.interfaceSlot;
                         result.functionReferences.push_back(std::move(reference));
                         referenceIndices.emplace(key, index);
                         instruction.index = index;
@@ -261,6 +320,14 @@ Module Lowerer::lower(const mir::Module& source) const {
                     static_cast<Register>(argument));
             }
             function.blocks.push_back(std::move(block));
+        }
+        for (const auto& sourceHandler : sourceFunction.exceptionHandlers) {
+            ExceptionHandler handler;
+            handler.protectedBlocks = sourceHandler.protectedBlocks;
+            handler.handlerBlock = sourceHandler.handlerBlock;
+            handler.catchTypeId = sourceHandler.catchTypeId;
+            handler.exceptionLocal = sourceHandler.exceptionLocal;
+            function.exceptionHandlers.push_back(std::move(handler));
         }
         result.functions.push_back(std::move(function));
     }
