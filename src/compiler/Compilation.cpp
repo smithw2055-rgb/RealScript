@@ -3582,6 +3582,176 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         module.publicFingerprint = stableFingerprint(publicSurface.str());
     }
 
+
+    // Interface implementation maps are initially validated in module-local
+    // declaration order. Close inherited maps globally so a derived module does
+    // not depend on whether its imported base module sorts before it.
+    {
+        struct InterfaceOwnerWork {
+            ModuleWork* module = nullptr;
+            semantic::TypeSymbol* type = nullptr;
+            std::size_t depth = 0;
+        };
+        std::vector<InterfaceOwnerWork> owners;
+        for (auto& [moduleName, module] : modules) {
+            (void)moduleName;
+            for (auto& type : module.types) {
+                if (type.kind != semantic::TypeKind::Class ||
+                    type.interfaceType) {
+                    continue;
+                }
+                std::size_t depth = 0;
+                std::unordered_set<semantic::SymbolId> visited;
+                auto current = type.baseTypeName;
+                while (!current.empty()) {
+                    const auto* base = phase19GlobalType(modules, current);
+                    if (!base || !visited.insert(base->id).second) break;
+                    ++depth;
+                    current = base->baseTypeName;
+                }
+                owners.push_back(InterfaceOwnerWork{&module, &type, depth});
+            }
+        }
+        std::sort(
+            owners.begin(), owners.end(),
+            [](const InterfaceOwnerWork& left,
+               const InterfaceOwnerWork& right) {
+                if (left.depth != right.depth) {
+                    return left.depth < right.depth;
+                }
+                return semantic::canonicalTypeName(*left.type) <
+                    semantic::canonicalTypeName(*right.type);
+            });
+
+        const auto interfaceNameById =
+            [&](semantic::SymbolId interfaceTypeId) {
+                for (const auto& [moduleName, module] : modules) {
+                    (void)moduleName;
+                    for (const auto& type : module.types) {
+                        if (type.id == interfaceTypeId &&
+                            type.interfaceType) {
+                            return semantic::canonicalTypeName(type);
+                        }
+                    }
+                }
+                return std::string{};
+            };
+
+        for (auto& work : owners) {
+            auto& owner = *work.type;
+            if (!owner.baseTypeName.empty()) {
+                const auto* base = phase19GlobalType(
+                    modules, owner.baseTypeName);
+                if (base) {
+                    for (const auto& inherited :
+                         base->interfaceDispatchMaps) {
+                        const auto found = std::find_if(
+                            owner.interfaceDispatchMaps.begin(),
+                            owner.interfaceDispatchMaps.end(),
+                            [&](const auto& current) {
+                                return current.interfaceTypeId ==
+                                    inherited.interfaceTypeId;
+                            });
+                        if (found == owner.interfaceDispatchMaps.end()) {
+                            auto closed = inherited;
+                            for (auto& targetId : closed.slots) {
+                                if (targetId == 0) continue;
+                                const auto baseMethod = std::find_if(
+                                    base->methods.begin(),
+                                    base->methods.end(),
+                                    [&](const auto& method) {
+                                        return method.id == targetId;
+                                    });
+                                if (baseMethod == base->methods.end() ||
+                                    baseMethod->virtualSlot ==
+                                        std::numeric_limits<std::uint32_t>::max()) {
+                                    continue;
+                                }
+                                const auto overrideMethod = std::find_if(
+                                    owner.methods.begin(),
+                                    owner.methods.end(),
+                                    [&](const auto& method) {
+                                        return !method.interfaceMethod &&
+                                            method.virtualSlot ==
+                                                baseMethod->virtualSlot;
+                                    });
+                                if (overrideMethod != owner.methods.end()) {
+                                    targetId = overrideMethod->abstractMethod
+                                        ? 0
+                                        : overrideMethod->id;
+                                }
+                            }
+                            owner.interfaceDispatchMaps.push_back(
+                                std::move(closed));
+                        }
+                    }
+                }
+            }
+            std::sort(
+                owner.interfaceDispatchMaps.begin(),
+                owner.interfaceDispatchMaps.end(),
+                [](const auto& left, const auto& right) {
+                    return left.interfaceTypeId < right.interfaceTypeId;
+                });
+
+            if (!owner.interfaceDispatchMaps.empty()) {
+                const auto typeName = semantic::canonicalTypeName(owner);
+                auto metadata = std::find_if(
+                    result.nativeInterfaces.begin(),
+                    result.nativeInterfaces.end(),
+                    [&](const auto& implementation) {
+                        return implementation.typeName == typeName;
+                    });
+                if (metadata == result.nativeInterfaces.end()) {
+                    LanguageInterfaceImplementation implementation;
+                    implementation.typeName = typeName;
+                    result.nativeInterfaces.push_back(
+                        std::move(implementation));
+                    metadata = std::prev(result.nativeInterfaces.end());
+                }
+                for (const auto& map : owner.interfaceDispatchMaps) {
+                    const auto name = interfaceNameById(
+                        map.interfaceTypeId);
+                    if (!name.empty()) {
+                        metadata->interfaces.push_back(name);
+                    }
+                }
+                std::sort(
+                    metadata->interfaces.begin(),
+                    metadata->interfaces.end());
+                metadata->interfaces.erase(
+                    std::unique(
+                        metadata->interfaces.begin(),
+                        metadata->interfaces.end()),
+                    metadata->interfaces.end());
+            }
+        }
+        for (auto& [moduleName, module] : modules) {
+            (void)moduleName;
+            refreshVisibleTypes(modules, module);
+
+            // The module fingerprint was calculated before global inherited
+            // interface closure. Fold the final object model into it so cache
+            // reuse and hot reload observe the completed maps.
+            std::vector<std::string> objectModelSignatures;
+            for (const auto& type : module.types) {
+                if (!type.synthetic) {
+                    objectModelSignatures.push_back(typeSignature(type));
+                }
+            }
+            std::sort(
+                objectModelSignatures.begin(),
+                objectModelSignatures.end());
+            std::ostringstream objectModelSurface;
+            for (const auto& signature : objectModelSignatures) {
+                objectModelSurface << signature << '\n';
+            }
+            module.publicFingerprint = combineFingerprint(
+                module.publicFingerprint,
+                stableFingerprint(objectModelSurface.str()));
+        }
+    }
+
     // Reject recursive value-type layouts before lowering. A struct must have a
     // finite inline representation; reference fields may be recursive, value
     // fields may not.

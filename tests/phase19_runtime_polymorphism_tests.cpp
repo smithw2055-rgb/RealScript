@@ -652,6 +652,143 @@ int main()
             result.error.message);
 }
 
+
+void testObjectModelLinkValidation() {
+    const char* source = R"(
+module Phase19.LinkValidation;
+public interface IRead
+{
+    public int Read();
+}
+public abstract class Base : IRead
+{
+    public abstract int Read();
+    public virtual int Other(int value) { return value + 3; }
+}
+public sealed class Derived : Base
+{
+    public override int Read() { return 7; }
+    public override int Other(int value) { return value + 5; }
+}
+int main()
+{
+    IRead value = new Derived();
+    return value.Read();
+}
+)";
+    realscript::compiler::Compilation compilation({{"link-validation.rs", source}});
+    const auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "object-model link-validation source failed to compile:\n" +
+            diagnosticsText(build.diagnostics));
+    realscript::bytecode::Lowerer lowerer;
+    std::vector<realscript::bytecode::Module> baseline;
+    baseline.push_back(lowerer.lower(build.modules.front()));
+
+    const auto derivedId = realscript::semantic::stableTypeId(
+        "Phase19.LinkValidation::Derived");
+    const auto baseId = realscript::semantic::stableTypeId(
+        "Phase19.LinkValidation::Base");
+    const auto interfaceId = realscript::semantic::stableTypeId(
+        "Phase19.LinkValidation::IRead");
+
+    const auto link = [](std::vector<realscript::bytecode::Module> modules) {
+        realscript::runtime::RuntimeError error;
+        auto image = realscript::runtime::ProgramImage::link(
+            std::move(modules), error);
+        return std::make_pair(std::move(image), std::move(error));
+    };
+    const auto requireRejected = [&](
+        std::vector<realscript::bytecode::Module> modules,
+        const std::string& context) {
+        auto [image, error] = link(std::move(modules));
+        require(!image &&
+                error.code == realscript::runtime::ErrorCode::InvalidProgram,
+            context + " was accepted by ProgramImage::link: " +
+                error.message);
+    };
+    const auto findType = [](auto& module, realscript::semantic::SymbolId id)
+        -> realscript::semantic::TypeSymbol& {
+        const auto found = std::find_if(
+            module.types.begin(), module.types.end(),
+            [&](const auto& type) { return type.id == id; });
+        if (found == module.types.end()) {
+            throw std::runtime_error("link-validation fixture lost a type");
+        }
+        return *found;
+    };
+
+    auto [validImage, validError] = link(baseline);
+    require(validImage.has_value(),
+        "valid object model failed to link: " + validError.message);
+
+    {
+        auto modules = baseline;
+        auto& derived = findType(modules.front(), derivedId);
+        derived.baseTypeId = 0xabcdef0123456789ull;
+        requireRejected(std::move(modules),
+            "missing base type descriptor");
+    }
+    {
+        auto modules = baseline;
+        auto& derived = findType(modules.front(), derivedId);
+        require(!derived.virtualDispatchTable.empty(),
+            "fixture has no virtual dispatch table");
+        derived.virtualDispatchTable.front() = 0xabcdef0123456789ull;
+        requireRejected(std::move(modules),
+            "missing virtual target");
+    }
+    {
+        auto modules = baseline;
+        auto& derived = findType(modules.front(), derivedId);
+        require(!derived.interfaceDispatchMaps.empty(),
+            "fixture has no interface dispatch map");
+        derived.interfaceDispatchMaps.front().interfaceTypeId = baseId;
+        requireRejected(std::move(modules),
+            "non-interface dispatch descriptor");
+    }
+    {
+        auto modules = baseline;
+        auto& derived = findType(modules.front(), derivedId);
+        require(!derived.interfaceDispatchMaps.empty(),
+            "fixture has no interface dispatch map");
+        derived.interfaceDispatchMaps.front().slots.push_back(0);
+        requireRejected(std::move(modules),
+            "interface dispatch slot-count mismatch");
+    }
+    {
+        auto modules = baseline;
+        auto& derived = findType(modules.front(), derivedId);
+        auto& base = findType(modules.front(), baseId);
+        base.baseTypeId = derivedId;
+        base.baseTypeName = realscript::semantic::canonicalTypeName(derived);
+        derived.baseTypeId = baseId;
+        derived.baseTypeName = realscript::semantic::canonicalTypeName(base);
+        requireRejected(std::move(modules),
+            "class inheritance cycle");
+    }
+    {
+        auto modules = baseline;
+        auto& derived = findType(modules.front(), derivedId);
+        const auto interfaceMap = std::find_if(
+            derived.interfaceDispatchMaps.begin(),
+            derived.interfaceDispatchMaps.end(),
+            [&](const auto& map) {
+                return map.interfaceTypeId == interfaceId;
+            });
+        const auto other = std::find_if(
+            derived.methods.begin(), derived.methods.end(),
+            [](const auto& method) { return method.name == "Other"; });
+        require(interfaceMap != derived.interfaceDispatchMaps.end() &&
+                !interfaceMap->slots.empty() &&
+                other != derived.methods.end(),
+            "fixture has incomplete dispatch metadata");
+        interfaceMap->slots.front() = other->id;
+        requireRejected(std::move(modules),
+            "interface target signature mismatch");
+    }
+}
+
 void testGameSdkInheritedObjectClosure() {
     realscript::game::GameApi api;
     realscript::game::GameScriptCompiler compiler(api);
@@ -851,11 +988,12 @@ public class CrossDerived : CrossBase
 {
     public override int Read() { return 5; }
 }
-int main() { CrossBase value = new CrossDerived(); return value.Read(); }
+int main() { ICrossRead value = new CrossDerived(); return value.Read(); }
 )"},
         {"z-base-module.rs", R"(
 module Phase19.ZBase;
-public class CrossBase
+public interface ICrossRead { public int Read(); }
+public class CrossBase : ICrossRead
 {
     public virtual int Read() { return 3; }
 }
@@ -871,6 +1009,11 @@ public class CrossBase
     for (const auto& module : build.modules) {
         modules.push_back(lowerer.lower(module));
     }
+    realscript::runtime::RuntimeError linkError;
+    const auto linked = realscript::runtime::ProgramImage::link(
+        modules, linkError);
+    require(linked.has_value(),
+        "global inheritance modules failed to link: " + linkError.message);
     realscript::runtime::Interpreter interpreter(std::move(modules));
     const auto sameModule = interpreter.invoke("Phase19.CrossFile::main");
     require(sameModule.succeeded &&
@@ -979,6 +1122,7 @@ int main() {
         testVirtualDispatchExecution();
         testInterfaceDispatchExecution();
         testObjectModelBytecodeRoundTrip();
+        testObjectModelLinkValidation();
         testGameSdkInheritedObjectClosure();
         testLanguageToolingVisibilityAndInheritance();
         testDebuggerShowsRuntimeUserMethod();
