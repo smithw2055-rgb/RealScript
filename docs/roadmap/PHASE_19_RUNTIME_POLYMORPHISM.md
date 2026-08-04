@@ -11,7 +11,7 @@ Tracking issue: #34. Development branch: `agent/phase19-runtime-polymorphism`.
 - **19C virtual dispatch:** implemented for `virtual`, `override`, `abstract`, and `sealed override`; stable slots execute through the interpreter, generated C++ AOT, and Toolchain JIT.
 - **19D interface values and dispatch:** implemented for interface-typed storage, class-to-interface conversion, deterministic interface slots, inherited implementation maps, interpreter dispatch, generated C++ AOT, and Toolchain JIT.
 - **19E artifact and runtime closure:** implemented for base-constructor execution, full visibility enforcement, `.rsbc` 0.7 object-model persistence, inherited save-state/Game SDK metadata, compiled AOT parity, and LSP/DAP/debugger surfaces.
-- **Phase status:** implementation-complete pending final branch CI. A clean Linux warnings-as-errors build and the current 38-target local CTest matrix pass; Ubuntu and Windows GitHub Actions must be green before merge.
+- **Phase status:** complete. A clean Linux warnings-as-errors build and the current 38-target local CTest matrix pass. GitHub Actions run `30891404788` passed the Ubuntu and Windows warnings-as-errors builds and full test suites.
 
 Direct non-virtual and `base` calls remain statically bound. Interface values reuse managed object references and preserve their exact interface TypeId in semantic, MIR, and bytecode signatures. Virtual and interface dispatch metadata is present in the interpreter, AOT, JIT, verifiers, printers, disassembler, content hashes, hot-reload compatibility checks, and `.rsbc` 0.7 artifacts. `.rsbc` 0.6 remains readable as a legacy format.
 
@@ -94,7 +94,7 @@ cmake --build build-review
 ctest --test-dir build-review --output-on-failure
 ```
 
-The Linux warnings-as-errors build completed and all 38 locally enabled CTest targets passed. The final merge decision still requires the repository Ubuntu and Windows jobs to pass on the published branch head.
+The Linux warnings-as-errors build completed and all 38 locally enabled CTest targets passed. GitHub Actions run `30891404788` then passed both repository jobs: Ubuntu configure/build/test and Windows Server 2025 / Visual Studio 2026 configure/build/test.
 
 ## Explicit non-goals
 
