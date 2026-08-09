@@ -150,6 +150,27 @@ void testBudgetsTracingAndGcRoots() {
                 realscript::runtime::ErrorCode::InstructionBudgetExceeded,
         "AOT execution ignored the instruction budget");
 
+    realscript::runtime::ExecutionOptions typedRaw;
+    typedRaw.limits.gcWorkBudget = 0;
+    const auto typedResult = aot.invoke(
+        "Phase5.App::failDivision",
+        {std::int64_t{2}},
+        typedRaw);
+    require(typedResult.succeeded &&
+            std::get<std::int64_t>(typedResult.value) == 5 &&
+            typedResult.instructionsExecuted != 0,
+        "typed AOT raw accounting returned an invalid result or instruction count");
+
+    typedRaw.limits.instructionBudget = 1;
+    const auto typedExhausted = aot.invoke(
+        "Phase5.App::failDivision",
+        {std::int64_t{2}},
+        typedRaw);
+    require(!typedExhausted.succeeded &&
+            typedExhausted.error.code ==
+                realscript::runtime::ErrorCode::InstructionBudgetExceeded,
+        "typed AOT raw accounting ignored the instruction budget");
+
     realscript::runtime::ExecutionOptions recursive;
     recursive.limits.recursionLimit = 3;
     const auto recursion = aot.invoke(
@@ -194,13 +215,17 @@ void testModuleQueryAndMetadata() {
         "AOT descriptor lost enum metadata");
 
     const RsFunctionEntryV1* mainEntry = nullptr;
+    const RsFunctionEntryV1* typedEntry = nullptr;
     for (std::uint32_t index = 0; index < exports.function_count; ++index) {
         const auto& entry = exports.functions[index];
         const auto* function = static_cast<
             const realscript::aot::FunctionDescriptor*>(entry.backend_data);
         if (function && std::string(function->name) == "Phase5.App::main") {
             mainEntry = &entry;
-            break;
+        }
+        if (function &&
+            std::string(function->name) == "Phase5.App::failDivision") {
+            typedEntry = &entry;
         }
     }
     require(mainEntry && mainEntry->entry_point &&
@@ -220,6 +245,19 @@ void testModuleQueryAndMetadata() {
     require(mainEntry->entry_point(nullptr, nullptr, 0, &result) ==
             RS_STATUS_V1_INVALID_ARGUMENT,
         "AOT C ABI entry point accepted a null execution context");
+
+    realscript::aot::ExecutionContext typedContext(
+        *descriptor,
+        std::make_shared<realscript::runtime::ManagedHeap>(),
+        nullptr);
+    realscript::runtime::Value wrongArgument = true;
+    require(typedEntry &&
+            typedEntry->entry_point(
+                &typedContext, &wrongArgument, 1, &result) ==
+                RS_STATUS_V1_RUNTIME_ERROR &&
+            typedContext.error().code ==
+                realscript::runtime::ErrorCode::TypeMismatch,
+        "typed AOT C ABI entry point accepted an invalid argument type");
 
     auto incompatible = api;
     incompatible.abi_major += 1;

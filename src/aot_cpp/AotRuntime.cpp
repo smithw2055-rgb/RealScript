@@ -181,6 +181,9 @@ ExecutionContext::ExecutionContext(
         static_cast<bool>(options_.trace);
     determinismOnly_ = determinismEventsEnabled_ &&
         options_.profile == nullptr && !diagnosticEventsEnabled_;
+    fastAccounting_ = !determinismEventsEnabled_ &&
+        options_.profile == nullptr && !diagnosticEventsEnabled_ &&
+        options_.limits.gcWorkBudget == 0;
     for (std::uint32_t index = 0; index < program.typeCount; ++index) {
         const auto& type = program.types[index];
         types_.emplace(type.id, &type);

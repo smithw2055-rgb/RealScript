@@ -278,6 +278,407 @@ std::string valueExpression(mir::ValueId id) {
     return "registers[" + std::to_string(id) + "]";
 }
 
+bool isTypedPrimitive(semantic::PrimitiveType type) noexcept {
+    return type == semantic::PrimitiveType::Int ||
+        type == semantic::PrimitiveType::Bool;
+}
+
+std::vector<semantic::PrimitiveType> valueTypes(
+    const mir::Function& function) {
+    std::vector<semantic::PrimitiveType> result(
+        registerCount(function), semantic::PrimitiveType::Error);
+    for (const auto& block : function.blocks) {
+        for (const auto& parameter : block.parameters) {
+            if (parameter.value >= 0) {
+                result[static_cast<std::size_t>(parameter.value)] =
+                    parameter.type;
+            }
+        }
+        for (const auto& instruction : block.instructions) {
+            if (instruction.result >= 0) {
+                result[static_cast<std::size_t>(instruction.result)] =
+                    instruction.resultType;
+            }
+        }
+    }
+    return result;
+}
+
+bool supportsTypedPrimitiveAot(const mir::Function& function) {
+    if (!function.exceptionHandlers.empty() ||
+        (function.returnType != semantic::PrimitiveType::Void &&
+         !isTypedPrimitive(function.returnType))) {
+        return false;
+    }
+    if (!std::all_of(function.parameterTypes.begin(),
+            function.parameterTypes.end(), isTypedPrimitive) ||
+        !std::all_of(function.localTypes.begin(),
+            function.localTypes.end(), isTypedPrimitive)) {
+        return false;
+    }
+    const auto types = valueTypes(function);
+    if (!std::all_of(types.begin(), types.end(), isTypedPrimitive)) {
+        return false;
+    }
+    const auto operandType = [&](const mir::Instruction& instruction,
+                                 std::size_t index) {
+        if (index >= instruction.operands.size() ||
+            instruction.operands[index] < 0) {
+            return semantic::PrimitiveType::Error;
+        }
+        return types[static_cast<std::size_t>(instruction.operands[index])];
+    };
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            switch (instruction.opcode) {
+            case mir::Opcode::Parameter:
+            case mir::Opcode::ConstantInt:
+            case mir::Opcode::ConstantBool:
+            case mir::Opcode::LoadLocal:
+            case mir::Opcode::StoreLocal:
+            case mir::Opcode::LessInt:
+            case mir::Opcode::LessOrEqualInt:
+            case mir::Opcode::GreaterInt:
+            case mir::Opcode::GreaterOrEqualInt:
+                break;
+            case mir::Opcode::AddInt:
+            case mir::Opcode::SubtractInt:
+            case mir::Opcode::MultiplyInt:
+            case mir::Opcode::DivideInt:
+            case mir::Opcode::RemainderInt:
+            case mir::Opcode::NegateInt:
+                if (!instruction.checkedArithmetic) return false;
+                break;
+            case mir::Opcode::LogicalNot:
+                if (operandType(instruction, 0) !=
+                    semantic::PrimitiveType::Bool) return false;
+                break;
+            case mir::Opcode::Equal:
+            case mir::Opcode::NotEqual:
+                if (operandType(instruction, 0) !=
+                    operandType(instruction, 1)) return false;
+                break;
+            default:
+                return false;
+            }
+        }
+        switch (block.terminator.kind) {
+        case mir::TerminatorKind::ReturnVoid:
+        case mir::TerminatorKind::ReturnValue:
+        case mir::TerminatorKind::Jump:
+        case mir::TerminatorKind::Branch:
+            break;
+        case mir::TerminatorKind::Throw:
+        case mir::TerminatorKind::None:
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string typedCppType(semantic::PrimitiveType type) {
+    return type == semantic::PrimitiveType::Bool
+        ? "bool"
+        : "std::int64_t";
+}
+
+std::string typedDefaultValue(semantic::PrimitiveType type) {
+    return type == semantic::PrimitiveType::Bool
+        ? "false"
+        : "std::int64_t{0}";
+}
+
+std::string typedValueExpression(mir::ValueId id) {
+    return "typedRegister_" + std::to_string(id);
+}
+
+std::string typedLocalExpression(std::size_t index) {
+    return "typedLocal_" + std::to_string(index);
+}
+
+void emitTypedTransfer(
+    Emitter& output,
+    const mir::Function& function,
+    mir::BlockId target,
+    const std::vector<mir::ValueId>& arguments,
+    const std::string& prefix,
+    const std::string& indent) {
+    const auto* block = findBlock(function, target);
+    if (!block) return;
+    for (std::size_t index = 0;
+         index < arguments.size() && index < block->parameters.size();
+         ++index) {
+        output.line(indent + "const auto " + prefix + "_" +
+            std::to_string(index) + " = " +
+            typedValueExpression(arguments[index]) + ";");
+    }
+    for (std::size_t index = 0;
+         index < arguments.size() && index < block->parameters.size();
+         ++index) {
+        output.line(indent +
+            typedValueExpression(block->parameters[index].value) + " = " +
+            prefix + "_" + std::to_string(index) + ";");
+    }
+    output.line(indent + "if constexpr (FastAccounting) {");
+    output.line(indent + "    context.branchRawTyped();");
+    output.line(indent + "} else if (!context.branch(" +
+        std::to_string(target) + ")) return false;");
+    output.line(indent + "currentBlock = " + std::to_string(target) + ";");
+}
+
+void emitTypedConsume(
+    Emitter& output,
+    mir::Opcode opcode,
+    const std::string& indent) {
+    output.line(indent + "if constexpr (FastAccounting) {");
+    output.line(indent + "    if (!context.consumeRawTyped()) return false;");
+    output.line(indent + "} else if (!context.consume(" +
+        std::to_string(runtime::determinismOperationId(
+            mir::opcodeName(opcode))) + "ULL, \"" +
+        escapeCppString(mir::opcodeName(opcode)) +
+        "\")) return false;");
+}
+
+void emitTypedConsume(
+    Emitter& output,
+    mir::TerminatorKind terminator,
+    const std::string& indent) {
+    output.line(indent + "if constexpr (FastAccounting) {");
+    output.line(indent + "    if (!context.consumeRawTyped()) return false;");
+    output.line(indent + "} else if (!context.consume(" +
+        std::to_string(runtime::determinismOperationId(
+            mir::terminatorName(terminator))) + "ULL, \"" +
+        escapeCppString(mir::terminatorName(terminator)) +
+        "\")) return false;");
+}
+
+void emitTypedPrimitiveFunction(
+    Emitter& source,
+    const FunctionView& view,
+    const GenerationOptions& options,
+    std::vector<SourceMapRecord>& sourceMap) {
+    const auto& module = *view.module;
+    const auto& function = *view.function;
+    const auto types = valueTypes(function);
+    source.line("template <bool FastAccounting>");
+    source.line("static bool " + view.cppName + "_typed(");
+    source.line("    ExecutionContext& context,");
+    source.line("    const runtime::Value* arguments,");
+    source.line("    std::size_t argumentCount,");
+    source.line("    runtime::Value& result) {");
+    source.line("    (void)arguments;");
+    source.line("    (void)argumentCount;");
+    source.line("    (void)result;");
+    for (std::size_t index = 0; index < function.localTypes.size(); ++index) {
+        source.line("    " + typedCppType(function.localTypes[index]) + " " +
+            typedLocalExpression(index) + " = " +
+            typedDefaultValue(function.localTypes[index]) + ";");
+    }
+    for (std::size_t index = 0; index < types.size(); ++index) {
+        source.line("    " + typedCppType(types[index]) + " " +
+            typedValueExpression(static_cast<mir::ValueId>(index)) + "{};");
+    }
+    source.line("    std::uint32_t currentBlock = 0;");
+    source.line("    for (;;) {");
+    source.line("        switch (currentBlock) {");
+
+    for (const auto& block : function.blocks) {
+        source.line("        case " + std::to_string(block.id) + ": {");
+        for (std::size_t instructionIndex = 0;
+             instructionIndex < block.instructions.size();
+             ++instructionIndex) {
+            const auto& instruction = block.instructions[instructionIndex];
+            emitLineDirective(
+                source,
+                module,
+                findPoint(function, block.id,
+                    static_cast<std::uint32_t>(instructionIndex), false),
+                options.emitLineDirectives,
+                sourceMap,
+                function.symbolId);
+            emitTypedConsume(source, instruction.opcode, "            ");
+            const auto result = instruction.result >= 0
+                ? typedValueExpression(instruction.result)
+                : std::string{};
+            const auto operand = [&](std::size_t index) {
+                return typedValueExpression(instruction.operands[index]);
+            };
+            switch (instruction.opcode) {
+            case mir::Opcode::Parameter: {
+                const auto index = static_cast<std::size_t>(
+                    instruction.integerImmediate);
+                source.line("            if (" + std::to_string(index) +
+                    "u >= argumentCount) return context.fail("
+                    "runtime::ErrorCode::InvalidArguments, "
+                    "\"AOT parameter index is invalid\");");
+                const auto argument = "typedArgument_" +
+                    std::to_string(instruction.result);
+                source.line("            const auto* " + argument +
+                    " = std::get_if<" +
+                    typedCppType(instruction.resultType) + ">(&arguments[" +
+                    std::to_string(index) + "]);");
+                source.line("            if (!" + argument +
+                    ") return context.fail(runtime::ErrorCode::TypeMismatch, "
+                    "\"AOT parameter type mismatch\");");
+                source.line("            " + result + " = *" + argument + ";");
+                break;
+            }
+            case mir::Opcode::ConstantInt:
+                source.line("            " + result + " = std::int64_t{" +
+                    std::to_string(instruction.integerImmediate) + "LL};");
+                break;
+            case mir::Opcode::ConstantBool:
+                source.line("            " + result + " = " +
+                    (instruction.boolImmediate ? "true" : "false") + ";");
+                break;
+            case mir::Opcode::LoadLocal:
+                source.line("            " + result + " = " +
+                    typedLocalExpression(instruction.localIndex) + ";");
+                break;
+            case mir::Opcode::StoreLocal:
+                source.line("            " +
+                    typedLocalExpression(instruction.localIndex) + " = " +
+                    operand(0) + ";");
+                break;
+            case mir::Opcode::AddInt:
+            case mir::Opcode::SubtractInt:
+            case mir::Opcode::MultiplyInt: {
+                const auto operation = instruction.opcode == mir::Opcode::AddInt
+                    ? "+"
+                    : instruction.opcode == mir::Opcode::SubtractInt ? "-" : "*";
+                const auto temporary = "typedArithmetic_" +
+                    std::to_string(instruction.result);
+                source.line("            const auto " + temporary + " = " +
+                    operand(0) + " " + operation + " " + operand(1) + ";");
+                source.line("            if (" + temporary +
+                    " < std::numeric_limits<std::int32_t>::min() || " +
+                    temporary +
+                    " > std::numeric_limits<std::int32_t>::max()) return "
+                    "context.fail(runtime::ErrorCode::IntegerOverflow, "
+                    "\"integer arithmetic overflow\");");
+                source.line("            " + result + " = " + temporary + ";");
+                break;
+            }
+            case mir::Opcode::DivideInt:
+            case mir::Opcode::RemainderInt: {
+                source.line("            if (" + operand(1) +
+                    " == 0) return context.fail(runtime::ErrorCode::DivisionByZero, \"" +
+                    (instruction.opcode == mir::Opcode::DivideInt
+                        ? "division by zero"
+                        : "remainder by zero") + "\");");
+                source.line("            if (" + operand(0) +
+                    " == std::numeric_limits<std::int32_t>::min() && " +
+                    operand(1) +
+                    " == -1) return context.fail(runtime::ErrorCode::IntegerOverflow, "
+                    "\"integer division overflow\");");
+                source.line("            " + result + " = " + operand(0) +
+                    (instruction.opcode == mir::Opcode::DivideInt ? " / " : " % ") +
+                    operand(1) + ";");
+                break;
+            }
+            case mir::Opcode::NegateInt:
+                source.line("            if (" + operand(0) +
+                    " == std::numeric_limits<std::int32_t>::min()) return "
+                    "context.fail(runtime::ErrorCode::IntegerOverflow, "
+                    "\"integer negation overflow\");");
+                source.line("            " + result + " = -" + operand(0) + ";");
+                break;
+            case mir::Opcode::LogicalNot:
+                source.line("            " + result + " = !" + operand(0) + ";");
+                break;
+            case mir::Opcode::Equal:
+            case mir::Opcode::NotEqual:
+                source.line("            " + result + " = " + operand(0) +
+                    (instruction.opcode == mir::Opcode::Equal ? " == " : " != ") +
+                    operand(1) + ";");
+                break;
+            case mir::Opcode::LessInt:
+            case mir::Opcode::LessOrEqualInt:
+            case mir::Opcode::GreaterInt:
+            case mir::Opcode::GreaterOrEqualInt: {
+                const char* operation = "<";
+                if (instruction.opcode == mir::Opcode::LessOrEqualInt) operation = "<=";
+                if (instruction.opcode == mir::Opcode::GreaterInt) operation = ">";
+                if (instruction.opcode == mir::Opcode::GreaterOrEqualInt) operation = ">=";
+                source.line("            " + result + " = " + operand(0) +
+                    " " + operation + " " + operand(1) + ";");
+                break;
+            }
+            default:
+                break;
+            }
+        }
+
+        emitLineDirective(
+            source,
+            module,
+            findPoint(function, block.id,
+                static_cast<std::uint32_t>(block.instructions.size()), true),
+            options.emitLineDirectives,
+            sourceMap,
+            function.symbolId);
+        emitTypedConsume(source, block.terminator.kind, "            ");
+        switch (block.terminator.kind) {
+        case mir::TerminatorKind::ReturnVoid:
+            source.line("            result = std::monostate{};");
+            source.line("            return true;");
+            break;
+        case mir::TerminatorKind::ReturnValue: {
+            const auto value = typedValueExpression(block.terminator.value);
+            source.line("            result = " +
+                (function.returnType == semantic::PrimitiveType::Bool
+                    ? value
+                    : "std::int64_t{" + value + "}") + ";");
+            source.line("            return true;");
+            break;
+        }
+        case mir::TerminatorKind::Jump:
+            emitTypedTransfer(
+                source, function, block.terminator.target,
+                block.terminator.arguments, "typedEdge", "            ");
+            source.line("            continue;");
+            break;
+        case mir::TerminatorKind::Branch:
+            source.line("            if (" +
+                typedValueExpression(block.terminator.condition) + ") {");
+            emitTypedTransfer(
+                source, function, block.terminator.target,
+                block.terminator.arguments, "typedTrueEdge", "                ");
+            source.line("            } else {");
+            emitTypedTransfer(
+                source, function, block.terminator.falseTarget,
+                block.terminator.falseArguments, "typedFalseEdge", "                ");
+            source.line("            }");
+            source.line("            continue;");
+            break;
+        case mir::TerminatorKind::Throw:
+        case mir::TerminatorKind::None:
+            break;
+        }
+        source.line("        }");
+    }
+    source.line("        default:");
+    source.line("            return context.fail(runtime::ErrorCode::InvalidProgram, "
+        "\"AOT branch target is invalid\");");
+    source.line("        }");
+    source.line("    }");
+    source.line("}");
+    source.line();
+    source.line("static bool " + view.cppName + "(");
+    source.line("    ExecutionContext& context,");
+    source.line("    const runtime::Value* arguments,");
+    source.line("    std::size_t argumentCount,");
+    source.line("    runtime::Value& result) {");
+    source.line("    if (context.fastAccountingEnabled()) {");
+    source.line("        return " + view.cppName +
+        "_typed<true>(context, arguments, argumentCount, result);");
+    source.line("    }");
+    source.line("    return " + view.cppName +
+        "_typed<false>(context, arguments, argumentCount, result);");
+    source.line("}");
+    source.line();
+}
+
 std::string arrayValues(
     const std::vector<mir::ValueId>& values,
     const std::string& name,
@@ -564,6 +965,7 @@ GeneratedProgram CppGenerator::generate(
     source.line("#include <array>");
     source.line("#include <cstddef>");
     source.line("#include <cstdint>");
+    source.line("#include <limits>");
     source.line("#include <utility>");
     source.line("#include <vector>");
     source.line();
@@ -756,6 +1158,9 @@ GeneratedProgram CppGenerator::generate(
     for (const auto& view : functions) {
         const auto& module = *view.module;
         const auto& function = *view.function;
+        if (supportsTypedPrimitiveAot(function)) {
+            emitTypedPrimitiveFunction(source, view, options, sourceMap);
+        } else {
         source.line("static bool " + view.cppName + "(");
         source.line("    ExecutionContext& context,");
         source.line("    const runtime::Value* arguments,");
@@ -1159,6 +1564,7 @@ GeneratedProgram CppGenerator::generate(
         source.line("    }");
         source.line("}");
         source.line();
+        }
 
         source.line("static RsStatusV1 abi_" + view.cppName + "(");
         source.line("    void* executionContext,");

@@ -213,7 +213,23 @@ public:
     [[nodiscard]] bool consume(
         runtime::DeterminismOperationId operationId,
         std::string_view operation);
+    [[nodiscard]] bool fastAccountingEnabled() const noexcept {
+        return fastAccounting_;
+    }
+    [[nodiscard]] bool consumeRawTyped() {
+        if (executed_ >= options_.limits.instructionBudget) {
+            return fail(
+                runtime::ErrorCode::InstructionBudgetExceeded,
+                "instruction budget exceeded");
+        }
+        ++executed_;
+        statistics_.instructionsExecuted = executed_;
+        return true;
+    }
     [[nodiscard]] bool branch(std::uint32_t blockId);
+    void branchRawTyped() noexcept {
+        ++statistics_.branchesTaken;
+    }
     [[nodiscard]] bool throwScript(const runtime::Value& value);
     [[nodiscard]] bool hasPendingException() const noexcept;
     [[nodiscard]] bool pendingExceptionMatches(
@@ -349,6 +365,7 @@ private:
     bool determinismEventsEnabled_ = false;
     bool determinismOnly_ = false;
     bool diagnosticEventsEnabled_ = false;
+    bool fastAccounting_ = false;
     std::uint64_t determinismEventDigest_ = runtime::DeterminismEventSeed;
     std::uint64_t determinismEventCount_ = 0;
     std::unordered_map<semantic::SymbolId, runtime::FunctionProfile>

@@ -6,13 +6,14 @@
 
 1. `invoke()` 每次重新验证全部 bytecode 并重建函数/类型索引，宿主调用成本随整个程序规模增长。
 2. Strict determinism 和 ProfileCollector 在每条指令上构造包含字符串的事件、哈希并（profiled 时）加锁更新 map。
-3. AOT/JIT 仍执行基于 `runtime::Value` 的 compiled MIR，并为每条 MIR 操作调用 `ExecutionContext::consume()`；当前不是 typed native code。
+3. P2 前 AOT/JIT 仍执行基于 `runtime::Value` 的 compiled MIR，并为每条 MIR 操作调用 `ExecutionContext::consume()`，不是 typed native code。
 
-当前已完成 P0 Runtime Image 和 P1 instrumentation 热路径优化。前两层成本已从主导瓶颈降到噪声或低比例开销；下一阶段的主要目标是 Typed AOT、Interpreter frame/branch/dispatch，以及产品级 macrobench。
+当前已完成 P0 Runtime Image、P1 instrumentation 热路径优化，以及 P2 Typed AOT 第一阶段。整数/布尔 primitive MIR 已直接生成 C++ 标量，整数循环 AOT RAW 从记录的 3.033 ms 降到 360.98 us。下一阶段的主要目标是扩大 Typed AOT 覆盖并减少逐指令 accounting/CFG 状态机成本、优化 Interpreter frame/branch/dispatch，以及建立产品级 macrobench。
 
 ## 测试环境
 
-- commit：`d8889964d2615db089fd98d7f73433f7fedbb7b1`
+- 初始基线 commit：`d8889964d2615db089fd98d7f73433f7fedbb7b1`
+- P2 工作树基点：`1e6334e6e8b514412a34af4df484610620600847`（P2 改动尚未提交）
 - OS：Windows 11 Home China，10.0.26200
 - CPU：AMD Ryzen 7 6800H，8C/16T
 - 内存：约 16 GB
@@ -110,7 +111,7 @@ Compiled MIR 的整数循环也接近目标：AOT raw/Strict 为 3.033/3.395 ms�
 
 本组 microbench 中 O2 没有减少执行指令数，也没有稳定优于 O0/O1。优化器当前没有消除循环中的 load/store、常量或控制流成本。应在下一阶段用 MIR 统计和 workload-specific pass 验证 O2 的实际价值。
 
-## AOT、JIT 与 native ceiling
+## P2 前 AOT、JIT 与 native ceiling
 
 工作负载为同一个 10,000 次整数求和循环。
 
@@ -132,6 +133,26 @@ AOT raw 比 Interpreter raw 快约 4 倍，但仍远离 native。生成源码保
 因此当前 JIT 的运行性能与 AOT 基本一致是预期行为：它缓存并加载同一类生成 C++，不是另一套优化执行后端。
 
 JIT cold 编译为 3,617 ms，紧随其后的 cache hit 为 2.61 ms。JIT 性能工作应分别看编译/缓存和运行时，不应把两者混成一个数。
+
+## P2 Typed AOT 第一阶段结果
+
+生成器现在对整函数做保守资格分析。只包含 `int`/`bool` 参数、局部变量、SSA value、checked 整数算术、比较和基本控制流的函数，生成 `std::int64_t`/`bool` 标量 local/register；对象、数组、调用、异常处理、long/double 和其他未覆盖 opcode 保持原有 `runtime::Value` 通用路径。ABI 边界仍负责 value boxing/unboxing，错误类型通过 C ABI 返回 `TypeMismatch`。
+
+RAW 且无 determinism/profile/trace、`gcWorkBudget=0` 时，Typed AOT 使用编译期选择的轻量 accounting 路径；它仍逐 MIR 指令检查 instruction budget、累计 instruction/branch statistics。Strict、trace 和 profile 继续走原有详细事件路径，因此跨后端 determinism digest/profile 保持一致。
+
+最终 Release 复测中，每个进程内部为 11 个样本、每样本 5 次调用；下表使用多进程中位数的中位数：
+
+| Backend / mode | P1 记录值 | P2 第一阶段 | 改善 | 相对 native |
+|---|---:|---:|---:|---:|
+| Native C++ Release | 约 4.06 us | 4.06 us | — | 1.0x |
+| AOT RAW | 3.033 ms | 360.98 us | 8.40x | 88.9x slower |
+| JIT RAW | 2.931 ms | 367.34 us | 7.98x | 90.5x slower |
+| AOT Strict | 3.395 ms | 1.223 ms | 2.78x | 301x slower |
+| JIT Strict | 3.347 ms | 1.215 ms | 2.75x | 299x slower |
+
+这里的总改善不能全部归因于 scalar lowering：P1 的 AOT/JIT 驱动虽然标记为 RAW，实际仍使用默认 `gcWorkBudget=8`。P2 已把 RAW/Strict 驱动都显式改为 0；在保留 `gcWorkBudget=8` 时，Typed AOT RAW 实测约 1.30–1.41 ms，说明 scalar lowering 本身已带来约 2.2 倍改善，关闭 GC idle work 并启用轻量 accounting 后才达到最终约 361 us。GC idle tax 仍应作为独立实验，不应混入 RAW 后端对比。
+
+P2 后 AOT 与 JIT RAW 已基本持平，说明 JIT 没有额外运行时瓶颈；距离 native 仍约 89–91 倍。当前主要剩余成本是每 MIR 指令的预算/统计更新、`switch (currentBlock)` 控制流状态机以及 checked arithmetic。下一阶段应优先研究保持精确 instruction-budget 语义的 block-level 批量 accounting 和结构化 CFG 生成，再扩大到 call、long/double 与混合 boxed value。
 
 ## GC idle tax
 
@@ -184,7 +205,16 @@ JIT cold 编译为 3,617 ms，紧随其后的 cache hit 为 2.61 ms。JIT 性能
 
 ### P2：Typed AOT
 
-CPU-heavy benchmark 已满足启动 Typed AOT 的信号：AOT 虽比 Interpreter 快约 4 倍，但仍比 native 慢数百倍。应让 primitive MIR register/local 直接生成 C++ primitive，只有 object、boxed/polymorphic value 和 ABI 边界使用 `runtime::Value`。
+状态：第一阶段已完成。
+
+- `int`/`bool` primitive MIR register/local 直接生成 C++ 标量；
+- checked 算术、比较、分支和 SSA block transfer 不再调用 `context.binary()` 或复制 `runtime::Value`；
+- ABI 边界保留参数校验与 result boxing；
+- RAW 使用轻量但仍精确的 instruction/branch accounting；
+- Strict/profile/trace 保持详细路径和跨后端事件一致性；
+- 不满足资格的函数整函数回退到原有通用生成器。
+
+第一阶段把整数循环 AOT RAW 降至约 361 us，与 JIT RAW 基本持平，但仍比 native 慢约 89 倍。第二阶段应解决逐指令 accounting 和 CFG 状态机，并扩大 primitive/call 覆盖。
 
 ### P3：Interpreter frame、branch 与 dispatch
 
@@ -215,13 +245,14 @@ CPU-heavy benchmark 已满足启动 Typed AOT 的信号：AOT 虽比 Interpreter
 
 ## 验证状态
 
-受本次改动直接影响的 Release 回归 6/6 通过：
+受本次改动直接影响的 Release 定向回归 7/7 通过：
 
+- Phase 2C；
 - Phase 6 JIT/core/AOT；
 - Phase 6 benchmark smoke；
 - Phase 19 runtime polymorphism/AOT。
 
-全量 Release build 尚未通过，阻塞来自本轮未修改的主线路径：
+纳入范围的完整 Release 重建通过；广覆盖测试为 32/35，通过/失败集合与 P0/P1 一致。未纳入项与失败均来自本轮未修改的主线路径：
 
 - Phase 20 AOT：`RS6001`，含 `RS3004` / `RS3082`；
 - Phase 24 AOT：`RS6001`，含 `RS3064`；
@@ -229,7 +260,7 @@ CPU-heavy benchmark 已满足启动 Typed AOT 的信号：AOT 虽比 Interpreter
 - Phase 2A：bytecode snapshot 与当前编译结果不一致；
 - Phase 21/23 AOT：结果一致，但 instruction accounting 与 Interpreter 分别相差 9 和 1。
 
-这些问题应单独修复后再恢复全量门禁（当前 CMake 列出 40 项测试）。本轮没有提交或推送。
+这些问题应单独修复后再恢复全量门禁（当前 CMake 列出 40 项测试）。Typed/Generic 混合生成、RAW instruction budget、C ABI 错误参数、Strict digest/profile parity 均已有回归覆盖。本轮没有提交或推送。
 
 ## 复现命令
 
@@ -254,3 +285,5 @@ $cmake = 'C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\Comm
 
 cmd.exe /d /s /c 'call "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat" -arch=amd64 && "C:\Projects\RealScript\build-perf\Release\rsbench_jit.exe"'
 ```
+
+`rsbench_aot` 和 `rsbench_jit` 的 RAW/Strict 驱动均显式使用 `gcWorkBudget=0`；GC idle tax 请用 `rsbench --gc-work` 单独测量。

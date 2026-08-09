@@ -112,9 +112,11 @@ int main() {
         realscript::runtime::ExecutionOptions rawOptions;
         rawOptions.determinism.mode =
             realscript::runtime::DeterminismMode::Off;
+        rawOptions.limits.gcWorkBudget = 0;
         realscript::runtime::ExecutionOptions deterministicOptions;
         deterministicOptions.determinism.mode =
             realscript::runtime::DeterminismMode::Strict;
+        deterministicOptions.limits.gcWorkBudget = 0;
         volatile std::int64_t resultSink = 0;
         const auto invoke = [&](const auto& execution) {
             const auto result = cached.module->invoke(

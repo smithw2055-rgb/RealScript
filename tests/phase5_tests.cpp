@@ -134,6 +134,13 @@ void testGeneratorDeterminismAndShape() {
             first.source.find("context.newArray") != std::string::npos &&
             first.source.find("context.newObject") != std::string::npos,
         "AOT output did not lower MIR control flow and runtime intrinsics");
+    require(first.source.find("template <bool FastAccounting>") !=
+                std::string::npos &&
+            first.source.find("typedRegister_") != std::string::npos &&
+            first.source.find("_typed<true>") != std::string::npos &&
+            first.source.find("context.consumeRawTyped()") !=
+                std::string::npos,
+        "AOT output did not select typed primitive scalar lowering");
     require(first.source.find("#line ") != std::string::npos &&
             first.manifest.find("sourceMapCount") != std::string::npos,
         "AOT source mapping metadata is missing");
