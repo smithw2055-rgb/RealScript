@@ -137,8 +137,9 @@ void testGeneratorDeterminismAndShape() {
     require(first.source.find("template <bool FastAccounting>") !=
                 std::string::npos &&
             first.source.find("typedRegister_") != std::string::npos &&
+            first.source.find("goto typedBlock_") != std::string::npos &&
             first.source.find("_typed<true>") != std::string::npos &&
-            first.source.find("context.consumeRawTyped()") !=
+            first.source.find("context.consumeRawTyped(") !=
                 std::string::npos,
         "AOT output did not select typed primitive scalar lowering");
     require(first.source.find("#line ") != std::string::npos &&

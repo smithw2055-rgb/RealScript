@@ -92,6 +92,8 @@ void testDifferentialExecution() {
             {"Phase5.App::doubleMath", {}},
             {"Phase5.App::greeting", {}},
             {"Phase5.App::failDivision", {std::int64_t{0}}},
+            {"Phase5.App::typedBranch", {std::int64_t{4}}},
+            {"Phase5.App::typedBranch", {std::int64_t{-4}}},
             {"Phase5.App::failOverflow", {}},
             {"Phase5.App::failLongOverflow", {}},
             {"Phase5.App::failBounds", {}},
@@ -161,6 +163,23 @@ void testBudgetsTracingAndGcRoots() {
             typedResult.instructionsExecuted != 0,
         "typed AOT raw accounting returned an invalid result or instruction count");
 
+    const auto typedDetailed = aot.invoke(
+        "Phase5.App::failDivision",
+        {std::int64_t{2}});
+    require(typedDetailed.succeeded &&
+            typedResult.instructionsExecuted ==
+                typedDetailed.instructionsExecuted,
+        "typed AOT raw accounting changed the detailed instruction count");
+
+    const auto typedBranch = aot.invoke(
+        "Phase5.App::typedBranch",
+        {std::int64_t{4}},
+        typedRaw);
+    require(typedBranch.succeeded &&
+            std::get<std::int64_t>(typedBranch.value) == 5 &&
+            typedBranch.statistics.branchesTaken != 0,
+        "typed AOT direct block transfer returned an invalid result or branch count");
+
     typedRaw.limits.instructionBudget = 1;
     const auto typedExhausted = aot.invoke(
         "Phase5.App::failDivision",
@@ -170,6 +189,28 @@ void testBudgetsTracingAndGcRoots() {
             typedExhausted.error.code ==
                 realscript::runtime::ErrorCode::InstructionBudgetExceeded,
         "typed AOT raw accounting ignored the instruction budget");
+
+    typedRaw.limits.instructionBudget = 4;
+    const auto beforeDivision = aot.invoke(
+        "Phase5.App::failDivision",
+        {std::int64_t{0}},
+        typedRaw);
+    require(!beforeDivision.succeeded &&
+            beforeDivision.error.code ==
+                realscript::runtime::ErrorCode::InstructionBudgetExceeded &&
+            beforeDivision.instructionsExecuted == 4,
+        "typed AOT batched accounting crossed a failing instruction boundary");
+
+    typedRaw.limits.instructionBudget = 5;
+    const auto atDivision = aot.invoke(
+        "Phase5.App::failDivision",
+        {std::int64_t{0}},
+        typedRaw);
+    require(!atDivision.succeeded &&
+            atDivision.error.code ==
+                realscript::runtime::ErrorCode::DivisionByZero &&
+            atDivision.instructionsExecuted == 5,
+        "typed AOT batched accounting changed runtime-error precedence");
 
     realscript::runtime::ExecutionOptions recursive;
     recursive.limits.recursionLimit = 3;

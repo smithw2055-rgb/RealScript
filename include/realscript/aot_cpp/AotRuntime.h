@@ -216,13 +216,17 @@ public:
     [[nodiscard]] bool fastAccountingEnabled() const noexcept {
         return fastAccounting_;
     }
-    [[nodiscard]] bool consumeRawTyped() {
-        if (executed_ >= options_.limits.instructionBudget) {
+    [[nodiscard]] bool consumeRawTyped(std::uint64_t count = 1) {
+        if (count == 0) return true;
+        const auto budget = options_.limits.instructionBudget;
+        if (executed_ >= budget || count > budget - executed_) {
+            executed_ = budget;
+            statistics_.instructionsExecuted = executed_;
             return fail(
                 runtime::ErrorCode::InstructionBudgetExceeded,
                 "instruction budget exceeded");
         }
-        ++executed_;
+        executed_ += count;
         statistics_.instructionsExecuted = executed_;
         return true;
     }

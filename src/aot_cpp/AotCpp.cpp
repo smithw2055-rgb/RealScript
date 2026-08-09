@@ -423,33 +423,74 @@ void emitTypedTransfer(
     output.line(indent + "    context.branchRawTyped();");
     output.line(indent + "} else if (!context.branch(" +
         std::to_string(target) + ")) return false;");
-    output.line(indent + "currentBlock = " + std::to_string(target) + ";");
+    output.line(indent + "goto typedBlock_" + std::to_string(target) + ";");
+}
+
+void emitTypedRawConsume(
+    Emitter& output,
+    std::uint64_t count,
+    const std::string& indent) {
+    if (count == 0) return;
+    output.line(indent + "if constexpr (FastAccounting) {");
+    output.line(indent + "    if (!context.consumeRawTyped(" +
+        std::to_string(count) + "ULL)) return false;");
+    output.line(indent + "}");
 }
 
 void emitTypedConsume(
     Emitter& output,
     mir::Opcode opcode,
     const std::string& indent) {
-    output.line(indent + "if constexpr (FastAccounting) {");
-    output.line(indent + "    if (!context.consumeRawTyped()) return false;");
-    output.line(indent + "} else if (!context.consume(" +
+    output.line(indent + "if constexpr (!FastAccounting) {");
+    output.line(indent + "    if (!context.consume(" +
         std::to_string(runtime::determinismOperationId(
             mir::opcodeName(opcode))) + "ULL, \"" +
         escapeCppString(mir::opcodeName(opcode)) +
         "\")) return false;");
+    output.line(indent + "}");
 }
 
 void emitTypedConsume(
     Emitter& output,
     mir::TerminatorKind terminator,
     const std::string& indent) {
-    output.line(indent + "if constexpr (FastAccounting) {");
-    output.line(indent + "    if (!context.consumeRawTyped()) return false;");
-    output.line(indent + "} else if (!context.consume(" +
+    output.line(indent + "if constexpr (!FastAccounting) {");
+    output.line(indent + "    if (!context.consume(" +
         std::to_string(runtime::determinismOperationId(
             mir::terminatorName(terminator))) + "ULL, \"" +
         escapeCppString(mir::terminatorName(terminator)) +
         "\")) return false;");
+    output.line(indent + "}");
+}
+
+bool typedInstructionCanFail(mir::Opcode opcode) noexcept {
+    switch (opcode) {
+    case mir::Opcode::Parameter:
+    case mir::Opcode::AddInt:
+    case mir::Opcode::SubtractInt:
+    case mir::Opcode::MultiplyInt:
+    case mir::Opcode::DivideInt:
+    case mir::Opcode::RemainderInt:
+    case mir::Opcode::NegateInt:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::vector<std::uint64_t> typedRawConsumeBatches(
+    const mir::BasicBlock& block) {
+    // End each batch at an operation that can fail. This preserves whether
+    // budget exhaustion or the script error is observed first.
+    std::vector<std::uint64_t> result(block.instructions.size() + 1, 0);
+    std::size_t batchStart = 0;
+    for (std::size_t index = 0; index < block.instructions.size(); ++index) {
+        if (!typedInstructionCanFail(block.instructions[index].opcode)) continue;
+        result[batchStart] = index - batchStart + 1;
+        batchStart = index + 1;
+    }
+    result[batchStart] = block.instructions.size() - batchStart + 1;
+    return result;
 }
 
 void emitTypedPrimitiveFunction(
@@ -478,12 +519,12 @@ void emitTypedPrimitiveFunction(
         source.line("    " + typedCppType(types[index]) + " " +
             typedValueExpression(static_cast<mir::ValueId>(index)) + "{};");
     }
-    source.line("    std::uint32_t currentBlock = 0;");
-    source.line("    for (;;) {");
-    source.line("        switch (currentBlock) {");
+    source.line("    goto typedBlock_0;");
 
     for (const auto& block : function.blocks) {
-        source.line("        case " + std::to_string(block.id) + ": {");
+        source.line("    typedBlock_" + std::to_string(block.id) + ":");
+        source.line("    {");
+        const auto rawConsumeBatches = typedRawConsumeBatches(block);
         for (std::size_t instructionIndex = 0;
              instructionIndex < block.instructions.size();
              ++instructionIndex) {
@@ -496,6 +537,8 @@ void emitTypedPrimitiveFunction(
                 options.emitLineDirectives,
                 sourceMap,
                 function.symbolId);
+            emitTypedRawConsume(
+                source, rawConsumeBatches[instructionIndex], "            ");
             emitTypedConsume(source, instruction.opcode, "            ");
             const auto result = instruction.result >= 0
                 ? typedValueExpression(instruction.result)
@@ -617,6 +660,8 @@ void emitTypedPrimitiveFunction(
             options.emitLineDirectives,
             sourceMap,
             function.symbolId);
+        emitTypedRawConsume(
+            source, rawConsumeBatches[block.instructions.size()], "            ");
         emitTypedConsume(source, block.terminator.kind, "            ");
         switch (block.terminator.kind) {
         case mir::TerminatorKind::ReturnVoid:
@@ -636,7 +681,6 @@ void emitTypedPrimitiveFunction(
             emitTypedTransfer(
                 source, function, block.terminator.target,
                 block.terminator.arguments, "typedEdge", "            ");
-            source.line("            continue;");
             break;
         case mir::TerminatorKind::Branch:
             source.line("            if (" +
@@ -649,19 +693,13 @@ void emitTypedPrimitiveFunction(
                 source, function, block.terminator.falseTarget,
                 block.terminator.falseArguments, "typedFalseEdge", "                ");
             source.line("            }");
-            source.line("            continue;");
             break;
         case mir::TerminatorKind::Throw:
         case mir::TerminatorKind::None:
             break;
         }
-        source.line("        }");
+        source.line("    }");
     }
-    source.line("        default:");
-    source.line("            return context.fail(runtime::ErrorCode::InvalidProgram, "
-        "\"AOT branch target is invalid\");");
-    source.line("        }");
-    source.line("    }");
     source.line("}");
     source.line();
     source.line("static bool " + view.cppName + "(");

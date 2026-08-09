@@ -8,12 +8,12 @@
 2. Strict determinism 和 ProfileCollector 在每条指令上构造包含字符串的事件、哈希并（profiled 时）加锁更新 map。
 3. P2 前 AOT/JIT 仍执行基于 `runtime::Value` 的 compiled MIR，并为每条 MIR 操作调用 `ExecutionContext::consume()`，不是 typed native code。
 
-当前已完成 P0 Runtime Image、P1 instrumentation 热路径优化，以及 P2 Typed AOT 第一阶段。整数/布尔 primitive MIR 已直接生成 C++ 标量，整数循环 AOT RAW 从记录的 3.033 ms 降到 360.98 us。下一阶段的主要目标是扩大 Typed AOT 覆盖并减少逐指令 accounting/CFG 状态机成本、优化 Interpreter frame/branch/dispatch，以及建立产品级 macrobench。
+当前已完成 P0 Runtime Image、P1 instrumentation 热路径优化，以及 P2 Typed AOT 前两个阶段。整数/布尔 primitive MIR 已直接生成 C++ 标量，Typed CFG 使用直接 block labels，RAW accounting 按错误边界安全合并；整数循环 AOT RAW 从记录的 3.033 ms 降到 41.64 us。下一阶段的主要目标是扩大 Typed AOT 覆盖、用范围分析消除可证明安全的 checked arithmetic、优化 Interpreter frame/branch/dispatch，以及建立产品级 macrobench。
 
 ## 测试环境
 
 - 初始基线 commit：`d8889964d2615db089fd98d7f73433f7fedbb7b1`
-- P2 工作树基点：`1e6334e6e8b514412a34af4df484610620600847`（P2 改动尚未提交）
+- P2 第二阶段工作树基点：`253f463`（第二阶段改动尚未提交）
 - OS：Windows 11 Home China，10.0.26200
 - CPU：AMD Ryzen 7 6800H，8C/16T
 - 内存：约 16 GB
@@ -154,6 +154,30 @@ RAW 且无 determinism/profile/trace、`gcWorkBudget=0` 时，Typed AOT 使用�
 
 P2 后 AOT 与 JIT RAW 已基本持平，说明 JIT 没有额外运行时瓶颈；距离 native 仍约 89–91 倍。当前主要剩余成本是每 MIR 指令的预算/统计更新、`switch (currentBlock)` 控制流状态机以及 checked arithmetic。下一阶段应优先研究保持精确 instruction-budget 语义的 block-level 批量 accounting 和结构化 CFG 生成，再扩大到 call、long/double 与混合 boxed value。
 
+## P2 Typed AOT 第二阶段结果
+
+第二阶段针对第一阶段确认的两个热点做了独立 A/B 测量和实现：
+
+- Typed CFG 从 `for + switch(currentBlock)` dispatcher 改为验证后 block id 的直接 C++ labels/goto；通用 `runtime::Value` 路径保持原实现。
+- RAW accounting 将连续无失败操作合并，并让每个 batch 结束在 parameter validation、checked arithmetic、除零或溢出等可能失败的操作上；当 batch 超出剩余预算时，instruction count 精确推进到 budget 后报错。
+- Strict/profile/trace 继续逐操作调用 `context.consume(operationId, name)`，不参与 RAW 合并。
+
+分步结果表明，直接 labels 将 AOT RAW 从 360.98 us 降到约 284.98 us（1.27x）；failure-aware accounting batching 再降到 41.64 us（6.84x）。最终五个独立进程的中位数汇总如下：
+
+| Backend / mode | P2 第一阶段 | P2 第二阶段 | 本阶段改善 | 相对 native |
+|---|---:|---:|---:|---:|
+| Native C++ Release | 4.06 us | 4.12 us | — | 1.0x |
+| AOT RAW | 360.98 us | 41.64 us | 8.67x | 10.1x slower |
+| JIT RAW | 367.34 us | 41.86 us | 8.78x | 10.2x slower |
+| AOT Strict | 1.223 ms | 1.082 ms | 1.13x | 263x slower |
+| JIT Strict | 1.215 ms | 1.220 ms | noise | 296x slower |
+
+相对 P1 记录值，AOT/JIT RAW 的累计改善分别约为 72.8 倍和 70.0 倍。AOT 与 JIT RAW 仍保持同一性能区间，说明两者继续执行同一生成后端。Strict 的绝对时间没有回退，但由于 RAW 大幅加速，Strict/RAW 比率重新扩大到约 26–29 倍；详细逐操作 determinism 事件现在是 Strict 模式的明确主导成本。
+
+预算与错误优先级新增边界验证：`failDivision(0)` 在 budget 4 时返回 `InstructionBudgetExceeded` 且计数为 4，在 budget 5 时返回 `DivisionByZero` 且计数为 5；RAW 与详细路径的成功调用指令数一致。新增多 block typed fixture 同时覆盖直接分支、branch statistics，以及 Interpreter/AOT Strict digest/profile parity。
+
+距离 native 剩余约 10 倍。整数循环的主要剩余成本是每次循环仍有多个 failure-boundary accounting 更新和 checked overflow 分支；下一步适合加入 MIR range analysis，消除可证明不溢出的检查，并研究“整 block 预留 + 预算不足慢路径”以把常见路径压到每 block 一次 accounting，同时继续保持有限预算的精确错误顺序。
+
 ## GC idle tax
 
 对 `integer_loop` 做 7 组交错进程复测：
@@ -205,16 +229,18 @@ P2 后 AOT 与 JIT RAW 已基本持平，说明 JIT 没有额外运行时瓶颈�
 
 ### P2：Typed AOT
 
-状态：第一阶段已完成。
+状态：第二阶段已完成。
 
 - `int`/`bool` primitive MIR register/local 直接生成 C++ 标量；
 - checked 算术、比较、分支和 SSA block transfer 不再调用 `context.binary()` 或复制 `runtime::Value`；
 - ABI 边界保留参数校验与 result boxing；
 - RAW 使用轻量但仍精确的 instruction/branch accounting；
 - Strict/profile/trace 保持详细路径和跨后端事件一致性；
-- 不满足资格的函数整函数回退到原有通用生成器。
+- 不满足资格的函数整函数回退到原有通用生成器；
+- Typed CFG 使用直接 block labels，移除每次分支后的 dispatcher；
+- RAW accounting 按可能失败的操作边界合并，保留精确预算计数和错误优先级。
 
-第一阶段把整数循环 AOT RAW 降至约 361 us，与 JIT RAW 基本持平，但仍比 native 慢约 89 倍。第二阶段应解决逐指令 accounting 和 CFG 状态机，并扩大 primitive/call 覆盖。
+前两个阶段把整数循环 AOT RAW 从约 3.033 ms 降至 41.64 us，与 JIT RAW 基本持平，距离 native 缩小到约 10 倍。下一阶段应增加 range analysis、整 block 常见路径预留，并扩大 primitive/call 覆盖；Strict 的逐操作事件成本需要作为独立性能目标处理。
 
 ### P3：Interpreter frame、branch 与 dispatch
 
@@ -260,7 +286,7 @@ P2 后 AOT 与 JIT RAW 已基本持平，说明 JIT 没有额外运行时瓶颈�
 - Phase 2A：bytecode snapshot 与当前编译结果不一致；
 - Phase 21/23 AOT：结果一致，但 instruction accounting 与 Interpreter 分别相差 9 和 1。
 
-这些问题应单独修复后再恢复全量门禁（当前 CMake 列出 40 项测试）。Typed/Generic 混合生成、RAW instruction budget、C ABI 错误参数、Strict digest/profile parity 均已有回归覆盖。本轮没有提交或推送。
+这些问题应单独修复后再恢复全量门禁（当前 CMake 列出 40 项测试）。Typed/Generic 混合生成、直接 block labels、failure-aware RAW batch、预算/运行时错误优先级、C ABI 错误参数、Strict digest/profile parity 均已有回归覆盖。本轮没有提交或推送。
 
 ## 复现命令
 

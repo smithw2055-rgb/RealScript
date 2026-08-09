@@ -58,6 +58,16 @@ int failDivision(int divisor)
     return 10 / divisor;
 }
 
+int typedBranch(int value)
+{
+    int result = 0;
+    if (value > 0)
+        result = value + 1;
+    else
+        result = 0 - value;
+    return result;
+}
+
 int main()
 {
     return sumArray(5) + objectMath() + structMath() + enumMath();

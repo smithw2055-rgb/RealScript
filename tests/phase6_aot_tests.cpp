@@ -7,6 +7,7 @@
 #include "realscript/optimization/Optimizer.h"
 #include "realscript/runtime/Runtime.h"
 
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -100,6 +101,22 @@ void testCrossBackendDeterminismAndProfiling() {
         }
         throw std::runtime_error("interpreter/AOT execution digests diverged");
     }
+
+    const auto interpretedTyped = interpreter.invoke(
+        "Phase5.App::typedBranch",
+        {std::int64_t{4}},
+        interpreterOptions);
+    const auto compiledTyped = aot.invoke(
+        "Phase5.App::typedBranch",
+        {std::int64_t{4}},
+        aotOptions);
+    require(interpretedTyped.succeeded && compiledTyped.succeeded &&
+            interpretedTyped.value == compiledTyped.value &&
+            interpretedTyped.instructionsExecuted ==
+                compiledTyped.instructionsExecuted &&
+            interpretedTyped.determinismDigest ==
+                compiledTyped.determinismDigest,
+        "typed interpreter/AOT deterministic execution diverged");
     require(
         realscript::runtime::profileToJson(interpreterProfile->snapshot()) ==
             realscript::runtime::profileToJson(aotProfile->snapshot()),
