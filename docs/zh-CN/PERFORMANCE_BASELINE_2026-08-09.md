@@ -49,6 +49,34 @@ Raw 的平均成本约 93–103 ns/解释器指令。Strict 增至约 346–356 
 
 `EngineRuntime` 在此基础上每次创建 Interpreter，并从 ProgramImage 复制 modules。它在 128 函数程序上再增加约 33.5 us，但首要问题仍是 verify/index per invoke。
 
+## P0 Runtime Image 优化结果
+
+基于后续 `af1bbe4` 性能基线完成了 verify/link/index once：
+
+- ProgramImage 在 link 阶段建立稳定的 FunctionLocation 和 type 索引；
+- 从裸 bytecode 构造 Interpreter 时只 link 一次，并保存 link error；
+- 从 ProgramImage 构造 Interpreter 时只保留 shared image，不再复制 modules；
+- `invoke(SymbolId)` 直接解析 FunctionLocation；
+- name lookup 使用 ProgramImage 的 name index；
+- EngineRuntime 新增 SymbolId 入口，benchmark 不再把 name lookup 混入调用时间。
+
+21 个样本、每样本 20,000 次调用的 Release 复测：
+
+| 程序规模 / 路径 | P0 前 | P0 后 | 改善 |
+|---|---:|---:|---:|
+| 1 function / Interpreter | 4.041 us | 0.855 us | -78.8% |
+| 128 functions / Interpreter | 407.130 us | 1.027 us | -99.75% |
+| 1 function / EngineRuntime | 6.446 us | 1.020 us | -84.2% |
+| 128 functions / EngineRuntime | 440.641 us | 0.977 us | -99.78% |
+
+128 函数 Interpreter 的宿主调用约加速 396 倍。更重要的是，1/128 函数结果已经落在同一个约 1 us 噪声区间，调用时间不再随未调用函数数线性增长。
+
+长循环复测没有显示吞吐回退：`integer_loop` raw 12.064 ms、`branch_loop` raw 17.156 ms、`function_call` raw 18.082 ms，均与 P0 前基线处于相同波动范围。
+
+Release 定向回归 7/7 通过：Phase 2C、Phase 6 JIT/core/AOT/benchmark smoke、Phase 19 runtime polymorphism/AOT。新增测试覆盖 ProgramImage copy/move 后的函数/类型索引生命周期以及 EngineRuntime SymbolId 直达调用。
+
+广覆盖 Release 验证为 32/35 通过。除已知无法生成的 Phase 20/24 AOT 和依赖 `rsc` 的打包测试外，新发现的三个基线阻塞为：Phase 2A bytecode snapshot 漂移；Phase 21 AOT 指令计数 Interpreter 3,549、AOT 3,540；Phase 23 NullableRoundTrip 指令计数 Interpreter 23、AOT 22。后两项执行结果一致，差异位于既有 AOT/Interpreter accounting parity，不在 P0 的 verify/index/copy 路径。
+
 ## Interpreter O0/O1/O2
 
 | Benchmark | O0 | O1 | O2 | O0/O1/O2 指令数 |
@@ -106,6 +134,8 @@ JIT cold 编译为 3,617 ms，紧随其后的 cache hit 为 2.61 ms。JIT 性能
 
 ### P0：Runtime Image 与宿主调用热路径
 
+状态：已完成。当前 1/128 函数宿主调用均约 1 us，以下架构条件已经满足。
+
 验收条件：
 
 - bytecode verify：0 次 / invoke；
@@ -117,6 +147,8 @@ JIT cold 编译为 3,617 ms，紧随其后的 cache hit 为 2.61 ms。JIT 性能
 建议让 ProgramImage 持有稳定的 function/type/dispatch/assignability 索引，Interpreter 和 EngineRuntime 只引用该不可变 image。
 
 ### P1：确定性与 profiling 成本
+
+状态：下一优化优先级。
 
 Raw 关闭路径已经不再生成逐事件对象。Strict/Profiled 下一步应：
 
@@ -171,8 +203,10 @@ CPU-heavy benchmark 已满足启动 Typed AOT 的信号：AOT 虽比 Interpreter
 - Phase 20 AOT：`RS6001`，含 `RS3004` / `RS3082`；
 - Phase 24 AOT：`RS6001`，含 `RS3064`；
 - `rsc`：`tools/rsc/main.cpp` 使用 `std::filesystem` 但缺少完整声明。
+- Phase 2A：bytecode snapshot 与当前编译结果不一致；
+- Phase 21/23 AOT：结果一致，但 instruction accounting 与 Interpreter 分别相差 9 和 1。
 
-这些问题应单独修复后再恢复 37/37（当前 CMake 已列出 39 项）全量门禁。本轮没有提交或推送。
+这些问题应单独修复后再恢复全量门禁（当前 CMake 列出 40 项测试）。本轮没有提交或推送。
 
 ## 复现命令
 

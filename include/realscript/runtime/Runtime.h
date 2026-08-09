@@ -652,6 +652,16 @@ private:
 
 class ProgramImage {
 public:
+    struct FunctionLocation {
+        const bytecode::Module* module = nullptr;
+        const bytecode::Function* function = nullptr;
+    };
+
+    ProgramImage(const ProgramImage& other);
+    ProgramImage& operator=(const ProgramImage& other);
+    ProgramImage(ProgramImage&&) noexcept = default;
+    ProgramImage& operator=(ProgramImage&&) noexcept = default;
+
     static std::optional<ProgramImage> link(
         std::vector<bytecode::Module> modules,
         RuntimeError& error);
@@ -662,12 +672,17 @@ public:
     [[nodiscard]] bool contains(semantic::SymbolId symbolId) const noexcept;
     [[nodiscard]] std::optional<semantic::SymbolId> findFunction(
         const std::string& qualifiedName) const;
+    [[nodiscard]] const FunctionLocation* resolveFunction(
+        semantic::SymbolId symbolId) const noexcept;
+    [[nodiscard]] const semantic::TypeSymbol* resolveType(
+        semantic::SymbolId typeId) const noexcept;
 
 private:
     explicit ProgramImage(std::vector<bytecode::Module> modules);
 
     std::vector<bytecode::Module> modules_;
-    std::unordered_map<semantic::SymbolId, std::string> functions_;
+    std::unordered_map<semantic::SymbolId, FunctionLocation> functions_;
+    std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> types_;
     std::unordered_map<std::string, semantic::SymbolId> names_;
 };
 
@@ -702,8 +717,8 @@ public:
         ExecutionOptions options) const;
 
 private:
-    std::vector<bytecode::Module> modules_;
     std::shared_ptr<const ProgramImage> program_;
+    RuntimeError programError_;
     ExternalFunction externalResolver_;
     std::shared_ptr<const BindingRegistry> bindings_;
     std::shared_ptr<ManagedHeap> heap_;
@@ -720,6 +735,10 @@ public:
     [[nodiscard]] std::shared_ptr<NativeHandleRegistry> nativeHandles() const noexcept;
     [[nodiscard]] ExecutionResult invoke(
         const std::string& qualifiedName,
+        const std::vector<Value>& arguments = {},
+        ExecutionOptions options = {}) const;
+    [[nodiscard]] ExecutionResult invoke(
+        semantic::SymbolId symbolId,
         const std::vector<Value>& arguments = {},
         ExecutionOptions options = {}) const;
     [[nodiscard]] const ProgramImage& program() const noexcept;

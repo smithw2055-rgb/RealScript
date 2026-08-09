@@ -446,12 +446,27 @@ std::size_t BindingRegistry::size() const noexcept { return bySymbol_.size() + b
 ProgramImage::ProgramImage(std::vector<bytecode::Module> modules)
     : modules_(std::move(modules)) {
     for (const auto& module : modules_) {
+        for (const auto& type : module.types) {
+            types_.emplace(type.id, &type);
+        }
         for (const auto& function : module.functions) {
             const auto qualified = module.name + "::" + function.name;
-            functions_.emplace(function.symbolId, qualified);
+            functions_.emplace(
+                function.symbolId,
+                FunctionLocation{&module, &function});
             names_.emplace(qualified, function.symbolId);
         }
     }
+}
+
+ProgramImage::ProgramImage(const ProgramImage& other)
+    : ProgramImage(other.modules_) {}
+
+ProgramImage& ProgramImage::operator=(const ProgramImage& other) {
+    if (this == &other) return *this;
+    ProgramImage replacement(other);
+    *this = std::move(replacement);
+    return *this;
 }
 
 std::optional<ProgramImage> ProgramImage::link(
@@ -503,6 +518,18 @@ std::optional<semantic::SymbolId> ProgramImage::findFunction(const std::string& 
     return found->second;
 }
 
+const ProgramImage::FunctionLocation* ProgramImage::resolveFunction(
+    semantic::SymbolId symbolId) const noexcept {
+    const auto found = functions_.find(symbolId);
+    return found == functions_.end() ? nullptr : &found->second;
+}
+
+const semantic::TypeSymbol* ProgramImage::resolveType(
+    semantic::SymbolId typeId) const noexcept {
+    const auto found = types_.find(typeId);
+    return found == types_.end() ? nullptr : found->second;
+}
+
 EngineRuntime::EngineRuntime(std::shared_ptr<const ProgramImage> program)
     : program_(std::move(program)),
       heap_(std::make_shared<ManagedHeap>()),
@@ -540,9 +567,33 @@ ExecutionResult EngineRuntime::invoke(
         result.error.message = "runtime has no linked program image";
         return result;
     }
+    const auto entry = program->findFunction(qualifiedName);
+    if (!entry) {
+        ExecutionResult result;
+        result.error.code = ErrorCode::FunctionNotFound;
+        result.error.message =
+            "entry function '" + qualifiedName + "' was not found";
+        return result;
+    }
     Interpreter interpreter(std::move(program), heap_);
     interpreter.setBindingRegistry(bindings_);
-    return interpreter.invoke(qualifiedName, arguments, std::move(options));
+    return interpreter.invoke(*entry, arguments, std::move(options));
+}
+
+ExecutionResult EngineRuntime::invoke(
+    semantic::SymbolId symbolId,
+    const std::vector<Value>& arguments,
+    ExecutionOptions options) const {
+    auto program = programSnapshot();
+    if (!program) {
+        ExecutionResult result;
+        result.error.code = ErrorCode::InvalidProgram;
+        result.error.message = "runtime has no linked program image";
+        return result;
+    }
+    Interpreter interpreter(std::move(program), heap_);
+    interpreter.setBindingRegistry(bindings_);
+    return interpreter.invoke(symbolId, arguments, std::move(options));
 }
 
 const ProgramImage& EngineRuntime::program() const noexcept {

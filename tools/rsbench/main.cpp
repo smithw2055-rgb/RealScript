@@ -309,7 +309,7 @@ int main(int argc, char** argv) {
         const auto invoke = [&](realscript::runtime::ExecutionOptions options) {
             return interpreter
                 ? interpreter->invoke(entrySymbol, {}, std::move(options))
-                : engineRuntime->invoke(entry, {}, std::move(options));
+                : engineRuntime->invoke(entrySymbol, {}, std::move(options));
         };
         for (std::uint64_t index = 0; index < warmup; ++index) {
             const auto result = invoke(execution);

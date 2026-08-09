@@ -35,6 +35,54 @@ void testProgramImageLinksOnce() {
     require(image->findFunction("Demo::main").has_value(), "linked function not indexed");
 }
 
+void testRuntimeImageIndexesSurviveMove() {
+    auto modules = compile({{"indexed.rs", R"(
+module Demo.Indexed;
+class Box
+{
+    int value;
+    Box(int initial) { value = initial; }
+    int Read() { return value; }
+}
+int main() { Box box = new Box(42); return box.Read(); }
+)"}});
+    realscript::runtime::RuntimeError error;
+    auto image = realscript::runtime::ProgramImage::link(
+        std::move(modules), error);
+    require(image.has_value(),
+        "indexed runtime image failed to link: " + error.message);
+    const auto entry = image->findFunction("Demo.Indexed::main");
+    require(entry.has_value(), "indexed runtime image lost the entry name");
+    const auto* beforeMove = image->resolveFunction(*entry);
+    require(beforeMove && beforeMove->module && beforeMove->function &&
+            beforeMove->module->name == "Demo.Indexed" &&
+            beforeMove->function->name == "main",
+        "runtime function index does not resolve its bytecode location");
+    const auto boxTypeId = realscript::semantic::stableTypeId(
+        "Demo.Indexed::Box");
+    require(image->resolveType(boxTypeId) != nullptr,
+        "runtime type index does not resolve the linked class");
+
+    realscript::runtime::ProgramImage copied(*image);
+    const auto* afterCopy = copied.resolveFunction(*entry);
+    require(afterCopy && afterCopy->module && afterCopy->function &&
+            afterCopy->function != beforeMove->function &&
+            copied.resolveType(boxTypeId) != nullptr,
+        "copied ProgramImage did not rebuild its pointer indexes");
+
+    auto shared = std::make_shared<realscript::runtime::ProgramImage>(
+        std::move(copied));
+    const auto* afterMove = shared->resolveFunction(*entry);
+    require(afterMove && afterMove->module && afterMove->function &&
+            shared->resolveType(boxTypeId) != nullptr,
+        "runtime indexes became invalid after ProgramImage move");
+    realscript::runtime::EngineRuntime runtime(shared);
+    const auto result = runtime.invoke(*entry);
+    require(result.succeeded &&
+            std::get<std::int64_t>(result.value) == 42,
+        "SymbolId-directed EngineRuntime invocation failed");
+}
+
 void testDuplicateSymbolsRejected() {
     auto modules = compile({{"main.rs", "module Demo; int main() { return 1; }"}});
     auto duplicate = modules.front();
@@ -159,6 +207,8 @@ int main() {
         }
     };
     run("Program image links once", testProgramImageLinksOnce);
+    run("Runtime image indexes survive move",
+        testRuntimeImageIndexesSurviveMove);
     run("Duplicate symbols rejected", testDuplicateSymbolsRejected);
     run("Qualified overloads link by SymbolId",
         testQualifiedOverloadsLinkBySymbolIdentity);

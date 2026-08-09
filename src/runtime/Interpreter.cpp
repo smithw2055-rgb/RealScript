@@ -13,19 +13,13 @@
 namespace realscript::runtime {
 namespace {
 
-struct FunctionLocation {
-    const bytecode::Module* module = nullptr;
-    const bytecode::Function* function = nullptr;
-};
-
 struct State {
     Limits limits;
     std::uint64_t executed = 0;
     RuntimeStatistics statistics;
     RuntimeError error;
     std::vector<std::string> stack;
-    const std::unordered_map<semantic::SymbolId, FunctionLocation>* functions = nullptr;
-    const std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*>* types = nullptr;
+    const ProgramImage* program = nullptr;
     const ExternalFunction* externalResolver = nullptr;
     const BindingRegistry* bindings = nullptr;
     const TraceSink* trace = nullptr;
@@ -162,18 +156,18 @@ bool runtimeAssignable(
     semantic::SymbolId actual,
     semantic::SymbolId expected) {
     if (actual == expected) return true;
-    if (!state.types) return false;
+    if (!state.program) return false;
     std::unordered_set<semantic::SymbolId> visited;
     auto current = actual;
     while (current != 0 && visited.insert(current).second) {
-        const auto found = state.types->find(current);
-        if (found == state.types->end()) return false;
+        const auto* found = state.program->resolveType(current);
+        if (!found) return false;
         for (const auto& implementation :
-             found->second->interfaceDispatchMaps) {
+             found->interfaceDispatchMaps) {
             if (implementation.interfaceTypeId == expected) return true;
         }
-        if (found->second->baseTypeId == expected) return true;
-        current = found->second->baseTypeId;
+        if (found->baseTypeId == expected) return true;
+        current = found->baseTypeId;
     }
     return false;
 }
@@ -182,19 +176,19 @@ const semantic::InterfaceDispatchMap* runtimeInterfaceMap(
     const State& state,
     semantic::SymbolId actual,
     semantic::SymbolId interfaceTypeId) {
-    if (!state.types) return nullptr;
+    if (!state.program) return nullptr;
     std::unordered_set<semantic::SymbolId> visited;
     auto current = actual;
     while (current != 0 && visited.insert(current).second) {
-        const auto found = state.types->find(current);
-        if (found == state.types->end()) return nullptr;
+        const auto* found = state.program->resolveType(current);
+        if (!found) return nullptr;
         for (const auto& implementation :
-             found->second->interfaceDispatchMaps) {
+             found->interfaceDispatchMaps) {
             if (implementation.interfaceTypeId == interfaceTypeId) {
                 return &implementation;
             }
         }
-        current = found->second->baseTypeId;
+        current = found->baseTypeId;
     }
     return nullptr;
 }
@@ -491,7 +485,7 @@ bool debugSequencePoint(
 
 bool executeFunction(
     State& state,
-    const FunctionLocation& location,
+    const ProgramImage::FunctionLocation& location,
     const std::vector<Value>& arguments,
     Value& result);
 
@@ -552,19 +546,19 @@ bool executeCall(
         const auto actualTypeId = receiver && state.heap
             ? state.heap->objectTypeId(*receiver)
             : std::optional<semantic::SymbolId>{};
-        if (!actualTypeId || !state.types) {
+        if (!actualTypeId || !state.program) {
             return fail(state, ErrorCode::InvalidObjectReference,
                 "virtual call receiver has no runtime type descriptor");
         }
-        const auto actualType = state.types->find(*actualTypeId);
-        if (actualType == state.types->end() ||
+        const auto* actualType = state.program->resolveType(*actualTypeId);
+        if (!actualType ||
             reference.virtualSlot >=
-                actualType->second->virtualDispatchTable.size()) {
+                actualType->virtualDispatchTable.size()) {
             return fail(state, ErrorCode::InvalidProgram,
                 "virtual call slot is outside the runtime dispatch table");
         }
         targetSymbolId =
-            actualType->second->virtualDispatchTable[reference.virtualSlot];
+            actualType->virtualDispatchTable[reference.virtualSlot];
         if (targetSymbolId == 0) {
             return fail(state, ErrorCode::InvalidProgram,
                 "virtual call reached an abstract runtime slot");
@@ -608,9 +602,11 @@ bool executeCall(
         }
     }
 
-    const auto found = state.functions->find(targetSymbolId);
-    if (found != state.functions->end()) {
-        return executeFunction(state, found->second, arguments, result);
+    const auto* found = state.program
+        ? state.program->resolveFunction(targetSymbolId)
+        : nullptr;
+    if (found) {
+        return executeFunction(state, *found, arguments, result);
     }
     if (reference.virtualDispatch || reference.interfaceDispatch) {
         return fail(state, ErrorCode::InvalidProgram,
@@ -1521,24 +1517,24 @@ bool executeInstruction(
             const auto runtimeType = receiver
                 ? state.heap->objectTypeId(*receiver)
                 : std::optional<semantic::SymbolId>{};
-            if (!runtimeType || !state.types) {
+            if (!runtimeType || !state.program) {
                 return fail(state, ErrorCode::InvalidObjectReference,
                     "delegate receiver has no runtime type");
             }
-            const auto foundType = state.types->find(*runtimeType);
-            if (foundType == state.types->end()) {
+            const auto* foundType = state.program->resolveType(*runtimeType);
+            if (!foundType) {
                 return fail(state, ErrorCode::InvalidProgram,
                     "delegate receiver descriptor is unavailable");
             }
             const auto dispatchSlot = static_cast<std::uint32_t>(*slot);
             if (virtualDispatch) {
                 if (dispatchSlot >=
-                    foundType->second->virtualDispatchTable.size()) {
+                    foundType->virtualDispatchTable.size()) {
                     return fail(state, ErrorCode::InvalidProgram,
                         "delegate virtual slot is invalid");
                 }
-                targetSymbolId = foundType->second
-                    ->virtualDispatchTable[dispatchSlot];
+                targetSymbolId =
+                    foundType->virtualDispatchTable[dispatchSlot];
             } else {
                 semantic::SymbolId interfaceTypeId = 0;
                 if (!readDelegateId(
@@ -1555,14 +1551,16 @@ bool executeInstruction(
                 targetSymbolId = map->slots[dispatchSlot];
             }
         }
-        const auto found = state.functions->find(targetSymbolId);
-        if (found == state.functions->end()) {
+        const auto* found = state.program
+            ? state.program->resolveFunction(targetSymbolId)
+            : nullptr;
+        if (!found) {
             return fail(state, ErrorCode::InvalidProgram,
                 "delegate target function is unavailable");
         }
         Value delegateResult;
         if (!executeFunction(
-                state, found->second, delegateArguments, delegateResult)) {
+                state, *found, delegateArguments, delegateResult)) {
             return false;
         }
         if (instruction.result == bytecode::InvalidRegister) return true;
@@ -1814,7 +1812,7 @@ bool executeInstruction(
 
 bool executeFunction(
     State& state,
-    const FunctionLocation& location,
+    const ProgramImage::FunctionLocation& location,
     const std::vector<Value>& arguments,
     Value& result) {
     const auto& function = *location.function;
@@ -2015,8 +2013,12 @@ bool executeFunction(
 } // namespace
 
 Interpreter::Interpreter(std::vector<bytecode::Module> modules)
-    : modules_(std::move(modules)),
-      heap_(std::make_shared<ManagedHeap>()) {}
+    : heap_(std::make_shared<ManagedHeap>()) {
+    auto linked = ProgramImage::link(std::move(modules), programError_);
+    if (linked) {
+        program_ = std::make_shared<ProgramImage>(std::move(*linked));
+    }
+}
 
 Interpreter::Interpreter(std::shared_ptr<const ProgramImage> program)
     : Interpreter(std::move(program), std::make_shared<ManagedHeap>()) {}
@@ -2026,7 +2028,10 @@ Interpreter::Interpreter(
     std::shared_ptr<ManagedHeap> heap)
     : program_(std::move(program)),
       heap_(heap ? std::move(heap) : std::make_shared<ManagedHeap>()) {
-    if (program_) modules_ = program_->modules();
+    if (!program_) {
+        programError_.code = ErrorCode::InvalidProgram;
+        programError_.message = "interpreter has no linked program image";
+    }
 }
 
 void Interpreter::setExternalResolver(ExternalFunction resolver) {
@@ -2056,30 +2061,17 @@ ExecutionResult Interpreter::invoke(
     semantic::SymbolId symbolId,
     const std::vector<Value>& arguments,
     ExecutionOptions options) const {
-    std::unordered_map<semantic::SymbolId, FunctionLocation> functions;
-    std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> types;
-    for (const auto& module : modules_) {
-        diagnostics::DiagnosticBag diagnostics;
-        if (!bytecode::verifyModule(module, diagnostics)) {
-            ExecutionResult invalid;
+    if (!program_) {
+        ExecutionResult invalid;
+        invalid.error = programError_;
+        if (invalid.error.code == ErrorCode::None) {
             invalid.error.code = ErrorCode::InvalidProgram;
-            invalid.error.message = "bytecode verification failed before execution";
-            return invalid;
+            invalid.error.message = "interpreter has no linked program image";
         }
-        for (const auto& type : module.types) {
-            types.emplace(type.id, &type);
-        }
-        for (const auto& function : module.functions) {
-            if (!functions.emplace(function.symbolId, FunctionLocation{&module, &function}).second) {
-                ExecutionResult duplicate;
-                duplicate.error.code = ErrorCode::InvalidProgram;
-                duplicate.error.message = "duplicate function SymbolId across loaded modules";
-                return duplicate;
-            }
-        }
+        return invalid;
     }
-    const auto found = functions.find(symbolId);
-    if (found == functions.end()) {
+    const auto* found = program_->resolveFunction(symbolId);
+    if (!found) {
         ExecutionResult missing;
         missing.error.code = ErrorCode::FunctionNotFound;
         missing.error.message = "entry function was not found";
@@ -2087,8 +2079,7 @@ ExecutionResult Interpreter::invoke(
     }
     State state;
     state.limits = options.limits;
-    state.functions = &functions;
-    state.types = &types;
+    state.program = program_.get();
     state.externalResolver = &externalResolver_;
     state.bindings = bindings_.get();
     state.trace = &options.trace;
@@ -2101,12 +2092,11 @@ ExecutionResult Interpreter::invoke(
     state.heap = heap_.get();
     state.debugger = options.debugger.get();
     if (state.debugger) {
-        if (program_) state.debugger->bindProgram(*program_);
-        else state.debugger->bindModules(modules_);
+        state.debugger->bindProgram(*program_);
     }
     Value value;
     ExecutionResult execution;
-    execution.succeeded = executeFunction(state, found->second, arguments, value);
+    execution.succeeded = executeFunction(state, *found, arguments, value);
     if (!execution.succeeded && state.pendingException &&
         state.error.code == ErrorCode::None) {
         state.error.code = ErrorCode::ScriptException;
@@ -2140,12 +2130,17 @@ ExecutionResult Interpreter::invoke(
     const std::string& qualifiedName,
     const std::vector<Value>& arguments,
     ExecutionOptions options) const {
-    for (const auto& module : modules_) {
-        for (const auto& function : module.functions) {
-            if (module.name + "::" + function.name == qualifiedName) {
-                return invoke(function.symbolId, arguments, std::move(options));
-            }
+    if (!program_) {
+        ExecutionResult invalid;
+        invalid.error = programError_;
+        if (invalid.error.code == ErrorCode::None) {
+            invalid.error.code = ErrorCode::InvalidProgram;
+            invalid.error.message = "interpreter has no linked program image";
         }
+        return invalid;
+    }
+    if (const auto symbolId = program_->findFunction(qualifiedName)) {
+        return invoke(*symbolId, arguments, std::move(options));
     }
     ExecutionResult missing;
     missing.error.code = ErrorCode::FunctionNotFound;
