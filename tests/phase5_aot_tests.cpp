@@ -94,6 +94,9 @@ void testDifferentialExecution() {
             {"Phase5.App::failDivision", {std::int64_t{0}}},
             {"Phase5.App::typedBranch", {std::int64_t{4}}},
             {"Phase5.App::typedBranch", {std::int64_t{-4}}},
+            {"Phase5.App::boundedIncrement", {std::int64_t{99}}},
+            {"Phase5.App::boundedIncrement", {std::int64_t{100}}},
+            {"Phase5.App::boundedIncrement", {std::int64_t{2147483647}}},
             {"Phase5.App::failOverflow", {}},
             {"Phase5.App::failLongOverflow", {}},
             {"Phase5.App::failBounds", {}},
@@ -179,6 +182,19 @@ void testBudgetsTracingAndGcRoots() {
             std::get<std::int64_t>(typedBranch.value) == 5 &&
             typedBranch.statistics.branchesTaken != 0,
         "typed AOT direct block transfer returned an invalid result or branch count");
+
+    const auto boundedIncrement = aot.invoke(
+        "Phase5.App::boundedIncrement",
+        {std::int64_t{99}},
+        typedRaw);
+    const auto boundedBoundary = aot.invoke(
+        "Phase5.App::boundedIncrement",
+        {std::int64_t{2147483647}},
+        typedRaw);
+    require(boundedIncrement.succeeded && boundedBoundary.succeeded &&
+            std::get<std::int64_t>(boundedIncrement.value) == 100 &&
+            std::get<std::int64_t>(boundedBoundary.value) == 2147483647,
+        "typed AOT range-proven arithmetic changed a branch boundary result");
 
     typedRaw.limits.instructionBudget = 1;
     const auto typedExhausted = aot.invoke(

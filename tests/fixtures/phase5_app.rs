@@ -68,6 +68,13 @@ int typedBranch(int value)
     return result;
 }
 
+int boundedIncrement(int value)
+{
+    if (value < 100)
+        return value + 1;
+    return value;
+}
+
 int main()
 {
     return sumArray(5) + objectMath() + structMath() + enumMath();

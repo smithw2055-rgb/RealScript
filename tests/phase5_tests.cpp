@@ -142,6 +142,12 @@ void testGeneratorDeterminismAndShape() {
             first.source.find("context.consumeRawTyped(") !=
                 std::string::npos,
         "AOT output did not select typed primitive scalar lowering");
+    require(first.source.find("range-proven checked arithmetic values:") !=
+                std::string::npos &&
+            first.source.find(
+                "checked arithmetic proven safe by integer range analysis") !=
+                std::string::npos,
+        "AOT output did not audit range-proven checked arithmetic lowering");
     require(first.source.find("#line ") != std::string::npos &&
             first.manifest.find("sourceMapCount") != std::string::npos,
         "AOT source mapping metadata is missing");

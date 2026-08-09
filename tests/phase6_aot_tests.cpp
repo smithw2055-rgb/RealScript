@@ -117,6 +117,21 @@ void testCrossBackendDeterminismAndProfiling() {
             interpretedTyped.determinismDigest ==
                 compiledTyped.determinismDigest,
         "typed interpreter/AOT deterministic execution diverged");
+    const auto interpretedBounded = interpreter.invoke(
+        "Phase5.App::boundedIncrement",
+        {std::int64_t{99}},
+        interpreterOptions);
+    const auto compiledBounded = aot.invoke(
+        "Phase5.App::boundedIncrement",
+        {std::int64_t{99}},
+        aotOptions);
+    require(interpretedBounded.succeeded && compiledBounded.succeeded &&
+            interpretedBounded.value == compiledBounded.value &&
+            interpretedBounded.instructionsExecuted ==
+                compiledBounded.instructionsExecuted &&
+            interpretedBounded.determinismDigest ==
+                compiledBounded.determinismDigest,
+        "range-proven typed interpreter/AOT deterministic execution diverged");
     require(
         realscript::runtime::profileToJson(interpreterProfile->snapshot()) ==
             realscript::runtime::profileToJson(aotProfile->snapshot()),
