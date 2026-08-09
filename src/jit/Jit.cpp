@@ -142,7 +142,9 @@ std::string compileCommand(
             command << quoteArgument(argument) << ' ';
         }
         command << quote(source) << ' ' << quote(options.supportLibrary)
-            << " /Fe:" << quote(library);
+            << " /Fe:" << quote(library)
+            << " /Fo:" << quote(
+                library.parent_path() / "realscript_aot_generated.obj");
     } else {
         command << "-std=c++17 -shared -fPIC -pthread "
             "-DREALSCRIPT_AOT_BUILD_SHARED_MODULE=1 ";
@@ -154,7 +156,11 @@ std::string compileCommand(
             << " -o " << quote(library);
     }
     command << " > " << quote(log) << " 2>&1";
+#if defined(_WIN32)
+    return "cmd.exe /D /S /C \"" + command.str() + "\"";
+#else
     return command.str();
+#endif
 }
 
 #if defined(_WIN32)

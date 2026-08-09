@@ -6,6 +6,7 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 option(REALSCRIPT_BUILD_TESTS "Build RealScript conformance tests" ON)
+option(REALSCRIPT_BUILD_BENCHMARKS "Build RealScript performance benchmarks" OFF)
 option(REALSCRIPT_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS "Run external C++ toolchain JIT integration tests" ON)
 option(REALSCRIPT_INSTALL_SDK "Generate installable RealScript SDK targets" ON)
@@ -152,6 +153,41 @@ foreach(realscript_tool IN ITEMS rsc rsdebug rslsp rsaot rsbench)
 endforeach()
 
 include(cmake/RealScriptAot.cmake)
+
+if(REALSCRIPT_BUILD_BENCHMARKS)
+    set(REALSCRIPT_BENCH_INTEGER_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/bench_integer")
+    realscript_add_aot_library(
+        realscript_bench_integer_generated
+        PROGRAM_NAME IntegerLoop
+        OUTPUT_DIRECTORY "${REALSCRIPT_BENCH_INTEGER_GENERATED_DIR}"
+        OPT_LEVEL 2
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/micro/integer_loop.rs"
+    )
+    add_executable(
+        rsbench_aot benchmarks/aot_integer_driver.cpp)
+    target_link_libraries(
+        rsbench_aot
+        PRIVATE realscript_bench_integer_generated RealScript::Full)
+    target_compile_features(rsbench_aot PRIVATE cxx_std_17)
+    realscript_enable_cxx_warnings(rsbench_aot)
+
+    add_executable(
+        rsbench_jit benchmarks/jit_integer_driver.cpp)
+    target_link_libraries(rsbench_jit PRIVATE RealScript::Full)
+    target_compile_features(rsbench_jit PRIVATE cxx_std_17)
+    target_compile_definitions(
+        rsbench_jit
+        PRIVATE
+            REALSCRIPT_BENCH_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+            REALSCRIPT_BENCH_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
+            REALSCRIPT_BENCH_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
+            REALSCRIPT_BENCH_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+            REALSCRIPT_BENCH_JIT_CACHE_BASE="${CMAKE_CURRENT_BINARY_DIR}/jit-benchmark-cache"
+    )
+    realscript_enable_cxx_warnings(rsbench_jit)
+endif()
 
 if(REALSCRIPT_BUILD_TESTS)
     enable_testing()

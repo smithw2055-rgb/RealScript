@@ -167,6 +167,10 @@ ExecutionContext::ExecutionContext(
       bindings_(std::move(bindings)),
       options_(std::move(options)),
       determinism_(options_.determinism) {
+    traceEventsEnabled_ =
+        options_.determinism.mode != runtime::DeterminismMode::Off ||
+        options_.profile != nullptr ||
+        static_cast<bool>(options_.trace);
     for (std::uint32_t index = 0; index < program.typeCount; ++index) {
         const auto& type = program.types[index];
         types_.emplace(type.id, &type);
@@ -215,6 +219,7 @@ const FunctionDescriptor* ExecutionContext::findFunction(
 void ExecutionContext::emitTrace(
     runtime::TraceEventKind kind,
     std::string operation) {
+    if (!traceEventsEnabled_) return;
     runtime::TraceEvent event;
     event.kind = kind;
     event.function = stack_.empty() ? std::string{} : stack_.back();
@@ -245,7 +250,9 @@ bool ExecutionContext::consume(std::string_view operation) {
     }
     ++executed_;
     statistics_.instructionsExecuted = executed_;
-    emitTrace(runtime::TraceEventKind::Instruction, std::string(operation));
+    if (traceEventsEnabled_) {
+        emitTrace(runtime::TraceEventKind::Instruction, std::string(operation));
+    }
     if (heap_ && options_.limits.gcWorkBudget != 0) {
         const auto work = heap_->step(
             shadowStack_,
@@ -260,7 +267,10 @@ bool ExecutionContext::consume(std::string_view operation) {
 
 bool ExecutionContext::branch(std::uint32_t blockId) {
     ++statistics_.branchesTaken;
-    emitTrace(runtime::TraceEventKind::Branch, "bb" + std::to_string(blockId));
+    if (traceEventsEnabled_) {
+        emitTrace(runtime::TraceEventKind::Branch,
+            "bb" + std::to_string(blockId));
+    }
     return true;
 }
 
@@ -514,9 +524,11 @@ bool ExecutionContext::invoke(
         stack_.pop_back();
         return false;
     }
-    emitTrace(
-        runtime::TraceEventKind::FunctionExit,
-        runtime::valueToString(result, heap_.get()));
+    if (traceEventsEnabled_) {
+        emitTrace(
+            runtime::TraceEventKind::FunctionExit,
+            runtime::valueToString(result, heap_.get()));
+    }
     stack_.pop_back();
     return true;
 }

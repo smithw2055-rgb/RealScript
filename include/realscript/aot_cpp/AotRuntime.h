@@ -339,6 +339,7 @@ private:
     std::shared_ptr<runtime::ManagedHeap> heap_;
     std::shared_ptr<const runtime::BindingRegistry> bindings_;
     runtime::ExecutionOptions options_;
+    bool traceEventsEnabled_ = false;
     runtime::RuntimeError error_;
     runtime::RuntimeStatistics statistics_;
     runtime::DeterminismSession determinism_;

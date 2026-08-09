@@ -30,6 +30,7 @@ struct State {
     const BindingRegistry* bindings = nullptr;
     const TraceSink* trace = nullptr;
     ProfileCollector* profile = nullptr;
+    bool traceEventsEnabled = false;
     DeterminismSession determinism;
     ManagedHeap* heap = nullptr;
     debug::DebugController* debugger = nullptr;
@@ -71,6 +72,7 @@ private:
 };
 
 void emitTrace(State& state, TraceEventKind kind, std::string operation = {}) {
+    if (!state.traceEventsEnabled) return;
     TraceEvent event;
     event.kind = kind;
     event.function = state.stack.empty() ? std::string{} : state.stack.back();
@@ -98,7 +100,7 @@ bool consume(State& state, std::string_view operation = {}) {
     }
     ++state.executed;
     state.statistics.instructionsExecuted = state.executed;
-    if (!operation.empty()) {
+    if (state.traceEventsEnabled && !operation.empty()) {
         emitTrace(state, TraceEventKind::Instruction, std::string(operation));
     }
     if (state.heap && state.limits.gcWorkBudget != 0) {
@@ -1933,8 +1935,10 @@ bool executeFunction(
         }
         if (terminator.kind == bytecode::TerminatorKind::ReturnVoid) {
             result = std::monostate{};
-            emitTrace(state, TraceEventKind::FunctionExit,
-                valueToString(result, state.heap));
+            if (state.traceEventsEnabled) {
+                emitTrace(state, TraceEventKind::FunctionExit,
+                    valueToString(result, state.heap));
+            }
             state.stack.pop_back();
             return true;
         }
@@ -1953,8 +1957,10 @@ bool executeFunction(
                 return false;
             }
             result = registers[terminator.value];
-            emitTrace(state, TraceEventKind::FunctionExit,
-                valueToString(result, state.heap));
+            if (state.traceEventsEnabled) {
+                emitTrace(state, TraceEventKind::FunctionExit,
+                    valueToString(result, state.heap));
+            }
             state.stack.pop_back();
             return true;
         }
@@ -1977,7 +1983,10 @@ bool executeFunction(
         }
 
         ++state.statistics.branchesTaken;
-        emitTrace(state, TraceEventKind::Branch, "bb" + std::to_string(target));
+        if (state.traceEventsEnabled) {
+            emitTrace(state, TraceEventKind::Branch,
+                "bb" + std::to_string(target));
+        }
         const auto* next = findBlock(function, target);
         if (!next || next->parameters.size() != edgeArguments->size()) {
             state.stack.pop_back();
@@ -2084,6 +2093,10 @@ ExecutionResult Interpreter::invoke(
     state.bindings = bindings_.get();
     state.trace = &options.trace;
     state.profile = options.profile.get();
+    state.traceEventsEnabled =
+        options.determinism.mode != DeterminismMode::Off ||
+        state.profile != nullptr ||
+        (state.trace && static_cast<bool>(*state.trace));
     state.determinism = DeterminismSession(options.determinism);
     state.heap = heap_.get();
     state.debugger = options.debugger.get();
