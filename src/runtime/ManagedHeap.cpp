@@ -119,7 +119,9 @@ struct ManagedHeap::Impl {
     RootToken nextRootToken = 1;
     GcPhase phase = GcPhase::Idle;
     bool requested = false;
+    bool resumeSweep = false;
     std::size_t sweepIndex = 0;
+    std::size_t sweepLimit = 0;
     std::size_t nextCollectionThreshold = 0;
     GcStatistics statistics;
 
@@ -198,7 +200,7 @@ struct ManagedHeap::Impl {
             markStack.push_back(reference);
             if (phase == GcPhase::Sweep) {
                 phase = GcPhase::Mark;
-                sweepIndex = 0;
+                resumeSweep = true;
             }
         }
         return reference;
@@ -264,6 +266,8 @@ struct ManagedHeap::Impl {
         }
         markStack.clear();
         sweepIndex = 0;
+        sweepLimit = slots.size();
+        resumeSweep = false;
         phase = GcPhase::Mark;
         ++statistics.collectionsStarted;
         markRoots(shadowStack);
@@ -289,14 +293,16 @@ struct ManagedHeap::Impl {
         markValue(value);
         if (phase == GcPhase::Sweep && !markStack.empty()) {
             phase = GcPhase::Mark;
-            sweepIndex = 0;
+            resumeSweep = true;
         }
     }
 
     void finishCollection() {
         phase = GcPhase::Idle;
         requested = false;
+        resumeSweep = false;
         sweepIndex = 0;
+        sweepLimit = 0;
         ++statistics.collectionsCompleted;
         const auto doubled = statistics.liveBytes >
                 std::numeric_limits<std::size_t>::max() / 2
@@ -665,18 +671,18 @@ std::size_t ManagedHeap::step(
         impl_->startCollection(shadowStack);
     }
 
+    impl_->markRoots(shadowStack);
     std::size_t performed = 0;
     while (performed < workBudget) {
-        impl_->markRoots(shadowStack);
         if (impl_->phase == GcPhase::Sweep && !impl_->markStack.empty()) {
             impl_->phase = GcPhase::Mark;
-            impl_->sweepIndex = 0;
+            impl_->resumeSweep = true;
         }
         if (impl_->phase == GcPhase::Mark) {
-            impl_->markRoots(shadowStack);
             if (impl_->markStack.empty()) {
                 impl_->phase = GcPhase::Sweep;
-                impl_->sweepIndex = 0;
+                if (!impl_->resumeSweep) impl_->sweepIndex = 0;
+                impl_->resumeSweep = false;
                 continue;
             }
             const auto reference = impl_->markStack.back();
@@ -688,7 +694,7 @@ std::size_t ManagedHeap::step(
         }
 
         if (impl_->phase == GcPhase::Sweep) {
-            if (impl_->sweepIndex >= impl_->slots.size()) {
+            if (impl_->sweepIndex >= impl_->sweepLimit) {
                 impl_->finishCollection();
                 break;
             }
@@ -979,6 +985,8 @@ bool ManagedHeap::restore(
     impl_->markStack.clear();
     impl_->requested = false;
     impl_->sweepIndex = 0;
+    impl_->resumeSweep = false;
+    impl_->sweepLimit = 0;
     impl_->statistics = snapshot.statistics;
     impl_->statistics.liveObjects = snapshot.objects.size();
     impl_->statistics.liveBytes = liveBytes;

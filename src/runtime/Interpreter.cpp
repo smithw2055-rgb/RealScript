@@ -49,7 +49,7 @@ struct State {
     std::uint64_t executed = 0;
     RuntimeStatistics statistics;
     RuntimeError error;
-    std::vector<std::string> stack;
+    std::vector<const std::string*> stack;
     const ProgramImage* program = nullptr;
     const ExternalFunction* externalResolver = nullptr;
     const BindingRegistry* bindings = nullptr;
@@ -59,6 +59,7 @@ struct State {
     bool determinismEventsEnabled = false;
     bool determinismOnly = false;
     bool diagnosticEventsEnabled = false;
+    bool fastAccounting = false;
     std::uint64_t determinismEventDigest = DeterminismEventSeed;
     std::uint64_t determinismEventCount = 0;
     std::unordered_map<semantic::SymbolId, FunctionProfile> profileFunctions;
@@ -71,6 +72,16 @@ struct State {
     ShadowStack shadowStack;
     std::optional<Value> pendingException;
 };
+
+std::vector<std::string> materializeStack(
+    const std::vector<const std::string*>& stack) {
+    std::vector<std::string> result;
+    result.reserve(stack.size());
+    for (const auto* frame : stack) {
+        result.push_back(frame ? *frame : std::string{});
+    }
+    return result;
+}
 
 class ShadowFrameScope {
 public:
@@ -94,14 +105,20 @@ class DebugFrameScope {
 public:
     DebugFrameScope(State& state, debug::DebugFrameView view)
         : state_(state) {
-        state_.debugFrames.push_back(std::move(view));
+        if (state_.debugger) {
+            state_.debugFrames.push_back(std::move(view));
+            active_ = true;
+        }
     }
-    ~DebugFrameScope() { state_.debugFrames.pop_back(); }
+    ~DebugFrameScope() {
+        if (active_) state_.debugFrames.pop_back();
+    }
     DebugFrameScope(const DebugFrameScope&) = delete;
     DebugFrameScope& operator=(const DebugFrameScope&) = delete;
 
 private:
     State& state_;
+    bool active_ = false;
 };
 
 void emitTrace(
@@ -124,7 +141,7 @@ void emitTrace(
         ++state.profileEvents;
         auto& profile = state.profileFunctions[state.currentFunctionId];
         if (profile.function.empty() && !state.stack.empty()) {
-            profile.function = state.stack.back();
+            profile.function = *state.stack.back();
         }
         profile.maximumCallDepth = std::max(
             profile.maximumCallDepth, state.stack.size());
@@ -141,7 +158,9 @@ void emitTrace(
     if (!state.diagnosticEventsEnabled) return;
     TraceEvent event;
     event.kind = kind;
-    event.function = state.stack.empty() ? std::string{} : state.stack.back();
+    event.function = state.stack.empty()
+        ? std::string{}
+        : *state.stack.back();
     event.operation.assign(operation.data(), operation.size());
     event.instructionIndex = state.executed;
     event.callDepth = state.stack.size();
@@ -163,7 +182,7 @@ void mergeProfile(State& state) {
 bool fail(State& state, ErrorCode code, std::string message) {
     state.error.code = code;
     state.error.message = std::move(message);
-    state.error.stackTrace = state.stack;
+    state.error.stackTrace = materializeStack(state.stack);
     std::reverse(state.error.stackTrace.begin(), state.error.stackTrace.end());
     emitTrace(state, TraceEventKind::RuntimeError, 0, state.error.message);
     return false;
@@ -178,6 +197,7 @@ bool consume(
             "instruction budget exceeded");
     }
     ++state.executed;
+    if (state.fastAccounting) return true;
     state.statistics.instructionsExecuted = state.executed;
     if (state.traceEventsEnabled && !operation.empty()) {
         if (state.determinismOnly) {
@@ -614,17 +634,6 @@ bool executeCall(
         return fail(state, ErrorCode::InvalidProgram,
             "call argument count does not match its reference");
     }
-    for (std::size_t index = 0; index < arguments.size(); ++index) {
-        if (!expectSignatureType(
-                state,
-                arguments[index],
-                reference.parameterTypes[index],
-                typeIdAt(reference.parameterTypeIds, index),
-                "call argument")) {
-            return false;
-        }
-    }
-
     auto targetSymbolId = reference.symbolId;
     if (reference.virtualDispatch && reference.interfaceDispatch) {
         return fail(state, ErrorCode::InvalidProgram,
@@ -714,6 +723,16 @@ bool executeCall(
         return fail(state, ErrorCode::InvalidProgram,
             "runtime dispatch target function is unavailable");
     }
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        if (!expectSignatureType(
+                state,
+                arguments[index],
+                reference.parameterTypes[index],
+                typeIdAt(reference.parameterTypeIds, index),
+                "call argument")) {
+            return false;
+        }
+    }
     RuntimeError externalError;
     ++state.statistics.externalCalls;
     emitTrace(state, TraceEventKind::ExternalCall,
@@ -735,7 +754,7 @@ bool executeCall(
             state.error.code = ErrorCode::ExternalFunctionUnresolved;
             state.error.message = "external function '" + reference.name + "' failed";
         }
-        state.error.stackTrace = state.stack;
+        state.error.stackTrace = materializeStack(state.stack);
         std::reverse(state.error.stackTrace.begin(), state.error.stackTrace.end());
         return false;
     }
@@ -1730,6 +1749,70 @@ bool executeInstruction(
         if (!valuesEqual(state, *left, *right, equal)) return false;
         return storeResult(instruction.opcode == bytecode::Opcode::Equal ? equal : !equal);
     }
+    const auto isIntOpcode =
+        instruction.opcode >= bytecode::Opcode::AddInt &&
+        instruction.opcode <= bytecode::Opcode::GreaterOrEqualInt;
+    if (isIntOpcode && instruction.operands.size() >= 2 &&
+        instruction.operands[0] < function.registerTypes.size() &&
+        instruction.operands[1] < function.registerTypes.size() &&
+        function.registerTypes[instruction.operands[0]] ==
+            semantic::PrimitiveType::Int &&
+        function.registerTypes[instruction.operands[1]] ==
+            semantic::PrimitiveType::Int) {
+        const auto* typedLeft = std::get_if<std::int64_t>(left);
+        const auto* typedRight = std::get_if<std::int64_t>(right);
+        if (!typedLeft || !typedRight) {
+            return fail(state, ErrorCode::TypeMismatch,
+                "binary operation expected int operands");
+        }
+        const auto a = *typedLeft;
+        const auto b = *typedRight;
+        Value intOutput;
+        switch (instruction.opcode) {
+        case bytecode::Opcode::AddInt:
+            if (!instruction.checkedArithmetic) {
+                return storeResult(wrapInt32(a + b));
+            }
+            return checkedIntResult(state, a + b, intOutput) &&
+                storeResult(std::move(intOutput));
+        case bytecode::Opcode::SubtractInt:
+            if (!instruction.checkedArithmetic) {
+                return storeResult(wrapInt32(a - b));
+            }
+            return checkedIntResult(state, a - b, intOutput) &&
+                storeResult(std::move(intOutput));
+        case bytecode::Opcode::MultiplyInt:
+            if (!instruction.checkedArithmetic) {
+                return storeResult(wrapInt32(a * b));
+            }
+            return checkedIntResult(state, a * b, intOutput) &&
+                storeResult(std::move(intOutput));
+        case bytecode::Opcode::DivideInt:
+            if (b == 0) {
+                return fail(state, ErrorCode::DivisionByZero,
+                    "division by zero");
+            }
+            if (a == std::numeric_limits<std::int32_t>::min() && b == -1) {
+                return fail(state, ErrorCode::IntegerOverflow,
+                    "integer division overflow");
+            }
+            return storeResult(a / b);
+        case bytecode::Opcode::RemainderInt:
+            if (b == 0) {
+                return fail(state, ErrorCode::DivisionByZero,
+                    "remainder by zero");
+            }
+            if (a == std::numeric_limits<std::int32_t>::min() && b == -1) {
+                return storeResult(std::int64_t{0});
+            }
+            return storeResult(a % b);
+        case bytecode::Opcode::LessInt: return storeResult(a < b);
+        case bytecode::Opcode::LessOrEqualInt: return storeResult(a <= b);
+        case bytecode::Opcode::GreaterInt: return storeResult(a > b);
+        case bytecode::Opcode::GreaterOrEqualInt: return storeResult(a >= b);
+        default: break;
+        }
+    }
     const auto isLongOpcode = instruction.opcode >= bytecode::Opcode::AddLong &&
         instruction.opcode <= bytecode::Opcode::GreaterOrEqualLong;
     const auto isDoubleOpcode = instruction.opcode >= bytecode::Opcode::AddDouble &&
@@ -1948,7 +2031,7 @@ bool executeFunction(
         semantic::SymbolId previous;
         ~RestoreFunctionId() { state.currentFunctionId = previous; }
     } restoreFunctionId{state, previousFunctionId};
-    state.stack.push_back(location.module->name + "::" + function.name);
+    state.stack.push_back(&location.qualifiedName);
     ++state.statistics.functionCalls;
     state.statistics.maximumCallDepth = std::max(state.statistics.maximumCallDepth, state.stack.size());
     emitTrace(state, TraceEventKind::FunctionEnter);
@@ -2232,6 +2315,8 @@ ExecutionResult Interpreter::invoke(
     state.traceEventsEnabled =
         state.determinismEventsEnabled || state.profile != nullptr ||
         state.diagnosticEventsEnabled;
+    state.fastAccounting = !state.traceEventsEnabled &&
+        options.limits.gcWorkBudget == 0 && options.debugger == nullptr;
     state.determinism = DeterminismSession(options.determinism);
     state.heap = heap_.get();
     state.debugger = options.debugger.get();
@@ -2241,11 +2326,12 @@ ExecutionResult Interpreter::invoke(
     Value value;
     ExecutionResult execution;
     execution.succeeded = executeFunction(state, *found, arguments, value);
+    state.statistics.instructionsExecuted = state.executed;
     if (!execution.succeeded && state.pendingException &&
         state.error.code == ErrorCode::None) {
         state.error.code = ErrorCode::ScriptException;
         state.error.message = "unhandled script exception";
-        state.error.stackTrace = state.stack;
+        state.error.stackTrace = materializeStack(state.stack);
     }
     if (state.determinismEventsEnabled) {
         state.determinism.mergeEventDigest(

@@ -690,6 +690,7 @@ public:
     struct FunctionLocation {
         const bytecode::Module* module = nullptr;
         const bytecode::Function* function = nullptr;
+        std::string qualifiedName;
     };
 
     ProgramImage(const ProgramImage& other);

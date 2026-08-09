@@ -187,6 +187,12 @@ if(REALSCRIPT_BUILD_BENCHMARKS)
             REALSCRIPT_BENCH_JIT_CACHE_BASE="${CMAKE_CURRENT_BINARY_DIR}/jit-benchmark-cache"
     )
     realscript_enable_cxx_warnings(rsbench_jit)
+
+    add_executable(
+        rsbench_product benchmarks/product_macro_driver.cpp)
+    target_link_libraries(rsbench_product PRIVATE RealScript::Full)
+    target_compile_features(rsbench_product PRIVATE cxx_std_17)
+    realscript_enable_cxx_warnings(rsbench_product)
 endif()
 
 if(REALSCRIPT_BUILD_TESTS)

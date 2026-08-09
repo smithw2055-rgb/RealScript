@@ -92,7 +92,10 @@ ScriptRuntime::ScriptRuntime(
       heap_(heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>()),
       nativeHandles_(nativeHandles
           ? std::move(nativeHandles)
-          : std::make_shared<runtime::NativeHandleRegistry>()) {}
+          : std::make_shared<runtime::NativeHandleRegistry>()),
+      interpreter_(program_, heap_) {
+    interpreter_.setBindingRegistry(bindings_);
+}
 
 std::optional<ScriptType> ScriptRuntime::findType(
     const std::string& canonicalName) const {

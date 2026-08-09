@@ -335,3 +335,85 @@ cmd.exe /d /s /c 'call "C:\Program Files\Microsoft Visual Studio\18\Community\Co
 ```
 
 `rsbench_aot` 和 `rsbench_jit` 的 RAW/Strict 驱动均显式使用 `gcWorkBudget=0`；GC idle tax 请用 `rsbench --gc-work` 单独测量。
+
+## 最终优化阶段（P2 第四阶段、P3、P4）
+
+本阶段完成了前文列出的剩余性能轨道，并保留了预算、统计、trace/profile、
+determinism、checked arithmetic、GC birth-cycle 和 rollback/replay 语义。
+
+### Typed AOT/JIT accounting 与 Strict
+
+- RAW 路径改为函数作用域的寄存器局部 accounting，执行结束或失败边界再同步
+  instruction/branch statistics；有限预算仍在同一 batch 边界精确失败。
+- Strict determinism 使用局部数值状态累计 operation/branch 事件，退出或失败前一次
+  flush；trace/profile 等详细模式仍走原事件路径。
+- 新增预算 0 到 20 的逐值 A/B 回归，比较 typed RAW 与 detailed path 的成功状态、
+  错误码、指令数、分支数和结果。
+
+7 个独立进程的“进程内中位数之中位数”结果：
+
+| Backend / mode | 第三阶段 | 最终阶段 | 改善 |
+|---|---:|---:|---:|
+| AOT RAW | 34.00 us | 25.86 us | -23.9% |
+| JIT RAW | 33.80 us | 25.68 us | -24.0% |
+| AOT Strict | 1.253 ms | 0.358 ms | -71.4% |
+| JIT Strict | 1.122 ms | 0.347 ms | -69.0% |
+| Native C++ | 4.06 us | 4.06 us | — |
+
+RAW 剩余约 6.4 倍 native。隔离实验完全去除 accounting 时约为 5.52 us，说明
+剩余差距主要是公开的精确 instruction budget/statistics 契约，而不是 scalar lowering。
+整 block 预扣再退款原型反而回退到约 30.52 us，已撤销；继续叠加预扣状态不值得保留。
+
+### Interpreter frame/dispatch
+
+- RAW 且 `gcWorkBudget=0` 时只在局部累加 instruction count，调用结束一次同步统计。
+- 经 bytecode verifier 证明为纯 `int` 的二元操作直接在标量 variant 上执行，保留动态
+  类型防御、除零和 checked overflow 语义。
+- 正常路径调用栈保存稳定 qualified-name 指针，只在错误/trace/profile 时物化字符串。
+- 内部调用移除了进入目标函数前的重复 reference-signature 校验；外部调用仍保留校验。
+
+最终三进程中位数（机器有频率波动，另一次隔离测量 integer loop 为 6.09 ms）：
+
+| Benchmark | 本阶段前 | 最终复测 | 说明 |
+|---|---:|---:|---|
+| `integer_loop` | 11.87 ms | 6.73 ms | -43.3% |
+| `branch_loop` | 约 16.7 ms 历史基线 | 9.46 ms | 直接整数分支路径 |
+| `function_call` | 18.61 ms 历史基线 | 12.99 ms | 含 10,000 次内部调用 |
+
+`integer_loop` Strict 为 7.28 ms（约 1.08x RAW），Profiled 为 8.44 ms（约
+1.25x RAW）。frame/register scratch 与 arguments-only scratch 两个 A/B 原型分别使
+function-call 变慢，均已撤销；当前 vector 所有权与递归语义下不再增加无数据支持的缓存层。
+
+### 产品级 macrobench 与 GC
+
+新增 AI tick、ability tick、event fanout、allocation tick 四个稳定脚本 workload，以及
+`rsbench_product` 的 10,000 协程 resume + heap/host snapshot/restore + deterministic replay。
+
+| Workload | 最终中位数 | 归一化信息 |
+|---|---:|---:|
+| AI tick | 22.65 ms | 338,011 instructions |
+| Ability tick | 9.05 ms | 146,607 instructions |
+| Event fanout | 21.08 ms | 286,011 instructions |
+| Allocation tick, GC off | 28.15 ms | 110,000 objects / 29.92 MB |
+| Allocation tick, GC work 8 | 27.75 ms | 460 collections, live 16,320 B, peak 65,552 B |
+
+原增量 GC 在 sweep 期间持续分配会把 sweep 游标重置并追逐不断增长的 slot 数组，实测
+5.239 s/调用且 collection 完成数为 0。修复后 sweep 保留游标、固定本轮 sweep limit，
+每次 `step()` 只扫描一次根；相同工作负载约 27.75 ms，约 189 倍加速并完成 460 次
+collection。新增持续 sweep-allocation 回归，验证 collection 有界完成且 birth-cycle 对象存活。
+
+产品协程基准 7 个独立进程的中位数：resume 86.06 ms（8.61 us/callback），snapshot
+15.35 ms（20,000 objects、10,000 roots），restore 30.72 ms，replay 89.45 ms。
+场景级 method descriptor 缓存、只读 Interpreter 门面复用和 one-shot scheduler payload
+移动，使 resume/replay 相对优化前约 105.33/115.60 ms 分别改善约 18%/23%。
+
+### 最终验证与完成判定
+
+- Release、VS 2026、warnings-as-errors、串行 `/m:1` 的受影响定向回归 14/14 通过。
+- 可构建的完整 Release 集合仍为 32/35；失败精确保持为既有 Phase 2A snapshot、
+  Phase 21 AOT accounting、Phase 23 nullable AOT accounting，没有新增回归。
+- 既有 Phase 20/24 AOT MIR 生成失败和依赖既有 `rsc` filesystem 编译问题的三项
+  CLI/安装测试仍不属于本性能轨道。
+- RAW/Strict、Interpreter dispatch/frame、GC allocation/progress、产品级 coroutine 与
+  rollback/replay 均已有实现和复测；无收益或负收益原型已撤销。因此本性能优化轨道完成，
+  后续工作应以新增 workload 或硬件 profiler 的新证据开启，而不是继续叠加猜测性快路径。

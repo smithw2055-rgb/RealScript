@@ -171,9 +171,7 @@ runtime::ExecutionResult ScriptRuntime::invokeSymbol(
             runtime::ErrorCode::InvalidProgram,
             "script runtime has no linked program image");
     }
-    runtime::Interpreter interpreter(program_, heap_);
-    interpreter.setBindingRegistry(bindings_);
-    return interpreter.invoke(symbolId, arguments, std::move(options));
+    return interpreter_.invoke(symbolId, arguments, std::move(options));
 }
 
 } // namespace realscript::game

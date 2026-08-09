@@ -219,16 +219,26 @@ ScriptDispatchBatch GameplayHost::drainDue(
     ScriptDispatchBatch batch;
     const auto fired = core_.scheduler().runDue(currentTick, timerBudget);
     batch.timersConsumed = fired.size();
+    batch.calls.reserve(fired.size());
     for (const auto& task : fired) {
         const auto callFound = calls_.find(task.payload);
         if (callFound == calls_.end()) continue;
-        const auto& call = callFound->second;
-        batch.calls.push_back(ScriptDispatchCall{
-            call.target,
-            call.callback,
-            call.arguments,
-            task.id,
-            0});
+        auto& call = callFound->second;
+        if (task.repeats) {
+            batch.calls.push_back(ScriptDispatchCall{
+                call.target,
+                call.callback,
+                call.arguments,
+                task.id,
+                0});
+        } else {
+            batch.calls.push_back(ScriptDispatchCall{
+                call.target,
+                std::move(call.callback),
+                std::move(call.arguments),
+                task.id,
+                0});
+        }
         if (!task.repeats) static_cast<void>(eraseCall(task.id, false));
     }
 

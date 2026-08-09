@@ -175,6 +175,155 @@ private:
 
 class ExecutionContext {
 public:
+    template <bool Enabled>
+    class TypedRawAccountingScope {
+    public:
+        explicit TypedRawAccountingScope(ExecutionContext& context) noexcept {
+            if constexpr (Enabled) {
+                state_.context = &context;
+                const auto budget = context.options_.limits.instructionBudget;
+                state_.remaining = context.executed_ < budget
+                    ? budget - context.executed_
+                    : 0;
+            } else {
+                (void)context;
+            }
+        }
+        ~TypedRawAccountingScope() {
+            if constexpr (Enabled) {
+                state_.context->executed_ += state_.consumed;
+                state_.context->statistics_.instructionsExecuted =
+                    state_.context->executed_;
+                state_.context->statistics_.branchesTaken += state_.branches;
+            }
+        }
+        TypedRawAccountingScope(const TypedRawAccountingScope&) = delete;
+        TypedRawAccountingScope& operator=(
+            const TypedRawAccountingScope&) = delete;
+
+        [[nodiscard]] bool consume(std::uint64_t count) {
+            if constexpr (!Enabled) {
+                (void)count;
+                return true;
+            } else {
+                if (count == 0) return true;
+                if (count > state_.remaining - state_.consumed) {
+                    state_.consumed = state_.remaining;
+                    return state_.context->fail(
+                        runtime::ErrorCode::InstructionBudgetExceeded,
+                        "instruction budget exceeded");
+                }
+                state_.consumed += count;
+                return true;
+            }
+        }
+        void branch() noexcept {
+            if constexpr (Enabled) ++state_.branches;
+        }
+
+    private:
+        struct EnabledState {
+            ExecutionContext* context = nullptr;
+            std::uint64_t remaining = 0;
+            std::uint64_t consumed = 0;
+            std::uint64_t branches = 0;
+        };
+        struct DisabledState {};
+        std::conditional_t<Enabled, EnabledState, DisabledState> state_;
+    };
+
+    template <bool Enabled>
+    class TypedDeterminismAccountingScope {
+    public:
+        explicit TypedDeterminismAccountingScope(
+            ExecutionContext& context) noexcept {
+            if constexpr (Enabled) {
+                state_.context = &context;
+                state_.budget = context.options_.limits.instructionBudget;
+                state_.executed = context.executed_;
+                state_.digest = context.determinismEventDigest_;
+                state_.eventCount = context.determinismEventCount_;
+                state_.branches = context.statistics_.branchesTaken;
+                state_.functionId = context.currentFunctionId_;
+                state_.callDepth = context.stack_.size();
+            } else {
+                (void)context;
+            }
+        }
+        ~TypedDeterminismAccountingScope() {
+            if constexpr (Enabled) flush();
+        }
+        TypedDeterminismAccountingScope(
+            const TypedDeterminismAccountingScope&) = delete;
+        TypedDeterminismAccountingScope& operator=(
+            const TypedDeterminismAccountingScope&) = delete;
+
+        [[nodiscard]] bool consume(
+            runtime::DeterminismOperationId operationId) {
+            if constexpr (!Enabled) {
+                (void)operationId;
+                return true;
+            } else {
+                if (state_.executed >= state_.budget) {
+                    flush();
+                    return state_.context->fail(
+                        runtime::ErrorCode::InstructionBudgetExceeded,
+                        "instruction budget exceeded");
+                }
+                ++state_.executed;
+                state_.digest = runtime::accumulateDeterminismEvent(
+                    state_.digest,
+                    runtime::TraceEventKind::Instruction,
+                    state_.functionId,
+                    operationId,
+                    state_.executed,
+                    state_.callDepth);
+                ++state_.eventCount;
+                return true;
+            }
+        }
+        void branch(std::uint32_t blockId) noexcept {
+            if constexpr (Enabled) {
+                ++state_.branches;
+                state_.digest = runtime::accumulateDeterminismEvent(
+                    state_.digest,
+                    runtime::TraceEventKind::Branch,
+                    state_.functionId,
+                    blockId,
+                    state_.executed,
+                    state_.callDepth);
+                ++state_.eventCount;
+            }
+        }
+        void flush() noexcept {
+            if constexpr (Enabled) {
+                if (state_.flushed) return;
+                state_.context->executed_ = state_.executed;
+                state_.context->statistics_.instructionsExecuted =
+                    state_.executed;
+                state_.context->statistics_.branchesTaken = state_.branches;
+                state_.context->determinismEventDigest_ = state_.digest;
+                state_.context->determinismEventCount_ = state_.eventCount;
+                state_.flushed = true;
+            }
+        }
+
+    private:
+        struct EnabledState {
+            ExecutionContext* context = nullptr;
+            std::uint64_t budget = 0;
+            std::uint64_t executed = 0;
+            std::uint64_t digest = runtime::DeterminismEventSeed;
+            std::uint64_t eventCount = 0;
+            std::uint64_t branches = 0;
+            semantic::SymbolId functionId = 0;
+            std::size_t callDepth = 0;
+            bool flushed = false;
+        };
+        struct DisabledState {};
+        std::conditional_t<Enabled, EnabledState, DisabledState> state_;
+    };
+
     ExecutionContext(
         const ProgramDescriptor& program,
         std::shared_ptr<runtime::ManagedHeap> heap,
@@ -215,6 +364,9 @@ public:
         std::string_view operation);
     [[nodiscard]] bool fastAccountingEnabled() const noexcept {
         return fastAccounting_;
+    }
+    [[nodiscard]] bool typedDeterminismAccountingEnabled() const noexcept {
+        return determinismOnly_ && options_.limits.gcWorkBudget == 0;
     }
     [[nodiscard]] bool consumeRawTyped(std::uint64_t count = 1) {
         if (count == 0) return true;

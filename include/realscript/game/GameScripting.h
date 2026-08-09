@@ -242,6 +242,7 @@ private:
     std::shared_ptr<const runtime::BindingRegistry> bindings_;
     std::shared_ptr<runtime::ManagedHeap> heap_;
     std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles_;
+    runtime::Interpreter interpreter_;
 };
 
 using SceneEntityId = std::uint64_t;
@@ -315,6 +316,13 @@ public:
     [[nodiscard]] ScriptObject* object(SceneEntityId entity);
 
 private:
+    struct MethodCacheEntry {
+        semantic::SymbolId typeId = 0;
+        std::string name;
+        std::size_t arity = 0;
+        std::optional<ScriptMethod> method;
+    };
+
     struct Instance {
         ScriptObject object;
         bool enabled = true;
@@ -330,6 +338,11 @@ private:
         std::optional<ScriptMethod> onDestroy;
     };
 
+    [[nodiscard]] const ScriptMethod* findCachedMethod(
+        const ScriptType& type,
+        const std::string& name,
+        std::size_t arity);
+
     bool invokeLifecycle(
         SceneEntityId entity,
         Instance& instance,
@@ -344,6 +357,7 @@ private:
     ScriptRuntime& runtime_;
     runtime::ExecutionOptions executionOptions_;
     std::map<SceneEntityId, Instance> instances_;
+    std::map<std::size_t, std::vector<MethodCacheEntry>> methodCache_;
     std::vector<ScriptEvent> eventQueue_;
     std::map<std::string, ScriptTrigger> triggers_;
     std::vector<SceneScriptError> errors_;

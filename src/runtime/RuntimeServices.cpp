@@ -453,7 +453,7 @@ ProgramImage::ProgramImage(std::vector<bytecode::Module> modules)
             const auto qualified = module.name + "::" + function.name;
             functions_.emplace(
                 function.symbolId,
-                FunctionLocation{&module, &function});
+                FunctionLocation{&module, &function, qualified});
             names_.emplace(qualified, function.symbolId);
         }
     }

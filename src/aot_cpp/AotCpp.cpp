@@ -820,7 +820,10 @@ void emitTypedTransfer(
             prefix + "_" + std::to_string(index) + ";");
     }
     output.line(indent + "if constexpr (FastAccounting) {");
-    output.line(indent + "    context.branchRawTyped();");
+    output.line(indent + "    rawAccounting.branch();");
+    output.line(indent + "} else if constexpr (DeterminismAccounting) {");
+    output.line(indent + "    determinismAccounting.branch(" +
+        std::to_string(target) + ");");
     output.line(indent + "} else if (!context.branch(" +
         std::to_string(target) + ")) return false;");
     output.line(indent + "goto typedBlock_" + std::to_string(target) + ";");
@@ -832,7 +835,7 @@ void emitTypedRawConsume(
     const std::string& indent) {
     if (count == 0) return;
     output.line(indent + "if constexpr (FastAccounting) {");
-    output.line(indent + "    if (!context.consumeRawTyped(" +
+    output.line(indent + "    if (!rawAccounting.consume(" +
         std::to_string(count) + "ULL)) return false;");
     output.line(indent + "}");
 }
@@ -841,10 +844,14 @@ void emitTypedConsume(
     Emitter& output,
     mir::Opcode opcode,
     const std::string& indent) {
-    output.line(indent + "if constexpr (!FastAccounting) {");
+    const auto operationId = std::to_string(
+        runtime::determinismOperationId(mir::opcodeName(opcode))) + "ULL";
+    output.line(indent + "if constexpr (DeterminismAccounting) {");
+    output.line(indent + "    if (!determinismAccounting.consume(" +
+        operationId + ")) return false;");
+    output.line(indent + "} else if constexpr (!FastAccounting) {");
     output.line(indent + "    if (!context.consume(" +
-        std::to_string(runtime::determinismOperationId(
-            mir::opcodeName(opcode))) + "ULL, \"" +
+        operationId + ", \"" +
         escapeCppString(mir::opcodeName(opcode)) +
         "\")) return false;");
     output.line(indent + "}");
@@ -854,10 +861,15 @@ void emitTypedConsume(
     Emitter& output,
     mir::TerminatorKind terminator,
     const std::string& indent) {
-    output.line(indent + "if constexpr (!FastAccounting) {");
+    const auto operationId = std::to_string(
+        runtime::determinismOperationId(
+            mir::terminatorName(terminator))) + "ULL";
+    output.line(indent + "if constexpr (DeterminismAccounting) {");
+    output.line(indent + "    if (!determinismAccounting.consume(" +
+        operationId + ")) return false;");
+    output.line(indent + "} else if constexpr (!FastAccounting) {");
     output.line(indent + "    if (!context.consume(" +
-        std::to_string(runtime::determinismOperationId(
-            mir::terminatorName(terminator))) + "ULL, \"" +
+        operationId + ", \"" +
         escapeCppString(mir::terminatorName(terminator)) +
         "\")) return false;");
     output.line(indent + "}");
@@ -923,7 +935,7 @@ void emitTypedPrimitiveFunction(
     source.line("// range-proven checked arithmetic values: " +
         (safeArithmeticValues.empty() ? std::string("none")
                                       : safeArithmeticValues));
-    source.line("template <bool FastAccounting>");
+    source.line("template <bool FastAccounting, bool DeterminismAccounting>");
     source.line("static bool " + view.cppName + "_typed(");
     source.line("    ExecutionContext& context,");
     source.line("    const runtime::Value* arguments,");
@@ -932,6 +944,12 @@ void emitTypedPrimitiveFunction(
     source.line("    (void)arguments;");
     source.line("    (void)argumentCount;");
     source.line("    (void)result;");
+    source.line("    ExecutionContext::TypedRawAccountingScope<FastAccounting> rawAccounting(context);");
+    source.line("    ExecutionContext::TypedDeterminismAccountingScope<DeterminismAccounting> determinismAccounting(context);");
+    source.line("    const auto typedFail = [&](runtime::ErrorCode code, const char* message) {");
+    source.line("        if constexpr (DeterminismAccounting) determinismAccounting.flush();");
+    source.line("        return context.fail(code, message);");
+    source.line("    };");
     for (std::size_t index = 0; index < function.localTypes.size(); ++index) {
         source.line("    " + typedCppType(function.localTypes[index]) + " " +
             typedLocalExpression(index) + " = " +
@@ -974,7 +992,7 @@ void emitTypedPrimitiveFunction(
                 const auto index = static_cast<std::size_t>(
                     instruction.integerImmediate);
                 source.line("            if (" + std::to_string(index) +
-                    "u >= argumentCount) return context.fail("
+                    "u >= argumentCount) return typedFail("
                     "runtime::ErrorCode::InvalidArguments, "
                     "\"AOT parameter index is invalid\");");
                 const auto argument = "typedArgument_" +
@@ -984,7 +1002,7 @@ void emitTypedPrimitiveFunction(
                     typedCppType(instruction.resultType) + ">(&arguments[" +
                     std::to_string(index) + "]);");
                 source.line("            if (!" + argument +
-                    ") return context.fail(runtime::ErrorCode::TypeMismatch, "
+                    ") return typedFail(runtime::ErrorCode::TypeMismatch, "
                     "\"AOT parameter type mismatch\");");
                 source.line("            " + result + " = *" + argument + ";");
                 break;
@@ -1024,7 +1042,7 @@ void emitTypedPrimitiveFunction(
                         " < std::numeric_limits<std::int32_t>::min() || " +
                         temporary +
                         " > std::numeric_limits<std::int32_t>::max()) return "
-                        "context.fail(runtime::ErrorCode::IntegerOverflow, "
+                        "typedFail(runtime::ErrorCode::IntegerOverflow, "
                         "\"integer arithmetic overflow\");");
                 }
                 source.line("            " + result + " = " + temporary + ";");
@@ -1033,14 +1051,14 @@ void emitTypedPrimitiveFunction(
             case mir::Opcode::DivideInt:
             case mir::Opcode::RemainderInt: {
                 source.line("            if (" + operand(1) +
-                    " == 0) return context.fail(runtime::ErrorCode::DivisionByZero, \"" +
+                    " == 0) return typedFail(runtime::ErrorCode::DivisionByZero, \"" +
                     (instruction.opcode == mir::Opcode::DivideInt
                         ? "division by zero"
                         : "remainder by zero") + "\");");
                 source.line("            if (" + operand(0) +
                     " == std::numeric_limits<std::int32_t>::min() && " +
                     operand(1) +
-                    " == -1) return context.fail(runtime::ErrorCode::IntegerOverflow, "
+                    " == -1) return typedFail(runtime::ErrorCode::IntegerOverflow, "
                     "\"integer division overflow\");");
                 source.line("            " + result + " = " + operand(0) +
                     (instruction.opcode == mir::Opcode::DivideInt ? " / " : " % ") +
@@ -1054,7 +1072,7 @@ void emitTypedPrimitiveFunction(
                 } else {
                     source.line("            if (" + operand(0) +
                         " == std::numeric_limits<std::int32_t>::min()) return "
-                        "context.fail(runtime::ErrorCode::IntegerOverflow, "
+                        "typedFail(runtime::ErrorCode::IntegerOverflow, "
                         "\"integer negation overflow\");");
                 }
                 source.line("            " + result + " = -" + operand(0) + ";");
@@ -1142,10 +1160,14 @@ void emitTypedPrimitiveFunction(
     source.line("    runtime::Value& result) {");
     source.line("    if (context.fastAccountingEnabled()) {");
     source.line("        return " + view.cppName +
-        "_typed<true>(context, arguments, argumentCount, result);");
+        "_typed<true, false>(context, arguments, argumentCount, result);");
+    source.line("    }");
+    source.line("    if (context.typedDeterminismAccountingEnabled()) {");
+    source.line("        return " + view.cppName +
+        "_typed<false, true>(context, arguments, argumentCount, result);");
     source.line("    }");
     source.line("    return " + view.cppName +
-        "_typed<false>(context, arguments, argumentCount, result);");
+        "_typed<false, false>(context, arguments, argumentCount, result);");
     source.line("}");
     source.line();
 }

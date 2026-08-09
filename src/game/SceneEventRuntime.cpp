@@ -16,6 +16,30 @@ runtime::ExecutionResult failedResult(
 
 } // namespace
 
+const ScriptMethod* SceneScriptRuntime::findCachedMethod(
+    const ScriptType& type,
+    const std::string& name,
+    std::size_t arity) {
+    auto hash = std::hash<std::string>{}(name);
+    hash ^= static_cast<std::size_t>(type.descriptor.id) +
+        0x9e3779b9u + (hash << 6u) + (hash >> 2u);
+    hash ^= arity + 0x9e3779b9u + (hash << 6u) + (hash >> 2u);
+    auto& bucket = methodCache_[hash];
+    for (auto& entry : bucket) {
+        if (entry.typeId == type.descriptor.id && entry.arity == arity &&
+            entry.name == name) {
+            return entry.method ? &*entry.method : nullptr;
+        }
+    }
+    bucket.push_back(MethodCacheEntry{
+        type.descriptor.id,
+        name,
+        arity,
+        runtime_.findMethod(type, name, arity)});
+    auto& method = bucket.back().method;
+    return method ? &*method : nullptr;
+}
+
 runtime::ExecutionResult SceneScriptRuntime::invoke(
     SceneEntityId entity,
     const std::string& callback,
@@ -26,7 +50,7 @@ runtime::ExecutionResult SceneScriptRuntime::invoke(
             runtime::ErrorCode::InvalidArguments,
             "scene entity does not have a script instance");
     }
-    auto method = runtime_.findMethod(
+    const auto* method = findCachedMethod(
         found->second.object.type(), callback, arguments.size());
     if (!method) {
         return failedResult(
@@ -46,7 +70,7 @@ bool SceneScriptRuntime::dispatch(const ScriptEvent& event) {
     bool succeeded = true;
     for (auto& [entity, instance] : instances_) {
         if (!instance.enabled) continue;
-        auto method = runtime_.findMethod(
+        const auto* method = findCachedMethod(
             instance.object.type(), event.callback, event.arguments.size());
         if (!method) continue;
         auto result = runtime_.invoke(

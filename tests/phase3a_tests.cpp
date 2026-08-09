@@ -132,6 +132,42 @@ void testIncrementalBudgetAndWriteBarrier() {
     roots.popFrame();
 }
 
+void testIncrementalSweepProgressDuringAllocation() {
+    realscript::runtime::ManagedHeap heap;
+    for (int index = 0; index < 128; ++index) {
+        require(heap.allocateString("garbage").has_value(),
+            "sweep-progress setup allocation failed");
+    }
+    realscript::runtime::ShadowStack roots;
+    heap.requestCollection();
+    while (heap.phase() == realscript::runtime::GcPhase::Idle ||
+           heap.phase() == realscript::runtime::GcPhase::Mark) {
+        require(heap.step(roots, 1) <= 1,
+            "sweep-progress mark exceeded the work budget");
+    }
+
+    std::vector<realscript::runtime::ObjectRef> allocatedDuringSweep;
+    std::size_t steps = 0;
+    while (heap.phase() != realscript::runtime::GcPhase::Idle ||
+           heap.collectionRequested()) {
+        if (heap.phase() == realscript::runtime::GcPhase::Sweep) {
+            const auto value = heap.allocateString("during-sweep");
+            require(value.has_value(), "allocation during sweep failed");
+            allocatedDuringSweep.push_back(*value);
+        }
+        require(heap.step(roots, 1) <= 1,
+            "sweep-progress step exceeded the work budget");
+        require(++steps < 1024,
+            "continuous allocation prevented incremental sweep completion");
+    }
+    require(!allocatedDuringSweep.empty(),
+        "sweep-progress test did not allocate during sweep");
+    for (const auto value : allocatedDuringSweep) {
+        require(heap.isAlive(value),
+            "an object allocated during sweep was reclaimed in its birth cycle");
+    }
+}
+
 void testInterpreterShadowStackRootsManagedValues() {
     auto modules = compile({{
         "identity.rs",
@@ -255,6 +291,8 @@ int main() {
     run("Transitive graph precise roots", testTransitiveGraphAndPreciseRoots);
     run("Persistent roots generation safety", testPersistentRootsAndGenerationSafety);
     run("Incremental budget write barrier", testIncrementalBudgetAndWriteBarrier);
+    run("Incremental sweep allocation progress",
+        testIncrementalSweepProgressDuringAllocation);
     run("Interpreter shadow-stack roots", testInterpreterShadowStackRootsManagedValues);
     run("Managed string literals", testStringLiteralUsesManagedHeap);
     run("Managed and host string equality", testManagedAndHostStringEquality);

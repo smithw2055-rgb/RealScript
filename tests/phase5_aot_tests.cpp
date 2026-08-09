@@ -183,6 +183,31 @@ void testBudgetsTracingAndGcRoots() {
             typedBranch.statistics.branchesTaken != 0,
         "typed AOT direct block transfer returned an invalid result or branch count");
 
+    realscript::runtime::ExecutionOptions typedDetailedAccounting;
+    typedDetailedAccounting.limits.gcWorkBudget = 0;
+    typedDetailedAccounting.trace = [](const auto&) {};
+    for (std::uint64_t budget = 0; budget <= 20; ++budget) {
+        typedRaw.limits.instructionBudget = budget;
+        typedDetailedAccounting.limits.instructionBudget = budget;
+        const auto rawBudgeted = aot.invoke(
+            "Phase5.App::typedBranch",
+            {std::int64_t{4}},
+            typedRaw);
+        const auto detailedBudgeted = aot.invoke(
+            "Phase5.App::typedBranch",
+            {std::int64_t{4}},
+            typedDetailedAccounting);
+        require(rawBudgeted.succeeded == detailedBudgeted.succeeded &&
+                rawBudgeted.error.code == detailedBudgeted.error.code &&
+                rawBudgeted.instructionsExecuted ==
+                    detailedBudgeted.instructionsExecuted &&
+                rawBudgeted.statistics.branchesTaken ==
+                    detailedBudgeted.statistics.branchesTaken &&
+                (!rawBudgeted.succeeded ||
+                    rawBudgeted.value == detailedBudgeted.value),
+            "typed AOT register-local accounting diverged at a budget boundary");
+    }
+
     const auto boundedIncrement = aot.invoke(
         "Phase5.App::boundedIncrement",
         {std::int64_t{99}},
