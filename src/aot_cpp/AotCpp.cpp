@@ -818,7 +818,11 @@ GeneratedProgram CppGenerator::generate(
                     options.emitLineDirectives,
                     sourceMap,
                     function.symbolId);
-                source.line("            if (!context.consume(\"" +
+                source.line("            if (!context.consume(" +
+                    std::to_string(
+                        runtime::determinismOperationId(
+                            mir::opcodeName(instruction.opcode))) +
+                    "ULL, \"" +
                     escapeCppString(mir::opcodeName(instruction.opcode)) +
                     "\")) return false;");
                 const auto result = instruction.result >= 0
@@ -1076,7 +1080,11 @@ GeneratedProgram CppGenerator::generate(
                 options.emitLineDirectives,
                 sourceMap,
                 function.symbolId);
-            source.line("            if (!context.consume(\"" +
+            source.line("            if (!context.consume(" +
+                std::to_string(
+                    runtime::determinismOperationId(
+                        mir::terminatorName(block.terminator.kind))) +
+                "ULL, \"" +
                 escapeCppString(mir::terminatorName(block.terminator.kind)) +
                 "\")) return false;");
             switch (block.terminator.kind) {

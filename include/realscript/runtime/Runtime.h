@@ -526,6 +526,37 @@ enum class TraceEventKind {
     RuntimeError,
 };
 
+using DeterminismOperationId = std::uint64_t;
+
+constexpr DeterminismOperationId determinismOperationId(
+    std::string_view operation) noexcept {
+    DeterminismOperationId hash = 1469598103934665603ULL;
+    for (const unsigned char value : operation) {
+        hash ^= value;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+constexpr std::uint64_t DeterminismEventSeed = 1469598103934665603ULL;
+
+constexpr std::uint64_t accumulateDeterminismEvent(
+    std::uint64_t digest,
+    TraceEventKind kind,
+    semantic::SymbolId functionId,
+    DeterminismOperationId operationId,
+    std::uint64_t instructionIndex,
+    std::size_t callDepth) noexcept {
+    auto event = operationId ^
+        (static_cast<std::uint64_t>(functionId) * 0x9e3779b185ebca87ULL);
+    event ^= instructionIndex * 0xc2b2ae3d27d4eb4fULL;
+    event ^= static_cast<std::uint64_t>(callDepth) << 48U;
+    event ^= (static_cast<std::uint64_t>(kind) + 1U) *
+        0x165667b19e3779f9ULL;
+    return digest ^ (event + 0x9e3779b97f4a7c15ULL +
+        (digest << 6U) + (digest >> 2U));
+}
+
 struct TraceEvent {
     TraceEventKind kind = TraceEventKind::Instruction;
     std::string function;
@@ -556,6 +587,7 @@ struct ExecutionProfile {
 class ProfileCollector {
 public:
     void record(const TraceEvent& event);
+    void merge(const ExecutionProfile& profile);
     [[nodiscard]] ExecutionProfile snapshot() const;
     void reset();
 
@@ -630,6 +662,9 @@ public:
     DeterminismSession& operator=(const DeterminismSession&) = delete;
 
     void observe(const TraceEvent& event);
+    void mergeEventDigest(
+        std::uint64_t eventDigest,
+        std::uint64_t eventCount) noexcept;
     [[nodiscard]] bool invokeExternal(
         const BindingRegistry* bindings,
         const ExternalFunction* fallback,

@@ -210,6 +210,9 @@ public:
         runtime::Value& result);
 
     [[nodiscard]] bool consume(std::string_view operation);
+    [[nodiscard]] bool consume(
+        runtime::DeterminismOperationId operationId,
+        std::string_view operation);
     [[nodiscard]] bool branch(std::uint32_t blockId);
     [[nodiscard]] bool throwScript(const runtime::Value& value);
     [[nodiscard]] bool hasPendingException() const noexcept;
@@ -333,18 +336,30 @@ private:
     [[nodiscard]] bool isAssignable(
         semantic::SymbolId actual,
         semantic::SymbolId expected) const noexcept;
-    void emitTrace(runtime::TraceEventKind kind, std::string operation = {});
+    void emitTrace(
+        runtime::TraceEventKind kind,
+        runtime::DeterminismOperationId operationId = 0,
+        std::string_view operation = {});
 
     const ProgramDescriptor* program_ = nullptr;
     std::shared_ptr<runtime::ManagedHeap> heap_;
     std::shared_ptr<const runtime::BindingRegistry> bindings_;
     runtime::ExecutionOptions options_;
     bool traceEventsEnabled_ = false;
+    bool determinismEventsEnabled_ = false;
+    bool determinismOnly_ = false;
+    bool diagnosticEventsEnabled_ = false;
+    std::uint64_t determinismEventDigest_ = runtime::DeterminismEventSeed;
+    std::uint64_t determinismEventCount_ = 0;
+    std::unordered_map<semantic::SymbolId, runtime::FunctionProfile>
+        profileFunctions_;
+    std::uint64_t profileEvents_ = 0;
     runtime::RuntimeError error_;
     runtime::RuntimeStatistics statistics_;
     runtime::DeterminismSession determinism_;
     std::uint64_t executed_ = 0;
     std::vector<std::string> stack_;
+    semantic::SymbolId currentFunctionId_ = 0;
     runtime::ShadowStack shadowStack_;
     std::unordered_map<semantic::SymbolId, const TypeDescriptor*> types_;
     std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> functions_;

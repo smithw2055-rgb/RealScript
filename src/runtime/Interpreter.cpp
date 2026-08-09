@@ -4,6 +4,7 @@
 #include "realscript/diagnostics/Diagnostic.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <unordered_map>
@@ -12,6 +13,36 @@
 
 namespace realscript::runtime {
 namespace {
+
+DeterminismOperationId instructionOperationId(
+    bytecode::Opcode opcode) noexcept {
+    constexpr auto Count =
+        static_cast<std::size_t>(bytecode::Opcode::ConstantTypeId) + 1U;
+    static const auto ids = [] {
+        std::array<DeterminismOperationId, Count> result{};
+        for (std::size_t index = 0; index < result.size(); ++index) {
+            result[index] = determinismOperationId(bytecode::opcodeName(
+                static_cast<bytecode::Opcode>(index)));
+        }
+        return result;
+    }();
+    return ids[static_cast<std::size_t>(opcode)];
+}
+
+DeterminismOperationId terminatorOperationId(
+    bytecode::TerminatorKind terminator) noexcept {
+    constexpr auto Count =
+        static_cast<std::size_t>(bytecode::TerminatorKind::Throw) + 1U;
+    static const auto ids = [] {
+        std::array<DeterminismOperationId, Count> result{};
+        for (std::size_t index = 0; index < result.size(); ++index) {
+            result[index] = determinismOperationId(bytecode::terminatorName(
+                static_cast<bytecode::TerminatorKind>(index)));
+        }
+        return result;
+    }();
+    return ids[static_cast<std::size_t>(terminator)];
+}
 
 struct State {
     Limits limits;
@@ -25,7 +56,15 @@ struct State {
     const TraceSink* trace = nullptr;
     ProfileCollector* profile = nullptr;
     bool traceEventsEnabled = false;
+    bool determinismEventsEnabled = false;
+    bool determinismOnly = false;
+    bool diagnosticEventsEnabled = false;
+    std::uint64_t determinismEventDigest = DeterminismEventSeed;
+    std::uint64_t determinismEventCount = 0;
+    std::unordered_map<semantic::SymbolId, FunctionProfile> profileFunctions;
+    std::uint64_t profileEvents = 0;
     DeterminismSession determinism;
+    semantic::SymbolId currentFunctionId = 0;
     ManagedHeap* heap = nullptr;
     debug::DebugController* debugger = nullptr;
     std::vector<debug::DebugFrameView> debugFrames;
@@ -65,17 +104,60 @@ private:
     State& state_;
 };
 
-void emitTrace(State& state, TraceEventKind kind, std::string operation = {}) {
+void emitTrace(
+    State& state,
+    TraceEventKind kind,
+    DeterminismOperationId operationId = 0,
+    std::string_view operation = {}) {
     if (!state.traceEventsEnabled) return;
+    if (state.determinismEventsEnabled) {
+        state.determinismEventDigest = accumulateDeterminismEvent(
+            state.determinismEventDigest,
+            kind,
+            state.currentFunctionId,
+            operationId,
+            state.executed,
+            state.stack.size());
+        ++state.determinismEventCount;
+    }
+    if (state.profile) {
+        ++state.profileEvents;
+        auto& profile = state.profileFunctions[state.currentFunctionId];
+        if (profile.function.empty() && !state.stack.empty()) {
+            profile.function = state.stack.back();
+        }
+        profile.maximumCallDepth = std::max(
+            profile.maximumCallDepth, state.stack.size());
+        switch (kind) {
+        case TraceEventKind::FunctionEnter: ++profile.calls; break;
+        case TraceEventKind::FunctionExit: ++profile.returns; break;
+        case TraceEventKind::Instruction: ++profile.instructions; break;
+        case TraceEventKind::Branch: ++profile.branches; break;
+        case TraceEventKind::ExternalCall: ++profile.externalCalls; break;
+        case TraceEventKind::GcStep: ++profile.gcSteps; break;
+        case TraceEventKind::RuntimeError: ++profile.runtimeErrors; break;
+        }
+    }
+    if (!state.diagnosticEventsEnabled) return;
     TraceEvent event;
     event.kind = kind;
     event.function = state.stack.empty() ? std::string{} : state.stack.back();
-    event.operation = std::move(operation);
+    event.operation.assign(operation.data(), operation.size());
     event.instructionIndex = state.executed;
     event.callDepth = state.stack.size();
-    state.determinism.observe(event);
-    if (state.profile) state.profile->record(event);
     if (state.trace && *state.trace) (*state.trace)(event);
+}
+
+void mergeProfile(State& state) {
+    if (!state.profile) return;
+    ExecutionProfile profile;
+    profile.totalEvents = state.profileEvents;
+    profile.functions.reserve(state.profileFunctions.size());
+    for (auto& [symbolId, function] : state.profileFunctions) {
+        (void)symbolId;
+        profile.functions.push_back(std::move(function));
+    }
+    state.profile->merge(profile);
 }
 
 bool fail(State& state, ErrorCode code, std::string message) {
@@ -83,11 +165,14 @@ bool fail(State& state, ErrorCode code, std::string message) {
     state.error.message = std::move(message);
     state.error.stackTrace = state.stack;
     std::reverse(state.error.stackTrace.begin(), state.error.stackTrace.end());
-    emitTrace(state, TraceEventKind::RuntimeError, state.error.message);
+    emitTrace(state, TraceEventKind::RuntimeError, 0, state.error.message);
     return false;
 }
 
-bool consume(State& state, std::string_view operation = {}) {
+bool consume(
+    State& state,
+    DeterminismOperationId operationId,
+    std::string_view operation = {}) {
     if (state.executed >= state.limits.instructionBudget) {
         return fail(state, ErrorCode::InstructionBudgetExceeded,
             "instruction budget exceeded");
@@ -95,7 +180,19 @@ bool consume(State& state, std::string_view operation = {}) {
     ++state.executed;
     state.statistics.instructionsExecuted = state.executed;
     if (state.traceEventsEnabled && !operation.empty()) {
-        emitTrace(state, TraceEventKind::Instruction, std::string(operation));
+        if (state.determinismOnly) {
+            state.determinismEventDigest = accumulateDeterminismEvent(
+                state.determinismEventDigest,
+                TraceEventKind::Instruction,
+                state.currentFunctionId,
+                operationId,
+                state.executed,
+                state.stack.size());
+            ++state.determinismEventCount;
+        } else {
+            emitTrace(state, TraceEventKind::Instruction,
+                operationId, operation);
+        }
     }
     if (state.heap && state.limits.gcWorkBudget != 0) {
         const auto work = state.heap->step(
@@ -103,7 +200,12 @@ bool consume(State& state, std::string_view operation = {}) {
             state.limits.gcWorkBudget);
         state.statistics.gcWorkPerformed += work;
         if (work != 0) {
-            emitTrace(state, TraceEventKind::GcStep, std::to_string(work));
+            if (state.diagnosticEventsEnabled) {
+                const auto workText = std::to_string(work);
+                emitTrace(state, TraceEventKind::GcStep, work, workText);
+            } else {
+                emitTrace(state, TraceEventKind::GcStep, work);
+            }
         }
     }
     return true;
@@ -614,7 +716,8 @@ bool executeCall(
     }
     RuntimeError externalError;
     ++state.statistics.externalCalls;
-    emitTrace(state, TraceEventKind::ExternalCall, reference.name);
+    emitTrace(state, TraceEventKind::ExternalCall,
+        reference.symbolId, reference.name);
     std::optional<Value> externalResult;
     const ExternalFunction* fallback =
         state.externalResolver && *state.externalResolver
@@ -777,7 +880,12 @@ bool executeInstruction(
     const std::vector<Value>& arguments,
     std::vector<Value>& locals,
     std::vector<Value>& registers) {
-    if (!consume(state, bytecode::opcodeName(instruction.opcode))) return false;
+    if (!consume(
+            state,
+            instructionOperationId(instruction.opcode),
+            bytecode::opcodeName(instruction.opcode))) {
+        return false;
+    }
     auto operand = [&](std::size_t index) -> const Value* {
         if (index >= instruction.operands.size() || instruction.operands[index] >= registers.size()) {
             fail(state, ErrorCode::InvalidProgram, "instruction operand register is invalid");
@@ -1833,6 +1941,13 @@ bool executeFunction(
         }
     }
 
+    const auto previousFunctionId = state.currentFunctionId;
+    state.currentFunctionId = function.symbolId;
+    struct RestoreFunctionId {
+        State& state;
+        semantic::SymbolId previous;
+        ~RestoreFunctionId() { state.currentFunctionId = previous; }
+    } restoreFunctionId{state, previousFunctionId};
     state.stack.push_back(location.module->name + "::" + function.name);
     ++state.statistics.functionCalls;
     state.statistics.maximumCallDepth = std::max(state.statistics.maximumCallDepth, state.stack.size());
@@ -1911,7 +2026,10 @@ bool executeFunction(
         if (!debugSequencePoint(
                 state, *location.module, function, block->id,
                 static_cast<std::uint32_t>(block->instructions.size()), true) ||
-            !consume(state, bytecode::terminatorName(block->terminator.kind))) {
+            !consume(
+                state,
+                terminatorOperationId(block->terminator.kind),
+                bytecode::terminatorName(block->terminator.kind))) {
             state.stack.pop_back();
             return false;
         }
@@ -1934,8 +2052,12 @@ bool executeFunction(
         if (terminator.kind == bytecode::TerminatorKind::ReturnVoid) {
             result = std::monostate{};
             if (state.traceEventsEnabled) {
-                emitTrace(state, TraceEventKind::FunctionExit,
-                    valueToString(result, state.heap));
+                if (state.diagnosticEventsEnabled) {
+                    const auto operation = valueToString(result, state.heap);
+                    emitTrace(state, TraceEventKind::FunctionExit, 0, operation);
+                } else {
+                    emitTrace(state, TraceEventKind::FunctionExit);
+                }
             }
             state.stack.pop_back();
             return true;
@@ -1956,8 +2078,12 @@ bool executeFunction(
             }
             result = registers[terminator.value];
             if (state.traceEventsEnabled) {
-                emitTrace(state, TraceEventKind::FunctionExit,
-                    valueToString(result, state.heap));
+                if (state.diagnosticEventsEnabled) {
+                    const auto operation = valueToString(result, state.heap);
+                    emitTrace(state, TraceEventKind::FunctionExit, 0, operation);
+                } else {
+                    emitTrace(state, TraceEventKind::FunctionExit);
+                }
             }
             state.stack.pop_back();
             return true;
@@ -1982,8 +2108,21 @@ bool executeFunction(
 
         ++state.statistics.branchesTaken;
         if (state.traceEventsEnabled) {
-            emitTrace(state, TraceEventKind::Branch,
-                "bb" + std::to_string(target));
+            if (state.determinismOnly) {
+                state.determinismEventDigest = accumulateDeterminismEvent(
+                    state.determinismEventDigest,
+                    TraceEventKind::Branch,
+                    state.currentFunctionId,
+                    target,
+                    state.executed,
+                    state.stack.size());
+                ++state.determinismEventCount;
+            } else if (state.diagnosticEventsEnabled) {
+                const auto operation = "bb" + std::to_string(target);
+                emitTrace(state, TraceEventKind::Branch, target, operation);
+            } else {
+                emitTrace(state, TraceEventKind::Branch, target);
+            }
         }
         const auto* next = findBlock(function, target);
         if (!next || next->parameters.size() != edgeArguments->size()) {
@@ -2084,10 +2223,15 @@ ExecutionResult Interpreter::invoke(
     state.bindings = bindings_.get();
     state.trace = &options.trace;
     state.profile = options.profile.get();
+    state.determinismEventsEnabled =
+        options.determinism.mode != DeterminismMode::Off;
+    state.diagnosticEventsEnabled =
+        state.trace && static_cast<bool>(*state.trace);
+    state.determinismOnly = state.determinismEventsEnabled &&
+        state.profile == nullptr && !state.diagnosticEventsEnabled;
     state.traceEventsEnabled =
-        options.determinism.mode != DeterminismMode::Off ||
-        state.profile != nullptr ||
-        (state.trace && static_cast<bool>(*state.trace));
+        state.determinismEventsEnabled || state.profile != nullptr ||
+        state.diagnosticEventsEnabled;
     state.determinism = DeterminismSession(options.determinism);
     state.heap = heap_.get();
     state.debugger = options.debugger.get();
@@ -2103,11 +2247,17 @@ ExecutionResult Interpreter::invoke(
         state.error.message = "unhandled script exception";
         state.error.stackTrace = state.stack;
     }
+    if (state.determinismEventsEnabled) {
+        state.determinism.mergeEventDigest(
+            state.determinismEventDigest,
+            state.determinismEventCount);
+    }
     execution.succeeded = state.determinism.finish(
         execution.succeeded,
         value,
         state.error,
         state.statistics);
+    mergeProfile(state);
     execution.value = std::move(value);
     execution.error = std::move(state.error);
     execution.instructionsExecuted = state.executed;

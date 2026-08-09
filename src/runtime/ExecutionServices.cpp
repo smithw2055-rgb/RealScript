@@ -235,6 +235,24 @@ void ProfileCollector::record(const TraceEvent& event) {
     }
 }
 
+void ProfileCollector::merge(const ExecutionProfile& profile) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    totalEvents_ += profile.totalEvents;
+    for (const auto& function : profile.functions) {
+        auto& merged = functions_[function.function];
+        merged.function = function.function;
+        merged.calls += function.calls;
+        merged.returns += function.returns;
+        merged.instructions += function.instructions;
+        merged.branches += function.branches;
+        merged.externalCalls += function.externalCalls;
+        merged.gcSteps += function.gcSteps;
+        merged.runtimeErrors += function.runtimeErrors;
+        merged.maximumCallDepth = std::max(
+            merged.maximumCallDepth, function.maximumCallDepth);
+    }
+}
+
 ExecutionProfile ProfileCollector::snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
     ExecutionProfile profile;
@@ -287,6 +305,14 @@ void DeterminismSession::observe(const TraceEvent& event) {
     hashScalar(impl_->digest, event.instructionIndex);
     const auto depth = static_cast<std::uint64_t>(event.callDepth);
     hashScalar(impl_->digest, depth);
+}
+
+void DeterminismSession::mergeEventDigest(
+    std::uint64_t eventDigest,
+    std::uint64_t eventCount) noexcept {
+    if (!impl_) return;
+    hashScalar(impl_->digest, eventCount);
+    hashScalar(impl_->digest, eventDigest);
 }
 
 bool DeterminismSession::invokeExternal(

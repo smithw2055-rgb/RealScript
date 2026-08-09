@@ -11,6 +11,11 @@
 namespace realscript::aot {
 namespace {
 
+runtime::DeterminismOperationId operationIdFromText(
+    std::string_view operation) noexcept {
+    return runtime::determinismOperationId(operation);
+}
+
 semantic::SymbolId typeIdAt(
     const semantic::SymbolId* ids,
     std::size_t count,
@@ -169,8 +174,13 @@ ExecutionContext::ExecutionContext(
       determinism_(options_.determinism) {
     traceEventsEnabled_ =
         options_.determinism.mode != runtime::DeterminismMode::Off ||
-        options_.profile != nullptr ||
+        options_.profile != nullptr || static_cast<bool>(options_.trace);
+    determinismEventsEnabled_ =
+        options_.determinism.mode != runtime::DeterminismMode::Off;
+    diagnosticEventsEnabled_ =
         static_cast<bool>(options_.trace);
+    determinismOnly_ = determinismEventsEnabled_ &&
+        options_.profile == nullptr && !diagnosticEventsEnabled_;
     for (std::uint32_t index = 0; index < program.typeCount; ++index) {
         const auto& type = program.types[index];
         types_.emplace(type.id, &type);
@@ -218,16 +228,44 @@ const FunctionDescriptor* ExecutionContext::findFunction(
 
 void ExecutionContext::emitTrace(
     runtime::TraceEventKind kind,
-    std::string operation) {
+    runtime::DeterminismOperationId operationId,
+    std::string_view operation) {
     if (!traceEventsEnabled_) return;
+    if (determinismEventsEnabled_) {
+        determinismEventDigest_ = runtime::accumulateDeterminismEvent(
+            determinismEventDigest_,
+            kind,
+            currentFunctionId_,
+            operationId,
+            executed_,
+            stack_.size());
+        ++determinismEventCount_;
+    }
+    if (options_.profile) {
+        ++profileEvents_;
+        auto& profile = profileFunctions_[currentFunctionId_];
+        if (profile.function.empty() && !stack_.empty()) {
+            profile.function = stack_.back();
+        }
+        profile.maximumCallDepth = std::max(
+            profile.maximumCallDepth, stack_.size());
+        switch (kind) {
+        case runtime::TraceEventKind::FunctionEnter: ++profile.calls; break;
+        case runtime::TraceEventKind::FunctionExit: ++profile.returns; break;
+        case runtime::TraceEventKind::Instruction: ++profile.instructions; break;
+        case runtime::TraceEventKind::Branch: ++profile.branches; break;
+        case runtime::TraceEventKind::ExternalCall: ++profile.externalCalls; break;
+        case runtime::TraceEventKind::GcStep: ++profile.gcSteps; break;
+        case runtime::TraceEventKind::RuntimeError: ++profile.runtimeErrors; break;
+        }
+    }
+    if (!diagnosticEventsEnabled_) return;
     runtime::TraceEvent event;
     event.kind = kind;
     event.function = stack_.empty() ? std::string{} : stack_.back();
-    event.operation = std::move(operation);
+    event.operation.assign(operation.data(), operation.size());
     event.instructionIndex = executed_;
     event.callDepth = stack_.size();
-    determinism_.observe(event);
-    if (options_.profile) options_.profile->record(event);
     if (options_.trace) options_.trace(event);
 }
 
@@ -238,11 +276,17 @@ bool ExecutionContext::fail(
     error_.message = std::move(message);
     error_.stackTrace = stack_;
     std::reverse(error_.stackTrace.begin(), error_.stackTrace.end());
-    emitTrace(runtime::TraceEventKind::RuntimeError, error_.message);
+    emitTrace(runtime::TraceEventKind::RuntimeError, 0, error_.message);
     return false;
 }
 
 bool ExecutionContext::consume(std::string_view operation) {
+    return consume(operationIdFromText(operation), operation);
+}
+
+bool ExecutionContext::consume(
+    runtime::DeterminismOperationId operationId,
+    std::string_view operation) {
     if (executed_ >= options_.limits.instructionBudget) {
         return fail(
             runtime::ErrorCode::InstructionBudgetExceeded,
@@ -251,7 +295,19 @@ bool ExecutionContext::consume(std::string_view operation) {
     ++executed_;
     statistics_.instructionsExecuted = executed_;
     if (traceEventsEnabled_) {
-        emitTrace(runtime::TraceEventKind::Instruction, std::string(operation));
+        if (determinismOnly_) {
+            determinismEventDigest_ = runtime::accumulateDeterminismEvent(
+                determinismEventDigest_,
+                runtime::TraceEventKind::Instruction,
+                currentFunctionId_,
+                operationId,
+                executed_,
+                stack_.size());
+            ++determinismEventCount_;
+        } else {
+            emitTrace(runtime::TraceEventKind::Instruction,
+                operationId, operation);
+        }
     }
     if (heap_ && options_.limits.gcWorkBudget != 0) {
         const auto work = heap_->step(
@@ -259,7 +315,12 @@ bool ExecutionContext::consume(std::string_view operation) {
             options_.limits.gcWorkBudget);
         statistics_.gcWorkPerformed += work;
         if (work != 0) {
-            emitTrace(runtime::TraceEventKind::GcStep, std::to_string(work));
+            if (diagnosticEventsEnabled_) {
+                const auto workText = std::to_string(work);
+                emitTrace(runtime::TraceEventKind::GcStep, work, workText);
+            } else {
+                emitTrace(runtime::TraceEventKind::GcStep, work);
+            }
         }
     }
     return true;
@@ -268,8 +329,21 @@ bool ExecutionContext::consume(std::string_view operation) {
 bool ExecutionContext::branch(std::uint32_t blockId) {
     ++statistics_.branchesTaken;
     if (traceEventsEnabled_) {
-        emitTrace(runtime::TraceEventKind::Branch,
-            "bb" + std::to_string(blockId));
+        if (determinismOnly_) {
+            determinismEventDigest_ = runtime::accumulateDeterminismEvent(
+                determinismEventDigest_,
+                runtime::TraceEventKind::Branch,
+                currentFunctionId_,
+                blockId,
+                executed_,
+                stack_.size());
+            ++determinismEventCount_;
+        } else if (diagnosticEventsEnabled_) {
+            const auto operation = "bb" + std::to_string(blockId);
+            emitTrace(runtime::TraceEventKind::Branch, blockId, operation);
+        } else {
+            emitTrace(runtime::TraceEventKind::Branch, blockId);
+        }
     }
     return true;
 }
@@ -488,6 +562,8 @@ bool ExecutionContext::invoke(
         }
     }
 
+    const auto previousFunctionId = currentFunctionId_;
+    currentFunctionId_ = function->symbolId;
     stack_.push_back(function->name ? function->name : "<aot-function>");
     ++statistics_.functionCalls;
     statistics_.maximumCallDepth = std::max(
@@ -514,6 +590,7 @@ bool ExecutionContext::invoke(
     }
     if (!succeeded) {
         stack_.pop_back();
+        currentFunctionId_ = previousFunctionId;
         return false;
     }
     if (!expectSignatureType(
@@ -522,14 +599,19 @@ bool ExecutionContext::invoke(
             function->returnTypeId,
             "return value")) {
         stack_.pop_back();
+        currentFunctionId_ = previousFunctionId;
         return false;
     }
     if (traceEventsEnabled_) {
-        emitTrace(
-            runtime::TraceEventKind::FunctionExit,
-            runtime::valueToString(result, heap_.get()));
+        if (diagnosticEventsEnabled_) {
+            const auto operation = runtime::valueToString(result, heap_.get());
+            emitTrace(runtime::TraceEventKind::FunctionExit, 0, operation);
+        } else {
+            emitTrace(runtime::TraceEventKind::FunctionExit);
+        }
     }
     stack_.pop_back();
+    currentFunctionId_ = previousFunctionId;
     return true;
 }
 
@@ -696,7 +778,8 @@ bool ExecutionContext::call(
     }
     runtime::RuntimeError externalError;
     ++statistics_.externalCalls;
-    emitTrace(runtime::TraceEventKind::ExternalCall, reference.name);
+    emitTrace(runtime::TraceEventKind::ExternalCall,
+        reference.symbolId, reference.name);
     std::optional<runtime::Value> externalResult;
     if (!determinism_.invokeExternal(
             bindings_.get(),
@@ -1981,7 +2064,22 @@ std::uint64_t ExecutionContext::instructionsExecuted() const noexcept {
 bool ExecutionContext::finalizeDeterminism(
     bool succeeded,
     const runtime::Value& value) {
-    return determinism_.finish(succeeded, value, error_, statistics_);
+    if (determinismEventsEnabled_) {
+        determinism_.mergeEventDigest(
+            determinismEventDigest_, determinismEventCount_);
+    }
+    succeeded = determinism_.finish(succeeded, value, error_, statistics_);
+    if (options_.profile) {
+        runtime::ExecutionProfile profile;
+        profile.totalEvents = profileEvents_;
+        profile.functions.reserve(profileFunctions_.size());
+        for (auto& [symbolId, function] : profileFunctions_) {
+            (void)symbolId;
+            profile.functions.push_back(std::move(function));
+        }
+        options_.profile->merge(profile);
+    }
+    return succeeded;
 }
 
 std::uint64_t ExecutionContext::determinismDigest() const noexcept {

@@ -2,13 +2,13 @@
 
 ## 结论
 
-当前最主要的性能问题不是单一的 Interpreter dispatch，而是三层可分离成本：
+基线最初显示，主要性能问题不是单一的 Interpreter dispatch，而是三层可分离成本：
 
 1. `invoke()` 每次重新验证全部 bytecode 并重建函数/类型索引，宿主调用成本随整个程序规模增长。
 2. Strict determinism 和 ProfileCollector 在每条指令上构造包含字符串的事件、哈希并（profiled 时）加锁更新 map。
 3. AOT/JIT 仍执行基于 `runtime::Value` 的 compiled MIR，并为每条 MIR 操作调用 `ExecutionContext::consume()`；当前不是 typed native code。
 
-本轮已先修正 benchmark 的 raw 路径和统计能力。关闭 instrumentation 后不再生成逐指令 `TraceEvent`，因此下面的 raw 数字可作为 VM/AOT 本体的第一版基线。
+当前已完成 P0 Runtime Image 和 P1 instrumentation 热路径优化。前两层成本已从主导瓶颈降到噪声或低比例开销；下一阶段的主要目标是 Typed AOT、Interpreter frame/branch/dispatch，以及产品级 macrobench。
 
 ## 测试环境
 
@@ -76,6 +76,29 @@ Raw 的平均成本约 93–103 ns/解释器指令。Strict 增至约 346–356 
 Release 定向回归 7/7 通过：Phase 2C、Phase 6 JIT/core/AOT/benchmark smoke、Phase 19 runtime polymorphism/AOT。新增测试覆盖 ProgramImage copy/move 后的函数/类型索引生命周期以及 EngineRuntime SymbolId 直达调用。
 
 广覆盖 Release 验证为 32/35 通过。除已知无法生成的 Phase 20/24 AOT 和依赖 `rsc` 的打包测试外，新发现的三个基线阻塞为：Phase 2A bytecode snapshot 漂移；Phase 21 AOT 指令计数 Interpreter 3,549、AOT 3,540；Phase 23 NullableRoundTrip 指令计数 Interpreter 23、AOT 22。后两项执行结果一致，差异位于既有 AOT/Interpreter accounting parity，不在 P0 的 verify/index/copy 路径。
+
+## P1 确定性与 profiling 优化结果
+
+P1 将执行事件拆成两个通道：
+
+- Strict 使用稳定的函数 `SymbolId`、opcode/terminator operation id、分支目标、指令序号和调用深度，在执行上下文内联累计结构化摘要；invoke 结束时只向 `DeterminismSession` 合并一次；
+- trace sink 仍收到原有完整字符串 `TraceEvent`，但未配置 sink 时不再构造字符串事件；
+- ProfileCollector 在每次 invoke 内按函数 id 累计数值计数，结束时一次加锁批量合并，不再逐事件执行 mutex + `map<string>` 更新；
+- AOT generator 为每条 MIR operation 直接生成稳定的数值 operation id，Interpreter、AOT、JIT 使用同一事件编码。
+
+21 个样本、每样本 3 次调用的最终 Release 复测：
+
+| Benchmark | P1 前 Strict | P1 后 Strict | P1 后 Strict/Raw | P1 前 Profiled | P1 后 Profiled | P1 后 Profiled/Raw |
+|---|---:|---:|---:|---:|---:|---:|
+| `integer_loop` | 44.912 ms | 13.468 ms | 1.11x | 55.153 ms | 16.305 ms | 1.35x |
+| `branch_loop` | 62.199 ms | 18.954 ms | 1.15x | 79.580 ms | 21.536 ms | 1.31x |
+| `function_call` | 64.031 ms | 20.015 ms | 1.05x | 85.098 ms | 25.472 ms | 1.34x |
+
+Strict 绝对时间降低约 69%–70%，Profiled 降低约 70%–73%。同进程的模式比值显著低于 Strict `<1.2x`、Profiled `<2x` 的目标。
+
+Compiled MIR 的整数循环也接近目标：AOT raw/Strict 为 3.033/3.395 ms（1.12x），JIT raw/Strict 为 2.931/3.347 ms（1.14x）。与 P1 前 AOT Strict 37.787 ms、JIT Strict 38.308 ms 相比，绝对时间均降低约 91%。
+
+确定性摘要现在使用结构化数值事件编码，因此摘要数值与 P1 前构建不兼容；同一构建内的重复执行以及 Interpreter/AOT/JIT 之间仍保持一致。Release 定向验证 7/7 通过，覆盖 Strict、Record/Replay、trace/profile、JIT、AOT 和 runtime polymorphism。最终广覆盖验证仍为 32/35，通过/失败集合与 P0 完全一致，没有新增回归。
 
 ## Interpreter O0/O1/O2
 
@@ -148,16 +171,16 @@ JIT cold 编译为 3,617 ms，紧随其后的 cache hit 为 2.61 ms。JIT 性能
 
 ### P1：确定性与 profiling 成本
 
-状态：下一优化优先级。
+状态：已完成。
 
-Raw 关闭路径已经不再生成逐事件对象。Strict/Profiled 下一步应：
+已完成：
 
 - 用数值 operation/event id 代替热路径字符串；
 - 对现有 MIR/bytecode 元数据直接增量哈希；
 - ProfileCollector 改为线程本地计数或无锁批量合并；
-- timing run 与 profile run 完全分离。
+- benchmark 的 timing 模式与 profile 模式保持显式分离。
 
-建议第一阶段目标：Strict 相对 raw 小于 1.2x；Profiled 小于 2x。当前分别约 3.4–3.7x 和 4.4–4.7x。
+第一阶段目标为 Strict 相对 raw 小于 1.2x、Profiled 小于 2x。最终 Interpreter 三组为 Strict 1.05–1.15x、Profiled 1.31–1.35x；AOT/JIT Strict 为 1.12x/1.14x。
 
 ### P2：Typed AOT
 
