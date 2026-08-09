@@ -66,11 +66,27 @@ void writeBinaryFile(
     }
 }
 
+std::string bytecodeArtifactName(std::string moduleName) {
+    if (moduleName.empty()) moduleName = "module";
+    for (auto& character : moduleName) {
+        switch (character) {
+        case '<': case '>': case ':': case '"':
+        case '/': case '\\': case '|': case '?': case '*':
+            character = '_';
+            break;
+        default:
+            break;
+        }
+    }
+    return moduleName + ".rsbc";
+}
+
 void printUsage() {
     std::cerr
         << "usage: rsc <file.rs>... "
            "[--check|--tokens|--mir|--symbols|--bytecode]\n"
         << "       rsc <file.rs>... --emit-bytecode <module.rsbc>\n"
+        << "       rsc <file.rs>... --emit-bytecode-dir <directory>\n"
         << "       rsc <module.rsbc> --disassemble\n"
         << "       rsc <file.rs>... --run <module::function>\n";
 }
@@ -111,7 +127,8 @@ int main(int argc, char** argv) {
     std::vector<std::string> paths;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
-        if (argument == "--emit-bytecode" || argument == "--run") {
+        if (argument == "--emit-bytecode" ||
+            argument == "--emit-bytecode-dir" || argument == "--run") {
             mode = argument;
             if (index + 1 >= argc) {
                 printUsage();
@@ -266,7 +283,8 @@ int main(int argc, char** argv) {
                 }
             }
         } else if (!result.diagnostics.hasErrors() &&
-            (mode == "--bytecode" || mode == "--emit-bytecode")) {
+            (mode == "--bytecode" || mode == "--emit-bytecode" ||
+             mode == "--emit-bytecode-dir")) {
             std::vector<realscript::bytecode::Module> modules;
             realscript::bytecode::Lowerer lowerer;
             for (const auto& mirModule : result.modules) {
@@ -283,7 +301,7 @@ int main(int argc, char** argv) {
                         std::cout << realscript::bytecode::disassembleModule(module)
                             << '\n';
                     }
-                } else {
+                } else if (mode == "--emit-bytecode") {
                     if (modules.size() != 1) {
                         result.diagnostics.report(
                             "RS5200",
@@ -293,6 +311,26 @@ int main(int argc, char** argv) {
                         writeBinaryFile(
                             outputPath,
                             realscript::bytecode::encodeModule(modules.front()));
+                    }
+                } else {
+                    std::error_code directoryError;
+                    std::filesystem::create_directories(
+                        outputPath, directoryError);
+                    if (directoryError) {
+                        result.diagnostics.report(
+                            "RS5201",
+                            "failed to create bytecode output directory: " +
+                                directoryError.message(),
+                            {});
+                    } else {
+                        for (const auto& module : modules) {
+                            const auto artifact =
+                                std::filesystem::path(outputPath) /
+                                bytecodeArtifactName(module.name);
+                            writeBinaryFile(
+                                artifact.string(),
+                                realscript::bytecode::encodeModule(module));
+                        }
                     }
                 }
             }
@@ -320,3 +358,4 @@ int main(int argc, char** argv) {
         return 2;
     }
 }
+#include <filesystem>

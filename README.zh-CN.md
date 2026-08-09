@@ -110,4 +110,4 @@ Gameplay 调度状态由 `encodeGameplayHostState()` / `restoreGameplayHostState
 
 ## License
 
-许可证尚未确定。在正式提交许可证文件前，请勿假定本仓库代码或文档可以再分发。
+RealScript 使用 Apache License 2.0 许可证，详见 [LICENSE](LICENSE)。

@@ -132,7 +132,7 @@ Use `SceneScriptRuntime` for lifecycle/event dispatch and `SceneGameplayDriver` 
 
 | Tool | Purpose |
 |---|---|
-| `rsc` | Compile, validate, inspect MIR/bytecode, run scripts, and emit profiles/digests. |
+| `rsc` | Compile, validate, inspect MIR/bytecode, run scripts, emit module directories, and emit profiles/digests. |
 | `rsaot` | Generate deterministic C++17 AOT sources and manifests. |
 | `rsdebug` | Source-level Debug Adapter Protocol server. |
 | `rslsp` | Language Server Protocol server. |
@@ -211,4 +211,4 @@ RealScript is not CLR-compatible C#. Current limits include:
 
 ## License
 
-A license has not yet been selected. Do not assume that the code or documentation may be redistributed until a license file is committed.
+RealScript is licensed under the Apache License 2.0. See [LICENSE](LICENSE).

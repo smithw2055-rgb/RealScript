@@ -106,7 +106,10 @@ rsc game.rs --emit-bytecode game.rsbc
 rsc game.rsbc --disassemble
 ```
 
-`--emit-bytecode` currently requires exactly one compiled module. Multi-module packaging/linking remains future work.
+`--emit-bytecode` retains the original single-module contract. The completed
+productization path also provides `--emit-bytecode-dir`, which writes one
+`.rsbc` artifact per compiled module for deterministic loading and linking by
+`GameProgramLoader`.
 
 ## Tests
 

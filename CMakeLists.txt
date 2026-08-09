@@ -96,6 +96,20 @@ realscript_add_component(realscript_debug Debug)
 realscript_add_component(realscript_tooling Tooling)
 realscript_add_component(realscript_full Full)
 
+function(realscript_enable_cxx_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+        if(REALSCRIPT_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE /WX)
+        endif()
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+        if(REALSCRIPT_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE -Werror)
+        endif()
+    endif()
+endfunction()
+
 if(MSVC)
     set_source_files_properties(
         src/aot_cpp/AotCpp.cpp
@@ -110,16 +124,8 @@ if(MSVC)
         src/game/GameplayStateCodec.cpp
         PROPERTIES COMPILE_OPTIONS "/wd4456"
     )
-    target_compile_options(realscript_frontend PRIVATE /W4 /permissive-)
-    if(REALSCRIPT_WARNINGS_AS_ERRORS)
-        target_compile_options(realscript_frontend PRIVATE /WX)
-    endif()
-else()
-    target_compile_options(realscript_frontend PRIVATE -Wall -Wextra -Wpedantic)
-    if(REALSCRIPT_WARNINGS_AS_ERRORS)
-        target_compile_options(realscript_frontend PRIVATE -Werror)
-    endif()
 endif()
+realscript_enable_cxx_warnings(realscript_frontend)
 
 add_executable(rsc tools/rsc/main.cpp)
 target_link_libraries(rsc PRIVATE RealScript::Compiler RealScript::Runtime)
@@ -141,6 +147,10 @@ add_executable(rsbench tools/rsbench/main.cpp)
 target_link_libraries(rsbench PRIVATE RealScript::Compiler RealScript::Runtime)
 target_compile_features(rsbench PRIVATE cxx_std_17)
 
+foreach(realscript_tool IN ITEMS rsc rsdebug rslsp rsaot rsbench)
+    realscript_enable_cxx_warnings(${realscript_tool})
+endforeach()
+
 include(cmake/RealScriptAot.cmake)
 
 if(REALSCRIPT_BUILD_TESTS)
@@ -150,6 +160,7 @@ if(REALSCRIPT_BUILD_TESTS)
         add_executable(${target} ${source})
         target_link_libraries(${target} PRIVATE RealScript::Full)
         target_compile_features(${target} PRIVATE cxx_std_17)
+        realscript_enable_cxx_warnings(${target})
         add_test(NAME ${test_name} COMMAND ${target})
     endfunction()
 
@@ -226,7 +237,7 @@ if(REALSCRIPT_BUILD_TESTS)
         PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME realscript.phase5.aot COMMAND realscript_phase5_aot_tests)
 
-    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS AND NOT MSVC)
+    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
         realscript_add_cpp_test(
             realscript_phase6_jit_tests
             realscript.phase6.jit
@@ -316,7 +327,7 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase20_generated
         PROGRAM_NAME Phase20Aot
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE20_GENERATED_DIR}"
-        OPT_LEVEL 0
+        OPT_LEVEL 2
         SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase20_aot.rs"
     )
@@ -339,7 +350,7 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase21_generated
         PROGRAM_NAME Phase21Aot
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE21_GENERATED_DIR}"
-        OPT_LEVEL 0
+        OPT_LEVEL 2
         SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase21_aot.rs"
     )
@@ -362,7 +373,7 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase22_generated
         PROGRAM_NAME Phase22Aot
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE22_GENERATED_DIR}"
-        OPT_LEVEL 0
+        OPT_LEVEL 2
         SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase22_aot.rs"
     )
@@ -385,7 +396,7 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase23_generated
         PROGRAM_NAME Phase23Aot
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE23_GENERATED_DIR}"
-        OPT_LEVEL 0
+        OPT_LEVEL 2
         SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase23_aot.rs"
     )
@@ -408,7 +419,7 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase24_generated
         PROGRAM_NAME Phase24Aot
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE24_GENERATED_DIR}"
-        OPT_LEVEL 0
+        OPT_LEVEL 2
         SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase24_aot.rs"
     )
@@ -431,7 +442,7 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase19_generated
         PROGRAM_NAME Phase19Aot
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE19_GENERATED_DIR}"
-        OPT_LEVEL 0
+        OPT_LEVEL 2
         SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase19_aot.rs"
     )
@@ -448,7 +459,7 @@ if(REALSCRIPT_BUILD_TESTS)
     add_test(
         NAME realscript.phase19.aot
         COMMAND realscript_phase19_aot_tests)
-    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS AND NOT MSVC)
+    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
         target_compile_definitions(
             realscript_phase19_runtime_polymorphism_tests
             PRIVATE
@@ -481,6 +492,39 @@ if(REALSCRIPT_BUILD_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rs"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rs"
     )
+    add_test(
+        NAME realscript.phase6.cli-multimodule-package
+        COMMAND ${CMAKE_COMMAND}
+            -DREALSCRIPT_RSC=$<TARGET_FILE:rsc>
+            -DREALSCRIPT_SOURCE_A=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rs
+            -DREALSCRIPT_SOURCE_B=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rs
+            -DREALSCRIPT_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/cli-multimodule/$<CONFIG>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/multimodule_cli_test.cmake
+    )
+
+    foreach(realscript_aot_test IN ITEMS
+            realscript_phase5_aot_tests
+            realscript_phase6_aot_tests
+            realscript_phase19_aot_tests
+            realscript_phase20_aot_tests
+            realscript_phase21_aot_tests
+            realscript_phase22_aot_tests
+            realscript_phase23_aot_tests
+            realscript_phase24_aot_tests)
+        realscript_enable_cxx_warnings(${realscript_aot_test})
+    endforeach()
+
+    add_test(
+        NAME realscript.productization.install-consumer
+        COMMAND ${CMAKE_COMMAND}
+            -DREALSCRIPT_BUILD_DIR=${CMAKE_BINARY_DIR}
+            -DREALSCRIPT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -DREALSCRIPT_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/install-consumer/$<CONFIG>/sdk
+            -DREALSCRIPT_INSTALL_LIBDIR=${CMAKE_INSTALL_LIBDIR}
+            -DREALSCRIPT_CONSUMER_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/install-consumer/$<CONFIG>/build
+            -DREALSCRIPT_CONFIG=$<CONFIG>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/install_consumer_test.cmake
+    )
 endif()
 
 if(REALSCRIPT_INSTALL_SDK)
@@ -496,12 +540,19 @@ if(REALSCRIPT_INSTALL_SDK)
             realscript_debug
             realscript_tooling
             realscript_full
+            rsaot
         EXPORT RealScriptTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
+    install(
+        TARGETS rsc rsdebug rslsp rsbench
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
     install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    install(FILES LICENSE
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/RealScript)
     install(FILES cmake/RealScriptAot.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/RealScript)
 

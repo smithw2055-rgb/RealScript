@@ -27,6 +27,7 @@ Available targets are:
 - `RealScript::Tooling`
 - `RealScript::Full`
 - `RealScript::Frontend` for compatibility
+- `RealScript::rsaot` as the installed AOT generator executable
 
 The v0.1 implementation still uses one internal static archive. The component targets are the supported consumer boundary; the implementation can be split later without changing downstream CMake files.
 
@@ -38,7 +39,7 @@ cmake --build build
 cmake --install build --prefix /path/to/realscript-sdk
 ```
 
-The package installs headers, `RealScriptConfig.cmake`, exported targets, version metadata, and `RealScriptAot.cmake`.
+The package installs headers, command-line tools, `RealScriptConfig.cmake`, exported targets, version metadata, the license, and `RealScriptAot.cmake`. The exported `RealScript::rsaot` executable target allows an installed consumer to include `${RealScript_AOT_MODULE}` and call `realscript_add_aot_library` without referring back to the source tree.
 
 ## SDK version contract
 
@@ -107,4 +108,4 @@ RS0 does not freeze the source language, `.rsbc` format, object ABI, or native m
 
 ## License status
 
-No license is selected in RS0. Choosing a redistribution license is a project-owner legal decision and remains a release blocker for external SDK distribution.
+RealScript is distributed under the Apache License 2.0. The SDK installation includes the repository `LICENSE` file under the platform data directory.

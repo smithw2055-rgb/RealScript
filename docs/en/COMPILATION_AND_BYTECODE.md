@@ -221,7 +221,13 @@ rsc source.rs --mir
 rsc source.rs --symbols
 rsc source.rs --bytecode
 rsc source.rs --emit-bytecode program.rsbc
+rsc model.rs app.rs --emit-bytecode-dir build/bytecode
 rsc program.rsbc --disassemble
 ```
+
+`--emit-bytecode` retains the single-module file workflow. For a compilation
+that produces multiple modules, `--emit-bytecode-dir` writes one canonically
+named `.rsbc` artifact per module so the files can be passed directly to
+`GameProgramLoader::loadBytecodeModules`.
 
 For backend details, continue with [AOT, JIT, and Performance](AOT_JIT_AND_PERFORMANCE.md).

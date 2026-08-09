@@ -27,9 +27,14 @@ function(realscript_add_aot_library target)
             "realscript_add_aot_library(${target}) received unknown arguments: "
             "${RSAOT_UNPARSED_ARGUMENTS}")
     endif()
-    if(NOT TARGET rsaot)
+    if(TARGET rsaot)
+        set(realscript_rsaot_target rsaot)
+    elseif(TARGET RealScript::rsaot)
+        set(realscript_rsaot_target RealScript::rsaot)
+    else()
         message(FATAL_ERROR
-            "realscript_add_aot_library requires the rsaot executable target")
+            "realscript_add_aot_library requires the rsaot executable target "
+            "from either the RealScript source tree or an installed SDK")
     endif()
     if(NOT RSAOT_SOURCES)
         message(FATAL_ERROR
@@ -98,12 +103,12 @@ function(realscript_add_aot_library target)
             "${generated_manifest}"
         COMMAND ${CMAKE_COMMAND} -E make_directory
             "${RSAOT_OUTPUT_DIRECTORY}"
-        COMMAND $<TARGET_FILE:rsaot> ${generator_arguments}
+        COMMAND $<TARGET_FILE:${realscript_rsaot_target}> ${generator_arguments}
         COMMAND ${CMAKE_COMMAND} -E touch_nocreate
             "${generated_header}"
             "${generated_source}"
             "${generated_manifest}"
-        DEPENDS rsaot ${aot_sources}
+        DEPENDS ${realscript_rsaot_target} ${aot_sources}
         COMMENT "Generating RealScript C++17 AOT target ${target}"
         VERBATIM
     )

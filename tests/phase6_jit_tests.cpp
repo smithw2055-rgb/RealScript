@@ -57,7 +57,13 @@ realscript::jit::ToolchainOptions options() {
     result.outputDirectory = REALSCRIPT_JIT_CACHE_DIR;
     result.generation.programName = "Phase6JitFixture";
     result.optimization.level = realscript::optimization::Level::Aggressive;
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#if defined(_DEBUG)
+    result.compilerArguments.push_back("/MDd");
+#else
+    result.compilerArguments.push_back("/MD");
+#endif
+#else
     result.compilerArguments.push_back("-O2");
 #endif
     return result;

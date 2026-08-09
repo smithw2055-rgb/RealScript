@@ -1,6 +1,6 @@
 # Project Status and Roadmap
 
-[Documentation Home](README.md) | [Repository README](../../README.md) | [Phase 11–17 Profile](LANGUAGE_EXPANSION_PHASE_11_17.md)
+[Documentation Home](README.md) | [Repository README](../../README.md) | [Phase 11–18 Profile](NATIVE_LANGUAGE_PHASE_11_18.md)
 
 The Phase 1–24 compiler, runtime, Game SDK, deterministic gameplay, and native language/runtime roadmap is complete. Phase 18 replaced the former Phase 11–17 source-expansion profile with native compiler constructs; Phases 19–24 then completed the planned polymorphism, closure, generic/collection, coroutine, value/reference, convenience/pattern, and structured-error slices.
 

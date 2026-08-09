@@ -374,6 +374,11 @@ int main()
 #if defined(REALSCRIPT_PHASE19_JIT_COMPILER)
     realscript::jit::ToolchainOptions jitOptions;
     jitOptions.compiler = REALSCRIPT_PHASE19_JIT_COMPILER;
+#if defined(_WIN32) && defined(_DEBUG)
+    jitOptions.compilerArguments.push_back("/MDd");
+#elif defined(_WIN32)
+    jitOptions.compilerArguments.push_back("/MD");
+#endif
     jitOptions.includeDirectory = REALSCRIPT_PHASE19_JIT_INCLUDE_DIR;
     jitOptions.supportLibrary =
         REALSCRIPT_PHASE19_JIT_SUPPORT_LIBRARY;
@@ -533,6 +538,11 @@ int main()
 #if defined(REALSCRIPT_PHASE19_JIT_COMPILER)
     realscript::jit::ToolchainOptions jitOptions;
     jitOptions.compiler = REALSCRIPT_PHASE19_JIT_COMPILER;
+#if defined(_WIN32) && defined(_DEBUG)
+    jitOptions.compilerArguments.push_back("/MDd");
+#elif defined(_WIN32)
+    jitOptions.compilerArguments.push_back("/MD");
+#endif
     jitOptions.includeDirectory = REALSCRIPT_PHASE19_JIT_INCLUDE_DIR;
     jitOptions.supportLibrary =
         REALSCRIPT_PHASE19_JIT_SUPPORT_LIBRARY;
