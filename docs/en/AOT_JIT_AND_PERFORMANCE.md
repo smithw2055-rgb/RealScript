@@ -87,7 +87,8 @@ The public ABI header can be included from a C11 host.
 
 ## Same-SDK Boundary
 
-The v0.1 AOT ABI assumes compatible RealScript SDK headers, runtime implementation, compiler settings, and C++ ABI.
+The v0.2.0 AOT ABI assumes compatible RealScript SDK headers, runtime
+implementation, compiler settings, and C++ ABI.
 
 It is not a promise that a precompiled module can be moved between arbitrary standard libraries, compiler versions, or platforms.
 
@@ -174,6 +175,37 @@ Benchmark output includes:
 - per-function profile information.
 
 A zero-warmup run is valid.
+
+## v0.2.0 Release Baseline
+
+The following local Release measurements were collected on Windows 11 with an
+AMD Ryzen 7 6800H and Visual Studio 2026. They are regression baselines, not
+cross-language rankings. Timings are medians; RAW native-backend measurements
+use `gcWorkBudget=0` so collector work is measured separately.
+
+| Workload | Median |
+|---|---:|
+| Native C++ integer loop | 4.06 µs |
+| C++17 AOT RAW | 25.86 µs |
+| Toolchain JIT RAW | 25.68 µs |
+| AOT Strict | 0.358 ms |
+| JIT Strict | 0.347 ms |
+| Interpreter integer loop, 130,011 instructions | 6.73 ms |
+| Interpreter branch loop, 180,011 instructions | 9.46 ms |
+| Interpreter function-call loop, 10,000 calls | 12.99 ms |
+| Allocation tick with GC work 8 | 27.75 ms |
+| 10,000 coroutine resume | 86.06 ms |
+| 10,000 coroutine deterministic replay | 89.45 ms |
+
+The AOT/JIT integer loop improved from the pre-typed baseline of roughly 3 ms
+to roughly 26 µs while preserving checked arithmetic, exact finite budgets,
+statistics, trace/profile behavior, and cross-backend deterministic digests.
+Continuous-allocation GC improved from 5.239 seconds with no completed
+collection to 27.75 ms with 460 completed collections and 16,320 bytes live.
+
+For the complete experiment history, rejected prototypes, product macrobench
+results, and reproduction commands, see the
+[detailed performance report](../zh-CN/PERFORMANCE_BASELINE_2026-08-09.md).
 
 ## Differential Validation
 

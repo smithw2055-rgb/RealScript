@@ -2,7 +2,8 @@
 
 [Repository README](../../README.md) | [简体中文文档](../zh-CN/README.md)
 
-This library describes the RealScript v0.1 alpha technical baseline through Phase 24. It is organized by subsystem and user workflow.
+This library describes the RealScript v0.2.0 implementation through Phase 24.
+It is organized by subsystem and user workflow.
 
 ## New Users
 
@@ -25,6 +26,7 @@ This library describes the RealScript v0.1 alpha technical baseline through Phas
 - [Deterministic Gameplay Runtime](GAMEPLAY_RUNTIME.md)
 - [SDK Productization](PRODUCTIZATION.md)
 - [AOT, JIT, and Performance](AOT_JIT_AND_PERFORMANCE.md)
+- [Detailed Performance Baseline (Chinese)](../zh-CN/PERFORMANCE_BASELINE_2026-08-09.md)
 - [Phase 18–24 Native Roadmap](../roadmap/PHASE_18_24_NATIVE_LANGUAGE_AND_RUNTIME.md)
 - [Phase 24 Language Completeness and Structured Errors](../roadmap/PHASE_24_LANGUAGE_COMPLETENESS_AND_STRUCTURED_ERRORS.md)
 
@@ -45,4 +47,8 @@ The original detailed documents remain useful for implementation history and sub
 
 ## Versioning
 
-The current documentation describes the v0.1 alpha implementation through Phase 24. The source language, MIR, bytecode, runtime ABI, metadata, and debug-info formats use separate version dimensions. None should be assumed stable until explicitly frozen.
+The current documentation describes the v0.2.0 implementation through Phase
+24. The source language, MIR, bytecode, runtime ABI, metadata, and debug-info
+formats use separate version dimensions. A numbered GitHub release does not
+freeze those compatibility contracts; pin an exact release and rebuild AOT
+artifacts with the matching SDK.

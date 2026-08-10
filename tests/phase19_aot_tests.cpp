@@ -3,6 +3,7 @@
 #include "realscript/aot_cpp/AotRuntime.h"
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
+#include "realscript/optimization/Optimizer.h"
 #include "realscript/runtime/Runtime.h"
 
 #include <fstream>
@@ -35,9 +36,15 @@ std::vector<realscript::bytecode::Module> compileFixture() {
     auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
         "Phase 19 AOT fixture compilation failed");
+    realscript::optimization::Options options;
+    options.level = realscript::optimization::Level::Aggressive;
+    auto optimized = realscript::optimization::Optimizer{}.optimize(
+        build.modules, build.diagnostics, options);
+    require(!build.diagnostics.hasErrors(),
+        "Phase 19 interpreter fixture optimization failed");
     realscript::bytecode::Lowerer lowerer;
     std::vector<realscript::bytecode::Module> modules;
-    for (const auto& module : build.modules) {
+    for (const auto& module : optimized.modules) {
         modules.push_back(lowerer.lower(module));
     }
     return modules;

@@ -205,4 +205,7 @@ The same event ordering is used by interpreter and AOT execution so deterministi
 
 ## Embedding Stability
 
-The v0.1 native and AOT contracts are designed for same-SDK integration. Hosts should not assume that precompiled modules remain binary compatible across unrelated compiler toolchains or future RealScript versions until the ABI is explicitly frozen.
+The v0.2.0 native and AOT contracts are designed for same-SDK integration.
+Hosts should not assume that precompiled modules remain binary compatible
+across unrelated compiler toolchains or future RealScript versions until the
+ABI is explicitly frozen.

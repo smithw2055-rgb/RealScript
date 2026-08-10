@@ -158,4 +158,9 @@ Changing one dimension does not automatically require changing every other dimen
 
 ## Current Architectural Boundaries
 
-The v0.1 Phase 24 alpha implements inheritance, runtime interfaces/virtual dispatch, compile-time generics, deterministic coroutine state machines, and script exceptions, but their source/artifact/ABI contracts are not frozen. Cross-toolchain AOT distribution and an in-process direct machine-code JIT remain future design areas. See the [compatibility matrix](CSHARP_COMPATIBILITY_MATRIX.md) for language boundaries.
+The v0.2.0 Phase 24 implementation includes inheritance, runtime
+interfaces/virtual dispatch, compile-time generics, deterministic coroutine
+state machines, and script exceptions, but their source/artifact/ABI contracts
+are not frozen. Cross-toolchain AOT distribution and an in-process direct
+machine-code JIT remain future design areas. See the
+[compatibility matrix](CSHARP_COMPATIBILITY_MATRIX.md) for language boundaries.

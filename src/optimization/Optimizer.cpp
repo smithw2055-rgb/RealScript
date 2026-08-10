@@ -31,10 +31,12 @@ struct Constant {
 bool isValueInstruction(const mir::Instruction& instruction) noexcept {
     if (instruction.opcode == mir::Opcode::StoreLocal ||
         instruction.opcode == mir::Opcode::StoreField ||
-        instruction.opcode == mir::Opcode::StoreElement) {
+        instruction.opcode == mir::Opcode::StoreElement ||
+        instruction.opcode == mir::Opcode::StoreStructField) {
         return false;
     }
-    return instruction.opcode != mir::Opcode::Call ||
+    return (instruction.opcode != mir::Opcode::Call &&
+            instruction.opcode != mir::Opcode::InvokeDelegate) ||
         instruction.resultType != semantic::PrimitiveType::Void;
 }
 
@@ -487,6 +489,13 @@ bool removeUnreachableBlocks(mir::Function& function, Statistics& statistics) {
             add(block->terminator.target);
             add(block->terminator.falseTarget);
         }
+        for (const auto& handler : function.exceptionHandlers) {
+            if (std::find(handler.protectedBlocks.begin(),
+                    handler.protectedBlocks.end(), id) !=
+                handler.protectedBlocks.end()) {
+                add(handler.handlerBlock);
+            }
+        }
     }
     const auto before = function.blocks.size();
     function.blocks.erase(
@@ -495,6 +504,22 @@ bool removeUnreachableBlocks(mir::Function& function, Statistics& statistics) {
                 return reachable.find(block.id) == reachable.end();
             }),
         function.blocks.end());
+    for (auto& handler : function.exceptionHandlers) {
+        handler.protectedBlocks.erase(
+            std::remove_if(handler.protectedBlocks.begin(),
+                handler.protectedBlocks.end(),
+                [&](mir::BlockId block) {
+                    return reachable.find(block) == reachable.end();
+                }),
+            handler.protectedBlocks.end());
+    }
+    function.exceptionHandlers.erase(
+        std::remove_if(function.exceptionHandlers.begin(),
+            function.exceptionHandlers.end(),
+            [](const mir::ExceptionHandler& handler) {
+                return handler.protectedBlocks.empty();
+            }),
+        function.exceptionHandlers.end());
     const auto removed = before - function.blocks.size();
     statistics.blocksRemoved += removed;
     return removed != 0;

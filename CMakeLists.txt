@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(RealScript VERSION 0.1.0 LANGUAGES C CXX)
+project(RealScript VERSION 0.2.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -11,7 +11,7 @@ option(REALSCRIPT_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS "Run external C++ toolchain JIT integration tests" ON)
 option(REALSCRIPT_INSTALL_SDK "Generate installable RealScript SDK targets" ON)
 
-# v0.1 keeps one implementation archive so existing applications retain the
+# v0.2 keeps one implementation archive so existing applications retain the
 # exact same link behavior. Productized component targets below provide a
 # stable consumer surface and allow the implementation to be split later
 # without changing downstream CMake files.
