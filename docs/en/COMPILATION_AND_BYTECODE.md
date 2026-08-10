@@ -59,7 +59,8 @@ Each module records:
 
 If an implementation changes without changing public signatures, dependent module MIR may be reused from the previous `BuildSnapshot`. If a public signature changes, direct dependents are rebound.
 
-The v0.1 baseline reuses semantic and MIR results. Persistent parser caches are future work.
+The v0.2.0 baseline reuses semantic and MIR results. Persistent parser caches
+are future work.
 
 ## Typed MIR
 

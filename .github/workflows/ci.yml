@@ -20,6 +20,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Configure MSVC environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $installation) {
+            throw "Visual Studio C++ toolchain was not found"
+          }
+          $vsDevCmd = Join-Path $installation "Common7\Tools\VsDevCmd.bat"
+          $environment = & $env:ComSpec /d /s /c `
+            "`"$vsDevCmd`" -arch=x64 -host_arch=x64 >nul && set"
+          if ($LASTEXITCODE -ne 0) {
+            throw "VsDevCmd failed with exit code $LASTEXITCODE"
+          }
+          foreach ($entry in $environment) {
+            if ($entry -match '^([^=]+)=(.*)$') {
+              "$($matches[1])=$($matches[2])" | Out-File `
+                -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
+
       - name: Configure
         run: >-
           python tools/ci/run_and_capture.py configure.log --

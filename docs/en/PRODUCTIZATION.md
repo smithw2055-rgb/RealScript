@@ -1,6 +1,8 @@
 # SDK Productization
 
-RealScript RS0 defines the first stable embedding surface for engine integration while the language and binary formats remain alpha.
+RealScript RS0 defines the first versioned embedding surface for engine
+integration. v0.2.0 ships that surface as a release, while the language and
+binary compatibility contracts remain unfrozen.
 
 ## CMake consumer targets
 
@@ -29,7 +31,9 @@ Available targets are:
 - `RealScript::Frontend` for compatibility
 - `RealScript::rsaot` as the installed AOT generator executable
 
-The v0.1 implementation still uses one internal static archive. The component targets are the supported consumer boundary; the implementation can be split later without changing downstream CMake files.
+The v0.2.0 implementation still uses one internal static archive. The component
+targets are the supported consumer boundary; the implementation can be split
+later without changing downstream CMake files.
 
 Install and consume the SDK:
 
@@ -50,7 +54,8 @@ The package installs headers, command-line tools, `RealScriptConfig.cmake`, expo
 - the Game SDK bytecode-package identity contract;
 - the restricted script-object state format.
 
-Hosts should pin RealScript to an exact release or commit while the ABI remains alpha.
+Hosts should pin RealScript to an exact release or commit while the ABI remains
+unfrozen.
 
 ## Loading verified bytecode modules
 

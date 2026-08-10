@@ -136,7 +136,9 @@ The CLI deterministic option enables the strict deterministic execution profile 
 
 ## Deterministic Simulation Boundary
 
-The v0.1 runtime establishes execution-level determinism, host-call policy, record/replay validation, and stable digests. A complete fixed-tick game simulation environment still needs host-level policies for:
+The v0.2.0 runtime establishes execution-level determinism, host-call policy,
+record/replay validation, and stable digests. A complete fixed-tick game
+simulation environment still needs host-level policies for:
 
 - fixed time steps;
 - seeded random-number streams;

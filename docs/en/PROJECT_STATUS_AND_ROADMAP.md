@@ -8,7 +8,10 @@ The Phase 1–24 compiler, runtime, Game SDK, deterministic gameplay, and native
 
 RealScript should currently be described as:
 
-> A complete Phase 24 alpha reference implementation of a native, strongly typed, deterministic C#-style game language and engine-integration baseline—not a frozen production 1.0 language, CLR-compatible platform, or .NET standard library.
+> A complete v0.2.0 Phase 24 implementation of a native, strongly typed,
+> deterministic C#-style game language and engine-integration baseline—not a
+> frozen production 1.0 language, CLR-compatible platform, or .NET standard
+> library.
 
 The implementation is suitable for:
 
@@ -150,8 +153,9 @@ The following remain draft:
 - GC and embedding ownership contracts;
 - cross-toolchain AOT module distribution.
 
-Projects integrating the alpha baseline should pin a specific revision and use
-the [current C#-style compatibility matrix](CSHARP_COMPATIBILITY_MATRIX.md).
+Projects integrating v0.2.0 should pin the exact release or commit, rebuild AOT
+artifacts with the matching SDK, and use the
+[current C#-style compatibility matrix](CSHARP_COMPATIBILITY_MATRIX.md).
 
 ## Recommended Next Stage
 
@@ -182,4 +186,7 @@ Future work may consider:
 
 ## Release Naming
 
-Until compatibility contracts are frozen, releases should use alpha or preview naming such as `v0.1.0-alpha`. Release notes should identify the exact commit and explicitly state source, expansion-profile, bytecode, SDK, gameplay-state, and ABI boundaries.
+v0.2.0 is a numbered development release, not a declaration that compatibility
+contracts are frozen. Release notes must identify the exact commit and state
+the source-language, bytecode, SDK, gameplay-state, and ABI boundaries. A future
+1.0 release requires explicit compatibility and migration policies.

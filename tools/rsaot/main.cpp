@@ -3,6 +3,7 @@
 #include "realscript/compiler/Compilation.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/optimization/Optimizer.h"
+#include "realscript/Version.h"
 
 #include <filesystem>
 #include <fstream>
@@ -90,7 +91,8 @@ int main(int argc, char** argv) {
             usage();
             return 0;
         } else if (argument == "--version") {
-            std::cout << "rsaot 0.1 (Runtime ABI "
+            std::cout << "rsaot " << realscript::kVersionString
+                << " (Runtime ABI "
                 << realscript::aot::RuntimeAbiMajor << '.'
                 << realscript::aot::RuntimeAbiMinor << ")\n";
             return 0;

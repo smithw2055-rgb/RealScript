@@ -1,4 +1,5 @@
 #include "realscript/tooling/LspServer.h"
+#include "realscript/Version.h"
 
 #include <algorithm>
 #include <string>
@@ -118,7 +119,8 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
                 {"documentSymbolProvider", true},
                 {"renameProvider", true},
             }},
-            {"serverInfo", Json::Object{{"name", "RealScript LSP"}, {"version", "0.1"}}},
+            {"serverInfo", Json::Object{{"name", "RealScript LSP"},
+                {"version", realscript::kVersionString}}},
         });
     }
     if (method == "shutdown") {

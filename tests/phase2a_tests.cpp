@@ -98,7 +98,8 @@ realscript::bytecode::Module compileFixture() {
     const std::string root = REALSCRIPT_SOURCE_DIR;
     return compileBytecode({{
         "phase2a.rs",
-        readFile(root + "/tests/fixtures/phase2a.rs"),
+        normalizeLineEndings(
+            readFile(root + "/tests/fixtures/phase2a.rs")),
     }});
 }
 

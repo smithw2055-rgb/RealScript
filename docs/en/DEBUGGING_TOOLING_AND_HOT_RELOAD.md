@@ -75,7 +75,8 @@ A paused frame exposes:
 - locals visible in the active lexical scope;
 - runtime value formatting.
 
-Expression evaluation with arbitrary side effects is not part of the v0.1 debugger.
+Expression evaluation with arbitrary side effects is not part of the v0.2.0
+debugger.
 
 ## Language Server
 
@@ -155,7 +156,7 @@ Running frames are not rewritten in place.
 
 ## Current Tooling Limits
 
-The v0.1 baseline does not include:
+The v0.2.0 baseline does not include:
 
 - conditional breakpoints;
 - data breakpoints;

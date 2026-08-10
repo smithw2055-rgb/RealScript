@@ -500,9 +500,15 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         }
         const auto elseBlock = createBlock(); emitBranch(condition, thenBlock, elseBlock, {}, {}, statement.span);
         setCurrentBlock(thenBlock); lowerStatement(*value.thenStatement);
-        std::optional<BlockId> thenEnd = hasCurrentBlock() && !currentBlockTerminated() ? currentBlockId_ : std::nullopt;
+        std::optional<BlockId> thenEnd;
+        if (currentBlockId_ && !currentBlockTerminated()) {
+            thenEnd = currentBlockId_;
+        }
         setCurrentBlock(elseBlock); lowerStatement(*value.elseStatement);
-        std::optional<BlockId> elseEnd = hasCurrentBlock() && !currentBlockTerminated() ? currentBlockId_ : std::nullopt;
+        std::optional<BlockId> elseEnd;
+        if (currentBlockId_ && !currentBlockTerminated()) {
+            elseEnd = currentBlockId_;
+        }
         if (!thenEnd && !elseEnd) { clearCurrentBlock(); return; }
         const auto merge = createBlock();
         if (thenEnd) { setCurrentBlock(*thenEnd); emitJump(merge, {}, value.thenStatement->span); }

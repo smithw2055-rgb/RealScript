@@ -10,6 +10,7 @@
 - [游戏脚本 SDK](GAME_SCRIPTING_SDK.md)
 - [确定性游戏运行时](GAMEPLAY_RUNTIME.md)
 - [C# 风格特性兼容矩阵](CSHARP_COMPATIBILITY_MATRIX.md)
+- [性能基线、瓶颈与优化结果](PERFORMANCE_BASELINE_2026-08-09.md)
 - [Phase 18–24 原生语言与运行时路线图](../roadmap/PHASE_18_24_NATIVE_LANGUAGE_AND_RUNTIME.md)
 - [Phase 11–17 游戏语言扩展 Profile](../roadmap/PHASE_11_17_LANGUAGE_EXPANSION.md)
 - [总体架构设计](../ENGINE_DESIGN.md)
@@ -53,4 +54,5 @@
 
 Phase 7 的 Game SDK 与产品化接口见上方专题文档；Phase 8–10 覆盖固定 Tick、Gameplay Host、状态快照与 Rollback；Phase 11–17 提供受限、确定性的 C# 风格游戏语言扩展，并明确保留运行时接口分派、完整闭包、开放泛型和完整引用语义等边界。
 
-英文文档按使用主题组织，中文文档按规范与历史实现阶段组织。两者描述同一个 v0.1 alpha 集成基线。
+英文文档按使用主题组织，中文文档按规范与历史实现阶段组织。两者描述同一个
+v0.2.0 实现基线；规范文档中的 Draft v0.1 是独立的规范版本，不等同于产品版本。

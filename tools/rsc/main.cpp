@@ -8,6 +8,7 @@
 #include "realscript/text/Text.h"
 
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
