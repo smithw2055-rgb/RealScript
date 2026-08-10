@@ -950,6 +950,7 @@ void emitTypedPrimitiveFunction(
     source.line("        if constexpr (DeterminismAccounting) determinismAccounting.flush();");
     source.line("        return context.fail(code, message);");
     source.line("    };");
+    source.line("    (void)typedFail;");
     for (std::size_t index = 0; index < function.localTypes.size(); ++index) {
         source.line("    " + typedCppType(function.localTypes[index]) + " " +
             typedLocalExpression(index) + " = " +
