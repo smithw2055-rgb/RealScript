@@ -31,9 +31,21 @@ Available targets are:
 - `RealScript::Frontend` for compatibility
 - `RealScript::rsaot` as the installed AOT generator executable
 
-The v0.2.0 implementation still uses one internal static archive. The component
-targets are the supported consumer boundary; the implementation can be split
-later without changing downstream CMake files.
+The implementation is split into real static libraries behind those names:
+
+- `RealScript::Compiler` — syntax, semantic, MIR, bytecode, optimizer, debug-info, and the C++17 AOT generator
+- `RealScript::Runtime` — interpreter, heap, and `DebugController` (the interpreter calls the debugger, so those objects share an archive)
+- `RealScript::GameRuntime` / `RealScript::GameCompiler` — gameplay host versus `GameScriptCompiler`
+- `RealScript::GameSdk` — umbrella over GameRuntime + GameCompiler
+- `RealScript::AotSupport` — AOT runtime support and the toolchain JIT driver
+- `RealScript::Debug` — DAP server and hot reload
+- `RealScript::Tooling` — JSON, language service, and LSP
+- `RealScript::Full` — umbrella over the complete implementation
+- `RealScript::Frontend` — combined convenience archive for compatibility and for the JIT's single support-library path
+
+`RealScript::Runtime` still links `RealScript::Compiler` because bytecode decode/verify and semantic helpers live in the compiler archive. Downstream files can keep using the same target names; prefer `RealScript::Full` when the host wants everything, or `RealScript::GameSdk` / `::Compiler` / `::Runtime` for the narrower product slices.
+
+Do not link `RealScript::Frontend` together with the component libraries or `RealScript::Full` in the same target: Frontend is a combined archive of the same objects and would duplicate symbols.
 
 Install and consume the SDK:
 

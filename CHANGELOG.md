@@ -3,6 +3,15 @@
 All notable RealScript changes are documented here. Compatibility contracts
 remain versioned but unfrozen until a future 1.0 release.
 
+## [Unreleased]
+
+- Split the former single `realscript_frontend` archive into real component
+  static libraries (`Compiler`, `Runtime`, `GameRuntime`, `GameCompiler`,
+  `AotSupport`, `Debug`, `Tooling`) while keeping the exported CMake target
+  names. `RealScript::Full` remains the umbrella for hosts that want the
+  complete implementation; `RealScript::Frontend` remains a combined
+  convenience archive for compatibility and the toolchain JIT support library.
+
 ## [0.2.0] - 2026-08-10
 
 v0.2.0 advances RealScript from the Phase 1–6 alpha baseline to the complete

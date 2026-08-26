@@ -11,24 +11,72 @@ option(REALSCRIPT_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS "Run external C++ toolchain JIT integration tests" ON)
 option(REALSCRIPT_INSTALL_SDK "Generate installable RealScript SDK targets" ON)
 
-# v0.2 keeps one implementation archive so existing applications retain the
-# exact same link behavior. Productized component targets below provide a
-# stable consumer surface and allow the implementation to be split later
-# without changing downstream CMake files.
-add_library(realscript_frontend STATIC
+# Component static libraries are the supported consumer surface. Downstream
+# CMake files keep linking RealScript::GameSdk / ::Compiler / ::Runtime /
+# ::Full (and the other exported names) without depending on how sources are
+# partitioned internally.
+#
+# Remaining shared-archive constraints, documented for a later split:
+# - Runtime still PUBLIC-links Compiler because bytecode decode/verify and
+#   semantic helpers (Symbols.cpp) are called from the interpreter/heap, and
+#   moving those TUs would be a semantic/bytecode refactor.
+# - Interpreter calls DebugController, so Debugger.cpp lives in Runtime rather
+#   than Debug. Splitting it out would create a Runtime <-> Debug link cycle.
+# - AotCpp.cpp (the generator) stays in Compiler because it consumes MIR;
+#   AotRuntime.cpp + Jit.cpp live in AotSupport. The JIT host links a single
+#   support .a (ToolchainOptions::supportLibrary), so RealScript::Frontend
+#   remains a combined convenience archive built from the same object files.
+
+function(realscript_enable_cxx_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+        if(REALSCRIPT_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE /WX)
+        endif()
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+        if(REALSCRIPT_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE -Werror)
+        endif()
+    endif()
+endfunction()
+
+function(realscript_configure_component target)
+    set_target_properties(${target} PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+    )
+    target_include_directories(${target}
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    )
+    target_compile_features(${target} PUBLIC cxx_std_17)
+endfunction()
+
+function(realscript_add_component_library target export_name)
+    add_library(${target}_objects OBJECT ${ARGN})
+    realscript_configure_component(${target}_objects)
+    realscript_enable_cxx_warnings(${target}_objects)
+
+    add_library(${target} STATIC $<TARGET_OBJECTS:${target}_objects>)
+    realscript_configure_component(${target})
+    set_target_properties(${target} PROPERTIES
+        EXPORT_NAME ${export_name}
+        LINKER_LANGUAGE CXX
+    )
+    add_library(RealScript::${export_name} ALIAS ${target})
+endfunction()
+
+function(realscript_add_umbrella target export_name)
+    add_library(${target} INTERFACE)
+    target_link_libraries(${target} INTERFACE ${ARGN})
+    set_target_properties(${target} PROPERTIES EXPORT_NAME ${export_name})
+    add_library(RealScript::${export_name} ALIAS ${target})
+endfunction()
+
+set(REALSCRIPT_COMPILER_SOURCES
     src/text/Text.cpp
     src/diagnostics/Diagnostic.cpp
-    src/aot_cpp/AotRuntime.cpp
-    src/aot_cpp/AotCpp.cpp
-    src/optimization/Optimizer.cpp
-    src/jit/Jit.cpp
-    src/debug/DebugInfo.cpp
-    src/debug/Debugger.cpp
-    src/debug/DapServer.cpp
-    src/hot_reload/HotReload.cpp
-    src/tooling/Json.cpp
-    src/tooling/LanguageService.cpp
-    src/tooling/LspServer.cpp
     src/syntax/SyntaxFacts.cpp
     src/syntax/Lexer.cpp
     src/syntax/SyntaxNodes.cpp
@@ -48,10 +96,22 @@ add_library(realscript_frontend STATIC
     src/bytecode/BytecodeVerifier.cpp
     src/bytecode/BytecodeDisassembler.cpp
     src/bytecode/BytecodeCodec.cpp
+    src/optimization/Optimizer.cpp
+    src/debug/DebugInfo.cpp
+    src/aot_cpp/AotCpp.cpp
+)
+set(REALSCRIPT_RUNTIME_SOURCES
     src/runtime/Interpreter.cpp
     src/runtime/RuntimeServices.cpp
     src/runtime/ExecutionServices.cpp
     src/runtime/ManagedHeap.cpp
+    src/debug/Debugger.cpp
+)
+set(REALSCRIPT_AOT_SUPPORT_SOURCES
+    src/aot_cpp/AotRuntime.cpp
+    src/jit/Jit.cpp
+)
+set(REALSCRIPT_GAME_RUNTIME_SOURCES
     src/game/GameApi.cpp
     src/game/ScriptObjectRuntime.cpp
     src/game/ScriptInvokeRuntime.cpp
@@ -64,52 +124,77 @@ add_library(realscript_frontend STATIC
     src/game/GameplayScripting.cpp
     src/game/GameplayStateCodec.cpp
 )
+set(REALSCRIPT_GAME_COMPILER_SOURCES
+    src/game/GameScriptCompiler.cpp
+)
+set(REALSCRIPT_DEBUG_SOURCES
+    src/debug/DapServer.cpp
+    src/hot_reload/HotReload.cpp
+)
+set(REALSCRIPT_TOOLING_SOURCES
+    src/tooling/Json.cpp
+    src/tooling/LanguageService.cpp
+    src/tooling/LspServer.cpp
+)
+
+realscript_add_component_library(
+    realscript_compiler Compiler ${REALSCRIPT_COMPILER_SOURCES})
+realscript_add_component_library(
+    realscript_runtime Runtime ${REALSCRIPT_RUNTIME_SOURCES})
+realscript_add_component_library(
+    realscript_aot_support AotSupport ${REALSCRIPT_AOT_SUPPORT_SOURCES})
+realscript_add_component_library(
+    realscript_game_runtime GameRuntime ${REALSCRIPT_GAME_RUNTIME_SOURCES})
+realscript_add_component_library(
+    realscript_game_compiler GameCompiler ${REALSCRIPT_GAME_COMPILER_SOURCES})
+realscript_add_component_library(
+    realscript_debug Debug ${REALSCRIPT_DEBUG_SOURCES})
+realscript_add_component_library(
+    realscript_tooling Tooling ${REALSCRIPT_TOOLING_SOURCES})
+
+target_link_libraries(realscript_runtime PUBLIC realscript_compiler)
+target_link_libraries(realscript_tooling PUBLIC realscript_compiler)
+target_link_libraries(realscript_aot_support PUBLIC realscript_runtime)
+target_link_libraries(realscript_game_runtime PUBLIC realscript_runtime)
+target_link_libraries(
+    realscript_game_compiler PUBLIC realscript_compiler realscript_game_runtime)
+target_link_libraries(
+    realscript_debug PUBLIC realscript_runtime realscript_tooling)
+if(CMAKE_DL_LIBS)
+    target_link_libraries(realscript_aot_support PUBLIC ${CMAKE_DL_LIBS})
+endif()
+
+realscript_add_umbrella(
+    realscript_game_sdk GameSdk
+    realscript_game_runtime
+    realscript_game_compiler)
+realscript_add_umbrella(
+    realscript_full Full
+    realscript_game_sdk
+    realscript_aot_support
+    realscript_debug
+    realscript_tooling)
+
+# Combined convenience archive for RealScript::Frontend compatibility and for
+# the toolchain JIT, which still accepts a single support-library path.
+add_library(realscript_frontend STATIC
+    $<TARGET_OBJECTS:realscript_compiler_objects>
+    $<TARGET_OBJECTS:realscript_runtime_objects>
+    $<TARGET_OBJECTS:realscript_aot_support_objects>
+    $<TARGET_OBJECTS:realscript_game_runtime_objects>
+    $<TARGET_OBJECTS:realscript_game_compiler_objects>
+    $<TARGET_OBJECTS:realscript_debug_objects>
+    $<TARGET_OBJECTS:realscript_tooling_objects>
+)
+realscript_configure_component(realscript_frontend)
 set_target_properties(realscript_frontend PROPERTIES
-    POSITION_INDEPENDENT_CODE ON
     EXPORT_NAME Frontend
+    LINKER_LANGUAGE CXX
 )
 add_library(RealScript::Frontend ALIAS realscript_frontend)
-
-target_include_directories(realscript_frontend
-    PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-)
-target_compile_features(realscript_frontend PUBLIC cxx_std_17)
 if(CMAKE_DL_LIBS)
     target_link_libraries(realscript_frontend PUBLIC ${CMAKE_DL_LIBS})
 endif()
-
-function(realscript_add_component target export_name)
-    add_library(${target} INTERFACE)
-    target_link_libraries(${target} INTERFACE realscript_frontend)
-    set_target_properties(${target} PROPERTIES EXPORT_NAME ${export_name})
-    add_library(RealScript::${export_name} ALIAS ${target})
-endfunction()
-
-realscript_add_component(realscript_runtime Runtime)
-realscript_add_component(realscript_compiler Compiler)
-realscript_add_component(realscript_game_runtime GameRuntime)
-realscript_add_component(realscript_game_compiler GameCompiler)
-realscript_add_component(realscript_game_sdk GameSdk)
-realscript_add_component(realscript_aot_support AotSupport)
-realscript_add_component(realscript_debug Debug)
-realscript_add_component(realscript_tooling Tooling)
-realscript_add_component(realscript_full Full)
-
-function(realscript_enable_cxx_warnings target)
-    if(MSVC)
-        target_compile_options(${target} PRIVATE /W4 /permissive-)
-        if(REALSCRIPT_WARNINGS_AS_ERRORS)
-            target_compile_options(${target} PRIVATE /WX)
-        endif()
-    else()
-        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
-        if(REALSCRIPT_WARNINGS_AS_ERRORS)
-            target_compile_options(${target} PRIVATE -Werror)
-        endif()
-    endif()
-endfunction()
 
 if(MSVC)
     set_source_files_properties(
@@ -126,7 +211,6 @@ if(MSVC)
         PROPERTIES COMPILE_OPTIONS "/wd4456"
     )
 endif()
-realscript_enable_cxx_warnings(realscript_frontend)
 
 add_executable(rsc tools/rsc/main.cpp)
 target_link_libraries(rsc PRIVATE RealScript::Compiler RealScript::Runtime)
