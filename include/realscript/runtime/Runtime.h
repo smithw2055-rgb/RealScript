@@ -685,6 +685,14 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+class ProgramImage;
+
+namespace detail {
+struct ExecutionMirror;
+[[nodiscard]] const ExecutionMirror& executionMirror(
+    const ProgramImage& program) noexcept;
+}
+
 class ProgramImage {
 public:
     struct FunctionLocation {
@@ -714,12 +722,16 @@ public:
         semantic::SymbolId typeId) const noexcept;
 
 private:
+    friend const detail::ExecutionMirror& detail::executionMirror(
+        const ProgramImage& program) noexcept;
+
     explicit ProgramImage(std::vector<bytecode::Module> modules);
 
     std::vector<bytecode::Module> modules_;
     std::unordered_map<semantic::SymbolId, FunctionLocation> functions_;
     std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> types_;
     std::unordered_map<std::string, semantic::SymbolId> names_;
+    std::shared_ptr<const detail::ExecutionMirror> executionMirror_;
 };
 
 class Interpreter {

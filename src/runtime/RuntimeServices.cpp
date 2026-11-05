@@ -1,5 +1,6 @@
 #include "realscript/runtime/Runtime.h"
 
+#include "ExecutionMirror.h"
 #include "realscript/diagnostics/Diagnostic.h"
 
 #include <algorithm>
@@ -395,6 +396,213 @@ bool validateObjectModel(
 
 } // namespace
 
+namespace detail {
+
+std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
+    const std::vector<bytecode::Module>& modules,
+    const std::unordered_map<
+        semantic::SymbolId, ProgramImage::FunctionLocation>& functions) {
+    auto mirror = std::make_shared<ExecutionMirror>();
+    std::size_t functionCount = 0;
+    for (const auto& module : modules) functionCount += module.functions.size();
+    mirror->functions.reserve(functionCount);
+
+    for (const auto& module : modules) {
+        for (const auto& function : module.functions) {
+            const auto quickOpcode = [&](const bytecode::Instruction& instruction) {
+                switch (instruction.opcode) {
+                case bytecode::Opcode::LoadParameter:
+                    return QuickOpcode::LoadParameter;
+                case bytecode::Opcode::ConstantInt:
+                    if (instruction.result < function.registerTypes.size() &&
+                        function.registerTypes[instruction.result] ==
+                            semantic::PrimitiveType::Int) {
+                        return QuickOpcode::ConstantInt;
+                    }
+                    break;
+                case bytecode::Opcode::LoadLocal:
+                    return QuickOpcode::LoadLocal;
+                case bytecode::Opcode::StoreLocal:
+                    return QuickOpcode::StoreLocal;
+                default:
+                    break;
+                }
+                if (instruction.operands.size() < 2 ||
+                    instruction.operands[0] >= function.registerTypes.size() ||
+                    instruction.operands[1] >= function.registerTypes.size() ||
+                    function.registerTypes[instruction.operands[0]] !=
+                        semantic::PrimitiveType::Int ||
+                    function.registerTypes[instruction.operands[1]] !=
+                        semantic::PrimitiveType::Int) {
+                    return QuickOpcode::Generic;
+                }
+                switch (instruction.opcode) {
+                case bytecode::Opcode::AddInt: return QuickOpcode::AddInt;
+                case bytecode::Opcode::SubtractInt: return QuickOpcode::SubtractInt;
+                case bytecode::Opcode::MultiplyInt: return QuickOpcode::MultiplyInt;
+                case bytecode::Opcode::DivideInt: return QuickOpcode::DivideInt;
+                case bytecode::Opcode::RemainderInt: return QuickOpcode::RemainderInt;
+                case bytecode::Opcode::LessInt: return QuickOpcode::LessInt;
+                case bytecode::Opcode::LessOrEqualInt:
+                    return QuickOpcode::LessOrEqualInt;
+                case bytecode::Opcode::GreaterInt: return QuickOpcode::GreaterInt;
+                case bytecode::Opcode::GreaterOrEqualInt:
+                    return QuickOpcode::GreaterOrEqualInt;
+                default: return QuickOpcode::Generic;
+                }
+            };
+            ExecutionFunction decoded;
+            decoded.bytecode = &function;
+            decoded.blocks.resize(function.blocks.size());
+            decoded.blockIndices.reserve(function.blocks.size());
+            for (std::size_t index = 0; index < function.blocks.size(); ++index) {
+                decoded.blocks[index].bytecode = &function.blocks[index];
+                auto& instructions = decoded.blocks[index].instructions;
+                instructions.reserve(function.blocks[index].instructions.size());
+                for (const auto& instruction : function.blocks[index].instructions) {
+                    instructions.push_back({&instruction, quickOpcode(instruction)});
+                }
+                const auto isBinaryInt = [](QuickOpcode opcode) {
+                    return opcode >= QuickOpcode::AddInt &&
+                        opcode <= QuickOpcode::GreaterOrEqualInt;
+                };
+                for (std::size_t instructionIndex = 0;
+                     instructionIndex < instructions.size();) {
+                    auto& first = instructions[instructionIndex];
+                    if (instructionIndex + 1 < instructions.size() &&
+                        first.opcode == QuickOpcode::LoadParameter &&
+                        instructions[instructionIndex + 1].opcode ==
+                            QuickOpcode::StoreLocal &&
+                        instructions[instructionIndex + 1]
+                                .bytecode->operands[0] ==
+                            first.bytecode->result) {
+                        first.superOpcode = SuperOpcode::LoadParameterStoreLocal;
+                        first.span = 2;
+                        instructionIndex += 2;
+                        continue;
+                    }
+                    if (instructionIndex + 2 < instructions.size() &&
+                        first.opcode == QuickOpcode::LoadLocal &&
+                        (instructions[instructionIndex + 1].opcode ==
+                                QuickOpcode::ConstantInt ||
+                            instructions[instructionIndex + 1].opcode ==
+                                QuickOpcode::LoadLocal) &&
+                        isBinaryInt(instructions[instructionIndex + 2].opcode)) {
+                        const auto& second = instructions[instructionIndex + 1];
+                        const auto& binary = instructions[instructionIndex + 2];
+                        if (binary.bytecode->operands[0] ==
+                                first.bytecode->result &&
+                            binary.bytecode->operands[1] ==
+                                second.bytecode->result) {
+                            const auto constant =
+                                second.opcode == QuickOpcode::ConstantInt;
+                            const auto storesResult =
+                                instructionIndex + 3 < instructions.size() &&
+                                instructions[instructionIndex + 3].opcode ==
+                                    QuickOpcode::StoreLocal &&
+                                instructions[instructionIndex + 3]
+                                        .bytecode->operands[0] ==
+                                    binary.bytecode->result;
+                            first.superOpcode = storesResult
+                                ? (constant
+                                    ? SuperOpcode::BinaryLocalIntConstantStoreLocal
+                                    : SuperOpcode::BinaryLocalIntLocalStoreLocal)
+                                : (constant
+                                    ? SuperOpcode::BinaryLocalIntConstant
+                                    : SuperOpcode::BinaryLocalIntLocal);
+                            first.span = storesResult ? 4 : 3;
+                            instructionIndex += first.span;
+                            continue;
+                        }
+                    }
+                    ++instructionIndex;
+                }
+                decoded.blockIndices.emplace(function.blocks[index].id, index);
+            }
+
+            const auto entry = decoded.blockIndices.find(0);
+            if (entry != decoded.blockIndices.end()) decoded.entry = entry->second;
+            const auto bindEdge = [&](ExecutionEdge& edge,
+                                      bytecode::BlockId target,
+                                      const std::vector<bytecode::Register>& sources) {
+                const auto found = decoded.blockIndices.find(target);
+                if (found == decoded.blockIndices.end()) return;
+                edge.target = found->second;
+                edge.sources = &sources;
+                edge.destinations = &function.blocks[found->second].parameters;
+                decoded.edgeScratchCount =
+                    std::max(decoded.edgeScratchCount, sources.size());
+            };
+            for (std::size_t index = 0; index < function.blocks.size(); ++index) {
+                const auto& block = function.blocks[index];
+                auto& blockMirror = decoded.blocks[index];
+                if (block.terminator.kind == bytecode::TerminatorKind::Jump ||
+                    block.terminator.kind == bytecode::TerminatorKind::Branch) {
+                    bindEdge(
+                        blockMirror.branch,
+                        block.terminator.target,
+                        block.terminator.arguments);
+                }
+                if (block.terminator.kind == bytecode::TerminatorKind::Branch) {
+                    bindEdge(
+                        blockMirror.falseBranch,
+                        block.terminator.falseTarget,
+                        block.terminator.falseArguments);
+                }
+            }
+            mirror->functions.emplace(&function, std::move(decoded));
+        }
+    }
+
+    for (const auto& module : modules) {
+        for (const auto& function : module.functions) {
+            const auto decoded = mirror->functions.find(&function);
+            if (decoded == mirror->functions.end()) continue;
+            for (auto& block : decoded->second.blocks) {
+                for (auto& instruction : block.instructions) {
+                    if (instruction.bytecode->opcode !=
+                            bytecode::Opcode::Call ||
+                        instruction.bytecode->index >=
+                            module.functionReferences.size()) {
+                        continue;
+                    }
+                    const auto& reference =
+                        module.functionReferences[instruction.bytecode->index];
+                    if (reference.virtualDispatch || reference.interfaceDispatch) {
+                        continue;
+                    }
+                    const auto target = functions.find(reference.symbolId);
+                    if (target == functions.end() || !target->second.function) {
+                        continue;
+                    }
+                    const auto& targetFunction = *target->second.function;
+                    if (reference.returnType != targetFunction.returnType ||
+                        reference.returnTypeId != targetFunction.returnTypeId ||
+                        reference.parameterTypes !=
+                            targetFunction.parameterTypes ||
+                        reference.parameterTypeIds !=
+                            targetFunction.parameterTypeIds ||
+                        instruction.bytecode->operands.size() !=
+                            targetFunction.parameterTypes.size()) {
+                        continue;
+                    }
+                    instruction.opcode = QuickOpcode::CallDirect;
+                    instruction.directTarget = &target->second;
+                    instruction.directExecution = findExecutionFunction(
+                        *mirror, targetFunction);
+                }
+            }
+        }
+    }
+    return mirror;
+}
+
+const ExecutionMirror& executionMirror(const ProgramImage& program) noexcept {
+    return *program.executionMirror_;
+}
+
+} // namespace detail
+
 bool BindingRegistry::bind(
     semantic::SymbolId symbolId,
     ExternalFunction function,
@@ -457,6 +665,7 @@ ProgramImage::ProgramImage(std::vector<bytecode::Module> modules)
             names_.emplace(qualified, function.symbolId);
         }
     }
+    executionMirror_ = detail::buildExecutionMirror(modules_, functions_);
 }
 
 ProgramImage::ProgramImage(const ProgramImage& other)

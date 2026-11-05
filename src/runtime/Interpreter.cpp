@@ -1,5 +1,6 @@
 #include "realscript/runtime/Runtime.h"
 
+#include "ExecutionMirror.h"
 #include "realscript/debug/Debugger.h"
 #include "realscript/diagnostics/Diagnostic.h"
 
@@ -13,6 +14,14 @@
 
 namespace realscript::runtime {
 namespace {
+
+struct InlineCallCacheEntry {
+    const bytecode::Instruction* callSite = nullptr;
+    ObjectRef receiver;
+    semantic::SymbolId receiverTypeId = 0;
+    const ProgramImage::FunctionLocation* target = nullptr;
+    const detail::ExecutionFunction* execution = nullptr;
+};
 
 DeterminismOperationId instructionOperationId(
     bytecode::Opcode opcode) noexcept {
@@ -70,7 +79,87 @@ struct State {
     debug::DebugController* debugger = nullptr;
     std::vector<debug::DebugFrameView> debugFrames;
     ShadowStack shadowStack;
+    std::vector<Value> values;
+    std::size_t valueTop = 0;
+    std::array<InlineCallCacheEntry, 64> inlineCallCache;
     std::optional<Value> pendingException;
+};
+
+struct ValueWindow {
+    std::vector<Value>* values = nullptr;
+    std::size_t offset = 0;
+    std::size_t count = 0;
+
+    [[nodiscard]] std::size_t size() const noexcept { return count; }
+    [[nodiscard]] Value& operator[](std::size_t index) {
+        return (*values)[offset + index];
+    }
+    [[nodiscard]] const Value& operator[](std::size_t index) const {
+        return (*values)[offset + index];
+    }
+    [[nodiscard]] debug::DebugValueWindow debugView() const noexcept {
+        return {values, offset, count};
+    }
+};
+
+struct ArgumentSource {
+    const std::vector<Value>* values = nullptr;
+    std::size_t offset = 0;
+    const std::vector<bytecode::Register>* indices = nullptr;
+    std::size_t count = 0;
+
+    ArgumentSource() = default;
+    ArgumentSource(const std::vector<Value>& contiguous)
+        : values(&contiguous), count(contiguous.size()) {}
+    ArgumentSource(
+        const ValueWindow& registers,
+        const std::vector<bytecode::Register>& operands)
+        : values(registers.values),
+          offset(registers.offset),
+          indices(&operands),
+          count(operands.size()) {}
+
+    [[nodiscard]] std::size_t size() const noexcept { return count; }
+    [[nodiscard]] bool empty() const noexcept { return count == 0; }
+    [[nodiscard]] const Value& operator[](std::size_t index) const {
+        return (*values)[offset + (indices ? (*indices)[index] : index)];
+    }
+    [[nodiscard]] const Value& front() const { return (*this)[0]; }
+};
+
+class ArenaFrameScope {
+public:
+    explicit ArenaFrameScope(State& state)
+        : state_(state), base_(state.valueTop) {}
+    ~ArenaFrameScope() {
+        if (!state_.fastAccounting) {
+            std::fill(
+                state_.values.begin() + static_cast<std::ptrdiff_t>(base_),
+                state_.values.begin() + static_cast<std::ptrdiff_t>(top_),
+                Value{});
+        }
+        state_.valueTop = base_;
+    }
+    ArenaFrameScope(const ArenaFrameScope&) = delete;
+    ArenaFrameScope& operator=(const ArenaFrameScope&) = delete;
+    [[nodiscard]] std::size_t base() const noexcept { return base_; }
+    void allocate(std::size_t count) {
+        top_ = base_ + count;
+        if (state_.values.size() < top_) {
+            state_.values.resize(top_);
+        } else if (!state_.fastAccounting) {
+            std::fill(
+                state_.values.begin() + static_cast<std::ptrdiff_t>(base_),
+                state_.values.begin() + static_cast<std::ptrdiff_t>(top_),
+                Value{});
+        }
+        state_.valueTop = top_;
+    }
+
+private:
+    State& state_;
+    std::size_t base_ = 0;
+    std::size_t top_ = 0;
 };
 
 std::vector<std::string> materializeStack(
@@ -562,15 +651,6 @@ bool checkedLongMultiply(State& state, std::int64_t left, std::int64_t right, Va
     return true;
 }
 
-const bytecode::BasicBlock* findBlock(
-    const bytecode::Function& function,
-    bytecode::BlockId id) {
-    for (const auto& block : function.blocks) {
-        if (block.id == id) return &block;
-    }
-    return nullptr;
-}
-
 const debug::SequencePoint* findSequencePoint(
     const bytecode::Function& function,
     bytecode::BlockId blockId,
@@ -608,27 +688,55 @@ bool debugSequencePoint(
 bool executeFunction(
     State& state,
     const ProgramImage::FunctionLocation& location,
-    const std::vector<Value>& arguments,
-    Value& result);
+    const ArgumentSource& arguments,
+    Value& result,
+    const detail::ExecutionFunction* cachedExecution = nullptr,
+    bool argumentsPrevalidated = false);
 
 bool executeCall(
     State& state,
     const bytecode::Module& module,
     const bytecode::Instruction& instruction,
-    const std::vector<Value>& registers,
+    const ValueWindow& registers,
     Value& result) {
     if (instruction.index >= module.functionReferences.size()) {
         return fail(state, ErrorCode::InvalidProgram, "call reference index is invalid");
     }
     const auto& reference = module.functionReferences[instruction.index];
-    std::vector<Value> arguments;
-    arguments.reserve(instruction.operands.size());
+    const ArgumentSource arguments(registers, instruction.operands);
     for (const auto operand : instruction.operands) {
         if (operand >= registers.size()) {
             return fail(state, ErrorCode::InvalidProgram, "call operand register is invalid");
         }
-        arguments.push_back(registers[operand]);
     }
+    const auto cacheIndex = [&] {
+        const auto callSite = reinterpret_cast<std::uintptr_t>(&instruction);
+        return static_cast<std::size_t>(
+            (callSite >> 4U) & (state.inlineCallCache.size() - 1U));
+    };
+    const auto invokeCached = [&](const InlineCallCacheEntry& cached)
+            -> std::optional<bool> {
+        if (cached.callSite != &instruction ||
+            !cached.target || !cached.execution) {
+            return std::nullopt;
+        }
+        return executeFunction(
+            state, *cached.target, arguments, result, cached.execution, true);
+    };
+    const auto tryCachedReceiver = [&](ObjectRef receiver)
+            -> std::optional<bool> {
+        const auto& cached = state.inlineCallCache[cacheIndex()];
+        return cached.receiver == receiver
+            ? invokeCached(cached)
+            : std::nullopt;
+    };
+    const auto tryCachedType = [&](semantic::SymbolId receiverTypeId)
+            -> std::optional<bool> {
+        const auto& cached = state.inlineCallCache[cacheIndex()];
+        return cached.receiverTypeId == receiverTypeId
+            ? invokeCached(cached)
+            : std::nullopt;
+    };
 
     if (arguments.size() != reference.parameterTypes.size()) {
         return fail(state, ErrorCode::InvalidProgram,
@@ -654,12 +762,20 @@ bool executeCall(
                 "virtual call attempted to dereference null");
         }
         const auto* receiver = std::get_if<ObjectRef>(&arguments.front());
+        if (receiver) {
+            if (const auto cached = tryCachedReceiver(*receiver)) {
+                return *cached;
+            }
+        }
         const auto actualTypeId = receiver && state.heap
             ? state.heap->objectTypeId(*receiver)
             : std::optional<semantic::SymbolId>{};
         if (!actualTypeId || !state.program) {
             return fail(state, ErrorCode::InvalidObjectReference,
                 "virtual call receiver has no runtime type descriptor");
+        }
+        if (const auto cached = tryCachedType(*actualTypeId)) {
+            return *cached;
         }
         const auto* actualType = state.program->resolveType(*actualTypeId);
         if (!actualType ||
@@ -692,12 +808,20 @@ bool executeCall(
                 "interface call attempted to dereference null");
         }
         const auto* receiver = std::get_if<ObjectRef>(&arguments.front());
+        if (receiver) {
+            if (const auto cached = tryCachedReceiver(*receiver)) {
+                return *cached;
+            }
+        }
         const auto actualTypeId = receiver && state.heap
             ? state.heap->objectTypeId(*receiver)
             : std::optional<semantic::SymbolId>{};
         if (!actualTypeId) {
             return fail(state, ErrorCode::InvalidObjectReference,
                 "interface call receiver has no runtime type descriptor");
+        }
+        if (const auto cached = tryCachedType(*actualTypeId)) {
+            return *cached;
         }
         const auto* implementation = runtimeInterfaceMap(
             state, *actualTypeId, reference.interfaceTypeId);
@@ -717,7 +841,21 @@ bool executeCall(
         ? state.program->resolveFunction(targetSymbolId)
         : nullptr;
     if (found) {
-        return executeFunction(state, *found, arguments, result);
+        const auto* execution = detail::findExecutionFunction(
+            detail::executionMirror(*state.program), *found->function);
+        if ((reference.virtualDispatch || reference.interfaceDispatch) &&
+            execution) {
+            const auto* receiver = std::get_if<ObjectRef>(&arguments.front());
+            const auto receiverTypeId = receiver && state.heap
+                ? state.heap->objectTypeId(*receiver)
+                : std::optional<semantic::SymbolId>{};
+            if (receiverTypeId) {
+                state.inlineCallCache[cacheIndex()] = {
+                    &instruction, *receiver, *receiverTypeId, found, execution};
+            }
+        }
+        return executeFunction(
+            state, *found, arguments, result, execution);
     }
     if (reference.virtualDispatch || reference.interfaceDispatch) {
         return fail(state, ErrorCode::InvalidProgram,
@@ -742,11 +880,16 @@ bool executeCall(
         state.externalResolver && *state.externalResolver
         ? state.externalResolver
         : nullptr;
+    std::vector<Value> materializedArguments;
+    materializedArguments.reserve(arguments.size());
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        materializedArguments.push_back(arguments[index]);
+    }
     if (!state.determinism.invokeExternal(
             state.bindings,
             fallback,
             reference,
-            arguments,
+            materializedArguments,
             externalResult,
             externalError)) {
         state.error = std::move(externalError);
@@ -891,14 +1034,186 @@ bool buildDelegateList(
     return true;
 }
 
+bool evaluateQuickInt(
+    State& state,
+    detail::QuickOpcode opcode,
+    const bytecode::Instruction& instruction,
+    std::int64_t left,
+    std::int64_t right,
+    Value& output) {
+    switch (opcode) {
+    case detail::QuickOpcode::AddInt:
+        if (!instruction.checkedArithmetic) {
+            output = wrapInt32(left + right);
+            return true;
+        }
+        return checkedIntResult(state, left + right, output);
+    case detail::QuickOpcode::SubtractInt:
+        if (!instruction.checkedArithmetic) {
+            output = wrapInt32(left - right);
+            return true;
+        }
+        return checkedIntResult(state, left - right, output);
+    case detail::QuickOpcode::MultiplyInt:
+        if (!instruction.checkedArithmetic) {
+            output = wrapInt32(left * right);
+            return true;
+        }
+        return checkedIntResult(state, left * right, output);
+    case detail::QuickOpcode::DivideInt:
+        if (right == 0) {
+            return fail(state, ErrorCode::DivisionByZero, "division by zero");
+        }
+        if (left == std::numeric_limits<std::int32_t>::min() && right == -1) {
+            return fail(state, ErrorCode::IntegerOverflow,
+                "integer division overflow");
+        }
+        output = left / right;
+        return true;
+    case detail::QuickOpcode::RemainderInt:
+        if (right == 0) {
+            return fail(state, ErrorCode::DivisionByZero, "remainder by zero");
+        }
+        output = left == std::numeric_limits<std::int32_t>::min() && right == -1
+            ? std::int64_t{0}
+            : left % right;
+        return true;
+    case detail::QuickOpcode::LessInt:
+        output = left < right;
+        return true;
+    case detail::QuickOpcode::LessOrEqualInt:
+        output = left <= right;
+        return true;
+    case detail::QuickOpcode::GreaterInt:
+        output = left > right;
+        return true;
+    case detail::QuickOpcode::GreaterOrEqualInt:
+        output = left >= right;
+        return true;
+    default:
+        return fail(state, ErrorCode::InvalidProgram,
+            "invalid quickened bytecode opcode");
+    }
+}
+
+bool executeQuickInstruction(
+    State& state,
+    const detail::ExecutionInstruction& decoded,
+    const ValueWindow& arguments,
+    ValueWindow locals,
+    ValueWindow registers) {
+    const auto& instruction = *decoded.bytecode;
+    if (!consume(
+            state,
+            instructionOperationId(instruction.opcode),
+            bytecode::opcodeName(instruction.opcode))) {
+        return false;
+    }
+    const auto storeResult = [&](Value value) {
+        registers[instruction.result] = std::move(value);
+        return true;
+    };
+    switch (decoded.opcode) {
+    case detail::QuickOpcode::LoadParameter:
+        return storeResult(arguments[instruction.index]);
+    case detail::QuickOpcode::ConstantInt:
+        return storeResult(instruction.integerImmediate);
+    case detail::QuickOpcode::LoadLocal:
+        return storeResult(locals[instruction.index]);
+    case detail::QuickOpcode::StoreLocal:
+        locals[instruction.index] = registers[instruction.operands[0]];
+        return true;
+    case detail::QuickOpcode::CallDirect: {
+        if (!decoded.directTarget || !decoded.directExecution) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "direct call execution cache is missing");
+        }
+        Value callResult;
+        if (!executeFunction(
+                state,
+                *decoded.directTarget,
+                ArgumentSource(registers, instruction.operands),
+                callResult,
+                decoded.directExecution,
+                true)) {
+            return false;
+        }
+        if (instruction.result == bytecode::InvalidRegister) return true;
+        return storeResult(std::move(callResult));
+    }
+    default:
+        break;
+    }
+
+    const auto left =
+        std::get<std::int64_t>(registers[instruction.operands[0]]);
+    const auto right =
+        std::get<std::int64_t>(registers[instruction.operands[1]]);
+    Value output;
+    return evaluateQuickInt(
+        state, decoded.opcode, instruction, left, right, output) &&
+        storeResult(std::move(output));
+}
+
+bool executeSuperInstruction(
+    State& state,
+    const std::vector<detail::ExecutionInstruction>& instructions,
+    std::size_t instructionIndex,
+    const ValueWindow& arguments,
+    ValueWindow locals,
+    ValueWindow registers) {
+    const auto& first = instructions[instructionIndex];
+    const auto& firstInstruction = *first.bytecode;
+    if (first.superOpcode == detail::SuperOpcode::LoadParameterStoreLocal) {
+        ++state.executed;
+        registers[firstInstruction.result] =
+            arguments[firstInstruction.index];
+        const auto& store = *instructions[instructionIndex + 1].bytecode;
+        ++state.executed;
+        locals[store.index] = registers[store.operands[0]];
+        return true;
+    }
+
+    const auto& second = instructions[instructionIndex + 1];
+    const auto& secondInstruction = *second.bytecode;
+    const auto& binary = instructions[instructionIndex + 2];
+    const auto& binaryInstruction = *binary.bytecode;
+    ++state.executed;
+    registers[firstInstruction.result] = locals[firstInstruction.index];
+    ++state.executed;
+    if (second.opcode == detail::QuickOpcode::ConstantInt) {
+        registers[secondInstruction.result] = secondInstruction.integerImmediate;
+    } else {
+        registers[secondInstruction.result] = locals[secondInstruction.index];
+    }
+
+    const auto left =
+        std::get<std::int64_t>(registers[binaryInstruction.operands[0]]);
+    const auto right =
+        std::get<std::int64_t>(registers[binaryInstruction.operands[1]]);
+    Value output;
+    ++state.executed;
+    if (!evaluateQuickInt(
+            state, binary.opcode, binaryInstruction, left, right, output)) {
+        return false;
+    }
+    registers[binaryInstruction.result] = std::move(output);
+    if (first.span == 4) {
+        const auto& store = *instructions[instructionIndex + 3].bytecode;
+        ++state.executed;
+        locals[store.index] = registers[store.operands[0]];
+    }
+    return true;
+}
+
 bool executeInstruction(
     State& state,
     const bytecode::Module& module,
     const bytecode::Function& function,
     const bytecode::Instruction& instruction,
-    const std::vector<Value>& arguments,
-    std::vector<Value>& locals,
-    std::vector<Value>& registers) {
+    const ValueWindow& arguments,
+    ValueWindow locals,
+    ValueWindow registers) {
     if (!consume(
             state,
             instructionOperationId(instruction.opcode),
@@ -906,30 +1221,17 @@ bool executeInstruction(
         return false;
     }
     auto operand = [&](std::size_t index) -> const Value* {
-        if (index >= instruction.operands.size() || instruction.operands[index] >= registers.size()) {
-            fail(state, ErrorCode::InvalidProgram, "instruction operand register is invalid");
-            return nullptr;
-        }
         return &registers[instruction.operands[index]];
     };
     auto storeResult = [&](Value value) {
-        if (instruction.result == bytecode::InvalidRegister || instruction.result >= registers.size()) {
-            return fail(state, ErrorCode::InvalidProgram, "instruction result register is invalid");
-        }
         registers[instruction.result] = std::move(value);
         return true;
     };
 
     switch (instruction.opcode) {
     case bytecode::Opcode::LoadParameter:
-        if (instruction.index >= arguments.size())
-            return fail(state, ErrorCode::InvalidProgram, "parameter index is invalid");
         return storeResult(arguments[instruction.index]);
     case bytecode::Opcode::ConstantInt: {
-        if (instruction.result >= function.registerTypes.size()) {
-            return fail(state, ErrorCode::InvalidProgram,
-                "constant result type metadata is missing");
-        }
         const auto resultType = function.registerTypes[instruction.result];
         if (resultType == semantic::PrimitiveType::Long) {
             return storeResult(LongValue{instruction.integerImmediate});
@@ -968,14 +1270,10 @@ bool executeInstruction(
     case bytecode::Opcode::ConstantNull:
         return storeResult(std::monostate{});
     case bytecode::Opcode::LoadLocal:
-        if (instruction.index >= locals.size())
-            return fail(state, ErrorCode::InvalidProgram, "local index is invalid");
         return storeResult(locals[instruction.index]);
     case bytecode::Opcode::StoreLocal: {
         const auto* value = operand(0);
         if (!value) return false;
-        if (instruction.index >= locals.size())
-            return fail(state, ErrorCode::InvalidProgram, "local index is invalid");
         locals[instruction.index] = *value;
         return true;
     }
@@ -1559,7 +1857,13 @@ bool executeInstruction(
             }
             Value lastResult;
             for (const auto& leaf : leaves) {
-                auto nestedRegisters = registers;
+                std::vector<Value> nestedRegisterValues;
+                nestedRegisterValues.reserve(registers.size());
+                for (std::size_t index = 0; index < registers.size(); ++index) {
+                    nestedRegisterValues.push_back(registers[index]);
+                }
+                ValueWindow nestedRegisters{
+                    &nestedRegisterValues, 0, nestedRegisterValues.size()};
                 nestedRegisters[instruction.operands.front()] = leaf;
                 if (!executeInstruction(
                         state, module, function, instruction,
@@ -2004,23 +2308,36 @@ bool executeInstruction(
 bool executeFunction(
     State& state,
     const ProgramImage::FunctionLocation& location,
-    const std::vector<Value>& arguments,
-    Value& result) {
+    const ArgumentSource& arguments,
+    Value& result,
+    const detail::ExecutionFunction* cachedExecution,
+    bool argumentsPrevalidated) {
     const auto& function = *location.function;
+    const auto* execution = cachedExecution
+        ? cachedExecution
+        : detail::findExecutionFunction(
+            detail::executionMirror(*state.program), function);
+    if (!execution || execution->entry == detail::InvalidBlockIndex) {
+        return fail(state, ErrorCode::InvalidProgram,
+            "function execution mirror is missing");
+    }
     if (state.stack.size() >= state.limits.recursionLimit) {
         return fail(state, ErrorCode::RecursionLimitExceeded, "recursion limit exceeded");
     }
-    if (arguments.size() != function.parameterTypes.size()) {
+    if (!argumentsPrevalidated &&
+        arguments.size() != function.parameterTypes.size()) {
         return fail(state, ErrorCode::InvalidArguments, "argument count does not match function signature");
     }
-    for (std::size_t index = 0; index < arguments.size(); ++index) {
-        if (!expectSignatureType(
-                state,
-                arguments[index],
-                function.parameterTypes[index],
-                typeIdAt(function.parameterTypeIds, index),
-                "argument")) {
-            return false;
+    if (!argumentsPrevalidated) {
+        for (std::size_t index = 0; index < arguments.size(); ++index) {
+            if (!expectSignatureType(
+                    state,
+                    arguments[index],
+                    function.parameterTypes[index],
+                    typeIdAt(function.parameterTypeIds, index),
+                    "argument")) {
+                return false;
+            }
         }
     }
 
@@ -2035,31 +2352,41 @@ bool executeFunction(
     ++state.statistics.functionCalls;
     state.statistics.maximumCallDepth = std::max(state.statistics.maximumCallDepth, state.stack.size());
     emitTrace(state, TraceEventKind::FunctionEnter);
-    std::vector<Value> locals(function.localTypes.size());
-    std::vector<Value> registers(function.registerTypes.size());
-    ShadowFrameScope roots(state.shadowStack, &arguments, &locals, &registers);
+    ArenaFrameScope frame(state);
+    const auto argumentOffset = frame.base();
+    const auto localOffset = argumentOffset + arguments.size();
+    const auto registerOffset = localOffset + function.localTypes.size();
+    const auto scratchOffset = registerOffset + function.registerTypes.size();
+    frame.allocate(
+        arguments.size() + function.localTypes.size() +
+        function.registerTypes.size() + execution->edgeScratchCount);
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        state.values[argumentOffset + index] = arguments[index];
+    }
+    ValueWindow argumentWindow{&state.values, argumentOffset, arguments.size()};
+    ValueWindow locals{&state.values, localOffset, function.localTypes.size()};
+    ValueWindow registers{
+        &state.values, registerOffset, function.registerTypes.size()};
+    ValueWindow edgeScratch{
+        &state.values, scratchOffset, execution->edgeScratchCount};
     DebugFrameScope debugFrame(state, debug::DebugFrameView{
         location.module,
         &function,
         nullptr,
-        &arguments,
-        &locals,
-        &registers,
+        argumentWindow.debugView(),
+        locals.debugView(),
+        registers.debugView(),
     });
-    const bytecode::BasicBlock* block = findBlock(function, 0);
-    if (!block) {
-        state.stack.pop_back();
-        return fail(state, ErrorCode::InvalidProgram, "entry block is missing");
-    }
+    const detail::ExecutionBlock* block = &execution->blocks[execution->entry];
 
     const auto routePendingException = [&](bytecode::BlockId protectedBlock) {
         if (!state.pendingException ||
             !std::holds_alternative<ObjectRef>(*state.pendingException)) {
-            return static_cast<const bytecode::BasicBlock*>(nullptr);
+            return static_cast<const detail::ExecutionBlock*>(nullptr);
         }
         const auto reference = std::get<ObjectRef>(*state.pendingException);
         const auto actual = state.heap->objectTypeId(reference);
-        if (!actual) return static_cast<const bytecode::BasicBlock*>(nullptr);
+        if (!actual) return static_cast<const detail::ExecutionBlock*>(nullptr);
         for (const auto& handler : function.exceptionHandlers) {
             if (std::find(handler.protectedBlocks.begin(),
                           handler.protectedBlocks.end(), protectedBlock) ==
@@ -2071,31 +2398,55 @@ bool executeFunction(
                 continue;
             }
             if (handler.exceptionLocal >= locals.size()) {
-                return static_cast<const bytecode::BasicBlock*>(nullptr);
+                return static_cast<const detail::ExecutionBlock*>(nullptr);
             }
             locals[handler.exceptionLocal] = *state.pendingException;
             state.pendingException.reset();
-            return findBlock(function, handler.handlerBlock);
+            return detail::findExecutionBlock(*execution, handler.handlerBlock);
         }
-        return static_cast<const bytecode::BasicBlock*>(nullptr);
+        return static_cast<const detail::ExecutionBlock*>(nullptr);
     };
 
     while (true) {
+        const auto& bytecodeBlock = *block->bytecode;
         bool exceptionTransferred = false;
         for (std::size_t instructionIndex = 0;
              instructionIndex < block->instructions.size();
              ++instructionIndex) {
-            const auto& instruction = block->instructions[instructionIndex];
+            const auto& decodedInstruction = block->instructions[instructionIndex];
+            const auto& instruction = *decodedInstruction.bytecode;
             if (!debugSequencePoint(
-                    state, *location.module, function, block->id,
+                    state, *location.module, function, bytecodeBlock.id,
                     static_cast<std::uint32_t>(instructionIndex), false)) {
                 state.stack.pop_back();
                 return false;
             }
-            if (!executeInstruction(state, *location.module, function, instruction,
-                    arguments, locals, registers)) {
+            std::size_t executionSpan = 1;
+            bool executed = false;
+            const auto canExecuteSuperInstruction =
+                state.fastAccounting &&
+                decodedInstruction.superOpcode != detail::SuperOpcode::None &&
+                state.executed <= state.limits.instructionBudget &&
+                decodedInstruction.span <=
+                    state.limits.instructionBudget - state.executed;
+            if (canExecuteSuperInstruction) {
+                executionSpan = decodedInstruction.span;
+                executed = executeSuperInstruction(
+                    state, block->instructions, instructionIndex,
+                    argumentWindow, locals, registers);
+            } else if (decodedInstruction.opcode ==
+                    detail::QuickOpcode::Generic) {
+                executed = executeInstruction(
+                    state, *location.module, function, instruction,
+                    argumentWindow, locals, registers);
+            } else {
+                executed = executeQuickInstruction(
+                    state, decodedInstruction,
+                    argumentWindow, locals, registers);
+            }
+            if (!executed) {
                 if (state.pendingException) {
-                    if (const auto* handler = routePendingException(block->id)) {
+                    if (const auto* handler = routePendingException(bytecodeBlock.id)) {
                         block = handler;
                         exceptionTransferred = true;
                         break;
@@ -2104,19 +2455,20 @@ bool executeFunction(
                 state.stack.pop_back();
                 return false;
             }
+            instructionIndex += executionSpan - 1;
         }
         if (exceptionTransferred) continue;
         if (!debugSequencePoint(
-                state, *location.module, function, block->id,
-                static_cast<std::uint32_t>(block->instructions.size()), true) ||
+                state, *location.module, function, bytecodeBlock.id,
+                static_cast<std::uint32_t>(bytecodeBlock.instructions.size()), true) ||
             !consume(
                 state,
-                terminatorOperationId(block->terminator.kind),
-                bytecode::terminatorName(block->terminator.kind))) {
+                terminatorOperationId(bytecodeBlock.terminator.kind),
+                bytecode::terminatorName(bytecodeBlock.terminator.kind))) {
             state.stack.pop_back();
             return false;
         }
-        const auto& terminator = block->terminator;
+        const auto& terminator = bytecodeBlock.terminator;
         if (terminator.kind == bytecode::TerminatorKind::Throw) {
             if (terminator.value >= registers.size() ||
                 !std::holds_alternative<ObjectRef>(registers[terminator.value])) {
@@ -2125,7 +2477,7 @@ bool executeFunction(
                     "throw requires a non-null script object");
             }
             state.pendingException = registers[terminator.value];
-            if (const auto* handler = routePendingException(block->id)) {
+            if (const auto* handler = routePendingException(bytecodeBlock.id)) {
                 block = handler;
                 continue;
             }
@@ -2173,16 +2525,17 @@ bool executeFunction(
         }
 
         bytecode::BlockId target = terminator.target;
-        const std::vector<bytecode::Register>* edgeArguments = &terminator.arguments;
+        const detail::ExecutionEdge* edge = &block->branch;
         if (terminator.kind == bytecode::TerminatorKind::Branch) {
             if (terminator.condition >= registers.size() ||
-                !expectType(state, registers[terminator.condition], semantic::PrimitiveType::Bool, "branch")) {
+                !expectType(state, registers[terminator.condition],
+                    semantic::PrimitiveType::Bool, "branch")) {
                 state.stack.pop_back();
                 return false;
             }
             if (!std::get<bool>(registers[terminator.condition])) {
                 target = terminator.falseTarget;
-                edgeArguments = &terminator.falseArguments;
+                edge = &block->falseBranch;
             }
         } else if (terminator.kind != bytecode::TerminatorKind::Jump) {
             state.stack.pop_back();
@@ -2207,28 +2560,32 @@ bool executeFunction(
                 emitTrace(state, TraceEventKind::Branch, target);
             }
         }
-        const auto* next = findBlock(function, target);
-        if (!next || next->parameters.size() != edgeArguments->size()) {
+        if (edge->target == detail::InvalidBlockIndex ||
+            !edge->sources || !edge->destinations ||
+            edge->sources->size() != edge->destinations->size()) {
             state.stack.pop_back();
             return fail(state, ErrorCode::InvalidProgram, "branch target or argument count is invalid");
         }
-        std::vector<Value> transferred;
-        transferred.reserve(edgeArguments->size());
-        for (const auto source : *edgeArguments) {
-            if (source >= registers.size()) {
-                state.stack.pop_back();
-                return fail(state, ErrorCode::InvalidProgram, "branch argument register is invalid");
-            }
-            transferred.push_back(registers[source]);
+        const auto& sources = *edge->sources;
+        const auto& destinations = *edge->destinations;
+        if (sources.size() > edgeScratch.size()) {
+            state.stack.pop_back();
+            return fail(state, ErrorCode::InvalidProgram,
+                "branch scratch space is too small");
         }
-        for (std::size_t index = 0; index < transferred.size(); ++index) {
-            if (next->parameters[index].target >= registers.size()) {
+        for (std::size_t index = 0; index < sources.size(); ++index) {
+            if (sources[index] >= registers.size() ||
+                destinations[index].target >= registers.size()) {
                 state.stack.pop_back();
-                return fail(state, ErrorCode::InvalidProgram, "block parameter register is invalid");
+                return fail(state, ErrorCode::InvalidProgram,
+                    "branch argument register is invalid");
             }
-            registers[next->parameters[index].target] = std::move(transferred[index]);
+            edgeScratch[index] = registers[sources[index]];
         }
-        block = next;
+        for (std::size_t index = 0; index < sources.size(); ++index) {
+            registers[destinations[index].target] = std::move(edgeScratch[index]);
+        }
+        block = &execution->blocks[edge->target];
     }
 }
 
@@ -2325,6 +2682,8 @@ ExecutionResult Interpreter::invoke(
     }
     Value value;
     ExecutionResult execution;
+    ShadowFrameScope roots(
+        state.shadowStack, nullptr, nullptr, &state.values);
     execution.succeeded = executeFunction(state, *found, arguments, value);
     state.statistics.instructionsExecuted = state.executed;
     if (!execution.succeeded && state.pendingException &&

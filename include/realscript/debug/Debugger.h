@@ -63,13 +63,24 @@ struct DebugStop {
     std::vector<DebugStackFrame> frames;
 };
 
+struct DebugValueWindow {
+    const std::vector<runtime::Value>* values = nullptr;
+    std::size_t offset = 0;
+    std::size_t count = 0;
+
+    [[nodiscard]] std::size_t size() const noexcept { return count; }
+    [[nodiscard]] const runtime::Value& operator[](std::size_t index) const {
+        return (*values)[offset + index];
+    }
+};
+
 struct DebugFrameView {
     const bytecode::Module* module = nullptr;
     const bytecode::Function* function = nullptr;
     const SequencePoint* point = nullptr;
-    const std::vector<runtime::Value>* arguments = nullptr;
-    const std::vector<runtime::Value>* locals = nullptr;
-    const std::vector<runtime::Value>* registers = nullptr;
+    DebugValueWindow arguments;
+    DebugValueWindow locals;
+    DebugValueWindow registers;
 };
 
 using StopHandler = std::function<ResumeMode(const DebugStop&)>;

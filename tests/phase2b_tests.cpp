@@ -176,6 +176,101 @@ void testDeterministicExecutionCount() {
     require(first.value == second.value, "deterministic values differ");
     require(first.instructionsExecuted == second.instructionsExecuted, "instruction counts differ");
 }
+
+void testRawSuperinstructionsMatchInstrumentedExecution() {
+    auto modules = compile({{"super.rs", R"(
+module Demo;
+int main()
+{
+    int total = 0;
+    int index = 0;
+    while (index < 100)
+    {
+        total = total + index;
+        index = index + 1;
+    }
+    return total;
+}
+)"}});
+    realscript::runtime::Interpreter fast(modules);
+    realscript::runtime::Interpreter instrumented(std::move(modules));
+    realscript::runtime::ExecutionOptions fastOptions;
+    fastOptions.limits.gcWorkBudget = 0;
+    realscript::runtime::ExecutionOptions instrumentedOptions;
+    instrumentedOptions.limits.gcWorkBudget = 1;
+    const auto fastResult = fast.invoke("Demo::main", {}, fastOptions);
+    const auto instrumentedResult = instrumented.invoke(
+        "Demo::main", {}, instrumentedOptions);
+    require(fastResult.succeeded && instrumentedResult.succeeded,
+        "raw or instrumented superinstruction comparison failed");
+    require(fastResult.value == instrumentedResult.value,
+        "superinstruction result differs from instrumented execution");
+    require(
+        fastResult.instructionsExecuted ==
+            instrumentedResult.instructionsExecuted,
+        "superinstruction instruction count differs from instrumented execution");
+}
+
+void testRawSuperinstructionBudgetBoundaries() {
+    auto modules = compile({{"budget-super.rs", R"(
+module Demo;
+int main()
+{
+    int value = 1;
+    value = value + 2;
+    return value;
+}
+)"}});
+    realscript::runtime::Interpreter interpreter(std::move(modules));
+    realscript::runtime::ExecutionOptions options;
+    options.limits.gcWorkBudget = 0;
+    const auto complete = interpreter.invoke("Demo::main", {}, options);
+    require(complete.succeeded, "superinstruction budget fixture failed");
+    for (std::uint64_t budget = 0;
+         budget < complete.instructionsExecuted;
+         ++budget) {
+        options.limits.instructionBudget = budget;
+        const auto limited = interpreter.invoke("Demo::main", {}, options);
+        require(!limited.succeeded &&
+                limited.error.code ==
+                    realscript::runtime::ErrorCode::InstructionBudgetExceeded,
+            "superinstruction did not stop at an instruction budget boundary");
+        require(limited.instructionsExecuted == budget,
+            "superinstruction skipped an instruction budget boundary");
+    }
+}
+
+void testRawSuperinstructionOverflowAccounting() {
+    auto modules = compile({{"overflow-super.rs", R"(
+module Demo;
+int addOne(int value)
+{
+    value = value + 1;
+    return value;
+}
+)"}});
+    realscript::runtime::Interpreter fast(modules);
+    realscript::runtime::Interpreter instrumented(std::move(modules));
+    realscript::runtime::ExecutionOptions fastOptions;
+    fastOptions.limits.gcWorkBudget = 0;
+    realscript::runtime::ExecutionOptions instrumentedOptions;
+    instrumentedOptions.limits.gcWorkBudget = 1;
+    const std::vector<realscript::runtime::Value> arguments{
+        std::int64_t{2147483647}};
+    const auto fastResult = fast.invoke(
+        "Demo::addOne", arguments, fastOptions);
+    const auto instrumentedResult = instrumented.invoke(
+        "Demo::addOne", arguments, instrumentedOptions);
+    require(!fastResult.succeeded && !instrumentedResult.succeeded &&
+            fastResult.error.code ==
+                realscript::runtime::ErrorCode::IntegerOverflow &&
+            instrumentedResult.error.code == fastResult.error.code,
+        "superinstruction overflow behavior differs from instrumented execution");
+    require(
+        fastResult.instructionsExecuted ==
+            instrumentedResult.instructionsExecuted,
+        "superinstruction overflow instruction accounting differs");
+}
 }
 
 int main() {
@@ -195,5 +290,11 @@ int main() {
     run("Integer overflow", testIntegerOverflow);
     run("Unresolved external", testUnresolvedExternal);
     run("Deterministic execution count", testDeterministicExecutionCount);
+    run("Raw superinstructions match instrumented execution",
+        testRawSuperinstructionsMatchInstrumentedExecution);
+    run("Raw superinstruction budget boundaries",
+        testRawSuperinstructionBudgetBoundaries);
+    run("Raw superinstruction overflow accounting",
+        testRawSuperinstructionOverflowAccounting);
     return failures == 0 ? 0 : 1;
 }

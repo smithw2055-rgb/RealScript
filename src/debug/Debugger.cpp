@@ -228,8 +228,8 @@ DebugStop DebugController::capture(
             if (sourceLambda && local.parameter && local.name == "this") {
                 continue;
             }
-            const auto* values = view->locals;
-            if (!values || local.slot >= values->size()) continue;
+            const auto& values = view->locals;
+            if (!values.values || local.slot >= values.size()) continue;
             if (!local.parameter && view->point) {
                 const auto offset = view->point->range.span.start;
                 if (offset < local.scope.span.start ||
@@ -237,7 +237,7 @@ DebugStop DebugController::capture(
             }
             DebugVariable variable;
             variable.name = local.name;
-            variable.value = (*values)[local.slot];
+            variable.value = values[local.slot];
             variable.type = local.type;
             variable.typeId = local.typeId;
             if (local.parameter) {
