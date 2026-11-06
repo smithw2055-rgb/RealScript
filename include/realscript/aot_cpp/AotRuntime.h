@@ -678,7 +678,7 @@ struct NativeValue<runtime::StructValue> {
 template <typename Result, typename... Args, std::size_t... I>
 std::optional<runtime::Value> invokeNativeTypedImpl(
     Result (*function)(Args...),
-    const std::vector<runtime::Value>& arguments,
+    runtime::ValueSpan arguments,
     runtime::RuntimeError& error,
     std::index_sequence<I...>) {
     if (arguments.size() != sizeof...(Args)) {
@@ -707,7 +707,7 @@ template <typename Result, typename... Args>
 runtime::ExternalFunction makeNativeThunk(Result (*function)(Args...)) {
     return [function](
         const bytecode::FunctionReference&,
-        const std::vector<runtime::Value>& arguments,
+        runtime::ValueSpan arguments,
         runtime::RuntimeError& error) -> std::optional<runtime::Value> {
         try {
             return invokeNativeTypedImpl(

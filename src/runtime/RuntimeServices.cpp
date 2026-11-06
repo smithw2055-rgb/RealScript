@@ -638,7 +638,7 @@ std::optional<ResolvedBinding> BindingRegistry::resolve(
 
 std::optional<Value> BindingRegistry::invoke(
     const bytecode::FunctionReference& reference,
-    const std::vector<Value>& arguments,
+    ValueSpan arguments,
     RuntimeError& error) const {
     const auto resolved = resolve(reference);
     if (resolved && resolved->function) {
@@ -650,6 +650,193 @@ std::optional<Value> BindingRegistry::invoke(
 }
 
 std::size_t BindingRegistry::size() const noexcept { return bySymbol_.size() + byName_.size(); }
+
+semantic::SymbolId fixedTypeId() noexcept {
+    static const semantic::SymbolId id =
+        semantic::stableTypeId("RealScript.Math::Fixed");
+    return id;
+}
+
+semantic::SymbolId fixed16TypeId() noexcept {
+    static const semantic::SymbolId id =
+        semantic::stableTypeId("RealScript.Math::Fixed16");
+    return id;
+}
+
+semantic::SymbolId vec2TypeId() noexcept {
+    static const semantic::SymbolId id =
+        semantic::stableTypeId("RealScript.Math::Vec2");
+    return id;
+}
+
+semantic::SymbolId vec3TypeId() noexcept {
+    static const semantic::SymbolId id =
+        semantic::stableTypeId("RealScript.Math::Vec3");
+    return id;
+}
+
+semantic::SymbolId quatTypeId() noexcept {
+    static const semantic::SymbolId id =
+        semantic::stableTypeId("RealScript.Math::Quat");
+    return id;
+}
+
+std::optional<semantic::SymbolId> structValueTypeId(const Value& value) noexcept {
+    if (std::holds_alternative<FixedValue>(value)) return fixedTypeId();
+    if (std::holds_alternative<Fixed16Value>(value)) return fixed16TypeId();
+    if (std::holds_alternative<Vec2Value>(value)) return vec2TypeId();
+    if (std::holds_alternative<Vec3Value>(value)) return vec3TypeId();
+    if (std::holds_alternative<QuatValue>(value)) return quatTypeId();
+    if (const auto* s = std::get_if<StructValue>(&value)) return s->typeId;
+    return std::nullopt;
+}
+
+std::optional<Value> makeDefaultInlineStructValue(semantic::SymbolId typeId) noexcept {
+    if (typeId == fixedTypeId()) return Value{FixedValue{}};
+    if (typeId == fixed16TypeId()) return Value{Fixed16Value{}};
+    if (typeId == vec2TypeId()) return Value{Vec2Value{}};
+    if (typeId == vec3TypeId()) return Value{Vec3Value{}};
+    if (typeId == quatTypeId()) return Value{QuatValue{}};
+    return std::nullopt;
+}
+
+std::optional<Value> loadInlineStructField(
+    const Value& value,
+    std::size_t fieldIndex) noexcept {
+    if (const auto* f = std::get_if<FixedValue>(&value)) {
+        if (fieldIndex == 0) return Value{static_cast<std::int64_t>(f->raw)};
+        return std::nullopt;
+    }
+    if (const auto* f16 = std::get_if<Fixed16Value>(&value)) {
+        if (fieldIndex == 0) return Value{static_cast<std::int64_t>(f16->raw)};
+        return std::nullopt;
+    }
+    if (const auto* v2 = std::get_if<Vec2Value>(&value)) {
+        if (fieldIndex == 0) return Value{FixedValue{v2->x}};
+        if (fieldIndex == 1) return Value{FixedValue{v2->y}};
+        return std::nullopt;
+    }
+    if (const auto* v3 = std::get_if<Vec3Value>(&value)) {
+        if (fieldIndex == 0) return Value{FixedValue{v3->x}};
+        if (fieldIndex == 1) return Value{FixedValue{v3->y}};
+        if (fieldIndex == 2) return Value{FixedValue{v3->z}};
+        return std::nullopt;
+    }
+    if (const auto* q = std::get_if<QuatValue>(&value)) {
+        if (fieldIndex == 0) return Value{FixedValue{q->x}};
+        if (fieldIndex == 1) return Value{FixedValue{q->y}};
+        if (fieldIndex == 2) return Value{FixedValue{q->z}};
+        if (fieldIndex == 3) return Value{FixedValue{q->w}};
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+namespace {
+std::optional<std::int32_t> extractRawFixedField(const Value& fieldValue) noexcept {
+    if (const auto* f = std::get_if<FixedValue>(&fieldValue)) {
+        return f->raw;
+    }
+    if (const auto* i = std::get_if<std::int64_t>(&fieldValue)) {
+        return static_cast<std::int32_t>(*i);
+    }
+    if (const auto* l = std::get_if<LongValue>(&fieldValue)) {
+        return static_cast<std::int32_t>(l->value);
+    }
+    if (const auto* s = std::get_if<StructValue>(&fieldValue)) {
+        if (s->typeId == fixedTypeId() && s->storage && s->storage->fields.size() == 1) {
+            if (const auto* rawInt = std::get_if<std::int64_t>(&s->storage->fields[0])) {
+                return static_cast<std::int32_t>(*rawInt);
+            }
+            if (const auto* rawLong = std::get_if<LongValue>(&s->storage->fields[0])) {
+                return static_cast<std::int32_t>(rawLong->value);
+            }
+        }
+    }
+    return std::nullopt;
+}
+} // namespace
+
+std::optional<Value> storeInlineStructField(
+    const Value& structure,
+    std::size_t fieldIndex,
+    const Value& fieldValue) noexcept {
+    if (std::holds_alternative<FixedValue>(structure)) {
+        if (fieldIndex != 0) return std::nullopt;
+        if (const auto* i = std::get_if<std::int64_t>(&fieldValue)) {
+            return Value{FixedValue{static_cast<std::int32_t>(*i)}};
+        }
+        if (const auto* l = std::get_if<LongValue>(&fieldValue)) {
+            return Value{FixedValue{static_cast<std::int32_t>(l->value)}};
+        }
+        return std::nullopt;
+    }
+    if (std::holds_alternative<Fixed16Value>(structure)) {
+        if (fieldIndex != 0) return std::nullopt;
+        if (const auto* l = std::get_if<LongValue>(&fieldValue)) {
+            return Value{Fixed16Value{l->value}};
+        }
+        if (const auto* i = std::get_if<std::int64_t>(&fieldValue)) {
+            return Value{Fixed16Value{*i}};
+        }
+        return std::nullopt;
+    }
+    if (const auto* v2 = std::get_if<Vec2Value>(&structure)) {
+        const auto raw = extractRawFixedField(fieldValue);
+        if (!raw) return std::nullopt;
+        Vec2Value out = *v2;
+        if (fieldIndex == 0) {
+            out.x = *raw;
+            return Value{out};
+        }
+        if (fieldIndex == 1) {
+            out.y = *raw;
+            return Value{out};
+        }
+        return std::nullopt;
+    }
+    if (const auto* v3 = std::get_if<Vec3Value>(&structure)) {
+        const auto raw = extractRawFixedField(fieldValue);
+        if (!raw) return std::nullopt;
+        Vec3Value out = *v3;
+        if (fieldIndex == 0) {
+            out.x = *raw;
+            return Value{out};
+        }
+        if (fieldIndex == 1) {
+            out.y = *raw;
+            return Value{out};
+        }
+        if (fieldIndex == 2) {
+            out.z = *raw;
+            return Value{out};
+        }
+        return std::nullopt;
+    }
+    if (const auto* q = std::get_if<QuatValue>(&structure)) {
+        const auto raw = extractRawFixedField(fieldValue);
+        if (!raw) return std::nullopt;
+        QuatValue out = *q;
+        if (fieldIndex == 0) {
+            out.x = *raw;
+            return Value{out};
+        }
+        if (fieldIndex == 1) {
+            out.y = *raw;
+            return Value{out};
+        }
+        if (fieldIndex == 2) {
+            out.z = *raw;
+            return Value{out};
+        }
+        if (fieldIndex == 3) {
+            out.w = *raw;
+            return Value{out};
+        }
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
 
 ProgramImage::ProgramImage(std::vector<bytecode::Module> modules)
     : modules_(std::move(modules)) {
@@ -833,6 +1020,258 @@ const char* traceEventKindName(TraceEventKind kind) noexcept {
     case TraceEventKind::RuntimeError: return "runtime-error";
     }
     return "unknown";
+}
+
+namespace {
+
+std::string extractIntrinsicString(const Value& val, const ManagedHeap* heap) {
+    if (std::holds_alternative<NullString>(val) ||
+        std::holds_alternative<std::monostate>(val)) {
+        return {};
+    }
+    if (const auto* s = std::get_if<std::string>(&val)) return *s;
+    if (const auto* ref = std::get_if<ObjectRef>(&val)) {
+        if (heap) {
+            if (const auto sv = heap->stringView(*ref)) {
+                return std::string(*sv);
+            }
+        }
+    }
+    return valueToString(val, heap);
+}
+
+bool makeIntrinsicStringResult(
+    std::string text,
+    ManagedHeap* heap,
+    Value& result,
+    std::string& errorMessage) {
+    if (heap) {
+        RuntimeError err;
+        const auto ref = heap->allocateString(std::move(text), &err);
+        if (!ref) {
+            errorMessage = err.message.empty()
+                ? "out of memory allocating string"
+                : err.message;
+            return false;
+        }
+        result = *ref;
+        return true;
+    }
+    result = std::move(text);
+    return true;
+}
+
+} // namespace
+
+bool tryExecuteRuntimeIntrinsic(
+    std::string_view name,
+    ValueSpan arguments,
+    ManagedHeap* heap,
+    Value& result,
+    std::string& errorMessage) {
+    constexpr std::string_view prefix = "$intrinsic::";
+    if (name.rfind(prefix, 0) != 0) return false;
+    const std::string_view op = name.substr(prefix.size());
+
+    constexpr std::string_view staticHasPrefix = "static_has::";
+    if (op.rfind(staticHasPrefix, 0) == 0) {
+        const std::string idStr(op.substr(staticHasPrefix.size()));
+        const auto id = static_cast<semantic::SymbolId>(
+            std::strtoull(idStr.c_str(), nullptr, 10));
+        result = heap ? heap->hasStaticField(id) : false;
+        return true;
+    }
+
+    constexpr std::string_view staticGetPrefix = "static_get::";
+    if (op.rfind(staticGetPrefix, 0) == 0) {
+        const std::string idStr(op.substr(staticGetPrefix.size()));
+        const auto id = static_cast<semantic::SymbolId>(
+            std::strtoull(idStr.c_str(), nullptr, 10));
+        if (heap) {
+            if (auto existing = heap->getStaticField(id)) {
+                result = std::move(*existing);
+                return true;
+            }
+        }
+        result = arguments.empty() ? Value{} : arguments[0];
+        if (heap) {
+            heap->setStaticField(id, result);
+        }
+        return true;
+    }
+
+    constexpr std::string_view staticSetPrefix = "static_set::";
+    if (op.rfind(staticSetPrefix, 0) == 0) {
+        const std::string idStr(op.substr(staticSetPrefix.size()));
+        const auto id = static_cast<semantic::SymbolId>(
+            std::strtoull(idStr.c_str(), nullptr, 10));
+        if (heap && !arguments.empty()) {
+            heap->setStaticField(id, arguments[0]);
+        }
+        result = std::monostate{};
+        return true;
+    }
+
+    if (op == "string_concat") {
+        if (arguments.size() != 2) {
+            errorMessage = "string_concat requires 2 arguments";
+            return false;
+        }
+        return makeIntrinsicStringResult(
+            extractIntrinsicString(arguments[0], heap) +
+                extractIntrinsicString(arguments[1], heap),
+            heap,
+            result,
+            errorMessage);
+    }
+
+    constexpr std::string_view toStringPrefix = "to_string::";
+    if (op.rfind(toStringPrefix, 0) == 0) {
+        if (arguments.empty()) {
+            errorMessage = "to_string requires 1 argument";
+            return false;
+        }
+        const auto& val = arguments[0];
+        if (const auto* d = std::get_if<double>(&val)) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%g", *d);
+            return makeIntrinsicStringResult(buf, heap, result, errorMessage);
+        }
+        if (const auto* f = std::get_if<FloatValue>(&val)) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%g", static_cast<double>(f->value));
+            return makeIntrinsicStringResult(buf, heap, result, errorMessage);
+        }
+        return makeIntrinsicStringResult(
+            valueToString(val, heap), heap, result, errorMessage);
+    }
+
+    if (!arguments.empty() && std::holds_alternative<NullString>(arguments[0])) {
+        errorMessage = "cannot invoke string method on null string";
+        return false;
+    }
+
+    if (op == "string_length") {
+        result = static_cast<std::int64_t>(
+            extractIntrinsicString(arguments[0], heap).size());
+        return true;
+    }
+    if (op == "string_is_empty") {
+        result = extractIntrinsicString(arguments[0], heap).empty();
+        return true;
+    }
+    if (op == "string_contains") {
+        const auto s = extractIntrinsicString(arguments[0], heap);
+        const auto sub = extractIntrinsicString(arguments[1], heap);
+        result = (s.find(sub) != std::string::npos);
+        return true;
+    }
+    if (op == "string_starts_with") {
+        const auto s = extractIntrinsicString(arguments[0], heap);
+        const auto p = extractIntrinsicString(arguments[1], heap);
+        result = (s.size() >= p.size() && s.compare(0, p.size(), p) == 0);
+        return true;
+    }
+    if (op == "string_ends_with") {
+        const auto s = extractIntrinsicString(arguments[0], heap);
+        const auto sfx = extractIntrinsicString(arguments[1], heap);
+        result = (s.size() >= sfx.size() &&
+                  s.compare(s.size() - sfx.size(), sfx.size(), sfx) == 0);
+        return true;
+    }
+    if (op == "string_index_of") {
+        const auto s = extractIntrinsicString(arguments[0], heap);
+        const auto sub = extractIntrinsicString(arguments[1], heap);
+        const auto pos = s.find(sub);
+        result = (pos == std::string::npos)
+            ? std::int64_t{-1}
+            : static_cast<std::int64_t>(pos);
+        return true;
+    }
+    if (op == "string_substring_1") {
+        const auto s = extractIntrinsicString(arguments[0], heap);
+        const auto rawStart = std::holds_alternative<std::int64_t>(arguments[1])
+            ? std::get<std::int64_t>(arguments[1])
+            : 0;
+        const auto clampedStart = std::clamp<std::int64_t>(
+            rawStart, 0, static_cast<std::int64_t>(s.size()));
+        return makeIntrinsicStringResult(
+            s.substr(static_cast<std::size_t>(clampedStart)),
+            heap,
+            result,
+            errorMessage);
+    }
+    if (op == "string_substring_2") {
+        const auto s = extractIntrinsicString(arguments[0], heap);
+        const auto rawStart = std::holds_alternative<std::int64_t>(arguments[1])
+            ? std::get<std::int64_t>(arguments[1])
+            : 0;
+        const auto rawLen = std::holds_alternative<std::int64_t>(arguments[2])
+            ? std::get<std::int64_t>(arguments[2])
+            : 0;
+        const auto clampedStart = std::clamp<std::int64_t>(
+            rawStart, 0, static_cast<std::int64_t>(s.size()));
+        const auto clampedLen = std::clamp<std::int64_t>(
+            rawLen, 0, static_cast<std::int64_t>(s.size()) - clampedStart);
+        return makeIntrinsicStringResult(
+            s.substr(
+                static_cast<std::size_t>(clampedStart),
+                static_cast<std::size_t>(clampedLen)),
+            heap,
+            result,
+            errorMessage);
+    }
+    if (op == "string_trim") {
+        const auto s = extractIntrinsicString(arguments[0], heap);
+        const auto isSpace = [](unsigned char c) {
+            return c == ' ' || c == '\t' || c == '\r' ||
+                   c == '\n' || c == '\v' || c == '\f';
+        };
+        std::size_t first = 0;
+        while (first < s.size() && isSpace(static_cast<unsigned char>(s[first]))) {
+            ++first;
+        }
+        std::size_t last = s.size();
+        while (last > first && isSpace(static_cast<unsigned char>(s[last - 1]))) {
+            --last;
+        }
+        return makeIntrinsicStringResult(
+            s.substr(first, last - first), heap, result, errorMessage);
+    }
+    if (op == "string_replace") {
+        auto s = extractIntrinsicString(arguments[0], heap);
+        const auto from = extractIntrinsicString(arguments[1], heap);
+        const auto to = extractIntrinsicString(arguments[2], heap);
+        if (!from.empty()) {
+            std::size_t pos = 0;
+            while ((pos = s.find(from, pos)) != std::string::npos) {
+                s.replace(pos, from.size(), to);
+                pos += to.size();
+            }
+        }
+        return makeIntrinsicStringResult(std::move(s), heap, result, errorMessage);
+    }
+    if (op == "string_to_upper") {
+        auto s = extractIntrinsicString(arguments[0], heap);
+        for (auto& ch : s) {
+            if (ch >= 'a' && ch <= 'z') {
+                ch = static_cast<char>(ch - 'a' + 'A');
+            }
+        }
+        return makeIntrinsicStringResult(std::move(s), heap, result, errorMessage);
+    }
+    if (op == "string_to_lower") {
+        auto s = extractIntrinsicString(arguments[0], heap);
+        for (auto& ch : s) {
+            if (ch >= 'A' && ch <= 'Z') {
+                ch = static_cast<char>(ch - 'A' + 'a');
+            }
+        }
+        return makeIntrinsicStringResult(std::move(s), heap, result, errorMessage);
+    }
+
+    errorMessage = "unknown runtime intrinsic '" + std::string(name) + "'";
+    return false;
 }
 
 } // namespace realscript::runtime

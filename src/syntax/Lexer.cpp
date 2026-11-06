@@ -62,13 +62,31 @@ SyntaxToken Lexer::lexNumber() {
             advance();
         }
     }
+    const auto digitsSpan = text::TextSpan{start, position_ - start};
+    const auto digitsText = std::string(source_.view(digitsSpan));
+    if (current() == 'f' || current() == 'F' || current() == 'd' || current() == 'D') {
+        isFloat = true;
+        advance();
+    } else if (!isFloat) {
+        if (current() == 'u' || current() == 'U') {
+            advance();
+            if (current() == 'l' || current() == 'L') {
+                advance();
+            }
+        } else if (current() == 'l' || current() == 'L') {
+            advance();
+            if (current() == 'u' || current() == 'U') {
+                advance();
+            }
+        }
+    }
 
     const auto span = text::TextSpan{start, position_ - start};
     const auto tokenText = std::string(source_.view(span));
     if (isFloat) {
         char* end = nullptr;
-        const double value = std::strtod(tokenText.c_str(), &end);
-        if (end == tokenText.c_str() || *end != '\0') {
+        const double value = std::strtod(digitsText.c_str(), &end);
+        if (end == digitsText.c_str() || *end != '\0') {
             diagnostics_.report("RS1003", "invalid floating-point literal", span);
             return {SyntaxKind::FloatLiteralToken, span, tokenText, 0.0, false};
         }
@@ -76,7 +94,7 @@ SyntaxToken Lexer::lexNumber() {
     }
 
     std::int64_t value = 0;
-    const auto result = std::from_chars(tokenText.data(), tokenText.data() + tokenText.size(), value);
+    const auto result = std::from_chars(digitsText.data(), digitsText.data() + digitsText.size(), value);
     if (result.ec != std::errc{}) {
         diagnostics_.report("RS1004", "integer literal is outside the supported range", span);
         value = 0;
@@ -145,6 +163,118 @@ SyntaxToken Lexer::lexString() {
     return {SyntaxKind::StringLiteralToken, span, std::string(source_.view(span)), std::move(value), false};
 }
 
+SyntaxToken Lexer::lexInterpolatedString() {
+    const auto start = position_;
+    advance(2); // skip $"
+    bool terminated = false;
+
+    enum class ModeKind { InterpText, InterpHole, NormalString };
+    struct Mode {
+        ModeKind kind;
+        int braceDepth = 0;
+    };
+    std::vector<Mode> stack{{ModeKind::InterpText, 0}};
+
+    while (current() != '\0' && !stack.empty()) {
+        const auto mode = stack.back().kind;
+        if (mode == ModeKind::InterpText) {
+            if (current() == '"') {
+                advance();
+                stack.pop_back();
+                if (stack.empty()) {
+                    terminated = true;
+                    break;
+                }
+                continue;
+            }
+            if (current() == '\r' || current() == '\n') {
+                break;
+            }
+            if (current() == '\\') {
+                const char escaped = peek(1);
+                if (escaped == '\0') {
+                    advance();
+                    break;
+                }
+                if (stack.size() == 1 &&
+                    escaped != 'n' && escaped != 'r' && escaped != 't' &&
+                    escaped != '\\' && escaped != '"' &&
+                    escaped != '{' && escaped != '}') {
+                    diagnostics_.report("RS1005", "unsupported escape sequence", {position_, 2});
+                }
+                advance(2);
+                continue;
+            }
+            if (current() == '{') {
+                if (peek(1) == '{') {
+                    advance(2);
+                    continue;
+                }
+                stack.push_back({ModeKind::InterpHole, 1});
+                advance();
+                continue;
+            }
+            if (current() == '}' && peek(1) == '}') {
+                advance(2);
+                continue;
+            }
+            advance();
+        } else if (mode == ModeKind::NormalString) {
+            if (current() == '\\' && peek(1) != '\0') {
+                advance(2);
+                continue;
+            }
+            if (current() == '"') {
+                stack.pop_back();
+            }
+            advance();
+        } else {
+            if (current() == '$' && peek(1) == '"') {
+                advance(2);
+                stack.push_back({ModeKind::InterpText, 0});
+                continue;
+            }
+            if (current() == '"') {
+                advance();
+                stack.push_back({ModeKind::NormalString, 0});
+                continue;
+            }
+            if (current() == '\'') {
+                advance();
+                if (current() == '\\' && peek(1) != '\0') {
+                    advance(2);
+                } else if (current() != '\0') {
+                    advance();
+                }
+                if (current() == '\'') {
+                    advance();
+                }
+                continue;
+            }
+            if (current() == '{') {
+                ++stack.back().braceDepth;
+                advance();
+                continue;
+            }
+            if (current() == '}') {
+                --stack.back().braceDepth;
+                advance();
+                if (stack.back().braceDepth == 0) {
+                    stack.pop_back();
+                }
+                continue;
+            }
+            advance();
+        }
+    }
+
+    const auto span = text::TextSpan{start, position_ - start};
+    if (!terminated) {
+        diagnostics_.report("RS1001", "unterminated string literal", span);
+    }
+    return {SyntaxKind::InterpolatedStringToken, span, std::string(source_.view(span)), {}, false};
+}
+
 SyntaxToken Lexer::nextToken() {
     skipTrivia();
     const auto start = position_;
@@ -154,6 +284,9 @@ SyntaxToken Lexer::nextToken() {
     }
     if (current() >= '0' && current() <= '9') {
         return lexNumber();
+    }
+    if (current() == '$' && peek(1) == '"') {
+        return lexInterpolatedString();
     }
     if ((current() >= 'a' && current() <= 'z') ||
         (current() >= 'A' && current() <= 'Z') || current() == '_') {

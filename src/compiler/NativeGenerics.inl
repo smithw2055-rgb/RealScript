@@ -120,6 +120,7 @@ std::string nativeBuiltinGenericSource(
             << first << "[] grown=new " << first << "[next];int i=0;"
             << "while(i<count){grown[i]=items[i];i=i+1;}items=grown;return;}"
             << "int Count(){return count;}int Capacity(){return items.length;}"
+            << "bool IsEmpty(){return count==0;}"
             << "void Add(" << first << " value){EnsureCapacity(count+1);"
             << "items[count]=value;count=count+1;return;}"
             << "void Insert(int index," << first << " value){EnsureCapacity(count+1);"
@@ -131,9 +132,18 @@ std::string nativeBuiltinGenericSource(
             << "if(i<0)return false;RemoveAt(i);return true;}"
             << "int IndexOf(" << first << " value){int i=0;while(i<count){"
             << "if(items[i]==value)return i;i=i+1;}return -1;}"
+            << "int LastIndexOf(" << first << " value){int i=count-1;while(i>=0){"
+            << "if(items[i]==value)return i;i=i-1;}return -1;}"
             << "bool Contains(" << first << " value){return IndexOf(value)>=0;}"
             << first << " Get(int index){return items[index];}"
             << "void Set(int index," << first << " value){items[index]=value;return;}"
+            << first << " First(){return items[0];}"
+            << first << " Last(){return items[count-1];}"
+            << "void Reverse(){int l=0;int r=count-1;while(l<r){"
+            << first << " tmp=items[l];items[l]=items[r];items[r]=tmp;"
+            << "l=l+1;r=r-1;}return;}"
+            << first << "[] ToArray(){" << first << "[] arr=new " << first
+            << "[count];int i=0;while(i<count){arr[i]=items[i];i=i+1;}return arr;}"
             << "void Clear(){count=0;return;}" << enumerator
             << " GetEnumerator(){return new " << enumerator << "(this);}}"
             << "class " << enumerator << "{" << generatedName
@@ -155,12 +165,17 @@ std::string nativeBuiltinGenericSource(
             << "while(i<count){grown[i]=items[(head+i)%items.length];i=i+1;}"
             << "items=grown;head=0;tail=count;return;}"
             << "int Count(){return count;}int Capacity(){return items.length;}"
+            << "bool IsEmpty(){return count==0;}"
             << "void Enqueue(" << first << " value){EnsureCapacity(count+1);"
             << "items[tail]=value;tail=(tail+1)%items.length;count=count+1;return;}"
             << first << " Dequeue(){" << first << " value=items[head];"
             << "head=(head+1)%items.length;count=count-1;return value;}"
             << first << " Peek(){return items[head];}"
             << first << " Get(int index){return items[(head+index)%items.length];}"
+            << "bool Contains(" << first << " value){int i=0;while(i<count){"
+            << "if(items[(head+i)%items.length]==value)return true;i=i+1;}return false;}"
+            << first << "[] ToArray(){" << first << "[] arr=new " << first
+            << "[count];int i=0;while(i<count){arr[i]=items[(head+i)%items.length];i=i+1;}return arr;}"
             << "void Clear(){head=0;tail=0;count=0;return;}" << enumerator
             << " GetEnumerator(){return new " << enumerator << "(this);}}"
             << "class " << enumerator << "{" << generatedName
@@ -179,11 +194,16 @@ std::string nativeBuiltinGenericSource(
             << first << "[] grown=new " << first << "[next];int i=0;"
             << "while(i<count){grown[i]=items[i];i=i+1;}items=grown;return;}"
             << "int Count(){return count;}int Capacity(){return items.length;}"
+            << "bool IsEmpty(){return count==0;}"
             << "void Push(" << first << " value){EnsureCapacity(count+1);"
             << "items[count]=value;count=count+1;return;}"
             << first << " Pop(){count=count-1;return items[count];}"
             << first << " Peek(){return items[count-1];}"
             << first << " Get(int index){return items[count-1-index];}"
+            << "bool Contains(" << first << " value){int i=0;while(i<count){"
+            << "if(items[i]==value)return true;i=i+1;}return false;}"
+            << first << "[] ToArray(){" << first << "[] arr=new " << first
+            << "[count];int i=0;while(i<count){arr[i]=items[count-1-i];i=i+1;}return arr;}"
             << "void Clear(){count=0;return;}" << enumerator
             << " GetEnumerator(){return new " << enumerator << "(this);}}"
             << "class " << enumerator << "{" << generatedName
@@ -228,6 +248,7 @@ std::string nativeBuiltinGenericSource(
             << first << "[] grown=new " << first << "[next];int i=0;"
             << "while(i<count){grown[i]=values[i];i=i+1;}values=grown;return;}"
             << "int Count(){return count;}"
+            << "bool IsEmpty(){return count==0;}"
             << "bool Contains(" << first
             << " value){int i=0;while(i<count){"
             << "if(values[i]==value)return true;i=i+1;}return false;}"
@@ -238,6 +259,8 @@ std::string nativeBuiltinGenericSource(
             << "if(values[i]==value){int j=i;while(j<count-1){values[j]=values[j+1];"
             << "j=j+1;}count=count-1;return true;}i=i+1;}return false;}"
             << first << " Get(int index){return values[index];}"
+            << first << "[] ToArray(){" << first << "[] arr=new " << first
+            << "[count];int i=0;while(i<count){arr[i]=values[i];i=i+1;}return arr;}"
             << "void Clear(){count=0;return;}" << enumerator
             << " GetEnumerator(){return new " << enumerator << "(this);}}"
             << "class " << enumerator << "{" << generatedName
@@ -262,11 +285,24 @@ std::string nativeBuiltinGenericSource(
             << "while(i<count){grownKeys[i]=keys[i];grownValues[i]=values[i];i=i+1;}"
             << "keys=grownKeys;values=grownValues;return;}"
             << "int Count(){return count;}"
+            << "bool IsEmpty(){return count==0;}"
             << "int Find(" << first
             << " key){int i=0;while(i<count){if(keys[i]==key)return i;"
             << "i=i+1;}return -1;}"
             << "bool ContainsKey(" << first
             << " key){return Find(key)>=0;}"
+            << "bool ContainsValue(" << second
+            << " value){int i=0;while(i<count){if(values[i]==value)return true;"
+            << "i=i+1;}return false;}"
+            << "bool TryGetValue(" << first << " key,out " << second
+            << " value){int i=Find(key);if(i<0){" << second
+            << "[] empty=new " << second << "[1];value=empty[0];return false;}value=values[i];return true;}"
+            << second << " GetOrDefault(" << first << " key," << second
+            << " fallback){int i=Find(key);if(i<0)return fallback;return values[i];}"
+            << first << "[] Keys(){" << first << "[] arr=new " << first
+            << "[count];int i=0;while(i<count){arr[i]=keys[i];i=i+1;}return arr;}"
+            << second << "[] Values(){" << second << "[] arr=new " << second
+            << "[count];int i=0;while(i<count){arr[i]=values[i];i=i+1;}return arr;}"
             << "void Put(" << first << " key," << second
             << " value){int i=Find(key);if(i>=0){values[i]=value;return;}"
             << "EnsureCapacity(count+1);"

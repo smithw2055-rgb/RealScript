@@ -3773,10 +3773,18 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
     }
     result->variable.index = nextVariableIndex_++;
     result->variable.parameter = false;
+    result->variable.isConst = syntaxTree.constKeyword.has_value();
     result->variable.declarationSpan = syntaxTree.identifierToken.span;
     result->variable.id = stableTypeId(std::to_string(currentFunctionId_) +
         "::local:" + std::to_string(result->variable.index) + ":" +
         result->variable.name);
+
+    if (result->variable.isConst && !syntaxTree.initializer) {
+        diagnostics_.report(
+            "RS2407",
+            "const local variable '" + result->variable.name + "' requires an initializer",
+            syntaxTree.identifierToken.span);
+    }
 
     if (capturedVariableNames_.find(result->variable.name) !=
         capturedVariableNames_.end()) {
@@ -3904,6 +3912,17 @@ PrimitiveType Binder::bindType(
     if (baseType == PrimitiveType::Error) {
         const auto found = visibleTypes_.find(syntaxTree.name.text);
         if (found != visibleTypes_.end()) {
+            if (found->second.id != 0 && !syntaxTree.name.span.empty()) {
+                SymbolOccurrence occ;
+                occ.id = found->second.id;
+                occ.kind = SymbolKind::Type;
+                occ.name = found->second.name;
+                occ.detail = canonicalTypeName(found->second);
+                occ.sourceName = currentSourceName_;
+                occ.span = syntaxTree.name.span;
+                occ.definition = false;
+                occurrences_.push_back(std::move(occ));
+            }
             baseType = found->second.kind == TypeKind::Class
                 ? PrimitiveType::Object
                 : found->second.kind == TypeKind::Struct

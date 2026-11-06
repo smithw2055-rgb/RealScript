@@ -669,8 +669,8 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
             auto rIt = valReg.find(vid);
             if (rIt != valReg.end()) return rIt->second;
             std::int64_t cval = evalConstInt(vid, 0);
-            result.instructions.emplace_back(
-                Opcode::LoadInt, 0, scratchReg, static_cast<std::uint32_t>(static_cast<std::int32_t>(cval)));
+            result.instructions.push_back(CompactInstruction(
+                Opcode::LoadInt, std::uint8_t{0}, scratchReg, static_cast<std::uint32_t>(static_cast<std::int32_t>(cval))));
             return scratchReg;
         };
 
@@ -723,16 +723,17 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                         if (localWriteCounts[ins.localIndex] <= 1) {
                             constLocal[ins.localIndex] = cIt->second;
                         } else {
-                            result.instructions.emplace_back(
+                            result.instructions.push_back(CompactInstruction(
                                 Opcode::LoadInt,
-                                0,
+                                std::uint8_t{0},
                                 dstReg,
-                                static_cast<std::uint32_t>(static_cast<std::int32_t>(cIt->second)));
+                                static_cast<std::uint32_t>(static_cast<std::int32_t>(cIt->second))));
                         }
                     } else if (valReg.find(src) != valReg.end()) {
                         std::uint16_t srcReg = valReg[src];
                         if (srcReg != dstReg) {
-                            result.instructions.emplace_back(Opcode::MoveReg, 0, dstReg, srcReg, 0);
+                            result.instructions.push_back(
+                                CompactInstruction(Opcode::MoveReg, std::uint8_t{0}, dstReg, srcReg, std::uint16_t{0}));
                         }
                     }
                     break;
@@ -810,57 +811,59 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                         case mir::Opcode::GreaterOrEqualInt: op = Opcode::CmpGe; break;
                         default: break;
                         }
-                        result.instructions.emplace_back(op, 0, rDst, rA, rB);
+                        result.instructions.push_back(CompactInstruction(op, std::uint8_t{0}, rDst, rA, rB));
                         valReg[ins.result] = rDst;
                     }
                     break;
                 }
                 case mir::Opcode::Call: {
                     if (isFiberIntrinsic(ins.symbolName, "Yield") && ins.operands.size() >= 1) {
-                        result.instructions.emplace_back(
+                        result.instructions.push_back(CompactInstruction(
                             Opcode::YieldTicks,
-                            0,
-                            0,
-                            static_cast<std::uint32_t>(evalConstInt(ins.operands[0], 1)));
+                            std::uint8_t{0},
+                            std::uint16_t{0},
+                            static_cast<std::uint32_t>(evalConstInt(ins.operands[0], 1))));
                     } else if (isFiberIntrinsic(ins.symbolName, "YieldRandom") && ins.operands.size() >= 2) {
-                        result.instructions.emplace_back(
+                        result.instructions.push_back(CompactInstruction(
                             Opcode::YieldTicks,
-                            1,
+                            std::uint8_t{1},
                             static_cast<std::uint16_t>(evalConstInt(ins.operands[0], 1)),
-                            static_cast<std::uint32_t>(evalConstInt(ins.operands[1], 1)));
+                            static_cast<std::uint32_t>(evalConstInt(ins.operands[1], 1))));
                     } else if (isFiberIntrinsic(ins.symbolName, "WaitUntil") && ins.operands.size() >= 3) {
-                        result.instructions.emplace_back(
+                        result.instructions.push_back(CompactInstruction(
                             Opcode::YieldUntilPredicate,
                             static_cast<std::uint8_t>(evalConstInt(ins.operands[0], 0)),
                             static_cast<std::uint16_t>(evalConstInt(ins.operands[1], 0)),
-                            static_cast<std::uint32_t>(evalConstInt(ins.operands[2], 0)));
+                            static_cast<std::uint32_t>(evalConstInt(ins.operands[2], 0))));
                     } else if (isFiberIntrinsic(ins.symbolName, "SetUnbreakable") && ins.operands.size() >= 1) {
-                        result.instructions.emplace_back(
+                        result.instructions.push_back(CompactInstruction(
                             Opcode::SetUnbreakable,
                             static_cast<std::uint8_t>(evalConstInt(ins.operands[0], 0) != 0 ? 1 : 0),
-                            0,
-                            0);
+                            std::uint16_t{0},
+                            std::uint32_t{0}));
                     } else if (isFiberIntrinsic(ins.symbolName, "Terminate")) {
-                        result.instructions.emplace_back(Opcode::KillFiber, 0, 0, 0);
+                        result.instructions.push_back(
+                            CompactInstruction(Opcode::KillFiber, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
                     } else if (isFiberIntrinsic(ins.symbolName, "Fork") && ins.operands.size() >= 1) {
                         std::size_t idx = result.instructions.size();
-                        result.instructions.emplace_back(Opcode::ForkFiber, 0, 0, 0);
+                        result.instructions.push_back(
+                            CompactInstruction(Opcode::ForkFiber, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
                         auto sIt = constStr.find(ins.operands[0]);
                         if (sIt != constStr.end()) {
                             functionPatches.push_back(FunctionPatch{idx, sIt->second});
                         }
                     } else if (isFiberIntrinsic(ins.symbolName, "ForkPc") && ins.operands.size() >= 1) {
-                        result.instructions.emplace_back(
+                        result.instructions.push_back(CompactInstruction(
                             Opcode::ForkFiber,
-                            0,
-                            0,
-                            static_cast<std::uint32_t>(evalConstInt(ins.operands[0], 0)));
+                            std::uint8_t{0},
+                            std::uint16_t{0},
+                            static_cast<std::uint32_t>(evalConstInt(ins.operands[0], 0))));
                     } else if (isFiberIntrinsic(ins.symbolName, "Command") && ins.operands.size() >= 3) {
-                        result.instructions.emplace_back(
+                        result.instructions.push_back(CompactInstruction(
                             Opcode::HostCommand,
                             static_cast<std::uint8_t>(evalConstInt(ins.operands[0], 0)),
                             static_cast<std::uint16_t>(evalConstInt(ins.operands[1], 0)),
-                            static_cast<std::uint32_t>(evalConstInt(ins.operands[2], 0)));
+                            static_cast<std::uint32_t>(evalConstInt(ins.operands[2], 0))));
                     } else if (isFiberIntrinsic(ins.symbolName, "Cond") && ins.operands.size() >= 3) {
                         HostCondExpr ce{};
                         ce.isRand = false;
@@ -880,13 +883,14 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                     } else if (isFiberIntrinsic(ins.symbolName, "SetReg") && ins.operands.size() >= 2) {
                         std::uint16_t slot = static_cast<std::uint16_t>(evalConstInt(ins.operands[0], 0) & 7);
                         if (constInt.find(ins.operands[1]) != constInt.end()) {
-                            result.instructions.emplace_back(
+                            result.instructions.push_back(CompactInstruction(
                                 Opcode::LoadInt,
-                                0,
+                                std::uint8_t{0},
                                 slot,
-                                static_cast<std::uint32_t>(static_cast<std::int32_t>(constInt[ins.operands[1]])));
+                                static_cast<std::uint32_t>(static_cast<std::int32_t>(constInt[ins.operands[1]]))));
                         } else if (valReg.find(ins.operands[1]) != valReg.end()) {
-                            result.instructions.emplace_back(Opcode::MoveReg, 0, slot, valReg[ins.operands[1]], 0);
+                            result.instructions.push_back(CompactInstruction(
+                                Opcode::MoveReg, std::uint8_t{0}, slot, valReg[ins.operands[1]], std::uint16_t{0}));
                         }
                     } else {
                         // Check if target is a single-block helper function in the same module
@@ -903,7 +907,8 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                             selfRef(targetIt->second->blocks[0].instructions, &paramConsts, selfRef);
                         } else if (targetIt != funcMap.end()) {
                             std::size_t idx = result.instructions.size();
-                            result.instructions.emplace_back(Opcode::Call, 0, 0, 0);
+                            result.instructions.push_back(
+                                CompactInstruction(Opcode::Call, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
                             functionPatches.push_back(FunctionPatch{idx, ins.symbolName});
                         }
                     }
@@ -928,7 +933,8 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
             case mir::TerminatorKind::Jump: {
                 if (!hasNextBlock || term.target != nextBlockId) {
                     std::size_t patchIdx = result.instructions.size();
-                    result.instructions.emplace_back(Opcode::Jump, 0, 0, 0);
+                    result.instructions.push_back(
+                        CompactInstruction(Opcode::Jump, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
                     blockPatches.push_back(BlockPatch{patchIdx, term.target, false});
                 }
                 break;
@@ -940,7 +946,8 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                     mir::BlockId taken = (cIt->second != 0) ? term.target : term.falseTarget;
                     if (!hasNextBlock || taken != nextBlockId) {
                         std::size_t patchIdx = result.instructions.size();
-                        result.instructions.emplace_back(Opcode::Jump, 0, 0, 0);
+                        result.instructions.push_back(
+                            CompactInstruction(Opcode::Jump, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
                         blockPatches.push_back(BlockPatch{patchIdx, taken, false});
                     }
                     break;
@@ -956,17 +963,19 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
 
                     std::size_t condIdx = result.instructions.size();
                     if (ce.isRand) {
-                        result.instructions.emplace_back(Opcode::RandJump, ce.kindOrThreshold, 0, 0);
+                        result.instructions.push_back(CompactInstruction(
+                            Opcode::RandJump, ce.kindOrThreshold, std::uint16_t{0}, std::uint32_t{0}));
                         blockPatches.push_back(BlockPatch{condIdx, jumpOnHostTrue, false});
                     } else {
-                        result.instructions.emplace_back(
-                            Opcode::HostCondJump, ce.kindOrThreshold, 0, ce.key16, ce.threshold16);
+                        result.instructions.push_back(CompactInstruction(
+                            Opcode::HostCondJump, ce.kindOrThreshold, std::uint16_t{0}, ce.key16, ce.threshold16));
                         blockPatches.push_back(BlockPatch{condIdx, jumpOnHostTrue, true});
                     }
 
                     if (!hasNextBlock || fallthroughOnHostFalse != nextBlockId) {
                         std::size_t jmpIdx = result.instructions.size();
-                        result.instructions.emplace_back(Opcode::Jump, 0, 0, 0);
+                        result.instructions.push_back(
+                            CompactInstruction(Opcode::Jump, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
                         blockPatches.push_back(BlockPatch{jmpIdx, fallthroughOnHostFalse, false});
                     }
                     break;
@@ -976,15 +985,18 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                 std::uint16_t condReg = ensureValReg(term.condition, 7);
                 if (hasNextBlock && term.target == nextBlockId) {
                     std::size_t jzIdx = result.instructions.size();
-                    result.instructions.emplace_back(Opcode::JumpIfZero, 0, condReg, 0);
+                    result.instructions.push_back(
+                        CompactInstruction(Opcode::JumpIfZero, std::uint8_t{0}, condReg, std::uint32_t{0}));
                     blockPatches.push_back(BlockPatch{jzIdx, term.falseTarget, false});
                 } else {
                     std::size_t jnzIdx = result.instructions.size();
-                    result.instructions.emplace_back(Opcode::JumpIfNonZero, 0, condReg, 0);
+                    result.instructions.push_back(
+                        CompactInstruction(Opcode::JumpIfNonZero, std::uint8_t{0}, condReg, std::uint32_t{0}));
                     blockPatches.push_back(BlockPatch{jnzIdx, term.target, false});
                     if (!hasNextBlock || term.falseTarget != nextBlockId) {
                         std::size_t jmpIdx = result.instructions.size();
-                        result.instructions.emplace_back(Opcode::Jump, 0, 0, 0);
+                        result.instructions.push_back(
+                            CompactInstruction(Opcode::Jump, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
                         blockPatches.push_back(BlockPatch{jmpIdx, term.falseTarget, false});
                     }
                 }
@@ -992,7 +1004,8 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
             }
             case mir::TerminatorKind::ReturnVoid:
             case mir::TerminatorKind::ReturnValue: {
-                result.instructions.emplace_back(Opcode::Return, 0, 0, 0);
+                result.instructions.push_back(
+                    CompactInstruction(Opcode::Return, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
                 break;
             }
             default:

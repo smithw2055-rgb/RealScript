@@ -461,9 +461,10 @@ bool ExecutionContext::expectSignatureType(
                 std::string(context) + " has the wrong native handle type");
         }
     } else if (type == semantic::PrimitiveType::Struct) {
+        const auto actualTypeId = runtime::structValueTypeId(value);
         const auto* structure = std::get_if<runtime::StructValue>(&value);
-        if (!structure || typeId == 0 || structure->typeId != typeId ||
-            !structure->storage) {
+        if (!actualTypeId || typeId == 0 || *actualTypeId != typeId ||
+            (structure && !structure->storage)) {
             return fail(
                 runtime::ErrorCode::TypeMismatch,
                 std::string(context) + " has the wrong struct type");
@@ -507,6 +508,9 @@ runtime::Value ExecutionContext::defaultValue(
     case semantic::PrimitiveType::Enum:
         return runtime::EnumValue{typeId, 0};
     case semantic::PrimitiveType::Struct: {
+        if (const auto inlined = runtime::makeDefaultInlineStructValue(typeId)) {
+            return *inlined;
+        }
         if (depth > 64) return runtime::StructValue{};
         const auto* descriptor = findType(typeId);
         if (!descriptor || descriptor->kind != semantic::TypeKind::Struct) {
@@ -748,6 +752,22 @@ bool ExecutionContext::call(
             runtime::ErrorCode::InvalidProgram,
             "AOT runtime dispatch target function is unavailable");
     }
+    if (signature.name &&
+        std::string_view(signature.name).rfind("$intrinsic::", 0) == 0) {
+        std::string intrinsicError;
+        if (!runtime::tryExecuteRuntimeIntrinsic(
+                signature.name,
+                runtime::ValueSpan(arguments, argumentCount),
+                heap_.get(),
+                result,
+                intrinsicError)) {
+            const auto code = intrinsicError.find("null") != std::string::npos
+                ? runtime::ErrorCode::NullReference
+                : runtime::ErrorCode::InvalidProgram;
+            return fail(code, intrinsicError);
+        }
+        return true;
+    }
     if (!bindings_) {
         return fail(
             runtime::ErrorCode::ExternalFunctionUnresolved,
@@ -775,10 +795,6 @@ bool ExecutionContext::call(
             signature.parameterTypeIds,
             signature.parameterTypeIds + signature.parameterCount);
     }
-    std::vector<runtime::Value> values;
-    if (argumentCount != 0) {
-        values.assign(arguments, arguments + argumentCount);
-    }
     runtime::RuntimeError externalError;
     ++statistics_.externalCalls;
     emitTrace(runtime::TraceEventKind::ExternalCall,
@@ -788,7 +804,7 @@ bool ExecutionContext::call(
             bindings_.get(),
             nullptr,
             reference,
-            values,
+            runtime::ValueSpan(arguments, argumentCount),
             externalResult,
             externalError)) {
         error_ = std::move(externalError);
@@ -1245,7 +1261,8 @@ bool ExecutionContext::newObject(
         const auto& field = type->fields[index];
         fields.push_back(defaultValue(field.type, field.typeId));
         if (semantic::isReferenceType(field.type) ||
-            field.type == semantic::PrimitiveType::Struct) {
+            (field.type == semantic::PrimitiveType::Struct &&
+             !runtime::makeDefaultInlineStructValue(field.typeId).has_value())) {
             references.push_back(index);
         }
     }
@@ -1272,6 +1289,9 @@ bool ExecutionContext::newStruct(
     semantic::SymbolId typeId,
     runtime::Value& result) {
     result = defaultValue(semantic::PrimitiveType::Struct, typeId);
+    if (runtime::makeDefaultInlineStructValue(typeId).has_value()) {
+        return true;
+    }
     const auto* structure = std::get_if<runtime::StructValue>(&result);
     if (!structure || !structure->storage) {
         return fail(
@@ -1608,13 +1628,24 @@ bool ExecutionContext::loadStructField(
             "struct field load")) {
         return false;
     }
+    const auto& field = type->fields[fieldIndex];
+    if (const auto inlinedField = runtime::loadInlineStructField(receiver, fieldIndex)) {
+        if (!expectSignatureType(
+                *inlinedField,
+                field.type,
+                field.typeId,
+                "struct field load value")) {
+            return false;
+        }
+        result = *inlinedField;
+        return true;
+    }
     const auto& structure = std::get<runtime::StructValue>(receiver);
     if (!structure.storage || fieldIndex >= structure.storage->fields.size()) {
         return fail(
             runtime::ErrorCode::InvalidProgram,
             "struct field load references an invalid field slot");
     }
-    const auto& field = type->fields[fieldIndex];
     const auto& value = structure.storage->fields[fieldIndex];
     if (!expectSignatureType(
             value,
@@ -1651,11 +1682,19 @@ bool ExecutionContext::storeStructField(
             "struct field store value")) {
         return false;
     }
+    if (const auto updatedInline = runtime::storeInlineStructField(receiver, fieldIndex, value)) {
+        result = *updatedInline;
+        return true;
+    }
     const auto& structure = std::get<runtime::StructValue>(receiver);
     if (!structure.storage || fieldIndex >= structure.storage->fields.size()) {
         return fail(
             runtime::ErrorCode::InvalidProgram,
             "struct field store references an invalid field slot");
+    }
+    if (&result == &receiver && structure.storage.use_count() == 1) {
+        const_cast<runtime::StructStorage&>(*structure.storage).fields[fieldIndex] = value;
+        return true;
     }
     auto storage = std::make_shared<runtime::StructStorage>(*structure.storage);
     storage->fields[fieldIndex] = value;

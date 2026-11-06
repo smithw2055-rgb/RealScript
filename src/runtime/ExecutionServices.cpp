@@ -119,6 +119,22 @@ void hashValue(
     } else if (const auto* v = std::get_if<EnumValue>(&value)) {
         hashScalar(hash, v->typeId);
         hashScalar(hash, v->value);
+    } else if (const auto* v = std::get_if<FixedValue>(&value)) {
+        hashScalar(hash, v->raw);
+    } else if (const auto* v = std::get_if<Fixed16Value>(&value)) {
+        hashScalar(hash, v->raw);
+    } else if (const auto* v = std::get_if<Vec2Value>(&value)) {
+        hashScalar(hash, v->x);
+        hashScalar(hash, v->y);
+    } else if (const auto* v = std::get_if<Vec3Value>(&value)) {
+        hashScalar(hash, v->x);
+        hashScalar(hash, v->y);
+        hashScalar(hash, v->z);
+    } else if (const auto* v = std::get_if<QuatValue>(&value)) {
+        hashScalar(hash, v->x);
+        hashScalar(hash, v->y);
+        hashScalar(hash, v->z);
+        hashScalar(hash, v->w);
     } else if (const auto* v = std::get_if<StructValue>(&value)) {
         hashScalar(hash, v->typeId);
         const auto count = v->storage
@@ -159,7 +175,7 @@ bool replayStable(const Value& value) noexcept {
 }
 
 std::uint64_t argumentsHash(
-    const std::vector<Value>& arguments,
+    ValueSpan arguments,
     bool canonicalizeFloatingPoint) noexcept {
     auto hash = FnvOffset;
     const auto count = static_cast<std::uint64_t>(arguments.size());
@@ -319,7 +335,7 @@ bool DeterminismSession::invokeExternal(
     const BindingRegistry* bindings,
     const ExternalFunction* fallback,
     const bytecode::FunctionReference& reference,
-    const std::vector<Value>& arguments,
+    ValueSpan arguments,
     std::optional<Value>& result,
     RuntimeError& error) {
     if (!impl_) return false;

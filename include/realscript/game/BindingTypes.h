@@ -182,6 +182,8 @@ std::optional<ScriptTypeRef> resolveScriptType(
         return ScriptTypeRef{"Vec2", "RealScript.Math", ScriptTypeCategory::Struct};
     } else if constexpr (std::is_same_v<ValueType, Vec3>) {
         return ScriptTypeRef{"Vec3", "RealScript.Math", ScriptTypeCategory::Struct};
+    } else if constexpr (std::is_same_v<ValueType, Quat>) {
+        return ScriptTypeRef{"Quat", "RealScript.Math", ScriptTypeCategory::Struct};
     } else if constexpr (IsSharedPtr<ValueType>::value) {
         using Element = typename IsSharedPtr<ValueType>::Element;
         const auto found = state->nativeTypeByCppType.find(std::type_index(typeid(Element)));

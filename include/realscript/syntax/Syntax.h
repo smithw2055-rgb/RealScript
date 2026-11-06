@@ -19,6 +19,7 @@ enum class SyntaxKind {
     IntegerLiteralToken,
     FloatLiteralToken,
     StringLiteralToken,
+    InterpolatedStringToken,
 
     PlusToken,
     PlusEqualsToken,
@@ -82,6 +83,7 @@ enum class SyntaxKind {
     DelegateKeyword,
     EventKeyword,
     StaticKeyword,
+    ConstKeyword,
     PublicKeyword,
     PrivateKeyword,
     ProtectedKeyword,
@@ -219,6 +221,7 @@ private:
     [[nodiscard]] SyntaxToken lexNumber();
     [[nodiscard]] SyntaxToken lexIdentifierOrKeyword();
     [[nodiscard]] SyntaxToken lexString();
+    [[nodiscard]] SyntaxToken lexInterpolatedString();
     [[nodiscard]] char current() const noexcept;
     [[nodiscard]] char peek(std::size_t offset) const noexcept;
     void advance(std::size_t count = 1) noexcept;
@@ -748,6 +751,7 @@ struct EventSubscriptionStatementSyntax final : StatementSyntax {
 };
 
 struct VariableDeclarationStatementSyntax final : StatementSyntax {
+    std::optional<SyntaxToken> constKeyword;
     std::optional<SyntaxToken> refKeyword;
     TypeSyntax type;
     SyntaxToken identifierToken;
@@ -820,6 +824,8 @@ struct FieldDeclarationSyntax final : SyntaxNode {
     std::vector<SyntaxToken> modifiers;
     TypeSyntax type;
     SyntaxToken identifierToken;
+    std::optional<SyntaxToken> equalsToken;
+    std::unique_ptr<ExpressionSyntax> initializer;
     SyntaxToken semicolonToken;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::FieldDeclaration; }

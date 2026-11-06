@@ -239,7 +239,7 @@ text::TextSpan EventSubscriptionStatementSyntax::span() const noexcept {
 
 text::TextSpan VariableDeclarationStatementSyntax::span() const noexcept {
     return combine(
-        refKeyword ? refKeyword->span : type.span(),
+        constKeyword ? constKeyword->span : (refKeyword ? refKeyword->span : type.span()),
         semicolonToken.span);
 }
 

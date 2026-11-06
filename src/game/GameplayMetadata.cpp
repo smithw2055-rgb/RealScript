@@ -373,7 +373,7 @@ InspectorFieldSchema buildInspectorFieldSchema(
     const std::string& ownerCanonicalTypeName,
     const semantic::FieldSymbol& field,
     const ScriptObject* prototype,
-    const runtime::StructValue* parentStructValue,
+    const runtime::Value* parentStructValue,
     std::size_t fieldIndexInParent,
     std::unordered_set<std::string>& visitedStructs) {
     const bool hasExport =
@@ -392,9 +392,14 @@ InspectorFieldSchema buildInspectorFieldSchema(
     fieldSchema.hiddenInInspector = hidden;
 
     runtime::RuntimeError error;
-    if (parentStructValue && parentStructValue->storage &&
-        fieldIndexInParent < parentStructValue->storage->fields.size()) {
-        fieldSchema.defaultValue = parentStructValue->storage->fields[fieldIndexInParent];
+    if (parentStructValue) {
+        if (const auto* structVal = std::get_if<runtime::StructValue>(parentStructValue)) {
+            if (structVal->storage && fieldIndexInParent < structVal->storage->fields.size()) {
+                fieldSchema.defaultValue = structVal->storage->fields[fieldIndexInParent];
+            }
+        } else if (auto inlineField = runtime::loadInlineStructField(*parentStructValue, fieldIndexInParent)) {
+            fieldSchema.defaultValue = std::move(*inlineField);
+        }
     } else if (prototype) {
         if (auto val = runtime.getMember(*prototype, field.name, error)) {
             fieldSchema.defaultValue = std::move(*val);
@@ -527,17 +532,20 @@ InspectorFieldSchema buildInspectorFieldSchema(
     if (field.type == semantic::PrimitiveType::Struct && !field.typeName.empty() &&
         visitedStructs.insert(field.typeName).second) {
         if (const auto structType = runtime.findType(field.typeName)) {
-            const auto* structVal = std::get_if<runtime::StructValue>(&fieldSchema.defaultValue);
+            const runtime::Value* parentVal =
+                runtime::structValueTypeId(fieldSchema.defaultValue).has_value()
+                ? &fieldSchema.defaultValue
+                : nullptr;
             for (std::size_t idx = 0; idx < structType->descriptor.fields.size(); ++idx) {
                 const auto& subField = structType->descriptor.fields[idx];
-                if (subField.synthetic) continue;
+                if (subField.synthetic || subField.staticField || subField.constField) continue;
                 fieldSchema.nestedFields.push_back(buildInspectorFieldSchema(
                     runtime,
                     metadata,
                     structType->canonicalName(),
                     subField,
                     nullptr,
-                    structVal,
+                    parentVal,
                     idx,
                     visitedStructs));
             }
@@ -614,7 +622,7 @@ std::optional<InspectorTypeSchema> inspectTypeSchema(
             }
             continue;
         }
-        if (field.name == "__native") continue;
+        if (field.name == "__native" || field.staticField || field.constField) continue;
 
         schema.fields.push_back(buildInspectorFieldSchema(
             runtime,

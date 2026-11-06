@@ -202,6 +202,81 @@ std::size_t visibleParameterOffset(const FunctionSymbol& function) noexcept {
     return function.method && !function.staticMethod ? 1u : 0u;
 }
 
+void recordSymbolReference(
+    std::vector<SymbolOccurrence>& occurrences,
+    const std::string& sourceName,
+    SymbolId id,
+    SymbolKind kind,
+    const std::string& name,
+    const std::string& detail,
+    text::TextSpan span) {
+    if (id == 0 || span.empty()) return;
+    SymbolOccurrence occ;
+    occ.id = id;
+    occ.kind = kind;
+    occ.name = name;
+    occ.detail = detail;
+    occ.sourceName = sourceName;
+    occ.span = span;
+    occ.definition = false;
+    occurrences.push_back(std::move(occ));
+}
+
+void recordSymbolReference(
+    std::vector<SymbolOccurrence>& occurrences,
+    const std::string& sourceName,
+    SymbolId id,
+    SymbolKind kind,
+    const std::string& name,
+    text::TextSpan span) {
+    recordSymbolReference(
+        occurrences, sourceName, id, kind, name, std::string{}, span);
+}
+
+FunctionSymbol makeIntrinsicFunction(
+    std::string intrinsicName,
+    PrimitiveType returnType,
+    const std::string& returnTypeName,
+    const std::vector<std::pair<PrimitiveType, std::string>>& params) {
+    constexpr std::string_view prefix = "$intrinsic::";
+    if (intrinsicName.rfind(prefix, 0) == 0) {
+        intrinsicName.erase(0, prefix.size());
+    }
+    FunctionSymbol fn;
+    fn.moduleName = "$intrinsic";
+    fn.name = intrinsicName;
+    fn.returnType = returnType;
+    fn.returnTypeName = returnTypeName;
+    fn.storageReturnType = returnType;
+    fn.storageReturnTypeName = returnTypeName;
+    std::size_t idx = 0;
+    for (const auto& [pType, pTypeName] : params) {
+        VariableSymbol p;
+        p.name = "arg" + std::to_string(idx);
+        p.type = pType;
+        p.typeName = pTypeName;
+        p.storageType = pType;
+        p.storageTypeName = pTypeName;
+        p.index = idx++;
+        p.parameter = true;
+        fn.parameters.push_back(std::move(p));
+    }
+    fn.id = stableTypeId("$intrinsic::" + intrinsicName);
+    return fn;
+}
+
+std::string formatLiteralTokenToString(const syntax::TokenValue& val) {
+    if (const auto* s = std::get_if<std::string>(&val)) return *s;
+    if (const auto* i = std::get_if<std::int64_t>(&val)) return std::to_string(*i);
+    if (const auto* d = std::get_if<double>(&val)) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%g", *d);
+        return std::string(buf);
+    }
+    if (const auto* b = std::get_if<bool>(&val)) return *b ? "true" : "false";
+    return "null";
+}
+
 std::vector<const syntax::ExpressionSyntax*> syntaxPointers(
     const std::vector<std::unique_ptr<syntax::ExpressionSyntax>>& values) {
     std::vector<const syntax::ExpressionSyntax*> result;
@@ -1077,15 +1152,25 @@ std::unique_ptr<BoundExpression> Binder::bindLiteralExpression(
         const auto value = std::holds_alternative<std::int64_t>(result->value)
             ? std::get<std::int64_t>(result->value)
             : 0;
-        result->type = value < std::numeric_limits<std::int32_t>::min() ||
+        const bool hasLongSuffix = !syntaxTree.literalToken.text.empty() &&
+            (syntaxTree.literalToken.text.back() == 'l' ||
+             syntaxTree.literalToken.text.back() == 'L');
+        result->type = hasLongSuffix ||
+                value < std::numeric_limits<std::int32_t>::min() ||
                 value > std::numeric_limits<std::int32_t>::max()
             ? PrimitiveType::Long
             : PrimitiveType::Int;
         break;
     }
-    case syntax::SyntaxKind::FloatLiteralToken:
-        result->type = PrimitiveType::Double;
+    case syntax::SyntaxKind::FloatLiteralToken: {
+        const bool hasFloatSuffix = !syntaxTree.literalToken.text.empty() &&
+            (syntaxTree.literalToken.text.back() == 'f' ||
+             syntaxTree.literalToken.text.back() == 'F');
+        result->type = hasFloatSuffix
+            ? PrimitiveType::Float
+            : PrimitiveType::Double;
         break;
+    }
     case syntax::SyntaxKind::StringLiteralToken:
         result->type = PrimitiveType::String;
         break;
@@ -1145,6 +1230,18 @@ std::unique_ptr<BoundExpression> Binder::bindNameExpression(
     const syntax::NameExpressionSyntax& syntaxTree) {
     if (const auto* variable = lookupVariable(
             syntaxTree.identifierToken.text)) {
+        if (variable->name != "this") {
+            recordSymbolReference(
+                occurrences_,
+                currentSourceName_,
+                variable->id,
+                variable->parameter ? SymbolKind::Parameter : SymbolKind::Local,
+                variable->name,
+                isExactType(variable->type) && !variable->typeName.empty()
+                    ? variable->typeName
+                    : primitiveTypeName(variable->type),
+                syntaxTree.identifierToken.span);
+        }
         if (storageTypeOf(*variable) != variable->type) {
             const auto wrapper = visibleTypes_.find(
                 storageTypeNameOf(*variable));
@@ -1176,7 +1273,7 @@ std::unique_ptr<BoundExpression> Binder::bindNameExpression(
         return makeSequenceFieldAccess(field->second, syntaxTree.span());
     }
 
-    if (currentOwnerType_ && !currentStaticMethod_) {
+    if (currentOwnerType_) {
         const auto* thisVariable = lookupVariable("this");
         if (const auto* field = findField(*currentOwnerType_, syntaxTree.identifierToken.text)) {
             if (!isMemberAccessible(
@@ -1184,6 +1281,47 @@ std::unique_ptr<BoundExpression> Binder::bindNameExpression(
                 diagnostics_.report(
                     "RS2534", "field '" + field->name + "' is inaccessible",
                     syntaxTree.span());
+                return makeError(syntaxTree.span());
+            }
+            recordSymbolReference(
+                occurrences_,
+                currentSourceName_,
+                field->id,
+                SymbolKind::Field,
+                field->name,
+                isExactType(field->type) && !field->typeName.empty()
+                    ? field->typeName
+                    : primitiveTypeName(field->type),
+                syntaxTree.identifierToken.span);
+            if (field->constField && field->hasConstantValue) {
+                auto lit = std::make_unique<BoundLiteralExpression>();
+                lit->span = syntaxTree.span();
+                lit->type = field->type;
+                lit->typeName = field->typeName;
+                lit->value = field->constantValue;
+                return lit;
+            }
+            if (field->staticField) {
+                auto result = std::make_unique<BoundMemberAccessExpression>();
+                result->span = syntaxTree.span();
+                result->type = field->type;
+                result->typeName = field->typeName;
+                result->ownerType = *currentOwnerType_;
+                result->field = *field;
+                if (!field->hasConstantValue && field->initializerSyntax) {
+                    result->staticInitializer = bindTargetExpression(
+                        *field->initializerSyntax,
+                        field->type,
+                        field->typeName,
+                        "static field initializer");
+                }
+                return result;
+            }
+            if (currentStaticMethod_ || !thisVariable) {
+                diagnostics_.report(
+                    "RS2484",
+                    "instance field '" + field->name + "' requires a value receiver",
+                    syntaxTree.identifierToken.span);
                 return makeError(syntaxTree.span());
             }
             const auto captureStorage = currentOwnerType_->synthetic &&
@@ -1235,7 +1373,7 @@ std::unique_ptr<BoundExpression> Binder::bindNameExpression(
             result->field = *field;
             return result;
         }
-        if (currentOwnerType_->synthetic) {
+        if (!currentStaticMethod_ && thisVariable && currentOwnerType_->synthetic) {
             const auto* capturedThis = findField(*currentOwnerType_, "this");
             const auto outer = capturedThis
                 ? visibleTypes_.find(capturedThis->typeName)
@@ -1244,6 +1382,16 @@ std::unique_ptr<BoundExpression> Binder::bindNameExpression(
                 ? findField(outer->second, syntaxTree.identifierToken.text)
                 : nullptr;
             if (capturedThis && outerField) {
+                recordSymbolReference(
+                    occurrences_,
+                    currentSourceName_,
+                    outerField->id,
+                    SymbolKind::Field,
+                    outerField->name,
+                    isExactType(outerField->type) && !outerField->typeName.empty()
+                        ? outerField->typeName
+                        : primitiveTypeName(outerField->type),
+                    syntaxTree.identifierToken.span);
                 auto capturedReceiver =
                     std::make_unique<BoundMemberAccessExpression>();
                 capturedReceiver->span = syntaxTree.span();
@@ -1274,7 +1422,26 @@ std::unique_ptr<BoundExpression> Binder::bindNameExpression(
                     syntaxTree.span());
                 return makeError(syntaxTree.span());
             }
-            if (property->getter) {
+            recordSymbolReference(
+                occurrences_,
+                currentSourceName_,
+                property->id,
+                SymbolKind::Property,
+                property->name,
+                isExactType(property->type) && !property->typeName.empty()
+                    ? property->typeName
+                    : primitiveTypeName(property->type),
+                syntaxTree.identifierToken.span);
+            if (property->staticProperty) {
+                if (property->getter) {
+                    auto result = std::make_unique<BoundCallExpression>();
+                    result->span = syntaxTree.span();
+                    result->type = property->type;
+                    result->typeName = property->typeName;
+                    result->function = *property->getter;
+                    return result;
+                }
+            } else if (!currentStaticMethod_ && thisVariable && property->getter) {
                 auto result = std::make_unique<BoundCallExpression>();
                 result->span = syntaxTree.span();
                 result->type = property->type;
@@ -1573,6 +1740,81 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryOperation(
                 right = std::move(arguments[1]);
             }
         }
+    }
+
+    if (tokenKind == syntax::SyntaxKind::PlusToken &&
+        (left->type == PrimitiveType::String || right->type == PrimitiveType::String)) {
+        if (left->type == PrimitiveType::Void || right->type == PrimitiveType::Void) {
+            goto invalidOperator;
+        }
+        auto ensureStringOperand = [&](std::unique_ptr<BoundExpression> expr,
+                                       text::TextSpan exprSpan)
+            -> std::unique_ptr<BoundExpression> {
+            if (expr->type == PrimitiveType::String) return expr;
+            if (expr->kind() == BoundNodeKind::LiteralExpression &&
+                expr->type != PrimitiveType::Enum) {
+                const auto& lit = static_cast<const BoundLiteralExpression&>(*expr);
+                auto strLit = std::make_unique<BoundLiteralExpression>();
+                strLit->span = exprSpan;
+                strLit->type = PrimitiveType::String;
+                strLit->value = formatLiteralTokenToString(lit.value);
+                return strLit;
+            }
+            const auto intrinsicName = "to_string::" +
+                std::to_string(static_cast<int>(expr->type)) + "::" +
+                expr->typeName;
+            auto call = std::make_unique<BoundCallExpression>();
+            call->span = exprSpan;
+            call->type = PrimitiveType::String;
+            call->function = makeIntrinsicFunction(
+                intrinsicName,
+                PrimitiveType::String,
+                {},
+                {{expr->type, expr->typeName}});
+            call->arguments.push_back(std::move(expr));
+            call->argumentEvaluationOrder = {0};
+            return call;
+        };
+        left = ensureStringOperand(std::move(left), leftSpan);
+        right = ensureStringOperand(std::move(right), rightSpan);
+        const auto* leftLit = left->kind() == BoundNodeKind::LiteralExpression
+            ? static_cast<const BoundLiteralExpression*>(left.get())
+            : nullptr;
+        const auto* rightLit = right->kind() == BoundNodeKind::LiteralExpression
+            ? static_cast<const BoundLiteralExpression*>(right.get())
+            : nullptr;
+        if (leftLit && rightLit &&
+            std::holds_alternative<std::string>(leftLit->value) &&
+            std::holds_alternative<std::string>(rightLit->value)) {
+            auto folded = std::make_unique<BoundLiteralExpression>();
+            folded->span = span;
+            folded->type = PrimitiveType::String;
+            folded->value = std::get<std::string>(leftLit->value) +
+                std::get<std::string>(rightLit->value);
+            return folded;
+        }
+        if (leftLit && std::holds_alternative<std::string>(leftLit->value) &&
+            std::get<std::string>(leftLit->value).empty()) {
+            right->span = span;
+            return right;
+        }
+        if (rightLit && std::holds_alternative<std::string>(rightLit->value) &&
+            std::get<std::string>(rightLit->value).empty()) {
+            left->span = span;
+            return left;
+        }
+        auto concatCall = std::make_unique<BoundCallExpression>();
+        concatCall->span = span;
+        concatCall->type = PrimitiveType::String;
+        concatCall->function = makeIntrinsicFunction(
+            "string_concat",
+            PrimitiveType::String,
+            {},
+            {{PrimitiveType::String, {}}, {PrimitiveType::String, {}}});
+        concatCall->arguments.push_back(std::move(left));
+        concatCall->arguments.push_back(std::move(right));
+        concatCall->argumentEvaluationOrder = {0, 1};
+        return concatCall;
     }
 
     if (tokenKind == syntax::SyntaxKind::PlusToken ||
@@ -1964,6 +2206,26 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
 
     if (const auto* variable = lookupVariable(
             syntaxTree.identifierToken.text)) {
+        if (variable->name != "this" && !compoundOp) {
+            recordSymbolReference(
+                occurrences_,
+                currentSourceName_,
+                variable->id,
+                variable->parameter ? SymbolKind::Parameter : SymbolKind::Local,
+                variable->name,
+                isExactType(variable->type) && !variable->typeName.empty()
+                    ? variable->typeName
+                    : primitiveTypeName(variable->type),
+                syntaxTree.identifierToken.span);
+        }
+        if (variable->isConst) {
+            diagnostics_.report(
+                "RS2483",
+                "cannot assign to const local variable '" +
+                    variable->name + "'",
+                syntaxTree.identifierToken.span);
+            return makeError(syntaxTree.span());
+        }
         if (variable->modifier == ParameterModifier::In) {
             diagnostics_.report(
                 "RS8702",
@@ -2025,7 +2287,7 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
         return result;
     }
 
-    if (currentOwnerType_ && !currentStaticMethod_) {
+    if (currentOwnerType_) {
         const auto* thisVariable = lookupVariable("this");
         if (const auto* field = findField(
                 *currentOwnerType_, syntaxTree.identifierToken.text)) {
@@ -2034,6 +2296,44 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 diagnostics_.report(
                     "RS2534", "field '" + field->name + "' is inaccessible",
                     syntaxTree.span());
+                return makeError(syntaxTree.span());
+            }
+            if (!compoundOp) {
+                recordSymbolReference(
+                    occurrences_,
+                    currentSourceName_,
+                    field->id,
+                    SymbolKind::Field,
+                    field->name,
+                    isExactType(field->type) && !field->typeName.empty()
+                        ? field->typeName
+                        : primitiveTypeName(field->type),
+                    syntaxTree.identifierToken.span);
+            }
+            if (field->constField) {
+                diagnostics_.report(
+                    "RS2483",
+                    "cannot assign to const field '" + field->name + "'",
+                    syntaxTree.identifierToken.span);
+                return makeError(syntaxTree.span());
+            }
+            if (field->staticField) {
+                auto value = bindAssignedValue(
+                    field->type, field->typeName, "field assignment");
+                auto result = std::make_unique<BoundMemberAssignmentExpression>();
+                result->span = syntaxTree.span();
+                result->type = field->type;
+                result->typeName = field->typeName;
+                result->ownerType = *currentOwnerType_;
+                result->field = *field;
+                result->expression = std::move(value);
+                return result;
+            }
+            if (currentStaticMethod_ || !thisVariable) {
+                diagnostics_.report(
+                    "RS2484",
+                    "instance field '" + field->name + "' requires a value receiver",
+                    syntaxTree.identifierToken.span);
                 return makeError(syntaxTree.span());
             }
             const auto captureStorage = currentOwnerType_->synthetic &&
@@ -2110,7 +2410,7 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
             result->expression = std::move(value);
             return result;
         }
-        if (currentOwnerType_->synthetic) {
+        if (!currentStaticMethod_ && thisVariable && currentOwnerType_->synthetic) {
             const auto* capturedThis = findField(*currentOwnerType_, "this");
             const auto outer = capturedThis
                 ? visibleTypes_.find(capturedThis->typeName)
@@ -2119,6 +2419,18 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 ? findField(outer->second, syntaxTree.identifierToken.text)
                 : nullptr;
             if (capturedThis && outerField) {
+                if (!compoundOp) {
+                    recordSymbolReference(
+                        occurrences_,
+                        currentSourceName_,
+                        outerField->id,
+                        SymbolKind::Field,
+                        outerField->name,
+                        isExactType(outerField->type) && !outerField->typeName.empty()
+                            ? outerField->typeName
+                            : primitiveTypeName(outerField->type),
+                        syntaxTree.identifierToken.span);
+                }
                 auto value = bindAssignedValue(
                     outerField->type,
                     outerField->typeName, "captured field assignment");
@@ -2154,6 +2466,18 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                     syntaxTree.span());
                 return makeError(syntaxTree.span());
             }
+            if (!compoundOp) {
+                recordSymbolReference(
+                    occurrences_,
+                    currentSourceName_,
+                    property->id,
+                    SymbolKind::Property,
+                    property->name,
+                    isExactType(property->type) && !property->typeName.empty()
+                        ? property->typeName
+                        : primitiveTypeName(property->type),
+                    syntaxTree.identifierToken.span);
+            }
             if (!property->setter) {
                 diagnostics_.report(
                     "RS2483",
@@ -2161,7 +2485,7 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                     syntaxTree.identifierToken.span);
                 return makeError(syntaxTree.span());
             }
-            if (currentOwnerType_->kind == TypeKind::Struct) {
+            if (!property->staticProperty && currentOwnerType_->kind == TypeKind::Struct) {
                 diagnostics_.report(
                     "RS2486",
                     "struct properties cannot be assigned through an instance method in the Phase 3E value model",
@@ -2176,8 +2500,10 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
             result->type = property->type;
             result->typeName = property->typeName;
             result->setter = *property->setter;
-            result->arguments.push_back(
-                variableExpression(*thisVariable, syntaxTree.span()));
+            if (!property->staticProperty && thisVariable) {
+                result->arguments.push_back(
+                    variableExpression(*thisVariable, syntaxTree.span()));
+            }
             result->assignedValue = std::move(assigned);
             return result;
         }
@@ -2376,12 +2702,32 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
             argument.targetKind = ReferenceTargetKind::Variable;
             argument.variable = static_cast<const
                 BoundVariableExpression&>(*value).variable;
+            if (argument.variable.isConst &&
+                argument.modifier != ParameterModifier::In) {
+                diagnostics_.report(
+                    "RS2483",
+                    "cannot pass const variable '" +
+                        argument.variable.name + "' as ref or out",
+                    targetSpan);
+                argument.value = std::move(value);
+                return false;
+            }
             argument.value = std::move(value);
             return true;
         }
         if (value->kind() == BoundNodeKind::MemberAccessExpression) {
             auto& member = static_cast<
                 BoundMemberAccessExpression&>(*value);
+            if (member.field.constField &&
+                argument.modifier != ParameterModifier::In) {
+                diagnostics_.report(
+                    "RS2483",
+                    "cannot pass const field '" +
+                        member.field.name + "' as ref or out",
+                    targetSpan);
+                argument.value = std::move(value);
+                return false;
+            }
             argument.targetKind = ReferenceTargetKind::ObjectField;
             argument.targetReceiver = std::move(member.receiver);
             argument.targetOwnerType = member.ownerType;
@@ -2535,6 +2881,14 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
                 syntax::NameExpressionSyntax&>(*syntaxArguments[index]);
             if (const auto* namedVariable = lookupVariable(
                     name.identifierToken.text)) {
+                if (namedVariable->isConst &&
+                    parameter.modifier != ParameterModifier::In) {
+                    diagnostics_.report(
+                        "RS2483",
+                        "cannot pass const variable '" +
+                            namedVariable->name + "' as ref or out",
+                        argumentSpan(index));
+                }
                 argument.targetKind = ReferenceTargetKind::Variable;
                 argument.variable = *namedVariable;
                 argument.value = std::move(arguments[index]);
@@ -2899,6 +3253,14 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
         return makeError(syntaxTree.span());
     }
 
+    recordSymbolReference(
+        occurrences_,
+        currentSourceName_,
+        best->id,
+        SymbolKind::Function,
+        best->name,
+        syntaxTree.identifierToken.span);
+
     std::unique_ptr<BoundExpression> receiver;
     if (best->method && !best->staticMethod) {
         const auto* thisVariable = lookupVariable("this");
@@ -2987,20 +3349,108 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
                     name.identifierToken.span);
                 return makeError(syntaxTree.span());
             }
-            if (!isTypeAccessible(type->second)) {
-                diagnostics_.report(
-                    "RS2534",
-                    "type '" + canonicalTypeName(type->second) +
-                        "' is inaccessible",
-                    name.identifierToken.span);
-                return makeError(syntaxTree.span());
-            }
+            recordSymbolReference(
+                occurrences_,
+                currentSourceName_,
+                type->second.id,
+                SymbolKind::Type,
+                type->second.name,
+                name.identifierToken.span);
             owner = type->second;
             staticCall = true;
         }
     }
     if (!staticCall) {
         receiver = bindExpression(*syntaxTree.receiver);
+        if (receiver->type == PrimitiveType::Array &&
+            (syntaxTree.nameToken.text == "Length" ||
+             syntaxTree.nameToken.text == "Count") &&
+            arguments.empty()) {
+            auto result = std::make_unique<BoundArrayLengthExpression>();
+            result->span = syntaxTree.span();
+            result->type = PrimitiveType::Int;
+            result->receiver = std::move(receiver);
+            return applyNullConditional(
+                std::move(result), syntaxTree.dotToken, syntaxTree.span());
+        }
+        if (receiver->type == PrimitiveType::String) {
+            const auto& methodName = syntaxTree.nameToken.text;
+            std::string intrinsicName;
+            PrimitiveType returnType = PrimitiveType::Error;
+            std::vector<std::pair<PrimitiveType, std::string>> expectedParams;
+            if ((methodName == "Length" || methodName == "Count") && arguments.empty()) {
+                intrinsicName = "$intrinsic::string_length";
+                returnType = PrimitiveType::Int;
+            } else if (methodName == "IsEmpty" && arguments.empty()) {
+                intrinsicName = "$intrinsic::string_is_empty";
+                returnType = PrimitiveType::Bool;
+            } else if (methodName == "Contains" && arguments.size() == 1) {
+                intrinsicName = "$intrinsic::string_contains";
+                returnType = PrimitiveType::Bool;
+                expectedParams = {{PrimitiveType::String, ""}};
+            } else if (methodName == "StartsWith" && arguments.size() == 1) {
+                intrinsicName = "$intrinsic::string_starts_with";
+                returnType = PrimitiveType::Bool;
+                expectedParams = {{PrimitiveType::String, ""}};
+            } else if (methodName == "EndsWith" && arguments.size() == 1) {
+                intrinsicName = "$intrinsic::string_ends_with";
+                returnType = PrimitiveType::Bool;
+                expectedParams = {{PrimitiveType::String, ""}};
+            } else if (methodName == "IndexOf" && arguments.size() == 1) {
+                intrinsicName = "$intrinsic::string_index_of";
+                returnType = PrimitiveType::Int;
+                expectedParams = {{PrimitiveType::String, ""}};
+            } else if (methodName == "Substring" && arguments.size() == 1) {
+                intrinsicName = "$intrinsic::string_substring_1";
+                returnType = PrimitiveType::String;
+                expectedParams = {{PrimitiveType::Int, ""}};
+            } else if (methodName == "Substring" && arguments.size() == 2) {
+                intrinsicName = "$intrinsic::string_substring_2";
+                returnType = PrimitiveType::String;
+                expectedParams = {{PrimitiveType::Int, ""}, {PrimitiveType::Int, ""}};
+            } else if (methodName == "Trim" && arguments.empty()) {
+                intrinsicName = "$intrinsic::string_trim";
+                returnType = PrimitiveType::String;
+            } else if (methodName == "Replace" && arguments.size() == 2) {
+                intrinsicName = "$intrinsic::string_replace";
+                returnType = PrimitiveType::String;
+                expectedParams = {{PrimitiveType::String, ""}, {PrimitiveType::String, ""}};
+            } else if (methodName == "ToUpper" && arguments.empty()) {
+                intrinsicName = "$intrinsic::string_to_upper";
+                returnType = PrimitiveType::String;
+            } else if (methodName == "ToLower" && arguments.empty()) {
+                intrinsicName = "$intrinsic::string_to_lower";
+                returnType = PrimitiveType::String;
+            }
+            if (!intrinsicName.empty()) {
+                std::vector<std::pair<PrimitiveType, std::string>> fullParams;
+                fullParams.push_back({PrimitiveType::String, ""});
+                for (const auto& p : expectedParams) fullParams.push_back(p);
+                auto call = std::make_unique<BoundCallExpression>();
+                call->span = syntaxTree.span();
+                call->type = returnType;
+                call->function = makeIntrinsicFunction(
+                    intrinsicName, returnType, "", fullParams);
+                call->function.method = true;
+                call->function.staticMethod = false;
+                call->arguments.push_back(std::move(receiver));
+                for (std::size_t i = 0; i < arguments.size(); ++i) {
+                    call->arguments.push_back(convertExpression(
+                        std::move(arguments[i]),
+                        expectedParams[i].first,
+                        syntaxTree.arguments[i]->span(),
+                        "string method argument",
+                        expectedParams[i].second));
+                }
+                return applyNullConditional(
+                    std::move(call), syntaxTree.dotToken, syntaxTree.span());
+            }
+            diagnostics_.report(
+                "RS2472",
+                "no applicable method '" + methodName + "' on type 'string'",
+                syntaxTree.span());
+            return makeError(syntaxTree.span());
+        }
         if ((receiver->type != PrimitiveType::Object &&
              receiver->type != PrimitiveType::Struct) ||
             receiver->typeName.empty()) {
@@ -3080,6 +3530,14 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
         return makeError(syntaxTree.span());
     }
 
+    recordSymbolReference(
+        occurrences_,
+        currentSourceName_,
+        best->id,
+        SymbolKind::Function,
+        best->name,
+        syntaxTree.nameToken.span);
+
     auto prepared = prepareCallArguments(
         *best, plan.sources, std::move(arguments),
         syntaxTree.arguments, syntaxTree.argumentModifiers,
@@ -3105,6 +3563,13 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
         diagnostics_.report("RS2403", "cannot allocate unknown or enum type '" + syntaxTree.type.name.text + "'", syntaxTree.type.span());
         return makeError(syntaxTree.span());
     }
+    recordSymbolReference(
+        occurrences_,
+        currentSourceName_,
+        found->second.id,
+        SymbolKind::Type,
+        found->second.name,
+        syntaxTree.type.name.span);
     if (!isTypeAccessible(found->second)) {
         diagnostics_.report(
             "RS2534",
@@ -3197,6 +3662,13 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
                             syntaxInitializer.span());
                         continue;
                     }
+                    recordSymbolReference(
+                        occurrences_,
+                        currentSourceName_,
+                        field->id,
+                        SymbolKind::Field,
+                        field->name,
+                        syntaxInitializer.nameToken->span);
                     initializer.kind = BoundNewObjectExpression::Initializer::Kind::Field;
                     initializer.field = *field;
                     initializer.arguments.push_back(bindTargetExpression(
@@ -3216,6 +3688,13 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
                             syntaxInitializer.span());
                         continue;
                     }
+                    recordSymbolReference(
+                        occurrences_,
+                        currentSourceName_,
+                        property->id,
+                        SymbolKind::Property,
+                        property->name,
+                        syntaxInitializer.nameToken->span);
                     initializer.kind = BoundNewObjectExpression::Initializer::Kind::Property;
                     initializer.function = *property->setter;
                     initializer.arguments.push_back(bindTargetExpression(
@@ -3294,6 +3773,21 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
     result->type = PrimitiveType::Object;
     result->typeName = canonicalTypeName(found->second);
     result->objectType = found->second;
+    for (const auto& field : found->second.fields) {
+        if (field.staticField || field.constField ||
+            field.hasConstantValue || !field.initializerSyntax) {
+            continue;
+        }
+        BoundNewObjectExpression::Initializer defaultInit;
+        defaultInit.kind = BoundNewObjectExpression::Initializer::Kind::Field;
+        defaultInit.field = field;
+        defaultInit.arguments.push_back(bindTargetExpression(
+            *field.initializerSyntax,
+            field.type,
+            field.typeName,
+            "field initializer"));
+        result->defaultFieldInitializers.push_back(std::move(defaultInit));
+    }
     if (best) result->constructor = *best;
     const auto offset = best ? visibleParameterOffset(*best) : 0;
     for (std::size_t i = 0;
@@ -3332,23 +3826,88 @@ std::unique_ptr<BoundExpression> Binder::bindNewArrayExpression(
 
 std::unique_ptr<BoundExpression> Binder::bindMemberAccessExpression(
     const syntax::MemberAccessExpressionSyntax& syntaxTree) {
-    // Static enum member or static property.
+    // Static enum member, static/const field, or static property.
     if (syntaxTree.receiver->kind() == syntax::SyntaxKind::NameExpression) {
         const auto& name = static_cast<const syntax::NameExpressionSyntax&>(*syntaxTree.receiver);
         const auto type = visibleTypes_.find(name.identifierToken.text);
         if (!lookupVariable(name.identifierToken.text) &&
             type != visibleTypes_.end()) {
+            recordSymbolReference(
+                occurrences_,
+                currentSourceName_,
+                type->second.id,
+                SymbolKind::Type,
+                type->second.name,
+                name.identifierToken.span);
             if (type->second.kind == TypeKind::Enum) {
                 const auto* member = findEnumMember(type->second, syntaxTree.nameToken.text);
                 if (!member) {
                     diagnostics_.report("RS2480", "enum '" + canonicalTypeName(type->second) + "' has no member '" + syntaxTree.nameToken.text + "'", syntaxTree.nameToken.span);
                     return makeError(syntaxTree.span());
                 }
+                recordSymbolReference(
+                    occurrences_,
+                    currentSourceName_,
+                    member->id,
+                    SymbolKind::EnumMember,
+                    member->name,
+                    syntaxTree.nameToken.span);
                 auto result = std::make_unique<BoundLiteralExpression>();
                 result->span = syntaxTree.span();
                 result->type = PrimitiveType::Enum;
                 result->typeName = canonicalTypeName(type->second);
                 result->value = member->value;
+                return result;
+            }
+            if (const auto* field = findField(
+                    type->second,
+                    syntaxTree.nameToken.text)) {
+                if (!isMemberAccessible(
+                        field->accessibility,
+                        field->declaringTypeId)) {
+                    diagnostics_.report(
+                        "RS2534",
+                        "field '" + field->name + "' is inaccessible",
+                        syntaxTree.span());
+                    return makeError(syntaxTree.span());
+                }
+                recordSymbolReference(
+                    occurrences_,
+                    currentSourceName_,
+                    field->id,
+                    SymbolKind::Field,
+                    field->name,
+                    syntaxTree.nameToken.span);
+                if (!field->staticField && !field->constField) {
+                    diagnostics_.report(
+                        "RS2484",
+                        "instance field '" + field->name +
+                            "' requires a value receiver",
+                        syntaxTree.nameToken.span);
+                    return makeError(syntaxTree.span());
+                }
+                if (field->constField && field->hasConstantValue) {
+                    auto literal = std::make_unique<BoundLiteralExpression>();
+                    literal->span = syntaxTree.span();
+                    literal->type = field->type;
+                    literal->typeName = field->typeName;
+                    literal->value = field->constantValue;
+                    return literal;
+                }
+                auto result = std::make_unique<BoundMemberAccessExpression>();
+                result->span = syntaxTree.span();
+                result->type = field->type;
+                result->typeName = field->typeName;
+                result->ownerType = type->second;
+                result->field = *field;
+                if (field->staticField && !field->hasConstantValue &&
+                    field->initializerSyntax) {
+                    result->staticInitializer = bindTargetExpression(
+                        *field->initializerSyntax,
+                        field->type,
+                        field->typeName,
+                        "static field initializer");
+                }
                 return result;
             }
             if (const auto* property = findProperty(
@@ -3363,6 +3922,13 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAccessExpression(
                         syntaxTree.span());
                     return makeError(syntaxTree.span());
                 }
+                recordSymbolReference(
+                    occurrences_,
+                    currentSourceName_,
+                    property->id,
+                    SymbolKind::Property,
+                    property->name,
+                    syntaxTree.nameToken.span);
                 if (!property->staticProperty) {
                     diagnostics_.report(
                         "RS2484",
@@ -3389,13 +3955,34 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAccessExpression(
     }
 
     auto receiver = bindExpression(*syntaxTree.receiver);
-    if (receiver->type == PrimitiveType::Array && syntaxTree.nameToken.text == "length") {
+    if (receiver->type == PrimitiveType::Array &&
+        (syntaxTree.nameToken.text == "length" ||
+         syntaxTree.nameToken.text == "Length" ||
+         syntaxTree.nameToken.text == "Count")) {
         auto result = std::make_unique<BoundArrayLengthExpression>();
         result->span = syntaxTree.span();
         result->type = PrimitiveType::Int;
         result->receiver = std::move(receiver);
         return applyNullConditional(
             std::move(result), syntaxTree.dotToken, syntaxTree.span());
+    }
+    if (receiver->type == PrimitiveType::String &&
+        (syntaxTree.nameToken.text == "length" ||
+         syntaxTree.nameToken.text == "Length" ||
+         syntaxTree.nameToken.text == "Count")) {
+        auto call = std::make_unique<BoundCallExpression>();
+        call->span = syntaxTree.span();
+        call->type = PrimitiveType::Int;
+        call->function = makeIntrinsicFunction(
+            "$intrinsic::string_length",
+            PrimitiveType::Int,
+            "",
+            {{PrimitiveType::String, ""}});
+        call->function.method = true;
+        call->function.staticMethod = false;
+        call->arguments.push_back(std::move(receiver));
+        return applyNullConditional(
+            std::move(call), syntaxTree.dotToken, syntaxTree.span());
     }
     if ((receiver->type != PrimitiveType::Object && receiver->type != PrimitiveType::Struct) || receiver->typeName.empty()) {
         diagnostics_.report("RS2404", "member access requires a class or struct value", syntaxTree.receiver->span());
@@ -3413,6 +4000,37 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAccessExpression(
                 "RS2534", "field '" + field->name + "' is inaccessible",
                 syntaxTree.span());
             return makeError(syntaxTree.span());
+        }
+        recordSymbolReference(
+            occurrences_,
+            currentSourceName_,
+            field->id,
+            SymbolKind::Field,
+            field->name,
+            syntaxTree.nameToken.span);
+        if (field->constField && field->hasConstantValue) {
+            auto literal = std::make_unique<BoundLiteralExpression>();
+            literal->span = syntaxTree.span();
+            literal->type = field->type;
+            literal->typeName = field->typeName;
+            literal->value = field->constantValue;
+            return literal;
+        }
+        if (field->staticField) {
+            auto result = std::make_unique<BoundMemberAccessExpression>();
+            result->span = syntaxTree.span();
+            result->type = field->type;
+            result->typeName = field->typeName;
+            result->ownerType = type->second;
+            result->field = *field;
+            if (!field->hasConstantValue && field->initializerSyntax) {
+                result->staticInitializer = bindTargetExpression(
+                    *field->initializerSyntax,
+                    field->type,
+                    field->typeName,
+                    "static field initializer");
+            }
+            return result;
         }
         if (type->second.kind == TypeKind::Struct) {
             auto result = std::make_unique<BoundStructFieldAccessExpression>();
@@ -3444,6 +4062,13 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAccessExpression(
                 syntaxTree.span());
             return makeError(syntaxTree.span());
         }
+        recordSymbolReference(
+            occurrences_,
+            currentSourceName_,
+            property->id,
+            SymbolKind::Property,
+            property->name,
+            syntaxTree.nameToken.span);
         if (property->staticProperty) {
             diagnostics_.report(
                 "RS2484",
@@ -3633,12 +4258,19 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
         return bindExpression(*syntaxTree.receiver);
     };
 
-    // Static property assignment.
+    // Static field or static property assignment.
     if (syntaxTree.receiver->kind() == syntax::SyntaxKind::NameExpression) {
         const auto& name = static_cast<const syntax::NameExpressionSyntax&>(*syntaxTree.receiver);
         const auto type = visibleTypes_.find(name.identifierToken.text);
         if (!lookupVariable(name.identifierToken.text) &&
             type != visibleTypes_.end()) {
+            recordSymbolReference(
+                occurrences_,
+                currentSourceName_,
+                type->second.id,
+                SymbolKind::Type,
+                type->second.name,
+                name.identifierToken.span);
             if (!isTypeAccessible(type->second)) {
                 diagnostics_.report(
                     "RS2534",
@@ -3646,6 +4278,85 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                         "' is inaccessible",
                     name.identifierToken.span);
                 return makeError(syntaxTree.span());
+            }
+            if (const auto* field = findField(
+                    type->second,
+                    syntaxTree.nameToken.text)) {
+                if (!isMemberAccessible(
+                        field->accessibility,
+                        field->declaringTypeId)) {
+                    diagnostics_.report(
+                        "RS2534",
+                        "field '" + field->name + "' is inaccessible",
+                        syntaxTree.span());
+                    return makeError(syntaxTree.span());
+                }
+                recordSymbolReference(
+                    occurrences_,
+                    currentSourceName_,
+                    field->id,
+                    SymbolKind::Field,
+                    field->name,
+                    syntaxTree.nameToken.span);
+                if (field->constField) {
+                    diagnostics_.report(
+                        "RS2483",
+                        "cannot assign to const field '" + field->name + "'",
+                        syntaxTree.nameToken.span);
+                    return makeError(syntaxTree.span());
+                }
+                if (!field->staticField) {
+                    diagnostics_.report(
+                        "RS2484",
+                        "instance field '" + field->name +
+                            "' requires a value receiver",
+                        syntaxTree.nameToken.span);
+                    return makeError(syntaxTree.span());
+                }
+                std::unique_ptr<BoundExpression> value;
+                if (compoundOp) {
+                    auto lhsValue = std::make_unique<BoundMemberAccessExpression>();
+                    lhsValue->span = syntaxTree.nameToken.span;
+                    lhsValue->type = field->type;
+                    lhsValue->typeName = field->typeName;
+                    lhsValue->ownerType = type->second;
+                    lhsValue->field = *field;
+                    if (!field->hasConstantValue && field->initializerSyntax) {
+                        lhsValue->staticInitializer = bindTargetExpression(
+                            *field->initializerSyntax,
+                            field->type,
+                            field->typeName,
+                            "static field initializer");
+                    }
+                    auto rhsValue = bindExpression(*syntaxTree.expression);
+                    auto combined = bindBinaryOperation(
+                        std::move(lhsValue),
+                        syntaxTree.nameToken.span,
+                        *compoundOp,
+                        std::move(rhsValue),
+                        syntaxTree.expression->span(),
+                        syntaxTree.span());
+                    value = convertExpression(
+                        std::move(combined),
+                        field->type,
+                        syntaxTree.span(),
+                        "field assignment",
+                        field->typeName);
+                } else {
+                    value = bindTargetExpression(
+                        *syntaxTree.expression,
+                        field->type,
+                        field->typeName,
+                        "field assignment");
+                }
+                auto result = std::make_unique<BoundMemberAssignmentExpression>();
+                result->span = syntaxTree.span();
+                result->type = field->type;
+                result->typeName = field->typeName;
+                result->ownerType = type->second;
+                result->field = *field;
+                result->expression = std::move(value);
+                return result;
             }
             if (const auto* property = findProperty(
                     type->second,
@@ -3659,6 +4370,13 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                         syntaxTree.span());
                     return makeError(syntaxTree.span());
                 }
+                recordSymbolReference(
+                    occurrences_,
+                    currentSourceName_,
+                    property->id,
+                    SymbolKind::Property,
+                    property->name,
+                    syntaxTree.nameToken.span);
                 if (!property->staticProperty) {
                     diagnostics_.report(
                         "RS2484",
@@ -3738,10 +4456,39 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                 syntaxTree.span());
             return makeError(syntaxTree.span());
         }
+        recordSymbolReference(
+            occurrences_,
+            currentSourceName_,
+            field->id,
+            SymbolKind::Field,
+            field->name,
+            syntaxTree.nameToken.span);
+        if (field->constField) {
+            diagnostics_.report(
+                "RS2483",
+                "cannot assign to const field '" + field->name + "'",
+                syntaxTree.nameToken.span);
+            return makeError(syntaxTree.span());
+        }
         std::unique_ptr<BoundExpression> value;
         if (compoundOp) {
             std::unique_ptr<BoundExpression> lhsValue;
-            if (type->second.kind == TypeKind::Struct) {
+            if (field->staticField) {
+                auto access = std::make_unique<BoundMemberAccessExpression>();
+                access->span = syntaxTree.nameToken.span;
+                access->type = field->type;
+                access->typeName = field->typeName;
+                access->ownerType = type->second;
+                access->field = *field;
+                if (!field->hasConstantValue && field->initializerSyntax) {
+                    access->staticInitializer = bindTargetExpression(
+                        *field->initializerSyntax,
+                        field->type,
+                        field->typeName,
+                        "static field initializer");
+                }
+                lhsValue = std::move(access);
+            } else if (type->second.kind == TypeKind::Struct) {
                 auto access = std::make_unique<BoundStructFieldAccessExpression>();
                 access->span = syntaxTree.nameToken.span;
                 access->type = field->type;
@@ -3778,6 +4525,16 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
             value = bindTargetExpression(
                 *syntaxTree.expression, field->type, field->typeName,
                 "field assignment");
+        }
+        if (field->staticField) {
+            auto result = std::make_unique<BoundMemberAssignmentExpression>();
+            result->span = syntaxTree.span();
+            result->type = field->type;
+            result->typeName = field->typeName;
+            result->ownerType = type->second;
+            result->field = *field;
+            result->expression = std::move(value);
+            return result;
         }
         if (type->second.kind == TypeKind::Struct) {
             const VariableSymbol* variable = nullptr;
@@ -3834,6 +4591,13 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                 syntaxTree.span());
             return makeError(syntaxTree.span());
         }
+        recordSymbolReference(
+            occurrences_,
+            currentSourceName_,
+            property->id,
+            SymbolKind::Property,
+            property->name,
+            syntaxTree.nameToken.span);
         if (property->staticProperty) {
             diagnostics_.report(
                 "RS2484",

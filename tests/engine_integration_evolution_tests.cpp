@@ -186,18 +186,14 @@ class Hero : NativeActor
         nativeHero->position.x == realscript::game::Fixed::fromInt(10) &&
             nativeHero->position.y == realscript::game::Fixed::fromInt(1),
         "NativeActor position should be updated to (10, 1)");
-    const auto* retStruct = std::get_if<realscript::runtime::StructValue>(&advExec.value);
     require(
-        retStruct && retStruct->storage && retStruct->storage->fields.size() == 2,
-        "returned value should be Vec2 StructValue");
-    const auto retX = realscript::game::detail::extractFixedStructValue(
-        retStruct->storage->fields[0]);
-    const auto retY = realscript::game::detail::extractFixedStructValue(
-        retStruct->storage->fields[1]);
+        std::holds_alternative<realscript::runtime::Vec2Value>(advExec.value),
+        "returned value should be inline Vec2Value");
+    const auto retVec = realscript::game::ScriptRuntime::readVec2(advExec.value);
     require(
-        retX.has_value() && retY.has_value() &&
-            *retX == realscript::game::Fixed::fromInt(18) &&
-            *retY == realscript::game::Fixed::fromInt(-1),
+        retVec.has_value() &&
+            retVec->x == realscript::game::Fixed::fromInt(18) &&
+            retVec->y == realscript::game::Fixed::fromInt(-1),
         "StepPosition should return (18, -1)");
 
     // Native object destruction / handle invalidation
@@ -1290,28 +1286,619 @@ class Mover
         "exportChromeTraceJson output is missing expected trace events: " + traceJson);
 }
 
+void testBoostStage1InlineMathAndValueSpanBindings() {
+    realscript::game::GameApi api;
+    std::size_t observedSpanCalls = 0;
+    const realscript::runtime::Value* observedDataPtr = nullptr;
+
+    require(
+        api.function(
+            "Engine.Stage1",
+            "InspectSpan",
+            [&](realscript::game::Fixed f, realscript::game::Vec2 v2, realscript::game::Vec3 v3) {
+                ++observedSpanCalls;
+                return realscript::game::Fixed::fromRaw(
+                    f.raw + v2.x.raw + v2.y.raw + v3.x.raw + v3.y.raw + v3.z.raw);
+            }),
+        "failed to register Engine.Stage1::InspectSpan");
+
+    // Also verify direct ValueSpan zero-allocation invocation on BindingRegistry
+    {
+        realscript::bytecode::FunctionReference ref;
+        ref.name = "Engine.Stage1::__rs_native_InspectSpan";
+        const auto resolved = api.bindings()->resolve(ref);
+        require(resolved.has_value() && resolved->function != nullptr, "failed to resolve InspectSpan binding");
+        std::array<realscript::runtime::Value, 3> stackArgs{
+            realscript::runtime::FixedValue{256},
+            realscript::runtime::Vec2Value{512, 768},
+            realscript::runtime::Vec3Value{256, 256, 256},
+        };
+        realscript::runtime::ValueSpan spanView(stackArgs);
+        observedDataPtr = spanView.data();
+        require(observedDataPtr == stackArgs.data(), "ValueSpan must point directly to stack array without copying");
+        realscript::runtime::RuntimeError directErr;
+        const auto directRes = (*resolved->function)(ref, spanView, directErr);
+        require(
+            directRes.has_value() &&
+                std::holds_alternative<realscript::runtime::FixedValue>(*directRes) &&
+                std::get<realscript::runtime::FixedValue>(*directRes).raw == (256 + 512 + 768 + 256 + 256 + 256),
+            "direct ValueSpan invocation of native binding failed");
+        observedSpanCalls = 0;
+    }
+
+    const char* source = R"(
+module Game.BoostStage1;
+import RealScript.Math;
+import Engine.Stage1;
+
+class MathRunner
+{
+    public Vec3 currentPos;
+    public Quat currentRot;
+
+    public Fixed RunInlineCheck()
+    {
+        Fixed f = FixedFromInt(3);
+        Vec2 v2 = new Vec2(FixedFromInt(4), FixedFromInt(5));
+        Vec3 v3 = new Vec3(FixedFromInt(1), FixedFromInt(2), FixedFromInt(6));
+        v2.x = v2.x + FixedFromInt(10);
+        v3.z = v3.z + FixedFromInt(20);
+        currentPos = v3;
+        currentRot = QuatIdentity();
+        return InspectSpan(f, v2, v3);
+    }
+}
+)";
+
+    realscript::game::GameScriptCompiler compiler(api);
+    auto compiled = compiler.compile({{"boost_stage1.rs", source}});
+    require(
+        compiled.succeeded(),
+        "boost_stage1 compile failed:\n" + diagnosticsText(compiled.diagnostics));
+
+    realscript::game::ScriptRuntime runtime(compiled.program);
+    const auto runnerType = runtime.findType("Game.BoostStage1::MathRunner");
+    require(runnerType.has_value(), "MathRunner type not found");
+
+    realscript::runtime::RuntimeError error;
+    auto runner = runtime.createObject(*runnerType, {}, error);
+    require(runner.has_value(), "failed to create MathRunner: " + error.message);
+
+    const auto runMethod = runtime.findMethod(*runnerType, "RunInlineCheck", 0);
+    require(runMethod.has_value(), "RunInlineCheck not found");
+    const auto execRes = runtime.invoke(*runner, *runMethod, {});
+    require(execRes.succeeded, "RunInlineCheck failed: " + execRes.error.message);
+    require(
+        observedSpanCalls == 1 && observedDataPtr != nullptr,
+        "InspectSpan should have been invoked via non-null ValueSpan");
+    require(
+        std::holds_alternative<realscript::runtime::FixedValue>(execRes.value),
+        "Fixed return value must be inline FixedValue in runtime::Value");
+    const auto totalFixed = realscript::game::Fixed::fromRaw(
+        std::get<realscript::runtime::FixedValue>(execRes.value).raw);
+    // 3 + (4+10) + 5 + 1 + 2 + (6+20) = 51
+    require(
+        totalFixed == realscript::game::Fixed::fromInt(51),
+        "RunInlineCheck expected Fixed(51)");
+
+    const auto posVal = runtime.getMember(*runner, "currentPos", error);
+    require(
+        posVal.has_value() &&
+            std::holds_alternative<realscript::runtime::Vec3Value>(*posVal),
+        "Vec3 field must be stored inline as Vec3Value without StructStorage allocation");
+    const auto rotVal = runtime.getMember(*runner, "currentRot", error);
+    require(
+        rotVal.has_value() &&
+            std::holds_alternative<realscript::runtime::QuatValue>(*rotVal),
+        "Quat field must be stored inline as QuatValue without StructStorage allocation");
+
+    // Verify JSON round-trip and Inspector schema on inline math struct fields
+    const std::string mathJson = realscript::game::exportScriptObjectJson(runtime, *runner, error);
+    require(!mathJson.empty(), "exportScriptObjectJson on inline math fields failed: " + error.message);
+
+    auto runnerCopy = runtime.createObject(*runnerType, {}, error);
+    require(runnerCopy.has_value(), "failed to create MathRunner copy");
+    require(
+        realscript::game::importScriptObjectJson(runtime, *runnerCopy, mathJson, error),
+        "importScriptObjectJson on inline math fields failed: " + error.message);
+    const auto copyPosVal = runtime.getMember(*runnerCopy, "currentPos", error);
+    require(
+        copyPosVal.has_value() &&
+            std::holds_alternative<realscript::runtime::Vec3Value>(*copyPosVal) &&
+            std::get<realscript::runtime::Vec3Value>(*copyPosVal).z == realscript::game::Fixed::fromInt(26).raw,
+        "importScriptObjectJson must preserve inline Vec3Value storage and field values");
+
+    realscript::game::ScriptMetadataRegistry mathMetadata;
+    mathMetadata.populateFromProgram(compiled.program);
+    const auto mathSchema = realscript::game::inspectTypeSchema(
+        runtime, mathMetadata, "Game.BoostStage1::MathRunner");
+    require(
+        mathSchema.has_value() &&
+            mathSchema->fields.size() == 2 &&
+            mathSchema->fields[0].nestedFields.size() == 3 &&
+            std::holds_alternative<realscript::runtime::FixedValue>(mathSchema->fields[0].nestedFields[0].defaultValue),
+        "inspectTypeSchema must populate nested defaultValue for inline Vec3/Fixed fields");
+}
+
+void testBoostStage2ConstStaticStringInterpolationMathAndContainers() {
+    realscript::game::GameApi api;
+
+    // 1. Verify const assignment/mutation produces diagnostic RS2483
+    {
+        const char* badConstSource = R"(
+module Game.BadConst;
+
+class BadConst
+{
+    public const int MaxPlayers = 4;
+
+    public int Mutate()
+    {
+        const int localLimit = 10;
+        localLimit = 20;
+        MaxPlayers = 8;
+        return localLimit;
+    }
+}
+)";
+        realscript::game::GameScriptCompiler compiler(api);
+        auto badCompiled = compiler.compile({{"bad_const.rs", badConstSource}});
+        require(!badCompiled.succeeded(), "mutating const field/local must fail compilation");
+        bool sawConstDiag = false;
+        for (const auto& item : badCompiled.diagnostics.items()) {
+            if (item.code == "RS2483") sawConstDiag = true;
+        }
+        require(sawConstDiag, "expected RS2483 diagnostic when assigning to const symbol");
+    }
+
+    // 2. Verify const/static fields, $"..." interpolation, RealScript.Math (Sin/Cos/Atan2/Lerp/Quat),
+    //    string methods, and List/Dictionary/HashSet/Queue/Stack standard methods.
+    const char* source = R"(
+module Game.BoostStage2;
+import RealScript.Math;
+
+class CounterConfig
+{
+    public const int BaseBonus = 10;
+    public const int ScaledBonus = BaseBonus * 3 + 5;
+    public static int GlobalCount = 100;
+    public int instanceBias = 7;
+    public float scaleFactor = 2.5;
+    public long seedId = 900;
+    public Vec2 spawnOffset = new Vec2(FixedFromInt(3), FixedFromInt(4));
+
+    public int Bump(int delta)
+    {
+        CounterConfig.GlobalCount = CounterConfig.GlobalCount + delta;
+        return CounterConfig.GlobalCount + ScaledBonus + instanceBias;
+    }
+
+    public int VerifyFieldInitializers()
+    {
+        CounterConfig fresh = new CounterConfig();
+        if (fresh.scaleFactor < 2.4 || fresh.scaleFactor > 2.6) return -1;
+        if (fresh.seedId != 900) return -2;
+        if (fresh.spawnOffset.x != FixedFromInt(3) || fresh.spawnOffset.y != FixedFromInt(4)) return -3;
+        return 1;
+    }
+}
+
+class ProductivitySuite
+{
+    public string FormatReport(string hero, int hp, bool alive)
+    {
+        const string prefix = "Hero";
+        string nested = $"outer {$"inner {"}"}:{hero}"}";
+        if (nested != "outer inner }:Aria")
+        {
+            return "bad_nested:" + nested;
+        }
+        string raw = $"  [{prefix}:{hero}] hp={hp + CounterConfig.BaseBonus} alive={alive} {{ok}}  ";
+        string trimmed = raw.Trim();
+        if (!trimmed.StartsWith("[Hero:") || !trimmed.EndsWith("{ok}"))
+        {
+            return "bad_affix";
+        }
+        if (!trimmed.Contains("hp=90") || trimmed.IndexOf("alive=true") < 0)
+        {
+            return "bad_content";
+        }
+        string replaced = trimmed.Replace("{ok}", "READY");
+        string sub = replaced.Substring(1, 9).ToUpper();
+        return sub + "|len=" + replaced.Length;
+    }
+
+    public int VerifyTrigAndQuat()
+    {
+        Fixed zero = Fixed.Zero();
+        Fixed one = Fixed.One();
+        Fixed half = Fixed.Half();
+        Fixed halfPi = HalfPi();
+        Fixed s0 = Sin(zero);
+        Fixed c0 = Cos(zero);
+        Fixed s90 = Sin(halfPi);
+        Fixed c90 = Cos(halfPi);
+
+        // s0 == 0, c0 == 1, s90 ~= 1, c90 ~= 0
+        if (Abs(s0) > FixedFromRatio(1, 100)) return -1;
+        if (Abs(c0 - one) > FixedFromRatio(1, 100)) return -2;
+        if (Abs(s90 - one) > FixedFromRatio(2, 100)) return -3;
+        if (Abs(c90) > FixedFromRatio(2, 100)) return -4;
+
+        Fixed angle = Atan2(one, one); // ~ Pi / 4
+        Fixed expectedQuarterPi = Pi() / FixedFromInt(4);
+        if (Abs(angle - expectedQuarterPi) > FixedFromRatio(2, 100)) return -5;
+
+        Fixed lerped = Lerp(FixedFromInt(10), FixedFromInt(30), half);
+        if (lerped != FixedFromInt(20)) return -6;
+
+        // Rotate (1, 0, 0) by 90 degrees around Z axis -> ~(0, 1, 0)
+        Quat rotZ = QuatFromAxisAngle(new Vec3(zero, zero, one), halfPi);
+        Quat normRot = QuatNormalize(rotZ);
+        Vec3 rotated = QuatRotateVec3(normRot, new Vec3(one, zero, zero));
+        if (Abs(rotated.x) > FixedFromRatio(3, 100)) return -7;
+        if (Abs(rotated.y - one) > FixedFromRatio(3, 100)) return -8;
+
+        return 42;
+    }
+
+    public int VerifyContainers()
+    {
+        List<int> list = new List<int>();
+        if (!list.IsEmpty()) return -1;
+        list.Add(10);
+        list.Add(20);
+        list.Add(10);
+        list.Add(30);
+        if (list.IsEmpty() || list.First() != 10 || list.Last() != 30) return -2;
+        if (list.LastIndexOf(10) != 2) return -3;
+        list.Reverse();
+        int[] listArr = list.ToArray();
+        if (listArr.Length != 4 || listArr.Count != 4 || listArr[0] != 30 || listArr[3] != 10) return -4;
+
+        Dictionary<string, int> dict = new Dictionary<string, int>();
+        if (!dict.IsEmpty()) return -5;
+        dict.Put("alpha", 11);
+        dict.Put("beta", 22);
+        if (!dict.ContainsValue(22) || dict.ContainsValue(99)) return -6;
+        int foundVal = 0;
+        if (!dict.TryGetValue("beta", out foundVal) || foundVal != 22) return -7;
+        if (dict.TryGetValue("missing", out foundVal) || foundVal != 0) return -8;
+        if (dict.GetOrDefault("missing", 77) != 77 || dict.GetOrDefault("alpha", 77) != 11) return -9;
+        string[] keys = dict.Keys();
+        int[] vals = dict.Values();
+        if (keys.Length != 2 || vals.Length != 2) return -10;
+
+        Queue<int> queue = new Queue<int>();
+        if (!queue.IsEmpty()) return -11;
+        queue.Enqueue(5);
+        queue.Enqueue(9);
+        if (!queue.Contains(9) || queue.Contains(3)) return -12;
+        int[] qArr = queue.ToArray();
+        if (qArr.Length != 2 || qArr[0] != 5 || qArr[1] != 9) return -13;
+
+        Stack<int> stack = new Stack<int>();
+        if (!stack.IsEmpty()) return -14;
+        stack.Push(4);
+        stack.Push(8);
+        if (!stack.Contains(4) || stack.Contains(99)) return -15;
+        int[] sArr = stack.ToArray();
+        if (sArr.Length != 2 || sArr[0] != 8 || sArr[1] != 4) return -16;
+
+        HashSet<int> uniqueSet = new HashSet<int>();
+        if (!uniqueSet.IsEmpty()) return -17;
+        uniqueSet.Add(100);
+        uniqueSet.Add(200);
+        int[] setArr = uniqueSet.ToArray();
+        if (setArr.Length != 2 || setArr[0] != 100 || setArr[1] != 200) return -18;
+
+        return listArr[0] + foundVal + dict.GetOrDefault("alpha", 0) + qArr[1] + sArr[0] + setArr[1];
+    }
+}
+)";
+
+    realscript::game::GameScriptCompiler compiler(api);
+    auto compiled = compiler.compile({{"boost_stage2.rs", source}});
+    require(
+        compiled.succeeded(),
+        "boost_stage2 compile failed:\n" + diagnosticsText(compiled.diagnostics));
+
+    realscript::game::ScriptRuntime runtime(compiled.program);
+    realscript::runtime::RuntimeError error;
+
+    const auto cfgType = runtime.findType("Game.BoostStage2::CounterConfig");
+    require(cfgType.has_value(), "CounterConfig not found");
+    auto cfgA = runtime.createObject(*cfgType, {}, error);
+    auto cfgB = runtime.createObject(*cfgType, {}, error);
+    require(cfgA.has_value() && cfgB.has_value(), "failed to create CounterConfig instances");
+    const auto bumpMethod = runtime.findMethod(*cfgType, "Bump", 1);
+    require(bumpMethod.has_value(), "CounterConfig.Bump not found");
+
+    // First call: GlobalCount becomes 100 + 5 = 105; returns 105 + 35 + 7 = 147
+    const auto bump1 = runtime.invoke(*cfgA, *bumpMethod, {std::int64_t{5}});
+    require(
+        bump1.succeeded && std::get<std::int64_t>(bump1.value) == 147,
+        "CounterConfig.Bump(5) expected 147, got " +
+            (bump1.succeeded ? std::to_string(std::get<std::int64_t>(bump1.value)) : bump1.error.message));
+
+    // Second call on a DIFFERENT instance: GlobalCount becomes 105 + 15 = 120; returns 120 + 35 + 7 = 162
+    const auto bump2 = runtime.invoke(*cfgB, *bumpMethod, {std::int64_t{15}});
+    require(
+        bump2.succeeded && std::get<std::int64_t>(bump2.value) == 162,
+        "CounterConfig.Bump(15) on second instance should share static GlobalCount and return 162");
+
+    // Verify host C++ getMember/setMember on const and static fields
+    const auto constVal = runtime.getMember(*cfgA, "ScaledBonus", error);
+    require(
+        constVal.has_value() && std::get<std::int64_t>(*constVal) == 35,
+        "getMember on const field ScaledBonus expected 35");
+    realscript::runtime::RuntimeError constMutErr;
+    require(
+        !runtime.setMember(*cfgA, "ScaledBonus", std::int64_t{999}, constMutErr) &&
+            constMutErr.code == realscript::runtime::ErrorCode::InvalidArguments,
+        "setMember on const field ScaledBonus must be rejected with InvalidArguments");
+
+    const auto staticVal = runtime.getMember(*cfgA, "GlobalCount", error);
+    require(
+        staticVal.has_value() && std::get<std::int64_t>(*staticVal) == 120,
+        "getMember on static field GlobalCount expected 120");
+    require(
+        runtime.setMember(*cfgA, "GlobalCount", std::int64_t{500}, error),
+        "setMember on static field GlobalCount failed: " + error.message);
+    const auto staticValB = runtime.getMember(*cfgB, "GlobalCount", error);
+    require(
+        staticValB.has_value() && std::get<std::int64_t>(*staticValB) == 500,
+        "getMember on second instance for static field GlobalCount expected 500");
+    const auto bump3 = runtime.invoke(*cfgB, *bumpMethod, {std::int64_t{10}});
+    require(
+        bump3.succeeded && std::get<std::int64_t>(bump3.value) == (510 + 35 + 7),
+        "Bump(10) after host setMember(GlobalCount, 500) expected 552");
+
+    const auto verifyInitMethod = runtime.findMethod(*cfgType, "VerifyFieldInitializers", 0);
+    require(verifyInitMethod.has_value(), "CounterConfig.VerifyFieldInitializers not found");
+    const auto verifyInitRes = runtime.invoke(*cfgA, *verifyInitMethod, {});
+    require(
+        verifyInitRes.succeeded && std::get<std::int64_t>(verifyInitRes.value) == 1,
+        "CounterConfig.VerifyFieldInitializers failed: " +
+            (verifyInitRes.succeeded ? std::to_string(std::get<std::int64_t>(verifyInitRes.value)) : verifyInitRes.error.message));
+
+    realscript::game::ScriptMetadataRegistry stage2Meta;
+    stage2Meta.populateFromProgram(compiled.program);
+    const auto cfgSchema = realscript::game::inspectTypeSchema(
+        runtime, stage2Meta, "Game.BoostStage2::CounterConfig");
+    require(
+        cfgSchema.has_value() && cfgSchema->fields.size() == 4,
+        "CounterConfig InspectorTypeSchema should include 4 instance fields and exclude const/static fields");
+    realscript::game::ScriptStatePolicy jsonPolicy;
+    jsonPolicy.allowDoubles = true;
+    const std::string cfgJson =
+        realscript::game::exportScriptObjectJson(runtime, *cfgA, error, jsonPolicy);
+    require(
+        !cfgJson.empty() &&
+            cfgJson.find("BaseBonus") == std::string::npos &&
+            cfgJson.find("GlobalCount") == std::string::npos &&
+            cfgJson.find("instanceBias") != std::string::npos,
+        "exportScriptObjectJson should exclude const/static fields");
+
+    const auto suiteType = runtime.findType("Game.BoostStage2::ProductivitySuite");
+    require(suiteType.has_value(), "ProductivitySuite not found");
+    auto suite = runtime.createObject(*suiteType, {}, error);
+    require(suite.has_value(), "failed to create ProductivitySuite");
+
+    const auto formatMethod = runtime.findMethod(*suiteType, "FormatReport", 3);
+    require(formatMethod.has_value(), "FormatReport not found");
+    const auto reportRes = runtime.invoke(
+        *suite,
+        *formatMethod,
+        {std::string("Aria"), std::int64_t{80}, true});
+    std::string reportStr;
+    if (reportRes.succeeded) {
+        if (const auto* s = std::get_if<std::string>(&reportRes.value)) {
+            reportStr = *s;
+        } else if (const auto* ref = std::get_if<realscript::runtime::ObjectRef>(&reportRes.value)) {
+            if (const auto sv = runtime.heap()->stringView(*ref)) {
+                reportStr = std::string(*sv);
+            }
+        }
+    }
+    require(
+        reportRes.succeeded && reportStr == "HERO:ARIA|len=34",
+        "FormatReport interpolation/string methods mismatch: " +
+            (reportRes.succeeded ? reportStr : reportRes.error.message));
+
+    const auto trigMethod = runtime.findMethod(*suiteType, "VerifyTrigAndQuat", 0);
+    require(trigMethod.has_value(), "VerifyTrigAndQuat not found");
+    const auto trigRes = runtime.invoke(*suite, *trigMethod, {});
+    require(
+        trigRes.succeeded && std::get<std::int64_t>(trigRes.value) == 42,
+        "VerifyTrigAndQuat failed with code: " +
+            (trigRes.succeeded ? std::to_string(std::get<std::int64_t>(trigRes.value)) : trigRes.error.message));
+
+    const auto containersMethod = runtime.findMethod(*suiteType, "VerifyContainers", 0);
+    require(containersMethod.has_value(), "VerifyContainers not found");
+    const auto containersRes = runtime.invoke(*suite, *containersMethod, {});
+    // 30 + 0 + 11 + 9 + 8 + 200 = 258
+    require(
+        containersRes.succeeded && std::get<std::int64_t>(containersRes.value) == 258,
+        "VerifyContainers failed with code: " +
+            (containersRes.succeeded
+                 ? std::to_string(std::get<std::int64_t>(containersRes.value))
+                 : containersRes.error.message));
+}
+
+void testBoostStage3LspExactSymbolIdReferencesRenameAndChainedCompletion() {
+    realscript::tooling::LanguageService service;
+    const std::string source = R"(module Game.LspStage3;
+
+class Weapon
+{
+    public int damage;
+    public string title;
+
+    public string GetTitle()
+    {
+        return title;
+    }
+}
+
+class Hero
+{
+    public int hp;
+    public Weapon weapon;
+
+    public void TakeDamage(int amount)
+    {
+        hp = hp - amount;
+    }
+}
+
+class Monster
+{
+    public int hp;
+    public int unreferencedHp;
+
+    public void Reset()
+    {
+        hp = 100;
+    }
+}
+
+class Party
+{
+    public Hero leader;
+    public Hero[] members;
+    public int unreferencedHp;
+
+    public Hero GetLeader()
+    {
+        return leader;
+    }
+
+    public int ComputeLocal(Party party)
+    {
+        int hp = 50;
+        hp = hp + 10;
+        unreferencedHp = 1;
+        party.leader.weapon.
+        party.GetLeader().weapon.title.
+        (party).members[0].weapon.
+        return hp;
+    }
+}
+)";
+    service.open("stage3_lsp.rs", source, 1);
+
+    // 1. Exact SymbolId references & rename on Hero.hp (line 15: "    public int hp;")
+    //    Hero.hp is declared on line 15, col 15, and referenced twice on line 20 ("        hp = hp - amount;").
+    //    Monster.hp (line 26, 31) and local `int hp` (line 48, 49, 54) MUST NOT be included!
+    const auto heroHpRefs = service.references("stage3_lsp.rs", {15, 15}, true);
+    require(
+        heroHpRefs.size() == 3,
+        "Hero.hp references(includeDefinition=true) should be 3 (1 decl + 2 uses), got " +
+            std::to_string(heroHpRefs.size()));
+    for (const auto& loc : heroHpRefs) {
+        require(
+            loc.range.start.line == 15 || loc.range.start.line == 20,
+            "Hero.hp reference leaked to unrelated symbol on line " +
+                std::to_string(loc.range.start.line));
+    }
+
+    const auto heroHpRename = service.rename("stage3_lsp.rs", {20, 8}, "hitPoints");
+    require(
+        heroHpRename.size() == 3,
+        "Hero.hp rename from usage site should produce 3 edits");
+
+    // 1b. Unreferenced field Monster.unreferencedHp (line 27, col 15) MUST NOT fall back to lexical token scanning
+    //     and leak to Party.unreferencedHp (line 39, 50)!
+    const auto monsterUnrefRefsNoDef = service.references("stage3_lsp.rs", {27, 15}, false);
+    require(
+        monsterUnrefRefsNoDef.empty(),
+        "unreferenced Monster.unreferencedHp references(includeDefinition=false) must be empty, got " +
+            std::to_string(monsterUnrefRefsNoDef.size()));
+    const auto monsterUnrefRename = service.rename("stage3_lsp.rs", {27, 15}, "monsterOnlyHp");
+    require(
+        monsterUnrefRename.size() == 1 && monsterUnrefRename[0].location.range.start.line == 27,
+        "renaming unreferenced Monster.unreferencedHp must only edit its own declaration on line 27");
+
+    // 2. Exact SymbolId references on local `hp` in Party.ComputeLocal (line 48: "        int hp = 50;")
+    //    Declared on line 48, used twice on line 49, and once on line 54 -> total 4 with definition, 3 without.
+    const auto localHpRefsNoDef = service.references("stage3_lsp.rs", {48, 12}, false);
+    require(
+        localHpRefsNoDef.size() == 3,
+        "local hp references(includeDefinition=false) should be 3, got " +
+            std::to_string(localHpRefsNoDef.size()));
+    for (const auto& loc : localHpRefsNoDef) {
+        require(
+            loc.range.start.line == 49 || loc.range.start.line == 54,
+            "local hp reference leaked to line " + std::to_string(loc.range.start.line));
+    }
+
+    // 3. Chained dot completion:
+    //    Line 51: "        party.leader.weapon." (column 28) -> Weapon members (damage, title, GetTitle)
+    const auto weaponChainItems = service.completion("stage3_lsp.rs", {51, 28});
+    bool foundDamage = false;
+    bool foundGetTitle = false;
+    for (const auto& item : weaponChainItems) {
+        if (item.label == "damage") foundDamage = true;
+        if (item.label == "GetTitle") foundGetTitle = true;
+    }
+    require(
+        foundDamage && foundGetTitle,
+        "chained completion 'party.leader.weapon.' should resolve Weapon members");
+
+    //    Line 52: "        party.GetLeader().weapon.title." (column 39) -> string members (Trim, ToUpper, Length)
+    const auto stringChainItems = service.completion("stage3_lsp.rs", {52, 39});
+    bool foundTrim = false;
+    bool foundToUpper = false;
+    bool foundLength = false;
+    for (const auto& item : stringChainItems) {
+        if (item.label == "Trim") foundTrim = true;
+        if (item.label == "ToUpper") foundToUpper = true;
+        if (item.label == "Length") foundLength = true;
+    }
+    require(
+        foundTrim && foundToUpper && foundLength,
+        "chained completion 'party.GetLeader().weapon.title.' should resolve string methods/properties");
+
+    //    Line 53: "        (party).members[0].weapon." (column 34) -> Weapon members via parenthesized receiver + array indexing
+    const auto indexedChainItems = service.completion("stage3_lsp.rs", {53, 34});
+    bool foundIndexedDamage = false;
+    for (const auto& item : indexedChainItems) {
+        if (item.label == "damage") foundIndexedDamage = true;
+    }
+    require(
+        foundIndexedDamage,
+        "chained completion '(party).members[0].weapon.' should resolve Weapon members through parenthesized receiver and array element indexing");
+}
+
 } // namespace
 
 int main() {
     try {
-        std::cout << "[1/9] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
+        std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
         testScriptInheritingNativeAndMathMarshaling();
-        std::cout << "[2/9] testMultiComponentSceneAndEditorMode..." << std::endl;
+        std::cout << "[2/12] testMultiComponentSceneAndEditorMode..." << std::endl;
         testMultiComponentSceneAndEditorMode();
-        std::cout << "[3/9] testInspectorAttributesJsonAndStatefulHotReload..." << std::endl;
+        std::cout << "[3/12] testInspectorAttributesJsonAndStatefulHotReload..." << std::endl;
         testInspectorAttributesJsonAndStatefulHotReload();
-        std::cout << "[4/9] testCoroutineWaitSeconds..." << std::endl;
+        std::cout << "[4/12] testCoroutineWaitSeconds..." << std::endl;
         testCoroutineWaitSeconds();
-        std::cout << "[5/9] testLspStubsDotCompletionAndSignatureHelp..." << std::endl;
+        std::cout << "[5/12] testLspStubsDotCompletionAndSignatureHelp..." << std::endl;
         testLspStubsDotCompletionAndSignatureHelp();
-        std::cout << "[6/9] testTieredExecutionDispatcher..." << std::endl;
+        std::cout << "[6/12] testTieredExecutionDispatcher..." << std::endl;
         testTieredExecutionDispatcher();
-        std::cout << "[7/9] testStage1EditorDataflowSignalsAndHotReloadRefs..." << std::endl;
+        std::cout << "[7/12] testStage1EditorDataflowSignalsAndHotReloadRefs..." << std::endl;
         testStage1EditorDataflowSignalsAndHotReloadRefs();
-        std::cout << "[8/9] testStage2CoroutinesAndDebuggerEvaluation..." << std::endl;
+        std::cout << "[8/12] testStage2CoroutinesAndDebuggerEvaluation..." << std::endl;
         testStage2CoroutinesAndDebuggerEvaluation();
-        std::cout << "[9/9] testStage3FastMathAndChromeTracing..." << std::endl;
+        std::cout << "[9/12] testStage3FastMathAndChromeTracing..." << std::endl;
         testStage3FastMathAndChromeTracing();
+        std::cout << "[10/12] testBoostStage1InlineMathAndValueSpanBindings..." << std::endl;
+        testBoostStage1InlineMathAndValueSpanBindings();
+        std::cout << "[11/12] testBoostStage2ConstStaticStringInterpolationMathAndContainers..." << std::endl;
+        testBoostStage2ConstStaticStringInterpolationMathAndContainers();
+        std::cout << "[12/12] testBoostStage3LspExactSymbolIdReferencesRenameAndChainedCompletion..." << std::endl;
+        testBoostStage3LspExactSymbolIdReferencesRenameAndChainedCompletion();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

@@ -214,7 +214,73 @@ std::optional<ScriptObject> ScriptRuntime::allocateUninitializedObject(
         const auto& field = type.descriptor.fields[index];
         const auto fieldTypeId = exactTypeId(field.type, field.typeName);
         std::unordered_set<semantic::SymbolId> visiting;
-        fields.push_back(defaultValue(field.type, fieldTypeId, visiting));
+        runtime::Value initialValue = defaultValue(field.type, fieldTypeId, visiting);
+        if (!field.staticField && !field.constField && field.hasConstantValue) {
+            if (std::holds_alternative<std::int64_t>(field.constantValue)) {
+                const auto raw = std::get<std::int64_t>(field.constantValue);
+                switch (field.type) {
+                case semantic::PrimitiveType::Byte:
+                    initialValue = runtime::ByteValue{static_cast<std::uint8_t>(raw)};
+                    break;
+                case semantic::PrimitiveType::SByte:
+                    initialValue = runtime::SByteValue{static_cast<std::int8_t>(raw)};
+                    break;
+                case semantic::PrimitiveType::Short:
+                    initialValue = runtime::ShortValue{static_cast<std::int16_t>(raw)};
+                    break;
+                case semantic::PrimitiveType::UShort:
+                    initialValue = runtime::UShortValue{static_cast<std::uint16_t>(raw)};
+                    break;
+                case semantic::PrimitiveType::Int:
+                    initialValue = raw;
+                    break;
+                case semantic::PrimitiveType::UInt:
+                    initialValue = runtime::UIntValue{static_cast<std::uint32_t>(raw)};
+                    break;
+                case semantic::PrimitiveType::Long:
+                    initialValue = runtime::LongValue{raw};
+                    break;
+                case semantic::PrimitiveType::ULong:
+                    initialValue = runtime::ULongValue{static_cast<std::uint64_t>(raw)};
+                    break;
+                case semantic::PrimitiveType::Char:
+                    initialValue = runtime::CharValue{static_cast<char16_t>(raw)};
+                    break;
+                case semantic::PrimitiveType::Enum:
+                    initialValue = runtime::EnumValue{fieldTypeId, raw};
+                    break;
+                case semantic::PrimitiveType::Float:
+                    initialValue = runtime::FloatValue{static_cast<float>(raw)};
+                    break;
+                case semantic::PrimitiveType::Double:
+                    initialValue = static_cast<double>(raw);
+                    break;
+                default:
+                    break;
+                }
+            } else if (std::holds_alternative<double>(field.constantValue)) {
+                const auto raw = std::get<double>(field.constantValue);
+                if (field.type == semantic::PrimitiveType::Float) {
+                    initialValue = runtime::FloatValue{static_cast<float>(raw)};
+                } else {
+                    initialValue = raw;
+                }
+            } else if (std::holds_alternative<bool>(field.constantValue)) {
+                initialValue = std::get<bool>(field.constantValue);
+            } else if (std::holds_alternative<std::string>(field.constantValue)) {
+                const auto& strVal = std::get<std::string>(field.constantValue);
+                if (heap_) {
+                    if (const auto strRef = heap_->allocateString(strVal, &error)) {
+                        initialValue = *strRef;
+                    } else {
+                        return std::nullopt;
+                    }
+                } else {
+                    initialValue = strVal;
+                }
+            }
+        }
+        fields.push_back(std::move(initialValue));
         if (field.type == semantic::PrimitiveType::String ||
             field.type == semantic::PrimitiveType::Object ||
             field.type == semantic::PrimitiveType::Array) {

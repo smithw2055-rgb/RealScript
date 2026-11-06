@@ -172,20 +172,31 @@ private:
     std::optional<runtime::Value> resolveMember(
         const runtime::Value& target,
         const std::string& member) {
-        if (const auto* structVal = std::get_if<runtime::StructValue>(&target)) {
-            if (!structVal->storage) {
-                setError("struct storage is null");
-                return std::nullopt;
-            }
-            const auto foundType = types_.find(structVal->typeId);
+        const auto structTypeId = runtime::structValueTypeId(target);
+        if (structTypeId && *structTypeId != 0) {
+            const auto foundType = types_.find(*structTypeId);
             if (foundType == types_.end()) {
                 setError("unknown struct type metadata");
                 return std::nullopt;
             }
-            for (std::size_t index = 0; index < foundType->second.fields.size(); ++index) {
-                if (foundType->second.fields[index].name == member &&
-                    index < structVal->storage->fields.size()) {
-                    return structVal->storage->fields[index];
+            if (const auto* structVal = std::get_if<runtime::StructValue>(&target)) {
+                if (!structVal->storage) {
+                    setError("struct storage is null");
+                    return std::nullopt;
+                }
+                for (std::size_t index = 0; index < foundType->second.fields.size(); ++index) {
+                    if (foundType->second.fields[index].name == member &&
+                        index < structVal->storage->fields.size()) {
+                        return structVal->storage->fields[index];
+                    }
+                }
+            } else {
+                for (std::size_t index = 0; index < foundType->second.fields.size(); ++index) {
+                    if (foundType->second.fields[index].name == member) {
+                        if (auto fieldVal = runtime::loadInlineStructField(target, index)) {
+                            return *fieldVal;
+                        }
+                    }
                 }
             }
             setError("unknown struct field '" + member + "'");

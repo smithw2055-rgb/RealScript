@@ -467,9 +467,10 @@ bool expectSignatureType(
                 context + " has the wrong native handle type");
         }
     } else if (type == semantic::PrimitiveType::Struct) {
+        const auto actualTypeId = structValueTypeId(value);
         const auto* structure = std::get_if<StructValue>(&value);
-        if (!structure || typeId == 0 || structure->typeId != typeId ||
-            !structure->storage) {
+        if (!actualTypeId || typeId == 0 || *actualTypeId != typeId ||
+            (structure && !structure->storage)) {
             return fail(state, ErrorCode::TypeMismatch,
                 context + " has the wrong struct type");
         }
@@ -517,6 +518,9 @@ Value defaultValue(
     }
     case semantic::PrimitiveType::Enum: return EnumValue{typeId, 0};
     case semantic::PrimitiveType::Struct: {
+        if (const auto inlined = makeDefaultInlineStructValue(typeId)) {
+            return *inlined;
+        }
         if (depth > 64) return StructValue{};
         const auto* descriptor = typeDescriptorById(module, typeId);
         if (!descriptor || descriptor->kind != semantic::TypeKind::Struct) {
@@ -871,6 +875,52 @@ bool executeCall(
             return false;
         }
     }
+    std::array<Value, 8> stackArguments{};
+    std::vector<Value> heapArguments;
+    ValueSpan argSpan;
+    if (arguments.empty()) {
+        argSpan = ValueSpan(nullptr, 0);
+    } else if (!arguments.indices) {
+        argSpan = ValueSpan(
+            arguments.values->data() + arguments.offset,
+            arguments.count);
+    } else {
+        bool contiguous = true;
+        const auto firstIndex = (*arguments.indices)[0];
+        for (std::size_t index = 1; index < arguments.count; ++index) {
+            if ((*arguments.indices)[index] != firstIndex + index) {
+                contiguous = false;
+                break;
+            }
+        }
+        if (contiguous) {
+            argSpan = ValueSpan(
+                arguments.values->data() + arguments.offset + firstIndex,
+                arguments.count);
+        } else if (arguments.count <= stackArguments.size()) {
+            for (std::size_t index = 0; index < arguments.count; ++index) {
+                stackArguments[index] = arguments[index];
+            }
+            argSpan = ValueSpan(stackArguments.data(), arguments.count);
+        } else {
+            heapArguments.reserve(arguments.count);
+            for (std::size_t index = 0; index < arguments.count; ++index) {
+                heapArguments.push_back(arguments[index]);
+            }
+            argSpan = ValueSpan(heapArguments);
+        }
+    }
+    if (reference.name.rfind("$intrinsic::", 0) == 0) {
+        std::string intrinsicError;
+        if (!tryExecuteRuntimeIntrinsic(
+                reference.name, argSpan, state.heap, result, intrinsicError)) {
+            const auto code = intrinsicError.find("null") != std::string::npos
+                ? ErrorCode::NullReference
+                : ErrorCode::InvalidProgram;
+            return fail(state, code, intrinsicError);
+        }
+        return true;
+    }
     RuntimeError externalError;
     ++state.statistics.externalCalls;
     emitTrace(state, TraceEventKind::ExternalCall,
@@ -880,16 +930,11 @@ bool executeCall(
         state.externalResolver && *state.externalResolver
         ? state.externalResolver
         : nullptr;
-    std::vector<Value> materializedArguments;
-    materializedArguments.reserve(arguments.size());
-    for (std::size_t index = 0; index < arguments.size(); ++index) {
-        materializedArguments.push_back(arguments[index]);
-    }
     if (!state.determinism.invokeExternal(
             state.bindings,
             fallback,
             reference,
-            materializedArguments,
+            argSpan,
             externalResult,
             externalError)) {
         state.error = std::move(externalError);
@@ -1431,13 +1476,15 @@ bool executeInstruction(
         fields.reserve(type->fields.size());
         for (std::size_t index = 0; index < type->fields.size(); ++index) {
             const auto fieldType = type->fields[index].type;
+            const auto fieldTypeId =
+                exactTypeId(fieldType, type->fields[index].typeName);
             fields.push_back(defaultValue(
-                module, fieldType,
-                exactTypeId(fieldType, type->fields[index].typeName)));
+                module, fieldType, fieldTypeId));
             if (fieldType == semantic::PrimitiveType::String ||
                 fieldType == semantic::PrimitiveType::Object ||
                 fieldType == semantic::PrimitiveType::Array ||
-                fieldType == semantic::PrimitiveType::Struct) {
+                (fieldType == semantic::PrimitiveType::Struct &&
+                 !makeDefaultInlineStructValue(fieldTypeId).has_value())) {
                 referenceFields.push_back(index);
             }
         }
@@ -1463,6 +1510,9 @@ bool executeInstruction(
         if (!type || type->kind != semantic::TypeKind::Struct) {
             return fail(state, ErrorCode::InvalidProgram,
                 "struct allocation references an invalid type descriptor");
+        }
+        if (const auto inlined = makeDefaultInlineStructValue(type->id)) {
+            return storeResult(*inlined);
         }
         auto storage = std::make_shared<StructStorage>();
         storage->fields.reserve(type->fields.size());
@@ -1666,12 +1716,19 @@ bool executeInstruction(
                 type->id, "struct field load")) {
             return false;
         }
+        const auto& field = type->fields[instruction.index];
+        if (const auto inlinedField = loadInlineStructField(*receiver, instruction.index)) {
+            if (!expectSignatureType(state, *inlinedField, field.type,
+                    exactTypeId(field.type, field.typeName), "struct field load value")) {
+                return false;
+            }
+            return storeResult(*inlinedField);
+        }
         const auto& structure = std::get<StructValue>(*receiver);
         if (!structure.storage || instruction.index >= structure.storage->fields.size()) {
             return fail(state, ErrorCode::InvalidProgram,
                 "struct field load references an invalid field slot");
         }
-        const auto& field = type->fields[instruction.index];
         const auto& value = structure.storage->fields[instruction.index];
         if (!expectSignatureType(state, value, field.type,
                 exactTypeId(field.type, field.typeName), "struct field load value")) {
@@ -1694,10 +1751,18 @@ bool executeInstruction(
                 exactTypeId(field.type, field.typeName), "struct field store value")) {
             return false;
         }
+        if (const auto updatedInline = storeInlineStructField(*receiver, instruction.index, *value)) {
+            return storeResult(*updatedInline);
+        }
         const auto& structure = std::get<StructValue>(*receiver);
         if (!structure.storage || instruction.index >= structure.storage->fields.size()) {
             return fail(state, ErrorCode::InvalidProgram,
                 "struct field store references an invalid field slot");
+        }
+        if (instruction.result == instruction.operands[0] &&
+            structure.storage.use_count() == 1) {
+            const_cast<StructStorage&>(*structure.storage).fields[instruction.index] = *value;
+            return true;
         }
         auto storage = std::make_shared<StructStorage>(*structure.storage);
         storage->fields[instruction.index] = *value;
@@ -2945,7 +3010,14 @@ semantic::PrimitiveType valueType(const Value& value) noexcept {
     if (std::holds_alternative<double>(value)) return semantic::PrimitiveType::Double;
     if (std::holds_alternative<CharValue>(value)) return semantic::PrimitiveType::Char;
     if (std::holds_alternative<EnumValue>(value)) return semantic::PrimitiveType::Enum;
-    if (std::holds_alternative<StructValue>(value)) return semantic::PrimitiveType::Struct;
+    if (std::holds_alternative<FixedValue>(value) ||
+        std::holds_alternative<Fixed16Value>(value) ||
+        std::holds_alternative<Vec2Value>(value) ||
+        std::holds_alternative<Vec3Value>(value) ||
+        std::holds_alternative<QuatValue>(value) ||
+        std::holds_alternative<StructValue>(value)) {
+        return semantic::PrimitiveType::Struct;
+    }
     if (std::holds_alternative<std::string>(value)) return semantic::PrimitiveType::String;
     if (std::holds_alternative<NativeHandle>(value)) return semantic::PrimitiveType::Handle;
     const auto& reference = std::get<ObjectRef>(value);
@@ -2978,6 +3050,23 @@ std::string valueToString(const Value& value, const ManagedHeap* heap) {
     if (const auto* enumeration = std::get_if<EnumValue>(&value)) {
         return "<enum:type=0x" + std::to_string(enumeration->typeId) + ":" +
             std::to_string(enumeration->value) + ">";
+    }
+    if (const auto* fixed = std::get_if<FixedValue>(&value)) {
+        return "<Fixed:raw=" + std::to_string(fixed->raw) + ">";
+    }
+    if (const auto* fixed16 = std::get_if<Fixed16Value>(&value)) {
+        return "<Fixed16:raw=" + std::to_string(fixed16->raw) + ">";
+    }
+    if (const auto* v2 = std::get_if<Vec2Value>(&value)) {
+        return "<Vec2:" + std::to_string(v2->x) + "," + std::to_string(v2->y) + ">";
+    }
+    if (const auto* v3 = std::get_if<Vec3Value>(&value)) {
+        return "<Vec3:" + std::to_string(v3->x) + "," + std::to_string(v3->y) + "," +
+            std::to_string(v3->z) + ">";
+    }
+    if (const auto* q = std::get_if<QuatValue>(&value)) {
+        return "<Quat:" + std::to_string(q->x) + "," + std::to_string(q->y) + "," +
+            std::to_string(q->z) + "," + std::to_string(q->w) + ">";
     }
     if (const auto* structure = std::get_if<StructValue>(&value)) {
         return "<struct:type=0x" + std::to_string(structure->typeId) + ":fields=" +

@@ -1239,6 +1239,34 @@ public class Math {
         }
         return ans;
     }
+
+    public static Fixed Pi() {
+        return new Fixed(804);
+    }
+
+    public static Fixed HalfPi() {
+        return new Fixed(402);
+    }
+
+    public static Fixed TwoPi() {
+        return new Fixed(1608);
+    }
+
+    public static Fixed Sin(Fixed radians) {
+        return Fixed.Sin(radians);
+    }
+
+    public static Fixed Cos(Fixed radians) {
+        return Fixed.Cos(radians);
+    }
+
+    public static Fixed Atan2(Fixed y, Fixed x) {
+        return Fixed.Atan2(y, x);
+    }
+
+    public static Fixed Lerp(Fixed a, Fixed b, Fixed t) {
+        return Fixed.Lerp(a, b, t);
+    }
 }
 
 public struct Fixed {
@@ -1258,6 +1286,18 @@ public struct Fixed {
 
     public static Fixed Half() {
         return new Fixed(128);
+    }
+
+    public static Fixed Pi() {
+        return new Fixed(804);
+    }
+
+    public static Fixed HalfPi() {
+        return new Fixed(402);
+    }
+
+    public static Fixed TwoPi() {
+        return new Fixed(1608);
     }
 
     public static Fixed Raw(int rawValue) {
@@ -1313,6 +1353,35 @@ public struct Fixed {
     public static Fixed Sqrt(Fixed v) {
         if (v.raw <= 0) return new Fixed(0);
         return new Fixed((int)Math.Sqrt64((long)v.raw * 256));
+    }
+
+    public static Fixed Sin(Fixed radians) {
+        int r = radians.raw % 1608;
+        if (r > 804) r = r - 1608;
+        if (r < -804) r = r + 1608;
+        int absR = r < 0 ? -r : r;
+        long y0 = ((long)r * (long)(804 - absR) * 262144) / (804 * 804);
+        long absY0 = y0 < 0 ? -y0 : y0;
+        long y = (y0 * 775 + ((y0 * absY0) / 65536) * 225) / 1000;
+        return new Fixed((int)(y / 256));
+    }
+
+    public static Fixed Cos(Fixed radians) {
+        return Fixed.Sin(new Fixed(radians.raw + 402));
+    }
+
+    public static Fixed Atan2(Fixed y, Fixed x) {
+        if (x.raw == 0 && y.raw == 0) return new Fixed(0);
+        long ax = x.raw < 0 ? -(long)x.raw : (long)x.raw;
+        long ay = y.raw < 0 ? -(long)y.raw : (long)y.raw;
+        long mn = ax < ay ? ax : ay;
+        long mx = ax > ay ? ax : ay;
+        long z = (mn * 65536) / mx;
+        long angle = (201 * z + (70 * z * (65536 - z)) / 65536) / 65536;
+        if (ay > ax) angle = 402 - angle;
+        if (x.raw < 0) angle = 804 - angle;
+        if (y.raw < 0) angle = -angle;
+        return new Fixed((int)angle);
     }
 
     public static Fixed operator +(Fixed a) {
@@ -1447,6 +1516,18 @@ public struct Fixed16 {
         return new Fixed16(32768);
     }
 
+    public static Fixed16 Pi() {
+        return new Fixed16(205887);
+    }
+
+    public static Fixed16 HalfPi() {
+        return new Fixed16(102944);
+    }
+
+    public static Fixed16 TwoPi() {
+        return new Fixed16(411775);
+    }
+
     public static Fixed16 Raw(int rawValue) {
         return new Fixed16(rawValue);
     }
@@ -1500,6 +1581,35 @@ public struct Fixed16 {
     public static Fixed16 Sqrt(Fixed16 v) {
         if (v.raw <= 0) return new Fixed16(0);
         return new Fixed16((int)Math.Sqrt64((long)v.raw * 65536));
+    }
+
+    public static Fixed16 Sin(Fixed16 radians) {
+        int r = radians.raw % 411775;
+        if (r > 205887) r = r - 411775;
+        if (r < -205887) r = r + 411775;
+        int absR = r < 0 ? -r : r;
+        long y0 = (((long)r * (long)(205887 - absR)) / 205887) * 262144 / 205887;
+        long absY0 = y0 < 0 ? -y0 : y0;
+        long y = (y0 * 775 + ((y0 * absY0) / 65536) * 225) / 1000;
+        return new Fixed16((int)y);
+    }
+
+    public static Fixed16 Cos(Fixed16 radians) {
+        return Fixed16.Sin(new Fixed16(radians.raw + 102944));
+    }
+
+    public static Fixed16 Atan2(Fixed16 y, Fixed16 x) {
+        if (x.raw == 0 && y.raw == 0) return new Fixed16(0);
+        long ax = x.raw < 0 ? -(long)x.raw : (long)x.raw;
+        long ay = y.raw < 0 ? -(long)y.raw : (long)y.raw;
+        long mn = ax < ay ? ax : ay;
+        long mx = ax > ay ? ax : ay;
+        long z = (mn * 65536) / mx;
+        long angle = (51472 * z + (17891 * z * (65536 - z)) / 65536) / 65536;
+        if (ay > ax) angle = 102944 - angle;
+        if (x.raw < 0) angle = 205887 - angle;
+        if (y.raw < 0) angle = -angle;
+        return new Fixed16((int)angle);
     }
 
     public static Fixed16 operator +(Fixed16 a) {
@@ -1861,6 +1971,164 @@ public struct Vec3 {
         return a.x != b.x || a.y != b.y || a.z != b.z;
     }
 }
+
+public struct Quat {
+    public Fixed x;
+    public Fixed y;
+    public Fixed z;
+    public Fixed w;
+
+    public Quat(Fixed xVal, Fixed yVal, Fixed zVal, Fixed wVal) {
+        x = xVal;
+        y = yVal;
+        z = zVal;
+        w = wVal;
+    }
+
+    public Quat(int xInt, int yInt, int zInt, int wInt) {
+        x = new Fixed(xInt * 256);
+        y = new Fixed(yInt * 256);
+        z = new Fixed(zInt * 256);
+        w = new Fixed(wInt * 256);
+    }
+
+    public static Quat Identity() {
+        return new Quat(new Fixed(0), new Fixed(0), new Fixed(0), new Fixed(256));
+    }
+
+    public static Quat Raw(int xRaw, int yRaw, int zRaw, int wRaw) {
+        return new Quat(
+            new Fixed(xRaw),
+            new Fixed(yRaw),
+            new Fixed(zRaw),
+            new Fixed(wRaw));
+    }
+
+    public static Quat FromAxisAngle(Vec3 axis, Fixed angle) {
+        Vec3 n = axis.Normalized();
+        Fixed half = angle / 2;
+        Fixed s = Fixed.Sin(half);
+        Fixed c = Fixed.Cos(half);
+        return new Quat(n.x * s, n.y * s, n.z * s, c);
+    }
+
+    public static Quat FromEuler(Fixed pitch, Fixed yaw, Fixed roll) {
+        Fixed hp = pitch / 2;
+        Fixed hy = yaw / 2;
+        Fixed hr = roll / 2;
+        Fixed sp = Fixed.Sin(hp);
+        Fixed cp = Fixed.Cos(hp);
+        Fixed sy = Fixed.Sin(hy);
+        Fixed cy = Fixed.Cos(hy);
+        Fixed sr = Fixed.Sin(hr);
+        Fixed cr = Fixed.Cos(hr);
+        return new Quat(
+            cy * sp * cr + sy * cp * sr,
+            sy * cp * cr - cy * sp * sr,
+            cy * cp * sr - sy * sp * cr,
+            cy * cp * cr + sy * sp * sr);
+    }
+
+    public static Fixed Dot(Quat a, Quat b) {
+        return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+
+    public Fixed LengthSq() {
+        return x * x + y * y + z * z + w * w;
+    }
+
+    public Fixed Length() {
+        long r2 =
+            (long)x.raw * (long)x.raw +
+            (long)y.raw * (long)y.raw +
+            (long)z.raw * (long)z.raw +
+            (long)w.raw * (long)w.raw;
+        return new Fixed((int)Math.Sqrt64(r2));
+    }
+
+    public Quat Normalized() {
+        Fixed len = Length();
+        if (len.raw <= 0) return Quat.Identity();
+        return new Quat(x / len, y / len, z / len, w / len);
+    }
+
+    public Quat Conjugate() {
+        return new Quat(-x, -y, -z, w);
+    }
+
+    public Quat Inverse() {
+        Fixed lsq = LengthSq();
+        if (lsq.raw <= 0) return Quat.Identity();
+        Quat c = Conjugate();
+        return new Quat(c.x / lsq, c.y / lsq, c.z / lsq, c.w / lsq);
+    }
+
+    public Vec3 Rotate(Vec3 v) {
+        Vec3 u = new Vec3(x, y, z);
+        Vec3 uv = Vec3.Cross(u, v);
+        Vec3 uuv = Vec3.Cross(u, uv);
+        return v + (uv * w + uuv) * 2;
+    }
+
+    public static Quat Lerp(Quat a, Quat b, Fixed t) {
+        Quat target = b;
+        if (Quat.Dot(a, b).raw < 0) {
+            target = new Quat(-b.x, -b.y, -b.z, -b.w);
+        }
+        Quat res = new Quat(
+            a.x + (target.x - a.x) * t,
+            a.y + (target.y - a.y) * t,
+            a.z + (target.z - a.z) * t,
+            a.w + (target.w - a.w) * t);
+        return res.Normalized();
+    }
+
+    public static Quat Slerp(Quat a, Quat b, Fixed t) {
+        return Quat.Lerp(a, b, t);
+    }
+
+    public static Quat operator *(Quat a, Quat b) {
+        return new Quat(
+            a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z);
+    }
+
+    public static Vec3 operator *(Quat q, Vec3 v) {
+        return q.Rotate(v);
+    }
+
+    public static bool operator ==(Quat a, Quat b) {
+        return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
+    }
+
+    public static bool operator !=(Quat a, Quat b) {
+        return a.x != b.x || a.y != b.y || a.z != b.z || a.w != b.w;
+    }
+}
+
+public Fixed FixedZero() { return Fixed.Zero(); }
+public Fixed FixedOne() { return Fixed.One(); }
+public Fixed FixedHalf() { return Fixed.Half(); }
+public Fixed FixedFromRaw(int rawValue) { return Fixed.Raw(rawValue); }
+public Fixed FixedFromInt(int whole) { return Fixed.Of(whole); }
+public Fixed FixedFromRatio(int num, int den) { return Fixed.Ratio(num, den); }
+public Fixed Pi() { return Fixed.Pi(); }
+public Fixed HalfPi() { return Fixed.HalfPi(); }
+public Fixed TwoPi() { return Fixed.TwoPi(); }
+public Fixed Abs(Fixed v) { return Fixed.Abs(v); }
+public Fixed Sin(Fixed radians) { return Fixed.Sin(radians); }
+public Fixed Cos(Fixed radians) { return Fixed.Cos(radians); }
+public Fixed Atan2(Fixed y, Fixed x) { return Fixed.Atan2(y, x); }
+public Fixed Lerp(Fixed a, Fixed b, Fixed t) { return Fixed.Lerp(a, b, t); }
+public Quat QuatIdentity() { return Quat.Identity(); }
+public Quat QuatFromAxisAngle(Vec3 axis, Fixed angle) { return Quat.FromAxisAngle(axis, angle); }
+public Quat QuatFromEuler(Fixed pitch, Fixed yaw, Fixed roll) { return Quat.FromEuler(pitch, yaw, roll); }
+public Quat QuatNormalize(Quat q) { return q.Normalized(); }
+public Vec3 QuatRotateVec3(Quat q, Vec3 v) { return q.Rotate(v); }
+public Quat QuatLerp(Quat a, Quat b, Fixed t) { return Quat.Lerp(a, b, t); }
+public Quat QuatSlerp(Quat a, Quat b, Fixed t) { return Quat.Slerp(a, b, t); }
 )RS";
     return kSource;
 }
@@ -4503,7 +4771,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             colors[name] = 1;
             stack.push_back(name);
             for (const auto& field : found->second.type->fields) {
-                if (field.type != semantic::PrimitiveType::Struct ||
+                if (field.staticField ||
+                    field.constField ||
+                    field.type != semantic::PrimitiveType::Struct ||
                     field.typeName.empty()) {
                     continue;
                 }

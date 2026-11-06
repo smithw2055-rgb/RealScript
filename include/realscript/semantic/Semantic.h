@@ -108,6 +108,7 @@ struct VariableSymbol {
     PrimitiveType defaultValueType = PrimitiveType::Error;
     std::size_t index = 0;
     bool parameter = false;
+    bool isConst = false;
     text::TextSpan declarationSpan;
     text::TextSpan scopeSpan;
     SymbolId id = 0;
@@ -136,6 +137,11 @@ struct FieldSymbol {
     std::string typeName;
     std::size_t index = 0;
     bool synthetic = false;
+    bool staticField = false;
+    bool constField = false;
+    bool hasConstantValue = false;
+    syntax::TokenValue constantValue;
+    const syntax::ExpressionSyntax* initializerSyntax = nullptr;
     std::string sourceName;
     text::TextSpan declarationSpan;
     SymbolId id = 0;
@@ -757,6 +763,7 @@ struct BoundNewObjectExpression final : BoundExpression {
     std::optional<FunctionSymbol> constructor;
     std::vector<std::unique_ptr<BoundExpression>> arguments;
     std::vector<std::size_t> argumentEvaluationOrder;
+    std::vector<Initializer> defaultFieldInitializers;
     std::vector<Initializer> initializers;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::NewObjectExpression;
@@ -827,6 +834,7 @@ struct BoundElementAccessExpression final : BoundExpression {
 
 struct BoundMemberAccessExpression final : BoundExpression {
     std::unique_ptr<BoundExpression> receiver;
+    std::unique_ptr<BoundExpression> staticInitializer;
     TypeSymbol ownerType;
     FieldSymbol field;
     bool nullConditional = false;

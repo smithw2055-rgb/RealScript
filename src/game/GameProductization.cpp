@@ -33,6 +33,11 @@ enum class ValueTag : std::uint8_t {
     ULong,
     Float,
     Char,
+    Fixed,
+    Fixed16,
+    Vec2,
+    Vec3,
+    Quat,
 };
 
 void fail(runtime::RuntimeError& error, runtime::ErrorCode code, std::string message) {
@@ -77,7 +82,12 @@ bool allowedValue(
         std::holds_alternative<runtime::LongValue>(value) ||
         std::holds_alternative<runtime::ULongValue>(value) ||
         std::holds_alternative<runtime::CharValue>(value) ||
-        std::holds_alternative<runtime::EnumValue>(value)) {
+        std::holds_alternative<runtime::EnumValue>(value) ||
+        std::holds_alternative<runtime::FixedValue>(value) ||
+        std::holds_alternative<runtime::Fixed16Value>(value) ||
+        std::holds_alternative<runtime::Vec2Value>(value) ||
+        std::holds_alternative<runtime::Vec3Value>(value) ||
+        std::holds_alternative<runtime::QuatValue>(value)) {
         return true;
     }
     if (std::holds_alternative<runtime::FloatValue>(value) ||
@@ -223,6 +233,27 @@ bool writeValue(
     } else if (const auto* item = std::get_if<runtime::CharValue>(&value)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Char));
         writer.writeU32(item->value);
+    } else if (const auto* item = std::get_if<runtime::FixedValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::Fixed));
+        writer.writeU32(static_cast<std::uint32_t>(item->raw));
+    } else if (const auto* item = std::get_if<runtime::Fixed16Value>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::Fixed16));
+        writer.writeU64(static_cast<std::uint64_t>(item->raw));
+    } else if (const auto* item = std::get_if<runtime::Vec2Value>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::Vec2));
+        writer.writeU32(static_cast<std::uint32_t>(item->x));
+        writer.writeU32(static_cast<std::uint32_t>(item->y));
+    } else if (const auto* item = std::get_if<runtime::Vec3Value>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::Vec3));
+        writer.writeU32(static_cast<std::uint32_t>(item->x));
+        writer.writeU32(static_cast<std::uint32_t>(item->y));
+        writer.writeU32(static_cast<std::uint32_t>(item->z));
+    } else if (const auto* item = std::get_if<runtime::QuatValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::Quat));
+        writer.writeU32(static_cast<std::uint32_t>(item->x));
+        writer.writeU32(static_cast<std::uint32_t>(item->y));
+        writer.writeU32(static_cast<std::uint32_t>(item->z));
+        writer.writeU32(static_cast<std::uint32_t>(item->w));
     } else if (const auto* item = std::get_if<runtime::StructValue>(&value)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Struct));
         writer.writeU64(item->typeId);
@@ -251,7 +282,7 @@ bool readValue(
 
     std::uint8_t rawTag = 0;
     if (!reader.readU8(rawTag) ||
-        rawTag > static_cast<std::uint8_t>(ValueTag::Char)) {
+        rawTag > static_cast<std::uint8_t>(ValueTag::Quat)) {
         return false;
     }
     const auto tag = static_cast<ValueTag>(rawTag);
@@ -351,6 +382,42 @@ bool readValue(
         std::uint32_t item = 0;
         if (!reader.readU32(item) || item > 0xffffU) return false;
         value = runtime::CharValue{static_cast<char16_t>(item)};
+        return true;
+    }
+    case ValueTag::Fixed: {
+        std::uint32_t raw = 0;
+        if (!reader.readU32(raw)) return false;
+        value = runtime::FixedValue{static_cast<std::int32_t>(raw)};
+        return true;
+    }
+    case ValueTag::Fixed16: {
+        if (!reader.readU64(first)) return false;
+        value = runtime::Fixed16Value{static_cast<std::int64_t>(first)};
+        return true;
+    }
+    case ValueTag::Vec2: {
+        std::uint32_t x = 0, y = 0;
+        if (!reader.readU32(x) || !reader.readU32(y)) return false;
+        value = runtime::Vec2Value{static_cast<std::int32_t>(x), static_cast<std::int32_t>(y)};
+        return true;
+    }
+    case ValueTag::Vec3: {
+        std::uint32_t x = 0, y = 0, z = 0;
+        if (!reader.readU32(x) || !reader.readU32(y) || !reader.readU32(z)) return false;
+        value = runtime::Vec3Value{
+            static_cast<std::int32_t>(x),
+            static_cast<std::int32_t>(y),
+            static_cast<std::int32_t>(z)};
+        return true;
+    }
+    case ValueTag::Quat: {
+        std::uint32_t x = 0, y = 0, z = 0, w = 0;
+        if (!reader.readU32(x) || !reader.readU32(y) || !reader.readU32(z) || !reader.readU32(w)) return false;
+        value = runtime::QuatValue{
+            static_cast<std::int32_t>(x),
+            static_cast<std::int32_t>(y),
+            static_cast<std::int32_t>(z),
+            static_cast<std::int32_t>(w)};
         return true;
     }
     }
@@ -728,16 +795,49 @@ bool valueToJson(
         out = tooling::Json(enumItem->value);
     } else if (const auto* strItem = std::get_if<std::string>(&value)) {
         out = tooling::Json(*strItem);
-    } else if (const auto* structItem = std::get_if<runtime::StructValue>(&value)) {
-        const auto* structDesc = findProgramTypeById(program, structItem->typeId);
-        if (structDesc && structDesc->fields.size() == structItem->storage->fields.size()) {
+    } else if (const auto structTypeId = runtime::structValueTypeId(value)) {
+        const auto* structDesc = findProgramTypeById(program, *structTypeId);
+        if (const auto* structItem = std::get_if<runtime::StructValue>(&value)) {
+            if (!structItem->storage) return false;
+            if (structDesc && structDesc->fields.size() == structItem->storage->fields.size()) {
+                tooling::Json::Object obj;
+                for (std::size_t idx = 0; idx < structDesc->fields.size(); ++idx) {
+                    tooling::Json fieldJson;
+                    if (!valueToJson(
+                            runtime,
+                            scene,
+                            structItem->storage->fields[idx],
+                            policy,
+                            depth + 1,
+                            fieldJson,
+                            error)) {
+                        return false;
+                    }
+                    obj[structDesc->fields[idx].name] = std::move(fieldJson);
+                }
+                out = tooling::Json(std::move(obj));
+            } else {
+                tooling::Json::Array arr;
+                arr.reserve(structItem->storage->fields.size());
+                for (const auto& elem : structItem->storage->fields) {
+                    tooling::Json fieldJson;
+                    if (!valueToJson(runtime, scene, elem, policy, depth + 1, fieldJson, error)) {
+                        return false;
+                    }
+                    arr.push_back(std::move(fieldJson));
+                }
+                out = tooling::Json(std::move(arr));
+            }
+        } else if (structDesc) {
             tooling::Json::Object obj;
             for (std::size_t idx = 0; idx < structDesc->fields.size(); ++idx) {
+                const auto fieldVal = runtime::loadInlineStructField(value, idx);
+                if (!fieldVal) return false;
                 tooling::Json fieldJson;
                 if (!valueToJson(
                         runtime,
                         scene,
-                        structItem->storage->fields[idx],
+                        *fieldVal,
                         policy,
                         depth + 1,
                         fieldJson,
@@ -749,10 +849,11 @@ bool valueToJson(
             out = tooling::Json(std::move(obj));
         } else {
             tooling::Json::Array arr;
-            arr.reserve(structItem->storage->fields.size());
-            for (const auto& elem : structItem->storage->fields) {
+            for (std::size_t idx = 0;; ++idx) {
+                const auto fieldVal = runtime::loadInlineStructField(value, idx);
+                if (!fieldVal) break;
                 tooling::Json fieldJson;
-                if (!valueToJson(runtime, scene, elem, policy, depth + 1, fieldJson, error)) {
+                if (!valueToJson(runtime, scene, *fieldVal, policy, depth + 1, fieldJson, error)) {
                     return false;
                 }
                 arr.push_back(std::move(fieldJson));
@@ -931,7 +1032,9 @@ bool jsonToValue(
         if (!structDesc || structDesc->kind != semantic::TypeKind::Struct) return false;
         auto storage = std::make_shared<runtime::StructStorage>();
         storage->fields.resize(structDesc->fields.size());
+        bool decoded = false;
         if (json.isObject()) {
+            decoded = true;
             for (std::size_t idx = 0; idx < structDesc->fields.size(); ++idx) {
                 const auto& fDesc = structDesc->fields[idx];
                 const auto* fJson = json.find(fDesc.name);
@@ -948,10 +1051,8 @@ bool jsonToValue(
                     return false;
                 }
             }
-            out = runtime::StructValue{typeId, std::move(storage)};
-            return true;
-        }
-        if (json.isArray() && json.arrayValue().size() == structDesc->fields.size()) {
+        } else if (json.isArray() && json.arrayValue().size() == structDesc->fields.size()) {
+            decoded = true;
             for (std::size_t idx = 0; idx < structDesc->fields.size(); ++idx) {
                 const auto& fDesc = structDesc->fields[idx];
                 if (!jsonToValue(
@@ -967,10 +1068,19 @@ bool jsonToValue(
                     return false;
                 }
             }
-            out = runtime::StructValue{typeId, std::move(storage)};
+        }
+        if (!decoded) return false;
+        if (auto inlineVal = runtime::makeDefaultInlineStructValue(typeId)) {
+            for (std::size_t idx = 0; idx < storage->fields.size(); ++idx) {
+                auto updated = runtime::storeInlineStructField(*inlineVal, idx, storage->fields[idx]);
+                if (!updated) return false;
+                inlineVal = std::move(updated);
+            }
+            out = std::move(*inlineVal);
             return true;
         }
-        return false;
+        out = runtime::StructValue{typeId, std::move(storage)};
+        return true;
     }
     default:
         return false;
@@ -1001,7 +1111,10 @@ std::string exportScriptObjectJson(
     tooling::Json::Object fieldsObj;
     for (std::size_t index = 0; index < fields.size(); ++index) {
         const auto& field = fields[index];
-        if (field.synthetic || (!field.name.empty() && field.name.front() == '$')) continue;
+        if (field.synthetic || field.staticField || field.constField ||
+            (!field.name.empty() && field.name.front() == '$')) {
+            continue;
+        }
         if (field.name == "__native" &&
             field.type == semantic::PrimitiveType::Handle) {
             continue;
@@ -1070,7 +1183,10 @@ bool importScriptObjectJson(
     std::vector<std::pair<std::string, runtime::Value>> decodedFields;
     decodedFields.reserve(descriptors.size());
     for (const auto& desc : descriptors) {
-        if (desc.synthetic || (!desc.name.empty() && desc.name.front() == '$')) continue;
+        if (desc.synthetic || desc.staticField || desc.constField ||
+            (!desc.name.empty() && desc.name.front() == '$')) {
+            continue;
+        }
         if (desc.name == "__native" &&
             desc.type == semantic::PrimitiveType::Handle) {
             continue;

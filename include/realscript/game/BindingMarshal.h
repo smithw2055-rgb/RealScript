@@ -48,25 +48,20 @@ std::optional<std::shared_ptr<T>> readNativeObject(
 }
 
 inline runtime::Value makeFixedStructValue(Fixed value) {
-    auto storage = std::make_shared<runtime::StructStorage>();
-    storage->fields.push_back(static_cast<std::int64_t>(value.raw));
-    return runtime::StructValue{
-        semantic::stableTypeId("RealScript.Math::Fixed"),
-        std::move(storage)};
+    return runtime::FixedValue{value.raw};
 }
 
 inline runtime::Value makeFixed16StructValue(Fixed16 value) {
-    auto storage = std::make_shared<runtime::StructStorage>();
-    storage->fields.push_back(static_cast<std::int64_t>(value.raw));
-    return runtime::StructValue{
-        semantic::stableTypeId("RealScript.Math::Fixed16"),
-        std::move(storage)};
+    return runtime::Fixed16Value{static_cast<std::int64_t>(value.raw)};
 }
 
 inline std::optional<Fixed> extractFixedStructValue(const runtime::Value& value) {
+    if (const auto* fixed = std::get_if<runtime::FixedValue>(&value)) {
+        return Fixed::fromRaw(fixed->raw);
+    }
     const auto* structure = std::get_if<runtime::StructValue>(&value);
     if (!structure ||
-        structure->typeId != semantic::stableTypeId("RealScript.Math::Fixed") ||
+        structure->typeId != runtime::fixedTypeId() ||
         !structure->storage || structure->storage->fields.size() != 1) {
         return std::nullopt;
     }
@@ -76,15 +71,22 @@ inline std::optional<Fixed> extractFixedStructValue(const runtime::Value& value)
 }
 
 inline std::optional<Fixed16> extractFixed16StructValue(const runtime::Value& value) {
+    if (const auto* fixed = std::get_if<runtime::Fixed16Value>(&value)) {
+        return Fixed16::fromRaw(static_cast<std::int32_t>(fixed->raw));
+    }
     const auto* structure = std::get_if<runtime::StructValue>(&value);
     if (!structure ||
-        structure->typeId != semantic::stableTypeId("RealScript.Math::Fixed16") ||
+        structure->typeId != runtime::fixed16TypeId() ||
         !structure->storage || structure->storage->fields.size() != 1) {
         return std::nullopt;
     }
-    const auto* raw = std::get_if<std::int64_t>(&structure->storage->fields[0]);
-    if (!raw) return std::nullopt;
-    return Fixed16::fromRaw(static_cast<std::int32_t>(*raw));
+    if (const auto* raw = std::get_if<std::int64_t>(&structure->storage->fields[0])) {
+        return Fixed16::fromRaw(static_cast<std::int32_t>(*raw));
+    }
+    if (const auto* rawLong = std::get_if<runtime::LongValue>(&structure->storage->fields[0])) {
+        return Fixed16::fromRaw(static_cast<std::int32_t>(rawLong->value));
+    }
+    return std::nullopt;
 }
 
 template <typename T>
@@ -211,9 +213,12 @@ std::optional<RemoveCvRef<T>> readValue(
         if (const auto fixed = extractFixed16StructValue(value)) return *fixed;
         setTypeMismatch(error, "expected Fixed16 argument");
     } else if constexpr (std::is_same_v<ValueType, Vec2>) {
+        if (const auto* vec2 = std::get_if<runtime::Vec2Value>(&value)) {
+            return Vec2{Fixed::fromRaw(vec2->x), Fixed::fromRaw(vec2->y)};
+        }
         const auto* structure = std::get_if<runtime::StructValue>(&value);
         if (structure &&
-            structure->typeId == semantic::stableTypeId("RealScript.Math::Vec2") &&
+            structure->typeId == runtime::vec2TypeId() &&
             structure->storage && structure->storage->fields.size() == 2) {
             const auto x = extractFixedStructValue(structure->storage->fields[0]);
             const auto y = extractFixedStructValue(structure->storage->fields[1]);
@@ -221,9 +226,12 @@ std::optional<RemoveCvRef<T>> readValue(
         }
         setTypeMismatch(error, "expected Vec2 argument");
     } else if constexpr (std::is_same_v<ValueType, Vec3>) {
+        if (const auto* vec3 = std::get_if<runtime::Vec3Value>(&value)) {
+            return Vec3{Fixed::fromRaw(vec3->x), Fixed::fromRaw(vec3->y), Fixed::fromRaw(vec3->z)};
+        }
         const auto* structure = std::get_if<runtime::StructValue>(&value);
         if (structure &&
-            structure->typeId == semantic::stableTypeId("RealScript.Math::Vec3") &&
+            structure->typeId == runtime::vec3TypeId() &&
             structure->storage && structure->storage->fields.size() == 3) {
             const auto x = extractFixedStructValue(structure->storage->fields[0]);
             const auto y = extractFixedStructValue(structure->storage->fields[1]);
@@ -231,6 +239,25 @@ std::optional<RemoveCvRef<T>> readValue(
             if (x && y && z) return Vec3{*x, *y, *z};
         }
         setTypeMismatch(error, "expected Vec3 argument");
+    } else if constexpr (std::is_same_v<ValueType, Quat>) {
+        if (const auto* quat = std::get_if<runtime::QuatValue>(&value)) {
+            return Quat{
+                Fixed::fromRaw(quat->x),
+                Fixed::fromRaw(quat->y),
+                Fixed::fromRaw(quat->z),
+                Fixed::fromRaw(quat->w)};
+        }
+        const auto* structure = std::get_if<runtime::StructValue>(&value);
+        if (structure &&
+            structure->typeId == runtime::quatTypeId() &&
+            structure->storage && structure->storage->fields.size() == 4) {
+            const auto x = extractFixedStructValue(structure->storage->fields[0]);
+            const auto y = extractFixedStructValue(structure->storage->fields[1]);
+            const auto z = extractFixedStructValue(structure->storage->fields[2]);
+            const auto w = extractFixedStructValue(structure->storage->fields[3]);
+            if (x && y && z && w) return Quat{*x, *y, *z, *w};
+        }
+        setTypeMismatch(error, "expected Quat argument");
     } else if constexpr (IsSharedPtr<ValueType>::value) {
         using Element = typename IsSharedPtr<ValueType>::Element;
         return readNativeObject<Element>(state, value, error);
@@ -241,8 +268,11 @@ std::optional<RemoveCvRef<T>> readValue(
         return object->get();
     } else {
         static_assert(!sizeof(T), "unsupported C++ argument type for RealScript game binding");
+        return std::nullopt;
     }
-    return std::nullopt;
+    if constexpr (!IsSharedPtr<ValueType>::value && !std::is_pointer_v<ValueType>) {
+        return std::nullopt;
+    }
 }
 
 template <typename T>
@@ -291,20 +321,11 @@ std::optional<runtime::Value> writeValue(
     } else if constexpr (std::is_same_v<ValueType, Fixed16>) {
         return makeFixed16StructValue(value);
     } else if constexpr (std::is_same_v<ValueType, Vec2>) {
-        auto storage = std::make_shared<runtime::StructStorage>();
-        storage->fields.push_back(makeFixedStructValue(value.x));
-        storage->fields.push_back(makeFixedStructValue(value.y));
-        return runtime::StructValue{
-            semantic::stableTypeId("RealScript.Math::Vec2"),
-            std::move(storage)};
+        return runtime::Value{runtime::Vec2Value{value.x.raw, value.y.raw}};
     } else if constexpr (std::is_same_v<ValueType, Vec3>) {
-        auto storage = std::make_shared<runtime::StructStorage>();
-        storage->fields.push_back(makeFixedStructValue(value.x));
-        storage->fields.push_back(makeFixedStructValue(value.y));
-        storage->fields.push_back(makeFixedStructValue(value.z));
-        return runtime::StructValue{
-            semantic::stableTypeId("RealScript.Math::Vec3"),
-            std::move(storage)};
+        return runtime::Value{runtime::Vec3Value{value.x.raw, value.y.raw, value.z.raw}};
+    } else if constexpr (std::is_same_v<ValueType, Quat>) {
+        return runtime::Value{runtime::QuatValue{value.x.raw, value.y.raw, value.z.raw, value.w.raw}};
     } else if constexpr (IsSharedPtr<ValueType>::value) {
         using Element = typename IsSharedPtr<ValueType>::Element;
         return writeNativeObject<Element>(state, std::forward<T>(value), error);
@@ -335,7 +356,7 @@ template <typename Callable, typename Traits, std::size_t... Indices>
 std::optional<runtime::Value> invokeFree(
     const std::shared_ptr<GameApiState>& state,
     Callable& callable,
-    const std::vector<runtime::Value>& arguments,
+    runtime::ValueSpan arguments,
     runtime::RuntimeError& error,
     std::index_sequence<Indices...>) {
     if (arguments.size() != sizeof...(Indices)) {
@@ -367,7 +388,7 @@ std::optional<runtime::Value> invokeFree(
 template <auto Method, typename Traits, std::size_t... Indices>
 std::optional<runtime::Value> invokeMethod(
     const std::shared_ptr<GameApiState>& state,
-    const std::vector<runtime::Value>& arguments,
+    runtime::ValueSpan arguments,
     runtime::RuntimeError& error,
     std::index_sequence<Indices...>) {
     using Class = typename Traits::Class;

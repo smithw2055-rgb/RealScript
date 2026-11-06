@@ -116,6 +116,7 @@ struct ManagedHeap::Impl {
     std::vector<std::uint32_t> freeSlots;
     std::vector<ObjectRef> markStack;
     std::unordered_map<RootToken, Value> persistentRoots;
+    std::unordered_map<semantic::SymbolId, Value> staticFields;
     RootToken nextRootToken = 1;
     GcPhase phase = GcPhase::Idle;
     bool requested = false;
@@ -258,6 +259,7 @@ struct ManagedHeap::Impl {
     void markRoots(const ShadowStack& shadowStack) {
         shadowStack.visitRoots([&](const Value& value) { markValue(value); });
         for (const auto& entry : persistentRoots) markValue(entry.second);
+        for (const auto& entry : staticFields) markValue(entry.second);
     }
 
     void startCollection(const ShadowStack& shadowStack) {
@@ -540,9 +542,10 @@ bool ManagedHeap::arraySet(
             return false;
         }
     } else if (expected == semantic::PrimitiveType::Struct) {
+        const auto actualTypeId = structValueTypeId(value);
         const auto* structure = std::get_if<StructValue>(&value);
-        if (!structure || structure->typeId != object->header.elementTypeId ||
-            !structure->storage) {
+        if (!actualTypeId || *actualTypeId != object->header.elementTypeId ||
+            (structure && !structure->storage)) {
             setHeapError(error, ErrorCode::TypeMismatch,
                 "managed array struct element type mismatch");
             return false;
@@ -656,6 +659,27 @@ PersistentRoot ManagedHeap::retain(ObjectRef reference) {
 PersistentRoot ManagedHeap::retain(Value value) {
     const auto token = addPersistentRoot(value);
     return PersistentRoot(token == 0 ? nullptr : this, token, std::move(value));
+}
+
+bool ManagedHeap::hasStaticField(semantic::SymbolId id) const noexcept {
+    return impl_->staticFields.find(id) != impl_->staticFields.end();
+}
+
+std::optional<Value> ManagedHeap::getStaticField(semantic::SymbolId id) const {
+    const auto found = impl_->staticFields.find(id);
+    if (found == impl_->staticFields.end()) return std::nullopt;
+    return found->second;
+}
+
+void ManagedHeap::setStaticField(semantic::SymbolId id, Value value) {
+    if (impl_->phase != GcPhase::Idle) {
+        impl_->markValue(value);
+        if (impl_->phase == GcPhase::Sweep && !impl_->markStack.empty()) {
+            impl_->phase = GcPhase::Mark;
+            impl_->resumeSweep = true;
+        }
+    }
+    impl_->staticFields[id] = std::move(value);
 }
 
 void ManagedHeap::requestCollection() noexcept { impl_->requested = true; }

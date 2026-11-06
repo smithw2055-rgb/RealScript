@@ -450,6 +450,8 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
             }
 
             for (const auto& newField : newType->descriptor.fields) {
+                const bool isInstanceField =
+                    !newField.synthetic && !newField.staticField && !newField.constField;
                 const auto newFieldTypeId = exactFieldTypeId(
                     newField.type, newField.typeName);
                 const auto directIt = saved.fields.find(newField.name);
@@ -458,7 +460,7 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                         directIt->second, newField.type, newFieldTypeId)) {
                     (void)runtime_.heap()->fieldSet(
                         newObj->reference(), newField.index, directIt->second, &allocError);
-                    if (!newField.synthetic) {
+                    if (isInstanceField) {
                         ++report.fieldsMigrated;
                     }
                     continue;
@@ -476,14 +478,14 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                             newField.index,
                             renamedIt->second,
                             &allocError);
-                        if (!newField.synthetic) {
+                        if (isInstanceField) {
                             ++report.fieldsMigrated;
                             ++report.fieldsRenamed;
                         }
                         continue;
                     }
                 }
-                if (!newField.synthetic) {
+                if (isInstanceField) {
                     ++report.fieldsDefaulted;
                 }
             }

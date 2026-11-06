@@ -347,6 +347,10 @@ FieldDeclarationSyntax Parser::parseFieldDeclaration(
     result.modifiers = std::move(modifiers);
     result.type = std::move(type);
     result.identifierToken = std::move(identifier);
+    if (current().kind == SyntaxKind::EqualsToken) {
+        result.equalsToken = nextToken();
+        result.initializer = parseExpression();
+    }
     result.semicolonToken = match(SyntaxKind::SemicolonToken);
     return result;
 }
@@ -715,9 +719,6 @@ ClassDeclarationSyntax Parser::parseClassDeclaration(
                         std::move(memberModifiers), std::move(type),
                         std::move(identifier), std::move(memberAttributes)));
                 } else {
-                    if (isStatic) diagnostics_.report(
-                        "RS1106", "static fields are not supported",
-                        identifier.span);
                     result.fields.push_back(parseFieldDeclaration(
                         std::move(type), std::move(identifier),
                         std::move(memberAttributes), std::move(memberModifiers)));
@@ -866,9 +867,6 @@ StructDeclarationSyntax Parser::parseStructDeclaration(
                         std::move(memberModifiers), std::move(type),
                         std::move(identifier), std::move(memberAttributes)));
                 } else {
-                    if (isStatic) diagnostics_.report(
-                        "RS1106", "static fields are not supported",
-                        identifier.span);
                     result.fields.push_back(parseFieldDeclaration(
                         std::move(type), std::move(identifier),
                         std::move(memberAttributes), std::move(memberModifiers)));
@@ -1365,6 +1363,9 @@ bool Parser::isLambdaExpressionStart() const noexcept {
 
 std::unique_ptr<StatementSyntax> Parser::parseVariableDeclarationStatement() {
     auto result = std::make_unique<VariableDeclarationStatementSyntax>();
+    if (current().kind == SyntaxKind::ConstKeyword) {
+        result->constKeyword = nextToken();
+    }
     if (current().kind == SyntaxKind::RefKeyword) {
         result->refKeyword = nextToken();
     }
@@ -1744,6 +1745,221 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
         result->literalToken = nextToken();
         return result;
     }
+    case SyntaxKind::InterpolatedStringToken: {
+        const auto token = nextToken();
+        const std::string_view raw(token.text);
+        const std::size_t end = (raw.size() >= 3 && raw.back() == '"')
+            ? raw.size() - 1
+            : raw.size();
+        auto makeStringLiteral = [&](std::string val, text::TextSpan span)
+            -> std::unique_ptr<ExpressionSyntax> {
+            auto lit = std::make_unique<LiteralExpressionSyntax>();
+            lit->literalToken.kind = SyntaxKind::StringLiteralToken;
+            lit->literalToken.span = span;
+            lit->literalToken.text = "\"" + val + "\"";
+            lit->literalToken.value = std::move(val);
+            return lit;
+        };
+        auto appendPart = [&](std::unique_ptr<ExpressionSyntax> accum,
+                              std::unique_ptr<ExpressionSyntax> part,
+                              text::TextSpan opSpan)
+            -> std::unique_ptr<ExpressionSyntax> {
+            if (!accum) return part;
+            auto bin = std::make_unique<BinaryExpressionSyntax>();
+            bin->left = std::move(accum);
+            bin->operatorToken.kind = SyntaxKind::PlusToken;
+            bin->operatorToken.span = opSpan;
+            bin->operatorToken.text = "+";
+            bin->right = std::move(part);
+            return bin;
+        };
+
+        std::unique_ptr<ExpressionSyntax> root;
+        std::string currentText;
+        std::size_t segmentStart = token.span.start;
+        std::size_t i = raw.size() >= 2 ? 2 : raw.size();
+        bool hasHole = false;
+
+        while (i < end) {
+            if (raw[i] == '\\' && i + 1 < end) {
+                const char esc = raw[i + 1];
+                switch (esc) {
+                case 'n': currentText.push_back('\n'); break;
+                case 'r': currentText.push_back('\r'); break;
+                case 't': currentText.push_back('\t'); break;
+                case '\\': currentText.push_back('\\'); break;
+                case '"': currentText.push_back('"'); break;
+                case '{': currentText.push_back('{'); break;
+                case '}': currentText.push_back('}'); break;
+                default: currentText.push_back(esc); break;
+                }
+                i += 2;
+                continue;
+            }
+            if (raw[i] == '}' && i + 1 < end && raw[i + 1] == '}') {
+                currentText.push_back('}');
+                i += 2;
+                continue;
+            }
+            if (raw[i] == '{') {
+                if (i + 1 < end && raw[i + 1] == '{') {
+                    currentText.push_back('{');
+                    i += 2;
+                    continue;
+                }
+                hasHole = true;
+                const text::TextSpan textSpan{
+                    segmentStart,
+                    (token.span.start + i) - segmentStart};
+                if (!currentText.empty() || !root) {
+                    root = appendPart(
+                        std::move(root),
+                        makeStringLiteral(std::move(currentText), textSpan),
+                        textSpan);
+                    currentText.clear();
+                }
+
+                const std::size_t exprStart = i + 1;
+                std::size_t j = exprStart;
+                enum class HoleModeKind { InterpText, InterpHole, NormalString };
+                struct HoleMode {
+                    HoleModeKind kind;
+                    int braceDepth = 0;
+                };
+                std::vector<HoleMode> modeStack{{HoleModeKind::InterpHole, 1}};
+                while (j < end && !modeStack.empty()) {
+                    const auto mode = modeStack.back().kind;
+                    if (mode == HoleModeKind::NormalString) {
+                        if (raw[j] == '\\' && j + 1 < end) {
+                            j += 2;
+                            continue;
+                        }
+                        if (raw[j] == '"') {
+                            modeStack.pop_back();
+                        }
+                        ++j;
+                    } else if (mode == HoleModeKind::InterpText) {
+                        if (raw[j] == '\\' && j + 1 < end) {
+                            j += 2;
+                            continue;
+                        }
+                        if (raw[j] == '"') {
+                            modeStack.pop_back();
+                            ++j;
+                            continue;
+                        }
+                        if (raw[j] == '{') {
+                            if (j + 1 < end && raw[j + 1] == '{') {
+                                j += 2;
+                                continue;
+                            }
+                            modeStack.push_back({HoleModeKind::InterpHole, 1});
+                            ++j;
+                            continue;
+                        }
+                        if (raw[j] == '}' && j + 1 < end && raw[j + 1] == '}') {
+                            j += 2;
+                            continue;
+                        }
+                        ++j;
+                    } else {
+                        if (raw[j] == '$' && j + 1 < end && raw[j + 1] == '"') {
+                            modeStack.push_back({HoleModeKind::InterpText, 0});
+                            j += 2;
+                            continue;
+                        }
+                        if (raw[j] == '"') {
+                            modeStack.push_back({HoleModeKind::NormalString, 0});
+                            ++j;
+                            continue;
+                        }
+                        if (raw[j] == '\'') {
+                            ++j;
+                            if (j < end && raw[j] == '\\' && j + 1 < end) {
+                                j += 2;
+                            } else if (j < end) {
+                                ++j;
+                            }
+                            if (j < end && raw[j] == '\'') {
+                                ++j;
+                            }
+                            continue;
+                        }
+                        if (raw[j] == '{') {
+                            ++modeStack.back().braceDepth;
+                            ++j;
+                            continue;
+                        }
+                        if (raw[j] == '}') {
+                            --modeStack.back().braceDepth;
+                            if (modeStack.back().braceDepth == 0) {
+                                modeStack.pop_back();
+                                if (modeStack.empty()) {
+                                    break;
+                                }
+                            }
+                            ++j;
+                            continue;
+                        }
+                        ++j;
+                    }
+                }
+                const auto holeSpan = text::TextSpan{
+                    token.span.start + i,
+                    (j < end ? j + 1 : end) - i};
+                if (!modeStack.empty()) {
+                    diagnostics_.report(
+                        "RS1001",
+                        "unterminated interpolation hole in string literal",
+                        holeSpan);
+                }
+                const auto exprSlice = raw.substr(exprStart, j - exprStart);
+                std::string padded(token.span.start + exprStart, ' ');
+                padded.append(exprSlice);
+                text::SourceText subSource(std::move(padded), source_.name());
+                Parser subParser(subSource, diagnostics_);
+                std::unique_ptr<ExpressionSyntax> innerExpr;
+                if (subParser.current().kind == SyntaxKind::EndOfFileToken) {
+                    diagnostics_.report(
+                        "RS1121",
+                        "interpolated string hole cannot be empty",
+                        holeSpan);
+                    innerExpr = makeStringLiteral("", holeSpan);
+                } else {
+                    innerExpr = subParser.parseExpression();
+                }
+                auto paren = std::make_unique<ParenthesizedExpressionSyntax>();
+                paren->openParenToken = {
+                    SyntaxKind::OpenParenToken,
+                    {token.span.start + i, 1}, "(", {}, true};
+                paren->expression = std::move(innerExpr);
+                paren->closeParenToken = {
+                    SyntaxKind::CloseParenToken,
+                    {token.span.start + (j < end ? j : end - 1), 1},
+                    ")", {}, true};
+                root = appendPart(std::move(root), std::move(paren), holeSpan);
+                i = (j < end) ? j + 1 : end;
+                segmentStart = token.span.start + i;
+                continue;
+            }
+            currentText.push_back(raw[i]);
+            ++i;
+        }
+
+        if (!hasHole) {
+            return makeStringLiteral(std::move(currentText), token.span);
+        }
+        if (!currentText.empty()) {
+            const text::TextSpan tailSpan{
+                segmentStart,
+                token.span.end() - segmentStart};
+            root = appendPart(
+                std::move(root),
+                makeStringLiteral(std::move(currentText), tailSpan),
+                tailSpan);
+        }
+        return root ? std::move(root) : makeStringLiteral("", token.span);
+    }
     case SyntaxKind::IdentifierToken:
         if (peek(1).kind == SyntaxKind::OpenParenToken ||
             isGenericCallStart()) {
@@ -1810,7 +2026,9 @@ std::unique_ptr<ExpressionSyntax> Parser::parseCallExpression() {
 }
 
 bool Parser::isVariableDeclarationStart() const noexcept {
-    const auto start = current().kind == SyntaxKind::RefKeyword ? 1u : 0u;
+    std::size_t start = 0;
+    if (peek(start).kind == SyntaxKind::ConstKeyword) ++start;
+    if (peek(start).kind == SyntaxKind::RefKeyword) ++start;
     if (!isIdentifierLike(peek(start).kind)) {
         return false;
     }

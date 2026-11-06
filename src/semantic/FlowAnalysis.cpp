@@ -216,6 +216,11 @@ private:
         case BoundNodeKind::NewObjectExpression: {
             const auto& value = static_cast<const
                 BoundNewObjectExpression&>(expression);
+            for (const auto& initializer : value.defaultFieldInitializers) {
+                for (const auto& argument : initializer.arguments) {
+                    analyzeExpression(*argument, assigned);
+                }
+            }
             for (const auto& argument : value.arguments) {
                 analyzeExpression(*argument, assigned);
             }
@@ -248,11 +253,17 @@ private:
             }
             return;
         }
-        case BoundNodeKind::MemberAccessExpression:
-            analyzeExpression(*static_cast<const BoundMemberAccessExpression&>(expression).receiver, assigned); return;
+        case BoundNodeKind::MemberAccessExpression: {
+            const auto& value = static_cast<const BoundMemberAccessExpression&>(expression);
+            if (value.receiver) analyzeExpression(*value.receiver, assigned);
+            if (value.staticInitializer) analyzeExpression(*value.staticInitializer, assigned);
+            return;
+        }
         case BoundNodeKind::MemberAssignmentExpression: {
             const auto& value = static_cast<const BoundMemberAssignmentExpression&>(expression);
-            analyzeExpression(*value.receiver, assigned); analyzeExpression(*value.expression, assigned); return;
+            if (value.receiver) analyzeExpression(*value.receiver, assigned);
+            analyzeExpression(*value.expression, assigned);
+            return;
         }
         case BoundNodeKind::ArrayLengthExpression:
             analyzeExpression(*static_cast<const BoundArrayLengthExpression&>(expression).receiver, assigned); return;

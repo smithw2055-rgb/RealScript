@@ -72,6 +72,9 @@ runtime::Value ScriptRuntime::defaultValue(
     case semantic::PrimitiveType::Enum:
         return runtime::EnumValue{typeId, 0};
     case semantic::PrimitiveType::Struct: {
+        if (auto inlineVal = runtime::makeDefaultInlineStructValue(typeId)) {
+            return *inlineVal;
+        }
         if (typeId == 0 || !visiting.insert(typeId).second) {
             return runtime::StructValue{};
         }
@@ -146,8 +149,12 @@ bool ScriptRuntime::valueMatches(
         return actual && (*actual == 0 || *actual == typeId);
     }
     case semantic::PrimitiveType::Struct: {
-        const auto* structure = std::get_if<runtime::StructValue>(&value);
-        return structure && structure->typeId == typeId && structure->storage;
+        const auto actualTypeId = runtime::structValueTypeId(value);
+        if (!actualTypeId || *actualTypeId == 0 || *actualTypeId != typeId) return false;
+        if (const auto* structure = std::get_if<runtime::StructValue>(&value)) {
+            return structure->storage != nullptr;
+        }
+        return true;
     }
     case semantic::PrimitiveType::Enum: {
         const auto* enumeration = std::get_if<runtime::EnumValue>(&value);
@@ -183,28 +190,19 @@ runtime::ExecutionResult ScriptRuntime::invokeSymbol(
 }
 
 runtime::Value ScriptRuntime::makeFixed(Fixed value) {
-    return detail::makeFixedStructValue(value);
+    return runtime::FixedValue{value.raw};
 }
 
 runtime::Value ScriptRuntime::makeVec2(Vec2 value) {
-    auto storage = std::make_shared<runtime::StructStorage>();
-    storage->fields.reserve(2);
-    storage->fields.push_back(detail::makeFixedStructValue(value.x));
-    storage->fields.push_back(detail::makeFixedStructValue(value.y));
-    return runtime::StructValue{
-        semantic::stableTypeId("RealScript.Math::Vec2"),
-        std::move(storage)};
+    return runtime::Vec2Value{value.x.raw, value.y.raw};
 }
 
 runtime::Value ScriptRuntime::makeVec3(Vec3 value) {
-    auto storage = std::make_shared<runtime::StructStorage>();
-    storage->fields.reserve(3);
-    storage->fields.push_back(detail::makeFixedStructValue(value.x));
-    storage->fields.push_back(detail::makeFixedStructValue(value.y));
-    storage->fields.push_back(detail::makeFixedStructValue(value.z));
-    return runtime::StructValue{
-        semantic::stableTypeId("RealScript.Math::Vec3"),
-        std::move(storage)};
+    return runtime::Vec3Value{value.x.raw, value.y.raw, value.z.raw};
+}
+
+runtime::Value ScriptRuntime::makeQuat(Quat value) {
+    return runtime::QuatValue{value.x.raw, value.y.raw, value.z.raw, value.w.raw};
 }
 
 std::optional<Fixed> ScriptRuntime::readFixed(
@@ -214,9 +212,12 @@ std::optional<Fixed> ScriptRuntime::readFixed(
 
 std::optional<Vec2> ScriptRuntime::readVec2(
     const runtime::Value& value) noexcept {
+    if (const auto* vec2 = std::get_if<runtime::Vec2Value>(&value)) {
+        return Vec2{Fixed::fromRaw(vec2->x), Fixed::fromRaw(vec2->y)};
+    }
     const auto* structure = std::get_if<runtime::StructValue>(&value);
     if (!structure ||
-        structure->typeId != semantic::stableTypeId("RealScript.Math::Vec2") ||
+        structure->typeId != runtime::vec2TypeId() ||
         !structure->storage || structure->storage->fields.size() != 2) {
         return std::nullopt;
     }
@@ -228,9 +229,12 @@ std::optional<Vec2> ScriptRuntime::readVec2(
 
 std::optional<Vec3> ScriptRuntime::readVec3(
     const runtime::Value& value) noexcept {
+    if (const auto* vec3 = std::get_if<runtime::Vec3Value>(&value)) {
+        return Vec3{Fixed::fromRaw(vec3->x), Fixed::fromRaw(vec3->y), Fixed::fromRaw(vec3->z)};
+    }
     const auto* structure = std::get_if<runtime::StructValue>(&value);
     if (!structure ||
-        structure->typeId != semantic::stableTypeId("RealScript.Math::Vec3") ||
+        structure->typeId != runtime::vec3TypeId() ||
         !structure->storage || structure->storage->fields.size() != 3) {
         return std::nullopt;
     }
@@ -239,6 +243,29 @@ std::optional<Vec3> ScriptRuntime::readVec3(
     const auto z = detail::extractFixedStructValue(structure->storage->fields[2]);
     if (!x || !y || !z) return std::nullopt;
     return Vec3{*x, *y, *z};
+}
+
+std::optional<Quat> ScriptRuntime::readQuat(
+    const runtime::Value& value) noexcept {
+    if (const auto* quat = std::get_if<runtime::QuatValue>(&value)) {
+        return Quat{
+            Fixed::fromRaw(quat->x),
+            Fixed::fromRaw(quat->y),
+            Fixed::fromRaw(quat->z),
+            Fixed::fromRaw(quat->w)};
+    }
+    const auto* structure = std::get_if<runtime::StructValue>(&value);
+    if (!structure ||
+        structure->typeId != runtime::quatTypeId() ||
+        !structure->storage || structure->storage->fields.size() != 4) {
+        return std::nullopt;
+    }
+    const auto x = detail::extractFixedStructValue(structure->storage->fields[0]);
+    const auto y = detail::extractFixedStructValue(structure->storage->fields[1]);
+    const auto z = detail::extractFixedStructValue(structure->storage->fields[2]);
+    const auto w = detail::extractFixedStructValue(structure->storage->fields[3]);
+    if (!x || !y || !z || !w) return std::nullopt;
+    return Quat{*x, *y, *z, *w};
 }
 
 std::optional<Vec2> ScriptRuntime::getMemberVec2(

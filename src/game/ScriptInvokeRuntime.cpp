@@ -22,6 +22,63 @@ runtime::ExecutionResult failedResult(
     return result;
 }
 
+std::optional<runtime::Value> evaluateFieldConstantValue(
+    const semantic::FieldSymbol& field,
+    semantic::SymbolId fieldTypeId,
+    runtime::ManagedHeap* heap,
+    runtime::RuntimeError& error) {
+    if (!field.hasConstantValue) return std::nullopt;
+    if (std::holds_alternative<std::int64_t>(field.constantValue)) {
+        const auto raw = std::get<std::int64_t>(field.constantValue);
+        switch (field.type) {
+        case semantic::PrimitiveType::Byte:
+            return runtime::Value{runtime::ByteValue{static_cast<std::uint8_t>(raw)}};
+        case semantic::PrimitiveType::SByte:
+            return runtime::Value{runtime::SByteValue{static_cast<std::int8_t>(raw)}};
+        case semantic::PrimitiveType::Short:
+            return runtime::Value{runtime::ShortValue{static_cast<std::int16_t>(raw)}};
+        case semantic::PrimitiveType::UShort:
+            return runtime::Value{runtime::UShortValue{static_cast<std::uint16_t>(raw)}};
+        case semantic::PrimitiveType::Int:
+            return runtime::Value{raw};
+        case semantic::PrimitiveType::UInt:
+            return runtime::Value{runtime::UIntValue{static_cast<std::uint32_t>(raw)}};
+        case semantic::PrimitiveType::Long:
+            return runtime::Value{runtime::LongValue{raw}};
+        case semantic::PrimitiveType::ULong:
+            return runtime::Value{runtime::ULongValue{static_cast<std::uint64_t>(raw)}};
+        case semantic::PrimitiveType::Char:
+            return runtime::Value{runtime::CharValue{static_cast<char16_t>(raw)}};
+        case semantic::PrimitiveType::Enum:
+            return runtime::Value{runtime::EnumValue{fieldTypeId, raw}};
+        case semantic::PrimitiveType::Float:
+            return runtime::Value{runtime::FloatValue{static_cast<float>(raw)}};
+        case semantic::PrimitiveType::Double:
+            return runtime::Value{static_cast<double>(raw)};
+        default:
+            break;
+        }
+    } else if (std::holds_alternative<double>(field.constantValue)) {
+        const auto raw = std::get<double>(field.constantValue);
+        if (field.type == semantic::PrimitiveType::Float) {
+            return runtime::Value{runtime::FloatValue{static_cast<float>(raw)}};
+        }
+        return runtime::Value{raw};
+    } else if (std::holds_alternative<bool>(field.constantValue)) {
+        return runtime::Value{std::get<bool>(field.constantValue)};
+    } else if (std::holds_alternative<std::string>(field.constantValue)) {
+        const auto& strVal = std::get<std::string>(field.constantValue);
+        if (heap) {
+            if (const auto strRef = heap->allocateString(strVal, &error)) {
+                return runtime::Value{*strRef};
+            }
+            return std::nullopt;
+        }
+        return runtime::Value{strVal};
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 runtime::ExecutionResult ScriptRuntime::invoke(
@@ -86,11 +143,25 @@ bool ScriptRuntime::setMember(
     }
     for (const auto& field : object.type().descriptor.fields) {
         if (field.name != name) continue;
+        if (field.constField) {
+            error.code = runtime::ErrorCode::InvalidArguments;
+            error.message = "script field '" + name + "' is const and read-only";
+            return false;
+        }
         const auto typeId = exactTypeId(field.type, field.typeName);
         if (!valueMatches(value, field.type, typeId)) {
             error.code = runtime::ErrorCode::TypeMismatch;
             error.message = "script field '" + name + "' received a value of the wrong type";
             return false;
+        }
+        if (field.staticField) {
+            if (!heap_) {
+                error.code = runtime::ErrorCode::InvalidObjectReference;
+                error.message = "cannot set static field '" + name + "' without a managed heap";
+                return false;
+            }
+            heap_->setStaticField(field.id, std::move(value));
+            return true;
         }
         return heap_->fieldSet(object.reference(), field.index, std::move(value), &error);
     }
@@ -131,6 +202,36 @@ std::optional<runtime::Value> ScriptRuntime::getMember(
     }
     for (const auto& field : object.type().descriptor.fields) {
         if (field.name == name) {
+            const auto typeId = exactTypeId(field.type, field.typeName);
+            if (field.constField) {
+                if (auto constVal = evaluateFieldConstantValue(
+                        field, typeId, heap_.get(), error)) {
+                    return constVal;
+                }
+                if (error.code != runtime::ErrorCode::None) return std::nullopt;
+                std::unordered_set<semantic::SymbolId> visiting;
+                return defaultValue(field.type, typeId, visiting);
+            }
+            if (field.staticField) {
+                if (!heap_) {
+                    error.code = runtime::ErrorCode::InvalidObjectReference;
+                    error.message = "cannot read static field '" + name + "' without a managed heap";
+                    return std::nullopt;
+                }
+                if (auto existing = heap_->getStaticField(field.id)) {
+                    return existing;
+                }
+                if (auto constVal = evaluateFieldConstantValue(
+                        field, typeId, heap_.get(), error)) {
+                    heap_->setStaticField(field.id, *constVal);
+                    return constVal;
+                }
+                if (error.code != runtime::ErrorCode::None) return std::nullopt;
+                std::unordered_set<semantic::SymbolId> visiting;
+                auto defVal = defaultValue(field.type, typeId, visiting);
+                heap_->setStaticField(field.id, defVal);
+                return defVal;
+            }
             auto value = heap_->fieldGet(object.reference(), field.index);
             if (!value) {
                 error.code = runtime::ErrorCode::InvalidObjectReference;

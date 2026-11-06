@@ -313,11 +313,14 @@ public:
     [[nodiscard]] static runtime::Value makeFixed(Fixed value);
     [[nodiscard]] static runtime::Value makeVec2(Vec2 value);
     [[nodiscard]] static runtime::Value makeVec3(Vec3 value);
+    [[nodiscard]] static runtime::Value makeQuat(Quat value);
     [[nodiscard]] static std::optional<Fixed> readFixed(
         const runtime::Value& value) noexcept;
     [[nodiscard]] static std::optional<Vec2> readVec2(
         const runtime::Value& value) noexcept;
     [[nodiscard]] static std::optional<Vec3> readVec3(
+        const runtime::Value& value) noexcept;
+    [[nodiscard]] static std::optional<Quat> readQuat(
         const runtime::Value& value) noexcept;
 
     [[nodiscard]] std::optional<Vec2> getMemberVec2(

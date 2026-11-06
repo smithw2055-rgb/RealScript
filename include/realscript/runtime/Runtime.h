@@ -3,9 +3,11 @@
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/semantic/Semantic.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <map>
@@ -149,6 +151,63 @@ struct EnumValue {
     }
 };
 
+struct FixedValue {
+    std::int32_t raw = 0;
+    friend constexpr bool operator==(FixedValue left, FixedValue right) noexcept {
+        return left.raw == right.raw;
+    }
+    friend constexpr bool operator!=(FixedValue left, FixedValue right) noexcept {
+        return left.raw != right.raw;
+    }
+};
+
+struct Fixed16Value {
+    std::int64_t raw = 0;
+    friend constexpr bool operator==(Fixed16Value left, Fixed16Value right) noexcept {
+        return left.raw == right.raw;
+    }
+    friend constexpr bool operator!=(Fixed16Value left, Fixed16Value right) noexcept {
+        return left.raw != right.raw;
+    }
+};
+
+struct Vec2Value {
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    friend constexpr bool operator==(Vec2Value left, Vec2Value right) noexcept {
+        return left.x == right.x && left.y == right.y;
+    }
+    friend constexpr bool operator!=(Vec2Value left, Vec2Value right) noexcept {
+        return !(left == right);
+    }
+};
+
+struct Vec3Value {
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t z = 0;
+    friend constexpr bool operator==(Vec3Value left, Vec3Value right) noexcept {
+        return left.x == right.x && left.y == right.y && left.z == right.z;
+    }
+    friend constexpr bool operator!=(Vec3Value left, Vec3Value right) noexcept {
+        return !(left == right);
+    }
+};
+
+struct QuatValue {
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t z = 0;
+    std::int32_t w = 0;
+    friend constexpr bool operator==(QuatValue left, QuatValue right) noexcept {
+        return left.x == right.x && left.y == right.y &&
+            left.z == right.z && left.w == right.w;
+    }
+    friend constexpr bool operator!=(QuatValue left, QuatValue right) noexcept {
+        return !(left == right);
+    }
+};
+
 struct StructStorage;
 
 struct StructValue {
@@ -176,10 +235,44 @@ using Value = std::variant<
     double,
     CharValue,
     EnumValue,
+    FixedValue,
+    Fixed16Value,
+    Vec2Value,
+    Vec3Value,
+    QuatValue,
     StructValue,
     std::string,
     ObjectRef,
     NativeHandle>;
+
+class ValueSpan {
+public:
+    constexpr ValueSpan() noexcept = default;
+    constexpr ValueSpan(const Value* data, std::size_t size) noexcept
+        : data_(data), size_(size) {}
+    ValueSpan(const std::vector<Value>& values) noexcept
+        : data_(values.data()), size_(values.size()) {}
+    constexpr ValueSpan(std::initializer_list<Value> values) noexcept
+        : data_(values.begin()), size_(values.size()) {}
+    template <std::size_t N>
+    constexpr ValueSpan(const std::array<Value, N>& values) noexcept
+        : data_(values.data()), size_(N) {}
+
+    [[nodiscard]] constexpr const Value* data() const noexcept { return data_; }
+    [[nodiscard]] constexpr std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] constexpr bool empty() const noexcept { return size_ == 0; }
+    [[nodiscard]] constexpr const Value& operator[](std::size_t index) const noexcept {
+        return data_[index];
+    }
+    [[nodiscard]] constexpr const Value& front() const noexcept { return data_[0]; }
+    [[nodiscard]] constexpr const Value& back() const noexcept { return data_[size_ - 1]; }
+    [[nodiscard]] constexpr const Value* begin() const noexcept { return data_; }
+    [[nodiscard]] constexpr const Value* end() const noexcept { return data_ + size_; }
+
+private:
+    const Value* data_ = nullptr;
+    std::size_t size_ = 0;
+};
 
 struct StructStorage {
     std::vector<Value> fields;
@@ -373,6 +466,10 @@ public:
     bool removePersistentRoot(RootToken token) noexcept;
     [[nodiscard]] PersistentRoot retain(ObjectRef reference);
     [[nodiscard]] PersistentRoot retain(Value value);
+
+    [[nodiscard]] bool hasStaticField(semantic::SymbolId id) const noexcept;
+    [[nodiscard]] std::optional<Value> getStaticField(semantic::SymbolId id) const;
+    void setStaticField(semantic::SymbolId id, Value value);
 
     void requestCollection() noexcept;
     [[nodiscard]] bool collectionRequested() const noexcept;
@@ -617,7 +714,7 @@ struct ExecutionResult {
 
 using ExternalFunction = std::function<std::optional<Value>(
     const bytecode::FunctionReference&,
-    const std::vector<Value>&,
+    ValueSpan,
     RuntimeError&)>;
 
 struct ResolvedBinding {
@@ -637,7 +734,7 @@ public:
         BindingDeterminism determinism = BindingDeterminism::Deterministic);
     [[nodiscard]] std::optional<Value> invoke(
         const bytecode::FunctionReference& reference,
-        const std::vector<Value>& arguments,
+        ValueSpan arguments,
         RuntimeError& error) const;
     [[nodiscard]] std::optional<ResolvedBinding> resolve(
         const bytecode::FunctionReference& reference) const;
@@ -669,7 +766,7 @@ public:
         const BindingRegistry* bindings,
         const ExternalFunction* fallback,
         const bytecode::FunctionReference& reference,
-        const std::vector<Value>& arguments,
+        ValueSpan arguments,
         std::optional<Value>& result,
         RuntimeError& error);
     [[nodiscard]] bool finish(
@@ -802,6 +899,19 @@ private:
     std::shared_ptr<NativeHandleRegistry> nativeHandles_;
 };
 
+[[nodiscard]] semantic::SymbolId fixedTypeId() noexcept;
+[[nodiscard]] semantic::SymbolId fixed16TypeId() noexcept;
+[[nodiscard]] semantic::SymbolId vec2TypeId() noexcept;
+[[nodiscard]] semantic::SymbolId vec3TypeId() noexcept;
+[[nodiscard]] semantic::SymbolId quatTypeId() noexcept;
+[[nodiscard]] std::optional<semantic::SymbolId> structValueTypeId(const Value& value) noexcept;
+[[nodiscard]] std::optional<Value> makeDefaultInlineStructValue(semantic::SymbolId typeId) noexcept;
+[[nodiscard]] std::optional<Value> loadInlineStructField(const Value& value, std::size_t fieldIndex) noexcept;
+[[nodiscard]] std::optional<Value> storeInlineStructField(
+    const Value& structure,
+    std::size_t fieldIndex,
+    const Value& fieldValue) noexcept;
+
 [[nodiscard]] const char* errorCodeName(ErrorCode code) noexcept;
 [[nodiscard]] const char* traceEventKindName(TraceEventKind kind) noexcept;
 [[nodiscard]] semantic::PrimitiveType valueType(const Value& value) noexcept;
@@ -821,5 +931,12 @@ private:
 [[nodiscard]] std::string exportChromeTraceJson(
     const ExecutionProfile& profile,
     const GcStatistics* gcStatistics = nullptr);
+
+[[nodiscard]] bool tryExecuteRuntimeIntrinsic(
+    std::string_view name,
+    ValueSpan arguments,
+    ManagedHeap* heap,
+    Value& result,
+    std::string& errorMessage);
 
 } // namespace realscript::runtime

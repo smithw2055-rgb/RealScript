@@ -145,6 +145,55 @@ void LanguageService::rebuild() {
         compilation.addSource({path, documents_.at(path).content});
     }
     result_ = compilation.build(hasSnapshot_ ? &snapshot_ : nullptr);
+    if (result_.diagnostics.hasErrors()) {
+        bool anySanitized = false;
+        compiler::Compilation fallbackCompilation;
+        for (const auto& path : ambientPaths) {
+            fallbackCompilation.addSource({path, ambientDocuments_.at(path).content});
+        }
+        for (const auto& path : paths) {
+            std::string content = documents_.at(path).content;
+            std::size_t lineStart = 0;
+            while (lineStart < content.size()) {
+                std::size_t lineEnd = content.find('\n', lineStart);
+                if (lineEnd == std::string::npos) lineEnd = content.size();
+                std::size_t lastNonWs = lineEnd;
+                while (lastNonWs > lineStart &&
+                       std::isspace(static_cast<unsigned char>(content[lastNonWs - 1]))) {
+                    --lastNonWs;
+                }
+                if (lastNonWs > lineStart && content[lastNonWs - 1] == '.') {
+                    for (std::size_t idx = lineStart; idx < lastNonWs; ++idx) {
+                        if (content[idx] != '\r' && content[idx] != '\n') {
+                            content[idx] = ' ';
+                        }
+                    }
+                    anySanitized = true;
+                }
+                lineStart = (lineEnd < content.size()) ? lineEnd + 1 : content.size();
+            }
+            fallbackCompilation.addSource({path, std::move(content)});
+        }
+        if (anySanitized) {
+            auto fallback = fallbackCompilation.build(nullptr);
+            for (auto& mod : fallback.modules) {
+                const bool exists = std::any_of(
+                    result_.modules.begin(),
+                    result_.modules.end(),
+                    [&](const mir::Module& existing) { return existing.name == mod.name; });
+                if (!exists) {
+                    result_.modules.push_back(std::move(mod));
+                }
+            }
+            if (result_.symbols.empty()) {
+                result_.symbols = std::move(fallback.symbols);
+            } else {
+                for (auto& occ : fallback.symbols) {
+                    result_.symbols.push_back(std::move(occ));
+                }
+            }
+        }
+    }
     snapshot_ = result_.snapshot;
     hasSnapshot_ = true;
     dirty_ = false;
@@ -277,6 +326,50 @@ std::optional<DocumentSymbol> LanguageService::resolve(
     const auto token = tokenAt(path, position);
     if (!token || token->kind != syntax::SyntaxKind::IdentifierToken) return std::nullopt;
     auto definitions = allDefinitions();
+
+    for (const auto& symbol : definitions) {
+        if (symbol.location.path == path &&
+            symbol.location.range.span.start == token->span.start &&
+            symbol.location.range.span.length == token->span.length) {
+            return symbol;
+        }
+    }
+
+    semantic::SymbolId matchedId = 0;
+    const semantic::SymbolOccurrence* matchedOcc = nullptr;
+    for (const auto& occ : result_.symbols) {
+        if (occ.id == 0 || occ.sourceName != path) continue;
+        if (occ.span.start == token->span.start &&
+            occ.span.length == token->span.length) {
+            matchedId = occ.id;
+            matchedOcc = &occ;
+            if (occ.definition) break;
+        }
+    }
+    if (matchedId != 0) {
+        for (const auto& symbol : definitions) {
+            if (symbol.id == matchedId) return symbol;
+        }
+        for (const auto& occ : result_.symbols) {
+            if (occ.id == matchedId && occ.definition && !occ.sourceName.empty()) {
+                return DocumentSymbol{
+                    occ.id,
+                    occ.kind,
+                    occ.name,
+                    occ.detail,
+                    {occ.sourceName, rangeFor(occ.sourceName, occ.span)}};
+            }
+        }
+        if (matchedOcc) {
+            return DocumentSymbol{
+                matchedOcc->id,
+                matchedOcc->kind,
+                matchedOcc->name,
+                matchedOcc->detail,
+                {matchedOcc->sourceName, rangeFor(matchedOcc->sourceName, matchedOcc->span)}};
+        }
+    }
+
     std::vector<DocumentSymbol> matches;
     for (const auto& symbol : definitions) {
         if (symbol.name == token->text) matches.push_back(symbol);
@@ -429,27 +522,106 @@ std::vector<CompletionItem> LanguageService::completion(
         }
         if (scan > 0 && doc->content[scan - 1] == '.') {
             std::size_t recvEnd = scan - 1;
-            while (recvEnd > 0 &&
-                   std::isspace(static_cast<unsigned char>(doc->content[recvEnd - 1]))) {
+            const auto isHorizSpace = [](char ch) noexcept {
+                return ch == ' ' || ch == '\t';
+            };
+            while (recvEnd > 0 && isHorizSpace(doc->content[recvEnd - 1])) {
                 --recvEnd;
             }
-            std::size_t recvStart = recvEnd;
-            while (recvStart > 0 &&
-                   (std::isalnum(static_cast<unsigned char>(doc->content[recvStart - 1])) ||
-                    doc->content[recvStart - 1] == '_')) {
-                --recvStart;
+            std::size_t exprStart = recvEnd;
+            while (exprStart > 0) {
+                while (exprStart > 0 && isHorizSpace(doc->content[exprStart - 1])) {
+                    --exprStart;
+                }
+                if (exprStart > 0 &&
+                    (doc->content[exprStart - 1] == ')' || doc->content[exprStart - 1] == ']')) {
+                    const char closeCh = doc->content[exprStart - 1];
+                    const char openCh = closeCh == ')' ? '(' : '[';
+                    int depth = 1;
+                    --exprStart;
+                    while (exprStart > 0 && depth > 0) {
+                        --exprStart;
+                        if (doc->content[exprStart] == closeCh) ++depth;
+                        else if (doc->content[exprStart] == openCh) --depth;
+                    }
+                    continue;
+                }
+                std::size_t idEnd = exprStart;
+                while (exprStart > 0 &&
+                       (std::isalnum(static_cast<unsigned char>(doc->content[exprStart - 1])) ||
+                        doc->content[exprStart - 1] == '_')) {
+                    --exprStart;
+                }
+                if (exprStart == idEnd) break;
+                std::size_t beforeId = exprStart;
+                while (beforeId > 0 && isHorizSpace(doc->content[beforeId - 1])) {
+                    --beforeId;
+                }
+                if (beforeId > 0 && doc->content[beforeId - 1] == '.') {
+                    exprStart = beforeId - 1;
+                    continue;
+                }
+                break;
             }
-            const std::string receiverName =
-                doc->content.substr(recvStart, recvEnd - recvStart);
-            if (!receiverName.empty()) {
-                const semantic::TypeSymbol* targetType = nullptr;
+
+            const auto trimText = [](std::string text) {
+                std::size_t begin = 0;
+                while (begin < text.size() &&
+                       std::isspace(static_cast<unsigned char>(text[begin]))) {
+                    ++begin;
+                }
+                std::size_t end = text.size();
+                while (end > begin &&
+                       std::isspace(static_cast<unsigned char>(text[end - 1]))) {
+                    --end;
+                }
+                return text.substr(begin, end - begin);
+            };
+
+            const std::string chainText =
+                trimText(doc->content.substr(exprStart, recvEnd - exprStart));
+            if (!chainText.empty()) {
+                std::vector<std::string> segments;
+                std::size_t segStart = 0;
+                int parenDepth = 0;
+                int bracketDepth = 0;
+                for (std::size_t idx = 0; idx < chainText.size(); ++idx) {
+                    const char ch = chainText[idx];
+                    if (ch == '(') ++parenDepth;
+                    else if (ch == ')' && parenDepth > 0) --parenDepth;
+                    else if (ch == '[') ++bracketDepth;
+                    else if (ch == ']' && bracketDepth > 0) --bracketDepth;
+                    else if (ch == '.' && parenDepth == 0 && bracketDepth == 0) {
+                        segments.push_back(trimText(chainText.substr(segStart, idx - segStart)));
+                        segStart = idx + 1;
+                    }
+                }
+                segments.push_back(trimText(chainText.substr(segStart)));
+
                 const auto findTypeByName =
                     [&](const std::string& typeName) -> const semantic::TypeSymbol* {
                     if (typeName.empty()) return nullptr;
+                    std::string genericTranslated = typeName;
+                    const auto ltPos = typeName.find('<');
+                    const auto gtPos = typeName.rfind('>');
+                    if (ltPos != std::string::npos && gtPos != std::string::npos && gtPos > ltPos) {
+                        std::string baseName = trimText(typeName.substr(0, ltPos));
+                        std::string argsPart = typeName.substr(ltPos + 1, gtPos - ltPos - 1);
+                        genericTranslated = baseName + "__";
+                        for (char ch : argsPart) {
+                            if (ch == ',') genericTranslated += "__";
+                            else if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '_') {
+                                genericTranslated.push_back(ch);
+                            } else if (!std::isspace(static_cast<unsigned char>(ch))) {
+                                genericTranslated.push_back('_');
+                            }
+                        }
+                    }
                     for (const auto& module : result_.modules) {
                         for (const auto& type : module.types) {
                             if (semantic::canonicalTypeName(type) == typeName ||
-                                type.name == typeName) {
+                                type.name == typeName ||
+                                type.name == genericTranslated) {
                                 return &type;
                             }
                         }
@@ -457,40 +629,231 @@ std::vector<CompletionItem> LanguageService::completion(
                     return nullptr;
                 };
 
-                if (receiverName == "this" && requesterTypeId != 0) {
-                    const auto found = types.find(requesterTypeId);
-                    if (found != types.end()) targetType = found->second;
-                }
-                if (!targetType) {
-                    for (const auto& occ : result_.symbols) {
-                        if (occ.definition && occ.sourceName == path &&
-                            occ.name == receiverName &&
-                            occ.span.start <= rawCursorOffset &&
-                            (occ.kind == semantic::SymbolKind::Local ||
-                             occ.kind == semantic::SymbolKind::Parameter ||
-                             occ.kind == semantic::SymbolKind::Field ||
-                             occ.kind == semantic::SymbolKind::Property)) {
-                            targetType = findTypeByName(occ.detail);
-                            if (targetType) break;
-                        }
-                    }
-                }
-                if (!targetType && requesterTypeId != 0) {
-                    const auto foundReq = types.find(requesterTypeId);
-                    if (foundReq != types.end()) {
-                        for (const auto& f : foundReq->second->fields) {
-                            if (f.name == receiverName) {
-                                targetType = findTypeByName(
-                                    typeDetail(f.type, f.typeName));
-                                break;
+                const auto resolveMemberOnType =
+                    [&](const semantic::TypeSymbol* owner,
+                        const std::string& memberName,
+                        bool isCall) -> std::string {
+                    std::unordered_set<semantic::SymbolId> visited;
+                    const semantic::TypeSymbol* curr = owner;
+                    while (curr && visited.insert(curr->id).second) {
+                        if (isCall) {
+                            for (const auto& method : curr->methods) {
+                                if (method.name == memberName) {
+                                    return typeDetail(method.returnType, method.returnTypeName);
+                                }
+                            }
+                        } else {
+                            for (const auto& field : curr->fields) {
+                                if (field.name == memberName) {
+                                    return typeDetail(field.type, field.typeName);
+                                }
+                            }
+                            for (const auto& prop : curr->properties) {
+                                if (prop.name == memberName) {
+                                    return typeDetail(prop.type, prop.typeName);
+                                }
+                            }
+                            for (const auto& method : curr->methods) {
+                                if (method.name == memberName) {
+                                    return typeDetail(method.returnType, method.returnTypeName);
+                                }
                             }
                         }
+                        const semantic::SymbolId baseId = curr->baseTypeId != 0
+                            ? curr->baseTypeId
+                            : (!curr->baseTypeName.empty()
+                                   ? semantic::stableTypeId(curr->baseTypeName)
+                                   : 0);
+                        const auto foundBase = types.find(baseId);
+                        curr = foundBase != types.end() ? foundBase->second : nullptr;
                     }
-                }
-                if (!targetType) {
-                    targetType = findTypeByName(receiverName);
+                    return {};
+                };
+
+                std::string currentTypeName;
+                for (std::size_t segIdx = 0; segIdx < segments.size(); ++segIdx) {
+                    std::string seg = segments[segIdx];
+                    if (seg.empty()) {
+                        currentTypeName.clear();
+                        break;
+                    }
+                    int indexCount = 0;
+                    while (!seg.empty() && seg.back() == ']') {
+                        int depth = 1;
+                        std::size_t pos = seg.size() - 1;
+                        while (pos > 0 && depth > 0) {
+                            --pos;
+                            if (seg[pos] == ']') ++depth;
+                            else if (seg[pos] == '[') --depth;
+                        }
+                        if (depth != 0) break;
+                        seg = trimText(seg.substr(0, pos));
+                        ++indexCount;
+                    }
+                    while (seg.size() >= 2 && seg.front() == '(' && seg.back() == ')') {
+                        int depth = 0;
+                        bool wrapsWhole = true;
+                        for (std::size_t k = 0; k < seg.size(); ++k) {
+                            if (seg[k] == '(') ++depth;
+                            else if (seg[k] == ')') {
+                                --depth;
+                                if (depth == 0 && k + 1 < seg.size()) {
+                                    wrapsWhole = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!wrapsWhole || depth != 0) break;
+                        seg = trimText(seg.substr(1, seg.size() - 2));
+                    }
+                    bool isCall = false;
+                    if (!seg.empty() && seg.back() == ')') {
+                        int depth = 1;
+                        std::size_t pos = seg.size() - 1;
+                        while (pos > 0 && depth > 0) {
+                            --pos;
+                            if (seg[pos] == ')') ++depth;
+                            else if (seg[pos] == '(') --depth;
+                        }
+                        if (depth == 0 && pos > 0) {
+                            seg = trimText(seg.substr(0, pos));
+                            isCall = true;
+                        }
+                    }
+                    if (seg.size() > 4 && seg.rfind("new ", 0) == 0) {
+                        seg = trimText(seg.substr(4));
+                        isCall = true;
+                    }
+
+                    std::string resolvedSegType;
+                    if (segIdx == 0) {
+                        if (seg == "this" && requesterTypeId != 0) {
+                            const auto found = types.find(requesterTypeId);
+                            if (found != types.end()) resolvedSegType = found->second->name;
+                        }
+                        if (resolvedSegType.empty() && isCall) {
+                            if (requesterTypeId != 0) {
+                                const auto foundReq = types.find(requesterTypeId);
+                                if (foundReq != types.end()) {
+                                    resolvedSegType =
+                                        resolveMemberOnType(foundReq->second, seg, true);
+                                }
+                            }
+                            if (resolvedSegType.empty()) {
+                                for (const auto& module : result_.modules) {
+                                    for (const auto& fn : module.functions) {
+                                        if (fn.name == seg) {
+                                            std::string retName;
+                                            if (fn.returnTypeId != 0) {
+                                                const auto foundRet = types.find(fn.returnTypeId);
+                                                if (foundRet != types.end()) {
+                                                    retName = foundRet->second->name;
+                                                }
+                                            }
+                                            resolvedSegType = typeDetail(fn.returnType, retName);
+                                            break;
+                                        }
+                                    }
+                                    if (!resolvedSegType.empty()) break;
+                                }
+                            }
+                            if (resolvedSegType.empty()) {
+                                if (const auto* ctorType = findTypeByName(seg)) {
+                                    resolvedSegType = ctorType->name;
+                                }
+                            }
+                        }
+                        if (resolvedSegType.empty() && !isCall) {
+                            const semantic::SymbolOccurrence* bestLocal = nullptr;
+                            for (const auto& occ : result_.symbols) {
+                                if (occ.definition && occ.sourceName == path &&
+                                    occ.name == seg &&
+                                    occ.span.start <= rawCursorOffset &&
+                                    (occ.kind == semantic::SymbolKind::Local ||
+                                     occ.kind == semantic::SymbolKind::Parameter ||
+                                     occ.kind == semantic::SymbolKind::Field ||
+                                     occ.kind == semantic::SymbolKind::Property)) {
+                                    if (!bestLocal || occ.span.start >= bestLocal->span.start) {
+                                        bestLocal = &occ;
+                                    }
+                                }
+                            }
+                            if (bestLocal && !bestLocal->detail.empty()) {
+                                resolvedSegType = bestLocal->detail;
+                            }
+                        }
+                        if (resolvedSegType.empty() && requesterTypeId != 0) {
+                            const auto foundReq = types.find(requesterTypeId);
+                            if (foundReq != types.end()) {
+                                resolvedSegType =
+                                    resolveMemberOnType(foundReq->second, seg, isCall);
+                            }
+                        }
+                        if (resolvedSegType.empty()) {
+                            if (const auto* namedType = findTypeByName(seg)) {
+                                resolvedSegType = namedType->name;
+                            }
+                        }
+                    } else {
+                        if (currentTypeName == "string") {
+                            if (seg == "Length" || seg == "Count" || seg == "IndexOf") {
+                                resolvedSegType = "int";
+                            } else if (seg == "IsEmpty" || seg == "Contains" ||
+                                       seg == "StartsWith" || seg == "EndsWith") {
+                                resolvedSegType = "bool";
+                            } else if (seg == "Substring" || seg == "Trim" ||
+                                       seg == "Replace" || seg == "ToUpper" ||
+                                       seg == "ToLower") {
+                                resolvedSegType = "string";
+                            }
+                        } else if (currentTypeName.size() > 2 &&
+                                   currentTypeName.substr(currentTypeName.size() - 2) == "[]") {
+                            if (seg == "length" || seg == "Length" || seg == "Count") {
+                                resolvedSegType = "int";
+                            }
+                        } else if (const auto* ownerType = findTypeByName(currentTypeName)) {
+                            resolvedSegType = resolveMemberOnType(ownerType, seg, isCall);
+                        }
+                    }
+
+                    for (int idx = 0; idx < indexCount; ++idx) {
+                        if (resolvedSegType.size() > 2 &&
+                            resolvedSegType.substr(resolvedSegType.size() - 2) == "[]") {
+                            resolvedSegType.resize(resolvedSegType.size() - 2);
+                        }
+                    }
+                    currentTypeName = std::move(resolvedSegType);
+                    if (currentTypeName.empty()) break;
                 }
 
+                if (currentTypeName == "string") {
+                    std::vector<CompletionItem> stringItems = {
+                        {"Contains", "bool Contains(string value)", semantic::SymbolKind::Function},
+                        {"Count", "int", semantic::SymbolKind::Property},
+                        {"EndsWith", "bool EndsWith(string suffix)", semantic::SymbolKind::Function},
+                        {"IndexOf", "int IndexOf(string value)", semantic::SymbolKind::Function},
+                        {"IsEmpty", "bool", semantic::SymbolKind::Property},
+                        {"Length", "int", semantic::SymbolKind::Property},
+                        {"Replace", "string Replace(string oldValue, string newValue)", semantic::SymbolKind::Function},
+                        {"StartsWith", "bool StartsWith(string prefix)", semantic::SymbolKind::Function},
+                        {"Substring", "string Substring(int start, int length)", semantic::SymbolKind::Function},
+                        {"ToLower", "string ToLower()", semantic::SymbolKind::Function},
+                        {"ToUpper", "string ToUpper()", semantic::SymbolKind::Function},
+                        {"Trim", "string Trim()", semantic::SymbolKind::Function},
+                    };
+                    return stringItems;
+                }
+                if (currentTypeName.size() > 2 &&
+                    currentTypeName.substr(currentTypeName.size() - 2) == "[]") {
+                    std::vector<CompletionItem> arrayItems = {
+                        {"Count", "int", semantic::SymbolKind::Property},
+                        {"Length", "int", semantic::SymbolKind::Property},
+                        {"length", "int", semantic::SymbolKind::Property},
+                    };
+                    return arrayItems;
+                }
+
+                const semantic::TypeSymbol* targetType = findTypeByName(currentTypeName);
                 if (targetType) {
                     std::vector<CompletionItem> memberItems;
                     std::set<std::pair<std::string, std::string>> seenMembers;
@@ -569,7 +932,7 @@ std::vector<CompletionItem> LanguageService::completion(
     const std::vector<std::string> keywords = {
         "module", "import", "class", "struct", "enum", "interface",
         "delegate", "event", "sequence", "yield", "wait_ticks", "wait_seconds", "wait_event", "wait_until",
-        "static",
+        "static", "const",
         "public", "private", "protected", "internal", "abstract", "virtual",
         "override", "sealed", "base", "return", "if", "else", "while",
         "for", "foreach", "do", "break", "continue", "switch", "case",
@@ -749,6 +1112,43 @@ std::vector<Location> LanguageService::references(
     const auto symbol = resolve(path, position);
     if (!token || !symbol) return {};
     std::vector<Location> output;
+
+    if (symbol->id != 0) {
+        bool hasAnySymbolOccurrence = false;
+        std::set<std::tuple<std::string, std::size_t, std::size_t>> seenSpans;
+        for (const auto& occ : result_.symbols) {
+            if (occ.id != symbol->id) continue;
+            if (documents_.find(occ.sourceName) == documents_.end() &&
+                ambientDocuments_.find(occ.sourceName) == ambientDocuments_.end()) {
+                continue;
+            }
+            hasAnySymbolOccurrence = true;
+            const bool definitionLocation =
+                occ.definition ||
+                (occ.sourceName == symbol->location.path &&
+                 occ.span.start == symbol->location.range.span.start);
+            if (!includeDefinition && definitionLocation) continue;
+            if (seenSpans.emplace(occ.sourceName, occ.span.start, occ.span.length).second) {
+                output.push_back({occ.sourceName, rangeFor(occ.sourceName, occ.span)});
+            }
+        }
+        if (includeDefinition &&
+            (documents_.find(symbol->location.path) != documents_.end() ||
+             ambientDocuments_.find(symbol->location.path) != ambientDocuments_.end())) {
+            const auto defSpan = symbol->location.range.span;
+            if (seenSpans.emplace(symbol->location.path, defSpan.start, defSpan.length).second) {
+                output.push_back(symbol->location);
+            }
+        }
+        if (hasAnySymbolOccurrence || symbol->kind != semantic::SymbolKind::Type) {
+            std::sort(output.begin(), output.end(), [](const auto& left, const auto& right) {
+                if (left.path != right.path) return left.path < right.path;
+                return left.range.span.start < right.range.span.start;
+            });
+            return output;
+        }
+    }
+
     for (const auto& [documentPath, value] : documents_) {
         text::SourceText source(value.content, documentPath);
         diagnostics::DiagnosticBag diagnostics;
