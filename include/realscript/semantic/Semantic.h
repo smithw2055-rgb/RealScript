@@ -1058,6 +1058,8 @@ private:
     [[nodiscard]] std::unique_ptr<BoundExpression> makeVariableAccess(
         const VariableSymbol& variable, text::TextSpan span);
     [[nodiscard]] const FunctionSymbol* findScheduleFunction() const noexcept;
+    [[nodiscard]] std::unique_ptr<BoundExpression> bindSequenceYieldDelay(
+        const syntax::YieldWaitStatementSyntax& yieldSyntax);
     void appendSequenceRestartCancellation(
         BoundBlockStatement& result,
         const FunctionBindingInput& input);

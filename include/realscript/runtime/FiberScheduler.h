@@ -29,6 +29,10 @@ struct FixedPoint32 {
     constexpr FixedPoint32() noexcept = default;
     constexpr explicit FixedPoint32(std::int32_t rawValue) noexcept : raw(rawValue) {}
 
+    [[nodiscard]] static constexpr FixedPoint32 fromRaw(std::int32_t rawValue) noexcept {
+        return FixedPoint32(rawValue);
+    }
+
     [[nodiscard]] static constexpr FixedPoint32 fromInt(std::int32_t val) noexcept {
         return FixedPoint32(val * SCALE);
     }
@@ -46,6 +50,7 @@ struct FixedPoint32 {
         return static_cast<double>(raw) / static_cast<double>(SCALE);
     }
 
+    constexpr FixedPoint32 operator-() const noexcept { return FixedPoint32(-raw); }
     constexpr FixedPoint32 operator+(FixedPoint32 rhs) const noexcept { return FixedPoint32(raw + rhs.raw); }
     constexpr FixedPoint32 operator-(FixedPoint32 rhs) const noexcept { return FixedPoint32(raw - rhs.raw); }
     constexpr FixedPoint32 operator*(FixedPoint32 rhs) const noexcept {

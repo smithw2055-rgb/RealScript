@@ -368,6 +368,10 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_fiber_scheduler_tests
         realscript.fiber-scheduler
         tests/fiber_scheduler_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_engine_integration_evolution_tests
+        realscript.engine-integration-evolution
+        tests/engine_integration_evolution_tests.cpp)
     set(REALSCRIPT_PHASE20_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/phase20")
     realscript_add_aot_library(

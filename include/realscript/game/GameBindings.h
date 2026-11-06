@@ -148,6 +148,10 @@ public:
     }
 
     [[nodiscard]] std::vector<compiler::SourceFile> generatedSources() const;
+    [[nodiscard]] std::vector<compiler::SourceFile> exportDeclarationStubs() const;
+    [[nodiscard]] std::string exportProjectConfigJson(
+        const std::string& projectName,
+        const std::vector<std::string>& sourcePaths = {}) const;
     [[nodiscard]] std::set<std::string> nativeModules() const;
     [[nodiscard]] const std::unordered_set<std::string>& nativeBindingNames() const noexcept;
     [[nodiscard]] bool valid() const noexcept;

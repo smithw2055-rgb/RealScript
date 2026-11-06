@@ -812,6 +812,85 @@ const FunctionSymbol* Binder::findScheduleFunction() const noexcept {
     return nullptr;
 }
 
+std::unique_ptr<BoundExpression> Binder::bindSequenceYieldDelay(
+    const syntax::YieldWaitStatementSyntax& yieldSyntax) {
+    auto delayExpr = bindExpression(*yieldSyntax.delay);
+    if (yieldSyntax.waitTicksToken.text != "wait_seconds") {
+        return convertExpression(
+            std::move(delayExpr),
+            PrimitiveType::Int,
+            yieldSyntax.delay->span(),
+            "sequence wait_ticks delay");
+    }
+
+    const FunctionSymbol* tpsFunc = nullptr;
+    const auto foundTps = visibleFunctions_.find("TicksPerSecond");
+    if (foundTps != visibleFunctions_.end()) {
+        for (const auto& candidate : foundTps->second) {
+            if (!candidate.method && candidate.parameters.empty() &&
+                candidate.returnType == PrimitiveType::Int) {
+                tpsFunc = &candidate;
+                break;
+            }
+        }
+    }
+
+    std::unique_ptr<BoundExpression> tickRateExpr;
+    if (tpsFunc) {
+        auto call = std::make_unique<BoundCallExpression>();
+        call->type = PrimitiveType::Int;
+        call->span = yieldSyntax.waitTicksToken.span;
+        call->function = *tpsFunc;
+        tickRateExpr = std::move(call);
+    } else {
+        auto lit = std::make_unique<BoundLiteralExpression>();
+        lit->type = PrimitiveType::Int;
+        lit->value = std::int64_t{60};
+        lit->span = yieldSyntax.waitTicksToken.span;
+        tickRateExpr = std::move(lit);
+    }
+
+    if (delayExpr->type == PrimitiveType::Double ||
+        delayExpr->type == PrimitiveType::Float) {
+        auto leftDouble = convertExpression(
+            std::move(delayExpr),
+            PrimitiveType::Double,
+            yieldSyntax.delay->span(),
+            "sequence wait_seconds delay");
+        auto rightDouble = convertExpression(
+            std::move(tickRateExpr),
+            PrimitiveType::Double,
+            yieldSyntax.waitTicksToken.span,
+            "sequence wait_seconds tick rate");
+        auto mul = std::make_unique<BoundBinaryExpression>();
+        mul->type = PrimitiveType::Double;
+        mul->operatorKind = BoundBinaryOperatorKind::Multiplication;
+        mul->span = yieldSyntax.delay->span();
+        mul->left = std::move(leftDouble);
+        mul->right = std::move(rightDouble);
+
+        auto castToInt = std::make_unique<BoundConversionExpression>();
+        castToInt->type = PrimitiveType::Int;
+        castToInt->conversion = ConversionKind::Numeric;
+        castToInt->span = yieldSyntax.delay->span();
+        castToInt->expression = std::move(mul);
+        return castToInt;
+    }
+
+    auto leftInt = convertExpression(
+        std::move(delayExpr),
+        PrimitiveType::Int,
+        yieldSyntax.delay->span(),
+        "sequence wait_seconds delay");
+    auto mul = std::make_unique<BoundBinaryExpression>();
+    mul->type = PrimitiveType::Int;
+    mul->operatorKind = BoundBinaryOperatorKind::Multiplication;
+    mul->span = yieldSyntax.delay->span();
+    mul->left = std::move(leftInt);
+    mul->right = std::move(tickRateExpr);
+    return mul;
+}
+
 void Binder::appendSequenceRestartCancellation(
     BoundBlockStatement& result,
     const FunctionBindingInput& input) {
@@ -1030,11 +1109,7 @@ Binder::bindSingleYieldLoopSequence(const FunctionBindingInput& input) {
         callback->span = yieldSyntax.waitTicksToken.span;
         callback->value = input.sequenceNextCallback->name;
         call->arguments.push_back(std::move(callback));
-        call->arguments.push_back(convertExpression(
-            bindExpression(*yieldSyntax.delay),
-            PrimitiveType::Int,
-            yieldSyntax.delay->span(),
-            "sequence wait_ticks delay"));
+        call->arguments.push_back(bindSequenceYieldDelay(yieldSyntax));
         auto statement = std::make_unique<BoundExpressionStatement>();
         statement->span = yieldSyntax.span();
         const auto* receiver = lookupVariable("this");
@@ -1207,9 +1282,7 @@ Binder::bindSingleYieldBranchSequence(const FunctionBindingInput& input) {
         callback->span = yieldSyntax.waitTicksToken.span;
         callback->value = input.sequenceNextCallback->name;
         call->arguments.push_back(std::move(callback));
-        call->arguments.push_back(convertExpression(
-            bindExpression(*yieldSyntax.delay), PrimitiveType::Int,
-            yieldSyntax.delay->span(), "sequence wait_ticks delay"));
+        call->arguments.push_back(bindSequenceYieldDelay(yieldSyntax));
         auto timerAssignment =
             std::make_unique<BoundMemberAssignmentExpression>();
         timerAssignment->type = input.sequenceTimerField.type;
@@ -1690,9 +1763,7 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                 callback->value = input.sequenceNextCallback->name;
                 callback->span = yield.waitTicksToken.span;
                 call->arguments.push_back(std::move(callback));
-                call->arguments.push_back(convertExpression(
-                    bindExpression(*yield.delay), PrimitiveType::Int,
-                    yield.delay->span(), "sequence wait_ticks delay"));
+                call->arguments.push_back(bindSequenceYieldDelay(yield));
                 auto timer = std::make_unique<BoundMemberAssignmentExpression>();
                 timer->type = input.sequenceTimerField.type;
                 timer->span = yield.span();
@@ -2458,11 +2529,7 @@ std::unique_ptr<BoundBlockStatement> Binder::bindSequenceSegment(
             callback->value = input.sequenceNextCallback->name;
             call->arguments.push_back(std::move(callback));
 
-            call->arguments.push_back(convertExpression(
-                bindExpression(*yieldSyntax.delay),
-                PrimitiveType::Int,
-                yieldSyntax.delay->span(),
-                "sequence wait_ticks delay"));
+            call->arguments.push_back(bindSequenceYieldDelay(yieldSyntax));
 
             auto statement = std::make_unique<BoundExpressionStatement>();
             statement->span = yieldSyntax.span();

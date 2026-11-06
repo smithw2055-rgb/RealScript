@@ -1264,10 +1264,11 @@ std::unique_ptr<StatementSyntax> Parser::parseYieldStatement() {
     auto result = std::make_unique<YieldWaitStatementSyntax>();
     result->yieldKeyword = match(SyntaxKind::YieldKeyword);
     result->waitTicksToken = match(SyntaxKind::IdentifierToken);
-    if (result->waitTicksToken.text != "wait_ticks") {
+    if (result->waitTicksToken.text != "wait_ticks" &&
+        result->waitTicksToken.text != "wait_seconds") {
         diagnostics_.report(
             "RS1113",
-            "yield currently supports only wait_ticks(expression)",
+            "yield currently supports only wait_ticks(expression) or wait_seconds(expression)",
             result->waitTicksToken.span);
     }
     result->openParenToken = match(SyntaxKind::OpenParenToken);

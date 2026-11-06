@@ -39,7 +39,7 @@ runtime::ExecutionResult ScriptRuntime::invoke(
             runtime::ErrorCode::InvalidArguments,
             "script method is not a valid instance method");
     }
-    if (method.descriptor.ownerTypeId != receiver.type().descriptor.id) {
+    if (!isTypeAssignable(receiver.type().descriptor.id, method.descriptor.ownerTypeId)) {
         return failedResult(
             runtime::ErrorCode::TypeMismatch,
             "script method belongs to a different receiver type");
@@ -94,15 +94,25 @@ bool ScriptRuntime::setMember(
         }
         return heap_->fieldSet(object.reference(), field.index, std::move(value), &error);
     }
-    for (const auto& property : object.type().descriptor.properties) {
-        if (property.name != name || !property.setter) continue;
-        const auto execution = invoke(
-            object, ScriptMethod{*property.setter}, {std::move(value)}, std::move(options));
-        if (!execution.succeeded) {
-            error = execution.error;
-            return false;
+    std::unordered_set<semantic::SymbolId> visited;
+    const semantic::TypeSymbol* current = &object.type().descriptor;
+    while (current && visited.insert(current->id).second) {
+        for (const auto& property : current->properties) {
+            if (property.name != name || !property.setter) continue;
+            const auto execution = invoke(
+                object, ScriptMethod{*property.setter}, {std::move(value)}, std::move(options));
+            if (!execution.succeeded) {
+                error = execution.error;
+                return false;
+            }
+            return true;
         }
-        return true;
+        const semantic::SymbolId baseId = current->baseTypeId != 0
+            ? current->baseTypeId
+            : (!current->baseTypeName.empty()
+                   ? semantic::stableTypeId(current->baseTypeName)
+                   : 0);
+        current = findTypeById(baseId);
     }
     error.code = runtime::ErrorCode::FunctionNotFound;
     error.message = "script member '" + name + "' was not found or is read-only";
@@ -129,15 +139,25 @@ std::optional<runtime::Value> ScriptRuntime::getMember(
             return value;
         }
     }
-    for (const auto& property : object.type().descriptor.properties) {
-        if (property.name != name || !property.getter) continue;
-        const auto execution = invoke(
-            object, ScriptMethod{*property.getter}, {}, std::move(options));
-        if (!execution.succeeded) {
-            error = execution.error;
-            return std::nullopt;
+    std::unordered_set<semantic::SymbolId> visited;
+    const semantic::TypeSymbol* current = &object.type().descriptor;
+    while (current && visited.insert(current->id).second) {
+        for (const auto& property : current->properties) {
+            if (property.name != name || !property.getter) continue;
+            const auto execution = invoke(
+                object, ScriptMethod{*property.getter}, {}, std::move(options));
+            if (!execution.succeeded) {
+                error = execution.error;
+                return std::nullopt;
+            }
+            return execution.value;
         }
-        return execution.value;
+        const semantic::SymbolId baseId = current->baseTypeId != 0
+            ? current->baseTypeId
+            : (!current->baseTypeName.empty()
+                   ? semantic::stableTypeId(current->baseTypeName)
+                   : 0);
+        current = findTypeById(baseId);
     }
     error.code = runtime::ErrorCode::FunctionNotFound;
     error.message = "script member '" + name + "' was not found or is write-only";

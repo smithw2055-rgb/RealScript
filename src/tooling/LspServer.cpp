@@ -112,7 +112,12 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
         return response(message, Json::Object{
             {"capabilities", Json::Object{
                 {"textDocumentSync", 1},
-                {"completionProvider", Json::Object{}},
+                {"completionProvider", Json::Object{
+                    {"triggerCharacters", Json::Array{"."}},
+                }},
+                {"signatureHelpProvider", Json::Object{
+                    {"triggerCharacters", Json::Array{"(", ","}},
+                }},
                 {"hoverProvider", true},
                 {"definitionProvider", true},
                 {"referencesProvider", true},
@@ -199,6 +204,29 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
             });
         }
         return response(message, Json(std::move(items)));
+    }
+    if (method == "textDocument/signatureHelp") {
+        const auto help = service_.signatureHelp(path, cursor);
+        if (!help) return response(message, nullptr);
+        Json::Array sigs;
+        for (const auto& sig : help->signatures) {
+            Json::Array paramsJson;
+            for (const auto& param : sig.parameters) {
+                paramsJson.emplace_back(Json::Object{
+                    {"label", param.label},
+                });
+            }
+            sigs.emplace_back(Json::Object{
+                {"label", sig.label},
+                {"documentation", sig.documentation},
+                {"parameters", Json(std::move(paramsJson))},
+            });
+        }
+        return response(message, Json::Object{
+            {"signatures", Json(std::move(sigs))},
+            {"activeSignature", static_cast<std::int64_t>(help->activeSignature)},
+            {"activeParameter", static_cast<std::int64_t>(help->activeParameter)},
+        });
     }
     if (method == "textDocument/hover") {
         const auto value = service_.hover(path, cursor);

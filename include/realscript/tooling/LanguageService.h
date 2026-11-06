@@ -47,16 +47,41 @@ struct TextEdit {
     std::string replacement;
 };
 
+struct ParameterInfo {
+    std::string label;
+    std::string type;
+};
+
+struct SignatureInfo {
+    std::string label;
+    std::string documentation;
+    std::vector<ParameterInfo> parameters;
+};
+
+struct SignatureHelp {
+    std::vector<SignatureInfo> signatures;
+    std::size_t activeSignature = 0;
+    std::size_t activeParameter = 0;
+};
+
 class LanguageService {
 public:
     void open(std::string path, std::string content, std::int64_t version = 1);
     void update(std::string path, std::string content, std::int64_t version);
     void close(const std::string& path);
 
+    void setAmbientSources(std::vector<compiler::SourceFile> sources);
+    void addAmbientSource(compiler::SourceFile source);
+    void clearAmbientSources();
+    bool loadProjectConfigJson(const std::string& jsonText);
+
     [[nodiscard]] bool contains(const std::string& path) const noexcept;
     [[nodiscard]] std::vector<std::string> documentPaths() const;
     [[nodiscard]] std::vector<LanguageDiagnostic> diagnostics(const std::string& path);
     [[nodiscard]] std::vector<CompletionItem> completion(
+        const std::string& path,
+        text::LinePosition position);
+    [[nodiscard]] std::optional<SignatureHelp> signatureHelp(
         const std::string& path,
         text::LinePosition position);
     [[nodiscard]] std::optional<HoverInfo> hover(
@@ -97,6 +122,7 @@ private:
         text::TextSpan span) const;
 
     std::unordered_map<std::string, Document> documents_;
+    std::unordered_map<std::string, Document> ambientDocuments_;
     compiler::BuildResult result_;
     compiler::BuildSnapshot snapshot_;
     bool hasSnapshot_ = false;

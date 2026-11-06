@@ -23,19 +23,68 @@ std::optional<std::shared_ptr<T>> readNativeObject(
         return std::nullopt;
     }
     const auto actualType = state->heap->objectTypeId(*reference);
-    if (!actualType || *actualType != type->typeId) {
+    if (!actualType) {
         setTypeMismatch(error, "script native-object wrapper has the wrong type");
         return std::nullopt;
     }
     const auto handleValue = state->heap->fieldGet(*reference, 0);
     if (!handleValue || !std::holds_alternative<runtime::NativeHandle>(*handleValue)) {
-        setTypeMismatch(error, "script native-object wrapper does not contain a native handle");
+        if (*actualType != type->typeId) {
+            setTypeMismatch(error, "script native-object wrapper has the wrong type");
+        } else {
+            setTypeMismatch(error, "script native-object wrapper does not contain a native handle");
+        }
+        return std::nullopt;
+    }
+    const auto handle = std::get<runtime::NativeHandle>(*handleValue);
+    if (*actualType != type->typeId && handle.typeId != type->typeId) {
+        setTypeMismatch(error, "script native-object wrapper has the wrong type");
         return std::nullopt;
     }
     auto resource = state->nativeHandles->resolve(
-        std::get<runtime::NativeHandle>(*handleValue), type->typeId, &error);
+        handle, type->typeId, &error);
     if (!resource) return std::nullopt;
     return std::static_pointer_cast<T>(std::move(resource));
+}
+
+inline runtime::Value makeFixedStructValue(Fixed value) {
+    auto storage = std::make_shared<runtime::StructStorage>();
+    storage->fields.push_back(static_cast<std::int64_t>(value.raw));
+    return runtime::StructValue{
+        semantic::stableTypeId("RealScript.Math::Fixed"),
+        std::move(storage)};
+}
+
+inline runtime::Value makeFixed16StructValue(Fixed16 value) {
+    auto storage = std::make_shared<runtime::StructStorage>();
+    storage->fields.push_back(static_cast<std::int64_t>(value.raw));
+    return runtime::StructValue{
+        semantic::stableTypeId("RealScript.Math::Fixed16"),
+        std::move(storage)};
+}
+
+inline std::optional<Fixed> extractFixedStructValue(const runtime::Value& value) {
+    const auto* structure = std::get_if<runtime::StructValue>(&value);
+    if (!structure ||
+        structure->typeId != semantic::stableTypeId("RealScript.Math::Fixed") ||
+        !structure->storage || structure->storage->fields.size() != 1) {
+        return std::nullopt;
+    }
+    const auto* raw = std::get_if<std::int64_t>(&structure->storage->fields[0]);
+    if (!raw) return std::nullopt;
+    return Fixed::fromRaw(static_cast<std::int32_t>(*raw));
+}
+
+inline std::optional<Fixed16> extractFixed16StructValue(const runtime::Value& value) {
+    const auto* structure = std::get_if<runtime::StructValue>(&value);
+    if (!structure ||
+        structure->typeId != semantic::stableTypeId("RealScript.Math::Fixed16") ||
+        !structure->storage || structure->storage->fields.size() != 1) {
+        return std::nullopt;
+    }
+    const auto* raw = std::get_if<std::int64_t>(&structure->storage->fields[0]);
+    if (!raw) return std::nullopt;
+    return Fixed16::fromRaw(static_cast<std::int32_t>(*raw));
 }
 
 template <typename T>
@@ -155,6 +204,33 @@ std::optional<RemoveCvRef<T>> readValue(
             if (text) return ValueType(*text);
         }
         setTypeMismatch(error, "expected string argument");
+    } else if constexpr (std::is_same_v<ValueType, Fixed>) {
+        if (const auto fixed = extractFixedStructValue(value)) return *fixed;
+        setTypeMismatch(error, "expected Fixed argument");
+    } else if constexpr (std::is_same_v<ValueType, Fixed16>) {
+        if (const auto fixed = extractFixed16StructValue(value)) return *fixed;
+        setTypeMismatch(error, "expected Fixed16 argument");
+    } else if constexpr (std::is_same_v<ValueType, Vec2>) {
+        const auto* structure = std::get_if<runtime::StructValue>(&value);
+        if (structure &&
+            structure->typeId == semantic::stableTypeId("RealScript.Math::Vec2") &&
+            structure->storage && structure->storage->fields.size() == 2) {
+            const auto x = extractFixedStructValue(structure->storage->fields[0]);
+            const auto y = extractFixedStructValue(structure->storage->fields[1]);
+            if (x && y) return Vec2{*x, *y};
+        }
+        setTypeMismatch(error, "expected Vec2 argument");
+    } else if constexpr (std::is_same_v<ValueType, Vec3>) {
+        const auto* structure = std::get_if<runtime::StructValue>(&value);
+        if (structure &&
+            structure->typeId == semantic::stableTypeId("RealScript.Math::Vec3") &&
+            structure->storage && structure->storage->fields.size() == 3) {
+            const auto x = extractFixedStructValue(structure->storage->fields[0]);
+            const auto y = extractFixedStructValue(structure->storage->fields[1]);
+            const auto z = extractFixedStructValue(structure->storage->fields[2]);
+            if (x && y && z) return Vec3{*x, *y, *z};
+        }
+        setTypeMismatch(error, "expected Vec3 argument");
     } else if constexpr (IsSharedPtr<ValueType>::value) {
         using Element = typename IsSharedPtr<ValueType>::Element;
         return readNativeObject<Element>(state, value, error);
@@ -210,6 +286,25 @@ std::optional<runtime::Value> writeValue(
         return runtime::Value{std::string(value)};
     } else if constexpr (std::is_same_v<ValueType, const char*>) {
         return runtime::Value{std::string(value ? value : "")};
+    } else if constexpr (std::is_same_v<ValueType, Fixed>) {
+        return makeFixedStructValue(value);
+    } else if constexpr (std::is_same_v<ValueType, Fixed16>) {
+        return makeFixed16StructValue(value);
+    } else if constexpr (std::is_same_v<ValueType, Vec2>) {
+        auto storage = std::make_shared<runtime::StructStorage>();
+        storage->fields.push_back(makeFixedStructValue(value.x));
+        storage->fields.push_back(makeFixedStructValue(value.y));
+        return runtime::StructValue{
+            semantic::stableTypeId("RealScript.Math::Vec2"),
+            std::move(storage)};
+    } else if constexpr (std::is_same_v<ValueType, Vec3>) {
+        auto storage = std::make_shared<runtime::StructStorage>();
+        storage->fields.push_back(makeFixedStructValue(value.x));
+        storage->fields.push_back(makeFixedStructValue(value.y));
+        storage->fields.push_back(makeFixedStructValue(value.z));
+        return runtime::StructValue{
+            semantic::stableTypeId("RealScript.Math::Vec3"),
+            std::move(storage)};
     } else if constexpr (IsSharedPtr<ValueType>::value) {
         using Element = typename IsSharedPtr<ValueType>::Element;
         return writeNativeObject<Element>(state, std::forward<T>(value), error);

@@ -535,6 +535,9 @@ bool installGameplayBindings(
     valid = api.function(moduleName, "CurrentTick", [host] {
         return static_cast<std::int64_t>(host->core().clock().tick());
     }) && valid;
+    valid = api.function(moduleName, "TicksPerSecond", [host] {
+        return static_cast<int>(host->core().clock().ticksPerSecond());
+    }) && valid;
     valid = api.function(moduleName, "CreateEntity", [host] {
         const auto entity = host->core().entities().create();
         return entity.valid()

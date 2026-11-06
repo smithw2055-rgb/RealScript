@@ -137,7 +137,7 @@ bool ScriptRuntime::valueMatches(
         if (typeId == 0) return true;
         const auto* reference = std::get_if<runtime::ObjectRef>(&value);
         const auto actual = reference ? heap_->objectTypeId(*reference) : std::nullopt;
-        return actual && *actual == typeId;
+        return actual && isTypeAssignable(*actual, typeId);
     }
     case semantic::PrimitiveType::Array: {
         if (typeId == 0) return true;
@@ -170,6 +170,14 @@ runtime::ExecutionResult ScriptRuntime::invokeSymbol(
         return failedResult(
             runtime::ErrorCode::InvalidProgram,
             "script runtime has no linked program image");
+    }
+    if (nativeProgram_ && backend_ != ScriptExecutionBackend::Interpreter) {
+        const auto& desc = nativeProgram_->descriptor();
+        for (std::uint32_t idx = 0; idx < desc.functionCount; ++idx) {
+            if (desc.functions && desc.functions[idx].symbolId == symbolId) {
+                return nativeProgram_->invoke(symbolId, arguments, std::move(options));
+            }
+        }
     }
     return interpreter_.invoke(symbolId, arguments, std::move(options));
 }

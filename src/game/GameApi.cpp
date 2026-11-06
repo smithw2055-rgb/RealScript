@@ -1,3 +1,4 @@
+#include "realscript/Version.h"
 #include "realscript/game/GameScripting.h"
 
 #include "realscript/diagnostics/Diagnostic.h"
@@ -29,6 +30,8 @@ std::string dummyReturn(const detail::ScriptTypeRef& type) {
     case detail::ScriptTypeCategory::Long: return "return 0;";
     case detail::ScriptTypeCategory::Double: return "return 0.0;";
     case detail::ScriptTypeCategory::String: return "return \"\";";
+    case detail::ScriptTypeCategory::Struct:
+        return "return new " + type.sourceName + "();";
     case detail::ScriptTypeCategory::NativeObject: return "return null;";
     }
     return "return;";
@@ -117,6 +120,106 @@ std::vector<compiler::SourceFile> GameApi::generatedSources() const {
         });
     }
     return result;
+}
+
+std::vector<compiler::SourceFile> GameApi::exportDeclarationStubs() const {
+    std::vector<compiler::SourceFile> result;
+    result.reserve(state_->modules.size());
+    for (const auto& [moduleName, module] : state_->modules) {
+        std::ostringstream out;
+        out << "// Auto-generated RealScript Engine API Stub\n";
+        out << "module " << moduleName << ";\n";
+        for (const auto& imported : module.imports) {
+            out << "import " << imported << ";\n";
+        }
+        if (!module.imports.empty()) out << '\n';
+
+        for (const auto typeIndex : module.nativeTypes) {
+            if (typeIndex >= state_->nativeTypes.size()) continue;
+            const auto& type = state_->nativeTypes[typeIndex];
+            out << "class " << type.name << "\n{\n";
+            out << "    handle __native;\n";
+            for (const auto& method : type.methods) {
+                out << "    " << method.returnType.sourceName << ' ' << method.name << '(';
+                writeParameters(out, method.parameters);
+                out << ") { " << dummyReturn(method.returnType) << " }\n";
+            }
+            for (const auto& property : type.properties) {
+                out << "    " << property.type.sourceName << ' ' << property.name << "\n    {\n";
+                if (property.getter) {
+                    out << "        get { " << dummyReturn(property.type) << " }\n";
+                }
+                if (property.setter) {
+                    out << "        set { return; }\n";
+                }
+                out << "    }\n";
+            }
+            out << "}\n\n";
+        }
+        for (const auto& function : module.functions) {
+            if (function.name.rfind("__rs_native_", 0) == 0) continue;
+            out << function.returnType.sourceName << ' ' << function.name << '(';
+            writeParameters(out, function.parameters);
+            out << ") { " << dummyReturn(function.returnType) << " }\n";
+        }
+
+        result.push_back({
+            sanitizeFileName(moduleName) + ".d.rs",
+            out.str(),
+        });
+    }
+    return result;
+}
+
+std::string GameApi::exportProjectConfigJson(
+    const std::string& projectName,
+    const std::vector<std::string>& sourcePaths) const {
+    const auto escapeJson = [](const std::string& text) {
+        std::string out;
+        out.reserve(text.size() + 8);
+        for (const char ch : text) {
+            switch (ch) {
+            case '\"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out.push_back(ch); break;
+            }
+        }
+        return out;
+    };
+
+    const auto stubs = exportDeclarationStubs();
+    std::ostringstream out;
+    out << "{\n";
+    out << "  \"projectName\": \"" << escapeJson(projectName) << "\",\n";
+    out << "  \"sdkVersion\": \"" << kVersionString << "\",\n";
+    out << "  \"nativeModules\": [";
+    bool firstModule = true;
+    for (const auto& [moduleName, module] : state_->modules) {
+        (void)module;
+        if (!firstModule) out << ", ";
+        firstModule = false;
+        out << "\"" << escapeJson(moduleName) << "\"";
+    }
+    out << "],\n";
+    out << "  \"sources\": [";
+    for (std::size_t i = 0; i < sourcePaths.size(); ++i) {
+        if (i != 0) out << ", ";
+        out << "\"" << escapeJson(sourcePaths[i]) << "\"";
+    }
+    out << "],\n";
+    out << "  \"ambientStubs\": [\n";
+    for (std::size_t i = 0; i < stubs.size(); ++i) {
+        out << "    {\"path\": \"" << escapeJson(stubs[i].path)
+            << "\", \"content\": \"" << escapeJson(stubs[i].content) << "\"}";
+        if (i + 1 < stubs.size()) out << ",";
+        out << "\n";
+    }
+    out << "  ]\n";
+    out << "}";
+    return out.str();
 }
 
 std::set<std::string> GameApi::nativeModules() const {

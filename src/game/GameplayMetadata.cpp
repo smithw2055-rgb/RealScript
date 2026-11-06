@@ -1,6 +1,10 @@
 #include "realscript/game/GameplayMetadata.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
+#include <unordered_set>
 
 namespace realscript::game {
 namespace {
@@ -80,6 +84,119 @@ bool ScriptMetadataRegistry::addMemberAttribute(
     if (found != attributes.end() && found->name == attribute.name) return false;
     attributes.insert(found, std::move(attribute));
     return true;
+}
+
+namespace {
+
+GameplayValue parseAttributeArgumentValue(const std::string& raw) {
+    std::size_t begin = 0;
+    std::size_t end = raw.size();
+    while (begin < end && std::isspace(static_cast<unsigned char>(raw[begin]))) {
+        ++begin;
+    }
+    while (end > begin && std::isspace(static_cast<unsigned char>(raw[end - 1]))) {
+        --end;
+    }
+    const std::string trimmed = raw.substr(begin, end - begin);
+    if (trimmed == "true") return true;
+    if (trimmed == "false") return false;
+    if (trimmed.size() >= 2 && trimmed.front() == '"' && trimmed.back() == '"') {
+        std::string unescaped;
+        unescaped.reserve(trimmed.size() - 2);
+        for (std::size_t i = 1; i + 1 < trimmed.size(); ++i) {
+            if (trimmed[i] == '\\' && i + 2 < trimmed.size()) {
+                ++i;
+                switch (trimmed[i]) {
+                case 'n': unescaped.push_back('\n'); break;
+                case 'r': unescaped.push_back('\r'); break;
+                case 't': unescaped.push_back('\t'); break;
+                default: unescaped.push_back(trimmed[i]); break;
+                }
+            } else {
+                unescaped.push_back(trimmed[i]);
+            }
+        }
+        return unescaped;
+    }
+    if (!trimmed.empty()) {
+        char* parseEnd = nullptr;
+        const long long intVal = std::strtoll(trimmed.c_str(), &parseEnd, 10);
+        if (parseEnd && *parseEnd == '\0') {
+            return static_cast<std::int64_t>(intVal);
+        }
+    }
+    return trimmed;
+}
+
+bool ingestAttributeRecords(
+    ScriptMetadataRegistry& registry,
+    const std::vector<compiler::LanguageAttributeRecord>& records,
+    std::size_t& count) {
+    static const char* const kMemberKinds[] = {
+        "::field:",
+        "::property:",
+        "::method:",
+        "::ctor:",
+        "::enum:",
+    };
+    for (const auto& record : records) {
+        ScriptAttribute attribute;
+        attribute.name = record.name;
+        for (const auto& arg : record.arguments) {
+            attribute.arguments[arg.name] = parseAttributeArgumentValue(arg.value);
+        }
+
+        bool matchedMember = false;
+        for (const char* marker : kMemberKinds) {
+            const auto pos = record.target.find(marker);
+            if (pos != std::string::npos) {
+                matchedMember = true;
+                std::string owner = record.target.substr(0, pos);
+                std::string member = record.target.substr(pos + std::strlen(marker));
+                const auto arityPos = member.find('#');
+                if (arityPos != std::string::npos) {
+                    member = member.substr(0, arityPos);
+                }
+                if (registry.addMemberAttribute(std::move(owner), std::move(member), std::move(attribute))) {
+                    ++count;
+                }
+                break;
+            }
+        }
+        if (!matchedMember) {
+            if (registry.addTypeAttribute(record.target, std::move(attribute))) {
+                ++count;
+            }
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+std::size_t ScriptMetadataRegistry::populateFromLanguageMetadata(
+    const GameLanguageMetadata& metadata) {
+    std::size_t added = 0;
+    ingestAttributeRecords(*this, metadata.attributes, added);
+    return added;
+}
+
+std::size_t ScriptMetadataRegistry::populateFromProgramImage(
+    const runtime::ProgramImage& program) {
+    std::size_t added = 0;
+    for (const auto& module : program.modules()) {
+        ingestAttributeRecords(*this, module.languageMetadata.attributes, added);
+    }
+    return added;
+}
+
+std::size_t ScriptMetadataRegistry::populateFromProgram(
+    const GameProgram& program) {
+    std::size_t added = populateFromLanguageMetadata(program.languageMetadata());
+    if (program.program()) {
+        added += populateFromProgramImage(*program.program());
+    }
+    return added;
 }
 
 const std::vector<ScriptAttribute>* ScriptMetadataRegistry::typeAttributes(
@@ -221,6 +338,94 @@ ScriptContract sceneBehaviorContract() {
             {"OnFixedUpdate", 1, false},
             {"OnDestroy", 0, false},
         }};
+}
+
+std::optional<InspectorTypeSchema> inspectTypeSchema(
+    const ScriptRuntime& runtime,
+    const ScriptMetadataRegistry& metadata,
+    const std::string& canonicalTypeName) {
+    const auto type = runtime.findType(canonicalTypeName);
+    if (!type) return std::nullopt;
+
+    InspectorTypeSchema schema;
+    schema.canonicalTypeName = type->canonicalName();
+    schema.executeInEditMode =
+        metadata.findTypeAttribute(schema.canonicalTypeName, "Tool") != nullptr ||
+        metadata.findTypeAttribute(schema.canonicalTypeName, "ExecuteInEditMode") != nullptr;
+
+    runtime::RuntimeError error;
+    auto prototype = runtime.createObject(*type, {}, error);
+
+    for (const auto& field : type->descriptor.fields) {
+        if (field.synthetic || field.name == "__native") continue;
+
+        const bool hasExport =
+            metadata.findMemberAttribute(schema.canonicalTypeName, field.name, "Export") != nullptr ||
+            metadata.findMemberAttribute(schema.canonicalTypeName, field.name, "SerializeField") != nullptr;
+        const bool isPublic =
+            field.accessibility == semantic::Accessibility::Public;
+        const bool hidden =
+            metadata.findMemberAttribute(schema.canonicalTypeName, field.name, "HideInInspector") != nullptr;
+
+        InspectorFieldSchema fieldSchema;
+        fieldSchema.name = field.name;
+        fieldSchema.type = field.type;
+        fieldSchema.typeName = field.typeName;
+        fieldSchema.exported = hasExport || isPublic;
+        fieldSchema.hiddenInInspector = hidden;
+
+        if (prototype) {
+            if (auto val = runtime.getMember(*prototype, field.name, error)) {
+                fieldSchema.defaultValue = std::move(*val);
+            }
+        }
+
+        if (const auto* rangeAttr = metadata.findMemberAttribute(
+                schema.canonicalTypeName, field.name, "Range")) {
+            const auto readIntArg = [&](const char* named, const char* positional) -> std::optional<std::int64_t> {
+                auto it = rangeAttr->arguments.find(named);
+                if (it == rangeAttr->arguments.end()) {
+                    it = rangeAttr->arguments.find(positional);
+                }
+                if (it != rangeAttr->arguments.end()) {
+                    if (const auto* v = std::get_if<std::int64_t>(&it->second)) return *v;
+                }
+                return std::nullopt;
+            };
+            fieldSchema.rangeMin = readIntArg("min", "arg0");
+            fieldSchema.rangeMax = readIntArg("max", "arg1");
+        }
+
+        if (const auto* tooltipAttr = metadata.findMemberAttribute(
+                schema.canonicalTypeName, field.name, "Tooltip")) {
+            auto it = tooltipAttr->arguments.find("text");
+            if (it == tooltipAttr->arguments.end()) {
+                it = tooltipAttr->arguments.find("arg0");
+            }
+            if (it != tooltipAttr->arguments.end()) {
+                if (const auto* v = std::get_if<std::string>(&it->second)) {
+                    fieldSchema.tooltip = *v;
+                }
+            }
+        }
+
+        if (const auto* renamedAttr = metadata.findMemberAttribute(
+                schema.canonicalTypeName, field.name, "FormerlySerializedAs")) {
+            auto it = renamedAttr->arguments.find("oldName");
+            if (it == renamedAttr->arguments.end()) {
+                it = renamedAttr->arguments.find("arg0");
+            }
+            if (it != renamedAttr->arguments.end()) {
+                if (const auto* v = std::get_if<std::string>(&it->second)) {
+                    fieldSchema.formerlySerializedAs = *v;
+                }
+            }
+        }
+
+        schema.fields.push_back(std::move(fieldSchema));
+    }
+
+    return schema;
 }
 
 } // namespace realscript::game

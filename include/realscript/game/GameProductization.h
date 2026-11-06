@@ -99,4 +99,17 @@ bool restoreScriptObject(
     runtime::RuntimeError& error,
     ScriptStatePolicy policy = {});
 
+[[nodiscard]] std::string exportScriptObjectJson(
+    const ScriptRuntime& runtime,
+    const ScriptObject& object,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy = {});
+
+bool importScriptObjectJson(
+    ScriptRuntime& runtime,
+    ScriptObject& object,
+    const std::string& jsonText,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy = {});
+
 } // namespace realscript::game

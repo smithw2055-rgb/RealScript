@@ -1,5 +1,7 @@
 #include "realscript/game/GameProductization.h"
 
+#include "realscript/tooling/Json.h"
+
 #include <algorithm>
 #include <cstring>
 #include <set>
@@ -601,6 +603,365 @@ std::optional<ScriptObjectState> decodeScriptObjectState(
         return std::nullopt;
     }
     return state;
+}
+
+namespace {
+
+const semantic::TypeSymbol* findProgramTypeById(
+    const runtime::ProgramImage* program,
+    semantic::SymbolId typeId) {
+    if (!program || typeId == 0) return nullptr;
+    for (const auto& module : program->modules()) {
+        for (const auto& type : module.types) {
+            if (type.id == typeId) return &type;
+        }
+    }
+    return nullptr;
+}
+
+bool valueToJson(
+    const runtime::ProgramImage* program,
+    const runtime::Value& value,
+    const ScriptStatePolicy& policy,
+    std::size_t depth,
+    tooling::Json& out,
+    runtime::RuntimeError& error) {
+    if (!allowedValue(value, policy, depth)) {
+        fail(error, runtime::ErrorCode::DeterminismViolation,
+            "script state contains a process-local or disallowed value");
+        return false;
+    }
+    if (std::holds_alternative<std::monostate>(value) ||
+        std::holds_alternative<runtime::NullString>(value)) {
+        out = tooling::Json(nullptr);
+    } else if (const auto* boolItem = std::get_if<bool>(&value)) {
+        out = tooling::Json(*boolItem);
+    } else if (const auto* byteItem = std::get_if<runtime::ByteValue>(&value)) {
+        out = tooling::Json(static_cast<std::int64_t>(byteItem->value));
+    } else if (const auto* sbyteItem = std::get_if<runtime::SByteValue>(&value)) {
+        out = tooling::Json(static_cast<std::int64_t>(sbyteItem->value));
+    } else if (const auto* shortItem = std::get_if<runtime::ShortValue>(&value)) {
+        out = tooling::Json(static_cast<std::int64_t>(shortItem->value));
+    } else if (const auto* ushortItem = std::get_if<runtime::UShortValue>(&value)) {
+        out = tooling::Json(static_cast<std::int64_t>(ushortItem->value));
+    } else if (const auto* intItem = std::get_if<std::int64_t>(&value)) {
+        out = tooling::Json(*intItem);
+    } else if (const auto* longItem = std::get_if<runtime::LongValue>(&value)) {
+        out = tooling::Json(longItem->value);
+    } else if (const auto* uintItem = std::get_if<runtime::UIntValue>(&value)) {
+        out = tooling::Json(static_cast<std::int64_t>(uintItem->value));
+    } else if (const auto* ulongItem = std::get_if<runtime::ULongValue>(&value)) {
+        out = tooling::Json(static_cast<std::int64_t>(ulongItem->value));
+    } else if (const auto* floatItem = std::get_if<runtime::FloatValue>(&value)) {
+        out = tooling::Json(static_cast<double>(floatItem->value));
+    } else if (const auto* doubleItem = std::get_if<double>(&value)) {
+        out = tooling::Json(*doubleItem);
+    } else if (const auto* charItem = std::get_if<runtime::CharValue>(&value)) {
+        out = tooling::Json(static_cast<std::int64_t>(charItem->value));
+    } else if (const auto* enumItem = std::get_if<runtime::EnumValue>(&value)) {
+        out = tooling::Json(enumItem->value);
+    } else if (const auto* strItem = std::get_if<std::string>(&value)) {
+        out = tooling::Json(*strItem);
+    } else if (const auto* structItem = std::get_if<runtime::StructValue>(&value)) {
+        const auto* structDesc = findProgramTypeById(program, structItem->typeId);
+        if (structDesc && structDesc->fields.size() == structItem->storage->fields.size()) {
+            tooling::Json::Object obj;
+            for (std::size_t idx = 0; idx < structDesc->fields.size(); ++idx) {
+                tooling::Json fieldJson;
+                if (!valueToJson(
+                        program,
+                        structItem->storage->fields[idx],
+                        policy,
+                        depth + 1,
+                        fieldJson,
+                        error)) {
+                    return false;
+                }
+                obj[structDesc->fields[idx].name] = std::move(fieldJson);
+            }
+            out = tooling::Json(std::move(obj));
+        } else {
+            tooling::Json::Array arr;
+            arr.reserve(structItem->storage->fields.size());
+            for (const auto& elem : structItem->storage->fields) {
+                tooling::Json fieldJson;
+                if (!valueToJson(program, elem, policy, depth + 1, fieldJson, error)) {
+                    return false;
+                }
+                arr.push_back(std::move(fieldJson));
+            }
+            out = tooling::Json(std::move(arr));
+        }
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool jsonToValue(
+    const runtime::ProgramImage* program,
+    const tooling::Json& json,
+    semantic::PrimitiveType expectedType,
+    const std::string& expectedTypeName,
+    const ScriptStatePolicy& policy,
+    std::size_t depth,
+    runtime::Value& out,
+    runtime::RuntimeError& error) {
+    if (depth > policy.maximumStructDepth) {
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "JSON script state exceeds maximum struct depth");
+        return false;
+    }
+    const semantic::SymbolId typeId =
+        semantic::isExactType(expectedType) && !expectedTypeName.empty()
+        ? semantic::stableTypeId(expectedTypeName)
+        : 0;
+
+    switch (expectedType) {
+    case semantic::PrimitiveType::Bool:
+        if (!json.isBool()) return false;
+        out = json.boolValue();
+        return true;
+    case semantic::PrimitiveType::Byte:
+        if (!json.isNumber()) return false;
+        out = runtime::ByteValue{static_cast<std::uint8_t>(json.integerValue())};
+        return true;
+    case semantic::PrimitiveType::SByte:
+        if (!json.isNumber()) return false;
+        out = runtime::SByteValue{static_cast<std::int8_t>(json.integerValue())};
+        return true;
+    case semantic::PrimitiveType::Short:
+        if (!json.isNumber()) return false;
+        out = runtime::ShortValue{static_cast<std::int16_t>(json.integerValue())};
+        return true;
+    case semantic::PrimitiveType::UShort:
+        if (!json.isNumber()) return false;
+        out = runtime::UShortValue{static_cast<std::uint16_t>(json.integerValue())};
+        return true;
+    case semantic::PrimitiveType::Int:
+        if (!json.isNumber()) return false;
+        out = json.integerValue();
+        return true;
+    case semantic::PrimitiveType::UInt:
+        if (!json.isNumber()) return false;
+        out = runtime::UIntValue{static_cast<std::uint32_t>(json.integerValue())};
+        return true;
+    case semantic::PrimitiveType::Long:
+        if (!json.isNumber()) return false;
+        out = runtime::LongValue{json.integerValue()};
+        return true;
+    case semantic::PrimitiveType::ULong:
+        if (!json.isNumber()) return false;
+        out = runtime::ULongValue{static_cast<std::uint64_t>(json.integerValue())};
+        return true;
+    case semantic::PrimitiveType::Float:
+        if (!policy.allowDoubles || !json.isNumber()) return false;
+        out = runtime::FloatValue{static_cast<float>(json.numberValue())};
+        return true;
+    case semantic::PrimitiveType::Double:
+        if (!policy.allowDoubles || !json.isNumber()) return false;
+        out = json.numberValue();
+        return true;
+    case semantic::PrimitiveType::Char:
+        if (!json.isNumber()) return false;
+        out = runtime::CharValue{static_cast<char16_t>(json.integerValue())};
+        return true;
+    case semantic::PrimitiveType::String:
+        if (json.isNull()) {
+            out = runtime::NullString{};
+            return true;
+        }
+        if (!policy.allowStrings || !json.isString()) return false;
+        out = json.stringValue();
+        return true;
+    case semantic::PrimitiveType::Enum: {
+        if (typeId == 0) return false;
+        if (json.isNumber()) {
+            out = runtime::EnumValue{typeId, json.integerValue()};
+            return true;
+        }
+        if (json.isString()) {
+            const auto* enumDesc = findProgramTypeById(program, typeId);
+            if (enumDesc) {
+                for (const auto& member : enumDesc->enumMembers) {
+                    if (member.name == json.stringValue()) {
+                        out = runtime::EnumValue{typeId, member.value};
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+    case semantic::PrimitiveType::Struct: {
+        const auto* structDesc = findProgramTypeById(program, typeId);
+        if (!structDesc || structDesc->kind != semantic::TypeKind::Struct) return false;
+        auto storage = std::make_shared<runtime::StructStorage>();
+        storage->fields.resize(structDesc->fields.size());
+        if (json.isObject()) {
+            for (std::size_t idx = 0; idx < structDesc->fields.size(); ++idx) {
+                const auto& fDesc = structDesc->fields[idx];
+                const auto* fJson = json.find(fDesc.name);
+                if (!fJson || !jsonToValue(
+                        program,
+                        *fJson,
+                        fDesc.type,
+                        fDesc.typeName,
+                        policy,
+                        depth + 1,
+                        storage->fields[idx],
+                        error)) {
+                    return false;
+                }
+            }
+            out = runtime::StructValue{typeId, std::move(storage)};
+            return true;
+        }
+        if (json.isArray() && json.arrayValue().size() == structDesc->fields.size()) {
+            for (std::size_t idx = 0; idx < structDesc->fields.size(); ++idx) {
+                const auto& fDesc = structDesc->fields[idx];
+                if (!jsonToValue(
+                        program,
+                        json.arrayValue()[idx],
+                        fDesc.type,
+                        fDesc.typeName,
+                        policy,
+                        depth + 1,
+                        storage->fields[idx],
+                        error)) {
+                    return false;
+                }
+            }
+            out = runtime::StructValue{typeId, std::move(storage)};
+            return true;
+        }
+        return false;
+    }
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
+std::string exportScriptObjectJson(
+    const ScriptRuntime& runtime,
+    const ScriptObject& object,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy) {
+    if (!object.valid()) {
+        fail(error, runtime::ErrorCode::InvalidObjectReference,
+            "cannot export JSON for an invalid script object");
+        return {};
+    }
+    const auto& fields = object.type().descriptor.fields;
+    if (fields.size() > policy.maximumFields) {
+        fail(error, runtime::ErrorCode::DeterminismViolation,
+            "script object has too many fields for the state policy");
+        return {};
+    }
+
+    tooling::Json::Object fieldsObj;
+    for (const auto& field : fields) {
+        if (field.name == "__native" &&
+            field.type == semantic::PrimitiveType::Handle) {
+            continue;
+        }
+        auto value = runtime.heap()->fieldGet(object.reference(), field.index);
+        if (!value) {
+            fail(error, runtime::ErrorCode::InvalidObjectReference,
+                "failed to read script field '" + field.name + "'");
+            return {};
+        }
+        tooling::Json fieldJson;
+        if (!valueToJson(
+                runtime.program().get(), *value, policy, 0, fieldJson, error)) {
+            return {};
+        }
+        fieldsObj[field.name] = std::move(fieldJson);
+    }
+
+    tooling::Json::Object root;
+    root["version"] = static_cast<std::int64_t>(kScriptObjectStateVersion);
+    root["type"] = object.type().canonicalName();
+    root["fields"] = tooling::Json(std::move(fieldsObj));
+    return tooling::Json(std::move(root)).dump();
+}
+
+bool importScriptObjectJson(
+    ScriptRuntime& runtime,
+    ScriptObject& object,
+    const std::string& jsonText,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy) {
+    if (!object.valid()) {
+        fail(error, runtime::ErrorCode::InvalidObjectReference,
+            "cannot import JSON into an invalid script object");
+        return false;
+    }
+    std::string parseError;
+    const auto parsed = tooling::Json::parse(jsonText, parseError);
+    if (!parsed || !parsed->isObject()) {
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "malformed script object JSON: " + parseError);
+        return false;
+    }
+    const auto* versionJson = parsed->find("version");
+    const auto* typeJson = parsed->find("type");
+    const auto* fieldsJson = parsed->find("fields");
+    if (!versionJson || !versionJson->isNumber() ||
+        versionJson->integerValue() != static_cast<std::int64_t>(kScriptObjectStateVersion) ||
+        !typeJson || !typeJson->isString() ||
+        typeJson->stringValue() != object.type().canonicalName() ||
+        !fieldsJson || !fieldsJson->isObject()) {
+        fail(error, runtime::ErrorCode::TypeMismatch,
+            "script object JSON header or type is incompatible with target object");
+        return false;
+    }
+
+    const auto& descriptors = object.type().descriptor.fields;
+    if (descriptors.size() > policy.maximumFields) {
+        fail(error, runtime::ErrorCode::DeterminismViolation,
+            "script object has too many fields for the state policy");
+        return false;
+    }
+
+    std::vector<std::pair<std::string, runtime::Value>> decodedFields;
+    decodedFields.reserve(descriptors.size());
+    for (const auto& desc : descriptors) {
+        if (desc.name == "__native" &&
+            desc.type == semantic::PrimitiveType::Handle) {
+            continue;
+        }
+        const auto* fieldJson = fieldsJson->find(desc.name);
+        if (!fieldJson) {
+            continue;
+        }
+        runtime::Value decodedValue;
+        if (!jsonToValue(
+                runtime.program().get(),
+                *fieldJson,
+                desc.type,
+                desc.typeName,
+                policy,
+                0,
+                decodedValue,
+                error)) {
+            if (error.code == runtime::ErrorCode::None) {
+                fail(error, runtime::ErrorCode::TypeMismatch,
+                    "script object JSON field '" + desc.name + "' type mismatch");
+            }
+            return false;
+        }
+        decodedFields.push_back({desc.name, std::move(decodedValue)});
+    }
+
+    for (const auto& entry : decodedFields) {
+        if (!runtime.setMember(object, entry.first, entry.second, error)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace realscript::game

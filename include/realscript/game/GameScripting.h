@@ -1,8 +1,23 @@
 #pragma once
 
+#include "realscript/aot_cpp/AotRuntime.h"
 #include "realscript/game/GameBindings.h"
+#include "realscript/jit/Jit.h"
 
 namespace realscript::game {
+
+class ScriptMetadataRegistry;
+
+enum class ScriptExecutionBackend {
+    Interpreter,
+    Jit,
+    Aot,
+};
+
+enum class SceneExecutionMode {
+    Play,
+    Editor,
+};
 
 struct GameLanguageMetadata {
     std::vector<compiler::LanguageAttributeRecord> attributes;
@@ -165,8 +180,9 @@ public:
             error.message = "cannot wrap a null native object";
             return std::nullopt;
         }
+        const auto handleTypeId = nativeBaseTypeId(*type);
         auto handle = nativeHandles_->create(
-            type->descriptor.id,
+            handleTypeId != 0 ? handleTypeId : type->descriptor.id,
             std::static_pointer_cast<void>(std::move(object)),
             std::move(debugName));
         std::vector<runtime::Value> fields(type->descriptor.fields.size());
@@ -185,6 +201,91 @@ public:
             return std::nullopt;
         }
         return ScriptObject{*type, *reference, std::move(root)};
+    }
+
+    template <typename T>
+    bool bindNative(
+        ScriptObject& object,
+        std::shared_ptr<T> nativeObject,
+        runtime::RuntimeError& error,
+        std::string debugName = {}) const {
+        if (!object.valid()) {
+            error.code = runtime::ErrorCode::InvalidObjectReference;
+            error.message = "cannot bind a native object to an invalid script object";
+            return false;
+        }
+        if (!nativeObject) {
+            error.code = runtime::ErrorCode::NullReference;
+            error.message = "cannot bind a null native object";
+            return false;
+        }
+        const auto handleTypeId = nativeBaseTypeId(object.type());
+        if (handleTypeId == 0) {
+            error.code = runtime::ErrorCode::TypeMismatch;
+            error.message = "script object does not inherit from a native handle wrapper type";
+            return false;
+        }
+        auto handle = nativeHandles_->create(
+            handleTypeId,
+            std::static_pointer_cast<void>(std::move(nativeObject)),
+            std::move(debugName));
+        if (!heap_->fieldSet(object.reference(), 0, handle, &error)) {
+            nativeHandles_->release(handle);
+            return false;
+        }
+        return true;
+    }
+
+    template <typename T>
+    [[nodiscard]] std::optional<ScriptObject> createDerivedNative(
+        const std::string& canonicalTypeName,
+        std::shared_ptr<T> nativeObject,
+        runtime::RuntimeError& error,
+        const std::vector<runtime::Value>& constructorArguments = {},
+        runtime::ExecutionOptions options = {},
+        std::string debugName = {}) const {
+        if (!nativeObject) {
+            error.code = runtime::ErrorCode::NullReference;
+            error.message = "cannot bind a null native object";
+            return std::nullopt;
+        }
+        const auto type = findType(canonicalTypeName);
+        if (!type) {
+            error.code = runtime::ErrorCode::FunctionNotFound;
+            error.message = "script type '" + canonicalTypeName + "' was not found";
+            return std::nullopt;
+        }
+        const auto handleTypeId = nativeBaseTypeId(*type);
+        if (handleTypeId == 0) {
+            error.code = runtime::ErrorCode::TypeMismatch;
+            error.message = "script type '" + canonicalTypeName +
+                "' does not inherit from a native handle wrapper type";
+            return std::nullopt;
+        }
+        auto object = allocateUninitializedObject(*type, error);
+        if (!object) return std::nullopt;
+        if (!bindNative(*object, std::move(nativeObject), error, std::move(debugName))) {
+            return std::nullopt;
+        }
+        if (!runObjectConstructor(*object, constructorArguments, error, std::move(options))) {
+            releaseNative(*object);
+            return std::nullopt;
+        }
+        return object;
+    }
+
+    [[nodiscard]] bool isNativeAlive(const ScriptObject& object) const noexcept;
+    bool releaseNative(ScriptObject& object) const noexcept;
+    [[nodiscard]] bool isTypeAssignable(
+        semantic::SymbolId actualTypeId,
+        semantic::SymbolId expectedTypeId) const noexcept;
+    void replaceProgram(const GameProgram& program);
+
+    void setAotBackend(const aot::ProgramDescriptor* descriptor);
+    void setJitBackend(std::shared_ptr<jit::Module> jitModule);
+    void clearNativeBackend() noexcept;
+    [[nodiscard]] ScriptExecutionBackend activeBackend() const noexcept {
+        return backend_;
     }
 
     [[nodiscard]] runtime::ExecutionResult invoke(
@@ -220,6 +321,17 @@ public:
     }
 
 private:
+    friend class SceneScriptRuntime;
+    [[nodiscard]] semantic::SymbolId nativeBaseTypeId(
+        const ScriptType& type) const noexcept;
+    [[nodiscard]] std::optional<ScriptObject> allocateUninitializedObject(
+        const ScriptType& type,
+        runtime::RuntimeError& error) const;
+    bool runObjectConstructor(
+        ScriptObject& object,
+        const std::vector<runtime::Value>& constructorArguments,
+        runtime::RuntimeError& error,
+        runtime::ExecutionOptions options) const;
     [[nodiscard]] const semantic::TypeSymbol* findTypeById(
         semantic::SymbolId typeId) const;
     [[nodiscard]] runtime::Value defaultValue(
@@ -243,9 +355,21 @@ private:
     std::shared_ptr<runtime::ManagedHeap> heap_;
     std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles_;
     runtime::Interpreter interpreter_;
+    ScriptExecutionBackend backend_ = ScriptExecutionBackend::Interpreter;
+    std::shared_ptr<jit::Module> jitModule_;
+    std::shared_ptr<aot::Program> nativeProgram_;
 };
 
 using SceneEntityId = std::uint64_t;
+
+struct SceneHotReloadReport {
+    bool succeeded = false;
+    std::size_t instancesMigrated = 0;
+    std::size_t fieldsMigrated = 0;
+    std::size_t fieldsRenamed = 0;
+    std::size_t fieldsDefaulted = 0;
+    std::vector<std::string> errors;
+};
 
 struct SceneScriptError {
     SceneEntityId entity = 0;
@@ -287,15 +411,40 @@ public:
         SceneEntityId entity,
         const std::string& scriptType,
         SceneScriptOptions options = {});
+    bool attachComponent(
+        SceneEntityId entity,
+        const std::string& scriptType,
+        SceneScriptOptions options = {});
     bool detach(SceneEntityId entity);
+    bool detachComponent(SceneEntityId entity, const std::string& scriptType);
     bool setEnabled(SceneEntityId entity, bool enabled);
+    bool setComponentEnabled(
+        SceneEntityId entity,
+        const std::string& scriptType,
+        bool enabled);
     void start();
     void update(double deltaTime);
     void fixedUpdate(double fixedDeltaTime);
     void lateUpdate(double deltaTime);
 
+    void setExecutionMode(SceneExecutionMode mode) noexcept {
+        executionMode_ = mode;
+    }
+    [[nodiscard]] SceneExecutionMode executionMode() const noexcept {
+        return executionMode_;
+    }
+
+    [[nodiscard]] SceneHotReloadReport hotReload(
+        const GameProgram& newProgram,
+        const ScriptMetadataRegistry* metadata = nullptr);
+
     [[nodiscard]] runtime::ExecutionResult invoke(
         SceneEntityId entity,
+        const std::string& callback,
+        const std::vector<runtime::Value>& arguments = {});
+    [[nodiscard]] runtime::ExecutionResult invokeComponent(
+        SceneEntityId entity,
+        const std::string& scriptType,
         const std::string& callback,
         const std::vector<runtime::Value>& arguments = {});
     bool dispatch(const ScriptEvent& event);
@@ -314,6 +463,14 @@ public:
     }
     void clearErrors() { errors_.clear(); }
     [[nodiscard]] ScriptObject* object(SceneEntityId entity);
+    [[nodiscard]] ScriptObject* getComponent(
+        SceneEntityId entity,
+        const std::string& typeOrInterfaceName);
+    [[nodiscard]] std::vector<ScriptObject*> getComponents(SceneEntityId entity);
+    [[nodiscard]] bool hasComponent(
+        SceneEntityId entity,
+        const std::string& typeOrInterfaceName) const;
+    [[nodiscard]] std::size_t componentCount(SceneEntityId entity) const noexcept;
 
 private:
     struct MethodCacheEntry {
@@ -327,6 +484,7 @@ private:
         ScriptObject object;
         bool enabled = true;
         bool started = false;
+        bool executeInEditMode = false;
         std::optional<ScriptMethod> onCreate0;
         std::optional<ScriptMethod> onCreate1;
         std::optional<ScriptMethod> onStart;
@@ -337,6 +495,12 @@ private:
         std::optional<ScriptMethod> onLateUpdate;
         std::optional<ScriptMethod> onDestroy;
     };
+
+    void bindLifecycleMethods(Instance& instance) const;
+    [[nodiscard]] bool shouldTickInCurrentMode(const Instance& instance) const noexcept;
+    [[nodiscard]] bool matchesComponentType(
+        const ScriptType& componentType,
+        const std::string& query) const;
 
     [[nodiscard]] const ScriptMethod* findCachedMethod(
         const ScriptType& type,
@@ -356,11 +520,17 @@ private:
 
     ScriptRuntime& runtime_;
     runtime::ExecutionOptions executionOptions_;
-    std::map<SceneEntityId, Instance> instances_;
+    SceneExecutionMode executionMode_ = SceneExecutionMode::Play;
+    std::map<SceneEntityId, std::vector<Instance>> instances_;
     std::map<std::size_t, std::vector<MethodCacheEntry>> methodCache_;
     std::vector<ScriptEvent> eventQueue_;
     std::map<std::string, ScriptTrigger> triggers_;
     std::vector<SceneScriptError> errors_;
 };
+
+bool installSceneComponentBindings(
+    GameApi& api,
+    SceneScriptRuntime& scene,
+    std::string moduleName = "RealScript.Scene");
 
 } // namespace realscript::game

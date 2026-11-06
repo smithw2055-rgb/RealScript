@@ -2,6 +2,7 @@
 
 #include "realscript/syntax/Syntax.h"
 #include "realscript/text/Text.h"
+#include "realscript/tooling/Json.h"
 
 #include <algorithm>
 #include <cctype>
@@ -54,6 +55,50 @@ void LanguageService::close(const std::string& path) {
     dirty_ = true;
 }
 
+void LanguageService::setAmbientSources(std::vector<compiler::SourceFile> sources) {
+    ambientDocuments_.clear();
+    for (auto& src : sources) {
+        ambientDocuments_[std::move(src.path)] = {std::move(src.content), 1};
+    }
+    dirty_ = true;
+}
+
+void LanguageService::addAmbientSource(compiler::SourceFile source) {
+    ambientDocuments_[std::move(source.path)] = {std::move(source.content), 1};
+    dirty_ = true;
+}
+
+void LanguageService::clearAmbientSources() {
+    ambientDocuments_.clear();
+    dirty_ = true;
+}
+
+bool LanguageService::loadProjectConfigJson(const std::string& jsonText) {
+    std::string error;
+    const auto parsed = Json::parse(jsonText, error);
+    if (!parsed || !parsed->isObject()) return false;
+    const auto* ambientArr = parsed->find("ambientStubs");
+    if (!ambientArr) {
+        ambientArr = parsed->find("ambientSources");
+    }
+    if (!ambientArr) {
+        ambientArr = parsed->find("generatedModules");
+    }
+    if (!ambientArr || !ambientArr->isArray()) return false;
+    ambientDocuments_.clear();
+    for (const auto& entry : ambientArr->arrayValue()) {
+        if (!entry.isObject()) continue;
+        const auto* pathVal = entry.find("path");
+        const auto* contentVal = entry.find("content");
+        if (!pathVal || !pathVal->isString() || !contentVal || !contentVal->isString()) {
+            continue;
+        }
+        ambientDocuments_[pathVal->stringValue()] = {contentVal->stringValue(), 1};
+    }
+    dirty_ = true;
+    return true;
+}
+
 bool LanguageService::contains(const std::string& path) const noexcept {
     return documents_.find(path) != documents_.end();
 }
@@ -76,6 +121,19 @@ const compiler::BuildResult& LanguageService::build() {
 
 void LanguageService::rebuild() {
     compiler::Compilation compilation;
+    std::vector<std::string> ambientPaths;
+    ambientPaths.reserve(ambientDocuments_.size());
+    for (const auto& [path, documentValue] : ambientDocuments_) {
+        (void)documentValue;
+        if (documents_.find(path) == documents_.end()) {
+            ambientPaths.push_back(path);
+        }
+    }
+    std::sort(ambientPaths.begin(), ambientPaths.end());
+    for (const auto& path : ambientPaths) {
+        compilation.addSource({path, ambientDocuments_.at(path).content});
+    }
+
     std::vector<std::string> paths;
     paths.reserve(documents_.size());
     for (const auto& [path, documentValue] : documents_) {
@@ -94,7 +152,9 @@ void LanguageService::rebuild() {
 
 const LanguageService::Document* LanguageService::document(const std::string& path) const noexcept {
     const auto found = documents_.find(path);
-    return found == documents_.end() ? nullptr : &found->second;
+    if (found != documents_.end()) return &found->second;
+    const auto ambientFound = ambientDocuments_.find(path);
+    return ambientFound == ambientDocuments_.end() ? nullptr : &ambientFound->second;
 }
 
 debug::SourceRange LanguageService::rangeFor(
@@ -153,7 +213,8 @@ std::vector<DocumentSymbol> LanguageService::allDefinitions() const {
                       std::string name, std::string detail,
                       const std::string& path, text::TextSpan span) {
         if (id == 0 || path.empty() ||
-            documents_.find(path) == documents_.end() ||
+            (documents_.find(path) == documents_.end() &&
+             ambientDocuments_.find(path) == ambientDocuments_.end()) ||
             !identifier(name) || generatedNames.find(name) != generatedNames.end() ||
             !seen.insert(id).second) {
             return;
@@ -344,10 +405,171 @@ std::vector<CompletionItem> LanguageService::completion(
         }
         return true;
     };
+    const auto* doc = document(path);
+    const auto computeByteOffset = [&](text::LinePosition pos) -> std::size_t {
+        if (!doc) return 0;
+        std::size_t line = 0;
+        std::size_t start = 0;
+        while (line < pos.line && start < doc->content.size()) {
+            const auto next = doc->content.find('\n', start);
+            if (next == std::string::npos) return doc->content.size();
+            start = next + 1;
+            ++line;
+        }
+        return std::min(start + pos.column, doc->content.size());
+    };
+    const auto rawCursorOffset = computeByteOffset(position);
+
+    if (doc && rawCursorOffset > 0) {
+        std::size_t scan = rawCursorOffset;
+        while (scan > 0 &&
+               (std::isalnum(static_cast<unsigned char>(doc->content[scan - 1])) ||
+                doc->content[scan - 1] == '_')) {
+            --scan;
+        }
+        if (scan > 0 && doc->content[scan - 1] == '.') {
+            std::size_t recvEnd = scan - 1;
+            while (recvEnd > 0 &&
+                   std::isspace(static_cast<unsigned char>(doc->content[recvEnd - 1]))) {
+                --recvEnd;
+            }
+            std::size_t recvStart = recvEnd;
+            while (recvStart > 0 &&
+                   (std::isalnum(static_cast<unsigned char>(doc->content[recvStart - 1])) ||
+                    doc->content[recvStart - 1] == '_')) {
+                --recvStart;
+            }
+            const std::string receiverName =
+                doc->content.substr(recvStart, recvEnd - recvStart);
+            if (!receiverName.empty()) {
+                const semantic::TypeSymbol* targetType = nullptr;
+                const auto findTypeByName =
+                    [&](const std::string& typeName) -> const semantic::TypeSymbol* {
+                    if (typeName.empty()) return nullptr;
+                    for (const auto& module : result_.modules) {
+                        for (const auto& type : module.types) {
+                            if (semantic::canonicalTypeName(type) == typeName ||
+                                type.name == typeName) {
+                                return &type;
+                            }
+                        }
+                    }
+                    return nullptr;
+                };
+
+                if (receiverName == "this" && requesterTypeId != 0) {
+                    const auto found = types.find(requesterTypeId);
+                    if (found != types.end()) targetType = found->second;
+                }
+                if (!targetType) {
+                    for (const auto& occ : result_.symbols) {
+                        if (occ.definition && occ.sourceName == path &&
+                            occ.name == receiverName &&
+                            occ.span.start <= rawCursorOffset &&
+                            (occ.kind == semantic::SymbolKind::Local ||
+                             occ.kind == semantic::SymbolKind::Parameter ||
+                             occ.kind == semantic::SymbolKind::Field ||
+                             occ.kind == semantic::SymbolKind::Property)) {
+                            targetType = findTypeByName(occ.detail);
+                            if (targetType) break;
+                        }
+                    }
+                }
+                if (!targetType && requesterTypeId != 0) {
+                    const auto foundReq = types.find(requesterTypeId);
+                    if (foundReq != types.end()) {
+                        for (const auto& f : foundReq->second->fields) {
+                            if (f.name == receiverName) {
+                                targetType = findTypeByName(
+                                    typeDetail(f.type, f.typeName));
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!targetType) {
+                    targetType = findTypeByName(receiverName);
+                }
+
+                if (targetType) {
+                    std::vector<CompletionItem> memberItems;
+                    std::set<std::pair<std::string, std::string>> seenMembers;
+                    std::unordered_set<semantic::SymbolId> visitedTypes;
+                    const semantic::TypeSymbol* curr = targetType;
+                    while (curr && visitedTypes.insert(curr->id).second) {
+                        for (const auto& field : curr->fields) {
+                            if (field.synthetic) continue;
+                            if (!accessAllowed(
+                                    field.accessibility,
+                                    field.declaringTypeId != 0 ? field.declaringTypeId : curr->id,
+                                    curr->moduleName)) {
+                                continue;
+                            }
+                            const auto detailStr = typeDetail(field.type, field.typeName);
+                            if (seenMembers.emplace(field.name, detailStr).second) {
+                                memberItems.push_back(
+                                    {field.name, detailStr, semantic::SymbolKind::Field});
+                            }
+                        }
+                        for (const auto& prop : curr->properties) {
+                            if (!accessAllowed(
+                                    prop.accessibility,
+                                    prop.declaringTypeId != 0 ? prop.declaringTypeId : curr->id,
+                                    curr->moduleName)) {
+                                continue;
+                            }
+                            const auto detailStr = typeDetail(prop.type, prop.typeName);
+                            if (seenMembers.emplace(prop.name, detailStr).second) {
+                                memberItems.push_back(
+                                    {prop.name, detailStr, semantic::SymbolKind::Property});
+                            }
+                        }
+                        for (const auto& method : curr->methods) {
+                            if (method.synthetic) continue;
+                            if (!accessAllowed(
+                                    method.accessibility,
+                                    method.declaringTypeId != 0 ? method.declaringTypeId : curr->id,
+                                    curr->moduleName)) {
+                                continue;
+                            }
+                            const auto detailStr = functionDetail(method);
+                            if (seenMembers.emplace(method.name, detailStr).second) {
+                                memberItems.push_back(
+                                    {method.name, detailStr, semantic::SymbolKind::Function});
+                            }
+                        }
+                        for (const auto& enumMember : curr->enumMembers) {
+                            const auto detailStr = std::to_string(enumMember.value);
+                            if (seenMembers.emplace(enumMember.name, detailStr).second) {
+                                memberItems.push_back(
+                                    {enumMember.name, detailStr, semantic::SymbolKind::EnumMember});
+                            }
+                        }
+                        const semantic::SymbolId baseId = curr->baseTypeId != 0
+                            ? curr->baseTypeId
+                            : (!curr->baseTypeName.empty()
+                                   ? semantic::stableTypeId(curr->baseTypeName)
+                                   : 0);
+                        const auto foundBase = types.find(baseId);
+                        curr = foundBase != types.end() ? foundBase->second : nullptr;
+                    }
+                    std::sort(
+                        memberItems.begin(),
+                        memberItems.end(),
+                        [](const auto& left, const auto& right) {
+                            return left.label < right.label;
+                        });
+                    return memberItems;
+                }
+            }
+        }
+    }
+
     std::vector<CompletionItem> output;
     const std::vector<std::string> keywords = {
         "module", "import", "class", "struct", "enum", "interface",
-        "delegate", "event", "sequence", "yield", "wait_ticks", "static",
+        "delegate", "event", "sequence", "yield", "wait_ticks", "wait_seconds",
+        "static",
         "public", "private", "protected", "internal", "abstract", "virtual",
         "override", "sealed", "base", "return", "if", "else", "while",
         "for", "foreach", "do", "break", "continue", "switch", "case",
@@ -376,6 +598,127 @@ std::vector<CompletionItem> LanguageService::completion(
         return left.label < right.label;
     });
     return output;
+}
+
+std::optional<SignatureHelp> LanguageService::signatureHelp(
+    const std::string& path,
+    text::LinePosition position) {
+    (void)build();
+    const auto* doc = document(path);
+    if (!doc) return std::nullopt;
+
+    std::size_t line = 0;
+    std::size_t start = 0;
+    while (line < position.line && start < doc->content.size()) {
+        const auto next = doc->content.find('\n', start);
+        if (next == std::string::npos) {
+            start = doc->content.size();
+            break;
+        }
+        start = next + 1;
+        ++line;
+    }
+    const std::size_t cursorOffset = std::min(start + position.column, doc->content.size());
+    if (cursorOffset == 0) return std::nullopt;
+
+    int parenDepth = 0;
+    std::size_t activeParam = 0;
+    std::size_t openParenPos = std::string::npos;
+    for (std::size_t idx = cursorOffset; idx > 0; --idx) {
+        const char ch = doc->content[idx - 1];
+        if (ch == ')') {
+            ++parenDepth;
+        } else if (ch == '(') {
+            if (parenDepth == 0) {
+                openParenPos = idx - 1;
+                break;
+            }
+            --parenDepth;
+        } else if (ch == ',' && parenDepth == 0) {
+            ++activeParam;
+        }
+    }
+    if (openParenPos == std::string::npos) return std::nullopt;
+
+    std::size_t nameEnd = openParenPos;
+    while (nameEnd > 0 && std::isspace(static_cast<unsigned char>(doc->content[nameEnd - 1]))) {
+        --nameEnd;
+    }
+    std::size_t nameStart = nameEnd;
+    while (nameStart > 0 &&
+           (std::isalnum(static_cast<unsigned char>(doc->content[nameStart - 1])) ||
+            doc->content[nameStart - 1] == '_')) {
+        --nameStart;
+    }
+    const std::string calleeName = doc->content.substr(nameStart, nameEnd - nameStart);
+    if (calleeName.empty()) return std::nullopt;
+
+    SignatureHelp help;
+    help.activeParameter = activeParam;
+    std::set<std::string> seenLabels;
+
+    auto addFunctionSymbol = [&](const semantic::FunctionSymbol& fn) {
+        const std::string label = functionDetail(fn);
+        if (!seenLabels.insert(label).second) return;
+        SignatureInfo sig;
+        sig.label = label;
+        sig.documentation = fn.moduleName.empty()
+            ? fn.name
+            : (fn.ownerTypeName.empty()
+                   ? fn.moduleName + "::" + fn.name
+                   : fn.moduleName + "::" + fn.ownerTypeName + "." + fn.name);
+        const std::size_t paramBegin = fn.method && !fn.staticMethod ? 1 : 0;
+        for (std::size_t idx = paramBegin; idx < fn.parameters.size(); ++idx) {
+            const auto& param = fn.parameters[idx];
+            const auto pType = typeDetail(param.type, param.typeName);
+            sig.parameters.push_back({pType + " " + param.name, pType});
+        }
+        help.signatures.push_back(std::move(sig));
+    };
+
+    for (const auto& module : result_.modules) {
+        for (const auto& type : module.types) {
+            for (const auto& method : type.methods) {
+                if (!method.synthetic && method.name == calleeName) {
+                    addFunctionSymbol(method);
+                }
+            }
+            if (type.name == calleeName) {
+                for (const auto& ctor : type.constructors) {
+                    if (!ctor.synthetic) {
+                        addFunctionSymbol(ctor);
+                    }
+                }
+            }
+        }
+        for (const auto& fn : module.functions) {
+            if (fn.name == calleeName) {
+                semantic::FunctionSymbol sym;
+                sym.moduleName = module.name;
+                sym.name = fn.name;
+                sym.returnType = fn.returnType;
+                sym.parameters.reserve(fn.parameterTypes.size());
+                for (std::size_t idx = 0; idx < fn.parameterTypes.size(); ++idx) {
+                    semantic::VariableSymbol param;
+                    param.name = idx < fn.debugInfo.locals.size()
+                        ? fn.debugInfo.locals[idx].name
+                        : ("arg" + std::to_string(idx));
+                    param.type = fn.parameterTypes[idx];
+                    sym.parameters.push_back(std::move(param));
+                }
+                addFunctionSymbol(sym);
+            }
+        }
+    }
+
+    if (help.signatures.empty()) return std::nullopt;
+    for (std::size_t idx = 0; idx < help.signatures.size(); ++idx) {
+        if (help.signatures[idx].parameters.size() > activeParam) {
+            help.activeSignature = idx;
+            break;
+        }
+    }
+    return help;
 }
 
 std::optional<HoverInfo> LanguageService::hover(
