@@ -23,14 +23,16 @@ The bytecode verifier validates source ranges, line tables, sequence targets, lo
 
 `DebugController` binds to a linked program image and manages:
 
-- source breakpoint binding;
+- source breakpoint binding (including conditional breakpoints via `BreakpointSpec` and `setConditionalBreakpoints`);
+- same-line sequence-point re-entry suppression;
 - stop on entry;
 - pause and continue;
 - step in;
 - step over;
 - step out;
 - termination;
-- thread-safe stack and variable snapshots.
+- thread-safe stack and variable snapshots;
+- side-effect-free expression evaluation (`evaluate`) on any paused frame.
 
 Source breakpoints bind to the nearest executable sequence point when an exact source line does not contain executable code.
 
@@ -48,14 +50,15 @@ The adapter communicates through standard DAP `Content-Length` framing over stdi
 
 Implemented request families include:
 
-- `initialize`;
+- `initialize` (advertising `supportsConditionalBreakpoints` and `supportsEvaluateForHovers`);
 - `launch`;
 - `configurationDone`;
-- `setBreakpoints`;
+- `setBreakpoints` (including per-breakpoint `condition` expressions);
 - `threads`;
 - `stackTrace`;
 - `scopes`;
 - `variables`;
+- `evaluate` (watch and hover expression evaluation);
 - `continue`;
 - `next`;
 - `stepIn`;
@@ -65,7 +68,7 @@ Implemented request families include:
 
 The adapter emits asynchronous stopped and terminated events. Stopped events do not require a follow-up client request to become visible.
 
-## Stack Frames and Variables
+## Stack Frames, Variables, and Watch Evaluation
 
 A paused frame exposes:
 
@@ -75,8 +78,7 @@ A paused frame exposes:
 - locals visible in the active lexical scope;
 - runtime value formatting.
 
-Expression evaluation with arbitrary side effects is not part of the v0.2.0
-debugger.
+`DebugController::evaluate` and DAP `evaluate` provide a deterministic, side-effect-free expression evaluator supporting locals, parameters, implicit/explicit `this` fields, nested struct and object fields, array indexing (`arr[i]`), `.Length`, literals, arithmetic, comparisons, and boolean logic (`&&`, `||`, `!`). Arbitrary function-call side effects remain disallowed during evaluation.
 
 ## Language Server
 
@@ -92,13 +94,14 @@ Implemented capabilities include:
 
 - document open, change, and close notifications;
 - diagnostics;
-- completion;
+- completion (including receiver-type member `.` dot-completion);
+- signature help (`textDocument/signatureHelp` with overload parameters and active parameter tracking);
 - hover;
 - definition;
 - references;
 - rename;
 - document symbols;
-- workspace source tracking;
+- workspace source tracking, `realscript.project.json` discovery, and `.d.rs` ambient host declaration loading (`GameApi::exportDeclarationStub()`);
 - diagnostic publication.
 
 The initial synchronization model uses full-document updates.
@@ -144,7 +147,7 @@ Incompatible changes include:
 
 The compatibility analyzer returns structured rejection reasons.
 
-## Publication Semantics
+## Publication Semantics and Stateful Scene Hot Reload
 
 `EngineRuntime` publishes a compatible replacement `ProgramImage` atomically.
 
@@ -152,19 +155,24 @@ The compatibility analyzer returns structured rejection reasons.
 - New invocations observe the replacement image.
 - Old images remain alive while borrowed references or active calls still require them.
 
-Running frames are not rewritten in place.
+For structural changes during editor/gameplay iteration, `ScriptRuntime::replaceProgram` and `SceneScriptRuntime::hotReload` provide stateful instance migration:
+
+- allocates new component instances against the updated `ProgramImage`;
+- migrates matching fields and fields renamed with `[FormerlySerializedAs("oldName")]`;
+- preserves synthetic coroutine (`$sequence_*`) and event (`$event_*`) state fields;
+- recursively patches cross-component `ObjectRef` fields, arrays, and delegate targets to point to the newly migrated instances.
+
+## Chrome Tracing Profiler Export
+
+`exportChromeTraceJson(profile, &gcStats)` serializes `ExecutionProfile` function timing/instruction metrics and `GcStatistics` counters into standard Chrome Tracing / Perfetto JSON (`{"traceEvents":[...]}`) for visual flame-graph inspection in `chrome://tracing` or `ui.perfetto.dev`.
 
 ## Current Tooling Limits
 
-The v0.2.0 baseline does not include:
+The current tooling surface intentionally excludes:
 
-- conditional breakpoints;
-- data breakpoints;
-- arbitrary side-effecting expression evaluation;
-- partial-document LSP synchronization;
-- inheritance-aware navigation;
-- class-layout migration;
-- running-frame replacement;
-- coroutine-state migration.
+- data (watchpoint) breakpoints;
+- side-effecting function invocations inside watch expressions;
+- partial-document incremental LSP text sync;
+- in-place rewriting of actively executing stack frames.
 
 These limits are explicit protocol and ABI boundaries rather than silent partial behavior.

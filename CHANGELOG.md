@@ -3,6 +3,69 @@
 All notable RealScript changes are documented here. Compatibility contracts
 remain versioned but unfrozen until a future 1.0 release.
 
+## [Unreleased]
+
+### Engine integration and editor dataflow
+
+- Added script class inheritance from C++ `NativeType` wrappers with polymorphic
+  native handle unwrapping and explicit native lifecycle release (`releaseNative`,
+  `rebindNative`).
+- Extended `SceneScriptRuntime` to support multi-component entities
+  (`attachComponent`, `detachComponent`, `getComponent`, `getComponents`),
+  `SceneExecutionMode` (`Play` vs. `Editor` with `[Tool]` and
+  `[ExecuteInEditMode]`), and scene component bindings (`GetComponent`,
+  `HasComponent`, `SetComponentEnabled`).
+- Added `OnValidate()` lifecycle support and `setInspectorMember()` to trigger
+  automatic validation when modifying component fields from the editor.
+- Added host/editor signal wiring (`SceneScriptRuntime::connectSignal`) to
+  connect script `event` delegates across entities and components.
+- Auto-ingested compiler source attributes into `ScriptMetadataRegistry` and
+  added deep `InspectorTypeSchema` reflection covering `[Export]`/`[SerializeField]`,
+  `[HideInInspector]`, `[Range]`, `[Tooltip]`, `[Header]`, `[ReadOnly]`,
+  `[EntityRef]`/`[ComponentRef]`/`[AssetRef]`, enum options, recursive nested
+  struct fields, collection element/key types, and `event` signal signatures.
+- Added human-readable JSON scene/prefab serialization (`exportScriptObjectJson`
+  and `importScriptObjectJson`) with support for nested structs, arrays, and
+  cross-entity component `ObjectRef` references (`{"$entity", "$component"}`).
+- Added stateful structural hot reload (`ScriptRuntime::replaceProgram` and
+  `SceneScriptRuntime::hotReload`) supporting added/removed fields,
+  `[FormerlySerializedAs]` field renames, synthetic coroutine/event state
+  preservation, and automatic cross-component `ObjectRef` and delegate target
+  migration.
+
+### Coroutines, math, fibers, and runtime
+
+- Extended `sequence` coroutines with `yield wait_seconds(expr)`,
+  `yield wait_event(topicExpr)` (via one-shot `GameplayHost::subscribeOnce`),
+  and `yield wait_until(conditionExpr)`, plus automatic active sequence
+  cancellation when a component or entity is disabled or detached.
+- Added user-defined `operator` overloading (`+`, `-`, `*`, `/`, `%`, `==`,
+  `!=`, `<`, `<=`, `>`, `>=`, unary `-`, `!`, `~`), compound assignments
+  (`+=`, `-=`, `*=`, `/=`, `%=`), and `RealScript.Math` (`Fixed`, `Fixed16`,
+  `Vec2`, `Vec3`, `Rect`, `Transform2D`).
+- Added direct C++ binding marshaling and zero-allocation `ScriptRuntime`
+  helpers (`makeFixed`, `makeVec2`, `makeVec3`, `readFixed`, `readVec2`,
+  `readVec3`, `getMemberVec2`, `setMemberVec2`) for `Fixed`/`Fixed16`/`Vec2`/`Vec3`.
+- Added `FiberScheduler` (`RealScript.Fiber` lowering), zero-copy SoA bridges,
+  and tiered execution dispatch (`TieredExecutionPolicy`: Interpreter, JIT, AOT)
+  with hot-loop/invocation auto-promotion.
+- Optimized the bytecode interpreter with an execution mirror, arena frames,
+  and inline call caches.
+
+### Debugging, LSP, and observability
+
+- Extended `DebugController`, `DebugSession`, and `DapServer` with conditional
+  breakpoints (`BreakpointSpec`, `setConditionalBreakpoints`), same-line
+  sequence-point re-entry suppression, and side-effect-free watch/hover
+  expression evaluation (`evaluate` supporting locals, parameters, `this`
+  fields, nested struct/object fields, array indexing, `.Length`, arithmetic,
+  comparisons, and boolean operators).
+- Extended `GameApi::exportDeclarationStub()` (`.d.rs`), `LanguageService`
+  (`realscript.project.json`, ambient sources, member `.` dot-completion, and
+  `signatureHelp`), and `LspServer` (`textDocument/signatureHelp`).
+- Added `exportChromeTraceJson` to export `ExecutionProfile` and `GcStatistics`
+  in Chrome Tracing / Perfetto (`traceEvents`) JSON format.
+
 ## [0.2.0] - 2026-08-10
 
 v0.2.0 advances RealScript from the Phase 1–6 alpha baseline to the complete

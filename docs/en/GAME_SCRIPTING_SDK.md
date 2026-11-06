@@ -130,11 +130,50 @@ OnCreate(owner)
 OnStart()
 OnEnable()
 OnDisable()
+OnValidate()
 OnUpdate(double deltaTime)
 OnFixedUpdate(double fixedDeltaTime)
 OnLateUpdate(double deltaTime)
 OnDestroy()
 ```
+
+### Multi-component entities, Editor mode, and Inspector validation
+
+`SceneScriptRuntime` supports attaching multiple distinct script components to a single entity (`attachComponent`, `detachComponent`, `getComponent`, `getComponents`) and exposing script-callable component lookup via `installSceneComponentBindings`:
+
+```cpp
+realscript::game::installSceneComponentBindings(api, &scene);
+scene.attachComponent(1001, "Game::HealthComponent");
+scene.attachComponent(1001, "Game::CombatController");
+```
+
+`SceneExecutionMode` controls whether `update` / `fixedUpdate` / `lateUpdate` run on all enabled components (`SceneExecutionMode::Play`) or only components annotated with `[Tool]` or `[ExecuteInEditMode]` (`SceneExecutionMode::Editor`).
+
+Modifying a field through `scene.setInspectorMember(entity, scriptType, memberName, value)` automatically invokes the component's `OnValidate()` method so scripts can clamp or normalize editor-authored values immediately.
+
+### Host/editor signal wiring
+
+`SceneScriptRuntime::connectSignal` connects a script `event` delegate field on a source component directly to a target method on any entity/component, supporting both single and multicast bindings:
+
+```cpp
+scene.connectSignal(
+    buttonEntity, "Game::SwitchPlate", "OnPressed",
+    doorEntity,   "Game::Door",        "OnSignalReceived");
+```
+
+### Stateful scene hot reload
+
+`SceneScriptRuntime::hotReload(newProgram)` replaces the underlying `ProgramImage` while migrating live component instances across structural class changes:
+
+- preserves matching field values and `[FormerlySerializedAs("oldName")]` renamed fields;
+- preserves active coroutine (`$sequence_*`) and event (`$event_*`) synthetic fields;
+- patches cross-component `ObjectRef` fields, arrays, and bound delegate targets so references point to the newly migrated instances.
+
+### Fast-path math marshaling and tiered execution
+
+`BindingMarshal.h` and `ScriptRuntime` directly marshal `RealScript.Math` types (`Fixed`, `Fixed16`, `Vec2`, `Vec3`) between C++ (`FixedValue`, `Fixed16Value`, `Vec2Value`, `Vec3Value`) and scripts. `ScriptRuntime::getMemberVec2` and `setMemberVec2` read and mutate unshared `Vec2` struct fields in place without intermediate heap allocations.
+
+`ScriptRuntime::setTieredExecutionPolicy` configures automatic promotion from the bytecode interpreter to JIT/AOT execution when function invocation counts or loop back-edge budgets exceed configured thresholds.
 
 ## Events and triggers
 
@@ -169,4 +208,4 @@ The engine owns condition evaluation; scripts own the reaction. This keeps spati
 
 Every invocation returns `ExecutionResult`; scene failures are accumulated as `SceneScriptError` values with entity, callback, runtime error, and script stack. Stale native handles, stale managed references, wrong exact types, execution budgets, and Strict/Record/Replay binding policies remain enforced.
 
-The scene layer is engine-neutral and does not prescribe an ECS, serializer, asset format, editor, or event bus. Generic `Get<T>()`, inheritance-based behaviors, interfaces, delegates, and coroutine lifecycle methods depend on future language features.
+The scene layer is engine-neutral and does not prescribe an ECS, serializer, asset format, editor, or event bus. Script classes can directly inherit bound `NativeType` wrappers, implement interfaces, expose `InspectorTypeSchema` metadata and `event` signals, and participate in stateful hot reload.

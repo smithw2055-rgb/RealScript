@@ -81,6 +81,7 @@ The default `RealScript.Game` module exposes:
 
 ```text
 long CurrentTick()
+int TickRate()
 long CreateEntity()
 bool DestroyEntity(long entity)
 bool IsEntityAlive(long entity)
@@ -89,14 +90,27 @@ long Schedule(long target, string callback, int delayTicks)
 long ScheduleRepeating(long target, string callback,
                        int delayTicks, int intervalTicks, int repeatCount)
 bool CancelTimer(long timer)
+int CancelEntityTimers(long target)
+long SubscribeOnce(string topic, long target, string callback)
 long Publish(string topic, int delayTicks)
 ```
 
 A repeat count of zero means repeat forever. A zero delay is normalized to the next simulation tick so callbacks cannot recursively re-enter the current scheduler drain.
 
+### Deterministic coroutine sequences
+
+Source-language `sequence` methods lower to explicit state machines backed by `RealScript.Game` scheduling primitives:
+
+- `yield wait_ticks(ticks)` suspends for an exact integer tick count;
+- `yield wait_seconds(seconds)` converts seconds using `TickRate()` (clamped to at least 1 tick);
+- `yield wait_event(topic)` registers a one-shot event subscription via `SubscribeOnce(topic, entityId, resumeCallback)` and resumes when the topic is published;
+- `yield wait_until(condition)` polls `condition` once per simulation tick until it evaluates to `true`.
+
+Disabling or detaching a component in `SceneScriptRuntime` automatically invokes the generated `Cancel<SequenceName>()` methods to cancel pending timers and one-shot event subscriptions.
+
 ## Interface-like contracts
 
-RealScript still has no source-language `interface` declaration. `ScriptContract` provides an engine-level contract that validates required callback names and arities against compiled script metadata.
+In addition to native source-language `interface` declarations, `ScriptContract` provides an engine-level contract that validates required callback names and arities against compiled script metadata.
 
 ```cpp
 realscript::game::ScriptContract abilityContract{
@@ -114,11 +128,11 @@ auto report = realscript::game::validateScriptContract(
     abilityContract);
 ```
 
-This is suitable for behavior, ability, quest, AI, and editor validation. It does not add inheritance, virtual dispatch, or interface values to the language.
+This is suitable for behavior, ability, quest, AI, and editor validation.
 
-## Attribute-style metadata
+## Attribute-style metadata and Inspector schema
 
-`ScriptMetadataRegistry` stores deterministic type and member annotations for serializers, inspectors, replication, save systems, and editor tooling.
+`ScriptMetadataRegistry` stores deterministic type and member annotations for serializers, inspectors, replication, save systems, and editor tooling. Source attributes (`[Export]`, `[SerializeField]`, `[HideInInspector]`, `[Range]`, `[Tooltip]`, `[Header]`, `[ReadOnly]`, `[FormerlySerializedAs]`, `[EntityRef]`, `[ComponentRef]`, `[AssetRef]`, `[Tool]`, `[ExecuteInEditMode]`) are automatically extracted from compiled scripts into `GameProgram::metadata()`, and can also be registered from C++:
 
 ```cpp
 metadata.addTypeAttribute(
@@ -130,7 +144,7 @@ metadata.addMemberAttribute(
     {"Replicated", {{"channel", std::string{"state"}}}});
 ```
 
-Metadata is host-owned in this stage. Source syntax such as `[Serializable]` remains future compiler work.
+`inspectTypeSchema(program, metadata, typeName)` builds a rich `InspectorTypeSchema` containing field types, default values, range constraints, enum options, recursive nested struct schemas, collection element/key types, reference kinds (`Entity`/`Component`/`Asset`), `hasOnValidate`, and `event` signal signatures.
 
 ## Phase 10 — Save, replay, and rollback state
 
@@ -164,16 +178,10 @@ The codec captures gameplay scheduling state. Script object fields remain covere
 
 A `GameplayHost` is an engine-owned simulation object. Mutations and `SceneGameplayDriver::step` should run on the simulation thread. Read-only state copies may be moved to replay, diagnostics, or network workers after a snapshot has been taken.
 
-## Deliberate language boundary
+## Language and runtime integration
 
-These phases productize the game runtime without pretending that all requested C# features have been implemented. The following remain parser/compiler work:
+Source-language features from Phases 18–24 and the engine integration evolution lower directly onto these deterministic gameplay primitives:
 
-- source-language interfaces and virtual dispatch;
-- generics and generic collections;
-- lambdas, delegates, and language `event` declarations;
-- `for`, `foreach`, `switch`, and pattern matching;
-- source attributes;
-- `yield`, coroutine state-machine lowering, and `async`;
-- `ref`, `out`, mutable struct receivers, and boxing.
-
-The runtime contracts, metadata, named events, and fixed-tick sequences establish stable engine semantics that those future syntax features can lower to rather than creating a second runtime later.
+- `sequence` methods lower to explicit state machines using `Schedule`, `SubscribeOnce`, and `CancelTimer` for `yield wait_ticks`, `yield wait_seconds`, `yield wait_event`, and `yield wait_until`;
+- source `[Attribute]` declarations populate `ScriptMetadataRegistry` and `InspectorTypeSchema` automatically;
+- language `event` declarations integrate with `SceneScriptRuntime::connectSignal` and survive stateful hot reload.

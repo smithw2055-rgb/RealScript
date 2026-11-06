@@ -29,17 +29,17 @@ RealScript 是一门面向现代 C++17 游戏引擎的嵌入式强类型脚本�
 
 ## 语言与运行时特性
 
-| 领域 | v0.2.0 已实现能力 |
+| 领域 | v0.2.0+ 已实现能力 |
 |---|---|
-| 语言 | Module/import、重载、Class、单继承、Interface、Virtual Dispatch、Delegate、Closure、Event、Generic、Collection、Enum、可变 Struct、Nullable、Boxing、Pattern、Initializer、灵活参数与结构化异常。 |
-| 控制流 | `if`、`while`、`for`、`foreach`、`do/while`、`switch`、Switch Expression、`break`、`continue`、`try/catch/finally` 和确定性 `sequence`/`yield wait_ticks`。 |
+| 语言 | Module/import、重载、运算符重载、复合赋值、Class、单继承（含脚本类直接继承 C++ 绑定类型）、Interface、Virtual Dispatch、Delegate、Closure、Event、Generic、Collection、Enum、可变 Struct、Nullable、Boxing、Pattern、Initializer、灵活参数与结构化异常。 |
+| 控制流 | `if`、`while`、`for`、`foreach`、`do/while`、`switch`、Switch Expression、`break`、`continue`、`try/catch/finally`、确定性 `sequence`（`yield wait_ticks`、`wait_seconds`、`wait_event`、`wait_until`）与 `RealScript.Fiber` 协作式纤程。 |
 | 编译器 | Lexer、Parser、Binder、Flow Analysis、稳定诊断、经过验证的多基本块 Typed MIR，以及 O0/O1/O2 优化。 |
 | 字节码 | 类型化寄存器 VM、确定性 `.rsbc` 0.9 输出、0.6–0.8 兼容读取、防御性验证和结构化脚本调用栈。 |
 | 内存 | 代际 ObjectRef、精确根、增量 Mark/Sweep、写屏障、有界 GC Work、Snapshot、Retaining Path 和泄漏诊断。 |
-| 原生执行 | 确定性 C++17 AOT、C11 Module Query ABI、Source Map、类型化 Native Thunk、可选工具链 JIT 和内容寻址缓存。 |
+| 原生执行 | 确定性 C++17 AOT、C11 Module Query ABI、Source Map、类型化 Native Thunk、可选工具链 JIT、内容寻址缓存与 Interpreter/JIT/AOT 分层执行。 |
 | 确定性 | Off/Strict/Record/Replay、指令/递归/分配/堆预算、稳定 Digest、外部调用回放与跨后端差分验证。 |
-| Game SDK | 类型化 Binding、Rooted Object、Scene 生命周期、Event/Trigger、固定 Tick Gameplay Host、Sequence 调度、`RSGS` 状态编码及 Save/Replay/Rollback 辅助。 |
-| 工具链 | `rsc`、`rsaot`、`rsdebug`、`rslsp`、`rsbench`、DAP、LSP、Profile、源码元数据和函数体兼容热重载。 |
+| Game SDK | 类型化 Binding、数学原语直接封送与快路径（`Fixed`/`Fixed16`/`Vec2`/`Vec3`）、单实体多组件、Editor/Play 模式（`[Tool]`/`[ExecuteInEditMode]`）、`OnValidate`、深度 `InspectorTypeSchema` 反射、宿主 `connectSignal`、JSON 场景/预制体序列化、`RSGS` 状态编码及零拷贝 SoA 桥接。 |
+| 工具链 | `rsc`、`rsaot`、`rsdebug`、`rslsp`、`rsbench`、DAP（条件断点与无副作用 Watch 求值）、LSP（成员 `.` 补全、`signatureHelp`、`.d.rs` 宿主声明导出）、Chrome Tracing 性能导出，以及带状态结构化热重载（`[FormerlySerializedAs]` 与跨组件引用迁移）。 |
 
 完整的支持/部分支持/不支持清单见
 [C# 风格兼容矩阵](docs/zh-CN/CSHARP_COMPATIBILITY_MATRIX.md)。
@@ -227,7 +227,7 @@ RealScript 不是 CLR 兼容 C#。v0.2.0 明确不提供：
 - 通用 `Task`、线程或不受限的 `async/await`；
 - Unsafe Pointer、Ref Struct、Ref Property 或完整 Escape Analysis；
 - Exception Filter、`using`、Native Exception Interop，或异常跨越协程暂停点；
-- Operator Overload、用户自定义转换、LINQ、`dynamic`、反射代码生成或 .NET BCL；
+- 用户自定义隐式/显式转换、LINQ、`dynamic`、反射代码生成或 .NET BCL；
 - 直接进程内机器码 JIT、OSR、PGO 或 Rollback Networking Protocol；
 - Source、`.rsbc`、AOT ABI、SDK Metadata 和 Gameplay State 的长期冻结兼容性。
 

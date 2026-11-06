@@ -21,8 +21,8 @@ RealScript 采用 C# 风格语法，但不是 CLR、ECMA C# 或 .NET 标准库�
 | Nullable 值类型 | 支持 | 精确 `T?`、空条件提升结果、`HasValue`、`Value`、`GetValueOrDefault`。 |
 | Boxing/Unboxing | 支持 | 保留脚本值类型精确身份，并纳入托管堆与 GC。 |
 | 引用位置 | 部分支持 | ref 参数、局部、返回、字段、Indexer 与 ref `this`；无 unsafe 指针、ref property、ref struct 和完整逃逸分析。 |
-| Attribute | 部分支持 | 原生语法及编译器/Game SDK/产物元数据；无可执行 Attribute Class 和完整 `AttributeUsage`。 |
-| 用户运算符/转换 | 不支持 | 仅支持内建确定性运算与转换。 |
+| Attribute | 部分支持 | 原生语法及编译器/Game SDK/产物元数据，自动导入 `ScriptMetadataRegistry` 与 `InspectorTypeSchema`；无可执行 Attribute Class 和完整 `AttributeUsage`。 |
+| 用户运算符/转换 | 部分支持 | 支持自定义 `operator` 重载（`+`、`-`、`*`、`/`、`%`、`==`、`!=`、`<`、`<=`、`>`、`>=`、一元 `-`、`!`、`~`）与复合赋值（`+=`、`-=`、`*=`、`/=`、`%=`）；不支持自定义隐式/显式类型转换。 |
 | `const`、`readonly`、静态字段 | 不支持 | 支持静态方法/属性，但 Phase24 未包含这些字段形式。 |
 
 ## 表达式与控制流
@@ -34,7 +34,7 @@ RealScript 采用 C# 风格语法，但不是 CLR、ECMA C# 或 .NET 标准库�
 | 运行时类型运算 | 支持 | `is`、`as`、`typeof` 和精确运行时可赋值规则。 |
 | Pattern | 支持 | 常量、null、类型、discard、模式变量、`when` guard 和穷尽 Switch Expression。 |
 | 其他模式族 | 部分支持 | 无关系、属性、位置、列表、递归、`and`/`or`/`not` 和 Range Pattern。 |
-| Coroutine | 支持受限模型 | 单线程确定性 `sequence`、`yield wait_ticks`、状态持久化、嵌套、取消、结果、快照/Rollback。 |
+| Coroutine | 支持受限模型 | 单线程确定性 `sequence`（`yield wait_ticks`、`wait_seconds`、`wait_event`、`wait_until`）、状态持久化、嵌套、禁用/卸载自动取消、结果、快照/Rollback，以及 `RealScript.Fiber` 协作式调度。 |
 | `async`/`await`、`Task`、线程 | 不支持 | 有意排除在确定性 Gameplay 执行模型之外。 |
 
 ## 异常与清理
@@ -55,7 +55,7 @@ RealScript 采用 C# 风格语法，但不是 CLR、ECMA C# 或 .NET 标准库�
 | C++17 AOT | 支持 | 生成代码与解释器共享 MIR 语义，包括委托、值类型、Pattern 和异常。 |
 | Toolchain JIT | 平台相关 | 配置后使用外部 C++ 工具链；不是 CLR 风格进程内机器码 JIT。 |
 | `.rsbc` | Draft、带版本 | 当前输出 0.9，Decoder 支持 0.6–0.9；格式尚未冻结。 |
-| LSP/DAP/Hot Reload | 支持受限模型 | 原始源码符号和 Sequence Point、补全/Rename、带布局/元数据兼容检查的函数体热重载。 |
+| LSP/DAP/Hot Reload | 支持受限模型 | 原始源码符号与 Sequence Point、成员 `.` 补全、`signatureHelp`、`.d.rs` 宿主声明导出、条件断点、无副作用 Watch 求值，以及带状态结构化热重载（`[FormerlySerializedAs]` 与跨组件引用迁移）。 |
 | Reflection 与 `dynamic` | 不支持 | 有稳定 TypeId，但无 CLR Reflection、`dynamic`、运行时代码生成和运行时泛型构造。 |
 | 标准库 | 专用模型 | 提供确定性游戏/运行时基础能力，不是 .NET BCL。 |
 

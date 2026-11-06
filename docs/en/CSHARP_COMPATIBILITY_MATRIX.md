@@ -24,8 +24,8 @@ deliberately smaller deterministic profile.
 | Nullable value types | Supported | Exact `T?`, lifted null-conditional results, `HasValue`, `Value`, `GetValueOrDefault`. |
 | Boxing/unboxing | Supported | Exact script value-type identity with managed-heap/GC support. |
 | Reference locations | Partial | Ref parameters, locals, returns, fields, indexers, and ref `this`. No unsafe pointers, ref properties, ref structs, or full escape analysis. |
-| Attributes | Partial | Native syntax and versioned metadata for compiler/Game SDK/artifacts. No executable attribute classes or full `AttributeUsage`. |
-| User operators/conversions | Not supported | Built-in deterministic operators and conversions only. |
+| Attributes | Partial | Native syntax and versioned metadata for compiler/Game SDK/artifacts, auto-ingested into `ScriptMetadataRegistry` and `InspectorTypeSchema`. No executable attribute classes or full `AttributeUsage`. |
+| User operators/conversions | Partial | User-defined `operator` overloads (`+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, unary `-`, `!`, `~`) and compound assignments (`+=`, `-=`, `*=`, `/=`, `%=`) are supported. User-defined implicit/explicit conversions are not supported. |
 | `const`, `readonly`, static fields | Not supported | Static methods/properties are supported; these field forms are not in the Phase 24 surface. |
 
 ## Expressions and control flow
@@ -37,7 +37,7 @@ deliberately smaller deterministic profile.
 | Runtime type operators | Supported | `is`, `as`, `typeof`, exact runtime assignability. |
 | Patterns | Supported | Constant, null, type, and discard patterns; variables and `when` guards; exhaustive switch expressions. |
 | Pattern families | Partial | No relational, property, positional, list, recursive, `and`/`or`/`not`, or range patterns. |
-| Coroutines | Supported profile | Deterministic single-threaded `sequence`, `yield wait_ticks`, persisted state, nesting, cancellation, results, snapshots/rollback. |
+| Coroutines | Supported profile | Deterministic single-threaded `sequence` (`yield wait_ticks`, `wait_seconds`, `wait_event`, `wait_until`), persisted state, nesting, auto-cancellation on disable/detach, results, snapshots/rollback, plus `RealScript.Fiber` cooperative scheduling. |
 | `async`/`await`, `Task`, threads | Not supported | Deliberately outside the deterministic gameplay execution model. |
 
 ## Errors and resource cleanup
@@ -58,7 +58,7 @@ deliberately smaller deterministic profile.
 | C++17 AOT | Supported | Generated native code executes the same MIR semantics, including delegates, value types, patterns, and exceptions. |
 | Toolchain JIT | Platform-dependent | External C++ toolchain JIT where configured; it is not an in-process CLR-style machine-code JIT. |
 | `.rsbc` artifacts | Draft, versioned | Current output is 0.9; decoder supports 0.6–0.9. Format is not frozen. |
-| LSP/DAP/hot reload | Supported profile | Original-source symbols/sequence points, completion/rename, body-only hot reload with layout/metadata compatibility checks. |
+| LSP/DAP/hot reload | Supported profile | Original-source symbols/sequence points, member `.` completion, `signatureHelp`, `.d.rs` host stubs, conditional breakpoints, side-effect-free watch `evaluate`, and stateful scene hot reload (`[FormerlySerializedAs]` & cross-component ref migration). |
 | Reflection and dynamic | Not supported | Stable compile-time/runtime TypeIds exist, but no CLR reflection, `dynamic`, runtime code emission, or runtime generic construction. |
 | Standard library | Purpose-built | Deterministic game/runtime primitives and collections, not the .NET BCL. |
 
