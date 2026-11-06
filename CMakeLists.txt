@@ -52,7 +52,7 @@ add_library(realscript_frontend STATIC
     src/runtime/RuntimeServices.cpp
     src/runtime/ExecutionServices.cpp
     src/runtime/ManagedHeap.cpp
-    src/runtime/RTSFiberScheduler.cpp
+    src/runtime/FiberScheduler.cpp
     src/game/GameApi.cpp
     src/game/ScriptObjectRuntime.cpp
     src/game/ScriptInvokeRuntime.cpp
@@ -364,15 +364,10 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase24_language_completeness_tests
         realscript.phase24.language-completeness
         tests/phase24_language_completeness_tests.cpp)
-    add_executable(
-        realscript_rts_starcraft_tests
-        tests/test_rts_starcraft_integration.cpp
-        src/game/StarCraftRTSBridge.cpp
-    )
-    target_link_libraries(realscript_rts_starcraft_tests PRIVATE RealScript::Full)
-    target_compile_features(realscript_rts_starcraft_tests PRIVATE cxx_std_17)
-    realscript_enable_cxx_warnings(realscript_rts_starcraft_tests)
-    add_test(NAME realscript.rts.starcraft COMMAND realscript_rts_starcraft_tests)
+    realscript_add_cpp_test(
+        realscript_fiber_scheduler_tests
+        realscript.fiber-scheduler
+        tests/fiber_scheduler_tests.cpp)
     set(REALSCRIPT_PHASE20_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/phase20")
     realscript_add_aot_library(

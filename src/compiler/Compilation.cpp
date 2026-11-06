@@ -141,7 +141,7 @@ std::string attributeValueText(
         : std::string(source.view(span));
 }
 
-#include "Phase19Inheritance.inl"
+#include "ClassInheritance.inl"
 
 void appendNativeAttributes(
     std::vector<LanguageAttributeRecord>& output,
@@ -1865,6 +1865,34 @@ public struct Vec3 {
     return kSource;
 }
 
+const std::string& builtinFiberModuleSource() {
+    static const std::string kSource = R"RS(
+module RealScript.Fiber;
+
+public class Fiber {
+    public static void Yield(int ticks) {}
+    public static void YieldRandom(int minTicks, int maxTicks) {}
+    public static void WaitUntil(int channel, int key, int requiredValue) {}
+    public static void SetUnbreakable(bool unbreakable) {}
+    public static void Terminate() {}
+    public static void Fork(string functionName) {}
+    public static void ForkPc(int targetPc) {}
+    public static void Command(int commandId, int arg16, int arg32) {}
+    public static bool Cond(int conditionKind, int key16, int threshold16) {
+        return false;
+    }
+    public static bool Chance(int threshold255) {
+        return false;
+    }
+    public static int GetReg(int slot) {
+        return 0;
+    }
+    public static void SetReg(int slot, int value) {}
+}
+)RS";
+    return kSource;
+}
+
 } // namespace
 
 BuildResult Compilation::build(const BuildSnapshot* previous) const {
@@ -1905,17 +1933,25 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     }
 
     bool importsBuiltinMath = false;
+    bool importsBuiltinFiber = false;
     for (const auto& [name, module] : modules) {
         (void)name;
         if (module.imports.find("RealScript.Math") != module.imports.end()) {
             importsBuiltinMath = true;
-            break;
+        }
+        if (module.imports.find("RealScript.Fiber") != module.imports.end()) {
+            importsBuiltinFiber = true;
         }
     }
     if (importsBuiltinMath && modules.find("RealScript.Math") == modules.end()) {
         addSourceUnit(SourceFile{
             "$builtin/RealScript.Math.rs",
             builtinDeterministicMathModuleSource()});
+    }
+    if (importsBuiltinFiber && modules.find("RealScript.Fiber") == modules.end()) {
+        addSourceUnit(SourceFile{
+            "$builtin/RealScript.Fiber.rs",
+            builtinFiberModuleSource()});
     }
 
     specializeNativeGenerics(units, modules, result);
@@ -2127,7 +2163,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         (void)name;
         refreshVisibleInterfaces(modules, module);
     }
-    resolvePhase19Inheritance(modules, result);
+    resolveClassInheritance(modules, result);
     for (auto& [name, module] : modules) {
         (void)name;
         refreshVisibleTypes(modules, module);
@@ -2280,7 +2316,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             }
         }
     }
-    applyPhase19FieldLayouts(modules, result);
+    applyInheritedFieldLayouts(modules, result);
 
     // Declare free functions before member signatures. Member declarations
     // are then processed in one global inheritance order so file and module
@@ -2335,7 +2371,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     }
                     auto owner = *ownerPointer;
                     if (!owner.baseTypeName.empty()) {
-                        const auto* base = phase19GlobalType(
+                        const auto* base = findGlobalType(
                             modules, owner.baseTypeName);
                         if (base) {
                             owner.methods = base->methods;
@@ -2419,7 +2455,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         }
                         appendParameters(binding, methodSyntax.parameters);
                         const auto inheritedIndex =
-                            phase19PrepareVirtualMethod(
+                            prepareVirtualMethod(
                                 owner, binding.symbol, methodSyntax,
                                 module, result, unit->source->name());
                         if (inheritedIndex) {
@@ -3639,7 +3675,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             }
                         }
                     }
-                    phase19ValidateConcreteType(owner, module, result);
+                    validateConcreteClassType(owner, module, result);
                     *ownerPointer = std::move(owner);
             };
 
@@ -3658,7 +3694,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         std::unordered_set<semantic::SymbolId> visited;
         auto current = owner.baseTypeName;
         while (!current.empty()) {
-            const auto* base = phase19GlobalType(modules, current);
+            const auto* base = findGlobalType(modules, current);
             if (!base || !visited.insert(base->id).second) break;
             ++depth;
             current = base->baseTypeName;
@@ -3945,7 +3981,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     };
                 inheritRuntimeContracts(*owner);
                 if (!owner->baseTypeName.empty()) {
-                    const auto* base = phase19GlobalType(
+                    const auto* base = findGlobalType(
                         modules, owner->baseTypeName);
                     if (base) inheritRuntimeContracts(*base);
                 }
@@ -4160,7 +4196,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     : std::string{};
                 while (!current.empty()) {
                     const auto* base =
-                        phase19GlobalType(modules, current);
+                        findGlobalType(modules, current);
                     if (!base ||
                         !visited.insert(base->id).second) {
                         break;
@@ -4291,7 +4327,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 std::unordered_set<semantic::SymbolId> visited;
                 auto current = type.baseTypeName;
                 while (!current.empty()) {
-                    const auto* base = phase19GlobalType(modules, current);
+                    const auto* base = findGlobalType(modules, current);
                     if (!base || !visited.insert(base->id).second) break;
                     ++depth;
                     current = base->baseTypeName;
@@ -4327,7 +4363,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         for (auto& work : owners) {
             auto& owner = *work.type;
             if (!owner.baseTypeName.empty()) {
-                const auto* base = phase19GlobalType(
+                const auto* base = findGlobalType(
                     modules, owner.baseTypeName);
                 if (base) {
                     for (const auto& inherited :

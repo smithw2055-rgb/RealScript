@@ -1,6 +1,6 @@
 #pragma once
 
-#include "realscript/runtime/RTSFiberScheduler.h"
+#include "realscript/runtime/FiberScheduler.h"
 
 #include <cstdint>
 #include <string>

@@ -1,6 +1,6 @@
 // Included in Compilation.cpp after ModuleWork and visibility helpers.
 
-semantic::TypeSymbol* phase19OwnType(
+semantic::TypeSymbol* findOwnClassOrType(
     ModuleWork& module,
     const std::string& name) {
     for (auto& type : module.types) {
@@ -12,7 +12,7 @@ semantic::TypeSymbol* phase19OwnType(
     return nullptr;
 }
 
-const semantic::TypeSymbol* phase19GlobalType(
+const semantic::TypeSymbol* findGlobalType(
     const std::map<std::string, ModuleWork>& modules,
     const std::string& canonicalName) {
     for (const auto& [moduleName, module] : modules) {
@@ -26,13 +26,13 @@ const semantic::TypeSymbol* phase19GlobalType(
     return nullptr;
 }
 
-void resolvePhase19Inheritance(
+void resolveClassInheritance(
     std::map<std::string, ModuleWork>& modules,
     BuildResult& result) {
     for (auto& [moduleName, module] : modules) {
         for (const auto* unit : module.units) {
             for (const auto& declaration : unit->syntaxTree->classes) {
-                auto* type = phase19OwnType(
+                auto* type = findOwnClassOrType(
                     module, declaration.identifierToken.text);
                 if (!type || declaration.interfaces.empty()) continue;
                 const auto& candidate = declaration.interfaces.front();
@@ -88,12 +88,12 @@ void resolvePhase19Inheritance(
             }
             colors[type.id] = 1;
             if (!type.baseTypeName.empty()) {
-                const auto* base = phase19GlobalType(
+                const auto* base = findGlobalType(
                     modules, type.baseTypeName);
                 if (base) {
                     for (auto& [baseModuleName, baseModule] : modules) {
                         (void)baseModuleName;
-                        auto* mutableBase = phase19OwnType(
+                        auto* mutableBase = findOwnClassOrType(
                             baseModule, semantic::canonicalTypeName(*base));
                         if (mutableBase) {
                             visit(baseModule, *mutableBase);
@@ -110,7 +110,7 @@ void resolvePhase19Inheritance(
     }
 }
 
-void applyPhase19FieldLayouts(
+void applyInheritedFieldLayouts(
     std::map<std::string, ModuleWork>& modules,
     BuildResult& result) {
     std::unordered_map<semantic::SymbolId, int> complete;
@@ -125,7 +125,7 @@ void applyPhase19FieldLayouts(
                 ModuleWork* baseModule = nullptr;
                 for (auto& [name, candidateModule] : modules) {
                     (void)name;
-                    auto* candidate = phase19OwnType(
+                    auto* candidate = findOwnClassOrType(
                         candidateModule, type.baseTypeName);
                     if (candidate) {
                         base = candidate;
@@ -170,12 +170,12 @@ void applyPhase19FieldLayouts(
     }
 }
 
-std::size_t phase19VisibleParameterOffset(
+std::size_t visibleMethodParameterOffset(
     const semantic::FunctionSymbol& function) noexcept {
     return function.method && !function.staticMethod ? 1u : 0u;
 }
 
-bool phase19SameMethodSignature(
+bool sameInheritedMethodSignature(
     const semantic::FunctionSymbol& left,
     const semantic::FunctionSymbol& right) {
     if (left.name != right.name ||
@@ -184,8 +184,8 @@ bool phase19SameMethodSignature(
         left.returnTypeName != right.returnTypeName) {
         return false;
     }
-    const auto leftOffset = phase19VisibleParameterOffset(left);
-    const auto rightOffset = phase19VisibleParameterOffset(right);
+    const auto leftOffset = visibleMethodParameterOffset(left);
+    const auto rightOffset = visibleMethodParameterOffset(right);
     if (left.parameters.size() - leftOffset !=
         right.parameters.size() - rightOffset) {
         return false;
@@ -203,7 +203,7 @@ bool phase19SameMethodSignature(
     return true;
 }
 
-std::optional<std::size_t> phase19PrepareVirtualMethod(
+std::optional<std::size_t> prepareVirtualMethod(
     semantic::TypeSymbol& owner,
     semantic::FunctionSymbol& method,
     const syntax::FunctionDeclarationSyntax& syntaxTree,
@@ -251,7 +251,7 @@ std::optional<std::size_t> phase19PrepareVirtualMethod(
     for (std::size_t index = 0; index < owner.methods.size(); ++index) {
         const auto& candidate = owner.methods[index];
         if (candidate.declaringTypeId == owner.id ||
-            !phase19SameMethodSignature(candidate, method)) {
+            !sameInheritedMethodSignature(candidate, method)) {
             continue;
         }
         inheritedIndex = index;
@@ -308,7 +308,7 @@ std::optional<std::size_t> phase19PrepareVirtualMethod(
     return std::nullopt;
 }
 
-void phase19ValidateConcreteType(
+void validateConcreteClassType(
     const semantic::TypeSymbol& owner,
     ModuleWork& module,
     BuildResult& result) {

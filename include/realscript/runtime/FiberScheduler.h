@@ -3,50 +3,59 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
 #include <vector>
+
+namespace realscript::mir {
+struct Module;
+} // namespace realscript::mir
 
 namespace realscript::runtime {
 
 /**
- * Generic Deterministic Fixed-Point primitive (Signed 32-bit storage with FracBits fractional bits).
- * Ensures 100% bit-identical cross-platform lockstep simulation, physics, and replay verification
- * across all game genres (RTS, fighting, physics, bullet-hell) without IEEE-754 float drift.
+ * Generic Deterministic Fixed-Point Arithmetic Template (`FixedPoint32<FracBits>`).
+ * Eliminates IEEE-754 floating-point non-determinism across x86_64 and ARM64 lockstep peers.
+ * - `FixedPoint32<8>`  (Q24.8): 1/256th unit precision for 2D/tile/pixel coordinates
+ * - `FixedPoint32<16>` (Q16.16): 1/65536th unit precision for 3D physics & angular math
  */
-template <std::uint8_t FracBits>
+template <std::uint32_t FracBits>
 struct FixedPoint32 {
-    static_assert(FracBits > 0 && FracBits < 31, "FracBits must be between 1 and 30");
-    static constexpr std::int32_t Scale = (1 << FracBits);
-
+    static_assert(FracBits > 0 && FracBits < 31, "FracBits must be in [1, 30]");
+    static constexpr std::int32_t SCALE = (1 << FracBits);
     std::int32_t raw{0};
 
     constexpr FixedPoint32() noexcept = default;
-    constexpr explicit FixedPoint32(std::int32_t rawVal) noexcept : raw(rawVal) {}
+    constexpr explicit FixedPoint32(std::int32_t rawValue) noexcept : raw(rawValue) {}
 
-    [[nodiscard]] static constexpr FixedPoint32 fromRaw(std::int32_t rawVal) noexcept {
-        return FixedPoint32(rawVal);
+    [[nodiscard]] static constexpr FixedPoint32 fromInt(std::int32_t val) noexcept {
+        return FixedPoint32(val * SCALE);
     }
-    [[nodiscard]] static constexpr FixedPoint32 fromInt(std::int32_t v) noexcept {
-        return FixedPoint32(v << FracBits);
+
+    [[nodiscard]] static constexpr FixedPoint32 fromFloat(double val) noexcept {
+        return FixedPoint32(static_cast<std::int32_t>(
+            val * static_cast<double>(SCALE) + (val >= 0.0 ? 0.5 : -0.5)));
     }
-    [[nodiscard]] static constexpr FixedPoint32 fromFloat(double v) noexcept {
-        return FixedPoint32(static_cast<std::int32_t>(v * static_cast<double>(Scale)));
+
+    [[nodiscard]] constexpr std::int32_t toIntFloor() const noexcept {
+        return raw >> FracBits;
     }
-    [[nodiscard]] constexpr std::int32_t toIntFloor() const noexcept { return raw >> FracBits; }
+
     [[nodiscard]] constexpr double toDouble() const noexcept {
-        return static_cast<double>(raw) / static_cast<double>(Scale);
+        return static_cast<double>(raw) / static_cast<double>(SCALE);
     }
 
-    constexpr FixedPoint32 operator+() const noexcept { return *this; }
-    constexpr FixedPoint32 operator-() const noexcept { return FixedPoint32(-raw); }
     constexpr FixedPoint32 operator+(FixedPoint32 rhs) const noexcept { return FixedPoint32(raw + rhs.raw); }
     constexpr FixedPoint32 operator-(FixedPoint32 rhs) const noexcept { return FixedPoint32(raw - rhs.raw); }
     constexpr FixedPoint32 operator*(FixedPoint32 rhs) const noexcept {
-        return FixedPoint32(static_cast<std::int32_t>((static_cast<std::int64_t>(raw) * rhs.raw) >> FracBits));
+        std::int64_t prod = static_cast<std::int64_t>(raw) * static_cast<std::int64_t>(rhs.raw);
+        return FixedPoint32(static_cast<std::int32_t>(prod >> FracBits));
     }
     constexpr FixedPoint32 operator/(FixedPoint32 rhs) const noexcept {
-        return rhs.raw != 0
-            ? FixedPoint32(static_cast<std::int32_t>((static_cast<std::int64_t>(raw) << FracBits) / rhs.raw))
-            : FixedPoint32(0);
+        if (rhs.raw == 0) return FixedPoint32(0);
+        std::int64_t num = (static_cast<std::int64_t>(raw) << FracBits);
+        return FixedPoint32(static_cast<std::int32_t>(num / rhs.raw));
     }
     constexpr bool operator==(FixedPoint32 rhs) const noexcept { return raw == rhs.raw; }
     constexpr bool operator!=(FixedPoint32 rhs) const noexcept { return raw != rhs.raw; }
@@ -131,13 +140,25 @@ enum class FiberOpcode : std::uint8_t {
     Nop = 0,
     LoadInt,                // regs[regOrSlot] = static_cast<int32_t>(imm32)
     LoadFixed24_8,          // regs[regOrSlot] = FixedPoint raw value in imm32
+    MoveReg,                // regs[regOrSlot] = regs[srcA]
     Add,                    // regs[regOrSlot] = regs[srcA] + regs[srcB]
     Sub,                    // regs[regOrSlot] = regs[srcA] - regs[srcB]
+    Mul,                    // regs[regOrSlot] = regs[srcA] * regs[srcB]
+    Div,                    // regs[regOrSlot] = (regs[srcB] != 0) ? (regs[srcA] / regs[srcB]) : 0
+    Mod,                    // regs[regOrSlot] = (regs[srcB] != 0) ? (regs[srcA] % regs[srcB]) : 0
+    CmpEq,                  // regs[regOrSlot] = (regs[srcA] == regs[srcB]) ? 1 : 0
+    CmpNe,                  // regs[regOrSlot] = (regs[srcA] != regs[srcB]) ? 1 : 0
+    CmpLt,                  // regs[regOrSlot] = (regs[srcA] <  regs[srcB]) ? 1 : 0
+    CmpLe,                  // regs[regOrSlot] = (regs[srcA] <= regs[srcB]) ? 1 : 0
+    CmpGt,                  // regs[regOrSlot] = (regs[srcA] >  regs[srcB]) ? 1 : 0
+    CmpGe,                  // regs[regOrSlot] = (regs[srcA] >= regs[srcB]) ? 1 : 0
     Jump,                   // pc = imm32
+    JumpIfZero,             // if (regs[regOrSlot] == 0) pc = imm32 else ++pc
+    JumpIfNonZero,          // if (regs[regOrSlot] != 0) pc = imm32 else ++pc
     Call,                   // push(pc + 1); pc = imm32
     Return,                 // pop(pc) or terminate if callDepth == 0
     RandJump,               // BT_ProbabilitySelector: if (prng.nextByte255() < flags) pc = imm32
-    HostCondJump,           // BT_ConditionDecorator / Switch: if (host->onEvaluateCondition(fiber, flags, regOrSlot, imm32)) pc = target
+    HostCondJump,           // BT_ConditionDecorator / Switch: if (host->onEvaluateCondition(fiber, flags, srcA, srcB)) pc = regOrSlot
     YieldTicks,             // Suspends fiber on O(1) Timing Wheel for imm32 ticks (or random [regOrSlot..imm32] if flags != 0)
     YieldUntilPredicate,    // Suspends fiber until notifyBlackboardEvent(ownerGroup, flags, regOrSlot, >= imm32) fires
     ForkFiber,              // BT_Parallel / Daemon: Spawns concurrent child fiber at targetPc = imm32
@@ -145,8 +166,6 @@ enum class FiberOpcode : std::uint8_t {
     SetUnbreakable,         // Sets fiber.unbreakableSection = (flags != 0) to guard critical animation/action windows
     HostCommand             // Invokes host->onHostCommand(fiber, flags, regOrSlot, imm32) for zero-copy ECS/Blackboard writes
 };
-
-using RTSOpcode = FiberOpcode;
 
 /**
  * Cache-Aligned 8-Byte (64-bit) Hot-Loop Instruction representation.
@@ -184,7 +203,7 @@ enum class FiberStatus : std::uint8_t {
  * Purely POD / Trivially Copyable Fiber Execution Context (zero raw pointers).
  * Safe for cross-process binary snapshots, network rollback, and hot-reload.
  */
-struct RTSFiberContext {
+struct FiberContext {
     std::uint32_t fiberId{0};
     std::uint32_t parentFiberId{0};
     std::uint32_t programId{0};
@@ -207,9 +226,9 @@ struct RTSFiberContext {
 };
 
 /**
- * Generic Host Callback Interface for DeterministicFiberScheduler.
- * Specific games (RTS, Fighting, Action RPG, Bullet-Hell) implement this interface
- * in their own adapter layer to bridge generic opcodes to their ECS SoA buffers & AI Blackboards.
+ * Generic Host Callback Interface for FiberScheduler.
+ * Specific game adapters implement this interface to bridge generic opcodes
+ * to their ECS SoA buffers & AI Blackboards.
  */
 struct IFiberHostCallbacks {
     virtual ~IFiberHostCallbacks() = default;
@@ -222,14 +241,14 @@ struct IFiberHostCallbacks {
      * @param arg32      32-bit parameter (`ins.imm32`).
      */
     virtual void onHostCommand(
-        RTSFiberContext& fiber,
+        FiberContext& fiber,
         std::uint8_t commandId,
         std::uint16_t arg16,
         std::uint32_t arg32) noexcept = 0;
 
     /**
      * Invoked by `FiberOpcode::HostCondJump` to evaluate game-specific blackboard/world predicates
-     * (e.g. enemy faction/race check, resource threshold, unit ownership, difficulty level).
+     * (e.g. faction check, resource threshold, unit ownership, difficulty level).
      * @param fiber         Active fiber context.
      * @param conditionKind Game-defined condition type (`ins.flags`).
      * @param key16         16-bit condition key (`ins.regs.srcA`).
@@ -237,7 +256,7 @@ struct IFiberHostCallbacks {
      * @return true to branch to `ins.regOrSlot`, false to fall through to `pc + 1`.
      */
     virtual bool onEvaluateCondition(
-        const RTSFiberContext& fiber,
+        const FiberContext& fiber,
         std::uint8_t conditionKind,
         std::uint16_t key16,
         std::uint16_t threshold16) const noexcept {
@@ -249,29 +268,65 @@ struct IFiberHostCallbacks {
     }
 };
 
-using IRTSHostCallbacks = IFiberHostCallbacks;
+using IFiberHost = IFiberHostCallbacks;
 
 /**
- * Engine-Agnostic Deterministic Micro-Fiber & Behavior Tree Scheduler.
+ * Compiled Fiber Program produced by lowering a RealScript (`.rs`) `mir::Module`.
+ * Contains a single contiguous 8-byte instruction stream and a symbol table mapping
+ * `.rs` function names to their entry PC offsets.
+ */
+struct CompiledFiberModule {
+    std::string moduleName;
+    std::vector<CompactInstruction> instructions;
+    std::unordered_map<std::string, std::uint32_t> entryPoints;
+
+    [[nodiscard]] bool hasFunction(const std::string& name) const noexcept {
+        return entryPoints.find(name) != entryPoints.end();
+    }
+
+    [[nodiscard]] std::uint32_t entryPc(const std::string& name) const noexcept {
+        auto it = entryPoints.find(name);
+        return it != entryPoints.end() ? it->second : 0u;
+    }
+};
+
+/**
+ * Compiler that lowers a RealScript `mir::Module` (written in `.rs` using `import RealScript.Fiber;`)
+ * directly into an 8-byte `CompactInstruction` stream for `FiberScheduler`.
+ */
+class FiberCompiler {
+public:
+    [[nodiscard]] static CompiledFiberModule compileModule(const realscript::mir::Module& module);
+};
+
+/**
+ * Engine-Agnostic Deterministic Fiber & Behavior Tree Scheduler.
  * Features:
- * - Program table registration (`registerProgram`) eliminating raw pointers in snapshots
+ * - Direct execution of `.rs` scripts lowered via `FiberCompiler`
+ * - Program table registration (`registerProgram` / `registerModule`) eliminating raw pointers in snapshots
  * - Free-list fiber slot recycling (`freeFiberIds_`) preventing unbounded memory growth
  * - O(1) 4096-slot hierarchical timing wheel for high-frequency tick sleeps
  * - Event-driven Blackboard predicate wakeup (`notifyBlackboardEvent`)
  * - 64-bit FNV-1a lockstep state digest (`computeLockstepDigest`)
  */
-class RTSFiberScheduler {
+class FiberScheduler {
 public:
     static constexpr std::size_t WHEEL_SLOTS = 4096;
     static constexpr std::size_t WHEEL_MASK = WHEEL_SLOTS - 1;
 
-    explicit RTSFiberScheduler(IFiberHostCallbacks* hostCallbacks = nullptr) noexcept;
+    explicit FiberScheduler(IFiberHostCallbacks* hostCallbacks = nullptr) noexcept;
 
     /**
      * Registers an immutable instruction stream in the scheduler's program table
      * and returns its `programId` (1-based). Safe across snapshots and hot-reload.
      */
     std::uint32_t registerProgram(std::vector<CompactInstruction> codeStream);
+
+    /**
+     * Registers a compiled `.rs` fiber module in the scheduler's program table
+     * and returns its `programId` (1-based).
+     */
+    std::uint32_t registerModule(const CompiledFiberModule& module);
 
     /**
      * Spawns a fiber bound to a registered `programId`.
@@ -290,6 +345,17 @@ public:
     std::uint32_t spawnFiber(
         const std::vector<CompactInstruction>& codeStream,
         std::uint32_t entryPc,
+        GenerationalEntityHandle entity,
+        std::uint8_t ownerGroupId = 0,
+        std::uint32_t parentFiberId = 0,
+        std::uint32_t seed = 0x53434257u);
+
+    /**
+     * Spawns a fiber starting at a named `.rs` function in a `CompiledFiberModule`.
+     */
+    std::uint32_t spawnFunction(
+        const CompiledFiberModule& module,
+        const std::string& functionName,
         GenerationalEntityHandle entity,
         std::uint8_t ownerGroupId = 0,
         std::uint32_t parentFiberId = 0,
@@ -319,23 +385,23 @@ public:
     [[nodiscard]] std::uint64_t computeLockstepDigest() const noexcept;
 
     [[nodiscard]] std::size_t activeFiberCount() const noexcept;
-    [[nodiscard]] const RTSFiberContext* getFiber(std::uint32_t fiberId) const noexcept;
+    [[nodiscard]] const FiberContext* getFiber(std::uint32_t fiberId) const noexcept;
 
 private:
-    void executeFiberSlice(RTSFiberContext& fiber, std::uint32_t currentTick, std::uint64_t& instrCounter);
+    void executeFiberSlice(FiberContext& fiber, std::uint32_t currentTick, std::uint64_t& instrCounter);
     void scheduleAtTick(std::uint32_t fiberId, std::uint32_t wakeTick);
 
     IFiberHostCallbacks* host_{nullptr};
     std::uint32_t currentTick_{0};
     std::vector<std::vector<CompactInstruction>> programs_;
     std::vector<const std::vector<CompactInstruction>*> externalStreamCache_;
-    std::vector<RTSFiberContext> fibers_;
+    std::vector<FiberContext> fibers_;
     std::vector<std::uint32_t> freeFiberIds_;
     std::vector<std::uint32_t> readyQueue_;
     std::array<std::vector<std::uint32_t>, WHEEL_SLOTS> timingWheel_{};
     std::vector<std::uint32_t> predicateWaitList_;
 };
 
-using DeterministicFiberScheduler = RTSFiberScheduler;
+using DeterministicFiberScheduler = FiberScheduler;
 
 } // namespace realscript::runtime
