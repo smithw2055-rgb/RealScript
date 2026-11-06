@@ -203,11 +203,11 @@ int main() {
     // 2. Verify generic FixedPoint32<FracBits> deterministic math (Q24.8 and Q16.16)
     Fixed24_8 topSpeed = Fixed24_8::fromFloat(5.33203125);
     Fixed24_8 ticks = Fixed24_8::fromInt(24);
-    Fixed24_8 distPerSec = topSpeed * ticks;
+    [[maybe_unused]] Fixed24_8 distPerSec = topSpeed * ticks;
     assert(distPerSec.toIntFloor() == 127);
 
-    Fixed16_16 physicsVel = Fixed16_16::fromFloat(1.5);
-    Fixed16_16 physicsTime = Fixed16_16::fromInt(10);
+    [[maybe_unused]] Fixed16_16 physicsVel = Fixed16_16::fromFloat(1.5);
+    [[maybe_unused]] Fixed16_16 physicsTime = Fixed16_16::fromInt(10);
     assert((physicsVel * physicsTime).toIntFloor() == 15);
     std::cout << "[PASS] FixedPoint32<8> (Q24.8) & FixedPoint32<16> (Q16.16) deterministic math verified\n";
 
@@ -388,7 +388,7 @@ public void CommanderBehaviorTree() {
     double elapsedMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     // Verify ECS SoA zero-copy state updates & AI Blackboard semantics driven by .rs fibers
-    const auto& bb = host.groupBlackboard(1);
+    [[maybe_unused]] const auto& bb = host.groupBlackboard(1);
     assert(host.sprites().lastOverlaySpawned[units[0].slot] == 431);
     assert(host.sprites().lastSoundCuePlayed[units[0].slot] == 65);
     assert(host.sprites().combatHitsTriggered[units[0].slot] > 25);

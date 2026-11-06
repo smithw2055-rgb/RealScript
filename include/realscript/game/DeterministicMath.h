@@ -47,11 +47,11 @@ struct Vec2 {
     }
 
     [[nodiscard]] static constexpr Vec2 raw(std::int32_t xRaw, std::int32_t yRaw) noexcept {
-        return Vec2{Fixed::fromRaw(xRaw), Fixed::fromRaw(yRaw)};
+        return Vec2{Fixed(xRaw), Fixed(yRaw)};
     }
 
     [[nodiscard]] static constexpr Vec2 fromRaw(std::int32_t xRaw, std::int32_t yRaw) noexcept {
-        return Vec2{Fixed::fromRaw(xRaw), Fixed::fromRaw(yRaw)};
+        return Vec2{Fixed(xRaw), Fixed(yRaw)};
     }
 
     [[nodiscard]] static constexpr Fixed dot(Vec2 a, Vec2 b) noexcept {
@@ -70,7 +70,7 @@ struct Vec2 {
         const std::int64_t r2 =
             static_cast<std::int64_t>(x.raw) * static_cast<std::int64_t>(x.raw) +
             static_cast<std::int64_t>(y.raw) * static_cast<std::int64_t>(y.raw);
-        return Fixed::fromRaw(static_cast<std::int32_t>(deterministicSqrt64(r2)));
+        return Fixed(static_cast<std::int32_t>(deterministicSqrt64(r2)));
     }
 
     friend constexpr Vec2 operator+(Vec2 a, Vec2 b) noexcept {
@@ -82,7 +82,7 @@ struct Vec2 {
     }
 
     friend constexpr Vec2 operator-(Vec2 a) noexcept {
-        return Vec2{-a.x, -a.y};
+        return Vec2{Fixed(-a.x.raw), Fixed(-a.y.raw)};
     }
 
     friend constexpr Vec2 operator*(Vec2 v, Fixed s) noexcept {
@@ -155,7 +155,7 @@ struct Vec3 {
             static_cast<std::int64_t>(x.raw) * static_cast<std::int64_t>(x.raw) +
             static_cast<std::int64_t>(y.raw) * static_cast<std::int64_t>(y.raw) +
             static_cast<std::int64_t>(z.raw) * static_cast<std::int64_t>(z.raw);
-        return Fixed::fromRaw(static_cast<std::int32_t>(deterministicSqrt64(r2)));
+        return Fixed(static_cast<std::int32_t>(deterministicSqrt64(r2)));
     }
 
     friend constexpr Vec3 operator+(Vec3 a, Vec3 b) noexcept {
@@ -167,7 +167,7 @@ struct Vec3 {
     }
 
     friend constexpr Vec3 operator-(Vec3 a) noexcept {
-        return Vec3{-a.x, -a.y, -a.z};
+        return Vec3{Fixed(-a.x.raw), Fixed(-a.y.raw), Fixed(-a.z.raw)};
     }
 
     friend constexpr Vec3 operator*(Vec3 v, Fixed s) noexcept {
