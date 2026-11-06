@@ -3161,6 +3161,140 @@ std::unique_ptr<BoundStatement> Binder::bindTryStatement(
 std::unique_ptr<BoundStatement>
 Binder::bindEventSubscriptionStatement(
     const syntax::EventSubscriptionStatementSyntax& syntaxTree) {
+    const auto hasFieldOrProperty = [](const TypeSymbol& type,
+                                       const std::string& name) {
+        for (const auto& field : type.fields) {
+            if (field.name == name) return true;
+        }
+        for (const auto& property : type.properties) {
+            if (property.name == name) return true;
+        }
+        return false;
+    };
+    const auto hasEvent = [](const TypeSymbol& type,
+                             const std::string& name) {
+        for (const auto& event : type.events) {
+            if (event.name == name) return true;
+        }
+        return false;
+    };
+
+    if (!syntaxTree.receiver) {
+        bool isCompoundAssignment =
+            lookupVariable(syntaxTree.eventNameToken.text) != nullptr ||
+            sequenceLocalFields_.find(syntaxTree.eventNameToken.text) !=
+                sequenceLocalFields_.end();
+        if (!isCompoundAssignment && currentOwnerType_ && !currentStaticMethod_) {
+            if (!hasEvent(*currentOwnerType_, syntaxTree.eventNameToken.text) &&
+                hasFieldOrProperty(*currentOwnerType_, syntaxTree.eventNameToken.text)) {
+                isCompoundAssignment = true;
+            }
+            if (!isCompoundAssignment && currentOwnerType_->synthetic) {
+                for (const auto& field : currentOwnerType_->fields) {
+                    if (field.name == "this") {
+                        const auto outer = visibleTypes_.find(field.typeName);
+                        if (outer != visibleTypes_.end() &&
+                            hasFieldOrProperty(
+                                outer->second, syntaxTree.eventNameToken.text)) {
+                            isCompoundAssignment = true;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if (isCompoundAssignment) {
+            syntax::AssignmentExpressionSyntax assignment;
+            assignment.identifierToken = syntaxTree.eventNameToken;
+            assignment.equalsToken = syntaxTree.operatorToken;
+            auto& mutableHandler =
+                const_cast<std::unique_ptr<syntax::ExpressionSyntax>&>(
+                    syntaxTree.handler);
+            assignment.expression = std::move(mutableHandler);
+            auto bound = bindAssignmentExpression(assignment);
+            mutableHandler = std::move(assignment.expression);
+            auto statement = std::make_unique<BoundExpressionStatement>();
+            statement->span = syntaxTree.span();
+            statement->expression = std::move(bound);
+            return statement;
+        }
+    } else {
+        bool isMemberCompoundAssignment = false;
+        if (syntaxTree.receiver->kind() == syntax::SyntaxKind::NameExpression) {
+            const auto& name = static_cast<const syntax::NameExpressionSyntax&>(
+                *syntaxTree.receiver);
+            if (!lookupVariable(name.identifierToken.text)) {
+                const auto staticType = visibleTypes_.find(name.identifierToken.text);
+                if (staticType != visibleTypes_.end() &&
+                    hasFieldOrProperty(
+                        staticType->second, syntaxTree.eventNameToken.text)) {
+                    isMemberCompoundAssignment = true;
+                }
+            }
+        }
+        if (!isMemberCompoundAssignment) {
+            std::unique_ptr<BoundExpression> probeReceiver;
+            if (syntaxTree.receiver->kind() == syntax::SyntaxKind::ThisExpression &&
+                currentOwnerType_ && currentOwnerType_->kind == TypeKind::Struct) {
+                if (const auto* self = lookupVariable("this")) {
+                    probeReceiver = makeVariableAccess(
+                        *self, syntaxTree.receiver->span());
+                }
+            } else if (syntaxTree.receiver->kind() ==
+                       syntax::SyntaxKind::ThisExpression) {
+                if (const auto* self = lookupVariable("this")) {
+                    probeReceiver = makeVariableAccess(
+                        *self, syntaxTree.receiver->span());
+                }
+            } else if (syntaxTree.receiver->kind() ==
+                       syntax::SyntaxKind::NameExpression) {
+                const auto& name = static_cast<const syntax::NameExpressionSyntax&>(
+                    *syntaxTree.receiver);
+                if (lookupVariable(name.identifierToken.text) ||
+                    sequenceLocalFields_.find(name.identifierToken.text) !=
+                        sequenceLocalFields_.end() ||
+                    (currentOwnerType_ && !currentStaticMethod_ &&
+                     hasFieldOrProperty(
+                         *currentOwnerType_, name.identifierToken.text))) {
+                    probeReceiver = bindExpression(*syntaxTree.receiver);
+                }
+            }
+            if (probeReceiver &&
+                (probeReceiver->type == PrimitiveType::Object ||
+                 probeReceiver->type == PrimitiveType::Struct) &&
+                !probeReceiver->typeName.empty()) {
+                const auto owner = visibleTypes_.find(probeReceiver->typeName);
+                if (owner != visibleTypes_.end() &&
+                    !hasEvent(owner->second, syntaxTree.eventNameToken.text) &&
+                    hasFieldOrProperty(
+                        owner->second, syntaxTree.eventNameToken.text)) {
+                    isMemberCompoundAssignment = true;
+                }
+            }
+        }
+        if (isMemberCompoundAssignment) {
+            syntax::MemberAssignmentExpressionSyntax assignment;
+            auto& mutableReceiver =
+                const_cast<std::unique_ptr<syntax::ExpressionSyntax>&>(
+                    syntaxTree.receiver);
+            auto& mutableHandler =
+                const_cast<std::unique_ptr<syntax::ExpressionSyntax>&>(
+                    syntaxTree.handler);
+            assignment.receiver = std::move(mutableReceiver);
+            if (syntaxTree.dotToken) assignment.dotToken = *syntaxTree.dotToken;
+            assignment.nameToken = syntaxTree.eventNameToken;
+            assignment.equalsToken = syntaxTree.operatorToken;
+            assignment.expression = std::move(mutableHandler);
+            auto bound = bindMemberAssignmentExpression(assignment);
+            mutableReceiver = std::move(assignment.receiver);
+            mutableHandler = std::move(assignment.expression);
+            auto statement = std::make_unique<BoundExpressionStatement>();
+            statement->span = syntaxTree.span();
+            statement->expression = std::move(bound);
+            return statement;
+        }
+    }
+
     auto result = std::make_unique<BoundEventSubscriptionStatement>();
     result->span = syntaxTree.span();
     TypeSymbol eventOwner;

@@ -1196,6 +1196,675 @@ void appendParameters(
     }
 }
 
+const std::string& builtinDeterministicMathModuleSource() {
+    static const std::string kSource = R"RS(
+module RealScript.Math;
+
+public class Math {
+    public static int Abs(int v) {
+        return v < 0 ? -v : v;
+    }
+
+    public static long Abs64(long v) {
+        return v < 0 ? -v : v;
+    }
+
+    public static int Min(int a, int b) {
+        return a <= b ? a : b;
+    }
+
+    public static int Max(int a, int b) {
+        return a >= b ? a : b;
+    }
+
+    public static int Clamp(int v, int lo, int hi) {
+        if (v < lo) return lo;
+        if (v > hi) return hi;
+        return v;
+    }
+
+    public static long Sqrt64(long n) {
+        if (n <= 0) return 0;
+        long lo = 1;
+        long hi = n < 3037000499 ? n : 3037000499;
+        long ans = 1;
+        while (lo <= hi) {
+            long mid = lo + (hi - lo) / 2;
+            if (mid <= n / mid) {
+                ans = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return ans;
+    }
+}
+
+public struct Fixed {
+    public int raw;
+
+    public Fixed(int rawValue) {
+        raw = rawValue;
+    }
+
+    public static Fixed Zero() {
+        return new Fixed(0);
+    }
+
+    public static Fixed One() {
+        return new Fixed(256);
+    }
+
+    public static Fixed Half() {
+        return new Fixed(128);
+    }
+
+    public static Fixed Raw(int rawValue) {
+        return new Fixed(rawValue);
+    }
+
+    public static Fixed Of(int whole) {
+        return new Fixed(whole * 256);
+    }
+
+    public static Fixed Ratio(int num, int den) {
+        return new Fixed((int)(((long)num * 256) / (long)den));
+    }
+
+    public int ToInt() {
+        return raw >= 0 ? raw / 256 : (raw - 255) / 256;
+    }
+
+    public int Trunc() {
+        return raw / 256;
+    }
+
+    public int Floor() {
+        return raw >= 0 ? raw / 256 : (raw - 255) / 256;
+    }
+
+    public int Round() {
+        return raw >= 0 ? (raw + 128) / 256 : (raw - 128) / 256;
+    }
+
+    public static Fixed Abs(Fixed v) {
+        return new Fixed(v.raw < 0 ? -v.raw : v.raw);
+    }
+
+    public static Fixed Min(Fixed a, Fixed b) {
+        return a.raw <= b.raw ? a : b;
+    }
+
+    public static Fixed Max(Fixed a, Fixed b) {
+        return a.raw >= b.raw ? a : b;
+    }
+
+    public static Fixed Clamp(Fixed v, Fixed lo, Fixed hi) {
+        if (v.raw < lo.raw) return lo;
+        if (v.raw > hi.raw) return hi;
+        return v;
+    }
+
+    public static Fixed Lerp(Fixed a, Fixed b, Fixed t) {
+        return a + (b - a) * t;
+    }
+
+    public static Fixed Sqrt(Fixed v) {
+        if (v.raw <= 0) return new Fixed(0);
+        return new Fixed((int)Math.Sqrt64((long)v.raw * 256));
+    }
+
+    public static Fixed operator +(Fixed a) {
+        return a;
+    }
+
+    public static Fixed operator -(Fixed a) {
+        return new Fixed(-a.raw);
+    }
+
+    public static Fixed operator +(Fixed a, Fixed b) {
+        return new Fixed(a.raw + b.raw);
+    }
+
+    public static Fixed operator +(Fixed a, int b) {
+        return new Fixed(a.raw + b * 256);
+    }
+
+    public static Fixed operator +(int a, Fixed b) {
+        return new Fixed(a * 256 + b.raw);
+    }
+
+    public static Fixed operator -(Fixed a, Fixed b) {
+        return new Fixed(a.raw - b.raw);
+    }
+
+    public static Fixed operator -(Fixed a, int b) {
+        return new Fixed(a.raw - b * 256);
+    }
+
+    public static Fixed operator -(int a, Fixed b) {
+        return new Fixed(a * 256 - b.raw);
+    }
+
+    public static Fixed operator *(Fixed a, Fixed b) {
+        return new Fixed((int)(((long)a.raw * (long)b.raw) / 256));
+    }
+
+    public static Fixed operator *(Fixed a, int scalar) {
+        return new Fixed(a.raw * scalar);
+    }
+
+    public static Fixed operator *(int scalar, Fixed a) {
+        return new Fixed(scalar * a.raw);
+    }
+
+    public static Fixed operator /(Fixed a, Fixed b) {
+        return new Fixed((int)(((long)a.raw * 256) / (long)b.raw));
+    }
+
+    public static Fixed operator /(Fixed a, int scalar) {
+        return new Fixed(a.raw / scalar);
+    }
+
+    public static Fixed operator %(Fixed a, Fixed b) {
+        return new Fixed(a.raw % b.raw);
+    }
+
+    public static bool operator ==(Fixed a, Fixed b) {
+        return a.raw == b.raw;
+    }
+
+    public static bool operator ==(Fixed a, int b) {
+        return a.raw == b * 256;
+    }
+
+    public static bool operator ==(int a, Fixed b) {
+        return a * 256 == b.raw;
+    }
+
+    public static bool operator !=(Fixed a, Fixed b) {
+        return a.raw != b.raw;
+    }
+
+    public static bool operator !=(Fixed a, int b) {
+        return a.raw != b * 256;
+    }
+
+    public static bool operator !=(int a, Fixed b) {
+        return a * 256 != b.raw;
+    }
+
+    public static bool operator <(Fixed a, Fixed b) {
+        return a.raw < b.raw;
+    }
+
+    public static bool operator <(Fixed a, int b) {
+        return a.raw < b * 256;
+    }
+
+    public static bool operator <=(Fixed a, Fixed b) {
+        return a.raw <= b.raw;
+    }
+
+    public static bool operator <=(Fixed a, int b) {
+        return a.raw <= b * 256;
+    }
+
+    public static bool operator >(Fixed a, Fixed b) {
+        return a.raw > b.raw;
+    }
+
+    public static bool operator >(Fixed a, int b) {
+        return a.raw > b * 256;
+    }
+
+    public static bool operator >=(Fixed a, Fixed b) {
+        return a.raw >= b.raw;
+    }
+
+    public static bool operator >=(Fixed a, int b) {
+        return a.raw >= b * 256;
+    }
+}
+
+public struct Fixed16 {
+    public int raw;
+
+    public Fixed16(int rawValue) {
+        raw = rawValue;
+    }
+
+    public static Fixed16 Zero() {
+        return new Fixed16(0);
+    }
+
+    public static Fixed16 One() {
+        return new Fixed16(65536);
+    }
+
+    public static Fixed16 Half() {
+        return new Fixed16(32768);
+    }
+
+    public static Fixed16 Raw(int rawValue) {
+        return new Fixed16(rawValue);
+    }
+
+    public static Fixed16 Of(int whole) {
+        return new Fixed16(whole * 65536);
+    }
+
+    public static Fixed16 Ratio(int num, int den) {
+        return new Fixed16((int)(((long)num * 65536) / (long)den));
+    }
+
+    public int ToInt() {
+        return raw >= 0 ? raw / 65536 : (raw - 65535) / 65536;
+    }
+
+    public int Trunc() {
+        return raw / 65536;
+    }
+
+    public int Floor() {
+        return raw >= 0 ? raw / 65536 : (raw - 65535) / 65536;
+    }
+
+    public int Round() {
+        return raw >= 0 ? (raw + 32768) / 65536 : (raw - 32768) / 65536;
+    }
+
+    public static Fixed16 Abs(Fixed16 v) {
+        return new Fixed16(v.raw < 0 ? -v.raw : v.raw);
+    }
+
+    public static Fixed16 Min(Fixed16 a, Fixed16 b) {
+        return a.raw <= b.raw ? a : b;
+    }
+
+    public static Fixed16 Max(Fixed16 a, Fixed16 b) {
+        return a.raw >= b.raw ? a : b;
+    }
+
+    public static Fixed16 Clamp(Fixed16 v, Fixed16 lo, Fixed16 hi) {
+        if (v.raw < lo.raw) return lo;
+        if (v.raw > hi.raw) return hi;
+        return v;
+    }
+
+    public static Fixed16 Lerp(Fixed16 a, Fixed16 b, Fixed16 t) {
+        return a + (b - a) * t;
+    }
+
+    public static Fixed16 Sqrt(Fixed16 v) {
+        if (v.raw <= 0) return new Fixed16(0);
+        return new Fixed16((int)Math.Sqrt64((long)v.raw * 65536));
+    }
+
+    public static Fixed16 operator +(Fixed16 a) {
+        return a;
+    }
+
+    public static Fixed16 operator -(Fixed16 a) {
+        return new Fixed16(-a.raw);
+    }
+
+    public static Fixed16 operator +(Fixed16 a, Fixed16 b) {
+        return new Fixed16(a.raw + b.raw);
+    }
+
+    public static Fixed16 operator +(Fixed16 a, int b) {
+        return new Fixed16(a.raw + b * 65536);
+    }
+
+    public static Fixed16 operator +(int a, Fixed16 b) {
+        return new Fixed16(a * 65536 + b.raw);
+    }
+
+    public static Fixed16 operator -(Fixed16 a, Fixed16 b) {
+        return new Fixed16(a.raw - b.raw);
+    }
+
+    public static Fixed16 operator -(Fixed16 a, int b) {
+        return new Fixed16(a.raw - b * 65536);
+    }
+
+    public static Fixed16 operator -(int a, Fixed16 b) {
+        return new Fixed16(a * 65536 - b.raw);
+    }
+
+    public static Fixed16 operator *(Fixed16 a, Fixed16 b) {
+        return new Fixed16((int)(((long)a.raw * (long)b.raw) / 65536));
+    }
+
+    public static Fixed16 operator *(Fixed16 a, int scalar) {
+        return new Fixed16(a.raw * scalar);
+    }
+
+    public static Fixed16 operator *(int scalar, Fixed16 a) {
+        return new Fixed16(scalar * a.raw);
+    }
+
+    public static Fixed16 operator /(Fixed16 a, Fixed16 b) {
+        return new Fixed16((int)(((long)a.raw * 65536) / (long)b.raw));
+    }
+
+    public static Fixed16 operator /(Fixed16 a, int scalar) {
+        return new Fixed16(a.raw / scalar);
+    }
+
+    public static Fixed16 operator %(Fixed16 a, Fixed16 b) {
+        return new Fixed16(a.raw % b.raw);
+    }
+
+    public static bool operator ==(Fixed16 a, Fixed16 b) {
+        return a.raw == b.raw;
+    }
+
+    public static bool operator ==(Fixed16 a, int b) {
+        return a.raw == b * 65536;
+    }
+
+    public static bool operator ==(int a, Fixed16 b) {
+        return a * 65536 == b.raw;
+    }
+
+    public static bool operator !=(Fixed16 a, Fixed16 b) {
+        return a.raw != b.raw;
+    }
+
+    public static bool operator !=(Fixed16 a, int b) {
+        return a.raw != b * 65536;
+    }
+
+    public static bool operator !=(int a, Fixed16 b) {
+        return a * 65536 != b.raw;
+    }
+
+    public static bool operator <(Fixed16 a, Fixed16 b) {
+        return a.raw < b.raw;
+    }
+
+    public static bool operator <=(Fixed16 a, Fixed16 b) {
+        return a.raw <= b.raw;
+    }
+
+    public static bool operator >(Fixed16 a, Fixed16 b) {
+        return a.raw > b.raw;
+    }
+
+    public static bool operator >=(Fixed16 a, Fixed16 b) {
+        return a.raw >= b.raw;
+    }
+}
+
+public struct Vec2 {
+    public Fixed x;
+    public Fixed y;
+
+    public Vec2(Fixed xVal, Fixed yVal) {
+        x = xVal;
+        y = yVal;
+    }
+
+    public Vec2(int xInt, int yInt) {
+        x = new Fixed(xInt * 256);
+        y = new Fixed(yInt * 256);
+    }
+
+    public static Vec2 Zero() {
+        return new Vec2(new Fixed(0), new Fixed(0));
+    }
+
+    public static Vec2 One() {
+        return new Vec2(new Fixed(256), new Fixed(256));
+    }
+
+    public static Vec2 Of(int xInt, int yInt) {
+        return new Vec2(new Fixed(xInt * 256), new Fixed(yInt * 256));
+    }
+
+    public static Vec2 Raw(int xRaw, int yRaw) {
+        return new Vec2(new Fixed(xRaw), new Fixed(yRaw));
+    }
+
+    public static Fixed Dot(Vec2 a, Vec2 b) {
+        return a.x * b.x + a.y * b.y;
+    }
+
+    public static Fixed Cross(Vec2 a, Vec2 b) {
+        return a.x * b.y - a.y * b.x;
+    }
+
+    public Fixed LengthSq() {
+        return x * x + y * y;
+    }
+
+    public Fixed Length() {
+        long r2 = (long)x.raw * (long)x.raw + (long)y.raw * (long)y.raw;
+        return new Fixed((int)Math.Sqrt64(r2));
+    }
+
+    public static Fixed DistSq(Vec2 a, Vec2 b) {
+        Vec2 d = a - b;
+        return d.LengthSq();
+    }
+
+    public static Fixed Dist(Vec2 a, Vec2 b) {
+        Vec2 d = a - b;
+        return d.Length();
+    }
+
+    public static Fixed Manhattan(Vec2 a, Vec2 b) {
+        return Fixed.Abs(a.x - b.x) + Fixed.Abs(a.y - b.y);
+    }
+
+    public static Vec2 Lerp(Vec2 a, Vec2 b, Fixed t) {
+        return a + (b - a) * t;
+    }
+
+    public Vec2 Normalized() {
+        Fixed len = Length();
+        if (len.raw <= 0) return Vec2.Zero();
+        return new Vec2(x / len, y / len);
+    }
+
+    public static Vec2 MoveTowards(Vec2 current, Vec2 target, Fixed maxDelta) {
+        Vec2 delta = target - current;
+        Fixed dist = delta.Length();
+        if (dist <= maxDelta || dist.raw <= 0) return target;
+        return current + (delta * maxDelta) / dist;
+    }
+
+    public static Vec2 MoveTowards(Vec2 current, Vec2 target, int maxDelta) {
+        return Vec2.MoveTowards(current, target, Fixed.Of(maxDelta));
+    }
+
+    public static Vec2 operator +(Vec2 a) {
+        return a;
+    }
+
+    public static Vec2 operator -(Vec2 a) {
+        return new Vec2(-a.x, -a.y);
+    }
+
+    public static Vec2 operator +(Vec2 a, Vec2 b) {
+        return new Vec2(a.x + b.x, a.y + b.y);
+    }
+
+    public static Vec2 operator -(Vec2 a, Vec2 b) {
+        return new Vec2(a.x - b.x, a.y - b.y);
+    }
+
+    public static Vec2 operator *(Vec2 v, Fixed s) {
+        return new Vec2(v.x * s, v.y * s);
+    }
+
+    public static Vec2 operator *(Fixed s, Vec2 v) {
+        return new Vec2(s * v.x, s * v.y);
+    }
+
+    public static Vec2 operator *(Vec2 v, int s) {
+        return new Vec2(v.x * s, v.y * s);
+    }
+
+    public static Vec2 operator *(int s, Vec2 v) {
+        return new Vec2(s * v.x, s * v.y);
+    }
+
+    public static Vec2 operator /(Vec2 v, Fixed s) {
+        return new Vec2(v.x / s, v.y / s);
+    }
+
+    public static Vec2 operator /(Vec2 v, int s) {
+        return new Vec2(v.x / s, v.y / s);
+    }
+
+    public static bool operator ==(Vec2 a, Vec2 b) {
+        return a.x == b.x && a.y == b.y;
+    }
+
+    public static bool operator !=(Vec2 a, Vec2 b) {
+        return a.x != b.x || a.y != b.y;
+    }
+}
+
+public struct Vec3 {
+    public Fixed x;
+    public Fixed y;
+    public Fixed z;
+
+    public Vec3(Fixed xVal, Fixed yVal, Fixed zVal) {
+        x = xVal;
+        y = yVal;
+        z = zVal;
+    }
+
+    public Vec3(int xInt, int yInt, int zInt) {
+        x = new Fixed(xInt * 256);
+        y = new Fixed(yInt * 256);
+        z = new Fixed(zInt * 256);
+    }
+
+    public static Vec3 Zero() {
+        return new Vec3(new Fixed(0), new Fixed(0), new Fixed(0));
+    }
+
+    public static Vec3 One() {
+        return new Vec3(new Fixed(256), new Fixed(256), new Fixed(256));
+    }
+
+    public static Vec3 Of(int xInt, int yInt, int zInt) {
+        return new Vec3(
+            new Fixed(xInt * 256),
+            new Fixed(yInt * 256),
+            new Fixed(zInt * 256));
+    }
+
+    public static Vec3 Raw(int xRaw, int yRaw, int zRaw) {
+        return new Vec3(
+            new Fixed(xRaw),
+            new Fixed(yRaw),
+            new Fixed(zRaw));
+    }
+
+    public static Fixed Dot(Vec3 a, Vec3 b) {
+        return a.x * b.x + a.y * b.y + a.z * b.z;
+    }
+
+    public static Vec3 Cross(Vec3 a, Vec3 b) {
+        return new Vec3(
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x);
+    }
+
+    public Fixed LengthSq() {
+        return x * x + y * y + z * z;
+    }
+
+    public Fixed Length() {
+        long r2 =
+            (long)x.raw * (long)x.raw +
+            (long)y.raw * (long)y.raw +
+            (long)z.raw * (long)z.raw;
+        return new Fixed((int)Math.Sqrt64(r2));
+    }
+
+    public static Fixed Dist(Vec3 a, Vec3 b) {
+        Vec3 d = a - b;
+        return d.Length();
+    }
+
+    public static Fixed Manhattan(Vec3 a, Vec3 b) {
+        return Fixed.Abs(a.x - b.x) +
+            Fixed.Abs(a.y - b.y) +
+            Fixed.Abs(a.z - b.z);
+    }
+
+    public static Vec3 Lerp(Vec3 a, Vec3 b, Fixed t) {
+        return a + (b - a) * t;
+    }
+
+    public Vec3 Normalized() {
+        Fixed len = Length();
+        if (len.raw <= 0) return Vec3.Zero();
+        return new Vec3(x / len, y / len, z / len);
+    }
+
+    public static Vec3 operator +(Vec3 a) {
+        return a;
+    }
+
+    public static Vec3 operator -(Vec3 a) {
+        return new Vec3(-a.x, -a.y, -a.z);
+    }
+
+    public static Vec3 operator +(Vec3 a, Vec3 b) {
+        return new Vec3(a.x + b.x, a.y + b.y, a.z + b.z);
+    }
+
+    public static Vec3 operator -(Vec3 a, Vec3 b) {
+        return new Vec3(a.x - b.x, a.y - b.y, a.z - b.z);
+    }
+
+    public static Vec3 operator *(Vec3 v, Fixed s) {
+        return new Vec3(v.x * s, v.y * s, v.z * s);
+    }
+
+    public static Vec3 operator *(Fixed s, Vec3 v) {
+        return new Vec3(s * v.x, s * v.y, s * v.z);
+    }
+
+    public static Vec3 operator *(Vec3 v, int s) {
+        return new Vec3(v.x * s, v.y * s, v.z * s);
+    }
+
+    public static Vec3 operator *(int s, Vec3 v) {
+        return new Vec3(s * v.x, s * v.y, s * v.z);
+    }
+
+    public static Vec3 operator /(Vec3 v, Fixed s) {
+        return new Vec3(v.x / s, v.y / s, v.z / s);
+    }
+
+    public static Vec3 operator /(Vec3 v, int s) {
+        return new Vec3(v.x / s, v.y / s, v.z / s);
+    }
+
+    public static bool operator ==(Vec3 a, Vec3 b) {
+        return a.x == b.x && a.y == b.y && a.z == b.z;
+    }
+
+    public static bool operator !=(Vec3 a, Vec3 b) {
+        return a.x != b.x || a.y != b.y || a.z != b.z;
+    }
+}
+)RS";
+    return kSource;
+}
+
 } // namespace
 
 BuildResult Compilation::build(const BuildSnapshot* previous) const {
@@ -1203,7 +1872,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     std::vector<std::unique_ptr<ParsedUnit>> units;
     std::map<std::string, ModuleWork> modules;
 
-    for (const auto& sourceFile : sources_) {
+    const auto addSourceUnit = [&](const SourceFile& sourceFile) {
         auto unit = std::make_unique<ParsedUnit>();
         unit->source = std::make_unique<text::SourceText>(sourceFile.content, sourceFile.path);
         diagnostics::DiagnosticBag parseDiagnostics;
@@ -1229,6 +1898,24 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         module.invalid = module.invalid || unit->invalid;
         module.imports.insert(unit->imports.begin(), unit->imports.end());
         units.push_back(std::move(unit));
+    };
+
+    for (const auto& sourceFile : sources_) {
+        addSourceUnit(sourceFile);
+    }
+
+    bool importsBuiltinMath = false;
+    for (const auto& [name, module] : modules) {
+        (void)name;
+        if (module.imports.find("RealScript.Math") != module.imports.end()) {
+            importsBuiltinMath = true;
+            break;
+        }
+    }
+    if (importsBuiltinMath && modules.find("RealScript.Math") == modules.end()) {
+        addSourceUnit(SourceFile{
+            "$builtin/RealScript.Math.rs",
+            builtinDeterministicMathModuleSource()});
     }
 
     specializeNativeGenerics(units, modules, result);

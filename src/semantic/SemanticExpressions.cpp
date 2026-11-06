@@ -119,6 +119,61 @@ ParameterModifier syntaxModifier(
     }
 }
 
+std::string unaryOperatorMethodName(syntax::SyntaxKind kind) {
+    switch (kind) {
+    case syntax::SyntaxKind::PlusToken: return "op_UnaryPlus";
+    case syntax::SyntaxKind::MinusToken: return "op_UnaryNegation";
+    case syntax::SyntaxKind::BangToken: return "op_LogicalNot";
+    default: return {};
+    }
+}
+
+std::string binaryOperatorMethodName(syntax::SyntaxKind kind) {
+    switch (kind) {
+    case syntax::SyntaxKind::PlusToken: return "op_Addition";
+    case syntax::SyntaxKind::MinusToken: return "op_Subtraction";
+    case syntax::SyntaxKind::StarToken: return "op_Multiply";
+    case syntax::SyntaxKind::SlashToken: return "op_Division";
+    case syntax::SyntaxKind::PercentToken: return "op_Modulus";
+    case syntax::SyntaxKind::EqualsEqualsToken: return "op_Equality";
+    case syntax::SyntaxKind::BangEqualsToken: return "op_Inequality";
+    case syntax::SyntaxKind::LessToken: return "op_LessThan";
+    case syntax::SyntaxKind::LessOrEqualsToken: return "op_LessThanOrEqual";
+    case syntax::SyntaxKind::GreaterToken: return "op_GreaterThan";
+    case syntax::SyntaxKind::GreaterOrEqualsToken: return "op_GreaterThanOrEqual";
+    default: return {};
+    }
+}
+
+std::optional<syntax::SyntaxToken> compoundBinaryOperatorToken(
+    const syntax::SyntaxToken& assignmentToken) {
+    syntax::SyntaxToken token = assignmentToken;
+    switch (assignmentToken.kind) {
+    case syntax::SyntaxKind::PlusEqualsToken:
+        token.kind = syntax::SyntaxKind::PlusToken;
+        token.text = "+";
+        return token;
+    case syntax::SyntaxKind::MinusEqualsToken:
+        token.kind = syntax::SyntaxKind::MinusToken;
+        token.text = "-";
+        return token;
+    case syntax::SyntaxKind::StarEqualsToken:
+        token.kind = syntax::SyntaxKind::StarToken;
+        token.text = "*";
+        return token;
+    case syntax::SyntaxKind::SlashEqualsToken:
+        token.kind = syntax::SyntaxKind::SlashToken;
+        token.text = "/";
+        return token;
+    case syntax::SyntaxKind::PercentEqualsToken:
+        token.kind = syntax::SyntaxKind::PercentToken;
+        token.text = "%";
+        return token;
+    default:
+        return std::nullopt;
+    }
+}
+
 std::unique_ptr<BoundVariableExpression> variableExpression(
     const VariableSymbol& variable,
     text::TextSpan span = {}) {
@@ -1243,6 +1298,58 @@ std::unique_ptr<BoundExpression> Binder::bindUnaryExpression(
     auto operand = bindExpression(*syntaxTree.operand);
     if (operand->type == PrimitiveType::Error) return makeError(syntaxTree.span());
 
+    if ((operand->type == PrimitiveType::Struct ||
+         operand->type == PrimitiveType::Object) &&
+        !operand->typeName.empty()) {
+        const auto opMethodName = unaryOperatorMethodName(
+            syntaxTree.operatorToken.kind);
+        const auto owner = visibleTypes_.find(operand->typeName);
+        if (!opMethodName.empty() && owner != visibleTypes_.end()) {
+            auto methods = findMethods(owner->second, opMethodName, true);
+            methods.erase(
+                std::remove_if(
+                    methods.begin(), methods.end(),
+                    [&](const auto* method) {
+                        return !isMemberAccessible(
+                            method->accessibility,
+                            method->declaringTypeId,
+                            method->moduleName);
+                    }),
+                methods.end());
+            if (!methods.empty()) {
+                std::vector<std::unique_ptr<BoundExpression>> arguments;
+                arguments.push_back(std::move(operand));
+                bool ambiguous = false;
+                const auto* best = selectBest(
+                    methods, arguments, nullptr, visibleTypes_, ambiguous);
+                if (ambiguous) {
+                    diagnostics_.report(
+                        "RS2473",
+                        "unary operator '" + syntaxTree.operatorToken.text +
+                            "' is ambiguous",
+                        syntaxTree.operatorToken.span);
+                    return makeError(syntaxTree.span());
+                }
+                if (best) {
+                    auto result = std::make_unique<BoundCallExpression>();
+                    result->span = syntaxTree.span();
+                    result->type = storageReturnTypeOf(*best);
+                    result->typeName = storageReturnTypeNameOf(*best);
+                    result->function = *best;
+                    result->arguments.push_back(convertExpression(
+                        std::move(arguments[0]),
+                        best->parameters[0].type,
+                        syntaxTree.operand->span(),
+                        "unary operator operand",
+                        best->parameters[0].typeName));
+                    result->argumentEvaluationOrder = {0};
+                    return result;
+                }
+                operand = std::move(arguments[0]);
+            }
+        }
+    }
+
     BoundUnaryOperatorKind operatorKind = BoundUnaryOperatorKind::Identity;
     PrimitiveType resultType = operand->type;
     switch (syntaxTree.operatorToken.kind) {
@@ -1310,11 +1417,29 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
     const syntax::BinaryExpressionSyntax& syntaxTree) {
     auto left = bindExpression(*syntaxTree.left);
     auto right = bindExpression(*syntaxTree.right);
-    if (left->type == PrimitiveType::Error || right->type == PrimitiveType::Error) {
-        return makeError(syntaxTree.span());
+    return bindBinaryOperation(
+        std::move(left),
+        syntaxTree.left->span(),
+        syntaxTree.operatorToken,
+        std::move(right),
+        syntaxTree.right->span(),
+        syntaxTree.span());
+}
+
+std::unique_ptr<BoundExpression> Binder::bindBinaryOperation(
+    std::unique_ptr<BoundExpression> left,
+    text::TextSpan leftSpan,
+    const syntax::SyntaxToken& operatorToken,
+    std::unique_ptr<BoundExpression> right,
+    text::TextSpan rightSpan,
+    text::TextSpan span) {
+    if (!left || !right ||
+        left->type == PrimitiveType::Error ||
+        right->type == PrimitiveType::Error) {
+        return makeError(span);
     }
 
-    if (syntaxTree.operatorToken.kind ==
+    if (operatorToken.kind ==
         syntax::SyntaxKind::QuestionQuestionToken) {
         const auto nullable = left->type == PrimitiveType::Struct
             ? visibleTypes_.find(left->typeName)
@@ -1328,11 +1453,11 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
             diagnostics_.report(
                 "RS8905",
                 "left operand of '" "??" "' must be a nullable reference value",
-                syntaxTree.left->span());
-            return makeError(syntaxTree.span());
+                leftSpan);
+            return makeError(span);
         }
         auto result = std::make_unique<BoundNullCoalescingExpression>();
-        result->span = syntaxTree.span();
+        result->span = span;
         result->nullableValue = nullableValue;
         if (nullableValue) {
             result->nullableType = nullable->second;
@@ -1346,14 +1471,14 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
         }
         result->left = std::move(left);
         result->right = convertExpression(
-            std::move(right), result->type, syntaxTree.right->span(),
+            std::move(right), result->type, rightSpan,
             "null-coalescing fallback", result->typeName);
         return result;
     }
 
     BoundBinaryOperatorKind operatorKind = BoundBinaryOperatorKind::Addition;
     PrimitiveType resultType = PrimitiveType::Error;
-    const auto tokenKind = syntaxTree.operatorToken.kind;
+    const auto tokenKind = operatorToken.kind;
 
     if ((tokenKind == syntax::SyntaxKind::PlusToken ||
          tokenKind == syntax::SyntaxKind::MinusToken) &&
@@ -1366,7 +1491,7 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
             found->second.delegateType) {
             auto result = std::make_unique<
                 BoundDelegateCombinationExpression>();
-            result->span = syntaxTree.span();
+            result->span = span;
             result->type = PrimitiveType::Object;
             result->typeName = left->typeName;
             result->delegateType = found->second;
@@ -1374,6 +1499,79 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
             result->left = std::move(left);
             result->right = std::move(right);
             return result;
+        }
+    }
+
+    if (left->type == PrimitiveType::Struct ||
+        right->type == PrimitiveType::Struct ||
+        left->type == PrimitiveType::Object ||
+        right->type == PrimitiveType::Object) {
+        const auto opMethodName = binaryOperatorMethodName(tokenKind);
+        if (!opMethodName.empty()) {
+            std::vector<const FunctionSymbol*> candidates;
+            std::unordered_set<SymbolId> seenIds;
+            const auto addOwnerCandidates = [&](const std::string& typeName) {
+                if (typeName.empty()) return;
+                const auto owner = visibleTypes_.find(typeName);
+                if (owner == visibleTypes_.end()) return;
+                for (const auto* method :
+                     findMethods(owner->second, opMethodName, true)) {
+                    if (isMemberAccessible(
+                            method->accessibility,
+                            method->declaringTypeId,
+                            method->moduleName) &&
+                        seenIds.insert(method->id).second) {
+                        candidates.push_back(method);
+                    }
+                }
+            };
+            if (left->type == PrimitiveType::Struct ||
+                left->type == PrimitiveType::Object) {
+                addOwnerCandidates(left->typeName);
+            }
+            if (right->type == PrimitiveType::Struct ||
+                right->type == PrimitiveType::Object) {
+                addOwnerCandidates(right->typeName);
+            }
+            if (!candidates.empty()) {
+                std::vector<std::unique_ptr<BoundExpression>> arguments;
+                arguments.push_back(std::move(left));
+                arguments.push_back(std::move(right));
+                bool ambiguous = false;
+                const auto* best = selectBest(
+                    candidates, arguments, nullptr, visibleTypes_, ambiguous);
+                if (ambiguous) {
+                    diagnostics_.report(
+                        "RS2473",
+                        "binary operator '" + operatorToken.text +
+                            "' is ambiguous",
+                        operatorToken.span);
+                    return makeError(span);
+                }
+                if (best) {
+                    auto result = std::make_unique<BoundCallExpression>();
+                    result->span = span;
+                    result->type = storageReturnTypeOf(*best);
+                    result->typeName = storageReturnTypeNameOf(*best);
+                    result->function = *best;
+                    result->arguments.push_back(convertExpression(
+                        std::move(arguments[0]),
+                        best->parameters[0].type,
+                        leftSpan,
+                        "binary operator left operand",
+                        best->parameters[0].typeName));
+                    result->arguments.push_back(convertExpression(
+                        std::move(arguments[1]),
+                        best->parameters[1].type,
+                        rightSpan,
+                        "binary operator right operand",
+                        best->parameters[1].typeName));
+                    result->argumentEvaluationOrder = {0, 1};
+                    return result;
+                }
+                left = std::move(arguments[0]);
+                right = std::move(arguments[1]);
+            }
         }
     }
 
@@ -1387,8 +1585,8 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
             (tokenKind == syntax::SyntaxKind::PercentToken && common == PrimitiveType::Double)) {
             goto invalidOperator;
         }
-        left = convertExpression(std::move(left), common, syntaxTree.left->span(), "numeric operand");
-        right = convertExpression(std::move(right), common, syntaxTree.right->span(), "numeric operand");
+        left = convertExpression(std::move(left), common, leftSpan, "numeric operand");
+        right = convertExpression(std::move(right), common, rightSpan, "numeric operand");
         resultType = common;
         switch (tokenKind) {
         case syntax::SyntaxKind::PlusToken: operatorKind = BoundBinaryOperatorKind::Addition; break;
@@ -1403,8 +1601,8 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
                tokenKind == syntax::SyntaxKind::GreaterOrEqualsToken) {
         const auto common = commonNumericType(left->type, right->type);
         if (common == PrimitiveType::Error) goto invalidOperator;
-        left = convertExpression(std::move(left), common, syntaxTree.left->span(), "comparison operand");
-        right = convertExpression(std::move(right), common, syntaxTree.right->span(), "comparison operand");
+        left = convertExpression(std::move(left), common, leftSpan, "comparison operand");
+        right = convertExpression(std::move(right), common, rightSpan, "comparison operand");
         resultType = PrimitiveType::Bool;
         switch (tokenKind) {
         case syntax::SyntaxKind::LessToken: operatorKind = BoundBinaryOperatorKind::Less; break;
@@ -1418,9 +1616,9 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
             const auto leftToRight = classifyConversion(left->type, right->type);
             const auto rightToLeft = classifyConversion(right->type, left->type);
             if (leftToRight != ConversionKind::None) {
-                left = convertExpression(std::move(left), right->type, syntaxTree.left->span(), "equality operand", right->typeName);
+                left = convertExpression(std::move(left), right->type, leftSpan, "equality operand", right->typeName);
             } else if (rightToLeft != ConversionKind::None) {
-                right = convertExpression(std::move(right), left->type, syntaxTree.right->span(), "equality operand", left->typeName);
+                right = convertExpression(std::move(right), left->type, rightSpan, "equality operand", left->typeName);
             } else {
                 goto invalidOperator;
             }
@@ -1447,7 +1645,7 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
 
     {
         auto result = std::make_unique<BoundBinaryExpression>();
-        result->span = syntaxTree.span();
+        result->span = span;
         result->type = resultType;
         result->operatorKind = operatorKind;
         result->checkedArithmetic = checkedArithmetic_;
@@ -1458,11 +1656,11 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryExpression(
 invalidOperator:
     diagnostics_.report(
         "RS2104",
-        "binary operator '" + syntaxTree.operatorToken.text +
+        "binary operator '" + operatorToken.text +
             "' is not defined for '" + primitiveTypeName(left->type) +
             "' and '" + primitiveTypeName(right->type) + "'",
-        syntaxTree.operatorToken.span);
-    return makeError(syntaxTree.span());
+        operatorToken.span);
+    return makeError(span);
 }
 
 std::unique_ptr<BoundExpression> Binder::bindConditionalExpression(
@@ -1739,6 +1937,31 @@ std::unique_ptr<BoundExpression> Binder::bindSwitchExpression(
 
 std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
     const syntax::AssignmentExpressionSyntax& syntaxTree) {
+    const auto compoundOp = compoundBinaryOperatorToken(syntaxTree.equalsToken);
+    const auto bindAssignedValue = [&](
+        PrimitiveType targetType,
+        const std::string& targetTypeName,
+        const std::string& context) -> std::unique_ptr<BoundExpression> {
+        if (!compoundOp) {
+            return bindTargetExpression(
+                *syntaxTree.expression, targetType, targetTypeName, context);
+        }
+        syntax::NameExpressionSyntax lhsSyntax;
+        lhsSyntax.identifierToken = syntaxTree.identifierToken;
+        auto lhsValue = bindNameExpression(lhsSyntax);
+        auto rhsValue = bindExpression(*syntaxTree.expression);
+        auto combined = bindBinaryOperation(
+            std::move(lhsValue),
+            syntaxTree.identifierToken.span,
+            *compoundOp,
+            std::move(rhsValue),
+            syntaxTree.expression->span(),
+            syntaxTree.span());
+        return convertExpression(
+            std::move(combined), targetType, syntaxTree.span(),
+            context, targetTypeName);
+    };
+
     if (const auto* variable = lookupVariable(
             syntaxTree.identifierToken.text)) {
         if (variable->modifier == ParameterModifier::In) {
@@ -1749,9 +1972,8 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 syntaxTree.identifierToken.span);
             return makeError(syntaxTree.span());
         }
-        auto value = bindTargetExpression(
-            *syntaxTree.expression, variable->type,
-            variable->typeName, "assignment");
+        auto value = bindAssignedValue(
+            variable->type, variable->typeName, "assignment");
         if (storageTypeOf(*variable) != variable->type) {
             const auto wrapper = visibleTypes_.find(
                 storageTypeNameOf(*variable));
@@ -1796,8 +2018,7 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
         result->receiver = variableExpression(*receiver, syntaxTree.span());
         result->ownerType = *currentOwnerType_;
         result->field = field->second;
-        result->expression = bindTargetExpression(
-            *syntaxTree.expression,
+        result->expression = bindAssignedValue(
             field->second.type,
             field->second.typeName,
             "sequence local assignment");
@@ -1825,8 +2046,8 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 captureStorage->second.fields.front().name == "Value") {
                 const auto& valueField =
                     captureStorage->second.fields.front();
-                auto value = bindTargetExpression(
-                    *syntaxTree.expression, valueField.type,
+                auto value = bindAssignedValue(
+                    valueField.type,
                     valueField.typeName, "captured variable assignment");
                 auto cell =
                     std::make_unique<BoundMemberAccessExpression>();
@@ -1848,8 +2069,8 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 result->expression = std::move(value);
                 return result;
             }
-            auto value = bindTargetExpression(
-                *syntaxTree.expression, field->type,
+            auto value = bindAssignedValue(
+                field->type,
                 field->typeName, "field assignment");
             if (currentOwnerType_->kind == TypeKind::Struct) {
                 auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
@@ -1898,8 +2119,8 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 ? findField(outer->second, syntaxTree.identifierToken.text)
                 : nullptr;
             if (capturedThis && outerField) {
-                auto value = bindTargetExpression(
-                    *syntaxTree.expression, outerField->type,
+                auto value = bindAssignedValue(
+                    outerField->type,
                     outerField->typeName, "captured field assignment");
                 auto capturedReceiver =
                     std::make_unique<BoundMemberAccessExpression>();
@@ -1947,8 +2168,8 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                     syntaxTree.identifierToken.span);
                 return makeError(syntaxTree.span());
             }
-            auto assigned = bindTargetExpression(
-                *syntaxTree.expression, property->type,
+            auto assigned = bindAssignedValue(
+                property->type,
                 property->typeName, "property assignment");
             auto result = std::make_unique<BoundPropertyAssignmentExpression>();
             result->span = syntaxTree.span();
@@ -2209,7 +2430,31 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
         receiverArgument.modifier = self.modifier;
         if (self.modifier == ParameterModifier::Ref) {
             const auto receiverSpan = receiver->span;
-            if (bindReferenceTarget(
+            const bool directWritebackTarget =
+                receiver->kind() == BoundNodeKind::VariableExpression ||
+                receiver->kind() == BoundNodeKind::MemberAccessExpression ||
+                receiver->kind() == BoundNodeKind::ElementAccessExpression ||
+                (receiver->kind() == BoundNodeKind::StructFieldAccessExpression &&
+                 static_cast<const BoundStructFieldAccessExpression&>(*receiver)
+                         .receiver->kind() == BoundNodeKind::VariableExpression);
+            if (!directWritebackTarget) {
+                receiverArgument.targetKind = ReferenceTargetKind::None;
+                receiverArgument.defensiveCopy = true;
+                receiverArgument.value = std::move(receiver);
+                const auto wrapper = visibleTypes_.find(
+                    storageTypeNameOf(self));
+                if (wrapper == visibleTypes_.end() ||
+                    wrapper->second.fields.empty()) {
+                    diagnostics_.report(
+                        "RS8705",
+                        "mutable struct receiver storage descriptor is unavailable",
+                        receiverSpan);
+                } else {
+                    receiverArgument.wrapperType = wrapper->second;
+                    receiverArgument.valueField =
+                        wrapper->second.fields.front();
+                }
+            } else if (bindReferenceTarget(
                     receiverArgument, std::move(receiver), receiverSpan)) {
                 const auto& variable = receiverArgument.variable;
                 const auto wrapper = visibleTypes_.find(
@@ -3375,6 +3620,19 @@ std::unique_ptr<BoundExpression> Binder::bindElementAccessExpression(
 
 std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
     const syntax::MemberAssignmentExpressionSyntax& syntaxTree) {
+    const auto compoundOp = compoundBinaryOperatorToken(syntaxTree.equalsToken);
+    const auto bindReceiverAccess = [&]() -> std::unique_ptr<BoundExpression> {
+        if (syntaxTree.receiver->kind() == syntax::SyntaxKind::ThisExpression &&
+            currentOwnerType_ && currentOwnerType_->kind == TypeKind::Struct) {
+            const auto* self = lookupVariable("this");
+            if (self) {
+                return variableExpression(*self, syntaxTree.receiver->span());
+            }
+            return makeError(syntaxTree.receiver->span());
+        }
+        return bindExpression(*syntaxTree.receiver);
+    };
+
     // Static property assignment.
     if (syntaxTree.receiver->kind() == syntax::SyntaxKind::NameExpression) {
         const auto& name = static_cast<const syntax::NameExpressionSyntax&>(*syntaxTree.receiver);
@@ -3416,11 +3674,41 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                         syntaxTree.nameToken.span);
                     return makeError(syntaxTree.span());
                 }
-                auto assigned = bindTargetExpression(
-                    *syntaxTree.expression,
-                    property->type,
-                    property->typeName,
-                    "property assignment");
+                std::unique_ptr<BoundExpression> assigned;
+                if (compoundOp) {
+                    if (!property->getter) {
+                        diagnostics_.report(
+                            "RS2481",
+                            "property '" + property->name + "' is write-only",
+                            syntaxTree.nameToken.span);
+                        return makeError(syntaxTree.span());
+                    }
+                    auto lhsValue = std::make_unique<BoundCallExpression>();
+                    lhsValue->span = syntaxTree.nameToken.span;
+                    lhsValue->type = property->type;
+                    lhsValue->typeName = property->typeName;
+                    lhsValue->function = *property->getter;
+                    auto rhsValue = bindExpression(*syntaxTree.expression);
+                    auto combined = bindBinaryOperation(
+                        std::move(lhsValue),
+                        syntaxTree.nameToken.span,
+                        *compoundOp,
+                        std::move(rhsValue),
+                        syntaxTree.expression->span(),
+                        syntaxTree.span());
+                    assigned = convertExpression(
+                        std::move(combined),
+                        property->type,
+                        syntaxTree.span(),
+                        "property assignment",
+                        property->typeName);
+                } else {
+                    assigned = bindTargetExpression(
+                        *syntaxTree.expression,
+                        property->type,
+                        property->typeName,
+                        "property assignment");
+                }
                 auto result = std::make_unique<BoundPropertyAssignmentExpression>();
                 result->span = syntaxTree.span();
                 result->type = property->type;
@@ -3432,19 +3720,7 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
         }
     }
 
-    std::unique_ptr<BoundExpression> receiver;
-    if (syntaxTree.receiver->kind() == syntax::SyntaxKind::ThisExpression &&
-        currentOwnerType_ && currentOwnerType_->kind == TypeKind::Struct) {
-        const auto* self = lookupVariable("this");
-        if (self) {
-            receiver = variableExpression(
-                *self, syntaxTree.receiver->span());
-        } else {
-            receiver = makeError(syntaxTree.receiver->span());
-        }
-    } else {
-        receiver = bindExpression(*syntaxTree.receiver);
-    }
+    std::unique_ptr<BoundExpression> receiver = bindReceiverAccess();
     if ((receiver->type != PrimitiveType::Object && receiver->type != PrimitiveType::Struct) || receiver->typeName.empty()) {
         diagnostics_.report("RS2404", "member assignment requires a class or struct value", syntaxTree.receiver->span());
         return makeError(syntaxTree.span());
@@ -3462,9 +3738,47 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                 syntaxTree.span());
             return makeError(syntaxTree.span());
         }
-        auto value = bindTargetExpression(
-            *syntaxTree.expression, field->type, field->typeName,
-            "field assignment");
+        std::unique_ptr<BoundExpression> value;
+        if (compoundOp) {
+            std::unique_ptr<BoundExpression> lhsValue;
+            if (type->second.kind == TypeKind::Struct) {
+                auto access = std::make_unique<BoundStructFieldAccessExpression>();
+                access->span = syntaxTree.nameToken.span;
+                access->type = field->type;
+                access->typeName = field->typeName;
+                access->receiver = bindReceiverAccess();
+                access->ownerType = type->second;
+                access->field = *field;
+                lhsValue = std::move(access);
+            } else {
+                auto access = std::make_unique<BoundMemberAccessExpression>();
+                access->span = syntaxTree.nameToken.span;
+                access->type = field->type;
+                access->typeName = field->typeName;
+                access->receiver = bindReceiverAccess();
+                access->ownerType = type->second;
+                access->field = *field;
+                lhsValue = std::move(access);
+            }
+            auto rhsValue = bindExpression(*syntaxTree.expression);
+            auto combined = bindBinaryOperation(
+                std::move(lhsValue),
+                syntaxTree.nameToken.span,
+                *compoundOp,
+                std::move(rhsValue),
+                syntaxTree.expression->span(),
+                syntaxTree.span());
+            value = convertExpression(
+                std::move(combined),
+                field->type,
+                syntaxTree.span(),
+                "field assignment",
+                field->typeName);
+        } else {
+            value = bindTargetExpression(
+                *syntaxTree.expression, field->type, field->typeName,
+                "field assignment");
+        }
         if (type->second.kind == TypeKind::Struct) {
             const VariableSymbol* variable = nullptr;
             if (receiver->kind() == BoundNodeKind::VariableExpression) {
@@ -3532,6 +3846,40 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
             diagnostics_.report("RS2483", "property '" + property->name + "' is read-only", syntaxTree.nameToken.span);
             return makeError(syntaxTree.span());
         }
+        const auto bindPropertyAssignedValue = [&]() -> std::unique_ptr<BoundExpression> {
+            if (!compoundOp) {
+                return bindTargetExpression(
+                    *syntaxTree.expression, property->type,
+                    property->typeName, "property assignment");
+            }
+            if (!property->getter) {
+                diagnostics_.report(
+                    "RS2481",
+                    "property '" + property->name + "' is write-only",
+                    syntaxTree.nameToken.span);
+                return makeError(syntaxTree.span());
+            }
+            auto lhsValue = std::make_unique<BoundCallExpression>();
+            lhsValue->span = syntaxTree.nameToken.span;
+            lhsValue->type = property->type;
+            lhsValue->typeName = property->typeName;
+            lhsValue->function = *property->getter;
+            lhsValue->arguments.push_back(bindReceiverAccess());
+            auto rhsValue = bindExpression(*syntaxTree.expression);
+            auto combined = bindBinaryOperation(
+                std::move(lhsValue),
+                syntaxTree.nameToken.span,
+                *compoundOp,
+                std::move(rhsValue),
+                syntaxTree.expression->span(),
+                syntaxTree.span());
+            return convertExpression(
+                std::move(combined),
+                property->type,
+                syntaxTree.span(),
+                "property assignment",
+                property->typeName);
+        };
         if (type->second.kind == TypeKind::Struct && property->backingFieldIndex != std::numeric_limits<std::size_t>::max()) {
             const VariableSymbol* variable = nullptr;
             if (receiver->kind() == BoundNodeKind::VariableExpression) variable = &static_cast<const BoundVariableExpression&>(*receiver).variable;
@@ -3554,14 +3902,10 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
             result->variable = *variable;
             result->ownerType = type->second;
             result->field = field;
-            result->expression = bindTargetExpression(
-                *syntaxTree.expression, property->type,
-                property->typeName, "property assignment");
+            result->expression = bindPropertyAssignedValue();
             return result;
         }
-        auto assigned = bindTargetExpression(
-            *syntaxTree.expression, property->type,
-            property->typeName, "property assignment");
+        auto assigned = bindPropertyAssignedValue();
         auto result = std::make_unique<BoundPropertyAssignmentExpression>();
         result->span = syntaxTree.span();
         result->type = property->type;
@@ -3596,7 +3940,37 @@ std::unique_ptr<BoundExpression> Binder::bindElementAssignmentExpression(
         }
     }
     auto index = convertExpression(bindExpression(*syntaxTree.index), PrimitiveType::Int, syntaxTree.index->span(), "array index");
-    auto value = convertExpression(bindExpression(*syntaxTree.expression), elementType, syntaxTree.expression->span(), "array element assignment", elementTypeName);
+    std::unique_ptr<BoundExpression> value;
+    if (const auto compoundOp = compoundBinaryOperatorToken(syntaxTree.equalsToken)) {
+        auto lhsValue = std::make_unique<BoundElementAccessExpression>();
+        lhsValue->span = syntaxTree.span();
+        lhsValue->type = elementType;
+        lhsValue->typeName = elementTypeName;
+        lhsValue->receiver = bindExpression(*syntaxTree.receiver);
+        lhsValue->index = convertExpression(
+            bindExpression(*syntaxTree.index),
+            PrimitiveType::Int,
+            syntaxTree.index->span(),
+            "array index");
+        lhsValue->elementType = elementType;
+        lhsValue->elementTypeName = elementTypeName;
+        auto rhsValue = bindExpression(*syntaxTree.expression);
+        auto combined = bindBinaryOperation(
+            std::move(lhsValue),
+            syntaxTree.receiver->span(),
+            *compoundOp,
+            std::move(rhsValue),
+            syntaxTree.expression->span(),
+            syntaxTree.span());
+        value = convertExpression(
+            std::move(combined),
+            elementType,
+            syntaxTree.span(),
+            "array element assignment",
+            elementTypeName);
+    } else {
+        value = convertExpression(bindExpression(*syntaxTree.expression), elementType, syntaxTree.expression->span(), "array element assignment", elementTypeName);
+    }
     auto result = std::make_unique<BoundElementAssignmentExpression>();
     result->span = syntaxTree.span();
     result->type = elementType;

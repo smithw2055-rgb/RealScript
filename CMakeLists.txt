@@ -53,7 +53,6 @@ add_library(realscript_frontend STATIC
     src/runtime/ExecutionServices.cpp
     src/runtime/ManagedHeap.cpp
     src/runtime/RTSFiberScheduler.cpp
-    src/game/StarCraftRTSBridge.cpp
     src/game/GameApi.cpp
     src/game/ScriptObjectRuntime.cpp
     src/game/ScriptInvokeRuntime.cpp
@@ -365,10 +364,15 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase24_language_completeness_tests
         realscript.phase24.language-completeness
         tests/phase24_language_completeness_tests.cpp)
-    realscript_add_cpp_test(
+    add_executable(
         realscript_rts_starcraft_tests
-        realscript.rts.starcraft
-        tests/test_rts_starcraft_integration.cpp)
+        tests/test_rts_starcraft_integration.cpp
+        src/game/StarCraftRTSBridge.cpp
+    )
+    target_link_libraries(realscript_rts_starcraft_tests PRIVATE RealScript::Full)
+    target_compile_features(realscript_rts_starcraft_tests PRIVATE cxx_std_17)
+    realscript_enable_cxx_warnings(realscript_rts_starcraft_tests)
+    add_test(NAME realscript.rts.starcraft COMMAND realscript_rts_starcraft_tests)
     set(REALSCRIPT_PHASE20_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/phase20")
     realscript_add_aot_library(

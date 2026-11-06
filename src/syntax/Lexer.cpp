@@ -181,9 +181,15 @@ SyntaxToken Lexer::nextToken() {
     case '-': return peek(1) == '='
         ? pair(SyntaxKind::MinusEqualsToken)
         : single(SyntaxKind::MinusToken);
-    case '*': return single(SyntaxKind::StarToken);
-    case '/': return single(SyntaxKind::SlashToken);
-    case '%': return single(SyntaxKind::PercentToken);
+    case '*': return peek(1) == '='
+        ? pair(SyntaxKind::StarEqualsToken)
+        : single(SyntaxKind::StarToken);
+    case '/': return peek(1) == '='
+        ? pair(SyntaxKind::SlashEqualsToken)
+        : single(SyntaxKind::SlashToken);
+    case '%': return peek(1) == '='
+        ? pair(SyntaxKind::PercentEqualsToken)
+        : single(SyntaxKind::PercentToken);
     case '(': return single(SyntaxKind::OpenParenToken);
     case ')': return single(SyntaxKind::CloseParenToken);
     case '{': return single(SyntaxKind::OpenBraceToken);

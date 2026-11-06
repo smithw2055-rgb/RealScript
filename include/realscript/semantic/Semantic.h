@@ -1121,6 +1121,13 @@ private:
         const syntax::UnaryExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindBinaryExpression(
         const syntax::BinaryExpressionSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundExpression> bindBinaryOperation(
+        std::unique_ptr<BoundExpression> left,
+        text::TextSpan leftSpan,
+        const syntax::SyntaxToken& operatorToken,
+        std::unique_ptr<BoundExpression> right,
+        text::TextSpan rightSpan,
+        text::TextSpan span);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindTypeBinaryExpression(
         const syntax::TypeBinaryExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindTypeOfExpression(

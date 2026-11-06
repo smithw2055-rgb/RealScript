@@ -627,28 +627,101 @@ ClassDeclarationSyntax Parser::parseClassDeclaration(
                 refReturnKeyword = nextToken();
             }
             auto type = parseType();
-            auto identifier = match(SyntaxKind::IdentifierToken);
-            const auto isAbstract = findModifier(
-                memberModifiers, SyntaxKind::AbstractKeyword).has_value();
-            if (current().kind == SyntaxKind::OpenParenToken ||
-                current().kind == SyntaxKind::LessToken ||
-                (isAbstract && current().kind == SyntaxKind::SemicolonToken)) {
+            if (current().kind == SyntaxKind::OperatorKeyword) {
+                const auto operatorKeyword = nextToken();
+                const auto opToken = nextToken();
+                SyntaxToken identifier;
+                identifier.kind = SyntaxKind::IdentifierToken;
+                identifier.span = opToken.span;
+                identifier.text = opToken.text;
                 auto method = parseFunctionDeclaration(
                     std::move(memberModifiers), std::move(type),
                     std::move(identifier), std::move(memberAttributes));
                 method.refReturnKeyword = refReturnKeyword;
+                if (!isStatic) {
+                    diagnostics_.report(
+                        "RS1112",
+                        "user-defined operator declaration must be static",
+                        operatorKeyword.span);
+                }
+                std::string opName;
+                const auto arity = method.parameters.size();
+                switch (opToken.kind) {
+                case SyntaxKind::PlusToken:
+                    opName = arity == 1 ? "op_UnaryPlus" : "op_Addition";
+                    if (arity != 1 && arity != 2) opName.clear();
+                    break;
+                case SyntaxKind::MinusToken:
+                    opName = arity == 1 ? "op_UnaryNegation" : "op_Subtraction";
+                    if (arity != 1 && arity != 2) opName.clear();
+                    break;
+                case SyntaxKind::BangToken:
+                    if (arity == 1) opName = "op_LogicalNot";
+                    break;
+                case SyntaxKind::StarToken:
+                    if (arity == 2) opName = "op_Multiply";
+                    break;
+                case SyntaxKind::SlashToken:
+                    if (arity == 2) opName = "op_Division";
+                    break;
+                case SyntaxKind::PercentToken:
+                    if (arity == 2) opName = "op_Modulus";
+                    break;
+                case SyntaxKind::EqualsEqualsToken:
+                    if (arity == 2) opName = "op_Equality";
+                    break;
+                case SyntaxKind::BangEqualsToken:
+                    if (arity == 2) opName = "op_Inequality";
+                    break;
+                case SyntaxKind::LessToken:
+                    if (arity == 2) opName = "op_LessThan";
+                    break;
+                case SyntaxKind::LessOrEqualsToken:
+                    if (arity == 2) opName = "op_LessThanOrEqual";
+                    break;
+                case SyntaxKind::GreaterToken:
+                    if (arity == 2) opName = "op_GreaterThan";
+                    break;
+                case SyntaxKind::GreaterOrEqualsToken:
+                    if (arity == 2) opName = "op_GreaterThanOrEqual";
+                    break;
+                default:
+                    break;
+                }
+                if (opName.empty()) {
+                    diagnostics_.report(
+                        "RS1113",
+                        "unsupported operator or invalid parameter count for operator '" +
+                            opToken.text + "'",
+                        opToken.span);
+                    opName = "op_Invalid";
+                }
+                method.identifierToken.text = std::move(opName);
                 result.methods.push_back(std::move(method));
-            } else if (current().kind == SyntaxKind::OpenBraceToken) {
-                result.properties.push_back(parsePropertyDeclaration(
-                    std::move(memberModifiers), std::move(type),
-                    std::move(identifier), std::move(memberAttributes)));
             } else {
-                if (isStatic) diagnostics_.report(
-                    "RS1106", "static fields are not supported",
-                    identifier.span);
-                result.fields.push_back(parseFieldDeclaration(
-                    std::move(type), std::move(identifier),
-                    std::move(memberAttributes), std::move(memberModifiers)));
+                auto identifier = match(SyntaxKind::IdentifierToken);
+                const auto isAbstract = findModifier(
+                    memberModifiers, SyntaxKind::AbstractKeyword).has_value();
+                if (current().kind == SyntaxKind::OpenParenToken ||
+                    current().kind == SyntaxKind::LessToken ||
+                    (isAbstract && current().kind == SyntaxKind::SemicolonToken)) {
+                    auto method = parseFunctionDeclaration(
+                        std::move(memberModifiers), std::move(type),
+                        std::move(identifier), std::move(memberAttributes));
+                    method.refReturnKeyword = refReturnKeyword;
+                    result.methods.push_back(std::move(method));
+                } else if (current().kind == SyntaxKind::OpenBraceToken) {
+                    result.properties.push_back(parsePropertyDeclaration(
+                        std::move(memberModifiers), std::move(type),
+                        std::move(identifier), std::move(memberAttributes)));
+                } else {
+                    if (isStatic) diagnostics_.report(
+                        "RS1106", "static fields are not supported",
+                        identifier.span);
+                    result.fields.push_back(parseFieldDeclaration(
+                        std::move(type), std::move(identifier),
+                        std::move(memberAttributes), std::move(memberModifiers)));
+                }
             }
         }
         if (before == position_) {
@@ -705,28 +778,101 @@ StructDeclarationSyntax Parser::parseStructDeclaration(
                 refReturnKeyword = nextToken();
             }
             auto type = parseType();
-            auto identifier = match(SyntaxKind::IdentifierToken);
-            const auto isAbstract = findModifier(
-                memberModifiers, SyntaxKind::AbstractKeyword).has_value();
-            if (current().kind == SyntaxKind::OpenParenToken ||
-                current().kind == SyntaxKind::LessToken ||
-                (isAbstract && current().kind == SyntaxKind::SemicolonToken)) {
+            if (current().kind == SyntaxKind::OperatorKeyword) {
+                const auto operatorKeyword = nextToken();
+                const auto opToken = nextToken();
+                SyntaxToken identifier;
+                identifier.kind = SyntaxKind::IdentifierToken;
+                identifier.span = opToken.span;
+                identifier.text = opToken.text;
                 auto method = parseFunctionDeclaration(
                     std::move(memberModifiers), std::move(type),
                     std::move(identifier), std::move(memberAttributes));
                 method.refReturnKeyword = refReturnKeyword;
+                if (!isStatic) {
+                    diagnostics_.report(
+                        "RS1112",
+                        "user-defined operator declaration must be static",
+                        operatorKeyword.span);
+                }
+                std::string opName;
+                const auto arity = method.parameters.size();
+                switch (opToken.kind) {
+                case SyntaxKind::PlusToken:
+                    opName = arity == 1 ? "op_UnaryPlus" : "op_Addition";
+                    if (arity != 1 && arity != 2) opName.clear();
+                    break;
+                case SyntaxKind::MinusToken:
+                    opName = arity == 1 ? "op_UnaryNegation" : "op_Subtraction";
+                    if (arity != 1 && arity != 2) opName.clear();
+                    break;
+                case SyntaxKind::BangToken:
+                    if (arity == 1) opName = "op_LogicalNot";
+                    break;
+                case SyntaxKind::StarToken:
+                    if (arity == 2) opName = "op_Multiply";
+                    break;
+                case SyntaxKind::SlashToken:
+                    if (arity == 2) opName = "op_Division";
+                    break;
+                case SyntaxKind::PercentToken:
+                    if (arity == 2) opName = "op_Modulus";
+                    break;
+                case SyntaxKind::EqualsEqualsToken:
+                    if (arity == 2) opName = "op_Equality";
+                    break;
+                case SyntaxKind::BangEqualsToken:
+                    if (arity == 2) opName = "op_Inequality";
+                    break;
+                case SyntaxKind::LessToken:
+                    if (arity == 2) opName = "op_LessThan";
+                    break;
+                case SyntaxKind::LessOrEqualsToken:
+                    if (arity == 2) opName = "op_LessThanOrEqual";
+                    break;
+                case SyntaxKind::GreaterToken:
+                    if (arity == 2) opName = "op_GreaterThan";
+                    break;
+                case SyntaxKind::GreaterOrEqualsToken:
+                    if (arity == 2) opName = "op_GreaterThanOrEqual";
+                    break;
+                default:
+                    break;
+                }
+                if (opName.empty()) {
+                    diagnostics_.report(
+                        "RS1113",
+                        "unsupported operator or invalid parameter count for operator '" +
+                            opToken.text + "'",
+                        opToken.span);
+                    opName = "op_Invalid";
+                }
+                method.identifierToken.text = std::move(opName);
                 result.methods.push_back(std::move(method));
-            } else if (current().kind == SyntaxKind::OpenBraceToken) {
-                result.properties.push_back(parsePropertyDeclaration(
-                    std::move(memberModifiers), std::move(type),
-                    std::move(identifier), std::move(memberAttributes)));
             } else {
-                if (isStatic) diagnostics_.report(
-                    "RS1106", "static fields are not supported",
-                    identifier.span);
-                result.fields.push_back(parseFieldDeclaration(
-                    std::move(type), std::move(identifier),
-                    std::move(memberAttributes), std::move(memberModifiers)));
+                auto identifier = match(SyntaxKind::IdentifierToken);
+                const auto isAbstract = findModifier(
+                    memberModifiers, SyntaxKind::AbstractKeyword).has_value();
+                if (current().kind == SyntaxKind::OpenParenToken ||
+                    current().kind == SyntaxKind::LessToken ||
+                    (isAbstract && current().kind == SyntaxKind::SemicolonToken)) {
+                    auto method = parseFunctionDeclaration(
+                        std::move(memberModifiers), std::move(type),
+                        std::move(identifier), std::move(memberAttributes));
+                    method.refReturnKeyword = refReturnKeyword;
+                    result.methods.push_back(std::move(method));
+                } else if (current().kind == SyntaxKind::OpenBraceToken) {
+                    result.properties.push_back(parsePropertyDeclaration(
+                        std::move(memberModifiers), std::move(type),
+                        std::move(identifier), std::move(memberAttributes)));
+                } else {
+                    if (isStatic) diagnostics_.report(
+                        "RS1106", "static fields are not supported",
+                        identifier.span);
+                    result.fields.push_back(parseFieldDeclaration(
+                        std::move(type), std::move(identifier),
+                        std::move(memberAttributes), std::move(memberModifiers)));
+                }
             }
         }
         if (before == position_) {
@@ -1246,7 +1392,12 @@ std::unique_ptr<ExpressionSyntax> Parser::parseExpression() {
 std::unique_ptr<ExpressionSyntax> Parser::parseAssignmentExpression() {
     if (isLambdaExpressionStart()) return parseEventHandler();
     auto left = parseConditionalExpression();
-    if (current().kind != SyntaxKind::EqualsToken) {
+    if (current().kind != SyntaxKind::EqualsToken &&
+        current().kind != SyntaxKind::PlusEqualsToken &&
+        current().kind != SyntaxKind::MinusEqualsToken &&
+        current().kind != SyntaxKind::StarEqualsToken &&
+        current().kind != SyntaxKind::SlashEqualsToken &&
+        current().kind != SyntaxKind::PercentEqualsToken) {
         return left;
     }
 
@@ -1413,14 +1564,17 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePostfixExpression() {
         if (current().kind == SyntaxKind::DotToken ||
             current().kind == SyntaxKind::QuestionDotToken) {
             const auto dot = nextToken();
+            const bool genericCall = isGenericCallStart();
             const auto name = match(SyntaxKind::IdentifierToken);
             std::optional<SyntaxToken> lessToken;
             std::vector<TypeSyntax> typeArguments;
             std::vector<SyntaxToken> typeArgumentCommas;
             std::optional<SyntaxToken> greaterToken;
-            parseTypeArgumentList(
-                lessToken, typeArguments, typeArgumentCommas,
-                greaterToken);
+            if (genericCall) {
+                parseTypeArgumentList(
+                    lessToken, typeArguments, typeArgumentCommas,
+                    greaterToken);
+            }
             if (current().kind == SyntaxKind::OpenParenToken) {
                 auto call = std::make_unique<MemberCallExpressionSyntax>();
                 call->receiver = std::move(expression);
@@ -1613,15 +1767,21 @@ bool Parser::isGenericCallStart() const noexcept {
     std::size_t offset = 1;
     while (position_ + offset < tokens_.size()) {
         const auto kind = peek(offset).kind;
-        if (kind == SyntaxKind::LessToken) ++depth;
-        else if (kind == SyntaxKind::GreaterToken) {
+        if (kind == SyntaxKind::LessToken) {
+            ++depth;
+        } else if (kind == SyntaxKind::GreaterToken) {
             --depth;
             if (depth == 0) {
                 return peek(offset + 1).kind ==
                     SyntaxKind::OpenParenToken;
             }
-        } else if (kind == SyntaxKind::EndOfFileToken ||
-                   kind == SyntaxKind::SemicolonToken) {
+        } else if (isIdentifierLike(kind) ||
+                   kind == SyntaxKind::CommaToken ||
+                   kind == SyntaxKind::QuestionToken ||
+                   kind == SyntaxKind::OpenBracketToken ||
+                   kind == SyntaxKind::CloseBracketToken) {
+            // valid token inside a generic type argument list
+        } else {
             return false;
         }
         ++offset;

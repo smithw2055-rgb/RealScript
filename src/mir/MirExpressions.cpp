@@ -919,6 +919,9 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 }
                 break;
             case semantic::ReferenceTargetKind::None:
+                if (argument.defensiveCopy && argument.value) {
+                    initial = lowerExpression(*argument.value);
+                }
                 break;
             }
 

@@ -18,8 +18,11 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(MinusEqualsToken);
         RS_KIND(ArrowToken);
         RS_KIND(StarToken);
+        RS_KIND(StarEqualsToken);
         RS_KIND(SlashToken);
+        RS_KIND(SlashEqualsToken);
         RS_KIND(PercentToken);
+        RS_KIND(PercentEqualsToken);
         RS_KIND(BangToken);
         RS_KIND(AmpersandAmpersandToken);
         RS_KIND(PipePipeToken);
@@ -91,6 +94,7 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(TypeofKeyword);
         RS_KIND(WhenKeyword);
         RS_KIND(ThrowKeyword);
+        RS_KIND(OperatorKeyword);
         RS_KIND(TryKeyword);
         RS_KIND(CatchKeyword);
         RS_KIND(FinallyKeyword);
@@ -229,6 +233,7 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"typeof", SyntaxKind::TypeofKeyword},
         {"when", SyntaxKind::WhenKeyword},
         {"throw", SyntaxKind::ThrowKeyword},
+        {"operator", SyntaxKind::OperatorKeyword},
         {"try", SyntaxKind::TryKeyword},
         {"catch", SyntaxKind::CatchKeyword},
         {"finally", SyntaxKind::FinallyKeyword},

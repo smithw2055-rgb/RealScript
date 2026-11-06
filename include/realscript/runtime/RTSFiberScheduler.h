@@ -8,46 +8,60 @@
 namespace realscript::runtime {
 
 /**
- * Deterministic Q24.8 Fixed-Point primitive (24-bit signed integer + 8-bit fractional part).
- * Matches StarCraft's flingy.dat / weapons.dat 1/256th pixel sub-tick precision for
- * 100% bit-identical cross-platform lockstep simulation and replay verification.
+ * Generic Deterministic Fixed-Point primitive (Signed 32-bit storage with FracBits fractional bits).
+ * Ensures 100% bit-identical cross-platform lockstep simulation, physics, and replay verification
+ * across all game genres (RTS, fighting, physics, bullet-hell) without IEEE-754 float drift.
  */
-struct Fixed24_8 {
+template <std::uint8_t FracBits>
+struct FixedPoint32 {
+    static_assert(FracBits > 0 && FracBits < 31, "FracBits must be between 1 and 30");
+    static constexpr std::int32_t Scale = (1 << FracBits);
+
     std::int32_t raw{0};
 
-    constexpr Fixed24_8() noexcept = default;
-    constexpr explicit Fixed24_8(std::int32_t rawVal) noexcept : raw(rawVal) {}
+    constexpr FixedPoint32() noexcept = default;
+    constexpr explicit FixedPoint32(std::int32_t rawVal) noexcept : raw(rawVal) {}
 
-    [[nodiscard]] static constexpr Fixed24_8 fromInt(std::int32_t v) noexcept {
-        return Fixed24_8(v << 8);
+    [[nodiscard]] static constexpr FixedPoint32 fromRaw(std::int32_t rawVal) noexcept {
+        return FixedPoint32(rawVal);
     }
-    [[nodiscard]] static constexpr Fixed24_8 fromFloat(double v) noexcept {
-        return Fixed24_8(static_cast<std::int32_t>(v * 256.0));
+    [[nodiscard]] static constexpr FixedPoint32 fromInt(std::int32_t v) noexcept {
+        return FixedPoint32(v << FracBits);
     }
-    [[nodiscard]] constexpr std::int32_t toIntFloor() const noexcept { return raw >> 8; }
-    [[nodiscard]] constexpr double toDouble() const noexcept { return static_cast<double>(raw) / 256.0; }
+    [[nodiscard]] static constexpr FixedPoint32 fromFloat(double v) noexcept {
+        return FixedPoint32(static_cast<std::int32_t>(v * static_cast<double>(Scale)));
+    }
+    [[nodiscard]] constexpr std::int32_t toIntFloor() const noexcept { return raw >> FracBits; }
+    [[nodiscard]] constexpr double toDouble() const noexcept {
+        return static_cast<double>(raw) / static_cast<double>(Scale);
+    }
 
-    constexpr Fixed24_8 operator+(Fixed24_8 rhs) const noexcept { return Fixed24_8(raw + rhs.raw); }
-    constexpr Fixed24_8 operator-(Fixed24_8 rhs) const noexcept { return Fixed24_8(raw - rhs.raw); }
-    constexpr Fixed24_8 operator*(Fixed24_8 rhs) const noexcept {
-        return Fixed24_8(static_cast<std::int32_t>((static_cast<std::int64_t>(raw) * rhs.raw) >> 8));
+    constexpr FixedPoint32 operator+() const noexcept { return *this; }
+    constexpr FixedPoint32 operator-() const noexcept { return FixedPoint32(-raw); }
+    constexpr FixedPoint32 operator+(FixedPoint32 rhs) const noexcept { return FixedPoint32(raw + rhs.raw); }
+    constexpr FixedPoint32 operator-(FixedPoint32 rhs) const noexcept { return FixedPoint32(raw - rhs.raw); }
+    constexpr FixedPoint32 operator*(FixedPoint32 rhs) const noexcept {
+        return FixedPoint32(static_cast<std::int32_t>((static_cast<std::int64_t>(raw) * rhs.raw) >> FracBits));
     }
-    constexpr Fixed24_8 operator/(Fixed24_8 rhs) const noexcept {
+    constexpr FixedPoint32 operator/(FixedPoint32 rhs) const noexcept {
         return rhs.raw != 0
-            ? Fixed24_8(static_cast<std::int32_t>((static_cast<std::int64_t>(raw) << 8) / rhs.raw))
-            : Fixed24_8(0);
+            ? FixedPoint32(static_cast<std::int32_t>((static_cast<std::int64_t>(raw) << FracBits) / rhs.raw))
+            : FixedPoint32(0);
     }
-    constexpr bool operator==(Fixed24_8 rhs) const noexcept { return raw == rhs.raw; }
-    constexpr bool operator!=(Fixed24_8 rhs) const noexcept { return raw != rhs.raw; }
-    constexpr bool operator<(Fixed24_8 rhs) const noexcept { return raw < rhs.raw; }
-    constexpr bool operator<=(Fixed24_8 rhs) const noexcept { return raw <= rhs.raw; }
-    constexpr bool operator>(Fixed24_8 rhs) const noexcept { return raw > rhs.raw; }
-    constexpr bool operator>=(Fixed24_8 rhs) const noexcept { return raw >= rhs.raw; }
+    constexpr bool operator==(FixedPoint32 rhs) const noexcept { return raw == rhs.raw; }
+    constexpr bool operator!=(FixedPoint32 rhs) const noexcept { return raw != rhs.raw; }
+    constexpr bool operator<(FixedPoint32 rhs) const noexcept { return raw < rhs.raw; }
+    constexpr bool operator<=(FixedPoint32 rhs) const noexcept { return raw <= rhs.raw; }
+    constexpr bool operator>(FixedPoint32 rhs) const noexcept { return raw > rhs.raw; }
+    constexpr bool operator>=(FixedPoint32 rhs) const noexcept { return raw >= rhs.raw; }
 };
 
+using Fixed24_8 = FixedPoint32<8>;   // Q24.8 (1/256th unit precision)
+using Fixed16_16 = FixedPoint32<16>; // Q16.16 (1/65536th unit precision)
+
 /**
- * Compact 8-Byte Generational Entity Handle directly isomorphic to ECS Entity IDs
- * and compatible with `realscript::runtime::NativeHandle` (`slot` + `generation`).
+ * Compact 8-Byte Generational Entity Handle directly isomorphic to `realscript::game::EntityId`
+ * and `realscript::runtime::NativeHandle` (`slot` + `generation`).
  */
 struct GenerationalEntityHandle {
     static constexpr std::uint32_t InvalidSlot = 0xFFFFFFFFu;
@@ -74,8 +88,8 @@ struct GenerationalEntityHandle {
 static_assert(sizeof(GenerationalEntityHandle) == 8, "GenerationalEntityHandle must be 8 bytes");
 
 /**
- * Deterministic PCG32 / LCG64 PRNG for bit-identical RTS lockstep & replay execution.
- * Used by `randcondjmp` / `waitrand` (iscript.bin) and `random_jump` / `set_randomseed` (aiscript.bin).
+ * Deterministic PCG32 PRNG for bit-identical lockstep & replay execution.
+ * Uses the same default state/stream constants as `realscript::game::RandomStream`.
  */
 struct DeterministicPRNG {
     std::uint64_t state{0x853C49E6748FEA9BULL};
@@ -109,62 +123,54 @@ struct DeterministicPRNG {
 };
 
 /**
- * Compact 8-Byte RTS Opcode set for high-density 24Hz lockstep execution of
- * StarCraft `iscript.bin` animation controllers and `aiscript.bin` / `bwscript.bin` Behavior Trees.
+ * Engine-Agnostic Compact 8-Byte Fiber Opcode Set.
+ * Drives high-density state machines, coroutines, timelines, and Behavior Trees (BT).
+ * All game-specific actions and queries are delegated through generic `HostCommand` and `HostCondJump`.
  */
-enum class RTSOpcode : std::uint8_t {
+enum class FiberOpcode : std::uint8_t {
     Nop = 0,
-    LoadInt,
-    LoadFixed24_8,
-    Add,
-    Jump,
-    Call,
-    Return,
-    RandJump,               // Deterministic PRNG branch: if (pcg_u8() < chance) goto targetPc
-    YieldTicks,             // Suspends fiber on O(1) Timing Wheel for N 24Hz ticks (wait / waitrand)
-    YieldUntilPredicate,    // Suspends fiber until Blackboard predicate fires (wait_build / wait_force)
-    ForkFiber,              // Spawns concurrent child fiber sharing parent Blackboard (multirun / expand / panic)
-    KillFiber,              // Terminates current fiber or child tree (end / stop / kill_thread)
-    FastSetSpriteFrame,     // Zero-copy ECS SoA write: sets SpriteRenderSoA.frameSet[entitySlot] (playfram)
-    FastSetSpriteOffset,    // Zero-copy ECS SoA write: sets local (dx, dy) pixel offset (sethorpos / setvertpos)
-    FastSpawnSocketOverlay, // Spawns child VFX sprite on 2D Socket mount (.lo* / imgol / sprol)
-    FastPlaySoundCue,       // Enqueues deterministic audio cue ID on AudioNotify bus (playsnd / playsndrand)
-    FastTriggerCombatHit,   // Emits combat damage/projectile event (attackwith / domissiledmg / attackmelee)
-    FastAIBuildOrder,       // Issues town build/train/upgrade/tech directive to FactionBlackboard
-    FastAIDispatchWave      // Commits accumulated attack wave roster and triggers attack_do
+    LoadInt,                // regs[regOrSlot] = static_cast<int32_t>(imm32)
+    LoadFixed24_8,          // regs[regOrSlot] = FixedPoint raw value in imm32
+    Add,                    // regs[regOrSlot] = regs[srcA] + regs[srcB]
+    Sub,                    // regs[regOrSlot] = regs[srcA] - regs[srcB]
+    Jump,                   // pc = imm32
+    Call,                   // push(pc + 1); pc = imm32
+    Return,                 // pop(pc) or terminate if callDepth == 0
+    RandJump,               // BT_ProbabilitySelector: if (prng.nextByte255() < flags) pc = imm32
+    HostCondJump,           // BT_ConditionDecorator / Switch: if (host->onEvaluateCondition(fiber, flags, regOrSlot, imm32)) pc = target
+    YieldTicks,             // Suspends fiber on O(1) Timing Wheel for imm32 ticks (or random [regOrSlot..imm32] if flags != 0)
+    YieldUntilPredicate,    // Suspends fiber until notifyBlackboardEvent(ownerGroup, flags, regOrSlot, >= imm32) fires
+    ForkFiber,              // BT_Parallel / Daemon: Spawns concurrent child fiber at targetPc = imm32
+    KillFiber,              // Terminates current fiber and all descendant fibers
+    SetUnbreakable,         // Sets fiber.unbreakableSection = (flags != 0) to guard critical animation/action windows
+    HostCommand             // Invokes host->onHostCommand(fiber, flags, regOrSlot, imm32) for zero-copy ECS/Blackboard writes
 };
+
+using RTSOpcode = FiberOpcode;
 
 /**
  * Cache-Aligned 8-Byte (64-bit) Hot-Loop Instruction representation.
  * 8 instructions fit inside a single 64-byte CPU L1 cache line.
  */
 struct alignas(8) CompactInstruction {
-    RTSOpcode opcode{RTSOpcode::Nop};
-    std::uint8_t flags{0};       // Sub-opcode mode, predicate kind, or probability threshold
-    std::uint16_t regOrSlot{0};  // Target register, unit ID, or socket index
+    FiberOpcode opcode{FiberOpcode::Nop};
+    std::uint8_t flags{0};       // Command ID, condition kind, predicate channel, or probability threshold
+    std::uint16_t regOrSlot{0};  // Target register, 16-bit parameter, or condition jump target PC
     union {
         struct {
             std::uint16_t srcA;
             std::uint16_t srcB;
         } regs;
-        std::uint32_t imm32{0};  // Target PC offset, tick count, sound ID, or constant index
+        std::uint32_t imm32{0};  // Target PC offset, tick count, or 32-bit command payload
     };
 
-    constexpr CompactInstruction() noexcept : opcode(RTSOpcode::Nop), flags(0), regOrSlot(0), imm32(0) {}
-    constexpr CompactInstruction(RTSOpcode op, std::uint8_t flg, std::uint16_t r0, std::uint32_t imm) noexcept
+    constexpr CompactInstruction() noexcept : opcode(FiberOpcode::Nop), flags(0), regOrSlot(0), imm32(0) {}
+    constexpr CompactInstruction(FiberOpcode op, std::uint8_t flg, std::uint16_t r0, std::uint32_t imm) noexcept
         : opcode(op), flags(flg), regOrSlot(r0), imm32(imm) {}
-    constexpr CompactInstruction(RTSOpcode op, std::uint8_t flg, std::uint16_t dst, std::uint16_t a, std::uint16_t b) noexcept
+    constexpr CompactInstruction(FiberOpcode op, std::uint8_t flg, std::uint16_t dst, std::uint16_t a, std::uint16_t b) noexcept
         : opcode(op), flags(flg), regOrSlot(dst), regs{a, b} {}
 };
 static_assert(sizeof(CompactInstruction) == 8, "CompactInstruction must be exactly 8 bytes (8 per L1 cache line)");
-
-enum class WaitPredicateKind : std::uint8_t {
-    None = 0,
-    UnitOrBuildingCompleted = 1, // wait_build / wait_train / wait_force
-    BuildingStarted = 2,         // wait_buildstart
-    UpgradeOrTechFinished = 3,   // wait_upgrades
-    AttackWaveFinished = 4       // wait_finishattack
-};
 
 enum class FiberStatus : std::uint8_t {
     Inactive = 0,
@@ -174,63 +180,139 @@ enum class FiberStatus : std::uint8_t {
     Terminated = 4
 };
 
+/**
+ * Purely POD / Trivially Copyable Fiber Execution Context (zero raw pointers).
+ * Safe for cross-process binary snapshots, network rollback, and hot-reload.
+ */
 struct RTSFiberContext {
     std::uint32_t fiberId{0};
     std::uint32_t parentFiberId{0};
+    std::uint32_t programId{0};
     GenerationalEntityHandle boundEntity{};
-    std::uint8_t factionId{0};
+    std::uint8_t ownerGroupId{0};
     FiberStatus status{FiberStatus::Inactive};
     bool unbreakableSection{false};
+    std::uint8_t callDepth{0};
 
-    const std::vector<CompactInstruction>* codeStream{nullptr};
     std::uint32_t pc{0};
     std::uint32_t wakeTick{0};
 
+    std::uint8_t waitPredicateChannel{0};
+    std::uint16_t waitTargetKey{0};
+    std::uint32_t waitRequiredValue{0};
+
     std::array<std::uint32_t, 8> callStack{};
-    std::uint8_t callDepth{0};
-
-    WaitPredicateKind waitPredicate{WaitPredicateKind::None};
-    std::uint16_t waitTargetId{0};
-    std::uint8_t waitRequiredCount{0};
-
     std::array<std::int32_t, 8> regs{};
     DeterministicPRNG prng{};
 };
 
-struct IRTSHostCallbacks {
-    virtual ~IRTSHostCallbacks() = default;
-    virtual void onSetSpriteFrame(GenerationalEntityHandle entity, std::uint16_t frameSet) noexcept = 0;
-    virtual void onSetSpriteOffset(GenerationalEntityHandle entity, std::int8_t dx, std::int8_t dy) noexcept = 0;
-    virtual void onSpawnSocketOverlay(GenerationalEntityHandle entity, std::uint16_t imageOrSpriteId, std::uint8_t socketSlot, bool above) noexcept = 0;
-    virtual void onPlaySoundCue(GenerationalEntityHandle entity, std::uint16_t soundId) noexcept = 0;
-    virtual void onTriggerCombatHit(GenerationalEntityHandle entity, std::uint8_t weaponSlot) noexcept = 0;
-    virtual void onAIBuildOrder(std::uint8_t factionId, std::uint16_t unitOrUpgradeId, std::uint8_t count, std::uint8_t priority) noexcept = 0;
-    virtual void onAIDispatchWave(std::uint8_t factionId, std::uint32_t waveCount) noexcept = 0;
+/**
+ * Generic Host Callback Interface for DeterministicFiberScheduler.
+ * Specific games (RTS, Fighting, Action RPG, Bullet-Hell) implement this interface
+ * in their own adapter layer to bridge generic opcodes to their ECS SoA buffers & AI Blackboards.
+ */
+struct IFiberHostCallbacks {
+    virtual ~IFiberHostCallbacks() = default;
+
+    /**
+     * Invoked by `FiberOpcode::HostCommand`.
+     * @param fiber      Active fiber context (provides `boundEntity`, `ownerGroupId`, `regs`, `prng`).
+     * @param commandId  Game-defined command ID (`ins.flags`).
+     * @param arg16      16-bit parameter (`ins.regOrSlot`).
+     * @param arg32      32-bit parameter (`ins.imm32`).
+     */
+    virtual void onHostCommand(
+        RTSFiberContext& fiber,
+        std::uint8_t commandId,
+        std::uint16_t arg16,
+        std::uint32_t arg32) noexcept = 0;
+
+    /**
+     * Invoked by `FiberOpcode::HostCondJump` to evaluate game-specific blackboard/world predicates
+     * (e.g. enemy faction/race check, resource threshold, unit ownership, difficulty level).
+     * @param fiber         Active fiber context.
+     * @param conditionKind Game-defined condition type (`ins.flags`).
+     * @param key16         16-bit condition key (`ins.regs.srcA`).
+     * @param threshold16   16-bit comparison operand (`ins.regs.srcB`).
+     * @return true to branch to `ins.regOrSlot`, false to fall through to `pc + 1`.
+     */
+    virtual bool onEvaluateCondition(
+        const RTSFiberContext& fiber,
+        std::uint8_t conditionKind,
+        std::uint16_t key16,
+        std::uint16_t threshold16) const noexcept {
+        (void)fiber;
+        (void)conditionKind;
+        (void)key16;
+        (void)threshold16;
+        return false;
+    }
 };
 
+using IRTSHostCallbacks = IFiberHostCallbacks;
+
+/**
+ * Engine-Agnostic Deterministic Micro-Fiber & Behavior Tree Scheduler.
+ * Features:
+ * - Program table registration (`registerProgram`) eliminating raw pointers in snapshots
+ * - Free-list fiber slot recycling (`freeFiberIds_`) preventing unbounded memory growth
+ * - O(1) 4096-slot hierarchical timing wheel for high-frequency tick sleeps
+ * - Event-driven Blackboard predicate wakeup (`notifyBlackboardEvent`)
+ * - 64-bit FNV-1a lockstep state digest (`computeLockstepDigest`)
+ */
 class RTSFiberScheduler {
 public:
     static constexpr std::size_t WHEEL_SLOTS = 4096;
     static constexpr std::size_t WHEEL_MASK = WHEEL_SLOTS - 1;
 
-    explicit RTSFiberScheduler(IRTSHostCallbacks* hostCallbacks = nullptr) noexcept;
+    explicit RTSFiberScheduler(IFiberHostCallbacks* hostCallbacks = nullptr) noexcept;
 
+    /**
+     * Registers an immutable instruction stream in the scheduler's program table
+     * and returns its `programId` (1-based). Safe across snapshots and hot-reload.
+     */
+    std::uint32_t registerProgram(std::vector<CompactInstruction> codeStream);
+
+    /**
+     * Spawns a fiber bound to a registered `programId`.
+     */
+    std::uint32_t spawnFiberByProgram(
+        std::uint32_t programId,
+        std::uint32_t entryPc,
+        GenerationalEntityHandle entity,
+        std::uint8_t ownerGroupId = 0,
+        std::uint32_t parentFiberId = 0,
+        std::uint32_t seed = 0x53434257u);
+
+    /**
+     * Convenience overload that registers or reuses `codeStream` and spawns a fiber.
+     */
     std::uint32_t spawnFiber(
         const std::vector<CompactInstruction>& codeStream,
         std::uint32_t entryPc,
         GenerationalEntityHandle entity,
-        std::uint8_t factionId = 0,
+        std::uint8_t ownerGroupId = 0,
         std::uint32_t parentFiberId = 0,
         std::uint32_t seed = 0x53434257u);
+
+    /**
+     * Attempts to interrupt/redirect a fiber to a new entry point.
+     * Respects `fiber.unbreakableSection` unless `force == true`.
+     */
+    bool interruptFiber(std::uint32_t fiberId, std::uint32_t newEntryPc, bool force = false) noexcept;
 
     void killFiberTree(std::uint32_t rootFiberId) noexcept;
     std::uint64_t stepTick(std::uint32_t currentTick);
 
+    /**
+     * Wakes all fibers waiting on `(ownerGroupId, predicateChannel, targetKey)`
+     * whose `waitRequiredValue <= currentValue`.
+     */
     std::uint32_t notifyBlackboardEvent(
-        std::uint8_t factionId,
-        WaitPredicateKind kind,
-        std::uint16_t targetId,
-        std::uint8_t currentOwnedCount);
+        std::uint8_t ownerGroupId,
+        std::uint8_t predicateChannel,
+        std::uint16_t targetKey,
+        std::uint32_t currentValue);
 
     [[nodiscard]] std::vector<std::uint8_t> captureBinarySnapshot() const;
     void restoreBinarySnapshot(const std::vector<std::uint8_t>& snapshot);
@@ -243,12 +325,17 @@ private:
     void executeFiberSlice(RTSFiberContext& fiber, std::uint32_t currentTick, std::uint64_t& instrCounter);
     void scheduleAtTick(std::uint32_t fiberId, std::uint32_t wakeTick);
 
-    IRTSHostCallbacks* host_{nullptr};
+    IFiberHostCallbacks* host_{nullptr};
     std::uint32_t currentTick_{0};
+    std::vector<std::vector<CompactInstruction>> programs_;
+    std::vector<const std::vector<CompactInstruction>*> externalStreamCache_;
     std::vector<RTSFiberContext> fibers_;
+    std::vector<std::uint32_t> freeFiberIds_;
     std::vector<std::uint32_t> readyQueue_;
     std::array<std::vector<std::uint32_t>, WHEEL_SLOTS> timingWheel_{};
     std::vector<std::uint32_t> predicateWaitList_;
 };
+
+using DeterministicFiberScheduler = RTSFiberScheduler;
 
 } // namespace realscript::runtime
