@@ -1737,6 +1737,45 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
             const auto& yield = static_cast<const
                 syntax::YieldWaitStatementSyntax&>(syntaxTree);
             const auto id = yieldIds.at(&yield);
+
+            if (yield.waitTicksToken.text == "wait_until") {
+                auto resumed = std::make_unique<BoundIfStatement>();
+                resumed->span = yield.span();
+                resumed->condition = convertExpression(
+                    bindExpression(*yield.delay),
+                    PrimitiveType::Bool,
+                    yield.delay->span(),
+                    "sequence wait_until condition");
+                resumed->thenStatement = makeStateAssignment(0, yield.span());
+                resumed->elseStatement = makeCompositionPoll(yield.span());
+
+                auto initialCheck = std::make_unique<BoundIfStatement>();
+                initialCheck->span = yield.span();
+                initialCheck->condition = convertExpression(
+                    bindExpression(*yield.delay),
+                    PrimitiveType::Bool,
+                    yield.delay->span(),
+                    "sequence wait_until condition");
+                initialCheck->thenStatement = makeStateAssignment(0, yield.span());
+                auto suspendBlock = std::make_unique<BoundBlockStatement>();
+                suspendBlock->span = yield.span();
+                suspendBlock->statements.push_back(
+                    makeStateAssignment(id, yield.span()));
+                auto poll = makeCompositionPoll(yield.span());
+                suspendBlock->statements.insert(
+                    suspendBlock->statements.end(),
+                    std::make_move_iterator(poll->statements.begin()),
+                    std::make_move_iterator(poll->statements.end()));
+                initialCheck->elseStatement = std::move(suspendBlock);
+
+                auto dispatch = std::make_unique<BoundIfStatement>();
+                dispatch->span = yield.span();
+                dispatch->condition = makeStateEquals(id, yield.span());
+                dispatch->thenStatement = std::move(resumed);
+                dispatch->elseStatement = std::move(initialCheck);
+                return dispatch;
+            }
+
             auto resumed = std::make_unique<BoundBlockStatement>();
             resumed->span = yield.span();
             resumed->statements.push_back(makeStateAssignment(0, yield.span()));
@@ -1744,41 +1783,98 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
             auto suspended = std::make_unique<BoundBlockStatement>();
             suspended->span = yield.span();
             suspended->statements.push_back(makeStateAssignment(id, yield.span()));
-            const auto* schedule = findScheduleFunction();
-            if (!schedule) {
-                diagnostics_.report(
-                    "RS2493",
-                    "sequence requires imported RealScript.Game.Schedule",
-                    yield.span());
+
+            if (yield.waitTicksToken.text == "wait_event") {
+                const FunctionSymbol* subscribeOnce = nullptr;
+                const auto foundSub = visibleFunctions_.find("SubscribeOnce");
+                if (foundSub != visibleFunctions_.end()) {
+                    for (const auto& candidate : foundSub->second) {
+                        if (!candidate.method &&
+                            candidate.parameters.size() == 3 &&
+                            candidate.parameters[0].type == PrimitiveType::Long &&
+                            candidate.parameters[1].type == PrimitiveType::String &&
+                            candidate.parameters[2].type == PrimitiveType::String) {
+                            subscribeOnce = &candidate;
+                            break;
+                        }
+                    }
+                }
+                if (!subscribeOnce) {
+                    diagnostics_.report(
+                        "RS2493",
+                        "sequence wait_event requires imported RealScript.Game.SubscribeOnce",
+                        yield.span());
+                } else {
+                    auto call = std::make_unique<BoundCallExpression>();
+                    call->type = subscribeOnce->returnType;
+                    call->typeName = subscribeOnce->returnTypeName;
+                    call->span = yield.span();
+                    call->function = *subscribeOnce;
+                    call->arguments.push_back(makeSequenceFieldAccess(
+                        input.sequenceTargetField, yield.span()));
+                    auto callback = std::make_unique<BoundLiteralExpression>();
+                    callback->type = PrimitiveType::String;
+                    callback->value = input.sequenceNextCallback->name;
+                    callback->span = yield.waitTicksToken.span;
+                    call->arguments.push_back(std::move(callback));
+                    call->arguments.push_back(convertExpression(
+                        bindExpression(*yield.delay),
+                        PrimitiveType::String,
+                        yield.delay->span(),
+                        "sequence wait_event topic"));
+                    auto timer = std::make_unique<BoundMemberAssignmentExpression>();
+                    timer->type = input.sequenceTimerField.type;
+                    timer->span = yield.span();
+                    const auto* receiver = lookupVariable("this");
+                    timer->receiver = receiver
+                        ? makeVariableAccess(*receiver, yield.span())
+                        : makeError(yield.span());
+                    timer->ownerType = *currentOwnerType_;
+                    timer->field = input.sequenceTimerField;
+                    timer->expression = std::move(call);
+                    auto subStatement =
+                        std::make_unique<BoundExpressionStatement>();
+                    subStatement->span = yield.span();
+                    subStatement->expression = std::move(timer);
+                    suspended->statements.push_back(std::move(subStatement));
+                }
             } else {
-                auto call = std::make_unique<BoundCallExpression>();
-                call->type = schedule->returnType;
-                call->typeName = schedule->returnTypeName;
-                call->span = yield.span();
-                call->function = *schedule;
-                call->arguments.push_back(makeSequenceFieldAccess(
-                    input.sequenceTargetField, yield.span()));
-                auto callback = std::make_unique<BoundLiteralExpression>();
-                callback->type = PrimitiveType::String;
-                callback->value = input.sequenceNextCallback->name;
-                callback->span = yield.waitTicksToken.span;
-                call->arguments.push_back(std::move(callback));
-                call->arguments.push_back(bindSequenceYieldDelay(yield));
-                auto timer = std::make_unique<BoundMemberAssignmentExpression>();
-                timer->type = input.sequenceTimerField.type;
-                timer->span = yield.span();
-                const auto* receiver = lookupVariable("this");
-                timer->receiver = receiver
-                    ? makeVariableAccess(*receiver, yield.span())
-                    : makeError(yield.span());
-                timer->ownerType = *currentOwnerType_;
-                timer->field = input.sequenceTimerField;
-                timer->expression = std::move(call);
-                auto scheduleStatement =
-                    std::make_unique<BoundExpressionStatement>();
-                scheduleStatement->span = yield.span();
-                scheduleStatement->expression = std::move(timer);
-                suspended->statements.push_back(std::move(scheduleStatement));
+                const auto* schedule = findScheduleFunction();
+                if (!schedule) {
+                    diagnostics_.report(
+                        "RS2493",
+                        "sequence requires imported RealScript.Game.Schedule",
+                        yield.span());
+                } else {
+                    auto call = std::make_unique<BoundCallExpression>();
+                    call->type = schedule->returnType;
+                    call->typeName = schedule->returnTypeName;
+                    call->span = yield.span();
+                    call->function = *schedule;
+                    call->arguments.push_back(makeSequenceFieldAccess(
+                        input.sequenceTargetField, yield.span()));
+                    auto callback = std::make_unique<BoundLiteralExpression>();
+                    callback->type = PrimitiveType::String;
+                    callback->value = input.sequenceNextCallback->name;
+                    callback->span = yield.waitTicksToken.span;
+                    call->arguments.push_back(std::move(callback));
+                    call->arguments.push_back(bindSequenceYieldDelay(yield));
+                    auto timer = std::make_unique<BoundMemberAssignmentExpression>();
+                    timer->type = input.sequenceTimerField.type;
+                    timer->span = yield.span();
+                    const auto* receiver = lookupVariable("this");
+                    timer->receiver = receiver
+                        ? makeVariableAccess(*receiver, yield.span())
+                        : makeError(yield.span());
+                    timer->ownerType = *currentOwnerType_;
+                    timer->field = input.sequenceTimerField;
+                    timer->expression = std::move(call);
+                    auto scheduleStatement =
+                        std::make_unique<BoundExpressionStatement>();
+                    scheduleStatement->span = yield.span();
+                    scheduleStatement->expression = std::move(timer);
+                    suspended->statements.push_back(std::move(scheduleStatement));
+                }
             }
             auto stop = std::make_unique<BoundReturnStatement>();
             stop->span = yield.span();

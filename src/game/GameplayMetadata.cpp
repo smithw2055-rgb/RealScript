@@ -340,6 +340,216 @@ ScriptContract sceneBehaviorContract() {
         }};
 }
 
+namespace {
+
+const compiler::LanguageGenericInstantiation* findGenericInstantiation(
+    const runtime::ProgramImage* program,
+    const std::string& typeName) {
+    if (!program || typeName.empty()) return nullptr;
+    std::string simpleName = typeName;
+    const auto sep = simpleName.rfind("::");
+    if (sep != std::string::npos) {
+        simpleName = simpleName.substr(sep + 2);
+    }
+    for (const auto& module : program->modules()) {
+        for (const auto& inst : module.languageMetadata.genericInstantiations) {
+            if (inst.generatedName == simpleName ||
+                (module.name + "::" + inst.generatedName) == typeName) {
+                return &inst;
+            }
+        }
+    }
+    return nullptr;
+}
+
+bool isBuiltinCollectionGenericName(const std::string& name) {
+    return name == "List" || name == "Queue" || name == "Stack" ||
+        name == "HashSet" || name == "Dictionary";
+}
+
+InspectorFieldSchema buildInspectorFieldSchema(
+    const ScriptRuntime& runtime,
+    const ScriptMetadataRegistry& metadata,
+    const std::string& ownerCanonicalTypeName,
+    const semantic::FieldSymbol& field,
+    const ScriptObject* prototype,
+    const runtime::StructValue* parentStructValue,
+    std::size_t fieldIndexInParent,
+    std::unordered_set<std::string>& visitedStructs) {
+    const bool hasExport =
+        metadata.findMemberAttribute(ownerCanonicalTypeName, field.name, "Export") != nullptr ||
+        metadata.findMemberAttribute(ownerCanonicalTypeName, field.name, "SerializeField") != nullptr;
+    const bool isPublic =
+        field.accessibility == semantic::Accessibility::Public;
+    const bool hidden =
+        metadata.findMemberAttribute(ownerCanonicalTypeName, field.name, "HideInInspector") != nullptr;
+
+    InspectorFieldSchema fieldSchema;
+    fieldSchema.name = field.name;
+    fieldSchema.type = field.type;
+    fieldSchema.typeName = field.typeName;
+    fieldSchema.exported = hasExport || isPublic;
+    fieldSchema.hiddenInInspector = hidden;
+
+    runtime::RuntimeError error;
+    if (parentStructValue && parentStructValue->storage &&
+        fieldIndexInParent < parentStructValue->storage->fields.size()) {
+        fieldSchema.defaultValue = parentStructValue->storage->fields[fieldIndexInParent];
+    } else if (prototype) {
+        if (auto val = runtime.getMember(*prototype, field.name, error)) {
+            fieldSchema.defaultValue = std::move(*val);
+        }
+    }
+
+    if (const auto* rangeAttr = metadata.findMemberAttribute(
+            ownerCanonicalTypeName, field.name, "Range")) {
+        const auto readIntArg = [&](const char* named, const char* positional) -> std::optional<std::int64_t> {
+            auto it = rangeAttr->arguments.find(named);
+            if (it == rangeAttr->arguments.end()) {
+                it = rangeAttr->arguments.find(positional);
+            }
+            if (it != rangeAttr->arguments.end()) {
+                if (const auto* v = std::get_if<std::int64_t>(&it->second)) return *v;
+            }
+            return std::nullopt;
+        };
+        fieldSchema.rangeMin = readIntArg("min", "arg0");
+        fieldSchema.rangeMax = readIntArg("max", "arg1");
+    }
+
+    if (const auto* tooltipAttr = metadata.findMemberAttribute(
+            ownerCanonicalTypeName, field.name, "Tooltip")) {
+        auto it = tooltipAttr->arguments.find("text");
+        if (it == tooltipAttr->arguments.end()) {
+            it = tooltipAttr->arguments.find("arg0");
+        }
+        if (it != tooltipAttr->arguments.end()) {
+            if (const auto* v = std::get_if<std::string>(&it->second)) {
+                fieldSchema.tooltip = *v;
+            }
+        }
+    }
+
+    if (const auto* renamedAttr = metadata.findMemberAttribute(
+            ownerCanonicalTypeName, field.name, "FormerlySerializedAs")) {
+        auto it = renamedAttr->arguments.find("oldName");
+        if (it == renamedAttr->arguments.end()) {
+            it = renamedAttr->arguments.find("arg0");
+        }
+        if (it != renamedAttr->arguments.end()) {
+            if (const auto* v = std::get_if<std::string>(&it->second)) {
+                fieldSchema.formerlySerializedAs = *v;
+            }
+        }
+    }
+
+    // Reference attributes: [EntityRef], [ComponentRef], [AssetRef]
+    const auto readRefTypeArg = [](const ScriptAttribute& attr) -> std::string {
+        for (const char* key : {"type", "Type", "arg0"}) {
+            const auto it = attr.arguments.find(key);
+            if (it != attr.arguments.end()) {
+                if (const auto* v = std::get_if<std::string>(&it->second)) {
+                    return *v;
+                }
+            }
+        }
+        return {};
+    };
+    if (const auto* entityAttr = metadata.findMemberAttribute(
+            ownerCanonicalTypeName, field.name, "EntityRef")) {
+        fieldSchema.referenceKind = InspectorReferenceKind::Entity;
+        fieldSchema.referencedTypeName = readRefTypeArg(*entityAttr);
+        if (fieldSchema.referencedTypeName.empty()) {
+            fieldSchema.referencedTypeName = "Entity";
+        }
+    } else if (const auto* assetAttr = metadata.findMemberAttribute(
+                   ownerCanonicalTypeName, field.name, "AssetRef")) {
+        fieldSchema.referenceKind = InspectorReferenceKind::Asset;
+        fieldSchema.referencedTypeName = readRefTypeArg(*assetAttr);
+        if (fieldSchema.referencedTypeName.empty()) {
+            fieldSchema.referencedTypeName = field.typeName.empty() ? "Asset" : field.typeName;
+        }
+    } else if (const auto* compAttr = metadata.findMemberAttribute(
+                   ownerCanonicalTypeName, field.name, "ComponentRef")) {
+        fieldSchema.referenceKind = InspectorReferenceKind::Component;
+        fieldSchema.referencedTypeName = readRefTypeArg(*compAttr);
+        if (fieldSchema.referencedTypeName.empty()) {
+            fieldSchema.referencedTypeName = field.typeName;
+        }
+    }
+
+    // Enum dropdown options
+    if (field.type == semantic::PrimitiveType::Enum && !field.typeName.empty()) {
+        if (const auto enumType = runtime.findType(field.typeName)) {
+            for (const auto& member : enumType->descriptor.enumMembers) {
+                fieldSchema.enumOptions.push_back(InspectorEnumOption{
+                    member.name,
+                    member.value,
+                });
+            }
+        }
+    }
+
+    // Array / Collection inspection
+    if (field.type == semantic::PrimitiveType::Array) {
+        fieldSchema.isCollection = true;
+        semantic::PrimitiveType elemPrim = semantic::PrimitiveType::Error;
+        std::string elemExact;
+        if (semantic::decodeArrayTypeName(field.typeName, elemPrim, elemExact)) {
+            fieldSchema.elementTypeName = elemExact.empty()
+                ? std::string(semantic::primitiveTypeName(elemPrim))
+                : elemExact;
+        }
+    } else if (field.type == semantic::PrimitiveType::Object && !field.typeName.empty()) {
+        if (const auto* inst = findGenericInstantiation(runtime.program().get(), field.typeName)) {
+            if (isBuiltinCollectionGenericName(inst->genericName)) {
+                fieldSchema.isCollection = true;
+                if (inst->genericName == "Dictionary" && inst->arguments.size() >= 2) {
+                    fieldSchema.keyTypeName = inst->arguments[0];
+                    fieldSchema.elementTypeName = inst->arguments[1];
+                } else if (!inst->arguments.empty()) {
+                    fieldSchema.elementTypeName = inst->arguments[0];
+                }
+            }
+        }
+        if (!fieldSchema.isCollection &&
+            fieldSchema.referenceKind == InspectorReferenceKind::None) {
+            if (const auto refType = runtime.findType(field.typeName)) {
+                if (!refType->descriptor.delegateType) {
+                    fieldSchema.referenceKind = InspectorReferenceKind::Component;
+                    fieldSchema.referencedTypeName = refType->canonicalName();
+                }
+            }
+        }
+    }
+
+    // Nested struct fields
+    if (field.type == semantic::PrimitiveType::Struct && !field.typeName.empty() &&
+        visitedStructs.insert(field.typeName).second) {
+        if (const auto structType = runtime.findType(field.typeName)) {
+            const auto* structVal = std::get_if<runtime::StructValue>(&fieldSchema.defaultValue);
+            for (std::size_t idx = 0; idx < structType->descriptor.fields.size(); ++idx) {
+                const auto& subField = structType->descriptor.fields[idx];
+                if (subField.synthetic) continue;
+                fieldSchema.nestedFields.push_back(buildInspectorFieldSchema(
+                    runtime,
+                    metadata,
+                    structType->canonicalName(),
+                    subField,
+                    nullptr,
+                    structVal,
+                    idx,
+                    visitedStructs));
+            }
+        }
+        visitedStructs.erase(field.typeName);
+    }
+
+    return fieldSchema;
+}
+
+} // namespace
+
 std::optional<InspectorTypeSchema> inspectTypeSchema(
     const ScriptRuntime& runtime,
     const ScriptMetadataRegistry& metadata,
@@ -352,77 +562,69 @@ std::optional<InspectorTypeSchema> inspectTypeSchema(
     schema.executeInEditMode =
         metadata.findTypeAttribute(schema.canonicalTypeName, "Tool") != nullptr ||
         metadata.findTypeAttribute(schema.canonicalTypeName, "ExecuteInEditMode") != nullptr;
+    schema.hasOnValidate =
+        runtime.findMethod(*type, "OnValidate", 0).has_value();
 
     runtime::RuntimeError error;
     auto prototype = runtime.createObject(*type, {}, error);
 
+    std::unordered_set<std::string> visitedStructs;
+    std::unordered_set<std::string> recordedSignals;
+
     for (const auto& field : type->descriptor.fields) {
-        if (field.synthetic || field.name == "__native") continue;
-
-        const bool hasExport =
-            metadata.findMemberAttribute(schema.canonicalTypeName, field.name, "Export") != nullptr ||
-            metadata.findMemberAttribute(schema.canonicalTypeName, field.name, "SerializeField") != nullptr;
-        const bool isPublic =
-            field.accessibility == semantic::Accessibility::Public;
-        const bool hidden =
-            metadata.findMemberAttribute(schema.canonicalTypeName, field.name, "HideInInspector") != nullptr;
-
-        InspectorFieldSchema fieldSchema;
-        fieldSchema.name = field.name;
-        fieldSchema.type = field.type;
-        fieldSchema.typeName = field.typeName;
-        fieldSchema.exported = hasExport || isPublic;
-        fieldSchema.hiddenInInspector = hidden;
-
-        if (prototype) {
-            if (auto val = runtime.getMember(*prototype, field.name, error)) {
-                fieldSchema.defaultValue = std::move(*val);
-            }
-        }
-
-        if (const auto* rangeAttr = metadata.findMemberAttribute(
-                schema.canonicalTypeName, field.name, "Range")) {
-            const auto readIntArg = [&](const char* named, const char* positional) -> std::optional<std::int64_t> {
-                auto it = rangeAttr->arguments.find(named);
-                if (it == rangeAttr->arguments.end()) {
-                    it = rangeAttr->arguments.find(positional);
-                }
-                if (it != rangeAttr->arguments.end()) {
-                    if (const auto* v = std::get_if<std::int64_t>(&it->second)) return *v;
-                }
-                return std::nullopt;
-            };
-            fieldSchema.rangeMin = readIntArg("min", "arg0");
-            fieldSchema.rangeMax = readIntArg("max", "arg1");
-        }
-
-        if (const auto* tooltipAttr = metadata.findMemberAttribute(
-                schema.canonicalTypeName, field.name, "Tooltip")) {
-            auto it = tooltipAttr->arguments.find("text");
-            if (it == tooltipAttr->arguments.end()) {
-                it = tooltipAttr->arguments.find("arg0");
-            }
-            if (it != tooltipAttr->arguments.end()) {
-                if (const auto* v = std::get_if<std::string>(&it->second)) {
-                    fieldSchema.tooltip = *v;
+        // Detect synthetic event delegate fields: $event_<SignalName>_delegate
+        if (field.synthetic) {
+            static constexpr const char* kEventPrefix = "$event_";
+            static constexpr const char* kEventSuffix = "_delegate";
+            const std::size_t prefixLen = std::strlen(kEventPrefix);
+            const std::size_t suffixLen = std::strlen(kEventSuffix);
+            if (field.name.size() > prefixLen + suffixLen &&
+                field.name.rfind(kEventPrefix, 0) == 0 &&
+                field.name.compare(
+                    field.name.size() - suffixLen, suffixLen, kEventSuffix) == 0) {
+                const std::string signalName = field.name.substr(
+                    prefixLen, field.name.size() - prefixLen - suffixLen);
+                if (recordedSignals.insert(signalName).second) {
+                    InspectorSignalSchema sig;
+                    sig.name = signalName;
+                    sig.delegateTypeName = field.typeName;
+                    if (const auto delType = runtime.findType(field.typeName)) {
+                        for (const auto& method : delType->descriptor.methods) {
+                            if (method.name == "Invoke") {
+                                const std::size_t startIdx =
+                                    (method.method && !method.staticMethod &&
+                                     !method.parameters.empty())
+                                    ? 1u
+                                    : 0u;
+                                for (std::size_t i = startIdx;
+                                     i < method.parameters.size();
+                                     ++i) {
+                                    sig.parameters.push_back(InspectorSignalParameter{
+                                        method.parameters[i].name,
+                                        method.parameters[i].type,
+                                        method.parameters[i].typeName,
+                                    });
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    schema.signals.push_back(std::move(sig));
                 }
             }
+            continue;
         }
+        if (field.name == "__native") continue;
 
-        if (const auto* renamedAttr = metadata.findMemberAttribute(
-                schema.canonicalTypeName, field.name, "FormerlySerializedAs")) {
-            auto it = renamedAttr->arguments.find("oldName");
-            if (it == renamedAttr->arguments.end()) {
-                it = renamedAttr->arguments.find("arg0");
-            }
-            if (it != renamedAttr->arguments.end()) {
-                if (const auto* v = std::get_if<std::string>(&it->second)) {
-                    fieldSchema.formerlySerializedAs = *v;
-                }
-            }
-        }
-
-        schema.fields.push_back(std::move(fieldSchema));
+        schema.fields.push_back(buildInspectorFieldSchema(
+            runtime,
+            metadata,
+            schema.canonicalTypeName,
+            field,
+            prototype ? &*prototype : nullptr,
+            nullptr,
+            0,
+            visitedStructs));
     }
 
     return schema;

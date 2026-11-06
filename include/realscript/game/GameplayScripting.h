@@ -31,6 +31,7 @@ struct ScriptEventSubscription {
     SceneEntityId target = 0;
     std::string callback;
     std::int32_t priority = 0;
+    bool once = false;
 };
 
 struct ScriptSequenceStep {
@@ -100,7 +101,13 @@ public:
         SceneEntityId target,
         std::string callback,
         std::int32_t priority = 0);
+    [[nodiscard]] SubscriptionId subscribeOnce(
+        std::string topic,
+        SceneEntityId target,
+        std::string callback,
+        std::int32_t priority = 0);
     bool unsubscribe(SubscriptionId subscriptionId);
+    std::size_t cancelEntityCalls(SceneEntityId target);
 
     [[nodiscard]] EventSequence publish(
         std::string topic,

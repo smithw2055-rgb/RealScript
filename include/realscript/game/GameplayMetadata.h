@@ -100,6 +100,32 @@ struct ScriptContractReport {
 
 [[nodiscard]] ScriptContract sceneBehaviorContract();
 
+struct InspectorFieldSchema;
+
+enum class InspectorReferenceKind {
+    None,
+    Entity,
+    Component,
+    Asset,
+};
+
+struct InspectorEnumOption {
+    std::string name;
+    std::int64_t value = 0;
+};
+
+struct InspectorSignalParameter {
+    std::string name;
+    semantic::PrimitiveType type = semantic::PrimitiveType::Error;
+    std::string typeName;
+};
+
+struct InspectorSignalSchema {
+    std::string name;
+    std::string delegateTypeName;
+    std::vector<InspectorSignalParameter> parameters;
+};
+
 struct InspectorFieldSchema {
     std::string name;
     semantic::PrimitiveType type = semantic::PrimitiveType::Error;
@@ -111,12 +137,21 @@ struct InspectorFieldSchema {
     std::optional<std::int64_t> rangeMax;
     std::string tooltip;
     std::string formerlySerializedAs;
+    InspectorReferenceKind referenceKind = InspectorReferenceKind::None;
+    std::string referencedTypeName;
+    bool isCollection = false;
+    std::string elementTypeName;
+    std::string keyTypeName;
+    std::vector<InspectorEnumOption> enumOptions;
+    std::vector<InspectorFieldSchema> nestedFields;
 };
 
 struct InspectorTypeSchema {
     std::string canonicalTypeName;
     bool executeInEditMode = false;
+    bool hasOnValidate = false;
     std::vector<InspectorFieldSchema> fields;
+    std::vector<InspectorSignalSchema> signals;
 };
 
 [[nodiscard]] std::optional<InspectorTypeSchema> inspectTypeSchema(

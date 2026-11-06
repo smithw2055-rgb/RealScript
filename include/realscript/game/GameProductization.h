@@ -103,13 +103,15 @@ bool restoreScriptObject(
     const ScriptRuntime& runtime,
     const ScriptObject& object,
     runtime::RuntimeError& error,
-    ScriptStatePolicy policy = {});
+    ScriptStatePolicy policy = {},
+    const SceneScriptRuntime* scene = nullptr);
 
 bool importScriptObjectJson(
     ScriptRuntime& runtime,
     ScriptObject& object,
     const std::string& jsonText,
     runtime::RuntimeError& error,
-    ScriptStatePolicy policy = {});
+    ScriptStatePolicy policy = {},
+    SceneScriptRuntime* scene = nullptr);
 
 } // namespace realscript::game

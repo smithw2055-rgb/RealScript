@@ -818,5 +818,8 @@ private:
 [[nodiscard]] const char* bindingDeterminismName(BindingDeterminism determinism) noexcept;
 [[nodiscard]] std::string formatProfile(const ExecutionProfile& profile);
 [[nodiscard]] std::string profileToJson(const ExecutionProfile& profile);
+[[nodiscard]] std::string exportChromeTraceJson(
+    const ExecutionProfile& profile,
+    const GcStatistics* gcStatistics = nullptr);
 
 } // namespace realscript::runtime

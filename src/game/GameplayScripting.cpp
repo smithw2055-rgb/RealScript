@@ -174,12 +174,51 @@ SubscriptionId GameplayHost::subscribe(
     }
     const auto id = nextSubscriptionId_++;
     subscriptions_.emplace(id, ScriptEventSubscription{
-        id, std::move(topic), target, std::move(callback), priority});
+        id, std::move(topic), target, std::move(callback), priority, false});
+    return id;
+}
+
+SubscriptionId GameplayHost::subscribeOnce(
+    std::string topic,
+    SceneEntityId target,
+    std::string callback,
+    std::int32_t priority) {
+    if (topic.empty() || target == 0 || callback.empty() ||
+        nextSubscriptionId_ == 0) {
+        return 0;
+    }
+    const auto id = nextSubscriptionId_++;
+    subscriptions_.emplace(id, ScriptEventSubscription{
+        id, std::move(topic), target, std::move(callback), priority, true});
     return id;
 }
 
 bool GameplayHost::unsubscribe(SubscriptionId subscriptionId) {
     return subscriptions_.erase(subscriptionId) != 0;
+}
+
+std::size_t GameplayHost::cancelEntityCalls(SceneEntityId target) {
+    if (target == 0) return 0;
+    std::vector<TimerId> timersToCancel;
+    for (const auto& [payloadId, call] : calls_) {
+        (void)payloadId;
+        if (call.target == target) {
+            timersToCancel.push_back(call.timerId);
+        }
+    }
+    std::size_t cancelled = 0;
+    for (const auto timerId : timersToCancel) {
+        if (cancelCall(timerId)) ++cancelled;
+    }
+    for (auto it = subscriptions_.begin(); it != subscriptions_.end();) {
+        if (it->second.target == target) {
+            it = subscriptions_.erase(it);
+            ++cancelled;
+        } else {
+            ++it;
+        }
+    }
+    return cancelled;
 }
 
 EventSequence GameplayHost::publish(
@@ -267,6 +306,7 @@ ScriptDispatchBatch GameplayHost::drainDue(
                 return left->priority < right->priority ||
                     (left->priority == right->priority && left->id < right->id);
             });
+        std::vector<SubscriptionId> oneShotConsumed;
         for (const auto* subscriber : subscribers) {
             batch.calls.push_back(ScriptDispatchCall{
                 subscriber->target,
@@ -274,6 +314,12 @@ ScriptDispatchBatch GameplayHost::drainDue(
                 event.arguments,
                 0,
                 event.sequence});
+            if (subscriber->once) {
+                oneShotConsumed.push_back(subscriber->id);
+            }
+        }
+        for (const auto subId : oneShotConsumed) {
+            subscriptions_.erase(subId);
         }
     }
     return batch;
@@ -590,8 +636,30 @@ bool installGameplayBindings(
                 static_cast<std::uint32_t>(repeatCount)));
         }) && valid;
     valid = api.function(moduleName, "CancelTimer", [host](std::int64_t timerId) {
-        return timerId > 0 && host->cancelCall(static_cast<TimerId>(timerId));
+        if (timerId <= 0) return false;
+        return host->cancelCall(static_cast<TimerId>(timerId)) ||
+            host->unsubscribe(static_cast<SubscriptionId>(timerId));
     }) && valid;
+    valid = api.function(
+        moduleName,
+        "SubscribeOnce",
+        [host](std::int64_t target, std::string callback, std::string topic) {
+            if (target <= 0 || callback.empty() || topic.empty()) {
+                return std::int64_t{0};
+            }
+            return static_cast<std::int64_t>(host->subscribeOnce(
+                std::move(topic),
+                static_cast<SceneEntityId>(target),
+                std::move(callback)));
+        }) && valid;
+    valid = api.function(
+        moduleName,
+        "CancelEntityTimers",
+        [host](std::int64_t target) {
+            if (target <= 0) return 0;
+            return static_cast<int>(
+                host->cancelEntityCalls(static_cast<SceneEntityId>(target)));
+        }) && valid;
     valid = api.function(
         moduleName,
         "Publish",

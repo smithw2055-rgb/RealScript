@@ -111,27 +111,33 @@ tooling::Json DapServer::handle(
             {"supportsConfigurationDoneRequest", true},
             {"supportsTerminateRequest", true},
             {"supportsSetVariable", false},
-            {"supportsEvaluateForHovers", false},
+            {"supportsConditionalBreakpoints", true},
+            {"supportsEvaluateForHovers", true},
         });
     }
     if (command == "setBreakpoints") {
         const auto path = nested(request, {"arguments", "source", "path"})
             ? nested(request, {"arguments", "source", "path"})->stringValue() : std::string{};
-        std::vector<text::LinePosition> positions;
+        std::vector<BreakpointSpec> specs;
         if (const auto* values = arguments ? arguments->find("breakpoints") : nullptr) {
             for (const auto& value : values->arrayValue()) {
                 const auto line = value.find("line")
                     ? value.find("line")->integerValue(1) : 1;
                 const auto column = value.find("column")
                     ? value.find("column")->integerValue(1) : 1;
-                positions.push_back({
-                    static_cast<std::size_t>(std::max<std::int64_t>(1, line) - 1),
-                    static_cast<std::size_t>(std::max<std::int64_t>(1, column) - 1),
+                const auto condition = value.find("condition")
+                    ? value.find("condition")->stringValue() : std::string{};
+                specs.push_back(BreakpointSpec{
+                    {
+                        static_cast<std::size_t>(std::max<std::int64_t>(1, line) - 1),
+                        static_cast<std::size_t>(std::max<std::int64_t>(1, column) - 1),
+                    },
+                    condition,
                 });
             }
         }
         tooling::Json::Array breakpoints;
-        for (const auto& breakpoint : session_->controller()->setBreakpoints(path, positions)) {
+        for (const auto& breakpoint : session_->controller()->setConditionalBreakpoints(path, specs)) {
             if (breakpoint.sourcePath != path) continue;
             breakpoints.emplace_back(tooling::Json::Object{
                 {"id", static_cast<std::int64_t>(breakpoint.id)},
@@ -141,6 +147,24 @@ tooling::Json DapServer::handle(
             });
         }
         return response(request, true, tooling::Json::Object{{"breakpoints", tooling::Json(std::move(breakpoints))}});
+    }
+    if (command == "evaluate") {
+        const auto expression = arguments && arguments->find("expression")
+            ? arguments->find("expression")->stringValue() : std::string{};
+        const auto frameId = arguments && arguments->find("frameId")
+            ? static_cast<std::uint32_t>(std::max<std::int64_t>(1, arguments->find("frameId")->integerValue(1)))
+            : 1u;
+        std::string errorMessage;
+        const auto evaluated = session_->evaluate(expression, frameId, &errorMessage);
+        if (!evaluated) {
+            return response(request, false, nullptr,
+                errorMessage.empty() ? "failed to evaluate expression" : errorMessage);
+        }
+        return response(request, true, tooling::Json::Object{
+            {"result", runtime::valueToString(*evaluated, heap_.get())},
+            {"type", semantic::primitiveTypeName(runtime::valueType(*evaluated))},
+            {"variablesReference", 0},
+        });
     }
     if (command == "launch") {
         const auto function = arguments && arguments->find("function")

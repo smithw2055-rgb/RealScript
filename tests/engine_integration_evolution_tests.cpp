@@ -1,3 +1,5 @@
+#include "realscript/debug/DapServer.h"
+#include "realscript/debug/Debugger.h"
 #include "realscript/game/GameProductization.h"
 #include "realscript/game/GameplayMetadata.h"
 #include "realscript/game/GameplayScripting.h"
@@ -763,16 +765,553 @@ class Calculator
         "InterpretOnly(10) should seamlessly fall back to Interpreter (20)");
 }
 
+void testStage1EditorDataflowSignalsAndHotReloadRefs() {
+    const char* sourceV1 = R"(
+module Game.Stage1;
+
+enum AlertLevel
+{
+    Calm = 0,
+    Caution = 1,
+    Danger = 5
+}
+
+struct TuningData
+{
+    int minDamage;
+    double critMultiplier;
+}
+
+delegate void SignalHandler(int code);
+
+class DoorComponent
+{
+    public int openCode;
+    public bool isOpen;
+
+    public void OnSwitchTriggered(int code)
+    {
+        openCode = code;
+        isOpen = code > 0;
+    }
+}
+
+class SwitchComponent
+{
+    public AlertLevel alert;
+    public TuningData tuning;
+    public int[] checkpoints;
+    public List<string> tags;
+    [EntityRef(Type = "Actor")]
+    public long linkedEntityId;
+    [AssetRef(Type = "AudioClip")]
+    public string clickSoundPath;
+    public DoorComponent targetDoor;
+    public int powerLevel;
+    public event SignalHandler OnTriggered;
+
+    public void OnValidate()
+    {
+        if (powerLevel < 0) powerLevel = 0;
+        if (powerLevel > 100) powerLevel = 100;
+    }
+
+    public void PullSwitch(int code)
+    {
+        if (targetDoor != null)
+        {
+            targetDoor.openCode = code * 10;
+        }
+        OnTriggered(code);
+    }
+}
+)";
+
+    realscript::game::GameApi api;
+    realscript::game::GameScriptCompiler compiler(api);
+    auto compiled = compiler.compile({{"stage1.rs", sourceV1}});
+    require(
+        compiled.succeeded(),
+        "Stage 1 script failed to compile:\n" + diagnosticsText(compiled.diagnostics));
+
+    realscript::game::ScriptRuntime runtime(compiled.program);
+    realscript::game::ScriptMetadataRegistry metadata;
+    metadata.populateFromProgram(compiled.program);
+
+    const auto schemaOpt = realscript::game::inspectTypeSchema(
+        runtime, metadata, "Game.Stage1::SwitchComponent");
+    require(schemaOpt.has_value(), "inspectTypeSchema for SwitchComponent failed");
+    const auto& schema = *schemaOpt;
+
+    require(schema.hasOnValidate, "SwitchComponent schema should detect OnValidate()");
+    require(
+        schema.signals.size() == 1 &&
+            schema.signals[0].name == "OnTriggered" &&
+            schema.signals[0].parameters.size() == 1 &&
+            schema.signals[0].parameters[0].type == realscript::semantic::PrimitiveType::Int,
+        "SwitchComponent schema should expose OnTriggered(int) signal");
+
+    bool checkedEnum = false;
+    bool checkedStruct = false;
+    bool checkedArray = false;
+    bool checkedList = false;
+    bool checkedEntityRef = false;
+    bool checkedAssetRef = false;
+    bool checkedComponentRef = false;
+    for (const auto& field : schema.fields) {
+        if (field.name == "alert") {
+            checkedEnum = field.enumOptions.size() == 3 &&
+                field.enumOptions[0].name == "Calm" && field.enumOptions[0].value == 0 &&
+                field.enumOptions[2].name == "Danger" && field.enumOptions[2].value == 5;
+        } else if (field.name == "tuning") {
+            checkedStruct = field.nestedFields.size() == 2 &&
+                field.nestedFields[0].name == "minDamage" &&
+                field.nestedFields[1].name == "critMultiplier";
+        } else if (field.name == "checkpoints") {
+            checkedArray = field.isCollection && field.elementTypeName == "int";
+        } else if (field.name == "tags") {
+            checkedList = field.isCollection && field.elementTypeName == "string";
+        } else if (field.name == "linkedEntityId") {
+            checkedEntityRef =
+                field.referenceKind == realscript::game::InspectorReferenceKind::Entity &&
+                field.referencedTypeName == "Actor";
+        } else if (field.name == "clickSoundPath") {
+            checkedAssetRef =
+                field.referenceKind == realscript::game::InspectorReferenceKind::Asset &&
+                field.referencedTypeName == "AudioClip";
+        } else if (field.name == "targetDoor") {
+            checkedComponentRef =
+                field.referenceKind == realscript::game::InspectorReferenceKind::Component &&
+                field.referencedTypeName == "Game.Stage1::DoorComponent";
+        }
+    }
+    require(checkedEnum, "InspectorFieldSchema enumOptions reflection failed");
+    require(checkedStruct, "InspectorFieldSchema nestedFields reflection failed");
+    require(checkedArray, "InspectorFieldSchema array collection reflection failed");
+    require(checkedList, "InspectorFieldSchema generic List reflection failed");
+    require(checkedEntityRef, "InspectorFieldSchema EntityRef reflection failed");
+    require(checkedAssetRef, "InspectorFieldSchema AssetRef reflection failed");
+    require(checkedComponentRef, "InspectorFieldSchema ComponentRef reflection failed");
+
+    // Scene wiring: entity 1 has SwitchComponent, entity 2 has DoorComponent
+    realscript::game::SceneScriptRuntime scene(runtime);
+    require(scene.attachComponent(1, "Game.Stage1::SwitchComponent"), "attach SwitchComponent failed");
+    require(scene.attachComponent(2, "Game.Stage1::DoorComponent"), "attach DoorComponent failed");
+
+    realscript::runtime::RuntimeError error;
+    // Test setInspectorMember + OnValidate clamping
+    require(
+        scene.setInspectorMember(
+            1, "SwitchComponent", "powerLevel", std::int64_t{250}),
+        "setInspectorMember failed");
+    auto* switchObj = scene.getComponent(1, "SwitchComponent");
+    auto* doorObj = scene.getComponent(2, "DoorComponent");
+    require(switchObj && doorObj, "failed to look up SwitchComponent or DoorComponent");
+    const auto clampedPower = runtime.getMember(*switchObj, "powerLevel", error);
+    require(
+        clampedPower.has_value() && std::get<std::int64_t>(*clampedPower) == 100,
+        "OnValidate should clamp powerLevel from 250 to 100");
+
+    // Set cross-entity component reference & array field, then round-trip JSON
+    require(
+        runtime.setMember(*switchObj, "targetDoor", doorObj->value(), error),
+        "setting targetDoor reference failed: " + error.message);
+    auto arrRef = runtime.heap()->allocateArray(2, std::int64_t{0}, &error);
+    require(arrRef.has_value(), "allocateArray failed");
+    runtime.heap()->arraySet(*arrRef, 0, std::int64_t{10});
+    runtime.heap()->arraySet(*arrRef, 1, std::int64_t{20});
+    require(
+        runtime.setMember(*switchObj, "checkpoints", *arrRef, error),
+        "setting checkpoints array failed");
+
+    realscript::game::ScriptStatePolicy jsonPolicy;
+    jsonPolicy.allowDoubles = true;
+    const std::string exportedJson = realscript::game::exportScriptObjectJson(
+        runtime, *switchObj, error, jsonPolicy, &scene);
+    require(
+        error.code == realscript::runtime::ErrorCode::None &&
+            exportedJson.find("\"$entity\":2") != std::string::npos &&
+            exportedJson.find("[10,20]") != std::string::npos,
+        "exportScriptObjectJson should serialize cross-entity component ref and array: " +
+            error.message + " / " + exportedJson);
+
+    // Clear fields and re-import from JSON
+    require(
+        runtime.setMember(*switchObj, "targetDoor", realscript::runtime::NullObject{}, error),
+        "clearing targetDoor failed");
+    require(
+        realscript::game::importScriptObjectJson(
+            runtime, *switchObj, exportedJson, error, jsonPolicy, &scene),
+        "importScriptObjectJson failed: " + error.message);
+
+    // Connect signal from entity 1 SwitchComponent.OnTriggered -> entity 2 DoorComponent.OnSwitchTriggered
+    require(
+        scene.connectSignal(
+            1, "SwitchComponent", "OnTriggered", 2, "DoorComponent", "OnSwitchTriggered"),
+        "connectSignal failed");
+
+    // Hot-reload v2 and verify both targetDoor reference AND OnTriggered signal survive migration!
+    const char* sourceV2 = R"(
+module Game.Stage1;
+
+enum AlertLevel
+{
+    Calm = 0,
+    Caution = 1,
+    Danger = 5
+}
+
+struct TuningData
+{
+    int minDamage;
+    double critMultiplier;
+}
+
+delegate void SignalHandler(int code);
+
+class DoorComponent
+{
+    public int openCode;
+    public bool isOpen;
+    public int reloadBonus;
+
+    public void OnSwitchTriggered(int code)
+    {
+        openCode = code + reloadBonus;
+        isOpen = true;
+    }
+}
+
+class SwitchComponent
+{
+    public AlertLevel alert;
+    public TuningData tuning;
+    public int[] checkpoints;
+    public List<string> tags;
+    public long linkedEntityId;
+    public string clickSoundPath;
+    public DoorComponent targetDoor;
+    public int powerLevel;
+    public event SignalHandler OnTriggered;
+
+    public void PullSwitch(int code)
+    {
+        if (targetDoor != null)
+        {
+            targetDoor.reloadBonus = code * 10;
+        }
+        OnTriggered(code);
+    }
+}
+)";
+    auto compiledV2 = compiler.compile({{"stage1.rs", sourceV2}});
+    require(compiledV2.succeeded(), "Stage 1 v2 failed to compile");
+    const auto reloadReport = scene.hotReload(compiledV2.program);
+    require(
+        reloadReport.succeeded && reloadReport.instancesMigrated == 2,
+        "Stage 1 hotReload failed");
+
+    const auto pullRes = scene.invokeComponent(
+        1, "SwitchComponent", "PullSwitch", {std::int64_t{7}});
+    require(
+        pullRes.succeeded,
+        "PullSwitch after hotReload failed: " + pullRes.error.message);
+
+    auto* reloadedDoor = scene.getComponent(2, "DoorComponent");
+    require(reloadedDoor != nullptr, "reloaded DoorComponent not found");
+    const auto openCodeVal = runtime.getMember(*reloadedDoor, "openCode", error);
+    const auto isOpenVal = runtime.getMember(*reloadedDoor, "isOpen", error);
+    require(
+        openCodeVal.has_value() && std::get<std::int64_t>(*openCodeVal) == 77 &&
+            isOpenVal.has_value() && std::get<bool>(*isOpenVal),
+        "After hotReload, targetDoor ref should set reloadBonus=70 and signal should set openCode=77");
+}
+
+void testStage2CoroutinesAndDebuggerEvaluation() {
+    auto host = std::make_shared<realscript::game::GameplayHost>(60);
+    realscript::game::GameApi api;
+    require(
+        realscript::game::installGameplayBindings(api, host),
+        "installGameplayBindings failed");
+
+    const char* coroutineSource = R"(
+module Game.Stage2;
+import RealScript.Game;
+
+class QuestRunner
+{
+    public int stage;
+    public int energy;
+
+    sequence RunQuest(long selfEntity)
+    {
+        stage = 1;
+        yield wait_event("GateOpened");
+        stage = 2;
+        yield wait_until(energy >= 3);
+        stage = 3;
+    }
+
+    public void AddEnergy(int amount)
+    {
+        energy = energy + amount;
+    }
+}
+)";
+    realscript::game::GameScriptCompiler compiler(api);
+    auto compiled = compiler.compile({{"stage2.rs", coroutineSource}});
+    require(
+        compiled.succeeded(),
+        "Stage 2 coroutine script failed to compile:\n" +
+            diagnosticsText(compiled.diagnostics));
+
+    realscript::game::ScriptRuntime runtime(compiled.program);
+    realscript::game::SceneScriptRuntime scene(runtime);
+    realscript::game::SceneGameplayDriver driver(scene, host);
+
+    std::cout << "  [8a] starting QuestRunner..." << std::endl;
+    require(scene.attach(1, "Game.Stage2::QuestRunner"), "attach QuestRunner failed");
+    require(
+        scene.invoke(1, "RunQuest", {realscript::runtime::LongValue{1}}).succeeded,
+        "starting RunQuest failed");
+
+    realscript::runtime::RuntimeError error;
+    auto readStage = [&]() -> std::int64_t {
+        const auto val = runtime.getMember(*scene.object(1), "stage", error);
+        return val ? std::get<std::int64_t>(*val) : -1;
+    };
+    require(readStage() == 1, "RunQuest should start at stage 1 and wait for GateOpened");
+
+    // Advance 3 ticks without publishing GateOpened -> still stage 1
+    (void)driver.advanceTicks(3);
+    require(readStage() == 1, "RunQuest should remain at stage 1 before GateOpened");
+
+    // Publish GateOpened -> transitions to stage 2 and begins polling wait_until(energy >= 3)
+    std::cout << "  [8b] publishing GateOpened..." << std::endl;
+    (void)host->publish("GateOpened", {}, 1);
+    (void)driver.advanceTicks(1);
+    require(readStage() == 2, "RunQuest should advance to stage 2 on GateOpened event");
+
+    // Add energy = 2 -> still waiting
+    require(scene.invoke(1, "AddEnergy", {std::int64_t{2}}).succeeded, "AddEnergy(2) failed");
+    (void)driver.advanceTicks(2);
+    require(readStage() == 2, "RunQuest should remain at stage 2 while energy == 2");
+
+    // Hot-reload while suspended in wait_until!
+    std::cout << "  [8c] hotReload during wait_until..." << std::endl;
+    const auto reloadReport = scene.hotReload(compiled.program);
+    require(reloadReport.succeeded, "hotReload during wait_until failed");
+
+    // Add energy +1 -> energy == 3 -> wait_until succeeds on next tick -> stage 3!
+    require(scene.invoke(1, "AddEnergy", {std::int64_t{1}}).succeeded, "AddEnergy(1) failed");
+    (void)driver.advanceTicks(1);
+    require(readStage() == 3, "RunQuest should reach stage 3 once energy >= 3");
+
+    // Verify automatic sequence cancellation when an entity is detached
+    std::cout << "  [8d] detach entity 2..." << std::endl;
+    require(scene.attach(2, "Game.Stage2::QuestRunner"), "attach QuestRunner #2 failed");
+    require(
+        scene.invoke(2, "RunQuest", {realscript::runtime::LongValue{2}}).succeeded,
+        "starting RunQuest #2 failed");
+    require(scene.detach(2), "detach entity 2 failed");
+    (void)host->publish("GateOpened", {}, 1);
+    (void)driver.advanceTicks(2);
+    require(driver.errors().empty(), "detached entity sequence should be cancelled cleanly without callback errors");
+
+    std::cout << "  [8e] launching DebugSession..." << std::endl;
+
+    // Test Conditional Breakpoints & Side-Effect-Free Watch/Hover Expression Evaluation
+    const char* debugSource = R"(
+module Game.DebugTest;
+
+class ScoreTracker
+{
+    int multiplier;
+    int[] bonusTable;
+
+    ScoreTracker()
+    {
+        multiplier = 10;
+        bonusTable = new int[3];
+        bonusTable[0] = 5;
+        bonusTable[1] = 15;
+        bonusTable[2] = 25;
+    }
+
+    int Accumulate(int count)
+    {
+        int total = 0;
+        for (int i = 0; i < count; i = i + 1)
+        {
+            total = total + i * multiplier;
+        }
+        return total;
+    }
+}
+
+int Main()
+{
+    ScoreTracker tracker = new ScoreTracker();
+    return tracker.Accumulate(5);
+}
+)";
+    auto debugCompiled = compiler.compile({{"debug_test.rs", debugSource}});
+    require(debugCompiled.succeeded(), "debug_test.rs failed to compile");
+
+    realscript::debug::DebugSession session(
+        debugCompiled.program.program(),
+        debugCompiled.program.heap());
+    // Set conditional breakpoint inside loop (line 23, 0-based 22) when i == 3 && multiplier == 10
+    const auto bps = session.controller()->setConditionalBreakpoints(
+        "debug_test.rs",
+        {realscript::debug::BreakpointSpec{{22, 0}, "i == 3 && multiplier == 10"}});
+    require(bps.size() == 1 && bps[0].verified, "conditional breakpoint should be verified");
+
+    require(session.launch("Game.DebugTest::Main"), "DebugSession launch failed");
+    require(
+        session.waitForStop(std::chrono::seconds{5}),
+        "DebugSession should stop on conditional breakpoint");
+
+    std::string evalError;
+    const auto iVal = session.evaluate("i", 1, &evalError);
+    require(
+        iVal.has_value() && std::get<std::int64_t>(*iVal) == 3,
+        "conditional breakpoint should stop only when i == 3, got error: " + evalError);
+
+    const auto watchExpr = session.evaluate("total + i * this.multiplier + bonusTable[1]", 1, &evalError);
+    require(
+        watchExpr.has_value() && std::get<std::int64_t>(*watchExpr) == (30 + 30 + 15),
+        "watch expression evaluation failed: " + evalError);
+
+    const auto lenExpr = session.evaluate("this.bonusTable.Length", 1, &evalError);
+    require(
+        lenExpr.has_value() && std::get<std::int64_t>(*lenExpr) == 3,
+        "array Length evaluation failed: " + evalError);
+
+    session.controller()->clearBreakpoints();
+    session.continueExecution();
+    session.join();
+    require(
+        session.result().has_value() &&
+            session.result()->succeeded &&
+            std::get<std::int64_t>(session.result()->value) == 100,
+        "DebugSession should finish and return 100");
+}
+
+void testStage3FastMathAndChromeTracing() {
+    realscript::game::GameApi api;
+    const char* source = R"(
+module Game.Stage3;
+import RealScript.Math;
+
+class Mover
+{
+    public Vec2 position;
+    public Vec2 velocity;
+
+    public void Step()
+    {
+        position = position + velocity;
+    }
+}
+)";
+    realscript::game::GameScriptCompiler compiler(api);
+    auto compiled = compiler.compile({{"stage3.rs", source}});
+    require(
+        compiled.succeeded(),
+        "Stage 3 script failed to compile:\n" + diagnosticsText(compiled.diagnostics));
+
+    realscript::game::ScriptRuntime runtime(compiled.program);
+    realscript::runtime::RuntimeError error;
+    auto mover = runtime.createObject("Game.Stage3::Mover", error);
+    require(mover.has_value(), "failed to create Mover: " + error.message);
+
+    require(
+        runtime.setMemberVec2(
+            *mover,
+            "position",
+            realscript::game::Vec2{
+                realscript::game::Fixed::fromInt(1),
+                realscript::game::Fixed::fromInt(2),
+            },
+            error) &&
+        runtime.setMemberVec2(
+            *mover,
+            "velocity",
+            realscript::game::Vec2{
+                realscript::game::Fixed::fromInt(3),
+                realscript::game::Fixed::fromInt(4),
+            },
+            error),
+        "initial setMemberVec2 failed: " + error.message);
+
+    const auto initialPos = runtime.getMemberVec2(*mover, "position", error);
+    require(
+        initialPos.has_value() &&
+            initialPos->x == realscript::game::Fixed::fromInt(1) &&
+            initialPos->y == realscript::game::Fixed::fromInt(2),
+        "getMemberVec2 initial position mismatch");
+
+    // Mutate Vec2 repeatedly and verify values
+    for (int i = 1; i <= 5; ++i) {
+        require(
+            runtime.setMemberVec2(
+                *mover,
+                "position",
+                realscript::game::Vec2{
+                    realscript::game::Fixed::fromInt(i * 10),
+                    realscript::game::Fixed::fromInt(i * 20),
+                },
+                error),
+            "setMemberVec2 failed: " + error.message);
+    }
+    const auto updatedPos = runtime.getMemberVec2(*mover, "position", error);
+    require(
+        updatedPos.has_value() &&
+            updatedPos->x == realscript::game::Fixed::fromInt(50) &&
+            updatedPos->y == realscript::game::Fixed::fromInt(100),
+        "getMemberVec2 after setMemberVec2 mismatch");
+
+    // Profile execution and export Chrome Trace JSON
+    auto collector = std::make_shared<realscript::runtime::ProfileCollector>();
+    realscript::runtime::ExecutionOptions execOptions;
+    execOptions.profile = collector;
+    const auto stepMethod = runtime.findMethod(mover->type(), "Step", 0);
+    require(stepMethod.has_value(), "Mover.Step not found");
+    const auto stepRes = runtime.invoke(*mover, *stepMethod, {}, execOptions);
+    require(stepRes.succeeded, "Mover.Step failed");
+
+    const auto traceJson = realscript::runtime::exportChromeTraceJson(
+        collector->snapshot(), &runtime.heap()->statistics());
+    require(
+        traceJson.find("\"traceEvents\":[") != std::string::npos &&
+            traceJson.find("\"cat\":\"script\"") != std::string::npos &&
+            traceJson.find("\"name\":\"GC Memory\"") != std::string::npos,
+        "exportChromeTraceJson output is missing expected trace events: " + traceJson);
+}
+
 } // namespace
 
 int main() {
     try {
+        std::cout << "[1/9] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
         testScriptInheritingNativeAndMathMarshaling();
+        std::cout << "[2/9] testMultiComponentSceneAndEditorMode..." << std::endl;
         testMultiComponentSceneAndEditorMode();
+        std::cout << "[3/9] testInspectorAttributesJsonAndStatefulHotReload..." << std::endl;
         testInspectorAttributesJsonAndStatefulHotReload();
+        std::cout << "[4/9] testCoroutineWaitSeconds..." << std::endl;
         testCoroutineWaitSeconds();
+        std::cout << "[5/9] testLspStubsDotCompletionAndSignatureHelp..." << std::endl;
         testLspStubsDotCompletionAndSignatureHelp();
+        std::cout << "[6/9] testTieredExecutionDispatcher..." << std::endl;
         testTieredExecutionDispatcher();
+        std::cout << "[7/9] testStage1EditorDataflowSignalsAndHotReloadRefs..." << std::endl;
+        testStage1EditorDataflowSignalsAndHotReloadRefs();
+        std::cout << "[8/9] testStage2CoroutinesAndDebuggerEvaluation..." << std::endl;
+        testStage2CoroutinesAndDebuggerEvaluation();
+        std::cout << "[9/9] testStage3FastMathAndChromeTracing..." << std::endl;
+        testStage3FastMathAndChromeTracing();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

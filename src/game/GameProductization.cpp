@@ -620,21 +620,87 @@ const semantic::TypeSymbol* findProgramTypeById(
 }
 
 bool valueToJson(
-    const runtime::ProgramImage* program,
+    const ScriptRuntime& runtime,
+    const SceneScriptRuntime* scene,
     const runtime::Value& value,
     const ScriptStatePolicy& policy,
     std::size_t depth,
     tooling::Json& out,
     runtime::RuntimeError& error) {
+    const auto* program = runtime.program().get();
+    if (depth > policy.maximumStructDepth) {
+        fail(error, runtime::ErrorCode::DeterminismViolation,
+            "script state exceeds maximum struct depth");
+        return false;
+    }
+    if (std::holds_alternative<std::monostate>(value) ||
+        std::holds_alternative<runtime::NullString>(value) ||
+        std::holds_alternative<runtime::NullObject>(value) ||
+        std::holds_alternative<runtime::NullArray>(value)) {
+        out = tooling::Json(nullptr);
+        return true;
+    }
+    if (const auto* objRef = std::get_if<runtime::ObjectRef>(&value)) {
+        if (!objRef->valid()) {
+            out = tooling::Json(nullptr);
+            return true;
+        }
+        if (objRef->kind == runtime::ObjectKind::String) {
+            if (!policy.allowStrings) {
+                fail(error, runtime::ErrorCode::DeterminismViolation,
+                    "script state contains a string disallowed by policy");
+                return false;
+            }
+            const auto view = runtime.heap()->stringView(*objRef);
+            if (!view) {
+                fail(error, runtime::ErrorCode::InvalidObjectReference,
+                    "failed to read script string object");
+                return false;
+            }
+            out = tooling::Json(std::string(*view));
+            return true;
+        }
+        if (objRef->kind == runtime::ObjectKind::Array) {
+            const auto len = runtime.heap()->arrayLength(*objRef);
+            if (!len) {
+                fail(error, runtime::ErrorCode::InvalidObjectReference,
+                    "failed to read script array length");
+                return false;
+            }
+            tooling::Json::Array arr;
+            arr.reserve(*len);
+            for (std::size_t i = 0; i < *len; ++i) {
+                const auto elem = runtime.heap()->arrayGet(*objRef, i);
+                if (!elem) return false;
+                tooling::Json elemJson;
+                if (!valueToJson(
+                        runtime, scene, *elem, policy, depth + 1, elemJson, error)) {
+                    return false;
+                }
+                arr.push_back(std::move(elemJson));
+            }
+            out = tooling::Json(std::move(arr));
+            return true;
+        }
+        if (scene) {
+            if (const auto loc = scene->findObjectLocation(*objRef)) {
+                tooling::Json::Object refObj;
+                refObj["$entity"] = static_cast<std::int64_t>(loc->entity);
+                refObj["$component"] = loc->canonicalTypeName;
+                out = tooling::Json(std::move(refObj));
+                return true;
+            }
+        }
+        fail(error, runtime::ErrorCode::DeterminismViolation,
+            "script state contains an unresolvable object reference");
+        return false;
+    }
     if (!allowedValue(value, policy, depth)) {
         fail(error, runtime::ErrorCode::DeterminismViolation,
             "script state contains a process-local or disallowed value");
         return false;
     }
-    if (std::holds_alternative<std::monostate>(value) ||
-        std::holds_alternative<runtime::NullString>(value)) {
-        out = tooling::Json(nullptr);
-    } else if (const auto* boolItem = std::get_if<bool>(&value)) {
+    if (const auto* boolItem = std::get_if<bool>(&value)) {
         out = tooling::Json(*boolItem);
     } else if (const auto* byteItem = std::get_if<runtime::ByteValue>(&value)) {
         out = tooling::Json(static_cast<std::int64_t>(byteItem->value));
@@ -669,7 +735,8 @@ bool valueToJson(
             for (std::size_t idx = 0; idx < structDesc->fields.size(); ++idx) {
                 tooling::Json fieldJson;
                 if (!valueToJson(
-                        program,
+                        runtime,
+                        scene,
                         structItem->storage->fields[idx],
                         policy,
                         depth + 1,
@@ -685,7 +752,7 @@ bool valueToJson(
             arr.reserve(structItem->storage->fields.size());
             for (const auto& elem : structItem->storage->fields) {
                 tooling::Json fieldJson;
-                if (!valueToJson(program, elem, policy, depth + 1, fieldJson, error)) {
+                if (!valueToJson(runtime, scene, elem, policy, depth + 1, fieldJson, error)) {
                     return false;
                 }
                 arr.push_back(std::move(fieldJson));
@@ -699,7 +766,8 @@ bool valueToJson(
 }
 
 bool jsonToValue(
-    const runtime::ProgramImage* program,
+    ScriptRuntime& runtime,
+    SceneScriptRuntime* scene,
     const tooling::Json& json,
     semantic::PrimitiveType expectedType,
     const std::string& expectedTypeName,
@@ -707,6 +775,7 @@ bool jsonToValue(
     std::size_t depth,
     runtime::Value& out,
     runtime::RuntimeError& error) {
+    const auto* program = runtime.program().get();
     if (depth > policy.maximumStructDepth) {
         fail(error, runtime::ErrorCode::InvalidProgram,
             "JSON script state exceeds maximum struct depth");
@@ -774,6 +843,70 @@ bool jsonToValue(
         if (!policy.allowStrings || !json.isString()) return false;
         out = json.stringValue();
         return true;
+    case semantic::PrimitiveType::Object: {
+        if (json.isNull()) {
+            out = runtime::NullObject{};
+            return true;
+        }
+        if (scene && json.isObject()) {
+            const auto* entJson = json.find("$entity");
+            const auto* compJson = json.find("$component");
+            if (entJson && entJson->isNumber() && compJson && compJson->isString()) {
+                const auto entityId = static_cast<SceneEntityId>(entJson->integerValue());
+                auto* compObj = scene->getComponent(entityId, compJson->stringValue());
+                if (compObj) {
+                    out = compObj->value();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    case semantic::PrimitiveType::Array: {
+        if (json.isNull()) {
+            out = runtime::NullArray{};
+            return true;
+        }
+        if (!json.isArray()) return false;
+        semantic::PrimitiveType elemPrim = semantic::PrimitiveType::Error;
+        std::string elemTypeName;
+        if (!semantic::decodeArrayTypeName(expectedTypeName, elemPrim, elemTypeName)) {
+            return false;
+        }
+        const semantic::SymbolId elemTypeId =
+            semantic::isExactType(elemPrim) && !elemTypeName.empty()
+            ? semantic::stableTypeId(elemTypeName)
+            : 0;
+        const auto& items = json.arrayValue();
+        std::vector<runtime::Value> decodedElements(items.size());
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            if (!jsonToValue(
+                    runtime,
+                    scene,
+                    items[i],
+                    elemPrim,
+                    elemTypeName,
+                    policy,
+                    depth + 1,
+                    decodedElements[i],
+                    error)) {
+                return false;
+            }
+        }
+        const runtime::Value defaultElem = decodedElements.empty()
+            ? runtime::Value{std::int64_t{0}}
+            : decodedElements.front();
+        const auto arrRef = runtime.heap()->allocateTypedArray(
+            typeId, elemPrim, elemTypeId, items.size(), defaultElem, &error);
+        if (!arrRef) return false;
+        for (std::size_t i = 0; i < decodedElements.size(); ++i) {
+            if (!runtime.heap()->arraySet(*arrRef, i, decodedElements[i], &error)) {
+                return false;
+            }
+        }
+        out = *arrRef;
+        return true;
+    }
     case semantic::PrimitiveType::Enum: {
         if (typeId == 0) return false;
         if (json.isNumber()) {
@@ -803,7 +936,8 @@ bool jsonToValue(
                 const auto& fDesc = structDesc->fields[idx];
                 const auto* fJson = json.find(fDesc.name);
                 if (!fJson || !jsonToValue(
-                        program,
+                        runtime,
+                        scene,
                         *fJson,
                         fDesc.type,
                         fDesc.typeName,
@@ -821,7 +955,8 @@ bool jsonToValue(
             for (std::size_t idx = 0; idx < structDesc->fields.size(); ++idx) {
                 const auto& fDesc = structDesc->fields[idx];
                 if (!jsonToValue(
-                        program,
+                        runtime,
+                        scene,
                         json.arrayValue()[idx],
                         fDesc.type,
                         fDesc.typeName,
@@ -848,7 +983,9 @@ std::string exportScriptObjectJson(
     const ScriptRuntime& runtime,
     const ScriptObject& object,
     runtime::RuntimeError& error,
-    ScriptStatePolicy policy) {
+    ScriptStatePolicy policy,
+    const SceneScriptRuntime* scene) {
+    error = {};
     if (!object.valid()) {
         fail(error, runtime::ErrorCode::InvalidObjectReference,
             "cannot export JSON for an invalid script object");
@@ -862,12 +999,14 @@ std::string exportScriptObjectJson(
     }
 
     tooling::Json::Object fieldsObj;
-    for (const auto& field : fields) {
+    for (std::size_t index = 0; index < fields.size(); ++index) {
+        const auto& field = fields[index];
+        if (field.synthetic || (!field.name.empty() && field.name.front() == '$')) continue;
         if (field.name == "__native" &&
             field.type == semantic::PrimitiveType::Handle) {
             continue;
         }
-        auto value = runtime.heap()->fieldGet(object.reference(), field.index);
+        auto value = runtime.heap()->fieldGet(object.reference(), index);
         if (!value) {
             fail(error, runtime::ErrorCode::InvalidObjectReference,
                 "failed to read script field '" + field.name + "'");
@@ -875,7 +1014,7 @@ std::string exportScriptObjectJson(
         }
         tooling::Json fieldJson;
         if (!valueToJson(
-                runtime.program().get(), *value, policy, 0, fieldJson, error)) {
+                runtime, scene, *value, policy, 0, fieldJson, error)) {
             return {};
         }
         fieldsObj[field.name] = std::move(fieldJson);
@@ -893,7 +1032,9 @@ bool importScriptObjectJson(
     ScriptObject& object,
     const std::string& jsonText,
     runtime::RuntimeError& error,
-    ScriptStatePolicy policy) {
+    ScriptStatePolicy policy,
+    SceneScriptRuntime* scene) {
+    error = {};
     if (!object.valid()) {
         fail(error, runtime::ErrorCode::InvalidObjectReference,
             "cannot import JSON into an invalid script object");
@@ -929,6 +1070,7 @@ bool importScriptObjectJson(
     std::vector<std::pair<std::string, runtime::Value>> decodedFields;
     decodedFields.reserve(descriptors.size());
     for (const auto& desc : descriptors) {
+        if (desc.synthetic || (!desc.name.empty() && desc.name.front() == '$')) continue;
         if (desc.name == "__native" &&
             desc.type == semantic::PrimitiveType::Handle) {
             continue;
@@ -939,7 +1081,8 @@ bool importScriptObjectJson(
         }
         runtime::Value decodedValue;
         if (!jsonToValue(
-                runtime.program().get(),
+                runtime,
+                scene,
                 *fieldJson,
                 desc.type,
                 desc.typeName,

@@ -310,6 +310,28 @@ public:
         runtime::RuntimeError& error,
         runtime::ExecutionOptions options = {}) const;
 
+    [[nodiscard]] static runtime::Value makeFixed(Fixed value);
+    [[nodiscard]] static runtime::Value makeVec2(Vec2 value);
+    [[nodiscard]] static runtime::Value makeVec3(Vec3 value);
+    [[nodiscard]] static std::optional<Fixed> readFixed(
+        const runtime::Value& value) noexcept;
+    [[nodiscard]] static std::optional<Vec2> readVec2(
+        const runtime::Value& value) noexcept;
+    [[nodiscard]] static std::optional<Vec3> readVec3(
+        const runtime::Value& value) noexcept;
+
+    [[nodiscard]] std::optional<Vec2> getMemberVec2(
+        const ScriptObject& object,
+        const std::string& name,
+        runtime::RuntimeError& error,
+        runtime::ExecutionOptions options = {}) const;
+    bool setMemberVec2(
+        ScriptObject& object,
+        const std::string& name,
+        Vec2 value,
+        runtime::RuntimeError& error,
+        runtime::ExecutionOptions options = {}) const;
+
     [[nodiscard]] std::shared_ptr<const runtime::ProgramImage> program() const noexcept {
         return program_;
     }
@@ -438,6 +460,31 @@ public:
         const GameProgram& newProgram,
         const ScriptMetadataRegistry* metadata = nullptr);
 
+    bool validate(SceneEntityId entity);
+    bool validateComponent(
+        SceneEntityId entity,
+        const std::string& scriptType);
+    bool setInspectorMember(
+        SceneEntityId entity,
+        const std::string& scriptType,
+        const std::string& memberName,
+        runtime::Value value);
+
+    bool connectSignal(
+        SceneEntityId sourceEntity,
+        const std::string& sourceComponent,
+        const std::string& signalName,
+        SceneEntityId targetEntity,
+        const std::string& targetComponent,
+        const std::string& targetMethod);
+
+    struct ComponentLocation {
+        SceneEntityId entity = 0;
+        std::string canonicalTypeName;
+    };
+    [[nodiscard]] std::optional<ComponentLocation> findObjectLocation(
+        runtime::ObjectRef reference) const;
+
     [[nodiscard]] runtime::ExecutionResult invoke(
         SceneEntityId entity,
         const std::string& callback,
@@ -462,6 +509,8 @@ public:
         return errors_;
     }
     void clearErrors() { errors_.clear(); }
+    [[nodiscard]] ScriptRuntime& runtime() noexcept { return runtime_; }
+    [[nodiscard]] const ScriptRuntime& runtime() const noexcept { return runtime_; }
     [[nodiscard]] ScriptObject* object(SceneEntityId entity);
     [[nodiscard]] ScriptObject* getComponent(
         SceneEntityId entity,
@@ -494,6 +543,7 @@ private:
         std::optional<ScriptMethod> onFixedUpdate;
         std::optional<ScriptMethod> onLateUpdate;
         std::optional<ScriptMethod> onDestroy;
+        std::optional<ScriptMethod> onValidate;
     };
 
     void bindLifecycleMethods(Instance& instance) const;

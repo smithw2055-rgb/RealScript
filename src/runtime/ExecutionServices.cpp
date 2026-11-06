@@ -548,4 +548,69 @@ std::string profileToJson(const ExecutionProfile& profile) {
     return out.str();
 }
 
+std::string exportChromeTraceJson(
+    const ExecutionProfile& profile,
+    const GcStatistics* gcStatistics) {
+    std::ostringstream out;
+    out << "{\"traceEvents\":[";
+    bool first = true;
+    const auto comma = [&] {
+        if (!first) out << ',';
+        first = false;
+    };
+
+    comma();
+    out << "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1,"
+        << "\"args\":{\"name\":\"RealScript VM\"}}";
+    comma();
+    out << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1,"
+        << "\"args\":{\"name\":\"Script Main Thread\"}}";
+
+    std::uint64_t cursorUs = 0;
+    for (const auto& function : profile.functions) {
+        const std::uint64_t durationUs = std::max<std::uint64_t>(
+            1,
+            function.instructions + function.externalCalls * 2 + function.gcSteps * 5);
+        const std::string name = function.function.empty()
+            ? "<runtime>"
+            : escapeJson(function.function);
+        comma();
+        out << "{\"name\":\"" << name << "\",\"cat\":\"script\",\"ph\":\"X\","
+            << "\"pid\":1,\"tid\":1,\"ts\":" << cursorUs
+            << ",\"dur\":" << durationUs
+            << ",\"args\":{\"calls\":" << function.calls
+            << ",\"returns\":" << function.returns
+            << ",\"instructions\":" << function.instructions
+            << ",\"branches\":" << function.branches
+            << ",\"externalCalls\":" << function.externalCalls
+            << ",\"gcSteps\":" << function.gcSteps
+            << ",\"runtimeErrors\":" << function.runtimeErrors
+            << ",\"maximumCallDepth\":" << function.maximumCallDepth
+            << "}}";
+        cursorUs += durationUs;
+    }
+
+    if (gcStatistics) {
+        comma();
+        out << "{\"name\":\"GC Memory\",\"cat\":\"gc\",\"ph\":\"C\","
+            << "\"pid\":1,\"tid\":1,\"ts\":" << cursorUs
+            << ",\"args\":{\"liveBytes\":" << gcStatistics->liveBytes
+            << ",\"peakLiveBytes\":" << gcStatistics->peakLiveBytes
+            << ",\"bytesAllocated\":" << gcStatistics->bytesAllocated
+            << ",\"bytesReclaimed\":" << gcStatistics->bytesReclaimed
+            << "}}";
+        comma();
+        out << "{\"name\":\"GC Objects\",\"cat\":\"gc\",\"ph\":\"C\","
+            << "\"pid\":1,\"tid\":1,\"ts\":" << cursorUs
+            << ",\"args\":{\"liveObjects\":" << gcStatistics->liveObjects
+            << ",\"objectsAllocated\":" << gcStatistics->objectsAllocated
+            << ",\"objectsReclaimed\":" << gcStatistics->objectsReclaimed
+            << ",\"collectionsCompleted\":" << gcStatistics->collectionsCompleted
+            << "}}";
+    }
+
+    out << "]}";
+    return out.str();
+}
+
 } // namespace realscript::runtime

@@ -143,7 +143,7 @@ bool ScriptRuntime::valueMatches(
         if (typeId == 0) return true;
         const auto* reference = std::get_if<runtime::ObjectRef>(&value);
         const auto actual = reference ? heap_->arrayTypeId(*reference) : std::nullopt;
-        return actual && *actual == typeId;
+        return actual && (*actual == 0 || *actual == typeId);
     }
     case semantic::PrimitiveType::Struct: {
         const auto* structure = std::get_if<runtime::StructValue>(&value);
@@ -180,6 +180,121 @@ runtime::ExecutionResult ScriptRuntime::invokeSymbol(
         }
     }
     return interpreter_.invoke(symbolId, arguments, std::move(options));
+}
+
+runtime::Value ScriptRuntime::makeFixed(Fixed value) {
+    return detail::makeFixedStructValue(value);
+}
+
+runtime::Value ScriptRuntime::makeVec2(Vec2 value) {
+    auto storage = std::make_shared<runtime::StructStorage>();
+    storage->fields.reserve(2);
+    storage->fields.push_back(detail::makeFixedStructValue(value.x));
+    storage->fields.push_back(detail::makeFixedStructValue(value.y));
+    return runtime::StructValue{
+        semantic::stableTypeId("RealScript.Math::Vec2"),
+        std::move(storage)};
+}
+
+runtime::Value ScriptRuntime::makeVec3(Vec3 value) {
+    auto storage = std::make_shared<runtime::StructStorage>();
+    storage->fields.reserve(3);
+    storage->fields.push_back(detail::makeFixedStructValue(value.x));
+    storage->fields.push_back(detail::makeFixedStructValue(value.y));
+    storage->fields.push_back(detail::makeFixedStructValue(value.z));
+    return runtime::StructValue{
+        semantic::stableTypeId("RealScript.Math::Vec3"),
+        std::move(storage)};
+}
+
+std::optional<Fixed> ScriptRuntime::readFixed(
+    const runtime::Value& value) noexcept {
+    return detail::extractFixedStructValue(value);
+}
+
+std::optional<Vec2> ScriptRuntime::readVec2(
+    const runtime::Value& value) noexcept {
+    const auto* structure = std::get_if<runtime::StructValue>(&value);
+    if (!structure ||
+        structure->typeId != semantic::stableTypeId("RealScript.Math::Vec2") ||
+        !structure->storage || structure->storage->fields.size() != 2) {
+        return std::nullopt;
+    }
+    const auto x = detail::extractFixedStructValue(structure->storage->fields[0]);
+    const auto y = detail::extractFixedStructValue(structure->storage->fields[1]);
+    if (!x || !y) return std::nullopt;
+    return Vec2{*x, *y};
+}
+
+std::optional<Vec3> ScriptRuntime::readVec3(
+    const runtime::Value& value) noexcept {
+    const auto* structure = std::get_if<runtime::StructValue>(&value);
+    if (!structure ||
+        structure->typeId != semantic::stableTypeId("RealScript.Math::Vec3") ||
+        !structure->storage || structure->storage->fields.size() != 3) {
+        return std::nullopt;
+    }
+    const auto x = detail::extractFixedStructValue(structure->storage->fields[0]);
+    const auto y = detail::extractFixedStructValue(structure->storage->fields[1]);
+    const auto z = detail::extractFixedStructValue(structure->storage->fields[2]);
+    if (!x || !y || !z) return std::nullopt;
+    return Vec3{*x, *y, *z};
+}
+
+std::optional<Vec2> ScriptRuntime::getMemberVec2(
+    const ScriptObject& object,
+    const std::string& name,
+    runtime::RuntimeError& error,
+    runtime::ExecutionOptions options) const {
+    const auto value = getMember(object, name, error, std::move(options));
+    if (!value) return std::nullopt;
+    const auto vec = readVec2(*value);
+    if (!vec) {
+        error.code = runtime::ErrorCode::TypeMismatch;
+        error.message = "member '" + name + "' is not a RealScript.Math::Vec2";
+        return std::nullopt;
+    }
+    return vec;
+}
+
+bool ScriptRuntime::setMemberVec2(
+    ScriptObject& object,
+    const std::string& name,
+    Vec2 value,
+    runtime::RuntimeError& error,
+    runtime::ExecutionOptions options) const {
+    if (object.valid() && heap_) {
+        const auto& fields = object.type().descriptor.fields;
+        for (std::size_t index = 0; index < fields.size(); ++index) {
+            if (fields[index].name != name) continue;
+            const auto current = heap_->fieldGet(object.reference(), index);
+            if (current) {
+                const auto* vecStruct = std::get_if<runtime::StructValue>(&*current);
+                if (vecStruct &&
+                    vecStruct->typeId == semantic::stableTypeId("RealScript.Math::Vec2") &&
+                    vecStruct->storage &&
+                    vecStruct->storage.use_count() == 2 &&
+                    vecStruct->storage->fields.size() == 2) {
+                    auto* mutableVec = const_cast<runtime::StructStorage*>(
+                        vecStruct->storage.get());
+                    auto* fx = std::get_if<runtime::StructValue>(&mutableVec->fields[0]);
+                    auto* fy = std::get_if<runtime::StructValue>(&mutableVec->fields[1]);
+                    if (fx && fx->storage && fx->storage.use_count() == 1 &&
+                        fx->storage->fields.size() == 1 &&
+                        fy && fy->storage && fy->storage.use_count() == 1 &&
+                        fy->storage->fields.size() == 1) {
+                        const_cast<runtime::StructStorage*>(fx->storage.get())->fields[0] =
+                            static_cast<std::int64_t>(value.x.raw);
+                        const_cast<runtime::StructStorage*>(fy->storage.get())->fields[0] =
+                            static_cast<std::int64_t>(value.y.raw);
+                        return true;
+                    }
+                }
+            }
+            break;
+        }
+    }
+    return setMember(object, name, makeVec2(value), error, std::move(options));
 }
 
 } // namespace realscript::game

@@ -54,6 +54,61 @@ std::string findRenamedFieldSource(
     return {};
 }
 
+void cancelActiveInstanceSequences(
+    const ScriptRuntime& runtime,
+    const ScriptObject& object,
+    const runtime::ExecutionOptions& options) {
+    if (!object.valid()) return;
+    static constexpr const char* kPrefix = "$sequence_state_";
+    const std::size_t prefixLen = std::strlen(kPrefix);
+    for (const auto& field : object.type().descriptor.fields) {
+        if (!field.synthetic) continue;
+        if (field.name.size() > prefixLen &&
+            field.name.rfind(kPrefix, 0) == 0) {
+            const std::string seqName = field.name.substr(prefixLen);
+            if (const auto cancelMethod = runtime.findMethod(
+                    object.type(), "Cancel" + seqName, 0)) {
+                (void)runtime.invoke(object, *cancelMethod, {}, options);
+            }
+        } else if (field.name == "$sequence_timer") {
+            for (const auto& method : object.type().descriptor.methods) {
+                if (method.synthetic &&
+                    method.name.rfind("Cancel", 0) == 0 &&
+                    method.parameters.size() == 1) {
+                    (void)runtime.invoke(object, ScriptMethod{method}, {}, options);
+                }
+            }
+        }
+    }
+}
+
+void patchMigratedObjectRefsInHeapObject(
+    runtime::ManagedHeap* heap,
+    runtime::ObjectRef target,
+    const std::unordered_map<std::uint64_t, runtime::ObjectRef>& refMap,
+    std::unordered_set<std::uint64_t>& visited) {
+    if (!heap || !target.valid()) return;
+    const std::uint64_t key =
+        (static_cast<std::uint64_t>(target.generation) << 32u) | target.slot;
+    if (!visited.insert(key).second) return;
+    const auto fCount = heap->fieldCount(target);
+    if (!fCount) return;
+    for (std::size_t i = 0; i < *fCount; ++i) {
+        auto val = heap->fieldGet(target, i);
+        if (!val) continue;
+        if (const auto* objRef = std::get_if<runtime::ObjectRef>(&*val)) {
+            const std::uint64_t refKey =
+                (static_cast<std::uint64_t>(objRef->generation) << 32u) | objRef->slot;
+            const auto mapped = refMap.find(refKey);
+            if (mapped != refMap.end()) {
+                (void)heap->fieldSet(target, i, mapped->second);
+            } else {
+                patchMigratedObjectRefsInHeapObject(heap, *objRef, refMap, visited);
+            }
+        }
+    }
+}
+
 } // namespace
 
 void SceneScriptRuntime::bindLifecycleMethods(Instance& instance) const {
@@ -67,6 +122,7 @@ void SceneScriptRuntime::bindLifecycleMethods(Instance& instance) const {
     instance.onFixedUpdate = runtime_.findMethod(type, "OnFixedUpdate", 1);
     instance.onLateUpdate = runtime_.findMethod(type, "OnLateUpdate", 1);
     instance.onDestroy = runtime_.findMethod(type, "OnDestroy", 0);
+    instance.onValidate = runtime_.findMethod(type, "OnValidate", 0);
     instance.executeInEditMode = hasEditModeAttribute(
         runtime_.program().get(), type.canonicalName());
 }
@@ -178,6 +234,7 @@ bool SceneScriptRuntime::detach(SceneEntityId entity) {
     const auto found = instances_.find(entity);
     if (found == instances_.end()) return false;
     for (auto& instance : found->second) {
+        cancelActiveInstanceSequences(runtime_, instance.object, executionOptions_);
         if (instance.enabled) {
             (void)invokeLifecycle(entity, instance, instance.onDisable, {}, "OnDisable");
         }
@@ -195,6 +252,7 @@ bool SceneScriptRuntime::detachComponent(
     auto& list = found->second;
     for (auto it = list.begin(); it != list.end(); ++it) {
         if (matchesComponentType(it->object.type(), scriptType)) {
+            cancelActiveInstanceSequences(runtime_, it->object, executionOptions_);
             if (it->enabled) {
                 (void)invokeLifecycle(entity, *it, it->onDisable, {}, "OnDisable");
             }
@@ -214,6 +272,9 @@ bool SceneScriptRuntime::setEnabled(SceneEntityId entity, bool enabled) {
         return false;
     }
     auto& instance = found->second.front();
+    if (!enabled) {
+        cancelActiveInstanceSequences(runtime_, instance.object, executionOptions_);
+    }
     const auto& callback = enabled ? instance.onEnable : instance.onDisable;
     if (!invokeLifecycle(
             entity,
@@ -236,6 +297,9 @@ bool SceneScriptRuntime::setComponentEnabled(
     for (auto& instance : found->second) {
         if (!matchesComponentType(instance.object.type(), scriptType)) continue;
         if (instance.enabled == enabled) return false;
+        if (!enabled) {
+            cancelActiveInstanceSequences(runtime_, instance.object, executionOptions_);
+        }
         const auto& callback = enabled ? instance.onEnable : instance.onDisable;
         if (!invokeLifecycle(
                 entity,
@@ -325,6 +389,7 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
 
     struct SavedComponentState {
         std::string canonicalTypeName;
+        runtime::ObjectRef oldRef;
         bool enabled = true;
         bool started = false;
         std::unordered_map<std::string, runtime::Value> fields;
@@ -337,6 +402,7 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         for (const auto& instance : components) {
             SavedComponentState saved;
             saved.canonicalTypeName = instance.object.type().canonicalName();
+            saved.oldRef = instance.object.reference();
             saved.enabled = instance.enabled;
             saved.started = instance.started;
             for (const auto& field : instance.object.type().descriptor.fields) {
@@ -352,6 +418,8 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
 
     runtime_.replaceProgram(newProgram);
     methodCache_.clear();
+
+    std::unordered_map<std::uint64_t, runtime::ObjectRef> migratedRefMap;
 
     for (auto& [entity, components] : instances_) {
         const auto& savedList = savedEntities[entity];
@@ -374,6 +442,13 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                 continue;
             }
 
+            if (saved.oldRef.valid()) {
+                const std::uint64_t oldKey =
+                    (static_cast<std::uint64_t>(saved.oldRef.generation) << 32u) |
+                    saved.oldRef.slot;
+                migratedRefMap[oldKey] = newObj->reference();
+            }
+
             for (const auto& newField : newType->descriptor.fields) {
                 const auto newFieldTypeId = exactFieldTypeId(
                     newField.type, newField.typeName);
@@ -383,7 +458,9 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                         directIt->second, newField.type, newFieldTypeId)) {
                     (void)runtime_.heap()->fieldSet(
                         newObj->reference(), newField.index, directIt->second, &allocError);
-                    ++report.fieldsMigrated;
+                    if (!newField.synthetic) {
+                        ++report.fieldsMigrated;
+                    }
                     continue;
                 }
 
@@ -399,12 +476,16 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                             newField.index,
                             renamedIt->second,
                             &allocError);
-                        ++report.fieldsMigrated;
-                        ++report.fieldsRenamed;
+                        if (!newField.synthetic) {
+                            ++report.fieldsMigrated;
+                            ++report.fieldsRenamed;
+                        }
                         continue;
                     }
                 }
-                ++report.fieldsDefaulted;
+                if (!newField.synthetic) {
+                    ++report.fieldsDefaulted;
+                }
             }
 
             instance.object = std::move(*newObj);
@@ -420,8 +501,193 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         }
     }
 
+    // Patch cross-component ObjectRef fields and delegate targets to point to migrated instances
+    if (!migratedRefMap.empty()) {
+        std::unordered_set<std::uint64_t> visited;
+        for (auto& [entity, components] : instances_) {
+            (void)entity;
+            for (auto& instance : components) {
+                patchMigratedObjectRefsInHeapObject(
+                    runtime_.heap().get(),
+                    instance.object.reference(),
+                    migratedRefMap,
+                    visited);
+            }
+        }
+    }
+
     report.succeeded = report.errors.empty();
     return report;
+}
+
+bool SceneScriptRuntime::validate(SceneEntityId entity) {
+    const auto found = instances_.find(entity);
+    if (found == instances_.end() || found->second.empty()) return false;
+    bool allOk = true;
+    for (auto& instance : found->second) {
+        if (!invokeLifecycle(entity, instance, instance.onValidate, {}, "OnValidate")) {
+            allOk = false;
+        }
+    }
+    return allOk;
+}
+
+bool SceneScriptRuntime::validateComponent(
+    SceneEntityId entity,
+    const std::string& scriptType) {
+    const auto found = instances_.find(entity);
+    if (found == instances_.end()) return false;
+    for (auto& instance : found->second) {
+        if (!matchesComponentType(instance.object.type(), scriptType)) continue;
+        return invokeLifecycle(entity, instance, instance.onValidate, {}, "OnValidate");
+    }
+    return false;
+}
+
+bool SceneScriptRuntime::setInspectorMember(
+    SceneEntityId entity,
+    const std::string& scriptType,
+    const std::string& memberName,
+    runtime::Value value) {
+    const auto found = instances_.find(entity);
+    if (found == instances_.end()) return false;
+    for (auto& instance : found->second) {
+        if (!scriptType.empty() &&
+            !matchesComponentType(instance.object.type(), scriptType)) {
+            continue;
+        }
+        runtime::RuntimeError error;
+        if (!runtime_.setMember(
+                instance.object,
+                memberName,
+                std::move(value),
+                error,
+                executionOptions_)) {
+            recordError(entity, "SetInspectorMember:" + memberName, error);
+            return false;
+        }
+        if (instance.onValidate) {
+            if (!invokeLifecycle(
+                    entity, instance, instance.onValidate, {}, "OnValidate")) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+bool SceneScriptRuntime::connectSignal(
+    SceneEntityId sourceEntity,
+    const std::string& sourceComponent,
+    const std::string& signalName,
+    SceneEntityId targetEntity,
+    const std::string& targetComponent,
+    const std::string& targetMethod) {
+    ScriptObject* srcObj = sourceComponent.empty()
+        ? object(sourceEntity)
+        : getComponent(sourceEntity, sourceComponent);
+    ScriptObject* dstObj = targetComponent.empty()
+        ? object(targetEntity)
+        : getComponent(targetEntity, targetComponent);
+    if (!srcObj || !dstObj || signalName.empty() || targetMethod.empty()) {
+        return false;
+    }
+
+    const std::string backingFieldName = "$event_" + signalName + "_delegate";
+    const semantic::FieldSymbol* eventField = nullptr;
+    for (const auto& field : srcObj->type().descriptor.fields) {
+        if (field.name == backingFieldName &&
+            field.type == semantic::PrimitiveType::Object) {
+            eventField = &field;
+            break;
+        }
+    }
+    if (!eventField) return false;
+
+    const auto delegateType = runtime_.findType(eventField->typeName);
+    if (!delegateType || !delegateType->descriptor.delegateType) return false;
+
+    const semantic::FunctionSymbol* invokeSig = nullptr;
+    for (const auto& method : delegateType->descriptor.methods) {
+        if (method.name == "Invoke") {
+            invokeSig = &method;
+            break;
+        }
+    }
+    if (!invokeSig) return false;
+    const std::size_t arity = invokeSig->parameters.size() > 0
+        ? invokeSig->parameters.size() - 1u
+        : 0u;
+
+    const auto dstMethod = runtime_.findMethod(dstObj->type(), targetMethod, arity);
+    if (!dstMethod || !dstMethod->instance()) return false;
+
+    // Construct leaf delegate object matching Interpreter::NewDelegate layout
+    const auto symbolId = dstMethod->descriptor.id;
+    const auto lowWord = static_cast<std::int64_t>(symbolId & 0xffffffffULL);
+    const auto highWord = static_cast<std::int64_t>((symbolId >> 32u) & 0xffffffffULL);
+    std::vector<runtime::Value> leafFields{
+        dstObj->value(),
+        lowWord,
+        highWord,
+        std::int64_t{0},
+        std::int64_t{0},
+        std::int64_t{0},
+        std::int64_t{0},
+        runtime::NullObject{},
+    };
+    runtime::RuntimeError error;
+    const auto leafRef = runtime_.heap()->allocateObject(
+        delegateType->descriptor.id, std::move(leafFields), {0u, 7u}, &error);
+    if (!leafRef) return false;
+
+    const auto existingVal = runtime_.heap()->fieldGet(
+        srcObj->reference(), eventField->index);
+    if (!existingVal || std::holds_alternative<runtime::NullObject>(*existingVal)) {
+        return runtime_.heap()->fieldSet(
+            srcObj->reference(), eventField->index, *leafRef, &error);
+    }
+
+    const auto* existingRef = std::get_if<runtime::ObjectRef>(&*existingVal);
+    if (!existingRef || !existingRef->valid()) {
+        return runtime_.heap()->fieldSet(
+            srcObj->reference(), eventField->index, *leafRef, &error);
+    }
+
+    // Combine into a multicast node (flags = 4, field[0] = existing, field[7] = leaf)
+    std::vector<runtime::Value> combinedFields{
+        *existingRef,
+        std::int64_t{0},
+        std::int64_t{0},
+        std::int64_t{4},
+        std::int64_t{0},
+        std::int64_t{0},
+        std::int64_t{0},
+        *leafRef,
+    };
+    const auto combinedRef = runtime_.heap()->allocateObject(
+        delegateType->descriptor.id, std::move(combinedFields), {0u, 7u}, &error);
+    if (!combinedRef) return false;
+
+    return runtime_.heap()->fieldSet(
+        srcObj->reference(), eventField->index, *combinedRef, &error);
+}
+
+std::optional<SceneScriptRuntime::ComponentLocation>
+SceneScriptRuntime::findObjectLocation(runtime::ObjectRef reference) const {
+    if (!reference.valid()) return std::nullopt;
+    for (const auto& [entity, components] : instances_) {
+        for (const auto& instance : components) {
+            if (instance.object.reference() == reference) {
+                return ComponentLocation{
+                    entity,
+                    instance.object.type().canonicalName(),
+                };
+            }
+        }
+    }
+    return std::nullopt;
 }
 
 } // namespace realscript::game

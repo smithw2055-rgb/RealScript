@@ -33,12 +33,18 @@ enum class ResumeMode {
     Terminate,
 };
 
+struct BreakpointSpec {
+    text::LinePosition position{};
+    std::string condition;
+};
+
 struct Breakpoint {
     std::uint32_t id = 0;
     std::string sourcePath;
     std::size_t line = 0;
     std::size_t column = 0;
     bool verified = false;
+    std::string condition;
 };
 
 struct DebugVariable {
@@ -94,6 +100,9 @@ public:
     [[nodiscard]] std::vector<Breakpoint> setBreakpoints(
         std::string sourcePath,
         const std::vector<text::LinePosition>& positions);
+    [[nodiscard]] std::vector<Breakpoint> setConditionalBreakpoints(
+        std::string sourcePath,
+        const std::vector<BreakpointSpec>& specs);
     [[nodiscard]] std::vector<Breakpoint> breakpoints() const;
     void clearBreakpoints();
 
@@ -105,6 +114,12 @@ public:
         const std::vector<DebugFrameView>& frames,
         runtime::ManagedHeap* heap);
 
+    [[nodiscard]] std::optional<runtime::Value> evaluate(
+        const std::string& expression,
+        std::uint32_t frameId = 1,
+        runtime::ManagedHeap* heap = nullptr,
+        std::string* errorMessage = nullptr) const;
+
     [[nodiscard]] DebugStop lastStop() const;
     [[nodiscard]] bool terminated() const;
 
@@ -115,11 +130,17 @@ private:
         std::size_t column = 0;
     };
 
+    [[nodiscard]] std::optional<runtime::Value> evaluateInFrameUnlocked(
+        const std::string& expression,
+        const DebugStackFrame& frame,
+        runtime::ManagedHeap* heap,
+        std::string* errorMessage = nullptr) const;
     [[nodiscard]] std::uint32_t matchingBreakpoint(
-        const SequencePoint& point,
-        const bytecode::Module& module) const;
+        const std::vector<DebugFrameView>& frames,
+        runtime::ManagedHeap* heap) const;
     [[nodiscard]] bool shouldStop(
         const std::vector<DebugFrameView>& frames,
+        runtime::ManagedHeap* heap,
         StopReason& reason,
         std::uint32_t& breakpointId);
     [[nodiscard]] DebugStop capture(
@@ -131,10 +152,13 @@ private:
     mutable std::mutex mutex_;
     std::vector<Breakpoint> breakpoints_;
     std::unordered_map<std::string, std::vector<BoundLocation>> executableLocations_;
+    std::unordered_map<semantic::SymbolId, semantic::TypeSymbol> types_;
+    runtime::ManagedHeap* lastHeap_ = nullptr;
     StopHandler stopHandler_;
     ResumeMode mode_ = ResumeMode::Continue;
     std::size_t stepDepth_ = 0;
     SourceRange lastLocation_;
+    SourceRange lastBreakpointLocation_;
     bool stopOnEntry_ = false;
     bool entryPending_ = false;
     std::atomic<bool> pauseRequested_{false};
@@ -163,6 +187,10 @@ public:
     [[nodiscard]] bool waitForStop(
         std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
     [[nodiscard]] std::optional<DebugStop> currentStop() const;
+    [[nodiscard]] std::optional<runtime::Value> evaluate(
+        const std::string& expression,
+        std::uint32_t frameId = 1,
+        std::string* errorMessage = nullptr) const;
     [[nodiscard]] bool paused() const noexcept;
     [[nodiscard]] bool finished() const noexcept;
     [[nodiscard]] std::optional<runtime::ExecutionResult> result() const;

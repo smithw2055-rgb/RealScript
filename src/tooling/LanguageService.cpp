@@ -568,7 +568,7 @@ std::vector<CompletionItem> LanguageService::completion(
     std::vector<CompletionItem> output;
     const std::vector<std::string> keywords = {
         "module", "import", "class", "struct", "enum", "interface",
-        "delegate", "event", "sequence", "yield", "wait_ticks", "wait_seconds",
+        "delegate", "event", "sequence", "yield", "wait_ticks", "wait_seconds", "wait_event", "wait_until",
         "static",
         "public", "private", "protected", "internal", "abstract", "virtual",
         "override", "sealed", "base", "return", "if", "else", "while",
