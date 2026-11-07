@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -226,13 +227,19 @@ struct InlineStructSlot {
         Float,
         Double,
         Char,
+        Enum,
         Fixed,
         Fixed16,
         Vec2,
+        Vec3,
+        Quat,
     };
 
     std::uint32_t lo = 0;
     std::uint32_t hi = 0;
+    std::uint8_t aux0 = 0;
+    std::uint8_t aux1 = 0;
+    std::uint8_t aux2 = 0;
     Kind kind = Kind::None;
 
     [[nodiscard]] constexpr std::uint64_t bits() const noexcept {
@@ -243,13 +250,30 @@ struct InlineStructSlot {
         lo = static_cast<std::uint32_t>(value & 0xffffffffULL);
         hi = static_cast<std::uint32_t>(value >> 32u);
     }
+    [[nodiscard]] constexpr std::int32_t auxInt24() const noexcept {
+        const std::uint32_t u = static_cast<std::uint32_t>(aux0) |
+            (static_cast<std::uint32_t>(aux1) << 8u) |
+            (static_cast<std::uint32_t>(aux2) << 16u);
+        return (u & 0x800000u) != 0
+            ? static_cast<std::int32_t>(u | 0xFF000000u)
+            : static_cast<std::int32_t>(u);
+    }
+    constexpr void setAuxInt24(std::int32_t value) noexcept {
+        const auto u = static_cast<std::uint32_t>(value);
+        aux0 = static_cast<std::uint8_t>(u & 0xFFu);
+        aux1 = static_cast<std::uint8_t>((u >> 8u) & 0xFFu);
+        aux2 = static_cast<std::uint8_t>((u >> 16u) & 0xFFu);
+    }
 
     friend constexpr bool operator==(
         const InlineStructSlot& left,
         const InlineStructSlot& right) noexcept {
         return left.kind == right.kind &&
             left.lo == right.lo &&
-            left.hi == right.hi;
+            left.hi == right.hi &&
+            left.aux0 == right.aux0 &&
+            left.aux1 == right.aux1 &&
+            left.aux2 == right.aux2;
     }
     friend constexpr bool operator!=(
         const InlineStructSlot& left,
@@ -412,6 +436,7 @@ enum class ErrorCode {
     DeterminismViolation,
     ReplayMismatch,
     ScriptException,
+    CapabilityDenied,
 };
 
 struct RuntimeError {
@@ -522,6 +547,11 @@ public:
     [[nodiscard]] std::optional<ObjectRef> allocateString(
         std::string value,
         RuntimeError* error = nullptr);
+    [[nodiscard]] std::optional<ObjectRef> internString(
+        std::string_view value,
+        RuntimeError* error = nullptr);
+    [[nodiscard]] std::size_t internedStringCount() const noexcept;
+    [[nodiscard]] std::size_t sharedTypeLayoutCount() const noexcept;
     [[nodiscard]] std::optional<ObjectRef> allocateArray(
         std::size_t length,
         Value initialValue = {},
@@ -735,6 +765,8 @@ struct DeterminismOptions {
     DeterminismMode mode = DeterminismMode::Off;
     std::shared_ptr<ReplayLog> replayLog;
     bool canonicalizeFloatingPoint = true;
+    bool enforceCapabilities = false;
+    std::unordered_set<std::string> grantedCapabilities;
 };
 
 struct Limits {
@@ -839,6 +871,8 @@ struct ExecutionOptions {
     std::shared_ptr<ProfileCollector> profile;
     DeterminismOptions determinism;
     std::shared_ptr<debug::DebugController> debugger;
+    bool enforceCapabilities = false;
+    std::unordered_set<std::string> grantedCapabilities;
 };
 
 struct ExecutionResult {
@@ -859,6 +893,7 @@ using ExternalFunction = std::function<std::optional<Value>(
 struct ResolvedBinding {
     const ExternalFunction* function = nullptr;
     BindingDeterminism determinism = BindingDeterminism::Deterministic;
+    std::string requiredCapability;
 };
 
 class BindingRegistry {
@@ -866,11 +901,13 @@ public:
     bool bind(
         semantic::SymbolId symbolId,
         ExternalFunction function,
-        BindingDeterminism determinism = BindingDeterminism::Deterministic);
+        BindingDeterminism determinism = BindingDeterminism::Deterministic,
+        std::string requiredCapability = {});
     bool bind(
         const std::string& canonicalName,
         ExternalFunction function,
-        BindingDeterminism determinism = BindingDeterminism::Deterministic);
+        BindingDeterminism determinism = BindingDeterminism::Deterministic,
+        std::string requiredCapability = {});
     [[nodiscard]] std::optional<Value> invoke(
         const bytecode::FunctionReference& reference,
         ValueSpan arguments,
@@ -878,14 +915,18 @@ public:
     [[nodiscard]] std::optional<ResolvedBinding> resolve(
         const bytecode::FunctionReference& reference) const;
     [[nodiscard]] std::size_t size() const noexcept;
+    [[nodiscard]] std::size_t cachedSymbolCount() const noexcept;
 
 private:
     struct Entry {
         ExternalFunction function;
         BindingDeterminism determinism = BindingDeterminism::Deterministic;
+        std::string requiredCapability;
     };
     std::unordered_map<semantic::SymbolId, Entry> bySymbol_;
     std::unordered_map<std::string, Entry> byName_;
+    mutable std::unordered_map<semantic::SymbolId, const Entry*> resolvedBySymbolCache_;
+    std::size_t entryCount_ = 0;
 };
 
 class DeterminismSession {

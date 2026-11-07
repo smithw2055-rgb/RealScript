@@ -175,6 +175,8 @@ struct FunctionSymbol {
     bool propertyGetter = false;
     bool propertySetter = false;
     bool synthetic = false;
+    bool deterministic = false;
+    bool nonDeterministic = false;
     std::string sourceName;
     text::TextSpan declarationSpan;
     text::TextSpan bodySpan;
@@ -274,6 +276,7 @@ struct TypeSymbol {
     bool interfaceType = false;
     bool abstractType = false;
     bool sealedType = false;
+    bool deterministic = false;
     SymbolId baseTypeId = 0;
     std::string baseTypeName;
     std::string moduleName;
@@ -932,7 +935,13 @@ struct BoundEcsQueryColumn {
 struct BoundForeachStatement final : BoundStatement {
     bool usesEnumerator = false;
     bool isEcsQuery = false;
+    bool hasEcsEntityBinding = false;
+    VariableSymbol ecsEntityVariable;
+    VariableSymbol ecsEntityCollectionVariable;
     std::vector<BoundEcsQueryColumn> ecsColumns;
+    std::vector<std::string> ecsWithTypes;
+    std::vector<std::string> ecsWithoutTypes;
+    std::string ecsQuerySpec;
     VariableSymbol collectionVariable;
     VariableSymbol indexVariable;
     VariableSymbol iterationVariable;
@@ -1261,6 +1270,7 @@ private:
     std::size_t loopDepth_ = 0;
     std::size_t breakableDepth_ = 0;
     bool checkedArithmetic_ = true;
+    bool currentDeterministicContext_ = false;
 };
 
 } // namespace realscript::semantic

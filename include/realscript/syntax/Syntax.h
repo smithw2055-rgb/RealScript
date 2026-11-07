@@ -725,6 +725,8 @@ struct YieldWaitStatementSyntax final : StatementSyntax {
     SyntaxToken waitTicksToken;
     SyntaxToken openParenToken;
     std::unique_ptr<ExpressionSyntax> delay;
+    std::optional<SyntaxToken> commaToken;
+    std::unique_ptr<ExpressionSyntax> secondArgument;
     SyntaxToken closeParenToken;
     SyntaxToken semicolonToken;
 
@@ -1095,6 +1097,7 @@ struct SequenceDeclarationSyntax final : SyntaxNode {
 };
 
 struct ModuleDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
     SyntaxToken moduleKeyword;
     std::vector<SyntaxToken> nameParts;
     std::vector<SyntaxToken> dotTokens;

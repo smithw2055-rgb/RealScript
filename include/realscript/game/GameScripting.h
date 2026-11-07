@@ -369,6 +369,39 @@ public:
         std::vector<runtime::Value>& outComponents,
         runtime::RuntimeError& error) const;
 
+    bool setEcsEntityComponent(
+        std::uint64_t entity,
+        const std::string& canonicalTypeName,
+        const runtime::Value& component,
+        runtime::RuntimeError& error) const;
+    [[nodiscard]] std::optional<runtime::Value> getEcsEntityComponent(
+        std::uint64_t entity,
+        const std::string& canonicalTypeName,
+        runtime::RuntimeError& error) const;
+    [[nodiscard]] bool hasEcsEntityComponent(
+        std::uint64_t entity,
+        const std::string& canonicalTypeName) const;
+    bool removeEcsEntityComponent(
+        std::uint64_t entity,
+        const std::string& canonicalTypeName,
+        runtime::RuntimeError& error) const;
+    bool destroyEcsEntity(
+        std::uint64_t entity,
+        runtime::RuntimeError& error) const;
+
+    void queueEcsSetComponent(
+        std::uint64_t entity,
+        const std::string& canonicalTypeName,
+        runtime::Value component) const;
+    void queueEcsRemoveComponent(
+        std::uint64_t entity,
+        const std::string& canonicalTypeName) const;
+    void queueEcsDestroyEntity(std::uint64_t entity) const;
+    [[nodiscard]] std::size_t pendingEcsCommandCount() const noexcept {
+        return ecsCommandBuffer_.size();
+    }
+    std::size_t flushEcsCommandBuffer(runtime::RuntimeError& error) const;
+
     [[nodiscard]] std::shared_ptr<const runtime::ProgramImage> program() const noexcept {
         return program_;
     }
@@ -417,6 +450,19 @@ private:
     ScriptExecutionBackend backend_ = ScriptExecutionBackend::Interpreter;
     std::shared_ptr<jit::Module> jitModule_;
     std::shared_ptr<aot::Program> nativeProgram_;
+
+    struct EcsQueuedCommand {
+        enum class Kind : std::uint8_t {
+            SetComponent,
+            RemoveComponent,
+            DestroyEntity,
+        };
+        Kind kind = Kind::SetComponent;
+        std::uint64_t entity = 0;
+        std::string canonicalTypeName;
+        runtime::Value component;
+    };
+    mutable std::vector<EcsQueuedCommand> ecsCommandBuffer_;
 };
 
 using SceneEntityId = std::uint64_t;
@@ -453,6 +499,20 @@ struct PrefabNodeTemplate {
     Transform3D localTransform{};
     std::vector<PrefabComponentTemplate> components;
     std::vector<PrefabNodeTemplate> children;
+};
+
+struct SceneCollider2D {
+    Vec2 halfExtents{Fixed::fromInt(1), Fixed::fromInt(1)};
+    Fixed radius{Fixed::fromInt(1)};
+    bool isCircle = false;
+    bool isTrigger = false;
+    std::uint32_t layerMask = 0xFFFFFFFFu;
+};
+
+struct RaycastHit2D {
+    SceneEntityId entity = 0;
+    Vec2 point{};
+    Fixed distance{};
 };
 
 struct ScriptEvent {
@@ -556,6 +616,45 @@ public:
     [[nodiscard]] const std::vector<SignalConnection>& signalConnections() const noexcept {
         return signalConnections_;
     }
+    std::size_t emitSignal(
+        SceneEntityId sourceEntity,
+        const std::string& sourceComponent,
+        const std::string& signalName,
+        const std::vector<runtime::Value>& arguments = {});
+    std::size_t emitSignal(
+        SceneEntityId sourceEntity,
+        const std::string& signalName,
+        const std::vector<runtime::Value>& arguments = {}) {
+        return emitSignal(sourceEntity, {}, signalName, arguments);
+    }
+    void setSignalTopicPublisher(
+        std::function<void(const std::string&)> publisher) {
+        signalTopicPublisher_ = std::move(publisher);
+    }
+
+    // Deterministic Input Snapshot (RealScript.Input)
+    void setInputAction(const std::string& action, bool pressed);
+    void setInputAxis2D(const std::string& axisName, Vec2 value);
+    void advanceInputTick();
+    [[nodiscard]] bool isInputActionPressed(const std::string& action) const noexcept;
+    [[nodiscard]] bool isInputActionJustPressed(const std::string& action) const noexcept;
+    [[nodiscard]] bool isInputActionJustReleased(const std::string& action) const noexcept;
+    [[nodiscard]] Vec2 getInputAxis2D(const std::string& axisName) const noexcept;
+    [[nodiscard]] std::uint64_t computeInputDigest() const noexcept;
+
+    // Deterministic 2D Physics & Spatial Queries (RealScript.Physics)
+    void setEntityCollider2D(SceneEntityId entity, SceneCollider2D collider);
+    bool removeEntityCollider2D(SceneEntityId entity);
+    [[nodiscard]] std::optional<RaycastHit2D> raycast2D(
+        Vec2 origin,
+        Vec2 direction,
+        Fixed maxDistance,
+        std::uint32_t layerMask = 0xFFFFFFFFu) const;
+    [[nodiscard]] std::vector<SceneEntityId> overlapCircle2D(
+        Vec2 center,
+        Fixed radius,
+        std::uint32_t layerMask = 0xFFFFFFFFu) const;
+    std::size_t stepPhysics2D();
 
     [[nodiscard]] std::optional<ComponentLocation> findObjectLocation(
         runtime::ObjectRef reference) const;
@@ -663,6 +762,12 @@ private:
         std::optional<ScriptMethod> onLateUpdate;
         std::optional<ScriptMethod> onDestroy;
         std::optional<ScriptMethod> onValidate;
+        std::optional<ScriptMethod> onCollisionEnter;
+        std::optional<ScriptMethod> onCollisionStay;
+        std::optional<ScriptMethod> onCollisionExit;
+        std::optional<ScriptMethod> onTriggerEnter;
+        std::optional<ScriptMethod> onTriggerStay;
+        std::optional<ScriptMethod> onTriggerExit;
     };
 
     struct TickRef {
@@ -719,6 +824,13 @@ private:
     mutable bool tickOrderDirty_ = true;
     mutable std::vector<TickRef> cachedTickOrder_;
     std::vector<SignalConnection> signalConnections_;
+    std::function<void(const std::string&)> signalTopicPublisher_;
+    std::map<std::string, bool> currentInputActions_;
+    std::map<std::string, bool> previousInputActions_;
+    std::map<std::string, Vec2> inputAxes2D_;
+    std::map<SceneEntityId, SceneCollider2D> colliders2D_;
+    std::set<std::pair<SceneEntityId, SceneEntityId>> activeOverlaps2D_;
+    std::map<std::pair<SceneEntityId, SceneEntityId>, bool> activeOverlapWasTrigger2D_;
     runtime::FiberScheduler* fiberScheduler_ = nullptr;
     std::map<std::size_t, std::vector<MethodCacheEntry>> methodCache_;
     std::vector<ScriptEvent> eventQueue_;

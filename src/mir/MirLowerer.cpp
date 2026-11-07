@@ -199,6 +199,13 @@ void Lowerer::collectLocalTypes(const semantic::BoundStatement& statement) {
         if (value.isEcsQuery) {
             currentFunction_->localTypes.at(value.indexVariable.index) = value.indexVariable.type;
             currentFunction_->localTypeIds.at(value.indexVariable.index) = 0;
+            if (value.hasEcsEntityBinding) {
+                for (const auto* variable : {&value.ecsEntityCollectionVariable, &value.ecsEntityVariable}) {
+                    currentFunction_->localTypes.at(variable->index) = variable->type;
+                    currentFunction_->localTypeIds.at(variable->index) = semantic::isExactType(variable->type)
+                        ? semantic::stableTypeId(variable->typeName) : 0;
+                }
+            }
             for (const auto& col : value.ecsColumns) {
                 for (const auto* variable : {&col.collectionVariable, &col.iterationVariable}) {
                     currentFunction_->localTypes.at(variable->index) = variable->type;
@@ -268,7 +275,8 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
     };
     const auto emitEcsWriteBack = [&](const semantic::BoundForeachStatement& ecsLoop, text::TextSpan span) {
         if (!hasCurrentBlock() || currentBlockTerminated()) return;
-        for (const auto& col : ecsLoop.ecsColumns) {
+        for (std::size_t colIdx = 0; colIdx < ecsLoop.ecsColumns.size(); ++colIdx) {
+            const auto& col = ecsLoop.ecsColumns[colIdx];
             if (!col.isWrite) continue;
             const auto elemTypeId = semantic::isExactType(col.elementType)
                 ? semantic::stableTypeId(col.elementTypeName)
@@ -284,6 +292,19 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
             store.elementTypeId = elemTypeId;
             store.sourceSpan = span;
             block(*currentBlockId_).instructions.push_back(std::move(store));
+
+            const std::string wbName =
+                "$intrinsic::ecs_writeback::" + std::to_string(colIdx) + "::" + ecsLoop.ecsQuerySpec;
+            Instruction wbCall;
+            wbCall.resultType = semantic::PrimitiveType::Void;
+            wbCall.opcode = Opcode::Call;
+            wbCall.operands = {curIdx, updatedElem};
+            wbCall.parameterTypes = {semantic::PrimitiveType::Int, col.elementType};
+            wbCall.parameterTypeIds = {0, elemTypeId};
+            wbCall.symbolId = semantic::stableTypeId(wbName);
+            wbCall.symbolName = wbName;
+            wbCall.sourceSpan = span;
+            block(*currentBlockId_).instructions.push_back(std::move(wbCall));
         }
     };
     const auto emitEcsWriteBacksUntil = [&](std::size_t depth) {
@@ -651,15 +672,39 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         const auto& value = static_cast<const semantic::BoundForeachStatement&>(statement);
         if (value.isEcsQuery) {
             if (value.ecsColumns.empty()) return;
-            for (const auto& col : value.ecsColumns) {
+            if (value.hasEcsEntityBinding) {
+                const auto entArrayTypeId = semantic::stableTypeId(value.ecsEntityCollectionVariable.typeName);
+                const auto zeroLen = emitInt(0, statement.span);
+                const auto emptyEntArr = emitValue(
+                    Opcode::NewArray, semantic::PrimitiveType::Array, {zeroLen}, statement.span);
+                auto& newArrInst = block(*currentBlockId_).instructions.back();
+                newArrInst.resultTypeId = entArrayTypeId;
+                newArrInst.elementType = semantic::PrimitiveType::Int;
+                newArrInst.elementTypeId = 0;
+                newArrInst.symbolName = value.ecsEntityCollectionVariable.typeName;
+
+                const std::string entGetName = "$intrinsic::static_get::ecs_ent::" + value.ecsQuerySpec;
+                Instruction entGetCall;
+                entGetCall.result = nextValueId_++;
+                entGetCall.resultType = semantic::PrimitiveType::Array;
+                entGetCall.resultTypeId = entArrayTypeId;
+                entGetCall.opcode = Opcode::Call;
+                entGetCall.operands = {emptyEntArr};
+                entGetCall.parameterTypes = {semantic::PrimitiveType::Array};
+                entGetCall.parameterTypeIds = {entArrayTypeId};
+                entGetCall.symbolId = semantic::stableTypeId(entGetName);
+                entGetCall.symbolName = entGetName;
+                entGetCall.sourceSpan = statement.span;
+                const auto entColResult = entGetCall.result;
+                block(*currentBlockId_).instructions.push_back(std::move(entGetCall));
+                emitStoreLocal(value.ecsEntityCollectionVariable.index, entColResult, statement.span);
+            }
+            for (std::size_t colIdx = 0; colIdx < value.ecsColumns.size(); ++colIdx) {
+                const auto& col = value.ecsColumns[colIdx];
                 const auto arrayTypeId = semantic::stableTypeId(col.collectionVariable.typeName);
                 const auto elemTypeId = semantic::isExactType(col.elementType)
                     ? semantic::stableTypeId(col.elementTypeName)
                     : 0;
-                const std::string compKey = col.elementTypeName.empty()
-                    ? std::string(semantic::primitiveTypeName(col.elementType))
-                    : col.elementTypeName;
-                const auto ecsColSymbolId = semantic::stableTypeId("$ecs_column::" + compKey);
                 const auto zeroLen = emitInt(0, statement.span);
                 const auto emptyArr = emitValue(
                     Opcode::NewArray, semantic::PrimitiveType::Array, {zeroLen}, statement.span);
@@ -669,7 +714,8 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 newArrInst.elementTypeId = elemTypeId;
                 newArrInst.symbolName = col.collectionVariable.typeName;
 
-                const std::string getName = "$intrinsic::static_get::" + std::to_string(ecsColSymbolId);
+                const std::string getName =
+                    "$intrinsic::static_get::ecs_col::" + std::to_string(colIdx) + "::" + value.ecsQuerySpec;
                 Instruction getCall;
                 getCall.result = nextValueId_++;
                 getCall.resultType = semantic::PrimitiveType::Array;
@@ -714,6 +760,17 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
             continueFinalizerDepths_.push_back(finalizers_.size());
 
             setCurrentBlock(bodyBlock);
+            if (value.hasEcsEntityBinding) {
+                const auto entArr = emitLoadLocal(value.ecsEntityCollectionVariable, statement.span);
+                const auto curIdx = emitLoadLocal(value.indexVariable, statement.span);
+                const auto entVal = emitValue(
+                    Opcode::LoadElement, semantic::PrimitiveType::Int, {entArr, curIdx}, statement.span);
+                auto& loadInst = block(*currentBlockId_).instructions.back();
+                loadInst.resultTypeId = 0;
+                loadInst.elementType = semantic::PrimitiveType::Int;
+                loadInst.elementTypeId = 0;
+                emitStoreLocal(value.ecsEntityVariable.index, entVal, value.ecsEntityVariable.declarationSpan);
+            }
             for (const auto& col : value.ecsColumns) {
                 const auto elemTypeId = semantic::isExactType(col.elementType)
                     ? semantic::stableTypeId(col.elementTypeName)

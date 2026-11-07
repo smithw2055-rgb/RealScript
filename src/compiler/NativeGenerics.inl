@@ -1304,27 +1304,58 @@ private:
                 value.collection->kind() == syntax::SyntaxKind::CallExpression) {
                 auto& call = static_cast<syntax::CallExpressionSyntax&>(*value.collection);
                 if (call.identifierToken.text == "Query" && call.lessToken.has_value()) {
+                    std::vector<syntax::TypeSyntax*> dataCompTypes;
                     for (std::size_t idx = 0; idx < call.typeArguments.size(); ++idx) {
                         auto& qArg = call.typeArguments[idx];
+                        if ((qArg.name.text == "With" || qArg.name.text == "Without") &&
+                            qArg.typeArguments.size() == 1) {
+                            rewriteType(qArg.typeArguments[0], moduleName, sourceName, queue);
+                            continue;
+                        }
                         syntax::TypeSyntax* compType = &qArg;
                         if ((qArg.name.text == "Write" || qArg.name.text == "Read") &&
                             qArg.typeArguments.size() == 1) {
                             compType = &qArg.typeArguments[0];
                         }
                         rewriteType(*compType, moduleName, sourceName, queue);
-                        syntax::TypeSyntax* bType = (idx == 0)
-                            ? &value.type
-                            : (idx - 1 < value.additionalBindings.size()
-                                ? &value.additionalBindings[idx - 1].type
-                                : nullptr);
-                        const std::string bName = (idx == 0)
-                            ? value.identifierToken.text
-                            : (idx - 1 < value.additionalBindings.size()
-                                ? value.additionalBindings[idx - 1].identifierToken.text
-                                : std::string{});
+                        dataCompTypes.push_back(compType);
+                    }
+                    const std::size_t totalBindings = 1 + value.additionalBindings.size();
+                    const bool hasEntityId = (totalBindings == dataCompTypes.size() + 1 && !dataCompTypes.empty());
+                    const auto getBindingType = [&](std::size_t bIdx) -> syntax::TypeSyntax* {
+                        if (bIdx == 0) return &value.type;
+                        if (bIdx - 1 < value.additionalBindings.size()) {
+                            return &value.additionalBindings[bIdx - 1].type;
+                        }
+                        return nullptr;
+                    };
+                    const auto getBindingName = [&](std::size_t bIdx) -> std::string {
+                        if (bIdx == 0) return value.identifierToken.text;
+                        if (bIdx - 1 < value.additionalBindings.size()) {
+                            return value.additionalBindings[bIdx - 1].identifierToken.text;
+                        }
+                        return {};
+                    };
+                    if (hasEntityId) {
+                        if (auto* entType = getBindingType(0)) {
+                            if (entType->name.text == "var") {
+                                clearGenericType(*entType, "int");
+                            } else {
+                                rewriteType(*entType, moduleName, sourceName, queue);
+                            }
+                            const auto entName = getBindingName(0);
+                            if (!entName.empty()) {
+                                localTypes_[entName] = typeText(*entType);
+                            }
+                        }
+                    }
+                    for (std::size_t idx = 0; idx < dataCompTypes.size(); ++idx) {
+                        const std::size_t bIdx = hasEntityId ? (idx + 1) : idx;
+                        auto* bType = getBindingType(bIdx);
+                        const auto bName = getBindingName(bIdx);
                         if (bType) {
                             if (bType->name.text == "var") {
-                                *bType = *compType;
+                                *bType = *dataCompTypes[idx];
                             } else {
                                 rewriteType(*bType, moduleName, sourceName, queue);
                             }

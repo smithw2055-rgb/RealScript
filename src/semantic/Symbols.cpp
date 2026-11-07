@@ -530,6 +530,21 @@ void appendSyntaxParameters(
 
 } // namespace
 
+namespace {
+
+bool hasAttributeName(
+    const std::vector<syntax::AttributeListSyntax>& lists,
+    std::string_view name) noexcept {
+    for (const auto& list : lists) {
+        for (const auto& attribute : list.attributes) {
+            if (attribute.nameToken.text == name) return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
 bool hasModifier(
     const std::vector<syntax::SyntaxToken>& modifiers,
     syntax::SyntaxKind kind) noexcept {
@@ -814,6 +829,8 @@ TypeSymbol declareTypeShell(
         syntaxTree.modifiers, syntax::SyntaxKind::AbstractKeyword);
     result.sealedType = hasModifier(
         syntaxTree.modifiers, syntax::SyntaxKind::SealedKeyword);
+    result.deterministic = hasAttributeName(
+        syntaxTree.attributes, "Deterministic");
     result.moduleName = moduleName;
     result.name = syntaxTree.identifierToken.text;
     result.id = stableTypeId(result);
@@ -828,6 +845,8 @@ TypeSymbol declareTypeShell(
     result.kind = TypeKind::Struct;
     result.accessibility = accessibilityFromModifiers(syntaxTree.modifiers);
     result.sealedType = true;
+    result.deterministic = hasAttributeName(
+        syntaxTree.attributes, "Deterministic");
     result.moduleName = moduleName;
     result.name = syntaxTree.identifierToken.text;
     result.id = stableTypeId(result);
@@ -958,6 +977,11 @@ FunctionSymbol declareFunctionSymbol(
         syntaxTree.modifiers, syntax::SyntaxKind::AbstractKeyword);
     result.sealedMethod = hasModifier(
         syntaxTree.modifiers, syntax::SyntaxKind::SealedKeyword);
+    result.nonDeterministic = hasAttributeName(
+        syntaxTree.attributes, "NonDeterministic");
+    result.deterministic = !result.nonDeterministic &&
+        ((owner && owner->deterministic) ||
+         hasAttributeName(syntaxTree.attributes, "Deterministic"));
     if (owner) {
         result.declaringTypeId = owner->id;
         result.declaringTypeName = canonicalTypeName(*owner);
@@ -1051,6 +1075,11 @@ FunctionSymbol declareConstructorSymbol(
         : std::string{};
     result.method = true;
     result.constructor = true;
+    result.nonDeterministic = hasAttributeName(
+        syntaxTree.attributes, "NonDeterministic");
+    result.deterministic = !result.nonDeterministic &&
+        (owner.deterministic ||
+         hasAttributeName(syntaxTree.attributes, "Deterministic"));
     result.accessibility = accessibilityFromModifiers(
         syntaxTree.modifiers);
     result.declaringTypeId = owner.id;
@@ -1099,6 +1128,7 @@ PropertySymbol declarePropertySymbol(
         getter.method = true;
         getter.staticMethod = result.staticProperty;
         getter.propertyGetter = true;
+        getter.deterministic = owner.deterministic;
         appendImplicitThis(getter, owner);
         getter.id = stableFunctionId(getter);
         getter.declarationSpan = syntaxTree.identifierToken.span;
@@ -1119,6 +1149,7 @@ PropertySymbol declarePropertySymbol(
         setter.method = true;
         setter.staticMethod = result.staticProperty;
         setter.propertySetter = true;
+        setter.deterministic = owner.deterministic;
         appendImplicitThis(setter, owner);
         VariableSymbol valueParameter;
         valueParameter.name = "value";

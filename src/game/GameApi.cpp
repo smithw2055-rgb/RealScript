@@ -50,6 +50,12 @@ void writeFunction(
     std::ostringstream& out,
     const detail::FunctionDeclaration& function,
     const char* indent) {
+    if (function.determinism == runtime::BindingDeterminism::NonDeterministic) {
+        out << indent << "[NonDeterministic]\n";
+    }
+    if (!function.requiredCapability.empty()) {
+        out << indent << "[Capability(\"" << function.requiredCapability << "\")]\n";
+    }
     out << indent << function.returnType.sourceName << ' ' << function.name << '(';
     writeParameters(out, function.parameters);
     out << ") { "

@@ -505,6 +505,8 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
         const auto found = visibleTypes_.find(input.symbol.ownerTypeName);
         if (found != visibleTypes_.end()) currentOwnerType_ = found->second;
     }
+    currentDeterministicContext_ = input.symbol.deterministic ||
+        (currentOwnerType_ && currentOwnerType_->deterministic);
 
     std::vector<std::unique_ptr<BoundStatement>>
         capturedParameterInitializers;
@@ -734,6 +736,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     currentStorageReturnTypeName_.clear();
     allVariables_.clear();
     sequenceLocalFields_.clear();
+    currentDeterministicContext_ = false;
     return result;
 }
 
@@ -1838,7 +1841,8 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                     subStatement->expression = std::move(timer);
                     suspended->statements.push_back(std::move(subStatement));
                 }
-            } else if (yield.waitTicksToken.text == "wait_event") {
+            } else if (yield.waitTicksToken.text == "wait_event" ||
+                       yield.waitTicksToken.text == "wait_signal") {
                 const FunctionSymbol* subscribeOnce = nullptr;
                 const auto foundSub = visibleFunctions_.find("SubscribeOnce");
                 if (foundSub != visibleFunctions_.end()) {
@@ -1871,11 +1875,56 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                     callback->value = input.sequenceNextCallback->name;
                     callback->span = yield.waitTicksToken.span;
                     call->arguments.push_back(std::move(callback));
-                    call->arguments.push_back(convertExpression(
-                        bindExpression(*yield.delay),
-                        PrimitiveType::String,
-                        yield.delay->span(),
-                        "sequence wait_event topic"));
+                    if (yield.secondArgument) {
+                        auto entityExpr = convertExpression(
+                            bindExpression(*yield.delay),
+                            PrimitiveType::Long,
+                            yield.delay->span(),
+                            "sequence wait_signal entityId");
+                        auto prefixLit = std::make_unique<BoundLiteralExpression>();
+                        prefixLit->span = yield.delay->span();
+                        prefixLit->type = PrimitiveType::String;
+                        prefixLit->value = std::string("$signal::");
+                        auto sepLit = std::make_unique<BoundLiteralExpression>();
+                        sepLit->span = yield.delay->span();
+                        sepLit->type = PrimitiveType::String;
+                        sepLit->value = std::string("::");
+                        auto sigExpr = convertExpression(
+                            bindExpression(*yield.secondArgument),
+                            PrimitiveType::String,
+                            yield.secondArgument->span(),
+                            "sequence wait_signal name");
+                        syntax::SyntaxToken plusToken{
+                            syntax::SyntaxKind::PlusToken, yield.span(), "+", {}};
+                        auto withEntity = bindBinaryOperation(
+                            std::move(prefixLit),
+                            yield.delay->span(),
+                            plusToken,
+                            std::move(entityExpr),
+                            yield.delay->span(),
+                            yield.delay->span());
+                        auto withSep = bindBinaryOperation(
+                            std::move(withEntity),
+                            yield.delay->span(),
+                            plusToken,
+                            std::move(sepLit),
+                            yield.delay->span(),
+                            yield.span());
+                        auto fullTopic = bindBinaryOperation(
+                            std::move(withSep),
+                            yield.delay->span(),
+                            plusToken,
+                            std::move(sigExpr),
+                            yield.secondArgument->span(),
+                            yield.span());
+                        call->arguments.push_back(std::move(fullTopic));
+                    } else {
+                        call->arguments.push_back(convertExpression(
+                            bindExpression(*yield.delay),
+                            PrimitiveType::String,
+                            yield.delay->span(),
+                            "sequence wait_event topic"));
+                    }
                     auto timer = std::make_unique<BoundMemberAssignmentExpression>();
                     timer->type = input.sequenceTimerField.type;
                     timer->span = yield.span();
@@ -2986,7 +3035,31 @@ std::unique_ptr<BoundStatement> Binder::bindForeachStatement(
                 bindings.push_back(RawBinding{
                     extra.modifierToken, extra.type, extra.identifierToken});
             }
-            if (call.typeArguments.size() != bindings.size() || call.typeArguments.empty()) {
+            std::vector<syntax::TypeSyntax> dataArgs;
+            for (const auto& qArg : call.typeArguments) {
+                if (qArg.name.text == "With" && qArg.typeArguments.size() == 1) {
+                    std::string filterTypeName;
+                    (void)bindType(qArg.typeArguments[0], false, &filterTypeName);
+                    if (!filterTypeName.empty()) {
+                        result->ecsWithTypes.push_back(std::move(filterTypeName));
+                    }
+                    continue;
+                }
+                if (qArg.name.text == "Without" && qArg.typeArguments.size() == 1) {
+                    std::string filterTypeName;
+                    (void)bindType(qArg.typeArguments[0], false, &filterTypeName);
+                    if (!filterTypeName.empty()) {
+                        result->ecsWithoutTypes.push_back(std::move(filterTypeName));
+                    }
+                    continue;
+                }
+                dataArgs.push_back(qArg);
+            }
+
+            const bool hasEntityBinding =
+                (!dataArgs.empty() && bindings.size() == dataArgs.size() + 1);
+            if (dataArgs.empty() ||
+                (!hasEntityBinding && bindings.size() != dataArgs.size())) {
                 diagnostics_.report(
                     "RS2214",
                     "ECS Query<...>() type argument count must match foreach binding variables",
@@ -3003,10 +3076,62 @@ std::unique_ptr<BoundStatement> Binder::bindForeachStatement(
                 result->indexVariable.name);
             (void)declareVariable(result->indexVariable, syntaxTree.inKeyword.span);
 
-            const std::size_t colCount = std::min(call.typeArguments.size(), bindings.size());
+            if (hasEntityBinding) {
+                result->hasEcsEntityBinding = true;
+                const auto& entBind = bindings[0];
+                if (entBind.modifierToken.has_value() &&
+                    entBind.modifierToken->kind == syntax::SyntaxKind::RefKeyword) {
+                    diagnostics_.report(
+                        "RS2215",
+                        "cannot bind 'ref' variable to read-only ECS entity id",
+                        entBind.modifierToken->span);
+                }
+                if (entBind.type.name.text != "var") {
+                    std::string declaredEntTypeName;
+                    const PrimitiveType declaredEntPrim =
+                        bindType(entBind.type, false, &declaredEntTypeName);
+                    if (declaredEntPrim != PrimitiveType::Int) {
+                        diagnostics_.report(
+                            "RS2216",
+                            "ECS query leading entity variable must have type 'int'",
+                            entBind.type.span());
+                    }
+                }
+                result->ecsEntityCollectionVariable.name =
+                    "$ecs_ent_col_" + std::to_string(nextVariableIndex_);
+                result->ecsEntityCollectionVariable.type = PrimitiveType::Array;
+                result->ecsEntityCollectionVariable.typeName =
+                    arrayTypeName(PrimitiveType::Int, {});
+                result->ecsEntityCollectionVariable.index = nextVariableIndex_++;
+                result->ecsEntityCollectionVariable.declarationSpan =
+                    syntaxTree.foreachKeyword.span;
+                result->ecsEntityCollectionVariable.id = stableTypeId(
+                    std::to_string(currentFunctionId_) + "::local:" +
+                    std::to_string(result->ecsEntityCollectionVariable.index) + ":" +
+                    result->ecsEntityCollectionVariable.name);
+                (void)declareVariable(
+                    result->ecsEntityCollectionVariable, syntaxTree.foreachKeyword.span);
+
+                result->ecsEntityVariable.name = entBind.identifierToken.text;
+                result->ecsEntityVariable.type = PrimitiveType::Int;
+                result->ecsEntityVariable.isConst = true;
+                result->ecsEntityVariable.modifier = ParameterModifier::In;
+                result->ecsEntityVariable.index = nextVariableIndex_++;
+                result->ecsEntityVariable.declarationSpan = entBind.identifierToken.span;
+                result->ecsEntityVariable.id = stableTypeId(
+                    std::to_string(currentFunctionId_) + "::local:" +
+                    std::to_string(result->ecsEntityVariable.index) + ":" +
+                    result->ecsEntityVariable.name);
+                (void)declareVariable(result->ecsEntityVariable, entBind.identifierToken.span);
+            }
+
+            const std::size_t availBindings = hasEntityBinding
+                ? (bindings.size() - 1)
+                : bindings.size();
+            const std::size_t colCount = std::min(dataArgs.size(), availBindings);
             for (std::size_t idx = 0; idx < colCount; ++idx) {
-                const auto& qArg = call.typeArguments[idx];
-                const auto& b = bindings[idx];
+                const auto& qArg = dataArgs[idx];
+                const auto& b = bindings[hasEntityBinding ? (idx + 1) : idx];
                 bool isWrite = false;
                 bool isReadOnly = false;
                 syntax::TypeSyntax compTypeSyntax = qArg;
@@ -3089,6 +3214,26 @@ std::unique_ptr<BoundStatement> Binder::bindForeachStatement(
             if (!result->ecsColumns.empty()) {
                 result->collectionVariable = result->ecsColumns.front().collectionVariable;
                 result->iterationVariable = result->ecsColumns.front().iterationVariable;
+            }
+            {
+                std::string spec;
+                for (std::size_t i = 0; i < result->ecsColumns.size(); ++i) {
+                    if (i != 0) spec += ",";
+                    spec += result->ecsColumns[i].elementTypeName.empty()
+                        ? std::string(primitiveTypeName(result->ecsColumns[i].elementType))
+                        : result->ecsColumns[i].elementTypeName;
+                }
+                spec += ";";
+                for (std::size_t i = 0; i < result->ecsWithTypes.size(); ++i) {
+                    if (i != 0) spec += ",";
+                    spec += result->ecsWithTypes[i];
+                }
+                spec += ";";
+                for (std::size_t i = 0; i < result->ecsWithoutTypes.size(); ++i) {
+                    if (i != 0) spec += ",";
+                    spec += result->ecsWithoutTypes[i];
+                }
+                result->ecsQuerySpec = std::move(spec);
             }
             ++loopDepth_;
             ++breakableDepth_;

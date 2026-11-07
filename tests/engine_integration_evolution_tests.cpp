@@ -2989,6 +2989,575 @@ void BadSystem() {
     }
 }
 
+
+void testRound2EngineGapsCompletion() {
+    using namespace realscript;
+
+    // 1. 3D InlineStructSlot (Vec3, Quat, Enum) zero-heap-allocation verification
+    {
+        game::GameApi api;
+        const char* src = R"RS(
+module Evolution.Inline3D;
+import RealScript.Math;
+
+enum MotionState {
+    Idle = 0,
+    Moving = 2,
+    Airborne = 5
+}
+
+struct TransformSnapshot {
+    Vec3 position;
+    Quat rotation;
+    MotionState state;
+    int frame;
+}
+
+class Updater {
+    public TransformSnapshot Step(TransformSnapshot snap, int nextFrame) {
+        snap.position = new Vec3(snap.position.x + Fixed.Of(3), snap.position.y, snap.position.z + Fixed.Of(4));
+        snap.state = MotionState.Moving;
+        snap.frame = nextFrame;
+        return snap;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"inline3d.rs", src}});
+        require(
+            compiled.succeeded(),
+            "Inline3D compile failed:\n" + diagnosticsText(compiled.diagnostics));
+
+        game::ScriptRuntime runtime(compiled.program);
+        runtime::RuntimeError error;
+        const auto enumType = runtime.findType("Evolution.Inline3D::MotionState");
+        require(enumType.has_value(), "MotionState enum not found");
+
+        auto snapVal = runtime.createStruct(
+            "Evolution.Inline3D::TransformSnapshot",
+            {
+                game::ScriptRuntime::makeVec3(game::Vec3::fromInts(1, 2, 3)),
+                game::ScriptRuntime::makeQuat(game::Quat::identity()),
+                runtime::EnumValue{enumType->descriptor.id, 0},
+                std::int64_t{10},
+            },
+            error);
+        require(snapVal.has_value(), "createStruct TransformSnapshot failed: " + error.message);
+        const auto* st = std::get_if<runtime::StructValue>(&*snapVal);
+        require(
+            st != nullptr && st->isInline && st->storage == nullptr,
+            "TransformSnapshot with Vec3, Quat, Enum, int must be stored inline without heap StructStorage");
+
+        auto updaterObj = runtime.createObject("Evolution.Inline3D::Updater", error);
+        require(updaterObj.has_value(), "createObject Updater failed");
+        const auto stepMethod = runtime.findMethod(updaterObj->type(), "Step", 2);
+        require(stepMethod.has_value(), "Updater.Step not found");
+
+        const auto res = runtime.invoke(*updaterObj, *stepMethod, {*snapVal, std::int64_t{11}});
+        require(res.succeeded, "Updater.Step failed: " + res.error.message);
+        const auto* outSt = std::get_if<runtime::StructValue>(&res.value);
+        require(
+            outSt != nullptr && outSt->isInline && outSt->storage == nullptr,
+            "returned TransformSnapshot must remain inline with zero heap allocation");
+        const auto posField = runtime::structValueFieldAt(*outSt, 0);
+        const auto stateField = runtime::structValueFieldAt(*outSt, 2);
+        const auto frameField = runtime::structValueFieldAt(*outSt, 3);
+        require(
+            posField.has_value() &&
+                game::ScriptRuntime::readVec3(*posField) == game::Vec3::fromInts(4, 2, 7),
+            "inline Vec3 field mutation mismatch");
+        require(
+            stateField.has_value() &&
+                std::holds_alternative<runtime::EnumValue>(*stateField) &&
+                std::get<runtime::EnumValue>(*stateField).value == 2,
+            "inline Enum field mutation mismatch");
+        require(
+            frameField.has_value() && std::get<std::int64_t>(*frameField) == 11,
+            "inline int field mutation mismatch");
+    }
+
+    // 2. ECS Sparse-Set Multi-Entity Join, With<T>/Without<U> Filters, EntityId Binding & ECB
+    {
+        game::GameApi api;
+        const char* ecsSrc = R"RS(
+module Evolution.SparseEcs;
+
+struct Pos {
+    int x;
+    int y;
+}
+
+struct Vel {
+    int dx;
+    int dy;
+}
+
+struct ActiveTag {
+    int flag;
+}
+
+struct FrozenTag {
+    int reason;
+}
+
+class EcsSystem {
+    public int RunFilteredSystem() {
+        int visitedSum = 0;
+        foreach (int entityId, ref var p, in var v in Query<Write<Pos>, Read<Vel>, With<ActiveTag>, Without<FrozenTag>>()) {
+            p.x = p.x + v.dx;
+            p.y = p.y + v.dy;
+            visitedSum = visitedSum + entityId;
+        }
+        return visitedSum;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"sparse_ecs.rs", ecsSrc}});
+        require(
+            compiled.succeeded(),
+            "SparseEcs compile failed:\n" + diagnosticsText(compiled.diagnostics));
+
+        game::ScriptRuntime runtime(compiled.program);
+        runtime::RuntimeError err;
+        const auto makePos = [&](std::int64_t x, std::int64_t y) {
+            return *runtime.createStruct("Evolution.SparseEcs::Pos", {x, y}, err);
+        };
+        const auto makeVel = [&](std::int64_t dx, std::int64_t dy) {
+            return *runtime.createStruct("Evolution.SparseEcs::Vel", {dx, dy}, err);
+        };
+        const auto activeVal = *runtime.createStruct("Evolution.SparseEcs::ActiveTag", {std::int64_t{1}}, err);
+        const auto frozenVal = *runtime.createStruct("Evolution.SparseEcs::FrozenTag", {std::int64_t{1}}, err);
+
+        // Entity 10: Pos + Vel + ActiveTag (MATCH)
+        require(runtime.setEcsEntityComponent(10, "Evolution.SparseEcs::Pos", makePos(100, 200), err), err.message);
+        require(runtime.setEcsEntityComponent(10, "Evolution.SparseEcs::Vel", makeVel(5, 6), err), err.message);
+        require(runtime.setEcsEntityComponent(10, "Evolution.SparseEcs::ActiveTag", activeVal, err), err.message);
+
+        // Entity 20: Pos + Vel + ActiveTag + FrozenTag (EXCLUDED by Without<FrozenTag>)
+        require(runtime.setEcsEntityComponent(20, "Evolution.SparseEcs::Pos", makePos(300, 400), err), err.message);
+        require(runtime.setEcsEntityComponent(20, "Evolution.SparseEcs::Vel", makeVel(9, 9), err), err.message);
+        require(runtime.setEcsEntityComponent(20, "Evolution.SparseEcs::ActiveTag", activeVal, err), err.message);
+        require(runtime.setEcsEntityComponent(20, "Evolution.SparseEcs::FrozenTag", frozenVal, err), err.message);
+
+        // Entity 30: Pos + Vel (EXCLUDED by With<ActiveTag>)
+        require(runtime.setEcsEntityComponent(30, "Evolution.SparseEcs::Pos", makePos(500, 600), err), err.message);
+        require(runtime.setEcsEntityComponent(30, "Evolution.SparseEcs::Vel", makeVel(7, 8), err), err.message);
+
+        // Entity 40: Pos + Vel + ActiveTag (MATCH)
+        require(runtime.setEcsEntityComponent(40, "Evolution.SparseEcs::Pos", makePos(10, 20), err), err.message);
+        require(runtime.setEcsEntityComponent(40, "Evolution.SparseEcs::Vel", makeVel(1, 2), err), err.message);
+        require(runtime.setEcsEntityComponent(40, "Evolution.SparseEcs::ActiveTag", activeVal, err), err.message);
+
+        auto sysObj = runtime.createObject("Evolution.SparseEcs::EcsSystem", err);
+        require(sysObj.has_value(), "createObject EcsSystem failed");
+        const auto runMethod = runtime.findMethod(sysObj->type(), "RunFilteredSystem", 0);
+        require(runMethod.has_value(), "RunFilteredSystem not found");
+
+        const auto runRes = runtime.invoke(*sysObj, *runMethod, {});
+        require(
+            runRes.succeeded && std::get<std::int64_t>(runRes.value) == 50,
+            "RunFilteredSystem should visit entities 10 and 40 (sum = 50)");
+
+        // Verify writeback updated entities 10 and 40 while leaving entity 20 untouched
+        const auto pos10 = runtime.getEcsEntityComponent(10, "Evolution.SparseEcs::Pos", err);
+        const auto pos20 = runtime.getEcsEntityComponent(20, "Evolution.SparseEcs::Pos", err);
+        const auto pos40 = runtime.getEcsEntityComponent(40, "Evolution.SparseEcs::Pos", err);
+        require(pos10.has_value() && pos20.has_value() && pos40.has_value(), "getEcsEntityComponent failed");
+        require(
+            *runtime::structValueFieldAt(std::get<runtime::StructValue>(*pos10), 0) == runtime::Value{std::int64_t{105}} &&
+                *runtime::structValueFieldAt(std::get<runtime::StructValue>(*pos10), 1) == runtime::Value{std::int64_t{206}},
+            "Entity 10 Pos writeback mismatch");
+        require(
+            *runtime::structValueFieldAt(std::get<runtime::StructValue>(*pos20), 0) == runtime::Value{std::int64_t{300}},
+            "Entity 20 Pos should not be modified");
+        require(
+            *runtime::structValueFieldAt(std::get<runtime::StructValue>(*pos40), 0) == runtime::Value{std::int64_t{11}} &&
+                *runtime::structValueFieldAt(std::get<runtime::StructValue>(*pos40), 1) == runtime::Value{std::int64_t{22}},
+            "Entity 40 Pos writeback mismatch");
+
+        // Test EntityCommandBuffer (ECB) deferred structural mutations
+        runtime.queueEcsRemoveComponent(20, "Evolution.SparseEcs::FrozenTag");
+        runtime.queueEcsSetComponent(30, "Evolution.SparseEcs::ActiveTag", activeVal);
+        runtime.queueEcsDestroyEntity(10);
+        require(runtime.pendingEcsCommandCount() == 3, "pendingEcsCommandCount should be 3");
+        const auto applied = runtime.flushEcsCommandBuffer(err);
+        require(applied == 3 && runtime.pendingEcsCommandCount() == 0, "flushEcsCommandBuffer failed");
+        require(!runtime.hasEcsEntityComponent(10, "Evolution.SparseEcs::Pos"), "Entity 10 should be destroyed");
+        require(!runtime.hasEcsEntityComponent(20, "Evolution.SparseEcs::FrozenTag"), "Entity 20 FrozenTag should be removed");
+        require(runtime.hasEcsEntityComponent(30, "Evolution.SparseEcs::ActiveTag"), "Entity 30 ActiveTag should be added");
+
+        // Re-run system: now entities 20, 30, 40 match (20 + 30 + 40 = 90)
+        const auto runRes2 = runtime.invoke(*sysObj, *runMethod, {});
+        require(
+            runRes2.succeeded && std::get<std::int64_t>(runRes2.value) == 90,
+            "After ECB flush, entities 20, 30, 40 should match (sum = 90)");
+    }
+
+    // 3. ManagedHeap Shared referenceFields Layout & String Interning + 4. BindingRegistry SymbolId Cache
+    {
+        game::GameApi api;
+        int pingCalls = 0;
+        require(
+            api.function("Evolution.Host", "Ping", [&pingCalls](int v) -> int {
+                ++pingCalls;
+                return v + 1;
+            }),
+            "bind Ping failed");
+
+        const char* heapSrc = R"RS(
+module Evolution.HeapOpt;
+import Evolution.Host;
+
+class NodeItem {
+    public string label;
+    public NodeItem next;
+
+    public int Run() {
+        string a = "shared_literal_key";
+        string b = "shared_literal_key";
+        if (a == b) {
+            return Ping(41);
+        }
+        return 0;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"heap_opt.rs", heapSrc}});
+        require(compiled.succeeded(), "HeapOpt compile failed");
+
+        game::ScriptRuntime runtime(compiled.program);
+        runtime::RuntimeError err;
+        auto n1 = runtime.createObject("Evolution.HeapOpt::NodeItem", err);
+        auto n2 = runtime.createObject("Evolution.HeapOpt::NodeItem", err);
+        auto n3 = runtime.createObject("Evolution.HeapOpt::NodeItem", err);
+        require(n1.has_value() && n2.has_value() && n3.has_value(), "createObject NodeItem failed");
+        require(
+            runtime.heap()->sharedTypeLayoutCount() >= 1,
+            "ManagedHeap should share referenceFields layout per typeId");
+
+        const auto s1 = runtime.heap()->internString("engine_tag_alpha", &err);
+        const auto s2 = runtime.heap()->internString("engine_tag_alpha", &err);
+        require(
+            s1.has_value() && s2.has_value() && *s1 == *s2,
+            "ManagedHeap::internString must return identical ObjectRef for identical strings");
+        require(
+            runtime.heap()->internedStringCount() >= 1,
+            "internedStringCount should track interned strings");
+
+        const auto runMethod = runtime.findMethod(n1->type(), "Run", 0);
+        const auto res = runtime.invoke(*n1, *runMethod, {});
+        require(
+            res.succeeded && std::get<std::int64_t>(res.value) == 42 && pingCalls == 1,
+            "NodeItem.Run should return 42");
+        require(
+            api.bindings()->cachedSymbolCount() >= 1,
+            "BindingRegistry should populate O(1) SymbolId resolution cache");
+    }
+
+    // 5. Sequence Coroutine `var` Local Type Inference & `yield wait_signal(...)` + `SceneScriptRuntime::emitSignal`
+    {
+        auto host = std::make_shared<game::GameplayHost>(60);
+        game::GameApi api;
+        require(game::installGameplayBindings(api, host), "installGameplayBindings failed");
+
+        const char* seqSrc = R"RS(
+module Evolution.Cutscene;
+import RealScript.Game;
+
+class QuestActor {
+    public int stage = 0;
+    public int reward = 0;
+
+    sequence RunQuest(long selfId, long bossEntityId) {
+        var baseReward = 50;
+        var multiplier = 3;
+        stage = 1;
+        yield wait_signal(bossEntityId, "OnBossDefeated");
+        reward = baseReward * multiplier;
+        stage = 2;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"cutscene.rs", seqSrc}});
+        require(
+            compiled.succeeded(),
+            "Cutscene sequence compile failed:\n" + diagnosticsText(compiled.diagnostics));
+
+        game::ScriptRuntime runtime(compiled.program);
+        game::SceneScriptRuntime scene(runtime);
+        game::SceneGameplayDriver driver(scene, host);
+
+        require(scene.attachComponent(1, "Evolution.Cutscene::QuestActor"), "attach QuestActor failed");
+        const auto startRes = scene.invoke(
+            1,
+            "RunQuest",
+            {runtime::LongValue{1}, runtime::LongValue{99}});
+        require(startRes.succeeded, "RunQuest start failed: " + startRes.error.message);
+
+        auto* actorObj = scene.getComponent(1, "QuestActor");
+        runtime::RuntimeError err;
+        require(
+            std::get<std::int64_t>(*runtime.getMember(*actorObj, "stage", err)) == 1 &&
+                std::get<std::int64_t>(*runtime.getMember(*actorObj, "reward", err)) == 0,
+            "QuestActor should suspend at stage 1 before signal is emitted");
+
+        // Advance 3 ticks without emitting the signal: sequence must stay suspended
+        (void)driver.advanceTicks(3);
+        require(
+            std::get<std::int64_t>(*runtime.getMember(*actorObj, "stage", err)) == 1,
+            "QuestActor should remain at stage 1 before OnBossDefeated signal");
+
+        // Emit signal from unrelated entity 50: sequence waiting on bossEntityId=99 must stay suspended
+        require(scene.emitSignal(50, "OnBossDefeated") > 0, "emitSignal(50) should publish signal");
+        (void)driver.advanceTicks(1);
+        require(
+            std::get<std::int64_t>(*runtime.getMember(*actorObj, "stage", err)) == 1,
+            "QuestActor must NOT wake up when unrelated entity 50 emits OnBossDefeated");
+
+        // Emit signal from bossEntityId=99 and advance 1 tick
+        require(scene.emitSignal(99, "OnBossDefeated") > 0, "emitSignal should publish signal");
+        (void)driver.advanceTicks(1);
+        require(
+            std::get<std::int64_t>(*runtime.getMember(*actorObj, "stage", err)) == 2 &&
+                std::get<std::int64_t>(*runtime.getMember(*actorObj, "reward", err)) == 150,
+            "QuestActor should resume after wait_signal with hoisted var locals preserved (reward=150)");
+    }
+
+    // 6. RealScript.Input Deterministic Snapshot & RealScript.Physics 2D Colliders/Queries/Callbacks
+    {
+        game::GameApi api;
+        game::GameScriptCompiler bootstrapCompiler(api);
+        auto bootstrap = bootstrapCompiler.compile({{"empty.rs", "module Empty; void Main() {}"}});
+        game::ScriptRuntime dummyRuntime(bootstrap.program);
+        game::SceneScriptRuntime scene(dummyRuntime);
+        require(
+            game::installSceneComponentBindings(api, scene),
+            "installSceneComponentBindings failed");
+
+        const char* physInputSrc = R"RS(
+module Evolution.PhysicsInput;
+import RealScript.Math;
+import RealScript.Scene;
+
+class PlayerActor {
+    public int jumpCount = 0;
+    public int releaseCount = 0;
+    public Fixed moveX;
+    public long lastRaycastHit = 0;
+    public int nearbyCount = 0;
+    public long collisionEnterEntity = 0;
+    public int collisionStayTicks = 0;
+    public long collisionExitEntity = 0;
+    public long triggerEnterEntity = 0;
+    public long triggerExitEntity = 0;
+
+    public void SampleInputAndSpatial() {
+        if (IsActionJustPressed("Jump")) {
+            jumpCount = jumpCount + 1;
+        }
+        if (IsActionJustReleased("Jump")) {
+            releaseCount = releaseCount + 1;
+        }
+        Vec2 axis = GetInputAxis2D("Move");
+        moveX = axis.x;
+        lastRaycastHit = Raycast2D(
+            new Vec2(Fixed.Of(0), Fixed.Of(0)),
+            new Vec2(Fixed.Of(1), Fixed.Of(0)),
+            Fixed.Of(20));
+        nearbyCount = OverlapCircleCount2D(
+            new Vec2(Fixed.Of(0), Fixed.Of(0)),
+            Fixed.Of(15));
+    }
+
+    public void OnCollisionEnter(long otherEntity) {
+        collisionEnterEntity = otherEntity;
+    }
+
+    public void OnCollisionStay(long otherEntity) {
+        collisionStayTicks = collisionStayTicks + 1;
+    }
+
+    public void OnCollisionExit(long otherEntity) {
+        collisionExitEntity = otherEntity;
+    }
+
+    public void OnTriggerEnter(long otherEntity) {
+        triggerEnterEntity = otherEntity;
+    }
+
+    public void OnTriggerExit(long otherEntity) {
+        triggerExitEntity = otherEntity;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"phys_input.rs", physInputSrc}});
+        require(
+            compiled.succeeded(),
+            "PhysicsInput compile failed:\n" + diagnosticsText(compiled.diagnostics));
+
+        dummyRuntime.replaceProgram(compiled.program);
+        require(scene.attachComponent(1, "Evolution.PhysicsInput::PlayerActor"), "attach PlayerActor 1 failed");
+        require(scene.attachComponent(2, "Evolution.PhysicsInput::PlayerActor"), "attach PlayerActor 2 failed");
+        require(scene.attachComponent(3, "Evolution.PhysicsInput::PlayerActor"), "attach PlayerActor 3 failed");
+
+        scene.setLocalPosition2D(1, game::Vec2::fromInts(0, 0));
+        scene.setLocalPosition2D(2, game::Vec2::fromInts(5, 0));
+        scene.setLocalPosition2D(3, game::Vec2::fromInts(25, 0));
+
+        game::SceneCollider2D col1;
+        col1.halfExtents = game::Vec2::fromInts(1, 1);
+        scene.setEntityCollider2D(1, col1);
+
+        game::SceneCollider2D col2;
+        col2.halfExtents = game::Vec2::fromInts(1, 1);
+        scene.setEntityCollider2D(2, col2);
+
+        game::SceneCollider2D trig3;
+        trig3.isCircle = true;
+        trig3.radius = game::Fixed::fromInt(2);
+        trig3.isTrigger = true;
+        scene.setEntityCollider2D(3, trig3);
+
+        // Input frame 1: press Jump and set Move axis
+        scene.setInputAction("Jump", true);
+        scene.setInputAxis2D("Move", game::Vec2::fromInts(1, 0));
+        const auto digest1 = scene.computeInputDigest();
+        require(digest1 != 0, "computeInputDigest must produce non-zero deterministic hash");
+        require(scene.invoke(1, "SampleInputAndSpatial").succeeded, "SampleInputAndSpatial frame 1 failed");
+
+        auto* p1 = scene.getComponent(1, "PlayerActor");
+        runtime::RuntimeError err;
+        require(
+            std::get<std::int64_t>(*dummyRuntime.getMember(*p1, "jumpCount", err)) == 1 &&
+                std::get<std::int64_t>(*dummyRuntime.getMember(*p1, "releaseCount", err)) == 0 &&
+                std::get<runtime::LongValue>(*dummyRuntime.getMember(*p1, "lastRaycastHit", err)).value == 1 &&
+                std::get<std::int64_t>(*dummyRuntime.getMember(*p1, "nearbyCount", err)) == 2,
+            "Input & spatial query results mismatch on frame 1");
+
+        // Advance input tick while keeping Jump pressed -> JustPressed must be false
+        scene.advanceInputTick();
+        require(scene.invoke(1, "SampleInputAndSpatial").succeeded, "SampleInputAndSpatial frame 2 failed");
+        require(
+            std::get<std::int64_t>(*dummyRuntime.getMember(*p1, "jumpCount", err)) == 1,
+            "IsActionJustPressed must not fire when button remains held");
+
+        // Release Jump -> JustReleased must fire
+        scene.advanceInputTick();
+        scene.setInputAction("Jump", false);
+        require(scene.invoke(1, "SampleInputAndSpatial").succeeded, "SampleInputAndSpatial frame 3 failed");
+        require(
+            std::get<std::int64_t>(*dummyRuntime.getMember(*p1, "releaseCount", err)) == 1,
+            "IsActionJustReleased should fire on release frame");
+
+        // Physics 2D lifecycle: move entity 2 onto entity 1 (solid collision) and entity 3 onto entity 1 (trigger)
+        scene.setLocalPosition2D(2, game::Vec2::fromInts(1, 0));
+        scene.setLocalPosition2D(3, game::Vec2::fromInts(1, 0));
+        require(scene.stepPhysics2D() > 0, "stepPhysics2D Enter step should fire callbacks");
+        require(
+            std::get<runtime::LongValue>(*dummyRuntime.getMember(*p1, "collisionEnterEntity", err)).value == 2 &&
+                std::get<runtime::LongValue>(*dummyRuntime.getMember(*p1, "triggerEnterEntity", err)).value == 3,
+            "OnCollisionEnter and OnTriggerEnter should fire on entity 1");
+
+        // Step again at same positions -> OnCollisionStay
+        require(scene.stepPhysics2D() > 0, "stepPhysics2D Stay step should fire callbacks");
+        require(
+            std::get<std::int64_t>(*dummyRuntime.getMember(*p1, "collisionStayTicks", err)) == 1,
+            "OnCollisionStay should increment collisionStayTicks");
+
+        // Separate entities 2 and 3 -> OnCollisionExit & OnTriggerExit
+        scene.setLocalPosition2D(2, game::Vec2::fromInts(50, 0));
+        scene.setLocalPosition2D(3, game::Vec2::fromInts(50, 0));
+        require(scene.stepPhysics2D() > 0, "stepPhysics2D Exit step should fire callbacks");
+        require(
+            std::get<runtime::LongValue>(*dummyRuntime.getMember(*p1, "collisionExitEntity", err)).value == 2 &&
+                std::get<runtime::LongValue>(*dummyRuntime.getMember(*p1, "triggerExitEntity", err)).value == 3,
+            "OnCollisionExit and OnTriggerExit should fire on separation");
+    }
+
+    // 7. Compile-Time [Deterministic] Verification (RS2495) & Runtime Capability Sandbox (CapabilityDenied)
+    {
+        game::GameApi api;
+        require(
+            api.function(
+                "Evolution.Net",
+                "FetchWallClock",
+                []() -> int { return 12345; },
+                runtime::BindingDeterminism::NonDeterministic),
+            "bind FetchWallClock failed");
+        require(
+            api.function(
+                "Evolution.Net",
+                "HttpGetStatus",
+                [](std::string url) -> int { return url.empty() ? 400 : 200; },
+                runtime::BindingDeterminism::Deterministic,
+                "Net.Http"),
+            "bind HttpGetStatus failed");
+
+        game::GameScriptCompiler compiler(api);
+
+        // 7a. Calling [NonDeterministic] function from [Deterministic] module must fail with RS2495
+        const char* badDetSrc = R"RS(
+[Deterministic]
+module Evolution.LockstepSim;
+import Evolution.Net;
+
+int SimulateTick() {
+    return FetchWallClock();
+}
+)RS";
+        auto badDet = compiler.compile({{"bad_det.rs", badDetSrc}});
+        require(!badDet.succeeded(), "calling NonDeterministic function in [Deterministic] module must fail");
+        bool sawRS2495 = false;
+        for (const auto& d : badDet.diagnostics.items()) {
+            if (d.code == "RS2495") sawRS2495 = true;
+        }
+        require(sawRS2495, "expected diagnostic RS2495 for non-deterministic call in [Deterministic] context");
+
+        // 7b. Capability sandbox enforcement at runtime
+        const char* capSrc = R"RS(
+module Evolution.ModScript;
+import Evolution.Net;
+
+class ModRunner {
+    public int CheckServer() {
+        return HttpGetStatus("https://example.com");
+    }
+}
+)RS";
+        auto capCompiled = compiler.compile({{"mod_script.rs", capSrc}});
+        require(
+            capCompiled.succeeded(),
+            "ModScript compile failed:\n" + diagnosticsText(capCompiled.diagnostics));
+
+        game::ScriptRuntime runtime(capCompiled.program);
+        runtime::RuntimeError err;
+        auto modObj = runtime.createObject("Evolution.ModScript::ModRunner", err);
+        require(modObj.has_value(), "createObject ModRunner failed");
+        const auto checkMethod = runtime.findMethod(modObj->type(), "CheckServer", 0);
+        require(checkMethod.has_value(), "CheckServer method not found");
+
+        runtime::ExecutionOptions deniedOpts;
+        deniedOpts.enforceCapabilities = true;
+        const auto deniedRes = runtime.invoke(*modObj, *checkMethod, {}, deniedOpts);
+        require(
+            !deniedRes.succeeded &&
+                deniedRes.error.code == runtime::ErrorCode::CapabilityDenied,
+            "invoking capability-protected binding without grant must fail with ErrorCode::CapabilityDenied");
+
+        runtime::ExecutionOptions grantedOpts;
+        grantedOpts.enforceCapabilities = true;
+        grantedOpts.grantedCapabilities.insert("Net.Http");
+        const auto grantedRes = runtime.invoke(*modObj, *checkMethod, {}, grantedOpts);
+        require(
+            grantedRes.succeeded && std::get<std::int64_t>(grantedRes.value) == 200,
+            "invoking capability-protected binding with Net.Http grant must succeed");
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -3019,8 +3588,10 @@ int main() {
         testCompleteEvolutionMilestones();
         std::cout << "[14/15] testModernEngineParityCompletionGoals..." << std::endl;
         testModernEngineParityCompletionGoals();
-        std::cout << "[15/15] testZeroHeapInlineStructAndEcsQueryMirLowering..." << std::endl;
+        std::cout << "[15/16] testZeroHeapInlineStructAndEcsQueryMirLowering..." << std::endl;
         testZeroHeapInlineStructAndEcsQueryMirLowering();
+        std::cout << "[16/16] testRound2EngineGapsCompletion..." << std::endl;
+        testRound2EngineGapsCompletion();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

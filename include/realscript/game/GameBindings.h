@@ -13,7 +13,8 @@ public:
     NativeTypeBuilder& method(
         std::string name,
         runtime::BindingDeterminism determinism =
-            runtime::BindingDeterminism::Deterministic);
+            runtime::BindingDeterminism::Deterministic,
+        std::string requiredCapability = {});
 
     template <auto Getter>
     NativeTypeBuilder& property(
@@ -77,7 +78,8 @@ public:
         std::string name,
         Callable callable,
         runtime::BindingDeterminism determinism =
-            runtime::BindingDeterminism::Deterministic) {
+            runtime::BindingDeterminism::Deterministic,
+        std::string requiredCapability = {}) {
         using CallableType = std::decay_t<Callable>;
         using Traits = detail::FunctionTraits<CallableType>;
         auto returnType = detail::resolveScriptType<typename Traits::Return>(state_);
@@ -120,14 +122,16 @@ public:
             ? call + "; return;"
             : "return " + call + ";";
         module.functions.push_back(detail::FunctionDeclaration{
-            name, *returnType, *parameters, wrapperBody});
+            name, *returnType, *parameters, wrapperBody, determinism, requiredCapability});
         module.functions.push_back(detail::FunctionDeclaration{
             nativeName,
             std::is_void_v<typename Traits::Return>
                 ? detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int}
                 : *returnType,
             *parameters,
-            {}});
+            {},
+            determinism,
+            requiredCapability});
         return state_->bindings->bind(
             bindingName,
             [state, sharedCallable](const auto&, const auto& arguments, auto& error) {
@@ -144,7 +148,8 @@ public:
                     return invoked;
                 }
             },
-            determinism);
+            determinism,
+            std::move(requiredCapability));
     }
 
     [[nodiscard]] std::vector<compiler::SourceFile> generatedSources() const;
@@ -192,7 +197,8 @@ template <typename T>
 template <auto Method>
 NativeTypeBuilder<T>& NativeTypeBuilder<T>::method(
     std::string name,
-    runtime::BindingDeterminism determinism) {
+    runtime::BindingDeterminism determinism,
+    std::string requiredCapability) {
     using Traits = detail::FunctionTraits<decltype(Method)>;
     static_assert(std::is_same_v<typename Traits::Class, T>,
         "bound method must belong to the native type being registered");
@@ -245,14 +251,16 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::method(
         ? call + "; return;"
         : "return " + call + ";";
     type.methods.push_back(detail::FunctionDeclaration{
-        name, *returnType, *parameters, wrapperBody});
+        name, *returnType, *parameters, wrapperBody, determinism, requiredCapability});
     module.functions.push_back(detail::FunctionDeclaration{
         nativeName,
         std::is_void_v<typename Traits::Return>
             ? detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int}
             : *returnType,
         std::move(nativeParameters),
-        {}});
+        {},
+        determinism,
+        requiredCapability});
     state_->bindings->bind(
         bindingName,
         [state](const auto&, const auto& arguments, auto& error) {
@@ -268,7 +276,8 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::method(
                 return invoked;
             }
         },
-        determinism);
+        determinism,
+        std::move(requiredCapability));
     return *this;
 }
 

@@ -540,7 +540,14 @@ std::optional<GameplayValue> toGameplayValue(const runtime::Value& value) {
 SceneGameplayDriver::SceneGameplayDriver(
     SceneScriptRuntime& scene,
     std::shared_ptr<GameplayHost> host)
-    : scene_(scene), host_(std::move(host)) {}
+    : scene_(scene), host_(std::move(host)) {
+    if (host_) {
+        auto h = host_;
+        scene_.setSignalTopicPublisher([h](const std::string& topic) {
+            (void)h->publish(topic, {}, 1);
+        });
+    }
+}
 
 SceneGameplayDriver::StepResult SceneGameplayDriver::step() {
     return step(Options{});

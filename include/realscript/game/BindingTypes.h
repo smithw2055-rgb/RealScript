@@ -54,6 +54,9 @@ struct FunctionDeclaration {
     ScriptTypeRef returnType;
     std::vector<ParameterDeclaration> parameters;
     std::string body;
+    runtime::BindingDeterminism determinism =
+        runtime::BindingDeterminism::Deterministic;
+    std::string requiredCapability;
 };
 
 struct PropertyDeclaration {

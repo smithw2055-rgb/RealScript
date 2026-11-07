@@ -2611,6 +2611,13 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
     text::TextSpan span,
     const std::string& context,
     bool forceStaticDispatch) {
+    if (currentDeterministicContext_ && function.nonDeterministic) {
+        diagnostics_.report(
+            "RS2495",
+            "cannot call non-deterministic function '" + function.name +
+                "' from a [Deterministic] context",
+            span);
+    }
     const auto offset = visibleParameterOffset(function);
     const auto argumentSpan = [&](std::size_t index) {
         return index < syntaxArguments.size() && syntaxArguments[index]

@@ -607,32 +607,58 @@ const ExecutionMirror& executionMirror(const ProgramImage& program) noexcept {
 bool BindingRegistry::bind(
     semantic::SymbolId symbolId,
     ExternalFunction function,
-    BindingDeterminism determinism) {
+    BindingDeterminism determinism,
+    std::string requiredCapability) {
     if (symbolId == 0 || !function) return false;
-    return bySymbol_.emplace(
+    const bool inserted = bySymbol_.emplace(
         symbolId,
-        Entry{std::move(function), determinism}).second;
+        Entry{std::move(function), determinism, std::move(requiredCapability)}).second;
+    if (inserted) ++entryCount_;
+    return inserted;
 }
 
 bool BindingRegistry::bind(
     const std::string& canonicalName,
     ExternalFunction function,
-    BindingDeterminism determinism) {
+    BindingDeterminism determinism,
+    std::string requiredCapability) {
     if (canonicalName.empty() || !function) return false;
-    return byName_.emplace(
-        canonicalName,
-        Entry{std::move(function), determinism}).second;
+    if (byName_.find(canonicalName) != byName_.end()) return false;
+    Entry entry{std::move(function), determinism, std::move(requiredCapability)};
+    const auto symId = semantic::stableTypeId(canonicalName);
+    bySymbol_.try_emplace(symId, entry);
+    const bool inserted = byName_.emplace(canonicalName, std::move(entry)).second;
+    if (inserted) ++entryCount_;
+    return inserted;
 }
 
 std::optional<ResolvedBinding> BindingRegistry::resolve(
     const bytecode::FunctionReference& reference) const {
-    const auto bySymbol = bySymbol_.find(reference.symbolId);
-    if (bySymbol != bySymbol_.end()) {
-        return ResolvedBinding{&bySymbol->second.function, bySymbol->second.determinism};
+    if (reference.symbolId != 0) {
+        const auto bySymbol = bySymbol_.find(reference.symbolId);
+        if (bySymbol != bySymbol_.end()) {
+            return ResolvedBinding{
+                &bySymbol->second.function,
+                bySymbol->second.determinism,
+                bySymbol->second.requiredCapability};
+        }
+        const auto cached = resolvedBySymbolCache_.find(reference.symbolId);
+        if (cached != resolvedBySymbolCache_.end() && cached->second) {
+            return ResolvedBinding{
+                &cached->second->function,
+                cached->second->determinism,
+                cached->second->requiredCapability};
+        }
     }
     const auto byName = byName_.find(reference.name);
     if (byName != byName_.end()) {
-        return ResolvedBinding{&byName->second.function, byName->second.determinism};
+        if (reference.symbolId != 0) {
+            resolvedBySymbolCache_.emplace(reference.symbolId, &byName->second);
+        }
+        return ResolvedBinding{
+            &byName->second.function,
+            byName->second.determinism,
+            byName->second.requiredCapability};
     }
     return std::nullopt;
 }
@@ -650,7 +676,10 @@ std::optional<Value> BindingRegistry::invoke(
     return std::nullopt;
 }
 
-std::size_t BindingRegistry::size() const noexcept { return bySymbol_.size() + byName_.size(); }
+std::size_t BindingRegistry::size() const noexcept { return entryCount_; }
+std::size_t BindingRegistry::cachedSymbolCount() const noexcept {
+    return bySymbol_.size() + resolvedBySymbolCache_.size();
+}
 
 semantic::SymbolId fixedTypeId() noexcept {
     static const semantic::SymbolId id =
@@ -778,11 +807,45 @@ std::optional<InlineStructSlot> encodeInlineStructSlot(
         slot.setBits(static_cast<std::uint64_t>(v->raw));
         return slot;
     }
+    if (const auto* v = std::get_if<EnumValue>(&value)) {
+        if (v->value >= -8388608 && v->value <= 8388607) {
+            slot.kind = InlineStructSlot::Kind::Enum;
+            slot.setBits(v->typeId);
+            slot.setAuxInt24(static_cast<std::int32_t>(v->value));
+            return slot;
+        }
+        return std::nullopt;
+    }
     if (const auto* v = std::get_if<Vec2Value>(&value)) {
         slot.kind = InlineStructSlot::Kind::Vec2;
         slot.lo = static_cast<std::uint32_t>(v->x);
         slot.hi = static_cast<std::uint32_t>(v->y);
         return slot;
+    }
+    if (const auto* v = std::get_if<Vec3Value>(&value)) {
+        if (v->z >= -8388608 && v->z <= 8388607) {
+            slot.kind = InlineStructSlot::Kind::Vec3;
+            slot.lo = static_cast<std::uint32_t>(v->x);
+            slot.hi = static_cast<std::uint32_t>(v->y);
+            slot.setAuxInt24(v->z);
+            return slot;
+        }
+        return std::nullopt;
+    }
+    if (const auto* v = std::get_if<QuatValue>(&value)) {
+        const auto inInt16 = [](std::int32_t c) noexcept {
+            return c >= std::numeric_limits<std::int16_t>::min() &&
+                   c <= std::numeric_limits<std::int16_t>::max();
+        };
+        if (inInt16(v->x) && inInt16(v->y) && inInt16(v->z) && inInt16(v->w)) {
+            slot.kind = InlineStructSlot::Kind::Quat;
+            slot.lo = static_cast<std::uint32_t>(static_cast<std::uint16_t>(static_cast<std::int16_t>(v->x))) |
+                (static_cast<std::uint32_t>(static_cast<std::uint16_t>(static_cast<std::int16_t>(v->y))) << 16u);
+            slot.hi = static_cast<std::uint32_t>(static_cast<std::uint16_t>(static_cast<std::int16_t>(v->z))) |
+                (static_cast<std::uint32_t>(static_cast<std::uint16_t>(static_cast<std::int16_t>(v->w))) << 16u);
+            return slot;
+        }
+        return std::nullopt;
     }
     return std::nullopt;
 }
@@ -825,10 +888,28 @@ Value decodeInlineStructSlot(const InlineStructSlot& slot) noexcept {
         return FixedValue{static_cast<std::int32_t>(slot.lo)};
     case InlineStructSlot::Kind::Fixed16:
         return Fixed16Value{static_cast<std::int64_t>(bits)};
+    case InlineStructSlot::Kind::Enum:
+        return EnumValue{
+            bits,
+            static_cast<std::int64_t>(slot.auxInt24()),
+        };
     case InlineStructSlot::Kind::Vec2:
         return Vec2Value{
             static_cast<std::int32_t>(slot.lo),
             static_cast<std::int32_t>(slot.hi),
+        };
+    case InlineStructSlot::Kind::Vec3:
+        return Vec3Value{
+            static_cast<std::int32_t>(slot.lo),
+            static_cast<std::int32_t>(slot.hi),
+            slot.auxInt24(),
+        };
+    case InlineStructSlot::Kind::Quat:
+        return QuatValue{
+            static_cast<std::int32_t>(static_cast<std::int16_t>(slot.lo & 0xFFFFu)),
+            static_cast<std::int32_t>(static_cast<std::int16_t>(slot.lo >> 16u)),
+            static_cast<std::int32_t>(static_cast<std::int16_t>(slot.hi & 0xFFFFu)),
+            static_cast<std::int32_t>(static_cast<std::int16_t>(slot.hi >> 16u)),
         };
     case InlineStructSlot::Kind::None:
         break;
@@ -1257,6 +1338,137 @@ std::string extractIntrinsicString(const Value& val, const ManagedHeap* heap) {
     return valueToString(val, heap);
 }
 
+void splitStringBy(std::string_view input, char delim, std::vector<std::string>& out) {
+    out.clear();
+    if (input.empty()) return;
+    std::size_t start = 0;
+    while (start <= input.size()) {
+        const auto pos = input.find(delim, start);
+        const auto piece = pos == std::string_view::npos
+            ? input.substr(start)
+            : input.substr(start, pos - start);
+        if (!piece.empty()) {
+            out.emplace_back(piece);
+        }
+        if (pos == std::string_view::npos) break;
+        start = pos + 1;
+    }
+}
+
+void parseEcsQuerySpec(
+    std::string_view spec,
+    std::vector<std::string>& cols,
+    std::vector<std::string>& withs,
+    std::vector<std::string>& withouts) {
+    cols.clear();
+    withs.clear();
+    withouts.clear();
+    const auto p1 = spec.find(';');
+    if (p1 == std::string_view::npos) {
+        splitStringBy(spec, ',', cols);
+        return;
+    }
+    splitStringBy(spec.substr(0, p1), ',', cols);
+    const auto rest = spec.substr(p1 + 1);
+    const auto p2 = rest.find(';');
+    if (p2 == std::string_view::npos) {
+        splitStringBy(rest, ',', withs);
+        return;
+    }
+    splitStringBy(rest.substr(0, p2), ',', withs);
+    splitStringBy(rest.substr(p2 + 1), ',', withouts);
+}
+
+bool readSparseIds(
+    ManagedHeap* heap,
+    const std::string& typeName,
+    std::vector<std::int64_t>& outIds,
+    ObjectRef* outValsRef = nullptr) {
+    outIds.clear();
+    if (!heap) return false;
+    const auto idsVal = heap->getStaticField(
+        semantic::stableTypeId("$ecs_sparse_ids::" + typeName));
+    if (!idsVal) return false;
+    const auto* idsRef = std::get_if<ObjectRef>(&*idsVal);
+    if (!idsRef || !idsRef->valid()) return false;
+    const auto len = heap->arrayLength(*idsRef);
+    if (!len) return false;
+    outIds.reserve(*len);
+    for (std::size_t i = 0; i < *len; ++i) {
+        const auto v = heap->arrayGet(*idsRef, i);
+        if (v && std::holds_alternative<std::int64_t>(*v)) {
+            outIds.push_back(std::get<std::int64_t>(*v));
+        }
+    }
+    if (outValsRef) {
+        const auto valsVal = heap->getStaticField(
+            semantic::stableTypeId("$ecs_sparse_vals::" + typeName));
+        if (valsVal && std::holds_alternative<ObjectRef>(*valsVal)) {
+            *outValsRef = std::get<ObjectRef>(*valsVal);
+        }
+    }
+    return true;
+}
+
+bool hasAnySparseEcsTable(
+    ManagedHeap* heap,
+    const std::vector<std::string>& cols,
+    const std::vector<std::string>& withs,
+    const std::vector<std::string>& withouts) {
+    if (!heap) return false;
+    for (const auto& list : {cols, withs, withouts}) {
+        for (const auto& t : list) {
+            if (heap->hasStaticField(semantic::stableTypeId("$ecs_sparse_ids::" + t))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+std::vector<std::int64_t> computeMatchedEcsEntities(
+    ManagedHeap* heap,
+    const std::vector<std::string>& cols,
+    const std::vector<std::string>& withs,
+    const std::vector<std::string>& withouts) {
+    std::vector<std::int64_t> matched;
+    bool initialized = false;
+    for (const auto& list : {cols, withs}) {
+        for (const auto& reqType : list) {
+            std::vector<std::int64_t> typeIds;
+            if (!readSparseIds(heap, reqType, typeIds)) {
+                return {};
+            }
+            if (!initialized) {
+                matched = std::move(typeIds);
+                initialized = true;
+            } else {
+                std::vector<std::int64_t> next;
+                for (const auto id : matched) {
+                    if (std::binary_search(typeIds.begin(), typeIds.end(), id)) {
+                        next.push_back(id);
+                    }
+                }
+                matched = std::move(next);
+            }
+            if (matched.empty()) return {};
+        }
+    }
+    for (const auto& exType : withouts) {
+        std::vector<std::int64_t> exIds;
+        if (!readSparseIds(heap, exType, exIds) || exIds.empty()) continue;
+        std::vector<std::int64_t> next;
+        for (const auto id : matched) {
+            if (!std::binary_search(exIds.begin(), exIds.end(), id)) {
+                next.push_back(id);
+            }
+        }
+        matched = std::move(next);
+        if (matched.empty()) return {};
+    }
+    return matched;
+}
+
 bool makeIntrinsicStringResult(
     std::string text,
     ManagedHeap* heap,
@@ -1301,7 +1513,140 @@ bool tryExecuteRuntimeIntrinsic(
 
     constexpr std::string_view staticGetPrefix = "static_get::";
     if (op.rfind(staticGetPrefix, 0) == 0) {
-        const std::string idStr(op.substr(staticGetPrefix.size()));
+        const std::string_view subOp = op.substr(staticGetPrefix.size());
+        constexpr std::string_view ecsColPrefix = "ecs_col::";
+        if (subOp.rfind(ecsColPrefix, 0) == 0) {
+            const auto rest = subOp.substr(ecsColPrefix.size());
+            const auto sep = rest.find("::");
+            if (sep == std::string_view::npos) {
+                errorMessage = "malformed ecs_col intrinsic";
+                return false;
+            }
+            const std::size_t colIdx = static_cast<std::size_t>(
+                std::strtoull(std::string(rest.substr(0, sep)).c_str(), nullptr, 10));
+            const auto spec = rest.substr(sep + 2);
+            std::vector<std::string> cols, withs, withouts;
+            parseEcsQuerySpec(spec, cols, withs, withouts);
+            if (colIdx >= cols.size()) {
+                result = arguments.empty() ? Value{} : arguments[0];
+                return true;
+            }
+            const auto& targetType = cols[colIdx];
+            if (!hasAnySparseEcsTable(heap, cols, withs, withouts) &&
+                withs.empty() && withouts.empty()) {
+                const auto denseId = semantic::stableTypeId("$ecs_column::" + targetType);
+                if (heap) {
+                    if (auto existing = heap->getStaticField(denseId)) {
+                        result = std::move(*existing);
+                        return true;
+                    }
+                }
+                result = arguments.empty() ? Value{} : arguments[0];
+                if (heap) {
+                    heap->setStaticField(denseId, result);
+                }
+                return true;
+            }
+            if (!heap || arguments.empty() || !std::holds_alternative<ObjectRef>(arguments[0])) {
+                result = arguments.empty() ? Value{} : arguments[0];
+                return true;
+            }
+            const auto tmplRef = std::get<ObjectRef>(arguments[0]);
+            const auto arrTypeId = heap->arrayTypeId(tmplRef).value_or(0);
+            const auto elemPrim = heap->arrayElementType(tmplRef).value_or(semantic::PrimitiveType::Struct);
+            const auto elemTypeId = heap->arrayElementTypeId(tmplRef).value_or(0);
+            const auto matched = computeMatchedEcsEntities(heap, cols, withs, withouts);
+            if (matched.empty()) {
+                result = tmplRef;
+                return true;
+            }
+            std::vector<std::int64_t> sparseIds;
+            ObjectRef sparseValsRef{};
+            if (!readSparseIds(heap, targetType, sparseIds, &sparseValsRef) ||
+                !sparseValsRef.valid()) {
+                result = tmplRef;
+                return true;
+            }
+            std::vector<Value> matchedVals;
+            matchedVals.reserve(matched.size());
+            for (const auto entId : matched) {
+                const auto it = std::lower_bound(sparseIds.begin(), sparseIds.end(), entId);
+                if (it != sparseIds.end() && *it == entId) {
+                    const auto idx = static_cast<std::size_t>(std::distance(sparseIds.begin(), it));
+                    if (auto v = heap->arrayGet(sparseValsRef, idx)) {
+                        matchedVals.push_back(std::move(*v));
+                    }
+                }
+            }
+            if (matchedVals.empty()) {
+                result = tmplRef;
+                return true;
+            }
+            RuntimeError allocErr;
+            const auto outArr = heap->allocateTypedArray(
+                arrTypeId, elemPrim, elemTypeId, matchedVals.size(), matchedVals[0], &allocErr);
+            if (!outArr) {
+                errorMessage = allocErr.message;
+                return false;
+            }
+            for (std::size_t i = 0; i < matchedVals.size(); ++i) {
+                (void)heap->arraySet(*outArr, i, matchedVals[i], &allocErr);
+            }
+            result = *outArr;
+            return true;
+        }
+
+        constexpr std::string_view ecsEntPrefix = "ecs_ent::";
+        if (subOp.rfind(ecsEntPrefix, 0) == 0) {
+            const auto spec = subOp.substr(ecsEntPrefix.size());
+            std::vector<std::string> cols, withs, withouts;
+            parseEcsQuerySpec(spec, cols, withs, withouts);
+            if (!heap || arguments.empty() || !std::holds_alternative<ObjectRef>(arguments[0])) {
+                result = arguments.empty() ? Value{} : arguments[0];
+                return true;
+            }
+            const auto tmplRef = std::get<ObjectRef>(arguments[0]);
+            const auto arrTypeId = heap->arrayTypeId(tmplRef).value_or(0);
+            std::vector<std::int64_t> matched;
+            if (!hasAnySparseEcsTable(heap, cols, withs, withouts) &&
+                withs.empty() && withouts.empty() && !cols.empty()) {
+                const auto denseId = semantic::stableTypeId("$ecs_column::" + cols[0]);
+                if (auto existing = heap->getStaticField(denseId)) {
+                    if (const auto* arrRef = std::get_if<ObjectRef>(&*existing)) {
+                        const auto len = heap->arrayLength(*arrRef).value_or(0);
+                        matched.resize(len);
+                        for (std::size_t i = 0; i < len; ++i) {
+                            matched[i] = static_cast<std::int64_t>(i);
+                        }
+                    }
+                }
+            } else {
+                matched = computeMatchedEcsEntities(heap, cols, withs, withouts);
+            }
+            if (matched.empty()) {
+                result = tmplRef;
+                return true;
+            }
+            RuntimeError allocErr;
+            const auto outArr = heap->allocateTypedArray(
+                arrTypeId,
+                semantic::PrimitiveType::Int,
+                0,
+                matched.size(),
+                std::int64_t{0},
+                &allocErr);
+            if (!outArr) {
+                errorMessage = allocErr.message;
+                return false;
+            }
+            for (std::size_t i = 0; i < matched.size(); ++i) {
+                (void)heap->arraySet(*outArr, i, matched[i], &allocErr);
+            }
+            result = *outArr;
+            return true;
+        }
+
+        const std::string idStr(subOp);
         const auto id = static_cast<semantic::SymbolId>(
             std::strtoull(idStr.c_str(), nullptr, 10));
         if (heap) {
@@ -1314,6 +1659,54 @@ bool tryExecuteRuntimeIntrinsic(
         if (heap) {
             heap->setStaticField(id, result);
         }
+        return true;
+    }
+
+    constexpr std::string_view ecsWritebackPrefix = "ecs_writeback::";
+    if (op.rfind(ecsWritebackPrefix, 0) == 0) {
+        const auto rest = op.substr(ecsWritebackPrefix.size());
+        const auto sep = rest.find("::");
+        if (sep == std::string_view::npos || arguments.size() < 2 || !heap) {
+            result = std::monostate{};
+            return true;
+        }
+        const std::size_t colIdx = static_cast<std::size_t>(
+            std::strtoull(std::string(rest.substr(0, sep)).c_str(), nullptr, 10));
+        const auto spec = rest.substr(sep + 2);
+        std::vector<std::string> cols, withs, withouts;
+        parseEcsQuerySpec(spec, cols, withs, withouts);
+        if (colIdx >= cols.size()) {
+            result = std::monostate{};
+            return true;
+        }
+        const std::string& compKey = cols[colIdx];
+        if (!heap->hasStaticField(semantic::stableTypeId("$ecs_sparse_ids::" + compKey))) {
+            result = std::monostate{};
+            return true;
+        }
+        const auto* idxPtr = std::get_if<std::int64_t>(&arguments[0]);
+        if (!idxPtr || *idxPtr < 0) {
+            result = std::monostate{};
+            return true;
+        }
+        const auto matched = computeMatchedEcsEntities(heap, cols, withs, withouts);
+        const auto idx = static_cast<std::size_t>(*idxPtr);
+        if (idx < matched.size()) {
+            const auto entId = matched[idx];
+            std::vector<std::int64_t> sparseIds;
+            ObjectRef sparseValsRef{};
+            if (readSparseIds(heap, compKey, sparseIds, &sparseValsRef) &&
+                sparseValsRef.valid()) {
+                const auto it = std::lower_bound(sparseIds.begin(), sparseIds.end(), entId);
+                if (it != sparseIds.end() && *it == entId) {
+                    const auto srcIdx = static_cast<std::size_t>(
+                        std::distance(sparseIds.begin(), it));
+                    RuntimeError setErr;
+                    (void)heap->arraySet(sparseValsRef, srcIdx, arguments[1], &setErr);
+                }
+            }
+        }
+        result = std::monostate{};
         return true;
     }
 

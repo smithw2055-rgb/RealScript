@@ -215,6 +215,12 @@ void SceneScriptRuntime::bindLifecycleMethods(Instance& instance) const {
     instance.onLateUpdate = runtime_.findMethod(type, "OnLateUpdate", 1);
     instance.onDestroy = runtime_.findMethod(type, "OnDestroy", 0);
     instance.onValidate = runtime_.findMethod(type, "OnValidate", 0);
+    instance.onCollisionEnter = runtime_.findMethod(type, "OnCollisionEnter", 1);
+    instance.onCollisionStay = runtime_.findMethod(type, "OnCollisionStay", 1);
+    instance.onCollisionExit = runtime_.findMethod(type, "OnCollisionExit", 1);
+    instance.onTriggerEnter = runtime_.findMethod(type, "OnTriggerEnter", 1);
+    instance.onTriggerStay = runtime_.findMethod(type, "OnTriggerStay", 1);
+    instance.onTriggerExit = runtime_.findMethod(type, "OnTriggerExit", 1);
     instance.executeInEditMode = hasEditModeAttribute(
         runtime_.program().get(), type.canonicalName());
     instance.executionOrder = findExecutionOrderAttribute(
@@ -443,6 +449,7 @@ bool SceneScriptRuntime::detach(SceneEntityId entity) {
     entityActiveSelf_.erase(entity);
     localTransforms_.erase(entity);
     worldTransformCache_.erase(entity);
+    (void)removeEntityCollider2D(entity);
 
     if (fiberScheduler_) {
         (void)fiberScheduler_->killEntityFibersBySlot(
@@ -1571,6 +1578,338 @@ std::uint32_t SceneScriptRuntime::spawnEntityFiber(
 std::uint64_t SceneScriptRuntime::stepFibers(std::uint32_t currentTick) {
     if (!fiberScheduler_) return 0;
     return fiberScheduler_->stepTick(currentTick);
+}
+
+std::size_t SceneScriptRuntime::emitSignal(
+    SceneEntityId sourceEntity,
+    const std::string& sourceComponent,
+    const std::string& signalName,
+    const std::vector<runtime::Value>& arguments) {
+    if (sourceEntity == BroadcastTarget || signalName.empty()) return 0;
+    ScriptObject* srcObj = sourceComponent.empty()
+        ? object(sourceEntity)
+        : getComponent(sourceEntity, sourceComponent);
+    const std::string resolvedSrcComp = srcObj ? srcObj->type().canonicalName() : sourceComponent;
+
+    std::size_t invokedCount = 0;
+    const auto connectionsSnapshot = signalConnections_;
+    for (const auto& conn : connectionsSnapshot) {
+        if (conn.sourceEntity != sourceEntity || conn.signalName != signalName) {
+            continue;
+        }
+        if (!sourceComponent.empty() && conn.sourceComponent != resolvedSrcComp &&
+            conn.sourceComponent != sourceComponent) {
+            continue;
+        }
+        const auto res = invokeComponent(
+            conn.targetEntity, conn.targetComponent, conn.targetMethod, arguments);
+        if (res.succeeded) ++invokedCount;
+    }
+
+    if (signalTopicPublisher_) {
+        signalTopicPublisher_("$signal::" + std::to_string(sourceEntity) + "::" + signalName);
+        signalTopicPublisher_(signalName);
+        ++invokedCount;
+    }
+    return invokedCount;
+}
+
+void SceneScriptRuntime::setInputAction(const std::string& action, bool pressed) {
+    if (action.empty()) return;
+    currentInputActions_[action] = pressed;
+}
+
+void SceneScriptRuntime::setInputAxis2D(const std::string& axisName, Vec2 value) {
+    if (axisName.empty()) return;
+    inputAxes2D_[axisName] = value;
+}
+
+void SceneScriptRuntime::advanceInputTick() {
+    previousInputActions_ = currentInputActions_;
+}
+
+bool SceneScriptRuntime::isInputActionPressed(const std::string& action) const noexcept {
+    const auto it = currentInputActions_.find(action);
+    return it != currentInputActions_.end() && it->second;
+}
+
+bool SceneScriptRuntime::isInputActionJustPressed(const std::string& action) const noexcept {
+    const bool curr = isInputActionPressed(action);
+    const auto prevIt = previousInputActions_.find(action);
+    const bool prev = prevIt != previousInputActions_.end() && prevIt->second;
+    return curr && !prev;
+}
+
+bool SceneScriptRuntime::isInputActionJustReleased(const std::string& action) const noexcept {
+    const bool curr = isInputActionPressed(action);
+    const auto prevIt = previousInputActions_.find(action);
+    const bool prev = prevIt != previousInputActions_.end() && prevIt->second;
+    return !curr && prev;
+}
+
+Vec2 SceneScriptRuntime::getInputAxis2D(const std::string& axisName) const noexcept {
+    const auto it = inputAxes2D_.find(axisName);
+    return it != inputAxes2D_.end() ? it->second : Vec2{};
+}
+
+std::uint64_t SceneScriptRuntime::computeInputDigest() const noexcept {
+    std::uint64_t hash = 14695981039346656037ULL;
+    const auto mixByte = [&](std::uint8_t b) {
+        hash ^= b;
+        hash *= 1099511628211ULL;
+    };
+    const auto mixU32 = [&](std::uint32_t v) {
+        mixByte(static_cast<std::uint8_t>(v & 0xFFu));
+        mixByte(static_cast<std::uint8_t>((v >> 8u) & 0xFFu));
+        mixByte(static_cast<std::uint8_t>((v >> 16u) & 0xFFu));
+        mixByte(static_cast<std::uint8_t>((v >> 24u) & 0xFFu));
+    };
+    const auto mixStr = [&](const std::string& s) {
+        for (const unsigned char ch : s) mixByte(ch);
+        mixByte(0xFFu);
+    };
+    for (const auto& [name, state] : currentInputActions_) {
+        mixStr(name);
+        mixByte(state ? 1u : 0u);
+        const auto prevIt = previousInputActions_.find(name);
+        const bool prev = prevIt != previousInputActions_.end() && prevIt->second;
+        mixByte(prev ? 1u : 0u);
+    }
+    for (const auto& [axis, vec] : inputAxes2D_) {
+        mixStr(axis);
+        mixU32(static_cast<std::uint32_t>(vec.x.raw));
+        mixU32(static_cast<std::uint32_t>(vec.y.raw));
+    }
+    return hash;
+}
+
+void SceneScriptRuntime::setEntityCollider2D(SceneEntityId entity, SceneCollider2D collider) {
+    if (entity == BroadcastTarget) return;
+    if (entityActiveSelf_.find(entity) == entityActiveSelf_.end()) {
+        entityActiveSelf_[entity] = true;
+    }
+    colliders2D_[entity] = collider;
+}
+
+bool SceneScriptRuntime::removeEntityCollider2D(SceneEntityId entity) {
+    for (auto it = activeOverlaps2D_.begin(); it != activeOverlaps2D_.end();) {
+        if (it->first == entity || it->second == entity) {
+            activeOverlapWasTrigger2D_.erase(*it);
+            it = activeOverlaps2D_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return colliders2D_.erase(entity) != 0;
+}
+
+namespace {
+
+constexpr Fixed fixedAbs(Fixed v) noexcept {
+    return v.raw < 0 ? Fixed::fromRaw(-v.raw) : v;
+}
+
+constexpr Fixed fixedClamp(Fixed v, Fixed lo, Fixed hi) noexcept {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+constexpr Fixed fixedSqrt(Fixed v) noexcept {
+    if (v.raw <= 0) return Fixed::fromRaw(0);
+    return Fixed::fromRaw(static_cast<std::int32_t>(
+        deterministicSqrt64(static_cast<std::int64_t>(v.raw) << 8)));
+}
+
+bool testOverlap2D(
+    Vec2 posA, const SceneCollider2D& colA,
+    Vec2 posB, const SceneCollider2D& colB) noexcept {
+    if ((colA.layerMask & colB.layerMask) == 0) return false;
+    if (colA.isCircle && colB.isCircle) {
+        const Vec2 delta = posB - posA;
+        const Fixed sumR = colA.radius + colB.radius;
+        return delta.lengthSq() <= (sumR * sumR);
+    }
+    if (!colA.isCircle && !colB.isCircle) {
+        const Fixed dx = fixedAbs(posB.x - posA.x);
+        const Fixed dy = fixedAbs(posB.y - posA.y);
+        return dx <= (colA.halfExtents.x + colB.halfExtents.x) &&
+               dy <= (colA.halfExtents.y + colB.halfExtents.y);
+    }
+    const Vec2 circlePos = colA.isCircle ? posA : posB;
+    const Fixed radius = colA.isCircle ? colA.radius : colB.radius;
+    const Vec2 boxPos = colA.isCircle ? posB : posA;
+    const Vec2 halfExt = colA.isCircle ? colB.halfExtents : colA.halfExtents;
+    const Fixed clampedX = fixedClamp(
+        circlePos.x, boxPos.x - halfExt.x, boxPos.x + halfExt.x);
+    const Fixed clampedY = fixedClamp(
+        circlePos.y, boxPos.y - halfExt.y, boxPos.y + halfExt.y);
+    const Vec2 diff{circlePos.x - clampedX, circlePos.y - clampedY};
+    return diff.lengthSq() <= (radius * radius);
+}
+
+} // namespace
+
+std::optional<RaycastHit2D> SceneScriptRuntime::raycast2D(
+    Vec2 origin,
+    Vec2 direction,
+    Fixed maxDistance,
+    std::uint32_t layerMask) const {
+    const Fixed dirLen = direction.length();
+    if (dirLen == Fixed::fromRaw(0) || maxDistance <= Fixed::fromRaw(0)) {
+        return std::nullopt;
+    }
+    const Vec2 dir = direction / dirLen;
+
+    std::optional<RaycastHit2D> closest;
+    for (const auto& [entity, col] : colliders2D_) {
+        if ((col.layerMask & layerMask) == 0 || !isActiveInHierarchy(entity)) {
+            continue;
+        }
+        const Vec2 center = getWorldPosition2D(entity);
+        if (col.isCircle) {
+            const Vec2 toCenter = center - origin;
+            const Fixed proj = Vec2::dot(toCenter, dir);
+            if (proj < -col.radius || proj > maxDistance + col.radius) continue;
+            const Vec2 closestPt = origin + dir * proj;
+            const Fixed distSq = (center - closestPt).lengthSq();
+            const Fixed rSq = col.radius * col.radius;
+            if (distSq > rSq) continue;
+            const Fixed offset = fixedSqrt(rSq - distSq);
+            if (proj + offset < Fixed::fromRaw(0)) continue;
+            Fixed hitDist = proj - offset;
+            if (hitDist < Fixed::fromRaw(0)) hitDist = Fixed::fromRaw(0);
+            if (hitDist > maxDistance) continue;
+            if (!closest || hitDist < closest->distance ||
+                (hitDist == closest->distance && entity < closest->entity)) {
+                closest = RaycastHit2D{entity, origin + dir * hitDist, hitDist};
+            }
+        } else {
+            const Vec2 minB = center - col.halfExtents;
+            const Vec2 maxB = center + col.halfExtents;
+            Fixed tMin = Fixed::fromRaw(0);
+            Fixed tMax = maxDistance;
+            bool hit = true;
+            for (int axis = 0; axis < 2; ++axis) {
+                const Fixed o = axis == 0 ? origin.x : origin.y;
+                const Fixed d = axis == 0 ? dir.x : dir.y;
+                const Fixed bMin = axis == 0 ? minB.x : minB.y;
+                const Fixed bMax = axis == 0 ? maxB.x : maxB.y;
+                if (d == Fixed::fromRaw(0)) {
+                    if (o < bMin || o > bMax) {
+                        hit = false;
+                        break;
+                    }
+                } else {
+                    Fixed t1 = (bMin - o) / d;
+                    Fixed t2 = (bMax - o) / d;
+                    if (t1 > t2) std::swap(t1, t2);
+                    if (t1 > tMin) tMin = t1;
+                    if (t2 < tMax) tMax = t2;
+                    if (tMin > tMax) {
+                        hit = false;
+                        break;
+                    }
+                }
+            }
+            if (!hit || tMin > maxDistance) continue;
+            if (!closest || tMin < closest->distance ||
+                (tMin == closest->distance && entity < closest->entity)) {
+                closest = RaycastHit2D{entity, origin + dir * tMin, tMin};
+            }
+        }
+    }
+    return closest;
+}
+
+std::vector<SceneEntityId> SceneScriptRuntime::overlapCircle2D(
+    Vec2 center,
+    Fixed radius,
+    std::uint32_t layerMask) const {
+    std::vector<SceneEntityId> result;
+    SceneCollider2D queryCircle;
+    queryCircle.isCircle = true;
+    queryCircle.radius = radius;
+    queryCircle.layerMask = layerMask;
+    for (const auto& [entity, col] : colliders2D_) {
+        if (!isActiveInHierarchy(entity)) continue;
+        if (testOverlap2D(center, queryCircle, getWorldPosition2D(entity), col)) {
+            result.push_back(entity);
+        }
+    }
+    return result;
+}
+
+std::size_t SceneScriptRuntime::stepPhysics2D() {
+    std::set<std::pair<SceneEntityId, SceneEntityId>> currentOverlaps;
+    std::map<std::pair<SceneEntityId, SceneEntityId>, bool> currentIsTrigger;
+
+    for (auto itA = colliders2D_.begin(); itA != colliders2D_.end(); ++itA) {
+        if (!isActiveInHierarchy(itA->first)) continue;
+        const Vec2 posA = getWorldPosition2D(itA->first);
+        auto itB = itA;
+        ++itB;
+        for (; itB != colliders2D_.end(); ++itB) {
+            if (!isActiveInHierarchy(itB->first)) continue;
+            const Vec2 posB = getWorldPosition2D(itB->first);
+            if (testOverlap2D(posA, itA->second, posB, itB->second)) {
+                const auto pair = std::make_pair(itA->first, itB->first);
+                currentOverlaps.insert(pair);
+                currentIsTrigger[pair] = itA->second.isTrigger || itB->second.isTrigger;
+            }
+        }
+    }
+
+    std::size_t callbacksFired = 0;
+    const auto dispatchPhysicsCallback = [&](
+        SceneEntityId selfEntity,
+        SceneEntityId otherEntity,
+        bool isTrigger,
+        int phase /* 0=Enter, 1=Stay, 2=Exit */) {
+        const auto instIt = instances_.find(selfEntity);
+        if (instIt == instances_.end()) return;
+        for (auto& instance : instIt->second) {
+            if (!instance.enabled || !shouldTickInCurrentMode(instance)) continue;
+            const std::optional<ScriptMethod>* slot = nullptr;
+            const char* cbName = "";
+            if (isTrigger) {
+                if (phase == 0) { slot = &instance.onTriggerEnter; cbName = "OnTriggerEnter"; }
+                else if (phase == 1) { slot = &instance.onTriggerStay; cbName = "OnTriggerStay"; }
+                else { slot = &instance.onTriggerExit; cbName = "OnTriggerExit"; }
+            } else {
+                if (phase == 0) { slot = &instance.onCollisionEnter; cbName = "OnCollisionEnter"; }
+                else if (phase == 1) { slot = &instance.onCollisionStay; cbName = "OnCollisionStay"; }
+                else { slot = &instance.onCollisionExit; cbName = "OnCollisionExit"; }
+            }
+            if (!slot || !*slot) continue;
+            const auto& param = (*slot)->descriptor.parameters.back();
+            runtime::Value argVal = param.type == semantic::PrimitiveType::Long
+                ? runtime::Value{runtime::LongValue{static_cast<std::int64_t>(otherEntity)}}
+                : runtime::Value{static_cast<std::int64_t>(otherEntity)};
+            if (invokeLifecycle(selfEntity, instance, *slot, {std::move(argVal)}, cbName)) {
+                ++callbacksFired;
+            }
+        }
+    };
+
+    // Enter & Stay
+    for (const auto& pair : currentOverlaps) {
+        const bool isTrig = currentIsTrigger[pair];
+        const int phase = activeOverlaps2D_.find(pair) == activeOverlaps2D_.end() ? 0 : 1;
+        dispatchPhysicsCallback(pair.first, pair.second, isTrig, phase);
+        dispatchPhysicsCallback(pair.second, pair.first, isTrig, phase);
+    }
+    // Exit
+    for (const auto& pair : activeOverlaps2D_) {
+        if (currentOverlaps.find(pair) == currentOverlaps.end()) {
+            const auto trigIt = activeOverlapWasTrigger2D_.find(pair);
+            const bool isTrig = trigIt != activeOverlapWasTrigger2D_.end() && trigIt->second;
+            dispatchPhysicsCallback(pair.first, pair.second, isTrig, 2);
+            dispatchPhysicsCallback(pair.second, pair.first, isTrig, 2);
+        }
+    }
+
+    activeOverlaps2D_ = std::move(currentOverlaps);
+    activeOverlapWasTrigger2D_ = std::move(currentIsTrigger);
+    return callbacksFired;
 }
 
 } // namespace realscript::game

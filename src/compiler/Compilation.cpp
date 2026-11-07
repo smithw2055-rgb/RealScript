@@ -98,6 +98,7 @@ struct ModuleWork {
     std::uint64_t publicFingerprint = 0;
     std::uint64_t dependencyFingerprint = 0;
     bool invalid = false;
+    bool deterministic = false;
 };
 
 #include "NativeGenerics.inl"
@@ -353,6 +354,7 @@ semantic::FunctionSymbol makeSequenceFunction(
     result.ownerTypeId = owner.id;
     result.returnType = semantic::PrimitiveType::Void;
     result.method = true;
+    result.deterministic = owner.deterministic;
     result.sourceName = sourceName;
     result.declarationSpan = sequence.identifierToken.span;
     result.bodySpan = sequence.body.span();
@@ -834,6 +836,80 @@ std::optional<semantic::FieldSymbol> makeSequenceLocalField(
     semantic::PrimitiveType type = semantic::resolvePrimitiveType(
         declaration.type.name.text);
     std::string typeName;
+    if (declaration.type.name.text == "var" && declaration.initializer) {
+        std::function<void(const syntax::ExpressionSyntax&)> inferVar;
+        inferVar = [&](const syntax::ExpressionSyntax& expr) {
+            switch (expr.kind()) {
+            case syntax::SyntaxKind::LiteralExpression: {
+                const auto& lit = static_cast<const syntax::LiteralExpressionSyntax&>(expr);
+                switch (lit.literalToken.kind) {
+                case syntax::SyntaxKind::TrueKeyword:
+                case syntax::SyntaxKind::FalseKeyword:
+                    type = semantic::PrimitiveType::Bool;
+                    return;
+                case syntax::SyntaxKind::StringLiteralToken:
+                    type = semantic::PrimitiveType::String;
+                    return;
+                case syntax::SyntaxKind::IntegerLiteralToken: {
+                    const auto& txt = lit.literalToken.text;
+                    type = (!txt.empty() && (txt.back() == 'L' || txt.back() == 'l'))
+                        ? semantic::PrimitiveType::Long
+                        : semantic::PrimitiveType::Int;
+                    return;
+                }
+                case syntax::SyntaxKind::FloatLiteralToken: {
+                    const auto& txt = lit.literalToken.text;
+                    type = (!txt.empty() && (txt.back() == 'f' || txt.back() == 'F'))
+                        ? semantic::PrimitiveType::Float
+                        : semantic::PrimitiveType::Double;
+                    return;
+                }
+                default:
+                    return;
+                }
+            }
+            case syntax::SyntaxKind::ParenthesizedExpression:
+                inferVar(*static_cast<const syntax::ParenthesizedExpressionSyntax&>(expr).expression);
+                return;
+            case syntax::SyntaxKind::UnaryExpression:
+                inferVar(*static_cast<const syntax::UnaryExpressionSyntax&>(expr).operand);
+                return;
+            case syntax::SyntaxKind::BinaryExpression: {
+                const auto& bin = static_cast<const syntax::BinaryExpressionSyntax&>(expr);
+                inferVar(*bin.left);
+                return;
+            }
+            case syntax::SyntaxKind::NewObjectExpression: {
+                const auto& nw = static_cast<const syntax::NewObjectExpressionSyntax&>(expr);
+                const auto found = visibleTypes.find(nw.type.name.text);
+                if (found != visibleTypes.end()) {
+                    type = found->second.kind == semantic::TypeKind::Struct
+                        ? semantic::PrimitiveType::Struct
+                        : (found->second.kind == semantic::TypeKind::Enum
+                            ? semantic::PrimitiveType::Enum
+                            : semantic::PrimitiveType::Object);
+                    typeName = semantic::canonicalTypeName(found->second);
+                }
+                return;
+            }
+            case syntax::SyntaxKind::CallExpression: {
+                const auto& call = static_cast<const syntax::CallExpressionSyntax&>(expr);
+                if (call.identifierToken.text == "FixedFromInt" ||
+                    call.identifierToken.text == "FixedFromRatio") {
+                    const auto found = visibleTypes.find("Fixed");
+                    if (found != visibleTypes.end()) {
+                        type = semantic::PrimitiveType::Struct;
+                        typeName = semantic::canonicalTypeName(found->second);
+                    }
+                }
+                return;
+            }
+            default:
+                return;
+            }
+        };
+        inferVar(*declaration.initializer);
+    }
     if (type == semantic::PrimitiveType::Error) {
         const auto found = visibleTypes.find(declaration.type.name.text);
         if (found == visibleTypes.end()) {
@@ -2419,6 +2495,15 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         unit->invalid = parseDiagnostics.hasErrors();
         auto& module = modules[unit->moduleName];
         module.name = unit->moduleName;
+        if (unit->syntaxTree->moduleDeclaration) {
+            for (const auto& list : unit->syntaxTree->moduleDeclaration->attributes) {
+                for (const auto& attr : list.attributes) {
+                    if (attr.nameToken.text == "Deterministic") {
+                        module.deterministic = true;
+                    }
+                }
+            }
+        }
         module.units.push_back(unit.get());
         module.invalid = module.invalid || unit->invalid;
         module.imports.insert(unit->imports.begin(), unit->imports.end());
@@ -2465,6 +2550,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         std::unordered_set<std::string> typeNames;
         const auto addShell = [&](auto const& syntaxNode, auto declare) {
             auto type = declare(moduleName, syntaxNode);
+            if (module.deterministic) type.deterministic = true;
             if (!typeNames.insert(type.name).second) {
                 result.diagnostics.report(
                     "RS4004", "duplicate type '" + type.name + "'",
@@ -2823,6 +2909,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         ModuleWork& module,
         semantic::FunctionBindingInput binding,
         text::TextSpan span) {
+        if (module.deterministic && !binding.symbol.nonDeterministic) {
+            binding.symbol.deterministic = true;
+        }
         const auto key = semantic::canonicalFunctionKey(binding.symbol);
         auto& keys = functionKeys[module.name];
         if (!keys.insert(key).second) {
@@ -3538,6 +3627,18 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             true,
                             unit->source->name(),
                             sequenceParameterTypes);
+                        bool seqDeterministic = module.deterministic || owner.deterministic;
+                        for (const auto& list : sequenceSyntax.attributes) {
+                            for (const auto& attr : list.attributes) {
+                                if (attr.nameToken.text == "Deterministic") {
+                                    seqDeterministic = true;
+                                }
+                            }
+                        }
+                        entry.deterministic = seqDeterministic;
+                        for (auto& cb : callbacks) {
+                            cb.deterministic = seqDeterministic;
+                        }
                         semantic::FunctionBindingInput entryBinding;
                         entryBinding.symbol = entry;
                         entryBinding.sourceName = unit->source->name();

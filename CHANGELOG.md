@@ -7,6 +7,38 @@ remain versioned but unfrozen until a future 1.0 release.
 
 ### Engine integration and editor dataflow
 
+- Upgraded 12-byte `InlineStructSlot` bit-packing to support `Vec3`, `Quat`, and
+  `Enum` fields inline inside `runtime::StructValue` without increasing
+  `sizeof(InlineStructSlot)` (12B) or `sizeof(Value)` (88B), and added in-place
+  slot updates in `Opcode::StoreStructField`.
+- Extended `Query<...>()` ECS chunk queries with multi-entity Sparse-Set
+  intersection joins (`setEcsEntityComponent`, `getEcsEntityComponent`,
+  `hasEcsEntityComponent`, `removeEcsEntityComponent`, `destroyEcsEntity`),
+  `With<T>` / `Without<U>` filter clauses, optional leading `int entityId`
+  iteration bindings, and `EntityCommandBuffer` (ECB) deferred structural
+  mutation queues (`queueEcsSetComponent`, `queueEcsRemoveComponent`,
+  `queueEcsDestroyEntity`, `flushEcsCommandBuffer`).
+- Optimized `ManagedHeap` by sharing `referenceFields` layout vectors across
+  instances of the same `typeId` (`sharedTypeLayoutCount`) and adding global
+  string interning (`internString`, `internedStringCount`) used by
+  `Opcode::ConstantString` in both the Bytecode Interpreter and C++17 AOT.
+- Added $O(1)$ `SymbolId` resolution caching (`cachedSymbolCount`) in
+  `BindingRegistry` to eliminate string hashing overhead on repeated external
+  calls.
+- Upgraded `sequence` coroutines to infer `var` local variable types across
+  suspension points (`makeSequenceLocalField`) and support 1- and 2-argument
+  `yield wait_signal(...)` bridged with `SceneScriptRuntime::emitSignal`.
+- Added deterministic `RealScript.Input` snapshot APIs (`setInputAction`,
+  `setInputAxis2D`, `advanceInputTick`, `IsActionPressed`,
+  `IsActionJustPressed`, `IsActionJustReleased`, `GetInputAxis2D`,
+  `computeInputDigest`) and `RealScript.Physics` 2D fixed-point colliders,
+  spatial queries (`raycast2D`/`Raycast2D`,
+  `overlapCircle2D`/`OverlapCircleCount2D`), and `OnCollisionEnter`/`Stay`/`Exit`
+  & `OnTriggerEnter`/`Stay`/`Exit` lifecycle callbacks (`stepPhysics2D`).
+- Implemented compile-time `[Deterministic]` / `[NonDeterministic]` static
+  verification (`RS2495`) across modules, types, and functions, and runtime
+  Mod capability sandboxing (`ErrorCode::CapabilityDenied`,
+  `ExecutionOptions::enforceCapabilities`, `grantedCapabilities`).
 - Implemented zero-heap-allocation inline storage (`InlineStructSlot`) inside
   `runtime::StructValue` for custom value-type `struct`s with up to 4 fields
   (`bool`, `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`,

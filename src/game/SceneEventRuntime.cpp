@@ -475,6 +475,52 @@ bool installSceneComponentBindings(
                 if (entityId <= 0) return Vec2{};
                 return scenePtr->getWorldPosition2D(
                     static_cast<SceneEntityId>(entityId));
+            }) &&
+        api.function(
+            moduleName,
+            "EmitSignal",
+            [scenePtr](std::int64_t sourceEntity, std::string signalName) -> bool {
+                if (sourceEntity <= 0 || signalName.empty()) return false;
+                return scenePtr->emitSignal(
+                    static_cast<SceneEntityId>(sourceEntity), signalName) > 0;
+            }) &&
+        api.function(
+            moduleName,
+            "IsActionPressed",
+            [scenePtr](std::string action) -> bool {
+                return scenePtr->isInputActionPressed(action);
+            }) &&
+        api.function(
+            moduleName,
+            "IsActionJustPressed",
+            [scenePtr](std::string action) -> bool {
+                return scenePtr->isInputActionJustPressed(action);
+            }) &&
+        api.function(
+            moduleName,
+            "IsActionJustReleased",
+            [scenePtr](std::string action) -> bool {
+                return scenePtr->isInputActionJustReleased(action);
+            }) &&
+        api.function(
+            moduleName,
+            "GetInputAxis2D",
+            [scenePtr](std::string axisName) -> Vec2 {
+                return scenePtr->getInputAxis2D(axisName);
+            }) &&
+        api.function(
+            moduleName,
+            "Raycast2D",
+            [scenePtr](Vec2 origin, Vec2 direction, Fixed maxDistance) -> std::int64_t {
+                const auto hit = scenePtr->raycast2D(origin, direction, maxDistance);
+                return hit ? static_cast<std::int64_t>(hit->entity) : std::int64_t{0};
+            }) &&
+        api.function(
+            moduleName,
+            "OverlapCircleCount2D",
+            [scenePtr](Vec2 center, Fixed radius) -> std::int32_t {
+                return static_cast<std::int32_t>(
+                    scenePtr->overlapCircle2D(center, radius).size());
             });
     return ok && api.valid();
 }

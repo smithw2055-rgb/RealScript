@@ -1308,7 +1308,7 @@ bool executeInstruction(
                 "string allocation requires a managed heap");
         }
         RuntimeError allocationError;
-        const auto reference = state.heap->allocateString(
+        const auto reference = state.heap->internString(
             instruction.stringImmediate,
             &allocationError);
         if (!reference) {
@@ -1778,11 +1778,6 @@ bool executeInstruction(
         if (!structure.storage || instruction.index >= structure.storage->fields.size()) {
             return fail(state, ErrorCode::InvalidProgram,
                 "struct field store references an invalid field slot");
-        }
-        if (instruction.result == instruction.operands[0] &&
-            structure.storage.use_count() == 1) {
-            const_cast<StructStorage&>(*structure.storage).fields[instruction.index] = *value;
-            return true;
         }
         auto storage = std::make_shared<StructStorage>(*structure.storage);
         storage->fields[instruction.index] = *value;
@@ -2759,6 +2754,12 @@ ExecutionResult Interpreter::invoke(
         state.diagnosticEventsEnabled;
     state.fastAccounting = !state.traceEventsEnabled &&
         options.limits.gcWorkBudget == 0 && options.debugger == nullptr;
+    if (options.enforceCapabilities) {
+        options.determinism.enforceCapabilities = true;
+        options.determinism.grantedCapabilities.insert(
+            options.grantedCapabilities.begin(),
+            options.grantedCapabilities.end());
+    }
     state.determinism = DeterminismSession(options.determinism);
     state.heap = heap_.get();
     state.debugger = options.debugger.get();
@@ -2850,6 +2851,7 @@ const char* errorCodeName(ErrorCode code) noexcept {
     case ErrorCode::DeterminismViolation: return "determinism-violation";
     case ErrorCode::ReplayMismatch: return "replay-mismatch";
     case ErrorCode::ScriptException: return "script-exception";
+    case ErrorCode::CapabilityDenied: return "capability-denied";
     }
     return "unknown";
 }

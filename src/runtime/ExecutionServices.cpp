@@ -339,12 +339,23 @@ bool DeterminismSession::invokeExternal(
     if (!impl_) return false;
     const auto mode = impl_->options.mode;
     auto policy = BindingDeterminism::NonDeterministic;
+    std::string requiredCapability;
     const ExternalFunction* function = fallback;
     if (bindings) {
         if (const auto resolved = bindings->resolve(reference)) {
             function = resolved->function;
             policy = resolved->determinism;
+            requiredCapability = resolved->requiredCapability;
         }
+    }
+    if (impl_->options.enforceCapabilities &&
+        !requiredCapability.empty() &&
+        impl_->options.grantedCapabilities.find(requiredCapability) ==
+            impl_->options.grantedCapabilities.end()) {
+        error.code = ErrorCode::CapabilityDenied;
+        error.message = "external function '" + reference.name +
+            "' requires capability '" + requiredCapability + "'";
+        return false;
     }
     const auto argumentHash = argumentsHash(
         arguments, impl_->options.canonicalizeFloatingPoint);

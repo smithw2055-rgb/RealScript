@@ -389,6 +389,11 @@ private:
             if (value.isEcsQuery) {
                 state.assigned.insert(value.indexVariable.index);
                 auto bodyAssigned = state.assigned;
+                if (value.hasEcsEntityBinding) {
+                    state.assigned.insert(value.ecsEntityCollectionVariable.index);
+                    bodyAssigned.insert(value.ecsEntityCollectionVariable.index);
+                    bodyAssigned.insert(value.ecsEntityVariable.index);
+                }
                 for (const auto& col : value.ecsColumns) {
                     state.assigned.insert(col.collectionVariable.index);
                     bodyAssigned.insert(col.collectionVariable.index);

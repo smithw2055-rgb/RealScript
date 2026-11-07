@@ -92,7 +92,7 @@ struct ManagedHeap::Impl {
     struct HeapObject {
         Header header;
         std::variant<std::string, std::vector<Value>> payload;
-        std::vector<std::size_t> referenceFields;
+        std::shared_ptr<const std::vector<std::size_t>> referenceFields;
     };
 
     struct Slot {
@@ -121,6 +121,8 @@ struct ManagedHeap::Impl {
     std::vector<ObjectRef> rememberedSet;
     std::unordered_map<RootToken, Value> persistentRoots;
     std::unordered_map<semantic::SymbolId, Value> staticFields;
+    std::unordered_map<std::string, ObjectRef> internedStrings;
+    std::unordered_map<semantic::SymbolId, std::shared_ptr<const std::vector<std::size_t>>> sharedTypeReferenceFields;
     RootToken nextRootToken = 1;
     GcPhase phase = GcPhase::Idle;
     bool requested = false;
@@ -154,7 +156,7 @@ struct ManagedHeap::Impl {
         semantic::PrimitiveType elementType,
         semantic::SymbolId elementTypeId,
         std::variant<std::string, std::vector<Value>> payload,
-        std::vector<std::size_t> referenceFields,
+        std::shared_ptr<const std::vector<std::size_t>> referenceFields,
         std::size_t sizeBytes,
         RuntimeError* error) {
         if (sizeBytes == std::numeric_limits<std::size_t>::max() ||
@@ -290,8 +292,10 @@ struct ManagedHeap::Impl {
             for (const auto& value : values) markValue(value);
             return;
         }
-        for (const auto index : object->referenceFields) {
-            if (index < values.size()) markValue(values[index]);
+        if (object->referenceFields) {
+            for (const auto index : *object->referenceFields) {
+                if (index < values.size()) markValue(values[index]);
+            }
         }
     }
 
@@ -355,7 +359,45 @@ std::optional<ObjectRef> ManagedHeap::allocateString(
     const auto size = sizeof(Impl::HeapObject) + value.size();
     return impl_->allocate(
         ObjectKind::String, 0, semantic::PrimitiveType::Error, 0,
-        std::move(value), {}, size, error);
+        std::move(value), nullptr, size, error);
+}
+
+std::optional<ObjectRef> ManagedHeap::internString(
+    std::string_view value,
+    RuntimeError* error) {
+    const std::string key(value);
+    const auto found = impl_->internedStrings.find(key);
+    if (found != impl_->internedStrings.end()) {
+        if (impl_->get(found->second) != nullptr) {
+            if (impl_->phase != GcPhase::Idle) {
+                impl_->mark(found->second);
+                if (impl_->phase == GcPhase::Sweep) {
+                    impl_->phase = GcPhase::Mark;
+                    impl_->resumeSweep = true;
+                }
+            }
+            return found->second;
+        }
+        impl_->internedStrings.erase(found);
+    }
+    auto allocated = allocateString(key, error);
+    if (allocated) {
+        impl_->internedStrings[key] = *allocated;
+    }
+    return allocated;
+}
+
+std::size_t ManagedHeap::internedStringCount() const noexcept {
+    std::size_t aliveCount = 0;
+    for (const auto& [k, ref] : impl_->internedStrings) {
+        (void)k;
+        if (impl_->get(ref) != nullptr) ++aliveCount;
+    }
+    return aliveCount;
+}
+
+std::size_t ManagedHeap::sharedTypeLayoutCount() const noexcept {
+    return impl_->sharedTypeReferenceFields.size();
 }
 
 std::optional<ObjectRef> ManagedHeap::allocateArray(
@@ -436,7 +478,7 @@ std::optional<ObjectRef> ManagedHeap::allocateRecord(
         semantic::PrimitiveType::Error,
         0,
         std::move(fields),
-        std::move(referenceFields),
+        std::make_shared<const std::vector<std::size_t>>(std::move(referenceFields)),
         sizeof(Impl::HeapObject) + storage,
         error);
 }
@@ -467,13 +509,22 @@ std::optional<ObjectRef> ManagedHeap::allocateObject(
     referenceFields.erase(
         std::unique(referenceFields.begin(), referenceFields.end()),
         referenceFields.end());
+    std::shared_ptr<const std::vector<std::size_t>> sharedRefs;
+    const auto foundLayout = impl_->sharedTypeReferenceFields.find(typeId);
+    if (foundLayout != impl_->sharedTypeReferenceFields.end() &&
+        foundLayout->second && *foundLayout->second == referenceFields) {
+        sharedRefs = foundLayout->second;
+    } else {
+        sharedRefs = std::make_shared<const std::vector<std::size_t>>(std::move(referenceFields));
+        impl_->sharedTypeReferenceFields[typeId] = sharedRefs;
+    }
     return impl_->allocate(
         ObjectKind::Record,
         typeId,
         semantic::PrimitiveType::Error,
         0,
         std::move(fields),
-        std::move(referenceFields),
+        std::move(sharedRefs),
         sizeof(Impl::HeapObject) + storage,
         error);
 }
@@ -638,9 +689,10 @@ bool ManagedHeap::fieldSet(
             "managed field index is out of range");
         return false;
     }
-    if (std::binary_search(
-            object->referenceFields.begin(),
-            object->referenceFields.end(),
+    if (object->referenceFields &&
+        std::binary_search(
+            object->referenceFields->begin(),
+            object->referenceFields->end(),
             index)) {
         impl_->writeBarrier(reference, value);
     }
@@ -750,6 +802,15 @@ std::size_t ManagedHeap::step(
             }
             auto& slot = impl_->slots[impl_->sweepIndex++];
             if (slot.object && !slot.object->header.marked) {
+                if (slot.object->header.kind == ObjectKind::String) {
+                    const auto& s = std::get<std::string>(slot.object->payload);
+                    const auto it = impl_->internedStrings.find(s);
+                    if (it != impl_->internedStrings.end() &&
+                        it->second.slot == static_cast<std::uint32_t>(impl_->sweepIndex - 1) &&
+                        it->second.generation == slot.generation) {
+                        impl_->internedStrings.erase(it);
+                    }
+                }
                 const auto bytes = slot.object->header.sizeBytes;
                 slot.object.reset();
                 ++slot.generation;
@@ -841,8 +902,8 @@ std::size_t ManagedHeap::collectYoung(
         const auto& values = std::get<std::vector<Value>>(oldObj->payload);
         if (oldObj->header.kind == ObjectKind::Array) {
             for (const auto& v : values) markYoungValue(markYoungValue, v);
-        } else {
-            for (const auto idx : oldObj->referenceFields) {
+        } else if (oldObj->referenceFields) {
+            for (const auto idx : *oldObj->referenceFields) {
                 if (idx < values.size()) markYoungValue(markYoungValue, values[idx]);
             }
         }
@@ -856,8 +917,8 @@ std::size_t ManagedHeap::collectYoung(
         const auto& values = std::get<std::vector<Value>>(obj->payload);
         if (obj->header.kind == ObjectKind::Array) {
             for (const auto& v : values) markYoungValue(markYoungValue, v);
-        } else {
-            for (const auto idx : obj->referenceFields) {
+        } else if (obj->referenceFields) {
+            for (const auto idx : *obj->referenceFields) {
                 if (idx < values.size()) markYoungValue(markYoungValue, values[idx]);
             }
         }
@@ -871,6 +932,15 @@ std::size_t ManagedHeap::collectYoung(
         if (!slot.object || !slot.object->header.inNursery) continue;
         ++processed;
         if (!slot.object->header.marked) {
+            if (slot.object->header.kind == ObjectKind::String) {
+                const auto& s = std::get<std::string>(slot.object->payload);
+                const auto it = impl_->internedStrings.find(s);
+                if (it != impl_->internedStrings.end() &&
+                    it->second.slot == slotIdx &&
+                    it->second.generation == slot.generation) {
+                    impl_->internedStrings.erase(it);
+                }
+            }
             const auto bytes = slot.object->header.sizeBytes;
             slot.object.reset();
             ++slot.generation;
@@ -1113,7 +1183,9 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
             const auto& values = std::get<std::vector<Value>>(object.payload);
             info.valueCount = values.size();
             info.values = values;
-            info.referenceFields = object.referenceFields;
+            if (object.referenceFields) {
+                info.referenceFields = *object.referenceFields;
+            }
             const auto addEdge = [&](std::size_t index) {
                 if (index >= values.size()) return;
                 std::unordered_set<const StructStorage*> visitedStructs;
@@ -1143,8 +1215,8 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
                 for (std::size_t index = 0; index < values.size(); ++index) {
                     addEdge(index);
                 }
-            } else {
-                for (const auto index : object.referenceFields) addEdge(index);
+            } else if (object.referenceFields) {
+                for (const auto index : *object.referenceFields) addEdge(index);
             }
         }
         result.objects.push_back(std::move(info));
@@ -1260,7 +1332,15 @@ bool ManagedHeap::restore(
                 }
             }
             object->payload = info.values;
-            object->referenceFields = info.referenceFields;
+            if (info.typeId != 0) {
+                auto& shared = impl_->sharedTypeReferenceFields[info.typeId];
+                if (!shared || *shared != info.referenceFields) {
+                    shared = std::make_shared<const std::vector<std::size_t>>(info.referenceFields);
+                }
+                object->referenceFields = shared;
+            } else {
+                object->referenceFields = std::make_shared<const std::vector<std::size_t>>(info.referenceFields);
+            }
         }
         slot.object = std::move(object);
     }
@@ -1320,6 +1400,7 @@ bool ManagedHeap::restore(
     impl_->freeSlots = std::move(freeSlots);
     impl_->persistentRoots = std::move(roots);
     impl_->nextRootToken = nextRootToken;
+    impl_->internedStrings.clear();
     impl_->markStack.clear();
     impl_->requested = false;
     impl_->sweepIndex = 0;

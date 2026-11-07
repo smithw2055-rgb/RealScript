@@ -56,15 +56,24 @@ SyntaxToken Parser::match(SyntaxKind expected) {
 
 CompilationUnitSyntax Parser::parseCompilationUnit() {
     CompilationUnitSyntax result;
+    auto leadingAttributes = parseAttributeLists();
     if (current().kind == SyntaxKind::ModuleKeyword) {
         result.moduleDeclaration = parseModuleDeclaration();
+        result.moduleDeclaration->attributes = std::move(leadingAttributes);
+        leadingAttributes.clear();
     }
     while (current().kind == SyntaxKind::ImportKeyword) {
         result.imports.push_back(parseImportDeclaration());
     }
     while (current().kind != SyntaxKind::EndOfFileToken) {
         const auto before = position_;
-        auto attributes = parseAttributeLists();
+        auto attributes = std::move(leadingAttributes);
+        leadingAttributes.clear();
+        auto moreAttributes = parseAttributeLists();
+        attributes.insert(
+            attributes.end(),
+            std::make_move_iterator(moreAttributes.begin()),
+            std::make_move_iterator(moreAttributes.end()));
         auto modifiers = parseModifiers();
         if (current().kind == SyntaxKind::ClassKeyword) {
             result.classes.push_back(parseClassDeclaration(
@@ -1352,6 +1361,7 @@ std::unique_ptr<StatementSyntax> Parser::parseYieldStatement() {
     if (result->waitTicksToken.text != "wait_ticks" &&
         result->waitTicksToken.text != "wait_seconds" &&
         result->waitTicksToken.text != "wait_event" &&
+        result->waitTicksToken.text != "wait_signal" &&
         result->waitTicksToken.text != "wait_until" &&
         result->waitTicksToken.text != "wait_async") {
         diagnostics_.report(
@@ -1361,6 +1371,10 @@ std::unique_ptr<StatementSyntax> Parser::parseYieldStatement() {
     }
     result->openParenToken = match(SyntaxKind::OpenParenToken);
     result->delay = parseExpression();
+    if (current().kind == SyntaxKind::CommaToken) {
+        result->commaToken = nextToken();
+        result->secondArgument = parseExpression();
+    }
     result->closeParenToken = match(SyntaxKind::CloseParenToken);
     result->semicolonToken = match(SyntaxKind::SemicolonToken);
     return result;

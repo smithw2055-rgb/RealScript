@@ -170,7 +170,15 @@ ExecutionContext::ExecutionContext(
     : program_(&program),
       heap_(heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>()),
       bindings_(std::move(bindings)),
-      options_(std::move(options)),
+      options_([&]() {
+          if (options.enforceCapabilities) {
+              options.determinism.enforceCapabilities = true;
+              options.determinism.grantedCapabilities.insert(
+                  options.grantedCapabilities.begin(),
+                  options.grantedCapabilities.end());
+          }
+          return std::move(options);
+      }()),
       determinism_(options_.determinism) {
     traceEventsEnabled_ =
         options_.determinism.mode != runtime::DeterminismMode::Off ||
@@ -1238,7 +1246,7 @@ bool ExecutionContext::constantString(
     std::string_view value,
     runtime::Value& result) {
     runtime::RuntimeError allocationError;
-    const auto reference = heap_->allocateString(std::string(value), &allocationError);
+    const auto reference = heap_->internString(value, &allocationError);
     if (!reference) {
         return fail(
             allocationError.code == runtime::ErrorCode::None
