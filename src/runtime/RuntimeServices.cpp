@@ -1,3 +1,4 @@
+#include <cstring>
 #include "realscript/runtime/Runtime.h"
 
 #include "ExecutionMirror.h"
@@ -700,6 +701,206 @@ std::optional<Value> makeDefaultInlineStructValue(semantic::SymbolId typeId) noe
     return std::nullopt;
 }
 
+std::optional<InlineStructSlot> encodeInlineStructSlot(
+    const Value& value) noexcept {
+    InlineStructSlot slot{};
+    if (const auto* b = std::get_if<bool>(&value)) {
+        slot.kind = InlineStructSlot::Kind::Bool;
+        slot.setBits(*b ? 1u : 0u);
+        return slot;
+    }
+    if (const auto* v = std::get_if<ByteValue>(&value)) {
+        slot.kind = InlineStructSlot::Kind::Byte;
+        slot.setBits(v->value);
+        return slot;
+    }
+    if (const auto* v = std::get_if<SByteValue>(&value)) {
+        slot.kind = InlineStructSlot::Kind::SByte;
+        slot.setBits(static_cast<std::uint8_t>(v->value));
+        return slot;
+    }
+    if (const auto* v = std::get_if<ShortValue>(&value)) {
+        slot.kind = InlineStructSlot::Kind::Short;
+        slot.setBits(static_cast<std::uint16_t>(v->value));
+        return slot;
+    }
+    if (const auto* v = std::get_if<UShortValue>(&value)) {
+        slot.kind = InlineStructSlot::Kind::UShort;
+        slot.setBits(v->value);
+        return slot;
+    }
+    if (const auto* v = std::get_if<std::int64_t>(&value)) {
+        slot.kind = InlineStructSlot::Kind::Int;
+        slot.setBits(static_cast<std::uint64_t>(*v));
+        return slot;
+    }
+    if (const auto* v = std::get_if<UIntValue>(&value)) {
+        slot.kind = InlineStructSlot::Kind::UInt;
+        slot.setBits(v->value);
+        return slot;
+    }
+    if (const auto* v = std::get_if<LongValue>(&value)) {
+        slot.kind = InlineStructSlot::Kind::Long;
+        slot.setBits(static_cast<std::uint64_t>(v->value));
+        return slot;
+    }
+    if (const auto* v = std::get_if<ULongValue>(&value)) {
+        slot.kind = InlineStructSlot::Kind::ULong;
+        slot.setBits(v->value);
+        return slot;
+    }
+    if (const auto* v = std::get_if<FloatValue>(&value)) {
+        slot.kind = InlineStructSlot::Kind::Float;
+        std::uint32_t fbits = 0;
+        std::memcpy(&fbits, &v->value, sizeof(fbits));
+        slot.setBits(fbits);
+        return slot;
+    }
+    if (const auto* v = std::get_if<double>(&value)) {
+        slot.kind = InlineStructSlot::Kind::Double;
+        std::uint64_t dbits = 0;
+        std::memcpy(&dbits, v, sizeof(dbits));
+        slot.setBits(dbits);
+        return slot;
+    }
+    if (const auto* v = std::get_if<CharValue>(&value)) {
+        slot.kind = InlineStructSlot::Kind::Char;
+        slot.setBits(v->value);
+        return slot;
+    }
+    if (const auto* v = std::get_if<FixedValue>(&value)) {
+        slot.kind = InlineStructSlot::Kind::Fixed;
+        slot.setBits(static_cast<std::uint32_t>(v->raw));
+        return slot;
+    }
+    if (const auto* v = std::get_if<Fixed16Value>(&value)) {
+        slot.kind = InlineStructSlot::Kind::Fixed16;
+        slot.setBits(static_cast<std::uint64_t>(v->raw));
+        return slot;
+    }
+    if (const auto* v = std::get_if<Vec2Value>(&value)) {
+        slot.kind = InlineStructSlot::Kind::Vec2;
+        slot.lo = static_cast<std::uint32_t>(v->x);
+        slot.hi = static_cast<std::uint32_t>(v->y);
+        return slot;
+    }
+    return std::nullopt;
+}
+
+Value decodeInlineStructSlot(const InlineStructSlot& slot) noexcept {
+    const auto bits = slot.bits();
+    switch (slot.kind) {
+    case InlineStructSlot::Kind::Bool:
+        return bits != 0;
+    case InlineStructSlot::Kind::Byte:
+        return ByteValue{static_cast<std::uint8_t>(bits)};
+    case InlineStructSlot::Kind::SByte:
+        return SByteValue{static_cast<std::int8_t>(static_cast<std::uint8_t>(bits))};
+    case InlineStructSlot::Kind::Short:
+        return ShortValue{static_cast<std::int16_t>(static_cast<std::uint16_t>(bits))};
+    case InlineStructSlot::Kind::UShort:
+        return UShortValue{static_cast<std::uint16_t>(bits)};
+    case InlineStructSlot::Kind::Int:
+        return static_cast<std::int64_t>(bits);
+    case InlineStructSlot::Kind::UInt:
+        return UIntValue{static_cast<std::uint32_t>(bits)};
+    case InlineStructSlot::Kind::Long:
+        return LongValue{static_cast<std::int64_t>(bits)};
+    case InlineStructSlot::Kind::ULong:
+        return ULongValue{bits};
+    case InlineStructSlot::Kind::Float: {
+        std::uint32_t fbits = slot.lo;
+        float val = 0.0f;
+        std::memcpy(&val, &fbits, sizeof(val));
+        return FloatValue{val};
+    }
+    case InlineStructSlot::Kind::Double: {
+        double val = 0.0;
+        std::memcpy(&val, &bits, sizeof(val));
+        return val;
+    }
+    case InlineStructSlot::Kind::Char:
+        return CharValue{static_cast<char16_t>(bits)};
+    case InlineStructSlot::Kind::Fixed:
+        return FixedValue{static_cast<std::int32_t>(slot.lo)};
+    case InlineStructSlot::Kind::Fixed16:
+        return Fixed16Value{static_cast<std::int64_t>(bits)};
+    case InlineStructSlot::Kind::Vec2:
+        return Vec2Value{
+            static_cast<std::int32_t>(slot.lo),
+            static_cast<std::int32_t>(slot.hi),
+        };
+    case InlineStructSlot::Kind::None:
+        break;
+    }
+    return std::monostate{};
+}
+
+StructValue makeStructValueFromFields(
+    semantic::SymbolId typeId,
+    ValueSpan fields) {
+    if (fields.size() <= StructValue::MaxInlineFields) {
+        StructValue inlineVal;
+        inlineVal.typeId = typeId;
+        inlineVal.inlineCount = static_cast<std::uint8_t>(fields.size());
+        inlineVal.isInline = true;
+        bool allInlined = true;
+        for (std::size_t i = 0; i < fields.size(); ++i) {
+            if (auto slot = encodeInlineStructSlot(fields[i])) {
+                inlineVal.inlineFields[i] = *slot;
+            } else {
+                allInlined = false;
+                break;
+            }
+        }
+        if (allInlined) {
+            return inlineVal;
+        }
+    }
+    auto storage = std::make_shared<StructStorage>();
+    storage->fields.assign(fields.begin(), fields.end());
+    return StructValue{typeId, std::move(storage)};
+}
+
+StructValue makeStructValueFromFields(
+    semantic::SymbolId typeId,
+    std::vector<Value> fields) {
+    if (fields.size() <= StructValue::MaxInlineFields) {
+        StructValue inlineVal;
+        inlineVal.typeId = typeId;
+        inlineVal.inlineCount = static_cast<std::uint8_t>(fields.size());
+        inlineVal.isInline = true;
+        bool allInlined = true;
+        for (std::size_t i = 0; i < fields.size(); ++i) {
+            if (auto slot = encodeInlineStructSlot(fields[i])) {
+                inlineVal.inlineFields[i] = *slot;
+            } else {
+                allInlined = false;
+                break;
+            }
+        }
+        if (allInlined) {
+            return inlineVal;
+        }
+    }
+    auto storage = std::make_shared<StructStorage>();
+    storage->fields = std::move(fields);
+    return StructValue{typeId, std::move(storage)};
+}
+
+std::optional<Value> structValueFieldAt(
+    const StructValue& structure,
+    std::size_t index) noexcept {
+    if (structure.isInline) {
+        if (index >= structure.inlineCount) return std::nullopt;
+        return decodeInlineStructSlot(structure.inlineFields[index]);
+    }
+    if (!structure.storage || index >= structure.storage->fields.size()) {
+        return std::nullopt;
+    }
+    return structure.storage->fields[index];
+}
+
 std::optional<Value> loadInlineStructField(
     const Value& value,
     std::size_t fieldIndex) noexcept {
@@ -727,6 +928,12 @@ std::optional<Value> loadInlineStructField(
         if (fieldIndex == 1) return Value{FixedValue{q->y}};
         if (fieldIndex == 2) return Value{FixedValue{q->z}};
         if (fieldIndex == 3) return Value{FixedValue{q->w}};
+        return std::nullopt;
+    }
+    if (const auto* s = std::get_if<StructValue>(&value); s && s->isInline) {
+        if (fieldIndex < s->inlineCount) {
+            return decodeInlineStructSlot(s->inlineFields[fieldIndex]);
+        }
         return std::nullopt;
     }
     return std::nullopt;
@@ -832,6 +1039,16 @@ std::optional<Value> storeInlineStructField(
         if (fieldIndex == 3) {
             out.w = *raw;
             return Value{out};
+        }
+        return std::nullopt;
+    }
+    if (const auto* s = std::get_if<StructValue>(&structure); s && s->isInline) {
+        if (fieldIndex < s->inlineCount) {
+            if (auto slot = encodeInlineStructSlot(fieldValue)) {
+                StructValue updated = *s;
+                updated.inlineFields[fieldIndex] = *slot;
+                return Value{updated};
+            }
         }
         return std::nullopt;
     }

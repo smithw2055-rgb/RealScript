@@ -114,6 +114,8 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
     breakTargets_.clear(); continueTargets_.clear();
     breakFinalizerDepths_.clear(); continueFinalizerDepths_.clear();
     finalizers_.clear();
+    ecsWriteBacks_.clear();
+    breakEcsWriteBackDepths_.clear();
     exceptionCleanupBlocks_.clear();
     collectLocalTypes(*function.body);
     const auto entry = createBlock(); setCurrentBlock(entry);
@@ -194,6 +196,19 @@ void Lowerer::collectLocalTypes(const semantic::BoundStatement& statement) {
     }
     case semantic::BoundNodeKind::ForeachStatement: {
         const auto& value = static_cast<const semantic::BoundForeachStatement&>(statement);
+        if (value.isEcsQuery) {
+            currentFunction_->localTypes.at(value.indexVariable.index) = value.indexVariable.type;
+            currentFunction_->localTypeIds.at(value.indexVariable.index) = 0;
+            for (const auto& col : value.ecsColumns) {
+                for (const auto* variable : {&col.collectionVariable, &col.iterationVariable}) {
+                    currentFunction_->localTypes.at(variable->index) = variable->type;
+                    currentFunction_->localTypeIds.at(variable->index) = semantic::isExactType(variable->type)
+                        ? semantic::stableTypeId(variable->typeName) : 0;
+                }
+            }
+            collectLocalTypes(*value.body);
+            return;
+        }
         for (const auto* variable : {&value.collectionVariable, &value.indexVariable, &value.iterationVariable}) {
             currentFunction_->localTypes.at(variable->index) = variable->type;
             currentFunction_->localTypeIds.at(variable->index) = semantic::isExactType(variable->type)
@@ -251,6 +266,32 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         const auto value = emitValue(Opcode::ConstantInt, semantic::PrimitiveType::Int, {}, span);
         block(*currentBlockId_).instructions.back().integerImmediate = immediate; return value;
     };
+    const auto emitEcsWriteBack = [&](const semantic::BoundForeachStatement& ecsLoop, text::TextSpan span) {
+        if (!hasCurrentBlock() || currentBlockTerminated()) return;
+        for (const auto& col : ecsLoop.ecsColumns) {
+            if (!col.isWrite) continue;
+            const auto elemTypeId = semantic::isExactType(col.elementType)
+                ? semantic::stableTypeId(col.elementTypeName)
+                : 0;
+            const auto colArr = emitLoadLocal(col.collectionVariable, span);
+            const auto curIdx = emitLoadLocal(ecsLoop.indexVariable, span);
+            const auto updatedElem = emitLoadLocal(col.iterationVariable, span);
+            Instruction store;
+            store.resultType = semantic::PrimitiveType::Void;
+            store.opcode = Opcode::StoreElement;
+            store.operands = {colArr, curIdx, updatedElem};
+            store.elementType = col.elementType;
+            store.elementTypeId = elemTypeId;
+            store.sourceSpan = span;
+            block(*currentBlockId_).instructions.push_back(std::move(store));
+        }
+    };
+    const auto emitEcsWriteBacksUntil = [&](std::size_t depth) {
+        for (std::size_t index = ecsWriteBacks_.size(); index > depth; --index) {
+            if (!hasCurrentBlock() || currentBlockTerminated()) break;
+            emitEcsWriteBack(*ecsWriteBacks_[index - 1], statement.span);
+        }
+    };
     const auto emitFinalizersUntil = [&](std::size_t depth) {
         if (finalizers_.size() > depth && hasCurrentBlock() &&
             !currentBlockTerminated()) {
@@ -276,6 +317,7 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         const auto returned = value.expression
             ? std::optional<ValueId>{lowerExpression(*value.expression)}
             : std::nullopt;
+        emitEcsWriteBacksUntil(0);
         emitFinalizersUntil(0);
         if (hasCurrentBlock() && !currentBlockTerminated()) {
             emitReturn(returned, statement.span);
@@ -284,6 +326,7 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
     }
     case semantic::BoundNodeKind::BreakStatement:
         if (breakTargets_.empty()) throw std::logic_error("unbound break reached MIR lowering");
+        emitEcsWriteBacksUntil(breakEcsWriteBackDepths_.back());
         emitFinalizersUntil(breakFinalizerDepths_.back());
         if (hasCurrentBlock() && !currentBlockTerminated()) {
             emitJump(breakTargets_.back(), {}, statement.span);
@@ -540,12 +583,12 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 {},
                 value.condition->span);
         }
-        if (exitBlock) { breakTargets_.push_back(*exitBlock); breakFinalizerDepths_.push_back(finalizers_.size()); }
+        if (exitBlock) { breakTargets_.push_back(*exitBlock); breakFinalizerDepths_.push_back(finalizers_.size()); breakEcsWriteBackDepths_.push_back(ecsWriteBacks_.size()); }
         continueTargets_.push_back(conditionBlock); continueFinalizerDepths_.push_back(finalizers_.size());
         setCurrentBlock(bodyBlock);
         lowerStatement(*value.body);
         continueTargets_.pop_back(); continueFinalizerDepths_.pop_back();
-        if (exitBlock) { breakTargets_.pop_back(); breakFinalizerDepths_.pop_back(); }
+        if (exitBlock) { breakTargets_.pop_back(); breakFinalizerDepths_.pop_back(); breakEcsWriteBackDepths_.pop_back(); }
         if (hasCurrentBlock() && !currentBlockTerminated()) {
             emitJump(conditionBlock, {}, value.body->span);
         }
@@ -581,7 +624,7 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 {},
                 value.condition->span);
         }
-        if (exitBlock) { breakTargets_.push_back(*exitBlock); breakFinalizerDepths_.push_back(finalizers_.size()); }
+        if (exitBlock) { breakTargets_.push_back(*exitBlock); breakFinalizerDepths_.push_back(finalizers_.size()); breakEcsWriteBackDepths_.push_back(ecsWriteBacks_.size()); }
         continueTargets_.push_back(incrementBlock); continueFinalizerDepths_.push_back(finalizers_.size());
         setCurrentBlock(bodyBlock);
         lowerStatement(*value.body);
@@ -599,13 +642,115 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 value.increment ? value.increment->span : statement.span);
         }
         continueTargets_.pop_back(); continueFinalizerDepths_.pop_back();
-        if (exitBlock) { breakTargets_.pop_back(); breakFinalizerDepths_.pop_back(); }
+        if (exitBlock) { breakTargets_.pop_back(); breakFinalizerDepths_.pop_back(); breakEcsWriteBackDepths_.pop_back(); }
         if (exitBlock) setCurrentBlock(*exitBlock);
         else clearCurrentBlock();
         return;
     }
     case semantic::BoundNodeKind::ForeachStatement: {
         const auto& value = static_cast<const semantic::BoundForeachStatement&>(statement);
+        if (value.isEcsQuery) {
+            if (value.ecsColumns.empty()) return;
+            for (const auto& col : value.ecsColumns) {
+                const auto arrayTypeId = semantic::stableTypeId(col.collectionVariable.typeName);
+                const auto elemTypeId = semantic::isExactType(col.elementType)
+                    ? semantic::stableTypeId(col.elementTypeName)
+                    : 0;
+                const std::string compKey = col.elementTypeName.empty()
+                    ? std::string(semantic::primitiveTypeName(col.elementType))
+                    : col.elementTypeName;
+                const auto ecsColSymbolId = semantic::stableTypeId("$ecs_column::" + compKey);
+                const auto zeroLen = emitInt(0, statement.span);
+                const auto emptyArr = emitValue(
+                    Opcode::NewArray, semantic::PrimitiveType::Array, {zeroLen}, statement.span);
+                auto& newArrInst = block(*currentBlockId_).instructions.back();
+                newArrInst.resultTypeId = arrayTypeId;
+                newArrInst.elementType = col.elementType;
+                newArrInst.elementTypeId = elemTypeId;
+                newArrInst.symbolName = col.collectionVariable.typeName;
+
+                const std::string getName = "$intrinsic::static_get::" + std::to_string(ecsColSymbolId);
+                Instruction getCall;
+                getCall.result = nextValueId_++;
+                getCall.resultType = semantic::PrimitiveType::Array;
+                getCall.resultTypeId = arrayTypeId;
+                getCall.opcode = Opcode::Call;
+                getCall.operands = {emptyArr};
+                getCall.parameterTypes = {semantic::PrimitiveType::Array};
+                getCall.parameterTypeIds = {arrayTypeId};
+                getCall.symbolId = semantic::stableTypeId(getName);
+                getCall.symbolName = getName;
+                getCall.sourceSpan = statement.span;
+                const auto colResult = getCall.result;
+                block(*currentBlockId_).instructions.push_back(std::move(getCall));
+                emitStoreLocal(col.collectionVariable.index, colResult, statement.span);
+            }
+            emitStoreLocal(value.indexVariable.index, emitInt(0, statement.span), statement.span);
+            const auto conditionBlock = createBlock(), bodyBlock = createBlock(), incrementBlock = createBlock(), exitBlock = createBlock();
+            emitJump(conditionBlock, {}, statement.span);
+            setCurrentBlock(conditionBlock);
+            const auto index = emitLoadLocal(value.indexVariable, statement.span);
+            for (std::size_t colIdx = 0; colIdx < value.ecsColumns.size(); ++colIdx) {
+                const auto colArr = emitLoadLocal(
+                    value.ecsColumns[colIdx].collectionVariable, statement.span);
+                const auto count = emitValue(
+                    Opcode::ArrayLength, semantic::PrimitiveType::Int, {colArr}, statement.span);
+                const auto condition = emitValue(
+                    Opcode::LessInt, semantic::PrimitiveType::Bool, {index, count}, statement.span);
+                if (colIdx + 1 == value.ecsColumns.size()) {
+                    emitBranch(condition, bodyBlock, exitBlock, {}, {}, statement.span);
+                } else {
+                    const auto nextColCheckBlock = createBlock();
+                    emitBranch(condition, nextColCheckBlock, exitBlock, {}, {}, statement.span);
+                    setCurrentBlock(nextColCheckBlock);
+                }
+            }
+
+            breakTargets_.push_back(exitBlock);
+            breakFinalizerDepths_.push_back(finalizers_.size());
+            breakEcsWriteBackDepths_.push_back(ecsWriteBacks_.size());
+            ecsWriteBacks_.push_back(&value);
+            continueTargets_.push_back(incrementBlock);
+            continueFinalizerDepths_.push_back(finalizers_.size());
+
+            setCurrentBlock(bodyBlock);
+            for (const auto& col : value.ecsColumns) {
+                const auto elemTypeId = semantic::isExactType(col.elementType)
+                    ? semantic::stableTypeId(col.elementTypeName)
+                    : 0;
+                const auto colArr = emitLoadLocal(col.collectionVariable, statement.span);
+                const auto curIdx = emitLoadLocal(value.indexVariable, statement.span);
+                const auto elemVal = emitValue(
+                    Opcode::LoadElement, col.elementType, {colArr, curIdx}, statement.span);
+                auto& loadInst = block(*currentBlockId_).instructions.back();
+                loadInst.resultTypeId = elemTypeId;
+                loadInst.elementType = col.elementType;
+                loadInst.elementTypeId = elemTypeId;
+                emitStoreLocal(col.iterationVariable.index, elemVal, col.iterationVariable.declarationSpan);
+            }
+            lowerStatement(*value.body);
+            if (hasCurrentBlock() && !currentBlockTerminated()) {
+                emitJump(incrementBlock, {}, value.body->span);
+            }
+
+            setCurrentBlock(incrementBlock);
+            emitEcsWriteBack(value, statement.span);
+            const auto currentIndex = emitLoadLocal(value.indexVariable, statement.span);
+            const auto nextIndex = emitValue(
+                Opcode::AddInt, semantic::PrimitiveType::Int,
+                {currentIndex, emitInt(1, statement.span)}, statement.span);
+            emitStoreLocal(value.indexVariable.index, nextIndex, statement.span);
+            emitJump(conditionBlock, {}, statement.span);
+
+            ecsWriteBacks_.pop_back();
+            continueTargets_.pop_back();
+            continueFinalizerDepths_.pop_back();
+            breakTargets_.pop_back();
+            breakFinalizerDepths_.pop_back();
+            breakEcsWriteBackDepths_.pop_back();
+            setCurrentBlock(exitBlock);
+            return;
+        }
         emitStoreLocal(value.collectionVariable.index, lowerExpression(*value.collection), value.collection->span);
         emitStoreLocal(value.indexVariable.index, emitInt(0, statement.span), statement.span);
         const auto conditionBlock = createBlock(), bodyBlock = createBlock(), incrementBlock = createBlock(), exitBlock = createBlock();
@@ -620,7 +765,7 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 {index, count}, statement.span);
         }
         emitBranch(condition, bodyBlock, exitBlock, {}, {}, statement.span);
-        breakTargets_.push_back(exitBlock); breakFinalizerDepths_.push_back(finalizers_.size());
+        breakTargets_.push_back(exitBlock); breakFinalizerDepths_.push_back(finalizers_.size()); breakEcsWriteBackDepths_.push_back(ecsWriteBacks_.size());
         continueTargets_.push_back(incrementBlock); continueFinalizerDepths_.push_back(finalizers_.size());
         setCurrentBlock(bodyBlock);
         emitStoreLocal(value.iterationVariable.index, lowerExpression(*value.element), value.iterationVariable.declarationSpan);
@@ -635,7 +780,7 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         }
         emitJump(conditionBlock, {}, statement.span);
         continueTargets_.pop_back(); continueFinalizerDepths_.pop_back();
-        breakTargets_.pop_back(); breakFinalizerDepths_.pop_back(); setCurrentBlock(exitBlock); return;
+        breakTargets_.pop_back(); breakFinalizerDepths_.pop_back(); breakEcsWriteBackDepths_.pop_back(); setCurrentBlock(exitBlock); return;
     }
     case semantic::BoundNodeKind::DoWhileStatement: {
         const auto& value =
@@ -649,7 +794,7 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
             ? std::optional<BlockId>{createBlock()}
             : std::nullopt;
         emitJump(bodyBlock, {}, statement.span);
-        if (exitBlock) { breakTargets_.push_back(*exitBlock); breakFinalizerDepths_.push_back(finalizers_.size()); }
+        if (exitBlock) { breakTargets_.push_back(*exitBlock); breakFinalizerDepths_.push_back(finalizers_.size()); breakEcsWriteBackDepths_.push_back(ecsWriteBacks_.size()); }
         continueTargets_.push_back(conditionBlock); continueFinalizerDepths_.push_back(finalizers_.size());
         setCurrentBlock(bodyBlock);
         lowerStatement(*value.body);
@@ -670,7 +815,7 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 value.condition->span);
         }
         continueTargets_.pop_back(); continueFinalizerDepths_.pop_back();
-        if (exitBlock) { breakTargets_.pop_back(); breakFinalizerDepths_.pop_back(); }
+        if (exitBlock) { breakTargets_.pop_back(); breakFinalizerDepths_.pop_back(); breakEcsWriteBackDepths_.pop_back(); }
         if (exitBlock) setCurrentBlock(*exitBlock);
         else clearCurrentBlock();
         return;
@@ -756,7 +901,7 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
             emitJump(defaultIndex ? sectionBlocks[*defaultIndex] : exitBlock, {}, statement.span);
             exitReachable = !defaultIndex.has_value();
         }
-        breakTargets_.push_back(exitBlock); breakFinalizerDepths_.push_back(finalizers_.size());
+        breakTargets_.push_back(exitBlock); breakFinalizerDepths_.push_back(finalizers_.size()); breakEcsWriteBackDepths_.push_back(ecsWriteBacks_.size());
         for (std::size_t i = 0; i < value.sections.size(); ++i) {
             setCurrentBlock(sectionBlocks[i]);
             for (const auto& child : value.sections[i].statements) {
@@ -769,7 +914,7 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 exitReachable = true;
             }
         }
-        breakTargets_.pop_back(); breakFinalizerDepths_.pop_back();
+        breakTargets_.pop_back(); breakFinalizerDepths_.pop_back(); breakEcsWriteBackDepths_.pop_back();
         if (exitReachable) setCurrentBlock(exitBlock);
         else {
             clearCurrentBlock();

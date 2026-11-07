@@ -114,4 +114,15 @@ bool importScriptObjectJson(
     ScriptStatePolicy policy = {},
     SceneScriptRuntime* scene = nullptr);
 
+[[nodiscard]] std::string exportSceneJson(
+    const SceneScriptRuntime& scene,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy = {});
+
+bool importSceneJson(
+    SceneScriptRuntime& scene,
+    const std::string& jsonText,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy = {});
+
 } // namespace realscript::game

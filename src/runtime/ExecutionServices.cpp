@@ -137,13 +137,11 @@ void hashValue(
         hashScalar(hash, v->w);
     } else if (const auto* v = std::get_if<StructValue>(&value)) {
         hashScalar(hash, v->typeId);
-        const auto count = v->storage
-            ? static_cast<std::uint64_t>(v->storage->fields.size())
-            : 0;
+        const auto count = static_cast<std::uint64_t>(v->fieldCount());
         hashScalar(hash, count);
-        if (v->storage) {
-            for (const auto& field : v->storage->fields) {
-                hashValue(hash, field, canonicalizeFloatingPoint);
+        for (std::size_t i = 0; i < v->fieldCount(); ++i) {
+            if (const auto f = structValueFieldAt(*v, i)) {
+                hashValue(hash, *f, canonicalizeFloatingPoint);
             }
         }
     } else if (const auto* v = std::get_if<std::string>(&value)) {
@@ -165,7 +163,7 @@ bool replayStable(const Value& value) noexcept {
         return false;
     }
     if (const auto* structure = std::get_if<StructValue>(&value)) {
-        if (!structure->storage) return true;
+        if (structure->isInline || !structure->storage) return true;
         return std::all_of(
             structure->storage->fields.begin(),
             structure->storage->fields.end(),

@@ -473,7 +473,7 @@ bool ExecutionContext::expectSignatureType(
         const auto actualTypeId = runtime::structValueTypeId(value);
         const auto* structure = std::get_if<runtime::StructValue>(&value);
         if (!actualTypeId || typeId == 0 || *actualTypeId != typeId ||
-            (structure && !structure->storage)) {
+            (structure && !structure->valid())) {
             return fail(
                 runtime::ErrorCode::TypeMismatch,
                 std::string(context) + " has the wrong struct type");
@@ -525,16 +525,16 @@ runtime::Value ExecutionContext::defaultValue(
         if (!descriptor || descriptor->kind != semantic::TypeKind::Struct) {
             return runtime::StructValue{};
         }
-        auto storage = std::make_shared<runtime::StructStorage>();
-        storage->fields.reserve(descriptor->fieldCount);
+        std::vector<runtime::Value> fields;
+        fields.reserve(descriptor->fieldCount);
         for (std::uint32_t index = 0; index < descriptor->fieldCount; ++index) {
             const auto& field = descriptor->fields[index];
-            storage->fields.push_back(defaultValue(
+            fields.push_back(defaultValue(
                 field.type,
                 field.typeId,
                 depth + 1));
         }
-        return runtime::StructValue{typeId, std::move(storage)};
+        return runtime::makeStructValueFromFields(typeId, std::move(fields));
     }
     case semantic::PrimitiveType::Null: return std::monostate{};
     case semantic::PrimitiveType::Void:
@@ -1301,7 +1301,7 @@ bool ExecutionContext::newStruct(
         return true;
     }
     const auto* structure = std::get_if<runtime::StructValue>(&result);
-    if (!structure || !structure->storage) {
+    if (!structure || !structure->valid()) {
         return fail(
             runtime::ErrorCode::InvalidProgram,
             "AOT struct allocation references an invalid struct descriptor");

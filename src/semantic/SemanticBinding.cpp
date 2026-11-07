@@ -2968,6 +2968,138 @@ std::unique_ptr<BoundStatement> Binder::bindForeachStatement(
     const syntax::ForeachStatementSyntax& syntaxTree) {
     auto result = std::make_unique<BoundForeachStatement>();
     result->span = syntaxTree.span();
+
+    if (syntaxTree.collection &&
+        syntaxTree.collection->kind() == syntax::SyntaxKind::CallExpression) {
+        const auto& call = static_cast<const syntax::CallExpressionSyntax&>(*syntaxTree.collection);
+        if (call.identifierToken.text == "Query" && call.lessToken.has_value()) {
+            result->isEcsQuery = true;
+            struct RawBinding {
+                std::optional<syntax::SyntaxToken> modifierToken;
+                syntax::TypeSyntax type;
+                syntax::SyntaxToken identifierToken;
+            };
+            std::vector<RawBinding> bindings;
+            bindings.push_back(RawBinding{
+                syntaxTree.modifierToken, syntaxTree.type, syntaxTree.identifierToken});
+            for (const auto& extra : syntaxTree.additionalBindings) {
+                bindings.push_back(RawBinding{
+                    extra.modifierToken, extra.type, extra.identifierToken});
+            }
+            if (call.typeArguments.size() != bindings.size() || call.typeArguments.empty()) {
+                diagnostics_.report(
+                    "RS2214",
+                    "ECS Query<...>() type argument count must match foreach binding variables",
+                    syntaxTree.collection->span());
+            }
+
+            pushScope(syntaxTree.span());
+            result->indexVariable.name = "$foreach_index_" + std::to_string(nextVariableIndex_);
+            result->indexVariable.type = PrimitiveType::Int;
+            result->indexVariable.index = nextVariableIndex_++;
+            result->indexVariable.declarationSpan = syntaxTree.inKeyword.span;
+            result->indexVariable.id = stableTypeId(std::to_string(currentFunctionId_) +
+                "::local:" + std::to_string(result->indexVariable.index) + ":" +
+                result->indexVariable.name);
+            (void)declareVariable(result->indexVariable, syntaxTree.inKeyword.span);
+
+            const std::size_t colCount = std::min(call.typeArguments.size(), bindings.size());
+            for (std::size_t idx = 0; idx < colCount; ++idx) {
+                const auto& qArg = call.typeArguments[idx];
+                const auto& b = bindings[idx];
+                bool isWrite = false;
+                bool isReadOnly = false;
+                syntax::TypeSyntax compTypeSyntax = qArg;
+                if (qArg.name.text == "Write" && qArg.typeArguments.size() == 1) {
+                    isWrite = true;
+                    isReadOnly = false;
+                    compTypeSyntax = qArg.typeArguments[0];
+                } else if (qArg.name.text == "Read" && qArg.typeArguments.size() == 1) {
+                    isWrite = false;
+                    isReadOnly = true;
+                    compTypeSyntax = qArg.typeArguments[0];
+                } else {
+                    isWrite = b.modifierToken.has_value() &&
+                        b.modifierToken->kind == syntax::SyntaxKind::RefKeyword;
+                    isReadOnly = b.modifierToken.has_value() &&
+                        b.modifierToken->kind == syntax::SyntaxKind::InKeyword;
+                }
+
+                if (b.modifierToken.has_value() &&
+                    b.modifierToken->kind == syntax::SyntaxKind::RefKeyword &&
+                    isReadOnly) {
+                    diagnostics_.report(
+                        "RS2215",
+                        "cannot bind 'ref' variable to read-only ECS query component 'Read<" +
+                            compTypeSyntax.name.text + ">'",
+                        b.modifierToken->span);
+                }
+                if (b.modifierToken.has_value() &&
+                    b.modifierToken->kind == syntax::SyntaxKind::InKeyword) {
+                    isWrite = false;
+                    isReadOnly = true;
+                }
+
+                std::string compTypeName;
+                const PrimitiveType compPrim = bindType(compTypeSyntax, false, &compTypeName);
+                if (b.type.name.text != "var") {
+                    std::string declaredTypeName;
+                    const PrimitiveType declaredPrim = bindType(b.type, false, &declaredTypeName);
+                    if (declaredPrim != compPrim || declaredTypeName != compTypeName) {
+                        diagnostics_.report(
+                            "RS2216",
+                            "ECS query iteration variable type does not match query component type",
+                            b.type.span());
+                    }
+                }
+
+                BoundEcsQueryColumn col;
+                col.isWrite = isWrite;
+                col.isReadOnly = isReadOnly;
+                col.elementType = compPrim;
+                col.elementTypeName = compTypeName;
+
+                col.collectionVariable.name = "$ecs_col_" + std::to_string(idx) + "_" +
+                    std::to_string(nextVariableIndex_);
+                col.collectionVariable.type = PrimitiveType::Array;
+                col.collectionVariable.typeName = arrayTypeName(compPrim, compTypeName);
+                col.collectionVariable.index = nextVariableIndex_++;
+                col.collectionVariable.declarationSpan = syntaxTree.foreachKeyword.span;
+                col.collectionVariable.id = stableTypeId(std::to_string(currentFunctionId_) +
+                    "::local:" + std::to_string(col.collectionVariable.index) + ":" +
+                    col.collectionVariable.name);
+                (void)declareVariable(col.collectionVariable, syntaxTree.foreachKeyword.span);
+
+                col.iterationVariable.name = b.identifierToken.text;
+                col.iterationVariable.type = compPrim;
+                col.iterationVariable.typeName = compTypeName;
+                col.iterationVariable.isConst = isReadOnly;
+                col.iterationVariable.modifier = isReadOnly
+                    ? ParameterModifier::In
+                    : (isWrite ? ParameterModifier::Ref : ParameterModifier::None);
+                col.iterationVariable.index = nextVariableIndex_++;
+                col.iterationVariable.declarationSpan = b.identifierToken.span;
+                col.iterationVariable.id = stableTypeId(std::to_string(currentFunctionId_) +
+                    "::local:" + std::to_string(col.iterationVariable.index) + ":" +
+                    col.iterationVariable.name);
+                (void)declareVariable(col.iterationVariable, b.identifierToken.span);
+
+                result->ecsColumns.push_back(std::move(col));
+            }
+            if (!result->ecsColumns.empty()) {
+                result->collectionVariable = result->ecsColumns.front().collectionVariable;
+                result->iterationVariable = result->ecsColumns.front().iterationVariable;
+            }
+            ++loopDepth_;
+            ++breakableDepth_;
+            result->body = bindEmbeddedStatement(*syntaxTree.body);
+            --breakableDepth_;
+            --loopDepth_;
+            popScope();
+            return result;
+        }
+    }
+
     result->collection = bindExpression(*syntaxTree.collection);
 
     PrimitiveType elementType = PrimitiveType::Error;

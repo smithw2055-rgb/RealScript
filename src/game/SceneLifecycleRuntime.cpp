@@ -2,7 +2,10 @@
 #include "realscript/game/GameScripting.h"
 #include "realscript/game/GameplayMetadata.h"
 
+#include <algorithm>
+#include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace realscript::game {
@@ -128,25 +131,72 @@ void patchMigratedObjectRefsInHeapObject(
     runtime::ManagedHeap* heap,
     runtime::ObjectRef target,
     const std::unordered_map<std::uint64_t, runtime::ObjectRef>& refMap,
+    std::unordered_set<std::uint64_t>& visited);
+
+bool patchMigratedObjectRefsInValue(
+    runtime::ManagedHeap* heap,
+    runtime::Value& val,
+    const std::unordered_map<std::uint64_t, runtime::ObjectRef>& refMap,
+    std::unordered_set<std::uint64_t>& visited) {
+    if (auto* objRef = std::get_if<runtime::ObjectRef>(&val)) {
+        if (!objRef->valid()) return false;
+        const std::uint64_t refKey =
+            (static_cast<std::uint64_t>(objRef->generation) << 32u) | objRef->slot;
+        const auto mapped = refMap.find(refKey);
+        if (mapped != refMap.end()) {
+            *objRef = mapped->second;
+            return true;
+        }
+        patchMigratedObjectRefsInHeapObject(heap, *objRef, refMap, visited);
+        return false;
+    }
+    if (auto* structVal = std::get_if<runtime::StructValue>(&val)) {
+        if (!structVal->storage) return false;
+        auto cloned = std::make_shared<runtime::StructStorage>(*structVal->storage);
+        bool changed = false;
+        for (auto& subField : cloned->fields) {
+            if (patchMigratedObjectRefsInValue(heap, subField, refMap, visited)) {
+                changed = true;
+            }
+        }
+        if (changed) {
+            structVal->storage = std::move(cloned);
+        }
+        return changed;
+    }
+    return false;
+}
+
+void patchMigratedObjectRefsInHeapObject(
+    runtime::ManagedHeap* heap,
+    runtime::ObjectRef target,
+    const std::unordered_map<std::uint64_t, runtime::ObjectRef>& refMap,
     std::unordered_set<std::uint64_t>& visited) {
     if (!heap || !target.valid()) return;
     const std::uint64_t key =
         (static_cast<std::uint64_t>(target.generation) << 32u) | target.slot;
     if (!visited.insert(key).second) return;
+
+    if (target.kind == runtime::ObjectKind::Array) {
+        const auto aLen = heap->arrayLength(target);
+        if (!aLen) return;
+        for (std::size_t i = 0; i < *aLen; ++i) {
+            auto elem = heap->arrayGet(target, i);
+            if (!elem) continue;
+            if (patchMigratedObjectRefsInValue(heap, *elem, refMap, visited)) {
+                (void)heap->arraySet(target, i, *elem);
+            }
+        }
+        return;
+    }
+
     const auto fCount = heap->fieldCount(target);
     if (!fCount) return;
     for (std::size_t i = 0; i < *fCount; ++i) {
         auto val = heap->fieldGet(target, i);
         if (!val) continue;
-        if (const auto* objRef = std::get_if<runtime::ObjectRef>(&*val)) {
-            const std::uint64_t refKey =
-                (static_cast<std::uint64_t>(objRef->generation) << 32u) | objRef->slot;
-            const auto mapped = refMap.find(refKey);
-            if (mapped != refMap.end()) {
-                (void)heap->fieldSet(target, i, mapped->second);
-            } else {
-                patchMigratedObjectRefsInHeapObject(heap, *objRef, refMap, visited);
-            }
+        if (patchMigratedObjectRefsInValue(heap, *val, refMap, visited)) {
+            (void)heap->fieldSet(target, i, *val);
         }
     }
 }
@@ -201,6 +251,80 @@ bool SceneScriptRuntime::matchesComponentType(
         }
     }
     return false;
+}
+
+void SceneScriptRuntime::rebuildTickOrderIfNeeded() const {
+    if (!tickOrderDirty_) return;
+    cachedTickOrder_.clear();
+    for (const auto& [entity, components] : instances_) {
+        for (std::size_t idx = 0; idx < components.size(); ++idx) {
+            cachedTickOrder_.push_back(
+                TickRef{components[idx].executionOrder, entity, idx});
+        }
+    }
+    std::sort(
+        cachedTickOrder_.begin(),
+        cachedTickOrder_.end(),
+        [](const TickRef& a, const TickRef& b) {
+            if (a.order != b.order) return a.order < b.order;
+            if (a.entity != b.entity) return a.entity < b.entity;
+            return a.compIndex < b.compIndex;
+        });
+    tickOrderDirty_ = false;
+}
+
+void SceneScriptRuntime::invalidateTransformSubtree(SceneEntityId entity) {
+    if (entity == BroadcastTarget) return;
+    worldTransformCache_.erase(entity);
+    const auto chIt = childrenByEntity_.find(entity);
+    if (chIt == childrenByEntity_.end()) return;
+    for (const auto child : chIt->second) {
+        invalidateTransformSubtree(child);
+    }
+}
+
+bool SceneScriptRuntime::attachComponentWithoutLifecycle(
+    SceneEntityId entity,
+    const std::string& scriptType,
+    SceneScriptOptions options,
+    std::size_t& outCompIndex) {
+    if (entity == BroadcastTarget) return false;
+    const auto existingEntity = instances_.find(entity);
+    if (existingEntity != instances_.end()) {
+        for (const auto& comp : existingEntity->second) {
+            if (comp.object.type().canonicalName() == scriptType ||
+                comp.object.type().descriptor.name == scriptType) {
+                return false;
+            }
+        }
+    }
+
+    runtime::RuntimeError error;
+    auto object = runtime_.createObject(scriptType, error, executionOptions_);
+    if (!object) {
+        recordError(entity, "OnCreate", error);
+        return false;
+    }
+    if (entityActiveSelf_.find(entity) == entityActiveSelf_.end()) {
+        entityActiveSelf_[entity] = true;
+    }
+    for (auto& [name, value] : options.initialMembers) {
+        if (!runtime_.setMember(*object, name, std::move(value), error, executionOptions_)) {
+            recordError(entity, "SetMember:" + name, error);
+            return false;
+        }
+    }
+
+    Instance instance;
+    instance.object = std::move(*object);
+    instance.enabled = options.enabled;
+    bindLifecycleMethods(instance);
+
+    auto& list = instances_[entity];
+    outCompIndex = list.size();
+    list.push_back(std::move(instance));
+    tickOrderDirty_ = true;
+    return true;
 }
 
 bool SceneScriptRuntime::attach(
@@ -263,6 +387,7 @@ bool SceneScriptRuntime::attachComponent(
 
     auto& list = instances_[entity];
     list.push_back(std::move(instance));
+    tickOrderDirty_ = true;
     auto& stored = list.back();
     const bool hasOwner = !std::holds_alternative<std::monostate>(options.owner);
     if (hasOwner && stored.onCreate1) {
@@ -270,24 +395,28 @@ bool SceneScriptRuntime::attachComponent(
                 entity, stored, stored.onCreate1, {std::move(options.owner)}, "OnCreate")) {
             list.pop_back();
             if (list.empty()) instances_.erase(entity);
+            tickOrderDirty_ = true;
             return false;
         }
     } else if (!invokeLifecycle(
             entity, stored, stored.onCreate0, {}, "OnCreate")) {
         list.pop_back();
         if (list.empty()) instances_.erase(entity);
+        tickOrderDirty_ = true;
         return false;
     }
-    if (stored.enabled && !invokeLifecycle(
+    if (stored.enabled && isActiveInHierarchy(entity) && !invokeLifecycle(
             entity, stored, stored.onEnable, {}, "OnEnable")) {
         list.pop_back();
         if (list.empty()) instances_.erase(entity);
+        tickOrderDirty_ = true;
         return false;
     }
     return true;
 }
 
 bool SceneScriptRuntime::detach(SceneEntityId entity) {
+    if (entity == BroadcastTarget) return false;
     const auto childrenIt = childrenByEntity_.find(entity);
     if (childrenIt != childrenByEntity_.end()) {
         const auto childrenCopy = childrenIt->second;
@@ -296,7 +425,12 @@ bool SceneScriptRuntime::detach(SceneEntityId entity) {
         }
         childrenByEntity_.erase(entity);
     }
+    const bool wasActiveInHierarchy = isActiveInHierarchy(entity);
     const auto parentIt = parentByEntity_.find(entity);
+    const bool hadHierarchyOrTransform =
+        parentIt != parentByEntity_.end() ||
+        entityActiveSelf_.find(entity) != entityActiveSelf_.end() ||
+        localTransforms_.find(entity) != localTransforms_.end();
     if (parentIt != parentByEntity_.end()) {
         const auto parentId = parentIt->second;
         parentByEntity_.erase(parentIt);
@@ -308,17 +442,28 @@ bool SceneScriptRuntime::detach(SceneEntityId entity) {
     }
     entityActiveSelf_.erase(entity);
     localTransforms_.erase(entity);
+    worldTransformCache_.erase(entity);
+
+    if (fiberScheduler_) {
+        (void)fiberScheduler_->killEntityFibersBySlot(
+            static_cast<std::uint32_t>(entity));
+    }
+
+    removeSignalsForEntityOrComponent(entity, {});
 
     const auto found = instances_.find(entity);
-    if (found == instances_.end()) return false;
+    if (found == instances_.end()) {
+        return hadHierarchyOrTransform;
+    }
     for (auto& instance : found->second) {
         cancelActiveInstanceSequences(runtime_, instance.object, executionOptions_);
-        if (instance.enabled) {
+        if (instance.enabled && wasActiveInHierarchy) {
             (void)invokeLifecycle(entity, instance, instance.onDisable, {}, "OnDisable");
         }
         (void)invokeLifecycle(entity, instance, instance.onDestroy, {}, "OnDestroy");
     }
     instances_.erase(found);
+    tickOrderDirty_ = true;
     return true;
 }
 
@@ -330,37 +475,124 @@ bool SceneScriptRuntime::detachComponent(
     auto& list = found->second;
     for (auto it = list.begin(); it != list.end(); ++it) {
         if (matchesComponentType(it->object.type(), scriptType)) {
+            const std::string canonicalRemoved = it->object.type().canonicalName();
+            removeSignalsForEntityOrComponent(entity, canonicalRemoved);
             cancelActiveInstanceSequences(runtime_, it->object, executionOptions_);
-            if (it->enabled) {
+            if (it->enabled && isActiveInHierarchy(entity)) {
                 (void)invokeLifecycle(entity, *it, it->onDisable, {}, "OnDisable");
             }
             (void)invokeLifecycle(entity, *it, it->onDestroy, {}, "OnDestroy");
             list.erase(it);
             if (list.empty()) instances_.erase(found);
+            tickOrderDirty_ = true;
             return true;
         }
     }
     return false;
 }
 
-bool SceneScriptRuntime::setEnabled(SceneEntityId entity, bool enabled) {
-    const auto found = instances_.find(entity);
-    if (found == instances_.end() || found->second.empty() ||
-        found->second.front().enabled == enabled) {
+bool SceneScriptRuntime::isEntityActiveSelf(SceneEntityId entity) const noexcept {
+    if (entity == BroadcastTarget) return false;
+    const auto it = entityActiveSelf_.find(entity);
+    if (it != entityActiveSelf_.end()) return it->second;
+    const auto instIt = instances_.find(entity);
+    if (instIt != instances_.end()) {
+        return !instIt->second.empty() && instIt->second.front().enabled;
+    }
+    return true;
+}
+
+bool SceneScriptRuntime::setEntityActive(SceneEntityId entity, bool active) {
+    if (entity == BroadcastTarget) return false;
+    const bool currentSelf = isEntityActiveSelf(entity);
+    if (entityActiveSelf_.find(entity) != entityActiveSelf_.end() &&
+        currentSelf == active) {
         return false;
     }
+    const bool parentActive =
+        getParent(entity) == BroadcastTarget || isActiveInHierarchy(getParent(entity));
+    const bool wasActiveInHierarchy = currentSelf && parentActive;
+
+    entityActiveSelf_[entity] = active;
+    tickOrderDirty_ = true;
+
+    const bool nowActiveInHierarchy = active && parentActive;
+    if (wasActiveInHierarchy == nowActiveInHierarchy) {
+        return true;
+    }
+
+    const auto notifyNodeComponents = [&](SceneEntityId nodeId, bool becomingActive) -> bool {
+        if (!becomingActive && fiberScheduler_) {
+            (void)fiberScheduler_->killEntityFibersBySlot(
+                static_cast<std::uint32_t>(nodeId));
+        }
+        const auto instIt = instances_.find(nodeId);
+        if (instIt == instances_.end()) return true;
+        bool ok = true;
+        for (auto& comp : instIt->second) {
+            if (!comp.enabled) continue;
+            if (!becomingActive) {
+                cancelActiveInstanceSequences(runtime_, comp.object, executionOptions_);
+            }
+            const auto& cb = becomingActive ? comp.onEnable : comp.onDisable;
+            if (!invokeLifecycle(
+                    nodeId,
+                    comp,
+                    cb,
+                    {},
+                    becomingActive ? "OnEnable" : "OnDisable")) {
+                ok = false;
+            }
+        }
+        return ok;
+    };
+
+    (void)notifyNodeComponents(entity, nowActiveInHierarchy);
+
+    const auto notifySubtree = [&](const auto& self, SceneEntityId parentNode) -> void {
+        const auto chIt = childrenByEntity_.find(parentNode);
+        if (chIt == childrenByEntity_.end()) return;
+        for (const auto childId : chIt->second) {
+            if (!isEntityActiveSelf(childId)) continue;
+            (void)notifyNodeComponents(childId, nowActiveInHierarchy);
+            self(self, childId);
+        }
+    };
+    notifySubtree(notifySubtree, entity);
+    return true;
+}
+
+bool SceneScriptRuntime::setEnabled(SceneEntityId entity, bool enabled) {
+    if (entity == BroadcastTarget) return false;
+    const auto found = instances_.find(entity);
+    if (found == instances_.end() || found->second.empty()) {
+        // Pure transform/hierarchy node without components: delegate to setEntityActive
+        return setEntityActive(entity, enabled);
+    }
+    if (found->second.front().enabled == enabled) {
+        return false;
+    }
+    const bool wasEntityActive = isEntityActiveSelf(entity);
+    const bool parentActive =
+        getParent(entity) == BroadcastTarget || isActiveInHierarchy(getParent(entity));
     auto& instance = found->second.front();
     if (!enabled) {
         cancelActiveInstanceSequences(runtime_, instance.object, executionOptions_);
+        if (fiberScheduler_) {
+            (void)fiberScheduler_->killEntityFibersBySlot(
+                static_cast<std::uint32_t>(entity));
+        }
     }
     const auto& callback = enabled ? instance.onEnable : instance.onDisable;
-    if (!invokeLifecycle(
-            entity,
-            instance,
-            callback,
-            {},
-            enabled ? "OnEnable" : "OnDisable")) {
-        return false;
+    if (parentActive) {
+        if (!invokeLifecycle(
+                entity,
+                instance,
+                callback,
+                {},
+                enabled ? "OnEnable" : "OnDisable")) {
+            return false;
+        }
     }
     instance.enabled = enabled;
     bool anyComponentEnabled = false;
@@ -371,31 +603,38 @@ bool SceneScriptRuntime::setEnabled(SceneEntityId entity, bool enabled) {
         }
     }
     entityActiveSelf_[entity] = anyComponentEnabled;
+    tickOrderDirty_ = true;
 
-    // Cascade OnEnable / OnDisable to active child entities in hierarchy
+    // Cascade OnEnable / OnDisable to active child entities only if effective hierarchy state changed
     const auto notifySubtree = [&](const auto& self, SceneEntityId parentNode) -> void {
         const auto chIt = childrenByEntity_.find(parentNode);
         if (chIt == childrenByEntity_.end()) return;
         for (const auto childId : chIt->second) {
-            const auto childSelfIt = entityActiveSelf_.find(childId);
-            const bool childSelfActive = (childSelfIt == entityActiveSelf_.end()) ? true : childSelfIt->second;
-            if (!childSelfActive) continue;
+            if (!isEntityActiveSelf(childId)) continue;
+            if (!anyComponentEnabled && fiberScheduler_) {
+                (void)fiberScheduler_->killEntityFibersBySlot(
+                    static_cast<std::uint32_t>(childId));
+            }
             const auto childInstIt = instances_.find(childId);
             if (childInstIt != instances_.end()) {
                 for (auto& childComp : childInstIt->second) {
                     if (!childComp.enabled) continue;
-                    if (!enabled) {
+                    if (!anyComponentEnabled) {
                         cancelActiveInstanceSequences(runtime_, childComp.object, executionOptions_);
                     }
-                    const auto& cb = enabled ? childComp.onEnable : childComp.onDisable;
+                    const auto& cb = anyComponentEnabled ? childComp.onEnable : childComp.onDisable;
                     (void)invokeLifecycle(
-                        childId, childComp, cb, {}, enabled ? "OnEnable" : "OnDisable");
+                        childId,
+                        childComp,
+                        cb,
+                        {},
+                        anyComponentEnabled ? "OnEnable" : "OnDisable");
                 }
             }
             self(self, childId);
         }
     };
-    if (isActiveInHierarchy(getParent(entity)) || getParent(entity) == 0) {
+    if (parentActive && wasEntityActive != anyComponentEnabled) {
         notifySubtree(notifySubtree, entity);
     }
     return true;
@@ -414,142 +653,106 @@ bool SceneScriptRuntime::setComponentEnabled(
             cancelActiveInstanceSequences(runtime_, instance.object, executionOptions_);
         }
         const auto& callback = enabled ? instance.onEnable : instance.onDisable;
-        if (!invokeLifecycle(
-                entity,
-                instance,
-                callback,
-                {},
-                enabled ? "OnEnable" : "OnDisable")) {
-            return false;
+        if (isActiveInHierarchy(entity)) {
+            if (!invokeLifecycle(
+                    entity,
+                    instance,
+                    callback,
+                    {},
+                    enabled ? "OnEnable" : "OnDisable")) {
+                return false;
+            }
         }
         instance.enabled = enabled;
+        tickOrderDirty_ = true;
         return true;
     }
     return false;
 }
 
-void SceneScriptRuntime::start() {
-    struct TickItem {
-        int order = 0;
-        SceneEntityId entity = 0;
-        std::size_t compIndex = 0;
-        Instance* instance = nullptr;
-    };
-    std::vector<TickItem> items;
-    for (auto& [entity, components] : instances_) {
-        if (!isActiveInHierarchy(entity)) continue;
-        for (std::size_t idx = 0; idx < components.size(); ++idx) {
-            auto& instance = components[idx];
-            if (!instance.enabled || instance.started ||
-                !shouldTickInCurrentMode(instance)) {
-                continue;
-            }
-            items.push_back(TickItem{instance.executionOrder, entity, idx, &instance});
+bool SceneScriptRuntime::isComponentEnabled(
+    SceneEntityId entity,
+    const std::string& scriptType) const noexcept {
+    const auto found = instances_.find(entity);
+    if (found == instances_.end()) return false;
+    for (const auto& instance : found->second) {
+        if (matchesComponentType(instance.object.type(), scriptType)) {
+            return instance.enabled;
         }
     }
-    std::sort(items.begin(), items.end(), [](const TickItem& a, const TickItem& b) {
-        if (a.order != b.order) return a.order < b.order;
-        if (a.entity != b.entity) return a.entity < b.entity;
-        return a.compIndex < b.compIndex;
-    });
-    for (auto& item : items) {
-        if (invokeLifecycle(item.entity, *item.instance, item.instance->onStart, {}, "OnStart")) {
-            item.instance->started = true;
+    return false;
+}
+
+void SceneScriptRuntime::start() {
+    rebuildTickOrderIfNeeded();
+    const auto snapshot = cachedTickOrder_;
+    for (const auto& ref : snapshot) {
+        if (!isActiveInHierarchy(ref.entity)) continue;
+        const auto it = instances_.find(ref.entity);
+        if (it == instances_.end() || ref.compIndex >= it->second.size()) continue;
+        auto& instance = it->second[ref.compIndex];
+        if (!instance.enabled || instance.started ||
+            !shouldTickInCurrentMode(instance)) {
+            continue;
+        }
+        if (invokeLifecycle(ref.entity, instance, instance.onStart, {}, "OnStart")) {
+            instance.started = true;
         }
     }
 }
 
 void SceneScriptRuntime::update(double deltaTime) {
-    struct TickItem {
-        int order = 0;
-        SceneEntityId entity = 0;
-        std::size_t compIndex = 0;
-        Instance* instance = nullptr;
-    };
-    std::vector<TickItem> items;
-    for (auto& [entity, components] : instances_) {
-        if (!isActiveInHierarchy(entity)) continue;
-        for (std::size_t idx = 0; idx < components.size(); ++idx) {
-            auto& instance = components[idx];
-            if (!instance.enabled || !shouldTickInCurrentMode(instance)) continue;
-            if (!instance.started && executionMode_ == SceneExecutionMode::Play) {
-                continue;
-            }
-            items.push_back(TickItem{instance.executionOrder, entity, idx, &instance});
+    rebuildTickOrderIfNeeded();
+    const auto snapshot = cachedTickOrder_;
+    for (const auto& ref : snapshot) {
+        if (!isActiveInHierarchy(ref.entity)) continue;
+        const auto it = instances_.find(ref.entity);
+        if (it == instances_.end() || ref.compIndex >= it->second.size()) continue;
+        auto& instance = it->second[ref.compIndex];
+        if (!instance.enabled || !shouldTickInCurrentMode(instance)) continue;
+        if (!instance.started && executionMode_ == SceneExecutionMode::Play) {
+            continue;
         }
-    }
-    std::sort(items.begin(), items.end(), [](const TickItem& a, const TickItem& b) {
-        if (a.order != b.order) return a.order < b.order;
-        if (a.entity != b.entity) return a.entity < b.entity;
-        return a.compIndex < b.compIndex;
-    });
-    for (auto& item : items) {
         (void)invokeLifecycle(
-            item.entity, *item.instance, item.instance->onUpdate, {deltaTime}, "OnUpdate");
+            ref.entity, instance, instance.onUpdate, {deltaTime}, "OnUpdate");
     }
 }
 
 void SceneScriptRuntime::fixedUpdate(double fixedDeltaTime) {
-    struct TickItem {
-        int order = 0;
-        SceneEntityId entity = 0;
-        std::size_t compIndex = 0;
-        Instance* instance = nullptr;
-    };
-    std::vector<TickItem> items;
-    for (auto& [entity, components] : instances_) {
-        if (!isActiveInHierarchy(entity)) continue;
-        for (std::size_t idx = 0; idx < components.size(); ++idx) {
-            auto& instance = components[idx];
-            if (!instance.enabled || !shouldTickInCurrentMode(instance)) continue;
-            if (!instance.started && executionMode_ == SceneExecutionMode::Play) {
-                continue;
-            }
-            items.push_back(TickItem{instance.executionOrder, entity, idx, &instance});
+    rebuildTickOrderIfNeeded();
+    const auto snapshot = cachedTickOrder_;
+    for (const auto& ref : snapshot) {
+        if (!isActiveInHierarchy(ref.entity)) continue;
+        const auto it = instances_.find(ref.entity);
+        if (it == instances_.end() || ref.compIndex >= it->second.size()) continue;
+        auto& instance = it->second[ref.compIndex];
+        if (!instance.enabled || !shouldTickInCurrentMode(instance)) continue;
+        if (!instance.started && executionMode_ == SceneExecutionMode::Play) {
+            continue;
         }
-    }
-    std::sort(items.begin(), items.end(), [](const TickItem& a, const TickItem& b) {
-        if (a.order != b.order) return a.order < b.order;
-        if (a.entity != b.entity) return a.entity < b.entity;
-        return a.compIndex < b.compIndex;
-    });
-    for (auto& item : items) {
         (void)invokeLifecycle(
-            item.entity,
-            *item.instance,
-            item.instance->onFixedUpdate,
+            ref.entity,
+            instance,
+            instance.onFixedUpdate,
             {fixedDeltaTime},
             "OnFixedUpdate");
     }
 }
 
 void SceneScriptRuntime::lateUpdate(double deltaTime) {
-    struct TickItem {
-        int order = 0;
-        SceneEntityId entity = 0;
-        std::size_t compIndex = 0;
-        Instance* instance = nullptr;
-    };
-    std::vector<TickItem> items;
-    for (auto& [entity, components] : instances_) {
-        if (!isActiveInHierarchy(entity)) continue;
-        for (std::size_t idx = 0; idx < components.size(); ++idx) {
-            auto& instance = components[idx];
-            if (!instance.enabled || !shouldTickInCurrentMode(instance)) continue;
-            if (!instance.started && executionMode_ == SceneExecutionMode::Play) {
-                continue;
-            }
-            items.push_back(TickItem{instance.executionOrder, entity, idx, &instance});
+    rebuildTickOrderIfNeeded();
+    const auto snapshot = cachedTickOrder_;
+    for (const auto& ref : snapshot) {
+        if (!isActiveInHierarchy(ref.entity)) continue;
+        const auto it = instances_.find(ref.entity);
+        if (it == instances_.end() || ref.compIndex >= it->second.size()) continue;
+        auto& instance = it->second[ref.compIndex];
+        if (!instance.enabled || !shouldTickInCurrentMode(instance)) continue;
+        if (!instance.started && executionMode_ == SceneExecutionMode::Play) {
+            continue;
         }
-    }
-    std::sort(items.begin(), items.end(), [](const TickItem& a, const TickItem& b) {
-        if (a.order != b.order) return a.order < b.order;
-        if (a.entity != b.entity) return a.entity < b.entity;
-        return a.compIndex < b.compIndex;
-    });
-    for (auto& item : items) {
         (void)invokeLifecycle(
-            item.entity, *item.instance, item.instance->onLateUpdate, {deltaTime}, "OnLateUpdate");
+            ref.entity, instance, instance.onLateUpdate, {deltaTime}, "OnLateUpdate");
     }
 }
 
@@ -599,8 +802,10 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
 
     runtime_.replaceProgram(newProgram);
     methodCache_.clear();
+    tickOrderDirty_ = true;
 
     std::unordered_map<std::uint64_t, runtime::ObjectRef> migratedRefMap;
+    std::unordered_map<std::string, std::optional<ScriptObject>> prototypeCache;
 
     for (auto& [entity, components] : instances_) {
         const auto& savedList = savedEntities[entity];
@@ -667,6 +872,22 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                     }
                 }
                 if (isInstanceField) {
+                    auto protoIt = prototypeCache.find(saved.canonicalTypeName);
+                    if (protoIt == prototypeCache.end()) {
+                        runtime::RuntimeError protoErr;
+                        protoIt = prototypeCache
+                                      .emplace(
+                                          saved.canonicalTypeName,
+                                          runtime_.createPrototypeObject(*newType, protoErr))
+                                      .first;
+                    }
+                    if (protoIt->second) {
+                        if (auto protoVal = runtime_.heap()->fieldGet(
+                                protoIt->second->reference(), newField.index)) {
+                            (void)runtime_.heap()->fieldSet(
+                                newObj->reference(), newField.index, *protoVal, &allocError);
+                        }
+                    }
                     ++report.fieldsDefaulted;
                 }
             }
@@ -684,7 +905,7 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         }
     }
 
-    // Patch cross-component ObjectRef fields and delegate targets to point to migrated instances
+    // Patch cross-component ObjectRef fields (including inside Arrays and Structs) and delegate targets
     if (!migratedRefMap.empty()) {
         std::unordered_set<std::uint64_t> visited;
         for (auto& [entity, components] : instances_) {
@@ -695,6 +916,19 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                     instance.object.reference(),
                     migratedRefMap,
                     visited);
+            }
+        }
+    }
+
+    // Rebind wired signal connections to updated method SymbolIds and migrated ObjectRefs
+    if (!signalConnections_.empty()) {
+        std::set<std::tuple<SceneEntityId, std::string, std::string>> uniqueSources;
+        for (const auto& conn : signalConnections_) {
+            uniqueSources.emplace(conn.sourceEntity, conn.sourceComponent, conn.signalName);
+        }
+        for (const auto& [srcEnt, srcComp, sigName] : uniqueSources) {
+            if (rebuildSignalDelegateChain(srcEnt, srcComp, sigName)) {
+                ++report.signalsRebound;
             }
         }
     }
@@ -769,6 +1003,141 @@ bool SceneScriptRuntime::setInspectorMember(
     return false;
 }
 
+bool SceneScriptRuntime::rebuildSignalDelegateChain(
+    SceneEntityId sourceEntity,
+    const std::string& sourceComponent,
+    const std::string& signalName) {
+    ScriptObject* srcObj = sourceComponent.empty()
+        ? object(sourceEntity)
+        : getComponent(sourceEntity, sourceComponent);
+    if (!srcObj || signalName.empty()) return false;
+
+    const std::string backingFieldName = "$event_" + signalName + "_delegate";
+    const semantic::FieldSymbol* eventField = nullptr;
+    for (const auto& field : srcObj->type().descriptor.fields) {
+        if (field.name == backingFieldName &&
+            field.type == semantic::PrimitiveType::Object) {
+            eventField = &field;
+            break;
+        }
+    }
+    if (!eventField) return false;
+
+    const auto delegateType = runtime_.findType(eventField->typeName);
+    if (!delegateType || !delegateType->descriptor.delegateType) return false;
+
+    const semantic::FunctionSymbol* invokeSig = nullptr;
+    for (const auto& method : delegateType->descriptor.methods) {
+        if (method.name == "Invoke") {
+            invokeSig = &method;
+            break;
+        }
+    }
+    if (!invokeSig) return false;
+    const std::size_t arity = invokeSig->parameters.size() > 0
+        ? invokeSig->parameters.size() - 1u
+        : 0u;
+
+    runtime::RuntimeError error;
+    std::optional<runtime::ObjectRef> chainHead;
+
+    for (const auto& conn : signalConnections_) {
+        if (conn.sourceEntity != sourceEntity || conn.signalName != signalName) {
+            continue;
+        }
+        if (!sourceComponent.empty() && !conn.sourceComponent.empty() &&
+            !matchesComponentType(srcObj->type(), conn.sourceComponent)) {
+            continue;
+        }
+        ScriptObject* dstObj = conn.targetComponent.empty()
+            ? object(conn.targetEntity)
+            : getComponent(conn.targetEntity, conn.targetComponent);
+        if (!dstObj) continue;
+
+        const auto dstMethod = runtime_.findMethod(dstObj->type(), conn.targetMethod, arity);
+        if (!dstMethod || !dstMethod->instance()) continue;
+
+        const auto symbolId = dstMethod->descriptor.id;
+        const auto lowWord = static_cast<std::int64_t>(symbolId & 0xffffffffULL);
+        const auto highWord = static_cast<std::int64_t>((symbolId >> 32u) & 0xffffffffULL);
+        std::vector<runtime::Value> leafFields{
+            dstObj->value(),
+            lowWord,
+            highWord,
+            std::int64_t{0},
+            std::int64_t{0},
+            std::int64_t{0},
+            std::int64_t{0},
+            runtime::NullObject{},
+        };
+        const auto leafRef = runtime_.heap()->allocateObject(
+            delegateType->descriptor.id, std::move(leafFields), {0u, 7u}, &error);
+        if (!leafRef) return false;
+
+        if (!chainHead) {
+            chainHead = *leafRef;
+        } else {
+            std::vector<runtime::Value> combinedFields{
+                *chainHead,
+                std::int64_t{0},
+                std::int64_t{0},
+                std::int64_t{4},
+                std::int64_t{0},
+                std::int64_t{0},
+                std::int64_t{0},
+                *leafRef,
+            };
+            const auto combinedRef = runtime_.heap()->allocateObject(
+                delegateType->descriptor.id, std::move(combinedFields), {0u, 7u}, &error);
+            if (!combinedRef) return false;
+            chainHead = *combinedRef;
+        }
+    }
+
+    if (!chainHead) {
+        return runtime_.heap()->fieldSet(
+            srcObj->reference(), eventField->index, runtime::NullObject{}, &error);
+    }
+    return runtime_.heap()->fieldSet(
+        srcObj->reference(), eventField->index, *chainHead, &error);
+}
+
+void SceneScriptRuntime::removeSignalsForEntityOrComponent(
+    SceneEntityId entity,
+    const std::string& removedComponentType) {
+    if (signalConnections_.empty()) return;
+
+    const auto matchesRemoved = [&](SceneEntityId ent, const std::string& compName) {
+        if (ent != entity) return false;
+        if (removedComponentType.empty()) return true;
+        if (compName.empty()) return false;
+        if (compName == removedComponentType) return true;
+        if (const auto* compObj = getComponent(entity, compName)) {
+            return compObj->type().canonicalName() == removedComponentType;
+        }
+        return false;
+    };
+
+    std::set<std::tuple<SceneEntityId, std::string, std::string>> affectedSources;
+    for (auto it = signalConnections_.begin(); it != signalConnections_.end();) {
+        const bool srcRemoved = matchesRemoved(it->sourceEntity, it->sourceComponent);
+        const bool dstRemoved = matchesRemoved(it->targetEntity, it->targetComponent);
+        if (srcRemoved || dstRemoved) {
+            if (!srcRemoved) {
+                affectedSources.emplace(
+                    it->sourceEntity, it->sourceComponent, it->signalName);
+            }
+            it = signalConnections_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    for (const auto& [srcEnt, srcComp, sigName] : affectedSources) {
+        (void)rebuildSignalDelegateChain(srcEnt, srcComp, sigName);
+    }
+}
+
 bool SceneScriptRuntime::connectSignal(
     SceneEntityId sourceEntity,
     const std::string& sourceComponent,
@@ -815,55 +1184,66 @@ bool SceneScriptRuntime::connectSignal(
     const auto dstMethod = runtime_.findMethod(dstObj->type(), targetMethod, arity);
     if (!dstMethod || !dstMethod->instance()) return false;
 
-    // Construct leaf delegate object matching Interpreter::NewDelegate layout
-    const auto symbolId = dstMethod->descriptor.id;
-    const auto lowWord = static_cast<std::int64_t>(symbolId & 0xffffffffULL);
-    const auto highWord = static_cast<std::int64_t>((symbolId >> 32u) & 0xffffffffULL);
-    std::vector<runtime::Value> leafFields{
-        dstObj->value(),
-        lowWord,
-        highWord,
-        std::int64_t{0},
-        std::int64_t{0},
-        std::int64_t{0},
-        std::int64_t{0},
-        runtime::NullObject{},
-    };
-    runtime::RuntimeError error;
-    const auto leafRef = runtime_.heap()->allocateObject(
-        delegateType->descriptor.id, std::move(leafFields), {0u, 7u}, &error);
-    if (!leafRef) return false;
+    const std::string resolvedSrcComp = srcObj->type().canonicalName();
+    const std::string resolvedDstComp = dstObj->type().canonicalName();
 
-    const auto existingVal = runtime_.heap()->fieldGet(
-        srcObj->reference(), eventField->index);
-    if (!existingVal || std::holds_alternative<runtime::NullObject>(*existingVal)) {
-        return runtime_.heap()->fieldSet(
-            srcObj->reference(), eventField->index, *leafRef, &error);
+    for (const auto& existing : signalConnections_) {
+        if (existing.sourceEntity == sourceEntity &&
+            existing.sourceComponent == resolvedSrcComp &&
+            existing.signalName == signalName &&
+            existing.targetEntity == targetEntity &&
+            existing.targetComponent == resolvedDstComp &&
+            existing.targetMethod == targetMethod) {
+            return true;
+        }
     }
 
-    const auto* existingRef = std::get_if<runtime::ObjectRef>(&*existingVal);
-    if (!existingRef || !existingRef->valid()) {
-        return runtime_.heap()->fieldSet(
-            srcObj->reference(), eventField->index, *leafRef, &error);
+    signalConnections_.push_back(SignalConnection{
+        sourceEntity,
+        resolvedSrcComp,
+        signalName,
+        targetEntity,
+        resolvedDstComp,
+        targetMethod,
+    });
+    return rebuildSignalDelegateChain(sourceEntity, resolvedSrcComp, signalName);
+}
+
+bool SceneScriptRuntime::disconnectSignal(
+    SceneEntityId sourceEntity,
+    const std::string& sourceComponent,
+    const std::string& signalName,
+    SceneEntityId targetEntity,
+    const std::string& targetComponent,
+    const std::string& targetMethod) {
+    ScriptObject* srcObj = sourceComponent.empty()
+        ? object(sourceEntity)
+        : getComponent(sourceEntity, sourceComponent);
+    ScriptObject* dstObj = targetComponent.empty()
+        ? object(targetEntity)
+        : getComponent(targetEntity, targetComponent);
+    const std::string resolvedSrcComp = srcObj ? srcObj->type().canonicalName() : sourceComponent;
+    const std::string resolvedDstComp = dstObj ? dstObj->type().canonicalName() : targetComponent;
+
+    bool removedAny = false;
+    for (auto it = signalConnections_.begin(); it != signalConnections_.end();) {
+        const bool srcMatch = it->sourceEntity == sourceEntity &&
+            (sourceComponent.empty() || it->sourceComponent == resolvedSrcComp ||
+             it->sourceComponent == sourceComponent);
+        const bool sigMatch = it->signalName == signalName;
+        const bool dstMatch = it->targetEntity == targetEntity &&
+            (targetComponent.empty() || it->targetComponent == resolvedDstComp ||
+             it->targetComponent == targetComponent) &&
+            (targetMethod.empty() || it->targetMethod == targetMethod);
+        if (srcMatch && sigMatch && dstMatch) {
+            it = signalConnections_.erase(it);
+            removedAny = true;
+        } else {
+            ++it;
+        }
     }
-
-    // Combine into a multicast node (flags = 4, field[0] = existing, field[7] = leaf)
-    std::vector<runtime::Value> combinedFields{
-        *existingRef,
-        std::int64_t{0},
-        std::int64_t{0},
-        std::int64_t{4},
-        std::int64_t{0},
-        std::int64_t{0},
-        std::int64_t{0},
-        *leafRef,
-    };
-    const auto combinedRef = runtime_.heap()->allocateObject(
-        delegateType->descriptor.id, std::move(combinedFields), {0u, 7u}, &error);
-    if (!combinedRef) return false;
-
-    return runtime_.heap()->fieldSet(
-        srcObj->reference(), eventField->index, *combinedRef, &error);
+    if (!removedAny) return false;
+    return rebuildSignalDelegateChain(sourceEntity, resolvedSrcComp, signalName);
 }
 
 std::optional<SceneScriptRuntime::ComponentLocation>
@@ -892,6 +1272,14 @@ bool SceneScriptRuntime::setParent(SceneEntityId child, SceneEntityId parent) {
         cursor = (pIt == parentByEntity_.end()) ? BroadcastTarget : pIt->second;
     }
 
+    if (entityActiveSelf_.find(child) == entityActiveSelf_.end()) {
+        entityActiveSelf_[child] = true;
+    }
+    if (parent != BroadcastTarget &&
+        entityActiveSelf_.find(parent) == entityActiveSelf_.end()) {
+        entityActiveSelf_[parent] = true;
+    }
+
     const auto oldParentIt = parentByEntity_.find(child);
     if (oldParentIt != parentByEntity_.end()) {
         const auto oldParent = oldParentIt->second;
@@ -911,6 +1299,7 @@ bool SceneScriptRuntime::setParent(SceneEntityId child, SceneEntityId parent) {
             children.push_back(child);
         }
     }
+    invalidateTransformSubtree(child);
     return true;
 }
 
@@ -947,7 +1336,11 @@ void SceneScriptRuntime::setLocalTransform(
     SceneEntityId entity,
     const Transform3D& transform) {
     if (entity == BroadcastTarget) return;
+    if (entityActiveSelf_.find(entity) == entityActiveSelf_.end()) {
+        entityActiveSelf_[entity] = true;
+    }
     localTransforms_[entity] = transform;
+    invalidateTransformSubtree(entity);
 }
 
 Transform3D SceneScriptRuntime::getLocalTransform(
@@ -959,25 +1352,27 @@ Transform3D SceneScriptRuntime::getLocalTransform(
 Transform3D SceneScriptRuntime::getWorldTransform(
     SceneEntityId entity) const noexcept {
     if (entity == BroadcastTarget) return Transform3D::identity();
-    std::vector<SceneEntityId> chain;
-    SceneEntityId cursor = entity;
-    while (cursor != BroadcastTarget) {
-        chain.push_back(cursor);
-        const auto pIt = parentByEntity_.find(cursor);
-        cursor = (pIt == parentByEntity_.end()) ? BroadcastTarget : pIt->second;
+    const auto cachedIt = worldTransformCache_.find(entity);
+    if (cachedIt != worldTransformCache_.end()) {
+        return cachedIt->second;
     }
-    Transform3D world = Transform3D::identity();
-    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-        world = Transform3D::combine(world, getLocalTransform(*it));
-    }
+    const SceneEntityId parentId = getParent(entity);
+    const Transform3D world = (parentId == BroadcastTarget)
+        ? getLocalTransform(entity)
+        : Transform3D::combine(getWorldTransform(parentId), getLocalTransform(entity));
+    worldTransformCache_[entity] = world;
     return world;
 }
 
 void SceneScriptRuntime::setLocalPosition2D(SceneEntityId entity, Vec2 position) {
     if (entity == BroadcastTarget) return;
+    if (entityActiveSelf_.find(entity) == entityActiveSelf_.end()) {
+        entityActiveSelf_[entity] = true;
+    }
     Transform3D t = getLocalTransform(entity);
     t.position = Vec3{position.x, position.y, t.position.z};
     localTransforms_[entity] = t;
+    invalidateTransformSubtree(entity);
 }
 
 Vec2 SceneScriptRuntime::getWorldPosition2D(SceneEntityId entity) const noexcept {
@@ -1021,32 +1416,161 @@ SceneEntityId SceneScriptRuntime::instantiatePrefab(
     SceneEntityId parent,
     const std::map<std::string, runtime::Value>& rootMemberOverrides) {
     if (nextEntityId == 0) nextEntityId = 1;
-    const SceneEntityId entityId = nextEntityId++;
-    entityActiveSelf_[entityId] = true;
-    localTransforms_[entityId] = prefab.localTransform;
-    if (parent != BroadcastTarget) {
-        (void)setParent(entityId, parent);
+
+    struct PendingActivation {
+        int order = 0;
+        SceneEntityId entity = 0;
+        std::size_t compIndex = 0;
+        runtime::Value owner;
+    };
+    std::vector<PendingActivation> activations;
+
+    // Phase 1: Allocate all entities, transforms, hierarchy links, and component instances
+    const auto allocateTree = [&](
+        const auto& self,
+        const PrefabNodeTemplate& node,
+        SceneEntityId parentId,
+        bool isRoot) -> SceneEntityId {
+        const SceneEntityId entityId = nextEntityId++;
+        entityActiveSelf_[entityId] = true;
+        localTransforms_[entityId] = node.localTransform;
+        if (parentId != BroadcastTarget) {
+            (void)setParent(entityId, parentId);
+        }
+        for (std::size_t i = 0; i < node.components.size(); ++i) {
+            SceneScriptOptions opts = node.components[i].options;
+            runtime::Value ownerCopy = opts.owner;
+            std::size_t compIdx = 0;
+            if (!attachComponentWithoutLifecycle(
+                    entityId, node.components[i].scriptType, std::move(opts), compIdx)) {
+                return BroadcastTarget;
+            }
+            const int order = instances_[entityId][compIdx].executionOrder;
+            activations.push_back(PendingActivation{
+                order, entityId, compIdx, std::move(ownerCopy)});
+        }
+        // Validate [RequireComponent] after all components on this entity have been allocated
+        const auto instIt = instances_.find(entityId);
+        if (instIt != instances_.end()) {
+            for (const auto& comp : instIt->second) {
+                for (const auto& reqType : findRequiredComponents(
+                         runtime_.program().get(), comp.object.type().canonicalName())) {
+                    if (!hasComponent(entityId, reqType)) {
+                        runtime::RuntimeError error;
+                        error.code = runtime::ErrorCode::InvalidArguments;
+                        error.message = "missing required component '" + reqType +
+                            "' for '" + comp.object.type().canonicalName() + "'";
+                        recordError(entityId, "RequireComponent", error);
+                        return BroadcastTarget;
+                    }
+                }
+            }
+        }
+        if (isRoot && !rootMemberOverrides.empty()) {
+            for (const auto& [k, v] : rootMemberOverrides) {
+                bool applied = false;
+                if (instIt != instances_.end()) {
+                    for (auto& comp : instIt->second) {
+                        runtime::RuntimeError err;
+                        if (runtime_.setMember(comp.object, k, v, err, executionOptions_)) {
+                            applied = true;
+                            break;
+                        }
+                    }
+                }
+                if (!applied) {
+                    runtime::RuntimeError err;
+                    err.code = runtime::ErrorCode::InvalidArguments;
+                    err.message = "override member '" + k + "' not found on root prefab entity";
+                    recordError(entityId, "SetInspectorMember:" + k, err);
+                    return BroadcastTarget;
+                }
+            }
+        }
+        for (const auto& childPrefab : node.children) {
+            if (self(self, childPrefab, entityId, false) == BroadcastTarget) {
+                return BroadcastTarget;
+            }
+        }
+        return entityId;
+    };
+
+    const SceneEntityId rootEntityId = allocateTree(allocateTree, prefab, parent, true);
+    if (rootEntityId == BroadcastTarget) {
+        return BroadcastTarget;
     }
-    for (std::size_t i = 0; i < prefab.components.size(); ++i) {
-        SceneScriptOptions opts = prefab.components[i].options;
-        if (!attachComponent(entityId, prefab.components[i].scriptType, std::move(opts))) {
-            (void)detach(entityId);
+
+    // Phase 2: Sort all newly instantiated components by (ExecutionOrder, EntityId, CompIndex)
+    // and invoke OnCreate followed by OnEnable
+    std::sort(
+        activations.begin(),
+        activations.end(),
+        [](const PendingActivation& a, const PendingActivation& b) {
+            if (a.order != b.order) return a.order < b.order;
+            if (a.entity != b.entity) return a.entity < b.entity;
+            return a.compIndex < b.compIndex;
+        });
+
+    for (auto& item : activations) {
+        auto& stored = instances_[item.entity][item.compIndex];
+        const bool hasOwner = !std::holds_alternative<std::monostate>(item.owner);
+        if (hasOwner && stored.onCreate1) {
+            if (!invokeLifecycle(
+                    item.entity, stored, stored.onCreate1, {std::move(item.owner)}, "OnCreate")) {
+                (void)detach(rootEntityId);
+                return BroadcastTarget;
+            }
+        } else if (!invokeLifecycle(
+                item.entity, stored, stored.onCreate0, {}, "OnCreate")) {
+            (void)detach(rootEntityId);
             return BroadcastTarget;
         }
-    }
-    for (const auto& [k, v] : rootMemberOverrides) {
-        if (!setInspectorMember(entityId, std::string{}, k, v)) {
-            (void)detach(entityId);
-            return BroadcastTarget;
+        if (stored.onValidate && !rootMemberOverrides.empty() && item.entity == rootEntityId) {
+            if (!invokeLifecycle(
+                    item.entity, stored, stored.onValidate, {}, "OnValidate")) {
+                (void)detach(rootEntityId);
+                return BroadcastTarget;
+            }
         }
     }
-    for (const auto& childPrefab : prefab.children) {
-        if (instantiatePrefab(childPrefab, nextEntityId, entityId) == BroadcastTarget) {
-            (void)detach(entityId);
-            return BroadcastTarget;
+
+    for (auto& item : activations) {
+        auto& stored = instances_[item.entity][item.compIndex];
+        if (stored.enabled && isActiveInHierarchy(item.entity)) {
+            if (!invokeLifecycle(
+                    item.entity, stored, stored.onEnable, {}, "OnEnable")) {
+                (void)detach(rootEntityId);
+                return BroadcastTarget;
+            }
         }
     }
-    return entityId;
+
+    tickOrderDirty_ = true;
+    invalidateTransformSubtree(rootEntityId);
+    return rootEntityId;
+}
+
+std::uint32_t SceneScriptRuntime::spawnEntityFiber(
+    SceneEntityId entity,
+    const runtime::CompiledFiberModule& module,
+    const std::string& functionName,
+    std::uint8_t ownerGroupId,
+    std::uint32_t seed) {
+    if (!fiberScheduler_ || entity == BroadcastTarget || !isActiveInHierarchy(entity)) {
+        return 0;
+    }
+    return fiberScheduler_->spawnFunction(
+        module,
+        functionName,
+        runtime::GenerationalEntityHandle{static_cast<std::uint32_t>(entity), 1u},
+        ownerGroupId,
+        0u,
+        seed);
+}
+
+std::uint64_t SceneScriptRuntime::stepFibers(std::uint32_t currentTick) {
+    if (!fiberScheduler_) return 0;
+    return fiberScheduler_->stepTick(currentTick);
 }
 
 } // namespace realscript::game

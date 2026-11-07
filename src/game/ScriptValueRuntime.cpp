@@ -83,16 +83,16 @@ runtime::Value ScriptRuntime::defaultValue(
             visiting.erase(typeId);
             return runtime::StructValue{};
         }
-        auto storage = std::make_shared<runtime::StructStorage>();
-        storage->fields.reserve(descriptor->fields.size());
+        std::vector<runtime::Value> fields;
+        fields.reserve(descriptor->fields.size());
         for (const auto& field : descriptor->fields) {
-            storage->fields.push_back(defaultValue(
+            fields.push_back(defaultValue(
                 field.type,
                 exactTypeId(field.type, field.typeName),
                 visiting));
         }
         visiting.erase(typeId);
-        return runtime::StructValue{typeId, std::move(storage)};
+        return runtime::makeStructValueFromFields(typeId, std::move(fields));
     }
     case semantic::PrimitiveType::Null:
     case semantic::PrimitiveType::Void:
@@ -152,7 +152,7 @@ bool ScriptRuntime::valueMatches(
         const auto actualTypeId = runtime::structValueTypeId(value);
         if (!actualTypeId || *actualTypeId == 0 || *actualTypeId != typeId) return false;
         if (const auto* structure = std::get_if<runtime::StructValue>(&value)) {
-            return structure->storage != nullptr;
+            return structure->valid();
         }
         return true;
     }
@@ -364,6 +364,119 @@ bool ScriptRuntime::writeArrayVec2(
         raw[i] = runtime::Vec2Value{values[i].x.raw, values[i].y.raw};
     }
     return heap_->writePackedVec2Array(arrayRef, raw.data(), raw.size(), &error);
+}
+
+std::optional<runtime::Value> ScriptRuntime::createStruct(
+    const std::string& canonicalTypeName,
+    const std::vector<runtime::Value>& fieldValues,
+    runtime::RuntimeError& error) const {
+    const auto type = findType(canonicalTypeName);
+    if (!type || type->descriptor.kind != semantic::TypeKind::Struct) {
+        error.code = runtime::ErrorCode::TypeMismatch;
+        error.message = "type '" + canonicalTypeName + "' is not a struct";
+        return std::nullopt;
+    }
+    if (fieldValues.size() != type->descriptor.fields.size()) {
+        error.code = runtime::ErrorCode::InvalidArguments;
+        error.message = "struct '" + canonicalTypeName + "' expects " +
+            std::to_string(type->descriptor.fields.size()) + " fields";
+        return std::nullopt;
+    }
+    for (std::size_t idx = 0; idx < fieldValues.size(); ++idx) {
+        const auto& field = type->descriptor.fields[idx];
+        const auto expectedTypeId = exactTypeId(field.type, field.typeName);
+        if (!valueMatches(fieldValues[idx], field.type, expectedTypeId)) {
+            error.code = runtime::ErrorCode::TypeMismatch;
+            error.message = "field '" + field.name + "' type mismatch in struct '" +
+                canonicalTypeName + "'";
+            return std::nullopt;
+        }
+    }
+    std::vector<runtime::Value> copy = fieldValues;
+    return runtime::makeStructValueFromFields(type->descriptor.id, std::move(copy));
+}
+
+bool ScriptRuntime::setEcsComponentColumn(
+    const std::string& canonicalTypeName,
+    const std::vector<runtime::Value>& components,
+    runtime::RuntimeError& error) const {
+    if (!heap_) {
+        error.code = runtime::ErrorCode::InvalidProgram;
+        error.message = "script runtime has no managed heap";
+        return false;
+    }
+    const auto type = findType(canonicalTypeName);
+    if (!type) {
+        error.code = runtime::ErrorCode::TypeMismatch;
+        error.message = "unknown ECS component type '" + canonicalTypeName + "'";
+        return false;
+    }
+    const semantic::PrimitiveType elemPrim =
+        type->descriptor.kind == semantic::TypeKind::Struct
+            ? semantic::PrimitiveType::Struct
+            : (type->descriptor.kind == semantic::TypeKind::Class
+                   ? semantic::PrimitiveType::Object
+                   : semantic::PrimitiveType::Enum);
+    for (const auto& elem : components) {
+        if (!valueMatches(elem, elemPrim, type->descriptor.id)) {
+            error.code = runtime::ErrorCode::TypeMismatch;
+            error.message = "ECS component column element does not match '" +
+                type->canonicalName() + "'";
+            return false;
+        }
+    }
+    const std::string arrayName = semantic::arrayTypeName(elemPrim, type->canonicalName());
+    const auto arrayTypeId = semantic::stableTypeId(arrayName);
+    std::unordered_set<semantic::SymbolId> visiting;
+    const runtime::Value defaultElem = defaultValue(elemPrim, type->descriptor.id, visiting);
+    const auto arrayRef = heap_->allocateTypedArray(
+        arrayTypeId,
+        elemPrim,
+        type->descriptor.id,
+        components.size(),
+        defaultElem,
+        &error);
+    if (!arrayRef) return false;
+    for (std::size_t idx = 0; idx < components.size(); ++idx) {
+        if (!heap_->arraySet(*arrayRef, idx, components[idx], &error)) {
+            return false;
+        }
+    }
+    const auto colSymbolId = semantic::stableTypeId("$ecs_column::" + type->canonicalName());
+    heap_->setStaticField(colSymbolId, *arrayRef);
+    return true;
+}
+
+bool ScriptRuntime::getEcsComponentColumn(
+    const std::string& canonicalTypeName,
+    std::vector<runtime::Value>& outComponents,
+    runtime::RuntimeError& error) const {
+    outComponents.clear();
+    if (!heap_) {
+        error.code = runtime::ErrorCode::InvalidProgram;
+        error.message = "script runtime has no managed heap";
+        return false;
+    }
+    const auto type = findType(canonicalTypeName);
+    if (!type) {
+        error.code = runtime::ErrorCode::TypeMismatch;
+        error.message = "unknown ECS component type '" + canonicalTypeName + "'";
+        return false;
+    }
+    const auto colSymbolId = semantic::stableTypeId("$ecs_column::" + type->canonicalName());
+    const auto val = heap_->getStaticField(colSymbolId);
+    if (!val) return true;
+    const auto* arrayRef = std::get_if<runtime::ObjectRef>(&*val);
+    if (!arrayRef || !arrayRef->valid()) return true;
+    const auto len = heap_->arrayLength(*arrayRef);
+    if (!len) return false;
+    outComponents.reserve(*len);
+    for (std::size_t idx = 0; idx < *len; ++idx) {
+        const auto elem = heap_->arrayGet(*arrayRef, idx);
+        if (!elem) return false;
+        outComponents.push_back(*elem);
+    }
+    return true;
 }
 
 } // namespace realscript::game

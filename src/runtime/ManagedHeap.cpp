@@ -248,7 +248,8 @@ struct ManagedHeap::Impl {
             return get(*reference) != nullptr;
         }
         if (const auto* structure = std::get_if<StructValue>(&value)) {
-            if (structure->typeId == 0 || !structure->storage) return false;
+            if (!structure->valid()) return false;
+            if (!structure->storage) return true;
             if (!visitedStructs.insert(structure->storage.get()).second) return true;
             for (const auto& field : structure->storage->fields) {
                 if (!validRootValue(field, visitedStructs)) return false;
@@ -570,7 +571,7 @@ bool ManagedHeap::arraySet(
         const auto actualTypeId = structValueTypeId(value);
         const auto* structure = std::get_if<StructValue>(&value);
         if (!actualTypeId || *actualTypeId != object->header.elementTypeId ||
-            (structure && !structure->storage)) {
+            (structure && !structure->valid())) {
             setHeapError(error, ErrorCode::TypeMismatch,
                 "managed array struct element type mismatch");
             return false;

@@ -1300,7 +1300,47 @@ private:
         }
         case syntax::SyntaxKind::ForeachStatement: {
             auto& value = static_cast<syntax::ForeachStatementSyntax&>(statement);
+            if (value.collection &&
+                value.collection->kind() == syntax::SyntaxKind::CallExpression) {
+                auto& call = static_cast<syntax::CallExpressionSyntax&>(*value.collection);
+                if (call.identifierToken.text == "Query" && call.lessToken.has_value()) {
+                    for (std::size_t idx = 0; idx < call.typeArguments.size(); ++idx) {
+                        auto& qArg = call.typeArguments[idx];
+                        syntax::TypeSyntax* compType = &qArg;
+                        if ((qArg.name.text == "Write" || qArg.name.text == "Read") &&
+                            qArg.typeArguments.size() == 1) {
+                            compType = &qArg.typeArguments[0];
+                        }
+                        rewriteType(*compType, moduleName, sourceName, queue);
+                        syntax::TypeSyntax* bType = (idx == 0)
+                            ? &value.type
+                            : (idx - 1 < value.additionalBindings.size()
+                                ? &value.additionalBindings[idx - 1].type
+                                : nullptr);
+                        const std::string bName = (idx == 0)
+                            ? value.identifierToken.text
+                            : (idx - 1 < value.additionalBindings.size()
+                                ? value.additionalBindings[idx - 1].identifierToken.text
+                                : std::string{});
+                        if (bType) {
+                            if (bType->name.text == "var") {
+                                *bType = *compType;
+                            } else {
+                                rewriteType(*bType, moduleName, sourceName, queue);
+                            }
+                            if (!bName.empty()) {
+                                localTypes_[bName] = typeText(*bType);
+                            }
+                        }
+                    }
+                    rewriteStatement(*value.body, moduleName, sourceName, queue);
+                    return;
+                }
+            }
             rewriteType(value.type, moduleName, sourceName, queue);
+            for (auto& extra : value.additionalBindings) {
+                rewriteType(extra.type, moduleName, sourceName, queue);
+            }
             rewriteExpression(*value.collection, moduleName, sourceName, queue);
             rewriteStatement(*value.body, moduleName, sourceName, queue);
             return;

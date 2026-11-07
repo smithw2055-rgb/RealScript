@@ -259,15 +259,47 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
         return std::string(s.substr(b, e - b));
     };
 
+    // Strip C and C++ comments while preserving newlines
+    std::string cleaned;
+    cleaned.reserve(headerContent.size());
+    for (std::size_t i = 0; i < headerContent.size();) {
+        if (i + 1 < headerContent.size() && headerContent[i] == '/' && headerContent[i + 1] == '/') {
+            i += 2;
+            while (i < headerContent.size() && headerContent[i] != '\n') ++i;
+        } else if (i + 1 < headerContent.size() && headerContent[i] == '/' && headerContent[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < headerContent.size() && !(headerContent[i] == '*' && headerContent[i + 1] == '/')) {
+                if (headerContent[i] == '\n') cleaned.push_back('\n');
+                ++i;
+            }
+            if (i + 1 < headerContent.size()) i += 2;
+        } else {
+            cleaned.push_back(headerContent[i]);
+            ++i;
+        }
+    }
+
     const auto mapCppTypeToRs = [&](std::string cppType) -> std::string {
-        if (cppType.rfind("const ", 0) == 0) {
-            cppType = trim(cppType.substr(6));
+        cppType = trim(cppType);
+        if (cppType.rfind("virtual ", 0) == 0) cppType = trim(cppType.substr(8));
+        if (cppType.rfind("inline ", 0) == 0) cppType = trim(cppType.substr(7));
+        if (cppType.rfind("constexpr ", 0) == 0) cppType = trim(cppType.substr(10));
+        if (cppType.rfind("const ", 0) == 0) cppType = trim(cppType.substr(6));
+        if (cppType.rfind("std::shared_ptr<", 0) == 0 && cppType.back() == '>') {
+            cppType = trim(cppType.substr(16, cppType.size() - 17));
+        } else if (cppType.rfind("shared_ptr<", 0) == 0 && cppType.back() == '>') {
+            cppType = trim(cppType.substr(11, cppType.size() - 12));
         }
         while (!cppType.empty() && (cppType.back() == '&' || cppType.back() == '*' || cppType.back() == ' ')) {
             cppType.pop_back();
         }
+        if (cppType.size() > 6 && cppType.compare(cppType.size() - 6, 6, " const") == 0) {
+            cppType = trim(cppType.substr(0, cppType.size() - 6));
+        }
         if (cppType == "int" || cppType == "int32_t" || cppType == "std::int32_t") return "int";
         if (cppType == "int64_t" || cppType == "std::int64_t" || cppType == "long") return "long";
+        if (cppType == "uint32_t" || cppType == "std::uint32_t" || cppType == "unsigned int") return "uint";
+        if (cppType == "uint64_t" || cppType == "std::uint64_t") return "ulong";
         if (cppType == "float") return "float";
         if (cppType == "double") return "double";
         if (cppType == "bool") return "bool";
@@ -276,8 +308,24 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
         if (cppType.find("Vec2") != std::string::npos) return "Vec2";
         if (cppType.find("Vec3") != std::string::npos) return "Vec3";
         if (cppType.find("Quat") != std::string::npos) return "Quat";
+        if (cppType.find("Fixed16") != std::string::npos) return "Fixed16";
         if (cppType.find("Fixed") != std::string::npos) return "Fixed";
+        const auto nsPos = cppType.rfind("::");
+        if (nsPos != std::string::npos) {
+            return cppType.substr(nsPos + 2);
+        }
         return cppType;
+    };
+
+    const auto dummyRsReturn = [](const std::string& rsRet) -> std::string {
+        if (rsRet == "void") return "return;";
+        if (rsRet == "bool") return "return false;";
+        if (rsRet == "string") return "return \"\";";
+        if (rsRet == "float" || rsRet == "double") return "return 0.0;";
+        if (rsRet == "Vec2" || rsRet == "Vec3" || rsRet == "Quat" || rsRet == "Fixed" || rsRet == "Fixed16") {
+            return "return new " + rsRet + "();";
+        }
+        return "return 0;";
     };
 
     cppOut << "// Auto-generated RealScript C++ Binding Registration\n";
@@ -289,14 +337,23 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
     std::string currentClass;
     std::string currentClassModule = defaultModuleName;
     bool pendingClassExport = false;
+    bool pendingEnumExport = false;
     bool pendingMethodExport = false;
     bool pendingFuncExport = false;
 
+    struct PendingProperty {
+        std::string propName;
+        std::string getterMethod;
+        std::string setterMethod;
+        std::string rsType = "int";
+    };
+    std::vector<PendingProperty> pendingClassProperties;
+
     std::size_t pos = 0;
-    while (pos < headerContent.size()) {
-        std::size_t endLine = headerContent.find('\n', pos);
-        if (endLine == std::string_view::npos) endLine = headerContent.size();
-        std::string line = trim(headerContent.substr(pos, endLine - pos));
+    while (pos < cleaned.size()) {
+        std::size_t endLine = cleaned.find('\n', pos);
+        if (endLine == std::string::npos) endLine = cleaned.size();
+        std::string line = trim(cleaned.substr(pos, endLine - pos));
         pos = endLine + 1;
         if (line.empty()) continue;
 
@@ -314,6 +371,38 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
             }
             continue;
         }
+        if (line.find("RS_EXPORT_ENUM") != std::string::npos) {
+            pendingEnumExport = true;
+            continue;
+        }
+        if (line.find("RS_EXPORT_PROPERTY") != std::string::npos) {
+            const auto openP = line.find('(');
+            const auto closeP = line.find(')', openP);
+            if (openP != std::string::npos && closeP != std::string::npos && !currentClass.empty()) {
+                std::string args = trim(line.substr(openP + 1, closeP - openP - 1));
+                std::vector<std::string> parts;
+                std::size_t pStart = 0;
+                while (pStart < args.size()) {
+                    std::size_t comma = args.find(',', pStart);
+                    if (comma == std::string::npos) comma = args.size();
+                    std::string token = trim(args.substr(pStart, comma - pStart));
+                    if (token.size() >= 2 && token.front() == '"' && token.back() == '"') {
+                        token = token.substr(1, token.size() - 2);
+                    }
+                    parts.push_back(std::move(token));
+                    pStart = comma + 1;
+                }
+                if (parts.size() >= 2) {
+                    PendingProperty prop;
+                    prop.propName = parts[0];
+                    prop.getterMethod = parts[1];
+                    if (parts.size() >= 3) prop.setterMethod = parts[2];
+                    if (parts.size() >= 4) prop.rsType = mapCppTypeToRs(parts[3]);
+                    pendingClassProperties.push_back(std::move(prop));
+                }
+            }
+            continue;
+        }
         if (line.find("RS_EXPORT_METHOD") != std::string::npos) {
             pendingMethodExport = true;
             continue;
@@ -323,12 +412,60 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
             continue;
         }
 
+        if (pendingEnumExport && line.rfind("enum ", 0) == 0) {
+            pendingEnumExport = false;
+            std::string fullEnum = line;
+            while (fullEnum.find('}') == std::string::npos && pos < cleaned.size()) {
+                std::size_t nextNl = cleaned.find('\n', pos);
+                if (nextNl == std::string::npos) nextNl = cleaned.size();
+                fullEnum += " " + trim(cleaned.substr(pos, nextNl - pos));
+                pos = nextNl + 1;
+            }
+            std::string headerPart = fullEnum;
+            const auto openBrace = fullEnum.find('{');
+            const auto closeBrace = fullEnum.find('}', openBrace);
+            if (openBrace != std::string::npos && closeBrace != std::string::npos) {
+                headerPart = trim(fullEnum.substr(0, openBrace));
+                if (headerPart.rfind("enum class ", 0) == 0) {
+                    headerPart = trim(headerPart.substr(11));
+                } else if (headerPart.rfind("enum ", 0) == 0) {
+                    headerPart = trim(headerPart.substr(5));
+                }
+                const auto colonPos = headerPart.find(':');
+                std::string enumName = trim(colonPos == std::string::npos ? headerPart : headerPart.substr(0, colonPos));
+                std::string bodyPart = trim(fullEnum.substr(openBrace + 1, closeBrace - openBrace - 1));
+                rsOut << "enum " << enumName << " {\n";
+                std::size_t mStart = 0;
+                std::int64_t nextVal = 0;
+                while (mStart < bodyPart.size()) {
+                    std::size_t comma = bodyPart.find(',', mStart);
+                    if (comma == std::string::npos) comma = bodyPart.size();
+                    std::string item = trim(bodyPart.substr(mStart, comma - mStart));
+                    mStart = comma + 1;
+                    if (item.empty()) continue;
+                    const auto eqPos = item.find('=');
+                    if (eqPos != std::string::npos) {
+                        std::string mName = trim(item.substr(0, eqPos));
+                        std::string mVal = trim(item.substr(eqPos + 1));
+                        rsOut << "    " << mName << " = " << mVal << ",\n";
+                        try { nextVal = std::stoll(mVal) + 1; } catch (...) { ++nextVal; }
+                    } else {
+                        rsOut << "    " << item << " = " << nextVal++ << ",\n";
+                    }
+                }
+                rsOut << "}\n\n";
+                ++res.enumsExported;
+            }
+            continue;
+        }
+
         if (pendingClassExport && (line.rfind("class ", 0) == 0 || line.rfind("struct ", 0) == 0)) {
             pendingClassExport = false;
             const auto spacePos = line.find(' ');
             std::string namePart = trim(line.substr(spacePos + 1));
             const auto endName = namePart.find_first_of(" :{");
             currentClass = endName == std::string::npos ? namePart : namePart.substr(0, endName);
+            pendingClassProperties.clear();
             ++res.classesExported;
             cppOut << "    auto builder_" << currentClass << " = api.type<" << currentClass
                    << ">(\"" << currentClassModule << "\", \"" << currentClass << "\");\n";
@@ -337,44 +474,90 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
         }
 
         if (!currentClass.empty() && line.rfind("};", 0) == 0) {
+            for (const auto& prop : pendingClassProperties) {
+                ++res.propertiesExported;
+                if (!prop.setterMethod.empty()) {
+                    cppOut << "    builder_" << currentClass << ".property<&" << currentClass
+                           << "::" << prop.getterMethod << ", &" << currentClass
+                           << "::" << prop.setterMethod << ">(\"" << prop.propName << "\");\n";
+                    rsOut << "    " << prop.rsType << " " << prop.propName << " {\n"
+                          << "        get { " << dummyRsReturn(prop.rsType) << " }\n"
+                          << "        set { return; }\n"
+                          << "    }\n";
+                } else {
+                    cppOut << "    builder_" << currentClass << ".property<&" << currentClass
+                           << "::" << prop.getterMethod << ">(\"" << prop.propName << "\");\n";
+                    rsOut << "    " << prop.rsType << " " << prop.propName << " {\n"
+                          << "        get { " << dummyRsReturn(prop.rsType) << " }\n"
+                          << "    }\n";
+                }
+            }
+            pendingClassProperties.clear();
             currentClass.clear();
             rsOut << "}\n\n";
             continue;
         }
 
-        if ((pendingMethodExport || pendingFuncExport) && line.find('(') != std::string::npos) {
+        if (pendingMethodExport || pendingFuncExport) {
+            // Accumulate multi-line declaration until '(' and matching ')' are found
+            std::string decl = line;
+            while ((decl.find('(') == std::string::npos ||
+                    decl.find(')', decl.find('(')) == std::string::npos) &&
+                   pos < cleaned.size()) {
+                std::size_t nextNl = cleaned.find('\n', pos);
+                if (nextNl == std::string::npos) nextNl = cleaned.size();
+                decl += " " + trim(cleaned.substr(pos, nextNl - pos));
+                pos = nextNl + 1;
+            }
             const bool isMethod = pendingMethodExport && !currentClass.empty();
             pendingMethodExport = false;
             pendingFuncExport = false;
 
-            const auto openParen = line.find('(');
-            const auto closeParen = line.find(')', openParen);
-            if (closeParen == std::string::npos) continue;
-            const std::string prefix = trim(line.substr(0, openParen));
+            const auto openParen = decl.find('(');
+            const auto closeParen = decl.find(')', openParen);
+            if (openParen == std::string::npos || closeParen == std::string::npos) continue;
+            const std::string prefix = trim(decl.substr(0, openParen));
             const auto lastSpace = prefix.rfind(' ');
             if (lastSpace == std::string::npos) continue;
             const std::string retCpp = trim(prefix.substr(0, lastSpace));
-            const std::string fnName = trim(prefix.substr(lastSpace + 1));
-            const std::string paramsStr = trim(line.substr(openParen + 1, closeParen - openParen - 1));
+            std::string fnName = trim(prefix.substr(lastSpace + 1));
+            while (!fnName.empty() && (fnName.front() == '*' || fnName.front() == '&')) {
+                fnName.erase(fnName.begin());
+            }
+            const std::string paramsStr = trim(decl.substr(openParen + 1, closeParen - openParen - 1));
 
             std::vector<std::pair<std::string, std::string>> rsParams;
             if (!paramsStr.empty() && paramsStr != "void") {
                 std::size_t pStart = 0;
                 int idx = 0;
                 while (pStart < paramsStr.size()) {
-                    std::size_t comma = paramsStr.find(',', pStart);
-                    if (comma == std::string::npos) comma = paramsStr.size();
+                    // Find comma at top template/paren depth
+                    int depth = 0;
+                    std::size_t comma = pStart;
+                    while (comma < paramsStr.size()) {
+                        const char c = paramsStr[comma];
+                        if (c == '<' || c == '(' || c == '{') ++depth;
+                        else if (c == '>' || c == ')' || c == '}') --depth;
+                        else if (c == ',' && depth == 0) break;
+                        ++comma;
+                    }
                     std::string pItem = trim(paramsStr.substr(pStart, comma - pStart));
                     pStart = comma + 1;
+                    // Strip default value (= ...)
+                    const auto eqPos = pItem.find('=');
+                    if (eqPos != std::string::npos) {
+                        pItem = trim(pItem.substr(0, eqPos));
+                    }
                     const auto pSpace = pItem.rfind(' ');
                     if (pSpace != std::string::npos) {
                         std::string pName = trim(pItem.substr(pSpace + 1));
+                        std::string pType = trim(pItem.substr(0, pSpace));
                         while (!pName.empty() && (pName.front() == '&' || pName.front() == '*')) {
+                            pType.push_back(pName.front());
                             pName.erase(pName.begin());
                         }
-                        rsParams.push_back({
-                            mapCppTypeToRs(trim(pItem.substr(0, pSpace))),
-                            std::move(pName)});
+                        if (pName.empty()) pName = "arg" + std::to_string(idx);
+                        rsParams.push_back({mapCppTypeToRs(pType), std::move(pName)});
                     } else {
                         rsParams.push_back({mapCppTypeToRs(pItem), "arg" + std::to_string(idx)});
                     }
@@ -383,6 +566,11 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
             }
 
             const std::string rsRet = mapCppTypeToRs(retCpp);
+            for (auto& prop : pendingClassProperties) {
+                if (prop.getterMethod == fnName) {
+                    prop.rsType = rsRet;
+                }
+            }
             if (isMethod) {
                 ++res.methodsExported;
                 cppOut << "    builder_" << currentClass << ".method<&" << currentClass
@@ -398,7 +586,7 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
                 if (i != 0) rsOut << ", ";
                 rsOut << rsParams[i].first << " " << rsParams[i].second;
             }
-            rsOut << ") { " << (rsRet == "void" ? "return;" : (rsRet == "bool" ? "return false;" : "return 0;")) << " }\n";
+            rsOut << ") { " << dummyRsReturn(rsRet) << " }\n";
         }
     }
 

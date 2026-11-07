@@ -394,8 +394,8 @@ InspectorFieldSchema buildInspectorFieldSchema(
     runtime::RuntimeError error;
     if (parentStructValue) {
         if (const auto* structVal = std::get_if<runtime::StructValue>(parentStructValue)) {
-            if (structVal->storage && fieldIndexInParent < structVal->storage->fields.size()) {
-                fieldSchema.defaultValue = structVal->storage->fields[fieldIndexInParent];
+            if (auto subVal = runtime::structValueFieldAt(*structVal, fieldIndexInParent)) {
+                fieldSchema.defaultValue = std::move(*subVal);
             }
         } else if (auto inlineField = runtime::loadInlineStructField(*parentStructValue, fieldIndexInParent)) {
             fieldSchema.defaultValue = std::move(*inlineField);
@@ -574,7 +574,7 @@ std::optional<InspectorTypeSchema> inspectTypeSchema(
         runtime.findMethod(*type, "OnValidate", 0).has_value();
 
     runtime::RuntimeError error;
-    auto prototype = runtime.createObject(*type, {}, error);
+    auto prototype = runtime.createPrototypeObject(*type, error);
 
     std::unordered_set<std::string> visitedStructs;
     std::unordered_set<std::string> recordedSignals;

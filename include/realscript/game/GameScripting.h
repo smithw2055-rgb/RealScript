@@ -3,6 +3,7 @@
 #include "realscript/aot_cpp/AotRuntime.h"
 #include "realscript/game/GameBindings.h"
 #include "realscript/jit/Jit.h"
+#include "realscript/runtime/FiberScheduler.h"
 
 namespace realscript::game {
 
@@ -160,6 +161,9 @@ public:
         const std::string& canonicalTypeName,
         runtime::RuntimeError& error,
         runtime::ExecutionOptions options = {}) const;
+    [[nodiscard]] std::optional<ScriptObject> createPrototypeObject(
+        const ScriptType& type,
+        runtime::RuntimeError& error) const;
 
     template <typename T>
     [[nodiscard]] std::optional<ScriptObject> wrapNative(
@@ -352,6 +356,19 @@ public:
         const std::vector<Vec2>& values,
         runtime::RuntimeError& error) const;
 
+    [[nodiscard]] std::optional<runtime::Value> createStruct(
+        const std::string& canonicalTypeName,
+        const std::vector<runtime::Value>& fieldValues,
+        runtime::RuntimeError& error) const;
+    bool setEcsComponentColumn(
+        const std::string& canonicalTypeName,
+        const std::vector<runtime::Value>& components,
+        runtime::RuntimeError& error) const;
+    bool getEcsComponentColumn(
+        const std::string& canonicalTypeName,
+        std::vector<runtime::Value>& outComponents,
+        runtime::RuntimeError& error) const;
+
     [[nodiscard]] std::shared_ptr<const runtime::ProgramImage> program() const noexcept {
         return program_;
     }
@@ -410,6 +427,7 @@ struct SceneHotReloadReport {
     std::size_t fieldsMigrated = 0;
     std::size_t fieldsRenamed = 0;
     std::size_t fieldsDefaulted = 0;
+    std::size_t signalsRebound = 0;
     std::vector<std::string> errors;
 };
 
@@ -458,6 +476,20 @@ class SceneScriptRuntime {
 public:
     static constexpr SceneEntityId BroadcastTarget = 0;
 
+    struct SignalConnection {
+        SceneEntityId sourceEntity = 0;
+        std::string sourceComponent;
+        std::string signalName;
+        SceneEntityId targetEntity = 0;
+        std::string targetComponent;
+        std::string targetMethod;
+    };
+
+    struct ComponentLocation {
+        SceneEntityId entity = 0;
+        std::string canonicalTypeName;
+    };
+
     explicit SceneScriptRuntime(ScriptRuntime& runtime)
         : runtime_(runtime) {}
 
@@ -472,10 +504,15 @@ public:
     bool detach(SceneEntityId entity);
     bool detachComponent(SceneEntityId entity, const std::string& scriptType);
     bool setEnabled(SceneEntityId entity, bool enabled);
+    bool setEntityActive(SceneEntityId entity, bool active);
+    [[nodiscard]] bool isEntityActiveSelf(SceneEntityId entity) const noexcept;
     bool setComponentEnabled(
         SceneEntityId entity,
         const std::string& scriptType,
         bool enabled);
+    [[nodiscard]] bool isComponentEnabled(
+        SceneEntityId entity,
+        const std::string& scriptType) const noexcept;
     void start();
     void update(double deltaTime);
     void fixedUpdate(double fixedDeltaTime);
@@ -509,11 +546,17 @@ public:
         SceneEntityId targetEntity,
         const std::string& targetComponent,
         const std::string& targetMethod);
+    bool disconnectSignal(
+        SceneEntityId sourceEntity,
+        const std::string& sourceComponent,
+        const std::string& signalName,
+        SceneEntityId targetEntity,
+        const std::string& targetComponent,
+        const std::string& targetMethod);
+    [[nodiscard]] const std::vector<SignalConnection>& signalConnections() const noexcept {
+        return signalConnections_;
+    }
 
-    struct ComponentLocation {
-        SceneEntityId entity = 0;
-        std::string canonicalTypeName;
-    };
     [[nodiscard]] std::optional<ComponentLocation> findObjectLocation(
         runtime::ObjectRef reference) const;
 
@@ -547,7 +590,12 @@ public:
     [[nodiscard]] ScriptObject* getComponent(
         SceneEntityId entity,
         const std::string& typeOrInterfaceName);
+    [[nodiscard]] const ScriptObject* getComponent(
+        SceneEntityId entity,
+        const std::string& typeOrInterfaceName) const;
     [[nodiscard]] std::vector<ScriptObject*> getComponents(SceneEntityId entity);
+    [[nodiscard]] std::vector<const ScriptObject*> getComponents(SceneEntityId entity) const;
+    [[nodiscard]] std::vector<SceneEntityId> entities() const;
     [[nodiscard]] bool hasComponent(
         SceneEntityId entity,
         const std::string& typeOrInterfaceName) const;
@@ -577,6 +625,20 @@ public:
         SceneEntityId parent = 0,
         const std::map<std::string, runtime::Value>& rootMemberOverrides = {});
 
+    void setFiberScheduler(runtime::FiberScheduler* scheduler) noexcept {
+        fiberScheduler_ = scheduler;
+    }
+    [[nodiscard]] runtime::FiberScheduler* fiberScheduler() const noexcept {
+        return fiberScheduler_;
+    }
+    std::uint32_t spawnEntityFiber(
+        SceneEntityId entity,
+        const runtime::CompiledFiberModule& module,
+        const std::string& functionName,
+        std::uint8_t ownerGroupId = 0,
+        std::uint32_t seed = 0x53434257u);
+    std::uint64_t stepFibers(std::uint32_t currentTick);
+
 private:
     struct MethodCacheEntry {
         semantic::SymbolId typeId = 0;
@@ -603,11 +665,31 @@ private:
         std::optional<ScriptMethod> onValidate;
     };
 
+    struct TickRef {
+        int order = 0;
+        SceneEntityId entity = 0;
+        std::size_t compIndex = 0;
+    };
+
     void bindLifecycleMethods(Instance& instance) const;
     [[nodiscard]] bool shouldTickInCurrentMode(const Instance& instance) const noexcept;
     [[nodiscard]] bool matchesComponentType(
         const ScriptType& componentType,
         const std::string& query) const;
+    void rebuildTickOrderIfNeeded() const;
+    void invalidateTransformSubtree(SceneEntityId entity);
+    bool rebuildSignalDelegateChain(
+        SceneEntityId sourceEntity,
+        const std::string& sourceComponent,
+        const std::string& signalName);
+    void removeSignalsForEntityOrComponent(
+        SceneEntityId entity,
+        const std::string& removedComponentType);
+    bool attachComponentWithoutLifecycle(
+        SceneEntityId entity,
+        const std::string& scriptType,
+        SceneScriptOptions options,
+        std::size_t& outCompIndex);
 
     [[nodiscard]] const ScriptMethod* findCachedMethod(
         const ScriptType& type,
@@ -633,10 +715,59 @@ private:
     std::map<SceneEntityId, std::vector<SceneEntityId>> childrenByEntity_;
     std::map<SceneEntityId, bool> entityActiveSelf_;
     std::map<SceneEntityId, Transform3D> localTransforms_;
+    mutable std::unordered_map<SceneEntityId, Transform3D> worldTransformCache_;
+    mutable bool tickOrderDirty_ = true;
+    mutable std::vector<TickRef> cachedTickOrder_;
+    std::vector<SignalConnection> signalConnections_;
+    runtime::FiberScheduler* fiberScheduler_ = nullptr;
     std::map<std::size_t, std::vector<MethodCacheEntry>> methodCache_;
     std::vector<ScriptEvent> eventQueue_;
     std::map<std::string, ScriptTrigger> triggers_;
     std::vector<SceneScriptError> errors_;
+};
+
+/**
+ * Default Fiber Host Adapter bridging `FiberScheduler` (`HostCommand` and `HostCondJump`)
+ * directly to `SceneScriptRuntime` entities and component fields/methods.
+ */
+class SceneFiberHostAdapter final : public runtime::IFiberHostCallbacks {
+public:
+    explicit SceneFiberHostAdapter(SceneScriptRuntime& scene) noexcept
+        : scene_(scene) {}
+
+    void registerCommandCallback(
+        std::uint8_t commandId,
+        std::string callbackName,
+        std::string componentType = {});
+    void registerConditionMember(
+        std::uint16_t key16,
+        std::string memberName,
+        std::string componentType = {});
+
+    void onHostCommand(
+        runtime::FiberContext& fiber,
+        std::uint8_t commandId,
+        std::uint16_t arg16,
+        std::uint32_t arg32) noexcept override;
+
+    bool onEvaluateCondition(
+        const runtime::FiberContext& fiber,
+        std::uint8_t conditionKind,
+        std::uint16_t key16,
+        std::uint16_t threshold16) const noexcept override;
+
+private:
+    struct CommandEntry {
+        std::string callbackName;
+        std::string componentType;
+    };
+    struct ConditionEntry {
+        std::string memberName;
+        std::string componentType;
+    };
+    SceneScriptRuntime& scene_;
+    std::unordered_map<std::uint8_t, CommandEntry> commands_;
+    std::unordered_map<std::uint16_t, ConditionEntry> conditions_;
 };
 
 bool installSceneComponentBindings(

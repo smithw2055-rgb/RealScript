@@ -7,6 +7,51 @@ remain versioned but unfrozen until a future 1.0 release.
 
 ### Engine integration and editor dataflow
 
+- Implemented zero-heap-allocation inline storage (`InlineStructSlot`) inside
+  `runtime::StructValue` for custom value-type `struct`s with up to 4 fields
+  (`bool`, `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`,
+  `float`, `double`, `char`, `Enum`, `Fixed`, `Fixed16`, `Vec2`, `Vec3`, `Quat`),
+  eliminating `std::shared_ptr<StructStorage>` and `std::vector<Value>` heap
+  allocations across the Bytecode Interpreter, C++17 AOT runtime, JSON
+  serialization, and `RSGS` binary state snapshots.
+- Implemented compile-time AST/Semantic/MIR lowering of ECS chunk queries
+  (`foreach (ref var transform, in var velocity in Query<Write<Transform>, Read<Velocity>>())`),
+  including compile-time read/write safety checks (`RS2214`, `RS2215`, `RS2216`,
+  and `RS8702` preventing mutation of `Read<T>` / `in` component fields),
+  contiguous SoA column iteration, automatic write-back for `Write<T>`
+  components, and C++ host helpers (`ScriptRuntime::createStruct`,
+  `setEcsComponentColumn`, `getEcsComponentColumn`).
+
+- Decoupled entity active state (`setEntityActive` / `isEntityActiveSelf`) from
+  per-component enabled state (`setComponentEnabled` / `isComponentEnabled`),
+  allowing empty transform parent nodes and multi-component entities to cascade
+  `OnEnable` / `OnDisable` accurately across hierarchy subtrees.
+- Upgraded `SceneScriptRuntime::instantiatePrefab` to a two-phase pipeline
+  (Phase 1: hierarchy, transform, component allocation, and `[RequireComponent]`
+  validation across the entire subtree; Phase 2: `OnCreate` and `OnEnable`
+  activation sorted by `[ExecutionOrder]`).
+- Added dirty-cached tick ordering (`rebuildTickOrderIfNeeded`) and dirty-cached
+  world transforms (`worldTransformCache_` with subtree invalidation) to eliminate
+  per-frame sorting and parent-chain walks.
+- Added persistent signal connection tracking (`SignalConnection`),
+  `disconnectSignal`, automatic signal disconnection when a target or source
+  entity/component is detached, and automatic signal rebinding across hot reloads.
+- Added whole-scene JSON serialization (`exportSceneJson` and `importSceneJson`)
+  preserving entities, hierarchy, local transforms, multi-component fields,
+  cross-entity `ObjectRef` references (including inside structs), and wired
+  signal connections.
+- Extended `SceneScriptRuntime::hotReload` to recursively patch migrated
+  `ObjectRef` instances inside `Array` elements and `StructValue` fields,
+  initialize newly added fields from class prototype defaults
+  (`createPrototypeObject`), and added `ReloadOptions::allowStructuralChanges`
+  to `realscript::hot_reload::prepare`.
+- Bridged `SceneScriptRuntime` with `FiberScheduler` (`SceneFiberHostAdapter`,
+  `spawnEntityFiber`, `stepFibers`, and `killEntityFibersBySlot` on entity
+  detach/deactivation).
+- Upgraded `GameApi::generateBindingsFromCppHeader` to support multi-line
+  declarations, comments, `RS_EXPORT_ENUM`, `RS_EXPORT_PROPERTY`, `const`
+  qualifiers, and default parameter values.
+
 - Added script class inheritance from C++ `NativeType` wrappers with polymorphic
   native handle unwrapping and explicit native lifecycle release (`releaseNative`,
   `rebindNative`).

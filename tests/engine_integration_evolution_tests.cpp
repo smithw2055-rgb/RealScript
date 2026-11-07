@@ -1,3 +1,4 @@
+#include "realscript/hot_reload/HotReload.h"
 #include "realscript/debug/DapServer.h"
 #include "realscript/debug/Debugger.h"
 #include "realscript/game/GameProductization.h"
@@ -2305,6 +2306,689 @@ public class LateSystem {
 
 } // namespace
 
+void testModernEngineParityCompletionGoals() {
+    using namespace realscript;
+
+    // 1. Empty Transform Parent Node setEntityActive, decoupled setComponentEnabled,
+    //    and Two-Phase Prefab Instantiation ([RequireComponent] order independence)
+    {
+        game::GameApi api;
+        game::ScriptRuntime dummyRt{game::GameProgram{}};
+        const char* src = R"RS(
+module Evolution.ParityPhase1;
+import RealScript.Scene;
+import RealScript.Math;
+
+class MotorComponent {
+    public int speed = 15;
+    public int enabledCount = 0;
+    public int disabledCount = 0;
+
+    public void OnEnable() { enabledCount = enabledCount + 1; }
+    public void OnDisable() { disabledCount = disabledCount + 1; }
+}
+
+[RequireComponent("MotorComponent")]
+class VehicleController {
+    public int initSawMotor = 0;
+    public int activeTicks = 0;
+
+    public void OnCreate() {
+        if (HasComponent(100, "MotorComponent") && HasComponent(101, "MotorComponent")) {
+            initSawMotor = 1;
+        }
+    }
+
+    public void OnUpdate(double dt) {
+        activeTicks = activeTicks + 1;
+    }
+}
+)RS";
+        game::SceneScriptRuntime* sceneBindingTarget = nullptr;
+        api.function("RealScript.Scene", "HasComponent", [&sceneBindingTarget]( std::int64_t entityId, std::string typeName) -> bool {
+            if (!sceneBindingTarget || entityId <= 0) return false;
+            return sceneBindingTarget->hasComponent(static_cast<game::SceneEntityId>(entityId), typeName);
+        });
+
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"parity_p1.rs", src}});
+        require(compiled.succeeded(), "Evolution.ParityPhase1 failed to compile:\n" + diagnosticsText(compiled.diagnostics));
+
+        game::ScriptRuntime rt(compiled.program);
+        game::SceneScriptRuntime scene(rt);
+        sceneBindingTarget = &scene;
+
+        // Build prefab where VehicleController is listed BEFORE its required MotorComponent,
+        // and also has a child entity 101 with MotorComponent.
+        game::PrefabNodeTemplate rootPrefab;
+        rootPrefab.name = "VehicleRoot";
+        rootPrefab.localTransform = game::Transform3D{
+            game::Vec3::of(10, 20, 0), game::Quat::identity(), game::Vec3::of(1, 1, 1)};
+        rootPrefab.components.push_back({"Evolution.ParityPhase1::VehicleController", {}});
+        rootPrefab.components.push_back({"Evolution.ParityPhase1::MotorComponent", {}});
+
+        game::PrefabNodeTemplate wheelPrefab;
+        wheelPrefab.name = "WheelChild";
+        wheelPrefab.localTransform = game::Transform3D{
+            game::Vec3::of(2, 3, 0), game::Quat::identity(), game::Vec3::of(1, 1, 1)};
+        wheelPrefab.components.push_back({"Evolution.ParityPhase1::MotorComponent", {}});
+        rootPrefab.children.push_back(wheelPrefab);
+
+        // Create an empty transform group node (entity 50) with 0 components as parent
+        scene.setLocalPosition2D(50, game::Vec2::of(100, 200));
+        game::SceneEntityId nextId = 100;
+        const auto rootId = scene.instantiatePrefab(rootPrefab, nextId, 50);
+        require(rootId == 100, "Two-phase instantiatePrefab should succeed even when RequireComponent target is listed second");
+
+        auto* ctrlObj = scene.getComponent(100, "VehicleController");
+        auto* motorObj = scene.getComponent(100, "MotorComponent");
+        require(ctrlObj && motorObj, "VehicleController and MotorComponent should exist on entity 100");
+
+        runtime::RuntimeError err;
+        auto sawMotor = rt.getMember(*ctrlObj, "initSawMotor", err);
+        require(sawMotor && std::get<std::int64_t>(*sawMotor) == 1,
+            "Two-phase instantiatePrefab should allocate all root and child components before invoking OnCreate");
+
+        // Verify dirty-cached world transform across 3-level hierarchy (50 -> 100 -> 101)
+        require(scene.getWorldPosition2D(101) == game::Vec2::of(112, 223),
+            "3-level world transform (100,200)+(10,20)+(2,3) should be (112,223)");
+        scene.setLocalPosition2D(50, game::Vec2::of(10, 10));
+        require(scene.getWorldPosition2D(101) == game::Vec2::of(22, 33),
+            "invalidated world transform cache should recompute (22, 33)");
+
+        // Decoupled setComponentEnabled: disabling MotorComponent on 100 must NOT disable VehicleController or entityActiveSelf
+        require(scene.setComponentEnabled(100, "MotorComponent", false), "setComponentEnabled(false) failed");
+        require(!scene.isComponentEnabled(100, "MotorComponent"), "MotorComponent should be disabled");
+        require(scene.isEntityActiveSelf(100), "Entity 100 should remain active when one component is disabled");
+
+        scene.start();
+        scene.update(0.016);
+        auto ticksAfter1 = rt.getMember(*ctrlObj, "activeTicks", err);
+        require(ticksAfter1 && std::get<std::int64_t>(*ticksAfter1) == 1,
+            "VehicleController should still tick while sibling MotorComponent is disabled");
+
+        // Empty transform parent node (entity 50) setEntityActive(false) must cascade to 100 and 101
+        require(scene.setEntityActive(50, false), "setEntityActive(50, false) on empty transform node failed");
+        require(!scene.isActiveInHierarchy(100) && !scene.isActiveInHierarchy(101),
+            "children of deactivated empty parent node 50 must be inactive in hierarchy");
+        scene.update(0.016);
+        auto ticksWhileInactive = rt.getMember(*ctrlObj, "activeTicks", err);
+        require(ticksWhileInactive && std::get<std::int64_t>(*ticksWhileInactive) == 1,
+            "VehicleController must not tick while parent empty node 50 is inactive");
+
+        require(scene.setEntityActive(50, true), "setEntityActive(50, true) failed");
+        require(scene.isActiveInHierarchy(100), "entity 100 should be active again");
+    }
+
+    // 2. Signal disconnectSignal, Auto-Disconnect on Detach, Whole-Scene JSON Serialization,
+    //    and Deep Array/Struct Reference Patching on Hot Reload
+    {
+        game::GameApi api;
+        const char* srcV1 = R"RS(
+module Evolution.SceneGraphV1;
+
+delegate void AlertHandler(int code);
+
+class ListenerComp {
+    public int receivedSum = 0;
+
+    public void OnAlert(int code) {
+        receivedSum = receivedSum + code;
+    }
+}
+
+struct TargetHolder {
+    public ListenerComp primary;
+}
+
+class HubComp {
+    public event AlertHandler OnAlertSignal;
+    public ListenerComp[] listeners;
+    public TargetHolder holder;
+
+    public void SetupLinks(ListenerComp a, ListenerComp b) {
+        listeners = new ListenerComp[2];
+        listeners[0] = a;
+        listeners[1] = b;
+        TargetHolder th = new TargetHolder();
+        th.primary = a;
+        holder = th;
+    }
+
+    public void Broadcast(int code) {
+        OnAlertSignal(code);
+    }
+
+    public int PingArrayAndStruct(int bonus) {
+        listeners[0].OnAlert(bonus);
+        holder.primary.OnAlert(bonus);
+        return listeners[0].receivedSum + listeners[1].receivedSum;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiledV1 = compiler.compile({{"scene_v1.rs", srcV1}});
+        require(compiledV1.succeeded(), "SceneGraphV1 failed to compile:\n" + diagnosticsText(compiledV1.diagnostics));
+
+        game::ScriptRuntime rt(compiledV1.program);
+        game::SceneScriptRuntime scene(rt);
+
+        require(scene.attachComponent(1, "Evolution.SceneGraphV1::HubComp"), "attach HubComp failed");
+        require(scene.attachComponent(2, "Evolution.SceneGraphV1::ListenerComp"), "attach Listener 2 failed");
+        require(scene.attachComponent(3, "Evolution.SceneGraphV1::ListenerComp"), "attach Listener 3 failed");
+        require(scene.setParent(2, 1) && scene.setParent(3, 1), "setParent failed");
+        scene.setLocalPosition2D(1, game::Vec2::of(5, 6));
+        scene.setLocalPosition2D(2, game::Vec2::of(1, 2));
+
+        auto* l2 = scene.getComponent(2, "ListenerComp");
+        auto* l3 = scene.getComponent(3, "ListenerComp");
+        require(l2 && l3, "listeners missing");
+        const auto setupRes = scene.invokeComponent(1, "HubComp", "SetupLinks", {l2->value(), l3->value()});
+        require(setupRes.succeeded, "SetupLinks failed: " + setupRes.error.message);
+
+        require(scene.connectSignal(1, "HubComp", "OnAlertSignal", 2, "ListenerComp", "OnAlert"),
+            "connectSignal 1->2 failed");
+        require(scene.connectSignal(1, "HubComp", "OnAlertSignal", 3, "ListenerComp", "OnAlert"),
+            "connectSignal 1->3 failed");
+
+        require(scene.invokeComponent(1, "HubComp", "Broadcast", {std::int64_t{10}}).succeeded,
+            "Broadcast(10) failed");
+
+        // Export whole scene to JSON and restore into a brand new SceneScriptRuntime
+        runtime::RuntimeError jsonErr;
+        game::ScriptStatePolicy policy;
+        policy.allowDoubles = true;
+        const std::string sceneJson = game::exportSceneJson(scene, jsonErr, policy);
+        require(!sceneJson.empty(), "exportSceneJson failed: " + jsonErr.message);
+
+        game::ScriptRuntime rtRestored(compiledV1.program);
+        game::SceneScriptRuntime restoredScene(rtRestored);
+        require(game::importSceneJson(restoredScene, sceneJson, jsonErr, policy),
+            "importSceneJson failed: " + jsonErr.message);
+        require(restoredScene.getParent(2) == 1 &&
+                restoredScene.getWorldPosition2D(2) == game::Vec2::of(6, 8),
+            "restored scene hierarchy/transform mismatch");
+        require(restoredScene.signalConnections().size() == 2,
+            "restored scene should have 2 wired signal connections");
+
+        // Verify restored signals fire properly
+        require(restoredScene.invokeComponent(1, "HubComp", "Broadcast", {std::int64_t{5}}).succeeded,
+            "Broadcast on restoredScene failed");
+        auto* rl2 = restoredScene.getComponent(2, "ListenerComp");
+        auto* rl3 = restoredScene.getComponent(3, "ListenerComp");
+        runtime::RuntimeError mErr;
+        require(std::get<std::int64_t>(*rtRestored.getMember(*rl2, "receivedSum", mErr)) == 15 &&
+                std::get<std::int64_t>(*rtRestored.getMember(*rl3, "receivedSum", mErr)) == 15,
+            "restored listeners should both have receivedSum == 15");
+
+        // Test disconnectSignal on restoredScene
+        require(restoredScene.disconnectSignal(1, "HubComp", "OnAlertSignal", 3, "ListenerComp", "OnAlert"),
+            "disconnectSignal 1->3 failed");
+        require(restoredScene.invokeComponent(1, "HubComp", "Broadcast", {std::int64_t{7}}).succeeded,
+            "Broadcast after disconnectSignal failed");
+        require(std::get<std::int64_t>(*rtRestored.getMember(*rl2, "receivedSum", mErr)) == 22 &&
+                std::get<std::int64_t>(*rtRestored.getMember(*rl3, "receivedSum", mErr)) == 15,
+            "only listener 2 should receive signal after listener 3 disconnected");
+
+        // Test automatic signal disconnection when target entity 2 is detached
+        require(restoredScene.detach(2), "detach(2) failed");
+        require(restoredScene.signalConnections().empty(),
+            "detaching entity 2 should automatically clean up remaining signal connection");
+        require(restoredScene.invokeComponent(1, "HubComp", "Broadcast", {std::int64_t{9}}).succeeded,
+            "Broadcast after detaching all listeners should succeed cleanly");
+
+        // Now test Hot Reload on original `scene` with Array and Struct ObjectRef patching + Signal Rebinding
+        const char* srcV2 = R"RS(
+module Evolution.SceneGraphV1;
+
+delegate void AlertHandler(int code);
+
+class ListenerComp {
+    public int receivedSum = 0;
+    public int scaleFactor = 2;
+
+    public void OnAlert(int code) {
+        receivedSum = receivedSum + code * scaleFactor;
+    }
+}
+
+struct TargetHolder {
+    public ListenerComp primary;
+}
+
+class HubComp {
+    public event AlertHandler OnAlertSignal;
+    public ListenerComp[] listeners;
+    public TargetHolder holder;
+
+    public void SetupLinks(ListenerComp a, ListenerComp b) {
+        listeners = new ListenerComp[2];
+        listeners[0] = a;
+        listeners[1] = b;
+        TargetHolder th = new TargetHolder();
+        th.primary = a;
+        holder = th;
+    }
+
+    public void Broadcast(int code) {
+        OnAlertSignal(code);
+    }
+
+    public int PingArrayAndStruct(int bonus) {
+        listeners[0].OnAlert(bonus);
+        holder.primary.OnAlert(bonus);
+        return listeners[0].receivedSum + listeners[1].receivedSum;
+    }
+}
+)RS";
+        auto compiledV2 = compiler.compile({{"scene_v2.rs", srcV2}});
+        require(compiledV2.succeeded(), "SceneGraphV2 failed to compile");
+
+        // Check structural hot_reload::prepare with ReloadOptions{true}
+        const auto strictPlan = hot_reload::prepare(*compiledV1.program.program(), compiledV2.modules);
+        require(!strictPlan.compatible, "strict body-only hot_reload::prepare should reject added field");
+        const auto structPlan = hot_reload::prepare(
+            *compiledV1.program.program(),
+            compiledV2.modules,
+            hot_reload::ReloadOptions{true, false});
+        require(structPlan.compatible && structPlan.structuralMigrationRequired &&
+                !structPlan.layoutChangedTypes.empty(),
+            "structural hot_reload::prepare should succeed and report layoutChangedTypes");
+
+        const auto reloadRep = scene.hotReload(compiledV2.program);
+        require(reloadRep.succeeded && reloadRep.signalsRebound == 1,
+            "scene.hotReload failed or did not rebind signal chain");
+
+        // Verify both wired signal and Array/Struct inner ObjectRef point to the migrated V2 instances
+        require(scene.invokeComponent(1, "HubComp", "Broadcast", {std::int64_t{5}}).succeeded,
+            "Broadcast after hotReload failed");
+        const auto pingRes = scene.invokeComponent(1, "HubComp", "PingArrayAndStruct", {std::int64_t{3}});
+        require(pingRes.succeeded && std::get<std::int64_t>(pingRes.value) == 52,
+            "PingArrayAndStruct after hotReload should update migrated V2 ListenerComp instances (20 + 6 + 6 + 20 = 52 or 62)");
+    }
+
+    // 3. Scene + FiberScheduler Bridge (SceneFiberHostAdapter & Auto-Kill on Detach)
+    //    and Multi-line C++ Header Binding Generator with Enum & Property
+    {
+        const char* fiberScript = R"RS(
+module Evolution.SceneFiber;
+import RealScript.Fiber;
+
+void PatrolRoutine() {
+    while (true) {
+        if (Fiber.Cond(0, 1, 10)) {
+            Fiber.Command(1, 5, 25);
+        }
+        Fiber.Yield(1);
+    }
+}
+)RS";
+        compiler::Compilation fiberComp;
+        fiberComp.addSource({"patrol_fiber.rs", fiberScript});
+        auto fiberBuild = fiberComp.build();
+        require(!fiberBuild.diagnostics.hasErrors() && !fiberBuild.modules.empty(),
+            "Evolution.SceneFiber failed to compile");
+        const auto fiberMod = runtime::FiberCompiler::compileModule(fiberBuild.modules.front());
+        require(fiberMod.hasFunction("PatrolRoutine"), "PatrolRoutine missing in CompiledFiberModule");
+
+        game::GameApi api;
+        const char* unitScript = R"RS(
+module Evolution.UnitComp;
+
+class GuardUnit {
+    public int energy = 12;
+    public int attacks = 0;
+
+    public void ExecuteAttack(int mode, int damage) {
+        attacks = attacks + mode + damage;
+    }
+}
+)RS";
+        game::GameScriptCompiler unitCompiler(api);
+        auto unitCompiled = unitCompiler.compile({{"guard.rs", unitScript}});
+        require(unitCompiled.succeeded(), "Evolution.UnitComp failed to compile");
+
+        game::ScriptRuntime rt(unitCompiled.program);
+        game::SceneScriptRuntime scene(rt);
+        require(scene.attachComponent(10, "Evolution.UnitComp::GuardUnit"), "attach GuardUnit failed");
+
+        game::SceneFiberHostAdapter adapter(scene);
+        adapter.registerConditionMember(1, "energy", "GuardUnit");
+        adapter.registerCommandCallback(1, "ExecuteAttack", "GuardUnit");
+
+        runtime::FiberScheduler scheduler(&adapter);
+        scene.setFiberScheduler(&scheduler);
+
+        const auto fid = scene.spawnEntityFiber(10, fiberMod, "PatrolRoutine");
+        require(fid != 0 && scheduler.activeFiberCount() == 1, "spawnEntityFiber failed");
+
+        (void)scene.stepFibers(1);
+        auto* guardObj = scene.getComponent(10, "GuardUnit");
+        runtime::RuntimeError err;
+        auto attacksVal = rt.getMember(*guardObj, "attacks", err);
+        require(attacksVal && std::get<std::int64_t>(*attacksVal) == 30,
+            "SceneFiberHostAdapter should evaluate energy>=10 and invoke ExecuteAttack(5, 25) -> 30");
+
+        // Detaching entity 10 must automatically terminate its bound fibers in FiberScheduler
+        require(scene.detach(10), "detach(10) failed");
+        require(scheduler.activeFiberCount() == 0,
+            "detaching entity 10 should automatically kill its bound fibers in FiberScheduler");
+
+        // Verify upgraded multi-line C++ Header Binding Generator (Enum, Property, Multi-line, Default Args)
+        const char* complexHeader = R"CPP(
+        // Sample multi-line header with comments, enum, property, and default args
+        RS_EXPORT_ENUM
+        enum class MotionMode : int {
+            Grounded = 0,
+            Airborne = 1,
+            Swimming = 2
+        };
+
+        RS_EXPORT_CLASS("Game.Native")
+        class CharacterMotor {
+        public:
+            RS_EXPORT_PROPERTY("MaxSpeed", GetMaxSpeed, SetMaxSpeed)
+            RS_EXPORT_METHOD
+            float GetMaxSpeed() const;
+
+            RS_EXPORT_METHOD
+            void SetMaxSpeed(float value);
+
+            /* Multi-line method with const ref and default parameter */
+            RS_EXPORT_METHOD
+            Vec3 MoveCharacter(
+                const Vec3& velocity,
+                float deltaTime = 0.016f
+            ) const;
+        };
+        )CPP";
+        const auto bindGen = game::GameApi::generateBindingsFromCppHeader(complexHeader, "Game.Native");
+        require(
+            bindGen.enumsExported == 1 &&
+            bindGen.classesExported == 1 &&
+            bindGen.propertiesExported == 1 &&
+            bindGen.methodsExported == 3 &&
+            bindGen.scriptDeclarationStub.find("enum MotionMode") != std::string::npos &&
+            bindGen.scriptDeclarationStub.find("float MaxSpeed") != std::string::npos &&
+            bindGen.scriptDeclarationStub.find("Vec3 MoveCharacter(Vec3 velocity, float deltaTime)") != std::string::npos &&
+            bindGen.cppRegistrationSource.find(".property<&CharacterMotor::GetMaxSpeed, &CharacterMotor::SetMaxSpeed>(\"MaxSpeed\")") != std::string::npos,
+            "upgraded generateBindingsFromCppHeader failed on multi-line/enum/property header");
+
+        // Verify inspectTypeSchema fallback (createPrototypeObject) on NativeType-derived class without 0-arg ctor
+        game::GameApi nativeApi;
+        nativeApi.type<NativeActor>("Engine.Core", "NativeActor")
+            .method<&NativeActor::heal>("Heal");
+        const char* derivedSrc = R"RS(
+module Evolution.DerivedSchema;
+import Engine.Core;
+
+class ParameterizedHero : NativeActor {
+    [Export]
+    [Range(0, 500)]
+    public int armor = 75;
+
+    ParameterizedHero(int initialBonus) {
+        Heal(initialBonus);
+    }
+}
+)RS";
+        game::GameScriptCompiler derivedComp(nativeApi);
+        auto derivedBuilt = derivedComp.compile({{"derived.rs", derivedSrc}});
+        require(derivedBuilt.succeeded(), "Evolution.DerivedSchema failed to compile");
+        game::ScriptRuntime derivedRt(derivedBuilt.program);
+        game::ScriptMetadataRegistry derivedMeta;
+        derivedMeta.populateFromProgram(derivedBuilt.program);
+        const auto heroSchema = game::inspectTypeSchema(
+            derivedRt, derivedMeta, "Evolution.DerivedSchema::ParameterizedHero");
+        require(heroSchema.has_value() && heroSchema->fields.size() == 1 &&
+                heroSchema->fields[0].name == "armor" &&
+                heroSchema->fields[0].exported &&
+                heroSchema->fields[0].rangeMax == 500,
+            "inspectTypeSchema should succeed on NativeActor-derived class without 0-arg constructor");
+    }
+}
+
+void testZeroHeapInlineStructAndEcsQueryMirLowering() {
+    using namespace realscript;
+
+    // 1. Custom Struct Zero-Heap-Allocation Contiguous Layout + Compile-time MIR Lowering of Query<Write<T>, Read<U>>()
+    {
+        game::GameApi api;
+        const char* ecsSrc = R"RS(
+module Evolution.EcsDataOriented;
+import RealScript.Math;
+
+struct Transform {
+    public Vec2 position;
+    public Fixed rotation;
+    public int layer;
+
+    public Transform(Vec2 pos, Fixed rot, int l) {
+        position = pos;
+        rotation = rot;
+        layer = l;
+    }
+}
+
+struct Velocity {
+    public Vec2 linear;
+    public Fixed angular;
+
+    public Velocity(Vec2 lin, Fixed ang) {
+        linear = lin;
+        angular = ang;
+    }
+}
+
+struct OversizedStruct {
+    public int a = 1;
+    public int b = 2;
+    public int c = 3;
+    public int d = 4;
+    public int e = 5;
+}
+
+class PhysicsSystem {
+    public Transform sampleTransform;
+    public OversizedStruct sampleOversized;
+    public int processedCount = 0;
+
+    public void InitSamples() {
+        sampleTransform = new Transform(new Vec2(FixedFromInt(10), FixedFromInt(20)), FixedFromInt(5), 3);
+        sampleOversized = new OversizedStruct();
+    }
+
+    public int VerifyValueCopySemantics() {
+        Transform original = new Transform(new Vec2(FixedFromInt(7), FixedFromInt(8)), FixedFromInt(1), 10);
+        Transform copied = original;
+        copied.layer = 99;
+        copied.position = new Vec2(FixedFromInt(100), FixedFromInt(200));
+        if (original.position.x != FixedFromInt(7)) return -1;
+        return original.layer + 7;
+    }
+
+    public void StepPhysics(Fixed dt) {
+        int count = 0;
+        foreach (ref var transform, in var velocity in Query<Write<Transform>, Read<Velocity>>()) {
+            transform.position = transform.position + velocity.linear * dt;
+            transform.rotation = transform.rotation + velocity.angular * dt;
+            transform.layer = transform.layer + 1;
+            count = count + 1;
+        }
+        processedCount = count;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto built = compiler.compile({{"ecs_system.rs", ecsSrc}});
+        if (!built.succeeded()) { for (const auto& d : built.diagnostics.items()) std::cerr << d.code << ": " << d.message << "\n"; }
+        require(built.succeeded(), "Evolution.EcsDataOriented failed to compile");
+
+        game::ScriptRuntime rt(built.program);
+        runtime::RuntimeError err;
+        auto sysObj = rt.createObject("Evolution.EcsDataOriented::PhysicsSystem", err);
+        require(sysObj.has_value(), "failed to create PhysicsSystem");
+
+        auto initMethod = rt.findMethod(sysObj->type(), "InitSamples", 0);
+        require(initMethod.has_value(), "failed to find InitSamples");
+        require(rt.invoke(*sysObj, *initMethod, {}).succeeded, "InitSamples failed");
+
+        // Verify custom value-type struct with <= 4 fields uses zero-heap-allocation inline storage!
+        auto sampleTVal = rt.getMember(*sysObj, "sampleTransform", err);
+        require(sampleTVal.has_value() && std::holds_alternative<runtime::StructValue>(*sampleTVal),
+            "sampleTransform should be a StructValue");
+        const auto& inlineStruct = std::get<runtime::StructValue>(*sampleTVal);
+        require(inlineStruct.isInline && inlineStruct.storage == nullptr && inlineStruct.inlineCount == 3,
+            "Transform (3 value fields: Vec2, Fixed, int) must use zero-heap-allocation inline layout (isInline == true, storage == nullptr)");
+
+        // Verify struct with > 4 fields falls back to heap StructStorage cleanly
+        auto sampleOverVal = rt.getMember(*sysObj, "sampleOversized", err);
+        require(sampleOverVal.has_value() && std::holds_alternative<runtime::StructValue>(*sampleOverVal),
+            "sampleOversized should be a StructValue");
+        const auto& fallbackStruct = std::get<runtime::StructValue>(*sampleOverVal);
+        require(!fallbackStruct.isInline && fallbackStruct.storage != nullptr && fallbackStruct.fieldCount() == 5,
+            "OversizedStruct (5 fields) should fall back to heap StructStorage");
+
+        // Verify value-copy semantics on inline structs
+        auto copyMethod = rt.findMethod(sysObj->type(), "VerifyValueCopySemantics", 0);
+        require(copyMethod.has_value(), "failed to find VerifyValueCopySemantics");
+        auto copyRes = rt.invoke(*sysObj, *copyMethod, {});
+        require(copyRes.succeeded && std::get<std::int64_t>(copyRes.value) == 17,
+            "inline struct value-copy semantics failed");
+
+        // Populate ECS contiguous component columns from C++ host via createStruct + setEcsComponentColumn
+        std::vector<runtime::Value> transforms;
+        std::vector<runtime::Value> velocities;
+        for (int i = 0; i < 3; ++i) {
+            auto t = rt.createStruct(
+                "Evolution.EcsDataOriented::Transform",
+                {
+                    game::ScriptRuntime::makeVec2({game::Fixed::fromInt(i * 10), game::Fixed::fromInt(i * 20)}),
+                    game::ScriptRuntime::makeFixed(game::Fixed::fromInt(i)),
+                    static_cast<std::int64_t>(100 + i),
+                },
+                err);
+            require(t.has_value(), "createStruct Transform failed: " + err.message);
+            const auto& tStruct = std::get<runtime::StructValue>(*t);
+            require(tStruct.isInline && tStruct.storage == nullptr,
+                "host-created Transform must be inline with zero heap allocation");
+            transforms.push_back(*t);
+
+            auto v = rt.createStruct(
+                "Evolution.EcsDataOriented::Velocity",
+                {
+                    game::ScriptRuntime::makeVec2({game::Fixed::fromInt(2 + i), game::Fixed::fromInt(3 + i)}),
+                    game::ScriptRuntime::makeFixed(game::Fixed::fromInt(1)),
+                },
+                err);
+            require(v.has_value(), "createStruct Velocity failed: " + err.message);
+            velocities.push_back(*v);
+        }
+
+        require(rt.setEcsComponentColumn("Evolution.EcsDataOriented::Transform", transforms, err),
+            "setEcsComponentColumn Transform failed: " + err.message);
+        require(rt.setEcsComponentColumn("Evolution.EcsDataOriented::Velocity", velocities, err),
+            "setEcsComponentColumn Velocity failed: " + err.message);
+
+        auto stepMethod = rt.findMethod(sysObj->type(), "StepPhysics", 1);
+        require(stepMethod.has_value(), "failed to find StepPhysics");
+        auto stepRes = rt.invoke(*sysObj, *stepMethod, {game::ScriptRuntime::makeFixed(game::Fixed::fromInt(2))});
+        require(stepRes.succeeded, "StepPhysics failed: " + stepRes.error.message);
+
+        auto procCount = rt.getMember(*sysObj, "processedCount", err);
+        require(procCount.has_value() && std::get<std::int64_t>(*procCount) == 3,
+            "StepPhysics should have iterated over 3 ECS entities");
+
+        std::vector<runtime::Value> updatedTransforms;
+        require(rt.getEcsComponentColumn("Evolution.EcsDataOriented::Transform", updatedTransforms, err),
+            "getEcsComponentColumn Transform failed: " + err.message);
+        require(updatedTransforms.size() == 3, "expected 3 updated Transform components");
+
+        for (int i = 0; i < 3; ++i) {
+            const auto& ut = std::get<runtime::StructValue>(updatedTransforms[static_cast<std::size_t>(i)]);
+            require(ut.isInline && ut.storage == nullptr,
+                "mutated Transform in ECS column must remain inline with zero heap allocation");
+            const auto posVal = runtime::structValueFieldAt(ut, 0);
+            const auto rotVal = runtime::structValueFieldAt(ut, 1);
+            const auto layerVal = runtime::structValueFieldAt(ut, 2);
+            require(posVal.has_value() && rotVal.has_value() && layerVal.has_value(),
+                "failed to read fields from updated inline Transform");
+            const auto pos = game::ScriptRuntime::readVec2(*posVal);
+            const auto rot = game::ScriptRuntime::readFixed(*rotVal);
+            const auto layer = std::get<std::int64_t>(*layerVal);
+            // Expected: pos.x = i*10 + (2+i)*2, pos.y = i*20 + (3+i)*2, rot = i + 1*2, layer = 100 + i + 1
+            require(pos.has_value() &&
+                    pos->x == game::Fixed::fromInt(i * 10 + (2 + i) * 2) &&
+                    pos->y == game::Fixed::fromInt(i * 20 + (3 + i) * 2),
+                "ECS Query<Write<Transform>, Read<Velocity>>() produced wrong Transform.position");
+            require(rot.has_value() && *rot == game::Fixed::fromInt(i + 2),
+                "ECS Query<Write<Transform>, Read<Velocity>>() produced wrong Transform.rotation");
+            require(layer == 100 + i + 1,
+                "ECS Query<Write<Transform>, Read<Velocity>>() produced wrong Transform.layer");
+        }
+
+        // Verify C++17 AOT backend code generation succeeds on ECS Query + Inline Structs
+        compiler::Compilation aotComp;
+        for (const auto& stub : api.exportDeclarationStubs()) {
+            aotComp.addSource(stub);
+        }
+        aotComp.addSource({"ecs_system.rs", ecsSrc});
+        auto aotBuild = aotComp.build();
+        require(!aotBuild.diagnostics.hasErrors(), "ECS Query Compilation::build failed");
+        diagnostics::DiagnosticBag aotDiag;
+        aot::CppGenerator aotGen;
+        auto aotEmitted = aotGen.generate(aotBuild.modules, aotDiag);
+        require(!aotDiag.hasErrors() && !aotEmitted.header.empty() && !aotEmitted.source.empty(),
+            "C++17 AOT emission failed on ECS Query<Write<Transform>, Read<Velocity>>()");
+        require(aotEmitted.source.find("static_get::") != std::string::npos,
+            "C++17 AOT source should contain lowered ECS column fetch");
+    }
+
+    // 2. Compile-Time Read/Write Safety Diagnostics on Query<Write<T>, Read<U>>()
+    {
+        game::GameApi api;
+        game::GameScriptCompiler compiler(api);
+
+        // 2a. Mutating a field of a Read<Velocity> (in) component must fail with RS8702
+        const char* mutateReadSrc = R"RS(
+module Evolution.BadQueryMutate;
+struct Transform { int x; }
+struct Velocity { int vx; }
+void BadSystem() {
+    foreach (ref var t, in var v in Query<Write<Transform>, Read<Velocity>>()) {
+        v.vx = 10;
+    }
+}
+)RS";
+        auto badMutate = compiler.compile({{"bad_mutate.rs", mutateReadSrc}});
+        require(!badMutate.succeeded(), "mutating Read<Velocity> component must fail compilation");
+        bool sawRS8702 = false;
+        for (const auto& d : badMutate.diagnostics.items()) {
+            if (d.code == "RS8702") sawRS8702 = true;
+        }
+        require(sawRS8702, "expected diagnostic RS8702 when mutating a field of Read<T> (in) query variable");
+
+        // 2b. Binding ref variable to Read<Velocity> must fail with RS2215
+        const char* refOnReadSrc = R"RS(
+module Evolution.BadQueryRef;
+struct Transform { int x; }
+struct Velocity { int vx; }
+void BadSystem() {
+    foreach (ref var t, ref var v in Query<Write<Transform>, Read<Velocity>>()) {
+        t.x = v.vx;
+    }
+}
+)RS";
+        auto badRef = compiler.compile({{"bad_ref.rs", refOnReadSrc}});
+        require(!badRef.succeeded(), "binding ref to Read<Velocity> must fail compilation");
+        bool sawRS2215 = false;
+        for (const auto& d : badRef.diagnostics.items()) {
+            if (d.code == "RS2215") sawRS2215 = true;
+        }
+        require(sawRS2215, "expected diagnostic RS2215 when binding ref variable to Read<T>");
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -2331,8 +3015,12 @@ int main() {
         testBoostStage2ConstStaticStringInterpolationMathAndContainers();
         std::cout << "[12/13] testBoostStage3LspExactSymbolIdReferencesRenameAndChainedCompletion..." << std::endl;
         testBoostStage3LspExactSymbolIdReferencesRenameAndChainedCompletion();
-        std::cout << "[13/13] testCompleteEvolutionMilestones..." << std::endl;
+        std::cout << "[13/14] testCompleteEvolutionMilestones..." << std::endl;
         testCompleteEvolutionMilestones();
+        std::cout << "[14/15] testModernEngineParityCompletionGoals..." << std::endl;
+        testModernEngineParityCompletionGoals();
+        std::cout << "[15/15] testZeroHeapInlineStructAndEcsQueryMirLowering..." << std::endl;
+        testZeroHeapInlineStructAndEcsQueryMirLowering();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

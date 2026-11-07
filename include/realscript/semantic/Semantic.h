@@ -920,8 +920,19 @@ struct BoundForStatement final : BoundStatement {
     }
 };
 
+struct BoundEcsQueryColumn {
+    bool isWrite = false;
+    bool isReadOnly = false;
+    PrimitiveType elementType = PrimitiveType::Error;
+    std::string elementTypeName;
+    VariableSymbol collectionVariable;
+    VariableSymbol iterationVariable;
+};
+
 struct BoundForeachStatement final : BoundStatement {
     bool usesEnumerator = false;
+    bool isEcsQuery = false;
+    std::vector<BoundEcsQueryColumn> ecsColumns;
     VariableSymbol collectionVariable;
     VariableSymbol indexVariable;
     VariableSymbol iterationVariable;

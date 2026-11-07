@@ -386,6 +386,17 @@ private:
         }
         case BoundNodeKind::ForeachStatement: {
             const auto& value = static_cast<const BoundForeachStatement&>(statement);
+            if (value.isEcsQuery) {
+                state.assigned.insert(value.indexVariable.index);
+                auto bodyAssigned = state.assigned;
+                for (const auto& col : value.ecsColumns) {
+                    state.assigned.insert(col.collectionVariable.index);
+                    bodyAssigned.insert(col.collectionVariable.index);
+                    bodyAssigned.insert(col.iterationVariable.index);
+                }
+                (void)analyzeStatement(*value.body, {std::move(bodyAssigned), ExitKind::None});
+                return state;
+            }
             analyzeExpression(*value.collection, state.assigned);
             state.assigned.insert(value.collectionVariable.index);
             state.assigned.insert(value.indexVariable.index);

@@ -141,6 +141,48 @@ void FiberScheduler::killFiberTree(std::uint32_t rootFiberId) noexcept {
     }
 }
 
+std::size_t FiberScheduler::killEntityFibers(GenerationalEntityHandle entity) noexcept {
+    if (!entity.valid()) return 0;
+    std::vector<std::uint32_t> roots;
+    for (std::size_t i = 1; i < fibers_.size(); ++i) {
+        if (fibers_[i].boundEntity == entity &&
+            fibers_[i].status != FiberStatus::Terminated &&
+            fibers_[i].status != FiberStatus::Inactive) {
+            roots.push_back(static_cast<std::uint32_t>(i));
+        }
+    }
+    std::size_t killed = 0;
+    for (std::uint32_t fid : roots) {
+        if (fibers_[fid].status != FiberStatus::Terminated &&
+            fibers_[fid].status != FiberStatus::Inactive) {
+            killFiberTree(fid);
+            ++killed;
+        }
+    }
+    return killed;
+}
+
+std::size_t FiberScheduler::killEntityFibersBySlot(std::uint32_t entitySlot) noexcept {
+    if (entitySlot == 0 || entitySlot == GenerationalEntityHandle::InvalidSlot) return 0;
+    std::vector<std::uint32_t> roots;
+    for (std::size_t i = 1; i < fibers_.size(); ++i) {
+        if (fibers_[i].boundEntity.slot == entitySlot &&
+            fibers_[i].status != FiberStatus::Terminated &&
+            fibers_[i].status != FiberStatus::Inactive) {
+            roots.push_back(static_cast<std::uint32_t>(i));
+        }
+    }
+    std::size_t killed = 0;
+    for (std::uint32_t fid : roots) {
+        if (fibers_[fid].status != FiberStatus::Terminated &&
+            fibers_[fid].status != FiberStatus::Inactive) {
+            killFiberTree(fid);
+            ++killed;
+        }
+    }
+    return killed;
+}
+
 void FiberScheduler::scheduleAtTick(std::uint32_t fiberId, std::uint32_t wakeTick) {
     fibers_[fiberId].status = FiberStatus::SleepingTicks;
     fibers_[fiberId].wakeTick = wakeTick;

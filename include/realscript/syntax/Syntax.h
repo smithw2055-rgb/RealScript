@@ -630,11 +630,20 @@ struct ForStatementSyntax final : StatementSyntax {
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
+struct ForeachBindingSyntax {
+    std::optional<SyntaxToken> modifierToken;
+    TypeSyntax type;
+    SyntaxToken identifierToken;
+};
+
 struct ForeachStatementSyntax final : StatementSyntax {
     SyntaxToken foreachKeyword;
     SyntaxToken openParenToken;
+    std::optional<SyntaxToken> modifierToken;
     TypeSyntax type;
     SyntaxToken identifierToken;
+    std::vector<SyntaxToken> bindingCommaTokens;
+    std::vector<ForeachBindingSyntax> additionalBindings;
     SyntaxToken inKeyword;
     std::unique_ptr<ExpressionSyntax> collection;
     SyntaxToken closeParenToken;

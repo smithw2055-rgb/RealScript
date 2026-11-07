@@ -4545,6 +4545,14 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                 diagnostics_.report("RS2482", "struct field assignment requires a variable receiver", syntaxTree.receiver->span());
                 return makeError(syntaxTree.span());
             }
+            if (variable->isConst || variable->modifier == ParameterModifier::In) {
+                diagnostics_.report(
+                    "RS8702",
+                    "cannot assign to field of read-only 'in' or 'Read<T>' variable '" +
+                        variable->name + "'",
+                    syntaxTree.receiver->span());
+                return makeError(syntaxTree.span());
+            }
             auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
             result->span = syntaxTree.span();
             result->type = field->type;

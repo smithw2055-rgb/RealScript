@@ -363,6 +363,18 @@ std::optional<ScriptObject> ScriptRuntime::createObject(
     return createObject(*type, {}, error, std::move(options));
 }
 
+std::optional<ScriptObject> ScriptRuntime::createPrototypeObject(
+    const ScriptType& type,
+    runtime::RuntimeError& error) const {
+    if (nativeBaseTypeId(type) == 0) {
+        runtime::RuntimeError ctorError;
+        if (auto obj = createObject(type, {}, ctorError)) {
+            return obj;
+        }
+    }
+    return allocateUninitializedObject(type, error);
+}
+
 bool ScriptRuntime::isNativeAlive(const ScriptObject& object) const noexcept {
     if (!object.valid() || !heap_ || !nativeHandles_ ||
         object.type().descriptor.fields.empty() ||

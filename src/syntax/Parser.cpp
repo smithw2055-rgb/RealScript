@@ -1194,8 +1194,23 @@ std::unique_ptr<StatementSyntax> Parser::parseForeachStatement() {
     auto result = std::make_unique<ForeachStatementSyntax>();
     result->foreachKeyword = match(SyntaxKind::ForeachKeyword);
     result->openParenToken = match(SyntaxKind::OpenParenToken);
+    if (current().kind == SyntaxKind::RefKeyword ||
+        current().kind == SyntaxKind::InKeyword) {
+        result->modifierToken = nextToken();
+    }
     result->type = parseType();
     result->identifierToken = match(SyntaxKind::IdentifierToken);
+    while (current().kind == SyntaxKind::CommaToken) {
+        result->bindingCommaTokens.push_back(nextToken());
+        ForeachBindingSyntax extra;
+        if (current().kind == SyntaxKind::RefKeyword ||
+            current().kind == SyntaxKind::InKeyword) {
+            extra.modifierToken = nextToken();
+        }
+        extra.type = parseType();
+        extra.identifierToken = match(SyntaxKind::IdentifierToken);
+        result->additionalBindings.push_back(std::move(extra));
+    }
     result->inKeyword = match(SyntaxKind::InKeyword);
     result->collection = parseExpression();
     result->closeParenToken = match(SyntaxKind::CloseParenToken);

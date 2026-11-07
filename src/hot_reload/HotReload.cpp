@@ -231,7 +231,8 @@ std::uint64_t functionBodyFingerprint(const bytecode::Module& module, const byte
 
 ReloadPlan prepare(
     const runtime::ProgramImage& current,
-    std::vector<bytecode::Module> replacementModules) {
+    std::vector<bytecode::Module> replacementModules,
+    ReloadOptions options) {
     ReloadPlan plan;
     runtime::RuntimeError error;
     auto linked = runtime::ProgramImage::link(std::move(replacementModules), error);
@@ -243,11 +244,15 @@ ReloadPlan prepare(
     const auto& oldModules = current.modules();
     const auto& newModules = linked->modules();
     if (moduleSet(oldModules) != moduleSet(newModules)) {
-        plan.issues.push_back({
-            ReloadIssueKind::ModuleSetChanged,
-            {},
-            "hot reload cannot add or remove modules",
-        });
+        if (!options.allowModuleSetChanges && !options.allowStructuralChanges) {
+            plan.issues.push_back({
+                ReloadIssueKind::ModuleSetChanged,
+                {},
+                "hot reload cannot add or remove modules",
+            });
+        } else {
+            plan.structuralMigrationRequired = true;
+        }
     }
     for (const auto& oldModule : oldModules) {
         const auto replacement = std::find_if(
@@ -259,17 +264,21 @@ ReloadPlan prepare(
             !sameLanguageMetadata(
                 oldModule.languageMetadata,
                 replacement->languageMetadata)) {
-            plan.issues.push_back({
-                ReloadIssueKind::LanguageMetadataChanged,
-                oldModule.name,
-                "language metadata changed during body-only hot reload",
-            });
+            if (!options.allowStructuralChanges) {
+                plan.issues.push_back({
+                    ReloadIssueKind::LanguageMetadataChanged,
+                    oldModule.name,
+                    "language metadata changed during body-only hot reload",
+                });
+            } else {
+                plan.structuralMigrationRequired = true;
+            }
         }
     }
 
     const auto oldTypes = types(oldModules);
     const auto newTypes = types(newModules);
-    if (oldTypes.size() != newTypes.size()) {
+    if (oldTypes.size() != newTypes.size() && !options.allowStructuralChanges) {
         plan.issues.push_back({
             ReloadIssueKind::TypeLayoutChanged,
             {},
@@ -278,18 +287,39 @@ ReloadPlan prepare(
     }
     for (const auto& [id, oldType] : oldTypes) {
         const auto found = newTypes.find(id);
-        if (found == newTypes.end() || !sameType(*oldType, *found->second)) {
-            plan.issues.push_back({
-                ReloadIssueKind::TypeLayoutChanged,
-                semantic::canonicalTypeName(*oldType),
-                "type layout changed during body-only hot reload",
-            });
+        if (found == newTypes.end()) {
+            plan.removedTypes.push_back(id);
+            plan.structuralMigrationRequired = true;
+            if (!options.allowStructuralChanges) {
+                plan.issues.push_back({
+                    ReloadIssueKind::TypeLayoutChanged,
+                    semantic::canonicalTypeName(*oldType),
+                    "type layout changed during body-only hot reload",
+                });
+            }
+        } else if (!sameType(*oldType, *found->second)) {
+            plan.layoutChangedTypes.push_back(id);
+            plan.structuralMigrationRequired = true;
+            if (!options.allowStructuralChanges) {
+                plan.issues.push_back({
+                    ReloadIssueKind::TypeLayoutChanged,
+                    semantic::canonicalTypeName(*oldType),
+                    "type layout changed during body-only hot reload",
+                });
+            }
+        }
+    }
+    for (const auto& [id, newType] : newTypes) {
+        (void)newType;
+        if (oldTypes.find(id) == oldTypes.end()) {
+            plan.addedTypes.push_back(id);
+            plan.structuralMigrationRequired = true;
         }
     }
 
     const auto oldFunctions = functions(oldModules);
     const auto newFunctions = functions(newModules);
-    if (oldFunctions.size() != newFunctions.size()) {
+    if (oldFunctions.size() != newFunctions.size() && !options.allowStructuralChanges) {
         plan.issues.push_back({
             ReloadIssueKind::FunctionSetChanged,
             {},
@@ -299,24 +329,40 @@ ReloadPlan prepare(
     for (const auto& [id, oldFunction] : oldFunctions) {
         const auto found = newFunctions.find(id);
         if (found == newFunctions.end()) {
-            plan.issues.push_back({
-                ReloadIssueKind::FunctionSetChanged,
-                oldFunction.function->name,
-                "function was removed during hot reload",
-            });
+            plan.removedFunctions.push_back(id);
+            plan.structuralMigrationRequired = true;
+            if (!options.allowStructuralChanges) {
+                plan.issues.push_back({
+                    ReloadIssueKind::FunctionSetChanged,
+                    oldFunction.function->name,
+                    "function was removed during hot reload",
+                });
+            }
             continue;
         }
         if (!sameSignature(*oldFunction.function, *found->second.function)) {
-            plan.issues.push_back({
-                ReloadIssueKind::FunctionSignatureChanged,
-                oldFunction.function->name,
-                "function signature changed",
-            });
+            plan.structuralMigrationRequired = true;
+            if (!options.allowStructuralChanges) {
+                plan.issues.push_back({
+                    ReloadIssueKind::FunctionSignatureChanged,
+                    oldFunction.function->name,
+                    "function signature changed",
+                });
+            } else {
+                plan.changedFunctions.push_back(id);
+            }
             continue;
         }
         if (functionBodyFingerprint(*oldFunction.module, *oldFunction.function) !=
             functionBodyFingerprint(*found->second.module, *found->second.function)) {
             plan.changedFunctions.push_back(id);
+        }
+    }
+    for (const auto& [id, newFunction] : newFunctions) {
+        (void)newFunction;
+        if (oldFunctions.find(id) == oldFunctions.end()) {
+            plan.addedFunctions.push_back(id);
+            plan.structuralMigrationRequired = true;
         }
     }
 
@@ -329,7 +375,8 @@ ReloadPlan prepare(
 
 ReloadPlan apply(
     runtime::EngineRuntime& runtime,
-    std::vector<bytecode::Module> replacementModules) {
+    std::vector<bytecode::Module> replacementModules,
+    ReloadOptions options) {
     auto current = runtime.programSnapshot();
     if (!current) {
         ReloadPlan plan;
@@ -340,7 +387,7 @@ ReloadPlan apply(
         });
         return plan;
     }
-    auto plan = prepare(*current, std::move(replacementModules));
+    auto plan = prepare(*current, std::move(replacementModules), options);
     if (plan.compatible) runtime.replaceProgram(plan.program);
     return plan;
 }

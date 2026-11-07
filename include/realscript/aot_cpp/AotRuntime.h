@@ -1032,11 +1032,9 @@ struct UnboxedCustomStruct {
     semantic::PrimitiveType type,
     const UnboxedCustomStruct& value) {
     (void)type;
-    auto storage = std::make_shared<runtime::StructStorage>();
-    storage->fields.assign(
-        value.fields.begin(),
-        value.fields.begin() + value.fieldCount);
-    return runtime::Value{runtime::StructValue{value.typeId, std::move(storage)}};
+    return runtime::Value{runtime::makeStructValueFromFields(
+        value.typeId,
+        runtime::ValueSpan(value.fields.data(), value.fieldCount))};
 }
 
 [[nodiscard]] inline bool typedUnboxScalar(
@@ -1209,11 +1207,15 @@ struct UnboxedCustomStruct {
     UnboxedCustomStruct& out) {
     (void)type;
     if (const auto* s = std::get_if<runtime::StructValue>(&value);
-        s && s->typeId != 0 && s->storage && s->storage->fields.size() <= 16) {
+        s && s->valid() && s->fieldCount() <= 16) {
         out.typeId = s->typeId;
-        out.fieldCount = static_cast<std::uint8_t>(s->storage->fields.size());
+        out.fieldCount = static_cast<std::uint8_t>(s->fieldCount());
         for (std::uint8_t i = 0; i < out.fieldCount; ++i) {
-            out.fields[i] = s->storage->fields[i];
+            if (auto f = runtime::structValueFieldAt(*s, i)) {
+                out.fields[i] = std::move(*f);
+            } else {
+                return false;
+            }
         }
         return true;
     }

@@ -5,6 +5,7 @@
 #include "realscript/mir/Mir.h"
 
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -54,6 +55,8 @@ public:
     Compilation() = default;
     explicit Compilation(std::vector<SourceFile> sources)
         : sources_(std::move(sources)) {}
+    Compilation(std::initializer_list<SourceFile> sources)
+        : sources_(sources) {}
 
     void addSource(SourceFile source) {
         sources_.push_back(std::move(source));

@@ -209,10 +209,74 @@ struct QuatValue {
 };
 
 struct StructStorage;
+class ValueSpan;
+
+struct InlineStructSlot {
+    enum class Kind : std::uint8_t {
+        None = 0,
+        Bool,
+        Byte,
+        SByte,
+        Short,
+        UShort,
+        Int,
+        UInt,
+        Long,
+        ULong,
+        Float,
+        Double,
+        Char,
+        Fixed,
+        Fixed16,
+        Vec2,
+    };
+
+    std::uint32_t lo = 0;
+    std::uint32_t hi = 0;
+    Kind kind = Kind::None;
+
+    [[nodiscard]] constexpr std::uint64_t bits() const noexcept {
+        return (static_cast<std::uint64_t>(hi) << 32u) |
+            static_cast<std::uint64_t>(lo);
+    }
+    constexpr void setBits(std::uint64_t value) noexcept {
+        lo = static_cast<std::uint32_t>(value & 0xffffffffULL);
+        hi = static_cast<std::uint32_t>(value >> 32u);
+    }
+
+    friend constexpr bool operator==(
+        const InlineStructSlot& left,
+        const InlineStructSlot& right) noexcept {
+        return left.kind == right.kind &&
+            left.lo == right.lo &&
+            left.hi == right.hi;
+    }
+    friend constexpr bool operator!=(
+        const InlineStructSlot& left,
+        const InlineStructSlot& right) noexcept {
+        return !(left == right);
+    }
+};
 
 struct StructValue {
+    static constexpr std::size_t MaxInlineFields = 4;
+
     semantic::SymbolId typeId = 0;
     std::shared_ptr<const StructStorage> storage;
+    std::uint8_t inlineCount = 0;
+    bool isInline = false;
+    std::array<InlineStructSlot, MaxInlineFields> inlineFields{};
+
+    StructValue() = default;
+    StructValue(
+        semantic::SymbolId id,
+        std::shared_ptr<const StructStorage> store) noexcept
+        : typeId(id), storage(std::move(store)), inlineCount(0), isInline(false) {}
+
+    [[nodiscard]] bool valid() const noexcept {
+        return typeId != 0 && (isInline || storage != nullptr);
+    }
+    [[nodiscard]] std::size_t fieldCount() const noexcept;
 
     friend bool operator==(const StructValue& left, const StructValue& right);
 };
@@ -285,11 +349,46 @@ struct StructStorage {
     std::vector<Value> fields;
 };
 
+[[nodiscard]] std::optional<InlineStructSlot> encodeInlineStructSlot(
+    const Value& value) noexcept;
+[[nodiscard]] Value decodeInlineStructSlot(
+    const InlineStructSlot& slot) noexcept;
+[[nodiscard]] StructValue makeStructValueFromFields(
+    semantic::SymbolId typeId,
+    ValueSpan fields);
+[[nodiscard]] StructValue makeStructValueFromFields(
+    semantic::SymbolId typeId,
+    std::vector<Value> fields);
+[[nodiscard]] std::optional<Value> structValueFieldAt(
+    const StructValue& structure,
+    std::size_t index) noexcept;
+
+inline std::size_t StructValue::fieldCount() const noexcept {
+    if (isInline) return inlineCount;
+    return storage ? storage->fields.size() : 0;
+}
+
 inline bool operator==(const StructValue& left, const StructValue& right) {
     if (left.typeId != right.typeId) return false;
-    if (left.storage == right.storage) return true;
-    if (!left.storage || !right.storage) return false;
-    return left.storage->fields == right.storage->fields;
+    const auto count = left.fieldCount();
+    if (count != right.fieldCount()) return false;
+    if (left.isInline && right.isInline) {
+        for (std::size_t i = 0; i < count; ++i) {
+            if (left.inlineFields[i] != right.inlineFields[i]) return false;
+        }
+        return true;
+    }
+    if (!left.isInline && !right.isInline) {
+        if (left.storage == right.storage) return true;
+        if (!left.storage || !right.storage) return false;
+        return left.storage->fields == right.storage->fields;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!(structValueFieldAt(left, i) == structValueFieldAt(right, i))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 enum class ErrorCode {

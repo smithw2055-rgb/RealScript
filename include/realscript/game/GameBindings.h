@@ -166,6 +166,8 @@ public:
         std::size_t classesExported = 0;
         std::size_t methodsExported = 0;
         std::size_t functionsExported = 0;
+        std::size_t propertiesExported = 0;
+        std::size_t enumsExported = 0;
     };
 
     [[nodiscard]] static HeaderBindingGenerationResult generateBindingsFromCppHeader(

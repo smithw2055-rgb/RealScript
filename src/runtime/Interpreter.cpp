@@ -470,7 +470,7 @@ bool expectSignatureType(
         const auto actualTypeId = structValueTypeId(value);
         const auto* structure = std::get_if<StructValue>(&value);
         if (!actualTypeId || typeId == 0 || *actualTypeId != typeId ||
-            (structure && !structure->storage)) {
+            (structure && !structure->valid())) {
             return fail(state, ErrorCode::TypeMismatch,
                 context + " has the wrong struct type");
         }
@@ -526,13 +526,23 @@ Value defaultValue(
         if (!descriptor || descriptor->kind != semantic::TypeKind::Struct) {
             return StructValue{};
         }
-        auto storage = std::make_shared<StructStorage>();
-        storage->fields.reserve(descriptor->fields.size());
+        if (descriptor->fields.size() <= StructValue::MaxInlineFields) {
+            std::array<Value, StructValue::MaxInlineFields> stackFields{};
+            for (std::size_t i = 0; i < descriptor->fields.size(); ++i) {
+                const auto& field = descriptor->fields[i];
+                stackFields[i] = defaultValue(
+                    module, field.type, exactTypeId(field.type, field.typeName), depth + 1);
+            }
+            return makeStructValueFromFields(
+                typeId, ValueSpan(stackFields.data(), descriptor->fields.size()));
+        }
+        std::vector<Value> fields;
+        fields.reserve(descriptor->fields.size());
         for (const auto& field : descriptor->fields) {
-            storage->fields.push_back(defaultValue(
+            fields.push_back(defaultValue(
                 module, field.type, exactTypeId(field.type, field.typeName), depth + 1));
         }
-        return StructValue{typeId, std::move(storage)};
+        return makeStructValueFromFields(typeId, std::move(fields));
     }
     case semantic::PrimitiveType::Null: return std::monostate{};
     case semantic::PrimitiveType::Void:
@@ -1514,13 +1524,23 @@ bool executeInstruction(
         if (const auto inlined = makeDefaultInlineStructValue(type->id)) {
             return storeResult(*inlined);
         }
-        auto storage = std::make_shared<StructStorage>();
-        storage->fields.reserve(type->fields.size());
+        if (type->fields.size() <= StructValue::MaxInlineFields) {
+            std::array<Value, StructValue::MaxInlineFields> stackFields{};
+            for (std::size_t i = 0; i < type->fields.size(); ++i) {
+                const auto& field = type->fields[i];
+                stackFields[i] = defaultValue(
+                    module, field.type, exactTypeId(field.type, field.typeName));
+            }
+            return storeResult(makeStructValueFromFields(
+                type->id, ValueSpan(stackFields.data(), type->fields.size())));
+        }
+        std::vector<Value> fields;
+        fields.reserve(type->fields.size());
         for (const auto& field : type->fields) {
-            storage->fields.push_back(defaultValue(
+            fields.push_back(defaultValue(
                 module, field.type, exactTypeId(field.type, field.typeName)));
         }
-        return storeResult(StructValue{type->id, std::move(storage)});
+        return storeResult(makeStructValueFromFields(type->id, std::move(fields)));
     }
     case bytecode::Opcode::ArrayLength: {
         const auto* receiver = operand(0);
@@ -3070,7 +3090,7 @@ std::string valueToString(const Value& value, const ManagedHeap* heap) {
     }
     if (const auto* structure = std::get_if<StructValue>(&value)) {
         return "<struct:type=0x" + std::to_string(structure->typeId) + ":fields=" +
-            std::to_string(structure->storage ? structure->storage->fields.size() : 0) + ">";
+            std::to_string(structure->fieldCount()) + ">";
     }
     if (std::holds_alternative<std::string>(value)) return std::get<std::string>(value);
     if (const auto* handle = std::get_if<NativeHandle>(&value)) {

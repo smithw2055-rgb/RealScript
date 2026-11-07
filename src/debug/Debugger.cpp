@@ -180,14 +180,15 @@ private:
                 return std::nullopt;
             }
             if (const auto* structVal = std::get_if<runtime::StructValue>(&target)) {
-                if (!structVal->storage) {
+                if (!structVal->valid()) {
                     setError("struct storage is null");
                     return std::nullopt;
                 }
                 for (std::size_t index = 0; index < foundType->second.fields.size(); ++index) {
-                    if (foundType->second.fields[index].name == member &&
-                        index < structVal->storage->fields.size()) {
-                        return structVal->storage->fields[index];
+                    if (foundType->second.fields[index].name == member) {
+                        if (auto fieldVal = runtime::structValueFieldAt(*structVal, index)) {
+                            return *fieldVal;
+                        }
                     }
                 }
             } else {

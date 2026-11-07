@@ -1,5 +1,6 @@
 #include "realscript/game/GameScripting.h"
 
+#include <set>
 #include <utility>
 
 namespace realscript::game {
@@ -191,6 +192,19 @@ ScriptObject* SceneScriptRuntime::getComponent(
     return nullptr;
 }
 
+const ScriptObject* SceneScriptRuntime::getComponent(
+    SceneEntityId entity,
+    const std::string& typeOrInterfaceName) const {
+    const auto found = instances_.find(entity);
+    if (found == instances_.end()) return nullptr;
+    for (const auto& instance : found->second) {
+        if (matchesComponentType(instance.object.type(), typeOrInterfaceName)) {
+            return &instance.object;
+        }
+    }
+    return nullptr;
+}
+
 std::vector<ScriptObject*> SceneScriptRuntime::getComponents(SceneEntityId entity) {
     std::vector<ScriptObject*> result;
     const auto found = instances_.find(entity);
@@ -200,6 +214,38 @@ std::vector<ScriptObject*> SceneScriptRuntime::getComponents(SceneEntityId entit
         result.push_back(&instance.object);
     }
     return result;
+}
+
+std::vector<const ScriptObject*> SceneScriptRuntime::getComponents(SceneEntityId entity) const {
+    std::vector<const ScriptObject*> result;
+    const auto found = instances_.find(entity);
+    if (found == instances_.end()) return result;
+    result.reserve(found->second.size());
+    for (const auto& instance : found->second) {
+        result.push_back(&instance.object);
+    }
+    return result;
+}
+
+std::vector<SceneEntityId> SceneScriptRuntime::entities() const {
+    std::set<SceneEntityId> allIds;
+    for (const auto& [ent, _] : instances_) {
+        (void)_;
+        if (ent != BroadcastTarget) allIds.insert(ent);
+    }
+    for (const auto& [ent, _] : entityActiveSelf_) {
+        (void)_;
+        if (ent != BroadcastTarget) allIds.insert(ent);
+    }
+    for (const auto& [ent, _] : localTransforms_) {
+        (void)_;
+        if (ent != BroadcastTarget) allIds.insert(ent);
+    }
+    for (const auto& [child, parent] : parentByEntity_) {
+        if (child != BroadcastTarget) allIds.insert(child);
+        if (parent != BroadcastTarget) allIds.insert(parent);
+    }
+    return std::vector<SceneEntityId>(allIds.begin(), allIds.end());
 }
 
 bool SceneScriptRuntime::hasComponent(
@@ -219,6 +265,106 @@ std::size_t SceneScriptRuntime::componentCount(
     SceneEntityId entity) const noexcept {
     const auto found = instances_.find(entity);
     return found == instances_.end() ? 0 : found->second.size();
+}
+
+void SceneFiberHostAdapter::registerCommandCallback(
+    std::uint8_t commandId,
+    std::string callbackName,
+    std::string componentType) {
+    commands_[commandId] = CommandEntry{std::move(callbackName), std::move(componentType)};
+}
+
+void SceneFiberHostAdapter::registerConditionMember(
+    std::uint16_t key16,
+    std::string memberName,
+    std::string componentType) {
+    conditions_[key16] = ConditionEntry{std::move(memberName), std::move(componentType)};
+}
+
+void SceneFiberHostAdapter::onHostCommand(
+    runtime::FiberContext& fiber,
+    std::uint8_t commandId,
+    std::uint16_t arg16,
+    std::uint32_t arg32) noexcept {
+    const auto it = commands_.find(commandId);
+    if (it == commands_.end()) return;
+    const auto entityId = static_cast<SceneEntityId>(fiber.boundEntity.slot);
+    if (entityId == SceneScriptRuntime::BroadcastTarget) return;
+
+    const std::vector<runtime::Value> args2{
+        static_cast<std::int64_t>(arg16),
+        static_cast<std::int64_t>(static_cast<std::int32_t>(arg32)),
+    };
+    const std::vector<runtime::Value> args1{
+        static_cast<std::int64_t>(static_cast<std::int32_t>(arg32)),
+    };
+
+    if (!it->second.componentType.empty()) {
+        auto* comp = scene_.getComponent(entityId, it->second.componentType);
+        if (!comp) return;
+        if (scene_.runtime().findMethod(comp->type(), it->second.callbackName, 2)) {
+            (void)scene_.invokeComponent(
+                entityId, it->second.componentType, it->second.callbackName, args2);
+        } else if (scene_.runtime().findMethod(comp->type(), it->second.callbackName, 1)) {
+            (void)scene_.invokeComponent(
+                entityId, it->second.componentType, it->second.callbackName, args1);
+        } else {
+            (void)scene_.invokeComponent(
+                entityId, it->second.componentType, it->second.callbackName, {});
+        }
+    } else {
+        auto* comp = scene_.object(entityId);
+        if (!comp) return;
+        if (scene_.runtime().findMethod(comp->type(), it->second.callbackName, 2)) {
+            (void)scene_.invoke(entityId, it->second.callbackName, args2);
+        } else if (scene_.runtime().findMethod(comp->type(), it->second.callbackName, 1)) {
+            (void)scene_.invoke(entityId, it->second.callbackName, args1);
+        } else {
+            (void)scene_.invoke(entityId, it->second.callbackName, {});
+        }
+    }
+}
+
+bool SceneFiberHostAdapter::onEvaluateCondition(
+    const runtime::FiberContext& fiber,
+    std::uint8_t conditionKind,
+    std::uint16_t key16,
+    std::uint16_t threshold16) const noexcept {
+    const auto it = conditions_.find(key16);
+    if (it == conditions_.end()) return false;
+    const auto entityId = static_cast<SceneEntityId>(fiber.boundEntity.slot);
+    if (entityId == SceneScriptRuntime::BroadcastTarget) return false;
+
+    const ScriptObject* comp = it->second.componentType.empty()
+        ? const_cast<SceneScriptRuntime&>(scene_).object(entityId)
+        : scene_.getComponent(entityId, it->second.componentType);
+    if (!comp) return false;
+
+    runtime::RuntimeError err;
+    const auto val = scene_.runtime().getMember(*comp, it->second.memberName, err);
+    if (!val) return false;
+
+    std::int64_t actual = 0;
+    if (const auto* iv = std::get_if<std::int64_t>(&*val)) {
+        actual = *iv;
+    } else if (const auto* bv = std::get_if<bool>(&*val)) {
+        actual = *bv ? 1 : 0;
+    } else if (const auto* lv = std::get_if<runtime::LongValue>(&*val)) {
+        actual = lv->value;
+    } else {
+        return false;
+    }
+
+    const auto rhs = static_cast<std::int64_t>(threshold16);
+    switch (conditionKind) {
+    case 0: return actual >= rhs;
+    case 1: return actual > rhs;
+    case 2: return actual == rhs;
+    case 3: return actual < rhs;
+    case 4: return actual <= rhs;
+    case 5: return actual != rhs;
+    default: return actual >= rhs;
+    }
 }
 
 bool installSceneComponentBindings(
@@ -250,6 +396,22 @@ bool installSceneComponentBindings(
                 if (entityId <= 0) return false;
                 return scenePtr->setComponentEnabled(
                     static_cast<SceneEntityId>(entityId), typeName, enabled);
+            }) &&
+        api.function(
+            moduleName,
+            "SetEntityActive",
+            [scenePtr](std::int64_t entityId, bool active) -> bool {
+                if (entityId <= 0) return false;
+                return scenePtr->setEntityActive(
+                    static_cast<SceneEntityId>(entityId), active);
+            }) &&
+        api.function(
+            moduleName,
+            "IsEntityActiveSelf",
+            [scenePtr](std::int64_t entityId) -> bool {
+                if (entityId <= 0) return false;
+                return scenePtr->isEntityActiveSelf(
+                    static_cast<SceneEntityId>(entityId));
             }) &&
         api.function(
             moduleName,

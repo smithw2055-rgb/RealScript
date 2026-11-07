@@ -94,9 +94,10 @@ bool allowedValue(
         std::holds_alternative<double>(value)) return policy.allowDoubles;
     if (std::holds_alternative<std::string>(value)) return policy.allowStrings;
     const auto* structure = std::get_if<runtime::StructValue>(&value);
-    if (!structure || !structure->storage) return false;
-    for (const auto& field : structure->storage->fields) {
-        if (!allowedValue(field, policy, depth + 1)) return false;
+    if (!structure || !structure->valid()) return false;
+    for (std::size_t i = 0; i < structure->fieldCount(); ++i) {
+        const auto field = runtime::structValueFieldAt(*structure, i);
+        if (!field || !allowedValue(*field, policy, depth + 1)) return false;
     }
     return true;
 }
@@ -257,9 +258,10 @@ bool writeValue(
     } else if (const auto* item = std::get_if<runtime::StructValue>(&value)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Struct));
         writer.writeU64(item->typeId);
-        writer.writeU32(static_cast<std::uint32_t>(item->storage->fields.size()));
-        for (const auto& field : item->storage->fields) {
-            if (!writeValue(writer, field, policy, depth + 1, error)) return false;
+        writer.writeU32(static_cast<std::uint32_t>(item->fieldCount()));
+        for (std::size_t i = 0; i < item->fieldCount(); ++i) {
+            const auto field = runtime::structValueFieldAt(*item, i);
+            if (!field || !writeValue(writer, *field, policy, depth + 1, error)) return false;
         }
     } else if (const auto* item = std::get_if<std::string>(&value)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::String));
@@ -363,12 +365,11 @@ bool readValue(
             count > policy.maximumFields) {
             return false;
         }
-        auto storage = std::make_shared<runtime::StructStorage>();
-        storage->fields.resize(count);
-        for (auto& field : storage->fields) {
+        std::vector<runtime::Value> fields(count);
+        for (auto& field : fields) {
             if (!readValue(reader, field, policy, depth + 1, error)) return false;
         }
-        value = runtime::StructValue{first, std::move(storage)};
+        value = runtime::makeStructValueFromFields(first, std::move(fields));
         return true;
     }
     case ValueTag::String: {
@@ -762,7 +763,8 @@ bool valueToJson(
             "script state contains an unresolvable object reference");
         return false;
     }
-    if (!allowedValue(value, policy, depth)) {
+    if (!std::holds_alternative<runtime::StructValue>(value) &&
+        !allowedValue(value, policy, depth)) {
         fail(error, runtime::ErrorCode::DeterminismViolation,
             "script state contains a process-local or disallowed value");
         return false;
@@ -798,15 +800,17 @@ bool valueToJson(
     } else if (const auto structTypeId = runtime::structValueTypeId(value)) {
         const auto* structDesc = findProgramTypeById(program, *structTypeId);
         if (const auto* structItem = std::get_if<runtime::StructValue>(&value)) {
-            if (!structItem->storage) return false;
-            if (structDesc && structDesc->fields.size() == structItem->storage->fields.size()) {
+            if (!structItem->valid()) return false;
+            if (structDesc && structDesc->fields.size() == structItem->fieldCount()) {
                 tooling::Json::Object obj;
                 for (std::size_t idx = 0; idx < structDesc->fields.size(); ++idx) {
+                    const auto elem = runtime::structValueFieldAt(*structItem, idx);
+                    if (!elem) return false;
                     tooling::Json fieldJson;
                     if (!valueToJson(
                             runtime,
                             scene,
-                            structItem->storage->fields[idx],
+                            *elem,
                             policy,
                             depth + 1,
                             fieldJson,
@@ -818,10 +822,12 @@ bool valueToJson(
                 out = tooling::Json(std::move(obj));
             } else {
                 tooling::Json::Array arr;
-                arr.reserve(structItem->storage->fields.size());
-                for (const auto& elem : structItem->storage->fields) {
+                arr.reserve(structItem->fieldCount());
+                for (std::size_t idx = 0; idx < structItem->fieldCount(); ++idx) {
+                    const auto elem = runtime::structValueFieldAt(*structItem, idx);
+                    if (!elem) return false;
                     tooling::Json fieldJson;
-                    if (!valueToJson(runtime, scene, elem, policy, depth + 1, fieldJson, error)) {
+                    if (!valueToJson(runtime, scene, *elem, policy, depth + 1, fieldJson, error)) {
                         return false;
                     }
                     arr.push_back(std::move(fieldJson));
@@ -1079,7 +1085,7 @@ bool jsonToValue(
             out = std::move(*inlineVal);
             return true;
         }
-        out = runtime::StructValue{typeId, std::move(storage)};
+        out = runtime::makeStructValueFromFields(typeId, std::move(storage->fields));
         return true;
     }
     default:
@@ -1220,6 +1226,342 @@ bool importScriptObjectJson(
             return false;
         }
     }
+    return true;
+}
+
+std::string exportSceneJson(
+    const SceneScriptRuntime& scene,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy) {
+    error = {};
+    const auto& runtime = scene.runtime();
+    tooling::Json::Array entitiesArr;
+
+    const auto encodeVec3Raw = [](const Vec3& v) {
+        tooling::Json::Array arr;
+        arr.push_back(tooling::Json(static_cast<std::int64_t>(v.x.raw)));
+        arr.push_back(tooling::Json(static_cast<std::int64_t>(v.y.raw)));
+        arr.push_back(tooling::Json(static_cast<std::int64_t>(v.z.raw)));
+        return tooling::Json(std::move(arr));
+    };
+    const auto encodeQuatRaw = [](const Quat& q) {
+        tooling::Json::Array arr;
+        arr.push_back(tooling::Json(static_cast<std::int64_t>(q.x.raw)));
+        arr.push_back(tooling::Json(static_cast<std::int64_t>(q.y.raw)));
+        arr.push_back(tooling::Json(static_cast<std::int64_t>(q.z.raw)));
+        arr.push_back(tooling::Json(static_cast<std::int64_t>(q.w.raw)));
+        return tooling::Json(std::move(arr));
+    };
+
+    for (const auto entityId : scene.entities()) {
+        tooling::Json::Object entObj;
+        entObj["id"] = static_cast<std::int64_t>(entityId);
+        entObj["activeSelf"] = scene.isEntityActiveSelf(entityId);
+        entObj["parent"] = static_cast<std::int64_t>(scene.getParent(entityId));
+
+        const Transform3D localTf = scene.getLocalTransform(entityId);
+        tooling::Json::Object tfObj;
+        tfObj["positionRaw"] = encodeVec3Raw(localTf.position);
+        tfObj["rotationRaw"] = encodeQuatRaw(localTf.rotation);
+        tfObj["scaleRaw"] = encodeVec3Raw(localTf.scale);
+        entObj["localTransform"] = tooling::Json(std::move(tfObj));
+
+        tooling::Json::Array compsArr;
+        for (const auto* compObj : scene.getComponents(entityId)) {
+            if (!compObj || !compObj->valid()) continue;
+            const auto& fields = compObj->type().descriptor.fields;
+            if (fields.size() > policy.maximumFields) {
+                fail(error, runtime::ErrorCode::DeterminismViolation,
+                    "script object has too many fields for the state policy");
+                return {};
+            }
+            tooling::Json::Object fieldsObj;
+            for (std::size_t index = 0; index < fields.size(); ++index) {
+                const auto& field = fields[index];
+                if (field.synthetic || field.staticField || field.constField ||
+                    (!field.name.empty() && field.name.front() == '$')) {
+                    continue;
+                }
+                if (field.name == "__native" &&
+                    field.type == semantic::PrimitiveType::Handle) {
+                    continue;
+                }
+                auto value = runtime.heap()->fieldGet(compObj->reference(), index);
+                if (!value) {
+                    fail(error, runtime::ErrorCode::InvalidObjectReference,
+                        "failed to read script field '" + field.name + "'");
+                    return {};
+                }
+                tooling::Json fieldJson;
+                if (!valueToJson(
+                        runtime, &scene, *value, policy, 0, fieldJson, error)) {
+                    return {};
+                }
+                fieldsObj[field.name] = std::move(fieldJson);
+            }
+            tooling::Json::Object compJson;
+            compJson["type"] = compObj->type().canonicalName();
+            compJson["enabled"] = scene.isComponentEnabled(
+                entityId, compObj->type().canonicalName());
+            compJson["fields"] = tooling::Json(std::move(fieldsObj));
+            compsArr.push_back(tooling::Json(std::move(compJson)));
+        }
+        entObj["components"] = tooling::Json(std::move(compsArr));
+        entitiesArr.push_back(tooling::Json(std::move(entObj)));
+    }
+
+    tooling::Json::Array signalsArr;
+    for (const auto& conn : scene.signalConnections()) {
+        tooling::Json::Object sigObj;
+        sigObj["sourceEntity"] = static_cast<std::int64_t>(conn.sourceEntity);
+        sigObj["sourceComponent"] = conn.sourceComponent;
+        sigObj["signalName"] = conn.signalName;
+        sigObj["targetEntity"] = static_cast<std::int64_t>(conn.targetEntity);
+        sigObj["targetComponent"] = conn.targetComponent;
+        sigObj["targetMethod"] = conn.targetMethod;
+        signalsArr.push_back(tooling::Json(std::move(sigObj)));
+    }
+
+    tooling::Json::Object root;
+    root["version"] = static_cast<std::int64_t>(kScriptObjectStateVersion);
+    root["entities"] = tooling::Json(std::move(entitiesArr));
+    root["signalConnections"] = tooling::Json(std::move(signalsArr));
+    return tooling::Json(std::move(root)).dump();
+}
+
+bool importSceneJson(
+    SceneScriptRuntime& scene,
+    const std::string& jsonText,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy) {
+    error = {};
+    std::string parseError;
+    const auto parsed = tooling::Json::parse(jsonText, parseError);
+    if (!parsed || !parsed->isObject()) {
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "malformed scene JSON: " + parseError);
+        return false;
+    }
+    const auto* versionJson = parsed->find("version");
+    const auto* entitiesJson = parsed->find("entities");
+    if (!versionJson || !versionJson->isNumber() ||
+        versionJson->integerValue() != static_cast<std::int64_t>(kScriptObjectStateVersion) ||
+        !entitiesJson || !entitiesJson->isArray()) {
+        fail(error, runtime::ErrorCode::TypeMismatch,
+            "scene JSON header or entities array is invalid");
+        return false;
+    }
+
+    const auto decodeVec3Raw = [](const tooling::Json* j, Vec3& out) -> bool {
+        if (!j || !j->isArray() || j->arrayValue().size() != 3) return false;
+        const auto& a = j->arrayValue();
+        if (!a[0].isNumber() || !a[1].isNumber() || !a[2].isNumber()) return false;
+        out.x = Fixed::fromRaw(static_cast<std::int32_t>(a[0].integerValue()));
+        out.y = Fixed::fromRaw(static_cast<std::int32_t>(a[1].integerValue()));
+        out.z = Fixed::fromRaw(static_cast<std::int32_t>(a[2].integerValue()));
+        return true;
+    };
+    const auto decodeQuatRaw = [](const tooling::Json* j, Quat& out) -> bool {
+        if (!j || !j->isArray() || j->arrayValue().size() != 4) return false;
+        const auto& a = j->arrayValue();
+        if (!a[0].isNumber() || !a[1].isNumber() || !a[2].isNumber() || !a[3].isNumber()) {
+            return false;
+        }
+        out.x = Fixed::fromRaw(static_cast<std::int32_t>(a[0].integerValue()));
+        out.y = Fixed::fromRaw(static_cast<std::int32_t>(a[1].integerValue()));
+        out.z = Fixed::fromRaw(static_cast<std::int32_t>(a[2].integerValue()));
+        out.w = Fixed::fromRaw(static_cast<std::int32_t>(a[3].integerValue()));
+        return true;
+    };
+
+    // Pre-validate entity entries before clearing existing scene state
+    for (const auto& entItem : entitiesJson->arrayValue()) {
+        if (!entItem.isObject()) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "scene JSON entity entry must be an object");
+            return false;
+        }
+        const auto* idJson = entItem.find("id");
+        if (!idJson || !idJson->isNumber()) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "scene JSON entity entry is missing numeric 'id'");
+            return false;
+        }
+        const auto entityId = static_cast<SceneEntityId>(idJson->integerValue());
+        if (entityId == SceneScriptRuntime::BroadcastTarget) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "scene JSON entity 'id' cannot be BroadcastTarget (0)");
+            return false;
+        }
+        if (const auto* compsJson = entItem.find("components"); compsJson && compsJson->isArray()) {
+            for (const auto& compItem : compsJson->arrayValue()) {
+                if (!compItem.isObject()) {
+                    fail(error, runtime::ErrorCode::InvalidProgram,
+                        "scene JSON component entry must be an object");
+                    return false;
+                }
+                const auto* typeJson = compItem.find("type");
+                if (!typeJson || !typeJson->isString()) {
+                    fail(error, runtime::ErrorCode::InvalidProgram,
+                        "scene JSON component entry is missing string 'type'");
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Clear existing entities in scene
+    for (const auto existingId : scene.entities()) {
+        (void)scene.detach(existingId);
+    }
+
+    struct DeferredComponentFields {
+        SceneEntityId entityId = 0;
+        std::string typeName;
+        bool enabled = true;
+        const tooling::Json* fieldsJson = nullptr;
+    };
+    std::vector<DeferredComponentFields> deferredComponents;
+    std::vector<std::pair<SceneEntityId, SceneEntityId>> deferredParents;
+    std::vector< std::pair<SceneEntityId, bool>> deferredEntityActive;
+
+    // Pass 1: Create all entities, local transforms, and attach all components
+    for (const auto& entItem : entitiesJson->arrayValue()) {
+        if (!entItem.isObject()) return false;
+        const auto* idJson = entItem.find("id");
+        if (!idJson || !idJson->isNumber()) return false;
+        const auto entityId = static_cast<SceneEntityId>(idJson->integerValue());
+        if (entityId == SceneScriptRuntime::BroadcastTarget) return false;
+
+        const auto* activeJson = entItem.find("activeSelf");
+        const bool activeSelf = (!activeJson || !activeJson->isBool()) ? true : activeJson->boolValue();
+        deferredEntityActive.push_back({entityId, activeSelf});
+
+        const auto* parentJson = entItem.find("parent");
+        if (parentJson && parentJson->isNumber() && parentJson->integerValue() > 0) {
+            deferredParents.push_back({
+                entityId, static_cast<SceneEntityId>(parentJson->integerValue())});
+        }
+
+        if (const auto* tfJson = entItem.find("localTransform"); tfJson && tfJson->isObject()) {
+            Transform3D tf = Transform3D::identity();
+            (void)decodeVec3Raw(tfJson->find("positionRaw"), tf.position);
+            (void)decodeQuatRaw(tfJson->find("rotationRaw"), tf.rotation);
+            (void)decodeVec3Raw(tfJson->find("scaleRaw"), tf.scale);
+            scene.setLocalTransform(entityId, tf);
+        }
+
+        if (const auto* compsJson = entItem.find("components"); compsJson && compsJson->isArray()) {
+            for (const auto& compItem : compsJson->arrayValue()) {
+                if (!compItem.isObject()) return false;
+                const auto* typeJson = compItem.find("type");
+                if (!typeJson || !typeJson->isString()) return false;
+                const auto* enabledJson = compItem.find("enabled");
+                const bool compEnabled = (!enabledJson || !enabledJson->isBool())
+                    ? true
+                    : enabledJson->boolValue();
+                SceneScriptOptions opts;
+                opts.enabled = compEnabled;
+                if (!scene.attachComponent(entityId, typeJson->stringValue(), std::move(opts))) {
+                    fail(error, runtime::ErrorCode::InvalidProgram,
+                        "failed to attach component '" + typeJson->stringValue() + "'");
+                    return false;
+                }
+                deferredComponents.push_back(DeferredComponentFields{
+                    entityId,
+                    typeJson->stringValue(),
+                    compEnabled,
+                    compItem.find("fields"),
+                });
+            }
+        }
+    }
+
+    // Pass 2: Wire hierarchy parents
+    for (const auto& [childId, parentId] : deferredParents) {
+        if (!scene.setParent(childId, parentId)) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "invalid parent hierarchy in scene JSON");
+            return false;
+        }
+    }
+
+    // Pass 3: Populate component fields (including cross-entity ObjectRefs)
+    auto& runtime = scene.runtime();
+    for (const auto& item : deferredComponents) {
+        if (!item.fieldsJson || !item.fieldsJson->isObject()) continue;
+        auto* compObj = scene.getComponent(item.entityId, item.typeName);
+        if (!compObj) return false;
+        for (const auto& desc : compObj->type().descriptor.fields) {
+            if (desc.synthetic || desc.staticField || desc.constField ||
+                (!desc.name.empty() && desc.name.front() == '$')) {
+                continue;
+            }
+            if (desc.name == "__native" &&
+                desc.type == semantic::PrimitiveType::Handle) {
+                continue;
+            }
+            const auto* fieldJson = item.fieldsJson->find(desc.name);
+            if (!fieldJson) continue;
+            runtime::Value decodedValue;
+            if (!jsonToValue(
+                    runtime,
+                    &scene,
+                    *fieldJson,
+                    desc.type,
+                    desc.typeName,
+                    policy,
+                    0,
+                    decodedValue,
+                    error)) {
+                if (error.code == runtime::ErrorCode::None) {
+                    fail(error, runtime::ErrorCode::TypeMismatch,
+                        "scene JSON field '" + desc.name + "' type mismatch");
+                }
+                return false;
+            }
+            if (!runtime.setMember(*compObj, desc.name, decodedValue, error)) {
+                return false;
+            }
+        }
+    }
+
+    // Pass 4: Restore wired signals
+    if (const auto* sigsJson = parsed->find("signalConnections"); sigsJson && sigsJson->isArray()) {
+        for (const auto& sigItem : sigsJson->arrayValue()) {
+            if (!sigItem.isObject()) return false;
+            const auto* srcEnt = sigItem.find("sourceEntity");
+            const auto* srcComp = sigItem.find("sourceComponent");
+            const auto* sigName = sigItem.find("signalName");
+            const auto* dstEnt = sigItem.find("targetEntity");
+            const auto* dstComp = sigItem.find("targetComponent");
+            const auto* dstMeth = sigItem.find("targetMethod");
+            if (!srcEnt || !srcEnt->isNumber() || !srcComp || !srcComp->isString() ||
+                !sigName || !sigName->isString() || !dstEnt || !dstEnt->isNumber() ||
+                !dstComp || !dstComp->isString() || !dstMeth || !dstMeth->isString()) {
+                return false;
+            }
+            if (!scene.connectSignal(
+                    static_cast<SceneEntityId>(srcEnt->integerValue()),
+                    srcComp->stringValue(),
+                    sigName->stringValue(),
+                    static_cast<SceneEntityId>(dstEnt->integerValue()),
+                    dstComp->stringValue(),
+                    dstMeth->stringValue())) {
+                fail(error, runtime::ErrorCode::InvalidProgram,
+                    "failed to restore signal connection '" + sigName->stringValue() + "'");
+                return false;
+            }
+        }
+    }
+
+    // Pass 5: Restore entity-level activeSelf states
+    for (const auto& [entId, activeSelf] : deferredEntityActive) {
+        if (!activeSelf) {
+            (void)scene.setEntityActive(entId, false);
+        }
+    }
+
     return true;
 }
 
