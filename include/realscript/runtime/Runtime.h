@@ -645,6 +645,8 @@ public:
         std::int64_t entityId);
     bool destroyNativeEcsEntity(std::int64_t entityId);
     [[nodiscard]] bool hasNativeEcsTable(std::string_view canonicalTypeName) const noexcept;
+    [[nodiscard]] std::vector<std::string> nativeEcsTableNames() const;
+    void clearNativeEcsTables() noexcept;
     [[nodiscard]] const std::vector<std::int64_t>* nativeEcsEntityIds(
         std::string_view canonicalTypeName) const noexcept;
     [[nodiscard]] const std::vector<Value>* nativeEcsComponentValues(

@@ -1854,6 +1854,77 @@ bool tryExecuteRuntimeIntrinsic(
         return true;
     }
 
+    if (op == "stable_hash" || op.rfind("stable_hash::", 0) == 0) {
+        if (arguments.empty()) {
+            result = std::int64_t{0};
+            return true;
+        }
+        std::uint64_t h = 1469598103934665603ULL;
+        const auto mixU64 = [&](std::uint64_t v) {
+            for (unsigned shift = 0; shift < 64; shift += 8) {
+                h ^= static_cast<std::uint8_t>((v >> shift) & 0xffu);
+                h *= 1099511628211ULL;
+            }
+        };
+        const auto mixStr = [&](std::string_view s) {
+            mixU64(s.size());
+            for (unsigned char ch : s) {
+                h ^= ch;
+                h *= 1099511628211ULL;
+            }
+        };
+        const auto hashVal = [&](const auto& self, const Value& v) -> void {
+            mixU64(v.index());
+            if (const auto* b = std::get_if<bool>(&v)) mixU64(*b ? 1u : 0u);
+            else if (const auto* i = std::get_if<std::int64_t>(&v)) mixU64(static_cast<std::uint64_t>(*i));
+            else if (const auto* l = std::get_if<LongValue>(&v)) mixU64(static_cast<std::uint64_t>(l->value));
+            else if (const auto* ui = std::get_if<UIntValue>(&v)) mixU64(ui->value);
+            else if (const auto* ul = std::get_if<ULongValue>(&v)) mixU64(ul->value);
+            else if (const auto* by = std::get_if<ByteValue>(&v)) mixU64(by->value);
+            else if (const auto* sb = std::get_if<SByteValue>(&v)) mixU64(static_cast<std::uint8_t>(sb->value));
+            else if (const auto* sh = std::get_if<ShortValue>(&v)) mixU64(static_cast<std::uint16_t>(sh->value));
+            else if (const auto* us = std::get_if<UShortValue>(&v)) mixU64(us->value);
+            else if (const auto* ch = std::get_if<CharValue>(&v)) mixU64(ch->value);
+            else if (const auto* en = std::get_if<EnumValue>(&v)) { mixU64(en->typeId); mixU64(static_cast<std::uint64_t>(en->value)); }
+            else if (const auto* fx = std::get_if<FixedValue>(&v)) mixU64(static_cast<std::uint32_t>(fx->raw));
+            else if (const auto* f16 = std::get_if<Fixed16Value>(&v)) mixU64(static_cast<std::uint64_t>(f16->raw));
+            else if (const auto* v2 = std::get_if<Vec2Value>(&v)) { mixU64(static_cast<std::uint32_t>(v2->x)); mixU64(static_cast<std::uint32_t>(v2->y)); }
+            else if (const auto* v3 = std::get_if<Vec3Value>(&v)) { mixU64(static_cast<std::uint32_t>(v3->x)); mixU64(static_cast<std::uint32_t>(v3->y)); mixU64(static_cast<std::uint32_t>(v3->z)); }
+            else if (const auto* q = std::get_if<QuatValue>(&v)) { mixU64(static_cast<std::uint32_t>(q->x)); mixU64(static_cast<std::uint32_t>(q->y)); mixU64(static_cast<std::uint32_t>(q->z)); mixU64(static_cast<std::uint32_t>(q->w)); }
+            else if (const auto* d = std::get_if<double>(&v)) {
+                std::uint64_t bits = 0;
+                const double norm = (*d == 0.0) ? 0.0 : *d;
+                std::memcpy(&bits, &norm, sizeof(bits));
+                mixU64(bits);
+            } else if (const auto* fl = std::get_if<FloatValue>(&v)) {
+                std::uint32_t bits = 0;
+                const float norm = (fl->value == 0.0f) ? 0.0f : fl->value;
+                std::memcpy(&bits, &norm, sizeof(bits));
+                mixU64(bits);
+            } else if (const auto* s = std::get_if<std::string>(&v)) {
+                mixStr(*s);
+            } else if (const auto* o = std::get_if<ObjectRef>(&v)) {
+                if (o->kind == ObjectKind::String && heap) {
+                    if (const auto sv = heap->stringView(*o)) {
+                        mixStr(*sv);
+                        return;
+                    }
+                }
+                mixU64((static_cast<std::uint64_t>(o->generation) << 32u) | o->slot);
+            } else if (const auto* st = std::get_if<StructValue>(&v)) {
+                mixU64(st->typeId);
+                for (std::size_t idx = 0; idx < st->fieldCount(); ++idx) {
+                    if (const auto fld = structValueFieldAt(*st, idx)) {
+                        self(self, *fld);
+                    }
+                }
+            }
+        };
+        hashVal(hashVal, arguments[0]);
+        result = static_cast<std::int64_t>(static_cast<std::int32_t>(h & 0x7fffffffULL));
+        return true;
+    }
+
     if (op == "string_concat") {
         if (arguments.size() != 2) {
             errorMessage = "string_concat requires 2 arguments";

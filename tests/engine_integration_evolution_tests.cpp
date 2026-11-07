@@ -4343,6 +4343,667 @@ int RunCalc() {
     }
 }
 
+void testRound5DeepFixesAndAdvancedParity() {
+    using namespace realscript;
+
+    // R5-1: GameplayHost & GameplayStateCodec subscription.once + asyncOps_ + nextAsyncOpId serialization & stableHash
+    {
+        game::GameplayHost hostA;
+        const auto sub1 = hostA.subscribeOnce("BossDefeated", 10, "OnBossDefeated", 5);
+        const auto op1 = hostA.createAsyncOperation("LoadDungeon");
+        require(sub1 != 0 && op1 != 0, "R5-1: subscribeOnce and createAsyncOperation should succeed");
+        require(
+            hostA.completeAsyncOperation(op1, game::GameplayValue{std::int32_t{777}}, 2),
+            "R5-1: completeAsyncOperation should succeed");
+
+        game::GameplayHost hostCompare;
+        (void)hostCompare.subscribe("BossDefeated", 10, "OnBossDefeated", 5);
+        (void)hostCompare.createAsyncOperation("LoadDungeon");
+        (void)hostCompare.completeAsyncOperation(1, game::GameplayValue{std::int32_t{777}}, 2);
+        require(
+            hostA.stableHash() != hostCompare.stableHash(),
+            "R5-1: stableHash must distinguish subscribeOnce(once=true) from subscribe(once=false)");
+
+        game::GameplayStateError codecErr;
+        const auto encoded = game::encodeGameplayHostState(hostA, codecErr);
+        require(!codecErr.failed() && !encoded.empty(), "R5-1: encodeGameplayHostState failed: " + codecErr.message);
+
+        game::GameplayHost hostB;
+        require(
+            game::restoreGameplayHostState(hostB, encoded, codecErr),
+            "R5-1: restoreGameplayHostState failed: " + codecErr.message);
+        require(
+            hostA.stableHash() == hostB.stableHash(),
+            "R5-1: restored GameplayHost must match original stableHash");
+        require(
+            hostB.isAsyncOperationCompleted(op1) &&
+                hostB.getAsyncOperationResult(op1).has_value() &&
+                std::get<std::int32_t>(*hostB.getAsyncOperationResult(op1)) == 777,
+            "R5-1: restored GameplayHost must preserve completed AsyncOperation result 777");
+        const auto op2 = hostB.createAsyncOperation("LoadNextZone");
+        require(op2 == 2, "R5-1: restored GameplayHost must preserve nextAsyncOpId == 2");
+
+        // Verify once=true is preserved on restored hostB: publishing once should consume the subscription
+        (void)hostB.publish("BossDefeated", {}, 1);
+        const auto batch1 = hostB.drainDue(1);
+        require(batch1.calls.size() == 1, "R5-1: once subscription should fire on first publish");
+        require(
+            hostB.subscriberCount("BossDefeated") == 0,
+            "R5-1: once subscription must auto-unsubscribe after firing on restored host");
+    }
+
+    // R5-2 & R5-3: exportSceneJson/importSceneJson coroutine `$sequence_*` + native ECS Sparse Set tables (Struct & Class)
+    //              AND unified captureRollbackFrame / restoreRollbackFrame (including 3D physics overlaps)
+    {
+        auto host = std::make_shared<game::GameplayHost>(60);
+        game::GameApi api;
+        require(game::installGameplayBindings(api, host), "R5-2: installGameplayBindings failed");
+
+        const char* src = R"RS(
+module Evolution.Round5Rollback;
+import RealScript.Game;
+
+struct ShieldData {
+    int capacity;
+    int rechargeRate;
+}
+
+class BuffBadge {
+    public int tier = 3;
+}
+
+class HeroCoroutine {
+    public int phase = 0;
+    public int counter = 0;
+    public int stay3DCount = 0;
+    public int enter3DCount = 0;
+
+    public void OnCollisionEnter3D(int other) { enter3DCount = enter3DCount + 1; }
+    public void OnCollisionStay3D(int other) { stay3DCount = stay3DCount + 1; }
+
+    public sequence RunCombo(long target, int bonus) {
+        phase = 1;
+        counter = counter + bonus;
+        yield wait_ticks(2);
+        phase = 2;
+        counter = counter + bonus * 10;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"r5_rollback.rs", src}});
+        require(compiled.succeeded(), "R5-2: failed to compile r5_rollback.rs:\n" + diagnosticsText(compiled.diagnostics));
+
+        game::ScriptRuntime rt(compiled.program);
+        game::SceneScriptRuntime scene(rt);
+        game::SceneGameplayDriver driver(scene, host);
+
+        runtime::RuntimeError snapErr;
+        require(scene.attach(1, "Evolution.Round5Rollback::HeroCoroutine"), "R5-2: attach 1 failed");
+        require(scene.attach(2, "Evolution.Round5Rollback::HeroCoroutine"), "R5-2: attach 2 failed");
+        auto shieldOpt = rt.createStruct(
+            "Evolution.Round5Rollback::ShieldData",
+            {std::int64_t{250}, std::int64_t{15}},
+            snapErr);
+        require(shieldOpt.has_value(), "R5-2: createStruct ShieldData failed: " + snapErr.message);
+        require(
+            rt.setEcsEntityComponent(1, "Evolution.Round5Rollback::ShieldData", *shieldOpt, snapErr),
+            "R5-2: setEcsEntityComponent Struct failed: " + snapErr.message);
+
+        // Also test Class (Object) component in native ECS Sparse Set (Review Defect #1)
+        auto badgeObj = rt.createObject("Evolution.Round5Rollback::BuffBadge", snapErr);
+        require(badgeObj.has_value(), "R5-2: createObject BuffBadge failed");
+        (void)rt.setMember(*badgeObj, "tier", std::int64_t{9}, snapErr);
+        require(
+            rt.setEcsEntityComponent(1, "Evolution.Round5Rollback::BuffBadge", badgeObj->reference(), snapErr),
+            "R5-2: setEcsEntityComponent Class failed: " + snapErr.message);
+
+        // Set up an active 3D overlap before capturing rollback frame (Review Defect #2)
+        game::SceneCollider3D c3d;
+        c3d.halfExtents = game::Vec3::of(2, 2, 2);
+        scene.setEntityCollider3D(1, c3d);
+        scene.setEntityCollider3D(2, c3d);
+        (void)scene.stepPhysics3D(); // Fires OnCollisionEnter3D once on 1 and 2
+
+        // Start coroutine on entity 1: executes up to `yield wait_ticks(2)` (phase=1, counter=5)
+        const auto startRes = scene.invoke(1, "RunCombo", {runtime::LongValue{1}, std::int64_t{5}});
+        require(startRes.succeeded, "R5-2: invoking RunCombo failed: " + startRes.error.message);
+
+        // Capture unified rollback frame right while coroutine is suspended at yield point!
+        const auto frameSnap = game::captureRollbackFrame(scene, *host, snapErr);
+        require(frameSnap.has_value() && frameSnap->frameHash != 0,
+            "R5-3: captureRollbackFrame failed: " + snapErr.message);
+
+        // Advance 2 ticks on original scene so coroutine finishes (phase=2, counter=55)
+        (void)driver.advanceTicks(2);
+        auto* heroOrig = scene.object(1);
+        require(
+            std::get<std::int64_t>(*rt.getMember(*heroOrig, "phase", snapErr)) == 2 &&
+                std::get<std::int64_t>(*rt.getMember(*heroOrig, "counter", snapErr)) == 55,
+            "R5-2: original coroutine should finish at phase=2, counter=55");
+
+        // Mutate ECS component in-flight before rollback
+        auto mutatedShield = rt.createStruct(
+            "Evolution.Round5Rollback::ShieldData",
+            {std::int64_t{0}, std::int64_t{0}},
+            snapErr);
+        (void)rt.setEcsEntityComponent(1, "Evolution.Round5Rollback::ShieldData", *mutatedShield, snapErr);
+
+        // Now restoreRollbackFrame back to the mid-coroutine yield point!
+        require(
+            game::restoreRollbackFrame(scene, *host, *frameSnap, snapErr),
+            "R5-3: restoreRollbackFrame failed: " + snapErr.message);
+
+        auto* heroRestored = scene.object(1);
+        require(
+            std::get<std::int64_t>(*rt.getMember(*heroRestored, "phase", snapErr)) == 1 &&
+                std::get<std::int64_t>(*rt.getMember(*heroRestored, "counter", snapErr)) == 5,
+            "R5-3: restored scene must be back at phase=1, counter=5");
+
+        // Stepping 3D physics after rollback must fire OnCollisionStay3D (not duplicate Enter3D)
+        (void)scene.stepPhysics3D();
+        require(
+            std::get<std::int64_t>(*rt.getMember(*heroRestored, "enter3DCount", snapErr)) == 1 &&
+                std::get<std::int64_t>(*rt.getMember(*heroRestored, "stay3DCount", snapErr)) == 1,
+            "R5-3: restored 3D activeOverlaps3D must fire OnCollisionStay3D instead of duplicate Enter3D");
+
+        // Verify native ECS Sparse Set tables (Struct and Class) were restored by importSceneJson
+        const auto restoredShield = rt.getEcsEntityComponent(1, "Evolution.Round5Rollback::ShieldData", snapErr);
+        require(restoredShield.has_value(), "R5-2: restored native ECS component ShieldData missing");
+        const auto capField = runtime::structValueFieldAt(std::get<runtime::StructValue>(*restoredShield), 0);
+        require(capField && std::get<std::int64_t>(*capField) == 250,
+            "R5-2: restored native ECS component ShieldData.capacity should be 250");
+
+        const auto restoredBadge = rt.getEcsEntityComponent(1, "Evolution.Round5Rollback::BuffBadge", snapErr);
+        require(
+            restoredBadge.has_value() && std::holds_alternative<runtime::ObjectRef>(*restoredBadge),
+            "R5-2: restored native ECS Class component BuffBadge must be an ObjectRef");
+
+        // Advance 2 ticks after rollback: coroutine must resume from state 1 and reach phase=2, counter=55!
+        (void)driver.advanceTicks(2);
+        require(
+            std::get<std::int64_t>(*rt.getMember(*heroRestored, "phase", snapErr)) == 2 &&
+                std::get<std::int64_t>(*rt.getMember(*heroRestored, "counter", snapErr)) == 55,
+            "R5-2/R5-3: rolled-back coroutine must resume seamlessly after restoreRollbackFrame");
+    }
+
+    // R5-4, R5-5 & R5-7: raycast2D box Y-axis normal fix + raycastAll2D + 3D Physics + setEnabled/EditMode fixes
+    {
+        game::GameApi api;
+        const char* physSrc = R"RS(
+module Evolution.Round5Physics3D;
+import RealScript.Math;
+import RealScript.Scene;
+
+class Sensor3D {
+    public int enter3D = 0;
+    public int stay3D = 0;
+    public int exit3D = 0;
+    public int destroyCalls = 0;
+
+    public void OnCollisionEnter3D(int other) { enter3D = enter3D + other; }
+    public void OnCollisionStay3D(int other) { stay3D = stay3D + other; }
+    public void OnCollisionExit3D(int other) { exit3D = exit3D + other; }
+    public void OnDestroy() { destroyCalls = destroyCalls + 1; }
+}
+)RS";
+        game::ScriptRuntime dummyRt{game::GameProgram{}};
+        game::SceneScriptRuntime dummyScene{dummyRt};
+        require(game::installSceneComponentBindings(api, dummyScene), "R5-5: installSceneComponentBindings failed");
+
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"r5_phys3d.rs", physSrc}});
+        require(compiled.succeeded(), "R5-5: r5_phys3d.rs compile failed:\n" + diagnosticsText(compiled.diagnostics));
+
+        game::ScriptRuntime rt(compiled.program);
+        game::SceneScriptRuntime scene(rt);
+
+        // R5-4: Box at (0, 10) with halfExtents (2, 2), ray from (0, 0) along +Y (0, 1)
+        game::SceneCollider2D box2D;
+        box2D.isCircle = false;
+        box2D.halfExtents = game::Vec2::of(2, 2);
+        scene.setLocalPosition2D(10, game::Vec2::of(0, 10));
+        scene.setEntityCollider2D(10, box2D);
+
+        scene.setLocalPosition2D(20, game::Vec2::of(0, 20));
+        scene.setEntityCollider2D(20, box2D);
+
+        const auto hit2D = scene.raycast2D(
+            game::Vec2::of(0, 0), game::Vec2::of(0, 1), game::Fixed::fromInt(50));
+        require(hit2D.has_value() && hit2D->entity == 10, "R5-4: raycast2D along +Y should hit entity 10");
+        require(
+            hit2D->normal.x == game::Fixed::fromInt(0) &&
+                hit2D->normal.y == game::Fixed::fromInt(-1),
+            "R5-4: raycast2D hitting bottom face of AABB along +Y must return normal (0, -1)");
+
+        const auto allHits2D = scene.raycastAll2D(
+            game::Vec2::of(0, 0), game::Vec2::of(0, 1), game::Fixed::fromInt(50));
+        require(
+            allHits2D.size() == 2 && allHits2D[0].entity == 10 && allHits2D[1].entity == 20,
+            "R5-4: raycastAll2D should return both hits sorted by distance (10 then 20)");
+
+        // R5-5: 3D Physics (Box/Sphere colliders, raycast3D, overlapSphere3D, stepPhysics3D, OnCollision*3D)
+        require(scene.attach(100, "Evolution.Round5Physics3D::Sensor3D"), "R5-5: attach 100 failed");
+        require(scene.attach(200, "Evolution.Round5Physics3D::Sensor3D"), "R5-5: attach 200 failed");
+
+        game::Transform3D tf100 = game::Transform3D::identity();
+        tf100.position = game::Vec3::of(0, 0, 10);
+        scene.setLocalTransform(100, tf100);
+
+        game::Transform3D tf200 = game::Transform3D::identity();
+        tf200.position = game::Vec3::of(0, 0, 11);
+        scene.setLocalTransform(200, tf200);
+
+        game::SceneCollider3D col3D;
+        col3D.isSphere = false;
+        col3D.halfExtents = game::Vec3::of(1, 1, 1);
+        scene.setEntityCollider3D(100, col3D);
+        scene.setEntityCollider3D(200, col3D);
+
+        const auto hit3D = scene.raycast3D(
+            game::Vec3::of(0, 0, 0), game::Vec3::of(0, 0, 1), game::Fixed::fromInt(50));
+        require(
+            hit3D.has_value() && hit3D->entity == 100 &&
+                hit3D->normal.z == game::Fixed::fromInt(-1),
+            "R5-5: raycast3D along +Z should hit entity 100 with normal (0, 0, -1)");
+
+        const auto sphereHits = scene.overlapSphere3D(game::Vec3::of(0, 0, 10), game::Fixed::fromInt(2));
+        require(sphereHits.size() == 2, "R5-5: overlapSphere3D should find both 3D colliders");
+
+        require(scene.stepPhysics3D() == 2, "R5-5: stepPhysics3D should fire OnCollisionEnter3D on 100 and 200");
+        const auto contact3D = scene.getCollisionContact3D(100, 200);
+        require(
+            contact3D.has_value() && contact3D->normal.z == game::Fixed::fromInt(1) &&
+                contact3D->penetration == game::Fixed::fromInt(1),
+            "R5-5: getCollisionContact3D should report +Z normal and penetration 1");
+
+        require(scene.stepPhysics3D() == 2, "R5-5: second stepPhysics3D should fire OnCollisionStay3D");
+        tf200.position = game::Vec3::of(0, 0, 30);
+        scene.setLocalTransform(200, tf200);
+        require(scene.stepPhysics3D() == 2, "R5-5: third stepPhysics3D should fire OnCollisionExit3D");
+
+        // Test 3D Sphere-vs-AABB corner exclusion (Review Defect #3):
+        // Box at (0,0,10) with halfExtents (1,1,1), Sphere at (2,2,12) with radius 1:
+        // Corner distance is sqrt(1+1+1) = sqrt(3) > 1, so Sphere must NOT collide with Box!
+        game::SceneCollider3D sphere3D;
+        sphere3D.isSphere = true;
+        sphere3D.radius = game::Fixed::fromInt(1);
+        tf200.position = game::Vec3::of(2, 2, 12);
+        scene.setLocalTransform(200, tf200);
+        scene.setEntityCollider3D(200, sphere3D);
+        require(
+            !scene.getCollisionContact3D(100, 200).has_value(),
+            "R5-5: Sphere at (2,2,12) radius 1 must NOT collide with Box at (0,0,10) halfExtents (1,1,1)");
+
+        runtime::RuntimeError err;
+        auto* s100 = scene.object(100);
+        require(
+            std::get<std::int64_t>(*rt.getMember(*s100, "enter3D", err)) == 200 &&
+                std::get<std::int64_t>(*rt.getMember(*s100, "stay3D", err)) == 200 &&
+                std::get<std::int64_t>(*rt.getMember(*s100, "exit3D", err)) == 200,
+            "R5-5: Sensor3D lifecycle counters should be 200/200/200");
+
+        // R5-7: setEnabled(100, false) must NOT deactivate entityActiveSelf when entity 100 is explicitly active
+        require(scene.setEntityActive(100, true) || scene.isEntityActiveSelf(100), "R5-7: entity 100 activeSelf");
+        (void)scene.setEntityActive(100, true);
+        require(scene.setEnabled(100, false), "R5-7: setEnabled(100, false) should succeed");
+        require(
+            scene.isEntityActiveSelf(100) && !scene.isComponentEnabled(100, "Sensor3D"),
+            "R5-7: setEnabled(entity, false) must disable the first component without overwriting entityActiveSelf");
+
+        // R5-7: In Editor mode, detaching an unstarted non-[Tool] component must NOT invoke OnDestroy
+        scene.setExecutionMode(game::SceneExecutionMode::Editor);
+        require(scene.attach(300, "Evolution.Round5Physics3D::Sensor3D"), "R5-7: attach 300 in Editor mode");
+        auto* s300 = scene.object(300);
+        const auto s300ObjRef = s300->reference();
+        const auto s300Root = rt.heap()->retain(s300ObjRef);
+        require(scene.detach(300), "R5-7: detach 300 in Editor mode");
+        const auto destroyCallsVal = rt.heap()->fieldGet(s300ObjRef, 3);
+        require(
+            destroyCallsVal && std::get<std::int64_t>(*destroyCallsVal) == 0,
+            "R5-7: detaching unstarted non-[Tool] component in Editor mode must not call OnDestroy");
+    }
+
+    // R5-6 & R5-8: O(1) Hash Bucket Dictionary/HashSet + User-Defined `this[Key k] { get; set; }` Indexers
+    {
+        game::GameApi api;
+        const char* langSrc = R"RS(
+module Evolution.Round5Lang;
+
+struct Grid2D {
+    int c00;
+    int c01;
+    int c10;
+    int c11;
+
+    Grid2D(int a, int b, int c, int d) {
+        c00 = a;
+        c01 = b;
+        c10 = c;
+        c11 = d;
+    }
+
+    public int this[int idx] {
+        get {
+            if (idx == 0) return c00;
+            if (idx == 1) return c01;
+            if (idx == 2) return c10;
+            return c11;
+        }
+        set {
+            if (idx == 0) c00 = value;
+            else if (idx == 1) c01 = value;
+            else if (idx == 2) c10 = value;
+            else c11 = value;
+        }
+    }
+}
+
+class InventoryBag {
+    Dictionary<string, int> counts;
+
+    InventoryBag() {
+        counts = new Dictionary<string, int>();
+    }
+
+    public int this[string item] {
+        get {
+            return counts.GetOrDefault(item, 0);
+        }
+        set {
+            counts.Put(item, value);
+        }
+    }
+}
+
+class Tester {
+    public int idxEvaluations = 0;
+
+    public int NextGridIdx() {
+        idxEvaluations = idxEvaluations + 1;
+        return 2;
+    }
+
+    public int Run() {
+        InventoryBag bag = new InventoryBag();
+        bag["potion"] = 3;
+        bag["potion"] += 4;
+        bag["elixir"] = 10;
+
+        Grid2D g = new Grid2D(1, 2, 3, 4);
+        g[2] = 25;
+        g[NextGridIdx()] += 5;
+
+        // Stress O(1) hash bucket Dictionary & HashSet with 64 entries and removals
+        Dictionary<int, int> bigMap = new Dictionary<int, int>(4);
+        HashSet<int> bigSet = new HashSet<int>(4);
+        int i = 0;
+        while (i < 64) {
+            bigMap[i] = i * 3;
+            bigSet.Add(i * 10);
+            i = i + 1;
+        }
+        bigMap.Remove(10);
+        bigSet.Remove(100);
+        int check = 0;
+        if (!bigMap.ContainsKey(10) && bigMap[20] == 60 && !bigSet.Contains(100) && bigSet.Contains(200)) {
+            check = 1000;
+        }
+        bigMap.Clear();
+        bigSet.Clear();
+        if (bigMap.Count() != 0 || bigSet.Count() != 0 || idxEvaluations != 1) {
+            return -1;
+        }
+        return bag["potion"] + bag["elixir"] + g[2] + check;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"r5_lang.rs", langSrc}});
+        require(compiled.succeeded(), "R5-6/R5-8: r5_lang.rs failed to compile:\n" + diagnosticsText(compiled.diagnostics));
+
+        game::ScriptRuntime rt(compiled.program);
+        game::SceneScriptRuntime scene(rt);
+        require(scene.attach(1, "Evolution.Round5Lang::Tester"), "R5-8: attach Tester failed");
+        const auto res = scene.invoke(1, "Run");
+        require(
+            res.succeeded && std::get<std::int64_t>(res.value) == 1047,
+            "R5-6/R5-8: expected 7 + 10 + 30 + 1000 = 1047, got " +
+                (res.succeeded ? std::to_string(std::get<std::int64_t>(res.value)) : res.error.message));
+    }
+
+    // R5-9 & R5-10: DAP Hierarchical variablesReference Expansion & Child Mutation + LSP Parameter InlayHints, formatting, workspace/symbol
+    {
+        game::GameApi api;
+        const char* dapSrc = R"RS(
+module Evolution.Round5Dap;
+
+struct Pair {
+    public static int SharedTag = 999;
+    int left;
+    int right;
+    Pair(int l, int r) { left = l; right = r; }
+}
+
+class BoxNode {
+    public int weight = 42;
+    public Pair pair;
+    BoxNode() {
+        pair = new Pair(7, 8);
+    }
+}
+
+int InspectHierarchy() {
+    BoxNode node = new BoxNode();
+    int[] nums = new int[3];
+    nums[0] = 11;
+    nums[1] = 22;
+    nums[2] = 33;
+    return node.weight + nums[1];
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto dapCompiled = compiler.compile({{"r5_dap.rs", dapSrc}});
+        require(dapCompiled.succeeded(), "R5-9: r5_dap.rs failed to compile");
+
+        debug::DapServer dap(dapCompiled.program.program(), dapCompiled.program.heap());
+        std::ostringstream dapEvents;
+        (void)dap.handle(tooling::Json::Object{
+            {"seq", 1},
+            {"type", "request"},
+            {"command", "setBreakpoints"},
+            {"arguments", tooling::Json::Object{
+                {"source", tooling::Json::Object{{"path", "r5_dap.rs"}}},
+                {"breakpoints", tooling::Json::Array{
+                    tooling::Json::Object{{"line", 25}, {"column", 1}},
+                }},
+            }},
+        }, &dapEvents);
+
+        (void)dap.handle(tooling::Json::Object{
+            {"seq", 2},
+            {"type", "request"},
+            {"command", "launch"},
+            {"arguments", tooling::Json::Object{
+                {"function", "Evolution.Round5Dap::InspectHierarchy"},
+            }},
+        }, &dapEvents);
+
+        // Request frame 1 locals (variablesReference = 3)
+        const auto localsResp = dap.handle(tooling::Json::Object{
+            {"seq", 3},
+            {"type", "request"},
+            {"command", "variables"},
+            {"arguments", tooling::Json::Object{{"variablesReference", 3}}},
+        }, &dapEvents);
+        const auto* varsArr = localsResp.find("body") ? localsResp.find("body")->find("variables") : nullptr;
+        require(varsArr && varsArr->isArray() && varsArr->arrayValue().size() >= 2,
+            "R5-9: DAP locals should include 'node' and 'nums'");
+
+        std::int64_t nodeRef = 0;
+        std::int64_t numsRef = 0;
+        for (const auto& v : varsArr->arrayValue()) {
+            const auto vName = v.find("name")->stringValue();
+            if (vName == "node") nodeRef = v.find("variablesReference")->integerValue();
+            if (vName == "nums") numsRef = v.find("variablesReference")->integerValue();
+        }
+        require(nodeRef >= 1000 && numsRef >= 1000,
+            "R5-9: ObjectRef 'node' and Array 'nums' must have non-zero expandable variablesReference IDs");
+
+        // Expand `node` fields
+        const auto nodeChildrenResp = dap.handle(tooling::Json::Object{
+            {"seq", 4},
+            {"type", "request"},
+            {"command", "variables"},
+            {"arguments", tooling::Json::Object{{"variablesReference", nodeRef}}},
+        }, &dapEvents);
+        const auto* nodeFields = nodeChildrenResp.find("body")->find("variables");
+        require(nodeFields && nodeFields->isArray() && nodeFields->arrayValue().size() == 2,
+            "R5-9: Expanding 'node' should return 'weight' and 'pair' fields");
+        const std::int64_t pairRef = nodeFields->arrayValue()[1].find("variablesReference")->integerValue();
+        require(pairRef >= 1000, "R5-9: StructValue 'pair' inside 'node' must also be expandable");
+
+        // Expand nested `pair` struct fields (Review Defect #7: must skip static field SharedTag!)
+        const auto pairChildrenResp = dap.handle(tooling::Json::Object{
+            {"seq", 5},
+            {"type", "request"},
+            {"command", "variables"},
+            {"arguments", tooling::Json::Object{{"variablesReference", pairRef}}},
+        }, &dapEvents);
+        const auto* pairFields = pairChildrenResp.find("body")->find("variables");
+        require(
+            pairFields && pairFields->isArray() && pairFields->arrayValue().size() == 2 &&
+                pairFields->arrayValue()[0].find("name")->stringValue() == "left" &&
+                pairFields->arrayValue()[0].find("value")->stringValue() == "7",
+            "R5-9: Expanding nested struct 'pair' should return left=7, right=8 without static field misalignment");
+
+        // Mutate child field `node.weight` via child variablesReference (Review Defect #7)
+        const auto setChildResp = dap.handle(tooling::Json::Object{
+            {"seq", 6},
+            {"type", "request"},
+            {"command", "setVariable"},
+            {"arguments", tooling::Json::Object{
+                {"variablesReference", nodeRef},
+                {"name", "weight"},
+                {"value", "100"},
+            }},
+        }, &dapEvents);
+        require(
+            setChildResp.find("success") && setChildResp.find("success")->boolValue() &&
+                setChildResp.find("body")->find("value")->stringValue() == "100",
+            "R5-9: DAP setVariable on child ObjectRef field 'weight' should succeed");
+
+        // Expand `nums` array elements
+        const auto numsChildrenResp = dap.handle(tooling::Json::Object{
+            {"seq", 7},
+            {"type", "request"},
+            {"command", "variables"},
+            {"arguments", tooling::Json::Object{{"variablesReference", numsRef}}},
+        }, &dapEvents);
+        const auto* numElems = numsChildrenResp.find("body")->find("variables");
+        require(
+            numElems && numElems->isArray() && numElems->arrayValue().size() == 3 &&
+                numElems->arrayValue()[1].find("name")->stringValue() == "[1]" &&
+                numElems->arrayValue()[1].find("value")->stringValue() == "22",
+            "R5-9: Expanding array 'nums' should return [0]=11, [1]=22, [2]=33");
+
+        (void)dap.handle(tooling::Json::Object{
+            {"seq", 8},
+            {"type", "request"},
+            {"command", "continue"},
+        }, &dapEvents);
+
+        // R5-10: LSP call-site parameter Inlay Hints, formatting, and workspace/symbol
+        tooling::LspServer lsp;
+        std::ostringstream lspOut;
+        (void)lsp.handle(tooling::Json::Object{
+            {"jsonrpc", "2.0"},
+            {"id", 1},
+            {"method", "initialize"},
+            {"params", tooling::Json::Object{}},
+        }, &lspOut);
+
+        const std::string unformattedCode =
+            "module Evolution.LspR5;\n"
+            "class CombatMath {\n"
+            "public int ComputeDamage(int rawDmg) {\n"
+            "return rawDmg;\n"
+            "}\n"
+            "public int ComputeDamage(int baseDmg, int armor) {\n"
+            "return baseDmg - armor;\n"
+            "}\n"
+            "public int TestCall() {\n"
+            "string path = \"C:\\\\folder\\\\\";\n"
+            "var total = ComputeDamage(50, 12);\n"
+            "return total;\n"
+            "}\n"
+            "}\n";
+        (void)lsp.handle(tooling::Json::Object{
+            {"jsonrpc", "2.0"},
+            {"method", "textDocument/didOpen"},
+            {"params", tooling::Json::Object{
+                {"textDocument", tooling::Json::Object{
+                    {"uri", "file:///lsp_r5.rs"},
+                    {"version", 1},
+                    {"text", unformattedCode},
+                }},
+            }},
+        }, &lspOut);
+
+        const auto inlayResp = lsp.handle(tooling::Json::Object{
+            {"jsonrpc", "2.0"},
+            {"id", 2},
+            {"method", "textDocument/inlayHint"},
+            {"params", tooling::Json::Object{
+                {"textDocument", tooling::Json::Object{{"uri", "file:///lsp_r5.rs"}}},
+            }},
+        }, &lspOut);
+        const auto* inlayArr = inlayResp.find("result");
+        bool sawVarTypeHint = false;
+        bool sawParamHint1 = false;
+        bool sawParamHint2 = false;
+        if (inlayArr && inlayArr->isArray()) {
+            for (const auto& h : inlayArr->arrayValue()) {
+                const auto lbl = h.find("label")->stringValue();
+                if (lbl == ": int") sawVarTypeHint = true;
+                if (lbl == "baseDmg:") sawParamHint1 = true;
+                if (lbl == "armor:") sawParamHint2 = true;
+            }
+        }
+        require(
+            sawVarTypeHint && sawParamHint1 && sawParamHint2,
+            "R5-10: textDocument/inlayHint must emit ': int' type hint and arity-matched 'baseDmg:', 'armor:' parameter hints");
+
+        const auto fmtResp = lsp.handle(tooling::Json::Object{
+            {"jsonrpc", "2.0"},
+            {"id", 3},
+            {"method", "textDocument/formatting"},
+            {"params", tooling::Json::Object{
+                {"textDocument", tooling::Json::Object{{"uri", "file:///lsp_r5.rs"}}},
+                {"options", tooling::Json::Object{{"tabSize", 4}}},
+            }},
+        }, &lspOut);
+        const auto* fmtArr = fmtResp.find("result");
+        require(
+            fmtArr && fmtArr->isArray() && !fmtArr->arrayValue().empty() &&
+                fmtArr->arrayValue()[0].find("newText")->stringValue().find("    public int ComputeDamage") != std::string::npos &&
+                fmtArr->arrayValue()[0].find("newText")->stringValue().back() == '\n',
+            "R5-10: textDocument/formatting should indent class body members by 4 spaces even after '\\\\' string literals");
+
+        const auto wsSymResp = lsp.handle(tooling::Json::Object{
+            {"jsonrpc", "2.0"},
+            {"id", 4},
+            {"method", "workspace/symbol"},
+            {"params", tooling::Json::Object{{"query", "computedamage"}}},
+        }, &lspOut);
+        const auto* wsArr = wsSymResp.find("result");
+        require(
+            wsArr && wsArr->isArray() && !wsArr->arrayValue().empty() &&
+                wsArr->arrayValue()[0].find("name")->stringValue() == "ComputeDamage",
+            "R5-10: workspace/symbol case-insensitive query 'computedamage' should locate ComputeDamage");
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -4381,6 +5042,8 @@ int main() {
         testRound3AuditFixesAndGodotUnityParity();
         std::cout << "[18/18] testRound4RoadmapP0ToP2All10Items..." << std::endl;
         testRound4RoadmapP0ToP2All10Items();
+        std::cout << "[19/19] testRound5DeepFixesAndAdvancedParity..." << std::endl;
+        testRound5DeepFixesAndAdvancedParity();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

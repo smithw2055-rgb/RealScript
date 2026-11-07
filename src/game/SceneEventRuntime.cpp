@@ -249,6 +249,10 @@ std::vector<SceneEntityId> SceneScriptRuntime::entities() const {
         (void)_;
         if (ent != BroadcastTarget) allIds.insert(ent);
     }
+    for (const auto& [ent, _] : colliders3D_) {
+        (void)_;
+        if (ent != BroadcastTarget) allIds.insert(ent);
+    }
     for (const auto& [ent, _] : entityNames_) {
         (void)_;
         if (ent != BroadcastTarget) allIds.insert(ent);
@@ -635,6 +639,37 @@ bool installSceneComponentBindings(
                     static_cast<SceneEntityId>(entityA),
                     static_cast<SceneEntityId>(entityB));
                 return contact ? contact->contactPoint : Vec2{};
+            }) &&
+        api.function(
+            moduleName,
+            "RaycastAllCount2D",
+            [scenePtr](Vec2 origin, Vec2 direction, Fixed maxDistance) -> std::int32_t {
+                return static_cast<std::int32_t>(
+                    scenePtr->raycastAll2D(origin, direction, maxDistance).size());
+            }) &&
+        api.function(
+            moduleName,
+            "Raycast3D",
+            [scenePtr](Vec3 origin, Vec3 direction, Fixed maxDistance) -> std::int64_t {
+                const auto hit = scenePtr->raycast3D(origin, direction, maxDistance);
+                return hit ? static_cast<std::int64_t>(hit->entity) : std::int64_t{0};
+            }) &&
+        api.function(
+            moduleName,
+            "OverlapSphereCount3D",
+            [scenePtr](Vec3 center, Fixed radius) -> std::int32_t {
+                return static_cast<std::int32_t>(
+                    scenePtr->overlapSphere3D(center, radius).size());
+            }) &&
+        api.function(
+            moduleName,
+            "GetCollisionNormal3D",
+            [scenePtr](std::int64_t entityA, std::int64_t entityB) -> Vec3 {
+                if (entityA <= 0 || entityB <= 0) return Vec3{};
+                const auto contact = scenePtr->getCollisionContact3D(
+                    static_cast<SceneEntityId>(entityA),
+                    static_cast<SceneEntityId>(entityB));
+                return contact ? contact->normal : Vec3{};
             });
     return ok && api.valid();
 }

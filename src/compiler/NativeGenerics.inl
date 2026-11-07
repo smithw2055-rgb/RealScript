@@ -240,29 +240,41 @@ std::string nativeBuiltinGenericSource(
     } else if (name == "HashSet") {
         const auto enumerator = generatedName + "__Enumerator";
         source << "class " << generatedName << "{" << first
-            << "[] values;int count;" << generatedName << "(){values=new "
-            << first << "[4];count=0;}" << generatedName
-            << "(int capacity){values=new " << first << "[capacity];count=0;}"
+            << "[] values;int[] buckets;int[] nexts;int count;" << generatedName
+            << "(){values=new " << first << "[4];buckets=new int[8];nexts=new int[4];count=0;}"
+            << generatedName << "(int capacity){int cap=capacity;if(cap<4)cap=4;"
+            << "int bcap=8;while(bcap<cap*2){bcap=bcap*2;}"
+            << "values=new " << first << "[cap];buckets=new int[bcap];nexts=new int[cap];count=0;}"
+            << "void Rehash(){int bcap=buckets.length;int bi=0;while(bi<bcap){buckets[bi]=0;bi=bi+1;}"
+            << "int i=0;while(i<count){int h=__rs_stable_hash(values[i]);if(h<0)h=0-h;"
+            << "int b=h%bcap;nexts[i]=buckets[b];buckets[b]=i+1;i=i+1;}return;}"
             << "void EnsureCapacity(int needed){if(needed<=values.length)return;"
             << "int next=values.length;if(next<4)next=4;while(next<needed){next=next*2;}"
+            << "int bcap=8;while(bcap<next*2){bcap=bcap*2;}"
             << first << "[] grown=new " << first << "[next];int i=0;"
-            << "while(i<count){grown[i]=values[i];i=i+1;}values=grown;return;}"
+            << "while(i<count){grown[i]=values[i];i=i+1;}values=grown;"
+            << "buckets=new int[bcap];nexts=new int[next];Rehash();return;}"
             << "int Count(){return count;}"
             << "bool IsEmpty(){return count==0;}"
-            << "bool Contains(" << first
-            << " value){int i=0;while(i<count){"
-            << "if(values[i]==value)return true;i=i+1;}return false;}"
+            << "int FindIndex(" << first << " value){if(count==0)return -1;"
+            << "int bcap=buckets.length;if(bcap==0)return -1;"
+            << "int h=__rs_stable_hash(value);if(h<0)h=0-h;"
+            << "int cur=buckets[h%bcap]-1;while(cur>=0){"
+            << "if(values[cur]==value)return cur;cur=nexts[cur]-1;}return -1;}"
+            << "bool Contains(" << first << " value){return FindIndex(value)>=0;}"
             << "bool Add(" << first
             << " value){if(Contains(value))return false;EnsureCapacity(count+1);"
-            << "values[count]=value;count=count+1;return true;}"
-            << "bool Remove(" << first << " value){int i=0;while(i<count){"
-            << "if(values[i]==value){int j=i;while(j<count-1){values[j]=values[j+1];"
-            << "j=j+1;}count=count-1;return true;}i=i+1;}return false;}"
+            << "int idx=count;values[idx]=value;count=count+1;"
+            << "int bcap=buckets.length;int h=__rs_stable_hash(value);if(h<0)h=0-h;"
+            << "int b=h%bcap;nexts[idx]=buckets[b];buckets[b]=idx+1;return true;}"
+            << "bool Remove(" << first << " value){int i=FindIndex(value);if(i<0)return false;"
+            << "int j=i;while(j<count-1){values[j]=values[j+1];j=j+1;}"
+            << "count=count-1;Rehash();return true;}"
             << first << " Get(int index){return values[index];}"
             << first << "[] ToArray(){" << first << "[] arr=new " << first
             << "[count];int i=0;while(i<count){arr[i]=values[i];i=i+1;}return arr;}"
-            << "void Clear(){count=0;return;}" << enumerator
-            << " GetEnumerator(){return new " << enumerator << "(this);}}"
+            << "void Clear(){count=0;values=new " << first << "[4];buckets=new int[8];nexts=new int[4];return;}"
+            << enumerator << " GetEnumerator(){return new " << enumerator << "(this);}}"
             << "class " << enumerator << "{" << generatedName
             << " owner;int index;" << enumerator << "(" << generatedName
             << " value){owner=value;index=-1;}bool MoveNext(){index=index+1;"
@@ -272,23 +284,30 @@ std::string nativeBuiltinGenericSource(
         if (arguments.size() != 2) return {};
         const auto enumerator = generatedName + "__Enumerator";
         source << "class " << generatedName << "{" << first
-            << "[] keys;" << second << "[] values;int count;" << generatedName
-            << "(){keys=new " << first << "[4];values=new " << second
-            << "[4];count=0;}" << generatedName
-            << "(int capacity){keys=new " << first
-            << "[capacity];values=new " << second
-            << "[capacity];count=0;}"
+            << "[] keys;" << second << "[] values;int[] buckets;int[] nexts;int count;"
+            << generatedName << "(){keys=new " << first << "[4];values=new " << second
+            << "[4];buckets=new int[8];nexts=new int[4];count=0;}" << generatedName
+            << "(int capacity){int cap=capacity;if(cap<4)cap=4;"
+            << "int bcap=8;while(bcap<cap*2){bcap=bcap*2;}"
+            << "keys=new " << first << "[cap];values=new " << second
+            << "[cap];buckets=new int[bcap];nexts=new int[cap];count=0;}"
+            << "void Rehash(){int bcap=buckets.length;int bi=0;while(bi<bcap){buckets[bi]=0;bi=bi+1;}"
+            << "int i=0;while(i<count){int h=__rs_stable_hash(keys[i]);if(h<0)h=0-h;"
+            << "int b=h%bcap;nexts[i]=buckets[b];buckets[b]=i+1;i=i+1;}return;}"
             << "void EnsureCapacity(int needed){if(needed<=keys.length)return;"
             << "int next=keys.length;if(next<4)next=4;while(next<needed){next=next*2;}"
+            << "int bcap=8;while(bcap<next*2){bcap=bcap*2;}"
             << first << "[] grownKeys=new " << first << "[next];"
             << second << "[] grownValues=new " << second << "[next];int i=0;"
             << "while(i<count){grownKeys[i]=keys[i];grownValues[i]=values[i];i=i+1;}"
-            << "keys=grownKeys;values=grownValues;return;}"
+            << "keys=grownKeys;values=grownValues;buckets=new int[bcap];nexts=new int[next];Rehash();return;}"
             << "int Count(){return count;}"
             << "bool IsEmpty(){return count==0;}"
-            << "int Find(" << first
-            << " key){int i=0;while(i<count){if(keys[i]==key)return i;"
-            << "i=i+1;}return -1;}"
+            << "int Find(" << first << " key){if(count==0)return -1;"
+            << "int bcap=buckets.length;if(bcap==0)return -1;"
+            << "int h=__rs_stable_hash(key);if(h<0)h=0-h;"
+            << "int cur=buckets[h%bcap]-1;while(cur>=0){"
+            << "if(keys[cur]==key)return cur;cur=nexts[cur]-1;}return -1;}"
             << "bool ContainsKey(" << first
             << " key){return Find(key)>=0;}"
             << "bool ContainsValue(" << second
@@ -306,7 +325,9 @@ std::string nativeBuiltinGenericSource(
             << "void Put(" << first << " key," << second
             << " value){int i=Find(key);if(i>=0){values[i]=value;return;}"
             << "EnsureCapacity(count+1);"
-            << "keys[count]=key;values[count]=value;count=count+1;return;}"
+            << "int idx=count;keys[idx]=key;values[idx]=value;count=count+1;"
+            << "int bcap=buckets.length;int h=__rs_stable_hash(key);if(h<0)h=0-h;"
+            << "int b=h%bcap;nexts[idx]=buckets[b];buckets[b]=idx+1;return;}"
             << "void Add(" << first << " key," << second
             << " value){Put(key,value);return;}"
             << second << " Get(" << first
@@ -314,9 +335,9 @@ std::string nativeBuiltinGenericSource(
             << second << " GetAt(int index){return values[index];}"
             << "bool Remove(" << first << " key){int i=Find(key);if(i<0)return false;"
             << "while(i<count-1){keys[i]=keys[i+1];values[i]=values[i+1];i=i+1;}"
-            << "count=count-1;return true;}"
-            << "void Clear(){count=0;return;}" << enumerator
-            << " GetEnumerator(){return new " << enumerator << "(this);}}"
+            << "count=count-1;Rehash();return true;}"
+            << "void Clear(){count=0;keys=new " << first << "[4];values=new " << second << "[4];buckets=new int[8];nexts=new int[4];return;}"
+            << enumerator << " GetEnumerator(){return new " << enumerator << "(this);}}"
             << "class " << enumerator << "{" << generatedName
             << " owner;int index;" << enumerator << "(" << generatedName
             << " value){owner=value;index=-1;}bool MoveNext(){index=index+1;"

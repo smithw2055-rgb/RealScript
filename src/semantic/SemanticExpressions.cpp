@@ -2955,6 +2955,26 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
 
 std::unique_ptr<BoundExpression> Binder::bindCallExpression(
     const syntax::CallExpressionSyntax& syntaxTree) {
+    if (syntaxTree.identifierToken.text == "__rs_stable_hash" &&
+        syntaxTree.arguments.size() == 1 &&
+        syntaxTree.typeArguments.empty()) {
+        auto arg = bindExpression(*syntaxTree.arguments.front());
+        const auto argType = arg->type;
+        const auto argTypeName = arg->typeName;
+        const std::string typeTag = argTypeName.empty()
+            ? std::string(primitiveTypeName(argType))
+            : argTypeName;
+        auto call = std::make_unique<BoundCallExpression>();
+        call->span = syntaxTree.span();
+        call->type = PrimitiveType::Int;
+        call->function = makeIntrinsicFunction(
+            "$intrinsic::stable_hash::" + typeTag,
+            PrimitiveType::Int,
+            "",
+            {{argType, argTypeName}});
+        call->arguments.push_back(std::move(arg));
+        return call;
+    }
     if ((syntaxTree.identifierToken.text == "checked" ||
          syntaxTree.identifierToken.text == "unchecked") &&
         syntaxTree.arguments.size() == 1 &&
@@ -4855,15 +4875,19 @@ std::unique_ptr<BoundExpression> Binder::bindElementAssignmentExpression(
             auto idxExpr = bindExpression(*syntaxTree.index);
             std::unique_ptr<BoundExpression> valExpr;
             if (const auto compoundOp = compoundBinaryOperatorToken(syntaxTree.equalsToken)) {
-                const auto recvTemp = allocateTempVariable(
-                    "indexer_recv", receiver->type, receiver->typeName, syntaxTree.receiver->span());
-                auto recvAssign = std::make_unique<BoundAssignmentExpression>();
-                recvAssign->span = syntaxTree.receiver->span();
-                recvAssign->type = receiver->type;
-                recvAssign->typeName = receiver->typeName;
-                recvAssign->variable = recvTemp;
-                recvAssign->expression = std::move(receiver);
-                receiver = std::move(recvAssign);
+                const bool isStructReceiver = (receiver->type == PrimitiveType::Struct);
+                VariableSymbol recvTemp{};
+                if (!isStructReceiver) {
+                    recvTemp = allocateTempVariable(
+                        "indexer_recv", receiver->type, receiver->typeName, syntaxTree.receiver->span());
+                    auto recvAssign = std::make_unique<BoundAssignmentExpression>();
+                    recvAssign->span = syntaxTree.receiver->span();
+                    recvAssign->type = receiver->type;
+                    recvAssign->typeName = receiver->typeName;
+                    recvAssign->variable = recvTemp;
+                    recvAssign->expression = std::move(receiver);
+                    receiver = std::move(recvAssign);
+                }
 
                 const auto idxTemp = allocateTempVariable(
                     "indexer_idx", idxExpr->type, idxExpr->typeName, syntaxTree.index->span());
@@ -4890,13 +4914,16 @@ std::unique_ptr<BoundExpression> Binder::bindElementAssignmentExpression(
                     auto getPrep = prepareCallArguments(
                         *getPlan.function, getPlan.sources, std::move(getArgs),
                         emptySyntaxArgs, emptyMods, syntaxTree.span(), "indexer argument");
+                    auto getReceiver = isStructReceiver
+                        ? bindExpression(*syntaxTree.receiver)
+                        : makeVariableAccess(recvTemp, syntaxTree.receiver->span());
                     auto lhsVal = bindSelectedCall(
                         *getPlan.function,
                         std::move(getPrep.arguments),
                         getPrep.syntaxArguments,
                         getPrep.modifiers,
                         std::move(getPrep.evaluationOrder),
-                        makeVariableAccess(recvTemp, syntaxTree.receiver->span()),
+                        std::move(getReceiver),
                         syntaxTree.span(),
                         "indexer argument",
                         false);

@@ -602,6 +602,32 @@ struct CollisionContact2D {
     bool isTrigger = false;
 };
 
+struct SceneCollider3D {
+    Vec3 halfExtents{Fixed::fromInt(1), Fixed::fromInt(1), Fixed::fromInt(1)};
+    Fixed radius{Fixed::fromInt(1)};
+    bool isSphere = false;
+    bool isTrigger = false;
+    std::uint32_t layerMask = 0xFFFFFFFFu;
+    std::uint32_t collisionLayer = 0xFFFFFFFFu;
+    std::uint32_t collisionMask = 0xFFFFFFFFu;
+};
+
+struct RaycastHit3D {
+    SceneEntityId entity = 0;
+    Vec3 point{};
+    Vec3 normal{};
+    Fixed distance{};
+};
+
+struct CollisionContact3D {
+    SceneEntityId entityA = 0;
+    SceneEntityId entityB = 0;
+    Vec3 normal{};
+    Vec3 contactPoint{};
+    Fixed penetration{};
+    bool isTrigger = false;
+};
+
 struct ScriptEvent {
     SceneEntityId target = 0;
     std::string callback;
@@ -771,6 +797,11 @@ public:
         Vec2 direction,
         Fixed maxDistance,
         std::uint32_t layerMask = 0xFFFFFFFFu) const;
+    [[nodiscard]] std::vector<RaycastHit2D> raycastAll2D(
+        Vec2 origin,
+        Vec2 direction,
+        Fixed maxDistance,
+        std::uint32_t layerMask = 0xFFFFFFFFu) const;
     [[nodiscard]] std::vector<SceneEntityId> overlapCircle2D(
         Vec2 center,
         Fixed radius,
@@ -781,6 +812,44 @@ public:
         SceneEntityId entityB) const noexcept;
     [[nodiscard]] std::size_t lastBroadphaseCandidatePairs2D() const noexcept {
         return lastBroadphasePairs2D_;
+    }
+
+    // Deterministic 3D Physics & Spatial Queries (RealScript.Physics3D)
+    void setEntityCollider3D(SceneEntityId entity, SceneCollider3D collider);
+    bool removeEntityCollider3D(SceneEntityId entity);
+    [[nodiscard]] std::optional<SceneCollider3D> getEntityCollider3D(SceneEntityId entity) const noexcept;
+    [[nodiscard]] const std::map<SceneEntityId, SceneCollider3D>& colliders3D() const noexcept {
+        return colliders3D_;
+    }
+    [[nodiscard]] const std::set<std::pair<SceneEntityId, SceneEntityId>>& activeOverlaps3D() const noexcept {
+        return activeOverlaps3D_;
+    }
+    [[nodiscard]] const std::map<std::pair<SceneEntityId, SceneEntityId>, bool>& activeOverlapWasTrigger3D() const noexcept {
+        return activeOverlapWasTrigger3D_;
+    }
+    void restorePhysicsOverlapState3D(
+        std::set<std::pair<SceneEntityId, SceneEntityId>> activeOverlaps,
+        std::map<std::pair<SceneEntityId, SceneEntityId>, bool> activeOverlapWasTrigger);
+    [[nodiscard]] std::optional<RaycastHit3D> raycast3D(
+        Vec3 origin,
+        Vec3 direction,
+        Fixed maxDistance,
+        std::uint32_t layerMask = 0xFFFFFFFFu) const;
+    [[nodiscard]] std::vector<RaycastHit3D> raycastAll3D(
+        Vec3 origin,
+        Vec3 direction,
+        Fixed maxDistance,
+        std::uint32_t layerMask = 0xFFFFFFFFu) const;
+    [[nodiscard]] std::vector<SceneEntityId> overlapSphere3D(
+        Vec3 center,
+        Fixed radius,
+        std::uint32_t layerMask = 0xFFFFFFFFu) const;
+    std::size_t stepPhysics3D();
+    [[nodiscard]] std::optional<CollisionContact3D> getCollisionContact3D(
+        SceneEntityId entityA,
+        SceneEntityId entityB) const noexcept;
+    [[nodiscard]] std::size_t lastBroadphaseCandidatePairs3D() const noexcept {
+        return lastBroadphasePairs3D_;
     }
 
     // Deferred Destruction, Entity Spawning, Generational Handles, Naming & Groups (Godot/Unity Parity)
@@ -917,6 +986,12 @@ private:
         std::optional<ScriptMethod> onTriggerEnter;
         std::optional<ScriptMethod> onTriggerStay;
         std::optional<ScriptMethod> onTriggerExit;
+        std::optional<ScriptMethod> onCollisionEnter3D;
+        std::optional<ScriptMethod> onCollisionStay3D;
+        std::optional<ScriptMethod> onCollisionExit3D;
+        std::optional<ScriptMethod> onTriggerEnter3D;
+        std::optional<ScriptMethod> onTriggerStay3D;
+        std::optional<ScriptMethod> onTriggerExit3D;
     };
 
     struct TickRef {
@@ -982,6 +1057,11 @@ private:
     std::map<std::pair<SceneEntityId, SceneEntityId>, bool> activeOverlapWasTrigger2D_;
     std::map<std::pair<SceneEntityId, SceneEntityId>, CollisionContact2D> activeContacts2D_;
     std::size_t lastBroadphasePairs2D_ = 0;
+    std::map<SceneEntityId, SceneCollider3D> colliders3D_;
+    std::set<std::pair<SceneEntityId, SceneEntityId>> activeOverlaps3D_;
+    std::map<std::pair<SceneEntityId, SceneEntityId>, bool> activeOverlapWasTrigger3D_;
+    std::map<std::pair<SceneEntityId, SceneEntityId>, CollisionContact3D> activeContacts3D_;
+    std::size_t lastBroadphasePairs3D_ = 0;
     std::vector<SceneEntityId> pendingDestroyEntities_;
     std::map<SceneEntityId, std::string> entityNames_;
     std::map<std::string, std::set<SceneEntityId>> groupEntities_;

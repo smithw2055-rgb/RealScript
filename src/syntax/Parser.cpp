@@ -712,6 +712,81 @@ ClassDeclarationSyntax Parser::parseClassDeclaration(
                 }
                 method.identifierToken.text = std::move(opName);
                 result.methods.push_back(std::move(method));
+            } else if (current().kind == SyntaxKind::ThisKeyword &&
+                       peek(1).kind == SyntaxKind::OpenBracketToken) {
+                const auto thisTok = nextToken();
+                const auto openBracket = match(SyntaxKind::OpenBracketToken);
+                std::vector<ParameterSyntax> idxParams;
+                std::vector<SyntaxToken> idxCommas;
+                if (current().kind != SyntaxKind::CloseBracketToken &&
+                    current().kind != SyntaxKind::EndOfFileToken) {
+                    idxParams.push_back(parseParameter());
+                    while (current().kind == SyntaxKind::CommaToken) {
+                        idxCommas.push_back(nextToken());
+                        idxParams.push_back(parseParameter());
+                    }
+                }
+                const auto closeBracket = match(SyntaxKind::CloseBracketToken);
+                (void)openBracket;
+                (void)closeBracket;
+                (void)match(SyntaxKind::OpenBraceToken);
+                while (current().kind != SyntaxKind::CloseBraceToken &&
+                       current().kind != SyntaxKind::EndOfFileToken) {
+                    auto accessor = parseAccessorDeclaration();
+                    if (accessor.keyword.kind == SyntaxKind::GetKeyword && accessor.body) {
+                        FunctionDeclarationSyntax getter;
+                        getter.attributes = memberAttributes;
+                        getter.modifiers = memberModifiers;
+                        getter.staticKeyword = findModifier(getter.modifiers, SyntaxKind::StaticKeyword);
+                        getter.refReturnKeyword = refReturnKeyword;
+                        getter.returnType = type;
+                        getter.identifierToken.kind = SyntaxKind::IdentifierToken;
+                        getter.identifierToken.span = thisTok.span;
+                        getter.identifierToken.text = "Get";
+                        for (const auto& ip : idxParams) {
+                            ParameterSyntax cp;
+                            cp.paramsKeyword = ip.paramsKeyword;
+                            cp.modifierToken = ip.modifierToken;
+                            cp.type = ip.type;
+                            cp.identifierToken = ip.identifierToken;
+                            getter.parameters.push_back(std::move(cp));
+                        }
+                        getter.commaTokens = idxCommas;
+                        getter.body = std::move(*accessor.body);
+                        result.methods.push_back(std::move(getter));
+                    } else if (accessor.keyword.kind == SyntaxKind::SetKeyword && accessor.body) {
+                        FunctionDeclarationSyntax setter;
+                        setter.attributes = memberAttributes;
+                        setter.modifiers = memberModifiers;
+                        setter.staticKeyword = findModifier(setter.modifiers, SyntaxKind::StaticKeyword);
+                        TypeSyntax voidType;
+                        voidType.name.kind = SyntaxKind::VoidKeyword;
+                        voidType.name.span = thisTok.span;
+                        voidType.name.text = "void";
+                        setter.returnType = std::move(voidType);
+                        setter.identifierToken.kind = SyntaxKind::IdentifierToken;
+                        setter.identifierToken.span = thisTok.span;
+                        setter.identifierToken.text = "Set";
+                        for (const auto& ip : idxParams) {
+                            ParameterSyntax cp;
+                            cp.paramsKeyword = ip.paramsKeyword;
+                            cp.modifierToken = ip.modifierToken;
+                            cp.type = ip.type;
+                            cp.identifierToken = ip.identifierToken;
+                            setter.parameters.push_back(std::move(cp));
+                        }
+                        setter.commaTokens = idxCommas;
+                        ParameterSyntax valParam;
+                        valParam.type = type;
+                        valParam.identifierToken.kind = SyntaxKind::IdentifierToken;
+                        valParam.identifierToken.span = accessor.keyword.span;
+                        valParam.identifierToken.text = "value";
+                        setter.parameters.push_back(std::move(valParam));
+                        setter.body = std::move(*accessor.body);
+                        result.methods.push_back(std::move(setter));
+                    }
+                }
+                (void)match(SyntaxKind::CloseBraceToken);
             } else {
                 auto identifier = match(SyntaxKind::IdentifierToken);
                 const auto isAbstract = findModifier(
@@ -860,6 +935,81 @@ StructDeclarationSyntax Parser::parseStructDeclaration(
                 }
                 method.identifierToken.text = std::move(opName);
                 result.methods.push_back(std::move(method));
+            } else if (current().kind == SyntaxKind::ThisKeyword &&
+                       peek(1).kind == SyntaxKind::OpenBracketToken) {
+                const auto thisTok = nextToken();
+                const auto openBracket = match(SyntaxKind::OpenBracketToken);
+                std::vector<ParameterSyntax> idxParams;
+                std::vector<SyntaxToken> idxCommas;
+                if (current().kind != SyntaxKind::CloseBracketToken &&
+                    current().kind != SyntaxKind::EndOfFileToken) {
+                    idxParams.push_back(parseParameter());
+                    while (current().kind == SyntaxKind::CommaToken) {
+                        idxCommas.push_back(nextToken());
+                        idxParams.push_back(parseParameter());
+                    }
+                }
+                const auto closeBracket = match(SyntaxKind::CloseBracketToken);
+                (void)openBracket;
+                (void)closeBracket;
+                (void)match(SyntaxKind::OpenBraceToken);
+                while (current().kind != SyntaxKind::CloseBraceToken &&
+                       current().kind != SyntaxKind::EndOfFileToken) {
+                    auto accessor = parseAccessorDeclaration();
+                    if (accessor.keyword.kind == SyntaxKind::GetKeyword && accessor.body) {
+                        FunctionDeclarationSyntax getter;
+                        getter.attributes = memberAttributes;
+                        getter.modifiers = memberModifiers;
+                        getter.staticKeyword = findModifier(getter.modifiers, SyntaxKind::StaticKeyword);
+                        getter.refReturnKeyword = refReturnKeyword;
+                        getter.returnType = type;
+                        getter.identifierToken.kind = SyntaxKind::IdentifierToken;
+                        getter.identifierToken.span = thisTok.span;
+                        getter.identifierToken.text = "Get";
+                        for (const auto& ip : idxParams) {
+                            ParameterSyntax cp;
+                            cp.paramsKeyword = ip.paramsKeyword;
+                            cp.modifierToken = ip.modifierToken;
+                            cp.type = ip.type;
+                            cp.identifierToken = ip.identifierToken;
+                            getter.parameters.push_back(std::move(cp));
+                        }
+                        getter.commaTokens = idxCommas;
+                        getter.body = std::move(*accessor.body);
+                        result.methods.push_back(std::move(getter));
+                    } else if (accessor.keyword.kind == SyntaxKind::SetKeyword && accessor.body) {
+                        FunctionDeclarationSyntax setter;
+                        setter.attributes = memberAttributes;
+                        setter.modifiers = memberModifiers;
+                        setter.staticKeyword = findModifier(setter.modifiers, SyntaxKind::StaticKeyword);
+                        TypeSyntax voidType;
+                        voidType.name.kind = SyntaxKind::VoidKeyword;
+                        voidType.name.span = thisTok.span;
+                        voidType.name.text = "void";
+                        setter.returnType = std::move(voidType);
+                        setter.identifierToken.kind = SyntaxKind::IdentifierToken;
+                        setter.identifierToken.span = thisTok.span;
+                        setter.identifierToken.text = "Set";
+                        for (const auto& ip : idxParams) {
+                            ParameterSyntax cp;
+                            cp.paramsKeyword = ip.paramsKeyword;
+                            cp.modifierToken = ip.modifierToken;
+                            cp.type = ip.type;
+                            cp.identifierToken = ip.identifierToken;
+                            setter.parameters.push_back(std::move(cp));
+                        }
+                        setter.commaTokens = idxCommas;
+                        ParameterSyntax valParam;
+                        valParam.type = type;
+                        valParam.identifierToken.kind = SyntaxKind::IdentifierToken;
+                        valParam.identifierToken.span = accessor.keyword.span;
+                        valParam.identifierToken.text = "value";
+                        setter.parameters.push_back(std::move(valParam));
+                        setter.body = std::move(*accessor.body);
+                        result.methods.push_back(std::move(setter));
+                    }
+                }
+                (void)match(SyntaxKind::CloseBraceToken);
             } else {
                 auto identifier = match(SyntaxKind::IdentifierToken);
                 const auto isAbstract = findModifier(

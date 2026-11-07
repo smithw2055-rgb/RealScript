@@ -390,6 +390,7 @@ GameplayHost::State GameplayHost::snapshot() const {
     state.nextPayloadId = nextPayloadId_;
     state.nextSubscriptionId = nextSubscriptionId_;
     state.nextSequenceId = nextSequenceId_;
+    state.nextAsyncOpId = nextAsyncOpId_;
     state.calls.reserve(calls_.size());
     for (const auto& entry : calls_) state.calls.push_back(entry.second);
     state.subscriptions.reserve(subscriptions_.size());
@@ -398,12 +399,14 @@ GameplayHost::State GameplayHost::snapshot() const {
     }
     state.sequences.reserve(sequences_.size());
     for (const auto& entry : sequences_) state.sequences.push_back(entry.second);
+    state.asyncOps.reserve(asyncOps_.size());
+    for (const auto& entry : asyncOps_) state.asyncOps.push_back(entry.second);
     return state;
 }
 
 bool GameplayHost::restore(const State& state) {
     if (state.nextPayloadId == 0 || state.nextSubscriptionId == 0 ||
-        state.nextSequenceId == 0) {
+        state.nextSequenceId == 0 || state.nextAsyncOpId == 0) {
         return false;
     }
 
@@ -461,15 +464,27 @@ bool GameplayHost::restore(const State& state) {
     }
     if (state.nextSequenceId <= maximumSequence) return false;
 
+    std::map<AsyncOperationId, ScriptAsyncOperationState> asyncOps;
+    AsyncOperationId maximumAsyncOp = 0;
+    for (const auto& op : state.asyncOps) {
+        if (op.id == 0 || !asyncOps.emplace(op.id, op).second) {
+            return false;
+        }
+        maximumAsyncOp = std::max(maximumAsyncOp, op.id);
+    }
+    if (state.nextAsyncOpId <= maximumAsyncOp) return false;
+
     core_ = std::move(core);
     nextPayloadId_ = state.nextPayloadId;
     nextSubscriptionId_ = state.nextSubscriptionId;
     nextSequenceId_ = state.nextSequenceId;
+    nextAsyncOpId_ = state.nextAsyncOpId;
     calls_ = std::move(calls);
     timerToPayload_ = std::move(timerToPayload);
     subscriptions_ = std::move(subscriptions);
     sequences_ = std::move(sequences);
     timerToSequence_ = std::move(timerToSequence);
+    asyncOps_ = std::move(asyncOps);
     return true;
 }
 
@@ -479,6 +494,7 @@ std::uint64_t GameplayHost::stableHash() const noexcept {
     hashU64(hash, nextPayloadId_);
     hashU64(hash, nextSubscriptionId_);
     hashU64(hash, nextSequenceId_);
+    hashU64(hash, nextAsyncOpId_);
     hashU64(hash, calls_.size());
     for (const auto& entry : calls_) {
         const auto& call = entry.second;
@@ -499,12 +515,21 @@ std::uint64_t GameplayHost::stableHash() const noexcept {
         hashU64(hash, subscription.target);
         hashString(hash, subscription.callback);
         hashU64(hash, static_cast<std::uint32_t>(subscription.priority));
+        hashU64(hash, subscription.once ? 1u : 0u);
     }
     hashU64(hash, sequences_.size());
     for (const auto& entry : sequences_) {
         hashU64(hash, entry.second.id);
         hashU64(hash, entry.second.timers.size());
         for (const auto timerId : entry.second.timers) hashU64(hash, timerId);
+    }
+    hashU64(hash, asyncOps_.size());
+    for (const auto& entry : asyncOps_) {
+        const auto& op = entry.second;
+        hashU64(hash, op.id);
+        hashString(hash, op.name);
+        hashU64(hash, op.completed ? 1u : 0u);
+        hashU64(hash, stableGameplayValueHash(op.result));
     }
     return hash;
 }

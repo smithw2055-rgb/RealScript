@@ -74,9 +74,11 @@ public:
         ScriptPayloadId nextPayloadId = 1;
         SubscriptionId nextSubscriptionId = 1;
         SequenceId nextSequenceId = 1;
+        AsyncOperationId nextAsyncOpId = 1;
         std::vector<ScheduledScriptCall> calls;
         std::vector<ScriptEventSubscription> subscriptions;
         std::vector<ScriptSequenceState> sequences;
+        std::vector<ScriptAsyncOperationState> asyncOps;
     };
 
     explicit GameplayHost(

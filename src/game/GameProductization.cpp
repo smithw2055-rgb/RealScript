@@ -759,6 +759,27 @@ bool valueToJson(
                 return true;
             }
         }
+        if (const auto objTypeId = runtime.heap()->objectTypeId(*objRef)) {
+            if (const auto* objDesc = findProgramTypeById(program, *objTypeId)) {
+                tooling::Json::Object instObj;
+                instObj["$objectType"] = objDesc->moduleName.empty()
+                    ? objDesc->name
+                    : (objDesc->moduleName + "::" + objDesc->name);
+                for (std::size_t i = 0; i < objDesc->fields.size(); ++i) {
+                    const auto& fld = objDesc->fields[i];
+                    if (fld.staticField || fld.constField || fld.synthetic) continue;
+                    const auto fVal = runtime.heap()->fieldGet(*objRef, i);
+                    if (!fVal) continue;
+                    tooling::Json fieldJson;
+                    if (!valueToJson(runtime, scene, *fVal, policy, depth + 1, fieldJson, error)) {
+                        return false;
+                    }
+                    instObj[fld.name] = std::move(fieldJson);
+                }
+                out = tooling::Json(std::move(instObj));
+                return true;
+            }
+        }
         fail(error, runtime::ErrorCode::DeterminismViolation,
             "script state contains an unresolvable object reference");
         return false;
@@ -965,6 +986,35 @@ bool jsonToValue(
                     out = compObj->value();
                     return true;
                 }
+            }
+        }
+        if (json.isObject()) {
+            std::string targetType = expectedTypeName;
+            if (const auto* ot = json.find("$objectType"); ot && ot->isString()) {
+                targetType = ot->stringValue();
+            }
+            if (!targetType.empty()) {
+                auto created = runtime.createObject(targetType, error);
+                if (!created) return false;
+                if (const auto* objDesc = findProgramTypeById(program, semantic::stableTypeId(targetType))) {
+                    for (std::size_t i = 0; i < objDesc->fields.size(); ++i) {
+                        const auto& fld = objDesc->fields[i];
+                        if (fld.staticField || fld.constField || fld.synthetic) continue;
+                        if (const auto* fJson = json.find(fld.name)) {
+                            runtime::Value fVal{};
+                            if (!jsonToValue(
+                                    runtime, scene, *fJson, fld.type, fld.typeName,
+                                    policy, depth + 1, fVal, error)) {
+                                return false;
+                            }
+                            if (!runtime.heap()->fieldSet(created->reference(), i, fVal, &error)) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                out = created->reference();
+                return true;
             }
         }
         return false;
@@ -1290,6 +1340,17 @@ std::string exportSceneJson(
             colObj["collisionMask"] = static_cast<std::int64_t>(col->collisionMask);
             entObj["collider2D"] = tooling::Json(std::move(colObj));
         }
+        if (const auto col3 = scene.getEntityCollider3D(entityId)) {
+            tooling::Json::Object col3Obj;
+            col3Obj["halfExtentsRaw"] = encodeVec3Raw(col3->halfExtents);
+            col3Obj["radiusRaw"] = static_cast<std::int64_t>(col3->radius.raw);
+            col3Obj["isSphere"] = col3->isSphere;
+            col3Obj["isTrigger"] = col3->isTrigger;
+            col3Obj["layerMask"] = static_cast<std::int64_t>(col3->layerMask);
+            col3Obj["collisionLayer"] = static_cast<std::int64_t>(col3->collisionLayer);
+            col3Obj["collisionMask"] = static_cast<std::int64_t>(col3->collisionMask);
+            entObj["collider3D"] = tooling::Json(std::move(col3Obj));
+        }
 
         tooling::Json::Array compsArr;
         for (const auto* compObj : scene.getComponents(entityId)) {
@@ -1303,8 +1364,11 @@ std::string exportSceneJson(
             tooling::Json::Object fieldsObj;
             for (std::size_t index = 0; index < fields.size(); ++index) {
                 const auto& field = fields[index];
-                if (field.synthetic || field.staticField || field.constField ||
-                    (!field.name.empty() && field.name.front() == '$')) {
+                const bool isSequenceSynthetic =
+                    field.synthetic && field.name.rfind("$sequence_", 0) == 0;
+                if (!isSequenceSynthetic &&
+                    (field.synthetic || field.staticField || field.constField ||
+                     (!field.name.empty() && field.name.front() == '$'))) {
                     continue;
                 }
                 if (field.name == "__native" &&
@@ -1358,6 +1422,17 @@ std::string exportSceneJson(
         overlapsArr.push_back(tooling::Json(std::move(ovObj)));
     }
 
+    tooling::Json::Array overlaps3DArr;
+    const auto& wasTriggerMap3D = scene.activeOverlapWasTrigger3D();
+    for (const auto& pair : scene.activeOverlaps3D()) {
+        tooling::Json::Object ovObj;
+        ovObj["entityA"] = static_cast<std::int64_t>(pair.first);
+        ovObj["entityB"] = static_cast<std::int64_t>(pair.second);
+        const auto trigIt = wasTriggerMap3D.find(pair);
+        ovObj["wasTrigger"] = (trigIt != wasTriggerMap3D.end()) ? trigIt->second : false;
+        overlaps3DArr.push_back(tooling::Json(std::move(ovObj)));
+    }
+
     tooling::Json::Object inputObj;
     {
         tooling::Json::Object curActObj;
@@ -1380,12 +1455,40 @@ std::string exportSceneJson(
         inputObj["axes2D"] = tooling::Json(std::move(axesObj));
     }
 
+    tooling::Json::Array ecsTablesArr;
+    if (runtime.heap()) {
+        for (const auto& tableName : runtime.heap()->nativeEcsTableNames()) {
+            const auto* entIds = runtime.heap()->nativeEcsEntityIds(tableName);
+            const auto* compVals = runtime.heap()->nativeEcsComponentValues(tableName);
+            if (!entIds || !compVals || entIds->size() != compVals->size() || entIds->empty()) {
+                continue;
+            }
+            tooling::Json::Object tableObj;
+            tableObj["type"] = tableName;
+            tooling::Json::Array entriesArr;
+            for (std::size_t i = 0; i < entIds->size(); ++i) {
+                tooling::Json valJson;
+                if (!valueToJson(runtime, &scene, (*compVals)[i], policy, 0, valJson, error)) {
+                    return {};
+                }
+                tooling::Json::Object entryObj;
+                entryObj["entity"] = (*entIds)[i];
+                entryObj["value"] = std::move(valJson);
+                entriesArr.push_back(tooling::Json(std::move(entryObj)));
+            }
+            tableObj["entries"] = tooling::Json(std::move(entriesArr));
+            ecsTablesArr.push_back(tooling::Json(std::move(tableObj)));
+        }
+    }
+
     tooling::Json::Object root;
     root["version"] = static_cast<std::int64_t>(kScriptObjectStateVersion);
     root["entities"] = tooling::Json(std::move(entitiesArr));
     root["signalConnections"] = tooling::Json(std::move(signalsArr));
     root["activeOverlaps2D"] = tooling::Json(std::move(overlapsArr));
+    root["activeOverlaps3D"] = tooling::Json(std::move(overlaps3DArr));
     root["inputSnapshot"] = tooling::Json(std::move(inputObj));
+    root["nativeEcsTables"] = tooling::Json(std::move(ecsTablesArr));
     return tooling::Json(std::move(root)).dump();
 }
 
@@ -1470,13 +1573,17 @@ bool importSceneJson(
         }
     }
 
-    // Clear existing entities and scene-wide physics/input state
+    // Clear existing entities and scene-wide physics/input/ECS state
     for (const auto existingId : scene.entities()) {
         (void)scene.detach(existingId);
     }
     scene.resetGenerationalSlots();
     scene.restorePhysicsOverlapState({}, {});
+    scene.restorePhysicsOverlapState3D({}, {});
     scene.restoreInputSnapshot({}, {}, {});
+    if (scene.runtime().heap()) {
+        scene.runtime().heap()->clearNativeEcsTables();
+    }
 
     struct DeferredComponentFields {
         SceneEntityId entityId = 0;
@@ -1555,6 +1662,29 @@ bool importSceneJson(
             }
             scene.setEntityCollider2D(entityId, col);
         }
+        if (const auto* col3Json = entItem.find("collider3D"); col3Json && col3Json->isObject()) {
+            SceneCollider3D col3;
+            (void)decodeVec3Raw(col3Json->find("halfExtentsRaw"), col3.halfExtents);
+            if (const auto* radJson = col3Json->find("radiusRaw"); radJson && radJson->isNumber()) {
+                col3.radius = Fixed::fromRaw(static_cast<std::int32_t>(radJson->integerValue()));
+            }
+            if (const auto* isJson = col3Json->find("isSphere"); isJson && isJson->isBool()) {
+                col3.isSphere = isJson->boolValue();
+            }
+            if (const auto* itJson = col3Json->find("isTrigger"); itJson && itJson->isBool()) {
+                col3.isTrigger = itJson->boolValue();
+            }
+            if (const auto* lmJson = col3Json->find("layerMask"); lmJson && lmJson->isNumber()) {
+                col3.layerMask = static_cast<std::uint32_t>(lmJson->integerValue());
+            }
+            if (const auto* clJson = col3Json->find("collisionLayer"); clJson && clJson->isNumber()) {
+                col3.collisionLayer = static_cast<std::uint32_t>(clJson->integerValue());
+            }
+            if (const auto* cmJson = col3Json->find("collisionMask"); cmJson && cmJson->isNumber()) {
+                col3.collisionMask = static_cast<std::uint32_t>(cmJson->integerValue());
+            }
+            scene.setEntityCollider3D(entityId, col3);
+        }
 
         if (const auto* compsJson = entItem.find("components"); compsJson && compsJson->isArray()) {
             for (const auto& compItem : compsJson->arrayValue()) {
@@ -1591,15 +1721,18 @@ bool importSceneJson(
         }
     }
 
-    // Pass 3: Populate component fields (including cross-entity ObjectRefs)
+    // Pass 3: Populate component fields (including cross-entity ObjectRefs and $sequence_* coroutine state)
     auto& runtime = scene.runtime();
     for (const auto& item : deferredComponents) {
         if (!item.fieldsJson || !item.fieldsJson->isObject()) continue;
         auto* compObj = scene.getComponent(item.entityId, item.typeName);
         if (!compObj) return false;
         for (const auto& desc : compObj->type().descriptor.fields) {
-            if (desc.synthetic || desc.staticField || desc.constField ||
-                (!desc.name.empty() && desc.name.front() == '$')) {
+            const bool isSequenceSynthetic =
+                desc.synthetic && desc.name.rfind("$sequence_", 0) == 0;
+            if (!isSequenceSynthetic &&
+                (desc.synthetic || desc.staticField || desc.constField ||
+                 (!desc.name.empty() && desc.name.front() == '$'))) {
                 continue;
             }
             if (desc.name == "__native" &&
@@ -1625,7 +1758,13 @@ bool importSceneJson(
                 }
                 return false;
             }
-            if (!runtime.setMember(*compObj, desc.name, decodedValue, error)) {
+            if (isSequenceSynthetic) {
+                if (!runtime.heap() ||
+                    !runtime.heap()->fieldSet(
+                        compObj->reference(), desc.index, std::move(decodedValue), &error)) {
+                    return false;
+                }
+            } else if (!runtime.setMember(*compObj, desc.name, decodedValue, error)) {
                 return false;
             }
         }
@@ -1667,7 +1806,7 @@ bool importSceneJson(
         }
     }
 
-    // Pass 6: Restore active 2D physics overlaps and deterministic input snapshot
+    // Pass 6: Restore active 2D/3D physics overlaps and deterministic input snapshot
     if (const auto* ovsJson = parsed->find("activeOverlaps2D"); ovsJson && ovsJson->isArray()) {
         std::set<std::pair<SceneEntityId, SceneEntityId>> activeOverlaps;
         std::map<std::pair<SceneEntityId, SceneEntityId>, bool> wasTriggerMap;
@@ -1685,6 +1824,25 @@ bool importSceneJson(
             wasTriggerMap[pair] = (wt && wt->isBool()) ? wt->boolValue() : false;
         }
         scene.restorePhysicsOverlapState(std::move(activeOverlaps), std::move(wasTriggerMap));
+    }
+
+    if (const auto* ovs3Json = parsed->find("activeOverlaps3D"); ovs3Json && ovs3Json->isArray()) {
+        std::set<std::pair<SceneEntityId, SceneEntityId>> activeOverlaps3D;
+        std::map<std::pair<SceneEntityId, SceneEntityId>, bool> wasTriggerMap3D;
+        for (const auto& ovItem : ovs3Json->arrayValue()) {
+            if (!ovItem.isObject()) continue;
+            const auto* ea = ovItem.find("entityA");
+            const auto* eb = ovItem.find("entityB");
+            if (!ea || !ea->isNumber() || !eb || !eb->isNumber()) continue;
+            auto a = static_cast<SceneEntityId>(ea->integerValue());
+            auto b = static_cast<SceneEntityId>(eb->integerValue());
+            if (a > b) std::swap(a, b);
+            const auto pair = std::make_pair(a, b);
+            activeOverlaps3D.insert(pair);
+            const auto* wt = ovItem.find("wasTrigger");
+            wasTriggerMap3D[pair] = (wt && wt->isBool()) ? wt->boolValue() : false;
+        }
+        scene.restorePhysicsOverlapState3D(std::move(activeOverlaps3D), std::move(wasTriggerMap3D));
     }
 
     if (const auto* inpJson = parsed->find("inputSnapshot"); inpJson && inpJson->isObject()) {
@@ -1716,6 +1874,104 @@ bool importSceneJson(
             std::move(curActions), std::move(prevActions), std::move(axes2D));
     }
 
+    // Pass 7: Restore native ECS Sparse-Set component tables
+    if (const auto* ecsJson = parsed->find("nativeEcsTables");
+        ecsJson && ecsJson->isArray() && runtime.heap()) {
+        for (const auto& tableItem : ecsJson->arrayValue()) {
+            if (!tableItem.isObject()) continue;
+            const auto* typeJson = tableItem.find("type");
+            const auto* entriesJson = tableItem.find("entries");
+            if (!typeJson || !typeJson->isString() || !entriesJson || !entriesJson->isArray()) {
+                continue;
+            }
+            const std::string& typeName = typeJson->stringValue();
+            semantic::PrimitiveType elemPrim = semantic::PrimitiveType::Struct;
+            if (const auto scriptType = runtime.findType(typeName)) {
+                if (scriptType->descriptor.kind == semantic::TypeKind::Class) {
+                    elemPrim = semantic::PrimitiveType::Object;
+                } else if (scriptType->descriptor.kind == semantic::TypeKind::Enum) {
+                    elemPrim = semantic::PrimitiveType::Enum;
+                }
+            }
+            for (const auto& entryItem : entriesJson->arrayValue()) {
+                if (!entryItem.isObject()) continue;
+                const auto* entJson = entryItem.find("entity");
+                const auto* valJson = entryItem.find("value");
+                if (!entJson || !entJson->isNumber() || !valJson) continue;
+                runtime::Value decodedVal;
+                if (!jsonToValue(
+                        runtime,
+                        &scene,
+                        *valJson,
+                        elemPrim,
+                        typeName,
+                        policy,
+                        0,
+                        decodedVal,
+                        error)) {
+                    return false;
+                }
+                (void)runtime.heap()->setNativeEcsComponent(
+                    typeName, entJson->integerValue(), std::move(decodedVal));
+            }
+        }
+    }
+
+    return true;
+}
+
+std::optional<RollbackFrameSnapshot> captureRollbackFrame(
+    const SceneScriptRuntime& scene,
+    const GameplayHost& host,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy) {
+    error = {};
+    RollbackFrameSnapshot snap;
+    snap.tick = host.core().clock().tick();
+    GameplayStateError hostErr;
+    snap.hostStateBytes = encodeGameplayHostState(host, hostErr);
+    if (hostErr.failed() || snap.hostStateBytes.empty()) {
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "failed to encode GameplayHost state: " + hostErr.message);
+        return std::nullopt;
+    }
+    snap.sceneJson = exportSceneJson(scene, error, policy);
+    if (error.code != runtime::ErrorCode::None || snap.sceneJson.empty()) {
+        return std::nullopt;
+    }
+    std::uint64_t hash = FnvOffset;
+    hashU64(hash, snap.tick);
+    hashBytes(hash, snap.hostStateBytes.data(), snap.hostStateBytes.size());
+    hashString(hash, snap.sceneJson);
+    snap.frameHash = hash;
+    return snap;
+}
+
+bool restoreRollbackFrame(
+    SceneScriptRuntime& scene,
+    GameplayHost& host,
+    const RollbackFrameSnapshot& snapshot,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy) {
+    error = {};
+    std::uint64_t expectedHash = FnvOffset;
+    hashU64(expectedHash, snapshot.tick);
+    hashBytes(expectedHash, snapshot.hostStateBytes.data(), snapshot.hostStateBytes.size());
+    hashString(expectedHash, snapshot.sceneJson);
+    if (expectedHash != snapshot.frameHash) {
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "rollback frame snapshot hash mismatch");
+        return false;
+    }
+    if (!importSceneJson(scene, snapshot.sceneJson, error, policy)) {
+        return false;
+    }
+    GameplayStateError hostErr;
+    if (!restoreGameplayHostState(host, snapshot.hostStateBytes, hostErr)) {
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "failed to restore GameplayHost state: " + hostErr.message);
+        return false;
+    }
     return true;
 }
 

@@ -31,12 +31,15 @@ private:
     void emitStopped(std::ostream& output);
     void emitTerminated(std::ostream& output);
     void rebuildVariableReferences();
+    [[nodiscard]] std::int64_t registerExpandableValue(const runtime::Value& value);
 
     std::shared_ptr<const runtime::ProgramImage> program_;
     std::shared_ptr<runtime::ManagedHeap> heap_;
     std::unique_ptr<DebugSession> session_;
     std::atomic<std::uint32_t> sequence_{1};
     std::unordered_map<std::int64_t, std::vector<DebugVariable>> variables_;
+    std::unordered_map<std::int64_t, runtime::ObjectRef> childOwnerObjects_;
+    std::int64_t nextChildRef_ = 1000;
 };
 
 } // namespace realscript::debug

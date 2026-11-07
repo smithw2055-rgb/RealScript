@@ -126,6 +126,8 @@ public:
     [[nodiscard]] std::vector<SemanticToken> semanticTokens(const std::string& path);
     [[nodiscard]] std::vector<std::uint32_t> semanticTokensEncoded(const std::string& path);
     [[nodiscard]] std::vector<InlayHint> inlayHints(const std::string& path);
+    [[nodiscard]] std::vector<TextEdit> formatDocument(const std::string& path, std::size_t tabSize = 4);
+    [[nodiscard]] std::vector<DocumentSymbol> workspaceSymbols(const std::string& query = {});
 
     [[nodiscard]] const compiler::BuildResult& build();
 

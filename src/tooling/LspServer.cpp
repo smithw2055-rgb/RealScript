@@ -122,6 +122,8 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
                 {"definitionProvider", true},
                 {"referencesProvider", true},
                 {"documentSymbolProvider", true},
+                {"workspaceSymbolProvider", true},
+                {"documentFormattingProvider", true},
                 {"renameProvider", true},
                 {"inlayHintProvider", true},
                 {"semanticTokensProvider", Json::Object{
@@ -327,6 +329,34 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
             });
         }
         return response(message, Json(std::move(items)));
+    }
+    if (method == "textDocument/formatting") {
+        std::size_t tabSize = 4;
+        if (const auto* ts = nested(message, {"params", "options", "tabSize"})) {
+            tabSize = static_cast<std::size_t>(std::max<std::int64_t>(1, ts->integerValue(4)));
+        }
+        Json::Array edits;
+        for (const auto& edit : service_.formatDocument(path, tabSize)) {
+            edits.emplace_back(Json::Object{
+                {"range", range(edit.location.range)},
+                {"newText", edit.replacement},
+            });
+        }
+        return response(message, Json(std::move(edits)));
+    }
+    if (method == "workspace/symbol") {
+        const auto query = (params && params->find("query"))
+            ? params->find("query")->stringValue()
+            : std::string{};
+        Json::Array values;
+        for (const auto& symbol : service_.workspaceSymbols(query)) {
+            values.emplace_back(Json::Object{
+                {"name", symbol.name},
+                {"kind", documentSymbolKind(symbol.kind)},
+                {"location", location(symbol.location)},
+            });
+        }
+        return response(message, Json(std::move(values)));
     }
 
     if (message.find("id")) return error(message, -32601, "method not found: " + method);

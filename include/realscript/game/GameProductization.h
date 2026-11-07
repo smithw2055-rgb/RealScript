@@ -2,6 +2,8 @@
 
 #include "realscript/Version.h"
 #include "realscript/game/GameScripting.h"
+#include "realscript/game/GameplayScripting.h"
+#include "realscript/game/GameplayStateCodec.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -122,6 +124,26 @@ bool importScriptObjectJson(
 bool importSceneJson(
     SceneScriptRuntime& scene,
     const std::string& jsonText,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy = {});
+
+struct RollbackFrameSnapshot {
+    GameTick tick = 0;
+    std::vector<std::uint8_t> hostStateBytes;
+    std::string sceneJson;
+    std::uint64_t frameHash = 0;
+};
+
+[[nodiscard]] std::optional<RollbackFrameSnapshot> captureRollbackFrame(
+    const SceneScriptRuntime& scene,
+    const GameplayHost& host,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy = {});
+
+bool restoreRollbackFrame(
+    SceneScriptRuntime& scene,
+    GameplayHost& host,
+    const RollbackFrameSnapshot& snapshot,
     runtime::RuntimeError& error,
     ScriptStatePolicy policy = {});
 

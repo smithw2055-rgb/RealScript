@@ -891,6 +891,21 @@ bool ManagedHeap::hasNativeEcsTable(std::string_view canonicalTypeName) const no
     return found != impl_->nativeEcsTables.end();
 }
 
+std::vector<std::string> ManagedHeap::nativeEcsTableNames() const {
+    std::vector<std::string> names;
+    names.reserve(impl_->nativeEcsTables.size());
+    for (const auto& [name, table] : impl_->nativeEcsTables) {
+        (void)table;
+        names.push_back(name);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+void ManagedHeap::clearNativeEcsTables() noexcept {
+    impl_->nativeEcsTables.clear();
+}
+
 const std::vector<std::int64_t>* ManagedHeap::nativeEcsEntityIds(
     std::string_view canonicalTypeName) const noexcept {
     const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));

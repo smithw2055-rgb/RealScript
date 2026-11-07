@@ -1304,7 +1304,235 @@ std::vector<InlayHint> LanguageService::inlayHints(const std::string& path) {
             }
         }
     }
+
+    // 2. Call-site parameter name inlay hints (`paramName:`) with arity-aware overload resolution
+    std::unordered_map<std::string, std::vector<std::vector<std::string>>> paramNamesByFunction;
+    const auto addOverloadParams = [&](const std::string& name, std::vector<std::string> names) {
+        if (names.empty()) return;
+        auto& overloads = paramNamesByFunction[name];
+        if (std::find(overloads.begin(), overloads.end(), names) == overloads.end()) {
+            overloads.push_back(std::move(names));
+        }
+    };
+    for (const auto& module : result_.modules) {
+        for (const auto& fn : module.functions) {
+            std::vector<std::string> names;
+            for (std::size_t idx = 0; idx < fn.parameterTypes.size(); ++idx) {
+                if (idx < fn.debugInfo.locals.size() && !fn.debugInfo.locals[idx].name.empty()) {
+                    names.push_back(fn.debugInfo.locals[idx].name);
+                } else {
+                    names.push_back("arg" + std::to_string(idx));
+                }
+            }
+            addOverloadParams(fn.name, std::move(names));
+        }
+        for (const auto& type : module.types) {
+            for (const auto& method : type.methods) {
+                if (method.synthetic) continue;
+                std::vector<std::string> names;
+                const std::size_t beginIdx = (method.method && !method.staticMethod) ? 1 : 0;
+                for (std::size_t idx = beginIdx; idx < method.parameters.size(); ++idx) {
+                    names.push_back(method.parameters[idx].name);
+                }
+                addOverloadParams(method.name, std::move(names));
+            }
+        }
+    }
+
+    for (std::size_t i = 0; i + 2 < allTokens.size(); ++i) {
+        if (allTokens[i].kind != syntax::SyntaxKind::IdentifierToken ||
+            allTokens[i + 1].kind != syntax::SyntaxKind::OpenParenToken) {
+            continue;
+        }
+        // Skip function/method declarations
+        if (i > 0) {
+            const auto prevKind = allTokens[i - 1].kind;
+            if (prevKind == syntax::SyntaxKind::IdentifierToken ||
+                syntax::isPrimitiveTypeKeyword(prevKind) ||
+                prevKind == syntax::SyntaxKind::VoidKeyword ||
+                prevKind == syntax::SyntaxKind::SequenceKeyword ||
+                prevKind == syntax::SyntaxKind::NewKeyword) {
+                continue;
+            }
+        }
+        const auto fnIt = paramNamesByFunction.find(allTokens[i].text);
+        if (fnIt == paramNamesByFunction.end() || fnIt->second.empty()) continue;
+
+        std::size_t j = i + 2;
+        if (j < allTokens.size() && allTokens[j].kind == syntax::SyntaxKind::CloseParenToken) {
+            continue;
+        }
+        // Count call-site arguments first to match overload arity
+        std::size_t argCount = 1;
+        {
+            std::size_t scan = j;
+            int scanDepth = 0;
+            while (scan < allTokens.size()) {
+                const auto sk = allTokens[scan].kind;
+                if (sk == syntax::SyntaxKind::EndOfFileToken) break;
+                if (scanDepth == 0 && sk == syntax::SyntaxKind::CloseParenToken) break;
+                if (sk == syntax::SyntaxKind::OpenParenToken ||
+                    sk == syntax::SyntaxKind::OpenBracketToken ||
+                    sk == syntax::SyntaxKind::OpenBraceToken) {
+                    ++scanDepth;
+                } else if (sk == syntax::SyntaxKind::CloseParenToken ||
+                           sk == syntax::SyntaxKind::CloseBracketToken ||
+                           sk == syntax::SyntaxKind::CloseBraceToken) {
+                    --scanDepth;
+                } else if (sk == syntax::SyntaxKind::CommaToken && scanDepth == 0) {
+                    ++argCount;
+                }
+                ++scan;
+            }
+        }
+        const std::vector<std::string>* selectedParams = nullptr;
+        for (const auto& candidate : fnIt->second) {
+            if (candidate.size() == argCount) {
+                selectedParams = &candidate;
+                break;
+            }
+        }
+        if (!selectedParams) {
+            for (const auto& candidate : fnIt->second) {
+                if (candidate.size() >= argCount) {
+                    selectedParams = &candidate;
+                    break;
+                }
+            }
+        }
+        if (!selectedParams) continue;
+        const auto& pNames = *selectedParams;
+
+        int depth = 0;
+        std::size_t paramIdx = 0;
+        bool atArgStart = true;
+        while (j < allTokens.size()) {
+            const auto k = allTokens[j].kind;
+            if (k == syntax::SyntaxKind::EndOfFileToken) break;
+            if (depth == 0 && k == syntax::SyntaxKind::CloseParenToken) break;
+            if (atArgStart && depth == 0 && paramIdx < pNames.size()) {
+                const bool isNamedArg =
+                    (j + 1 < allTokens.size() &&
+                     allTokens[j + 1].kind == syntax::SyntaxKind::ColonToken);
+                if (!isNamedArg && allTokens[j].text != pNames[paramIdx]) {
+                    const auto rng = rangeFor(path, allTokens[j].span);
+                    const std::size_t line0 = rng.start.line > 0 ? rng.start.line - 1 : 0;
+                    const std::size_t col0 = rng.start.column > 0 ? rng.start.column - 1 : 0;
+                    hints.push_back(InlayHint{{line0, col0}, pNames[paramIdx] + ":", 2u});
+                }
+                atArgStart = false;
+            }
+            if (k == syntax::SyntaxKind::OpenParenToken ||
+                k == syntax::SyntaxKind::OpenBracketToken ||
+                k == syntax::SyntaxKind::OpenBraceToken) {
+                ++depth;
+            } else if (k == syntax::SyntaxKind::CloseParenToken ||
+                       k == syntax::SyntaxKind::CloseBracketToken ||
+                       k == syntax::SyntaxKind::CloseBraceToken) {
+                --depth;
+            } else if (k == syntax::SyntaxKind::CommaToken && depth == 0) {
+                ++paramIdx;
+                atArgStart = true;
+            }
+            ++j;
+        }
+    }
+
     return hints;
+}
+
+std::vector<TextEdit> LanguageService::formatDocument(const std::string& path, std::size_t tabSize) {
+    const auto* doc = document(path);
+    if (!doc) return {};
+    std::string formatted;
+    formatted.reserve(doc->content.size() + 64);
+
+    int indentLevel = 0;
+    std::size_t pos = 0;
+    while (pos < doc->content.size()) {
+        std::size_t lineEnd = doc->content.find('\n', pos);
+        const bool hasNewline = lineEnd != std::string::npos;
+        if (!hasNewline) lineEnd = doc->content.size();
+
+        std::string line = doc->content.substr(pos, lineEnd - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        std::size_t firstNonSpace = 0;
+        while (firstNonSpace < line.size() &&
+               (line[firstNonSpace] == ' ' || line[firstNonSpace] == '\t')) {
+            ++firstNonSpace;
+        }
+        std::size_t lastNonSpace = line.size();
+        while (lastNonSpace > firstNonSpace &&
+               (line[lastNonSpace - 1] == ' ' || line[lastNonSpace - 1] == '\t')) {
+            --lastNonSpace;
+        }
+        const std::string trimmed = line.substr(firstNonSpace, lastNonSpace - firstNonSpace);
+
+        if (!trimmed.empty()) {
+            int leadingClose = 0;
+            for (char ch : trimmed) {
+                if (ch == '}') ++leadingClose;
+                else break;
+            }
+            const int effectiveIndent = std::max(0, indentLevel - leadingClose);
+            formatted.append(static_cast<std::size_t>(effectiveIndent) * tabSize, ' ');
+            formatted.append(trimmed);
+
+            int netBraces = 0;
+            bool inStr = false;
+            for (std::size_t i = 0; i < trimmed.size(); ++i) {
+                if (trimmed[i] == '"') {
+                    std::size_t bsCount = 0;
+                    std::size_t back = i;
+                    while (back > 0 && trimmed[back - 1] == '\\') {
+                        ++bsCount;
+                        --back;
+                    }
+                    if ((bsCount % 2) == 0) {
+                        inStr = !inStr;
+                    }
+                } else if (!inStr) {
+                    if (trimmed[i] == '/' && i + 1 < trimmed.size() && trimmed[i + 1] == '/') {
+                        break;
+                    }
+                    if (trimmed[i] == '{') ++netBraces;
+                    else if (trimmed[i] == '}') --netBraces;
+                }
+            }
+            indentLevel = std::max(0, indentLevel + netBraces);
+        }
+        if (hasNewline) formatted.push_back('\n');
+        pos = lineEnd + 1;
+    }
+
+    if (formatted == doc->content) return {};
+    const auto fullRange = rangeFor(path, text::TextSpan{0, doc->content.size()});
+    return {TextEdit{Location{path, fullRange}, std::move(formatted)}};
+}
+
+std::vector<DocumentSymbol> LanguageService::workspaceSymbols(const std::string& query) {
+    (void)build();
+    std::string lowerQuery = query;
+    for (char& ch : lowerQuery) {
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    }
+    std::vector<DocumentSymbol> output;
+    for (const auto& symbol : allDefinitions()) {
+        if (symbol.kind == semantic::SymbolKind::Local ||
+            symbol.kind == semantic::SymbolKind::Parameter) {
+            continue;
+        }
+        if (!lowerQuery.empty()) {
+            std::string lowerName = symbol.name;
+            for (char& ch : lowerName) {
+                if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+            }
+            if (lowerName.find(lowerQuery) == std::string::npos) continue;
+        }
+        output.push_back(symbol);
+    }
+    return output;
 }
 
 const char* symbolKindName(semantic::SymbolKind kind) noexcept {

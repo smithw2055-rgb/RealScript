@@ -53,8 +53,93 @@ tooling::Json DapServer::response(
 }
 
 
+std::int64_t DapServer::registerExpandableValue(const runtime::Value& value) {
+    if (const auto* objRef = std::get_if<runtime::ObjectRef>(&value)) {
+        if (!heap_ || !objRef->valid() || !heap_->isAlive(*objRef)) return 0;
+        if (objRef->kind == runtime::ObjectKind::String) return 0;
+        if (objRef->kind == runtime::ObjectKind::Array) {
+            const auto len = heap_->arrayLength(*objRef).value_or(0);
+            const auto elemType = heap_->arrayElementType(*objRef).value_or(semantic::PrimitiveType::Error);
+            const auto elemTypeId = heap_->arrayElementTypeId(*objRef).value_or(0);
+            std::vector<DebugVariable> children;
+            children.reserve(std::min<std::size_t>(len, 256));
+            for (std::size_t i = 0; i < std::min<std::size_t>(len, 256); ++i) {
+                if (const auto elem = heap_->arrayGet(*objRef, i)) {
+                    children.push_back(DebugVariable{
+                        "[" + std::to_string(i) + "]",
+                        *elem,
+                        elemType != semantic::PrimitiveType::Error ? elemType : runtime::valueType(*elem),
+                        elemTypeId,
+                    });
+                }
+            }
+            const auto refId = nextChildRef_++;
+            variables_[refId] = std::move(children);
+            childOwnerObjects_[refId] = *objRef;
+            return refId;
+        }
+        const auto typeId = heap_->objectTypeId(*objRef).value_or(0);
+        const auto* typeDesc = (program_ && typeId != 0) ? program_->resolveType(typeId) : nullptr;
+        const auto fCount = heap_->fieldCount(*objRef).value_or(0);
+        std::vector<DebugVariable> children;
+        for (std::size_t i = 0; i < fCount; ++i) {
+            if (typeDesc && i < typeDesc->fields.size()) {
+                if (typeDesc->fields[i].staticField ||
+                    typeDesc->fields[i].constField ||
+                    typeDesc->fields[i].synthetic) {
+                    continue;
+                }
+            }
+            const auto fVal = heap_->fieldGet(*objRef, i);
+            if (!fVal) continue;
+            std::string fName = "field_" + std::to_string(i);
+            semantic::PrimitiveType fType = runtime::valueType(*fVal);
+            if (typeDesc && i < typeDesc->fields.size()) {
+                fName = typeDesc->fields[i].name;
+                fType = typeDesc->fields[i].type;
+            }
+            children.push_back(DebugVariable{std::move(fName), *fVal, fType, 0});
+        }
+        if (children.empty()) return 0;
+        const auto refId = nextChildRef_++;
+        variables_[refId] = std::move(children);
+        childOwnerObjects_[refId] = *objRef;
+        return refId;
+    }
+    if (const auto* stVal = std::get_if<runtime::StructValue>(&value)) {
+        if (!stVal->valid() || stVal->fieldCount() == 0) return 0;
+        const auto* typeDesc = (program_ && stVal->typeId != 0) ? program_->resolveType(stVal->typeId) : nullptr;
+        std::vector<DebugVariable> children;
+        for (std::size_t i = 0; i < stVal->fieldCount(); ++i) {
+            if (typeDesc && i < typeDesc->fields.size()) {
+                if (typeDesc->fields[i].staticField ||
+                    typeDesc->fields[i].constField ||
+                    typeDesc->fields[i].synthetic) {
+                    continue;
+                }
+            }
+            const auto fVal = runtime::structValueFieldAt(*stVal, i);
+            if (!fVal) continue;
+            std::string fName = "field_" + std::to_string(i);
+            semantic::PrimitiveType fType = runtime::valueType(*fVal);
+            if (typeDesc && i < typeDesc->fields.size()) {
+                fName = typeDesc->fields[i].name;
+                fType = typeDesc->fields[i].type;
+            }
+            children.push_back(DebugVariable{std::move(fName), *fVal, fType, 0});
+        }
+        if (children.empty()) return 0;
+        const auto refId = nextChildRef_++;
+        variables_[refId] = std::move(children);
+        return refId;
+    }
+    return 0;
+}
+
 void DapServer::rebuildVariableReferences() {
     variables_.clear();
+    childOwnerObjects_.clear();
+    nextChildRef_ = 1000;
     const auto stop = session_->currentStop();
     if (!stop) return;
     for (const auto& frame : stop->frames) {
@@ -237,12 +322,14 @@ tooling::Json DapServer::handle(
         tooling::Json::Array values;
         const auto found = variables_.find(reference);
         if (found != variables_.end()) {
-            for (const auto& variable : found->second) {
+            const auto listCopy = found->second;
+            for (const auto& variable : listCopy) {
+                const auto childRef = registerExpandableValue(variable.value);
                 values.emplace_back(tooling::Json::Object{
                     {"name", variable.name},
                     {"value", runtime::valueToString(variable.value, heap_.get())},
                     {"type", semantic::primitiveTypeName(variable.type)},
-                    {"variablesReference", 0},
+                    {"variablesReference", childRef},
                 });
             }
         }
@@ -255,6 +342,70 @@ tooling::Json DapServer::handle(
             ? arguments->find("name")->stringValue() : std::string{};
         const auto valExpr = arguments && arguments->find("value")
             ? arguments->find("value")->stringValue() : std::string{};
+        if (reference >= 1000) {
+            const auto ownerIt = childOwnerObjects_.find(reference);
+            if (ownerIt == childOwnerObjects_.end() || !heap_ || !heap_->isAlive(ownerIt->second)) {
+                return response(request, false, nullptr,
+                    "cannot mutate non-heap child variable reference");
+            }
+            std::string errMsg;
+            const auto evaluated = session_->evaluate(valExpr, 1u, &errMsg);
+            if (!evaluated) {
+                return response(request, false, nullptr,
+                    errMsg.empty() ? "failed to evaluate new value" : errMsg);
+            }
+            const auto ownerRef = ownerIt->second;
+            runtime::RuntimeError rtErr;
+            if (ownerRef.kind == runtime::ObjectKind::Array) {
+                if (name.size() < 3 || name.front() != '[' || name.back() != ']') {
+                    return response(request, false, nullptr, "invalid array element name: " + name);
+                }
+                const auto idx = static_cast<std::size_t>(
+                    std::strtoull(name.substr(1, name.size() - 2).c_str(), nullptr, 10));
+                if (!heap_->arraySet(ownerRef, idx, *evaluated, &rtErr)) {
+                    return response(request, false, nullptr, rtErr.message);
+                }
+            } else {
+                const auto typeId = heap_->objectTypeId(ownerRef).value_or(0);
+                const auto* typeDesc = (program_ && typeId != 0) ? program_->resolveType(typeId) : nullptr;
+                std::size_t targetIdx = std::numeric_limits<std::size_t>::max();
+                if (typeDesc) {
+                    for (std::size_t i = 0; i < typeDesc->fields.size(); ++i) {
+                        const auto& fld = typeDesc->fields[i];
+                        if (fld.staticField || fld.constField) continue;
+                        if (fld.name == name) {
+                            targetIdx = i;
+                            break;
+                        }
+                    }
+                }
+                if (targetIdx == std::numeric_limits<std::size_t>::max() ||
+                    !heap_->fieldSet(ownerRef, targetIdx, *evaluated, &rtErr)) {
+                    return response(request, false, nullptr,
+                        rtErr.message.empty() ? ("unknown field: " + name) : rtErr.message);
+                }
+            }
+            if (auto it = variables_.find(reference); it != variables_.end()) {
+                for (auto& childVar : it->second) {
+                    if (childVar.name == name) {
+                        childVar.value = *evaluated;
+                        break;
+                    }
+                }
+            }
+            if (const auto stop = session_->currentStop()) {
+                for (const auto& frame : stop->frames) {
+                    variables_[static_cast<std::int64_t>(frame.id) * 2] = frame.arguments;
+                    variables_[static_cast<std::int64_t>(frame.id) * 2 + 1] = frame.locals;
+                }
+            }
+            const auto childRef = registerExpandableValue(*evaluated);
+            return response(request, true, tooling::Json::Object{
+                {"value", runtime::valueToString(*evaluated, heap_.get())},
+                {"type", semantic::primitiveTypeName(runtime::valueType(*evaluated))},
+                {"variablesReference", childRef},
+            });
+        }
         const auto frameId = static_cast<std::uint32_t>(std::max<std::int64_t>(1, reference / 2));
         runtime::Value updatedVal{};
         std::string errMsg;
@@ -263,10 +414,11 @@ tooling::Json DapServer::handle(
                 errMsg.empty() ? "failed to set variable" : errMsg);
         }
         rebuildVariableReferences();
+        const auto childRef = registerExpandableValue(updatedVal);
         return response(request, true, tooling::Json::Object{
             {"value", runtime::valueToString(updatedVal, heap_.get())},
             {"type", semantic::primitiveTypeName(runtime::valueType(updatedVal))},
-            {"variablesReference", 0},
+            {"variablesReference", childRef},
         });
     }
     if (command == "continue" || command == "next" ||
