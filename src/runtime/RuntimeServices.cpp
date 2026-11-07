@@ -1,3 +1,6 @@
+#include <atomic>
+#include <deque>
+#include <mutex>
 #include <cstring>
 #include "realscript/runtime/Runtime.h"
 
@@ -399,6 +402,46 @@ bool validateObjectModel(
 
 namespace detail {
 
+namespace {
+
+DeterminismOperationId cachedInstructionOperationId(
+    bytecode::Opcode opcode) noexcept {
+    constexpr auto Count =
+        static_cast<std::size_t>(bytecode::Opcode::ConstantTypeId) + 1U;
+    static const auto ids = [] {
+        std::array<DeterminismOperationId, Count> result{};
+        for (std::size_t index = 0; index < result.size(); ++index) {
+            result[index] = determinismOperationId(bytecode::opcodeName(
+                static_cast<bytecode::Opcode>(index)));
+        }
+        return result;
+    }();
+    return ids[static_cast<std::size_t>(opcode)];
+}
+
+DeterminismOperationId cachedTerminatorOperationId(
+    bytecode::TerminatorKind terminator) noexcept {
+    constexpr auto Count =
+        static_cast<std::size_t>(bytecode::TerminatorKind::Throw) + 1U;
+    static const auto ids = [] {
+        std::array<DeterminismOperationId, Count> result{};
+        for (std::size_t index = 0; index < result.size(); ++index) {
+            result[index] = determinismOperationId(bytecode::terminatorName(
+                static_cast<bytecode::TerminatorKind>(index)));
+        }
+        return result;
+    }();
+    return ids[static_cast<std::size_t>(terminator)];
+}
+
+std::uint16_t toCompactReg(std::uint32_t value) noexcept {
+    return value < InvalidCompactReg
+        ? static_cast<std::uint16_t>(value)
+        : InvalidCompactReg;
+}
+
+} // namespace
+
 std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
     const std::vector<bytecode::Module>& modules,
     const std::unordered_map<
@@ -411,26 +454,96 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
     for (const auto& module : modules) {
         for (const auto& function : module.functions) {
             const auto quickOpcode = [&](const bytecode::Instruction& instruction) {
+                const bool validRes =
+                    instruction.result < function.registerTypes.size() &&
+                    instruction.result < InvalidCompactReg;
                 switch (instruction.opcode) {
                 case bytecode::Opcode::LoadParameter:
-                    return QuickOpcode::LoadParameter;
+                    if (validRes &&
+                        instruction.index < function.parameterTypes.size() &&
+                        instruction.index < InvalidCompactReg) {
+                        return QuickOpcode::LoadParameter;
+                    }
+                    return QuickOpcode::Generic;
                 case bytecode::Opcode::ConstantInt:
-                    if (instruction.result < function.registerTypes.size() &&
+                    if (validRes &&
                         function.registerTypes[instruction.result] ==
                             semantic::PrimitiveType::Int) {
                         return QuickOpcode::ConstantInt;
                     }
-                    break;
+                    return QuickOpcode::Generic;
                 case bytecode::Opcode::LoadLocal:
-                    return QuickOpcode::LoadLocal;
+                    if (validRes &&
+                        instruction.index < function.localTypes.size() &&
+                        instruction.index < InvalidCompactReg &&
+                        function.registerTypes[instruction.result] ==
+                            function.localTypes[instruction.index]) {
+                        return QuickOpcode::LoadLocal;
+                    }
+                    return QuickOpcode::Generic;
                 case bytecode::Opcode::StoreLocal:
-                    return QuickOpcode::StoreLocal;
+                    if (instruction.index < function.localTypes.size() &&
+                        instruction.index < InvalidCompactReg &&
+                        instruction.operands.size() == 1 &&
+                        instruction.operands[0] < function.registerTypes.size() &&
+                        instruction.operands[0] < InvalidCompactReg &&
+                        function.registerTypes[instruction.operands[0]] ==
+                            function.localTypes[instruction.index]) {
+                        return QuickOpcode::StoreLocal;
+                    }
+                    return QuickOpcode::Generic;
+                case bytecode::Opcode::CheckNotNull:
+                    if (validRes &&
+                        instruction.operands.size() == 1 &&
+                        instruction.operands[0] < function.registerTypes.size() &&
+                        instruction.operands[0] < InvalidCompactReg &&
+                        function.registerTypes[instruction.operands[0]] ==
+                            semantic::PrimitiveType::Object) {
+                        return QuickOpcode::CheckNotNullFast;
+                    }
+                    return QuickOpcode::Generic;
+                case bytecode::Opcode::LoadElement:
+                    if (validRes &&
+                        instruction.elementType == semantic::PrimitiveType::Int &&
+                        instruction.operands.size() == 2 &&
+                        instruction.operands[0] < function.registerTypes.size() &&
+                        instruction.operands[0] < InvalidCompactReg &&
+                        instruction.operands[1] < function.registerTypes.size() &&
+                        instruction.operands[1] < InvalidCompactReg &&
+                        function.registerTypes[instruction.operands[0]] ==
+                            semantic::PrimitiveType::Array &&
+                        function.registerTypes[instruction.operands[1]] ==
+                            semantic::PrimitiveType::Int) {
+                        return QuickOpcode::LoadElementIntFast;
+                    }
+                    return QuickOpcode::Generic;
+                case bytecode::Opcode::StoreElement:
+                    if (instruction.elementType == semantic::PrimitiveType::Int &&
+                        instruction.operands.size() == 3 &&
+                        instruction.operands[0] < function.registerTypes.size() &&
+                        instruction.operands[0] < InvalidCompactReg &&
+                        instruction.operands[1] < function.registerTypes.size() &&
+                        instruction.operands[1] < InvalidCompactReg &&
+                        instruction.operands[2] < function.registerTypes.size() &&
+                        instruction.operands[2] < InvalidCompactReg &&
+                        function.registerTypes[instruction.operands[0]] ==
+                            semantic::PrimitiveType::Array &&
+                        function.registerTypes[instruction.operands[1]] ==
+                            semantic::PrimitiveType::Int &&
+                        function.registerTypes[instruction.operands[2]] ==
+                            semantic::PrimitiveType::Int) {
+                        return QuickOpcode::StoreElementIntFast;
+                    }
+                    return QuickOpcode::Generic;
                 default:
                     break;
                 }
-                if (instruction.operands.size() < 2 ||
+                if (!validRes ||
+                    instruction.operands.size() < 2 ||
                     instruction.operands[0] >= function.registerTypes.size() ||
+                    instruction.operands[0] >= InvalidCompactReg ||
                     instruction.operands[1] >= function.registerTypes.size() ||
+                    instruction.operands[1] >= InvalidCompactReg ||
                     function.registerTypes[instruction.operands[0]] !=
                         semantic::PrimitiveType::Int ||
                     function.registerTypes[instruction.operands[1]] !=
@@ -449,39 +562,94 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                 case bytecode::Opcode::GreaterInt: return QuickOpcode::GreaterInt;
                 case bytecode::Opcode::GreaterOrEqualInt:
                     return QuickOpcode::GreaterOrEqualInt;
+                case bytecode::Opcode::Equal:
+                    return QuickOpcode::EqualInt;
+                case bytecode::Opcode::NotEqual:
+                    return QuickOpcode::NotEqualInt;
                 default: return QuickOpcode::Generic;
                 }
             };
             ExecutionFunction decoded;
             decoded.bytecode = &function;
+            decoded.hasDebugSequencePoints = !function.debugInfo.sequencePoints.empty();
             decoded.blocks.resize(function.blocks.size());
             decoded.blockIndices.reserve(function.blocks.size());
             for (std::size_t index = 0; index < function.blocks.size(); ++index) {
-                decoded.blocks[index].bytecode = &function.blocks[index];
-                auto& instructions = decoded.blocks[index].instructions;
-                instructions.reserve(function.blocks[index].instructions.size());
-                for (const auto& instruction : function.blocks[index].instructions) {
-                    instructions.push_back({&instruction, quickOpcode(instruction)});
+                const auto& bb = function.blocks[index];
+                auto& blockMirror = decoded.blocks[index];
+                blockMirror.bytecode = &bb;
+                blockMirror.terminatorKind = bb.terminator.kind;
+                blockMirror.terminatorOpId = cachedTerminatorOperationId(bb.terminator.kind);
+                blockMirror.terminatorOpName = bytecode::terminatorName(bb.terminator.kind);
+                if (bb.terminator.kind == bytecode::TerminatorKind::Branch) {
+                    blockMirror.terminatorReg = bb.terminator.condition;
+                    blockMirror.conditionPrevalidatedBool =
+                        bb.terminator.condition < function.registerTypes.size() &&
+                        function.registerTypes[bb.terminator.condition] ==
+                            semantic::PrimitiveType::Bool;
+                } else if (bb.terminator.kind == bytecode::TerminatorKind::ReturnValue ||
+                           bb.terminator.kind == bytecode::TerminatorKind::Throw) {
+                    blockMirror.terminatorReg = bb.terminator.value;
+                    if (bb.terminator.kind == bytecode::TerminatorKind::ReturnValue &&
+                        bb.terminator.value < function.registerTypes.size() &&
+                        function.registerTypes[bb.terminator.value] == function.returnType &&
+                        !semantic::isExactType(function.returnType) &&
+                        function.returnType != semantic::PrimitiveType::Object &&
+                        function.returnType != semantic::PrimitiveType::Array &&
+                        function.returnType != semantic::PrimitiveType::String &&
+                        function.returnType != semantic::PrimitiveType::Handle) {
+                        blockMirror.returnPrevalidatedScalar = true;
+                    }
                 }
+
+                auto& instructions = blockMirror.instructions;
+                instructions.reserve(bb.instructions.size());
+                for (const auto& instruction : bb.instructions) {
+                    ExecutionInstruction execInst;
+                    execInst.bytecode = &instruction;
+                    execInst.opcode = quickOpcode(instruction);
+                    execInst.operationId = cachedInstructionOperationId(instruction.opcode);
+                    execInst.opcodeName = bytecode::opcodeName(instruction.opcode);
+                    execInst.result = toCompactReg(instruction.result);
+                    execInst.checkedArithmetic1 = instruction.checkedArithmetic;
+                    execInst.integerImmediate = instruction.integerImmediate;
+                    if (instruction.opcode == bytecode::Opcode::LoadParameter ||
+                        instruction.opcode == bytecode::Opcode::LoadLocal ||
+                        instruction.opcode == bytecode::Opcode::StoreLocal) {
+                        execInst.auxReg1 = toCompactReg(instruction.index);
+                    }
+                    if (!instruction.operands.empty()) {
+                        execInst.op0 = toCompactReg(instruction.operands[0]);
+                    }
+                    if (instruction.operands.size() >= 2) {
+                        execInst.op1 = toCompactReg(instruction.operands[1]);
+                    }
+                    if (instruction.operands.size() >= 3) {
+                        execInst.op2 = toCompactReg(instruction.operands[2]);
+                    }
+                    instructions.push_back(execInst);
+                }
+
                 const auto isBinaryInt = [](QuickOpcode opcode) {
                     return opcode >= QuickOpcode::AddInt &&
-                        opcode <= QuickOpcode::GreaterOrEqualInt;
+                        opcode <= QuickOpcode::NotEqualInt;
                 };
                 for (std::size_t instructionIndex = 0;
                      instructionIndex < instructions.size();) {
                     auto& first = instructions[instructionIndex];
+                    // Pattern 1: LoadParameter + StoreLocal (span 2)
                     if (instructionIndex + 1 < instructions.size() &&
                         first.opcode == QuickOpcode::LoadParameter &&
                         instructions[instructionIndex + 1].opcode ==
                             QuickOpcode::StoreLocal &&
-                        instructions[instructionIndex + 1]
-                                .bytecode->operands[0] ==
-                            first.bytecode->result) {
+                        instructions[instructionIndex + 1].op0 == first.result) {
                         first.superOpcode = SuperOpcode::LoadParameterStoreLocal;
                         first.span = 2;
+                        first.storeSlot = instructions[instructionIndex + 1].auxReg1;
                         instructionIndex += 2;
                         continue;
                     }
+                    // Pattern 2: LoadLocal + (ConstantInt | LoadLocal) + BinaryInt (+ StoreLocal) (span 3 or 4)
                     if (instructionIndex + 2 < instructions.size() &&
                         first.opcode == QuickOpcode::LoadLocal &&
                         (instructions[instructionIndex + 1].opcode ==
@@ -491,19 +659,17 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         isBinaryInt(instructions[instructionIndex + 2].opcode)) {
                         const auto& second = instructions[instructionIndex + 1];
                         const auto& binary = instructions[instructionIndex + 2];
-                        if (binary.bytecode->operands[0] ==
-                                first.bytecode->result &&
-                            binary.bytecode->operands[1] ==
-                                second.bytecode->result) {
+                        if (first.result != second.result &&
+                            binary.op0 == first.result &&
+                            binary.op1 == second.result) {
                             const auto constant =
                                 second.opcode == QuickOpcode::ConstantInt;
                             const auto storesResult =
                                 instructionIndex + 3 < instructions.size() &&
                                 instructions[instructionIndex + 3].opcode ==
                                     QuickOpcode::StoreLocal &&
-                                instructions[instructionIndex + 3]
-                                        .bytecode->operands[0] ==
-                                    binary.bytecode->result;
+                                instructions[instructionIndex + 3].op0 ==
+                                    binary.result;
                             first.superOpcode = storesResult
                                 ? (constant
                                     ? SuperOpcode::BinaryLocalIntConstantStoreLocal
@@ -512,25 +678,94 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                     ? SuperOpcode::BinaryLocalIntConstant
                                     : SuperOpcode::BinaryLocalIntLocal);
                             first.span = storesResult ? 4 : 3;
+                            first.binaryOpcode1 = binary.opcode;
+                            first.checkedArithmetic1 = binary.checkedArithmetic1;
+                            first.op1 = second.auxReg1; // right local index (if LoadLocal)
+                            first.integerImmediate = second.integerImmediate; // right const (if ConstantInt)
+                            first.auxReg2 = second.result; // second temp reg
+                            first.superResult = binary.result; // binary dest reg
+                            if (storesResult) {
+                                first.storeSlot = instructions[instructionIndex + 3].auxReg1;
+                            }
+                            instructionIndex += first.span;
+                            continue;
+                        }
+                    }
+                    // Pattern 3: LoadLocal + BinaryInt(r_loaded, r_reg) + BinaryInt(r_mid, r_reg2) + StoreLocal (span 4, e.g. ai_tick)
+                    if (instructionIndex + 3 < instructions.size() &&
+                        first.opcode == QuickOpcode::LoadLocal &&
+                        isBinaryInt(instructions[instructionIndex + 1].opcode) &&
+                        isBinaryInt(instructions[instructionIndex + 2].opcode) &&
+                        instructions[instructionIndex + 3].opcode == QuickOpcode::StoreLocal) {
+                        const auto& bin1 = instructions[instructionIndex + 1];
+                        const auto& bin2 = instructions[instructionIndex + 2];
+                        const auto& store = instructions[instructionIndex + 3];
+                        if (bin1.op0 == first.result &&
+                            bin1.op1 != first.result &&
+                            bin2.op0 == bin1.result &&
+                            bin2.op1 != bin1.result &&
+                            bin2.op1 != first.result &&
+                            store.op0 == bin2.result) {
+                            first.superOpcode = SuperOpcode::BinaryLocalIntRegChainStoreLocal;
+                            first.span = 4;
+                            first.binaryOpcode1 = bin1.opcode;
+                            first.checkedArithmetic1 = bin1.checkedArithmetic1;
+                            first.binaryOpcode2 = bin2.opcode;
+                            first.checkedArithmetic2 = bin2.checkedArithmetic1;
+                            first.op1 = bin1.op1;      // first rhs register
+                            first.op2 = bin2.op1;      // second rhs register
+                            first.auxReg2 = bin1.result;  // r_mid
+                            first.superResult = bin2.result; // r_final
+                            first.storeSlot = store.auxReg1; // target local index
+                            instructionIndex += 4;
+                            continue;
+                        }
+                    }
+                    // Pattern 4: LoadLocal + BinaryInt(r_loaded, r_reg) (+ StoreLocal) (span 2 or 3, O2 LICM loop headers & bodies!)
+                    if (instructionIndex + 1 < instructions.size() &&
+                        first.opcode == QuickOpcode::LoadLocal &&
+                        isBinaryInt(instructions[instructionIndex + 1].opcode)) {
+                        const auto& binary = instructions[instructionIndex + 1];
+                        if (binary.op0 == first.result &&
+                            binary.op1 != first.result) {
+                            const auto storesResult =
+                                instructionIndex + 2 < instructions.size() &&
+                                instructions[instructionIndex + 2].opcode ==
+                                    QuickOpcode::StoreLocal &&
+                                instructions[instructionIndex + 2].op0 ==
+                                    binary.result;
+                            first.superOpcode = storesResult
+                                ? SuperOpcode::BinaryLocalIntRegStoreLocal
+                                : SuperOpcode::BinaryLocalIntReg;
+                            first.span = storesResult ? 3 : 2;
+                            first.binaryOpcode1 = binary.opcode;
+                            first.checkedArithmetic1 = binary.checkedArithmetic1;
+                            first.op1 = binary.op1;       // rhs register index
+                            first.superResult = binary.result; // binary result register
+                            if (storesResult) {
+                                first.storeSlot = instructions[instructionIndex + 2].auxReg1;
+                            }
                             instructionIndex += first.span;
                             continue;
                         }
                     }
                     ++instructionIndex;
                 }
-                decoded.blockIndices.emplace(function.blocks[index].id, index);
+                decoded.blockIndices.emplace(bb.id, index);
             }
 
             const auto entry = decoded.blockIndices.find(0);
             if (entry != decoded.blockIndices.end()) decoded.entry = entry->second;
             const auto bindEdge = [&](ExecutionEdge& edge,
                                       bytecode::BlockId target,
-                                      const std::vector<bytecode::Register>& sources) {
+                                      const bytecode::SmallRegisterVector& sources) {
                 const auto found = decoded.blockIndices.find(target);
                 if (found == decoded.blockIndices.end()) return;
                 edge.target = found->second;
+                edge.targetBlockId = target;
                 edge.sources = &sources;
                 edge.destinations = &function.blocks[found->second].parameters;
+                edge.hasArguments = !sources.empty();
                 decoded.edgeScratchCount =
                     std::max(decoded.edgeScratchCount, sources.size());
             };
@@ -570,6 +805,34 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     const auto& reference =
                         module.functionReferences[instruction.bytecode->index];
                     if (reference.virtualDispatch || reference.interfaceDispatch) {
+                        bool operandsValid =
+                            instruction.bytecode->operands.size() ==
+                                reference.parameterTypes.size() &&
+                            !instruction.bytecode->operands.empty();
+                        if (instruction.bytecode->result != bytecode::InvalidRegister &&
+                            (instruction.bytecode->result >= function.registerTypes.size() ||
+                             instruction.bytecode->result >= InvalidCompactReg)) {
+                            operandsValid = false;
+                        }
+                        for (const auto op : instruction.bytecode->operands) {
+                            if (op >= function.registerTypes.size() || op >= InvalidCompactReg) {
+                                operandsValid = false;
+                                break;
+                            }
+                        }
+                        if (operandsValid &&
+                            !(reference.virtualDispatch && reference.interfaceDispatch) &&
+                            ((reference.virtualDispatch &&
+                              reference.virtualSlot != std::numeric_limits<std::uint32_t>::max() &&
+                              reference.parameterTypes.front() == semantic::PrimitiveType::Object) ||
+                             (reference.interfaceDispatch &&
+                              reference.interfaceTypeId != 0 &&
+                              reference.interfaceSlot != std::numeric_limits<std::uint32_t>::max() &&
+                              reference.parameterTypes.front() == semantic::PrimitiveType::Object &&
+                              (reference.parameterTypeIds.empty() ? 0 : reference.parameterTypeIds.front()) ==
+                                  reference.interfaceTypeId))) {
+                            instruction.opcode = QuickOpcode::CallPolled;
+                        }
                         continue;
                     }
                     const auto target = functions.find(reference.symbolId);
@@ -587,6 +850,17 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                             targetFunction.parameterTypes.size()) {
                         continue;
                     }
+                    bool callDirectRegsValid =
+                        instruction.bytecode->result == bytecode::InvalidRegister ||
+                        (instruction.bytecode->result < function.registerTypes.size() &&
+                         instruction.bytecode->result < InvalidCompactReg);
+                    for (const auto op : instruction.bytecode->operands) {
+                        if (op >= function.registerTypes.size() || op >= InvalidCompactReg) {
+                            callDirectRegsValid = false;
+                            break;
+                        }
+                    }
+                    if (!callDirectRegsValid) continue;
                     instruction.opcode = QuickOpcode::CallDirect;
                     instruction.directTarget = &target->second;
                     instruction.directExecution = findExecutionFunction(
@@ -847,8 +1121,28 @@ std::optional<InlineStructSlot> encodeInlineStructSlot(
         }
         return std::nullopt;
     }
+    if (std::holds_alternative<NullString>(value)) {
+        slot.kind = InlineStructSlot::Kind::NullString;
+        return slot;
+    }
+    if (std::holds_alternative<NullObject>(value)) {
+        slot.kind = InlineStructSlot::Kind::NullObject;
+        return slot;
+    }
+    if (std::holds_alternative<NullArray>(value)) {
+        slot.kind = InlineStructSlot::Kind::NullArray;
+        return slot;
+    }
+    if (const auto* sv = std::get_if<StringValue>(&value)) {
+        slot.kind = InlineStructSlot::Kind::String;
+        slot.lo = sv->id;
+        return slot;
+    }
+
     return std::nullopt;
 }
+
+StringValue runtimeStringPoolById(std::uint32_t id) noexcept;
 
 Value decodeInlineStructSlot(const InlineStructSlot& slot) noexcept {
     const auto bits = slot.bits();
@@ -911,10 +1205,304 @@ Value decodeInlineStructSlot(const InlineStructSlot& slot) noexcept {
             static_cast<std::int32_t>(static_cast<std::int16_t>(slot.hi & 0xFFFFu)),
             static_cast<std::int32_t>(static_cast<std::int16_t>(slot.hi >> 16u)),
         };
+    case InlineStructSlot::Kind::NullString:
+        return NullString{};
+    case InlineStructSlot::Kind::NullObject:
+        return NullObject{};
+    case InlineStructSlot::Kind::NullArray:
+        return NullArray{};
+    case InlineStructSlot::Kind::String:
+        return runtimeStringPoolById(slot.lo);
+
     case InlineStructSlot::Kind::None:
         break;
     }
     return std::monostate{};
+}
+
+struct RuntimeStringPool {
+    std::mutex mutex;
+    std::deque<std::string> entries;
+    std::unordered_map<std::string_view, std::uint32_t> indexByView;
+
+    RuntimeStringPool() {
+        entries.emplace_back(""); // id 0 = empty string
+        indexByView.emplace(entries.front(), 0u);
+    }
+
+    StringValue intern(std::string_view text) {
+        if (text.empty()) {
+            StringValue sv;
+            sv.id = 0u;
+            sv.length = 0u;
+            sv.ptr = &entries[0];
+            return sv;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto found = indexByView.find(text);
+        if (found != indexByView.end()) {
+            const auto id = found->second;
+            const auto& stored = entries[id];
+            StringValue sv;
+            sv.id = id;
+            sv.length = static_cast<std::uint32_t>(stored.size());
+            sv.ptr = &stored;
+            return sv;
+        }
+        const auto id = static_cast<std::uint32_t>(entries.size());
+        entries.emplace_back(text);
+        const auto& stored = entries.back();
+        indexByView.emplace(std::string_view(stored), id);
+        StringValue sv;
+        sv.id = id;
+        sv.length = static_cast<std::uint32_t>(stored.size());
+        sv.ptr = &stored;
+        return sv;
+    }
+
+    StringValue getById(std::uint32_t id) noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto safeId = id < entries.size() ? id : 0u;
+        const auto& stored = entries[safeId];
+        StringValue sv;
+        sv.id = safeId;
+        sv.length = static_cast<std::uint32_t>(stored.size());
+        sv.ptr = &stored;
+        return sv;
+    }
+
+    const std::string& empty() const noexcept {
+        return entries[0];
+    }
+};
+
+RuntimeStringPool& runtimeStringPool() {
+    static RuntimeStringPool pool;
+    return pool;
+}
+
+StringValue runtimeStringPoolById(std::uint32_t id) noexcept {
+    return runtimeStringPool().getById(id);
+}
+
+struct InlineStructEntryEq {
+    bool operator()(const InlineStructArenaEntry& a, const InlineStructArenaEntry& b) const noexcept {
+        return a.nestedTypeId == b.nestedTypeId &&
+            a.nestedFieldMask == b.nestedFieldMask &&
+            a.slots == b.slots;
+    }
+};
+
+struct InlineStructEntryHash {
+    std::size_t operator()(const InlineStructArenaEntry& e) const noexcept {
+        std::uint64_t h = e.nestedTypeId ^ (static_cast<std::uint64_t>(e.nestedFieldMask) * 0x9e3779b97f4a7c15ULL);
+        for (const auto& s : e.slots) {
+            const std::uint64_t w = s.bits() ^
+                (static_cast<std::uint64_t>(s.aux0) << 40u) ^
+                (static_cast<std::uint64_t>(s.aux1) << 48u) ^
+                (static_cast<std::uint64_t>(s.aux2) << 56u) ^
+                static_cast<std::uint64_t>(s.kind);
+            h ^= w + 0x9e3779b97f4a7c15ULL + (h << 6u) + (h >> 2u);
+        }
+        return static_cast<std::size_t>(h);
+    }
+};
+
+constexpr std::uint32_t InlinePageShift = 16u;
+constexpr std::uint32_t InlinePageSize = 1u << InlinePageShift; // 65,536 entries per page
+constexpr std::uint32_t InlinePageMask = InlinePageSize - 1u;
+constexpr std::uint32_t MaxInlinePages = 32768u; // Up to 2^31 entries without wrap-around
+
+InlineStructArenaEntry g_inlinePage0[InlinePageSize]{};
+
+struct InlineStructPool {
+    std::mutex mutex;
+    std::atomic<InlineStructArenaEntry*> pages[MaxInlinePages]{};
+    std::vector<std::unique_ptr<InlineStructArenaEntry[]>> ownedPages;
+    std::uint32_t nextIndex = 1u;
+    std::unordered_map<
+        InlineStructArenaEntry,
+        std::uint32_t,
+        InlineStructEntryHash,
+        InlineStructEntryEq> dedupMap;
+
+    InlineStructPool() {
+        pages[0].store(g_inlinePage0, std::memory_order_relaxed);
+    }
+
+    std::uint32_t intern(const InlineStructArenaEntry& entry) noexcept {
+        // Fast thread-local 256-way direct-mapped cache to avoid mutex in tight loops
+        struct TlsCacheSlot {
+            InlineStructArenaEntry key{};
+            std::uint32_t idx = 0;
+        };
+        thread_local std::array<TlsCacheSlot, 256> tlsCache{};
+        const std::size_t h = InlineStructEntryHash{}(entry);
+        auto& slot = tlsCache[h & 0xFFu];
+        if (slot.idx != 0 && InlineStructEntryEq{}(slot.key, entry)) {
+            return slot.idx;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto found = dedupMap.find(entry);
+        if (found != dedupMap.end()) {
+            slot.key = entry;
+            slot.idx = found->second;
+            return found->second;
+        }
+        if (nextIndex >= 0x7FFFFFFFu) {
+            return 0u;
+        }
+        const std::uint32_t idx = nextIndex++;
+        const std::uint32_t pageIdx = idx >> InlinePageShift;
+        const std::uint32_t offset = idx & InlinePageMask;
+        InlineStructArenaEntry* page = pages[pageIdx].load(std::memory_order_relaxed);
+        if (!page) {
+            auto newPage = std::make_unique<InlineStructArenaEntry[]>(InlinePageSize);
+            page = newPage.get();
+            ownedPages.push_back(std::move(newPage));
+            pages[pageIdx].store(page, std::memory_order_release);
+        }
+        page[offset] = entry;
+        if (dedupMap.size() > 262144u) {
+            dedupMap.clear();
+        }
+        dedupMap.emplace(entry, idx);
+        slot.key = entry;
+        slot.idx = idx;
+        return idx;
+    }
+
+    const InlineStructArenaEntry& get(std::uint32_t idx) const noexcept {
+        const std::uint32_t pageIdx = idx >> InlinePageShift;
+        if (pageIdx < MaxInlinePages) {
+            if (const auto* page = pages[pageIdx].load(std::memory_order_acquire)) {
+                return page[idx & InlinePageMask];
+            }
+        }
+        return g_inlinePage0[0];
+    }
+};
+
+InlineStructPool& inlineStructPool() {
+    static InlineStructPool pool;
+    return pool;
+}
+
+std::uint32_t allocateInlineArenaEntry(const InlineStructArenaEntry& entry) noexcept {
+    return inlineStructPool().intern(entry);
+}
+
+struct HeapStructStoragePool {
+    std::mutex mutex;
+    std::deque<std::shared_ptr<const StructStorage>> entries;
+
+    HeapStructStoragePool() {
+        entries.push_back(nullptr); // slot 0 = nullptr
+    }
+
+    std::uint32_t registerStorage(std::shared_ptr<const StructStorage> store) {
+        if (!store) return 0u;
+        std::lock_guard<std::mutex> lock(mutex);
+        // Check recent entries to deduplicate identical StructStorage values in loops
+        const std::size_t sz = entries.size();
+        const std::size_t scanStart = sz > 64 ? sz - 64 : 1;
+        for (std::size_t i = sz; i > scanStart; --i) {
+            const auto& prev = entries[i - 1];
+            if (prev && (prev.get() == store.get() || prev->fields == store->fields)) {
+                return static_cast<std::uint32_t>(i - 1);
+            }
+        }
+        const auto id = static_cast<std::uint32_t>(entries.size());
+        entries.push_back(std::move(store));
+        return id;
+    }
+
+    const StructStorage* get(std::uint32_t id) noexcept {
+        if (id == 0u) return nullptr;
+        std::lock_guard<std::mutex> lock(mutex);
+        return id < entries.size() ? entries[id].get() : nullptr;
+    }
+};
+
+HeapStructStoragePool& heapStructPool() {
+    static HeapStructStoragePool pool;
+    return pool;
+}
+
+StructStorageHandle::StructStorageHandle(std::shared_ptr<const StructStorage> store)
+    : raw_(heapStructPool().registerStorage(std::move(store))) {}
+
+StructStorageHandle::StructStorageHandle(std::shared_ptr<StructStorage> store)
+    : raw_(heapStructPool().registerStorage(std::move(store))) {}
+
+const StructStorage* StructStorageHandle::get() const noexcept {
+    if (!isStoragePtr()) return nullptr;
+    return heapStructPool().get(raw_);
+}
+
+const InlineStructArenaEntry& StructValue::inlineEntry() const noexcept {
+    return inlineStructPool().get(storage.inlineArenaIndex());
+}
+
+std::uint16_t StructValue::nestedFieldMask() const noexcept {
+    return isInline ? inlineEntry().nestedFieldMask : 0u;
+}
+
+semantic::SymbolId StructValue::nestedTypeId() const noexcept {
+    return isInline ? inlineEntry().nestedTypeId : 0u;
+}
+
+bool operator==(const StructValue& left, const StructValue& right) {
+    if (left.typeId != right.typeId) return false;
+    const auto count = left.fieldCount();
+    if (count != right.fieldCount()) return false;
+    if (left.isInline && right.isInline) {
+        if (left.storage.raw_ == right.storage.raw_ &&
+            left.inlineSlotCount == right.inlineSlotCount &&
+            left.packedOffsetsAndLengths == right.packedOffsetsAndLengths) {
+            return true;
+        }
+        const auto& le = left.inlineEntry();
+        const auto& re = right.inlineEntry();
+        if (le.nestedTypeId == re.nestedTypeId &&
+            left.inlineSlotCount == right.inlineSlotCount &&
+            left.packedOffsetsAndLengths == right.packedOffsetsAndLengths &&
+            le.nestedFieldMask == re.nestedFieldMask) {
+            const std::size_t slots = left.inlineSlotCount != 0 ? left.inlineSlotCount : count;
+            for (std::size_t i = 0; i < slots; ++i) {
+                if (le.slots[i] != re.slots[i]) return false;
+            }
+            return true;
+        }
+    }
+    if (!left.isInline && !right.isInline) {
+        if (left.storage == right.storage) return true;
+        if (!left.storage || !right.storage) return false;
+        return left.storage->fields == right.storage->fields;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!(structValueFieldAt(left, i) == structValueFieldAt(right, i))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+StringValue::StringValue(const std::string& value) {
+    *this = runtimeStringPool().intern(value);
+}
+
+StringValue::StringValue(std::string&& value) {
+    *this = runtimeStringPool().intern(value);
+}
+
+StringValue::StringValue(std::string_view value) {
+    *this = runtimeStringPool().intern(value);
+}
+
+const std::string& StringValue::str() const noexcept {
+    return ptr ? *ptr : runtimeStringPool().empty();
 }
 
 namespace {
@@ -928,6 +1516,7 @@ bool tryPackInlineStructFields(
     outVal.typeId = typeId;
     outVal.inlineCount = static_cast<std::uint8_t>(fields.size());
     outVal.isInline = true;
+    InlineStructArenaEntry entry{};
     std::size_t slotCursor = 0;
     bool anyNested = false;
     for (std::size_t i = 0; i < fields.size(); ++i) {
@@ -935,25 +1524,26 @@ bool tryPackInlineStructFields(
             if (slotCursor + 1 > StructValue::MaxInlineSlots) return false;
             outVal.packedOffsetsAndLengths |=
                 static_cast<std::uint8_t>((slotCursor & 0x3u) << (i * 2));
-            outVal.nestedFieldMask |= static_cast<std::uint16_t>(1u << (i * 2));
-            outVal.inlineFields[slotCursor++] = *slot;
+            entry.nestedFieldMask |= static_cast<std::uint16_t>(1u << (i * 2));
+            entry.slots[slotCursor++] = *slot;
             continue;
         }
         if (const auto* nested = std::get_if<StructValue>(&fields[i]);
             nested && nested->isInline && nested->inlineSlotCount > 0 &&
-            nested->inlineSlotCount <= 3 && (nested->nestedFieldMask >> 8u) == 0 &&
-            nested->nestedTypeId == 0 && !anyNested) {
+            nested->inlineSlotCount <= 3 && (nested->nestedFieldMask() >> 8u) == 0 &&
+            nested->nestedTypeId() == 0 && !anyNested) {
             if (slotCursor + nested->inlineSlotCount <= StructValue::MaxInlineSlots) {
                 anyNested = true;
-                outVal.nestedTypeId = nested->typeId;
+                const auto& nestedEntry = nested->inlineEntry();
+                entry.nestedTypeId = nested->typeId;
                 outVal.packedOffsetsAndLengths |=
                     static_cast<std::uint8_t>((slotCursor & 0x3u) << (i * 2));
-                outVal.nestedFieldMask |=
+                entry.nestedFieldMask |=
                     static_cast<std::uint16_t>((nested->inlineSlotCount & 0x3u) << (i * 2));
-                outVal.nestedFieldMask |=
+                entry.nestedFieldMask |=
                     static_cast<std::uint16_t>(((i & 0x3u) + 1u) << 8u);
                 for (std::size_t k = 0; k < nested->inlineSlotCount; ++k) {
-                    outVal.inlineFields[slotCursor++] = nested->inlineFields[k];
+                    entry.slots[slotCursor++] = nestedEntry.slots[k];
                 }
                 continue;
             }
@@ -961,11 +1551,12 @@ bool tryPackInlineStructFields(
         return false;
     }
     if (!anyNested) {
-        outVal.nestedTypeId = 0;
+        entry.nestedTypeId = 0;
         outVal.packedOffsetsAndLengths = 0;
-        outVal.nestedFieldMask = 0;
+        entry.nestedFieldMask = 0;
     }
     outVal.inlineSlotCount = static_cast<std::uint8_t>(slotCursor);
+    outVal.storage.setInlineArenaIndex(allocateInlineArenaEntry(entry));
     return true;
 }
 
@@ -1000,13 +1591,14 @@ std::optional<Value> structValueFieldAt(
     std::size_t index) noexcept {
     if (structure.isInline) {
         if (index >= structure.inlineCount) return std::nullopt;
-        const std::uint8_t highByte = static_cast<std::uint8_t>(structure.nestedFieldMask >> 8u);
+        const auto& entry = structure.inlineEntry();
+        const std::uint8_t highByte = static_cast<std::uint8_t>(entry.nestedFieldMask >> 8u);
         if (highByte != 0) {
             const std::size_t nestedIdx = static_cast<std::size_t>(highByte - 1u) & 0x3u;
             const std::uint8_t offset = structure.fieldOffset(index);
             const std::uint8_t len = structure.fieldLength(index);
             if (index == nestedIdx) {
-                const semantic::SymbolId nestedType = structure.nestedTypeId;
+                const semantic::SymbolId nestedType = entry.nestedTypeId;
                 if (nestedType == 0 || offset + len > structure.inlineSlotCount) {
                     return std::nullopt;
                 }
@@ -1015,15 +1607,17 @@ std::optional<Value> structValueFieldAt(
                 nested.isInline = true;
                 nested.inlineCount = len;
                 nested.inlineSlotCount = len;
+                InlineStructArenaEntry nestedEntry{};
                 for (std::uint8_t k = 0; k < len; ++k) {
-                    nested.inlineFields[k] = structure.inlineFields[offset + k];
+                    nestedEntry.slots[k] = entry.slots[offset + k];
                 }
+                nested.storage.setInlineArenaIndex(allocateInlineArenaEntry(nestedEntry));
                 return Value{nested};
             }
             if (offset >= structure.inlineSlotCount) return std::nullopt;
-            return decodeInlineStructSlot(structure.inlineFields[offset]);
+            return decodeInlineStructSlot(entry.slots[offset]);
         }
-        return decodeInlineStructSlot(structure.inlineFields[index]);
+        return decodeInlineStructSlot(entry.slots[index]);
     }
     if (!structure.storage || index >= structure.storage->fields.size()) {
         return std::nullopt;

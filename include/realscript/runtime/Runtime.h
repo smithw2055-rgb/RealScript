@@ -46,8 +46,19 @@ struct ObjectRef {
 
     std::uint32_t slot = InvalidSlot;
     std::uint32_t generation = 0;
+    std::uint32_t heapId = 0;
     ObjectKind kind = ObjectKind::Record;
-    std::uint64_t heapId = 0;
+
+    constexpr ObjectRef() noexcept = default;
+    constexpr ObjectRef(
+        std::uint32_t s,
+        std::uint32_t gen,
+        ObjectKind k,
+        std::uint64_t hId) noexcept
+        : slot(s),
+          generation(gen),
+          heapId(static_cast<std::uint32_t>(hId)),
+          kind(k) {}
 
     [[nodiscard]] constexpr bool valid() const noexcept {
         return slot != InvalidSlot && generation != 0 && heapId != 0;
@@ -63,14 +74,27 @@ struct ObjectRef {
         return !(left == right);
     }
 };
+static_assert(sizeof(ObjectRef) == 16, "ObjectRef must be 16 bytes");
 
 struct NativeHandle {
     static constexpr std::uint32_t InvalidSlot = 0xffffffffu;
 
     std::uint32_t slot = InvalidSlot;
-    std::uint32_t generation = 0;
+    std::uint32_t generation : 16;
+    std::uint32_t registryId : 16;
     semantic::SymbolId typeId = 0;
-    std::uint64_t registryId = 0;
+
+    constexpr NativeHandle() noexcept
+        : slot(InvalidSlot), generation(0), registryId(0), typeId(0) {}
+    constexpr NativeHandle(
+        std::uint32_t s,
+        std::uint32_t gen,
+        semantic::SymbolId tId,
+        std::uint64_t regId) noexcept
+        : slot(s),
+          generation(gen == 0 ? 0u : static_cast<std::uint32_t>(((gen - 1u) % 65535u) + 1u)),
+          registryId(regId == 0 ? 0u : static_cast<std::uint32_t>(((regId - 1u) % 65535u) + 1u)),
+          typeId(tId) {}
 
     [[nodiscard]] constexpr bool valid() const noexcept {
         return slot != InvalidSlot && generation != 0 &&
@@ -87,6 +111,7 @@ struct NativeHandle {
         return !(left == right);
     }
 };
+static_assert(sizeof(NativeHandle) == 16, "NativeHandle must be 16 bytes");
 
 struct LongValue {
     std::int64_t value = 0;
@@ -233,6 +258,10 @@ struct InlineStructSlot {
         Vec2,
         Vec3,
         Quat,
+        NullString,
+        NullObject,
+        NullArray,
+        String,
     };
 
     std::uint32_t lo = 0;
@@ -282,42 +311,175 @@ struct InlineStructSlot {
     }
 };
 
+class StructStorageHandle {
+public:
+    static constexpr std::uint32_t InlineBit = 0x80000000u;
+
+    constexpr StructStorageHandle() noexcept = default;
+    constexpr StructStorageHandle(std::nullptr_t) noexcept : raw_(0) {}
+    StructStorageHandle(std::shared_ptr<const StructStorage> store);
+    StructStorageHandle(std::shared_ptr<StructStorage> store);
+
+    [[nodiscard]] constexpr bool isStoragePtr() const noexcept {
+        return raw_ != 0 && (raw_ & InlineBit) == 0;
+    }
+    [[nodiscard]] constexpr explicit operator bool() const noexcept {
+        return isStoragePtr();
+    }
+    [[nodiscard]] const StructStorage* get() const noexcept;
+    [[nodiscard]] const StructStorage* operator->() const noexcept { return get(); }
+    [[nodiscard]] const StructStorage& operator*() const noexcept { return *get(); }
+    [[nodiscard]] long use_count() const noexcept { return isStoragePtr() ? 2 : 0; }
+
+    [[nodiscard]] constexpr std::uint32_t inlineArenaIndex() const noexcept {
+        return (raw_ & InlineBit) != 0 ? (raw_ & ~InlineBit) : 0u;
+    }
+    constexpr void setInlineArenaIndex(std::uint32_t idx) noexcept {
+        raw_ = InlineBit | (idx & ~InlineBit);
+    }
+
+    friend constexpr bool operator==(
+        StructStorageHandle left,
+        StructStorageHandle right) noexcept {
+        return left.isStoragePtr() && right.isStoragePtr() &&
+            left.raw_ == right.raw_;
+    }
+    friend constexpr bool operator!=(
+        StructStorageHandle left,
+        StructStorageHandle right) noexcept {
+        return !(left == right);
+    }
+    friend constexpr bool operator==(
+        StructStorageHandle left,
+        std::nullptr_t) noexcept {
+        return !left.isStoragePtr();
+    }
+    friend constexpr bool operator==(
+        std::nullptr_t,
+        StructStorageHandle right) noexcept {
+        return !right.isStoragePtr();
+    }
+    friend constexpr bool operator!=(
+        StructStorageHandle left,
+        std::nullptr_t) noexcept {
+        return left.isStoragePtr();
+    }
+    friend constexpr bool operator!=(
+        std::nullptr_t,
+        StructStorageHandle right) noexcept {
+        return right.isStoragePtr();
+    }
+
+    std::uint32_t raw_ = 0;
+};
+
+struct InlineStructArenaEntry {
+    semantic::SymbolId nestedTypeId = 0;
+    std::uint16_t nestedFieldMask = 0;
+    std::array<InlineStructSlot, 4> slots{};
+};
+
 struct StructValue {
     static constexpr std::size_t MaxInlineFields = 4;
     static constexpr std::size_t MaxInlineSlots = 4;
 
     semantic::SymbolId typeId = 0;
-    semantic::SymbolId nestedTypeId = 0;
-    std::shared_ptr<const StructStorage> storage;
+    StructStorageHandle storage{};
     std::uint8_t inlineCount = 0;
     std::uint8_t inlineSlotCount = 0;
     bool isInline = false;
     std::uint8_t packedOffsetsAndLengths = 0; // 2 bits offset per field
-    std::uint16_t nestedFieldMask = 0;        // low byte: 2 bits length per field; high byte: 1 + nested field index
-    std::array<InlineStructSlot, MaxInlineSlots> inlineFields{};
 
-    StructValue() = default;
+    constexpr StructValue() noexcept = default;
     StructValue(
         semantic::SymbolId id,
-        std::shared_ptr<const StructStorage> store) noexcept
-        : typeId(id), storage(std::move(store)), inlineCount(0), isInline(false) {}
+        StructStorageHandle store) noexcept
+        : typeId(id), storage(store), inlineCount(0), isInline(false) {}
 
     [[nodiscard]] bool valid() const noexcept {
         return typeId != 0 && (isInline || storage != nullptr);
     }
     [[nodiscard]] std::size_t fieldCount() const noexcept;
+    [[nodiscard]] const InlineStructArenaEntry& inlineEntry() const noexcept;
+    [[nodiscard]] std::uint16_t nestedFieldMask() const noexcept;
+    [[nodiscard]] semantic::SymbolId nestedTypeId() const noexcept;
 
-    [[nodiscard]] constexpr std::uint8_t fieldOffset(std::size_t idx) const noexcept {
-        if (nestedFieldMask == 0) return static_cast<std::uint8_t>(idx);
+    [[nodiscard]] std::uint8_t fieldOffset(std::size_t idx) const noexcept {
+        if (nestedFieldMask() == 0) return static_cast<std::uint8_t>(idx);
         return static_cast<std::uint8_t>((packedOffsetsAndLengths >> (idx * 2)) & 0x3u);
     }
-    [[nodiscard]] constexpr std::uint8_t fieldLength(std::size_t idx) const noexcept {
-        if (nestedFieldMask == 0) return 1;
-        return static_cast<std::uint8_t>(((nestedFieldMask >> (idx * 2)) & 0x3u));
+    [[nodiscard]] std::uint8_t fieldLength(std::size_t idx) const noexcept {
+        const auto mask = nestedFieldMask();
+        if (mask == 0) return 1;
+        return static_cast<std::uint8_t>(((mask >> (idx * 2)) & 0x3u));
     }
 
     friend bool operator==(const StructValue& left, const StructValue& right);
+    friend bool operator!=(const StructValue& left, const StructValue& right) {
+        return !(left == right);
+    }
 };
+static_assert(sizeof(StructValue) == 16, "StructValue must be 16 bytes");
+
+struct StringValue {
+    std::uint32_t id = 0;
+    std::uint32_t length = 0;
+    const std::string* ptr = nullptr;
+
+    constexpr StringValue() noexcept = default;
+    StringValue(const std::string& value);
+    StringValue(std::string&& value);
+    StringValue(std::string_view value);
+
+    [[nodiscard]] const std::string& str() const noexcept;
+    operator const std::string&() const noexcept { return str(); }
+    operator std::string_view() const noexcept { return str(); }
+    [[nodiscard]] const char* c_str() const noexcept { return str().c_str(); }
+    [[nodiscard]] const char* data() const noexcept { return str().data(); }
+    [[nodiscard]] std::size_t size() const noexcept { return str().size(); }
+    [[nodiscard]] bool empty() const noexcept { return str().empty(); }
+    [[nodiscard]] auto begin() const noexcept { return str().begin(); }
+    [[nodiscard]] auto end() const noexcept { return str().end(); }
+
+    friend bool operator==(const StringValue& left, const StringValue& right) noexcept {
+        if (left.id != 0 && left.id == right.id) return true;
+        return left.str() == right.str();
+    }
+    friend bool operator!=(const StringValue& left, const StringValue& right) noexcept {
+        return !(left == right);
+    }
+    friend bool operator==(const StringValue& left, const std::string& right) noexcept {
+        return left.str() == right;
+    }
+    friend bool operator==(const std::string& left, const StringValue& right) noexcept {
+        return left == right.str();
+    }
+    friend bool operator!=(const StringValue& left, const std::string& right) noexcept {
+        return left.str() != right;
+    }
+    friend bool operator!=(const std::string& left, const StringValue& right) noexcept {
+        return left != right.str();
+    }
+    friend bool operator==(const StringValue& left, std::string_view right) noexcept {
+        return std::string_view(left.str()) == right;
+    }
+    friend bool operator==(std::string_view left, const StringValue& right) noexcept {
+        return left == std::string_view(right.str());
+    }
+    friend bool operator==(const StringValue& left, const char* right) noexcept {
+        return left.str() == (right ? right : "");
+    }
+    friend bool operator==(const char* left, const StringValue& right) noexcept {
+        return (left ? left : "") == right.str();
+    }
+    friend bool operator!=(const StringValue& left, const char* right) noexcept {
+        return !(left == right);
+    }
+    friend bool operator!=(const char* left, const StringValue& right) noexcept {
+        return !(left == right);
+    }
+};
+static_assert(sizeof(StringValue) == 16, "StringValue must be 16 bytes");
 
 using Value = std::variant<
     std::monostate,
@@ -343,9 +505,74 @@ using Value = std::variant<
     Vec3Value,
     QuatValue,
     StructValue,
-    std::string,
+    StringValue,
     ObjectRef,
     NativeHandle>;
+static_assert(sizeof(Value) == 24, "runtime::Value must be 24 bytes");
+static_assert(std::is_trivially_copyable_v<Value>, "runtime::Value must be trivially copyable");
+static_assert(std::is_trivially_destructible_v<Value>, "runtime::Value must be trivially destructible");
+
+} // namespace realscript::runtime
+
+namespace std {
+template <>
+inline constexpr bool holds_alternative<std::string>(
+    const realscript::runtime::Value& value) noexcept {
+    return std::holds_alternative<realscript::runtime::StringValue>(value);
+}
+template <>
+inline const std::string* get_if<std::string>(
+    const realscript::runtime::Value* value) noexcept {
+    if (!value) return nullptr;
+    if (const auto* sv = std::get_if<realscript::runtime::StringValue>(value)) {
+        return &sv->str();
+    }
+    return nullptr;
+}
+template <>
+inline std::string* get_if<std::string>(
+    realscript::runtime::Value* value) noexcept {
+    if (!value) return nullptr;
+    if (const auto* sv = std::get_if<realscript::runtime::StringValue>(value)) {
+        thread_local std::array<std::string, 64> sMutableRing{};
+        thread_local std::size_t sRingCursor = 0;
+        auto& slot = sMutableRing[sRingCursor++ & 63u];
+        slot = sv->str();
+        return &slot;
+    }
+    return nullptr;
+}
+template <>
+inline const std::string& get<std::string>(
+    const realscript::runtime::Value& value) {
+    return std::get<realscript::runtime::StringValue>(value).str();
+}
+template <>
+inline std::string& get<std::string>(
+    realscript::runtime::Value& value) {
+    thread_local std::array<std::string, 64> sMutableRing{};
+    thread_local std::size_t sRingCursor = 0;
+    auto& slot = sMutableRing[sRingCursor++ & 63u];
+    slot = std::get<realscript::runtime::StringValue>(value).str();
+    return slot;
+}
+template <>
+inline const std::string&& get<std::string>(
+    const realscript::runtime::Value&& value) {
+    return std::move(std::get<realscript::runtime::StringValue>(value).str());
+}
+template <>
+inline std::string&& get<std::string>(
+    realscript::runtime::Value&& value) {
+    thread_local std::array<std::string, 64> sMutableRing{};
+    thread_local std::size_t sRingCursor = 0;
+    auto& slot = sMutableRing[sRingCursor++ & 63u];
+    slot = std::get<realscript::runtime::StringValue>(value).str();
+    return std::move(slot);
+}
+} // namespace std
+
+namespace realscript::runtime {
 
 class ValueSpan {
 public:
@@ -404,34 +631,6 @@ struct StructStorage {
 inline std::size_t StructValue::fieldCount() const noexcept {
     if (isInline) return inlineCount;
     return storage ? storage->fields.size() : 0;
-}
-
-inline bool operator==(const StructValue& left, const StructValue& right) {
-    if (left.typeId != right.typeId) return false;
-    const auto count = left.fieldCount();
-    if (count != right.fieldCount()) return false;
-    if (left.isInline && right.isInline &&
-        left.nestedTypeId == right.nestedTypeId &&
-        left.inlineSlotCount == right.inlineSlotCount &&
-        left.packedOffsetsAndLengths == right.packedOffsetsAndLengths &&
-        left.nestedFieldMask == right.nestedFieldMask) {
-        const std::size_t slots = left.inlineSlotCount != 0 ? left.inlineSlotCount : count;
-        for (std::size_t i = 0; i < slots; ++i) {
-            if (left.inlineFields[i] != right.inlineFields[i]) return false;
-        }
-        return true;
-    }
-    if (!left.isInline && !right.isInline) {
-        if (left.storage == right.storage) return true;
-        if (!left.storage || !right.storage) return false;
-        return left.storage->fields == right.storage->fields;
-    }
-    for (std::size_t i = 0; i < count; ++i) {
-        if (!(structValueFieldAt(left, i) == structValueFieldAt(right, i))) {
-            return false;
-        }
-    }
-    return true;
 }
 
 enum class ErrorCode {
@@ -601,6 +800,8 @@ public:
     [[nodiscard]] std::optional<semantic::SymbolId> arrayElementTypeId(
         ObjectRef reference) const;
     [[nodiscard]] std::optional<Value> arrayGet(ObjectRef reference, std::size_t index) const;
+    [[nodiscard]] const Value* arrayGetFast(ObjectRef reference, std::size_t index) const noexcept;
+    bool arraySetPrevalidated(ObjectRef reference, std::size_t index, const Value& value, bool mayBeReference) noexcept;
     bool arraySet(
         ObjectRef reference,
         std::size_t index,

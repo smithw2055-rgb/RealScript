@@ -244,12 +244,17 @@ Module Lowerer::lower(const mir::Module& source) const {
                         throw std::logic_error(
                             "MIR object instruction references missing type descriptor");
                     }
-                    instruction.typeIndex = foundType->second;
+                    instruction.typeIndex = static_cast<std::uint16_t>(foundType->second);
                 }
                 instruction.elementType = sourceInstruction.elementType;
-                instruction.elementTypeId = sourceInstruction.elementTypeId;
-                instruction.integerImmediate = sourceInstruction.integerImmediate;
-                instruction.doubleImmediate = sourceInstruction.doubleImmediate;
+                instruction.elementTypeId = 0;
+                if (instruction.usesDoubleImmediate()) {
+                    instruction.doubleImmediate = sourceInstruction.doubleImmediate;
+                } else if (instruction.usesIntegerImmediate()) {
+                    instruction.integerImmediate = sourceInstruction.integerImmediate;
+                } else {
+                    instruction.elementTypeId = sourceInstruction.elementTypeId;
+                }
                 instruction.boolImmediate = sourceInstruction.boolImmediate;
                 instruction.checkedArithmetic =
                     sourceInstruction.checkedArithmetic;
@@ -309,8 +314,8 @@ Module Lowerer::lower(const mir::Module& source) const {
             block.terminator.value = sourceBlock.terminator.value < 0
                 ? InvalidRegister
                 : static_cast<Register>(sourceBlock.terminator.value);
-            block.terminator.target = sourceBlock.terminator.target;
-            block.terminator.falseTarget = sourceBlock.terminator.falseTarget;
+            block.terminator.target = static_cast<std::uint16_t>(sourceBlock.terminator.target);
+            block.terminator.falseTarget = static_cast<std::uint16_t>(sourceBlock.terminator.falseTarget);
             for (const auto argument : sourceBlock.terminator.arguments) {
                 block.terminator.arguments.push_back(
                     static_cast<Register>(argument));

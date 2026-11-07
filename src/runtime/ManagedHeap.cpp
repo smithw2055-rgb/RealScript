@@ -91,12 +91,14 @@ struct ManagedHeap::Impl {
 
     struct HeapObject {
         Header header;
-        std::variant<std::string, std::vector<Value>> payload;
+        std::vector<Value> values;
+        std::string stringPayload;
         std::shared_ptr<const std::vector<std::size_t>> referenceFields;
 
         void reset() noexcept {
             header = Header{};
-            payload = std::string{};
+            values.clear(); // Retain capacity in slot pool to avoid malloc/free churn!
+            stringPayload.clear();
             referenceFields.reset();
         }
     };
@@ -172,6 +174,7 @@ struct ManagedHeap::Impl {
     GcPhase phase = GcPhase::Idle;
     bool requested = false;
     bool resumeSweep = false;
+    bool rootsRescannedForSweep = false;
     std::size_t sweepIndex = 0;
     std::size_t sweepLimit = 0;
     std::size_t nextCollectionThreshold = 0;
@@ -195,13 +198,7 @@ struct ManagedHeap::Impl {
         return slot.object.get();
     }
 
-    [[nodiscard]] std::optional<ObjectRef> allocate(
-        ObjectKind kind,
-        semantic::SymbolId typeId,
-        semantic::PrimitiveType elementType,
-        semantic::SymbolId elementTypeId,
-        std::variant<std::string, std::vector<Value>> payload,
-        std::shared_ptr<const std::vector<std::size_t>> referenceFields,
+    [[nodiscard]] std::optional<std::uint32_t> acquireSlot(
         std::size_t sizeBytes,
         RuntimeError* error) {
         if (sizeBytes == std::numeric_limits<std::size_t>::max() ||
@@ -212,33 +209,41 @@ struct ManagedHeap::Impl {
             requested = true;
             return std::nullopt;
         }
-
-        std::uint32_t slotIndex = 0;
         if (!freeSlots.empty()) {
-            slotIndex = freeSlots.back();
+            const auto slotIndex = freeSlots.back();
             freeSlots.pop_back();
-        } else {
-            if (slots.size() >= static_cast<std::size_t>(ObjectRef::InvalidSlot)) {
-                setHeapError(error, ErrorCode::OutOfMemory,
-                    "managed heap exhausted the object handle space");
-                return std::nullopt;
-            }
-            slotIndex = static_cast<std::uint32_t>(slots.size());
-            slots.emplace_back();
+            return slotIndex;
         }
+        if (slots.size() >= static_cast<std::size_t>(ObjectRef::InvalidSlot)) {
+            setHeapError(error, ErrorCode::OutOfMemory,
+                "managed heap exhausted the object handle space");
+            return std::nullopt;
+        }
+        const auto slotIndex = static_cast<std::uint32_t>(slots.size());
+        slots.emplace_back();
+        return slotIndex;
+    }
 
-        HeapObject object;
+    [[nodiscard]] ObjectRef finalizeSlotAllocation(
+        std::uint32_t slotIndex,
+        ObjectKind kind,
+        semantic::SymbolId typeId,
+        semantic::PrimitiveType elementType,
+        semantic::SymbolId elementTypeId,
+        std::shared_ptr<const std::vector<std::size_t>> referenceFields,
+        std::size_t sizeBytes) {
+        auto& slot = slots[slotIndex];
+        auto& object = slot.object.storage;
         object.header.kind = kind;
         object.header.typeId = typeId;
         object.header.elementType = elementType;
         object.header.elementTypeId = elementTypeId;
         object.header.marked = phase != GcPhase::Idle;
-        object.header.sizeBytes = sizeBytes;
-        object.payload = std::move(payload);
-        object.referenceFields = std::move(referenceFields);
         object.header.inNursery = true;
-        auto& slot = slots[slotIndex];
-        slot.object.emplace(std::move(object));
+        object.header.inRememberedSet = false;
+        object.header.sizeBytes = sizeBytes;
+        object.referenceFields = std::move(referenceFields);
+        slot.object.occupied = true;
         nurserySlots.push_back(slotIndex);
         const ObjectRef reference{slotIndex, slot.generation, kind, heapId};
 
@@ -258,6 +263,62 @@ struct ManagedHeap::Impl {
             }
         }
         return reference;
+    }
+
+    [[nodiscard]] std::optional<ObjectRef> allocateStringSlot(
+        std::string value,
+        std::size_t sizeBytes,
+        RuntimeError* error) {
+        const auto slotIndex = acquireSlot(sizeBytes, error);
+        if (!slotIndex) return std::nullopt;
+        auto& object = slots[*slotIndex].object.storage;
+        object.values.clear();
+        object.stringPayload = std::move(value);
+        return finalizeSlotAllocation(
+            *slotIndex, ObjectKind::String, 0,
+            semantic::PrimitiveType::Error, 0, nullptr, sizeBytes);
+    }
+
+    [[nodiscard]] std::optional<ObjectRef> allocateArraySlot(
+        semantic::SymbolId arrayTypeId,
+        semantic::PrimitiveType elementType,
+        semantic::SymbolId elementTypeId,
+        std::size_t length,
+        const Value& initialValue,
+        std::size_t sizeBytes,
+        RuntimeError* error) {
+        const auto slotIndex = acquireSlot(sizeBytes, error);
+        if (!slotIndex) return std::nullopt;
+        auto& object = slots[*slotIndex].object.storage;
+        object.stringPayload.clear();
+        // Reuse existing vector capacity in-place without malloc/free!
+        object.values.assign(length, initialValue);
+        return finalizeSlotAllocation(
+            *slotIndex, ObjectKind::Array, arrayTypeId,
+            elementType, elementTypeId, nullptr, sizeBytes);
+    }
+
+    [[nodiscard]] std::optional<ObjectRef> allocateValuesSlot(
+        ObjectKind kind,
+        semantic::SymbolId typeId,
+        semantic::PrimitiveType elementType,
+        semantic::SymbolId elementTypeId,
+        std::vector<Value>&& vals,
+        std::shared_ptr<const std::vector<std::size_t>> referenceFields,
+        std::size_t sizeBytes,
+        RuntimeError* error) {
+        const auto slotIndex = acquireSlot(sizeBytes, error);
+        if (!slotIndex) return std::nullopt;
+        auto& object = slots[*slotIndex].object.storage;
+        object.stringPayload.clear();
+        if (object.values.capacity() >= vals.size()) {
+            object.values.assign(vals.begin(), vals.end());
+        } else {
+            object.values = std::move(vals);
+        }
+        return finalizeSlotAllocation(
+            *slotIndex, kind, typeId, elementType, elementTypeId,
+            std::move(referenceFields), sizeBytes);
     }
 
     void mark(ObjectRef reference) {
@@ -329,6 +390,7 @@ struct ManagedHeap::Impl {
         sweepIndex = 0;
         sweepLimit = slots.size();
         resumeSweep = false;
+        rootsRescannedForSweep = false;
         phase = GcPhase::Mark;
         ++statistics.collectionsStarted;
         markRoots(shadowStack);
@@ -337,7 +399,7 @@ struct ManagedHeap::Impl {
     void scan(ObjectRef reference) {
         const auto* object = get(reference);
         if (!object || object->header.kind == ObjectKind::String) return;
-        const auto& values = std::get<std::vector<Value>>(object->payload);
+        const auto& values = object->values;
         if (object->header.kind == ObjectKind::Array) {
             for (const auto& value : values) markValue(value);
             return;
@@ -407,9 +469,7 @@ std::optional<ObjectRef> ManagedHeap::allocateString(
     std::string value,
     RuntimeError* error) {
     const auto size = sizeof(Impl::HeapObject) + value.size();
-    return impl_->allocate(
-        ObjectKind::String, 0, semantic::PrimitiveType::Error, 0,
-        std::move(value), nullptr, size, error);
+    return impl_->allocateStringSlot(std::move(value), size, error);
 }
 
 std::optional<ObjectRef> ManagedHeap::internString(
@@ -497,14 +557,12 @@ std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
         setHeapError(error, ErrorCode::OutOfMemory, "managed array is too large");
         return std::nullopt;
     }
-    std::vector<Value> values(length, std::move(initialValue));
-    return impl_->allocate(
-        ObjectKind::Array,
+    return impl_->allocateArraySlot(
         arrayTypeId,
         elementType,
         elementTypeId,
-        std::move(values),
-        {},
+        length,
+        initialValue,
         sizeof(Impl::HeapObject) + storage,
         error);
 }
@@ -522,7 +580,7 @@ std::optional<ObjectRef> ManagedHeap::allocateRecord(
     for (std::size_t index = 0; index < fieldCount; ++index) {
         referenceFields[index] = index;
     }
-    return impl_->allocate(
+    return impl_->allocateValuesSlot(
         ObjectKind::Record,
         0,
         semantic::PrimitiveType::Error,
@@ -568,7 +626,7 @@ std::optional<ObjectRef> ManagedHeap::allocateObject(
         sharedRefs = std::make_shared<const std::vector<std::size_t>>(std::move(referenceFields));
         impl_->sharedTypeReferenceFields[typeId] = sharedRefs;
     }
-    return impl_->allocate(
+    return impl_->allocateValuesSlot(
         ObjectKind::Record,
         typeId,
         semantic::PrimitiveType::Error,
@@ -586,13 +644,13 @@ bool ManagedHeap::isAlive(ObjectRef reference) const noexcept {
 std::optional<std::string_view> ManagedHeap::stringView(ObjectRef reference) const {
     const auto* object = impl_->get(reference);
     if (!object || object->header.kind != ObjectKind::String) return std::nullopt;
-    return std::string_view(std::get<std::string>(object->payload));
+    return std::string_view(object->stringPayload);
 }
 
 std::optional<std::size_t> ManagedHeap::arrayLength(ObjectRef reference) const {
     const auto* object = impl_->get(reference);
     if (!object || object->header.kind != ObjectKind::Array) return std::nullopt;
-    return std::get<std::vector<Value>>(object->payload).size();
+    return object->values.size();
 }
 
 std::optional<semantic::SymbolId> ManagedHeap::arrayTypeId(
@@ -619,9 +677,33 @@ std::optional<semantic::SymbolId> ManagedHeap::arrayElementTypeId(
 std::optional<Value> ManagedHeap::arrayGet(ObjectRef reference, std::size_t index) const {
     const auto* object = impl_->get(reference);
     if (!object || object->header.kind != ObjectKind::Array) return std::nullopt;
-    const auto& values = std::get<std::vector<Value>>(object->payload);
+    const auto& values = object->values;
     if (index >= values.size()) return std::nullopt;
     return values[index];
+}
+
+const Value* ManagedHeap::arrayGetFast(ObjectRef reference, std::size_t index) const noexcept {
+    const auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array || index >= object->values.size()) {
+        return nullptr;
+    }
+    return &object->values[index];
+}
+
+bool ManagedHeap::arraySetPrevalidated(
+    ObjectRef reference,
+    std::size_t index,
+    const Value& value,
+    bool mayBeReference) noexcept {
+    auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array || index >= object->values.size()) {
+        return false;
+    }
+    if (mayBeReference) {
+        impl_->writeBarrier(reference, value);
+    }
+    object->values[index] = value;
+    return true;
 }
 
 bool ManagedHeap::arraySet(
@@ -636,7 +718,7 @@ bool ManagedHeap::arraySet(
             "managed array reference is invalid");
         return false;
     }
-    auto& values = std::get<std::vector<Value>>(object->payload);
+    auto& values = object->values;
     if (index >= values.size()) {
         setHeapError(error, ErrorCode::IndexOutOfRange,
             "managed array index is out of range");
@@ -711,13 +793,13 @@ std::optional<semantic::SymbolId> ManagedHeap::objectTypeId(
 std::optional<std::size_t> ManagedHeap::fieldCount(ObjectRef reference) const {
     const auto* object = impl_->get(reference);
     if (!object || object->header.kind != ObjectKind::Record) return std::nullopt;
-    return std::get<std::vector<Value>>(object->payload).size();
+    return object->values.size();
 }
 
 std::optional<Value> ManagedHeap::fieldGet(ObjectRef reference, std::size_t index) const {
     const auto* object = impl_->get(reference);
     if (!object || object->header.kind != ObjectKind::Record) return std::nullopt;
-    const auto& fields = std::get<std::vector<Value>>(object->payload);
+    const auto& fields = object->values;
     if (index >= fields.size()) return std::nullopt;
     return fields[index];
 }
@@ -733,7 +815,7 @@ bool ManagedHeap::fieldSet(
             "managed record reference is invalid");
         return false;
     }
-    auto& fields = std::get<std::vector<Value>>(object->payload);
+    auto& fields = object->values;
     if (index >= fields.size()) {
         setHeapError(error, ErrorCode::InvalidArguments,
             "managed field index is out of range");
@@ -951,17 +1033,24 @@ std::size_t ManagedHeap::step(
     if (impl_->phase == GcPhase::Idle) {
         if (!impl_->requested) return 0;
         impl_->startCollection(shadowStack);
+    } else if (impl_->phase == GcPhase::Mark) {
+        impl_->markRoots(shadowStack);
     }
 
-    impl_->markRoots(shadowStack);
     std::size_t performed = 0;
     while (performed < workBudget) {
         if (impl_->phase == GcPhase::Sweep && !impl_->markStack.empty()) {
             impl_->phase = GcPhase::Mark;
             impl_->resumeSweep = true;
+            impl_->rootsRescannedForSweep = false;
         }
         if (impl_->phase == GcPhase::Mark) {
             if (impl_->markStack.empty()) {
+                if (!impl_->rootsRescannedForSweep) {
+                    impl_->markRoots(shadowStack);
+                    impl_->rootsRescannedForSweep = true;
+                    if (!impl_->markStack.empty()) continue;
+                }
                 impl_->phase = GcPhase::Sweep;
                 if (!impl_->resumeSweep) impl_->sweepIndex = 0;
                 impl_->resumeSweep = false;
@@ -983,7 +1072,7 @@ std::size_t ManagedHeap::step(
             auto& slot = impl_->slots[impl_->sweepIndex++];
             if (slot.object && !slot.object->header.marked) {
                 if (slot.object->header.kind == ObjectKind::String) {
-                    const auto& s = std::get<std::string>(slot.object->payload);
+                    const auto& s = slot.object->stringPayload;
                     const auto it = impl_->internedStrings.find(s);
                     if (it != impl_->internedStrings.end() &&
                         it->second.slot == static_cast<std::uint32_t>(impl_->sweepIndex - 1) &&
@@ -1084,7 +1173,7 @@ std::size_t ManagedHeap::collectYoung(
     for (const auto& oldRef : impl_->rememberedSet) {
         const auto* oldObj = impl_->get(oldRef);
         if (!oldObj || oldObj->header.kind == ObjectKind::String) continue;
-        const auto& values = std::get<std::vector<Value>>(oldObj->payload);
+        const auto& values = oldObj->values;
         if (oldObj->header.kind == ObjectKind::Array) {
             for (const auto& v : values) markYoungValue(markYoungValue, v);
         } else if (oldObj->referenceFields) {
@@ -1099,7 +1188,7 @@ std::size_t ManagedHeap::collectYoung(
         youngQueue.pop_back();
         const auto* obj = impl_->get(ref);
         if (!obj || obj->header.kind == ObjectKind::String) continue;
-        const auto& values = std::get<std::vector<Value>>(obj->payload);
+        const auto& values = obj->values;
         if (obj->header.kind == ObjectKind::Array) {
             for (const auto& v : values) markYoungValue(markYoungValue, v);
         } else if (obj->referenceFields) {
@@ -1118,7 +1207,7 @@ std::size_t ManagedHeap::collectYoung(
         ++processed;
         if (!slot.object->header.marked) {
             if (slot.object->header.kind == ObjectKind::String) {
-                const auto& s = std::get<std::string>(slot.object->payload);
+                const auto& s = slot.object->stringPayload;
                 const auto it = impl_->internedStrings.find(s);
                 if (it != impl_->internedStrings.end() &&
                     it->second.slot == slotIdx &&
@@ -1167,7 +1256,7 @@ bool ManagedHeap::readPackedIntArray(
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
         return false;
     }
-    const auto& values = std::get<std::vector<Value>>(object->payload);
+    const auto& values = object->values;
     out.resize(values.size());
     for (std::size_t i = 0; i < values.size(); ++i) {
         if (const auto* iv = std::get_if<std::int64_t>(&values[i])) {
@@ -1202,7 +1291,7 @@ bool ManagedHeap::writePackedIntArray(
         setHeapError(error, ErrorCode::TypeMismatch, "array element is not an integer");
         return false;
     }
-    auto& values = std::get<std::vector<Value>>(object->payload);
+    auto& values = object->values;
     if (count > values.size()) {
         setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
         return false;
@@ -1223,7 +1312,7 @@ bool ManagedHeap::readPackedDoubleArray(
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
         return false;
     }
-    const auto& values = std::get<std::vector<Value>>(object->payload);
+    const auto& values = object->values;
     out.resize(values.size());
     for (std::size_t i = 0; i < values.size(); ++i) {
         if (const auto* dv = std::get_if<double>(&values[i])) {
@@ -1258,7 +1347,7 @@ bool ManagedHeap::writePackedDoubleArray(
         setHeapError(error, ErrorCode::TypeMismatch, "array element is not a floating-point number");
         return false;
     }
-    auto& values = std::get<std::vector<Value>>(object->payload);
+    auto& values = object->values;
     if (count > values.size()) {
         setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
         return false;
@@ -1279,7 +1368,7 @@ bool ManagedHeap::readPackedVec2Array(
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
         return false;
     }
-    const auto& values = std::get<std::vector<Value>>(object->payload);
+    const auto& values = object->values;
     out.resize(values.size());
     for (std::size_t i = 0; i < values.size(); ++i) {
         if (const auto* v2 = std::get_if<Vec2Value>(&values[i])) {
@@ -1318,7 +1407,7 @@ bool ManagedHeap::writePackedVec2Array(
         setHeapError(error, ErrorCode::TypeMismatch, "array element is not a Vec2");
         return false;
     }
-    auto& values = std::get<std::vector<Value>>(object->payload);
+    auto& values = object->values;
     if (count > values.size()) {
         setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
         return false;
@@ -1363,9 +1452,9 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
         info.elementTypeId = object.header.elementTypeId;
         info.sizeBytes = object.header.sizeBytes;
         if (object.header.kind == ObjectKind::String) {
-            info.stringValue = std::get<std::string>(object.payload);
+            info.stringValue = object.stringPayload;
         } else {
-            const auto& values = std::get<std::vector<Value>>(object.payload);
+            const auto& values = object.values;
             info.valueCount = values.size();
             info.values = values;
             if (object.referenceFields) {
@@ -1512,7 +1601,7 @@ bool ManagedHeap::restore(
                     "heap snapshot string payload is invalid");
                 return false;
             }
-            object.payload = info.stringValue;
+            object.stringPayload = info.stringValue;
         } else {
             if (info.values.size() != info.valueCount) {
                 setHeapError(error, ErrorCode::InvalidProgram,
@@ -1526,7 +1615,7 @@ bool ManagedHeap::restore(
                     return false;
                 }
             }
-            object.payload = info.values;
+            object.values = info.values;
             if (info.typeId != 0) {
                 auto& shared = impl_->sharedTypeReferenceFields[info.typeId];
                 if (!shared || *shared != info.referenceFields) {
@@ -1806,7 +1895,7 @@ std::shared_ptr<void> NativeHandleRegistry::resolve(
     NativeHandle handle,
     semantic::SymbolId expectedTypeId,
     RuntimeError* error) const {
-    if (!handle.valid() || handle.registryId != registryId_ ||
+    if (!handle.valid() || handle.registryId != ((registryId_ == 0) ? 0u : (((registryId_ - 1u) % 65535u) + 1u)) ||
         handle.slot >= slots_.size()) {
         setHeapError(error, ErrorCode::InvalidNativeHandle,
             "native handle is invalid");
@@ -1828,7 +1917,7 @@ std::shared_ptr<void> NativeHandleRegistry::resolve(
 }
 
 bool NativeHandleRegistry::isAlive(NativeHandle handle) const noexcept {
-    return handle.valid() && handle.registryId == registryId_ &&
+    return handle.valid() && handle.registryId == ((registryId_ == 0) ? 0u : (((registryId_ - 1u) % 65535u) + 1u)) &&
         handle.slot < slots_.size() &&
         slots_[handle.slot].resource &&
         slots_[handle.slot].generation == handle.generation &&
@@ -1842,7 +1931,7 @@ bool NativeHandleRegistry::release(NativeHandle handle) noexcept {
     slot.typeId = 0;
     slot.debugName.clear();
     ++slot.generation;
-    if (slot.generation == 0) slot.generation = 1;
+    if (slot.generation == 0 || slot.generation > 0xFFFFu) slot.generation = 1;
     freeSlots_.push_back(handle.slot);
     return true;
 }
@@ -1856,7 +1945,7 @@ void NativeHandleRegistry::clear() noexcept {
             slot.typeId = 0;
             slot.debugName.clear();
             ++slot.generation;
-            if (slot.generation == 0) slot.generation = 1;
+            if (slot.generation == 0 || slot.generation > 0xFFFFu) slot.generation = 1;
         }
         freeSlots_.push_back(static_cast<std::uint32_t>(index));
     }

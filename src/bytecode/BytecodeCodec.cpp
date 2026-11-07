@@ -286,12 +286,14 @@ bool readTypeIds(
     return reader.valid();
 }
 
-void writeRegisters(Writer& writer, const std::vector<Register>& values) {
+template <typename RegContainer>
+void writeRegisters(Writer& writer, const RegContainer& values) {
     writer.u32(static_cast<std::uint32_t>(values.size()));
     for (const auto value : values) writer.u32(value);
 }
 
-bool readRegisters(Reader& reader, std::vector<Register>& values) {
+template <typename RegContainer>
+bool readRegisters(Reader& reader, RegContainer& values) {
     const auto count = reader.u32();
     if (!reader.valid() || count > reader.remaining() / 4) return false;
     values.reserve(count);
@@ -818,9 +820,9 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
                 codeSection.u32(instruction.index);
                 codeSection.u32(instruction.typeIndex);
                 codeSection.u8(encodeOptionalType(instruction.elementType));
-                codeSection.u64(instruction.elementTypeId);
-                codeSection.i64(instruction.integerImmediate);
-                codeSection.f64(instruction.doubleImmediate);
+                codeSection.u64(instruction.activeElementTypeId());
+                codeSection.i64(instruction.activeIntegerImmediate());
+                codeSection.f64(instruction.activeDoubleImmediate());
                 codeSection.u8(static_cast<std::uint8_t>(
                     (instruction.boolImmediate ? 1u : 0u) |
                     (instruction.checkedArithmetic ? 0u : 2u)));
@@ -1709,14 +1711,22 @@ bool decodeModule(
                     return false;
                 }
                 instruction.index = reader.u32();
-                instruction.typeIndex = reader.u32();
+                const auto rawTypeIdx = reader.u32();
+                instruction.typeIndex = rawTypeIdx > 0xFFFFu ? 0xFFFFu : static_cast<std::uint16_t>(rawTypeIdx);
                 if (!decodeOptionalType(reader.u8(), instruction.elementType)) {
                     diagnostics.report("RS5004", "invalid instruction element type", {});
                     return false;
                 }
-                instruction.elementTypeId = reader.u64();
-                instruction.integerImmediate = reader.i64();
-                instruction.doubleImmediate = reader.f64();
+                const auto elemTypeId = reader.u64();
+                const auto intImm = reader.i64();
+                const auto dblImm = reader.f64();
+                if (instruction.usesDoubleImmediate()) {
+                    instruction.doubleImmediate = dblImm;
+                } else if (instruction.usesIntegerImmediate()) {
+                    instruction.integerImmediate = intImm;
+                } else {
+                    instruction.elementTypeId = elemTypeId;
+                }
                 const auto arithmeticFlags = reader.u8();
                 if (arithmeticFlags > 3u) {
                     diagnostics.report(
@@ -1747,8 +1757,10 @@ bool decodeModule(
             block.terminator.kind = static_cast<TerminatorKind>(terminator);
             block.terminator.condition = reader.u32();
             block.terminator.value = reader.u32();
-            block.terminator.target = reader.u32();
-            block.terminator.falseTarget = reader.u32();
+            const auto rawTarget = reader.u32();
+            const auto rawFalseTarget = reader.u32();
+            block.terminator.target = rawTarget > 0xFFFFu ? 0xFFFFu : static_cast<std::uint16_t>(rawTarget);
+            block.terminator.falseTarget = rawFalseTarget > 0xFFFFu ? 0xFFFFu : static_cast<std::uint16_t>(rawFalseTarget);
             if (!readRegisters(reader, block.terminator.arguments) ||
                 !readRegisters(reader, block.terminator.falseArguments)) {
                 diagnostics.report("RS5003", "truncated bytecode terminator", {});

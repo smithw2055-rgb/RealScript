@@ -198,11 +198,12 @@ std::uint64_t functionBodyFingerprint(const bytecode::Module& module, const byte
             }
             append(hash, instruction.typeIndex);
             append(hash, static_cast<std::uint64_t>(instruction.elementType));
-            append(hash, instruction.elementTypeId);
-            append(hash, static_cast<std::uint64_t>(instruction.integerImmediate));
+            append(hash, instruction.activeElementTypeId());
+            append(hash, static_cast<std::uint64_t>(instruction.activeIntegerImmediate()));
             std::uint64_t bits = 0;
-            static_assert(sizeof(bits) == sizeof(instruction.doubleImmediate), "double size");
-            std::memcpy(&bits, &instruction.doubleImmediate, sizeof(bits));
+            const double activeDbl = instruction.activeDoubleImmediate();
+            static_assert(sizeof(bits) == sizeof(activeDbl), "double size");
+            std::memcpy(&bits, &activeDbl, sizeof(bits));
             append(hash, bits);
             append(hash, instruction.boolImmediate ? 1 : 0);
             append(hash, instruction.checkedArithmetic ? 1 : 0);

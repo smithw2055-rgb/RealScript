@@ -41,9 +41,139 @@ std::string functionDetail(const semantic::FunctionSymbol& function) {
 
 } // namespace
 
+void LanguageService::initDocument(
+    const std::string& path,
+    std::string content,
+    std::int64_t version,
+    Document& doc) {
+    doc.content = std::move(content);
+    doc.version = version;
+    doc.fileInfo.id = 0;
+    doc.fileInfo.path = path;
+    doc.fileInfo.lineStarts.clear();
+    doc.fileInfo.lineStarts.push_back(0);
+    for (std::size_t offset = 0; offset < doc.content.size(); ++offset) {
+        if (doc.content[offset] == '\n') {
+            doc.fileInfo.lineStarts.push_back(static_cast<std::uint32_t>(offset + 1));
+        }
+    }
+    doc.tokens.clear();
+    doc.hasTokens = false;
+}
+
+const std::vector<syntax::SyntaxToken>& LanguageService::documentTokens(
+    const std::string& path,
+    const Document& doc) const {
+    if (!doc.hasTokens) {
+        text::SourceText source(doc.content, path);
+        diagnostics::DiagnosticBag diagnostics;
+        syntax::Lexer lexer(source, diagnostics);
+        doc.tokens = lexer.lexAll();
+        doc.hasTokens = true;
+    }
+    return doc.tokens;
+}
+
+LanguageService::DocHeaderInfo LanguageService::parseDocHeader(const Document& doc) {
+    DocHeaderInfo info;
+    const auto& s = doc.content;
+    if (s.find('<') != std::string::npos ||
+        s.find('[') != std::string::npos ||
+        s.find("sequence ") != std::string::npos ||
+        s.find("interface ") != std::string::npos) {
+        info.eligibleForSubgraph = false;
+    } else {
+        info.eligibleForSubgraph = true;
+    }
+    std::size_t pos = 0;
+    const auto skipWsAndComments = [&]() {
+        while (pos < s.size()) {
+            while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+            if (pos + 1 < s.size() && s[pos] == '/' && s[pos + 1] == '/') {
+                pos += 2;
+                while (pos < s.size() && s[pos] != '\n') ++pos;
+                continue;
+            }
+            if (pos + 1 < s.size() && s[pos] == '/' && s[pos + 1] == '*') {
+                pos += 2;
+                while (pos + 1 < s.size() && !(s[pos] == '*' && s[pos + 1] == '/')) ++pos;
+                if (pos + 1 < s.size()) pos += 2;
+                continue;
+            }
+            break;
+        }
+    };
+    const auto readWord = [&]() -> std::string {
+        skipWsAndComments();
+        std::size_t start = pos;
+        while (pos < s.size() &&
+               (std::isalnum(static_cast<unsigned char>(s[pos])) || s[pos] == '_' || s[pos] == '.')) {
+            ++pos;
+        }
+        return s.substr(start, pos - start);
+    };
+    while (pos < s.size()) {
+        skipWsAndComments();
+        if (pos >= s.size()) break;
+        if (s[pos] == '[') {
+            int bracketDepth = 1;
+            ++pos;
+            bool inString = false;
+            while (pos < s.size() && bracketDepth > 0) {
+                if (s[pos] == '"' && (pos == 0 || s[pos - 1] != '\\')) {
+                    inString = !inString;
+                } else if (!inString) {
+                    if (s[pos] == '[') ++bracketDepth;
+                    else if (s[pos] == ']') --bracketDepth;
+                }
+                ++pos;
+            }
+            continue;
+        }
+        const std::size_t saved = pos;
+        const auto kw = readWord();
+        if (kw == "module") {
+            const auto mName = readWord();
+            skipWsAndComments();
+            if (pos < s.size() && s[pos] == ';' && !mName.empty()) {
+                ++pos;
+                info.moduleName = mName;
+                continue;
+            }
+            pos = saved;
+            break;
+        } else if (kw == "import") {
+            const auto iName = readWord();
+            skipWsAndComments();
+            if (pos < s.size() && s[pos] == ';' && !iName.empty()) {
+                ++pos;
+                info.imports.insert(iName);
+                continue;
+            }
+            pos = saved;
+            break;
+        } else {
+            break;
+        }
+    }
+    if (info.moduleName.empty()) {
+        info.moduleName = "$global";
+        info.eligibleForSubgraph = false;
+    }
+    return info;
+}
+
 void LanguageService::open(std::string path, std::string content, std::int64_t version) {
-    documents_[std::move(path)] = {std::move(content), version};
+    const bool existed = (documents_.find(path) != documents_.end());
+    auto& doc = documents_[path];
+    initDocument(path, std::move(content), version, doc);
+    if (!existed) {
+        structuralDirty_ = true;
+    } else {
+        dirtyPaths_.insert(path);
+    }
     dirty_ = true;
+    hasCachedDefinitions_ = false;
 }
 
 void LanguageService::update(std::string path, std::string content, std::int64_t version) {
@@ -57,11 +187,13 @@ bool LanguageService::applyContentChanges(
     auto it = documents_.find(path);
     if (it == documents_.end()) {
         if (changes.empty()) return false;
-        documents_[path] = {std::string{}, version};
+        initDocument(path, std::string{}, version, documents_[path]);
         it = documents_.find(path);
+        structuralDirty_ = true;
+    } else {
+        dirtyPaths_.insert(path);
     }
-    std::string& content = it->second.content;
-    it->second.version = version;
+    std::string content = std::move(it->second.content);
 
     const auto lineColToOffset = [](const std::string& text, std::size_t line1, std::size_t col1) -> std::size_t {
         std::size_t curLine = 1;
@@ -91,7 +223,9 @@ bool LanguageService::applyContentChanges(
             content.replace(startOff, endOff - startOff, change.text);
         }
     }
+    initDocument(path, std::move(content), version, it->second);
     dirty_ = true;
+    hasCachedDefinitions_ = false;
     return true;
 }
 
@@ -102,25 +236,35 @@ std::string LanguageService::documentContent(const std::string& path) const {
 
 void LanguageService::close(const std::string& path) {
     documents_.erase(path);
+    structuralDirty_ = true;
     dirty_ = true;
+    hasCachedDefinitions_ = false;
 }
 
 void LanguageService::setAmbientSources(std::vector<compiler::SourceFile> sources) {
     ambientDocuments_.clear();
     for (auto& src : sources) {
-        ambientDocuments_[std::move(src.path)] = {std::move(src.content), 1};
+        auto& doc = ambientDocuments_[src.path];
+        initDocument(src.path, std::move(src.content), 1, doc);
     }
+    structuralDirty_ = true;
     dirty_ = true;
+    hasCachedDefinitions_ = false;
 }
 
 void LanguageService::addAmbientSource(compiler::SourceFile source) {
-    ambientDocuments_[std::move(source.path)] = {std::move(source.content), 1};
+    auto& doc = ambientDocuments_[source.path];
+    initDocument(source.path, std::move(source.content), 1, doc);
+    structuralDirty_ = true;
     dirty_ = true;
+    hasCachedDefinitions_ = false;
 }
 
 void LanguageService::clearAmbientSources() {
     ambientDocuments_.clear();
+    structuralDirty_ = true;
     dirty_ = true;
+    hasCachedDefinitions_ = false;
 }
 
 bool LanguageService::loadProjectConfigJson(const std::string& jsonText) {
@@ -143,9 +287,13 @@ bool LanguageService::loadProjectConfigJson(const std::string& jsonText) {
         if (!pathVal || !pathVal->isString() || !contentVal || !contentVal->isString()) {
             continue;
         }
-        ambientDocuments_[pathVal->stringValue()] = {contentVal->stringValue(), 1};
+        const auto& p = pathVal->stringValue();
+        auto& doc = ambientDocuments_[p];
+        initDocument(p, contentVal->stringValue(), 1, doc);
     }
+    structuralDirty_ = true;
     dirty_ = true;
+    hasCachedDefinitions_ = false;
     return true;
 }
 
@@ -169,7 +317,231 @@ const compiler::BuildResult& LanguageService::build() {
     return result_;
 }
 
+void LanguageService::recordFullBuildGraph() {
+    docHeaders_.clear();
+    moduleToPaths_.clear();
+    moduleImports_.clear();
+    reverseImports_.clear();
+    moduleSymbolSlices_.clear();
+
+    for (const auto& [path, doc] : ambientDocuments_) {
+        if (documents_.find(path) != documents_.end()) continue;
+        auto hdr = parseDocHeader(doc);
+        moduleToPaths_[hdr.moduleName].insert(path);
+        for (const auto& imp : hdr.imports) {
+            moduleImports_[hdr.moduleName].insert(imp);
+            reverseImports_[imp].insert(hdr.moduleName);
+        }
+        docHeaders_[path] = std::move(hdr);
+    }
+    for (const auto& [path, doc] : documents_) {
+        auto hdr = parseDocHeader(doc);
+        moduleToPaths_[hdr.moduleName].insert(path);
+        for (const auto& imp : hdr.imports) {
+            moduleImports_[hdr.moduleName].insert(imp);
+            reverseImports_[imp].insert(hdr.moduleName);
+        }
+        docHeaders_[path] = std::move(hdr);
+    }
+
+    // Compute per-module symbol slices in result_.symbols
+    std::size_t idx = 0;
+    while (idx < result_.symbols.size()) {
+        const auto& srcPath = result_.symbols[idx].sourceName;
+        const auto hdrIt = docHeaders_.find(srcPath);
+        if (hdrIt == docHeaders_.end()) {
+            ++idx;
+            continue;
+        }
+        const std::string& modName = hdrIt->second.moduleName;
+        const std::size_t start = idx;
+        while (idx < result_.symbols.size()) {
+            const auto& p = result_.symbols[idx].sourceName;
+            const auto it2 = docHeaders_.find(p);
+            if (it2 == docHeaders_.end() || it2->second.moduleName != modName) break;
+            ++idx;
+        }
+        if (moduleSymbolSlices_.find(modName) == moduleSymbolSlices_.end()) {
+            moduleSymbolSlices_[modName] = {start, idx - start};
+        } else {
+            // Non-contiguous symbols for a module: disable fast slice replacement
+            moduleSymbolSlices_.clear();
+            break;
+        }
+    }
+    dirtyPaths_.clear();
+    structuralDirty_ = false;
+}
+
+bool LanguageService::tryIncrementalSubgraphRebuild() {
+    if (structuralDirty_ || !hasSnapshot_ || dirtyPaths_.empty() ||
+        !result_.nativeGenericInstantiations.empty() ||
+        moduleSymbolSlices_.empty()) {
+        return false;
+    }
+
+    std::set<std::string> dirtyModules;
+    for (const auto& path : dirtyPaths_) {
+        const auto docIt = documents_.find(path);
+        const auto oldHdrIt = docHeaders_.find(path);
+        if (docIt == documents_.end() || oldHdrIt == docHeaders_.end()) return false;
+        const auto newHdr = parseDocHeader(docIt->second);
+        if (!newHdr.eligibleForSubgraph ||
+            newHdr.moduleName != oldHdrIt->second.moduleName ||
+            newHdr.imports != oldHdrIt->second.imports) {
+            return false;
+        }
+        dirtyModules.insert(newHdr.moduleName);
+    }
+    if (dirtyModules.size() != 1) return false;
+    const std::string& dirtyMod = *dirtyModules.begin();
+    if (moduleSymbolSlices_.find(dirtyMod) == moduleSymbolSlices_.end()) return false;
+
+    // Collect transitive imports of dirtyMod
+    std::set<std::string> subgraphModules;
+    std::vector<std::string> queue = {dirtyMod};
+    while (!queue.empty()) {
+        auto curr = std::move(queue.back());
+        queue.pop_back();
+        if (!subgraphModules.insert(curr).second) continue;
+        if (curr != dirtyMod && snapshot_.modules.find(curr) == snapshot_.modules.end()) {
+            return false;
+        }
+        if (const auto impIt = moduleImports_.find(curr); impIt != moduleImports_.end()) {
+            for (const auto& imp : impIt->second) queue.push_back(imp);
+        }
+    }
+
+    // If dirtyMod is at least 4 modules smaller than total workspace, run subgraph Compilation
+    if (subgraphModules.size() + 3 >= moduleToPaths_.size()) {
+        return false;
+    }
+
+    compiler::Compilation subCompilation;
+    std::set<std::string> dirtyModPaths;
+    for (const auto& modName : subgraphModules) {
+        const auto pathsIt = moduleToPaths_.find(modName);
+        if (pathsIt == moduleToPaths_.end()) return false;
+        for (const auto& p : pathsIt->second) {
+            const auto* doc = document(p);
+            if (!doc) return false;
+            subCompilation.addSource({p, doc->content});
+            if (modName == dirtyMod) dirtyModPaths.insert(p);
+        }
+    }
+
+    auto subResult = subCompilation.build(&snapshot_);
+
+    // If other modules import dirtyMod, verify dirtyMod's publicFingerprint did not change
+    const auto revIt = reverseImports_.find(dirtyMod);
+    if (revIt != reverseImports_.end() && !revIt->second.empty()) {
+        if (subResult.diagnostics.hasErrors()) return false;
+        const auto snapOld = snapshot_.modules.find(dirtyMod);
+        const auto snapNew = subResult.snapshot.modules.find(dirtyMod);
+        if (snapOld == snapshot_.modules.end() ||
+            snapNew == subResult.snapshot.modules.end() ||
+            snapOld->second.publicFingerprint != snapNew->second.publicFingerprint) {
+            return false;
+        }
+    }
+
+    // 1. Update snapshot_.modules[dirtyMod]
+    if (auto snapNew = subResult.snapshot.modules.find(dirtyMod);
+        snapNew != subResult.snapshot.modules.end()) {
+        snapshot_.modules[dirtyMod] = std::move(snapNew->second);
+    }
+
+    // 2. Update result_.modules for dirtyMod
+    const mir::Module* newMirMod = nullptr;
+    for (auto& m : subResult.modules) {
+        if (m.name == dirtyMod) {
+            newMirMod = &m;
+            break;
+        }
+    }
+    if (newMirMod) {
+        bool replaced = false;
+        for (auto& existingMod : result_.modules) {
+            if (existingMod.name == dirtyMod) {
+                existingMod = *newMirMod;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            result_.modules.push_back(*newMirMod);
+        }
+    }
+
+    // 3. Update result_.buildInfo
+    for (auto& bi : result_.buildInfo) {
+        if (bi.name != dirtyMod) {
+            bi.reused = true;
+        } else {
+            for (const auto& sbi : subResult.buildInfo) {
+                if (sbi.name == dirtyMod) {
+                    bi = sbi;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 4. Update result_.diagnostics (keep diagnostics from non-dirty files, replace dirtyMod diagnostics)
+    diagnostics::DiagnosticBag mergedDiags;
+    for (const auto& item : result_.diagnostics.items()) {
+        if (dirtyModPaths.find(item.sourceName) == dirtyModPaths.end()) {
+            mergedDiags.report(item.code, item.message, item.span, item.severity, item.sourceName);
+        }
+    }
+    for (const auto& item : subResult.diagnostics.items()) {
+        if (dirtyModPaths.find(item.sourceName) != dirtyModPaths.end()) {
+            mergedDiags.report(item.code, item.message, item.span, item.severity, item.sourceName);
+        }
+    }
+    result_.diagnostics = std::move(mergedDiags);
+
+    // 5. Update result_.symbols for dirtyMod in O(|dirtyMod symbols|) by moving dirtyMod slice to tail if needed
+    std::vector<semantic::SymbolOccurrence> newModSymbols;
+    for (auto& occ : subResult.symbols) {
+        if (dirtyModPaths.find(occ.sourceName) != dirtyModPaths.end()) {
+            newModSymbols.push_back(std::move(occ));
+        }
+    }
+    auto slice = moduleSymbolSlices_[dirtyMod];
+    if (slice.first + slice.second < result_.symbols.size()) {
+        // Move dirtyMod slice to the end once so subsequent edits are O(1) tail resize
+        const std::size_t oldStart = slice.first;
+        const std::size_t oldCount = slice.second;
+        result_.symbols.erase(
+            result_.symbols.begin() + static_cast<std::ptrdiff_t>(oldStart),
+            result_.symbols.begin() + static_cast<std::ptrdiff_t>(oldStart + oldCount));
+        for (auto& [mName, mSlice] : moduleSymbolSlices_) {
+            if (mName != dirtyMod && mSlice.first > oldStart) {
+                mSlice.first -= oldCount;
+            }
+        }
+        slice.first = result_.symbols.size();
+        slice.second = 0;
+    }
+    result_.symbols.resize(slice.first);
+    slice.second = newModSymbols.size();
+    result_.symbols.insert(
+        result_.symbols.end(),
+        std::make_move_iterator(newModSymbols.begin()),
+        std::make_move_iterator(newModSymbols.end()));
+    moduleSymbolSlices_[dirtyMod] = slice;
+
+    dirtyPaths_.clear();
+    hasCachedDefinitions_ = false;
+    dirty_ = false;
+    return true;
+}
+
 void LanguageService::rebuild() {
+    if (tryIncrementalSubgraphRebuild()) {
+        return;
+    }
     compiler::Compilation compilation;
     std::vector<std::string> ambientPaths;
     ambientPaths.reserve(ambientDocuments_.size());
@@ -196,9 +568,13 @@ void LanguageService::rebuild() {
     }
     result_ = compilation.build(hasSnapshot_ ? &snapshot_ : nullptr);
     if (!result_.snapshot.modules.empty()) {
-        snapshot_ = result_.snapshot;
+        for (auto& [modName, cachedMod] : result_.snapshot.modules) {
+            snapshot_.modules[modName] = std::move(cachedMod);
+        }
         hasSnapshot_ = true;
     }
+    recordFullBuildGraph();
+    hasCachedDefinitions_ = false;
     dirty_ = false;
 }
 
@@ -214,15 +590,7 @@ debug::SourceRange LanguageService::rangeFor(
     text::TextSpan span) const {
     const auto* value = document(path);
     if (!value) return {};
-    text::SourceText source(value->content, path);
-    debug::SourceFileInfo file;
-    file.id = 0;
-    file.path = path;
-    file.lineStarts.push_back(0);
-    for (std::size_t offset = 0; offset < value->content.size(); ++offset) {
-        if (value->content[offset] == '\n') file.lineStarts.push_back(static_cast<std::uint32_t>(offset + 1));
-    }
-    return debug::makeSourceRange(file, span);
+    return debug::makeSourceRange(value->fileInfo, span);
 }
 
 std::optional<syntax::SyntaxToken> LanguageService::tokenAt(
@@ -230,29 +598,22 @@ std::optional<syntax::SyntaxToken> LanguageService::tokenAt(
     text::LinePosition position) const {
     const auto* value = document(path);
     if (!value) return std::nullopt;
-    text::SourceText source(value->content, path);
-    diagnostics::DiagnosticBag diagnostics;
-    syntax::Lexer lexer(source, diagnostics);
-    const auto offset = [&] {
-        std::size_t line = 0;
-        std::size_t start = 0;
-        while (line < position.line && start < value->content.size()) {
-            const auto next = value->content.find('\n', start);
-            if (next == std::string::npos) return value->content.size();
-            start = next + 1;
-            ++line;
-        }
-        return std::min(start + position.column, value->content.size());
-    }();
-    for (const auto& token : lexer.lexAll()) {
+    const auto& lineStarts = value->fileInfo.lineStarts;
+    const std::size_t offset = position.line < lineStarts.size()
+        ? std::min(static_cast<std::size_t>(lineStarts[position.line]) + position.column, value->content.size())
+        : value->content.size();
+    for (const auto& token : documentTokens(path, *value)) {
         if (token.kind == syntax::SyntaxKind::EndOfFileToken) continue;
         if (offset >= token.span.start && offset <= token.span.end()) return token;
     }
     return std::nullopt;
 }
 
-std::vector<DocumentSymbol> LanguageService::allDefinitions() const {
-    std::vector<DocumentSymbol> symbols;
+const std::vector<DocumentSymbol>& LanguageService::allDefinitionsRef() const {
+    if (hasCachedDefinitions_) return cachedDefinitions_;
+    cachedDefinitions_.clear();
+    cachedDefById_.clear();
+    cachedOccByPath_.clear();
     std::unordered_set<semantic::SymbolId> seen;
     std::unordered_set<std::string> generatedNames;
     for (const auto& module : result_.modules) {
@@ -271,10 +632,14 @@ std::vector<DocumentSymbol> LanguageService::allDefinitions() const {
             !seen.insert(id).second) {
             return;
         }
-        symbols.push_back({id, kind, std::move(name), std::move(detail), {path, rangeFor(path, span)}});
+        cachedDefinitions_.push_back({id, kind, std::move(name), std::move(detail), {path, rangeFor(path, span)}});
     };
 
-    for (const auto& occurrence : result_.symbols) {
+    for (std::size_t occIdx = 0; occIdx < result_.symbols.size(); ++occIdx) {
+        const auto& occurrence = result_.symbols[occIdx];
+        if (!occurrence.sourceName.empty()) {
+            cachedOccByPath_[occurrence.sourceName].push_back(occIdx);
+        }
         if (occurrence.definition) {
             append(occurrence.id, occurrence.kind, occurrence.name, occurrence.detail,
                 occurrence.sourceName, occurrence.span);
@@ -316,11 +681,19 @@ std::vector<DocumentSymbol> LanguageService::allDefinitions() const {
                 function.debugInfo.declaration.span);
         }
     }
-    std::sort(symbols.begin(), symbols.end(), [](const auto& left, const auto& right) {
+    std::sort(cachedDefinitions_.begin(), cachedDefinitions_.end(), [](const auto& left, const auto& right) {
         if (left.location.path != right.location.path) return left.location.path < right.location.path;
         return left.location.range.span.start < right.location.range.span.start;
     });
-    return symbols;
+    for (std::size_t idx = 0; idx < cachedDefinitions_.size(); ++idx) {
+        cachedDefById_[cachedDefinitions_[idx].id] = idx;
+    }
+    hasCachedDefinitions_ = true;
+    return cachedDefinitions_;
+}
+
+std::vector<DocumentSymbol> LanguageService::allDefinitions() const {
+    return allDefinitionsRef();
 }
 
 std::optional<DocumentSymbol> LanguageService::resolve(
@@ -328,7 +701,7 @@ std::optional<DocumentSymbol> LanguageService::resolve(
     text::LinePosition position) const {
     const auto token = tokenAt(path, position);
     if (!token || token->kind != syntax::SyntaxKind::IdentifierToken) return std::nullopt;
-    auto definitions = allDefinitions();
+    const auto& definitions = allDefinitionsRef();
 
     for (const auto& symbol : definitions) {
         if (symbol.location.path == path &&
@@ -340,18 +713,21 @@ std::optional<DocumentSymbol> LanguageService::resolve(
 
     semantic::SymbolId matchedId = 0;
     const semantic::SymbolOccurrence* matchedOcc = nullptr;
-    for (const auto& occ : result_.symbols) {
-        if (occ.id == 0 || occ.sourceName != path) continue;
-        if (occ.span.start == token->span.start &&
-            occ.span.length == token->span.length) {
-            matchedId = occ.id;
-            matchedOcc = &occ;
-            if (occ.definition) break;
+    if (const auto pathOccs = cachedOccByPath_.find(path); pathOccs != cachedOccByPath_.end()) {
+        for (const std::size_t occIdx : pathOccs->second) {
+            const auto& occ = result_.symbols[occIdx];
+            if (occ.id == 0) continue;
+            if (occ.span.start == token->span.start &&
+                occ.span.length == token->span.length) {
+                matchedId = occ.id;
+                matchedOcc = &occ;
+                if (occ.definition) break;
+            }
         }
     }
     if (matchedId != 0) {
-        for (const auto& symbol : definitions) {
-            if (symbol.id == matchedId) return symbol;
+        if (const auto defIt = cachedDefById_.find(matchedId); defIt != cachedDefById_.end()) {
+            return definitions[defIt->second];
         }
         for (const auto& occ : result_.symbols) {
             if (occ.id == matchedId && occ.definition && !occ.sourceName.empty()) {
@@ -768,8 +1144,11 @@ std::vector<CompletionItem> LanguageService::completion(
                         }
                         if (resolvedSegType.empty() && !isCall) {
                             const semantic::SymbolOccurrence* bestLocal = nullptr;
-                            for (const auto& occ : result_.symbols) {
-                                if (occ.definition && occ.sourceName == path &&
+                            (void)allDefinitionsRef();
+                            if (const auto pathOccIt = cachedOccByPath_.find(path); pathOccIt != cachedOccByPath_.end()) {
+                                for (const std::size_t occIdx : pathOccIt->second) {
+                                    const auto& occ = result_.symbols[occIdx];
+                                    if (occ.definition &&
                                     occ.name == seg &&
                                     occ.span.start <= rawCursorOffset &&
                                     (occ.kind == semantic::SymbolKind::Local ||
@@ -778,6 +1157,7 @@ std::vector<CompletionItem> LanguageService::completion(
                                      occ.kind == semantic::SymbolKind::Property)) {
                                     if (!bestLocal || occ.span.start >= bestLocal->span.start) {
                                         bestLocal = &occ;
+                                    }
                                     }
                                 }
                             }
@@ -948,7 +1328,7 @@ std::vector<CompletionItem> LanguageService::completion(
     };
     for (const auto& keyword : keywords) output.push_back({keyword, "keyword", semantic::SymbolKind::Module});
     std::set<std::pair<std::string, std::string>> seen;
-    for (const auto& symbol : allDefinitions()) {
+    for (const auto& symbol : allDefinitionsRef()) {
         if (!symbolVisible(symbol.id)) continue;
         if ((symbol.kind == semantic::SymbolKind::Local ||
              symbol.kind == semantic::SymbolKind::Parameter) &&
@@ -1186,7 +1566,7 @@ std::vector<TextEdit> LanguageService::rename(
 std::vector<DocumentSymbol> LanguageService::documentSymbols(const std::string& path) {
     (void)build();
     std::vector<DocumentSymbol> output;
-    for (const auto& symbol : allDefinitions()) {
+    for (const auto& symbol : allDefinitionsRef()) {
         if (symbol.location.path == path &&
             symbol.kind != semantic::SymbolKind::Local &&
             symbol.kind != semantic::SymbolKind::Parameter) {
@@ -1518,7 +1898,7 @@ std::vector<DocumentSymbol> LanguageService::workspaceSymbols(const std::string&
         if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
     }
     std::vector<DocumentSymbol> output;
-    for (const auto& symbol : allDefinitions()) {
+    for (const auto& symbol : allDefinitionsRef()) {
         if (symbol.kind == semantic::SymbolKind::Local ||
             symbol.kind == semantic::SymbolKind::Parameter) {
             continue;

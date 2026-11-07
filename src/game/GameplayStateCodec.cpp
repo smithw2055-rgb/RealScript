@@ -203,6 +203,11 @@ public:
         std::uint32_t encoded = 0;
         if (!u32(encoded)) return false;
         value = encoded;
+        if (value > end_ - position_) {
+            fail(error_, GameplayStateErrorCode::MalformedInput,
+                std::string{name} + " exceeds remaining payload bytes");
+            return false;
+        }
         if (value > maximum) {
             fail(error_, GameplayStateErrorCode::LimitExceeded,
                 std::string{name} + " exceeds the codec limit");

@@ -439,6 +439,14 @@ public:
         : units_(units), modules_(modules), result_(result) {}
 
     void run() {
+        bool anyGenericSyntax = false;
+        for (const auto& u : units_) {
+            if (u && u->hasGenericSyntax) {
+                anyGenericSyntax = true;
+                break;
+            }
+        }
+        if (!anyGenericSyntax) return;
         collectTemplates();
         std::vector<ParsedUnit*> queue;
         for (auto& unit : units_) queue.push_back(unit.get());
@@ -873,11 +881,11 @@ private:
             nativeGenericSanitize(targetModule) + "/" +
             generatedName + ".rs";
         auto unit = std::make_unique<ParsedUnit>();
-        unit->source = std::make_unique<text::SourceText>(
+        unit->source = std::make_shared<text::SourceText>(
             generated.str(), path);
         diagnostics::DiagnosticBag parseDiagnostics;
         syntax::Parser parser(*unit->source, parseDiagnostics);
-        unit->syntaxTree = std::make_unique<syntax::CompilationUnitSyntax>(
+        unit->syntaxTree = std::make_shared<syntax::CompilationUnitSyntax>(
             parser.parseCompilationUnit());
         unit->moduleName = targetModule;
         unit->sourceFingerprint = stableFingerprint(
@@ -1054,6 +1062,7 @@ private:
         }
         auto method = std::move(parsed.classes.front().methods.front());
         auto* ownerUnit = const_cast<ParsedUnit*>(pending.declaration->unit);
+        detachSyntaxTree(*ownerUnit);
         for (auto& declaration : ownerUnit->syntaxTree->classes) {
             if (declaration.identifierToken.text !=
                 pending.declaration->ownerName) continue;
@@ -1503,7 +1512,20 @@ private:
         }
     }
 
+    static void detachSyntaxTree(ParsedUnit& unit) {
+        if (unit.syntaxTree.use_count() > 1 && unit.source) {
+            diagnostics::DiagnosticBag ignored;
+            syntax::Parser parser(*unit.source, ignored);
+            unit.syntaxTree = std::make_shared<syntax::CompilationUnitSyntax>(
+                parser.parseCompilationUnit());
+        }
+    }
+
     void rewriteUnit(ParsedUnit& unit, std::vector<ParsedUnit*>& queue) {
+        if (!unit.hasGenericSyntax && registry_.functions.empty() && registry_.members.empty()) {
+            return;
+        }
+        detachSyntaxTree(unit);
         const auto& moduleName = unit.moduleName;
         const auto sourceName = unit.source->name();
         for (auto& declaration : unit.syntaxTree->classes) rewriteTypeDeclaration(declaration, moduleName, sourceName, queue);

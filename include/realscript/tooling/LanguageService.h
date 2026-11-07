@@ -2,9 +2,11 @@
 
 #include "realscript/compiler/Compilation.h"
 #include "realscript/debug/DebugInfo.h"
+#include "realscript/syntax/Syntax.h"
 
 #include <cstdint>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -135,7 +137,20 @@ private:
     struct Document {
         std::string content;
         std::int64_t version = 0;
+        debug::SourceFileInfo fileInfo{};
+        mutable std::vector<syntax::SyntaxToken> tokens;
+        mutable bool hasTokens = false;
     };
+
+    static void initDocument(
+        const std::string& path,
+        std::string content,
+        std::int64_t version,
+        Document& doc);
+    [[nodiscard]] const std::vector<syntax::SyntaxToken>& documentTokens(
+        const std::string& path,
+        const Document& doc) const;
+    [[nodiscard]] const std::vector<DocumentSymbol>& allDefinitionsRef() const;
 
     void rebuild();
     [[nodiscard]] const Document* document(const std::string& path) const noexcept;
@@ -154,6 +169,27 @@ private:
     std::unordered_map<std::string, Document> ambientDocuments_;
     compiler::BuildResult result_;
     compiler::BuildSnapshot snapshot_;
+    struct DocHeaderInfo {
+        std::string moduleName;
+        std::set<std::string> imports;
+        bool eligibleForSubgraph = false;
+    };
+    static DocHeaderInfo parseDocHeader(const Document& doc);
+    void recordFullBuildGraph();
+    bool tryIncrementalSubgraphRebuild();
+
+    std::unordered_map<std::string, DocHeaderInfo> docHeaders_;
+    std::unordered_map<std::string, std::set<std::string>> moduleToPaths_;
+    std::unordered_map<std::string, std::set<std::string>> moduleImports_;
+    std::unordered_map<std::string, std::set<std::string>> reverseImports_;
+    std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> moduleSymbolSlices_;
+    std::set<std::string> dirtyPaths_;
+    bool structuralDirty_ = true;
+
+    mutable std::vector<DocumentSymbol> cachedDefinitions_;
+    mutable std::unordered_map<semantic::SymbolId, std::size_t> cachedDefById_;
+    mutable std::unordered_map<std::string, std::vector<std::size_t>> cachedOccByPath_;
+    mutable bool hasCachedDefinitions_ = false;
     bool hasSnapshot_ = false;
     bool dirty_ = true;
 };

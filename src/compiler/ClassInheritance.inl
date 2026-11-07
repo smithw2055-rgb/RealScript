@@ -30,6 +30,7 @@ void resolveClassInheritance(
     std::map<std::string, ModuleWork>& modules,
     BuildResult& result) {
     for (auto& [moduleName, module] : modules) {
+        if (module.frontendCached) continue;
         for (const auto* unit : module.units) {
             for (const auto& declaration : unit->syntaxTree->classes) {
                 auto* type = findOwnClassOrType(
@@ -72,6 +73,7 @@ void resolveClassInheritance(
     std::unordered_map<semantic::SymbolId, int> colors;
     std::function<void(ModuleWork&, semantic::TypeSymbol&)> visit =
         [&](ModuleWork& module, semantic::TypeSymbol& type) {
+            if (module.frontendCached) return;
             if (type.kind != semantic::TypeKind::Class ||
                 type.interfaceType) return;
             if (colors[type.id] == 2) return;
@@ -106,6 +108,7 @@ void resolveClassInheritance(
         };
     for (auto& [moduleName, module] : modules) {
         (void)moduleName;
+        if (module.frontendCached) continue;
         for (auto& type : module.types) visit(module, type);
     }
 }
@@ -116,6 +119,7 @@ void applyInheritedFieldLayouts(
     std::unordered_map<semantic::SymbolId, int> complete;
     std::function<void(ModuleWork&, semantic::TypeSymbol&)> apply =
         [&](ModuleWork& module, semantic::TypeSymbol& type) {
+            if (module.frontendCached) return;
             if (type.kind != semantic::TypeKind::Class ||
                 type.interfaceType || complete[type.id] == 2) return;
             if (complete[type.id] == 1) return;
@@ -162,10 +166,12 @@ void applyInheritedFieldLayouts(
         };
     for (auto& [moduleName, module] : modules) {
         (void)moduleName;
+        if (module.frontendCached) continue;
         for (auto& type : module.types) apply(module, type);
     }
     for (auto& [moduleName, module] : modules) {
         (void)moduleName;
+        if (module.frontendCached) continue;
         refreshVisibleTypes(modules, module);
     }
 }

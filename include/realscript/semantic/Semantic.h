@@ -18,7 +18,7 @@ namespace realscript::semantic {
 
 using SymbolId = std::uint64_t;
 
-enum class PrimitiveType {
+enum class PrimitiveType : std::uint8_t {
     Error,
     Void,
     Bool,
@@ -42,13 +42,13 @@ enum class PrimitiveType {
     Null,
 };
 
-enum class TypeKind {
+enum class TypeKind : std::uint8_t {
     Class,
     Struct,
     Enum,
 };
 
-enum class Accessibility {
+enum class Accessibility : std::uint8_t {
     Public,
     Internal,
     Protected,

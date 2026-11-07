@@ -3,6 +3,7 @@
 #include "realscript/runtime/Runtime.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <unordered_map>
@@ -12,11 +13,14 @@ namespace realscript::runtime::detail {
 
 inline constexpr std::size_t InvalidBlockIndex =
     std::numeric_limits<std::size_t>::max();
+inline constexpr std::uint16_t InvalidCompactReg = 0xffffu;
 
 struct ExecutionEdge {
     std::size_t target = InvalidBlockIndex;
-    const std::vector<bytecode::Register>* sources = nullptr;
+    bytecode::BlockId targetBlockId = 0;
+    const bytecode::SmallRegisterVector* sources = nullptr;
     const std::vector<bytecode::BlockParameter>* destinations = nullptr;
+    bool hasArguments = false;
 };
 
 struct ExecutionFunction;
@@ -28,6 +32,7 @@ enum class QuickOpcode : std::uint8_t {
     LoadLocal,
     StoreLocal,
     CallDirect,
+    CallPolled,
     AddInt,
     SubtractInt,
     MultiplyInt,
@@ -37,6 +42,11 @@ enum class QuickOpcode : std::uint8_t {
     LessOrEqualInt,
     GreaterInt,
     GreaterOrEqualInt,
+    EqualInt,
+    NotEqualInt,
+    CheckNotNullFast,
+    LoadElementIntFast,
+    StoreElementIntFast,
 };
 
 enum class SuperOpcode : std::uint8_t {
@@ -46,15 +56,35 @@ enum class SuperOpcode : std::uint8_t {
     BinaryLocalIntLocal,
     BinaryLocalIntConstantStoreLocal,
     BinaryLocalIntLocalStoreLocal,
+    BinaryLocalIntReg,
+    BinaryLocalIntRegStoreLocal,
+    BinaryLocalIntRegChainStoreLocal,
 };
 
-struct ExecutionInstruction {
+struct alignas(8) ExecutionInstruction {
     const bytecode::Instruction* bytecode = nullptr;
-    QuickOpcode opcode = QuickOpcode::Generic;
-    SuperOpcode superOpcode = SuperOpcode::None;
-    std::uint8_t span = 1;
     const ProgramImage::FunctionLocation* directTarget = nullptr;
     const ExecutionFunction* directExecution = nullptr;
+    std::int64_t integerImmediate = 0;
+    DeterminismOperationId operationId = 0;
+    const char* opcodeName = nullptr;
+
+    QuickOpcode opcode = QuickOpcode::Generic;
+    SuperOpcode superOpcode = SuperOpcode::None;
+    QuickOpcode binaryOpcode1 = QuickOpcode::Generic;
+    QuickOpcode binaryOpcode2 = QuickOpcode::Generic;
+    std::uint8_t span = 1;
+    bool checkedArithmetic1 = true;
+    bool checkedArithmetic2 = true;
+
+    std::uint16_t result = InvalidCompactReg;
+    std::uint16_t op0 = InvalidCompactReg;
+    std::uint16_t op1 = InvalidCompactReg;
+    std::uint16_t op2 = InvalidCompactReg;
+    std::uint16_t auxReg1 = InvalidCompactReg;
+    std::uint16_t auxReg2 = InvalidCompactReg;
+    std::uint16_t superResult = InvalidCompactReg;
+    std::uint16_t storeSlot = InvalidCompactReg;
 };
 
 struct ExecutionBlock {
@@ -62,12 +92,19 @@ struct ExecutionBlock {
     std::vector<ExecutionInstruction> instructions;
     ExecutionEdge branch;
     ExecutionEdge falseBranch;
+    bytecode::TerminatorKind terminatorKind = bytecode::TerminatorKind::None;
+    DeterminismOperationId terminatorOpId = 0;
+    const char* terminatorOpName = nullptr;
+    bytecode::Register terminatorReg = bytecode::InvalidRegister;
+    bool conditionPrevalidatedBool = false;
+    bool returnPrevalidatedScalar = false;
 };
 
 struct ExecutionFunction {
     const bytecode::Function* bytecode = nullptr;
     std::size_t entry = InvalidBlockIndex;
     std::size_t edgeScratchCount = 0;
+    bool hasDebugSequencePoints = false;
     std::vector<ExecutionBlock> blocks;
     std::unordered_map<bytecode::BlockId, std::size_t> blockIndices;
 };

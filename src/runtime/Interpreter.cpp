@@ -38,7 +38,7 @@ DeterminismOperationId instructionOperationId(
     return ids[static_cast<std::size_t>(opcode)];
 }
 
-DeterminismOperationId terminatorOperationId(
+[[maybe_unused]] DeterminismOperationId terminatorOperationId(
     bytecode::TerminatorKind terminator) noexcept {
     constexpr auto Count =
         static_cast<std::size_t>(bytecode::TerminatorKind::Throw) + 1U;
@@ -105,7 +105,8 @@ struct ValueWindow {
 struct ArgumentSource {
     const std::vector<Value>* values = nullptr;
     std::size_t offset = 0;
-    const std::vector<bytecode::Register>* indices = nullptr;
+    std::array<bytecode::Register, 2> inlineRegs{0, 0};
+    const bytecode::Register* indices = nullptr;
     std::size_t count = 0;
 
     ArgumentSource() = default;
@@ -113,18 +114,41 @@ struct ArgumentSource {
         : values(&contiguous), count(contiguous.size()) {}
     ArgumentSource(
         const ValueWindow& registers,
-        const std::vector<bytecode::Register>& operands)
+        const bytecode::SmallRegisterVector& operands) noexcept
         : values(registers.values),
           offset(registers.offset),
-          indices(&operands),
+          indices(operands.data()),
           count(operands.size()) {}
+    ArgumentSource(
+        const ValueWindow& registers,
+        bytecode::Register reg0) noexcept
+        : values(registers.values),
+          offset(registers.offset),
+          inlineRegs{reg0, 0},
+          indices(inlineRegs.data()),
+          count(1) {}
+    ArgumentSource(
+        const ValueWindow& registers,
+        bytecode::Register reg0,
+        bytecode::Register reg1) noexcept
+        : values(registers.values),
+          offset(registers.offset),
+          inlineRegs{reg0, reg1},
+          indices(inlineRegs.data()),
+          count(2) {}
+    ArgumentSource(
+        const ValueWindow& registers) noexcept
+        : values(registers.values),
+          offset(registers.offset),
+          indices(nullptr),
+          count(0) {}
 
     [[nodiscard]] std::size_t size() const noexcept { return count; }
     [[nodiscard]] bool empty() const noexcept { return count == 0; }
-    [[nodiscard]] const Value& operator[](std::size_t index) const {
-        return (*values)[offset + (indices ? (*indices)[index] : index)];
+    [[nodiscard]] const Value& operator[](std::size_t index) const noexcept {
+        return (*values)[offset + (indices ? indices[index] : index)];
     }
-    [[nodiscard]] const Value& front() const { return (*this)[0]; }
+    [[nodiscard]] const Value& front() const noexcept { return (*this)[0]; }
 };
 
 class ArenaFrameScope {
@@ -365,12 +389,11 @@ semantic::SymbolId exactTypeId(
 bool runtimeAssignable(
     const State& state,
     semantic::SymbolId actual,
-    semantic::SymbolId expected) {
+    semantic::SymbolId expected) noexcept {
     if (actual == expected) return true;
     if (!state.program) return false;
-    std::unordered_set<semantic::SymbolId> visited;
     auto current = actual;
-    while (current != 0 && visited.insert(current).second) {
+    for (std::size_t depth = 0; current != 0 && depth < 256; ++depth) {
         const auto* found = state.program->resolveType(current);
         if (!found) return false;
         for (const auto& implementation :
@@ -386,11 +409,10 @@ bool runtimeAssignable(
 const semantic::InterfaceDispatchMap* runtimeInterfaceMap(
     const State& state,
     semantic::SymbolId actual,
-    semantic::SymbolId interfaceTypeId) {
+    semantic::SymbolId interfaceTypeId) noexcept {
     if (!state.program) return nullptr;
-    std::unordered_set<semantic::SymbolId> visited;
     auto current = actual;
-    while (current != 0 && visited.insert(current).second) {
+    for (std::size_t depth = 0; current != 0 && depth < 256; ++depth) {
         const auto* found = state.program->resolveType(current);
         if (!found) return nullptr;
         for (const auto& implementation :
@@ -896,9 +918,9 @@ bool executeCall(
             arguments.count);
     } else {
         bool contiguous = true;
-        const auto firstIndex = (*arguments.indices)[0];
+        const auto firstIndex = arguments.indices[0];
         for (std::size_t index = 1; index < arguments.count; ++index) {
-            if ((*arguments.indices)[index] != firstIndex + index) {
+            if (arguments.indices[index] != firstIndex + index) {
                 contiguous = false;
                 break;
             }
@@ -1092,25 +1114,25 @@ bool buildDelegateList(
 bool evaluateQuickInt(
     State& state,
     detail::QuickOpcode opcode,
-    const bytecode::Instruction& instruction,
+    bool checkedArithmetic,
     std::int64_t left,
     std::int64_t right,
     Value& output) {
     switch (opcode) {
     case detail::QuickOpcode::AddInt:
-        if (!instruction.checkedArithmetic) {
+        if (!checkedArithmetic) {
             output = wrapInt32(left + right);
             return true;
         }
         return checkedIntResult(state, left + right, output);
     case detail::QuickOpcode::SubtractInt:
-        if (!instruction.checkedArithmetic) {
+        if (!checkedArithmetic) {
             output = wrapInt32(left - right);
             return true;
         }
         return checkedIntResult(state, left - right, output);
     case detail::QuickOpcode::MultiplyInt:
-        if (!instruction.checkedArithmetic) {
+        if (!checkedArithmetic) {
             output = wrapInt32(left * right);
             return true;
         }
@@ -1145,6 +1167,12 @@ bool evaluateQuickInt(
     case detail::QuickOpcode::GreaterOrEqualInt:
         output = left >= right;
         return true;
+    case detail::QuickOpcode::EqualInt:
+        output = left == right;
+        return true;
+    case detail::QuickOpcode::NotEqualInt:
+        output = left != right;
+        return true;
     default:
         return fail(state, ErrorCode::InvalidProgram,
             "invalid quickened bytecode opcode");
@@ -1153,112 +1181,291 @@ bool evaluateQuickInt(
 
 bool executeQuickInstruction(
     State& state,
+    const bytecode::Module& module,
     const detail::ExecutionInstruction& decoded,
     const ValueWindow& arguments,
     ValueWindow locals,
     ValueWindow registers) {
-    const auto& instruction = *decoded.bytecode;
     if (!consume(
             state,
-            instructionOperationId(instruction.opcode),
-            bytecode::opcodeName(instruction.opcode))) {
+            decoded.operationId,
+            decoded.opcodeName ? std::string_view(decoded.opcodeName) : std::string_view{})) {
         return false;
     }
-    const auto storeResult = [&](Value value) {
-        registers[instruction.result] = std::move(value);
-        return true;
-    };
     switch (decoded.opcode) {
     case detail::QuickOpcode::LoadParameter:
-        return storeResult(arguments[instruction.index]);
-    case detail::QuickOpcode::ConstantInt:
-        return storeResult(instruction.integerImmediate);
-    case detail::QuickOpcode::LoadLocal:
-        return storeResult(locals[instruction.index]);
-    case detail::QuickOpcode::StoreLocal:
-        locals[instruction.index] = registers[instruction.operands[0]];
+        registers[decoded.result] = arguments[decoded.auxReg1];
         return true;
+    case detail::QuickOpcode::ConstantInt:
+        registers[decoded.result] = decoded.integerImmediate;
+        return true;
+    case detail::QuickOpcode::LoadLocal:
+        registers[decoded.result] = locals[decoded.auxReg1];
+        return true;
+    case detail::QuickOpcode::StoreLocal:
+        locals[decoded.auxReg1] = registers[decoded.op0];
+        return true;
+    case detail::QuickOpcode::CheckNotNullFast: {
+        const auto& val = registers[decoded.op0];
+        if (const auto* ref = std::get_if<ObjectRef>(&val)) {
+            if (state.heap && state.heap->isAlive(*ref)) {
+                registers[decoded.result] = val;
+                return true;
+            }
+        }
+        if (std::holds_alternative<NullObject>(val)) {
+            return fail(state, ErrorCode::NullReference,
+                "field access attempted to dereference null");
+        }
+        return fail(state, ErrorCode::InvalidObjectReference,
+            "field access contains an invalid managed object reference");
+    }
+    case detail::QuickOpcode::LoadElementIntFast: {
+        const auto& arrVal = registers[decoded.op0];
+        const auto& idxVal = registers[decoded.op1];
+        if (const auto* ref = std::get_if<ObjectRef>(&arrVal)) {
+            const auto idx = std::get<std::int64_t>(idxVal);
+            if (idx >= 0 && state.heap) {
+                if (const auto* elem = state.heap->arrayGetFast(
+                        *ref, static_cast<std::size_t>(idx))) {
+                    registers[decoded.result] = *elem;
+                    return true;
+                }
+            }
+            if (!state.heap || !state.heap->arrayLength(*ref)) {
+                return fail(state, ErrorCode::InvalidObjectReference,
+                    "array element load references an invalid managed array");
+            }
+            return fail(state, ErrorCode::IndexOutOfRange,
+                "array element index is out of range");
+        }
+        if (std::holds_alternative<NullArray>(arrVal)) {
+            return fail(state, ErrorCode::NullReference,
+                "array element load attempted to dereference null");
+        }
+        return fail(state, ErrorCode::InvalidObjectReference,
+            "array element load contains an invalid managed object reference");
+    }
+    case detail::QuickOpcode::StoreElementIntFast: {
+        const auto& arrVal = registers[decoded.op0];
+        const auto& idxVal = registers[decoded.op1];
+        const auto& storeVal = registers[decoded.op2];
+        if (const auto* ref = std::get_if<ObjectRef>(&arrVal)) {
+            const auto idx = std::get<std::int64_t>(idxVal);
+            if (idx >= 0 && state.heap &&
+                state.heap->arraySetPrevalidated(
+                    *ref, static_cast<std::size_t>(idx), storeVal, false)) {
+                return true;
+            }
+            if (!state.heap || !state.heap->arrayLength(*ref)) {
+                return fail(state, ErrorCode::InvalidObjectReference,
+                    "array element store references an invalid managed array");
+            }
+            return fail(state, ErrorCode::IndexOutOfRange,
+                "array element index is out of range");
+        }
+        if (std::holds_alternative<NullArray>(arrVal)) {
+            return fail(state, ErrorCode::NullReference,
+                "array element store attempted to dereference null");
+        }
+        return fail(state, ErrorCode::InvalidObjectReference,
+            "array element store contains an invalid managed object reference");
+    }
     case detail::QuickOpcode::CallDirect: {
         if (!decoded.directTarget || !decoded.directExecution) {
             return fail(state, ErrorCode::InvalidProgram,
                 "direct call execution cache is missing");
         }
         Value callResult;
-        if (!executeFunction(
-                state,
-                *decoded.directTarget,
-                ArgumentSource(registers, instruction.operands),
-                callResult,
-                decoded.directExecution,
-                true)) {
+        const bool ok = (decoded.op0 == detail::InvalidCompactReg)
+            ? executeFunction(
+                state, *decoded.directTarget, ArgumentSource(registers),
+                callResult, decoded.directExecution, true)
+            : (decoded.op1 == detail::InvalidCompactReg)
+                ? executeFunction(
+                    state, *decoded.directTarget,
+                    ArgumentSource(registers, static_cast<bytecode::Register>(decoded.op0)),
+                    callResult, decoded.directExecution, true)
+                : (decoded.op2 == detail::InvalidCompactReg)
+                    ? executeFunction(
+                        state, *decoded.directTarget,
+                        ArgumentSource(
+                            registers,
+                            static_cast<bytecode::Register>(decoded.op0),
+                            static_cast<bytecode::Register>(decoded.op1)),
+                        callResult, decoded.directExecution, true)
+                    : executeFunction(
+                        state, *decoded.directTarget,
+                        ArgumentSource(registers, decoded.bytecode->operands),
+                        callResult, decoded.directExecution, true);
+        if (!ok) {
             return false;
         }
-        if (instruction.result == bytecode::InvalidRegister) return true;
-        return storeResult(std::move(callResult));
+        if (decoded.result == detail::InvalidCompactReg) return true;
+        registers[decoded.result] = std::move(callResult);
+        return true;
+    }
+    case detail::QuickOpcode::CallPolled: {
+        const auto& instruction = *decoded.bytecode;
+        const auto* receiver = std::get_if<ObjectRef>(&registers[decoded.op0]);
+        if (receiver) {
+            const auto callSite = reinterpret_cast<std::uintptr_t>(&instruction);
+            const auto idx = static_cast<std::size_t>(
+                (callSite >> 4U) & (state.inlineCallCache.size() - 1U));
+            const auto& cached = state.inlineCallCache[idx];
+            if (cached.callSite == &instruction &&
+                cached.receiver == *receiver &&
+                cached.target && cached.execution) {
+                Value callResult;
+                if (!executeFunction(
+                        state,
+                        *cached.target,
+                        (decoded.op1 == detail::InvalidCompactReg
+                            ? ArgumentSource(registers, static_cast<bytecode::Register>(decoded.op0))
+                            : ArgumentSource(registers, instruction.operands)),
+                        callResult,
+                        cached.execution,
+                        true)) {
+                    return false;
+                }
+                if (decoded.result == detail::InvalidCompactReg) return true;
+                registers[decoded.result] = std::move(callResult);
+                return true;
+            }
+        }
+        Value callResult;
+        if (!executeCall(state, module, instruction, registers, callResult)) {
+            return false;
+        }
+        if (decoded.result == detail::InvalidCompactReg) return true;
+        registers[decoded.result] = std::move(callResult);
+        return true;
     }
     default:
         break;
     }
 
-    const auto left =
-        std::get<std::int64_t>(registers[instruction.operands[0]]);
-    const auto right =
-        std::get<std::int64_t>(registers[instruction.operands[1]]);
+    const auto* leftPtr = std::get_if<std::int64_t>(&registers[decoded.op0]);
+    const auto* rightPtr = std::get_if<std::int64_t>(&registers[decoded.op1]);
+    if (!leftPtr || !rightPtr) {
+        return fail(state, ErrorCode::TypeMismatch, "expected int operand in quick instruction");
+    }
     Value output;
-    return evaluateQuickInt(
-        state, decoded.opcode, instruction, left, right, output) &&
-        storeResult(std::move(output));
+    if (!evaluateQuickInt(
+            state, decoded.opcode, decoded.checkedArithmetic1, *leftPtr, *rightPtr, output)) {
+        return false;
+    }
+    registers[decoded.result] = std::move(output);
+    return true;
 }
 
 bool executeSuperInstruction(
     State& state,
-    const std::vector<detail::ExecutionInstruction>& instructions,
-    std::size_t instructionIndex,
+    const detail::ExecutionInstruction& first,
     const ValueWindow& arguments,
     ValueWindow locals,
     ValueWindow registers) {
-    const auto& first = instructions[instructionIndex];
-    const auto& firstInstruction = *first.bytecode;
-    if (first.superOpcode == detail::SuperOpcode::LoadParameterStoreLocal) {
-        ++state.executed;
-        registers[firstInstruction.result] =
-            arguments[firstInstruction.index];
-        const auto& store = *instructions[instructionIndex + 1].bytecode;
-        ++state.executed;
-        locals[store.index] = registers[store.operands[0]];
+    switch (first.superOpcode) {
+    case detail::SuperOpcode::LoadParameterStoreLocal: {
+        state.executed += 2;
+        const auto& val = arguments[first.auxReg1];
+        registers[first.result] = val;
+        locals[first.storeSlot] = val;
         return true;
     }
-
-    const auto& second = instructions[instructionIndex + 1];
-    const auto& secondInstruction = *second.bytecode;
-    const auto& binary = instructions[instructionIndex + 2];
-    const auto& binaryInstruction = *binary.bytecode;
-    ++state.executed;
-    registers[firstInstruction.result] = locals[firstInstruction.index];
-    ++state.executed;
-    if (second.opcode == detail::QuickOpcode::ConstantInt) {
-        registers[secondInstruction.result] = secondInstruction.integerImmediate;
-    } else {
-        registers[secondInstruction.result] = locals[secondInstruction.index];
+    case detail::SuperOpcode::BinaryLocalIntConstant:
+    case detail::SuperOpcode::BinaryLocalIntLocal:
+    case detail::SuperOpcode::BinaryLocalIntConstantStoreLocal:
+    case detail::SuperOpcode::BinaryLocalIntLocalStoreLocal: {
+        const auto& leftVal = locals[first.auxReg1];
+        registers[first.result] = leftVal;
+        const auto* leftPtr = std::get_if<std::int64_t>(&leftVal);
+        if (!leftPtr) return fail(state, ErrorCode::TypeMismatch, "expected int local");
+        const auto left = *leftPtr;
+        std::int64_t right = 0;
+        if (first.superOpcode == detail::SuperOpcode::BinaryLocalIntConstant ||
+            first.superOpcode == detail::SuperOpcode::BinaryLocalIntConstantStoreLocal) {
+            right = first.integerImmediate;
+            registers[first.auxReg2] = right;
+        } else {
+            const auto& rightVal = locals[first.op1];
+            registers[first.auxReg2] = rightVal;
+            const auto* rightPtr = std::get_if<std::int64_t>(&rightVal);
+            if (!rightPtr) return fail(state, ErrorCode::TypeMismatch, "expected int local");
+            right = *rightPtr;
+        }
+        state.executed += 3;
+        Value output;
+        if (!evaluateQuickInt(
+                state, first.binaryOpcode1, first.checkedArithmetic1,
+                left, right, output)) {
+            return false;
+        }
+        registers[first.superResult] = output;
+        if (first.span == 4) {
+            ++state.executed;
+            locals[first.storeSlot] = std::move(output);
+        }
+        return true;
     }
-
-    const auto left =
-        std::get<std::int64_t>(registers[binaryInstruction.operands[0]]);
-    const auto right =
-        std::get<std::int64_t>(registers[binaryInstruction.operands[1]]);
-    Value output;
-    ++state.executed;
-    if (!evaluateQuickInt(
-            state, binary.opcode, binaryInstruction, left, right, output)) {
+    case detail::SuperOpcode::BinaryLocalIntReg:
+    case detail::SuperOpcode::BinaryLocalIntRegStoreLocal: {
+        const auto& leftVal = locals[first.auxReg1];
+        registers[first.result] = leftVal;
+        const auto* leftPtr = std::get_if<std::int64_t>(&leftVal);
+        const auto* rightPtr = std::get_if<std::int64_t>(&registers[first.op1]);
+        if (!leftPtr || !rightPtr) return fail(state, ErrorCode::TypeMismatch, "expected int operand");
+        const auto left = *leftPtr;
+        const auto right = *rightPtr;
+        state.executed += 2;
+        Value output;
+        if (!evaluateQuickInt(
+                state, first.binaryOpcode1, first.checkedArithmetic1,
+                left, right, output)) {
+            return false;
+        }
+        registers[first.superResult] = output;
+        if (first.span == 3) {
+            ++state.executed;
+            locals[first.storeSlot] = std::move(output);
+        }
+        return true;
+    }
+    case detail::SuperOpcode::BinaryLocalIntRegChainStoreLocal: {
+        const auto& leftVal = locals[first.auxReg1];
+        registers[first.result] = leftVal;
+        const auto* leftPtr = std::get_if<std::int64_t>(&leftVal);
+        const auto* right1Ptr = std::get_if<std::int64_t>(&registers[first.op1]);
+        if (!leftPtr || !right1Ptr) return fail(state, ErrorCode::TypeMismatch, "expected int operand");
+        const auto left = *leftPtr;
+        const auto right1 = *right1Ptr;
+        state.executed += 2;
+        Value midOutput;
+        if (!evaluateQuickInt(
+                state, first.binaryOpcode1, first.checkedArithmetic1,
+                left, right1, midOutput)) {
+            return false;
+        }
+        registers[first.auxReg2] = midOutput;
+        const auto midInt = std::get<std::int64_t>(midOutput);
+        const auto* right2Ptr = std::get_if<std::int64_t>(&registers[first.op2]);
+        if (!right2Ptr) return fail(state, ErrorCode::TypeMismatch, "expected int operand");
+        const auto right2 = *right2Ptr;
+        ++state.executed;
+        Value finalOutput;
+        if (!evaluateQuickInt(
+                state, first.binaryOpcode2, first.checkedArithmetic2,
+                midInt, right2, finalOutput)) {
+            return false;
+        }
+        registers[first.superResult] = finalOutput;
+        ++state.executed;
+        locals[first.storeSlot] = std::move(finalOutput);
+        return true;
+    }
+    default:
         return false;
     }
-    registers[binaryInstruction.result] = std::move(output);
-    if (first.span == 4) {
-        const auto& store = *instructions[instructionIndex + 3].bytecode;
-        ++state.executed;
-        locals[store.index] = registers[store.operands[0]];
-    }
-    return true;
 }
 
 bool executeInstruction(
@@ -2449,14 +2656,16 @@ bool executeFunction(
         &state.values, registerOffset, function.registerTypes.size()};
     ValueWindow edgeScratch{
         &state.values, scratchOffset, execution->edgeScratchCount};
-    DebugFrameScope debugFrame(state, debug::DebugFrameView{
-        location.module,
-        &function,
-        nullptr,
-        argumentWindow.debugView(),
-        locals.debugView(),
-        registers.debugView(),
-    });
+    DebugFrameScope debugFrame(state, state.debugger
+        ? debug::DebugFrameView{
+            location.module,
+            &function,
+            nullptr,
+            argumentWindow.debugView(),
+            locals.debugView(),
+            registers.debugView(),
+        }
+        : debug::DebugFrameView{});
     const detail::ExecutionBlock* block = &execution->blocks[execution->entry];
 
     const auto routePendingException = [&](bytecode::BlockId protectedBlock) {
@@ -2494,8 +2703,8 @@ bool executeFunction(
              instructionIndex < block->instructions.size();
              ++instructionIndex) {
             const auto& decodedInstruction = block->instructions[instructionIndex];
-            const auto& instruction = *decodedInstruction.bytecode;
-            if (!debugSequencePoint(
+            if (state.debugger && execution->hasDebugSequencePoints &&
+                !debugSequencePoint(
                     state, *location.module, function, bytecodeBlock.id,
                     static_cast<std::uint32_t>(instructionIndex), false)) {
                 state.stack.pop_back();
@@ -2512,16 +2721,16 @@ bool executeFunction(
             if (canExecuteSuperInstruction) {
                 executionSpan = decodedInstruction.span;
                 executed = executeSuperInstruction(
-                    state, block->instructions, instructionIndex,
+                    state, decodedInstruction,
                     argumentWindow, locals, registers);
             } else if (decodedInstruction.opcode ==
                     detail::QuickOpcode::Generic) {
                 executed = executeInstruction(
-                    state, *location.module, function, instruction,
+                    state, *location.module, function, *decodedInstruction.bytecode,
                     argumentWindow, locals, registers);
             } else {
                 executed = executeQuickInstruction(
-                    state, decodedInstruction,
+                    state, *location.module, decodedInstruction,
                     argumentWindow, locals, registers);
             }
             if (!executed) {
@@ -2538,15 +2747,43 @@ bool executeFunction(
             instructionIndex += executionSpan - 1;
         }
         if (exceptionTransferred) continue;
-        if (!debugSequencePoint(
+        if ((state.debugger && !debugSequencePoint(
                 state, *location.module, function, bytecodeBlock.id,
-                static_cast<std::uint32_t>(bytecodeBlock.instructions.size()), true) ||
+                static_cast<std::uint32_t>(bytecodeBlock.instructions.size()), true)) ||
             !consume(
                 state,
-                terminatorOperationId(bytecodeBlock.terminator.kind),
-                bytecode::terminatorName(bytecodeBlock.terminator.kind))) {
+                block->terminatorOpId,
+                block->terminatorOpName ? std::string_view(block->terminatorOpName) : std::string_view{})) {
             state.stack.pop_back();
             return false;
+        }
+        if (state.fastAccounting) {
+            if (block->terminatorKind == bytecode::TerminatorKind::Branch &&
+                block->conditionPrevalidatedBool) {
+                const auto cond = std::get<bool>(registers[block->terminatorReg]);
+                const detail::ExecutionEdge* fastEdge = cond ? &block->branch : &block->falseBranch;
+                if (!fastEdge->hasArguments && fastEdge->target != detail::InvalidBlockIndex) {
+                    ++state.statistics.branchesTaken;
+                    block = &execution->blocks[fastEdge->target];
+                    continue;
+                }
+            } else if (block->terminatorKind == bytecode::TerminatorKind::Jump) {
+                const detail::ExecutionEdge* fastEdge = &block->branch;
+                if (!fastEdge->hasArguments && fastEdge->target != detail::InvalidBlockIndex) {
+                    ++state.statistics.branchesTaken;
+                    block = &execution->blocks[fastEdge->target];
+                    continue;
+                }
+            } else if (block->terminatorKind == bytecode::TerminatorKind::ReturnValue &&
+                       block->returnPrevalidatedScalar) {
+                result = registers[block->terminatorReg];
+                state.stack.pop_back();
+                return true;
+            } else if (block->terminatorKind == bytecode::TerminatorKind::ReturnVoid) {
+                result = std::monostate{};
+                state.stack.pop_back();
+                return true;
+            }
         }
         const auto& terminator = bytecodeBlock.terminator;
         if (terminator.kind == bytecode::TerminatorKind::Throw) {
