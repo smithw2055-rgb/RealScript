@@ -166,16 +166,22 @@ ExecutionContext::ExecutionContext(
     const ProgramDescriptor& program,
     std::shared_ptr<runtime::ManagedHeap> heap,
     std::shared_ptr<const runtime::BindingRegistry> bindings,
-    runtime::ExecutionOptions options)
+    runtime::ExecutionOptions options,
+    const std::unordered_map<semantic::SymbolId, const TypeDescriptor*>* prebuiltTypes,
+    const std::unordered_map<semantic::SymbolId, const FunctionDescriptor*>* prebuiltFunctions)
     : program_(&program),
       heap_(heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>()),
       bindings_(std::move(bindings)),
       options_([&]() {
           if (options.enforceCapabilities) {
               options.determinism.enforceCapabilities = true;
-              options.determinism.grantedCapabilities.insert(
-                  options.grantedCapabilities.begin(),
-                  options.grantedCapabilities.end());
+              if (options.determinism.grantedCapabilities.empty()) {
+                  options.determinism.grantedCapabilities = options.grantedCapabilities;
+              } else {
+                  options.determinism.grantedCapabilities.insert(
+                      options.grantedCapabilities.begin(),
+                      options.grantedCapabilities.end());
+              }
           }
           return std::move(options);
       }()),
@@ -192,14 +198,26 @@ ExecutionContext::ExecutionContext(
     fastAccounting_ = !determinismEventsEnabled_ &&
         options_.profile == nullptr && !diagnosticEventsEnabled_ &&
         options_.limits.gcWorkBudget == 0;
-    for (std::uint32_t index = 0; index < program.typeCount; ++index) {
-        const auto& type = program.types[index];
-        types_.emplace(type.id, &type);
+    if (prebuiltTypes) {
+        typesPtr_ = prebuiltTypes;
+    } else {
+        ownedTypes_.reserve(program.typeCount);
+        for (std::uint32_t index = 0; index < program.typeCount; ++index) {
+            const auto& type = program.types[index];
+            ownedTypes_.emplace(type.id, &type);
+        }
+        typesPtr_ = &ownedTypes_;
     }
     stack_.reserve(64);
-    for (std::uint32_t index = 0; index < program.functionCount; ++index) {
-        const auto& function = program.functions[index];
-        functions_.emplace(function.symbolId, &function);
+    if (prebuiltFunctions) {
+        functionsPtr_ = prebuiltFunctions;
+    } else {
+        ownedFunctions_.reserve(program.functionCount);
+        for (std::uint32_t index = 0; index < program.functionCount; ++index) {
+            const auto& function = program.functions[index];
+            ownedFunctions_.emplace(function.symbolId, &function);
+        }
+        functionsPtr_ = &ownedFunctions_;
     }
 }
 
@@ -214,8 +232,9 @@ std::vector<std::string> ExecutionContext::materializeStackTrace() const {
 
 const TypeDescriptor* ExecutionContext::findType(
     semantic::SymbolId typeId) const {
-    const auto found = types_.find(typeId);
-    return found == types_.end() ? nullptr : found->second;
+    if (!typesPtr_) return nullptr;
+    const auto found = typesPtr_->find(typeId);
+    return found == typesPtr_->end() ? nullptr : found->second;
 }
 
 bool ExecutionContext::isAssignable(
@@ -243,8 +262,9 @@ bool ExecutionContext::isAssignable(
 
 const FunctionDescriptor* ExecutionContext::findFunction(
     semantic::SymbolId symbolId) const {
-    const auto found = functions_.find(symbolId);
-    return found == functions_.end() ? nullptr : found->second;
+    if (!functionsPtr_) return nullptr;
+    const auto found = functionsPtr_->find(symbolId);
+    return found == functionsPtr_->end() ? nullptr : found->second;
 }
 
 void ExecutionContext::emitTrace(
@@ -2293,6 +2313,7 @@ Program::Program(const ProgramDescriptor& descriptor)
 
     for (std::uint32_t index = 0; index < descriptor.typeCount; ++index) {
         const auto& type = descriptor.types[index];
+        types_.emplace(type.id, &type);
         for (std::uint32_t fieldIndex = 0;
              fieldIndex < type.fieldCount;
              ++fieldIndex) {
@@ -2331,6 +2352,7 @@ Program::Program(const ProgramDescriptor& descriptor)
         // by the compiler use SymbolId; the name-only embedding convenience API
         // retains the first deterministic descriptor.
         names_.try_emplace(function.name, function.symbolId);
+        functions_.emplace(function.symbolId, &function);
         for (std::uint32_t parameter = 0;
              parameter < function.parameterCount;
              ++parameter) {
@@ -2378,7 +2400,13 @@ runtime::ExecutionResult Program::invoke(
     semantic::SymbolId symbolId,
     const std::vector<runtime::Value>& arguments,
     runtime::ExecutionOptions options) const {
-    ExecutionContext context(*descriptor_, heap_, bindings_, std::move(options));
+    ExecutionContext context(
+        *descriptor_,
+        heap_,
+        bindings_,
+        std::move(options),
+        &types_,
+        &functions_);
     runtime::Value value;
     runtime::ExecutionResult execution;
     execution.succeeded = context.invoke(

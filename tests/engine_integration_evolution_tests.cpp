@@ -3310,8 +3310,8 @@ class QuestActor {
             std::get<std::int64_t>(*runtime.getMember(*actorObj, "stage", err)) == 1,
             "QuestActor should remain at stage 1 before OnBossDefeated signal");
 
-        // Emit signal from unrelated entity 50: sequence waiting on bossEntityId=99 must stay suspended
-        require(scene.emitSignal(50, "OnBossDefeated") > 0, "emitSignal(50) should publish signal");
+        // Emit signal from unrelated entity 50: sequence waiting on bossEntityId=99 must stay suspended (0 listeners woken)
+        require(scene.emitSignal(50, "OnBossDefeated") == 0, "emitSignal(50) should wake 0 listeners");
         (void)driver.advanceTicks(1);
         require(
             std::get<std::int64_t>(*runtime.getMember(*actorObj, "stage", err)) == 1,
@@ -3558,6 +3558,253 @@ class ModRunner {
     }
 }
 
+void testRound3AuditFixesAndGodotUnityParity() {
+    using namespace realscript;
+
+    // 1. Fixed-point 64-bit exact geometry at large world coordinates (>3000 & 100000 units)
+    //    and asymmetric collisionLayer / collisionMask filtering
+    {
+        game::GameApi api;
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"empty.rs", "module Empty; void Main() {}"}});
+        require(compiled.succeeded(), "Empty compile failed");
+        game::ScriptRuntime runtime(compiled.program);
+        game::SceneScriptRuntime scene(runtime);
+
+        // Place entity 1 at (0, 0) and entity 2 at (3000, 0).
+        // Previously, dx=3000 in Q24.8 (raw 768000) overflowed int32_t when squared in Fixed::operator*,
+        // producing a negative wrapped distanceSq and false-positive circle overlaps!
+        scene.setLocalPosition2D(1, game::Vec2::fromInts(0, 0));
+        scene.setLocalPosition2D(2, game::Vec2::fromInts(3000, 0));
+        scene.setLocalPosition2D(3, game::Vec2::fromInts(100000, 0));
+
+        game::SceneCollider2D c1;
+        c1.isCircle = true;
+        c1.radius = game::Fixed::fromInt(10);
+        c1.collisionLayer = 1u << 0;
+        c1.collisionMask = 1u << 1;
+        scene.setEntityCollider2D(1, c1);
+
+        game::SceneCollider2D c2;
+        c2.isCircle = true;
+        c2.radius = game::Fixed::fromInt(10);
+        c2.collisionLayer = 1u << 1;
+        c2.collisionMask = 1u << 0;
+        scene.setEntityCollider2D(2, c2);
+
+        game::SceneCollider2D c3;
+        c3.isCircle = true;
+        c3.radius = game::Fixed::fromInt(10);
+        scene.setEntityCollider2D(3, c3);
+
+        const auto hitsNearOrigin = scene.overlapCircle2D(
+            game::Vec2::fromInts(0, 0), game::Fixed::fromInt(5));
+        require(
+            hitsNearOrigin.size() == 1 && hitsNearOrigin[0] == 1,
+            "overlapCircle2D at origin must NOT false-match entities at x=3000 or x=100000 due to Q24.8 overflow");
+
+        (void)scene.stepPhysics2D();
+        require(
+            scene.activeOverlaps2D().empty(),
+            "stepPhysics2D must NOT report false overlap between circles 3000 units apart");
+
+        // Raycast2D over 3000 units toward entity 2 at (3000, 0) on layer 1
+        const auto farRayHit = scene.raycast2D(
+            game::Vec2::fromInts(0, 0),
+            game::Vec2::fromInts(1, 0),
+            game::Fixed::fromInt(3500),
+            1u << 1);
+        require(
+            farRayHit.has_value() && farRayHit->entity == 2 &&
+                farRayHit->distance == game::Fixed::fromInt(2990),
+            "raycast2D at distance 3000 must hit entity 2 at distance 2990 without Q24.8 overflow");
+
+        // Asymmetric collisionLayer / collisionMask: move entity 2 onto entity 1, verify overlap,
+        // then change entity 2's collisionMask so it no longer masks layer 0.
+        scene.setLocalPosition2D(2, game::Vec2::fromInts(5, 0));
+        (void)scene.stepPhysics2D();
+        require(
+            scene.activeOverlaps2D().count({1, 2}) == 1,
+            "entities 1 and 2 with matching layer/mask should overlap at distance 5");
+
+        c2.collisionMask = 1u << 2; // no longer collides with entity 1 (layer 0)
+        scene.setEntityCollider2D(2, c2);
+        (void)scene.stepPhysics2D();
+        require(
+            scene.activeOverlaps2D().empty(),
+            "asymmetric collisionLayer/collisionMask mismatch must prevent overlap");
+    }
+
+    // 2. Reentrant QueueDestroyEntity in OnCollisionEnter, Entity Naming, Groups, and Scene JSON Snapshot Round-Trip
+    {
+        game::GameApi api;
+        game::GameScriptCompiler bootstrapCompiler(api);
+        auto bootstrap = bootstrapCompiler.compile({{"empty.rs", "module Empty; void Main() {}"}});
+        game::ScriptRuntime runtime(bootstrap.program);
+        game::SceneScriptRuntime scene(runtime);
+        require(
+            game::installSceneComponentBindings(api, scene),
+            "installSceneComponentBindings failed");
+
+        const char* src = R"RS(
+module Evolution.ParityRound3;
+import RealScript.Scene;
+
+class BulletActor {
+    public long hitTarget = 0;
+    public int stayTicks = 0;
+    public int exitTicks = 0;
+    public long spawnedVfx = 0;
+    public int enemyGroupCount = 0;
+    public bool jumpReleasedAfterRestore = false;
+
+    public void OnCollisionEnter(long other) {
+        hitTarget = other;
+        enemyGroupCount = GetGroupCount("Enemies");
+        if (IsInGroup(other, "DestroyOnHit")) {
+            QueueDestroyEntity(other);
+            spawnedVfx = SpawnEntity("HitVfx");
+            AddToGroup(spawnedVfx, "VfxGroup");
+        }
+    }
+
+    public void OnCollisionStay(long other) {
+        stayTicks = stayTicks + 1;
+    }
+
+    public void OnCollisionExit(long other) {
+        exitTicks = exitTicks + 1;
+    }
+
+    public void CheckInputAfterRestore() {
+        if (IsActionJustReleased("Fire")) {
+            jumpReleasedAfterRestore = true;
+        }
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"parity_round3.rs", src}});
+        require(
+            compiled.succeeded(),
+            "ParityRound3 compile failed:\n" + diagnosticsText(compiled.diagnostics));
+        runtime.replaceProgram(compiled.program);
+
+        require(scene.attachComponent(1, "Evolution.ParityRound3::BulletActor"), "attach 1 failed");
+        require(scene.attachComponent(2, "Evolution.ParityRound3::BulletActor"), "attach 2 failed");
+        require(scene.attachComponent(3, "Evolution.ParityRound3::BulletActor"), "attach 3 failed");
+
+        scene.setEntityName(1, "PlayerBullet");
+        scene.setEntityName(2, "FragileCrate");
+        scene.setEntityName(3, "BossArmor");
+        scene.addEntityToGroup(2, "Enemies");
+        scene.addEntityToGroup(2, "DestroyOnHit");
+        scene.addEntityToGroup(3, "Enemies");
+
+        require(scene.findEntityByName("FragileCrate") == 2, "findEntityByName(FragileCrate) should return 2");
+
+        scene.setLocalPosition2D(1, game::Vec2::fromInts(0, 0));
+        scene.setLocalPosition2D(2, game::Vec2::fromInts(0, 0));
+        scene.setLocalPosition2D(3, game::Vec2::fromInts(0, 0));
+
+        game::SceneCollider2D box;
+        box.halfExtents = game::Vec2::fromInts(2, 2);
+        scene.setEntityCollider2D(1, box);
+        scene.setEntityCollider2D(2, box);
+        scene.setEntityCollider2D(3, box);
+
+        // Press "Fire" before snapshot
+        scene.setInputAction("Fire", true);
+        scene.setInputAxis2D("Aim", game::Vec2::fromInts(3, -4));
+
+        // Step physics: entity 1 collides with 2 and 3.
+        // Callback on 1 queues destruction of entity 2 AND spawns "HitVfx" during stepPhysics2D!
+        (void)scene.stepPhysics2D();
+
+        // Entity 2 must be flushed at the end of stepPhysics2D, while entity 1, 3, and spawned HitVfx remain
+        require(!scene.hasComponent(2, "BulletActor"), "entity 2 queued for destroy must be removed after stepPhysics2D");
+        require(scene.findEntityByName("FragileCrate") == 0, "destroyed entity name must be removed");
+        const auto vfxId = scene.findEntityByName("HitVfx");
+        require(vfxId != 0 && scene.isEntityInGroup(vfxId, "VfxGroup"), "spawned HitVfx entity and group must exist");
+
+        // Advance input tick and release "Fire" so previousActions["Fire"]=true, currentActions["Fire"]=false
+        scene.advanceInputTick();
+        scene.setInputAction("Fire", false);
+
+        // Export scene JSON while entity 1 & 3 have an active overlap AND "Fire" was just released
+        runtime::RuntimeError err;
+        const std::string snapshotJson = game::exportSceneJson(scene, err);
+        require(!snapshotJson.empty() && err.code == runtime::ErrorCode::None, "exportSceneJson failed: " + err.message);
+
+        // Mutate scene state, then import snapshot back
+        (void)scene.detach(1);
+        (void)scene.detach(3);
+        scene.restoreInputSnapshot({}, {}, {});
+        scene.restorePhysicsOverlapState({}, {});
+
+        require(game::importSceneJson(scene, snapshotJson, err), "importSceneJson failed: " + err.message);
+        require(scene.findEntityByName("PlayerBullet") == 1, "restored scene must preserve entity name PlayerBullet");
+        require(scene.isEntityInGroup(3, "Enemies"), "restored scene must preserve entity groups");
+        require(scene.getEntityCollider2D(1).has_value(), "restored scene must preserve 2D colliders");
+        require(
+            scene.isInputActionJustReleased("Fire") &&
+                scene.getInputAxis2D("Aim") == game::Vec2::fromInts(3, -4),
+            "restored scene must preserve deterministic input snapshot (JustReleased & 2D axis)");
+
+        // Stepping physics at same positions after restore must fire OnCollisionStay (NOT OnCollisionEnter again!)
+        (void)scene.stepPhysics2D();
+        auto* b1 = scene.getComponent(1, "BulletActor");
+        require(b1 != nullptr, "BulletActor on entity 1 missing after import");
+        require(
+            std::get<std::int64_t>(*runtime.getMember(*b1, "stayTicks", err)) == 1,
+            "restored activeOverlaps2D must trigger OnCollisionStay on next physics step");
+    }
+
+    // 3. Unregistered externalResolver capability hardening
+    {
+        game::GameApi api;
+        // Register signature in semantic symbols via api, then run on bare Interpreter with custom externalResolver
+        require(
+            api.function("Evolution.RawHost", "SecretHook", []() -> int { return 77; }),
+            "bind SecretHook failed");
+        game::GameScriptCompiler compiler(api);
+        const char* rawSrc = R"RS(
+module Evolution.RawCheck;
+import Evolution.RawHost;
+
+int CallSecret() {
+    return SecretHook();
+}
+)RS";
+        auto compiled = compiler.compile({{"raw_check.rs", rawSrc}});
+        require(compiled.succeeded(), "RawCheck compile failed");
+
+        // Execute bytecode on an Interpreter WITHOUT BindingRegistry (only raw externalResolver)
+        runtime::Interpreter interp(compiled.program.program());
+        interp.setExternalResolver(
+            [](const bytecode::FunctionReference&,
+               runtime::ValueSpan,
+               runtime::RuntimeError&) -> std::optional<runtime::Value> {
+                return std::int64_t{77};
+            });
+
+        runtime::ExecutionOptions deniedOpts;
+        deniedOpts.enforceCapabilities = true;
+        const auto deniedRes = interp.invoke("Evolution.RawCheck::CallSecret", {}, deniedOpts);
+        require(
+            !deniedRes.succeeded && deniedRes.error.code == runtime::ErrorCode::CapabilityDenied,
+            "unregistered externalResolver must be blocked when enforceCapabilities=true without Host.UnregisteredExternal");
+
+        runtime::ExecutionOptions allowedOpts;
+        allowedOpts.enforceCapabilities = true;
+        allowedOpts.grantedCapabilities.insert("Host.UnregisteredExternal");
+        const auto allowedRes = interp.invoke("Evolution.RawCheck::CallSecret", {}, allowedOpts);
+        require(
+            allowedRes.succeeded && std::get<std::int64_t>(allowedRes.value) == 77,
+            "unregistered externalResolver must succeed when Host.UnregisteredExternal is granted");
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -3588,10 +3835,12 @@ int main() {
         testCompleteEvolutionMilestones();
         std::cout << "[14/15] testModernEngineParityCompletionGoals..." << std::endl;
         testModernEngineParityCompletionGoals();
-        std::cout << "[15/16] testZeroHeapInlineStructAndEcsQueryMirLowering..." << std::endl;
+        std::cout << "[15/17] testZeroHeapInlineStructAndEcsQueryMirLowering..." << std::endl;
         testZeroHeapInlineStructAndEcsQueryMirLowering();
-        std::cout << "[16/16] testRound2EngineGapsCompletion..." << std::endl;
+        std::cout << "[16/17] testRound2EngineGapsCompletion..." << std::endl;
         testRound2EngineGapsCompletion();
+        std::cout << "[17/17] testRound3AuditFixesAndGodotUnityParity..." << std::endl;
+        testRound3AuditFixesAndGodotUnityParity();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

@@ -180,11 +180,8 @@ runtime::ExecutionResult ScriptRuntime::invokeSymbol(
             "script runtime has no linked program image");
     }
     if (nativeProgram_ && backend_ != ScriptExecutionBackend::Interpreter) {
-        const auto& desc = nativeProgram_->descriptor();
-        for (std::uint32_t idx = 0; idx < desc.functionCount; ++idx) {
-            if (desc.functions && desc.functions[idx].symbolId == symbolId) {
-                return nativeProgram_->invoke(symbolId, arguments, std::move(options));
-            }
+        if (nativeProgram_->hasFunction(symbolId)) {
+            return nativeProgram_->invoke(symbolId, arguments, std::move(options));
         }
     }
     return interpreter_.invoke(symbolId, arguments, std::move(options));
@@ -522,15 +519,29 @@ bool ScriptRuntime::setEcsEntityComponent(
             ? std::get<runtime::ObjectRef>(*valsVal)
             : runtime::ObjectRef{};
         const auto len = heap_->arrayLength(idsRef).value_or(0);
+        const auto targetId = static_cast<std::int64_t>(entity);
+        std::size_t lo = 0;
+        std::size_t hi = len;
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2;
+            const auto idElem = heap_->arrayGet(idsRef, mid);
+            if (!idElem || !std::holds_alternative<std::int64_t>(*idElem)) break;
+            const auto midId = std::get<std::int64_t>(*idElem);
+            if (midId == targetId && valsRef.valid()) {
+                return heap_->arraySet(valsRef, mid, component, &error);
+            }
+            if (midId < targetId) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
         ids.reserve(len + 1);
         vals.reserve(len + 1);
         for (std::size_t i = 0; i < len; ++i) {
             const auto idElem = heap_->arrayGet(idsRef, i);
             const auto valElem = valsRef.valid() ? heap_->arrayGet(valsRef, i) : std::nullopt;
             if (idElem && std::holds_alternative<std::int64_t>(*idElem) && valElem) {
-                if (std::get<std::int64_t>(*idElem) == static_cast<std::int64_t>(entity)) {
-                    return heap_->arraySet(valsRef, i, component, &error);
-                }
                 ids.push_back(std::get<std::int64_t>(*idElem));
                 vals.push_back(*valElem);
             }
@@ -593,11 +604,21 @@ std::optional<runtime::Value> ScriptRuntime::getEcsEntityComponent(
     const auto idsRef = std::get<runtime::ObjectRef>(*idsVal);
     const auto valsRef = std::get<runtime::ObjectRef>(*valsVal);
     const auto len = heap_->arrayLength(idsRef).value_or(0);
-    for (std::size_t i = 0; i < len; ++i) {
-        const auto idElem = heap_->arrayGet(idsRef, i);
-        if (idElem && std::holds_alternative<std::int64_t>(*idElem) &&
-            std::get<std::int64_t>(*idElem) == static_cast<std::int64_t>(entity)) {
-            return heap_->arrayGet(valsRef, i);
+    const auto targetId = static_cast<std::int64_t>(entity);
+    std::size_t lo = 0;
+    std::size_t hi = len;
+    while (lo < hi) {
+        const std::size_t mid = lo + (hi - lo) / 2;
+        const auto idElem = heap_->arrayGet(idsRef, mid);
+        if (!idElem || !std::holds_alternative<std::int64_t>(*idElem)) break;
+        const auto midId = std::get<std::int64_t>(*idElem);
+        if (midId == targetId) {
+            return heap_->arrayGet(valsRef, mid);
+        }
+        if (midId < targetId) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
     }
     return std::nullopt;
@@ -687,6 +708,9 @@ bool ScriptRuntime::destroyEcsEntity(
     for (const auto& mod : program_->modules()) {
         for (const auto& t : mod.types) {
             const std::string canon = t.moduleName.empty() ? t.name : (t.moduleName + "::" + t.name);
+            if (!heap_->hasStaticField(semantic::stableTypeId("$ecs_sparse_ids::" + canon))) {
+                continue;
+            }
             if (removeEcsEntityComponent(entity, canon, error)) {
                 anyRemoved = true;
             }

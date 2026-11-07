@@ -50,17 +50,44 @@ struct FixedPoint32 {
         return static_cast<double>(raw) / static_cast<double>(SCALE);
     }
 
-    constexpr FixedPoint32 operator-() const noexcept { return FixedPoint32(-raw); }
-    constexpr FixedPoint32 operator+(FixedPoint32 rhs) const noexcept { return FixedPoint32(raw + rhs.raw); }
-    constexpr FixedPoint32 operator-(FixedPoint32 rhs) const noexcept { return FixedPoint32(raw - rhs.raw); }
+    [[nodiscard]] static constexpr std::int32_t clampRaw64(std::int64_t val) noexcept {
+        if (val > 2147483647LL) return static_cast<std::int32_t>(2147483647LL);
+        if (val < -2147483648LL) return static_cast<std::int32_t>(-2147483648LL);
+        return static_cast<std::int32_t>(val);
+    }
+
+    [[nodiscard]] constexpr FixedPoint32 saturatingAdd(FixedPoint32 rhs) const noexcept {
+        return FixedPoint32(clampRaw64(static_cast<std::int64_t>(raw) + static_cast<std::int64_t>(rhs.raw)));
+    }
+
+    [[nodiscard]] constexpr FixedPoint32 saturatingSub(FixedPoint32 rhs) const noexcept {
+        return FixedPoint32(clampRaw64(static_cast<std::int64_t>(raw) - static_cast<std::int64_t>(rhs.raw)));
+    }
+
+    [[nodiscard]] constexpr FixedPoint32 saturatingMul(FixedPoint32 rhs) const noexcept {
+        const std::int64_t prod = static_cast<std::int64_t>(raw) * static_cast<std::int64_t>(rhs.raw);
+        return FixedPoint32(clampRaw64(prod >> FracBits));
+    }
+
+    constexpr FixedPoint32 operator-() const noexcept {
+        return FixedPoint32(static_cast<std::int32_t>(0u - static_cast<std::uint32_t>(raw)));
+    }
+    constexpr FixedPoint32 operator+(FixedPoint32 rhs) const noexcept {
+        return FixedPoint32(static_cast<std::int32_t>(
+            static_cast<std::uint32_t>(raw) + static_cast<std::uint32_t>(rhs.raw)));
+    }
+    constexpr FixedPoint32 operator-(FixedPoint32 rhs) const noexcept {
+        return FixedPoint32(static_cast<std::int32_t>(
+            static_cast<std::uint32_t>(raw) - static_cast<std::uint32_t>(rhs.raw)));
+    }
     constexpr FixedPoint32 operator*(FixedPoint32 rhs) const noexcept {
-        std::int64_t prod = static_cast<std::int64_t>(raw) * static_cast<std::int64_t>(rhs.raw);
-        return FixedPoint32(static_cast<std::int32_t>(prod >> FracBits));
+        const std::int64_t prod = static_cast<std::int64_t>(raw) * static_cast<std::int64_t>(rhs.raw);
+        return FixedPoint32(static_cast<std::int32_t>(static_cast<std::uint64_t>(prod >> FracBits)));
     }
     constexpr FixedPoint32 operator/(FixedPoint32 rhs) const noexcept {
         if (rhs.raw == 0) return FixedPoint32(0);
-        std::int64_t num = (static_cast<std::int64_t>(raw) << FracBits);
-        return FixedPoint32(static_cast<std::int32_t>(num / rhs.raw));
+        const std::int64_t num = (static_cast<std::int64_t>(raw) << FracBits);
+        return FixedPoint32(static_cast<std::int32_t>(static_cast<std::uint64_t>(num / rhs.raw)));
     }
     constexpr bool operator==(FixedPoint32 rhs) const noexcept { return raw == rhs.raw; }
     constexpr bool operator!=(FixedPoint32 rhs) const noexcept { return raw != rhs.raw; }

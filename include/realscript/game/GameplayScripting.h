@@ -115,6 +115,7 @@ public:
         std::string callback,
         std::int32_t priority = 0);
     bool unsubscribe(SubscriptionId subscriptionId);
+    [[nodiscard]] std::size_t subscriberCount(std::string_view topic) const noexcept;
     std::size_t cancelEntityCalls(SceneEntityId target);
 
     [[nodiscard]] EventSequence publish(

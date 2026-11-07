@@ -23,7 +23,7 @@ RealScript 采用 C# 风格语法，但不是 CLR、ECMA C# 或 .NET 标准库�
 | 引用位置 | 部分支持 | ref 参数、局部、返回、字段、Indexer 与 ref `this`；无 unsafe 指针、ref property、ref struct 和完整逃逸分析。 |
 | Attribute | 部分支持 | 原生语法及编译器/Game SDK/产物元数据，自动导入 `ScriptMetadataRegistry` 与 `InspectorTypeSchema`；无可执行 Attribute Class 和完整 `AttributeUsage`。 |
 | 用户运算符/转换 | 部分支持 | 支持自定义 `operator` 重载（`+`、`-`、`*`、`/`、`%`、`==`、`!=`、`<`、`<=`、`>`、`>=`、一元 `-`、`!`、`~`）与复合赋值（`+=`、`-=`、`*=`、`/=`、`%=`）；不支持自定义隐式/显式类型转换。 |
-| `const`、`readonly`、静态字段 | 不支持 | 支持静态方法/属性，但 Phase24 未包含这些字段形式。 |
+| `const`、`readonly`、静态字段 | 支持 | 支持编译期 `const`、构造函数内赋值的 `readonly` 字段，以及跨解释器、字节码与 C++17 AOT 的 `static` 字段及初始化器。 |
 
 ## 表达式与控制流
 

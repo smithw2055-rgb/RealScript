@@ -365,7 +365,9 @@ public:
         const ProgramDescriptor& program,
         std::shared_ptr<runtime::ManagedHeap> heap,
         std::shared_ptr<const runtime::BindingRegistry> bindings,
-        runtime::ExecutionOptions options = {});
+        runtime::ExecutionOptions options = {},
+        const std::unordered_map<semantic::SymbolId, const TypeDescriptor*>* prebuiltTypes = nullptr,
+        const std::unordered_map<semantic::SymbolId, const FunctionDescriptor*>* prebuiltFunctions = nullptr);
 
     [[nodiscard]] bool invoke(
         semantic::SymbolId symbolId,
@@ -652,8 +654,10 @@ private:
     std::vector<const char*> stack_;
     semantic::SymbolId currentFunctionId_ = 0;
     runtime::ShadowStack shadowStack_;
-    std::unordered_map<semantic::SymbolId, const TypeDescriptor*> types_;
-    std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> functions_;
+    std::unordered_map<semantic::SymbolId, const TypeDescriptor*> ownedTypes_;
+    std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> ownedFunctions_;
+    const std::unordered_map<semantic::SymbolId, const TypeDescriptor*>* typesPtr_ = nullptr;
+    const std::unordered_map<semantic::SymbolId, const FunctionDescriptor*>* functionsPtr_ = nullptr;
     std::optional<runtime::Value> pendingException_;
 };
 
@@ -665,6 +669,9 @@ public:
     void setHeap(std::shared_ptr<runtime::ManagedHeap> heap);
     [[nodiscard]] std::shared_ptr<runtime::ManagedHeap> heap() const noexcept;
     [[nodiscard]] const ProgramDescriptor& descriptor() const noexcept;
+    [[nodiscard]] bool hasFunction(semantic::SymbolId symbolId) const noexcept {
+        return functions_.find(symbolId) != functions_.end();
+    }
 
     [[nodiscard]] runtime::ExecutionResult invoke(
         semantic::SymbolId symbolId,
@@ -680,6 +687,8 @@ private:
     std::shared_ptr<const runtime::BindingRegistry> bindings_;
     std::shared_ptr<runtime::ManagedHeap> heap_;
     std::unordered_map<std::string, semantic::SymbolId> names_;
+    std::unordered_map<semantic::SymbolId, const TypeDescriptor*> types_;
+    std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> functions_;
 };
 
 // Typed host binding adapters. They keep generated/native call sites on stable

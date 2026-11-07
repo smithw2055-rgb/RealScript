@@ -1266,6 +1266,31 @@ std::string exportSceneJson(
         tfObj["scaleRaw"] = encodeVec3Raw(localTf.scale);
         entObj["localTransform"] = tooling::Json(std::move(tfObj));
 
+        if (const auto entName = scene.getEntityName(entityId); !entName.empty()) {
+            entObj["name"] = entName;
+        }
+        if (const auto groups = scene.getEntityGroups(entityId); !groups.empty()) {
+            tooling::Json::Array grpArr;
+            for (const auto& g : groups) {
+                grpArr.push_back(tooling::Json(g));
+            }
+            entObj["groups"] = tooling::Json(std::move(grpArr));
+        }
+        if (const auto col = scene.getEntityCollider2D(entityId)) {
+            tooling::Json::Object colObj;
+            colObj["halfExtentsRaw"] = tooling::Json(tooling::Json::Array{
+                tooling::Json(static_cast<std::int64_t>(col->halfExtents.x.raw)),
+                tooling::Json(static_cast<std::int64_t>(col->halfExtents.y.raw)),
+            });
+            colObj["radiusRaw"] = static_cast<std::int64_t>(col->radius.raw);
+            colObj["isCircle"] = col->isCircle;
+            colObj["isTrigger"] = col->isTrigger;
+            colObj["layerMask"] = static_cast<std::int64_t>(col->layerMask);
+            colObj["collisionLayer"] = static_cast<std::int64_t>(col->collisionLayer);
+            colObj["collisionMask"] = static_cast<std::int64_t>(col->collisionMask);
+            entObj["collider2D"] = tooling::Json(std::move(colObj));
+        }
+
         tooling::Json::Array compsArr;
         for (const auto* compObj : scene.getComponents(entityId)) {
             if (!compObj || !compObj->valid()) continue;
@@ -1322,10 +1347,45 @@ std::string exportSceneJson(
         signalsArr.push_back(tooling::Json(std::move(sigObj)));
     }
 
+    tooling::Json::Array overlapsArr;
+    const auto& wasTriggerMap = scene.activeOverlapWasTrigger2D();
+    for (const auto& pair : scene.activeOverlaps2D()) {
+        tooling::Json::Object ovObj;
+        ovObj["entityA"] = static_cast<std::int64_t>(pair.first);
+        ovObj["entityB"] = static_cast<std::int64_t>(pair.second);
+        const auto trigIt = wasTriggerMap.find(pair);
+        ovObj["wasTrigger"] = (trigIt != wasTriggerMap.end()) ? trigIt->second : false;
+        overlapsArr.push_back(tooling::Json(std::move(ovObj)));
+    }
+
+    tooling::Json::Object inputObj;
+    {
+        tooling::Json::Object curActObj;
+        for (const auto& [k, v] : scene.currentInputActions()) {
+            curActObj[k] = v;
+        }
+        tooling::Json::Object prevActObj;
+        for (const auto& [k, v] : scene.previousInputActions()) {
+            prevActObj[k] = v;
+        }
+        tooling::Json::Object axesObj;
+        for (const auto& [k, v] : scene.inputAxes2D()) {
+            axesObj[k] = tooling::Json(tooling::Json::Array{
+                tooling::Json(static_cast<std::int64_t>(v.x.raw)),
+                tooling::Json(static_cast<std::int64_t>(v.y.raw)),
+            });
+        }
+        inputObj["currentActions"] = tooling::Json(std::move(curActObj));
+        inputObj["previousActions"] = tooling::Json(std::move(prevActObj));
+        inputObj["axes2D"] = tooling::Json(std::move(axesObj));
+    }
+
     tooling::Json::Object root;
     root["version"] = static_cast<std::int64_t>(kScriptObjectStateVersion);
     root["entities"] = tooling::Json(std::move(entitiesArr));
     root["signalConnections"] = tooling::Json(std::move(signalsArr));
+    root["activeOverlaps2D"] = tooling::Json(std::move(overlapsArr));
+    root["inputSnapshot"] = tooling::Json(std::move(inputObj));
     return tooling::Json(std::move(root)).dump();
 }
 
@@ -1410,10 +1470,12 @@ bool importSceneJson(
         }
     }
 
-    // Clear existing entities in scene
+    // Clear existing entities and scene-wide physics/input state
     for (const auto existingId : scene.entities()) {
         (void)scene.detach(existingId);
     }
+    scene.restorePhysicsOverlapState({}, {});
+    scene.restoreInputSnapshot({}, {}, {});
 
     struct DeferredComponentFields {
         SceneEntityId entityId = 0;
@@ -1423,9 +1485,9 @@ bool importSceneJson(
     };
     std::vector<DeferredComponentFields> deferredComponents;
     std::vector<std::pair<SceneEntityId, SceneEntityId>> deferredParents;
-    std::vector< std::pair<SceneEntityId, bool>> deferredEntityActive;
+    std::vector<std::pair<SceneEntityId, bool>> deferredEntityActive;
 
-    // Pass 1: Create all entities, local transforms, and attach all components
+    // Pass 1: Create all entities, local transforms, names/groups/colliders, and attach all components
     for (const auto& entItem : entitiesJson->arrayValue()) {
         if (!entItem.isObject()) return false;
         const auto* idJson = entItem.find("id");
@@ -1449,6 +1511,47 @@ bool importSceneJson(
             (void)decodeQuatRaw(tfJson->find("rotationRaw"), tf.rotation);
             (void)decodeVec3Raw(tfJson->find("scaleRaw"), tf.scale);
             scene.setLocalTransform(entityId, tf);
+        }
+
+        if (const auto* nameJson = entItem.find("name"); nameJson && nameJson->isString()) {
+            scene.setEntityName(entityId, nameJson->stringValue());
+        }
+        if (const auto* grpJson = entItem.find("groups"); grpJson && grpJson->isArray()) {
+            for (const auto& g : grpJson->arrayValue()) {
+                if (g.isString()) {
+                    scene.addEntityToGroup(entityId, g.stringValue());
+                }
+            }
+        }
+        if (const auto* colJson = entItem.find("collider2D"); colJson && colJson->isObject()) {
+            SceneCollider2D col;
+            if (const auto* heJson = colJson->find("halfExtentsRaw");
+                heJson && heJson->isArray() && heJson->arrayValue().size() == 2) {
+                const auto& a = heJson->arrayValue();
+                if (a[0].isNumber() && a[1].isNumber()) {
+                    col.halfExtents.x = Fixed::fromRaw(static_cast<std::int32_t>(a[0].integerValue()));
+                    col.halfExtents.y = Fixed::fromRaw(static_cast<std::int32_t>(a[1].integerValue()));
+                }
+            }
+            if (const auto* radJson = colJson->find("radiusRaw"); radJson && radJson->isNumber()) {
+                col.radius = Fixed::fromRaw(static_cast<std::int32_t>(radJson->integerValue()));
+            }
+            if (const auto* icJson = colJson->find("isCircle"); icJson && icJson->isBool()) {
+                col.isCircle = icJson->boolValue();
+            }
+            if (const auto* itJson = colJson->find("isTrigger"); itJson && itJson->isBool()) {
+                col.isTrigger = itJson->boolValue();
+            }
+            if (const auto* lmJson = colJson->find("layerMask"); lmJson && lmJson->isNumber()) {
+                col.layerMask = static_cast<std::uint32_t>(lmJson->integerValue());
+            }
+            if (const auto* clJson = colJson->find("collisionLayer"); clJson && clJson->isNumber()) {
+                col.collisionLayer = static_cast<std::uint32_t>(clJson->integerValue());
+            }
+            if (const auto* cmJson = colJson->find("collisionMask"); cmJson && cmJson->isNumber()) {
+                col.collisionMask = static_cast<std::uint32_t>(cmJson->integerValue());
+            }
+            scene.setEntityCollider2D(entityId, col);
         }
 
         if (const auto* compsJson = entItem.find("components"); compsJson && compsJson->isArray()) {
@@ -1560,6 +1663,55 @@ bool importSceneJson(
         if (!activeSelf) {
             (void)scene.setEntityActive(entId, false);
         }
+    }
+
+    // Pass 6: Restore active 2D physics overlaps and deterministic input snapshot
+    if (const auto* ovsJson = parsed->find("activeOverlaps2D"); ovsJson && ovsJson->isArray()) {
+        std::set<std::pair<SceneEntityId, SceneEntityId>> activeOverlaps;
+        std::map<std::pair<SceneEntityId, SceneEntityId>, bool> wasTriggerMap;
+        for (const auto& ovItem : ovsJson->arrayValue()) {
+            if (!ovItem.isObject()) continue;
+            const auto* ea = ovItem.find("entityA");
+            const auto* eb = ovItem.find("entityB");
+            if (!ea || !ea->isNumber() || !eb || !eb->isNumber()) continue;
+            auto a = static_cast<SceneEntityId>(ea->integerValue());
+            auto b = static_cast<SceneEntityId>(eb->integerValue());
+            if (a > b) std::swap(a, b);
+            const auto pair = std::make_pair(a, b);
+            activeOverlaps.insert(pair);
+            const auto* wt = ovItem.find("wasTrigger");
+            wasTriggerMap[pair] = (wt && wt->isBool()) ? wt->boolValue() : false;
+        }
+        scene.restorePhysicsOverlapState(std::move(activeOverlaps), std::move(wasTriggerMap));
+    }
+
+    if (const auto* inpJson = parsed->find("inputSnapshot"); inpJson && inpJson->isObject()) {
+        std::map<std::string, bool> curActions;
+        std::map<std::string, bool> prevActions;
+        std::map<std::string, Vec2> axes2D;
+        if (const auto* curJson = inpJson->find("currentActions"); curJson && curJson->isObject()) {
+            for (const auto& [k, v] : curJson->objectValue()) {
+                if (v.isBool()) curActions[k] = v.boolValue();
+            }
+        }
+        if (const auto* prevJson = inpJson->find("previousActions"); prevJson && prevJson->isObject()) {
+            for (const auto& [k, v] : prevJson->objectValue()) {
+                if (v.isBool()) prevActions[k] = v.boolValue();
+            }
+        }
+        if (const auto* axesJson = inpJson->find("axes2D"); axesJson && axesJson->isObject()) {
+            for (const auto& [k, v] : axesJson->objectValue()) {
+                if (v.isArray() && v.arrayValue().size() == 2 &&
+                    v.arrayValue()[0].isNumber() && v.arrayValue()[1].isNumber()) {
+                    axes2D[k] = Vec2{
+                        Fixed::fromRaw(static_cast<std::int32_t>(v.arrayValue()[0].integerValue())),
+                        Fixed::fromRaw(static_cast<std::int32_t>(v.arrayValue()[1].integerValue())),
+                    };
+                }
+            }
+        }
+        scene.restoreInputSnapshot(
+            std::move(curActions), std::move(prevActions), std::move(axes2D));
     }
 
     return true;

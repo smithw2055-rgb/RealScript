@@ -245,6 +245,14 @@ std::vector<SceneEntityId> SceneScriptRuntime::entities() const {
         if (child != BroadcastTarget) allIds.insert(child);
         if (parent != BroadcastTarget) allIds.insert(parent);
     }
+    for (const auto& [ent, _] : colliders2D_) {
+        (void)_;
+        if (ent != BroadcastTarget) allIds.insert(ent);
+    }
+    for (const auto& [ent, _] : entityNames_) {
+        (void)_;
+        if (ent != BroadcastTarget) allIds.insert(ent);
+    }
     return std::vector<SceneEntityId>(allIds.begin(), allIds.end());
 }
 
@@ -521,6 +529,69 @@ bool installSceneComponentBindings(
             [scenePtr](Vec2 center, Fixed radius) -> std::int32_t {
                 return static_cast<std::int32_t>(
                     scenePtr->overlapCircle2D(center, radius).size());
+            }) &&
+        api.function(
+            moduleName,
+            "SpawnEntity",
+            [scenePtr](std::string name) -> std::int64_t {
+                return static_cast<std::int64_t>(scenePtr->spawnEntity(name));
+            }) &&
+        api.function(
+            moduleName,
+            "QueueDestroyEntity",
+            [scenePtr](std::int64_t entityId) -> bool {
+                if (entityId <= 0) return false;
+                scenePtr->queueDestroyEntity(static_cast<SceneEntityId>(entityId));
+                return true;
+            }) &&
+        api.function(
+            moduleName,
+            "SetEntityName",
+            [scenePtr](std::int64_t entityId, std::string name) -> bool {
+                if (entityId <= 0) return false;
+                scenePtr->setEntityName(static_cast<SceneEntityId>(entityId), std::move(name));
+                return true;
+            }) &&
+        api.function(
+            moduleName,
+            "GetEntityName",
+            [scenePtr](std::int64_t entityId) -> std::string {
+                if (entityId <= 0) return {};
+                return scenePtr->getEntityName(static_cast<SceneEntityId>(entityId));
+            }) &&
+        api.function(
+            moduleName,
+            "FindEntityByName",
+            [scenePtr](std::string name) -> std::int64_t {
+                return static_cast<std::int64_t>(scenePtr->findEntityByName(name));
+            }) &&
+        api.function(
+            moduleName,
+            "AddToGroup",
+            [scenePtr](std::int64_t entityId, std::string group) -> bool {
+                if (entityId <= 0 || group.empty()) return false;
+                scenePtr->addEntityToGroup(static_cast<SceneEntityId>(entityId), group);
+                return true;
+            }) &&
+        api.function(
+            moduleName,
+            "RemoveFromGroup",
+            [scenePtr](std::int64_t entityId, std::string group) -> bool {
+                if (entityId <= 0 || group.empty()) return false;
+                return scenePtr->removeEntityFromGroup(static_cast<SceneEntityId>(entityId), group);
+            }) &&
+        api.function(
+            moduleName,
+            "IsInGroup",
+            [scenePtr](std::int64_t entityId, std::string group) -> bool {
+                if (entityId <= 0 || group.empty()) return false;
+                return scenePtr->isEntityInGroup(static_cast<SceneEntityId>(entityId), group);
+            }) &&
+        api.function(
+            moduleName,
+            "GetGroupCount",
+            [scenePtr](std::string group) -> std::int32_t {
+                return static_cast<std::int32_t>(scenePtr->getEntitiesInGroup(group).size());
             });
     return ok && api.valid();
 }

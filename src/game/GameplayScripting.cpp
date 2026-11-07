@@ -197,6 +197,17 @@ bool GameplayHost::unsubscribe(SubscriptionId subscriptionId) {
     return subscriptions_.erase(subscriptionId) != 0;
 }
 
+std::size_t GameplayHost::subscriberCount(std::string_view topic) const noexcept {
+    std::size_t count = 0;
+    for (const auto& [id, sub] : subscriptions_) {
+        (void)id;
+        if (sub.topic == topic) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 std::size_t GameplayHost::cancelEntityCalls(SceneEntityId target) {
     if (target == 0) return 0;
     std::vector<TimerId> timersToCancel;
@@ -543,8 +554,10 @@ SceneGameplayDriver::SceneGameplayDriver(
     : scene_(scene), host_(std::move(host)) {
     if (host_) {
         auto h = host_;
-        scene_.setSignalTopicPublisher([h](const std::string& topic) {
+        scene_.setSignalTopicPublisherCounted([h](const std::string& topic) -> std::size_t {
+            const auto matched = h->subscriberCount(topic);
             (void)h->publish(topic, {}, 1);
+            return matched;
         });
     }
 }

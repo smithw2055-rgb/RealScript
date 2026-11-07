@@ -26,7 +26,7 @@ deliberately smaller deterministic profile.
 | Reference locations | Partial | Ref parameters, locals, returns, fields, indexers, and ref `this`. No unsafe pointers, ref properties, ref structs, or full escape analysis. |
 | Attributes | Partial | Native syntax and versioned metadata for compiler/Game SDK/artifacts, auto-ingested into `ScriptMetadataRegistry` and `InspectorTypeSchema`. No executable attribute classes or full `AttributeUsage`. |
 | User operators/conversions | Partial | User-defined `operator` overloads (`+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, unary `-`, `!`, `~`) and compound assignments (`+=`, `-=`, `*=`, `/=`, `%=`) are supported. User-defined implicit/explicit conversions are not supported. |
-| `const`, `readonly`, static fields | Not supported | Static methods/properties are supported; these field forms are not in the Phase 24 surface. |
+| `const`, `readonly`, static fields | Supported | Compile-time `const`, constructor-assigned `readonly` fields, and `static` fields/initializers are supported across interpreter, bytecode, and C++17 AOT. |
 
 ## Expressions and control flow
 

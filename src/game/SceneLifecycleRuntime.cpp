@@ -436,7 +436,9 @@ bool SceneScriptRuntime::detach(SceneEntityId entity) {
     const bool hadHierarchyOrTransform =
         parentIt != parentByEntity_.end() ||
         entityActiveSelf_.find(entity) != entityActiveSelf_.end() ||
-        localTransforms_.find(entity) != localTransforms_.end();
+        localTransforms_.find(entity) != localTransforms_.end() ||
+        entityNames_.find(entity) != entityNames_.end() ||
+        colliders2D_.find(entity) != colliders2D_.end();
     if (parentIt != parentByEntity_.end()) {
         const auto parentId = parentIt->second;
         parentByEntity_.erase(parentIt);
@@ -449,9 +451,18 @@ bool SceneScriptRuntime::detach(SceneEntityId entity) {
     entityActiveSelf_.erase(entity);
     localTransforms_.erase(entity);
     worldTransformCache_.erase(entity);
+    entityNames_.erase(entity);
+    for (auto gIt = groupEntities_.begin(); gIt != groupEntities_.end();) {
+        gIt->second.erase(entity);
+        if (gIt->second.empty()) {
+            gIt = groupEntities_.erase(gIt);
+        } else {
+            ++gIt;
+        }
+    }
     (void)removeEntityCollider2D(entity);
 
-    if (fiberScheduler_) {
+    if (fiberScheduler_ && entity <= std::numeric_limits<std::uint32_t>::max()) {
         (void)fiberScheduler_->killEntityFibersBySlot(
             static_cast<std::uint32_t>(entity));
     }
@@ -723,6 +734,7 @@ void SceneScriptRuntime::update(double deltaTime) {
         (void)invokeLifecycle(
             ref.entity, instance, instance.onUpdate, {deltaTime}, "OnUpdate");
     }
+    (void)flushDestroyedEntities();
 }
 
 void SceneScriptRuntime::fixedUpdate(double fixedDeltaTime) {
@@ -744,6 +756,7 @@ void SceneScriptRuntime::fixedUpdate(double fixedDeltaTime) {
             {fixedDeltaTime},
             "OnFixedUpdate");
     }
+    (void)flushDestroyedEntities();
 }
 
 void SceneScriptRuntime::lateUpdate(double deltaTime) {
@@ -761,6 +774,7 @@ void SceneScriptRuntime::lateUpdate(double deltaTime) {
         (void)invokeLifecycle(
             ref.entity, instance, instance.onLateUpdate, {deltaTime}, "OnLateUpdate");
     }
+    (void)flushDestroyedEntities();
 }
 
 SceneHotReloadReport SceneScriptRuntime::hotReload(
@@ -1607,11 +1621,19 @@ std::size_t SceneScriptRuntime::emitSignal(
     }
 
     if (signalTopicPublisher_) {
-        signalTopicPublisher_("$signal::" + std::to_string(sourceEntity) + "::" + signalName);
-        signalTopicPublisher_(signalName);
-        ++invokedCount;
+        invokedCount += signalTopicPublisher_("$signal::" + std::to_string(sourceEntity) + "::" + signalName);
+        invokedCount += signalTopicPublisher_(signalName);
     }
     return invokedCount;
+}
+
+void SceneScriptRuntime::restoreInputSnapshot(
+    std::map<std::string, bool> currentActions,
+    std::map<std::string, bool> previousActions,
+    std::map<std::string, Vec2> axes2D) {
+    currentInputActions_ = std::move(currentActions);
+    previousInputActions_ = std::move(previousActions);
+    inputAxes2D_ = std::move(axes2D);
 }
 
 void SceneScriptRuntime::setInputAction(const std::string& action, bool pressed) {
@@ -1703,47 +1725,75 @@ bool SceneScriptRuntime::removeEntityCollider2D(SceneEntityId entity) {
     return colliders2D_.erase(entity) != 0;
 }
 
-namespace {
-
-constexpr Fixed fixedAbs(Fixed v) noexcept {
-    return v.raw < 0 ? Fixed::fromRaw(-v.raw) : v;
+std::optional<SceneCollider2D> SceneScriptRuntime::getEntityCollider2D(
+    SceneEntityId entity) const noexcept {
+    const auto it = colliders2D_.find(entity);
+    if (it == colliders2D_.end()) return std::nullopt;
+    return it->second;
 }
 
-constexpr Fixed fixedClamp(Fixed v, Fixed lo, Fixed hi) noexcept {
+void SceneScriptRuntime::restorePhysicsOverlapState(
+    std::set<std::pair<SceneEntityId, SceneEntityId>> activeOverlaps,
+    std::map<std::pair<SceneEntityId, SceneEntityId>, bool> activeOverlapWasTrigger) {
+    activeOverlaps2D_ = std::move(activeOverlaps);
+    activeOverlapWasTrigger2D_ = std::move(activeOverlapWasTrigger);
+}
+
+namespace {
+
+constexpr std::int64_t fixedAbs64(std::int64_t v) noexcept {
+    return v < 0 ? -v : v;
+}
+
+constexpr std::int64_t fixedClamp64(std::int64_t v, std::int64_t lo, std::int64_t hi) noexcept {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-constexpr Fixed fixedSqrt(Fixed v) noexcept {
-    if (v.raw <= 0) return Fixed::fromRaw(0);
-    return Fixed::fromRaw(static_cast<std::int32_t>(
-        deterministicSqrt64(static_cast<std::int64_t>(v.raw) << 8)));
+constexpr bool collidersMatchLayers(
+    const SceneCollider2D& colA,
+    const SceneCollider2D& colB) noexcept {
+    const std::uint32_t layerA = colA.collisionLayer & colA.layerMask;
+    const std::uint32_t maskA = colA.collisionMask & colA.layerMask;
+    const std::uint32_t layerB = colB.collisionLayer & colB.layerMask;
+    const std::uint32_t maskB = colB.collisionMask & colB.layerMask;
+    return ((layerA & maskB) != 0u) && ((layerB & maskA) != 0u);
 }
 
 bool testOverlap2D(
     Vec2 posA, const SceneCollider2D& colA,
     Vec2 posB, const SceneCollider2D& colB) noexcept {
-    if ((colA.layerMask & colB.layerMask) == 0) return false;
+    if (!collidersMatchLayers(colA, colB)) return false;
     if (colA.isCircle && colB.isCircle) {
-        const Vec2 delta = posB - posA;
-        const Fixed sumR = colA.radius + colB.radius;
-        return delta.lengthSq() <= (sumR * sumR);
+        const std::int64_t dx = static_cast<std::int64_t>(posB.x.raw) - static_cast<std::int64_t>(posA.x.raw);
+        const std::int64_t dy = static_cast<std::int64_t>(posB.y.raw) - static_cast<std::int64_t>(posA.y.raw);
+        const std::int64_t sumR = static_cast<std::int64_t>(colA.radius.raw) + static_cast<std::int64_t>(colB.radius.raw);
+        if (sumR < 0) return false;
+        return (dx * dx + dy * dy) <= (sumR * sumR);
     }
     if (!colA.isCircle && !colB.isCircle) {
-        const Fixed dx = fixedAbs(posB.x - posA.x);
-        const Fixed dy = fixedAbs(posB.y - posA.y);
-        return dx <= (colA.halfExtents.x + colB.halfExtents.x) &&
-               dy <= (colA.halfExtents.y + colB.halfExtents.y);
+        const std::int64_t dx = fixedAbs64(static_cast<std::int64_t>(posB.x.raw) - static_cast<std::int64_t>(posA.x.raw));
+        const std::int64_t dy = fixedAbs64(static_cast<std::int64_t>(posB.y.raw) - static_cast<std::int64_t>(posA.y.raw));
+        const std::int64_t sumX = static_cast<std::int64_t>(colA.halfExtents.x.raw) + static_cast<std::int64_t>(colB.halfExtents.x.raw);
+        const std::int64_t sumY = static_cast<std::int64_t>(colA.halfExtents.y.raw) + static_cast<std::int64_t>(colB.halfExtents.y.raw);
+        return dx <= sumX && dy <= sumY;
     }
     const Vec2 circlePos = colA.isCircle ? posA : posB;
     const Fixed radius = colA.isCircle ? colA.radius : colB.radius;
     const Vec2 boxPos = colA.isCircle ? posB : posA;
     const Vec2 halfExt = colA.isCircle ? colB.halfExtents : colA.halfExtents;
-    const Fixed clampedX = fixedClamp(
-        circlePos.x, boxPos.x - halfExt.x, boxPos.x + halfExt.x);
-    const Fixed clampedY = fixedClamp(
-        circlePos.y, boxPos.y - halfExt.y, boxPos.y + halfExt.y);
-    const Vec2 diff{circlePos.x - clampedX, circlePos.y - clampedY};
-    return diff.lengthSq() <= (radius * radius);
+    const std::int64_t cx = circlePos.x.raw;
+    const std::int64_t cy = circlePos.y.raw;
+    const std::int64_t bx = boxPos.x.raw;
+    const std::int64_t by = boxPos.y.raw;
+    const std::int64_t hx = halfExt.x.raw;
+    const std::int64_t hy = halfExt.y.raw;
+    const std::int64_t clampedX = fixedClamp64(cx, bx - hx, bx + hx);
+    const std::int64_t clampedY = fixedClamp64(cy, by - hy, by + hy);
+    const std::int64_t dx = cx - clampedX;
+    const std::int64_t dy = cy - clampedY;
+    const std::int64_t r = radius.raw;
+    if (r < 0) return false;
+    return (dx * dx + dy * dy) <= (r * r);
 }
 
 } // namespace
@@ -1761,59 +1811,83 @@ std::optional<RaycastHit2D> SceneScriptRuntime::raycast2D(
 
     std::optional<RaycastHit2D> closest;
     for (const auto& [entity, col] : colliders2D_) {
-        if ((col.layerMask & layerMask) == 0 || !isActiveInHierarchy(entity)) {
+        const std::uint32_t effectiveLayer = col.collisionLayer & col.layerMask;
+        if ((effectiveLayer & layerMask) == 0 || !isActiveInHierarchy(entity)) {
             continue;
         }
         const Vec2 center = getWorldPosition2D(entity);
         if (col.isCircle) {
-            const Vec2 toCenter = center - origin;
-            const Fixed proj = Vec2::dot(toCenter, dir);
-            if (proj < -col.radius || proj > maxDistance + col.radius) continue;
-            const Vec2 closestPt = origin + dir * proj;
-            const Fixed distSq = (center - closestPt).lengthSq();
-            const Fixed rSq = col.radius * col.radius;
-            if (distSq > rSq) continue;
-            const Fixed offset = fixedSqrt(rSq - distSq);
-            if (proj + offset < Fixed::fromRaw(0)) continue;
-            Fixed hitDist = proj - offset;
-            if (hitDist < Fixed::fromRaw(0)) hitDist = Fixed::fromRaw(0);
-            if (hitDist > maxDistance) continue;
+            const std::int64_t toCenterX = static_cast<std::int64_t>(center.x.raw) - static_cast<std::int64_t>(origin.x.raw);
+            const std::int64_t toCenterY = static_cast<std::int64_t>(center.y.raw) - static_cast<std::int64_t>(origin.y.raw);
+            const std::int64_t projRaw = (toCenterX * static_cast<std::int64_t>(dir.x.raw) +
+                                          toCenterY * static_cast<std::int64_t>(dir.y.raw)) >> 8;
+            const std::int64_t rRaw = static_cast<std::int64_t>(col.radius.raw);
+            const std::int64_t maxDistRaw = static_cast<std::int64_t>(maxDistance.raw);
+            if (rRaw < 0 || projRaw < -rRaw || projRaw > maxDistRaw + rRaw) continue;
+            const std::int64_t closestX = static_cast<std::int64_t>(origin.x.raw) +
+                ((static_cast<std::int64_t>(dir.x.raw) * projRaw) >> 8);
+            const std::int64_t closestY = static_cast<std::int64_t>(origin.y.raw) +
+                ((static_cast<std::int64_t>(dir.y.raw) * projRaw) >> 8);
+            const std::int64_t diffX = static_cast<std::int64_t>(center.x.raw) - closestX;
+            const std::int64_t diffY = static_cast<std::int64_t>(center.y.raw) - closestY;
+            const std::int64_t distSqRaw2 = diffX * diffX + diffY * diffY;
+            const std::int64_t rSqRaw2 = rRaw * rRaw;
+            if (distSqRaw2 > rSqRaw2) continue;
+            const std::int64_t offsetRaw = deterministicSqrt64(rSqRaw2 - distSqRaw2);
+            if (projRaw + offsetRaw < 0) continue;
+            std::int64_t hitDistRaw = projRaw - offsetRaw;
+            if (hitDistRaw < 0) hitDistRaw = 0;
+            if (hitDistRaw > maxDistRaw) continue;
+            const Fixed hitDist = Fixed::fromRaw(Fixed::clampRaw64(hitDistRaw));
+            const Vec2 hitPt{
+                Fixed::fromRaw(Fixed::clampRaw64(
+                    static_cast<std::int64_t>(origin.x.raw) + ((static_cast<std::int64_t>(dir.x.raw) * hitDistRaw) >> 8))),
+                Fixed::fromRaw(Fixed::clampRaw64(
+                    static_cast<std::int64_t>(origin.y.raw) + ((static_cast<std::int64_t>(dir.y.raw) * hitDistRaw) >> 8))),
+            };
             if (!closest || hitDist < closest->distance ||
                 (hitDist == closest->distance && entity < closest->entity)) {
-                closest = RaycastHit2D{entity, origin + dir * hitDist, hitDist};
+                closest = RaycastHit2D{entity, hitPt, hitDist};
             }
         } else {
-            const Vec2 minB = center - col.halfExtents;
-            const Vec2 maxB = center + col.halfExtents;
-            Fixed tMin = Fixed::fromRaw(0);
-            Fixed tMax = maxDistance;
+            std::int64_t tMinRaw = 0;
+            std::int64_t tMaxRaw = static_cast<std::int64_t>(maxDistance.raw);
             bool hit = true;
             for (int axis = 0; axis < 2; ++axis) {
-                const Fixed o = axis == 0 ? origin.x : origin.y;
-                const Fixed d = axis == 0 ? dir.x : dir.y;
-                const Fixed bMin = axis == 0 ? minB.x : minB.y;
-                const Fixed bMax = axis == 0 ? maxB.x : maxB.y;
-                if (d == Fixed::fromRaw(0)) {
+                const std::int64_t o = axis == 0 ? origin.x.raw : origin.y.raw;
+                const std::int64_t d = axis == 0 ? dir.x.raw : dir.y.raw;
+                const std::int64_t c = axis == 0 ? center.x.raw : center.y.raw;
+                const std::int64_t h = axis == 0 ? col.halfExtents.x.raw : col.halfExtents.y.raw;
+                const std::int64_t bMin = c - h;
+                const std::int64_t bMax = c + h;
+                if (d == 0) {
                     if (o < bMin || o > bMax) {
                         hit = false;
                         break;
                     }
                 } else {
-                    Fixed t1 = (bMin - o) / d;
-                    Fixed t2 = (bMax - o) / d;
+                    std::int64_t t1 = ((bMin - o) << 8) / d;
+                    std::int64_t t2 = ((bMax - o) << 8) / d;
                     if (t1 > t2) std::swap(t1, t2);
-                    if (t1 > tMin) tMin = t1;
-                    if (t2 < tMax) tMax = t2;
-                    if (tMin > tMax) {
+                    if (t1 > tMinRaw) tMinRaw = t1;
+                    if (t2 < tMaxRaw) tMaxRaw = t2;
+                    if (tMinRaw > tMaxRaw) {
                         hit = false;
                         break;
                     }
                 }
             }
-            if (!hit || tMin > maxDistance) continue;
+            if (!hit || tMinRaw > static_cast<std::int64_t>(maxDistance.raw)) continue;
+            const Fixed tMin = Fixed::fromRaw(Fixed::clampRaw64(tMinRaw));
+            const Vec2 hitPt{
+                Fixed::fromRaw(Fixed::clampRaw64(
+                    static_cast<std::int64_t>(origin.x.raw) + ((static_cast<std::int64_t>(dir.x.raw) * tMinRaw) >> 8))),
+                Fixed::fromRaw(Fixed::clampRaw64(
+                    static_cast<std::int64_t>(origin.y.raw) + ((static_cast<std::int64_t>(dir.y.raw) * tMinRaw) >> 8))),
+            };
             if (!closest || tMin < closest->distance ||
                 (tMin == closest->distance && entity < closest->entity)) {
-                closest = RaycastHit2D{entity, origin + dir * tMin, tMin};
+                closest = RaycastHit2D{entity, hitPt, tMin};
             }
         }
     }
@@ -1891,25 +1965,143 @@ std::size_t SceneScriptRuntime::stepPhysics2D() {
     };
 
     // Enter & Stay
+    const auto previousOverlapsSnapshot = activeOverlaps2D_;
+    const auto previousTriggerSnapshot = activeOverlapWasTrigger2D_;
+    activeOverlaps2D_ = currentOverlaps;
+    activeOverlapWasTrigger2D_ = currentIsTrigger;
+
     for (const auto& pair : currentOverlaps) {
+        if (colliders2D_.find(pair.first) == colliders2D_.end() ||
+            colliders2D_.find(pair.second) == colliders2D_.end()) {
+            continue;
+        }
         const bool isTrig = currentIsTrigger[pair];
-        const int phase = activeOverlaps2D_.find(pair) == activeOverlaps2D_.end() ? 0 : 1;
+        const int phase = previousOverlapsSnapshot.find(pair) == previousOverlapsSnapshot.end() ? 0 : 1;
         dispatchPhysicsCallback(pair.first, pair.second, isTrig, phase);
         dispatchPhysicsCallback(pair.second, pair.first, isTrig, phase);
     }
     // Exit
-    for (const auto& pair : activeOverlaps2D_) {
+    for (const auto& pair : previousOverlapsSnapshot) {
         if (currentOverlaps.find(pair) == currentOverlaps.end()) {
-            const auto trigIt = activeOverlapWasTrigger2D_.find(pair);
-            const bool isTrig = trigIt != activeOverlapWasTrigger2D_.end() && trigIt->second;
+            const auto trigIt = previousTriggerSnapshot.find(pair);
+            const bool isTrig = trigIt != previousTriggerSnapshot.end() && trigIt->second;
             dispatchPhysicsCallback(pair.first, pair.second, isTrig, 2);
             dispatchPhysicsCallback(pair.second, pair.first, isTrig, 2);
         }
     }
 
-    activeOverlaps2D_ = std::move(currentOverlaps);
-    activeOverlapWasTrigger2D_ = std::move(currentIsTrigger);
+    (void)flushDestroyedEntities();
     return callbacksFired;
+}
+
+SceneEntityId SceneScriptRuntime::spawnEntity(const std::string& name) {
+    while (nextAutoEntityId_ == BroadcastTarget ||
+           entityActiveSelf_.find(nextAutoEntityId_) != entityActiveSelf_.end() ||
+           instances_.find(nextAutoEntityId_) != instances_.end() ||
+           localTransforms_.find(nextAutoEntityId_) != localTransforms_.end() ||
+           parentByEntity_.find(nextAutoEntityId_) != parentByEntity_.end() ||
+           colliders2D_.find(nextAutoEntityId_) != colliders2D_.end()) {
+        ++nextAutoEntityId_;
+    }
+    const SceneEntityId id = nextAutoEntityId_++;
+    entityActiveSelf_[id] = true;
+    localTransforms_[id] = Transform3D::identity();
+    if (!name.empty()) {
+        entityNames_[id] = name;
+    }
+    return id;
+}
+
+void SceneScriptRuntime::queueDestroyEntity(SceneEntityId entity) {
+    if (entity == BroadcastTarget) return;
+    if (std::find(pendingDestroyEntities_.begin(), pendingDestroyEntities_.end(), entity) ==
+        pendingDestroyEntities_.end()) {
+        pendingDestroyEntities_.push_back(entity);
+    }
+}
+
+std::size_t SceneScriptRuntime::flushDestroyedEntities() {
+    if (pendingDestroyEntities_.empty()) return 0;
+    auto queue = std::move(pendingDestroyEntities_);
+    pendingDestroyEntities_.clear();
+    std::size_t destroyed = 0;
+    for (const auto entity : queue) {
+        if (detach(entity)) {
+            ++destroyed;
+        }
+    }
+    return destroyed;
+}
+
+void SceneScriptRuntime::setEntityName(SceneEntityId entity, std::string name) {
+    if (entity == BroadcastTarget) return;
+    if (entityActiveSelf_.find(entity) == entityActiveSelf_.end()) {
+        entityActiveSelf_[entity] = true;
+    }
+    if (name.empty()) {
+        entityNames_.erase(entity);
+    } else {
+        entityNames_[entity] = std::move(name);
+    }
+}
+
+std::string SceneScriptRuntime::getEntityName(SceneEntityId entity) const {
+    const auto it = entityNames_.find(entity);
+    return it != entityNames_.end() ? it->second : std::string{};
+}
+
+SceneEntityId SceneScriptRuntime::findEntityByName(const std::string& name) const noexcept {
+    if (name.empty()) return 0;
+    for (const auto& [entity, entName] : entityNames_) {
+        if (entName == name && isActiveInHierarchy(entity)) {
+            return entity;
+        }
+    }
+    for (const auto& [entity, entName] : entityNames_) {
+        if (entName == name) {
+            return entity;
+        }
+    }
+    return 0;
+}
+
+void SceneScriptRuntime::addEntityToGroup(SceneEntityId entity, const std::string& group) {
+    if (entity == BroadcastTarget || group.empty()) return;
+    if (entityActiveSelf_.find(entity) == entityActiveSelf_.end()) {
+        entityActiveSelf_[entity] = true;
+    }
+    groupEntities_[group].insert(entity);
+}
+
+bool SceneScriptRuntime::removeEntityFromGroup(SceneEntityId entity, const std::string& group) {
+    const auto it = groupEntities_.find(group);
+    if (it == groupEntities_.end()) return false;
+    const bool removed = it->second.erase(entity) != 0;
+    if (it->second.empty()) {
+        groupEntities_.erase(it);
+    }
+    return removed;
+}
+
+bool SceneScriptRuntime::isEntityInGroup(SceneEntityId entity, const std::string& group) const noexcept {
+    const auto it = groupEntities_.find(group);
+    return it != groupEntities_.end() && it->second.find(entity) != it->second.end();
+}
+
+std::vector<SceneEntityId> SceneScriptRuntime::getEntitiesInGroup(const std::string& group) const {
+    const auto it = groupEntities_.find(group);
+    if (it == groupEntities_.end()) return {};
+    return std::vector<SceneEntityId>(it->second.begin(), it->second.end());
+}
+
+std::vector<std::string> SceneScriptRuntime::getEntityGroups(SceneEntityId entity) const {
+    std::vector<std::string> result;
+    for (const auto& [group, members] : groupEntities_) {
+        if (members.find(entity) != members.end()) {
+            result.push_back(group);
+        }
+    }
+    return result;
 }
 
 } // namespace realscript::game

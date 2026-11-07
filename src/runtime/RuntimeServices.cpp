@@ -1569,12 +1569,15 @@ bool tryExecuteRuntimeIntrinsic(
             }
             std::vector<Value> matchedVals;
             matchedVals.reserve(matched.size());
+            std::vector<std::int64_t> matchedSrcIndices;
+            matchedSrcIndices.reserve(matched.size());
             for (const auto entId : matched) {
                 const auto it = std::lower_bound(sparseIds.begin(), sparseIds.end(), entId);
                 if (it != sparseIds.end() && *it == entId) {
                     const auto idx = static_cast<std::size_t>(std::distance(sparseIds.begin(), it));
                     if (auto v = heap->arrayGet(sparseValsRef, idx)) {
                         matchedVals.push_back(std::move(*v));
+                        matchedSrcIndices.push_back(static_cast<std::int64_t>(idx));
                     }
                 }
             }
@@ -1591,6 +1594,25 @@ bool tryExecuteRuntimeIntrinsic(
             }
             for (std::size_t i = 0; i < matchedVals.size(); ++i) {
                 (void)heap->arraySet(*outArr, i, matchedVals[i], &allocErr);
+            }
+            const auto intArrTypeId = semantic::stableTypeId(
+                semantic::arrayTypeName(semantic::PrimitiveType::Int, {}));
+            if (const auto mapArr = heap->allocateTypedArray(
+                    intArrTypeId,
+                    semantic::PrimitiveType::Int,
+                    0,
+                    matchedSrcIndices.size(),
+                    std::int64_t{0},
+                    &allocErr)) {
+                for (std::size_t i = 0; i < matchedSrcIndices.size(); ++i) {
+                    (void)heap->arraySet(*mapArr, i, matchedSrcIndices[i], &allocErr);
+                }
+                const std::string wbMapKey =
+                    "$ecs_wb_map::" + std::to_string(colIdx) + "::" + std::string(spec);
+                const std::string wbTargetKey =
+                    "$ecs_wb_target::" + std::to_string(colIdx) + "::" + std::string(spec);
+                heap->setStaticField(semantic::stableTypeId(wbMapKey), *mapArr);
+                heap->setStaticField(semantic::stableTypeId(wbTargetKey), sparseValsRef);
             }
             result = *outArr;
             return true;
@@ -1670,6 +1692,30 @@ bool tryExecuteRuntimeIntrinsic(
             result = std::monostate{};
             return true;
         }
+        const auto* idxPtr = std::get_if<std::int64_t>(&arguments[0]);
+        if (!idxPtr || *idxPtr < 0) {
+            result = std::monostate{};
+            return true;
+        }
+        const auto idx = static_cast<std::size_t>(*idxPtr);
+        const std::string wbMapKey = "$ecs_wb_map::" + std::string(rest);
+        const std::string wbTargetKey = "$ecs_wb_target::" + std::string(rest);
+        if (const auto mapVal = heap->getStaticField(semantic::stableTypeId(wbMapKey));
+            mapVal && std::holds_alternative<ObjectRef>(*mapVal)) {
+            const auto targetVal = heap->getStaticField(semantic::stableTypeId(wbTargetKey));
+            if (targetVal && std::holds_alternative<ObjectRef>(*targetVal)) {
+                const auto mapRef = std::get<ObjectRef>(*mapVal);
+                const auto targetRef = std::get<ObjectRef>(*targetVal);
+                if (const auto srcIdxVal = heap->arrayGet(mapRef, idx);
+                    srcIdxVal && std::holds_alternative<std::int64_t>(*srcIdxVal)) {
+                    const auto srcIdx = static_cast<std::size_t>(std::get<std::int64_t>(*srcIdxVal));
+                    RuntimeError setErr;
+                    (void)heap->arraySet(targetRef, srcIdx, arguments[1], &setErr);
+                    result = std::monostate{};
+                    return true;
+                }
+            }
+        }
         const std::size_t colIdx = static_cast<std::size_t>(
             std::strtoull(std::string(rest.substr(0, sep)).c_str(), nullptr, 10));
         const auto spec = rest.substr(sep + 2);
@@ -1684,13 +1730,7 @@ bool tryExecuteRuntimeIntrinsic(
             result = std::monostate{};
             return true;
         }
-        const auto* idxPtr = std::get_if<std::int64_t>(&arguments[0]);
-        if (!idxPtr || *idxPtr < 0) {
-            result = std::monostate{};
-            return true;
-        }
         const auto matched = computeMatchedEcsEntities(heap, cols, withs, withouts);
-        const auto idx = static_cast<std::size_t>(*idxPtr);
         if (idx < matched.size()) {
             const auto entId = matched[idx];
             std::vector<std::int64_t> sparseIds;

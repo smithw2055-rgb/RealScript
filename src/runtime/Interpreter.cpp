@@ -2756,11 +2756,15 @@ ExecutionResult Interpreter::invoke(
         options.limits.gcWorkBudget == 0 && options.debugger == nullptr;
     if (options.enforceCapabilities) {
         options.determinism.enforceCapabilities = true;
-        options.determinism.grantedCapabilities.insert(
-            options.grantedCapabilities.begin(),
-            options.grantedCapabilities.end());
+        if (options.determinism.grantedCapabilities.empty()) {
+            options.determinism.grantedCapabilities = std::move(options.grantedCapabilities);
+        } else {
+            options.determinism.grantedCapabilities.insert(
+                options.grantedCapabilities.begin(),
+                options.grantedCapabilities.end());
+        }
     }
-    state.determinism = DeterminismSession(options.determinism);
+    state.determinism = DeterminismSession(std::move(options.determinism));
     state.heap = heap_.get();
     state.debugger = options.debugger.get();
     if (state.debugger) {

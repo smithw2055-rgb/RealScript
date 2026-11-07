@@ -507,6 +507,8 @@ struct SceneCollider2D {
     bool isCircle = false;
     bool isTrigger = false;
     std::uint32_t layerMask = 0xFFFFFFFFu;
+    std::uint32_t collisionLayer = 0xFFFFFFFFu;
+    std::uint32_t collisionMask = 0xFFFFFFFFu;
 };
 
 struct RaycastHit2D {
@@ -629,6 +631,14 @@ public:
     }
     void setSignalTopicPublisher(
         std::function<void(const std::string&)> publisher) {
+        signalTopicPublisher_ = [pub = std::move(publisher)](const std::string& topic) -> std::size_t {
+            if (!pub) return 0;
+            pub(topic);
+            return 1;
+        };
+    }
+    void setSignalTopicPublisherCounted(
+        std::function<std::size_t(const std::string&)> publisher) {
         signalTopicPublisher_ = std::move(publisher);
     }
 
@@ -641,10 +651,36 @@ public:
     [[nodiscard]] bool isInputActionJustReleased(const std::string& action) const noexcept;
     [[nodiscard]] Vec2 getInputAxis2D(const std::string& axisName) const noexcept;
     [[nodiscard]] std::uint64_t computeInputDigest() const noexcept;
+    [[nodiscard]] const std::map<std::string, bool>& currentInputActions() const noexcept {
+        return currentInputActions_;
+    }
+    [[nodiscard]] const std::map<std::string, bool>& previousInputActions() const noexcept {
+        return previousInputActions_;
+    }
+    [[nodiscard]] const std::map<std::string, Vec2>& inputAxes2D() const noexcept {
+        return inputAxes2D_;
+    }
+    void restoreInputSnapshot(
+        std::map<std::string, bool> currentActions,
+        std::map<std::string, bool> previousActions,
+        std::map<std::string, Vec2> axes2D);
 
     // Deterministic 2D Physics & Spatial Queries (RealScript.Physics)
     void setEntityCollider2D(SceneEntityId entity, SceneCollider2D collider);
     bool removeEntityCollider2D(SceneEntityId entity);
+    [[nodiscard]] std::optional<SceneCollider2D> getEntityCollider2D(SceneEntityId entity) const noexcept;
+    [[nodiscard]] const std::map<SceneEntityId, SceneCollider2D>& colliders2D() const noexcept {
+        return colliders2D_;
+    }
+    [[nodiscard]] const std::set<std::pair<SceneEntityId, SceneEntityId>>& activeOverlaps2D() const noexcept {
+        return activeOverlaps2D_;
+    }
+    [[nodiscard]] const std::map<std::pair<SceneEntityId, SceneEntityId>, bool>& activeOverlapWasTrigger2D() const noexcept {
+        return activeOverlapWasTrigger2D_;
+    }
+    void restorePhysicsOverlapState(
+        std::set<std::pair<SceneEntityId, SceneEntityId>> activeOverlaps,
+        std::map<std::pair<SceneEntityId, SceneEntityId>, bool> activeOverlapWasTrigger);
     [[nodiscard]] std::optional<RaycastHit2D> raycast2D(
         Vec2 origin,
         Vec2 direction,
@@ -655,6 +691,22 @@ public:
         Fixed radius,
         std::uint32_t layerMask = 0xFFFFFFFFu) const;
     std::size_t stepPhysics2D();
+
+    // Deferred Destruction, Entity Spawning, Naming & Groups (Godot/Unity Parity)
+    SceneEntityId spawnEntity(const std::string& name = {});
+    void queueDestroyEntity(SceneEntityId entity);
+    [[nodiscard]] std::size_t pendingDestroyCount() const noexcept {
+        return pendingDestroyEntities_.size();
+    }
+    std::size_t flushDestroyedEntities();
+    void setEntityName(SceneEntityId entity, std::string name);
+    [[nodiscard]] std::string getEntityName(SceneEntityId entity) const;
+    [[nodiscard]] SceneEntityId findEntityByName(const std::string& name) const noexcept;
+    void addEntityToGroup(SceneEntityId entity, const std::string& group);
+    bool removeEntityFromGroup(SceneEntityId entity, const std::string& group);
+    [[nodiscard]] bool isEntityInGroup(SceneEntityId entity, const std::string& group) const noexcept;
+    [[nodiscard]] std::vector<SceneEntityId> getEntitiesInGroup(const std::string& group) const;
+    [[nodiscard]] std::vector<std::string> getEntityGroups(SceneEntityId entity) const;
 
     [[nodiscard]] std::optional<ComponentLocation> findObjectLocation(
         runtime::ObjectRef reference) const;
@@ -824,13 +876,17 @@ private:
     mutable bool tickOrderDirty_ = true;
     mutable std::vector<TickRef> cachedTickOrder_;
     std::vector<SignalConnection> signalConnections_;
-    std::function<void(const std::string&)> signalTopicPublisher_;
+    std::function<std::size_t(const std::string&)> signalTopicPublisher_;
     std::map<std::string, bool> currentInputActions_;
     std::map<std::string, bool> previousInputActions_;
     std::map<std::string, Vec2> inputAxes2D_;
     std::map<SceneEntityId, SceneCollider2D> colliders2D_;
     std::set<std::pair<SceneEntityId, SceneEntityId>> activeOverlaps2D_;
     std::map<std::pair<SceneEntityId, SceneEntityId>, bool> activeOverlapWasTrigger2D_;
+    std::vector<SceneEntityId> pendingDestroyEntities_;
+    std::map<SceneEntityId, std::string> entityNames_;
+    std::map<std::string, std::set<SceneEntityId>> groupEntities_;
+    SceneEntityId nextAutoEntityId_ = 1;
     runtime::FiberScheduler* fiberScheduler_ = nullptr;
     std::map<std::size_t, std::vector<MethodCacheEntry>> methodCache_;
     std::vector<ScriptEvent> eventQueue_;

@@ -341,27 +341,36 @@ bool DeterminismSession::invokeExternal(
     auto policy = BindingDeterminism::NonDeterministic;
     std::string requiredCapability;
     const ExternalFunction* function = fallback;
+    bool resolvedFromRegistry = false;
     if (bindings) {
         if (const auto resolved = bindings->resolve(reference)) {
             function = resolved->function;
             policy = resolved->determinism;
             requiredCapability = resolved->requiredCapability;
+            resolvedFromRegistry = true;
         }
     }
-    if (impl_->options.enforceCapabilities &&
-        !requiredCapability.empty() &&
-        impl_->options.grantedCapabilities.find(requiredCapability) ==
-            impl_->options.grantedCapabilities.end()) {
-        error.code = ErrorCode::CapabilityDenied;
-        error.message = "external function '" + reference.name +
-            "' requires capability '" + requiredCapability + "'";
-        return false;
+    if (impl_->options.enforceCapabilities) {
+        if (!resolvedFromRegistry && function && *function) {
+            requiredCapability = "Host.UnregisteredExternal";
+        }
+        if (!requiredCapability.empty() &&
+            impl_->options.grantedCapabilities.find(requiredCapability) ==
+                impl_->options.grantedCapabilities.end()) {
+            error.code = ErrorCode::CapabilityDenied;
+            error.message = "external function '" + reference.name +
+                "' requires capability '" + requiredCapability + "'";
+            return false;
+        }
     }
-    const auto argumentHash = argumentsHash(
-        arguments, impl_->options.canonicalizeFloatingPoint);
-    hashScalar(impl_->digest, reference.symbolId);
-    hashString(impl_->digest, reference.name);
-    hashScalar(impl_->digest, argumentHash);
+    std::uint64_t argumentHash = 0;
+    if (mode != DeterminismMode::Off) {
+        argumentHash = argumentsHash(
+            arguments, impl_->options.canonicalizeFloatingPoint);
+        hashScalar(impl_->digest, reference.symbolId);
+        hashString(impl_->digest, reference.name);
+        hashScalar(impl_->digest, argumentHash);
+    }
 
     if (mode == DeterminismMode::Strict &&
         policy != BindingDeterminism::Deterministic) {
@@ -447,13 +456,17 @@ bool DeterminismSession::invokeExternal(
     }
     if (!succeeded) {
         error = std::move(invocationError);
-        hashScalar(impl_->digest, static_cast<std::uint16_t>(error.code));
-        hashString(impl_->digest, error.message);
+        if (mode != DeterminismMode::Off) {
+            hashScalar(impl_->digest, static_cast<std::uint16_t>(error.code));
+            hashString(impl_->digest, error.message);
+        }
         return false;
     }
     result = std::move(invocationResult);
-    hashValue(impl_->digest, *result,
-                impl_->options.canonicalizeFloatingPoint);
+    if (mode != DeterminismMode::Off) {
+        hashValue(impl_->digest, *result,
+            impl_->options.canonicalizeFloatingPoint);
+    }
     return true;
 }
 

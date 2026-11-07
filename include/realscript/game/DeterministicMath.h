@@ -54,16 +54,30 @@ struct Vec2 {
         return Vec2{Fixed::fromRaw(xRaw), Fixed::fromRaw(yRaw)};
     }
 
+    [[nodiscard]] static constexpr std::int64_t dotRaw64(Vec2 a, Vec2 b) noexcept {
+        return (static_cast<std::int64_t>(a.x.raw) * static_cast<std::int64_t>(b.x.raw) +
+                static_cast<std::int64_t>(a.y.raw) * static_cast<std::int64_t>(b.y.raw)) >> 8;
+    }
+
     [[nodiscard]] static constexpr Fixed dot(Vec2 a, Vec2 b) noexcept {
-        return a.x * b.x + a.y * b.y;
+        return Fixed::fromRaw(Fixed::clampRaw64(dotRaw64(a, b)));
+    }
+
+    [[nodiscard]] static constexpr std::int64_t crossRaw64(Vec2 a, Vec2 b) noexcept {
+        return (static_cast<std::int64_t>(a.x.raw) * static_cast<std::int64_t>(b.y.raw) -
+                static_cast<std::int64_t>(a.y.raw) * static_cast<std::int64_t>(b.x.raw)) >> 8;
     }
 
     [[nodiscard]] static constexpr Fixed cross(Vec2 a, Vec2 b) noexcept {
-        return a.x * b.y - a.y * b.x;
+        return Fixed::fromRaw(Fixed::clampRaw64(crossRaw64(a, b)));
+    }
+
+    [[nodiscard]] constexpr std::int64_t lengthSqRaw64() const noexcept {
+        return dotRaw64(*this, *this);
     }
 
     [[nodiscard]] constexpr Fixed lengthSq() const noexcept {
-        return x * x + y * y;
+        return Fixed::fromRaw(Fixed::clampRaw64(lengthSqRaw64()));
     }
 
     [[nodiscard]] constexpr Fixed length() const noexcept {
@@ -139,8 +153,14 @@ struct Vec3 {
             Fixed::fromInt(zInt)};
     }
 
+    [[nodiscard]] static constexpr std::int64_t dotRaw64(Vec3 a, Vec3 b) noexcept {
+        return (static_cast<std::int64_t>(a.x.raw) * static_cast<std::int64_t>(b.x.raw) +
+                static_cast<std::int64_t>(a.y.raw) * static_cast<std::int64_t>(b.y.raw) +
+                static_cast<std::int64_t>(a.z.raw) * static_cast<std::int64_t>(b.z.raw)) >> 8;
+    }
+
     [[nodiscard]] static constexpr Fixed dot(Vec3 a, Vec3 b) noexcept {
-        return a.x * b.x + a.y * b.y + a.z * b.z;
+        return Fixed::fromRaw(Fixed::clampRaw64(dotRaw64(a, b)));
     }
 
     [[nodiscard]] static constexpr Vec3 cross(Vec3 a, Vec3 b) noexcept {
@@ -157,8 +177,12 @@ struct Vec3 {
             a.z + (b.z - a.z) * t};
     }
 
+    [[nodiscard]] constexpr std::int64_t lengthSqRaw64() const noexcept {
+        return dotRaw64(*this, *this);
+    }
+
     [[nodiscard]] constexpr Fixed lengthSq() const noexcept {
-        return x * x + y * y + z * z;
+        return Fixed::fromRaw(Fixed::clampRaw64(lengthSqRaw64()));
     }
 
     [[nodiscard]] constexpr Fixed length() const noexcept {
