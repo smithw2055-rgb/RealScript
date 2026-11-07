@@ -205,7 +205,7 @@ collection to 27.75 ms with 460 completed collections and 16,320 bytes live.
 
 For the complete experiment history, rejected prototypes, product macrobench
 results, and reproduction commands, see the
-[detailed performance report](../zh-CN/PERFORMANCE_BASELINE_2026-08-09.md).
+[detailed performance report](../zh-CN/PERFORMANCE_BASELINE.md).
 
 ## Differential Validation
 

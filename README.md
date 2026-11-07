@@ -178,7 +178,7 @@ Key v0.2.0 performance changes:
 - cached scene method descriptors and lower scheduler payload-copy cost.
 
 Read the [AOT/JIT performance guide](docs/en/AOT_JIT_AND_PERFORMANCE.md) and the
-[full benchmark report](docs/zh-CN/PERFORMANCE_BASELINE_2026-08-09.md) for
+[full benchmark report](docs/zh-CN/PERFORMANCE_BASELINE.md) for
 methodology, optimization history, rejected experiments, and reproduction
 commands.
 

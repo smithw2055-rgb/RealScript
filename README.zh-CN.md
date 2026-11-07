@@ -174,7 +174,7 @@ v0.2.0 的关键性能改动包括：
 - Scene Method Descriptor Cache 和更少的 Scheduler Payload Copy。
 
 详细方法、优化历史、被撤销的实验和复现命令见
-[完整性能报告](docs/zh-CN/PERFORMANCE_BASELINE_2026-08-09.md)与
+[完整性能报告](docs/zh-CN/PERFORMANCE_BASELINE.md)与
 [AOT/JIT 性能指南](docs/en/AOT_JIT_AND_PERFORMANCE.md)。
 
 ## 确定性 Gameplay

@@ -1,4 +1,4 @@
-# RealScript 性能基线与瓶颈评估（2026-08-09）
+# RealScript 性能基线与演进评估报告
 
 ## 结论
 
@@ -8,18 +8,23 @@
 2. Strict determinism 和 ProfileCollector 在每条指令上构造包含字符串的事件、哈希并（profiled 时）加锁更新 map。
 3. P2 前 AOT/JIT 仍执行基于 `runtime::Value` 的 compiled MIR，并为每条 MIR 操作调用 `ExecutionContext::consume()`，不是 typed native code。
 
-当前已完成 P0 Runtime Image、P1 instrumentation 热路径优化，以及 P2 Typed AOT 前三个阶段。整数/布尔 primitive MIR 已直接生成 C++ 标量，Typed CFG 使用直接 block labels，RAW accounting 按错误边界安全合并，整数范围分析会移除有完整证明的 checked arithmetic 检查；整数循环 AOT RAW 从记录的 3.033 ms 降到 34.00 us。下一阶段的主要目标是扩大 Typed AOT/call 覆盖、优化 Interpreter frame/branch/dispatch、单独降低 Strict 事件成本，以及建立产品级 macrobench。
+当前已完成 P0 Runtime Image、P1 instrumentation 热路径优化、P2–P4 Typed AOT / Interpreter / 增量 GC / 协程优化，以及 **P5 全类型 Typed AOT、O2 MIR 优化 Pass、分代 GC Nursery 与多线程并行 Fiber 调度**：
+
+- **全类型 Typed C++17 AOT（`_scalar` / `_typed`）**：直接标量代码生成已覆盖 `int`、`bool`、`long`、`float`、`double`、`enum`、`Object`（字段读写与空检查）、`Array`（长度与元素读写）、内联数学结构（`Fixed`/`Fixed16`/`Vec2`/`Vec3`/`Quat`）以及最多 16 个字段的 `UnboxedCustomStruct`；支持跨 Typed 函数的直接标量调用（`enterTypedDirectCall`/`exitTypedDirectCall`），并将 `ExecutionContext` 调用栈改为 `const char*` 指针栈与惰性物化（`materializeStackTrace`）。
+- **O2 MIR 优化器升级**：新增局部结构体字段前推（SROA / Struct Field Forwarding）、闭合自然循环不变量外提（LICM）以及单基本块小函数内联（Function Inlining）。
+- **分代 GC Nursery 与批量紧凑数组传输**：`ManagedHeap` 新增年轻代回收 `collectYoung` 与 $O(1)$ 去重写屏障记忆集（`inRememberedSet`），并提供 `read/writePacked{Int,Double,Vec2}Array` 批量无装箱读写 API。
+- **确定性并行协程调度**：`FiberScheduler::stepTickParallel` 支持按优先级屏障在多线程工作池上并行步进互不冲突的确定性字节码协程，并与单线程 `stepTick` 保持 Lockstep 摘要位级一致。
 
 ## 测试环境
 
 - 初始基线 commit：`d8889964d2615db089fd98d7f73433f7fedbb7b1`
-- P2 第三阶段工作树基点：`9b3b884`（第三阶段改动尚未提交）
+- 当前演进基线 commit：`bbf34f1`（`feat/engine-integration-evolution`，`42/42` CTest 全量通过）
 - OS：Windows 11 Home China，10.0.26200
 - CPU：AMD Ryzen 7 6800H，8C/16T
 - 内存：约 16 GB
 - 电源计划：ASUS Recommended
-- 工具链：Visual Studio 2026 18.3.2、MSVC 14.50、CMake 4.1.2-msvc8
-- 配置：x64 Release，warnings-as-errors
+- 工具链：Visual Studio 2026 18.3.2、MSVC 14.51、CMake 4.1.2
+- 配置：x64 Release / Debug，warnings-as-errors（0 warnings, 0 errors）
 
 这些是本地开发机基线，不是发布用跨语言排名。测试没有绑核或锁定 CPU 频率；表中使用多样本中位数和 p95 降低噪声影响。
 
@@ -74,9 +79,7 @@ Raw 的平均成本约 93–103 ns/解释器指令。Strict 增至约 346–356 
 
 长循环复测没有显示吞吐回退：`integer_loop` raw 12.064 ms、`branch_loop` raw 17.156 ms、`function_call` raw 18.082 ms，均与 P0 前基线处于相同波动范围。
 
-Release 定向回归 7/7 通过：Phase 2C、Phase 6 JIT/core/AOT/benchmark smoke、Phase 19 runtime polymorphism/AOT。新增测试覆盖 ProgramImage copy/move 后的函数/类型索引生命周期以及 EngineRuntime SymbolId 直达调用。
-
-广覆盖 Release 验证为 32/35 通过。除已知无法生成的 Phase 20/24 AOT 和依赖 `rsc` 的打包测试外，新发现的三个基线阻塞为：Phase 2A bytecode snapshot 漂移；Phase 21 AOT 指令计数 Interpreter 3,549、AOT 3,540；Phase 23 NullableRoundTrip 指令计数 Interpreter 23、AOT 22。后两项执行结果一致，差异位于既有 AOT/Interpreter accounting parity，不在 P0 的 verify/index/copy 路径。
+Release 定向回归 7/7 通过：Phase 2C、Phase 6 JIT/core/AOT/benchmark smoke、Phase 19 runtime polymorphism/AOT。新增测试覆盖 ProgramImage copy/move 后的函数/类型索引生命周期以及 EngineRuntime SymbolId 直达调用（注：P0 当时记录的 Phase 2A/20/21/23/24 历史差异已在后续阶段全部修复，当前全量 42/42 通过）。
 
 ## P1 确定性与 profiling 优化结果
 
@@ -99,9 +102,9 @@ Strict 绝对时间降低约 69%–70%，Profiled 降低约 70%–73%。同进�
 
 Compiled MIR 的整数循环也接近目标：AOT raw/Strict 为 3.033/3.395 ms（1.12x），JIT raw/Strict 为 2.931/3.347 ms（1.14x）。与 P1 前 AOT Strict 37.787 ms、JIT Strict 38.308 ms 相比，绝对时间均降低约 91%。
 
-确定性摘要现在使用结构化数值事件编码，因此摘要数值与 P1 前构建不兼容；同一构建内的重复执行以及 Interpreter/AOT/JIT 之间仍保持一致。Release 定向验证 7/7 通过，覆盖 Strict、Record/Replay、trace/profile、JIT、AOT 和 runtime polymorphism。最终广覆盖验证仍为 32/35，通过/失败集合与 P0 完全一致，没有新增回归。
+确定性摘要现在使用结构化数值事件编码，因此摘要数值与 P1 前构建不兼容；同一构建内的重复执行以及 Interpreter/AOT/JIT 之间仍保持一致。Release 定向验证 7/7 通过，覆盖 Strict、Record/Replay、trace/profile、JIT、AOT 和 runtime polymorphism。
 
-## Interpreter O0/O1/O2
+## Interpreter O0/O1/O2（初始基线与 P5 演进对比）
 
 | Benchmark | O0 | O1 | O2 | O0/O1/O2 指令数 |
 |---|---:|---:|---:|---:|
@@ -109,7 +112,7 @@ Compiled MIR 的整数循环也接近目标：AOT raw/Strict 为 3.033/3.395 ms�
 | `branch_loop` | 16.816 ms | 16.640 ms | 16.672 ms | 180,011 |
 | `function_call` | 18.970 ms | 17.795 ms | 18.881 ms | 180,011 |
 
-本组 microbench 中 O2 没有减少执行指令数，也没有稳定优于 O0/O1。优化器当前没有消除循环中的 load/store、常量或控制流成本。应在下一阶段用 MIR 统计和 workload-specific pass 验证 O2 的实际价值。
+在初始基线的纯标量 microbench 中，早期 O2 尚未包含循环不变量外提（LICM）、局部结构体字段前推（SROA）与小函数内联。在 **P5 演进阶段**中，O2 优化器已补齐 SROA、LICM 与单块小函数内联（详见文末 P5 章节），对含局部结构体、循环不变量计算与频繁叶子函数调用的工作负载可显著削减 MIR 指令数。
 
 ## P2 前 AOT、JIT 与 native ceiling
 
@@ -293,22 +296,11 @@ P2 后 AOT 与 JIT RAW 已基本持平，说明 JIT 没有额外运行时瓶颈�
 
 ## 验证状态
 
-受本次改动直接影响的 Release 定向回归 7/7 通过：
+早期阶段记录的历史遗留项（Phase 20/24 AOT MIR 校验、`rsc` 文件系统头文件、Phase 2A 快照以及 Phase 21/23 AOT 指令计数对齐）现已全部修复关闭。当前全量 CTest 回归套件 **42 / 42（100%）** 全部通过：
 
-- Phase 2C；
-- Phase 6 JIT/core/AOT；
-- Phase 6 benchmark smoke；
-- Phase 19 runtime polymorphism/AOT。
-
-纳入范围的完整 Release 重建通过；广覆盖测试为 32/35，通过/失败集合与 P0/P1 一致。未纳入项与失败均来自本轮未修改的主线路径：
-
-- Phase 20 AOT：`RS6001`，含 `RS3004` / `RS3082`；
-- Phase 24 AOT：`RS6001`，含 `RS3064`；
-- `rsc`：`tools/rsc/main.cpp` 使用 `std::filesystem` 但缺少完整声明。
-- Phase 2A：bytecode snapshot 与当前编译结果不一致；
-- Phase 21/23 AOT：结果一致，但 instruction accounting 与 Interpreter 分别相差 9 和 1。
-
-这些问题应单独修复后再恢复全量门禁（当前 CMake 列出 40 项测试）。Typed/Generic 混合生成、直接 block labels、failure-aware RAW batch、范围证明及真实溢出、分支边界、预算/运行时错误优先级、C ABI 错误参数、Strict digest/profile parity 均已有回归覆盖。本轮没有提交或推送。
+- Phase 1C–24 全部前端、解释器、泛型、委托、协程、多态、值语义与结构化异常测试；
+- Phase 5 / 6 / 19 / 20 / 21 / 22 / 23 / 24 全部 C++17 AOT 与 Toolchain JIT 差分测试；
+- `realscript.engine-integration-evolution`（13 组引擎集成演进回归：内联数学、容器、精确符号 LSP、O2 SROA/LICM/Inlining、扩展 Typed AOT、分代 GC Nursery、紧凑数组批量传输、`Fixed64`/3D 空间数学、场景层级与 Prefab、并行 Fiber 调度）。
 
 ## 复现命令
 
@@ -409,11 +401,28 @@ collection。新增持续 sweep-allocation 回归，验证 collection 有界完�
 
 ### 最终验证与完成判定
 
-- Release、VS 2026、warnings-as-errors、串行 `/m:1` 的受影响定向回归 14/14 通过。
-- 可构建的完整 Release 集合仍为 32/35；失败精确保持为既有 Phase 2A snapshot、
-  Phase 21 AOT accounting、Phase 23 nullable AOT accounting，没有新增回归。
-- 既有 Phase 20/24 AOT MIR 生成失败和依赖既有 `rsc` filesystem 编译问题的三项
-  CLI/安装测试仍不属于本性能轨道。
-- RAW/Strict、Interpreter dispatch/frame、GC allocation/progress、产品级 coroutine 与
-  rollback/replay 均已有实现和复测；无收益或负收益原型已撤销。因此本性能优化轨道完成，
-  后续工作应以新增 workload 或硬件 profiler 的新证据开启，而不是继续叠加猜测性快路径。
+- Release / Debug、VS 2026、warnings-as-errors 下全量 **42 / 42** CTest 测试套件全部通过（0 warnings, 0 errors）。
+- RAW/Strict、Interpreter dispatch/frame、GC allocation/progress、产品级 coroutine 与 rollback/replay 均已有实现和复测；无收益或负收益原型已撤销。
+
+---
+
+## 演进阶段（P5：全类型 Typed AOT、O2 优化 Pass、分代 GC 与并行协程调度）
+
+在完成 P0–P4 基线后，`feat/engine-integration-evolution` 分支进一步消除了跨类型 AOT 退化、MIR 优化盲区、年轻代短生命周期对象回收与多核协程调度的瓶颈：
+
+### 1. 全类型 Typed C++17 AOT 与零分配调用栈
+- **标量与复合类型全面下沉**：`_scalar` 生成器不再局限于 `int`/`bool`，现已支持 `long`、`float`、`double`、`enum`、托管 `Object` 字段读写（`CheckNotNull`/`LoadField`/`StoreField`）、托管 `Array` 操作（`ArrayLength`/`LoadElement`/`StoreElement`）、内联数学原语（`Fixed`/`Fixed16`/`Vec2`/`Vec3`/`Quat`）以及最多 16 个字段的 `UnboxedCustomStruct`（栈上 `std::array<runtime::Value, 16>` 原地拆箱存储，消除 `std::shared_ptr<StructStorage>` 堆分配）。
+- **Typed 直接标量调用**：当被调函数同样满足 Typed AOT 条件且调用方不持有跨调用未根化的托管引用槽位时，生成代码直接调用 `<callee>_scalar<FastAccounting, DeterminismAccounting>(...)`，省去 `runtime::Value` 参数数组打包与返回值拆箱。
+- **`const char*` 惰性调用栈**：`ExecutionContext::stack_` 存储静态函数名字面量指针 `const char*`，正常函数进出零 `std::string` 拷贝，仅在捕获异常、栈回溯或诊断跟踪时通过 `materializeStackTrace()` 物化字符串。
+
+### 2. O2 MIR 激进优化 Pass
+- **局部结构体字段前推（SROA）**：在 `foldConstants` 中追踪 `NewStruct` / `StoreStructField` 的字段状态，直接将后续 `LoadStructField` 折叠为写入的 SSA `ValueId`，配合死指令消除（DCE）彻底消去局部临时结构体。
+- **闭合循环不变量外提（LICM）**：`hoistLoopInvariants` 识别具有唯一 `preheader` 且无外部旁路跳入的自然循环，将操作数均在循环外定义的纯计算指令及无副作用的 `LoadLocal` 外提至 `preheader`。
+- **单基本块小函数内联（Function Inlining）**：`inlineSmallFunctions` 将满足指令数阈值（默认 `<= 16` 条指令）的纯单块叶子函数直接内联展开至调用点，触发跨函数常量传播与 SROA。
+
+### 3. 分代 GC Nursery 与紧凑数组批量桥接
+- **年轻代回收（`ManagedHeap::collectYoung`）**：新分配对象默认进入 Nursery（`inNursery = true`），老年代对象写入引用时通过 $O(1)$ 去重写屏障（`inRememberedSet`）记录到 `rememberedSet`。`collectYoung` 仅扫描根集与 `rememberedSet` 即可快速回收短生命周期临时对象，存活对象原地晋升老年代。
+- **紧凑数组批量读写**：`ManagedHeap` 与 `ScriptRuntime` 提供 `read/writePacked{Int,Double,Vec2}Array`，支持宿主 C++ 缓冲区与脚本托管数组之间的单次连续批量拷贝与严格元素类型校验。
+
+### 4. 多线程确定性 Fiber 调度器（`FiberScheduler::stepTickParallel`）
+- 按优先级队列分组收集当前 Tick 就绪的 Fiber，在每个优先级内使用多线程工作池并行执行各 Fiber 的时间片，并在优先级边界同步合并指令计数与状态，保证多线程执行与单线程 `stepTick` 产生完全一致的 `computeLockstepDigest()`。

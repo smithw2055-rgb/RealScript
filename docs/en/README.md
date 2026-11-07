@@ -26,7 +26,7 @@ It is organized by subsystem and user workflow.
 - [Deterministic Gameplay Runtime](GAMEPLAY_RUNTIME.md)
 - [SDK Productization](PRODUCTIZATION.md)
 - [AOT, JIT, and Performance](AOT_JIT_AND_PERFORMANCE.md)
-- [Detailed Performance Baseline (Chinese)](../zh-CN/PERFORMANCE_BASELINE_2026-08-09.md)
+- [Detailed Performance Baseline (Chinese)](../zh-CN/PERFORMANCE_BASELINE.md)
 - [Phase 18–24 Native Roadmap](../roadmap/PHASE_18_24_NATIVE_LANGUAGE_AND_RUNTIME.md)
 - [Phase 24 Language Completeness and Structured Errors](../roadmap/PHASE_24_LANGUAGE_COMPLETENESS_AND_STRUCTURED_ERRORS.md)
 
