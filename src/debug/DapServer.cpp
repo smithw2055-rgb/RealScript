@@ -110,7 +110,7 @@ tooling::Json DapServer::handle(
         return response(request, true, tooling::Json::Object{
             {"supportsConfigurationDoneRequest", true},
             {"supportsTerminateRequest", true},
-            {"supportsSetVariable", false},
+            {"supportsSetVariable", true},
             {"supportsConditionalBreakpoints", true},
             {"supportsEvaluateForHovers", true},
         });
@@ -247,6 +247,27 @@ tooling::Json DapServer::handle(
             }
         }
         return response(request, true, tooling::Json::Object{{"variables", tooling::Json(std::move(values))}});
+    }
+    if (command == "setVariable") {
+        const auto reference = arguments && arguments->find("variablesReference")
+            ? arguments->find("variablesReference")->integerValue() : 2;
+        const auto name = arguments && arguments->find("name")
+            ? arguments->find("name")->stringValue() : std::string{};
+        const auto valExpr = arguments && arguments->find("value")
+            ? arguments->find("value")->stringValue() : std::string{};
+        const auto frameId = static_cast<std::uint32_t>(std::max<std::int64_t>(1, reference / 2));
+        runtime::Value updatedVal{};
+        std::string errMsg;
+        if (!session_->setVariable(name, valExpr, frameId, &updatedVal, &errMsg)) {
+            return response(request, false, nullptr,
+                errMsg.empty() ? "failed to set variable" : errMsg);
+        }
+        rebuildVariableReferences();
+        return response(request, true, tooling::Json::Object{
+            {"value", runtime::valueToString(updatedVal, heap_.get())},
+            {"type", semantic::primitiveTypeName(runtime::valueType(updatedVal))},
+            {"variablesReference", 0},
+        });
     }
     if (command == "continue" || command == "next" ||
         command == "stepIn" || command == "stepOut") {

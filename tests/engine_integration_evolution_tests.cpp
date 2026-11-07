@@ -3805,6 +3805,544 @@ int CallSecret() {
     }
 }
 
+void testRound4RoadmapP0ToP2All10Items() {
+    using namespace realscript;
+
+    // 1. P0-1: Nested Inline Struct (Struct containing another custom Struct) with zero heap StructStorage
+    //    & P0-2: Native O(1) ECS Sparse Set (zero per-mutation heap array allocations)
+    //    & P0-3: Inline ManagedHeap Slot Storage
+    {
+        game::GameApi api;
+        const char* p0Src = R"RS(
+module Evolution.P0NestedStructAndEcs;
+import RealScript.Math;
+
+struct Bounds2D {
+    public Vec2 minPt;
+    public Vec2 maxPt;
+
+    public Bounds2D(Vec2 mn, Vec2 mx) {
+        minPt = mn;
+        maxPt = mx;
+    }
+}
+
+struct SpatialBody {
+    public Bounds2D box;
+    public int mass;
+
+    public SpatialBody(Bounds2D b, int m) {
+        box = b;
+        mass = m;
+    }
+}
+
+class SpatialRunner {
+    public SpatialBody sampleBody;
+
+    public void Init() {
+        Bounds2D b = new Bounds2D(
+            new Vec2(Fixed.Of(1), Fixed.Of(2)),
+            new Vec2(Fixed.Of(10), Fixed.Of(20)));
+        sampleBody = new SpatialBody(b, 50);
+    }
+
+    public int MutateNestedStruct() {
+        SpatialBody copy = sampleBody;
+        copy.mass = 99;
+        Bounds2D inner = copy.box;
+        inner.maxPt = new Vec2(Fixed.Of(30), Fixed.Of(40));
+        copy.box = inner;
+        if (sampleBody.mass != 50) return -1;
+        if (sampleBody.box.maxPt.x != Fixed.Of(10)) return -2;
+        return copy.box.maxPt.x.ToInt() + copy.mass;
+    }
+
+    public int RunEcsBatch() {
+        int sumMass = 0;
+        foreach (int entityId, ref var body in Query<Write<SpatialBody>>()) {
+            body.mass = body.mass + entityId;
+            sumMass = sumMass + body.mass;
+        }
+        return sumMass;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"p0_test.rs", p0Src}});
+        require(
+            compiled.succeeded(),
+            "Evolution.P0NestedStructAndEcs compile failed:\n" +
+                diagnosticsText(compiled.diagnostics));
+
+        game::ScriptRuntime rt(compiled.program);
+        runtime::RuntimeError err;
+        auto runner = rt.createObject("Evolution.P0NestedStructAndEcs::SpatialRunner", err);
+        require(runner.has_value(), "createObject SpatialRunner failed");
+        require(
+            rt.invoke(*runner, *rt.findMethod(runner->type(), "Init", 0), {}).succeeded,
+            "SpatialRunner.Init failed");
+
+        const auto bodyVal = rt.getMember(*runner, "sampleBody", err);
+        require(
+            bodyVal.has_value() && std::holds_alternative<runtime::StructValue>(*bodyVal),
+            "sampleBody must be a StructValue");
+        const auto& inlineBody = std::get<runtime::StructValue>(*bodyVal);
+        require(
+            inlineBody.isInline && inlineBody.storage == nullptr &&
+                inlineBody.inlineCount == 2 && inlineBody.inlineSlotCount == 3,
+            "P0-1: SpatialBody (nested Bounds2D{Vec2,Vec2} + int mass) must pack inline into 3 slots with storage == nullptr");
+
+        const auto mutateRes = rt.invoke(
+            *runner, *rt.findMethod(runner->type(), "MutateNestedStruct", 0), {});
+        require(
+            mutateRes.succeeded && std::get<std::int64_t>(mutateRes.value) == 129,
+            "P0-1: MutateNestedStruct value-copy semantics expected 30 + 99 = 129");
+
+        // P0-2: Verify O(1) Native ECS Sparse Set does NOT allocate managed heap objects per entity insertion!
+        const std::size_t allocsBefore = rt.heap()->statistics().objectsAllocated;
+        for (std::uint64_t ent = 1; ent <= 50; ++ent) {
+            require(
+                rt.setEcsEntityComponent(
+                    ent, "Evolution.P0NestedStructAndEcs::SpatialBody", *bodyVal, err),
+                "setEcsEntityComponent failed: " + err.message);
+        }
+        const std::size_t allocsAfter = rt.heap()->statistics().objectsAllocated;
+        require(
+            allocsAfter == allocsBefore,
+            "P0-2: inserting 50 ECS components into native Sparse Set must perform ZERO ManagedHeap object allocations");
+
+        const auto ecsRes = rt.invoke(
+            *runner, *rt.findMethod(runner->type(), "RunEcsBatch", 0), {});
+        // 50 entities * 50 base mass = 2500, plus sum(1..50) = 1275 => 3775
+        require(
+            ecsRes.succeeded && std::get<std::int64_t>(ecsRes.value) == 3775,
+            "P0-2: RunEcsBatch over 50 native Sparse Set entities expected 3775");
+    }
+
+    // 2. P1-1: Generational SceneEntityId (ABA protection), P1-2: Spatial Hash Grid Broadphase & CollisionContact2D,
+    //    P1-3: Non-shared_ptr Raw Native Pointer Binding, P1-4: Scriptable Assets & Sequence Hot Reload Migration
+    {
+        struct EngineManagedMotor {
+            int rpm = 1000;
+            bool customReleased = false;
+            void boost(int delta) { rpm += delta; }
+            int getRpm() const { return rpm; }
+        };
+
+        game::GameApi api;
+        api.type<EngineManagedMotor>("Engine.Raw", "EngineManagedMotor")
+            .method<&EngineManagedMotor::boost>("Boost")
+            .method<&EngineManagedMotor::getRpm>("GetRpm");
+
+        auto host = std::make_shared<game::GameplayHost>(60);
+        require(game::installGameplayBindings(api, host), "installGameplayBindings failed");
+
+        game::GameScriptCompiler bootstrapCompiler(api);
+        auto bootstrap = bootstrapCompiler.compile({{"empty.rs", "module Empty; void Main() {}"}});
+        game::ScriptRuntime rt(bootstrap.program);
+        game::SceneScriptRuntime scene(rt);
+        require(game::installSceneComponentBindings(api, scene), "installSceneComponentBindings failed");
+
+        const char* p1SrcV1 = R"RS(
+module Evolution.P1EngineRuntime;
+import Engine.Raw;
+import RealScript.Math;
+import RealScript.Game;
+import RealScript.Scene;
+
+class WeaponDataAsset {
+    public string weaponName = "PlasmaRifle";
+    public int baseDamage = 40;
+
+    public void OnValidate() {
+        if (baseDamage > 100) baseDamage = 100;
+    }
+}
+
+class ShipController : EngineManagedMotor {
+    public WeaponDataAsset equippedWeapon;
+    public int shield = 50;
+    public int seqStage = 0;
+    public Vec2 lastHitNormal;
+    public Fixed lastPenetration;
+
+    public void OnCollisionEnter(long other) {
+        lastHitNormal = GetCollisionNormal2D(1, other);
+        lastPenetration = GetCollisionPenetration2D(1, other);
+    }
+
+    sequence ChargeSequence(long selfId) {
+        seqStage = 1;
+        yield wait_ticks(5);
+        seqStage = 2;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiledV1 = compiler.compile({{"p1_v1.rs", p1SrcV1}});
+        require(
+            compiledV1.succeeded(),
+            "P1EngineRuntime V1 compile failed:\n" + diagnosticsText(compiledV1.diagnostics));
+        rt.replaceProgram(compiledV1.program);
+
+        // P1-1: Generational Entity Handle ABA protection
+        const auto genId1 = scene.spawnGenerationalEntity("TempDrone");
+        require(
+            game::entityIdGeneration(genId1) == 1 && scene.isEntityAlive(genId1),
+            "P1-1: first generational entity should have generation == 1 and be alive");
+        const auto slot1 = game::entityIdSlot(genId1);
+        require(scene.detach(genId1), "detach genId1 failed");
+        require(!scene.isEntityAlive(genId1), "detached genId1 must not be alive");
+        const auto genId2 = scene.spawnGenerationalEntity("ReusedSlotDrone");
+        require(
+            game::entityIdSlot(genId2) == slot1 &&
+                game::entityIdGeneration(genId2) == 2 &&
+                !scene.isEntityAlive(genId1) &&
+                scene.isEntityAlive(genId2),
+            "P1-1: reused generational slot must increment generation to 2 and reject stale genId1 handle");
+        scene.setEntityName(genId1, "StaleGhost");
+        scene.setLocalPosition2D(genId1, game::Vec2::fromInts(99, 99));
+        require(
+            scene.findEntityByName("StaleGhost") == 0 &&
+                !scene.attachComponent(genId1, "Evolution.P1EngineRuntime::ShipController"),
+            "P1-1: mutating APIs must reject stale generational handle genId1");
+        runtime::RuntimeError importErr;
+        const std::string genSceneJson = game::exportSceneJson(scene, importErr);
+        require(
+            !genSceneJson.empty() &&
+                game::importSceneJson(scene, genSceneJson, importErr) &&
+                scene.isEntityAlive(genId2),
+            "P1-1: exportSceneJson/importSceneJson must preserve generational entity liveness for genId2");
+        (void)scene.detach(genId2);
+
+        // P1-3: Non-shared_ptr Raw Native Pointer Binding with custom deleter hook
+        EngineManagedMotor stackMotor;
+        stackMotor.rpm = 1200;
+        bool deleterCalled = false;
+        runtime::RuntimeError err;
+        auto rawBoundShip = rt.createDerivedRawNative<EngineManagedMotor>(
+            "Evolution.P1EngineRuntime::ShipController",
+            &stackMotor,
+            err,
+            {},
+            [&](EngineManagedMotor* ptr) {
+                ptr->customReleased = true;
+                deleterCalled = true;
+            });
+        require(rawBoundShip.has_value(), "P1-3: createDerivedRawNative failed: " + err.message);
+        require(
+            rt.invoke(*rawBoundShip, *rt.findMethod(rawBoundShip->type(), "Boost", 1), {std::int64_t{300}}).succeeded &&
+                stackMotor.rpm == 1500,
+            "P1-3: invoking inherited C++ method on raw pointer binding should update stackMotor.rpm to 1500");
+        require(rt.releaseNative(*rawBoundShip) && deleterCalled && stackMotor.customReleased,
+            "P1-3: releasing raw native handle should invoke custom non-owning deleter callback");
+
+        // P1-4: Reusable Scriptable Data Asset (`createAsset` / `findAsset`)
+        auto weaponAsset = rt.createAsset(
+            "assets/weapons/plasma.rsasset",
+            "Evolution.P1EngineRuntime::WeaponDataAsset",
+            err,
+            {{"baseDamage", std::int64_t{250}}});
+        require(weaponAsset.has_value(), "P1-4: createAsset failed: " + err.message);
+        // OnValidate should have clamped baseDamage from 250 to 100
+        auto* lookedUpAsset = rt.findAsset("assets/weapons/plasma.rsasset");
+        require(
+            lookedUpAsset != nullptr &&
+                std::get<std::int64_t>(*rt.getMember(*lookedUpAsset, "baseDamage", err)) == 100,
+            "P1-4: createAsset should run OnValidate and register retrievable ScriptObject in asset registry");
+
+        // P1-2: Spatial Hash Grid Broadphase + CollisionContact2D normal & penetration
+        require(scene.attachComponent(1, "Evolution.P1EngineRuntime::ShipController"), "attach ship 1");
+        require(scene.attachComponent(2, "Evolution.P1EngineRuntime::ShipController"), "attach ship 2");
+        scene.setLocalPosition2D(1, game::Vec2::fromInts(0, 0));
+        scene.setLocalPosition2D(2, game::Vec2::fromInts(3, 0));
+
+        game::SceneCollider2D circleCol;
+        circleCol.isCircle = true;
+        circleCol.radius = game::Fixed::fromInt(2); // sumR = 4, dist = 3 => penetration = 1, normal = (1, 0)
+        scene.setEntityCollider2D(1, circleCol);
+        scene.setEntityCollider2D(2, circleCol);
+
+        // Add 20 distant colliders in far cells to verify Spatial Hash Grid culls distant pairs
+        for (game::SceneEntityId farId = 10; farId < 30; ++farId) {
+            scene.setLocalPosition2D(farId, game::Vec2::fromInts(static_cast<int>(farId * 100), 500));
+            scene.setEntityCollider2D(farId, circleCol);
+        }
+        require(scene.stepPhysics2D() > 0, "stepPhysics2D should fire overlap callbacks");
+        // Total colliders = 22 -> O(N^2) would be 22*21/2 = 231 pairs; Spatial Hash Grid only pairs entities 1 & 2 (1 pair)!
+        require(
+            scene.lastBroadphaseCandidatePairs2D() == 1,
+            "P1-2: Spatial Hash Grid broadphase should cull 20 distant colliders down to 1 candidate pair, got " +
+                std::to_string(scene.lastBroadphaseCandidatePairs2D()));
+
+        const auto contact = scene.getCollisionContact2D(1, 2);
+        require(
+            contact.has_value() &&
+                contact->normal == game::Vec2::fromInts(1, 0) &&
+                contact->penetration == game::Fixed::fromInt(1),
+            "P1-2: CollisionContact2D between circles at (0,0) and (3,0) with r=2 should have normal=(1,0) and penetration=1");
+
+        // P1-2b: Circle-vs-AABB contact manifold + AABB Y-axis raycast normal
+        game::SceneCollider2D aabbCol;
+        aabbCol.isCircle = false;
+        aabbCol.halfExtents = game::Vec2::fromInts(2, 2);
+        scene.setLocalPosition2D(3, game::Vec2::fromInts(6, 0)); // box X in [4, 8]; circle 2 at (3,0) r=2 overlaps [4,5] -> penetration 1, normal (1,0)
+        scene.setEntityCollider2D(3, aabbCol);
+        (void)scene.stepPhysics2D();
+        const auto circleBoxContact = scene.getCollisionContact2D(2, 3);
+        require(
+            circleBoxContact.has_value() &&
+                circleBoxContact->normal == game::Vec2::fromInts(1, 0) &&
+                circleBoxContact->penetration == game::Fixed::fromInt(1),
+            "P1-2b: Circle-vs-AABB CollisionContact2D should compute exact normal=(1,0) and penetration=1");
+        const auto yRayHit = scene.raycast2D(
+            game::Vec2::fromInts(6, 10), game::Vec2::fromInts(0, -1), game::Fixed::fromInt(20));
+        require(
+            yRayHit.has_value() && yRayHit->entity == 3 && yRayHit->normal == game::Vec2::fromInts(0, 1),
+            "P1-2b: AABB raycast2D along -Y into top face of box at (6,0) must return normal=(0,1)");
+        scene.removeEntityCollider2D(3);
+
+        // P1-4b: Hot reload while ChargeSequence is suspended in `yield wait_ticks(5)`
+        game::SceneGameplayDriver driver(scene, host);
+        require(
+            scene.invoke(1, "ChargeSequence", {runtime::LongValue{1}}).succeeded,
+            "ChargeSequence start failed");
+        (void)driver.advanceTicks(2);
+        auto* ship1V1 = scene.getComponent(1, "ShipController");
+        require(
+            std::get<std::int64_t>(*rt.getMember(*ship1V1, "seqStage", err)) == 1,
+            "ChargeSequence should be at seqStage 1 after 2 ticks");
+
+        // Hot-reload V2 that adds a new field `armorBonus` while ChargeSequence is suspended at tick 2/5
+        const char* p1SrcV2 = R"RS(
+module Evolution.P1EngineRuntime;
+import Engine.Raw;
+import RealScript.Math;
+import RealScript.Game;
+import RealScript.Scene;
+
+class WeaponDataAsset {
+    public string weaponName = "PlasmaRifle";
+    public int baseDamage = 40;
+}
+
+class ShipController : EngineManagedMotor {
+    public WeaponDataAsset equippedWeapon;
+    public int shield = 50;
+    public int armorBonus = 25;
+    public int seqStage = 0;
+    public Vec2 lastHitNormal;
+    public Fixed lastPenetration;
+
+    sequence ChargeSequence(long selfId) {
+        seqStage = 1;
+        yield wait_ticks(5);
+        seqStage = 2 + armorBonus;
+    }
+}
+)RS";
+        auto compiledV2 = compiler.compile({{"p1_v2.rs", p1SrcV2}});
+        require(compiledV2.succeeded(), "P1EngineRuntime V2 compile failed");
+        const auto reloadRep = scene.hotReload(compiledV2.program);
+        require(reloadRep.succeeded, "P1-4: hotReload during wait_ticks failed");
+
+        // Advance remaining 3 ticks -> migrated $sequence_state_ChargeSequence resumes and sets seqStage = 2 + 25 = 27!
+        (void)driver.advanceTicks(3);
+        auto* ship1V2 = scene.getComponent(1, "ShipController");
+        require(
+            std::get<std::int64_t>(*rt.getMember(*ship1V2, "seqStage", err)) == 27,
+            "P1-4: ChargeSequence should preserve $sequence_state_* across structural hotReload and resume to set seqStage=27");
+    }
+
+    // 3. P2-1: Resilient Parser MemberAccess Recovery (no double-rebuild hack),
+    //    P2-2: Collection Indexers (`dict[k]`, `list[i]`), Typed Result Sequences (`sequence<int>`), and Extension Methods (`this T`),
+    //    P2-3: LSP `semanticTokens/full`, `inlayHint`, and DAP `setVariable`
+    {
+        auto host = std::make_shared<game::GameplayHost>(60);
+        game::GameApi api;
+        require(game::installGameplayBindings(api, host), "installGameplayBindings failed");
+
+        const char* p2Src = R"RS(
+module Evolution.P2LanguageAndTools;
+import RealScript.Game;
+
+int ClampScore(this int value, int minVal, int maxVal) {
+    if (value < minVal) return minVal;
+    if (value > maxVal) return maxVal;
+    return value;
+}
+
+class InventoryManager {
+    public int finalScore = 0;
+    public int idxCalls = 0;
+
+    public int NextIndex() {
+        idxCalls += 1;
+        return 1;
+    }
+
+    public int TestIndexersAndExtension() {
+        List<int> numbers = new List<int>();
+        numbers.Add(10);
+        numbers.Add(20);
+        numbers[1] = numbers[0] + 35; // 45 via List[i] indexer
+        numbers[NextIndex()] += 5;    // 50 via compound List[i] assignment; NextIndex() must be called ONCE
+        if (idxCalls != 1) return -999;
+
+        Dictionary<string, int> prices = new Dictionary<string, int>();
+        prices["sword"] = 120;        // Put via Dictionary[k] indexer
+        prices["sword"] += 30;        // 150 via compound Dictionary[k] assignment
+        int rawTotal = numbers[1] + prices["sword"]; // 50 + 150 = 200
+        return rawTotal.ClampScore(0, 180);          // Extension method on int -> 180
+    }
+
+    sequence<int> ComputeBonusSequence(long selfId, int baseVal) {
+        yield wait_ticks(2);
+        return baseVal * 3;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"p2_lang.rs", p2Src}});
+        require(
+            compiled.succeeded(),
+            "P2LanguageAndTools compile failed:\n" + diagnosticsText(compiled.diagnostics));
+
+        game::ScriptRuntime rt(compiled.program);
+        game::SceneScriptRuntime scene(rt);
+        game::SceneGameplayDriver driver(scene, host);
+
+        require(scene.attachComponent(1, "Evolution.P2LanguageAndTools::InventoryManager"), "attach InventoryManager");
+        const auto idxRes = scene.invoke(1, "TestIndexersAndExtension");
+        require(
+            idxRes.succeeded && std::get<std::int64_t>(idxRes.value) == 180,
+            "P2-2: List/Dictionary indexers and int.ClampScore extension method expected 180");
+
+        require(
+            scene.invoke(1, "ComputeBonusSequence", {runtime::LongValue{1}, std::int64_t{14}}).succeeded,
+            "ComputeBonusSequence start failed");
+        (void)driver.advanceTicks(2);
+        const auto seqDone = scene.invoke(1, "IsComputeBonusSequenceCompleted");
+        const auto seqVal = scene.invoke(1, "GetComputeBonusSequenceResult");
+        require(
+            seqDone.succeeded && std::get<bool>(seqDone.value) &&
+                seqVal.succeeded && std::get<std::int64_t>(seqVal.value) == 42,
+            "P2-2: sequence<int> should complete after 2 ticks with GetComputeBonusSequenceResult() == 42");
+
+        // P2-1 & P2-3: Verify LSP semanticTokens/full, inlayHint, and resilient dot-completion without line-blanking hack
+        tooling::LspServer lsp;
+        std::ostringstream notifications;
+        const auto initResp = lsp.handle(tooling::Json::Object{
+            {"jsonrpc", "2.0"},
+            {"id", 1},
+            {"method", "initialize"},
+            {"params", tooling::Json::Object{}},
+        }, &notifications);
+        const auto* caps = initResp.find("result")->find("capabilities");
+        require(
+            caps && caps->find("semanticTokensProvider") && caps->find("inlayHintProvider"),
+            "P2-3: LspServer must advertise semanticTokensProvider and inlayHintProvider");
+
+        tooling::LanguageService ls;
+        ls.open("p2_lsp.rs", R"RS(module Evolution.P2Lsp;
+class Bag {
+    public int coins;
+}
+int Compute(Bag b) {
+    var totalCoins = 100;
+    b.
+    return totalCoins;
+}
+)RS", 1);
+        const auto compItems = ls.completion("p2_lsp.rs", {6, 6});
+        bool foundCoins = false;
+        for (const auto& item : compItems) {
+            if (item.label == "coins") foundCoins = true;
+        }
+        require(foundCoins, "P2-1: resilient Parser must resolve 'b.' completion without line-blanking hack");
+
+        const auto semTokens = ls.semanticTokensEncoded("p2_lsp.rs");
+        require(!semTokens.empty() && semTokens.size() % 5 == 0,
+            "P2-3: semanticTokensEncoded must return 5-tuple encoded token stream");
+
+        const auto hints = ls.inlayHints("p2_lsp.rs");
+        require(!hints.empty() && hints.front().label == ": int",
+            "P2-3: inlayHints must infer ': int' for 'var totalCoins = 100;'");
+
+        // P2-3: Verify DAP setVariable modifies live frame variable at breakpoint
+        const char* dapSrc = R"RS(
+module Evolution.DapSetVar;
+int RunCalc() {
+    int score = 10;
+    int bonus = 5;
+    return score + bonus;
+}
+)RS";
+        auto dapCompiled = compiler.compile({{"dap_setvar.rs", dapSrc}});
+        require(dapCompiled.succeeded(), "dap_setvar.rs failed to compile");
+
+        debug::DapServer dap(dapCompiled.program.program(), dapCompiled.program.heap());
+        std::ostringstream dapEvents;
+        (void)dap.handle(tooling::Json::Object{
+            {"seq", 1},
+            {"type", "request"},
+            {"command", "setBreakpoints"},
+            {"arguments", tooling::Json::Object{
+                {"source", tooling::Json::Object{{"path", "dap_setvar.rs"}}},
+                {"breakpoints", tooling::Json::Array{
+                    tooling::Json::Object{{"line", 6}, {"column", 1}},
+                }},
+            }},
+        }, &dapEvents);
+
+        (void)dap.handle(tooling::Json::Object{
+            {"seq", 2},
+            {"type", "request"},
+            {"command", "launch"},
+            {"arguments", tooling::Json::Object{
+                {"function", "Evolution.DapSetVar::RunCalc"},
+            }},
+        }, &dapEvents);
+
+        // Mutate `score` from 10 to 95 via DAP `setVariable`!
+        const auto setVarResp = dap.handle(tooling::Json::Object{
+            {"seq", 3},
+            {"type", "request"},
+            {"command", "setVariable"},
+            {"arguments", tooling::Json::Object{
+                {"variablesReference", 3},
+                {"name", "score"},
+                {"value", "95"},
+            }},
+        }, &dapEvents);
+        require(
+            setVarResp.find("success") && setVarResp.find("success")->boolValue() &&
+                setVarResp.find("body")->find("value")->stringValue() == "95",
+            "P2-3: DAP setVariable should update 'score' to 95");
+
+        const auto badSetVarResp = dap.handle(tooling::Json::Object{
+            {"seq", 4},
+            {"type", "request"},
+            {"command", "setVariable"},
+            {"arguments", tooling::Json::Object{
+                {"variablesReference", 3},
+                {"name", "score"},
+                {"value", "\"not_an_int\""},
+            }},
+        }, &dapEvents);
+        require(
+            badSetVarResp.find("success") && !badSetVarResp.find("success")->boolValue(),
+            "P2-3: DAP setVariable must reject assigning a string to an int variable");
+
+        (void)dap.handle(tooling::Json::Object{
+            {"seq", 5},
+            {"type", "request"},
+            {"command", "continue"},
+        }, &dapEvents);
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -3839,8 +4377,10 @@ int main() {
         testZeroHeapInlineStructAndEcsQueryMirLowering();
         std::cout << "[16/17] testRound2EngineGapsCompletion..." << std::endl;
         testRound2EngineGapsCompletion();
-        std::cout << "[17/17] testRound3AuditFixesAndGodotUnityParity..." << std::endl;
+        std::cout << "[17/18] testRound3AuditFixesAndGodotUnityParity..." << std::endl;
         testRound3AuditFixesAndGodotUnityParity();
+        std::cout << "[18/18] testRound4RoadmapP0ToP2All10Items..." << std::endl;
+        testRound4RoadmapP0ToP2All10Items();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

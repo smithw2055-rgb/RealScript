@@ -505,77 +505,8 @@ bool ScriptRuntime::setEcsEntityComponent(
         return false;
     }
 
-    const std::string canon = type->canonicalName();
-    const auto idsKey = semantic::stableTypeId("$ecs_sparse_ids::" + canon);
-    const auto valsKey = semantic::stableTypeId("$ecs_sparse_vals::" + canon);
-
-    std::vector<std::int64_t> ids;
-    std::vector<runtime::Value> vals;
-    if (const auto existingIdsVal = heap_->getStaticField(idsKey);
-        existingIdsVal && std::holds_alternative<runtime::ObjectRef>(*existingIdsVal)) {
-        const auto idsRef = std::get<runtime::ObjectRef>(*existingIdsVal);
-        const auto valsVal = heap_->getStaticField(valsKey);
-        const auto valsRef = (valsVal && std::holds_alternative<runtime::ObjectRef>(*valsVal))
-            ? std::get<runtime::ObjectRef>(*valsVal)
-            : runtime::ObjectRef{};
-        const auto len = heap_->arrayLength(idsRef).value_or(0);
-        const auto targetId = static_cast<std::int64_t>(entity);
-        std::size_t lo = 0;
-        std::size_t hi = len;
-        while (lo < hi) {
-            const std::size_t mid = lo + (hi - lo) / 2;
-            const auto idElem = heap_->arrayGet(idsRef, mid);
-            if (!idElem || !std::holds_alternative<std::int64_t>(*idElem)) break;
-            const auto midId = std::get<std::int64_t>(*idElem);
-            if (midId == targetId && valsRef.valid()) {
-                return heap_->arraySet(valsRef, mid, component, &error);
-            }
-            if (midId < targetId) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        ids.reserve(len + 1);
-        vals.reserve(len + 1);
-        for (std::size_t i = 0; i < len; ++i) {
-            const auto idElem = heap_->arrayGet(idsRef, i);
-            const auto valElem = valsRef.valid() ? heap_->arrayGet(valsRef, i) : std::nullopt;
-            if (idElem && std::holds_alternative<std::int64_t>(*idElem) && valElem) {
-                ids.push_back(std::get<std::int64_t>(*idElem));
-                vals.push_back(*valElem);
-            }
-        }
-    }
-
-    const auto insertPos = std::lower_bound(
-        ids.begin(), ids.end(), static_cast<std::int64_t>(entity));
-    const auto insertIdx = static_cast<std::size_t>(std::distance(ids.begin(), insertPos));
-    ids.insert(insertPos, static_cast<std::int64_t>(entity));
-    vals.insert(vals.begin() + static_cast<std::ptrdiff_t>(insertIdx), component);
-
-    const auto intArrTypeId = semantic::stableTypeId(
-        semantic::arrayTypeName(semantic::PrimitiveType::Int, {}));
-    const auto newIdsRef = heap_->allocateTypedArray(
-        intArrTypeId, semantic::PrimitiveType::Int, 0, ids.size(), std::int64_t{0}, &error);
-    if (!newIdsRef) return false;
-    for (std::size_t i = 0; i < ids.size(); ++i) {
-        if (!heap_->arraySet(*newIdsRef, i, ids[i], &error)) return false;
-    }
-
-    const auto valArrTypeId = semantic::stableTypeId(
-        semantic::arrayTypeName(elemPrim, canon));
-    const auto newValsRef = heap_->allocateTypedArray(
-        valArrTypeId, elemPrim, type->descriptor.id, vals.size(), vals[0], &error);
-    if (!newValsRef) return false;
-    for (std::size_t i = 0; i < vals.size(); ++i) {
-        if (!heap_->arraySet(*newValsRef, i, vals[i], &error)) return false;
-    }
-
-    heap_->setStaticField(idsKey, *newIdsRef);
-    heap_->setStaticField(valsKey, *newValsRef);
-    heap_->setStaticField(semantic::stableTypeId("$ecs_column::" + canon), *newValsRef);
-    return true;
+    return heap_->setNativeEcsComponent(
+        type->canonicalName(), static_cast<std::int64_t>(entity), component);
 }
 
 std::optional<runtime::Value> ScriptRuntime::getEcsEntityComponent(
@@ -593,130 +524,38 @@ std::optional<runtime::Value> ScriptRuntime::getEcsEntityComponent(
         error.message = "unknown ECS component type '" + canonicalTypeName + "'";
         return std::nullopt;
     }
-    const std::string canon = type->canonicalName();
-    const auto idsVal = heap_->getStaticField(semantic::stableTypeId("$ecs_sparse_ids::" + canon));
-    const auto valsVal = heap_->getStaticField(semantic::stableTypeId("$ecs_sparse_vals::" + canon));
-    if (!idsVal || !valsVal ||
-        !std::holds_alternative<runtime::ObjectRef>(*idsVal) ||
-        !std::holds_alternative<runtime::ObjectRef>(*valsVal)) {
-        return std::nullopt;
-    }
-    const auto idsRef = std::get<runtime::ObjectRef>(*idsVal);
-    const auto valsRef = std::get<runtime::ObjectRef>(*valsVal);
-    const auto len = heap_->arrayLength(idsRef).value_or(0);
-    const auto targetId = static_cast<std::int64_t>(entity);
-    std::size_t lo = 0;
-    std::size_t hi = len;
-    while (lo < hi) {
-        const std::size_t mid = lo + (hi - lo) / 2;
-        const auto idElem = heap_->arrayGet(idsRef, mid);
-        if (!idElem || !std::holds_alternative<std::int64_t>(*idElem)) break;
-        const auto midId = std::get<std::int64_t>(*idElem);
-        if (midId == targetId) {
-            return heap_->arrayGet(valsRef, mid);
-        }
-        if (midId < targetId) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    return std::nullopt;
+    return heap_->getNativeEcsComponent(
+        type->canonicalName(), static_cast<std::int64_t>(entity));
 }
 
 bool ScriptRuntime::hasEcsEntityComponent(
     std::uint64_t entity,
     const std::string& canonicalTypeName) const {
-    runtime::RuntimeError dummy;
-    return getEcsEntityComponent(entity, canonicalTypeName, dummy).has_value();
+    if (!heap_) return false;
+    const auto type = findType(canonicalTypeName);
+    if (!type) return false;
+    return heap_->hasNativeEcsComponent(
+        type->canonicalName(), static_cast<std::int64_t>(entity));
 }
 
 bool ScriptRuntime::removeEcsEntityComponent(
     std::uint64_t entity,
     const std::string& canonicalTypeName,
     runtime::RuntimeError& error) const {
+    (void)error;
     if (!heap_) return false;
     const auto type = findType(canonicalTypeName);
     if (!type) return false;
-    const std::string canon = type->canonicalName();
-    const auto idsKey = semantic::stableTypeId("$ecs_sparse_ids::" + canon);
-    const auto valsKey = semantic::stableTypeId("$ecs_sparse_vals::" + canon);
-    const auto idsVal = heap_->getStaticField(idsKey);
-    const auto valsVal = heap_->getStaticField(valsKey);
-    if (!idsVal || !valsVal ||
-        !std::holds_alternative<runtime::ObjectRef>(*idsVal) ||
-        !std::holds_alternative<runtime::ObjectRef>(*valsVal)) {
-        return false;
-    }
-    const auto idsRef = std::get<runtime::ObjectRef>(*idsVal);
-    const auto valsRef = std::get<runtime::ObjectRef>(*valsVal);
-    const auto len = heap_->arrayLength(idsRef).value_or(0);
-    std::vector<std::int64_t> ids;
-    std::vector<runtime::Value> vals;
-    bool removed = false;
-    for (std::size_t i = 0; i < len; ++i) {
-        const auto idElem = heap_->arrayGet(idsRef, i);
-        const auto valElem = heap_->arrayGet(valsRef, i);
-        if (idElem && std::holds_alternative<std::int64_t>(*idElem) && valElem) {
-            if (std::get<std::int64_t>(*idElem) == static_cast<std::int64_t>(entity)) {
-                removed = true;
-                continue;
-            }
-            ids.push_back(std::get<std::int64_t>(*idElem));
-            vals.push_back(*valElem);
-        }
-    }
-    if (!removed) return false;
-
-    const semantic::PrimitiveType elemPrim =
-        type->descriptor.kind == semantic::TypeKind::Struct
-            ? semantic::PrimitiveType::Struct
-            : (type->descriptor.kind == semantic::TypeKind::Class
-                   ? semantic::PrimitiveType::Object
-                   : semantic::PrimitiveType::Enum);
-    std::unordered_set<semantic::SymbolId> visiting;
-    const runtime::Value defaultElem = defaultValue(elemPrim, type->descriptor.id, visiting);
-    const auto intArrTypeId = semantic::stableTypeId(
-        semantic::arrayTypeName(semantic::PrimitiveType::Int, {}));
-    const auto newIdsRef = heap_->allocateTypedArray(
-        intArrTypeId, semantic::PrimitiveType::Int, 0, ids.size(), std::int64_t{0}, &error);
-    if (!newIdsRef) return false;
-    for (std::size_t i = 0; i < ids.size(); ++i) {
-        (void)heap_->arraySet(*newIdsRef, i, ids[i], &error);
-    }
-
-    const auto valArrTypeId = semantic::stableTypeId(
-        semantic::arrayTypeName(elemPrim, canon));
-    const auto newValsRef = heap_->allocateTypedArray(
-        valArrTypeId, elemPrim, type->descriptor.id, vals.size(), defaultElem, &error);
-    if (!newValsRef) return false;
-    for (std::size_t i = 0; i < vals.size(); ++i) {
-        (void)heap_->arraySet(*newValsRef, i, vals[i], &error);
-    }
-
-    heap_->setStaticField(idsKey, *newIdsRef);
-    heap_->setStaticField(valsKey, *newValsRef);
-    heap_->setStaticField(semantic::stableTypeId("$ecs_column::" + canon), *newValsRef);
-    return true;
+    return heap_->removeNativeEcsComponent(
+        type->canonicalName(), static_cast<std::int64_t>(entity));
 }
 
 bool ScriptRuntime::destroyEcsEntity(
     std::uint64_t entity,
     runtime::RuntimeError& error) const {
-    if (!program_ || !heap_) return false;
-    bool anyRemoved = false;
-    for (const auto& mod : program_->modules()) {
-        for (const auto& t : mod.types) {
-            const std::string canon = t.moduleName.empty() ? t.name : (t.moduleName + "::" + t.name);
-            if (!heap_->hasStaticField(semantic::stableTypeId("$ecs_sparse_ids::" + canon))) {
-                continue;
-            }
-            if (removeEcsEntityComponent(entity, canon, error)) {
-                anyRemoved = true;
-            }
-        }
-    }
-    return anyRemoved;
+    (void)error;
+    if (!heap_) return false;
+    return heap_->destroyNativeEcsEntity(static_cast<std::int64_t>(entity));
 }
 
 void ScriptRuntime::queueEcsSetComponent(

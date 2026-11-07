@@ -166,6 +166,54 @@ public:
         runtime::RuntimeError& error) const;
 
     template <typename T>
+    [[nodiscard]] std::optional<ScriptObject> wrapRawNative(
+        const std::string& canonicalTypeName,
+        T* rawObject,
+        runtime::RuntimeError& error,
+        std::function<void(T*)> customDeleter = {},
+        std::string debugName = {}) const {
+        if (!rawObject) {
+            error.code = runtime::ErrorCode::NullReference;
+            error.message = "cannot wrap a null raw native pointer";
+            return std::nullopt;
+        }
+        std::shared_ptr<T> aliasing(
+            rawObject,
+            [del = std::move(customDeleter)](T* ptr) {
+                if (del && ptr) del(ptr);
+            });
+        return wrapNative<T>(canonicalTypeName, std::move(aliasing), error, std::move(debugName));
+    }
+
+    template <typename T>
+    [[nodiscard]] std::optional<ScriptObject> createDerivedRawNative(
+        const std::string& canonicalTypeName,
+        T* rawObject,
+        runtime::RuntimeError& error,
+        const std::vector<runtime::Value>& constructorArguments = {},
+        std::function<void(T*)> customDeleter = {},
+        runtime::ExecutionOptions options = {},
+        std::string debugName = {}) const {
+        if (!rawObject) {
+            error.code = runtime::ErrorCode::NullReference;
+            error.message = "cannot bind a null raw native pointer";
+            return std::nullopt;
+        }
+        std::shared_ptr<T> aliasing(
+            rawObject,
+            [del = std::move(customDeleter)](T* ptr) {
+                if (del && ptr) del(ptr);
+            });
+        return createDerivedNative<T>(
+            canonicalTypeName,
+            std::move(aliasing),
+            error,
+            constructorArguments,
+            std::move(options),
+            std::move(debugName));
+    }
+
+    template <typename T>
     [[nodiscard]] std::optional<ScriptObject> wrapNative(
         const std::string& canonicalTypeName,
         std::shared_ptr<T> object,
@@ -402,6 +450,17 @@ public:
     }
     std::size_t flushEcsCommandBuffer(runtime::RuntimeError& error) const;
 
+    // P1-4: Reusable Scriptable Data Assets (ScriptableObject / Resource parity)
+    [[nodiscard]] std::optional<ScriptObject> createAsset(
+        const std::string& assetPath,
+        const std::string& canonicalTypeName,
+        runtime::RuntimeError& error,
+        const std::map<std::string, runtime::Value>& initialFields = {});
+    [[nodiscard]] ScriptObject* findAsset(const std::string& assetPath);
+    [[nodiscard]] const ScriptObject* findAsset(const std::string& assetPath) const;
+    bool unloadAsset(const std::string& assetPath);
+    [[nodiscard]] std::size_t assetCount() const noexcept { return assets_.size(); }
+
     [[nodiscard]] std::shared_ptr<const runtime::ProgramImage> program() const noexcept {
         return program_;
     }
@@ -463,9 +522,25 @@ private:
         runtime::Value component;
     };
     mutable std::vector<EcsQueuedCommand> ecsCommandBuffer_;
+    std::map<std::string, ScriptObject> assets_;
 };
 
 using SceneEntityId = std::uint64_t;
+
+[[nodiscard]] constexpr SceneEntityId makeGenerationalEntityId(
+    std::uint32_t slot,
+    std::uint32_t generation = 0) noexcept {
+    return (static_cast<SceneEntityId>(generation) << 32u) |
+        static_cast<SceneEntityId>(slot);
+}
+
+[[nodiscard]] constexpr std::uint32_t entityIdSlot(SceneEntityId id) noexcept {
+    return static_cast<std::uint32_t>(id & 0xFFFFFFFFULL);
+}
+
+[[nodiscard]] constexpr std::uint32_t entityIdGeneration(SceneEntityId id) noexcept {
+    return static_cast<std::uint32_t>(id >> 32u);
+}
 
 struct SceneHotReloadReport {
     bool succeeded = false;
@@ -514,7 +589,17 @@ struct SceneCollider2D {
 struct RaycastHit2D {
     SceneEntityId entity = 0;
     Vec2 point{};
+    Vec2 normal{};
     Fixed distance{};
+};
+
+struct CollisionContact2D {
+    SceneEntityId entityA = 0;
+    SceneEntityId entityB = 0;
+    Vec2 normal{};
+    Vec2 contactPoint{};
+    Fixed penetration{};
+    bool isTrigger = false;
 };
 
 struct ScriptEvent {
@@ -691,9 +776,21 @@ public:
         Fixed radius,
         std::uint32_t layerMask = 0xFFFFFFFFu) const;
     std::size_t stepPhysics2D();
+    [[nodiscard]] std::optional<CollisionContact2D> getCollisionContact2D(
+        SceneEntityId entityA,
+        SceneEntityId entityB) const noexcept;
+    [[nodiscard]] std::size_t lastBroadphaseCandidatePairs2D() const noexcept {
+        return lastBroadphasePairs2D_;
+    }
 
-    // Deferred Destruction, Entity Spawning, Naming & Groups (Godot/Unity Parity)
+    // Deferred Destruction, Entity Spawning, Generational Handles, Naming & Groups (Godot/Unity Parity)
     SceneEntityId spawnEntity(const std::string& name = {});
+    SceneEntityId spawnGenerationalEntity(const std::string& name = {});
+    [[nodiscard]] bool isEntityAlive(SceneEntityId entity) const noexcept;
+    [[nodiscard]] bool isStaleGenerationalEntity(SceneEntityId entity) const noexcept;
+    [[nodiscard]] std::uint32_t getEntitySlotGeneration(std::uint32_t slot) const noexcept;
+    void registerImportedEntityHandle(SceneEntityId entity);
+    void resetGenerationalSlots();
     void queueDestroyEntity(SceneEntityId entity);
     [[nodiscard]] std::size_t pendingDestroyCount() const noexcept {
         return pendingDestroyEntities_.size();
@@ -883,9 +980,14 @@ private:
     std::map<SceneEntityId, SceneCollider2D> colliders2D_;
     std::set<std::pair<SceneEntityId, SceneEntityId>> activeOverlaps2D_;
     std::map<std::pair<SceneEntityId, SceneEntityId>, bool> activeOverlapWasTrigger2D_;
+    std::map<std::pair<SceneEntityId, SceneEntityId>, CollisionContact2D> activeContacts2D_;
+    std::size_t lastBroadphasePairs2D_ = 0;
     std::vector<SceneEntityId> pendingDestroyEntities_;
     std::map<SceneEntityId, std::string> entityNames_;
     std::map<std::string, std::set<SceneEntityId>> groupEntities_;
+    std::unordered_map<std::uint32_t, std::uint32_t> slotGenerations_;
+    std::vector<std::uint32_t> freeGenerationalSlots_;
+    std::uint32_t nextGenerationalSlot_ = 1;
     SceneEntityId nextAutoEntityId_ = 1;
     runtime::FiberScheduler* fiberScheduler_ = nullptr;
     std::map<std::size_t, std::vector<MethodCacheEntry>> methodCache_;

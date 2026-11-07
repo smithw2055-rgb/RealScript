@@ -1474,6 +1474,7 @@ bool importSceneJson(
     for (const auto existingId : scene.entities()) {
         (void)scene.detach(existingId);
     }
+    scene.resetGenerationalSlots();
     scene.restorePhysicsOverlapState({}, {});
     scene.restoreInputSnapshot({}, {}, {});
 
@@ -1494,6 +1495,7 @@ bool importSceneJson(
         if (!idJson || !idJson->isNumber()) return false;
         const auto entityId = static_cast<SceneEntityId>(idJson->integerValue());
         if (entityId == SceneScriptRuntime::BroadcastTarget) return false;
+        scene.registerImportedEntityHandle(entityId);
 
         const auto* activeJson = entItem.find("activeSelf");
         const bool activeSelf = (!activeJson || !activeJson->isBool()) ? true : activeJson->boolValue();

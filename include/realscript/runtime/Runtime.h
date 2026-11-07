@@ -284,12 +284,17 @@ struct InlineStructSlot {
 
 struct StructValue {
     static constexpr std::size_t MaxInlineFields = 4;
+    static constexpr std::size_t MaxInlineSlots = 4;
 
     semantic::SymbolId typeId = 0;
+    semantic::SymbolId nestedTypeId = 0;
     std::shared_ptr<const StructStorage> storage;
     std::uint8_t inlineCount = 0;
+    std::uint8_t inlineSlotCount = 0;
     bool isInline = false;
-    std::array<InlineStructSlot, MaxInlineFields> inlineFields{};
+    std::uint8_t packedOffsetsAndLengths = 0; // 2 bits offset per field
+    std::uint16_t nestedFieldMask = 0;        // low byte: 2 bits length per field; high byte: 1 + nested field index
+    std::array<InlineStructSlot, MaxInlineSlots> inlineFields{};
 
     StructValue() = default;
     StructValue(
@@ -301,6 +306,15 @@ struct StructValue {
         return typeId != 0 && (isInline || storage != nullptr);
     }
     [[nodiscard]] std::size_t fieldCount() const noexcept;
+
+    [[nodiscard]] constexpr std::uint8_t fieldOffset(std::size_t idx) const noexcept {
+        if (nestedFieldMask == 0) return static_cast<std::uint8_t>(idx);
+        return static_cast<std::uint8_t>((packedOffsetsAndLengths >> (idx * 2)) & 0x3u);
+    }
+    [[nodiscard]] constexpr std::uint8_t fieldLength(std::size_t idx) const noexcept {
+        if (nestedFieldMask == 0) return 1;
+        return static_cast<std::uint8_t>(((nestedFieldMask >> (idx * 2)) & 0x3u));
+    }
 
     friend bool operator==(const StructValue& left, const StructValue& right);
 };
@@ -396,8 +410,13 @@ inline bool operator==(const StructValue& left, const StructValue& right) {
     if (left.typeId != right.typeId) return false;
     const auto count = left.fieldCount();
     if (count != right.fieldCount()) return false;
-    if (left.isInline && right.isInline) {
-        for (std::size_t i = 0; i < count; ++i) {
+    if (left.isInline && right.isInline &&
+        left.nestedTypeId == right.nestedTypeId &&
+        left.inlineSlotCount == right.inlineSlotCount &&
+        left.packedOffsetsAndLengths == right.packedOffsetsAndLengths &&
+        left.nestedFieldMask == right.nestedFieldMask) {
+        const std::size_t slots = left.inlineSlotCount != 0 ? left.inlineSlotCount : count;
+        for (std::size_t i = 0; i < slots; ++i) {
             if (left.inlineFields[i] != right.inlineFields[i]) return false;
         }
         return true;
@@ -609,6 +628,31 @@ public:
     [[nodiscard]] bool hasStaticField(semantic::SymbolId id) const noexcept;
     [[nodiscard]] std::optional<Value> getStaticField(semantic::SymbolId id) const;
     void setStaticField(semantic::SymbolId id, Value value);
+
+    // O(1) Native Unmanaged Sparse-Set ECS Storage (zero per-mutation array allocation)
+    bool setNativeEcsComponent(
+        std::string_view canonicalTypeName,
+        std::int64_t entityId,
+        Value component);
+    [[nodiscard]] std::optional<Value> getNativeEcsComponent(
+        std::string_view canonicalTypeName,
+        std::int64_t entityId) const;
+    [[nodiscard]] bool hasNativeEcsComponent(
+        std::string_view canonicalTypeName,
+        std::int64_t entityId) const noexcept;
+    bool removeNativeEcsComponent(
+        std::string_view canonicalTypeName,
+        std::int64_t entityId);
+    bool destroyNativeEcsEntity(std::int64_t entityId);
+    [[nodiscard]] bool hasNativeEcsTable(std::string_view canonicalTypeName) const noexcept;
+    [[nodiscard]] const std::vector<std::int64_t>* nativeEcsEntityIds(
+        std::string_view canonicalTypeName) const noexcept;
+    [[nodiscard]] const std::vector<Value>* nativeEcsComponentValues(
+        std::string_view canonicalTypeName) const noexcept;
+    bool setNativeEcsComponentByDenseIndex(
+        std::string_view canonicalTypeName,
+        std::size_t denseIndex,
+        Value component);
 
     void requestCollection() noexcept;
     [[nodiscard]] bool collectionRequested() const noexcept;

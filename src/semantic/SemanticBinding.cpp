@@ -740,6 +740,27 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     return result;
 }
 
+VariableSymbol Binder::allocateTempVariable(
+    const std::string& prefix,
+    PrimitiveType type,
+    const std::string& typeName,
+    text::TextSpan span) {
+    VariableSymbol temp;
+    temp.name = "$" + prefix + "_" + std::to_string(nextVariableIndex_);
+    temp.type = type;
+    temp.typeName = typeName;
+    temp.storageType = type;
+    temp.storageTypeName = typeName;
+    temp.index = nextVariableIndex_++;
+    temp.declarationSpan = span;
+    temp.scopeSpan = span;
+    temp.id = stableTypeId(
+        std::to_string(currentFunctionId_) + "::local:" +
+        std::to_string(temp.index) + ":" + temp.name);
+    allVariables_.push_back(temp);
+    return temp;
+}
+
 std::unique_ptr<BoundExpression> Binder::makeVariableAccess(
     const VariableSymbol& variable,
     text::TextSpan span) {

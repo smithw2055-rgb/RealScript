@@ -70,11 +70,14 @@ struct DebugStop {
 };
 
 struct DebugValueWindow {
-    const std::vector<runtime::Value>* values = nullptr;
+    std::vector<runtime::Value>* values = nullptr;
     std::size_t offset = 0;
     std::size_t count = 0;
 
     [[nodiscard]] std::size_t size() const noexcept { return count; }
+    [[nodiscard]] runtime::Value& operator[](std::size_t index) {
+        return (*values)[offset + index];
+    }
     [[nodiscard]] const runtime::Value& operator[](std::size_t index) const {
         return (*values)[offset + index];
     }
@@ -119,6 +122,13 @@ public:
         std::uint32_t frameId = 1,
         runtime::ManagedHeap* heap = nullptr,
         std::string* errorMessage = nullptr) const;
+    bool setVariable(
+        const std::string& name,
+        const std::string& valueExpression,
+        std::uint32_t frameId = 1,
+        runtime::ManagedHeap* heap = nullptr,
+        runtime::Value* outNewValue = nullptr,
+        std::string* errorMessage = nullptr);
 
     [[nodiscard]] DebugStop lastStop() const;
     [[nodiscard]] bool terminated() const;
@@ -165,6 +175,7 @@ private:
     bool terminated_ = false;
     std::uint32_t nextBreakpointId_ = 1;
     DebugStop lastStop_;
+    const std::vector<DebugFrameView>* activeFrameViews_ = nullptr;
 };
 
 
@@ -191,6 +202,12 @@ public:
         const std::string& expression,
         std::uint32_t frameId = 1,
         std::string* errorMessage = nullptr) const;
+    bool setVariable(
+        const std::string& name,
+        const std::string& valueExpression,
+        std::uint32_t frameId = 1,
+        runtime::Value* outNewValue = nullptr,
+        std::string* errorMessage = nullptr);
     [[nodiscard]] bool paused() const noexcept;
     [[nodiscard]] bool finished() const noexcept;
     [[nodiscard]] std::optional<runtime::ExecutionResult> result() const;

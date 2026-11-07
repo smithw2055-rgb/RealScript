@@ -592,6 +592,49 @@ bool installSceneComponentBindings(
             "GetGroupCount",
             [scenePtr](std::string group) -> std::int32_t {
                 return static_cast<std::int32_t>(scenePtr->getEntitiesInGroup(group).size());
+            }) &&
+        api.function(
+            moduleName,
+            "SpawnGenerationalEntity",
+            [scenePtr](std::string name) -> std::int64_t {
+                return static_cast<std::int64_t>(scenePtr->spawnGenerationalEntity(name));
+            }) &&
+        api.function(
+            moduleName,
+            "IsEntityAlive",
+            [scenePtr](std::int64_t entityId) -> bool {
+                if (entityId <= 0) return false;
+                return scenePtr->isEntityAlive(static_cast<SceneEntityId>(entityId));
+            }) &&
+        api.function(
+            moduleName,
+            "GetCollisionNormal2D",
+            [scenePtr](std::int64_t entityA, std::int64_t entityB) -> Vec2 {
+                if (entityA <= 0 || entityB <= 0) return Vec2{};
+                const auto contact = scenePtr->getCollisionContact2D(
+                    static_cast<SceneEntityId>(entityA),
+                    static_cast<SceneEntityId>(entityB));
+                return contact ? contact->normal : Vec2{};
+            }) &&
+        api.function(
+            moduleName,
+            "GetCollisionPenetration2D",
+            [scenePtr](std::int64_t entityA, std::int64_t entityB) -> Fixed {
+                if (entityA <= 0 || entityB <= 0) return Fixed::fromRaw(0);
+                const auto contact = scenePtr->getCollisionContact2D(
+                    static_cast<SceneEntityId>(entityA),
+                    static_cast<SceneEntityId>(entityB));
+                return contact ? contact->penetration : Fixed::fromRaw(0);
+            }) &&
+        api.function(
+            moduleName,
+            "GetCollisionPoint2D",
+            [scenePtr](std::int64_t entityA, std::int64_t entityB) -> Vec2 {
+                if (entityA <= 0 || entityB <= 0) return Vec2{};
+                const auto contact = scenePtr->getCollisionContact2D(
+                    static_cast<SceneEntityId>(entityA),
+                    static_cast<SceneEntityId>(entityB));
+                return contact ? contact->contactPoint : Vec2{};
             });
     return ok && api.valid();
 }

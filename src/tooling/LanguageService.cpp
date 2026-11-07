@@ -195,57 +195,10 @@ void LanguageService::rebuild() {
         compilation.addSource({path, documents_.at(path).content});
     }
     result_ = compilation.build(hasSnapshot_ ? &snapshot_ : nullptr);
-    if (result_.diagnostics.hasErrors()) {
-        bool anySanitized = false;
-        compiler::Compilation fallbackCompilation;
-        for (const auto& path : ambientPaths) {
-            fallbackCompilation.addSource({path, ambientDocuments_.at(path).content});
-        }
-        for (const auto& path : paths) {
-            std::string content = documents_.at(path).content;
-            std::size_t lineStart = 0;
-            while (lineStart < content.size()) {
-                std::size_t lineEnd = content.find('\n', lineStart);
-                if (lineEnd == std::string::npos) lineEnd = content.size();
-                std::size_t lastNonWs = lineEnd;
-                while (lastNonWs > lineStart &&
-                       std::isspace(static_cast<unsigned char>(content[lastNonWs - 1]))) {
-                    --lastNonWs;
-                }
-                if (lastNonWs > lineStart && content[lastNonWs - 1] == '.') {
-                    for (std::size_t idx = lineStart; idx < lastNonWs; ++idx) {
-                        if (content[idx] != '\r' && content[idx] != '\n') {
-                            content[idx] = ' ';
-                        }
-                    }
-                    anySanitized = true;
-                }
-                lineStart = (lineEnd < content.size()) ? lineEnd + 1 : content.size();
-            }
-            fallbackCompilation.addSource({path, std::move(content)});
-        }
-        if (anySanitized) {
-            auto fallback = fallbackCompilation.build(nullptr);
-            for (auto& mod : fallback.modules) {
-                const bool exists = std::any_of(
-                    result_.modules.begin(),
-                    result_.modules.end(),
-                    [&](const mir::Module& existing) { return existing.name == mod.name; });
-                if (!exists) {
-                    result_.modules.push_back(std::move(mod));
-                }
-            }
-            if (result_.symbols.empty()) {
-                result_.symbols = std::move(fallback.symbols);
-            } else {
-                for (auto& occ : fallback.symbols) {
-                    result_.symbols.push_back(std::move(occ));
-                }
-            }
-        }
+    if (!result_.snapshot.modules.empty()) {
+        snapshot_ = result_.snapshot;
+        hasSnapshot_ = true;
     }
-    snapshot_ = result_.snapshot;
-    hasSnapshot_ = true;
     dirty_ = false;
 }
 
@@ -1241,6 +1194,117 @@ std::vector<DocumentSymbol> LanguageService::documentSymbols(const std::string& 
         }
     }
     return output;
+}
+
+std::vector<SemanticToken> LanguageService::semanticTokens(const std::string& path) {
+    (void)build();
+    const auto* doc = document(path);
+    if (!doc) return {};
+
+    // Legend: 0=namespace, 1=type, 2=function, 3=variable, 4=parameter, 5=property, 6=enumMember, 7=keyword, 8=number, 9=string
+    const auto mapKindToTokenType = [](semantic::SymbolKind kind) -> std::uint32_t {
+        switch (kind) {
+        case semantic::SymbolKind::Module: return 0;
+        case semantic::SymbolKind::Type: return 1;
+        case semantic::SymbolKind::Function: return 2;
+        case semantic::SymbolKind::Local: return 3;
+        case semantic::SymbolKind::Parameter: return 4;
+        case semantic::SymbolKind::Field:
+        case semantic::SymbolKind::Property: return 5;
+        case semantic::SymbolKind::EnumMember: return 6;
+        }
+        return 3;
+    };
+
+    std::unordered_map<std::size_t, const semantic::SymbolOccurrence*> occByStart;
+    for (const auto& occ : result_.symbols) {
+        if (occ.sourceName == path && occ.span.length > 0) {
+            occByStart[occ.span.start] = &occ;
+        }
+    }
+
+    text::SourceText source(doc->content, path);
+    diagnostics::DiagnosticBag diag;
+    syntax::Lexer lexer(source, diag);
+    std::vector<SemanticToken> tokens;
+    for (const auto& tok : lexer.lexAll()) {
+        if (tok.kind == syntax::SyntaxKind::EndOfFileToken || tok.span.length == 0) continue;
+        const auto rng = rangeFor(path, tok.span);
+        const std::size_t line0 = rng.start.line > 0 ? rng.start.line - 1 : 0;
+        const std::size_t col0 = rng.start.column > 0 ? rng.start.column - 1 : 0;
+
+        if (const auto it = occByStart.find(tok.span.start); it != occByStart.end()) {
+            const std::uint32_t mods = it->second->definition ? 1u : 0u;
+            tokens.push_back(SemanticToken{
+                line0, col0, tok.span.length, mapKindToTokenType(it->second->kind), mods});
+            continue;
+        }
+        if (syntax::isPrimitiveTypeKeyword(tok.kind)) {
+            tokens.push_back(SemanticToken{line0, col0, tok.span.length, 1u, 0u});
+        } else if (tok.kind == syntax::SyntaxKind::IntegerLiteralToken ||
+                   tok.kind == syntax::SyntaxKind::FloatLiteralToken) {
+            tokens.push_back(SemanticToken{line0, col0, tok.span.length, 8u, 0u});
+        } else if (tok.kind == syntax::SyntaxKind::StringLiteralToken ||
+                   tok.kind == syntax::SyntaxKind::InterpolatedStringToken) {
+            tokens.push_back(SemanticToken{line0, col0, tok.span.length, 9u, 0u});
+        } else if (tok.kind != syntax::SyntaxKind::IdentifierToken &&
+                   !tok.text.empty() &&
+                   std::isalpha(static_cast<unsigned char>(tok.text.front()))) {
+            tokens.push_back(SemanticToken{line0, col0, tok.span.length, 7u, 0u});
+        }
+    }
+    return tokens;
+}
+
+std::vector<std::uint32_t> LanguageService::semanticTokensEncoded(const std::string& path) {
+    const auto raw = semanticTokens(path);
+    std::vector<std::uint32_t> data;
+    data.reserve(raw.size() * 5);
+    std::size_t prevLine = 0;
+    std::size_t prevChar = 0;
+    for (const auto& t : raw) {
+        const std::size_t deltaLine = t.line - prevLine;
+        const std::size_t deltaStart = (deltaLine == 0) ? (t.startChar - prevChar) : t.startChar;
+        data.push_back(static_cast<std::uint32_t>(deltaLine));
+        data.push_back(static_cast<std::uint32_t>(deltaStart));
+        data.push_back(static_cast<std::uint32_t>(t.length));
+        data.push_back(t.tokenType);
+        data.push_back(t.tokenModifiers);
+        prevLine = t.line;
+        prevChar = t.startChar;
+    }
+    return data;
+}
+
+std::vector<InlayHint> LanguageService::inlayHints(const std::string& path) {
+    (void)build();
+    const auto* doc = document(path);
+    if (!doc) return {};
+
+    std::vector<InlayHint> hints;
+    text::SourceText source(doc->content, path);
+    diagnostics::DiagnosticBag diag;
+    syntax::Lexer lexer(source, diag);
+    const auto allTokens = lexer.lexAll();
+
+    // 1. Type inlay hints for `var name = ...` declarations
+    for (std::size_t i = 0; i + 1 < allTokens.size(); ++i) {
+        if (allTokens[i].text == "var" &&
+            allTokens[i + 1].kind == syntax::SyntaxKind::IdentifierToken) {
+            const auto& idTok = allTokens[i + 1];
+            for (const auto& occ : result_.symbols) {
+                if (occ.definition && occ.sourceName == path &&
+                    occ.span.start == idTok.span.start && !occ.detail.empty()) {
+                    const auto rng = rangeFor(path, idTok.span);
+                    const std::size_t line0 = rng.end.line > 0 ? rng.end.line - 1 : 0;
+                    const std::size_t col0 = rng.end.column > 0 ? rng.end.column - 1 : 0;
+                    hints.push_back(InlayHint{{line0, col0}, ": " + occ.detail, 1u});
+                    break;
+                }
+            }
+        }
+    }
+    return hints;
 }
 
 const char* symbolKindName(semantic::SymbolKind kind) noexcept {

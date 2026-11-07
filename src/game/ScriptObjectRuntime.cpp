@@ -491,4 +491,54 @@ void ScriptRuntime::clearNativeBackend() noexcept {
     backend_ = ScriptExecutionBackend::Interpreter;
 }
 
+std::optional<ScriptObject> ScriptRuntime::createAsset(
+    const std::string& assetPath,
+    const std::string& canonicalTypeName,
+    runtime::RuntimeError& error,
+    const std::map<std::string, runtime::Value>& initialFields) {
+    if (assetPath.empty()) {
+        error.code = runtime::ErrorCode::InvalidArguments;
+        error.message = "asset path must not be empty";
+        return std::nullopt;
+    }
+    auto obj = createObject(canonicalTypeName, error);
+    if (!obj) return std::nullopt;
+    for (const auto& [fieldName, fieldVal] : initialFields) {
+        if (!setMember(*obj, fieldName, fieldVal, error)) {
+            return std::nullopt;
+        }
+    }
+    if (const auto validateMethod = findMethod(obj->type(), "OnValidate", 0)) {
+        const auto valExec = invoke(*obj, *validateMethod);
+        if (!valExec.succeeded) {
+            error = valExec.error;
+            return std::nullopt;
+        }
+    }
+    if (heap_) {
+        // Retain another root referencing the exact same ObjectRef in assets_ registry
+        auto assetRoot = heap_->retain(obj->reference());
+        if (assetRoot.valid()) {
+            assets_.insert_or_assign(
+                assetPath,
+                ScriptObject{obj->type(), obj->reference(), std::move(assetRoot)});
+        }
+    }
+    return obj;
+}
+
+ScriptObject* ScriptRuntime::findAsset(const std::string& assetPath) {
+    const auto it = assets_.find(assetPath);
+    return it != assets_.end() ? &it->second : nullptr;
+}
+
+const ScriptObject* ScriptRuntime::findAsset(const std::string& assetPath) const {
+    const auto it = assets_.find(assetPath);
+    return it != assets_.end() ? &it->second : nullptr;
+}
+
+bool ScriptRuntime::unloadAsset(const std::string& assetPath) {
+    return assets_.erase(assetPath) != 0;
+}
+
 } // namespace realscript::game

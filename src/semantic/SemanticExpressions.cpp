@@ -3329,6 +3329,107 @@ std::unique_ptr<BoundExpression> Binder::bindCastExpression(
     return result;
 }
 
+std::unique_ptr<BoundExpression> Binder::tryBindExtensionMethodCall(
+    const syntax::MemberCallExpressionSyntax& syntaxTree,
+    std::unique_ptr<BoundExpression>& receiver,
+    std::vector<std::unique_ptr<BoundExpression>>& arguments) {
+    if (!receiver) return nullptr;
+    std::vector<const FunctionSymbol*> extCandidates;
+    const auto globals = visibleFunctions_.find(syntaxTree.nameToken.text);
+    if (globals != visibleFunctions_.end()) {
+        for (const auto& fn : globals->second) {
+            if (!fn.method && fn.extensionMethod && !fn.parameters.empty() &&
+                isMemberAccessible(
+                    fn.accessibility, fn.declaringTypeId, fn.moduleName)) {
+                extCandidates.push_back(&fn);
+            }
+        }
+    }
+    for (const auto& [visName, visType] : visibleTypes_) {
+        (void)visName;
+        for (const auto& m : visType.methods) {
+            if (m.staticMethod && m.extensionMethod &&
+                m.name == syntaxTree.nameToken.text && !m.parameters.empty() &&
+                isMemberAccessible(
+                    m.accessibility, m.declaringTypeId, m.moduleName)) {
+                extCandidates.push_back(&m);
+            }
+        }
+    }
+    if (extCandidates.empty()) return nullptr;
+
+    std::vector<std::unique_ptr<BoundExpression>> extArgs;
+    extArgs.reserve(arguments.size() + 1);
+    extArgs.push_back(std::move(receiver));
+    for (auto& arg : arguments) extArgs.push_back(std::move(arg));
+
+    std::vector<std::optional<syntax::SyntaxToken>> extNames;
+    if (!syntaxTree.argumentNames.empty()) {
+        extNames.push_back(std::nullopt);
+        for (const auto& n : syntaxTree.argumentNames) extNames.push_back(n);
+    }
+    std::vector<std::optional<syntax::SyntaxToken>> extMods;
+    if (!syntaxTree.argumentModifiers.empty()) {
+        extMods.push_back(std::nullopt);
+        for (const auto& m : syntaxTree.argumentModifiers) extMods.push_back(m);
+    }
+
+    bool extAmbiguous = false;
+    const auto extPlan = selectFlexibleCall(
+        extCandidates,
+        extArgs,
+        extNames.empty() ? nullptr : &extNames,
+        extMods.empty() ? nullptr : &extMods,
+        visibleTypes_,
+        extAmbiguous);
+    if (!extPlan.function || extAmbiguous) {
+        receiver = std::move(extArgs.front());
+        for (std::size_t i = 0; i < arguments.size(); ++i) {
+            arguments[i] = std::move(extArgs[i + 1]);
+        }
+        return nullptr;
+    }
+
+    recordSymbolReference(
+        occurrences_,
+        currentSourceName_,
+        extPlan.function->id,
+        SymbolKind::Function,
+        extPlan.function->name,
+        syntaxTree.nameToken.span);
+    std::vector<std::unique_ptr<syntax::ExpressionSyntax>> extSyntaxArgs;
+    extSyntaxArgs.reserve(syntaxTree.arguments.size() + 1);
+    auto dummyName = std::make_unique<syntax::NameExpressionSyntax>();
+    dummyName->identifierToken.span = syntaxTree.receiver->span();
+    extSyntaxArgs.push_back(std::move(dummyName));
+    for (const auto& a : syntaxTree.arguments) {
+        auto dn = std::make_unique<syntax::NameExpressionSyntax>();
+        dn->identifierToken.span = a->span();
+        extSyntaxArgs.push_back(std::move(dn));
+    }
+    auto prepared = prepareCallArguments(
+        *extPlan.function,
+        extPlan.sources,
+        std::move(extArgs),
+        extSyntaxArgs,
+        extMods,
+        syntaxTree.span(),
+        "extension method argument");
+    return applyNullConditional(
+        bindSelectedCall(
+            *extPlan.function,
+            std::move(prepared.arguments),
+            prepared.syntaxArguments,
+            prepared.modifiers,
+            std::move(prepared.evaluationOrder),
+            nullptr,
+            syntaxTree.span(),
+            "extension method argument",
+            false),
+        syntaxTree.dotToken,
+        syntaxTree.span());
+}
+
 std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
     const syntax::MemberCallExpressionSyntax& syntaxTree) {
     std::vector<std::unique_ptr<BoundExpression>> arguments;
@@ -3461,6 +3562,9 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
         if ((receiver->type != PrimitiveType::Object &&
              receiver->type != PrimitiveType::Struct) ||
             receiver->typeName.empty()) {
+            if (auto extCall = tryBindExtensionMethodCall(syntaxTree, receiver, arguments)) {
+                return extCall;
+            }
             diagnostics_.report(
                 "RS2471",
                 "member call requires a class or struct receiver",
@@ -3519,6 +3623,11 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
         methods, arguments, &syntaxTree.argumentNames,
         &syntaxTree.argumentModifiers, visibleTypes_, ambiguous);
     const auto* best = plan.function;
+    if (!best && !staticCall && receiver) {
+        if (auto extCall = tryBindExtensionMethodCall(syntaxTree, receiver, arguments)) {
+            return extCall;
+        }
+    }
     if (!best) {
         diagnostics_.report(
             "RS2472",
@@ -3846,6 +3955,9 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAccessExpression(
                 SymbolKind::Type,
                 type->second.name,
                 name.identifierToken.span);
+            if (syntaxTree.nameToken.missing) {
+                return makeError(syntaxTree.span());
+            }
             if (type->second.kind == TypeKind::Enum) {
                 const auto* member = findEnumMember(type->second, syntaxTree.nameToken.text);
                 if (!member) {
@@ -3962,6 +4074,9 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAccessExpression(
     }
 
     auto receiver = bindExpression(*syntaxTree.receiver);
+    if (syntaxTree.nameToken.missing) {
+        return makeError(syntaxTree.span());
+    }
     if (receiver->type == PrimitiveType::Array &&
         (syntaxTree.nameToken.text == "length" ||
          syntaxTree.nameToken.text == "Length" ||
@@ -4220,6 +4335,38 @@ std::unique_ptr<BoundExpression> Binder::applyNullConditional(
 std::unique_ptr<BoundExpression> Binder::bindElementAccessExpression(
     const syntax::ElementAccessExpressionSyntax& syntaxTree) {
     auto receiver = bindExpression(*syntaxTree.receiver);
+    if ((receiver->type == PrimitiveType::Object || receiver->type == PrimitiveType::Struct) &&
+        !receiver->typeName.empty()) {
+        const auto ownerIt = visibleTypes_.find(receiver->typeName);
+        if (ownerIt != visibleTypes_.end()) {
+            std::vector<std::unique_ptr<BoundExpression>> args;
+            args.push_back(bindExpression(*syntaxTree.index));
+            auto methods = findMethods(ownerIt->second, "Get", false);
+            bool ambiguous = false;
+            const auto plan = selectFlexibleCall(
+                methods, args, nullptr, nullptr, visibleTypes_, ambiguous);
+            if (plan.function && !ambiguous) {
+                std::vector<std::unique_ptr<syntax::ExpressionSyntax>> synthArgs;
+                auto dn0 = std::make_unique<syntax::NameExpressionSyntax>();
+                dn0->identifierToken.span = syntaxTree.index->span();
+                synthArgs.push_back(std::move(dn0));
+                std::vector<std::optional<syntax::SyntaxToken>> synthMods;
+                auto prepared = prepareCallArguments(
+                    *plan.function, plan.sources, std::move(args),
+                    synthArgs, synthMods, syntaxTree.span(), "indexer argument");
+                return bindSelectedCall(
+                    *plan.function,
+                    std::move(prepared.arguments),
+                    prepared.syntaxArguments,
+                    prepared.modifiers,
+                    std::move(prepared.evaluationOrder),
+                    std::move(receiver),
+                    syntaxTree.span(),
+                    "indexer argument",
+                    false);
+            }
+        }
+    }
     if (receiver->type != PrimitiveType::Array || receiver->typeName.empty()) {
         diagnostics_.report("RS2421", "element access requires an array", syntaxTree.receiver->span());
         return makeError(syntaxTree.span());
@@ -4701,6 +4848,108 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
 std::unique_ptr<BoundExpression> Binder::bindElementAssignmentExpression(
     const syntax::ElementAssignmentExpressionSyntax& syntaxTree) {
     auto receiver = bindExpression(*syntaxTree.receiver);
+    if ((receiver->type == PrimitiveType::Object || receiver->type == PrimitiveType::Struct) &&
+        !receiver->typeName.empty()) {
+        const auto ownerIt = visibleTypes_.find(receiver->typeName);
+        if (ownerIt != visibleTypes_.end()) {
+            auto idxExpr = bindExpression(*syntaxTree.index);
+            std::unique_ptr<BoundExpression> valExpr;
+            if (const auto compoundOp = compoundBinaryOperatorToken(syntaxTree.equalsToken)) {
+                const auto recvTemp = allocateTempVariable(
+                    "indexer_recv", receiver->type, receiver->typeName, syntaxTree.receiver->span());
+                auto recvAssign = std::make_unique<BoundAssignmentExpression>();
+                recvAssign->span = syntaxTree.receiver->span();
+                recvAssign->type = receiver->type;
+                recvAssign->typeName = receiver->typeName;
+                recvAssign->variable = recvTemp;
+                recvAssign->expression = std::move(receiver);
+                receiver = std::move(recvAssign);
+
+                const auto idxTemp = allocateTempVariable(
+                    "indexer_idx", idxExpr->type, idxExpr->typeName, syntaxTree.index->span());
+                auto idxAssign = std::make_unique<BoundAssignmentExpression>();
+                idxAssign->span = syntaxTree.index->span();
+                idxAssign->type = idxExpr->type;
+                idxAssign->typeName = idxExpr->typeName;
+                idxAssign->variable = idxTemp;
+                idxAssign->expression = std::move(idxExpr);
+                idxExpr = std::move(idxAssign);
+
+                auto getMethods = findMethods(ownerIt->second, "Get", false);
+                std::vector<std::unique_ptr<BoundExpression>> getArgs;
+                getArgs.push_back(makeVariableAccess(idxTemp, syntaxTree.index->span()));
+                bool getAmbig = false;
+                const auto getPlan = selectFlexibleCall(
+                    getMethods, getArgs, nullptr, nullptr, visibleTypes_, getAmbig);
+                if (getPlan.function && !getAmbig) {
+                    std::vector<std::unique_ptr<syntax::ExpressionSyntax>> emptySyntaxArgs;
+                    auto dn0 = std::make_unique<syntax::NameExpressionSyntax>();
+                    dn0->identifierToken.span = syntaxTree.index->span();
+                    emptySyntaxArgs.push_back(std::move(dn0));
+                    std::vector<std::optional<syntax::SyntaxToken>> emptyMods;
+                    auto getPrep = prepareCallArguments(
+                        *getPlan.function, getPlan.sources, std::move(getArgs),
+                        emptySyntaxArgs, emptyMods, syntaxTree.span(), "indexer argument");
+                    auto lhsVal = bindSelectedCall(
+                        *getPlan.function,
+                        std::move(getPrep.arguments),
+                        getPrep.syntaxArguments,
+                        getPrep.modifiers,
+                        std::move(getPrep.evaluationOrder),
+                        makeVariableAccess(recvTemp, syntaxTree.receiver->span()),
+                        syntaxTree.span(),
+                        "indexer argument",
+                        false);
+                    auto rhsVal = bindExpression(*syntaxTree.expression);
+                    valExpr = bindBinaryOperation(
+                        std::move(lhsVal),
+                        syntaxTree.receiver->span(),
+                        *compoundOp,
+                        std::move(rhsVal),
+                        syntaxTree.expression->span(),
+                        syntaxTree.span());
+                } else {
+                    valExpr = bindExpression(*syntaxTree.expression);
+                }
+            } else {
+                valExpr = bindExpression(*syntaxTree.expression);
+            }
+            std::vector<std::unique_ptr<BoundExpression>> args;
+            args.push_back(std::move(idxExpr));
+            args.push_back(std::move(valExpr));
+            auto methods = findMethods(ownerIt->second, "Put", false);
+            if (methods.empty()) {
+                methods = findMethods(ownerIt->second, "Set", false);
+            }
+            bool ambiguous = false;
+            const auto plan = selectFlexibleCall(
+                methods, args, nullptr, nullptr, visibleTypes_, ambiguous);
+            if (plan.function && !ambiguous) {
+                std::vector<std::unique_ptr<syntax::ExpressionSyntax>> synthArgs;
+                auto dn0 = std::make_unique<syntax::NameExpressionSyntax>();
+                dn0->identifierToken.span = syntaxTree.index->span();
+                synthArgs.push_back(std::move(dn0));
+                auto dn1 = std::make_unique<syntax::NameExpressionSyntax>();
+                dn1->identifierToken.span = syntaxTree.expression->span();
+                synthArgs.push_back(std::move(dn1));
+                std::vector<std::optional<syntax::SyntaxToken>> synthMods;
+                auto prepared = prepareCallArguments(
+                    *plan.function, plan.sources, std::move(args),
+                    synthArgs, synthMods, syntaxTree.span(), "indexer assignment");
+                auto callExpr = bindSelectedCall(
+                    *plan.function,
+                    std::move(prepared.arguments),
+                    prepared.syntaxArguments,
+                    prepared.modifiers,
+                    std::move(prepared.evaluationOrder),
+                    std::move(receiver),
+                    syntaxTree.span(),
+                    "indexer assignment",
+                    false);
+                return callExpr;
+            }
+        }
+    }
     if (receiver->type != PrimitiveType::Array || receiver->typeName.empty()) {
         diagnostics_.report("RS2421", "element assignment requires an array", syntaxTree.receiver->span());
         return makeError(syntaxTree.span());
@@ -4721,16 +4970,31 @@ std::unique_ptr<BoundExpression> Binder::bindElementAssignmentExpression(
     auto index = convertExpression(bindExpression(*syntaxTree.index), PrimitiveType::Int, syntaxTree.index->span(), "array index");
     std::unique_ptr<BoundExpression> value;
     if (const auto compoundOp = compoundBinaryOperatorToken(syntaxTree.equalsToken)) {
+        const auto recvTemp = allocateTempVariable(
+            "arr_recv", receiver->type, receiver->typeName, syntaxTree.receiver->span());
+        auto recvAssign = std::make_unique<BoundAssignmentExpression>();
+        recvAssign->span = syntaxTree.receiver->span();
+        recvAssign->type = receiver->type;
+        recvAssign->typeName = receiver->typeName;
+        recvAssign->variable = recvTemp;
+        recvAssign->expression = std::move(receiver);
+        receiver = std::move(recvAssign);
+
+        const auto idxTemp = allocateTempVariable(
+            "arr_idx", PrimitiveType::Int, {}, syntaxTree.index->span());
+        auto idxAssign = std::make_unique<BoundAssignmentExpression>();
+        idxAssign->span = syntaxTree.index->span();
+        idxAssign->type = PrimitiveType::Int;
+        idxAssign->variable = idxTemp;
+        idxAssign->expression = std::move(index);
+        index = std::move(idxAssign);
+
         auto lhsValue = std::make_unique<BoundElementAccessExpression>();
         lhsValue->span = syntaxTree.span();
         lhsValue->type = elementType;
         lhsValue->typeName = elementTypeName;
-        lhsValue->receiver = bindExpression(*syntaxTree.receiver);
-        lhsValue->index = convertExpression(
-            bindExpression(*syntaxTree.index),
-            PrimitiveType::Int,
-            syntaxTree.index->span(),
-            "array index");
+        lhsValue->receiver = makeVariableAccess(recvTemp, syntaxTree.receiver->span());
+        lhsValue->index = makeVariableAccess(idxTemp, syntaxTree.index->span());
         lhsValue->elementType = elementType;
         lhsValue->elementTypeName = elementTypeName;
         auto rhsValue = bindExpression(*syntaxTree.expression);

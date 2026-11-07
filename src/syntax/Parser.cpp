@@ -334,7 +334,8 @@ ParameterSyntax Parser::parseParameter() {
     }
     if (current().kind == SyntaxKind::RefKeyword ||
         current().kind == SyntaxKind::OutKeyword ||
-        current().kind == SyntaxKind::InKeyword) {
+        current().kind == SyntaxKind::InKeyword ||
+        current().kind == SyntaxKind::ThisKeyword) {
         result.modifierToken = nextToken();
     }
     result.type = parseType();
@@ -1487,6 +1488,21 @@ std::unique_ptr<StatementSyntax> Parser::parseVariableDeclarationStatement() {
 std::unique_ptr<StatementSyntax> Parser::parseExpressionStatement() {
     auto result = std::make_unique<ExpressionStatementSyntax>();
     result->expression = parseExpression();
+    if (result->expression &&
+        result->expression->kind() == SyntaxKind::MemberAccessExpression) {
+        const auto& member = static_cast<const MemberAccessExpressionSyntax&>(
+            *result->expression);
+        if (member.nameToken.missing &&
+            current().kind != SyntaxKind::SemicolonToken) {
+            result->semicolonToken = SyntaxToken{
+                SyntaxKind::SemicolonToken,
+                {current().span.start, 0},
+                "",
+                {},
+                true};
+            return result;
+        }
+    }
     result->semicolonToken = match(SyntaxKind::SemicolonToken);
     return result;
 }

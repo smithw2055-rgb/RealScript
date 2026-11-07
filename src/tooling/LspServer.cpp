@@ -123,6 +123,17 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
                 {"referencesProvider", true},
                 {"documentSymbolProvider", true},
                 {"renameProvider", true},
+                {"inlayHintProvider", true},
+                {"semanticTokensProvider", Json::Object{
+                    {"full", true},
+                    {"legend", Json::Object{
+                        {"tokenTypes", Json::Array{
+                            "namespace", "type", "function", "variable",
+                            "parameter", "property", "enumMember", "keyword",
+                            "number", "string"}},
+                        {"tokenModifiers", Json::Array{"declaration"}},
+                    }},
+                }},
             }},
             {"serverInfo", Json::Object{{"name", "RealScript LSP"},
                 {"version", realscript::kVersionString}}},
@@ -298,6 +309,24 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
             });
         }
         return response(message, Json::Object{{"changes", Json(std::move(changes))}});
+    }
+    if (method == "textDocument/semanticTokens/full") {
+        Json::Array data;
+        for (const auto val : service_.semanticTokensEncoded(path)) {
+            data.emplace_back(static_cast<std::int64_t>(val));
+        }
+        return response(message, Json::Object{{"data", Json(std::move(data))}});
+    }
+    if (method == "textDocument/inlayHint") {
+        Json::Array items;
+        for (const auto& hint : service_.inlayHints(path)) {
+            items.emplace_back(Json::Object{
+                {"position", position(hint.position)},
+                {"label", hint.label},
+                {"kind", static_cast<std::int64_t>(hint.kind)},
+            });
+        }
+        return response(message, Json(std::move(items)));
     }
 
     if (message.find("id")) return error(message, -32601, "method not found: " + method);

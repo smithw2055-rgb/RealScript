@@ -294,7 +294,7 @@ bool SceneScriptRuntime::attachComponentWithoutLifecycle(
     const std::string& scriptType,
     SceneScriptOptions options,
     std::size_t& outCompIndex) {
-    if (entity == BroadcastTarget) return false;
+    if (entity == BroadcastTarget || isStaleGenerationalEntity(entity)) return false;
     const auto existingEntity = instances_.find(entity);
     if (existingEntity != instances_.end()) {
         for (const auto& comp : existingEntity->second) {
@@ -347,7 +347,7 @@ bool SceneScriptRuntime::attachComponent(
     SceneEntityId entity,
     const std::string& scriptType,
     SceneScriptOptions options) {
-    if (entity == BroadcastTarget) {
+    if (entity == BroadcastTarget || isStaleGenerationalEntity(entity)) {
         return false;
     }
     const auto existingEntity = instances_.find(entity);
@@ -462,9 +462,19 @@ bool SceneScriptRuntime::detach(SceneEntityId entity) {
     }
     (void)removeEntityCollider2D(entity);
 
-    if (fiberScheduler_ && entity <= std::numeric_limits<std::uint32_t>::max()) {
-        (void)fiberScheduler_->killEntityFibersBySlot(
-            static_cast<std::uint32_t>(entity));
+    const std::uint32_t gen = entityIdGeneration(entity);
+    const std::uint32_t slot = entityIdSlot(entity);
+    if (gen != 0) {
+        const auto genIt = slotGenerations_.find(slot);
+        if (genIt != slotGenerations_.end() && genIt->second == gen) {
+            ++genIt->second;
+            if (genIt->second == 0) genIt->second = 1;
+            freeGenerationalSlots_.push_back(slot);
+        }
+    }
+
+    if (fiberScheduler_) {
+        (void)fiberScheduler_->killEntityFibersBySlot(slot);
     }
 
     removeSignalsForEntityOrComponent(entity, {});
@@ -521,7 +531,7 @@ bool SceneScriptRuntime::isEntityActiveSelf(SceneEntityId entity) const noexcept
 }
 
 bool SceneScriptRuntime::setEntityActive(SceneEntityId entity, bool active) {
-    if (entity == BroadcastTarget) return false;
+    if (entity == BroadcastTarget || isStaleGenerationalEntity(entity)) return false;
     const bool currentSelf = isEntityActiveSelf(entity);
     if (entityActiveSelf_.find(entity) != entityActiveSelf_.end() &&
         currentSelf == active) {
@@ -800,6 +810,7 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         std::unordered_map<std::string, runtime::Value> fields;
     };
     std::map<SceneEntityId, std::vector<SavedComponentState>> savedEntities;
+    std::map<std::string, SavedComponentState> savedAssets;
 
     for (const auto& [entity, components] : instances_) {
         auto& savedList = savedEntities[entity];
@@ -821,12 +832,111 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         }
     }
 
+    for (const auto& [assetPath, assetObj] : runtime_.assets_) {
+        SavedComponentState saved;
+        saved.canonicalTypeName = assetObj.type().canonicalName();
+        saved.oldRef = assetObj.reference();
+        for (const auto& field : assetObj.type().descriptor.fields) {
+            auto val = runtime_.heap()->fieldGet(
+                assetObj.reference(), field.index);
+            if (val) {
+                saved.fields.emplace(field.name, std::move(*val));
+            }
+        }
+        savedAssets.emplace(assetPath, std::move(saved));
+    }
+
     runtime_.replaceProgram(newProgram);
     methodCache_.clear();
     tickOrderDirty_ = true;
 
     std::unordered_map<std::uint64_t, runtime::ObjectRef> migratedRefMap;
     std::unordered_map<std::string, std::optional<ScriptObject>> prototypeCache;
+
+    const auto migrateSavedFieldsToNewObject = [&](
+        const SavedComponentState& saved,
+        const ScriptType& newType,
+        const ScriptObject& newObj,
+        runtime::RuntimeError& allocError) {
+        for (const auto& newField : newType.descriptor.fields) {
+            const bool isSequenceSynthetic =
+                newField.synthetic && newField.name.rfind("$sequence_", 0) == 0;
+            const bool isInstanceField =
+                !newField.synthetic && !newField.staticField && !newField.constField;
+            const auto newFieldTypeId = exactFieldTypeId(
+                newField.type, newField.typeName);
+            const auto directIt = saved.fields.find(newField.name);
+            if (directIt != saved.fields.end() &&
+                runtime_.valueMatches(
+                    directIt->second, newField.type, newFieldTypeId)) {
+                (void)runtime_.heap()->fieldSet(
+                    newObj.reference(), newField.index, directIt->second, &allocError);
+                if (isInstanceField || isSequenceSynthetic) {
+                    if (isInstanceField) ++report.fieldsMigrated;
+                }
+                continue;
+            }
+
+            const std::string oldFieldName = findRenamedFieldSource(
+                mergedMetadata, saved.canonicalTypeName, newField.name);
+            if (!oldFieldName.empty()) {
+                const auto renamedIt = saved.fields.find(oldFieldName);
+                if (renamedIt != saved.fields.end() &&
+                    runtime_.valueMatches(
+                        renamedIt->second, newField.type, newFieldTypeId)) {
+                    (void)runtime_.heap()->fieldSet(
+                        newObj.reference(),
+                        newField.index,
+                        renamedIt->second,
+                        &allocError);
+                    if (isInstanceField) {
+                        ++report.fieldsMigrated;
+                        ++report.fieldsRenamed;
+                    }
+                    continue;
+                }
+            }
+            if (isInstanceField) {
+                auto protoIt = prototypeCache.find(saved.canonicalTypeName);
+                if (protoIt == prototypeCache.end()) {
+                    runtime::RuntimeError protoErr;
+                    protoIt = prototypeCache
+                                  .emplace(
+                                      saved.canonicalTypeName,
+                                      runtime_.createPrototypeObject(newType, protoErr))
+                                  .first;
+                }
+                if (protoIt->second) {
+                    if (auto protoVal = runtime_.heap()->fieldGet(
+                            protoIt->second->reference(), newField.index)) {
+                        (void)runtime_.heap()->fieldSet(
+                            newObj.reference(), newField.index, *protoVal, &allocError);
+                    }
+                }
+                ++report.fieldsDefaulted;
+            }
+        }
+    };
+
+    for (auto& [assetPath, assetObj] : runtime_.assets_) {
+        const auto savedIt = savedAssets.find(assetPath);
+        if (savedIt == savedAssets.end()) continue;
+        const auto& saved = savedIt->second;
+        const auto newType = runtime_.findType(saved.canonicalTypeName);
+        if (!newType) continue;
+        runtime::RuntimeError allocError;
+        auto newObj = runtime_.allocateUninitializedObject(*newType, allocError);
+        if (!newObj) continue;
+        if (saved.oldRef.valid()) {
+            const std::uint64_t oldKey =
+                (static_cast<std::uint64_t>(saved.oldRef.generation) << 32u) |
+                saved.oldRef.slot;
+            migratedRefMap[oldKey] = newObj->reference();
+        }
+        migrateSavedFieldsToNewObject(saved, *newType, *newObj, allocError);
+        assetObj = std::move(*newObj);
+        ++report.instancesMigrated;
+    }
 
     for (auto& [entity, components] : instances_) {
         const auto& savedList = savedEntities[entity];
@@ -856,62 +966,7 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                 migratedRefMap[oldKey] = newObj->reference();
             }
 
-            for (const auto& newField : newType->descriptor.fields) {
-                const bool isInstanceField =
-                    !newField.synthetic && !newField.staticField && !newField.constField;
-                const auto newFieldTypeId = exactFieldTypeId(
-                    newField.type, newField.typeName);
-                const auto directIt = saved.fields.find(newField.name);
-                if (directIt != saved.fields.end() &&
-                    runtime_.valueMatches(
-                        directIt->second, newField.type, newFieldTypeId)) {
-                    (void)runtime_.heap()->fieldSet(
-                        newObj->reference(), newField.index, directIt->second, &allocError);
-                    if (isInstanceField) {
-                        ++report.fieldsMigrated;
-                    }
-                    continue;
-                }
-
-                const std::string oldFieldName = findRenamedFieldSource(
-                    mergedMetadata, saved.canonicalTypeName, newField.name);
-                if (!oldFieldName.empty()) {
-                    const auto renamedIt = saved.fields.find(oldFieldName);
-                    if (renamedIt != saved.fields.end() &&
-                        runtime_.valueMatches(
-                            renamedIt->second, newField.type, newFieldTypeId)) {
-                        (void)runtime_.heap()->fieldSet(
-                            newObj->reference(),
-                            newField.index,
-                            renamedIt->second,
-                            &allocError);
-                        if (isInstanceField) {
-                            ++report.fieldsMigrated;
-                            ++report.fieldsRenamed;
-                        }
-                        continue;
-                    }
-                }
-                if (isInstanceField) {
-                    auto protoIt = prototypeCache.find(saved.canonicalTypeName);
-                    if (protoIt == prototypeCache.end()) {
-                        runtime::RuntimeError protoErr;
-                        protoIt = prototypeCache
-                                      .emplace(
-                                          saved.canonicalTypeName,
-                                          runtime_.createPrototypeObject(*newType, protoErr))
-                                      .first;
-                    }
-                    if (protoIt->second) {
-                        if (auto protoVal = runtime_.heap()->fieldGet(
-                                protoIt->second->reference(), newField.index)) {
-                            (void)runtime_.heap()->fieldSet(
-                                newObj->reference(), newField.index, *protoVal, &allocError);
-                        }
-                    }
-                    ++report.fieldsDefaulted;
-                }
-            }
+            migrateSavedFieldsToNewObject(saved, *newType, *newObj, allocError);
 
             instance.object = std::move(*newObj);
             instance.enabled = saved.enabled;
@@ -926,7 +981,7 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         }
     }
 
-    // Patch cross-component ObjectRef fields (including inside Arrays and Structs) and delegate targets
+    // Patch cross-component ObjectRef fields (including inside Arrays, Structs, and Assets) and delegate targets
     if (!migratedRefMap.empty()) {
         std::unordered_set<std::uint64_t> visited;
         for (auto& [entity, components] : instances_) {
@@ -938,6 +993,14 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                     migratedRefMap,
                     visited);
             }
+        }
+        for (auto& [assetPath, assetObj] : runtime_.assets_) {
+            (void)assetPath;
+            patchMigratedObjectRefsInHeapObject(
+                runtime_.heap().get(),
+                assetObj.reference(),
+                migratedRefMap,
+                visited);
         }
     }
 
@@ -1284,7 +1347,11 @@ SceneScriptRuntime::findObjectLocation(runtime::ObjectRef reference) const {
 }
 
 bool SceneScriptRuntime::setParent(SceneEntityId child, SceneEntityId parent) {
-    if (child == BroadcastTarget || child == parent) return false;
+    if (child == BroadcastTarget || child == parent ||
+        isStaleGenerationalEntity(child) ||
+        (parent != BroadcastTarget && isStaleGenerationalEntity(parent))) {
+        return false;
+    }
     // Prevent cycle in hierarchy
     SceneEntityId cursor = parent;
     while (cursor != BroadcastTarget) {
@@ -1356,7 +1423,7 @@ bool SceneScriptRuntime::isActiveInHierarchy(SceneEntityId entity) const noexcep
 void SceneScriptRuntime::setLocalTransform(
     SceneEntityId entity,
     const Transform3D& transform) {
-    if (entity == BroadcastTarget) return;
+    if (entity == BroadcastTarget || isStaleGenerationalEntity(entity)) return;
     if (entityActiveSelf_.find(entity) == entityActiveSelf_.end()) {
         entityActiveSelf_[entity] = true;
     }
@@ -1386,7 +1453,7 @@ Transform3D SceneScriptRuntime::getWorldTransform(
 }
 
 void SceneScriptRuntime::setLocalPosition2D(SceneEntityId entity, Vec2 position) {
-    if (entity == BroadcastTarget) return;
+    if (entity == BroadcastTarget || isStaleGenerationalEntity(entity)) return;
     if (entityActiveSelf_.find(entity) == entityActiveSelf_.end()) {
         entityActiveSelf_[entity] = true;
     }
@@ -1577,13 +1644,16 @@ std::uint32_t SceneScriptRuntime::spawnEntityFiber(
     const std::string& functionName,
     std::uint8_t ownerGroupId,
     std::uint32_t seed) {
-    if (!fiberScheduler_ || entity == BroadcastTarget || !isActiveInHierarchy(entity)) {
+    if (!fiberScheduler_ || entity == BroadcastTarget || !isActiveInHierarchy(entity) ||
+        isStaleGenerationalEntity(entity)) {
         return 0;
     }
+    const std::uint32_t slot = entityIdSlot(entity);
+    const std::uint32_t gen = entityIdGeneration(entity);
     return fiberScheduler_->spawnFunction(
         module,
         functionName,
-        runtime::GenerationalEntityHandle{static_cast<std::uint32_t>(entity), 1u},
+        runtime::GenerationalEntityHandle{slot, gen != 0 ? gen : 1u},
         ownerGroupId,
         0u,
         seed);
@@ -1706,7 +1776,7 @@ std::uint64_t SceneScriptRuntime::computeInputDigest() const noexcept {
 }
 
 void SceneScriptRuntime::setEntityCollider2D(SceneEntityId entity, SceneCollider2D collider) {
-    if (entity == BroadcastTarget) return;
+    if (entity == BroadcastTarget || isStaleGenerationalEntity(entity)) return;
     if (entityActiveSelf_.find(entity) == entityActiveSelf_.end()) {
         entityActiveSelf_[entity] = true;
     }
@@ -1717,6 +1787,7 @@ bool SceneScriptRuntime::removeEntityCollider2D(SceneEntityId entity) {
     for (auto it = activeOverlaps2D_.begin(); it != activeOverlaps2D_.end();) {
         if (it->first == entity || it->second == entity) {
             activeOverlapWasTrigger2D_.erase(*it);
+            activeContacts2D_.erase(*it);
             it = activeOverlaps2D_.erase(it);
         } else {
             ++it;
@@ -1737,6 +1808,7 @@ void SceneScriptRuntime::restorePhysicsOverlapState(
     std::map<std::pair<SceneEntityId, SceneEntityId>, bool> activeOverlapWasTrigger) {
     activeOverlaps2D_ = std::move(activeOverlaps);
     activeOverlapWasTrigger2D_ = std::move(activeOverlapWasTrigger);
+    activeContacts2D_.clear();
 }
 
 namespace {
@@ -1845,13 +1917,22 @@ std::optional<RaycastHit2D> SceneScriptRuntime::raycast2D(
                 Fixed::fromRaw(Fixed::clampRaw64(
                     static_cast<std::int64_t>(origin.y.raw) + ((static_cast<std::int64_t>(dir.y.raw) * hitDistRaw) >> 8))),
             };
+            const Vec2 diffNorm = hitPt - center;
+            const Fixed diffLen = diffNorm.length();
+            const Vec2 hitNormal = diffLen > Fixed::fromRaw(0)
+                ? (diffNorm / diffLen)
+                : Vec2{Fixed::fromInt(-1), Fixed::fromRaw(0)};
             if (!closest || hitDist < closest->distance ||
                 (hitDist == closest->distance && entity < closest->entity)) {
-                closest = RaycastHit2D{entity, hitPt, hitDist};
+                closest = RaycastHit2D{entity, hitPt, hitNormal, hitDist};
             }
         } else {
             std::int64_t tMinRaw = 0;
             std::int64_t tMaxRaw = static_cast<std::int64_t>(maxDistance.raw);
+            int hitAxis = (fixedAbs64(dir.y.raw) > fixedAbs64(dir.x.raw)) ? 1 : 0;
+            int hitSign = (hitAxis == 0)
+                ? (dir.x.raw >= 0 ? -1 : 1)
+                : (dir.y.raw >= 0 ? -1 : 1);
             bool hit = true;
             for (int axis = 0; axis < 2; ++axis) {
                 const std::int64_t o = axis == 0 ? origin.x.raw : origin.y.raw;
@@ -1868,8 +1949,13 @@ std::optional<RaycastHit2D> SceneScriptRuntime::raycast2D(
                 } else {
                     std::int64_t t1 = ((bMin - o) << 8) / d;
                     std::int64_t t2 = ((bMax - o) << 8) / d;
-                    if (t1 > t2) std::swap(t1, t2);
-                    if (t1 > tMinRaw) tMinRaw = t1;
+                    const bool swapped = t1 > t2;
+                    if (swapped) std::swap(t1, t2);
+                    if (t1 > tMinRaw) {
+                        tMinRaw = t1;
+                        hitAxis = axis;
+                        hitSign = swapped ? 1 : -1;
+                    }
                     if (t2 < tMaxRaw) tMaxRaw = t2;
                     if (tMinRaw > tMaxRaw) {
                         hit = false;
@@ -1885,9 +1971,12 @@ std::optional<RaycastHit2D> SceneScriptRuntime::raycast2D(
                 Fixed::fromRaw(Fixed::clampRaw64(
                     static_cast<std::int64_t>(origin.y.raw) + ((static_cast<std::int64_t>(dir.y.raw) * tMinRaw) >> 8))),
             };
+            const Vec2 hitNormal = (hitAxis == 0)
+                ? Vec2{Fixed::fromInt(hitSign), Fixed::fromRaw(0)}
+                : Vec2{Fixed::fromRaw(0), Fixed::fromInt(hitSign)};
             if (!closest || tMin < closest->distance ||
                 (tMin == closest->distance && entity < closest->entity)) {
-                closest = RaycastHit2D{entity, hitPt, tMin};
+                closest = RaycastHit2D{entity, hitPt, hitNormal, tMin};
             }
         }
     }
@@ -1912,25 +2001,212 @@ std::vector<SceneEntityId> SceneScriptRuntime::overlapCircle2D(
     return result;
 }
 
+namespace {
+
+CollisionContact2D computeContact2D(
+    SceneEntityId entA, Vec2 posA, const SceneCollider2D& colA,
+    SceneEntityId entB, Vec2 posB, const SceneCollider2D& colB) noexcept {
+    CollisionContact2D contact;
+    contact.entityA = entA;
+    contact.entityB = entB;
+    contact.isTrigger = colA.isTrigger || colB.isTrigger;
+    const Vec2 delta = posB - posA;
+    if (colA.isCircle && colB.isCircle) {
+        const Fixed dist = delta.length();
+        const Fixed sumR = colA.radius + colB.radius;
+        contact.penetration = sumR > dist ? (sumR - dist) : Fixed::fromRaw(0);
+        contact.normal = dist > Fixed::fromRaw(0)
+            ? (delta / dist)
+            : Vec2{Fixed::fromInt(1), Fixed::fromRaw(0)};
+        contact.contactPoint = posA + contact.normal * colA.radius;
+        return contact;
+    }
+    if (colA.isCircle != colB.isCircle) {
+        const bool aIsCircle = colA.isCircle;
+        const Vec2 circlePos = aIsCircle ? posA : posB;
+        const Fixed radius = aIsCircle ? colA.radius : colB.radius;
+        const Vec2 boxPos = aIsCircle ? posB : posA;
+        const Vec2 halfExt = aIsCircle ? colB.halfExtents : colA.halfExtents;
+        const std::int64_t cx = circlePos.x.raw;
+        const std::int64_t cy = circlePos.y.raw;
+        const std::int64_t bx = boxPos.x.raw;
+        const std::int64_t by = boxPos.y.raw;
+        const std::int64_t hx = halfExt.x.raw;
+        const std::int64_t hy = halfExt.y.raw;
+        const std::int64_t clampedX = fixedClamp64(cx, bx - hx, bx + hx);
+        const std::int64_t clampedY = fixedClamp64(cy, by - hy, by + hy);
+        const Vec2 closestOnBox{
+            Fixed::fromRaw(Fixed::clampRaw64(clampedX)),
+            Fixed::fromRaw(Fixed::clampRaw64(clampedY)),
+        };
+        const Vec2 circleToBox = closestOnBox - circlePos;
+        const Fixed dist = circleToBox.length();
+        if (dist > Fixed::fromRaw(0)) {
+            const Vec2 dirCircleToBox = circleToBox / dist;
+            contact.normal = aIsCircle
+                ? dirCircleToBox
+                : Vec2{-dirCircleToBox.x, -dirCircleToBox.y};
+            contact.penetration = radius > dist ? (radius - dist) : Fixed::fromRaw(0);
+            contact.contactPoint = closestOnBox;
+            return contact;
+        }
+        // Circle center is inside the AABB: push out along nearest box face
+        const std::int64_t distLeft = cx - (bx - hx);
+        const std::int64_t distRight = (bx + hx) - cx;
+        const std::int64_t distDown = cy - (by - hy);
+        const std::int64_t distUp = (by + hy) - cy;
+        const std::int64_t minX = distLeft <= distRight ? distLeft : distRight;
+        const std::int64_t minY = distDown <= distUp ? distDown : distUp;
+        Vec2 dirCircleToBox{};
+        std::int64_t penRaw = 0;
+        if (minX <= minY) {
+            dirCircleToBox = Vec2{
+                distLeft <= distRight ? Fixed::fromInt(1) : Fixed::fromInt(-1),
+                Fixed::fromRaw(0)};
+            penRaw = static_cast<std::int64_t>(radius.raw) + minX;
+        } else {
+            dirCircleToBox = Vec2{
+                Fixed::fromRaw(0),
+                distDown <= distUp ? Fixed::fromInt(1) : Fixed::fromInt(-1)};
+            penRaw = static_cast<std::int64_t>(radius.raw) + minY;
+        }
+        contact.normal = aIsCircle
+            ? dirCircleToBox
+            : Vec2{-dirCircleToBox.x, -dirCircleToBox.y};
+        contact.penetration = Fixed::fromRaw(Fixed::clampRaw64(penRaw > 0 ? penRaw : 0));
+        contact.contactPoint = circlePos;
+        return contact;
+    }
+    const std::int64_t rxA = colA.isCircle ? colA.radius.raw : colA.halfExtents.x.raw;
+    const std::int64_t ryA = colA.isCircle ? colA.radius.raw : colA.halfExtents.y.raw;
+    const std::int64_t rxB = colB.isCircle ? colB.radius.raw : colB.halfExtents.x.raw;
+    const std::int64_t ryB = colB.isCircle ? colB.radius.raw : colB.halfExtents.y.raw;
+    const std::int64_t overlapX = (rxA + rxB) - fixedAbs64(static_cast<std::int64_t>(delta.x.raw));
+    const std::int64_t overlapY = (ryA + ryB) - fixedAbs64(static_cast<std::int64_t>(delta.y.raw));
+    if (overlapX <= overlapY) {
+        contact.penetration = Fixed::fromRaw(Fixed::clampRaw64(overlapX > 0 ? overlapX : 0));
+        contact.normal = Vec2{
+            delta.x.raw >= 0 ? Fixed::fromInt(1) : Fixed::fromInt(-1),
+            Fixed::fromRaw(0)};
+    } else {
+        contact.penetration = Fixed::fromRaw(Fixed::clampRaw64(overlapY > 0 ? overlapY : 0));
+        contact.normal = Vec2{
+            Fixed::fromRaw(0),
+            delta.y.raw >= 0 ? Fixed::fromInt(1) : Fixed::fromInt(-1)};
+    }
+    contact.contactPoint = Vec2{
+        Fixed::fromRaw(Fixed::clampRaw64((static_cast<std::int64_t>(posA.x.raw) + static_cast<std::int64_t>(posB.x.raw)) / 2)),
+        Fixed::fromRaw(Fixed::clampRaw64((static_cast<std::int64_t>(posA.y.raw) + static_cast<std::int64_t>(posB.y.raw)) / 2)),
+    };
+    return contact;
+}
+
+} // namespace
+
+std::optional<CollisionContact2D> SceneScriptRuntime::getCollisionContact2D(
+    SceneEntityId entityA,
+    SceneEntityId entityB) const noexcept {
+    if (entityA == entityB) return std::nullopt;
+    const auto key = entityA < entityB
+        ? std::make_pair(entityA, entityB)
+        : std::make_pair(entityB, entityA);
+    const auto it = activeContacts2D_.find(key);
+    if (it == activeContacts2D_.end()) return std::nullopt;
+    if (entityA < entityB) return it->second;
+    CollisionContact2D flipped = it->second;
+    std::swap(flipped.entityA, flipped.entityB);
+    flipped.normal = Vec2{-flipped.normal.x, -flipped.normal.y};
+    return flipped;
+}
+
 std::size_t SceneScriptRuntime::stepPhysics2D() {
     std::set<std::pair<SceneEntityId, SceneEntityId>> currentOverlaps;
     std::map<std::pair<SceneEntityId, SceneEntityId>, bool> currentIsTrigger;
+    std::map<std::pair<SceneEntityId, SceneEntityId>, CollisionContact2D> currentContacts;
 
-    for (auto itA = colliders2D_.begin(); itA != colliders2D_.end(); ++itA) {
-        if (!isActiveInHierarchy(itA->first)) continue;
-        const Vec2 posA = getWorldPosition2D(itA->first);
-        auto itB = itA;
-        ++itB;
-        for (; itB != colliders2D_.end(); ++itB) {
-            if (!isActiveInHierarchy(itB->first)) continue;
-            const Vec2 posB = getWorldPosition2D(itB->first);
-            if (testOverlap2D(posA, itA->second, posB, itB->second)) {
-                const auto pair = std::make_pair(itA->first, itB->first);
-                currentOverlaps.insert(pair);
-                currentIsTrigger[pair] = itA->second.isTrigger || itB->second.isTrigger;
+    struct ActiveColliderEntry {
+        SceneEntityId entity = 0;
+        Vec2 pos{};
+        const SceneCollider2D* col = nullptr;
+        std::int64_t minX = 0;
+        std::int64_t maxX = 0;
+        std::int64_t minY = 0;
+        std::int64_t maxY = 0;
+    };
+    std::vector<ActiveColliderEntry> activeEntries;
+    activeEntries.reserve(colliders2D_.size());
+    for (const auto& [ent, col] : colliders2D_) {
+        if (!isActiveInHierarchy(ent)) continue;
+        const Vec2 pos = getWorldPosition2D(ent);
+        const std::int64_t extX = col.isCircle ? col.radius.raw : col.halfExtents.x.raw;
+        const std::int64_t extY = col.isCircle ? col.radius.raw : col.halfExtents.y.raw;
+        activeEntries.push_back(ActiveColliderEntry{
+            ent,
+            pos,
+            &col,
+            static_cast<std::int64_t>(pos.x.raw) - extX,
+            static_cast<std::int64_t>(pos.x.raw) + extX,
+            static_cast<std::int64_t>(pos.y.raw) - extY,
+            static_cast<std::int64_t>(pos.y.raw) + extY,
+        });
+    }
+
+    // Spatial Hash Grid broadphase (cell size = 16 world units = 4096 raw Q24.8 units)
+    constexpr std::int64_t kCellShift = 12; // 4096 raw units
+    std::unordered_map<std::uint64_t, std::vector<std::size_t>> gridCells;
+    std::set<std::pair<std::size_t, std::size_t>> candidatePairs;
+    bool useSweepFallback = false;
+
+    for (std::size_t idx = 0; idx < activeEntries.size(); ++idx) {
+        const auto& e = activeEntries[idx];
+        const std::int64_t cMinX = e.minX >> kCellShift;
+        const std::int64_t cMaxX = e.maxX >> kCellShift;
+        const std::int64_t cMinY = e.minY >> kCellShift;
+        const std::int64_t cMaxY = e.maxY >> kCellShift;
+        if ((cMaxX - cMinX + 1) * (cMaxY - cMinY + 1) > 64) {
+            useSweepFallback = true;
+            break;
+        }
+        for (std::int64_t cy = cMinY; cy <= cMaxY; ++cy) {
+            for (std::int64_t cx = cMinX; cx <= cMaxX; ++cx) {
+                const std::uint64_t cellKey =
+                    (static_cast<std::uint64_t>(static_cast<std::uint32_t>(cx)) << 32u) |
+                    static_cast<std::uint64_t>(static_cast<std::uint32_t>(cy));
+                auto& bucket = gridCells[cellKey];
+                for (const std::size_t otherIdx : bucket) {
+                    candidatePairs.emplace(
+                        std::min(otherIdx, idx), std::max(otherIdx, idx));
+                }
+                bucket.push_back(idx);
             }
         }
     }
+
+    if (useSweepFallback) {
+        candidatePairs.clear();
+        for (std::size_t i = 0; i < activeEntries.size(); ++i) {
+            for (std::size_t j = i + 1; j < activeEntries.size(); ++j) {
+                candidatePairs.emplace(i, j);
+            }
+        }
+    }
+    lastBroadphasePairs2D_ = candidatePairs.size();
+
+    for (const auto& [idxA, idxB] : candidatePairs) {
+        const auto& a = activeEntries[idxA];
+        const auto& b = activeEntries[idxB];
+        if (testOverlap2D(a.pos, *a.col, b.pos, *b.col)) {
+            const auto pair = a.entity < b.entity
+                ? std::make_pair(a.entity, b.entity)
+                : std::make_pair(b.entity, a.entity);
+            currentOverlaps.insert(pair);
+            currentIsTrigger[pair] = a.col->isTrigger || b.col->isTrigger;
+            currentContacts[pair] = (a.entity < b.entity)
+                ? computeContact2D(a.entity, a.pos, *a.col, b.entity, b.pos, *b.col)
+                : computeContact2D(b.entity, b.pos, *b.col, a.entity, a.pos, *a.col);
+        }
+    }
+    activeContacts2D_ = currentContacts;
 
     std::size_t callbacksFired = 0;
     const auto dispatchPhysicsCallback = [&](
@@ -1996,6 +2272,7 @@ std::size_t SceneScriptRuntime::stepPhysics2D() {
 
 SceneEntityId SceneScriptRuntime::spawnEntity(const std::string& name) {
     while (nextAutoEntityId_ == BroadcastTarget ||
+           slotGenerations_.find(static_cast<std::uint32_t>(nextAutoEntityId_)) != slotGenerations_.end() ||
            entityActiveSelf_.find(nextAutoEntityId_) != entityActiveSelf_.end() ||
            instances_.find(nextAutoEntityId_) != instances_.end() ||
            localTransforms_.find(nextAutoEntityId_) != localTransforms_.end() ||
@@ -2004,12 +2281,91 @@ SceneEntityId SceneScriptRuntime::spawnEntity(const std::string& name) {
         ++nextAutoEntityId_;
     }
     const SceneEntityId id = nextAutoEntityId_++;
+    if (nextGenerationalSlot_ <= static_cast<std::uint32_t>(id)) {
+        nextGenerationalSlot_ = static_cast<std::uint32_t>(id) + 1u;
+    }
     entityActiveSelf_[id] = true;
     localTransforms_[id] = Transform3D::identity();
     if (!name.empty()) {
         entityNames_[id] = name;
     }
     return id;
+}
+
+SceneEntityId SceneScriptRuntime::spawnGenerationalEntity(const std::string& name) {
+    std::uint32_t slot = 0;
+    if (!freeGenerationalSlots_.empty()) {
+        slot = freeGenerationalSlots_.back();
+        freeGenerationalSlots_.pop_back();
+    } else {
+        while (nextGenerationalSlot_ == 0 ||
+               entityActiveSelf_.find(nextGenerationalSlot_) != entityActiveSelf_.end() ||
+               instances_.find(nextGenerationalSlot_) != instances_.end() ||
+               localTransforms_.find(nextGenerationalSlot_) != localTransforms_.end()) {
+            ++nextGenerationalSlot_;
+        }
+        slot = nextGenerationalSlot_++;
+        if (nextAutoEntityId_ <= slot) {
+            nextAutoEntityId_ = static_cast<SceneEntityId>(slot) + 1u;
+        }
+    }
+    std::uint32_t& gen = slotGenerations_[slot];
+    if (gen == 0) gen = 1;
+    const SceneEntityId id = makeGenerationalEntityId(slot, gen);
+    entityActiveSelf_[id] = true;
+    localTransforms_[id] = Transform3D::identity();
+    if (!name.empty()) {
+        entityNames_[id] = name;
+    }
+    return id;
+}
+
+bool SceneScriptRuntime::isStaleGenerationalEntity(SceneEntityId entity) const noexcept {
+    const std::uint32_t gen = entityIdGeneration(entity);
+    if (gen == 0) return false;
+    const auto genIt = slotGenerations_.find(entityIdSlot(entity));
+    return genIt == slotGenerations_.end() || genIt->second != gen;
+}
+
+bool SceneScriptRuntime::isEntityAlive(SceneEntityId entity) const noexcept {
+    if (entity == BroadcastTarget || isStaleGenerationalEntity(entity)) return false;
+    return entityActiveSelf_.find(entity) != entityActiveSelf_.end() ||
+           instances_.find(entity) != instances_.end() ||
+           localTransforms_.find(entity) != localTransforms_.end() ||
+           parentByEntity_.find(entity) != parentByEntity_.end() ||
+           colliders2D_.find(entity) != colliders2D_.end() ||
+           entityNames_.find(entity) != entityNames_.end();
+}
+
+std::uint32_t SceneScriptRuntime::getEntitySlotGeneration(std::uint32_t slot) const noexcept {
+    const auto it = slotGenerations_.find(slot);
+    return it != slotGenerations_.end() ? it->second : 0u;
+}
+
+void SceneScriptRuntime::registerImportedEntityHandle(SceneEntityId entity) {
+    if (entity == BroadcastTarget) return;
+    const std::uint32_t slot = entityIdSlot(entity);
+    const std::uint32_t gen = entityIdGeneration(entity);
+    if (gen != 0) {
+        auto& storedGen = slotGenerations_[slot];
+        if (gen > storedGen) storedGen = gen;
+        freeGenerationalSlots_.erase(
+            std::remove(freeGenerationalSlots_.begin(), freeGenerationalSlots_.end(), slot),
+            freeGenerationalSlots_.end());
+    }
+    if (slot >= nextGenerationalSlot_) {
+        nextGenerationalSlot_ = slot + 1u;
+    }
+    if (gen == 0 && entity >= nextAutoEntityId_) {
+        nextAutoEntityId_ = entity + 1u;
+    }
+}
+
+void SceneScriptRuntime::resetGenerationalSlots() {
+    slotGenerations_.clear();
+    freeGenerationalSlots_.clear();
+    nextGenerationalSlot_ = 1;
+    nextAutoEntityId_ = 1;
 }
 
 void SceneScriptRuntime::queueDestroyEntity(SceneEntityId entity) {
@@ -2034,7 +2390,7 @@ std::size_t SceneScriptRuntime::flushDestroyedEntities() {
 }
 
 void SceneScriptRuntime::setEntityName(SceneEntityId entity, std::string name) {
-    if (entity == BroadcastTarget) return;
+    if (entity == BroadcastTarget || isStaleGenerationalEntity(entity)) return;
     if (entityActiveSelf_.find(entity) == entityActiveSelf_.end()) {
         entityActiveSelf_[entity] = true;
     }
@@ -2066,7 +2422,7 @@ SceneEntityId SceneScriptRuntime::findEntityByName(const std::string& name) cons
 }
 
 void SceneScriptRuntime::addEntityToGroup(SceneEntityId entity, const std::string& group) {
-    if (entity == BroadcastTarget || group.empty()) return;
+    if (entity == BroadcastTarget || group.empty() || isStaleGenerationalEntity(entity)) return;
     if (entityActiveSelf_.find(entity) == entityActiveSelf_.end()) {
         entityActiveSelf_[entity] = true;
     }

@@ -69,6 +69,20 @@ struct SignatureHelp {
     std::size_t activeParameter = 0;
 };
 
+struct SemanticToken {
+    std::size_t line = 0;
+    std::size_t startChar = 0;
+    std::size_t length = 0;
+    std::uint32_t tokenType = 0;
+    std::uint32_t tokenModifiers = 0;
+};
+
+struct InlayHint {
+    text::LinePosition position{};
+    std::string label;
+    std::uint32_t kind = 1; // 1 = Type, 2 = Parameter
+};
+
 class LanguageService {
 public:
     void open(std::string path, std::string content, std::int64_t version = 1);
@@ -109,6 +123,9 @@ public:
         text::LinePosition position,
         const std::string& newName);
     [[nodiscard]] std::vector<DocumentSymbol> documentSymbols(const std::string& path);
+    [[nodiscard]] std::vector<SemanticToken> semanticTokens(const std::string& path);
+    [[nodiscard]] std::vector<std::uint32_t> semanticTokensEncoded(const std::string& path);
+    [[nodiscard]] std::vector<InlayHint> inlayHints(const std::string& path);
 
     [[nodiscard]] const compiler::BuildResult& build();
 

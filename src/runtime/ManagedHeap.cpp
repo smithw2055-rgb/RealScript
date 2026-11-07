@@ -93,12 +93,56 @@ struct ManagedHeap::Impl {
         Header header;
         std::variant<std::string, std::vector<Value>> payload;
         std::shared_ptr<const std::vector<std::size_t>> referenceFields;
+
+        void reset() noexcept {
+            header = Header{};
+            payload = std::string{};
+            referenceFields.reset();
+        }
+    };
+
+    struct InlineSlotObjectPtr {
+        HeapObject storage{};
+        bool occupied = false;
+
+        [[nodiscard]] constexpr explicit operator bool() const noexcept { return occupied; }
+        [[nodiscard]] constexpr HeapObject* get() noexcept { return occupied ? &storage : nullptr; }
+        [[nodiscard]] constexpr const HeapObject* get() const noexcept { return occupied ? &storage : nullptr; }
+        [[nodiscard]] constexpr HeapObject* operator->() noexcept { return &storage; }
+        [[nodiscard]] constexpr const HeapObject* operator->() const noexcept { return &storage; }
+        [[nodiscard]] constexpr HeapObject& operator*() noexcept { return storage; }
+        [[nodiscard]] constexpr const HeapObject& operator*() const noexcept { return storage; }
+
+        void emplace(HeapObject&& obj) noexcept {
+            storage = std::move(obj);
+            occupied = true;
+        }
+        void reset() noexcept {
+            if (occupied) {
+                storage.reset();
+                occupied = false;
+            }
+        }
     };
 
     struct Slot {
-        std::unique_ptr<HeapObject> object;
+        InlineSlotObjectPtr object;
         std::uint32_t generation = 1;
     };
+
+    struct NativeEcsColumnTable {
+        std::vector<std::int64_t> entityIds;
+        std::vector<Value> values;
+        bool mayContainReferences = false;
+    };
+
+    [[nodiscard]] static bool valueMayContainReferences(const Value& value) noexcept {
+        if (std::holds_alternative<ObjectRef>(value)) return true;
+        if (const auto* s = std::get_if<StructValue>(&value)) {
+            return !s->isInline && s->storage != nullptr;
+        }
+        return false;
+    }
 
     explicit Impl(HeapConfig value)
         : config(value), heapId(nextHeapId()),
@@ -121,6 +165,7 @@ struct ManagedHeap::Impl {
     std::vector<ObjectRef> rememberedSet;
     std::unordered_map<RootToken, Value> persistentRoots;
     std::unordered_map<semantic::SymbolId, Value> staticFields;
+    std::unordered_map<std::string, NativeEcsColumnTable> nativeEcsTables;
     std::unordered_map<std::string, ObjectRef> internedStrings;
     std::unordered_map<semantic::SymbolId, std::shared_ptr<const std::vector<std::size_t>>> sharedTypeReferenceFields;
     RootToken nextRootToken = 1;
@@ -182,18 +227,18 @@ struct ManagedHeap::Impl {
             slots.emplace_back();
         }
 
-        auto object = std::make_unique<HeapObject>();
-        object->header.kind = kind;
-        object->header.typeId = typeId;
-        object->header.elementType = elementType;
-        object->header.elementTypeId = elementTypeId;
-        object->header.marked = phase != GcPhase::Idle;
-        object->header.sizeBytes = sizeBytes;
-        object->payload = std::move(payload);
-        object->referenceFields = std::move(referenceFields);
-        object->header.inNursery = true;
+        HeapObject object;
+        object.header.kind = kind;
+        object.header.typeId = typeId;
+        object.header.elementType = elementType;
+        object.header.elementTypeId = elementTypeId;
+        object.header.marked = phase != GcPhase::Idle;
+        object.header.sizeBytes = sizeBytes;
+        object.payload = std::move(payload);
+        object.referenceFields = std::move(referenceFields);
+        object.header.inNursery = true;
         auto& slot = slots[slotIndex];
-        slot.object = std::move(object);
+        slot.object.emplace(std::move(object));
         nurserySlots.push_back(slotIndex);
         const ObjectRef reference{slotIndex, slot.generation, kind, heapId};
 
@@ -269,6 +314,11 @@ struct ManagedHeap::Impl {
         shadowStack.visitRoots([&](const Value& value) { markValue(value); });
         for (const auto& entry : persistentRoots) markValue(entry.second);
         for (const auto& entry : staticFields) markValue(entry.second);
+        for (const auto& [typeName, table] : nativeEcsTables) {
+            (void)typeName;
+            if (!table.mayContainReferences) continue;
+            for (const auto& v : table.values) markValue(v);
+        }
     }
 
     void startCollection(const ShadowStack& shadowStack) {
@@ -760,6 +810,121 @@ void ManagedHeap::setStaticField(semantic::SymbolId id, Value value) {
     impl_->staticFields[id] = std::move(value);
 }
 
+bool ManagedHeap::setNativeEcsComponent(
+    std::string_view canonicalTypeName,
+    std::int64_t entityId,
+    Value component) {
+    if (impl_->phase != GcPhase::Idle) {
+        impl_->markValue(component);
+        if (impl_->phase == GcPhase::Sweep && !impl_->markStack.empty()) {
+            impl_->phase = GcPhase::Mark;
+            impl_->resumeSweep = true;
+        }
+    }
+    auto& table = impl_->nativeEcsTables[std::string(canonicalTypeName)];
+    if (Impl::valueMayContainReferences(component)) {
+        table.mayContainReferences = true;
+    }
+    const auto it = std::lower_bound(table.entityIds.begin(), table.entityIds.end(), entityId);
+    const auto idx = static_cast<std::size_t>(std::distance(table.entityIds.begin(), it));
+    if (it != table.entityIds.end() && *it == entityId) {
+        table.values[idx] = std::move(component);
+        return true;
+    }
+    table.entityIds.insert(it, entityId);
+    table.values.insert(table.values.begin() + static_cast<std::ptrdiff_t>(idx), std::move(component));
+    return true;
+}
+
+std::optional<Value> ManagedHeap::getNativeEcsComponent(
+    std::string_view canonicalTypeName,
+    std::int64_t entityId) const {
+    const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
+    if (found == impl_->nativeEcsTables.end()) return std::nullopt;
+    const auto& table = found->second;
+    const auto it = std::lower_bound(table.entityIds.begin(), table.entityIds.end(), entityId);
+    if (it == table.entityIds.end() || *it != entityId) return std::nullopt;
+    const auto idx = static_cast<std::size_t>(std::distance(table.entityIds.begin(), it));
+    return table.values[idx];
+}
+
+bool ManagedHeap::hasNativeEcsComponent(
+    std::string_view canonicalTypeName,
+    std::int64_t entityId) const noexcept {
+    const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
+    if (found == impl_->nativeEcsTables.end()) return false;
+    const auto& table = found->second;
+    return std::binary_search(table.entityIds.begin(), table.entityIds.end(), entityId);
+}
+
+bool ManagedHeap::removeNativeEcsComponent(
+    std::string_view canonicalTypeName,
+    std::int64_t entityId) {
+    const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
+    if (found == impl_->nativeEcsTables.end()) return false;
+    auto& table = found->second;
+    const auto it = std::lower_bound(table.entityIds.begin(), table.entityIds.end(), entityId);
+    if (it == table.entityIds.end() || *it != entityId) return false;
+    const auto idx = static_cast<std::size_t>(std::distance(table.entityIds.begin(), it));
+    table.entityIds.erase(it);
+    table.values.erase(table.values.begin() + static_cast<std::ptrdiff_t>(idx));
+    return true;
+}
+
+bool ManagedHeap::destroyNativeEcsEntity(std::int64_t entityId) {
+    bool removedAny = false;
+    for (auto& [typeName, table] : impl_->nativeEcsTables) {
+        (void)typeName;
+        const auto it = std::lower_bound(table.entityIds.begin(), table.entityIds.end(), entityId);
+        if (it != table.entityIds.end() && *it == entityId) {
+            const auto idx = static_cast<std::size_t>(std::distance(table.entityIds.begin(), it));
+            table.entityIds.erase(it);
+            table.values.erase(table.values.begin() + static_cast<std::ptrdiff_t>(idx));
+            removedAny = true;
+        }
+    }
+    return removedAny;
+}
+
+bool ManagedHeap::hasNativeEcsTable(std::string_view canonicalTypeName) const noexcept {
+    const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
+    return found != impl_->nativeEcsTables.end();
+}
+
+const std::vector<std::int64_t>* ManagedHeap::nativeEcsEntityIds(
+    std::string_view canonicalTypeName) const noexcept {
+    const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
+    return found != impl_->nativeEcsTables.end() ? &found->second.entityIds : nullptr;
+}
+
+const std::vector<Value>* ManagedHeap::nativeEcsComponentValues(
+    std::string_view canonicalTypeName) const noexcept {
+    const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
+    return found != impl_->nativeEcsTables.end() ? &found->second.values : nullptr;
+}
+
+bool ManagedHeap::setNativeEcsComponentByDenseIndex(
+    std::string_view canonicalTypeName,
+    std::size_t denseIndex,
+    Value component) {
+    const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
+    if (found == impl_->nativeEcsTables.end() || denseIndex >= found->second.values.size()) {
+        return false;
+    }
+    if (impl_->phase != GcPhase::Idle) {
+        impl_->markValue(component);
+        if (impl_->phase == GcPhase::Sweep && !impl_->markStack.empty()) {
+            impl_->phase = GcPhase::Mark;
+            impl_->resumeSweep = true;
+        }
+    }
+    if (Impl::valueMayContainReferences(component)) {
+        found->second.mayContainReferences = true;
+    }
+    found->second.values[denseIndex] = std::move(component);
+    return true;
+}
+
 void ManagedHeap::requestCollection() noexcept { impl_->requested = true; }
 bool ManagedHeap::collectionRequested() const noexcept { return impl_->requested; }
 GcPhase ManagedHeap::phase() const noexcept { return impl_->phase; }
@@ -896,6 +1061,11 @@ std::size_t ManagedHeap::collectYoung(
     shadowStack.visitRoots([&](const Value& val) { markYoungValue(markYoungValue, val); });
     for (const auto& entry : impl_->persistentRoots) markYoungValue(markYoungValue, entry.second);
     for (const auto& entry : impl_->staticFields) markYoungValue(markYoungValue, entry.second);
+    for (const auto& [typeName, table] : impl_->nativeEcsTables) {
+        (void)typeName;
+        if (!table.mayContainReferences) continue;
+        for (const auto& v : table.values) markYoungValue(markYoungValue, v);
+    }
     for (const auto& oldRef : impl_->rememberedSet) {
         const auto* oldObj = impl_->get(oldRef);
         if (!oldObj || oldObj->header.kind == ObjectKind::String) continue;
@@ -1244,6 +1414,16 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
     for (const auto& [token, value] : impl_->persistentRoots) {
         appendRoots(value, token, "persistent");
     }
+    {
+        std::uint64_t ecsRootIndex = 0;
+        for (const auto& [typeName, table] : impl_->nativeEcsTables) {
+            (void)typeName;
+            if (!table.mayContainReferences) continue;
+            for (const auto& v : table.values) {
+                appendRoots(v, ++ecsRootIndex, "ecs");
+            }
+        }
+    }
     if (shadowStack) {
         std::uint64_t index = 0;
         shadowStack->visitRoots([&](const Value& value) {
@@ -1305,19 +1485,19 @@ bool ManagedHeap::restore(
         }
         auto& slot = slots[info.reference.slot];
         slot.generation = info.reference.generation;
-        auto object = std::make_unique<Impl::HeapObject>();
-        object->header.kind = info.kind;
-        object->header.typeId = info.typeId;
-        object->header.elementType = info.elementType;
-        object->header.elementTypeId = info.elementTypeId;
-        object->header.sizeBytes = info.sizeBytes;
+        Impl::HeapObject object;
+        object.header.kind = info.kind;
+        object.header.typeId = info.typeId;
+        object.header.elementType = info.elementType;
+        object.header.elementTypeId = info.elementTypeId;
+        object.header.sizeBytes = info.sizeBytes;
         if (info.kind == ObjectKind::String) {
             if (!info.values.empty() || info.valueCount != 0) {
                 setHeapError(error, ErrorCode::InvalidProgram,
                     "heap snapshot string payload is invalid");
                 return false;
             }
-            object->payload = info.stringValue;
+            object.payload = info.stringValue;
         } else {
             if (info.values.size() != info.valueCount) {
                 setHeapError(error, ErrorCode::InvalidProgram,
@@ -1331,18 +1511,18 @@ bool ManagedHeap::restore(
                     return false;
                 }
             }
-            object->payload = info.values;
+            object.payload = info.values;
             if (info.typeId != 0) {
                 auto& shared = impl_->sharedTypeReferenceFields[info.typeId];
                 if (!shared || *shared != info.referenceFields) {
                     shared = std::make_shared<const std::vector<std::size_t>>(info.referenceFields);
                 }
-                object->referenceFields = shared;
+                object.referenceFields = shared;
             } else {
-                object->referenceFields = std::make_shared<const std::vector<std::size_t>>(info.referenceFields);
+                object.referenceFields = std::make_shared<const std::vector<std::size_t>>(info.referenceFields);
             }
         }
-        slot.object = std::move(object);
+        slot.object.emplace(std::move(object));
     }
 
     const auto validValue = [&](const auto& self,

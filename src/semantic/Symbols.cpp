@@ -408,6 +408,17 @@ void appendSyntaxParameters(
     for (std::size_t syntaxIndex = 0;
          syntaxIndex < parameters.size(); ++syntaxIndex) {
         const auto& parameterSyntax = parameters[syntaxIndex];
+        if (parameterSyntax.modifierToken &&
+            parameterSyntax.modifierToken->kind == syntax::SyntaxKind::ThisKeyword) {
+            if (syntaxIndex == 0 && (!result.method || result.staticMethod) && !result.constructor) {
+                result.extensionMethod = true;
+            } else {
+                diagnostics.report(
+                    "RS8920",
+                    "'this' parameter modifier is only valid on the first parameter of a static or free function",
+                    parameterSyntax.modifierToken->span);
+            }
+        }
         const auto parameterType = resolveType(
             parameterSyntax.type, visibleTypes, false);
         if (parameterType.type == PrimitiveType::Error) {

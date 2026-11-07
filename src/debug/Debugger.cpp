@@ -776,6 +776,86 @@ std::optional<runtime::Value> DebugController::evaluate(
     return evaluateInFrameUnlocked(expression, *targetFrame, heap, errorMessage);
 }
 
+bool DebugController::setVariable(
+    const std::string& name,
+    const std::string& valueExpression,
+    std::uint32_t frameId,
+    runtime::ManagedHeap* heap,
+    runtime::Value* outNewValue,
+    std::string* errorMessage) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (lastStop_.frames.empty() || !activeFrameViews_ || activeFrameViews_->empty()) {
+        if (errorMessage) *errorMessage = "debugger has no active stack frame";
+        return false;
+    }
+    std::size_t stopIdx = 0;
+    for (std::size_t i = 0; i < lastStop_.frames.size(); ++i) {
+        if (lastStop_.frames[i].id == frameId) {
+            stopIdx = i;
+            break;
+        }
+    }
+    auto& targetFrame = lastStop_.frames[stopIdx];
+    auto* effectiveHeap = heap ? heap : lastHeap_;
+    const auto evaluated = evaluateInFrameUnlocked(
+        valueExpression, targetFrame, effectiveHeap, errorMessage);
+    if (!evaluated) return false;
+
+    const std::size_t viewIdx = activeFrameViews_->size() - 1 - stopIdx;
+    if (viewIdx >= activeFrameViews_->size()) return false;
+    const auto& view = (*activeFrameViews_)[viewIdx];
+    if (!view.function || !view.locals.values) return false;
+
+    for (const auto& local : view.function->debugInfo.locals) {
+        if (local.name != name || local.slot >= view.locals.size()) continue;
+        if (!local.parameter && view.point) {
+            const auto offset = view.point->range.span.start;
+            if (offset < local.scope.span.start ||
+                offset > local.scope.span.end()) {
+                continue;
+            }
+        }
+        runtime::Value converted = *evaluated;
+        if (semantic::isNumericType(local.type)) {
+            if (!runtime::tryConvertNumeric(*evaluated, local.type, converted, false)) {
+                if (errorMessage) {
+                    *errorMessage = "cannot convert '" +
+                        std::string(semantic::primitiveTypeName(runtime::valueType(*evaluated))) +
+                        "' to '" + semantic::primitiveTypeName(local.type) + "'";
+                }
+                return false;
+            }
+        } else {
+            const auto actualType = runtime::valueType(converted);
+            const bool isNullRef = actualType == semantic::PrimitiveType::Null &&
+                semantic::isReferenceType(local.type);
+            if (!isNullRef && actualType != local.type) {
+                if (errorMessage) {
+                    *errorMessage = "cannot assign '" +
+                        std::string(semantic::primitiveTypeName(actualType)) +
+                        "' to variable '" + name + "' of type '" +
+                        semantic::primitiveTypeName(local.type) + "'";
+                }
+                return false;
+            }
+        }
+        (*view.locals.values)[view.locals.offset + local.slot] = converted;
+        if (local.parameter && view.arguments.values && local.slot < view.arguments.size()) {
+            (*view.arguments.values)[view.arguments.offset + local.slot] = converted;
+        }
+        for (auto& v : targetFrame.locals) {
+            if (v.name == name) v.value = converted;
+        }
+        for (auto& v : targetFrame.arguments) {
+            if (v.name == name) v.value = converted;
+        }
+        if (outNewValue) *outNewValue = std::move(converted);
+        return true;
+    }
+    if (errorMessage) *errorMessage = "variable '" + name + "' not found in frame";
+    return false;
+}
+
 std::uint32_t DebugController::matchingBreakpoint(
     const std::vector<DebugFrameView>& frames,
     runtime::ManagedHeap* heap) const {
@@ -894,12 +974,14 @@ bool DebugController::onSequencePoint(
         if (terminated_) return false;
         if (!shouldStop(frames, heap, reason, breakpointId)) return true;
         lastStop_ = capture(reason, breakpointId, frames, heap);
+        activeFrameViews_ = &frames;
         handler = stopHandler_;
     }
 
     const auto next = handler ? handler(lastStop_) : ResumeMode::Continue;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        activeFrameViews_ = nullptr;
         mode_ = next;
         stepDepth_ = frames.size();
         if (!frames.empty() && frames.back().point) {
@@ -1022,6 +1104,21 @@ std::optional<runtime::Value> DebugSession::evaluate(
     std::uint32_t frameId,
     std::string* errorMessage) const {
     return controller_->evaluate(expression, frameId, heap_.get(), errorMessage);
+}
+
+bool DebugSession::setVariable(
+    const std::string& name,
+    const std::string& valueExpression,
+    std::uint32_t frameId,
+    runtime::Value* outNewValue,
+    std::string* errorMessage) {
+    const bool ok = controller_->setVariable(
+        name, valueExpression, frameId, heap_.get(), outNewValue, errorMessage);
+    if (ok) {
+        std::lock_guard<std::mutex> lock(sessionMutex_);
+        currentStop_ = controller_->lastStop();
+    }
+    return ok;
 }
 
 bool DebugSession::paused() const noexcept {

@@ -171,6 +171,7 @@ struct FunctionSymbol {
     std::vector<VariableSymbol> parameters;
     bool method = false;
     bool staticMethod = false;
+    bool extensionMethod = false;
     bool constructor = false;
     bool propertyGetter = false;
     bool propertySetter = false;
@@ -1085,6 +1086,11 @@ private:
         const FieldSymbol& field, text::TextSpan span);
     [[nodiscard]] std::unique_ptr<BoundExpression> makeVariableAccess(
         const VariableSymbol& variable, text::TextSpan span);
+    [[nodiscard]] VariableSymbol allocateTempVariable(
+        const std::string& prefix,
+        PrimitiveType type,
+        const std::string& typeName,
+        text::TextSpan span);
     [[nodiscard]] const FunctionSymbol* findScheduleFunction() const noexcept;
     [[nodiscard]] std::unique_ptr<BoundExpression> bindSequenceYieldDelay(
         const syntax::YieldWaitStatementSyntax& yieldSyntax);
@@ -1192,6 +1198,10 @@ private:
         const std::string& context);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindMemberCallExpression(
         const syntax::MemberCallExpressionSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundExpression> tryBindExtensionMethodCall(
+        const syntax::MemberCallExpressionSyntax& syntax,
+        std::unique_ptr<BoundExpression>& receiver,
+        std::vector<std::unique_ptr<BoundExpression>>& arguments);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindNewObjectExpression(
         const syntax::NewObjectExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundStatement>

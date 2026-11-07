@@ -917,26 +917,66 @@ Value decodeInlineStructSlot(const InlineStructSlot& slot) noexcept {
     return std::monostate{};
 }
 
+namespace {
+
+bool tryPackInlineStructFields(
+    semantic::SymbolId typeId,
+    ValueSpan fields,
+    StructValue& outVal) noexcept {
+    if (fields.size() > StructValue::MaxInlineFields) return false;
+    outVal = StructValue{};
+    outVal.typeId = typeId;
+    outVal.inlineCount = static_cast<std::uint8_t>(fields.size());
+    outVal.isInline = true;
+    std::size_t slotCursor = 0;
+    bool anyNested = false;
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        if (auto slot = encodeInlineStructSlot(fields[i])) {
+            if (slotCursor + 1 > StructValue::MaxInlineSlots) return false;
+            outVal.packedOffsetsAndLengths |=
+                static_cast<std::uint8_t>((slotCursor & 0x3u) << (i * 2));
+            outVal.nestedFieldMask |= static_cast<std::uint16_t>(1u << (i * 2));
+            outVal.inlineFields[slotCursor++] = *slot;
+            continue;
+        }
+        if (const auto* nested = std::get_if<StructValue>(&fields[i]);
+            nested && nested->isInline && nested->inlineSlotCount > 0 &&
+            nested->inlineSlotCount <= 3 && (nested->nestedFieldMask >> 8u) == 0 &&
+            nested->nestedTypeId == 0 && !anyNested) {
+            if (slotCursor + nested->inlineSlotCount <= StructValue::MaxInlineSlots) {
+                anyNested = true;
+                outVal.nestedTypeId = nested->typeId;
+                outVal.packedOffsetsAndLengths |=
+                    static_cast<std::uint8_t>((slotCursor & 0x3u) << (i * 2));
+                outVal.nestedFieldMask |=
+                    static_cast<std::uint16_t>((nested->inlineSlotCount & 0x3u) << (i * 2));
+                outVal.nestedFieldMask |=
+                    static_cast<std::uint16_t>(((i & 0x3u) + 1u) << 8u);
+                for (std::size_t k = 0; k < nested->inlineSlotCount; ++k) {
+                    outVal.inlineFields[slotCursor++] = nested->inlineFields[k];
+                }
+                continue;
+            }
+        }
+        return false;
+    }
+    if (!anyNested) {
+        outVal.nestedTypeId = 0;
+        outVal.packedOffsetsAndLengths = 0;
+        outVal.nestedFieldMask = 0;
+    }
+    outVal.inlineSlotCount = static_cast<std::uint8_t>(slotCursor);
+    return true;
+}
+
+} // namespace
+
 StructValue makeStructValueFromFields(
     semantic::SymbolId typeId,
     ValueSpan fields) {
-    if (fields.size() <= StructValue::MaxInlineFields) {
-        StructValue inlineVal;
-        inlineVal.typeId = typeId;
-        inlineVal.inlineCount = static_cast<std::uint8_t>(fields.size());
-        inlineVal.isInline = true;
-        bool allInlined = true;
-        for (std::size_t i = 0; i < fields.size(); ++i) {
-            if (auto slot = encodeInlineStructSlot(fields[i])) {
-                inlineVal.inlineFields[i] = *slot;
-            } else {
-                allInlined = false;
-                break;
-            }
-        }
-        if (allInlined) {
-            return inlineVal;
-        }
+    StructValue inlineVal;
+    if (tryPackInlineStructFields(typeId, fields, inlineVal)) {
+        return inlineVal;
     }
     auto storage = std::make_shared<StructStorage>();
     storage->fields.assign(fields.begin(), fields.end());
@@ -946,23 +986,9 @@ StructValue makeStructValueFromFields(
 StructValue makeStructValueFromFields(
     semantic::SymbolId typeId,
     std::vector<Value> fields) {
-    if (fields.size() <= StructValue::MaxInlineFields) {
-        StructValue inlineVal;
-        inlineVal.typeId = typeId;
-        inlineVal.inlineCount = static_cast<std::uint8_t>(fields.size());
-        inlineVal.isInline = true;
-        bool allInlined = true;
-        for (std::size_t i = 0; i < fields.size(); ++i) {
-            if (auto slot = encodeInlineStructSlot(fields[i])) {
-                inlineVal.inlineFields[i] = *slot;
-            } else {
-                allInlined = false;
-                break;
-            }
-        }
-        if (allInlined) {
-            return inlineVal;
-        }
+    StructValue inlineVal;
+    if (tryPackInlineStructFields(typeId, ValueSpan(fields), inlineVal)) {
+        return inlineVal;
     }
     auto storage = std::make_shared<StructStorage>();
     storage->fields = std::move(fields);
@@ -974,6 +1000,29 @@ std::optional<Value> structValueFieldAt(
     std::size_t index) noexcept {
     if (structure.isInline) {
         if (index >= structure.inlineCount) return std::nullopt;
+        const std::uint8_t highByte = static_cast<std::uint8_t>(structure.nestedFieldMask >> 8u);
+        if (highByte != 0) {
+            const std::size_t nestedIdx = static_cast<std::size_t>(highByte - 1u) & 0x3u;
+            const std::uint8_t offset = structure.fieldOffset(index);
+            const std::uint8_t len = structure.fieldLength(index);
+            if (index == nestedIdx) {
+                const semantic::SymbolId nestedType = structure.nestedTypeId;
+                if (nestedType == 0 || offset + len > structure.inlineSlotCount) {
+                    return std::nullopt;
+                }
+                StructValue nested;
+                nested.typeId = nestedType;
+                nested.isInline = true;
+                nested.inlineCount = len;
+                nested.inlineSlotCount = len;
+                for (std::uint8_t k = 0; k < len; ++k) {
+                    nested.inlineFields[k] = structure.inlineFields[offset + k];
+                }
+                return Value{nested};
+            }
+            if (offset >= structure.inlineSlotCount) return std::nullopt;
+            return decodeInlineStructSlot(structure.inlineFields[offset]);
+        }
         return decodeInlineStructSlot(structure.inlineFields[index]);
     }
     if (!structure.storage || index >= structure.storage->fields.size()) {
@@ -1012,10 +1061,7 @@ std::optional<Value> loadInlineStructField(
         return std::nullopt;
     }
     if (const auto* s = std::get_if<StructValue>(&value); s && s->isInline) {
-        if (fieldIndex < s->inlineCount) {
-            return decodeInlineStructSlot(s->inlineFields[fieldIndex]);
-        }
-        return std::nullopt;
+        return structValueFieldAt(*s, fieldIndex);
     }
     return std::nullopt;
 }
@@ -1125,9 +1171,21 @@ std::optional<Value> storeInlineStructField(
     }
     if (const auto* s = std::get_if<StructValue>(&structure); s && s->isInline) {
         if (fieldIndex < s->inlineCount) {
-            if (auto slot = encodeInlineStructSlot(fieldValue)) {
-                StructValue updated = *s;
-                updated.inlineFields[fieldIndex] = *slot;
+            std::array<Value, StructValue::MaxInlineFields> unpacked{};
+            for (std::size_t i = 0; i < s->inlineCount; ++i) {
+                if (i == fieldIndex) {
+                    unpacked[i] = fieldValue;
+                } else {
+                    const auto existing = structValueFieldAt(*s, i);
+                    if (!existing) return std::nullopt;
+                    unpacked[i] = *existing;
+                }
+            }
+            StructValue updated;
+            if (tryPackInlineStructFields(
+                    s->typeId,
+                    ValueSpan(unpacked.data(), s->inlineCount),
+                    updated)) {
                 return Value{updated};
             }
         }
@@ -1386,6 +1444,11 @@ bool readSparseIds(
     ObjectRef* outValsRef = nullptr) {
     outIds.clear();
     if (!heap) return false;
+    if (const auto* nativeIds = heap->nativeEcsEntityIds(typeName)) {
+        outIds = *nativeIds;
+        if (outValsRef) *outValsRef = ObjectRef{};
+        return true;
+    }
     const auto idsVal = heap->getStaticField(
         semantic::stableTypeId("$ecs_sparse_ids::" + typeName));
     if (!idsVal) return false;
@@ -1418,7 +1481,8 @@ bool hasAnySparseEcsTable(
     if (!heap) return false;
     for (const auto& list : {cols, withs, withouts}) {
         for (const auto& t : list) {
-            if (heap->hasStaticField(semantic::stableTypeId("$ecs_sparse_ids::" + t))) {
+            if (heap->hasNativeEcsTable(t) ||
+                heap->hasStaticField(semantic::stableTypeId("$ecs_sparse_ids::" + t))) {
                 return true;
             }
         }
@@ -1560,24 +1624,39 @@ bool tryExecuteRuntimeIntrinsic(
                 result = tmplRef;
                 return true;
             }
+            const auto* nativeIds = heap->nativeEcsEntityIds(targetType);
+            const auto* nativeVals = heap->nativeEcsComponentValues(targetType);
             std::vector<std::int64_t> sparseIds;
             ObjectRef sparseValsRef{};
-            if (!readSparseIds(heap, targetType, sparseIds, &sparseValsRef) ||
-                !sparseValsRef.valid()) {
-                result = tmplRef;
-                return true;
+            if (!nativeIds || !nativeVals) {
+                if (!readSparseIds(heap, targetType, sparseIds, &sparseValsRef) ||
+                    !sparseValsRef.valid()) {
+                    result = tmplRef;
+                    return true;
+                }
             }
             std::vector<Value> matchedVals;
             matchedVals.reserve(matched.size());
             std::vector<std::int64_t> matchedSrcIndices;
             matchedSrcIndices.reserve(matched.size());
             for (const auto entId : matched) {
-                const auto it = std::lower_bound(sparseIds.begin(), sparseIds.end(), entId);
-                if (it != sparseIds.end() && *it == entId) {
-                    const auto idx = static_cast<std::size_t>(std::distance(sparseIds.begin(), it));
-                    if (auto v = heap->arrayGet(sparseValsRef, idx)) {
-                        matchedVals.push_back(std::move(*v));
-                        matchedSrcIndices.push_back(static_cast<std::int64_t>(idx));
+                if (nativeIds && nativeVals) {
+                    const auto it = std::lower_bound(nativeIds->begin(), nativeIds->end(), entId);
+                    if (it != nativeIds->end() && *it == entId) {
+                        const auto idx = static_cast<std::size_t>(std::distance(nativeIds->begin(), it));
+                        if (idx < nativeVals->size()) {
+                            matchedVals.push_back((*nativeVals)[idx]);
+                            matchedSrcIndices.push_back(static_cast<std::int64_t>(idx));
+                        }
+                    }
+                } else {
+                    const auto it = std::lower_bound(sparseIds.begin(), sparseIds.end(), entId);
+                    if (it != sparseIds.end() && *it == entId) {
+                        const auto idx = static_cast<std::size_t>(std::distance(sparseIds.begin(), it));
+                        if (auto v = heap->arrayGet(sparseValsRef, idx)) {
+                            matchedVals.push_back(std::move(*v));
+                            matchedSrcIndices.push_back(static_cast<std::int64_t>(idx));
+                        }
                     }
                 }
             }
@@ -1698,24 +1777,6 @@ bool tryExecuteRuntimeIntrinsic(
             return true;
         }
         const auto idx = static_cast<std::size_t>(*idxPtr);
-        const std::string wbMapKey = "$ecs_wb_map::" + std::string(rest);
-        const std::string wbTargetKey = "$ecs_wb_target::" + std::string(rest);
-        if (const auto mapVal = heap->getStaticField(semantic::stableTypeId(wbMapKey));
-            mapVal && std::holds_alternative<ObjectRef>(*mapVal)) {
-            const auto targetVal = heap->getStaticField(semantic::stableTypeId(wbTargetKey));
-            if (targetVal && std::holds_alternative<ObjectRef>(*targetVal)) {
-                const auto mapRef = std::get<ObjectRef>(*mapVal);
-                const auto targetRef = std::get<ObjectRef>(*targetVal);
-                if (const auto srcIdxVal = heap->arrayGet(mapRef, idx);
-                    srcIdxVal && std::holds_alternative<std::int64_t>(*srcIdxVal)) {
-                    const auto srcIdx = static_cast<std::size_t>(std::get<std::int64_t>(*srcIdxVal));
-                    RuntimeError setErr;
-                    (void)heap->arraySet(targetRef, srcIdx, arguments[1], &setErr);
-                    result = std::monostate{};
-                    return true;
-                }
-            }
-        }
         const std::size_t colIdx = static_cast<std::size_t>(
             std::strtoull(std::string(rest.substr(0, sep)).c_str(), nullptr, 10));
         const auto spec = rest.substr(sep + 2);
@@ -1726,6 +1787,37 @@ bool tryExecuteRuntimeIntrinsic(
             return true;
         }
         const std::string& compKey = cols[colIdx];
+        const std::string wbMapKey = "$ecs_wb_map::" + std::string(rest);
+        const std::string wbTargetKey = "$ecs_wb_target::" + std::string(rest);
+        if (const auto mapVal = heap->getStaticField(semantic::stableTypeId(wbMapKey));
+            mapVal && std::holds_alternative<ObjectRef>(*mapVal)) {
+            const auto mapRef = std::get<ObjectRef>(*mapVal);
+            if (const auto srcIdxVal = heap->arrayGet(mapRef, idx);
+                srcIdxVal && std::holds_alternative<std::int64_t>(*srcIdxVal)) {
+                const auto srcIdx = static_cast<std::size_t>(std::get<std::int64_t>(*srcIdxVal));
+                if (heap->hasNativeEcsTable(compKey)) {
+                    (void)heap->setNativeEcsComponentByDenseIndex(compKey, srcIdx, arguments[1]);
+                    result = std::monostate{};
+                    return true;
+                }
+                const auto targetVal = heap->getStaticField(semantic::stableTypeId(wbTargetKey));
+                if (targetVal && std::holds_alternative<ObjectRef>(*targetVal)) {
+                    const auto targetRef = std::get<ObjectRef>(*targetVal);
+                    RuntimeError setErr;
+                    (void)heap->arraySet(targetRef, srcIdx, arguments[1], &setErr);
+                    result = std::monostate{};
+                    return true;
+                }
+            }
+        }
+        if (heap->hasNativeEcsTable(compKey)) {
+            const auto matched = computeMatchedEcsEntities(heap, cols, withs, withouts);
+            if (idx < matched.size()) {
+                (void)heap->setNativeEcsComponent(compKey, matched[idx], arguments[1]);
+            }
+            result = std::monostate{};
+            return true;
+        }
         if (!heap->hasStaticField(semantic::stableTypeId("$ecs_sparse_ids::" + compKey))) {
             result = std::monostate{};
             return true;

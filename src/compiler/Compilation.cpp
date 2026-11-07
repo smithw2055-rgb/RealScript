@@ -5182,10 +5182,10 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 continue;
             }
         }
-        if (module.invalid) {
-            result.buildInfo.push_back(buildInfo);
-            continue;
-        }
+        // Even if a syntax error occurred (such as an incomplete trailing '.' during editing),
+        // still run the semantic binder to collect symbol occurrences for IDE/LSP services,
+        // and only skip MIR lowering if errors remain.
+        const bool hadSyntaxError = module.invalid;
 
         semantic::FunctionOverloadMap visibleFunctions;
         for (const auto& function : module.declarations) {
@@ -5228,8 +5228,31 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         auto semanticModel = binder.bindModule(bindingInput);
         result.symbols.insert(result.symbols.end(),
             semanticModel.occurrences.begin(), semanticModel.occurrences.end());
-        if (moduleDiagnostics.hasErrors()) {
+        if (hadSyntaxError || moduleDiagnostics.hasErrors()) {
             result.diagnostics.append(moduleDiagnostics);
+            for (const auto& t : bindingInput.types) {
+                if (t.moduleName == moduleName) {
+                    mir::Module partialMod;
+                    partialMod.name = moduleName;
+                    for (const auto& [visName, visType] : module.visibleTypes) {
+                        (void)visName;
+                        if (visType.moduleName == moduleName) {
+                            const bool dup = std::any_of(
+                                partialMod.types.begin(),
+                                partialMod.types.end(),
+                                [&](const semantic::TypeSymbol& ex) { return ex.id == visType.id; });
+                            if (!dup) partialMod.types.push_back(visType);
+                        }
+                    }
+                    for (std::size_t sourceIndex = 0; sourceIndex < module.units.size(); ++sourceIndex) {
+                        partialMod.sourceFiles.push_back(makeSourceFileInfo(
+                            *module.units[sourceIndex]->source,
+                            static_cast<debug::SourceFileId>(sourceIndex)));
+                    }
+                    result.modules.push_back(std::move(partialMod));
+                    break;
+                }
+            }
             result.buildInfo.push_back(buildInfo);
             continue;
         }
