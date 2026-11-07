@@ -2084,7 +2084,30 @@ public struct Quat {
     }
 
     public static Quat Slerp(Quat a, Quat b, Fixed t) {
-        return Quat.Lerp(a, b, t);
+        Quat qa = a.Normalized();
+        Quat qb = b.Normalized();
+        Fixed cosTheta = Quat.Dot(qa, qb);
+        if (cosTheta.raw < 0) {
+            qb = new Quat(-qb.x, -qb.y, -qb.z, -qb.w);
+            cosTheta = -cosTheta;
+        }
+        if (cosTheta.raw >= 250) {
+            return Quat.Lerp(qa, qb, t);
+        }
+        long sin2Raw = 65536 - (long)cosTheta.raw * (long)cosTheta.raw;
+        Fixed sinTheta = new Fixed((int)Math.Sqrt64(sin2Raw > 0 ? sin2Raw : 0));
+        if (sinTheta.raw <= 4) {
+            return Quat.Lerp(qa, qb, t);
+        }
+        Fixed theta = Fixed.Atan2(sinTheta, cosTheta);
+        Fixed s0 = Fixed.Sin((Fixed.One() - t) * theta) / sinTheta;
+        Fixed s1 = Fixed.Sin(t * theta) / sinTheta;
+        Quat res = new Quat(
+            qa.x * s0 + qb.x * s1,
+            qa.y * s0 + qb.y * s1,
+            qa.z * s0 + qb.z * s1,
+            qa.w * s0 + qb.w * s1);
+        return res.Normalized();
     }
 
     public static Quat operator *(Quat a, Quat b) {
@@ -2129,6 +2152,212 @@ public Quat QuatNormalize(Quat q) { return q.Normalized(); }
 public Vec3 QuatRotateVec3(Quat q, Vec3 v) { return q.Rotate(v); }
 public Quat QuatLerp(Quat a, Quat b, Fixed t) { return Quat.Lerp(a, b, t); }
 public Quat QuatSlerp(Quat a, Quat b, Fixed t) { return Quat.Slerp(a, b, t); }
+
+public struct Fixed64 {
+    public long raw;
+
+    public Fixed64(long rawValue) {
+        raw = rawValue;
+    }
+
+    public static Fixed64 Zero() {
+        return new Fixed64(0);
+    }
+
+    public static Fixed64 One() {
+        return new Fixed64(4294967296);
+    }
+
+    public static Fixed64 Half() {
+        return new Fixed64(2147483648);
+    }
+
+    public static Fixed64 Raw(long rawValue) {
+        return new Fixed64(rawValue);
+    }
+
+    public static Fixed64 Of(long whole) {
+        return new Fixed64(whole * 4294967296);
+    }
+
+    public long ToInt() {
+        return raw >= 0 ? raw / 4294967296 : (raw - 4294967295) / 4294967296;
+    }
+
+    public static Fixed64 operator +(Fixed64 a, Fixed64 b) {
+        return new Fixed64(a.raw + b.raw);
+    }
+
+    public static Fixed64 operator -(Fixed64 a, Fixed64 b) {
+        return new Fixed64(a.raw - b.raw);
+    }
+
+    public static Fixed64 operator -(Fixed64 a) {
+        return new Fixed64(-a.raw);
+    }
+
+    public static Fixed64 operator *(Fixed64 a, Fixed64 b) {
+        long scale = 4294967296;
+        long aHi = a.raw >= 0 ? a.raw / scale : (a.raw - (scale - 1)) / scale;
+        long aLo = a.raw - aHi * scale;
+        long bHi = b.raw >= 0 ? b.raw / scale : (b.raw - (scale - 1)) / scale;
+        long bLo = b.raw - bHi * scale;
+        long aLoHi = aLo / 65536;
+        long aLoLo = aLo - aLoHi * 65536;
+        long bLoHi = bLo / 65536;
+        long bLoLo = bLo - bLoHi * 65536;
+        long loCarry = (aLoHi * bLoLo + aLoLo * bLoHi + (aLoLo * bLoLo) / 65536) / 65536;
+        long loProd = aLoHi * bLoHi + loCarry;
+        return new Fixed64(aHi * bHi * scale + aHi * bLo + aLo * bHi + loProd);
+    }
+
+    public static Fixed64 operator /(Fixed64 a, Fixed64 b) {
+        if (b.raw == 0) return new Fixed64(0);
+        bool neg = (a.raw < 0) != (b.raw < 0);
+        long ua = a.raw < 0 ? -a.raw : a.raw;
+        long ub = b.raw < 0 ? -b.raw : b.raw;
+        long qHi = ua / ub;
+        long rem = ua - qHi * ub;
+        long qLo = 0;
+        int bit = 0;
+        while (bit < 32) {
+            qLo = qLo * 2;
+            if (rem >= ub - rem) {
+                rem = rem - (ub - rem);
+                qLo = qLo + 1;
+            } else {
+                rem = rem * 2;
+            }
+            bit = bit + 1;
+        }
+        long q = qHi * 4294967296 + qLo;
+        return new Fixed64(neg ? -q : q);
+    }
+
+    public static bool operator ==(Fixed64 a, Fixed64 b) {
+        return a.raw == b.raw;
+    }
+
+    public static bool operator !=(Fixed64 a, Fixed64 b) {
+        return a.raw != b.raw;
+    }
+
+    public static bool operator <(Fixed64 a, Fixed64 b) {
+        return a.raw < b.raw;
+    }
+
+    public static bool operator <=(Fixed64 a, Fixed64 b) {
+        return a.raw <= b.raw;
+    }
+
+    public static bool operator >(Fixed64 a, Fixed64 b) {
+        return a.raw > b.raw;
+    }
+
+    public static bool operator >=(Fixed64 a, Fixed64 b) {
+        return a.raw >= b.raw;
+    }
+}
+
+public struct Vec4 {
+    public Fixed x;
+    public Fixed y;
+    public Fixed z;
+    public Fixed w;
+
+    public Vec4(Fixed xVal, Fixed yVal, Fixed zVal, Fixed wVal) {
+        x = xVal;
+        y = yVal;
+        z = zVal;
+        w = wVal;
+    }
+
+    public static Vec4 Of(int xInt, int yInt, int zInt, int wInt) {
+        return new Vec4(Fixed.Of(xInt), Fixed.Of(yInt), Fixed.Of(zInt), Fixed.Of(wInt));
+    }
+
+    public static Fixed Dot(Vec4 a, Vec4 b) {
+        return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+
+    public Vec3 Xyz() {
+        return new Vec3(x, y, z);
+    }
+}
+
+public struct Transform3D {
+    public Vec3 position;
+    public Quat rotation;
+    public Vec3 scale;
+
+    public Transform3D(Vec3 pos, Quat rot, Vec3 scl) {
+        position = pos;
+        rotation = rot;
+        scale = scl;
+    }
+
+    public static Transform3D Identity() {
+        return new Transform3D(Vec3.Zero(), Quat.Identity(), Vec3.One());
+    }
+
+    public Vec3 TransformPoint(Vec3 localPoint) {
+        Vec3 scaled = new Vec3(
+            localPoint.x * scale.x,
+            localPoint.y * scale.y,
+            localPoint.z * scale.z);
+        return position + rotation.Rotate(scaled);
+    }
+
+    public static Transform3D Combine(Transform3D parent, Transform3D local) {
+        return new Transform3D(
+            parent.TransformPoint(local.position),
+            (parent.rotation * local.rotation).Normalized(),
+            new Vec3(
+                parent.scale.x * local.scale.x,
+                parent.scale.y * local.scale.y,
+                parent.scale.z * local.scale.z));
+    }
+}
+
+public struct AABB {
+    public Vec3 min;
+    public Vec3 max;
+
+    public AABB(Vec3 minVal, Vec3 maxVal) {
+        min = minVal;
+        max = maxVal;
+    }
+
+    public static AABB FromCenterExtents(Vec3 center, Vec3 extents) {
+        return new AABB(center - extents, center + extents);
+    }
+
+    public bool Contains(Vec3 p) {
+        return p.x >= min.x && p.x <= max.x &&
+               p.y >= min.y && p.y <= max.y &&
+               p.z >= min.z && p.z <= max.z;
+    }
+
+    public bool Intersects(AABB other) {
+        return min.x <= other.max.x && max.x >= other.min.x &&
+               min.y <= other.max.y && max.y >= other.min.y &&
+               min.z <= other.max.z && max.z >= other.min.z;
+    }
+}
+
+public struct Ray {
+    public Vec3 origin;
+    public Vec3 direction;
+
+    public Ray(Vec3 orig, Vec3 dir) {
+        origin = orig;
+        direction = dir;
+    }
+
+    public Vec3 At(Fixed t) {
+        return origin + direction * t;
+    }
+}
 )RS";
     return kSource;
 }

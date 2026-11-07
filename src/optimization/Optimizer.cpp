@@ -31,8 +31,7 @@ struct Constant {
 bool isValueInstruction(const mir::Instruction& instruction) noexcept {
     if (instruction.opcode == mir::Opcode::StoreLocal ||
         instruction.opcode == mir::Opcode::StoreField ||
-        instruction.opcode == mir::Opcode::StoreElement ||
-        instruction.opcode == mir::Opcode::StoreStructField) {
+        instruction.opcode == mir::Opcode::StoreElement) {
         return false;
     }
     return (instruction.opcode != mir::Opcode::Call &&
@@ -75,6 +74,9 @@ bool isRemovableWhenUnused(mir::Opcode opcode) noexcept {
     case mir::Opcode::LessOrEqualDouble:
     case mir::Opcode::GreaterDouble:
     case mir::Opcode::GreaterOrEqualDouble:
+    case mir::Opcode::NewStruct:
+    case mir::Opcode::LoadStructField:
+    case mir::Opcode::StoreStructField:
         return true;
     default:
         return false;
@@ -394,27 +396,94 @@ std::optional<Constant> foldInstruction(
     }
 }
 
-bool foldConstants(mir::Function& function, Statistics& statistics) {
+bool foldConstants(
+    mir::Function& function,
+    Statistics& statistics,
+    bool enableStructFieldForwarding = true) {
     bool changed = false;
     std::unordered_map<mir::ValueId, Constant> constants;
+    std::unordered_map<mir::ValueId, std::unordered_map<std::size_t, Constant>> structFieldConstants;
     for (auto& block : function.blocks) {
         std::unordered_map<std::size_t, Constant> localConstants;
+        std::unordered_map<std::size_t, std::unordered_map<std::size_t, Constant>> localStructFields;
+        std::unordered_map<mir::ValueId, std::unordered_map<std::size_t, mir::ValueId>> blockStructFieldValues;
+        std::unordered_map<std::size_t, std::unordered_map<std::size_t, mir::ValueId>> localStructFieldValues;
+        std::unordered_map<mir::ValueId, mir::ValueId> valueReplacements;
+
+        const auto resolveReplacement = [&](mir::ValueId v) {
+            while (v >= 0) {
+                const auto it = valueReplacements.find(v);
+                if (it == valueReplacements.end() || it->second == v) break;
+                v = it->second;
+            }
+            return v;
+        };
+
         for (auto& instruction : block.instructions) {
+            for (auto& op : instruction.operands) {
+                const auto replaced = resolveReplacement(op);
+                if (replaced != op) {
+                    op = replaced;
+                    changed = true;
+                }
+            }
             if (instruction.opcode == mir::Opcode::StoreLocal &&
                 instruction.operands.size() == 1) {
-                const auto found = constants.find(instruction.operands.front());
+                const auto srcVal = instruction.operands.front();
+                const auto found = constants.find(srcVal);
                 if (found != constants.end()) {
                     localConstants[instruction.localIndex] = found->second;
                 } else {
                     localConstants.erase(instruction.localIndex);
                 }
+                const auto foundStructConst = structFieldConstants.find(srcVal);
+                if (foundStructConst != structFieldConstants.end()) {
+                    localStructFields[instruction.localIndex] = foundStructConst->second;
+                } else {
+                    localStructFields.erase(instruction.localIndex);
+                }
+                const auto foundStructVals = blockStructFieldValues.find(srcVal);
+                if (foundStructVals != blockStructFieldValues.end()) {
+                    localStructFieldValues[instruction.localIndex] = foundStructVals->second;
+                } else {
+                    localStructFieldValues.erase(instruction.localIndex);
+                }
                 continue;
             }
             if (instruction.opcode == mir::Opcode::Call ||
                 instruction.opcode == mir::Opcode::StoreField ||
-                instruction.opcode == mir::Opcode::StoreElement ||
-                instruction.opcode == mir::Opcode::StoreStructField) {
+                instruction.opcode == mir::Opcode::StoreElement) {
                 localConstants.clear();
+                localStructFields.clear();
+                localStructFieldValues.clear();
+            }
+            if (enableStructFieldForwarding &&
+                instruction.opcode == mir::Opcode::NewStruct) {
+                structFieldConstants[instruction.result].clear();
+                blockStructFieldValues[instruction.result].clear();
+            }
+            if (enableStructFieldForwarding &&
+                instruction.opcode == mir::Opcode::StoreStructField &&
+                instruction.operands.size() == 2) {
+                const auto baseStruct = instruction.operands[0];
+                const auto fieldVal = instruction.operands[1];
+                auto& fieldConstMap = structFieldConstants[instruction.result];
+                if (const auto baseIt = structFieldConstants.find(baseStruct);
+                    baseIt != structFieldConstants.end()) {
+                    fieldConstMap = baseIt->second;
+                }
+                if (const auto constIt = constants.find(fieldVal);
+                    constIt != constants.end()) {
+                    fieldConstMap[instruction.fieldIndex] = constIt->second;
+                } else {
+                    fieldConstMap.erase(instruction.fieldIndex);
+                }
+                auto& fieldValMap = blockStructFieldValues[instruction.result];
+                if (const auto baseValIt = blockStructFieldValues.find(baseStruct);
+                    baseValIt != blockStructFieldValues.end()) {
+                    fieldValMap = baseValIt->second;
+                }
+                fieldValMap[instruction.fieldIndex] = fieldVal;
             }
             if (instruction.opcode == mir::Opcode::LoadLocal) {
                 const auto found = localConstants.find(instruction.localIndex);
@@ -425,6 +494,49 @@ bool foldConstants(mir::Function& function, Statistics& statistics) {
                     instruction = makeConstant(instruction, std::move(constant));
                     ++statistics.localLoadsFolded;
                     changed = true;
+                } else if (enableStructFieldForwarding) {
+                    if (const auto foundStruct = localStructFields.find(instruction.localIndex);
+                        foundStruct != localStructFields.end()) {
+                        structFieldConstants[instruction.result] = foundStruct->second;
+                    }
+                    if (const auto foundStructVal = localStructFieldValues.find(instruction.localIndex);
+                        foundStructVal != localStructFieldValues.end()) {
+                        blockStructFieldValues[instruction.result] = foundStructVal->second;
+                    }
+                }
+            }
+            if (enableStructFieldForwarding &&
+                instruction.opcode == mir::Opcode::LoadStructField &&
+                instruction.operands.size() == 1) {
+                const auto baseStruct = instruction.operands[0];
+                bool foldedField = false;
+                if (const auto structIt = structFieldConstants.find(baseStruct);
+                    structIt != structFieldConstants.end()) {
+                    if (const auto fieldIt = structIt->second.find(instruction.fieldIndex);
+                        fieldIt != structIt->second.end() &&
+                        fieldIt->second.type == instruction.resultType) {
+                        auto constant = fieldIt->second;
+                        constant.type = instruction.resultType;
+                        constant.typeId = instruction.resultTypeId;
+                        instruction = makeConstant(instruction, std::move(constant));
+                        ++statistics.constantsFolded;
+                        ++statistics.structFieldsForwarded;
+                        changed = true;
+                        foldedField = true;
+                    }
+                }
+                if (!foldedField) {
+                    if (const auto structValIt = blockStructFieldValues.find(baseStruct);
+                        structValIt != blockStructFieldValues.end()) {
+                        if (const auto fieldValIt = structValIt->second.find(instruction.fieldIndex);
+                            fieldValIt != structValIt->second.end() &&
+                            fieldValIt->second >= 0) {
+                            valueReplacements[instruction.result] =
+                                resolveReplacement(fieldValIt->second);
+                            ++statistics.structFieldsForwarded;
+                            changed = true;
+                        }
+                    }
                 }
             }
             if (const auto folded = foldInstruction(instruction, constants)) {
@@ -439,6 +551,12 @@ bool foldConstants(mir::Function& function, Statistics& statistics) {
                     constants.erase(instruction.result);
                 }
             }
+        }
+        if (!valueReplacements.empty()) {
+            block.terminator.condition = resolveReplacement(block.terminator.condition);
+            block.terminator.value = resolveReplacement(block.terminator.value);
+            for (auto& arg : block.terminator.arguments) arg = resolveReplacement(arg);
+            for (auto& arg : block.terminator.falseArguments) arg = resolveReplacement(arg);
         }
         if (block.terminator.kind == mir::TerminatorKind::Branch) {
             const auto found = constants.find(block.terminator.condition);
@@ -657,6 +775,387 @@ void refreshDebugInfo(
     }
 }
 
+bool isLicmSafeOpcode(mir::Opcode opcode) noexcept {
+    switch (opcode) {
+    case mir::Opcode::ConstantNull:
+    case mir::Opcode::ConstantBool:
+    case mir::Opcode::ConstantInt:
+    case mir::Opcode::ConstantDouble:
+    case mir::Opcode::ConstantString:
+    case mir::Opcode::ConvertIntToLong:
+    case mir::Opcode::ConvertIntToDouble:
+    case mir::Opcode::ConvertLongToDouble:
+    case mir::Opcode::LogicalNot:
+    case mir::Opcode::Equal:
+    case mir::Opcode::NotEqual:
+    case mir::Opcode::LessInt:
+    case mir::Opcode::LessOrEqualInt:
+    case mir::Opcode::GreaterInt:
+    case mir::Opcode::GreaterOrEqualInt:
+    case mir::Opcode::LessLong:
+    case mir::Opcode::LessOrEqualLong:
+    case mir::Opcode::GreaterLong:
+    case mir::Opcode::GreaterOrEqualLong:
+    case mir::Opcode::LessDouble:
+    case mir::Opcode::LessOrEqualDouble:
+    case mir::Opcode::GreaterDouble:
+    case mir::Opcode::GreaterOrEqualDouble:
+    case mir::Opcode::AddDouble:
+    case mir::Opcode::SubtractDouble:
+    case mir::Opcode::MultiplyDouble:
+    case mir::Opcode::DivideDouble:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool hoistLoopInvariants(mir::Function& function, Statistics& statistics) {
+    if (function.blocks.size() < 2 || !function.exceptionHandlers.empty()) {
+        return false;
+    }
+    bool changed = false;
+    std::unordered_map<mir::BlockId, std::size_t> blockIndexById;
+    for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+        blockIndexById[function.blocks[i].id] = i;
+    }
+
+    for (std::size_t headerIdx = 1; headerIdx < function.blocks.size(); ++headerIdx) {
+        const auto headerId = function.blocks[headerIdx].id;
+        if (!function.blocks[headerIdx].parameters.empty()) continue;
+
+        // Preheader must be headerIdx - 1 jumping unconditionally to headerId
+        auto& preheader = function.blocks[headerIdx - 1];
+        if (preheader.terminator.kind != mir::TerminatorKind::Jump ||
+            preheader.terminator.target != headerId ||
+            !preheader.terminator.arguments.empty()) {
+            continue;
+        }
+
+        // Find back-edge block index >= headerIdx jumping/branching to headerId
+        std::size_t latchIdx = 0;
+        bool hasBackEdge = false;
+        bool invalidPred = false;
+        for (std::size_t idx = 0; idx < function.blocks.size(); ++idx) {
+            const auto& term = function.blocks[idx].terminator;
+            const bool edgesToHeader =
+                (term.kind == mir::TerminatorKind::Jump && term.target == headerId) ||
+                (term.kind == mir::TerminatorKind::Branch &&
+                 (term.target == headerId || term.falseTarget == headerId));
+            if (!edgesToHeader) continue;
+            if (idx == headerIdx - 1) continue;
+            if (idx < headerIdx) {
+                invalidPred = true;
+                break;
+            }
+            hasBackEdge = true;
+            latchIdx = std::max(latchIdx, idx);
+        }
+        if (!hasBackEdge || invalidPred) continue;
+
+        // Verify no block outside [headerIdx, latchIdx] (other than preheader -> headerId)
+        // jumps into [headerIdx, latchIdx]
+        std::unordered_set<mir::BlockId> loopBlockIds;
+        for (std::size_t idx = headerIdx; idx <= latchIdx; ++idx) {
+            loopBlockIds.insert(function.blocks[idx].id);
+        }
+        for (std::size_t idx = 0; idx < function.blocks.size(); ++idx) {
+            if (idx >= headerIdx && idx <= latchIdx) continue;
+            if (idx == headerIdx - 1) continue;
+            const auto& term = function.blocks[idx].terminator;
+            if (term.kind == mir::TerminatorKind::Jump &&
+                loopBlockIds.find(term.target) != loopBlockIds.end()) {
+                invalidPred = true;
+                break;
+            }
+            if (term.kind == mir::TerminatorKind::Branch &&
+                (loopBlockIds.find(term.target) != loopBlockIds.end() ||
+                 loopBlockIds.find(term.falseTarget) != loopBlockIds.end())) {
+                invalidPred = true;
+                break;
+            }
+        }
+        if (invalidPred) continue;
+
+        // Collect all ValueIds defined inside the loop [headerIdx, latchIdx]
+        std::unordered_set<mir::ValueId> loopDefinedValues;
+        std::unordered_set<std::size_t> loopModifiedLocals;
+        bool loopHasCallOrStore = false;
+        for (std::size_t idx = headerIdx; idx <= latchIdx; ++idx) {
+            for (const auto& param : function.blocks[idx].parameters) {
+                loopDefinedValues.insert(param.value);
+            }
+            for (const auto& inst : function.blocks[idx].instructions) {
+                if (isValueInstruction(inst)) {
+                    loopDefinedValues.insert(inst.result);
+                }
+                if (inst.opcode == mir::Opcode::StoreLocal) {
+                    loopModifiedLocals.insert(inst.localIndex);
+                }
+                if (inst.opcode == mir::Opcode::Call ||
+                    inst.opcode == mir::Opcode::StoreField ||
+                    inst.opcode == mir::Opcode::StoreElement) {
+                    loopHasCallOrStore = true;
+                }
+            }
+        }
+
+        for (std::size_t blkIdx = headerIdx; blkIdx <= latchIdx; ++blkIdx) {
+            auto& loopBlock = function.blocks[blkIdx];
+            std::vector<mir::Instruction> remaining;
+            remaining.reserve(loopBlock.instructions.size());
+            for (auto& inst : loopBlock.instructions) {
+                bool canHoist = false;
+                if (isValueInstruction(inst)) {
+                    if (isLicmSafeOpcode(inst.opcode) ||
+                        ((inst.opcode == mir::Opcode::AddInt ||
+                          inst.opcode == mir::Opcode::SubtractInt ||
+                          inst.opcode == mir::Opcode::MultiplyInt ||
+                          inst.opcode == mir::Opcode::AddLong ||
+                          inst.opcode == mir::Opcode::SubtractLong ||
+                          inst.opcode == mir::Opcode::MultiplyLong) &&
+                         !inst.checkedArithmetic) ||
+                        (inst.opcode == mir::Opcode::LoadLocal &&
+                         !loopHasCallOrStore &&
+                         loopModifiedLocals.find(inst.localIndex) == loopModifiedLocals.end())) {
+                        bool allOperandsOutside = true;
+                        for (const auto op : inst.operands) {
+                            if (loopDefinedValues.find(op) != loopDefinedValues.end()) {
+                                allOperandsOutside = false;
+                                break;
+                            }
+                        }
+                        if (allOperandsOutside) {
+                            canHoist = true;
+                        }
+                    }
+                }
+                if (canHoist) {
+                    loopDefinedValues.erase(inst.result);
+                    preheader.instructions.push_back(std::move(inst));
+                    ++statistics.loopInvariantsHoisted;
+                    changed = true;
+                } else {
+                    remaining.push_back(std::move(inst));
+                }
+            }
+            loopBlock.instructions = std::move(remaining);
+        }
+    }
+    return changed;
+}
+
+bool isInlineSafeInstruction(const mir::Instruction& inst) noexcept {
+    switch (inst.opcode) {
+    case mir::Opcode::ConstantNull:
+    case mir::Opcode::ConstantBool:
+    case mir::Opcode::ConstantInt:
+    case mir::Opcode::ConstantDouble:
+    case mir::Opcode::ConstantString:
+    case mir::Opcode::ConvertIntToLong:
+    case mir::Opcode::ConvertIntToDouble:
+    case mir::Opcode::ConvertLongToDouble:
+    case mir::Opcode::ConvertNullToString:
+    case mir::Opcode::ConvertNullToObject:
+    case mir::Opcode::ConvertNullToArray:
+    case mir::Opcode::LogicalNot:
+    case mir::Opcode::Equal:
+    case mir::Opcode::NotEqual:
+    case mir::Opcode::LessInt:
+    case mir::Opcode::LessOrEqualInt:
+    case mir::Opcode::GreaterInt:
+    case mir::Opcode::GreaterOrEqualInt:
+    case mir::Opcode::LessLong:
+    case mir::Opcode::LessOrEqualLong:
+    case mir::Opcode::GreaterLong:
+    case mir::Opcode::GreaterOrEqualLong:
+    case mir::Opcode::LessDouble:
+    case mir::Opcode::LessOrEqualDouble:
+    case mir::Opcode::GreaterDouble:
+    case mir::Opcode::GreaterOrEqualDouble:
+    case mir::Opcode::AddDouble:
+    case mir::Opcode::SubtractDouble:
+    case mir::Opcode::MultiplyDouble:
+    case mir::Opcode::DivideDouble:
+    case mir::Opcode::NegateDouble:
+    case mir::Opcode::NewStruct:
+    case mir::Opcode::LoadStructField:
+    case mir::Opcode::StoreStructField:
+    case mir::Opcode::Parameter:
+    case mir::Opcode::LoadLocal:
+    case mir::Opcode::StoreLocal:
+        return true;
+    case mir::Opcode::AddInt:
+    case mir::Opcode::SubtractInt:
+    case mir::Opcode::MultiplyInt:
+    case mir::Opcode::AddLong:
+    case mir::Opcode::SubtractLong:
+    case mir::Opcode::MultiplyLong:
+    case mir::Opcode::NegateInt:
+    case mir::Opcode::NegateLong:
+        return true;
+    default:
+        return false;
+    }
+}
+
+mir::ValueId findMaxValueId(const mir::Function& function) noexcept {
+    mir::ValueId maxId = -1;
+    for (const auto& block : function.blocks) {
+        for (const auto& param : block.parameters) {
+            maxId = std::max(maxId, param.value);
+        }
+        for (const auto& inst : block.instructions) {
+            maxId = std::max(maxId, inst.result);
+            for (const auto op : inst.operands) maxId = std::max(maxId, op);
+        }
+    }
+    return maxId;
+}
+
+bool inlineSmallFunctions(
+    mir::Module& module,
+    const Options& options,
+    Statistics& statistics) {
+    if (options.level != Level::Aggressive || !options.enableInlining) {
+        return false;
+    }
+    std::unordered_map<semantic::SymbolId, const mir::Function*> inlineCandidates;
+    for (const auto& func : module.functions) {
+        if (func.blocks.size() != 1 ||
+            !func.exceptionHandlers.empty()) {
+            continue;
+        }
+        const auto& entry = func.blocks.front();
+        if (entry.terminator.kind != mir::TerminatorKind::ReturnValue ||
+            entry.instructions.size() > options.maxInlineInstructions ||
+            !entry.parameters.empty()) {
+            continue;
+        }
+        bool allSafe = true;
+        for (const auto& inst : entry.instructions) {
+            if (!isInlineSafeInstruction(inst)) {
+                allSafe = false;
+                break;
+            }
+        }
+        if (allSafe) {
+            inlineCandidates[func.symbolId] = &func;
+        }
+    }
+    if (inlineCandidates.empty()) return false;
+
+    bool anyInlined = false;
+    for (auto& caller : module.functions) {
+        mir::ValueId nextId = findMaxValueId(caller) + 1;
+        bool callerChanged = false;
+        for (auto& block : caller.blocks) {
+            std::vector<mir::Instruction> expanded;
+            expanded.reserve(block.instructions.size());
+            std::unordered_map<mir::ValueId, mir::ValueId> replacements;
+            const auto resolveVal = [&](mir::ValueId v) {
+                while (v >= 0) {
+                    const auto it = replacements.find(v);
+                    if (it == replacements.end() || it->second == v) break;
+                    v = it->second;
+                }
+                return v;
+            };
+            for (auto& inst : block.instructions) {
+                for (auto& op : inst.operands) op = resolveVal(op);
+                if (inst.opcode == mir::Opcode::Call &&
+                    !inst.virtualDispatch && !inst.interfaceDispatch &&
+                    inst.symbolId != 0) {
+                    const auto targetSym = inst.symbolId;
+                    const auto candIt = inlineCandidates.find(targetSym);
+                    if (candIt != inlineCandidates.end() &&
+                        targetSym != caller.symbolId &&
+                        candIt->second->parameterTypes.size() == inst.operands.size()) {
+                        const auto& callee = *candIt->second;
+                        const auto& calleeBlock = callee.blocks.front();
+                        std::unordered_map<mir::ValueId, mir::ValueId> valueMap;
+                        std::unordered_map<std::size_t, mir::ValueId> localMap;
+                        bool inlineOk = true;
+                        std::vector<mir::Instruction> stagedClones;
+                        for (const auto& calleeInst : calleeBlock.instructions) {
+                            if (calleeInst.opcode == mir::Opcode::Parameter) {
+                                const auto pIdx = static_cast<std::size_t>(calleeInst.integerImmediate);
+                                if (pIdx < inst.operands.size()) {
+                                    valueMap[calleeInst.result] = inst.operands[pIdx];
+                                } else {
+                                    inlineOk = false;
+                                    break;
+                                }
+                                continue;
+                            }
+                            if (calleeInst.opcode == mir::Opcode::StoreLocal) {
+                                if (calleeInst.operands.size() == 1) {
+                                    const auto m = valueMap.find(calleeInst.operands[0]);
+                                    if (m != valueMap.end()) {
+                                        localMap[calleeInst.localIndex] = m->second;
+                                        continue;
+                                    }
+                                }
+                                inlineOk = false;
+                                break;
+                            }
+                            if (calleeInst.opcode == mir::Opcode::LoadLocal) {
+                                const auto lm = localMap.find(calleeInst.localIndex);
+                                if (lm != localMap.end()) {
+                                    valueMap[calleeInst.result] = lm->second;
+                                    continue;
+                                }
+                                inlineOk = false;
+                                break;
+                            }
+                            mir::Instruction cloned = calleeInst;
+                            for (auto& op : cloned.operands) {
+                                const auto m = valueMap.find(op);
+                                if (m == valueMap.end()) {
+                                    inlineOk = false;
+                                    break;
+                                }
+                                op = m->second;
+                            }
+                            if (!inlineOk) break;
+                            if (isValueInstruction(cloned)) {
+                                const mir::ValueId fresh = nextId++;
+                                valueMap[calleeInst.result] = fresh;
+                                cloned.result = fresh;
+                            }
+                            stagedClones.push_back(std::move(cloned));
+                        }
+                        const auto retVal = calleeBlock.terminator.value;
+                        const auto mappedRet = valueMap.find(retVal);
+                        if (inlineOk && mappedRet != valueMap.end()) {
+                            for (auto& sc : stagedClones) {
+                                expanded.push_back(std::move(sc));
+                            }
+                            replacements[inst.result] = mappedRet->second;
+                            ++statistics.functionsInlined;
+                            callerChanged = true;
+                            anyInlined = true;
+                            continue;
+                        }
+                    }
+                }
+                expanded.push_back(std::move(inst));
+            }
+            if (!replacements.empty()) {
+                block.terminator.condition = resolveVal(block.terminator.condition);
+                block.terminator.value = resolveVal(block.terminator.value);
+                for (auto& arg : block.terminator.arguments) arg = resolveVal(arg);
+                for (auto& arg : block.terminator.falseArguments) arg = resolveVal(arg);
+            }
+            block.instructions = std::move(expanded);
+        }
+        if (callerChanged) {
+            compactValueIds(caller);
+        }
+    }
+    return anyInlined;
+}
+
 bool optimizeFunction(
     mir::Function& function,
     const Options& options,
@@ -667,9 +1166,15 @@ bool optimizeFunction(
     const auto iterations = std::max<std::size_t>(1, options.maximumIterations);
     for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
         bool changed = false;
-        changed |= foldConstants(function, statistics);
+        changed |= foldConstants(
+            function,
+            statistics,
+            options.level == Level::Aggressive && options.enableStructFieldForwarding);
         changed |= removeUnreachableBlocks(function, statistics);
         if (options.level == Level::Aggressive) {
+            if (options.enableLicm) {
+                changed |= hoistLoopInvariants(function, statistics);
+            }
             changed |= eliminateDeadInstructions(function, statistics);
         }
         ++statistics.iterations;
@@ -685,7 +1190,8 @@ bool optimizeFunction(
 bool Statistics::changed() const noexcept {
     return constantsFolded != 0 || branchesFolded != 0 ||
         instructionsRemoved != 0 || blocksRemoved != 0 ||
-        localLoadsFolded != 0;
+        localLoadsFolded != 0 || functionsInlined != 0 ||
+        loopInvariantsHoisted != 0 || structFieldsForwarded != 0;
 }
 
 Result Optimizer::optimize(
@@ -717,6 +1223,9 @@ mir::Module Optimizer::optimizeModule(
                 {});
             diagnostics.append(inputDiagnostics);
             return module;
+        }
+        if (options.level == Level::Aggressive && options.enableInlining) {
+            (void)inlineSmallFunctions(module, options, target);
         }
         for (auto& function : module.functions) {
             (void)optimizeFunction(function, options, target);

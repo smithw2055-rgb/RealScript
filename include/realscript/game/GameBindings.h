@@ -160,6 +160,18 @@ public:
     [[nodiscard]] std::shared_ptr<runtime::ManagedHeap> heap() const noexcept;
     [[nodiscard]] std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles() const noexcept;
 
+    struct HeaderBindingGenerationResult {
+        std::string cppRegistrationSource;
+        std::string scriptDeclarationStub;
+        std::size_t classesExported = 0;
+        std::size_t methodsExported = 0;
+        std::size_t functionsExported = 0;
+    };
+
+    [[nodiscard]] static HeaderBindingGenerationResult generateBindingsFromCppHeader(
+        std::string_view headerContent,
+        const std::string& defaultModuleName = "Engine.Native");
+
     template <typename T>
     [[nodiscard]] std::string canonicalTypeName() const {
         const auto found = state_->nativeTypeByCppType.find(std::type_index(typeid(T)));

@@ -220,6 +220,27 @@ public:
         void branch() noexcept {
             if constexpr (Enabled) ++state_.branches;
         }
+        void suspendBeforeCall() noexcept {
+            if constexpr (Enabled) {
+                state_.context->executed_ += state_.consumed;
+                state_.context->statistics_.instructionsExecuted =
+                    state_.context->executed_;
+                state_.context->statistics_.branchesTaken += state_.branches;
+                state_.consumed = 0;
+                state_.branches = 0;
+            }
+        }
+        void resumeAfterCall() noexcept {
+            if constexpr (Enabled) {
+                const auto budget =
+                    state_.context->options_.limits.instructionBudget;
+                state_.remaining = state_.context->executed_ < budget
+                    ? budget - state_.context->executed_
+                    : 0;
+                state_.consumed = 0;
+                state_.branches = 0;
+            }
+        }
 
     private:
         struct EnabledState {
@@ -307,6 +328,22 @@ public:
                 state_.flushed = true;
             }
         }
+        void suspendBeforeCall() noexcept {
+            if constexpr (Enabled) {
+                flush();
+            }
+        }
+        void resumeAfterCall() noexcept {
+            if constexpr (Enabled) {
+                state_.executed = state_.context->executed_;
+                state_.digest = state_.context->determinismEventDigest_;
+                state_.eventCount = state_.context->determinismEventCount_;
+                state_.branches = state_.context->statistics_.branchesTaken;
+                state_.functionId = state_.context->currentFunctionId_;
+                state_.callDepth = state_.context->stack_.size();
+                state_.flushed = false;
+            }
+        }
 
     private:
         struct EnabledState {
@@ -367,6 +404,72 @@ public:
     }
     [[nodiscard]] bool typedDeterminismAccountingEnabled() const noexcept {
         return determinismOnly_ && options_.limits.gcWorkBudget == 0;
+    }
+    template <bool FastAccounting, bool DeterminismAccounting>
+    [[nodiscard]] bool enterTypedDirectCall(
+        semantic::SymbolId calleeSymbolId,
+        const char* calleeName,
+        semantic::SymbolId& outPreviousFunctionId) {
+        if (stack_.size() >= options_.limits.recursionLimit) {
+            return fail(
+                runtime::ErrorCode::RecursionLimitExceeded,
+                "recursion limit exceeded");
+        }
+        outPreviousFunctionId = currentFunctionId_;
+        currentFunctionId_ = calleeSymbolId;
+        stack_.push_back(calleeName ? calleeName : "<aot-function>");
+        ++statistics_.functionCalls;
+        if (stack_.size() > statistics_.maximumCallDepth) {
+            statistics_.maximumCallDepth = stack_.size();
+        }
+        if constexpr (DeterminismAccounting) {
+            determinismEventDigest_ = runtime::accumulateDeterminismEvent(
+                determinismEventDigest_,
+                runtime::TraceEventKind::FunctionEnter,
+                currentFunctionId_,
+                0,
+                executed_,
+                stack_.size());
+            ++determinismEventCount_;
+        } else if constexpr (!FastAccounting) {
+            emitTrace(runtime::TraceEventKind::FunctionEnter);
+        }
+        return true;
+    }
+
+    template <bool FastAccounting, bool DeterminismAccounting, typename BoxFn>
+    void exitTypedDirectCall(
+        semantic::SymbolId previousFunctionId,
+        bool succeeded,
+        BoxFn&& boxReturnValue) {
+        if (succeeded) {
+            if constexpr (DeterminismAccounting) {
+                determinismEventDigest_ = runtime::accumulateDeterminismEvent(
+                    determinismEventDigest_,
+                    runtime::TraceEventKind::FunctionExit,
+                    currentFunctionId_,
+                    0,
+                    executed_,
+                    stack_.size());
+                ++determinismEventCount_;
+            } else if constexpr (!FastAccounting) {
+                if (traceEventsEnabled_) {
+                    if (diagnosticEventsEnabled_) {
+                        const runtime::Value boxed = boxReturnValue();
+                        const auto operation =
+                            runtime::valueToString(boxed, heap_.get());
+                        emitTrace(
+                            runtime::TraceEventKind::FunctionExit,
+                            0,
+                            operation);
+                    } else {
+                        emitTrace(runtime::TraceEventKind::FunctionExit);
+                    }
+                }
+            }
+        }
+        stack_.pop_back();
+        currentFunctionId_ = previousFunctionId;
     }
     [[nodiscard]] bool consumeRawTyped(std::uint64_t count = 1) {
         if (count == 0) return true;
@@ -470,6 +573,20 @@ public:
         const runtime::Value& receiver,
         const runtime::Value& value,
         runtime::Value& result);
+    [[nodiscard]] bool initUnboxedStruct(
+        semantic::SymbolId typeId,
+        struct UnboxedCustomStruct& result);
+    [[nodiscard]] bool loadUnboxedStructField(
+        semantic::SymbolId typeId,
+        std::size_t fieldIndex,
+        const struct UnboxedCustomStruct& receiver,
+        runtime::Value& result);
+    [[nodiscard]] bool storeUnboxedStructField(
+        semantic::SymbolId typeId,
+        std::size_t fieldIndex,
+        const struct UnboxedCustomStruct& receiver,
+        const runtime::Value& value,
+        struct UnboxedCustomStruct& result);
     [[nodiscard]] bool convert(
         semantic::ConversionKind conversion,
         semantic::PrimitiveType targetType,
@@ -531,7 +648,8 @@ private:
     runtime::RuntimeStatistics statistics_;
     runtime::DeterminismSession determinism_;
     std::uint64_t executed_ = 0;
-    std::vector<std::string> stack_;
+    [[nodiscard]] std::vector<std::string> materializeStackTrace() const;
+    std::vector<const char*> stack_;
     semantic::SymbolId currentFunctionId_ = 0;
     runtime::ShadowStack shadowStack_;
     std::unordered_map<semantic::SymbolId, const TypeDescriptor*> types_;
@@ -727,4 +845,425 @@ runtime::ExternalFunction makeNativeThunk(Result (*function)(Args...)) {
     };
 }
 
+
+inline std::int64_t typedWrapInt32(std::int64_t value) noexcept {
+    const auto bits = static_cast<std::uint32_t>(value);
+    return bits <= static_cast<std::uint32_t>(
+                       std::numeric_limits<std::int32_t>::max())
+        ? static_cast<std::int64_t>(bits)
+        : static_cast<std::int64_t>(bits) - (std::int64_t{1} << 32);
+}
+
+inline std::int64_t typedSignedFromBits(std::uint64_t bits) noexcept {
+    return bits <= static_cast<std::uint64_t>(
+                       std::numeric_limits<std::int64_t>::max())
+        ? static_cast<std::int64_t>(bits)
+        : -1 - static_cast<std::int64_t>(
+            std::numeric_limits<std::uint64_t>::max() - bits);
+}
+
+template <bool Checked>
+[[nodiscard]] inline bool typedAddLong(
+    std::int64_t left,
+    std::int64_t right,
+    std::int64_t& out) noexcept {
+    if constexpr (Checked) {
+        if ((right > 0 && left > std::numeric_limits<std::int64_t>::max() - right) ||
+            (right < 0 && left < std::numeric_limits<std::int64_t>::min() - right)) {
+            return false;
+        }
+        out = left + right;
+        return true;
+    } else {
+        out = typedSignedFromBits(
+            static_cast<std::uint64_t>(left) +
+            static_cast<std::uint64_t>(right));
+        return true;
+    }
+}
+
+template <bool Checked>
+[[nodiscard]] inline bool typedSubLong(
+    std::int64_t left,
+    std::int64_t right,
+    std::int64_t& out) noexcept {
+    if constexpr (Checked) {
+        if ((right < 0 && left > std::numeric_limits<std::int64_t>::max() + right) ||
+            (right > 0 && left < std::numeric_limits<std::int64_t>::min() + right)) {
+            return false;
+        }
+        out = left - right;
+        return true;
+    } else {
+        out = typedSignedFromBits(
+            static_cast<std::uint64_t>(left) -
+            static_cast<std::uint64_t>(right));
+        return true;
+    }
+}
+
+template <bool Checked>
+[[nodiscard]] inline bool typedMulLong(
+    std::int64_t left,
+    std::int64_t right,
+    std::int64_t& out) noexcept {
+    if constexpr (Checked) {
+        if (left == 0 || right == 0) {
+            out = 0;
+            return true;
+        }
+        const auto minimum = std::numeric_limits<std::int64_t>::min();
+        const auto maximum = std::numeric_limits<std::int64_t>::max();
+        bool overflow = false;
+        if (left > 0) {
+            overflow = right > 0 ? left > maximum / right : right < minimum / left;
+        } else {
+            overflow = right > 0 ? left < minimum / right
+                                 : (left != 0 && right < maximum / left);
+        }
+        if (overflow) return false;
+        out = left * right;
+        return true;
+    } else {
+        out = typedSignedFromBits(
+            static_cast<std::uint64_t>(left) *
+            static_cast<std::uint64_t>(right));
+        return true;
+    }
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    bool value) noexcept {
+    (void)type;
+    return runtime::Value{value};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    std::int64_t value) noexcept {
+    if (type == semantic::PrimitiveType::Long) {
+        return runtime::Value{runtime::LongValue{value}};
+    }
+    return runtime::Value{value};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    float value) noexcept {
+    (void)type;
+    return runtime::Value{runtime::FloatValue{value}};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    double value) noexcept {
+    (void)type;
+    return runtime::Value{value};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    runtime::FixedValue value) noexcept {
+    (void)type;
+    return runtime::Value{value};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    runtime::Fixed16Value value) noexcept {
+    (void)type;
+    return runtime::Value{value};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    runtime::Vec2Value value) noexcept {
+    (void)type;
+    return runtime::Value{value};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    runtime::Vec3Value value) noexcept {
+    (void)type;
+    return runtime::Value{value};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    runtime::QuatValue value) noexcept {
+    (void)type;
+    return runtime::Value{value};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    runtime::EnumValue value) noexcept {
+    (void)type;
+    return runtime::Value{value};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value) {
+    (void)type;
+    return value;
+}
+
+struct UnboxedCustomStruct {
+    semantic::SymbolId typeId = 0;
+    std::array<runtime::Value, 16> fields{};
+    std::uint8_t fieldCount = 0;
+
+    friend bool operator==(const UnboxedCustomStruct& left, const UnboxedCustomStruct& right) {
+        if (left.typeId != right.typeId || left.fieldCount != right.fieldCount) return false;
+        for (std::uint8_t i = 0; i < left.fieldCount; ++i) {
+            if (!(left.fields[i] == right.fields[i])) return false;
+        }
+        return true;
+    }
+    friend bool operator!=(const UnboxedCustomStruct& left, const UnboxedCustomStruct& right) {
+        return !(left == right);
+    }
+};
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    const UnboxedCustomStruct& value) {
+    (void)type;
+    auto storage = std::make_shared<runtime::StructStorage>();
+    storage->fields.assign(
+        value.fields.begin(),
+        value.fields.begin() + value.fieldCount);
+    return runtime::Value{runtime::StructValue{value.typeId, std::move(storage)}};
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    bool& out) noexcept {
+    (void)type;
+    if (const auto* p = std::get_if<bool>(&value)) {
+        out = *p;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    std::int64_t& out) noexcept {
+    if (type == semantic::PrimitiveType::Long) {
+        if (const auto* p = std::get_if<runtime::LongValue>(&value)) {
+            out = p->value;
+            return true;
+        }
+        return false;
+    }
+    if (const auto* p = std::get_if<std::int64_t>(&value)) {
+        out = *p;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    float& out) noexcept {
+    (void)type;
+    if (const auto* p = std::get_if<runtime::FloatValue>(&value)) {
+        out = p->value;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    double& out) noexcept {
+    (void)type;
+    if (const auto* p = std::get_if<double>(&value)) {
+        out = *p;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    runtime::FixedValue& out) noexcept {
+    (void)type;
+    if (const auto* p = std::get_if<runtime::FixedValue>(&value)) {
+        out = *p;
+        return true;
+    }
+    if (const auto f0 = runtime::loadInlineStructField(value, 0)) {
+        if (const auto* i = std::get_if<std::int64_t>(&*f0)) {
+            out = runtime::FixedValue{static_cast<std::int32_t>(*i)};
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    runtime::Fixed16Value& out) noexcept {
+    (void)type;
+    if (const auto* p = std::get_if<runtime::Fixed16Value>(&value)) {
+        out = *p;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    runtime::Vec2Value& out) noexcept {
+    (void)type;
+    if (const auto* p = std::get_if<runtime::Vec2Value>(&value)) {
+        out = *p;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    runtime::Vec3Value& out) noexcept {
+    (void)type;
+    if (const auto* p = std::get_if<runtime::Vec3Value>(&value)) {
+        out = *p;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    runtime::QuatValue& out) noexcept {
+    (void)type;
+    if (const auto* p = std::get_if<runtime::QuatValue>(&value)) {
+        out = *p;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    runtime::EnumValue& out) noexcept {
+    (void)type;
+    if (const auto* p = std::get_if<runtime::EnumValue>(&value)) {
+        out = *p;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    runtime::Value& out) {
+    if (type == semantic::PrimitiveType::Object) {
+        if (std::holds_alternative<runtime::NullObject>(value)) {
+            out = value;
+            return true;
+        }
+        if (const auto* ref = std::get_if<runtime::ObjectRef>(&value);
+            ref && ref->kind == runtime::ObjectKind::Record) {
+            out = value;
+            return true;
+        }
+        return false;
+    }
+    if (type == semantic::PrimitiveType::Array) {
+        if (std::holds_alternative<runtime::NullArray>(value)) {
+            out = value;
+            return true;
+        }
+        if (const auto* ref = std::get_if<runtime::ObjectRef>(&value);
+            ref && ref->kind == runtime::ObjectKind::Array) {
+            out = value;
+            return true;
+        }
+        return false;
+    }
+    out = value;
+    return true;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    UnboxedCustomStruct& out) {
+    (void)type;
+    if (const auto* s = std::get_if<runtime::StructValue>(&value);
+        s && s->typeId != 0 && s->storage && s->storage->fields.size() <= 16) {
+        out.typeId = s->typeId;
+        out.fieldCount = static_cast<std::uint8_t>(s->storage->fields.size());
+        for (std::uint8_t i = 0; i < out.fieldCount; ++i) {
+            out.fields[i] = s->storage->fields[i];
+        }
+        return true;
+    }
+    return false;
+}
+
+template <semantic::PrimitiveType SrcType, semantic::PrimitiveType DstType, bool Checked, typename SrcT, typename DstT>
+[[nodiscard]] inline bool typedConvertNumeric(SrcT src, DstT& dst) noexcept {
+    if constexpr (SrcType == DstType) {
+        dst = static_cast<DstT>(src);
+        return true;
+    } else if constexpr (SrcType == semantic::PrimitiveType::Int &&
+                         DstType == semantic::PrimitiveType::Long) {
+        dst = static_cast<std::int64_t>(src);
+        return true;
+    } else if constexpr (SrcType == semantic::PrimitiveType::Long &&
+                         DstType == semantic::PrimitiveType::Int) {
+        if constexpr (Checked) {
+            if (src < std::numeric_limits<std::int32_t>::min() ||
+                src > std::numeric_limits<std::int32_t>::max()) {
+                return false;
+            }
+            dst = static_cast<std::int64_t>(src);
+            return true;
+        } else {
+            dst = typedWrapInt32(src);
+            return true;
+        }
+    } else if constexpr ((SrcType == semantic::PrimitiveType::Int ||
+                          SrcType == semantic::PrimitiveType::Long ||
+                          SrcType == semantic::PrimitiveType::Float) &&
+                         DstType == semantic::PrimitiveType::Double) {
+        dst = static_cast<double>(src);
+        return true;
+    } else if constexpr (SrcType == semantic::PrimitiveType::Int &&
+                         DstType == semantic::PrimitiveType::Float) {
+        dst = static_cast<float>(src);
+        return true;
+    } else {
+        runtime::Value converted;
+        if (!runtime::tryConvertNumeric(
+                typedBoxScalar(SrcType, src),
+                DstType,
+                converted,
+                Checked)) {
+            return false;
+        }
+        return typedUnboxScalar(DstType, converted, dst);
+    }
+}
+
 } // namespace realscript::aot
+

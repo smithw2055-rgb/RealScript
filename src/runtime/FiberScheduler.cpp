@@ -2,6 +2,8 @@
 #include "realscript/mir/Mir.h"
 
 #include <cstring>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -180,6 +182,322 @@ std::uint64_t FiberScheduler::stepTick(std::uint32_t currentTick) {
     readyQueue_.clear();
 
     return instrExecuted;
+}
+
+std::uint64_t FiberScheduler::stepTickParallel(
+    std::uint32_t currentTick,
+    std::size_t workerCount) {
+    if (workerCount <= 1) {
+        return stepTick(currentTick);
+    }
+    currentTick_ = currentTick;
+
+    const std::size_t slot = static_cast<std::size_t>(currentTick) & WHEEL_MASK;
+    auto& bucket = timingWheel_[slot];
+    std::vector<std::uint32_t> remainingInBucket;
+    for (std::uint32_t fid : bucket) {
+        if (fid >= fibers_.size()) continue;
+        auto& f = fibers_[fid];
+        if (f.status == FiberStatus::SleepingTicks) {
+            if (f.wakeTick <= currentTick) {
+                f.status = FiberStatus::Ready;
+                readyQueue_.push_back(fid);
+            } else {
+                remainingInBucket.push_back(fid);
+            }
+        }
+    }
+    bucket.swap(remainingInBucket);
+
+    if (readyQueue_.size() < 2) {
+        std::uint64_t instrExecuted = 0;
+        for (std::size_t idx = 0; idx < readyQueue_.size(); ++idx) {
+            std::uint32_t fid = readyQueue_[idx];
+            if (fid == 0 || fid >= fibers_.size()) continue;
+            auto& fiber = fibers_[fid];
+            if (fiber.status != FiberStatus::Ready) continue;
+            executeFiberSlice(fiber, currentTick, instrExecuted);
+        }
+        readyQueue_.clear();
+        return instrExecuted;
+    }
+
+    struct DeferredFiberOutcome {
+        std::uint32_t fiberId = 0;
+        std::uint64_t instructions = 0;
+        bool sleepScheduled = false;
+        std::uint32_t wakeTick = 0;
+        bool predicateWait = false;
+        bool killed = false;
+        bool forked = false;
+        std::uint32_t forkProgramId = 0;
+        std::uint32_t forkTargetPc = 0;
+        GenerationalEntityHandle forkEntity{};
+        std::uint8_t forkGroup = 0;
+        std::uint32_t forkSeed = 0;
+    };
+
+    const std::vector<std::uint32_t> batch = readyQueue_;
+    readyQueue_.clear();
+    std::vector<DeferredFiberOutcome> outcomes(batch.size());
+    std::mutex hostMutex;
+
+    const auto runIsolatedFiber = [&](std::size_t batchIndex) {
+        const std::uint32_t fid = batch[batchIndex];
+        auto& out = outcomes[batchIndex];
+        out.fiberId = fid;
+        if (fid == 0 || fid >= fibers_.size()) return;
+        auto& fiber = fibers_[fid];
+        if (fiber.status != FiberStatus::Ready) return;
+        if (fiber.programId == 0 || fiber.programId >= programs_.size()) {
+            out.killed = true;
+            return;
+        }
+        const auto& code = programs_[fiber.programId];
+        std::uint32_t sliceBudget = 256;
+        while (fiber.pc < code.size() && sliceBudget-- > 0) {
+            const CompactInstruction& ins = code[fiber.pc];
+            ++out.instructions;
+            switch (ins.opcode) {
+            case Opcode::Nop: ++fiber.pc; break;
+            case Opcode::LoadInt:
+            case Opcode::LoadFixed24_8:
+                if (ins.regOrSlot < fiber.regs.size()) {
+                    fiber.regs[ins.regOrSlot] = static_cast<std::int32_t>(ins.imm32);
+                }
+                ++fiber.pc;
+                break;
+            case Opcode::MoveReg:
+                if (ins.regOrSlot < fiber.regs.size()) {
+                    fiber.regs[ins.regOrSlot] = fiber.regs[ins.regs.srcA & 7u];
+                }
+                ++fiber.pc;
+                break;
+            case Opcode::Add:
+                if (ins.regOrSlot < fiber.regs.size()) {
+                    fiber.regs[ins.regOrSlot] =
+                        fiber.regs[ins.regs.srcA & 7u] + fiber.regs[ins.regs.srcB & 7u];
+                }
+                ++fiber.pc;
+                break;
+            case Opcode::Sub:
+                if (ins.regOrSlot < fiber.regs.size()) {
+                    fiber.regs[ins.regOrSlot] =
+                        fiber.regs[ins.regs.srcA & 7u] - fiber.regs[ins.regs.srcB & 7u];
+                }
+                ++fiber.pc;
+                break;
+            case Opcode::Mul:
+                if (ins.regOrSlot < fiber.regs.size()) {
+                    fiber.regs[ins.regOrSlot] =
+                        fiber.regs[ins.regs.srcA & 7u] * fiber.regs[ins.regs.srcB & 7u];
+                }
+                ++fiber.pc;
+                break;
+            case Opcode::Div:
+                if (ins.regOrSlot < fiber.regs.size()) {
+                    std::int32_t rhs = fiber.regs[ins.regs.srcB & 7u];
+                    fiber.regs[ins.regOrSlot] = (rhs != 0) ? (fiber.regs[ins.regs.srcA & 7u] / rhs) : 0;
+                }
+                ++fiber.pc;
+                break;
+            case Opcode::Mod:
+                if (ins.regOrSlot < fiber.regs.size()) {
+                    std::int32_t rhs = fiber.regs[ins.regs.srcB & 7u];
+                    fiber.regs[ins.regOrSlot] = (rhs != 0) ? (fiber.regs[ins.regs.srcA & 7u] % rhs) : 0;
+                }
+                ++fiber.pc;
+                break;
+            case Opcode::CmpEq:
+                if (ins.regOrSlot < fiber.regs.size()) {
+                    fiber.regs[ins.regOrSlot] =
+                        (fiber.regs[ins.regs.srcA & 7u] == fiber.regs[ins.regs.srcB & 7u]) ? 1 : 0;
+                }
+                ++fiber.pc;
+                break;
+            case Opcode::CmpNe:
+                if (ins.regOrSlot < fiber.regs.size()) {
+                    fiber.regs[ins.regOrSlot] =
+                        (fiber.regs[ins.regs.srcA & 7u] != fiber.regs[ins.regs.srcB & 7u]) ? 1 : 0;
+                }
+                ++fiber.pc;
+                break;
+            case Opcode::CmpLt:
+                if (ins.regOrSlot < fiber.regs.size()) {
+                    fiber.regs[ins.regOrSlot] =
+                        (fiber.regs[ins.regs.srcA & 7u] < fiber.regs[ins.regs.srcB & 7u]) ? 1 : 0;
+                }
+                ++fiber.pc;
+                break;
+            case Opcode::CmpLe:
+                if (ins.regOrSlot < fiber.regs.size()) {
+                    fiber.regs[ins.regOrSlot] =
+                        (fiber.regs[ins.regs.srcA & 7u] <= fiber.regs[ins.regs.srcB & 7u]) ? 1 : 0;
+                }
+                ++fiber.pc;
+                break;
+            case Opcode::CmpGt:
+                if (ins.regOrSlot < fiber.regs.size()) {
+                    fiber.regs[ins.regOrSlot] =
+                        (fiber.regs[ins.regs.srcA & 7u] > fiber.regs[ins.regs.srcB & 7u]) ? 1 : 0;
+                }
+                ++fiber.pc;
+                break;
+            case Opcode::CmpGe:
+                if (ins.regOrSlot < fiber.regs.size()) {
+                    fiber.regs[ins.regOrSlot] =
+                        (fiber.regs[ins.regs.srcA & 7u] >= fiber.regs[ins.regs.srcB & 7u]) ? 1 : 0;
+                }
+                ++fiber.pc;
+                break;
+            case Opcode::Jump:
+                fiber.pc = ins.imm32;
+                break;
+            case Opcode::JumpIfZero:
+                if (fiber.regs[ins.regOrSlot & 7u] == 0) fiber.pc = ins.imm32;
+                else ++fiber.pc;
+                break;
+            case Opcode::JumpIfNonZero:
+                if (fiber.regs[ins.regOrSlot & 7u] != 0) fiber.pc = ins.imm32;
+                else ++fiber.pc;
+                break;
+            case Opcode::Call:
+                if (fiber.callDepth < fiber.callStack.size()) {
+                    fiber.callStack[fiber.callDepth++] = fiber.pc + 1;
+                    fiber.pc = ins.imm32;
+                } else {
+                    ++fiber.pc;
+                }
+                break;
+            case Opcode::Return:
+                if (fiber.callDepth > 0) {
+                    fiber.pc = fiber.callStack[--fiber.callDepth];
+                } else {
+                    out.killed = true;
+                    return;
+                }
+                break;
+            case Opcode::RandJump: {
+                std::uint8_t roll = fiber.prng.nextByte255();
+                if (roll < ins.flags) fiber.pc = ins.imm32;
+                else ++fiber.pc;
+                break;
+            }
+            case Opcode::HostCondJump: {
+                bool cond = false;
+                if (host_ != nullptr) {
+                    std::lock_guard<std::mutex> lock(hostMutex);
+                    cond = host_->onEvaluateCondition(fiber, ins.flags, ins.regs.srcA, ins.regs.srcB);
+                }
+                if (cond) fiber.pc = ins.regOrSlot;
+                else ++fiber.pc;
+                break;
+            }
+            case Opcode::YieldTicks: {
+                std::uint32_t waitTicks = ins.imm32;
+                if (ins.flags > 0) {
+                    waitTicks = fiber.prng.nextRange(ins.regOrSlot, static_cast<std::uint16_t>(ins.imm32));
+                }
+                ++fiber.pc;
+                out.sleepScheduled = true;
+                out.wakeTick = currentTick + (waitTicks > 0 ? waitTicks : 1u);
+                return;
+            }
+            case Opcode::YieldUntilPredicate: {
+                ++fiber.pc;
+                fiber.status = FiberStatus::WaitingPredicate;
+                fiber.waitPredicateChannel = ins.flags;
+                fiber.waitTargetKey = ins.regOrSlot;
+                fiber.waitRequiredValue = ins.imm32;
+                out.predicateWait = true;
+                return;
+            }
+            case Opcode::ForkFiber: {
+                out.forked = true;
+                out.forkProgramId = fiber.programId;
+                out.forkTargetPc = ins.imm32;
+                out.forkEntity = fiber.boundEntity;
+                out.forkGroup = fiber.ownerGroupId;
+                out.forkSeed = fiber.prng.nextUInt32();
+                ++fiber.pc;
+                out.sleepScheduled = true;
+                out.wakeTick = currentTick + 1;
+                return;
+            }
+            case Opcode::KillFiber:
+                out.killed = true;
+                return;
+            case Opcode::SetUnbreakable:
+                fiber.unbreakableSection = (ins.flags != 0);
+                ++fiber.pc;
+                break;
+            case Opcode::HostCommand:
+                if (host_) {
+                    std::lock_guard<std::mutex> lock(hostMutex);
+                    host_->onHostCommand(fiber, ins.flags, ins.regOrSlot, ins.imm32);
+                }
+                ++fiber.pc;
+                break;
+            default:
+                ++fiber.pc;
+                break;
+            }
+        }
+        if (fiber.pc >= code.size()) {
+            out.killed = true;
+        } else if (fiber.status == FiberStatus::Ready) {
+            out.sleepScheduled = true;
+            out.wakeTick = currentTick + 1;
+        }
+    };
+
+    const std::size_t numThreads = std::min<std::size_t>(workerCount, batch.size());
+    std::vector<std::thread> workers;
+    workers.reserve(numThreads);
+    for (std::size_t t = 0; t < numThreads; ++t) {
+        workers.emplace_back([&, t, numThreads]() {
+            for (std::size_t idx = t; idx < batch.size(); idx += numThreads) {
+                runIsolatedFiber(idx);
+            }
+        });
+    }
+    for (auto& w : workers) {
+        if (w.joinable()) w.join();
+    }
+
+    std::uint64_t totalInstr = 0;
+    for (const auto& out : outcomes) {
+        totalInstr += out.instructions;
+        if (out.killed) {
+            killFiberTree(out.fiberId);
+            continue;
+        }
+        if (out.sleepScheduled) {
+            scheduleAtTick(out.fiberId, out.wakeTick);
+        }
+        if (out.predicateWait) {
+            predicateWaitList_.push_back(out.fiberId);
+        }
+        if (out.forked) {
+            spawnFiberByProgram(
+                out.forkProgramId,
+                out.forkTargetPc,
+                out.forkEntity,
+                out.forkGroup,
+                out.fiberId,
+                out.forkSeed);
+        }
+    }
+
+    for (std::size_t idx = 0; idx < readyQueue_.size(); ++idx) {
+        std::uint32_t fid = readyQueue_[idx];
+        if (fid == 0 || fid >= fibers_.size()) continue;
+        auto& fiber = fibers_[fid];
+        if (fiber.status != FiberStatus::Ready) continue;
+        executeFiberSlice(fiber, currentTick, totalInstr);
+    }
+    readyQueue_.clear();
+    return totalInstr;
 }
 
 void FiberScheduler::executeFiberSlice(

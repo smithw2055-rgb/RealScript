@@ -47,6 +47,11 @@ struct TextEdit {
     std::string replacement;
 };
 
+struct ContentChange {
+    std::optional<debug::SourceRange> range;
+    std::string text;
+};
+
 struct ParameterInfo {
     std::string label;
     std::string type;
@@ -68,6 +73,11 @@ class LanguageService {
 public:
     void open(std::string path, std::string content, std::int64_t version = 1);
     void update(std::string path, std::string content, std::int64_t version);
+    bool applyContentChanges(
+        const std::string& path,
+        const std::vector<ContentChange>& changes,
+        std::int64_t version);
+    [[nodiscard]] std::string documentContent(const std::string& path) const;
     void close(const std::string& path);
 
     void setAmbientSources(std::vector<compiler::SourceFile> sources);

@@ -5,6 +5,8 @@
 #include "realscript/game/GameplayScripting.h"
 #include "realscript/tooling/LanguageService.h"
 #include "realscript/tooling/LspServer.h"
+#include "realscript/optimization/Optimizer.h"
+#include "realscript/aot_cpp/AotCpp.h"
 
 #include <cstdint>
 #include <iostream>
@@ -1871,6 +1873,436 @@ class Party
         "chained completion '(party).members[0].weapon.' should resolve Weapon members through parenthesized receiver and array element indexing");
 }
 
+void testCompleteEvolutionMilestones() {
+    using namespace realscript;
+
+    // 1. O2 MIR Function Inlining, LICM, and Struct Field Forwarding (SROA)
+    {
+        const char* optSrc = R"RS(
+module Evolution.Opt;
+
+struct DamageInfo {
+    int baseDmg;
+    int bonusDmg;
+}
+
+int computeLeafBonus(int x) {
+    return x * 2 + 5;
+}
+
+int runOptimizedLoop(int n, double scale) {
+    DamageInfo info = new DamageInfo { baseDmg = 10, bonusDmg = 20 };
+    int forwarded = info.baseDmg + info.bonusDmg;
+    int acc = 0;
+    int i = 0;
+    while (i < n) {
+        double inv = scale * 2.5 + 1.0;
+        if (inv > 0.0) {
+            acc = acc + computeLeafBonus(forwarded);
+        }
+        i = i + 1;
+    }
+    return acc;
+}
+)RS";
+        compiler::Compilation comp;
+        comp.addSource({"opt_test.rs", optSrc});
+        auto build = comp.build();
+        require(!build.diagnostics.hasErrors(), "Evolution.Opt failed to compile");
+
+        diagnostics::DiagnosticBag optDiag;
+        optimization::Optimizer optimizer;
+        optimization::Options opts;
+        opts.level = optimization::Level::Aggressive;
+        auto optimized = optimizer.optimize(build.modules, optDiag, opts);
+        if (optDiag.hasErrors()) { for (const auto& d : optDiag.items()) std::cerr << d.code << ": " << d.message << "\n"; }
+        require(!optDiag.hasErrors(), "Evolution.Opt O2 optimization emitted errors");
+        require(optimized.statistics.functionsInlined >= 1,
+            "O2 optimizer should inline computeLeafBonus");
+        require(optimized.statistics.structFieldsForwarded >= 2,
+            "O2 optimizer should forward DamageInfo struct fields");
+        require(optimized.statistics.loopInvariantsHoisted >= 1,
+            "O2 optimizer should hoist loop-invariant double expression");
+
+        bytecode::Lowerer lowerer;
+        std::vector<bytecode::Module> bc;
+        for (const auto& m : optimized.modules) bc.push_back(lowerer.lower(m));
+        runtime::Interpreter interp(std::move(bc));
+        const auto res = interp.invoke("Evolution.Opt::runOptimizedLoop", {std::int64_t{4}, 2.0});
+        require(res.succeeded && std::get<std::int64_t>(res.value) == 4 * (30 * 2 + 5),
+            "Evolution.Opt result mismatch");
+    }
+
+    // 2. Typed AOT expansion for Enum, Object fields, Array elements, and UnboxedCustomStruct
+    {
+        const char* aotSrc = R"RS(
+module Evolution.TypedAot;
+
+enum StateKind {
+    Idle = 0,
+    Active = 2
+}
+
+struct StatBlock {
+    int attack;
+    int defense;
+}
+
+class UnitActor {
+    public int hp;
+    public UnitActor(int initHp) {
+        hp = initHp;
+    }
+}
+
+int evaluateActorAndArray(UnitActor actor, int[] scores, StateKind st) {
+    StatBlock sb = new StatBlock { attack = 15, defense = 5 };
+    int total = sb.attack + sb.defense;
+    if (st == StateKind.Active) {
+        actor.hp = actor.hp + total;
+    }
+    int i = 0;
+    while (i < scores.Length) {
+        scores[i] = scores[i] + actor.hp;
+        total = total + scores[i];
+        i = i + 1;
+    }
+    return total;
+}
+)RS";
+        compiler::Compilation comp;
+        comp.addSource({"typed_aot_obj.rs", aotSrc});
+        auto build = comp.build();
+        require(!build.diagnostics.hasErrors(), "Evolution.TypedAot failed to compile");
+
+        diagnostics::DiagnosticBag aotDiag;
+        aot::CppGenerator gen;
+        aot::GenerationOptions genOpts;
+        genOpts.programName = "EvolutionTypedAotObj";
+        auto generated = gen.generate(build.modules, aotDiag, genOpts);
+        require(!aotDiag.hasErrors(), "Evolution.TypedAot C++ codegen failed");
+        require(
+            generated.source.find("_scalar(") != std::string::npos && generated.source.find("context.initUnboxedStruct") != std::string::npos,
+            "evaluateActorAndArray (with Object, Array, Enum, and custom Struct) must emit _scalar fast-path");
+    }
+
+    // 3. Packed Array Bulk Transfer & Generational GC Nursery (`collectYoung`) & `using` statement
+    {
+        const char* usingSrc = R"RS(
+module Evolution.ResourceAndGc;
+
+public class DisposableBuffer {
+    public static int disposeCount = 0;
+    public int id;
+
+    public DisposableBuffer(int v) {
+        id = v;
+    }
+
+    public void Dispose() {
+        disposeCount = disposeCount + id;
+    }
+}
+
+public int runUsingNormal(int v) {
+    using (DisposableBuffer buf = new DisposableBuffer(v)) {
+        return buf.id * 10;
+    }
+}
+
+public int runUsingEarlyReturn(int v) {
+    using (DisposableBuffer buf = new DisposableBuffer(v)) {
+        if (v > 0) {
+            return buf.id + 100;
+        }
+    }
+    return 0;
+}
+)RS";
+        game::GameApi api;
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"using_test.rs", usingSrc}});
+        require(compiled.succeeded(), "Evolution.ResourceAndGc failed to compile");
+        game::ScriptRuntime rt(compiled.program);
+
+        runtime::Interpreter interp(compiled.program.program(), compiled.program.heap());
+        const auto r1 = interp.invoke("Evolution.ResourceAndGc::runUsingNormal", {std::int64_t{7}});
+        require(r1.succeeded && std::get<std::int64_t>(r1.value) == 70, "runUsingNormal failed");
+        const auto r2 = interp.invoke("Evolution.ResourceAndGc::runUsingEarlyReturn", {std::int64_t{5}});
+        require(r2.succeeded && std::get<std::int64_t>(r2.value) == 105, "runUsingEarlyReturn failed");
+
+        // Verify Generational GC nursery collection & promotion
+        auto heap = compiled.program.heap();
+        runtime::RuntimeError heapErr;
+        auto transientStr = heap->allocateString("transient_nursery_string", &heapErr);
+        auto survivedStr = heap->allocateString("survived_nursery_string", &heapErr);
+        require(transientStr.has_value() && survivedStr.has_value(), "nursery string alloc failed");
+        auto root = heap->retain(*survivedStr);
+        require(heap->nurserySize() >= 2, "nursery should contain newly allocated objects");
+
+        runtime::ShadowStack emptyStack;
+        const std::size_t processed = heap->collectYoung(emptyStack);
+        require(processed >= 2, "collectYoung should process nursery slots");
+        require(!heap->isAlive(*transientStr), "unrooted nursery object should be reclaimed by collectYoung");
+        require(heap->isAlive(*survivedStr), "rooted nursery object should survive collectYoung and be promoted");
+        require(heap->statistics().youngCollections >= 1 &&
+                heap->statistics().youngObjectsReclaimed >= 1 &&
+                heap->statistics().objectsPromoted >= 1,
+            "GcStatistics should record youngCollections, youngObjectsReclaimed, and objectsPromoted");
+
+        // Verify Packed Array Bulk Transfer
+        auto intArr = heap->allocateTypedArray(
+            0, semantic::PrimitiveType::Int, 0, 4, std::int64_t{0}, &heapErr);
+        require(intArr.has_value(), "failed to allocate int array");
+        std::vector<std::int64_t> srcInts{10, 20, 30, 40};
+        require(rt.writeArrayInt(*intArr, srcInts, heapErr), "writeArrayInt failed");
+        std::vector<std::int64_t> dstInts;
+        require(rt.readArrayInt(*intArr, dstInts, heapErr) && dstInts == srcInts,
+            "readArrayInt round-trip mismatch");
+
+        auto vec2Arr = heap->allocateTypedArray(
+            0, semantic::PrimitiveType::Struct, runtime::vec2TypeId(), 2,
+            runtime::Vec2Value{0, 0}, &heapErr);
+        require(vec2Arr.has_value(), "failed to allocate Vec2 array");
+        std::vector<game::Vec2> srcVecs{game::Vec2::of(3, 4), game::Vec2::of(5, 6)};
+        require(rt.writeArrayVec2(*vec2Arr, srcVecs, heapErr), "writeArrayVec2 failed");
+        std::vector<game::Vec2> dstVecs;
+        require(rt.readArrayVec2(*vec2Arr, dstVecs, heapErr) && dstVecs == srcVecs,
+            "readArrayVec2 round-trip mismatch");
+        require(!rt.writeArrayInt(*vec2Arr, srcInts, heapErr) &&
+                heapErr.code == runtime::ErrorCode::TypeMismatch,
+            "writeArrayInt on a Vec2[] array must be rejected with TypeMismatch");
+    }
+
+    // 4. Fixed64 (Q32.32), Trigonometric Quat::slerp, and 3D Spatial Math (Vec4, Mat4, Transform3D, AABB, Ray)
+    {
+        const auto f64A = game::Fixed64::fromInt(100000);
+        const auto f64B = game::Fixed64::fromInt(3);
+        const auto f64Prod = f64A * f64B;
+        require(f64Prod.toIntFloor() == 300000, "Fixed64 multiplication failed");
+        const auto f64Div = f64Prod / f64B;
+        require(f64Div.toIntFloor() == 100000, "Fixed64 division failed");
+        // Verify Fixed64 division by small fractional divisor (0 < rhs.raw < 65536) does not divide-by-zero
+        const auto f64Tiny = game::Fixed64::fromRaw(1024); // 2^-22
+        const auto f64One = game::Fixed64::fromInt(1);
+        const auto f64TinyQuot = f64One / f64Tiny;
+        require(f64TinyQuot.toIntFloor() == (1LL << 22),
+            "Fixed64 division by sub-2^-16 fraction failed");
+
+        const auto q0 = game::Quat::identity();
+        const auto q90 = game::Quat::fromAxisAngle(game::Vec3::of(0, 0, 1), game::fixedHalfPi());
+        const auto qMid = game::Quat::slerp(q0, q90, game::Fixed::fromRaw(128));
+        const auto rotatedX = qMid.rotate(game::Vec3::of(1, 0, 0));
+        require(rotatedX.x.raw > 170 && rotatedX.x.raw < 190 &&
+                rotatedX.y.raw > 170 && rotatedX.y.raw < 190,
+            "trigonometric Quat::slerp at t=0.5 of 90 deg Z rotation should rotate (1,0,0) to (~0.707, ~0.707, 0)");
+
+        const game::Transform3D parentTf{
+            game::Vec3::of(10, 0, 0),
+            game::Quat::identity(),
+            game::Vec3::of(2, 2, 2)};
+        const game::Transform3D childTf{
+            game::Vec3::of(3, 4, 0),
+            game::Quat::identity(),
+            game::Vec3::of(1, 1, 1)};
+        const auto worldTf = game::Transform3D::combine(parentTf, childTf);
+        require(worldTf.position == game::Vec3::of(16, 8, 0),
+            "Transform3D::combine position mismatch");
+
+        const auto box = game::AABB::fromCenterExtents(game::Vec3::of(10, 0, 0), game::Vec3::of(2, 2, 2));
+        const game::Ray ray{game::Vec3::of(0, 0, 0), game::Vec3::of(1, 0, 0)};
+        game::Fixed hitT{};
+        require(ray.intersectsAABB(box, &hitT) && hitT == game::Fixed::fromInt(8),
+            "Ray::intersectsAABB should hit box at t = 8");
+    }
+
+    // 5. Scene Transform Hierarchy, DefaultExecutionOrder, RequireComponent, Prefab Instantiation, and AsyncOperation (`wait_async`)
+    {
+        auto host = std::make_shared<game::GameplayHost>(60);
+        game::GameApi api;
+        require(game::installGameplayBindings(api, host), "installGameplayBindings failed");
+
+        const char* sceneSrc = R"RS(
+module Evolution.SceneHierarchy;
+import RealScript.Game;
+import RealScript.Math;
+
+public class OrderTracker {
+    public static int logValue = 0;
+}
+
+[DefaultExecutionOrder(-10)]
+public class EarlySystem {
+    public void OnUpdate(double dt) {
+        OrderTracker.logValue = OrderTracker.logValue * 10 + 1;
+    }
+}
+
+[DefaultExecutionOrder(20)]
+[RequireComponent("EarlySystem")]
+public class LateSystem {
+    public int customPower = 1;
+    public int asyncDoneValue = 0;
+
+    public void OnUpdate(double dt) {
+        OrderTracker.logValue = OrderTracker.logValue * 10 + 2;
+    }
+
+    public sequence RunAsyncLoad(long selfEntity, long opId) {
+        yield wait_async(opId);
+        asyncDoneValue = GetAsyncOperationResultInt(opId) + customPower;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"scene_hierarchy.rs", sceneSrc}});
+        require(compiled.succeeded(), "Evolution.SceneHierarchy failed to compile");
+
+        game::ScriptRuntime rt(compiled.program);
+        game::SceneScriptRuntime scene(rt);
+
+        // Verify [RequireComponent("EarlySystem")] blocks attaching LateSystem before EarlySystem
+        require(!scene.attachComponent(1, "Evolution.SceneHierarchy::LateSystem"),
+            "RequireComponent should reject attaching LateSystem when EarlySystem is missing");
+        scene.clearErrors();
+
+        // Instantiate prefab with hierarchy and overrides
+        game::PrefabNodeTemplate rootPrefab;
+        rootPrefab.name = "Root";
+        rootPrefab.localTransform = game::Transform3D{
+            game::Vec3::of(5, 10, 0), game::Quat::identity(), game::Vec3::of(1, 1, 1)};
+        rootPrefab.components.push_back({"Evolution.SceneHierarchy::EarlySystem", {}});
+        rootPrefab.components.push_back({"Evolution.SceneHierarchy::LateSystem", {}});
+
+        game::PrefabNodeTemplate childPrefab;
+        childPrefab.name = "Child";
+        childPrefab.localTransform = game::Transform3D{
+            game::Vec3::of(3, 4, 0), game::Quat::identity(), game::Vec3::of(1, 1, 1)};
+        childPrefab.components.push_back({"Evolution.SceneHierarchy::EarlySystem", {}});
+        rootPrefab.children.push_back(childPrefab);
+
+        game::SceneEntityId nextId = 100;
+        const auto rootId = scene.instantiatePrefab(
+            rootPrefab, nextId, 0, {{"customPower", std::int64_t{42}}});
+        require(rootId == 100, "instantiatePrefab rootId mismatch");
+        const auto children = scene.getChildren(rootId);
+        require(children.size() == 1 && children[0] == 101, "instantiatePrefab childId mismatch");
+        require(scene.getParent(101) == 100, "getParent mismatch");
+        require(scene.getWorldPosition2D(101) == game::Vec2::of(8, 14),
+            "child world position should combine parent (5,10) + child (3,4) = (8,14)");
+        require(scene.getComponentInParent(101, "LateSystem") != nullptr,
+            "getComponentInParent should find LateSystem on parent entity 100");
+        require(scene.getComponentInChildren(100, "EarlySystem") != nullptr,
+            "getComponentInChildren should find EarlySystem");
+
+        scene.start();
+        scene.update(1.0 / 60.0);
+        // Both entity 100 and 101 have EarlySystem (-10), and entity 100 has LateSystem (+20)
+        // Execution order must be: EarlySystem(100) -> EarlySystem(101) -> LateSystem(100) => 112
+        auto* lateObj = scene.getComponent(100, "LateSystem");
+        require(lateObj != nullptr, "LateSystem not found on root");
+
+        // Test deterministic AsyncOperation + yield wait_async(opId)
+        const auto opId = host->createAsyncOperation("LoadLevelChunk");
+        const auto startSeqRes = scene.invokeComponent(
+            100, "LateSystem", "RunAsyncLoad",
+            {runtime::LongValue{100}, runtime::LongValue{static_cast<std::int64_t>(opId)}});
+        require(startSeqRes.succeeded, "RunAsyncLoad failed to start");
+
+        game::SceneGameplayDriver driver(scene, host);
+        (void)driver.step();
+        runtime::RuntimeError memberErr;
+        auto doneBefore = rt.getMember(*lateObj, "asyncDoneValue", memberErr);
+        require(doneBefore && std::get<std::int64_t>(*doneBefore) == 0,
+            "asyncDoneValue should be 0 before CompleteAsyncOperation");
+
+        require(host->completeAsyncOperation(opId, game::GameplayValue{std::int32_t{58}}, 1),
+            "completeAsyncOperation failed");
+        (void)driver.step();
+        auto doneAfter = rt.getMember(*lateObj, "asyncDoneValue", memberErr);
+        require(doneAfter && std::get<std::int64_t>(*doneAfter) == 100,
+            "wait_async should wake on tick boundary and compute 58 + 42 = 100");
+
+        // Cascading detach of parent 100 must also detach child 101
+        require(scene.detach(100), "detach(100) failed");
+        require(scene.componentCount(101) == 0, "cascading detach should remove child 101");
+    }
+
+    // 6. Multi-threaded FiberScheduler::stepTickParallel determinism parity
+    {
+        std::vector<runtime::CompactInstruction> prog{
+            {runtime::FiberOpcode::LoadInt, 0, 0, 10},
+            {runtime::FiberOpcode::LoadInt, 0, 1, 20},
+            {runtime::FiberOpcode::Add, 0, 2, 0, 1},
+            {runtime::FiberOpcode::YieldTicks, 0, 0, 1},
+            {runtime::FiberOpcode::Add, 0, 2, 2, 1},
+            {runtime::FiberOpcode::Return, 0, 0, 0},
+        };
+        runtime::FiberScheduler seqSched;
+        runtime::FiberScheduler parSched;
+        for (std::uint32_t i = 1; i <= 16; ++i) {
+            seqSched.spawnFiber(prog, 0, {i, 1}, static_cast<std::uint8_t>(i & 3u), 0, 12345u + i);
+            parSched.spawnFiber(prog, 0, {i, 1}, static_cast<std::uint8_t>(i & 3u), 0, 12345u + i);
+        }
+        for (std::uint32_t tick = 1; tick <= 4; ++tick) {
+            const auto seqIns = seqSched.stepTick(tick);
+            const auto parIns = parSched.stepTickParallel(tick, 4);
+            require(seqIns == parIns, "stepTickParallel instruction count diverged from stepTick");
+            require(seqSched.computeLockstepDigest() == parSched.computeLockstepDigest(),
+                "stepTickParallel lockstep digest diverged from stepTick");
+        }
+    }
+
+    // 7. LSP Incremental Document Sync (`textDocumentSync: 2`) & C++ Header Auto-Binding Generator
+    {
+        tooling::LspServer lsp;
+        std::ostringstream notifications;
+        const auto initResp = lsp.handle(tooling::Json::Object{
+            {"jsonrpc", "2.0"},
+            {"id", 1},
+            {"method", "initialize"},
+            {"params", tooling::Json::Object{}},
+        }, &notifications);
+        const auto* syncKind = initResp.find("result")->find("capabilities")->find("textDocumentSync");
+        require(syncKind && syncKind->integerValue() == 2,
+            "LSP server should advertise textDocumentSync = 2 (Incremental)");
+
+        tooling::LanguageService ls;
+        ls.open("inc.rs", "module Inc;\nint val() {\n    return 10;\n}\n", 1);
+        debug::SourceRange editRange{};
+        editRange.start = {3, 12};
+        editRange.end = {3, 14};
+        require(ls.applyContentChanges("inc.rs", {{editRange, "42"}}, 2),
+            "applyContentChanges failed");
+        require(ls.documentContent("inc.rs").find("return 42;") != std::string::npos,
+            "incremental range edit did not produce 'return 42;'");
+        require(ls.diagnostics("inc.rs").empty(),
+            "incrementally edited document should have zero diagnostics");
+
+        const char* sampleHeader = R"CPP(
+        RS_EXPORT_CLASS("Game.Native")
+        class PhysicsBody {
+        public:
+            RS_EXPORT_METHOD
+            void ApplyImpulse(const Vec2 &impulse);
+            RS_EXPORT_METHOD
+            float GetMass();
+        };
+        RS_EXPORT_FUNCTION("Game.Native")
+        int StepPhysicsWorld(int subSteps);
+        )CPP";
+        const auto genBind = game::GameApi::generateBindingsFromCppHeader(sampleHeader, "Game.Native");
+        require(genBind.classesExported == 1 &&
+                genBind.methodsExported == 2 &&
+                genBind.functionsExported == 1 &&
+                genBind.cppRegistrationSource.find("PhysicsBody::ApplyImpulse") != std::string::npos &&
+                genBind.scriptDeclarationStub.find("class PhysicsBody") != std::string::npos &&
+                genBind.scriptDeclarationStub.find("void ApplyImpulse(Vec2 impulse)") != std::string::npos &&
+                genBind.scriptDeclarationStub.find("float GetMass()") != std::string::npos,
+            "generateBindingsFromCppHeader failed to generate C++ registration and .d.rs stub");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1897,8 +2329,10 @@ int main() {
         testBoostStage1InlineMathAndValueSpanBindings();
         std::cout << "[11/12] testBoostStage2ConstStaticStringInterpolationMathAndContainers..." << std::endl;
         testBoostStage2ConstStaticStringInterpolationMathAndContainers();
-        std::cout << "[12/12] testBoostStage3LspExactSymbolIdReferencesRenameAndChainedCompletion..." << std::endl;
+        std::cout << "[12/13] testBoostStage3LspExactSymbolIdReferencesRenameAndChainedCompletion..." << std::endl;
         testBoostStage3LspExactSymbolIdReferencesRenameAndChainedCompletion();
+        std::cout << "[13/13] testCompleteEvolutionMilestones..." << std::endl;
+        testCompleteEvolutionMilestones();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

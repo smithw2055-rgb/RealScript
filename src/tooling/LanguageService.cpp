@@ -50,6 +50,56 @@ void LanguageService::update(std::string path, std::string content, std::int64_t
     open(std::move(path), std::move(content), version);
 }
 
+bool LanguageService::applyContentChanges(
+    const std::string& path,
+    const std::vector<ContentChange>& changes,
+    std::int64_t version) {
+    auto it = documents_.find(path);
+    if (it == documents_.end()) {
+        if (changes.empty()) return false;
+        documents_[path] = {std::string{}, version};
+        it = documents_.find(path);
+    }
+    std::string& content = it->second.content;
+    it->second.version = version;
+
+    const auto lineColToOffset = [](const std::string& text, std::size_t line1, std::size_t col1) -> std::size_t {
+        std::size_t curLine = 1;
+        std::size_t idx = 0;
+        while (idx < text.size() && curLine < line1) {
+            if (text[idx] == '\n') ++curLine;
+            ++idx;
+        }
+        std::size_t curCol = 1;
+        while (idx < text.size() && text[idx] != '\n' && text[idx] != '\r' && curCol < col1) {
+            ++idx;
+            ++curCol;
+        }
+        return idx;
+    };
+
+    for (const auto& change : changes) {
+        if (!change.range.has_value()) {
+            content = change.text;
+        } else {
+            const auto& rng = *change.range;
+            const std::size_t startOff = lineColToOffset(
+                content, rng.start.line, rng.start.column);
+            const std::size_t endOff = std::max(
+                startOff,
+                lineColToOffset(content, rng.end.line, rng.end.column));
+            content.replace(startOff, endOff - startOff, change.text);
+        }
+    }
+    dirty_ = true;
+    return true;
+}
+
+std::string LanguageService::documentContent(const std::string& path) const {
+    const auto* doc = document(path);
+    return doc ? doc->content : std::string{};
+}
+
 void LanguageService::close(const std::string& path) {
     documents_.erase(path);
     dirty_ = true;

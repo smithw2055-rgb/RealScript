@@ -374,6 +374,7 @@ public:
 
     void killFiberTree(std::uint32_t rootFiberId) noexcept;
     std::uint64_t stepTick(std::uint32_t currentTick);
+    std::uint64_t stepTickParallel(std::uint32_t currentTick, std::size_t workerCount = 2);
 
     /**
      * Wakes all fibers waiting on `(ownerGroupId, predicateChannel, targetKey)`

@@ -1,3 +1,4 @@
+#include <cstring>
 #include "realscript/game/GameScripting.h"
 #include "realscript/game/GameplayMetadata.h"
 
@@ -28,6 +29,47 @@ bool hasEditModeAttribute(
         }
     }
     return false;
+}
+
+int findExecutionOrderAttribute(
+    const runtime::ProgramImage* program,
+    const std::string& canonicalTypeName) {
+    if (!program) return 0;
+    for (const auto& module : program->modules()) {
+        for (const auto& attr : module.languageMetadata.attributes) {
+            if (attr.target == canonicalTypeName &&
+                (attr.name == "DefaultExecutionOrder" || attr.name == "ExecutionOrder") &&
+                !attr.arguments.empty()) {
+                try {
+                    return std::stoi(attr.arguments.front().value);
+                } catch (...) {
+                    return 0;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+std::vector<std::string> findRequiredComponents(
+    const runtime::ProgramImage* program,
+    const std::string& canonicalTypeName) {
+    std::vector<std::string> required;
+    if (!program) return required;
+    for (const auto& module : program->modules()) {
+        for (const auto& attr : module.languageMetadata.attributes) {
+            if (attr.target == canonicalTypeName &&
+                attr.name == "RequireComponent" &&
+                !attr.arguments.empty()) {
+                std::string val = attr.arguments.front().value;
+                if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
+                    val = val.substr(1, val.size() - 2);
+                }
+                if (!val.empty()) required.push_back(std::move(val));
+            }
+        }
+    }
+    return required;
 }
 
 std::string findRenamedFieldSource(
@@ -125,6 +167,8 @@ void SceneScriptRuntime::bindLifecycleMethods(Instance& instance) const {
     instance.onValidate = runtime_.findMethod(type, "OnValidate", 0);
     instance.executeInEditMode = hasEditModeAttribute(
         runtime_.program().get(), type.canonicalName());
+    instance.executionOrder = findExecutionOrderAttribute(
+        runtime_.program().get(), type.canonicalName());
 }
 
 bool SceneScriptRuntime::shouldTickInCurrentMode(
@@ -192,6 +236,19 @@ bool SceneScriptRuntime::attachComponent(
         recordError(entity, "OnCreate", error);
         return false;
     }
+    for (const auto& reqType : findRequiredComponents(
+             runtime_.program().get(), object->type().canonicalName())) {
+        if (!hasComponent(entity, reqType)) {
+            error.code = runtime::ErrorCode::InvalidArguments;
+            error.message = "missing required component '" + reqType +
+                "' for '" + object->type().canonicalName() + "'";
+            recordError(entity, "RequireComponent", error);
+            return false;
+        }
+    }
+    if (entityActiveSelf_.find(entity) == entityActiveSelf_.end()) {
+        entityActiveSelf_[entity] = true;
+    }
     for (auto& [name, value] : options.initialMembers) {
         if (!runtime_.setMember(*object, name, std::move(value), error, executionOptions_)) {
             recordError(entity, "SetMember:" + name, error);
@@ -231,6 +288,27 @@ bool SceneScriptRuntime::attachComponent(
 }
 
 bool SceneScriptRuntime::detach(SceneEntityId entity) {
+    const auto childrenIt = childrenByEntity_.find(entity);
+    if (childrenIt != childrenByEntity_.end()) {
+        const auto childrenCopy = childrenIt->second;
+        for (const auto child : childrenCopy) {
+            (void)detach(child);
+        }
+        childrenByEntity_.erase(entity);
+    }
+    const auto parentIt = parentByEntity_.find(entity);
+    if (parentIt != parentByEntity_.end()) {
+        const auto parentId = parentIt->second;
+        parentByEntity_.erase(parentIt);
+        const auto pChildrenIt = childrenByEntity_.find(parentId);
+        if (pChildrenIt != childrenByEntity_.end()) {
+            auto& vec = pChildrenIt->second;
+            vec.erase(std::remove(vec.begin(), vec.end(), entity), vec.end());
+        }
+    }
+    entityActiveSelf_.erase(entity);
+    localTransforms_.erase(entity);
+
     const auto found = instances_.find(entity);
     if (found == instances_.end()) return false;
     for (auto& instance : found->second) {
@@ -285,6 +363,41 @@ bool SceneScriptRuntime::setEnabled(SceneEntityId entity, bool enabled) {
         return false;
     }
     instance.enabled = enabled;
+    bool anyComponentEnabled = false;
+    for (const auto& comp : found->second) {
+        if (comp.enabled) {
+            anyComponentEnabled = true;
+            break;
+        }
+    }
+    entityActiveSelf_[entity] = anyComponentEnabled;
+
+    // Cascade OnEnable / OnDisable to active child entities in hierarchy
+    const auto notifySubtree = [&](const auto& self, SceneEntityId parentNode) -> void {
+        const auto chIt = childrenByEntity_.find(parentNode);
+        if (chIt == childrenByEntity_.end()) return;
+        for (const auto childId : chIt->second) {
+            const auto childSelfIt = entityActiveSelf_.find(childId);
+            const bool childSelfActive = (childSelfIt == entityActiveSelf_.end()) ? true : childSelfIt->second;
+            if (!childSelfActive) continue;
+            const auto childInstIt = instances_.find(childId);
+            if (childInstIt != instances_.end()) {
+                for (auto& childComp : childInstIt->second) {
+                    if (!childComp.enabled) continue;
+                    if (!enabled) {
+                        cancelActiveInstanceSequences(runtime_, childComp.object, executionOptions_);
+                    }
+                    const auto& cb = enabled ? childComp.onEnable : childComp.onDisable;
+                    (void)invokeLifecycle(
+                        childId, childComp, cb, {}, enabled ? "OnEnable" : "OnDisable");
+                }
+            }
+            self(self, childId);
+        }
+    };
+    if (isActiveInHierarchy(getParent(entity)) || getParent(entity) == 0) {
+        notifySubtree(notifySubtree, entity);
+    }
     return true;
 }
 
@@ -316,59 +429,127 @@ bool SceneScriptRuntime::setComponentEnabled(
 }
 
 void SceneScriptRuntime::start() {
+    struct TickItem {
+        int order = 0;
+        SceneEntityId entity = 0;
+        std::size_t compIndex = 0;
+        Instance* instance = nullptr;
+    };
+    std::vector<TickItem> items;
     for (auto& [entity, components] : instances_) {
-        for (auto& instance : components) {
+        if (!isActiveInHierarchy(entity)) continue;
+        for (std::size_t idx = 0; idx < components.size(); ++idx) {
+            auto& instance = components[idx];
             if (!instance.enabled || instance.started ||
                 !shouldTickInCurrentMode(instance)) {
                 continue;
             }
-            if (invokeLifecycle(entity, instance, instance.onStart, {}, "OnStart")) {
-                instance.started = true;
-            }
+            items.push_back(TickItem{instance.executionOrder, entity, idx, &instance});
+        }
+    }
+    std::sort(items.begin(), items.end(), [](const TickItem& a, const TickItem& b) {
+        if (a.order != b.order) return a.order < b.order;
+        if (a.entity != b.entity) return a.entity < b.entity;
+        return a.compIndex < b.compIndex;
+    });
+    for (auto& item : items) {
+        if (invokeLifecycle(item.entity, *item.instance, item.instance->onStart, {}, "OnStart")) {
+            item.instance->started = true;
         }
     }
 }
 
 void SceneScriptRuntime::update(double deltaTime) {
+    struct TickItem {
+        int order = 0;
+        SceneEntityId entity = 0;
+        std::size_t compIndex = 0;
+        Instance* instance = nullptr;
+    };
+    std::vector<TickItem> items;
     for (auto& [entity, components] : instances_) {
-        for (auto& instance : components) {
+        if (!isActiveInHierarchy(entity)) continue;
+        for (std::size_t idx = 0; idx < components.size(); ++idx) {
+            auto& instance = components[idx];
             if (!instance.enabled || !shouldTickInCurrentMode(instance)) continue;
             if (!instance.started && executionMode_ == SceneExecutionMode::Play) {
                 continue;
             }
-            (void)invokeLifecycle(
-                entity, instance, instance.onUpdate, {deltaTime}, "OnUpdate");
+            items.push_back(TickItem{instance.executionOrder, entity, idx, &instance});
         }
+    }
+    std::sort(items.begin(), items.end(), [](const TickItem& a, const TickItem& b) {
+        if (a.order != b.order) return a.order < b.order;
+        if (a.entity != b.entity) return a.entity < b.entity;
+        return a.compIndex < b.compIndex;
+    });
+    for (auto& item : items) {
+        (void)invokeLifecycle(
+            item.entity, *item.instance, item.instance->onUpdate, {deltaTime}, "OnUpdate");
     }
 }
 
 void SceneScriptRuntime::fixedUpdate(double fixedDeltaTime) {
+    struct TickItem {
+        int order = 0;
+        SceneEntityId entity = 0;
+        std::size_t compIndex = 0;
+        Instance* instance = nullptr;
+    };
+    std::vector<TickItem> items;
     for (auto& [entity, components] : instances_) {
-        for (auto& instance : components) {
+        if (!isActiveInHierarchy(entity)) continue;
+        for (std::size_t idx = 0; idx < components.size(); ++idx) {
+            auto& instance = components[idx];
             if (!instance.enabled || !shouldTickInCurrentMode(instance)) continue;
             if (!instance.started && executionMode_ == SceneExecutionMode::Play) {
                 continue;
             }
-            (void)invokeLifecycle(
-                entity,
-                instance,
-                instance.onFixedUpdate,
-                {fixedDeltaTime},
-                "OnFixedUpdate");
+            items.push_back(TickItem{instance.executionOrder, entity, idx, &instance});
         }
+    }
+    std::sort(items.begin(), items.end(), [](const TickItem& a, const TickItem& b) {
+        if (a.order != b.order) return a.order < b.order;
+        if (a.entity != b.entity) return a.entity < b.entity;
+        return a.compIndex < b.compIndex;
+    });
+    for (auto& item : items) {
+        (void)invokeLifecycle(
+            item.entity,
+            *item.instance,
+            item.instance->onFixedUpdate,
+            {fixedDeltaTime},
+            "OnFixedUpdate");
     }
 }
 
 void SceneScriptRuntime::lateUpdate(double deltaTime) {
+    struct TickItem {
+        int order = 0;
+        SceneEntityId entity = 0;
+        std::size_t compIndex = 0;
+        Instance* instance = nullptr;
+    };
+    std::vector<TickItem> items;
     for (auto& [entity, components] : instances_) {
-        for (auto& instance : components) {
+        if (!isActiveInHierarchy(entity)) continue;
+        for (std::size_t idx = 0; idx < components.size(); ++idx) {
+            auto& instance = components[idx];
             if (!instance.enabled || !shouldTickInCurrentMode(instance)) continue;
             if (!instance.started && executionMode_ == SceneExecutionMode::Play) {
                 continue;
             }
-            (void)invokeLifecycle(
-                entity, instance, instance.onLateUpdate, {deltaTime}, "OnLateUpdate");
+            items.push_back(TickItem{instance.executionOrder, entity, idx, &instance});
         }
+    }
+    std::sort(items.begin(), items.end(), [](const TickItem& a, const TickItem& b) {
+        if (a.order != b.order) return a.order < b.order;
+        if (a.entity != b.entity) return a.entity < b.entity;
+        return a.compIndex < b.compIndex;
+    });
+    for (auto& item : items) {
+        (void)invokeLifecycle(
+            item.entity, *item.instance, item.instance->onLateUpdate, {deltaTime}, "OnLateUpdate");
     }
 }
 
@@ -553,6 +734,7 @@ bool SceneScriptRuntime::setInspectorMember(
     runtime::Value value) {
     const auto found = instances_.find(entity);
     if (found == instances_.end()) return false;
+    runtime::RuntimeError lastError;
     for (auto& instance : found->second) {
         if (!scriptType.empty() &&
             !matchesComponentType(instance.object.type(), scriptType)) {
@@ -562,9 +744,13 @@ bool SceneScriptRuntime::setInspectorMember(
         if (!runtime_.setMember(
                 instance.object,
                 memberName,
-                std::move(value),
+                value,
                 error,
                 executionOptions_)) {
+            if (scriptType.empty()) {
+                lastError = std::move(error);
+                continue;
+            }
             recordError(entity, "SetInspectorMember:" + memberName, error);
             return false;
         }
@@ -575,6 +761,10 @@ bool SceneScriptRuntime::setInspectorMember(
             }
         }
         return true;
+    }
+    if (scriptType.empty() && !found->second.empty() &&
+        lastError.code != runtime::ErrorCode::None) {
+        recordError(entity, "SetInspectorMember:" + memberName, lastError);
     }
     return false;
 }
@@ -690,6 +880,173 @@ SceneScriptRuntime::findObjectLocation(runtime::ObjectRef reference) const {
         }
     }
     return std::nullopt;
+}
+
+bool SceneScriptRuntime::setParent(SceneEntityId child, SceneEntityId parent) {
+    if (child == BroadcastTarget || child == parent) return false;
+    // Prevent cycle in hierarchy
+    SceneEntityId cursor = parent;
+    while (cursor != BroadcastTarget) {
+        if (cursor == child) return false;
+        const auto pIt = parentByEntity_.find(cursor);
+        cursor = (pIt == parentByEntity_.end()) ? BroadcastTarget : pIt->second;
+    }
+
+    const auto oldParentIt = parentByEntity_.find(child);
+    if (oldParentIt != parentByEntity_.end()) {
+        const auto oldParent = oldParentIt->second;
+        if (oldParent == parent) return true;
+        const auto chIt = childrenByEntity_.find(oldParent);
+        if (chIt != childrenByEntity_.end()) {
+            auto& vec = chIt->second;
+            vec.erase(std::remove(vec.begin(), vec.end(), child), vec.end());
+        }
+        parentByEntity_.erase(oldParentIt);
+    }
+
+    if (parent != BroadcastTarget) {
+        parentByEntity_[child] = parent;
+        auto& children = childrenByEntity_[parent];
+        if (std::find(children.begin(), children.end(), child) == children.end()) {
+            children.push_back(child);
+        }
+    }
+    return true;
+}
+
+SceneEntityId SceneScriptRuntime::getParent(SceneEntityId entity) const noexcept {
+    const auto it = parentByEntity_.find(entity);
+    return it == parentByEntity_.end() ? BroadcastTarget : it->second;
+}
+
+std::vector<SceneEntityId> SceneScriptRuntime::getChildren(SceneEntityId entity) const {
+    const auto it = childrenByEntity_.find(entity);
+    return it == childrenByEntity_.end() ? std::vector<SceneEntityId>{} : it->second;
+}
+
+bool SceneScriptRuntime::isActiveInHierarchy(SceneEntityId entity) const noexcept {
+    if (entity == BroadcastTarget) return false;
+    SceneEntityId cursor = entity;
+    while (cursor != BroadcastTarget) {
+        const auto activeIt = entityActiveSelf_.find(cursor);
+        if (activeIt != entityActiveSelf_.end() && !activeIt->second) {
+            return false;
+        }
+        const auto instIt = instances_.find(cursor);
+        if (instIt != instances_.end() && !instIt->second.empty() &&
+            !instIt->second.front().enabled && activeIt == entityActiveSelf_.end()) {
+            return false;
+        }
+        const auto pIt = parentByEntity_.find(cursor);
+        cursor = (pIt == parentByEntity_.end()) ? BroadcastTarget : pIt->second;
+    }
+    return true;
+}
+
+void SceneScriptRuntime::setLocalTransform(
+    SceneEntityId entity,
+    const Transform3D& transform) {
+    if (entity == BroadcastTarget) return;
+    localTransforms_[entity] = transform;
+}
+
+Transform3D SceneScriptRuntime::getLocalTransform(
+    SceneEntityId entity) const noexcept {
+    const auto it = localTransforms_.find(entity);
+    return it == localTransforms_.end() ? Transform3D::identity() : it->second;
+}
+
+Transform3D SceneScriptRuntime::getWorldTransform(
+    SceneEntityId entity) const noexcept {
+    if (entity == BroadcastTarget) return Transform3D::identity();
+    std::vector<SceneEntityId> chain;
+    SceneEntityId cursor = entity;
+    while (cursor != BroadcastTarget) {
+        chain.push_back(cursor);
+        const auto pIt = parentByEntity_.find(cursor);
+        cursor = (pIt == parentByEntity_.end()) ? BroadcastTarget : pIt->second;
+    }
+    Transform3D world = Transform3D::identity();
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        world = Transform3D::combine(world, getLocalTransform(*it));
+    }
+    return world;
+}
+
+void SceneScriptRuntime::setLocalPosition2D(SceneEntityId entity, Vec2 position) {
+    if (entity == BroadcastTarget) return;
+    Transform3D t = getLocalTransform(entity);
+    t.position = Vec3{position.x, position.y, t.position.z};
+    localTransforms_[entity] = t;
+}
+
+Vec2 SceneScriptRuntime::getWorldPosition2D(SceneEntityId entity) const noexcept {
+    const Transform3D w = getWorldTransform(entity);
+    return Vec2{w.position.x, w.position.y};
+}
+
+ScriptObject* SceneScriptRuntime::getComponentInChildren(
+    SceneEntityId entity,
+    const std::string& typeOrInterfaceName) {
+    if (auto* selfComp = getComponent(entity, typeOrInterfaceName)) {
+        return selfComp;
+    }
+    const auto chIt = childrenByEntity_.find(entity);
+    if (chIt == childrenByEntity_.end()) return nullptr;
+    for (const auto child : chIt->second) {
+        if (auto* found = getComponentInChildren(child, typeOrInterfaceName)) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
+ScriptObject* SceneScriptRuntime::getComponentInParent(
+    SceneEntityId entity,
+    const std::string& typeOrInterfaceName) {
+    SceneEntityId cursor = entity;
+    while (cursor != BroadcastTarget) {
+        if (auto* comp = getComponent(cursor, typeOrInterfaceName)) {
+            return comp;
+        }
+        const auto pIt = parentByEntity_.find(cursor);
+        cursor = (pIt == parentByEntity_.end()) ? BroadcastTarget : pIt->second;
+    }
+    return nullptr;
+}
+
+SceneEntityId SceneScriptRuntime::instantiatePrefab(
+    const PrefabNodeTemplate& prefab,
+    SceneEntityId& nextEntityId,
+    SceneEntityId parent,
+    const std::map<std::string, runtime::Value>& rootMemberOverrides) {
+    if (nextEntityId == 0) nextEntityId = 1;
+    const SceneEntityId entityId = nextEntityId++;
+    entityActiveSelf_[entityId] = true;
+    localTransforms_[entityId] = prefab.localTransform;
+    if (parent != BroadcastTarget) {
+        (void)setParent(entityId, parent);
+    }
+    for (std::size_t i = 0; i < prefab.components.size(); ++i) {
+        SceneScriptOptions opts = prefab.components[i].options;
+        if (!attachComponent(entityId, prefab.components[i].scriptType, std::move(opts))) {
+            (void)detach(entityId);
+            return BroadcastTarget;
+        }
+    }
+    for (const auto& [k, v] : rootMemberOverrides) {
+        if (!setInspectorMember(entityId, std::string{}, k, v)) {
+            (void)detach(entityId);
+            return BroadcastTarget;
+        }
+    }
+    for (const auto& childPrefab : prefab.children) {
+        if (instantiatePrefab(childPrefab, nextEntityId, entityId) == BroadcastTarget) {
+            (void)detach(entityId);
+            return BroadcastTarget;
+        }
+    }
+    return entityId;
 }
 
 } // namespace realscript::game

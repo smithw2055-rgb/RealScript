@@ -244,6 +244,170 @@ std::shared_ptr<runtime::NativeHandleRegistry> GameApi::nativeHandles() const no
     return state_->nativeHandles;
 }
 
+GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
+    std::string_view headerContent,
+    const std::string& defaultModuleName) {
+    HeaderBindingGenerationResult res;
+    std::ostringstream cppOut;
+    std::ostringstream rsOut;
+
+    const auto trim = [](std::string_view s) -> std::string {
+        std::size_t b = 0;
+        while (b < s.size() && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n')) ++b;
+        std::size_t e = s.size();
+        while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n')) --e;
+        return std::string(s.substr(b, e - b));
+    };
+
+    const auto mapCppTypeToRs = [&](std::string cppType) -> std::string {
+        if (cppType.rfind("const ", 0) == 0) {
+            cppType = trim(cppType.substr(6));
+        }
+        while (!cppType.empty() && (cppType.back() == '&' || cppType.back() == '*' || cppType.back() == ' ')) {
+            cppType.pop_back();
+        }
+        if (cppType == "int" || cppType == "int32_t" || cppType == "std::int32_t") return "int";
+        if (cppType == "int64_t" || cppType == "std::int64_t" || cppType == "long") return "long";
+        if (cppType == "float") return "float";
+        if (cppType == "double") return "double";
+        if (cppType == "bool") return "bool";
+        if (cppType == "void") return "void";
+        if (cppType.find("string") != std::string::npos) return "string";
+        if (cppType.find("Vec2") != std::string::npos) return "Vec2";
+        if (cppType.find("Vec3") != std::string::npos) return "Vec3";
+        if (cppType.find("Quat") != std::string::npos) return "Quat";
+        if (cppType.find("Fixed") != std::string::npos) return "Fixed";
+        return cppType;
+    };
+
+    cppOut << "// Auto-generated RealScript C++ Binding Registration\n";
+    cppOut << "inline void registerGeneratedHeaderBindings(realscript::game::GameApi& api) {\n";
+
+    rsOut << "// Auto-generated RealScript Stub from C++ Header\n";
+    rsOut << "module " << defaultModuleName << ";\n\n";
+
+    std::string currentClass;
+    std::string currentClassModule = defaultModuleName;
+    bool pendingClassExport = false;
+    bool pendingMethodExport = false;
+    bool pendingFuncExport = false;
+
+    std::size_t pos = 0;
+    while (pos < headerContent.size()) {
+        std::size_t endLine = headerContent.find('\n', pos);
+        if (endLine == std::string_view::npos) endLine = headerContent.size();
+        std::string line = trim(headerContent.substr(pos, endLine - pos));
+        pos = endLine + 1;
+        if (line.empty()) continue;
+
+        if (line.find("RS_EXPORT_CLASS") != std::string::npos) {
+            pendingClassExport = true;
+            const auto openP = line.find('(');
+            const auto closeP = line.find(')');
+            if (openP != std::string::npos && closeP != std::string::npos && closeP > openP + 1) {
+                currentClassModule = trim(line.substr(openP + 1, closeP - openP - 1));
+                if (currentClassModule.size() >= 2 && currentClassModule.front() == '"') {
+                    currentClassModule = currentClassModule.substr(1, currentClassModule.size() - 2);
+                }
+            } else {
+                currentClassModule = defaultModuleName;
+            }
+            continue;
+        }
+        if (line.find("RS_EXPORT_METHOD") != std::string::npos) {
+            pendingMethodExport = true;
+            continue;
+        }
+        if (line.find("RS_EXPORT_FUNCTION") != std::string::npos) {
+            pendingFuncExport = true;
+            continue;
+        }
+
+        if (pendingClassExport && (line.rfind("class ", 0) == 0 || line.rfind("struct ", 0) == 0)) {
+            pendingClassExport = false;
+            const auto spacePos = line.find(' ');
+            std::string namePart = trim(line.substr(spacePos + 1));
+            const auto endName = namePart.find_first_of(" :{");
+            currentClass = endName == std::string::npos ? namePart : namePart.substr(0, endName);
+            ++res.classesExported;
+            cppOut << "    auto builder_" << currentClass << " = api.type<" << currentClass
+                   << ">(\"" << currentClassModule << "\", \"" << currentClass << "\");\n";
+            rsOut << "class " << currentClass << " {\n    handle __native;\n";
+            continue;
+        }
+
+        if (!currentClass.empty() && line.rfind("};", 0) == 0) {
+            currentClass.clear();
+            rsOut << "}\n\n";
+            continue;
+        }
+
+        if ((pendingMethodExport || pendingFuncExport) && line.find('(') != std::string::npos) {
+            const bool isMethod = pendingMethodExport && !currentClass.empty();
+            pendingMethodExport = false;
+            pendingFuncExport = false;
+
+            const auto openParen = line.find('(');
+            const auto closeParen = line.find(')', openParen);
+            if (closeParen == std::string::npos) continue;
+            const std::string prefix = trim(line.substr(0, openParen));
+            const auto lastSpace = prefix.rfind(' ');
+            if (lastSpace == std::string::npos) continue;
+            const std::string retCpp = trim(prefix.substr(0, lastSpace));
+            const std::string fnName = trim(prefix.substr(lastSpace + 1));
+            const std::string paramsStr = trim(line.substr(openParen + 1, closeParen - openParen - 1));
+
+            std::vector<std::pair<std::string, std::string>> rsParams;
+            if (!paramsStr.empty() && paramsStr != "void") {
+                std::size_t pStart = 0;
+                int idx = 0;
+                while (pStart < paramsStr.size()) {
+                    std::size_t comma = paramsStr.find(',', pStart);
+                    if (comma == std::string::npos) comma = paramsStr.size();
+                    std::string pItem = trim(paramsStr.substr(pStart, comma - pStart));
+                    pStart = comma + 1;
+                    const auto pSpace = pItem.rfind(' ');
+                    if (pSpace != std::string::npos) {
+                        std::string pName = trim(pItem.substr(pSpace + 1));
+                        while (!pName.empty() && (pName.front() == '&' || pName.front() == '*')) {
+                            pName.erase(pName.begin());
+                        }
+                        rsParams.push_back({
+                            mapCppTypeToRs(trim(pItem.substr(0, pSpace))),
+                            std::move(pName)});
+                    } else {
+                        rsParams.push_back({mapCppTypeToRs(pItem), "arg" + std::to_string(idx)});
+                    }
+                    ++idx;
+                }
+            }
+
+            const std::string rsRet = mapCppTypeToRs(retCpp);
+            if (isMethod) {
+                ++res.methodsExported;
+                cppOut << "    builder_" << currentClass << ".method<&" << currentClass
+                       << "::" << fnName << ">(\"" << fnName << "\");\n";
+                rsOut << "    " << rsRet << " " << fnName << "(";
+            } else {
+                ++res.functionsExported;
+                cppOut << "    api.function(\"" << defaultModuleName << "\", \""
+                       << fnName << "\", &" << fnName << ");\n";
+                rsOut << rsRet << " " << fnName << "(";
+            }
+            for (std::size_t i = 0; i < rsParams.size(); ++i) {
+                if (i != 0) rsOut << ", ";
+                rsOut << rsParams[i].first << " " << rsParams[i].second;
+            }
+            rsOut << ") { " << (rsRet == "void" ? "return;" : (rsRet == "bool" ? "return false;" : "return 0;")) << " }\n";
+        }
+    }
+
+    cppOut << "}\n";
+    res.cppRegistrationSource = cppOut.str();
+    res.scriptDeclarationStub = rsOut.str();
+    return res;
+}
+
 GameCompileResult GameScriptCompiler::compile(
     const std::vector<compiler::SourceFile>& sources) const {
     GameCompileResult result;

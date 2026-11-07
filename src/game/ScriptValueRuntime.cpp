@@ -324,4 +324,46 @@ bool ScriptRuntime::setMemberVec2(
     return setMember(object, name, makeVec2(value), error, std::move(options));
 }
 
+bool ScriptRuntime::readArrayInt(
+    runtime::ObjectRef arrayRef,
+    std::vector<std::int64_t>& out,
+    runtime::RuntimeError& error) const {
+    if (!heap_) return false;
+    return heap_->readPackedIntArray(arrayRef, out, &error);
+}
+
+bool ScriptRuntime::writeArrayInt(
+    runtime::ObjectRef arrayRef,
+    const std::vector<std::int64_t>& values,
+    runtime::RuntimeError& error) const {
+    if (!heap_) return false;
+    return heap_->writePackedIntArray(arrayRef, values.data(), values.size(), &error);
+}
+
+bool ScriptRuntime::readArrayVec2(
+    runtime::ObjectRef arrayRef,
+    std::vector<Vec2>& out,
+    runtime::RuntimeError& error) const {
+    if (!heap_) return false;
+    std::vector<runtime::Vec2Value> raw;
+    if (!heap_->readPackedVec2Array(arrayRef, raw, &error)) return false;
+    out.resize(raw.size());
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+        out[i] = Vec2{Fixed::fromRaw(raw[i].x), Fixed::fromRaw(raw[i].y)};
+    }
+    return true;
+}
+
+bool ScriptRuntime::writeArrayVec2(
+    runtime::ObjectRef arrayRef,
+    const std::vector<Vec2>& values,
+    runtime::RuntimeError& error) const {
+    if (!heap_) return false;
+    std::vector<runtime::Vec2Value> raw(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        raw[i] = runtime::Vec2Value{values[i].x.raw, values[i].y.raw};
+    }
+    return heap_->writePackedVec2Array(arrayRef, raw.data(), raw.size(), &error);
+}
+
 } // namespace realscript::game

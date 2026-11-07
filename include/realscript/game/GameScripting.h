@@ -335,6 +335,23 @@ public:
         runtime::RuntimeError& error,
         runtime::ExecutionOptions options = {}) const;
 
+    bool readArrayInt(
+        runtime::ObjectRef arrayRef,
+        std::vector<std::int64_t>& out,
+        runtime::RuntimeError& error) const;
+    bool writeArrayInt(
+        runtime::ObjectRef arrayRef,
+        const std::vector<std::int64_t>& values,
+        runtime::RuntimeError& error) const;
+    bool readArrayVec2(
+        runtime::ObjectRef arrayRef,
+        std::vector<Vec2>& out,
+        runtime::RuntimeError& error) const;
+    bool writeArrayVec2(
+        runtime::ObjectRef arrayRef,
+        const std::vector<Vec2>& values,
+        runtime::RuntimeError& error) const;
+
     [[nodiscard]] std::shared_ptr<const runtime::ProgramImage> program() const noexcept {
         return program_;
     }
@@ -406,6 +423,18 @@ struct SceneScriptOptions {
     bool enabled = true;
     std::map<std::string, runtime::Value> initialMembers;
     runtime::Value owner;
+};
+
+struct PrefabComponentTemplate {
+    std::string scriptType;
+    SceneScriptOptions options;
+};
+
+struct PrefabNodeTemplate {
+    std::string name;
+    Transform3D localTransform{};
+    std::vector<PrefabComponentTemplate> components;
+    std::vector<PrefabNodeTemplate> children;
 };
 
 struct ScriptEvent {
@@ -524,6 +553,30 @@ public:
         const std::string& typeOrInterfaceName) const;
     [[nodiscard]] std::size_t componentCount(SceneEntityId entity) const noexcept;
 
+    bool setParent(SceneEntityId child, SceneEntityId parent);
+    [[nodiscard]] SceneEntityId getParent(SceneEntityId entity) const noexcept;
+    [[nodiscard]] std::vector<SceneEntityId> getChildren(SceneEntityId entity) const;
+    [[nodiscard]] bool isActiveInHierarchy(SceneEntityId entity) const noexcept;
+
+    void setLocalTransform(SceneEntityId entity, const Transform3D& transform);
+    [[nodiscard]] Transform3D getLocalTransform(SceneEntityId entity) const noexcept;
+    [[nodiscard]] Transform3D getWorldTransform(SceneEntityId entity) const noexcept;
+    void setLocalPosition2D(SceneEntityId entity, Vec2 position);
+    [[nodiscard]] Vec2 getWorldPosition2D(SceneEntityId entity) const noexcept;
+
+    [[nodiscard]] ScriptObject* getComponentInChildren(
+        SceneEntityId entity,
+        const std::string& typeOrInterfaceName);
+    [[nodiscard]] ScriptObject* getComponentInParent(
+        SceneEntityId entity,
+        const std::string& typeOrInterfaceName);
+
+    SceneEntityId instantiatePrefab(
+        const PrefabNodeTemplate& prefab,
+        SceneEntityId& nextEntityId,
+        SceneEntityId parent = 0,
+        const std::map<std::string, runtime::Value>& rootMemberOverrides = {});
+
 private:
     struct MethodCacheEntry {
         semantic::SymbolId typeId = 0;
@@ -537,6 +590,7 @@ private:
         bool enabled = true;
         bool started = false;
         bool executeInEditMode = false;
+        int executionOrder = 0;
         std::optional<ScriptMethod> onCreate0;
         std::optional<ScriptMethod> onCreate1;
         std::optional<ScriptMethod> onStart;
@@ -575,6 +629,10 @@ private:
     runtime::ExecutionOptions executionOptions_;
     SceneExecutionMode executionMode_ = SceneExecutionMode::Play;
     std::map<SceneEntityId, std::vector<Instance>> instances_;
+    std::map<SceneEntityId, SceneEntityId> parentByEntity_;
+    std::map<SceneEntityId, std::vector<SceneEntityId>> childrenByEntity_;
+    std::map<SceneEntityId, bool> entityActiveSelf_;
+    std::map<SceneEntityId, Transform3D> localTransforms_;
     std::map<std::size_t, std::vector<MethodCacheEntry>> methodCache_;
     std::vector<ScriptEvent> eventQueue_;
     std::map<std::string, ScriptTrigger> triggers_;

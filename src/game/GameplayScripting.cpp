@@ -233,6 +233,54 @@ EventSequence GameplayHost::publish(
         std::move(arguments)});
 }
 
+AsyncOperationId GameplayHost::createAsyncOperation(std::string name) {
+    if (nextAsyncOpId_ == 0) return 0;
+    const auto id = nextAsyncOpId_++;
+    asyncOps_.emplace(id, ScriptAsyncOperationState{
+        id, std::move(name), false, GameplayValue{std::monostate{}}});
+    return id;
+}
+
+bool GameplayHost::completeAsyncOperation(
+    AsyncOperationId operationId,
+    GameplayValue result,
+    GameTick delayTicks) {
+    const auto found = asyncOps_.find(operationId);
+    if (found == asyncOps_.end() || found->second.completed) return false;
+    found->second.completed = true;
+    found->second.result = std::move(result);
+    (void)publish("$async_op_" + std::to_string(operationId), {}, delayTicks);
+    return true;
+}
+
+bool GameplayHost::isAsyncOperationCompleted(AsyncOperationId operationId) const noexcept {
+    const auto found = asyncOps_.find(operationId);
+    return found != asyncOps_.end() && found->second.completed;
+}
+
+std::optional<GameplayValue> GameplayHost::getAsyncOperationResult(
+    AsyncOperationId operationId) const {
+    const auto found = asyncOps_.find(operationId);
+    if (found == asyncOps_.end() || !found->second.completed) return std::nullopt;
+    return found->second.result;
+}
+
+SubscriptionId GameplayHost::waitAsyncOperation(
+    AsyncOperationId operationId,
+    SceneEntityId target,
+    std::string callback) {
+    if (operationId == 0 || target == 0 || callback.empty()) return 0;
+    const auto found = asyncOps_.find(operationId);
+    if (found == asyncOps_.end()) return 0;
+    if (found->second.completed) {
+        return scheduleCall(target, std::move(callback), 1);
+    }
+    return subscribeOnce(
+        "$async_op_" + std::to_string(operationId),
+        target,
+        std::move(callback));
+}
+
 EventSequence GameplayHost::enqueueDirect(
     SceneEntityId target,
     std::string callback,
@@ -667,6 +715,55 @@ bool installGameplayBindings(
             if (delayTicks < 0) return std::int64_t{0};
             return static_cast<std::int64_t>(host->publish(
                 std::move(topic), {}, static_cast<GameTick>(delayTicks)));
+        }) && valid;
+    valid = api.function(
+        moduleName,
+        "CreateAsyncOperation",
+        [host](std::string name) {
+            return static_cast<std::int64_t>(
+                host->createAsyncOperation(std::move(name)));
+        }) && valid;
+    valid = api.function(
+        moduleName,
+        "CompleteAsyncOperation",
+        [host](std::int64_t opId, int resultValue) {
+            if (opId <= 0) return false;
+            return host->completeAsyncOperation(
+                static_cast<AsyncOperationId>(opId),
+                GameplayValue{static_cast<std::int32_t>(resultValue)},
+                1);
+        }) && valid;
+    valid = api.function(
+        moduleName,
+        "IsAsyncOperationCompleted",
+        [host](std::int64_t opId) {
+            if (opId <= 0) return false;
+            return host->isAsyncOperationCompleted(
+                static_cast<AsyncOperationId>(opId));
+        }) && valid;
+    valid = api.function(
+        moduleName,
+        "GetAsyncOperationResultInt",
+        [host](std::int64_t opId) -> int {
+            if (opId <= 0) return 0;
+            const auto res = host->getAsyncOperationResult(
+                static_cast<AsyncOperationId>(opId));
+            if (!res) return 0;
+            if (const auto* iv = std::get_if<std::int32_t>(&*res)) return *iv;
+            if (const auto* lv = std::get_if<std::int64_t>(&*res)) return static_cast<int>(*lv);
+            return 0;
+        }) && valid;
+    valid = api.function(
+        moduleName,
+        "WaitAsyncOperation",
+        [host](std::int64_t target, std::string callback, std::int64_t opId) {
+            if (target <= 0 || callback.empty() || opId <= 0) {
+                return std::int64_t{0};
+            }
+            return static_cast<std::int64_t>(host->waitAsyncOperation(
+                static_cast<AsyncOperationId>(opId),
+                static_cast<SceneEntityId>(target),
+                std::move(callback)));
         }) && valid;
     return valid;
 }

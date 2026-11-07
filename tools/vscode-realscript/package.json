@@ -1,0 +1,39 @@
+{
+  "name": "vscode-realscript",
+  "displayName": "RealScript Language Support",
+  "description": "Syntax highlighting, snippets, and LSP integration (rslsp) for the RealScript game scripting engine.",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "realscript",
+        "aliases": ["RealScript", "realscript"],
+        "extensions": [".rs", ".d.rs"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "realscript",
+        "scopeName": "source.realscript",
+        "path": "./syntaxes/realscript.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "RealScript",
+      "properties": {
+        "realscript.lsp.serverPath": {
+          "type": "string",
+          "default": "rslsp",
+          "description": "Path to the RealScript Language Server (rslsp) executable."
+        }
+      }
+    }
+  }
+}

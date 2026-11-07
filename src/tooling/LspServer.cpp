@@ -111,7 +111,7 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
     if (method == "initialize") {
         return response(message, Json::Object{
             {"capabilities", Json::Object{
-                {"textDocumentSync", 1},
+                {"textDocumentSync", 2},
                 {"completionProvider", Json::Object{
                     {"triggerCharacters", Json::Array{"."}},
                 }},
@@ -156,14 +156,36 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
             ? document->find("uri")->stringValue() : std::string{});
         const auto version = document && document->find("version")
             ? document->find("version")->integerValue() : 0;
-        std::string content;
+        std::vector<ContentChange> parsedChanges;
         if (const auto* changes = params ? params->find("contentChanges") : nullptr) {
-            if (!changes->arrayValue().empty()) {
-                const auto* text = changes->arrayValue().front().find("text");
-                if (text) content = text->stringValue();
+            for (const auto& item : changes->arrayValue()) {
+                if (!item.isObject()) continue;
+                const auto* text = item.find("text");
+                if (!text || !text->isString()) continue;
+                ContentChange cc;
+                cc.text = text->stringValue();
+                if (const auto* rangeObj = item.find("range"); rangeObj && rangeObj->isObject()) {
+                    const auto* sObj = rangeObj->find("start");
+                    const auto* eObj = rangeObj->find("end");
+                    if (sObj && sObj->isObject() && eObj && eObj->isObject()) {
+                        const auto startPos = readPosition(sObj);
+                        const auto endPos = readPosition(eObj);
+                        debug::SourceRange sr{};
+                        sr.start.line = static_cast<std::uint32_t>(startPos.line + 1);
+                        sr.start.column = static_cast<std::uint32_t>(startPos.column + 1);
+                        sr.end.line = static_cast<std::uint32_t>(endPos.line + 1);
+                        sr.end.column = static_cast<std::uint32_t>(endPos.column + 1);
+                        cc.range = sr;
+                    }
+                }
+                parsedChanges.push_back(std::move(cc));
             }
         }
-        service_.update(path, content, version);
+        if (!parsedChanges.empty()) {
+            service_.applyContentChanges(path, parsedChanges, version);
+        } else {
+            service_.update(path, std::string{}, version);
+        }
         if (notifications) {
             for (const auto& documentPath : service_.documentPaths()) {
                 publishDiagnostics(documentPath, *notifications);

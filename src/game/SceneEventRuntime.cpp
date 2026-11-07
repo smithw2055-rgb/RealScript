@@ -271,6 +271,48 @@ bool installSceneComponentBindings(
                     static_cast<SceneEntityId>(entityId),
                     std::move(callback),
                     {static_cast<std::int64_t>(payload)}});
+            }) &&
+        api.function(
+            moduleName,
+            "SetParent",
+            [scenePtr](std::int64_t childId, std::int64_t parentId) -> bool {
+                if (childId <= 0 || parentId < 0) return false;
+                return scenePtr->setParent(
+                    static_cast<SceneEntityId>(childId),
+                    static_cast<SceneEntityId>(parentId));
+            }) &&
+        api.function(
+            moduleName,
+            "GetParent",
+            [scenePtr](std::int64_t entityId) -> std::int64_t {
+                if (entityId <= 0) return 0;
+                return static_cast<std::int64_t>(scenePtr->getParent(
+                    static_cast<SceneEntityId>(entityId)));
+            }) &&
+        api.function(
+            moduleName,
+            "IsActiveInHierarchy",
+            [scenePtr](std::int64_t entityId) -> bool {
+                if (entityId <= 0) return false;
+                return scenePtr->isActiveInHierarchy(
+                    static_cast<SceneEntityId>(entityId));
+            }) &&
+        api.function(
+            moduleName,
+            "SetLocalPosition2D",
+            [scenePtr](std::int64_t entityId, Vec2 pos) -> bool {
+                if (entityId <= 0) return false;
+                scenePtr->setLocalPosition2D(
+                    static_cast<SceneEntityId>(entityId), pos);
+                return true;
+            }) &&
+        api.function(
+            moduleName,
+            "GetWorldPosition2D",
+            [scenePtr](std::int64_t entityId) -> Vec2 {
+                if (entityId <= 0) return Vec2{};
+                return scenePtr->getWorldPosition2D(
+                    static_cast<SceneEntityId>(entityId));
             });
     return ok && api.valid();
 }

@@ -16,6 +16,14 @@ namespace realscript::game {
 using SubscriptionId = std::uint64_t;
 using SequenceId = std::uint64_t;
 using ScriptPayloadId = std::uint64_t;
+using AsyncOperationId = std::uint64_t;
+
+struct ScriptAsyncOperationState {
+    AsyncOperationId id = 0;
+    std::string name;
+    bool completed = false;
+    GameplayValue result{};
+};
 
 struct ScheduledScriptCall {
     ScriptPayloadId payloadId = 0;
@@ -113,6 +121,19 @@ public:
         std::string topic,
         std::vector<GameplayValue> arguments = {},
         GameTick delayTicks = 1);
+
+    AsyncOperationId createAsyncOperation(std::string name = {});
+    bool completeAsyncOperation(
+        AsyncOperationId operationId,
+        GameplayValue result = {},
+        GameTick delayTicks = 1);
+    [[nodiscard]] bool isAsyncOperationCompleted(AsyncOperationId operationId) const noexcept;
+    [[nodiscard]] std::optional<GameplayValue> getAsyncOperationResult(
+        AsyncOperationId operationId) const;
+    SubscriptionId waitAsyncOperation(
+        AsyncOperationId operationId,
+        SceneEntityId target,
+        std::string callback);
     [[nodiscard]] EventSequence enqueueDirect(
         SceneEntityId target,
         std::string callback,
@@ -137,11 +158,13 @@ private:
     ScriptPayloadId nextPayloadId_ = 1;
     SubscriptionId nextSubscriptionId_ = 1;
     SequenceId nextSequenceId_ = 1;
+    AsyncOperationId nextAsyncOpId_ = 1;
     std::map<ScriptPayloadId, ScheduledScriptCall> calls_;
     std::map<TimerId, ScriptPayloadId> timerToPayload_;
     std::map<SubscriptionId, ScriptEventSubscription> subscriptions_;
     std::map<SequenceId, ScriptSequenceState> sequences_;
     std::map<TimerId, SequenceId> timerToSequence_;
+    std::map<AsyncOperationId, ScriptAsyncOperationState> asyncOps_;
 };
 
 [[nodiscard]] runtime::Value toRuntimeValue(const GameplayValue& value);

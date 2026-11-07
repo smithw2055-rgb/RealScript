@@ -1784,7 +1784,61 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
             suspended->span = yield.span();
             suspended->statements.push_back(makeStateAssignment(id, yield.span()));
 
-            if (yield.waitTicksToken.text == "wait_event") {
+            if (yield.waitTicksToken.text == "wait_async") {
+                const FunctionSymbol* waitAsync = nullptr;
+                const auto foundAsync = visibleFunctions_.find("WaitAsyncOperation");
+                if (foundAsync != visibleFunctions_.end()) {
+                    for (const auto& candidate : foundAsync->second) {
+                        if (!candidate.method &&
+                            candidate.parameters.size() == 3 &&
+                            candidate.parameters[0].type == PrimitiveType::Long &&
+                            candidate.parameters[1].type == PrimitiveType::String &&
+                            candidate.parameters[2].type == PrimitiveType::Long) {
+                            waitAsync = &candidate;
+                            break;
+                        }
+                    }
+                }
+                if (!waitAsync) {
+                    diagnostics_.report(
+                        "RS2493",
+                        "sequence wait_async requires imported RealScript.Game.WaitAsyncOperation",
+                        yield.span());
+                } else {
+                    auto call = std::make_unique<BoundCallExpression>();
+                    call->type = waitAsync->returnType;
+                    call->typeName = waitAsync->returnTypeName;
+                    call->span = yield.span();
+                    call->function = *waitAsync;
+                    call->arguments.push_back(makeSequenceFieldAccess(
+                        input.sequenceTargetField, yield.span()));
+                    auto callback = std::make_unique<BoundLiteralExpression>();
+                    callback->type = PrimitiveType::String;
+                    callback->value = input.sequenceNextCallback->name;
+                    callback->span = yield.waitTicksToken.span;
+                    call->arguments.push_back(std::move(callback));
+                    call->arguments.push_back(convertExpression(
+                        bindExpression(*yield.delay),
+                        PrimitiveType::Long,
+                        yield.delay->span(),
+                        "sequence wait_async operation id"));
+                    auto timer = std::make_unique<BoundMemberAssignmentExpression>();
+                    timer->type = input.sequenceTimerField.type;
+                    timer->span = yield.span();
+                    const auto* receiver = lookupVariable("this");
+                    timer->receiver = receiver
+                        ? makeVariableAccess(*receiver, yield.span())
+                        : makeError(yield.span());
+                    timer->ownerType = *currentOwnerType_;
+                    timer->field = input.sequenceTimerField;
+                    timer->expression = std::move(call);
+                    auto subStatement =
+                        std::make_unique<BoundExpressionStatement>();
+                    subStatement->span = yield.span();
+                    subStatement->expression = std::move(timer);
+                    suspended->statements.push_back(std::move(subStatement));
+                }
+            } else if (yield.waitTicksToken.text == "wait_event") {
                 const FunctionSymbol* subscribeOnce = nullptr;
                 const auto foundSub = visibleFunctions_.find("SubscribeOnce");
                 if (foundSub != visibleFunctions_.end()) {
@@ -3314,6 +3368,49 @@ std::unique_ptr<BoundStatement> Binder::bindTryStatement(
         finallyLoopDepth_ = loopDepth_;
         result->finallyBody = bindBlockStatement(
             *syntaxTree.finallyBody, true);
+        if (syntaxTree.finallyKeyword->text == "$using_finally" &&
+            result->finallyBody &&
+            result->finallyBody->kind() == BoundNodeKind::BlockStatement &&
+            static_cast<BoundBlockStatement&>(*result->finallyBody).statements.size() == 1 &&
+            syntaxTree.finallyBody->statements.size() == 1 &&
+            syntaxTree.finallyBody->statements[0]->kind() ==
+                syntax::SyntaxKind::ExpressionStatement) {
+            const auto& exprStmt = static_cast<const syntax::ExpressionStatementSyntax&>(
+                *syntaxTree.finallyBody->statements[0]);
+            if (exprStmt.expression &&
+                exprStmt.expression->kind() == syntax::SyntaxKind::MemberCallExpression) {
+                const auto& mcall = static_cast<const syntax::MemberCallExpressionSyntax&>(
+                    *exprStmt.expression);
+                if (mcall.receiver &&
+                    mcall.receiver->kind() == syntax::SyntaxKind::NameExpression) {
+                    const auto& nameExpr = static_cast<const syntax::NameExpressionSyntax&>(
+                        *mcall.receiver);
+                    if (const auto* varSym = lookupVariable(nameExpr.identifierToken.text);
+                        varSym && varSym->type == PrimitiveType::Object) {
+                        auto nullLit = std::make_unique<BoundLiteralExpression>();
+                        nullLit->type = PrimitiveType::Null;
+                        nullLit->span = nameExpr.identifierToken.span;
+                        auto cond = std::make_unique<BoundBinaryExpression>();
+                        cond->type = PrimitiveType::Bool;
+                        cond->operatorKind = BoundBinaryOperatorKind::NotEquals;
+                        cond->span = nameExpr.identifierToken.span;
+                        cond->left = makeVariableAccess(*varSym, nameExpr.identifierToken.span);
+                        cond->right = convertExpression(
+                            std::move(nullLit),
+                            PrimitiveType::Object,
+                            nameExpr.identifierToken.span,
+                            "using null check",
+                            varSym->typeName);
+                        auto ifStmt = std::make_unique<BoundIfStatement>();
+                        ifStmt->span = nameExpr.identifierToken.span;
+                        ifStmt->condition = std::move(cond);
+                        auto& finallyStmts = static_cast<BoundBlockStatement&>(*result->finallyBody).statements;
+                        ifStmt->thenStatement = std::move(finallyStmts[0]);
+                        finallyStmts[0] = std::move(ifStmt);
+                    }
+                }
+            }
+        }
         bindingFinally_ = previousFinally;
         finallyBreakableDepth_ = previousFinallyBreakableDepth;
         finallyLoopDepth_ = previousFinallyLoopDepth;

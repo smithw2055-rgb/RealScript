@@ -1010,6 +1010,78 @@ BlockStatementSyntax Parser::parseBlockStatement() {
 
 std::unique_ptr<StatementSyntax> Parser::parseStatement() {
     if (current().kind == SyntaxKind::IdentifierToken &&
+        current().text == "using" &&
+        peek(1).kind == SyntaxKind::OpenParenToken) {
+        const auto usingToken = nextToken();
+        const auto openParen = match(SyntaxKind::OpenParenToken);
+        (void)openParen;
+        auto varDecl = std::make_unique<VariableDeclarationStatementSyntax>();
+        varDecl->type = parseType();
+        varDecl->identifierToken = match(SyntaxKind::IdentifierToken);
+        varDecl->equalsToken = match(SyntaxKind::EqualsToken);
+        varDecl->initializer = parseExpression();
+        const auto closeParen = match(SyntaxKind::CloseParenToken);
+        varDecl->semicolonToken = {
+            SyntaxKind::SemicolonToken, closeParen.span, ";", {}, false};
+
+        const auto varToken = varDecl->identifierToken;
+        auto innerBody = parseStatement();
+        BlockStatementSyntax tryBody;
+        if (innerBody && innerBody->kind() == SyntaxKind::BlockStatement) {
+            tryBody = std::move(static_cast<BlockStatementSyntax&>(*innerBody));
+        } else {
+            tryBody.openBraceToken = {
+                SyntaxKind::OpenBraceToken, usingToken.span, "{", {}, false};
+            if (innerBody) {
+                tryBody.statements.push_back(std::move(innerBody));
+            }
+            tryBody.closeBraceToken = {
+                SyntaxKind::CloseBraceToken, closeParen.span, "}", {}, false};
+        }
+
+        auto disposeCall = std::make_unique<MemberCallExpressionSyntax>();
+        auto receiver = std::make_unique<NameExpressionSyntax>();
+        receiver->identifierToken = varToken;
+        disposeCall->receiver = std::move(receiver);
+        disposeCall->dotToken = {
+            SyntaxKind::DotToken, varToken.span, ".", {}, false};
+        disposeCall->nameToken = {
+            SyntaxKind::IdentifierToken, varToken.span, "Dispose", {}, false};
+        disposeCall->openParenToken = {
+            SyntaxKind::OpenParenToken, varToken.span, "(", {}, false};
+        disposeCall->closeParenToken = {
+            SyntaxKind::CloseParenToken, varToken.span, ")", {}, false};
+
+        auto disposeStmt = std::make_unique<ExpressionStatementSyntax>();
+        disposeStmt->expression = std::move(disposeCall);
+        disposeStmt->semicolonToken = {
+            SyntaxKind::SemicolonToken, varToken.span, ";", {}, false};
+
+        BlockStatementSyntax finallyBlock;
+        finallyBlock.openBraceToken = {
+            SyntaxKind::OpenBraceToken, closeParen.span, "{", {}, false};
+        finallyBlock.statements.push_back(std::move(disposeStmt));
+        finallyBlock.closeBraceToken = {
+            SyntaxKind::CloseBraceToken, closeParen.span, "}", {}, false};
+
+        auto tryStmt = std::make_unique<TryStatementSyntax>();
+        tryStmt->tryKeyword = {
+            SyntaxKind::TryKeyword, usingToken.span, "try", {}, false};
+        tryStmt->body = std::move(tryBody);
+        tryStmt->finallyKeyword = {
+            SyntaxKind::FinallyKeyword, closeParen.span, "$using_finally", {}, false};
+        tryStmt->finallyBody = std::move(finallyBlock);
+
+        auto outerBlock = std::make_unique<BlockStatementSyntax>();
+        outerBlock->openBraceToken = {
+            SyntaxKind::OpenBraceToken, usingToken.span, "{", {}, false};
+        outerBlock->statements.push_back(std::move(varDecl));
+        outerBlock->statements.push_back(std::move(tryStmt));
+        outerBlock->closeBraceToken = {
+            SyntaxKind::CloseBraceToken, closeParen.span, "}", {}, false};
+        return outerBlock;
+    }
+    if (current().kind == SyntaxKind::IdentifierToken &&
         (peek(1).kind == SyntaxKind::PlusEqualsToken ||
          peek(1).kind == SyntaxKind::MinusEqualsToken)) {
         return parseEventSubscriptionStatement();
@@ -1265,10 +1337,11 @@ std::unique_ptr<StatementSyntax> Parser::parseYieldStatement() {
     if (result->waitTicksToken.text != "wait_ticks" &&
         result->waitTicksToken.text != "wait_seconds" &&
         result->waitTicksToken.text != "wait_event" &&
-        result->waitTicksToken.text != "wait_until") {
+        result->waitTicksToken.text != "wait_until" &&
+        result->waitTicksToken.text != "wait_async") {
         diagnostics_.report(
             "RS1113",
-            "yield currently supports only wait_ticks(expression), wait_seconds(expression), wait_event(expression), or wait_until(expression)",
+            "yield currently supports only wait_ticks(expression), wait_seconds(expression), wait_event(expression), wait_until(expression), or wait_async(expression)",
             result->waitTicksToken.span);
     }
     result->openParenToken = match(SyntaxKind::OpenParenToken);

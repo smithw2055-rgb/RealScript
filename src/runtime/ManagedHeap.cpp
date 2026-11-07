@@ -84,6 +84,8 @@ struct ManagedHeap::Impl {
         semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
         semantic::SymbolId elementTypeId = 0;
         bool marked = false;
+        bool inNursery = true;
+        bool inRememberedSet = false;
         std::size_t sizeBytes = 0;
     };
 
@@ -115,6 +117,8 @@ struct ManagedHeap::Impl {
     std::vector<Slot> slots;
     std::vector<std::uint32_t> freeSlots;
     std::vector<ObjectRef> markStack;
+    std::vector<std::uint32_t> nurserySlots;
+    std::vector<ObjectRef> rememberedSet;
     std::unordered_map<RootToken, Value> persistentRoots;
     std::unordered_map<semantic::SymbolId, Value> staticFields;
     RootToken nextRootToken = 1;
@@ -185,8 +189,10 @@ struct ManagedHeap::Impl {
         object->header.sizeBytes = sizeBytes;
         object->payload = std::move(payload);
         object->referenceFields = std::move(referenceFields);
+        object->header.inNursery = true;
         auto& slot = slots[slotIndex];
         slot.object = std::move(object);
+        nurserySlots.push_back(slotIndex);
         const ObjectRef reference{slotIndex, slot.generation, kind, heapId};
 
         ++statistics.objectsAllocated;
@@ -289,6 +295,11 @@ struct ManagedHeap::Impl {
     }
 
     void writeBarrier(ObjectRef owner, const Value& value) {
+        if (auto* ownerObj = get(owner);
+            ownerObj && !ownerObj->header.inNursery && !ownerObj->header.inRememberedSet) {
+            ownerObj->header.inRememberedSet = true;
+            rememberedSet.push_back(owner);
+        }
         if (phase == GcPhase::Idle) return;
         const auto* object = get(owner);
         if (!object || !object->header.marked) return;
@@ -305,6 +316,20 @@ struct ManagedHeap::Impl {
         resumeSweep = false;
         sweepIndex = 0;
         sweepLimit = 0;
+        for (const auto slotIdx : nurserySlots) {
+            if (slotIdx < slots.size() && slots[slotIdx].object &&
+                slots[slotIdx].object->header.inNursery) {
+                slots[slotIdx].object->header.inNursery = false;
+                ++statistics.objectsPromoted;
+            }
+        }
+        nurserySlots.clear();
+        for (const auto& ref : rememberedSet) {
+            if (auto* obj = get(ref)) {
+                obj->header.inRememberedSet = false;
+            }
+        }
+        rememberedSet.clear();
         ++statistics.collectionsCompleted;
         const auto doubled = statistics.liveBytes >
                 std::numeric_limits<std::size_t>::max() / 2
@@ -758,6 +783,294 @@ void ManagedHeap::collectFull(const ShadowStack& shadowStack) {
     if (impl_->phase != GcPhase::Idle) drainCollection();
     requestCollection();
     drainCollection();
+}
+
+std::size_t ManagedHeap::nurserySize() const noexcept {
+    return impl_->nurserySlots.size();
+}
+
+std::size_t ManagedHeap::collectYoung(
+    const ShadowStack& shadowStack,
+    std::size_t workBudget) {
+    if (impl_->phase != GcPhase::Idle) {
+        if (workBudget != 0) {
+            return step(shadowStack, workBudget);
+        }
+        std::size_t totalWork = 0;
+        while (impl_->phase != GcPhase::Idle) {
+            const auto budget = std::max<std::size_t>(64, impl_->slots.size() + 1);
+            totalWork += step(shadowStack, budget);
+        }
+        return totalWork;
+    }
+    if (impl_->nurserySlots.empty()) return 0;
+
+    for (const auto slotIdx : impl_->nurserySlots) {
+        if (slotIdx < impl_->slots.size() && impl_->slots[slotIdx].object) {
+            impl_->slots[slotIdx].object->header.marked = false;
+        }
+    }
+
+    std::vector<ObjectRef> youngQueue;
+    std::unordered_set<const StructStorage*> visitedStructs;
+    const auto markYoungValue = [&](const auto& self, const Value& val) -> void {
+        if (const auto* ref = std::get_if<ObjectRef>(&val)) {
+            auto* obj = impl_->get(*ref);
+            if (obj && obj->header.inNursery && !obj->header.marked) {
+                obj->header.marked = true;
+                youngQueue.push_back(*ref);
+            }
+            return;
+        }
+        if (const auto* structure = std::get_if<StructValue>(&val);
+            structure && structure->storage &&
+            visitedStructs.insert(structure->storage.get()).second) {
+            for (const auto& field : structure->storage->fields) {
+                self(self, field);
+            }
+        }
+    };
+
+    shadowStack.visitRoots([&](const Value& val) { markYoungValue(markYoungValue, val); });
+    for (const auto& entry : impl_->persistentRoots) markYoungValue(markYoungValue, entry.second);
+    for (const auto& entry : impl_->staticFields) markYoungValue(markYoungValue, entry.second);
+    for (const auto& oldRef : impl_->rememberedSet) {
+        const auto* oldObj = impl_->get(oldRef);
+        if (!oldObj || oldObj->header.kind == ObjectKind::String) continue;
+        const auto& values = std::get<std::vector<Value>>(oldObj->payload);
+        if (oldObj->header.kind == ObjectKind::Array) {
+            for (const auto& v : values) markYoungValue(markYoungValue, v);
+        } else {
+            for (const auto idx : oldObj->referenceFields) {
+                if (idx < values.size()) markYoungValue(markYoungValue, values[idx]);
+            }
+        }
+    }
+
+    while (!youngQueue.empty()) {
+        const auto ref = youngQueue.back();
+        youngQueue.pop_back();
+        const auto* obj = impl_->get(ref);
+        if (!obj || obj->header.kind == ObjectKind::String) continue;
+        const auto& values = std::get<std::vector<Value>>(obj->payload);
+        if (obj->header.kind == ObjectKind::Array) {
+            for (const auto& v : values) markYoungValue(markYoungValue, v);
+        } else {
+            for (const auto idx : obj->referenceFields) {
+                if (idx < values.size()) markYoungValue(markYoungValue, values[idx]);
+            }
+        }
+        ++impl_->statistics.markWork;
+    }
+
+    std::size_t processed = 0;
+    for (const auto slotIdx : impl_->nurserySlots) {
+        if (slotIdx >= impl_->slots.size()) continue;
+        auto& slot = impl_->slots[slotIdx];
+        if (!slot.object || !slot.object->header.inNursery) continue;
+        ++processed;
+        if (!slot.object->header.marked) {
+            const auto bytes = slot.object->header.sizeBytes;
+            slot.object.reset();
+            ++slot.generation;
+            if (slot.generation == 0) slot.generation = 1;
+            impl_->freeSlots.push_back(slotIdx);
+            --impl_->statistics.liveObjects;
+            impl_->statistics.liveBytes -= bytes;
+            ++impl_->statistics.objectsReclaimed;
+            ++impl_->statistics.youngObjectsReclaimed;
+            impl_->statistics.bytesReclaimed += bytes;
+        } else {
+            slot.object->header.inNursery = false;
+            slot.object->header.marked = false;
+            ++impl_->statistics.objectsPromoted;
+        }
+        ++impl_->statistics.sweepWork;
+    }
+
+    impl_->nurserySlots.clear();
+    for (const auto& ref : impl_->rememberedSet) {
+        if (auto* obj = impl_->get(ref)) {
+            obj->header.inRememberedSet = false;
+        }
+    }
+    impl_->rememberedSet.clear();
+    ++impl_->statistics.youngCollections;
+    if (impl_->statistics.liveBytes < impl_->nextCollectionThreshold) {
+        impl_->requested = false;
+    }
+    return processed;
+}
+
+bool ManagedHeap::readPackedIntArray(
+    ObjectRef reference,
+    std::vector<std::int64_t>& out,
+    RuntimeError* error) const {
+    const auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array) {
+        setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
+        return false;
+    }
+    const auto& values = std::get<std::vector<Value>>(object->payload);
+    out.resize(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (const auto* iv = std::get_if<std::int64_t>(&values[i])) {
+            out[i] = *iv;
+        } else if (const auto* lv = std::get_if<LongValue>(&values[i])) {
+            out[i] = lv->value;
+        } else {
+            setHeapError(error, ErrorCode::TypeMismatch, "array element is not an integer");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ManagedHeap::writePackedIntArray(
+    ObjectRef reference,
+    const std::int64_t* data,
+    std::size_t count,
+    RuntimeError* error) {
+    if (count > 0 && !data) {
+        setHeapError(error, ErrorCode::InvalidArguments, "bulk write source buffer is null");
+        return false;
+    }
+    auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array) {
+        setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
+        return false;
+    }
+    if (object->header.elementType != semantic::PrimitiveType::Int &&
+        object->header.elementType != semantic::PrimitiveType::Long &&
+        object->header.elementType != semantic::PrimitiveType::Error) {
+        setHeapError(error, ErrorCode::TypeMismatch, "array element is not an integer");
+        return false;
+    }
+    auto& values = std::get<std::vector<Value>>(object->payload);
+    if (count > values.size()) {
+        setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
+        return false;
+    }
+    const bool asLong = object->header.elementType == semantic::PrimitiveType::Long;
+    for (std::size_t i = 0; i < count; ++i) {
+        values[i] = asLong ? Value{LongValue{data[i]}} : Value{data[i]};
+    }
+    return true;
+}
+
+bool ManagedHeap::readPackedDoubleArray(
+    ObjectRef reference,
+    std::vector<double>& out,
+    RuntimeError* error) const {
+    const auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array) {
+        setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
+        return false;
+    }
+    const auto& values = std::get<std::vector<Value>>(object->payload);
+    out.resize(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (const auto* dv = std::get_if<double>(&values[i])) {
+            out[i] = *dv;
+        } else if (const auto* fv = std::get_if<FloatValue>(&values[i])) {
+            out[i] = static_cast<double>(fv->value);
+        } else {
+            setHeapError(error, ErrorCode::TypeMismatch, "array element is not a floating-point number");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ManagedHeap::writePackedDoubleArray(
+    ObjectRef reference,
+    const double* data,
+    std::size_t count,
+    RuntimeError* error) {
+    if (count > 0 && !data) {
+        setHeapError(error, ErrorCode::InvalidArguments, "bulk write source buffer is null");
+        return false;
+    }
+    auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array) {
+        setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
+        return false;
+    }
+    if (object->header.elementType != semantic::PrimitiveType::Double &&
+        object->header.elementType != semantic::PrimitiveType::Float &&
+        object->header.elementType != semantic::PrimitiveType::Error) {
+        setHeapError(error, ErrorCode::TypeMismatch, "array element is not a floating-point number");
+        return false;
+    }
+    auto& values = std::get<std::vector<Value>>(object->payload);
+    if (count > values.size()) {
+        setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
+        return false;
+    }
+    const bool asFloat = object->header.elementType == semantic::PrimitiveType::Float;
+    for (std::size_t i = 0; i < count; ++i) {
+        values[i] = asFloat ? Value{FloatValue{static_cast<float>(data[i])}} : Value{data[i]};
+    }
+    return true;
+}
+
+bool ManagedHeap::readPackedVec2Array(
+    ObjectRef reference,
+    std::vector<Vec2Value>& out,
+    RuntimeError* error) const {
+    const auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array) {
+        setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
+        return false;
+    }
+    const auto& values = std::get<std::vector<Value>>(object->payload);
+    out.resize(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (const auto* v2 = std::get_if<Vec2Value>(&values[i])) {
+            out[i] = *v2;
+        } else {
+            const auto fx = loadInlineStructField(values[i], 0);
+            const auto fy = loadInlineStructField(values[i], 1);
+            if (fx && fy && std::holds_alternative<FixedValue>(*fx) && std::holds_alternative<FixedValue>(*fy)) {
+                out[i] = Vec2Value{std::get<FixedValue>(*fx).raw, std::get<FixedValue>(*fy).raw};
+            } else {
+                setHeapError(error, ErrorCode::TypeMismatch, "array element is not a Vec2");
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool ManagedHeap::writePackedVec2Array(
+    ObjectRef reference,
+    const Vec2Value* data,
+    std::size_t count,
+    RuntimeError* error) {
+    if (count > 0 && !data) {
+        setHeapError(error, ErrorCode::InvalidArguments, "bulk write source buffer is null");
+        return false;
+    }
+    auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array) {
+        setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
+        return false;
+    }
+    if (object->header.elementType != semantic::PrimitiveType::Error &&
+        !(object->header.elementType == semantic::PrimitiveType::Struct &&
+          object->header.elementTypeId == vec2TypeId())) {
+        setHeapError(error, ErrorCode::TypeMismatch, "array element is not a Vec2");
+        return false;
+    }
+    auto& values = std::get<std::vector<Value>>(object->payload);
+    if (count > values.size()) {
+        setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
+        return false;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        values[i] = Value{data[i]};
+    }
+    return true;
 }
 
 const GcStatistics& ManagedHeap::statistics() const noexcept {

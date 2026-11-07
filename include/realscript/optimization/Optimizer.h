@@ -20,6 +20,10 @@ struct Options {
     Level level = Level::Basic;
     std::size_t maximumIterations = 4;
     bool preserveDebugInfo = true;
+    bool enableInlining = true;
+    bool enableLicm = true;
+    bool enableStructFieldForwarding = true;
+    std::size_t maxInlineInstructions = 12;
 };
 
 struct Statistics {
@@ -30,6 +34,9 @@ struct Statistics {
     std::uint64_t instructionsRemoved = 0;
     std::uint64_t blocksRemoved = 0;
     std::uint64_t localLoadsFolded = 0;
+    std::uint64_t functionsInlined = 0;
+    std::uint64_t loopInvariantsHoisted = 0;
+    std::uint64_t structFieldsForwarded = 0;
 
     [[nodiscard]] bool changed() const noexcept;
 };

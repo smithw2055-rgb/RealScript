@@ -188,10 +188,20 @@ ExecutionContext::ExecutionContext(
         const auto& type = program.types[index];
         types_.emplace(type.id, &type);
     }
+    stack_.reserve(64);
     for (std::uint32_t index = 0; index < program.functionCount; ++index) {
         const auto& function = program.functions[index];
         functions_.emplace(function.symbolId, &function);
     }
+}
+
+std::vector<std::string> ExecutionContext::materializeStackTrace() const {
+    std::vector<std::string> result;
+    result.reserve(stack_.size());
+    for (auto it = stack_.rbegin(); it != stack_.rend(); ++it) {
+        result.emplace_back(*it ? *it : "<aot-function>");
+    }
+    return result;
 }
 
 const TypeDescriptor* ExecutionContext::findType(
@@ -265,7 +275,7 @@ void ExecutionContext::emitTrace(
     if (!diagnosticEventsEnabled_) return;
     runtime::TraceEvent event;
     event.kind = kind;
-    event.function = stack_.empty() ? std::string{} : stack_.back();
+    event.function = stack_.empty() ? std::string{} : std::string(stack_.back());
     event.operation.assign(operation.data(), operation.size());
     event.instructionIndex = executed_;
     event.callDepth = stack_.size();
@@ -277,8 +287,7 @@ bool ExecutionContext::fail(
     std::string message) {
     error_.code = code;
     error_.message = std::move(message);
-    error_.stackTrace = stack_;
-    std::reverse(error_.stackTrace.begin(), error_.stackTrace.end());
+    error_.stackTrace = materializeStackTrace();
     emitTrace(runtime::TraceEventKind::RuntimeError, 0, error_.message);
     return false;
 }
@@ -388,7 +397,7 @@ void ExecutionContext::reportUnhandledScriptException() {
     if (!pendingException_ || error_.code != runtime::ErrorCode::None) return;
     error_.code = runtime::ErrorCode::ScriptException;
     error_.message = "unhandled script exception";
-    error_.stackTrace = stack_;
+    error_.stackTrace = materializeStackTrace();
 }
 
 bool ExecutionContext::expectType(
@@ -812,8 +821,7 @@ bool ExecutionContext::call(
             error_.code = runtime::ErrorCode::ExternalFunctionUnresolved;
             error_.message = "external function '" + reference.name + "' failed";
         }
-        error_.stackTrace = stack_;
-        std::reverse(error_.stackTrace.begin(), error_.stackTrace.end());
+        error_.stackTrace = materializeStackTrace();
         return false;
     }
     if (!expectSignatureType(
@@ -1699,6 +1707,82 @@ bool ExecutionContext::storeStructField(
     auto storage = std::make_shared<runtime::StructStorage>(*structure.storage);
     storage->fields[fieldIndex] = value;
     result = runtime::StructValue{typeId, std::move(storage)};
+    return true;
+}
+
+bool ExecutionContext::initUnboxedStruct(
+    semantic::SymbolId typeId,
+    UnboxedCustomStruct& result) {
+    const auto* descriptor = findType(typeId);
+    if (!descriptor || descriptor->kind != semantic::TypeKind::Struct ||
+        descriptor->fieldCount > 16) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT unboxed struct allocation references an invalid struct descriptor");
+    }
+    result.typeId = typeId;
+    result.fieldCount = static_cast<std::uint8_t>(descriptor->fieldCount);
+    for (std::uint32_t index = 0; index < descriptor->fieldCount; ++index) {
+        const auto& field = descriptor->fields[index];
+        result.fields[index] = defaultValue(field.type, field.typeId, 1);
+    }
+    return true;
+}
+
+bool ExecutionContext::loadUnboxedStructField(
+    semantic::SymbolId typeId,
+    std::size_t fieldIndex,
+    const UnboxedCustomStruct& receiver,
+    runtime::Value& result) {
+    const auto* type = findType(typeId);
+    if (!type || type->kind != semantic::TypeKind::Struct ||
+        receiver.typeId != typeId ||
+        fieldIndex >= type->fieldCount ||
+        fieldIndex >= receiver.fieldCount) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "struct field load references an invalid field slot");
+    }
+    const auto& field = type->fields[fieldIndex];
+    const auto& value = receiver.fields[fieldIndex];
+    if (!expectSignatureType(
+            value,
+            field.type,
+            field.typeId,
+            "struct field load value")) {
+        return false;
+    }
+    result = value;
+    return true;
+}
+
+bool ExecutionContext::storeUnboxedStructField(
+    semantic::SymbolId typeId,
+    std::size_t fieldIndex,
+    const UnboxedCustomStruct& receiver,
+    const runtime::Value& value,
+    UnboxedCustomStruct& result) {
+    const auto* type = findType(typeId);
+    if (!type || type->kind != semantic::TypeKind::Struct ||
+        receiver.typeId != typeId ||
+        fieldIndex >= type->fieldCount ||
+        fieldIndex >= receiver.fieldCount) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "struct field store references an invalid field slot");
+    }
+    const auto& field = type->fields[fieldIndex];
+    if (!expectSignatureType(
+            value,
+            field.type,
+            field.typeId,
+            "struct field store value")) {
+        return false;
+    }
+    if (&result != &receiver) {
+        result = receiver;
+    }
+    result.fields[fieldIndex] = value;
     return true;
 }
 

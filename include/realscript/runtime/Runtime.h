@@ -252,8 +252,15 @@ public:
         : data_(data), size_(size) {}
     ValueSpan(const std::vector<Value>& values) noexcept
         : data_(values.data()), size_(values.size()) {}
-    constexpr ValueSpan(std::initializer_list<Value> values) noexcept
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winit-list-lifetime"
+#endif
+    ValueSpan(std::initializer_list<Value> values) noexcept
         : data_(values.begin()), size_(values.size()) {}
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     template <std::size_t N>
     constexpr ValueSpan(const std::array<Value, N>& values) noexcept
         : data_(values.data()), size_(N) {}
@@ -337,6 +344,9 @@ struct GcStatistics {
     std::size_t liveObjects = 0;
     std::size_t liveBytes = 0;
     std::size_t peakLiveBytes = 0;
+    std::uint64_t youngCollections = 0;
+    std::uint64_t youngObjectsReclaimed = 0;
+    std::uint64_t objectsPromoted = 0;
 };
 
 struct HeapEdge {
@@ -476,6 +486,36 @@ public:
     [[nodiscard]] GcPhase phase() const noexcept;
     std::size_t step(const ShadowStack& shadowStack, std::size_t workBudget);
     void collectFull(const ShadowStack& shadowStack);
+    std::size_t collectYoung(const ShadowStack& shadowStack, std::size_t workBudget = 0);
+    [[nodiscard]] std::size_t nurserySize() const noexcept;
+
+    bool readPackedIntArray(
+        ObjectRef reference,
+        std::vector<std::int64_t>& out,
+        RuntimeError* error = nullptr) const;
+    bool writePackedIntArray(
+        ObjectRef reference,
+        const std::int64_t* data,
+        std::size_t count,
+        RuntimeError* error = nullptr);
+    bool readPackedDoubleArray(
+        ObjectRef reference,
+        std::vector<double>& out,
+        RuntimeError* error = nullptr) const;
+    bool writePackedDoubleArray(
+        ObjectRef reference,
+        const double* data,
+        std::size_t count,
+        RuntimeError* error = nullptr);
+    bool readPackedVec2Array(
+        ObjectRef reference,
+        std::vector<Vec2Value>& out,
+        RuntimeError* error = nullptr) const;
+    bool writePackedVec2Array(
+        ObjectRef reference,
+        const Vec2Value* data,
+        std::size_t count,
+        RuntimeError* error = nullptr);
 
     [[nodiscard]] const GcStatistics& statistics() const noexcept;
     [[nodiscard]] std::size_t liveObjects() const noexcept;

@@ -162,10 +162,72 @@ void testOptimizedAotGeneration() {
 
 } // namespace
 
+
+void testExpandedTypedAotMathLongDoubleAndDirectCalls() {
+    const char* mathAndCallSource = R"RS(
+module Phase6.ExpandedTypedAot;
+import RealScript.Math;
+
+int addHelper(int a, int b) {
+    return a + b;
+}
+
+long computeLongChain(int seed, int steps) {
+    long acc = (long)seed;
+    for (int i = 0; i < steps; i = i + 1) {
+        acc = acc + (long)addHelper(i, 3) * 2;
+    }
+    return acc;
+}
+
+double computeDoubleChain(int steps) {
+    double total = 0.5;
+    for (int i = 1; i <= steps; i = i + 1) {
+        total = total + (double)i * 1.25;
+    }
+    return total;
+}
+
+Fixed simulateVec2Vec3(int steps) {
+    Vec2 pos = new Vec2(Fixed.Of(2), Fixed.Of(3));
+    Vec2 vel = new Vec2(Fixed.Ratio(1, 4), Fixed.Ratio(1, 2));
+    Vec3 acc3 = new Vec3(Fixed.Of(1), Fixed.Of(2), Fixed.Of(3));
+    for (int i = 0; i < steps; i = i + 1) {
+        pos = pos + vel;
+        acc3.x = acc3.x + pos.x;
+        acc3.y = acc3.y + pos.y;
+    }
+    return acc3.x + acc3.y + acc3.z;
+}
+)RS";
+
+    realscript::compiler::Compilation compilation;
+    compilation.addSource({"phase6_expanded_typed_aot.rs", mathAndCallSource});
+    auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(), "Expanded Typed AOT source failed to compile");
+
+    realscript::diagnostics::DiagnosticBag diagnostics;
+    realscript::aot::CppGenerator generator;
+    realscript::aot::GenerationOptions genOptions;
+    genOptions.programName = "Phase6ExpandedTyped";
+    const auto generated = generator.generate(build.modules, diagnostics, genOptions);
+    require(!diagnostics.hasErrors(), "Expanded Typed AOT generation failed");
+
+    // Verify that all 4 functions in Phase6.ExpandedTypedAot and RealScript.Math functions lowered to _scalar
+    require(
+        generated.source.find("_scalar<FastAccounting, DeterminismAccounting>(") != std::string::npos &&
+        generated.source.find("enterTypedDirectCall<FastAccounting, DeterminismAccounting>") != std::string::npos &&
+        generated.source.find("runtime::Vec2Value") != std::string::npos &&
+        generated.source.find("runtime::Vec3Value") != std::string::npos &&
+        generated.source.find("runtime::FixedValue") != std::string::npos,
+        "Expanded Typed AOT did not emit scalar math types and direct calls");
+}
+
 int main() {
     try {
         testCrossBackendDeterminismAndProfiling();
         testOptimizedAotGeneration();
+        testExpandedTypedAotMathLongDoubleAndDirectCalls();
         std::cout << "Phase 6 AOT determinism tests passed\n";
         return 0;
     } catch (const std::exception& exception) {
