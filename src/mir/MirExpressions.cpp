@@ -308,6 +308,20 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 : 0;
             return value;
         }
+        if (literal.type == semantic::PrimitiveType::Float) {
+            const auto dblVal = emitValue(
+                Opcode::ConstantDouble,
+                semantic::PrimitiveType::Double,
+                {},
+                expression.span);
+            block(*currentBlockId_).instructions.back().doubleImmediate =
+                std::get<double>(literal.value);
+            return emitValue(
+                Opcode::ConvertNumeric,
+                semantic::PrimitiveType::Float,
+                {dblVal},
+                expression.span);
+        }
         if (literal.type == semantic::PrimitiveType::Double) {
             const auto value = emitValue(Opcode::ConstantDouble, literal.type, {}, expression.span);
             block(*currentBlockId_).instructions.back().doubleImmediate =

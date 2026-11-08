@@ -520,6 +520,11 @@ bool ScriptRuntime::bindEcsRawColumn(
     view.strideBytes = strideBytes;
     view.structTypeId = type->descriptor.id;
     view.fields = fieldLayouts;
+    for (std::size_t i = 0; i < view.fields.size(); ++i) {
+        view.fields[i].scriptType = type->descriptor.fields[i].type;
+        view.fields[i].scriptTypeId = exactTypeId(
+            type->descriptor.fields[i].type, type->descriptor.fields[i].typeName);
+    }
     view.readOnly = readOnly;
 
     const auto colSymbolId = semantic::stableTypeId("$ecs_column::" + type->canonicalName());

@@ -149,7 +149,11 @@ add_executable(rsbench tools/rsbench/main.cpp)
 target_link_libraries(rsbench PRIVATE RealScript::Compiler RealScript::Runtime)
 target_compile_features(rsbench PRIVATE cxx_std_17)
 
-foreach(realscript_tool IN ITEMS rsc rsdebug rslsp rsaot rsbench)
+add_executable(rsbind tools/rsbind/main.cpp)
+target_link_libraries(rsbind PRIVATE RealScript::GameSdk)
+target_compile_features(rsbind PRIVATE cxx_std_17)
+
+foreach(realscript_tool IN ITEMS rsc rsdebug rslsp rsaot rsbench rsbind)
     realscript_enable_cxx_warnings(${realscript_tool})
 endforeach()
 
@@ -650,7 +654,7 @@ if(REALSCRIPT_INSTALL_SDK)
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
     install(
-        TARGETS rsc rsdebug rslsp rsbench
+        TARGETS rsc rsdebug rslsp rsbench rsbind
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
     install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

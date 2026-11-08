@@ -6178,6 +6178,164 @@ int main()
     }
 }
 
+void testRsbindHeaderGeneratorAndZeroCopyEcsLongField() {
+    const std::string cppHeader = R"CPP(
+#pragma once
+#include "realscript/game/GameBindings.h"
+
+namespace engine::physics {
+
+RS_EXPORT_ENUM()
+enum class BodyMode {
+    Static = 0,
+    Kinematic = 1,
+    Dynamic = 4
+};
+
+RS_EXPORT_ECS_COMPONENT("Engine.Physics")
+struct RigidBodyComponent {
+    int64_t entityId = 0;
+    float mass = 1.0f;
+    Vec3 velocity = Vec3(0.0f, 0.0f, 0.0f);
+};
+
+RS_EXPORT_CLASS("Engine.Physics")
+class PhysicsWorld {
+public:
+    RS_EXPORT_PROPERTY("gravity", GetGravity, SetGravity)
+    RS_EXPORT_METHOD
+    float GetGravity() const { return gravity_; }
+
+    RS_EXPORT_METHOD
+    void SetGravity(float g) { gravity_ = g; }
+
+    RS_EXPORT_METHOD void StepWorld(float dt, int subSteps);
+
+    RS_EXPORT_METHOD_EX(NonDeterministic, "Physics.Query")
+    uint32_t RaycastCount(Vec3 origin, Vec3 dir);
+
+    RS_EXPORT_METHOD
+    BodyMode GetDefaultMode() const;
+
+    RS_EXPORT_METHOD
+    RigidBodyComponent GetTemplateBody() const;
+
+    RS_EXPORT_METHOD
+    PhysicsWorld* GetSelf();
+
+private:
+    float gravity_ = -9.81f;
+};
+
+RS_EXPORT_FUNCTION_EX("Engine.Physics", NonDeterministic, "Physics.Global")
+int ResetPhysicsSubsystem(int seed);
+
+} // namespace engine::physics
+)CPP";
+
+    const auto gen = realscript::game::GameApi::generateBindingsFromCppHeader(
+        cppHeader, "Engine.Physics");
+    require(gen.enumsExported == 1, "expected 1 exported enum");
+    require(gen.structsExported == 1, "expected 1 exported ECS struct");
+    require(gen.classesExported == 1, "expected 1 exported class");
+    require(gen.propertiesExported == 1, "expected 1 exported property");
+    require(gen.methodsExported == 7, "expected 7 exported methods");
+    require(gen.functionsExported == 1, "expected 1 exported function");
+
+    // Verify namespace qualification survived inline method braces inside PhysicsWorld
+    require(
+        gen.cppRegistrationSource.find("&engine::physics::PhysicsWorld::StepWorld") != std::string::npos,
+        "expected single-line RS_EXPORT_METHOD StepWorld to be registered with namespace qualification");
+    require(
+        gen.cppRegistrationSource.find("&engine::physics::ResetPhysicsSubsystem") != std::string::npos,
+        "expected function after class with inline methods to retain engine::physics:: namespace prefix");
+    require(
+        gen.cppRegistrationSource.find("offsetof(engine::physics::RigidBodyComponent, velocity)") != std::string::npos,
+        "expected ECS field with default constructor initializer Vec3(0.0f, 0.0f, 0.0f) to be parsed");
+
+    // Verify generated .d.rs stub compiles cleanly alongside a script using 0.0f float literals and ECS raw columns
+    realscript::game::GameApi api;
+    realscript::game::GameScriptCompiler compiler(api);
+    const std::string testUserScript = R"RS(
+module Game.PhysicsTest;
+import Engine.Physics;
+import RealScript.Math;
+
+class PhysicsRunner
+{
+    public long runTest()
+    {
+        float dt = 0.5f;
+        long total = 0;
+        foreach (ref var body in Query<Write<RigidBodyComponent>>())
+        {
+            if (body.mass > 0.0f)
+            {
+                body.entityId = body.entityId + 100;
+                body.mass = body.mass + dt;
+                body.velocity = body.velocity + new Vec3(FixedFromInt(1), FixedFromInt(2), FixedFromInt(3));
+                total = total + body.entityId;
+            }
+        }
+        return total;
+    }
+}
+)RS";
+
+    auto compiled = compiler.compile({
+        {"Engine_Physics.d.rs", gen.scriptDeclarationStub},
+        {"PhysicsTest.rs", testUserScript},
+    });
+    require(
+        compiled.succeeded(),
+        "Generated .d.rs stub + user script failed to compile:\n" +
+            diagnosticsText(compiled.diagnostics) + "\nStub was:\n" + gen.scriptDeclarationStub);
+
+    struct NativeRigidBody {
+        std::int64_t entityId;
+        float mass;
+        realscript::runtime::Vec3Value velocity;
+    };
+    NativeRigidBody nativeBodies[2] = {
+        {10, 2.0f, {0, 0, 0}},
+        {20, 4.0f, {0, 0, realscript::game::Fixed::fromInt(5).raw}},
+    };
+
+    realscript::game::ScriptRuntime runtime(compiled.program);
+    realscript::runtime::RuntimeError err;
+    const std::vector<realscript::runtime::NativeFieldLayout> fields = {
+        {offsetof(NativeRigidBody, entityId), realscript::runtime::NativeFieldKind::Int64},
+        {offsetof(NativeRigidBody, mass), realscript::runtime::NativeFieldKind::Float32},
+        {offsetof(NativeRigidBody, velocity), realscript::runtime::NativeFieldKind::Vec3},
+    };
+    require(
+        runtime.bindEcsRawColumn(
+            "Engine.Physics::RigidBodyComponent",
+            nativeBodies,
+            2,
+            sizeof(NativeRigidBody),
+            fields,
+            err),
+        "bindEcsRawColumn with Int64/Float32/Vec3 failed: " + err.message);
+
+    auto runnerObj = runtime.createObject("Game.PhysicsTest::PhysicsRunner", err);
+    require(runnerObj.has_value(), "createObject PhysicsRunner failed: " + err.message);
+    const auto fn = runtime.findMethod(runnerObj->type(), "runTest", 0);
+    require(fn.has_value(), "findMethod runTest failed");
+    const auto callRes = runtime.invoke(*runnerObj, *fn, {});
+    require(callRes.succeeded, "runTest invocation failed: " + callRes.error.message);
+    // body[0].entityId = 110, body[1].entityId = 120 -> total = 230
+    require(
+        std::holds_alternative<realscript::runtime::LongValue>(callRes.value) &&
+            std::get<realscript::runtime::LongValue>(callRes.value).value == 230,
+        "unexpected runTest result");
+    require(
+        nativeBodies[0].entityId == 110 && nativeBodies[1].entityId == 120 &&
+            nativeBodies[0].mass == 2.5f &&
+            nativeBodies[1].velocity.z == realscript::game::Fixed::fromInt(8).raw,
+        "Zero-copy C++ memory writeback for int64_t/float/Vec3 fields failed");
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -6224,8 +6382,10 @@ int main() {
         testStaticConstructorsAndReadonlyFieldsCompleteness();
         std::cout << "[22/23] testPropertyInitializersAndAutoPropertiesCompleteness..." << std::endl;
         testPropertyInitializersAndAutoPropertiesCompleteness();
-        std::cout << "[23/23] testFlatFrameComputedGotoInterpreterCompleteness..." << std::endl;
+        std::cout << "[23/24] testFlatFrameComputedGotoInterpreterCompleteness..." << std::endl;
         testFlatFrameComputedGotoInterpreterCompleteness();
+        std::cout << "[24/24] testRsbindHeaderGeneratorAndZeroCopyEcsLongField..." << std::endl;
+        testRsbindHeaderGeneratorAndZeroCopyEcsLongField();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

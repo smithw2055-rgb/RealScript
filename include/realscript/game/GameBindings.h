@@ -2,6 +2,34 @@
 
 #include "realscript/game/BindingMarshal.h"
 
+#if !defined(RS_EXPORT_CLASS)
+#define RS_EXPORT_CLASS(...)
+#endif
+#if !defined(RS_EXPORT_ECS_COMPONENT)
+#define RS_EXPORT_ECS_COMPONENT(...)
+#endif
+#if !defined(RS_EXPORT_STRUCT)
+#define RS_EXPORT_STRUCT(...)
+#endif
+#if !defined(RS_EXPORT_FIELD)
+#define RS_EXPORT_FIELD
+#endif
+#if !defined(RS_EXPORT_METHOD)
+#define RS_EXPORT_METHOD
+#endif
+#if !defined(RS_EXPORT_METHOD_EX)
+#define RS_EXPORT_METHOD_EX(...)
+#endif
+#if !defined(RS_EXPORT_PROPERTY)
+#define RS_EXPORT_PROPERTY(...)
+#endif
+#if !defined(RS_EXPORT_FUNCTION)
+#define RS_EXPORT_FUNCTION(...)
+#endif
+#if !defined(RS_EXPORT_ENUM)
+#define RS_EXPORT_ENUM
+#endif
+
 namespace realscript::game {
 
 class GameApi;
@@ -169,6 +197,7 @@ public:
         std::string cppRegistrationSource;
         std::string scriptDeclarationStub;
         std::size_t classesExported = 0;
+        std::size_t structsExported = 0;
         std::size_t methodsExported = 0;
         std::size_t functionsExported = 0;
         std::size_t propertiesExported = 0;
@@ -331,6 +360,8 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::property(
             type.name,
             type.moduleName,
             detail::ScriptTypeCategory::NativeObject}, "self"}},
+        {},
+        determinism,
         {}});
     auto state = state_;
     state_->bindings->bind(
@@ -412,11 +443,15 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::property(
         getterNativeName,
         *getterType,
         {receiver},
+        {},
+        determinism,
         {}});
     module.functions.push_back(detail::FunctionDeclaration{
         setterNativeName,
         detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int},
         {receiver, detail::ParameterDeclaration{*setterType, "value"}},
+        {},
+        determinism,
         {}});
 
     auto state = state_;
