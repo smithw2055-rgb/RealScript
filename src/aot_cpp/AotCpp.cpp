@@ -251,28 +251,78 @@ const debug::SourceFileInfo* findSource(
     return nullptr;
 }
 
-void emitLineDirective(
+const debug::SourceFileInfo* findFunctionSource(
+    const mir::Module& module,
+    const mir::Function& function) {
+    if (const auto* byId = findSource(module, function.debugInfo.sourceFileId)) {
+        return byId;
+    }
+    if (!function.debugInfo.sourceName.empty()) {
+        for (const auto& source : module.sourceFiles) {
+            if (source.path == function.debugInfo.sourceName) return &source;
+        }
+    }
+    return module.sourceFiles.empty() ? nullptr : &module.sourceFiles.front();
+}
+
+std::optional<debug::SequencePoint> resolveSequencePoint(
+    const mir::Module& module,
+    const mir::Function& function,
+    mir::BlockId blockId,
+    std::uint32_t instructionIndex,
+    bool terminator,
+    text::TextSpan fallbackSpan,
+    bool* outExplicitSequencePoint = nullptr) {
+    if (const auto* point = findPoint(function, blockId, instructionIndex, terminator)) {
+        if (outExplicitSequencePoint) *outExplicitSequencePoint = true;
+        return *point;
+    }
+    if (outExplicitSequencePoint) *outExplicitSequencePoint = false;
+    if (fallbackSpan.empty()) return std::nullopt;
+    const auto* source = findFunctionSource(module, function);
+    if (!source || source->path.empty()) return std::nullopt;
+    debug::SequencePoint synthesized;
+    synthesized.blockId = blockId;
+    synthesized.instructionIndex = instructionIndex;
+    synthesized.terminator = terminator;
+    synthesized.range = debug::makeSourceRange(*source, fallbackSpan);
+    return synthesized;
+}
+
+bool emitLineDirective(
     Emitter& output,
     const mir::Module& module,
-    const debug::SequencePoint* point,
+    const std::optional<debug::SequencePoint>& point,
     bool enabled,
-    std::vector<SourceMapRecord>& sourceMap,
-    semantic::SymbolId symbolId) {
-    if (!point) return;
+    std::vector<SourceMapRecord>* sourceMap,
+    semantic::SymbolId symbolId,
+    bool recordInMap = true) {
+    if (!point) return false;
     const auto* source = findSource(module, point->range.fileId);
-    if (!source || source->path.empty()) return;
-    const auto line = point->range.start.line + 1;
+    if (!source || source->path.empty()) return false;
+    const auto line = static_cast<std::uint32_t>(point->range.start.line + 1);
     if (enabled) {
         output.line("#line " + std::to_string(line) + " \"" +
             escapeCppString(source->path) + "\"");
     }
-    SourceMapRecord entry;
-    entry.symbolId = symbolId;
-    entry.generatedLine = output.nextLine();
-    entry.sourcePath = source->path;
-    entry.sourceLine = line;
-    entry.sourceColumn = point->range.start.column + 1;
-    sourceMap.push_back(std::move(entry));
+    if (sourceMap && recordInMap) {
+        SourceMapRecord entry;
+        entry.symbolId = symbolId;
+        entry.generatedLine = output.nextLine();
+        entry.sourcePath = source->path;
+        entry.sourceLine = line;
+        entry.sourceColumn = static_cast<std::uint32_t>(point->range.start.column + 1);
+        sourceMap->push_back(std::move(entry));
+    }
+    return enabled;
+}
+
+void emitGeneratedLineReset(
+    Emitter& output,
+    bool enabled) {
+    if (!enabled) return;
+    output.line("#line " + std::to_string(output.nextLine() + 1u) +
+        " \"realscript_aot_generated.cpp\"");
 }
 
 std::string valueExpression(mir::ValueId id) {
@@ -1137,6 +1187,15 @@ void emitTypedTransfer(
     const std::string& indent) {
     const auto* block = findBlock(function, target);
     if (!block) return;
+    output.line(indent + "if constexpr (FastAccounting && !TrustedRelease) {");
+    output.line(indent + "    rawAccounting.branch();");
+    output.line(indent + "} else if constexpr (DeterminismAccounting && !TrustedRelease) {");
+    output.line(indent + "    determinismAccounting.branch(" +
+        std::to_string(target) + ");");
+    output.line(indent + "} else if constexpr (!TrustedRelease) {");
+    output.line(indent + "    if (!context.branch(" +
+        std::to_string(target) + ")) return false;");
+    output.line(indent + "}");
     for (std::size_t index = 0;
          index < arguments.size() && index < block->parameters.size();
          ++index) {
@@ -1151,15 +1210,6 @@ void emitTypedTransfer(
             typedValueExpression(block->parameters[index].value) + " = " +
             prefix + "_" + std::to_string(index) + ";");
     }
-    output.line(indent + "if constexpr (FastAccounting && !TrustedRelease) {");
-    output.line(indent + "    rawAccounting.branch();");
-    output.line(indent + "} else if constexpr (DeterminismAccounting && !TrustedRelease) {");
-    output.line(indent + "    determinismAccounting.branch(" +
-        std::to_string(target) + ");");
-    output.line(indent + "} else if constexpr (!TrustedRelease) {");
-    output.line(indent + "    if (!context.branch(" +
-        std::to_string(target) + ")) return false;");
-    output.line(indent + "}");
     output.line(indent + "goto typedBlock_" + std::to_string(target) + ";");
 }
 
@@ -1815,9 +1865,11 @@ void emitVectorizedBodyInstruction(
 
 void emitVectorizedEcsLoop(
     Emitter& source,
+    const mir::Module& module,
     const mir::Function& function,
     const std::vector<TypedSlotType>& types,
-    const VectorizedEcsLoopPlan& plan) {
+    const VectorizedEcsLoopPlan& plan,
+    bool emitLineDirectives) {
     const auto* bodyBlock = findBlock(function, plan.bodyBlockId);
     if (!bodyBlock) return;
 
@@ -1881,8 +1933,23 @@ void emitVectorizedEcsLoop(
             " = " + ptrName + "[ecsIdx];");
     }
     for (std::size_t i = plan.bodyPreambleCount; i < bodyBlock->instructions.size(); ++i) {
+        emitLineDirective(
+            source,
+            module,
+            resolveSequencePoint(
+                module,
+                function,
+                bodyBlock->id,
+                static_cast<std::uint32_t>(i),
+                false,
+                bodyBlock->instructions[i].sourceSpan),
+            emitLineDirectives,
+            nullptr,
+            function.symbolId,
+            false);
         emitVectorizedBodyInstruction(source, bodyBlock->instructions[i], types, "                        ");
     }
+    emitGeneratedLineReset(source, emitLineDirectives);
     for (const auto& col : plan.columns) {
         if (!col.isWrite) continue;
         const std::string ptrName = "ecsPtr_" + std::to_string(col.colLocalIndex);
@@ -1909,8 +1976,23 @@ void emitVectorizedEcsLoop(
             rawCol + ", ecsIdx, " + typedLocalExpression(col.iterLocalIndex) + ");");
     }
     for (std::size_t i = plan.bodyPreambleCount; i < bodyBlock->instructions.size(); ++i) {
+        emitLineDirective(
+            source,
+            module,
+            resolveSequencePoint(
+                module,
+                function,
+                bodyBlock->id,
+                static_cast<std::uint32_t>(i),
+                false,
+                bodyBlock->instructions[i].sourceSpan),
+            emitLineDirectives,
+            nullptr,
+            function.symbolId,
+            false);
         emitVectorizedBodyInstruction(source, bodyBlock->instructions[i], types, "                        ");
     }
+    emitGeneratedLineReset(source, emitLineDirectives);
     for (const auto& col : plan.columns) {
         if (!col.isWrite) continue;
         const auto rawCol = "typedLocalRawCol_" + std::to_string(col.colLocalIndex);
@@ -2016,6 +2098,35 @@ void emitTypedPrimitiveFunction(
         source.line("    " + typedCppType(types[index]) + " " +
             typedValueExpression(static_cast<mir::ValueId>(index)) + "{};");
     }
+    if (options.emitLineDirectives && !function.debugInfo.locals.empty()) {
+        std::unordered_map<std::string, std::size_t> debugNameCounts;
+        for (const auto& local : function.debugInfo.locals) {
+            if (!local.name.empty() && local.name.front() != '$') ++debugNameCounts[sanitizeCppIdentifier(local.name)];
+        }
+        std::set<std::string> emittedDebugAliases;
+        for (const auto& local : function.debugInfo.locals) {
+            if (local.name.empty() || local.name.front() == '$') continue;
+            const std::string clean = sanitizeCppIdentifier(local.name);
+            std::string aliasName = "dbg_" + clean;
+            if (debugNameCounts[clean] > 1) {
+                aliasName += (local.parameter ? "_arg" : "_slot") + std::to_string(local.slot);
+            }
+            if (!emittedDebugAliases.insert(aliasName).second) continue;
+            if (local.parameter &&
+                local.slot < localStoreCounts.size() &&
+                localStoreCounts[local.slot] > 1 &&
+                local.slot < function.localTypes.size()) {
+                source.line("    [[maybe_unused]] auto& " + aliasName +
+                    " = " + typedLocalExpression(local.slot) + ";");
+            } else if (local.parameter && local.slot < function.parameterTypes.size()) {
+                source.line("    [[maybe_unused]] auto& " + aliasName +
+                    " = typedArg_" + std::to_string(local.slot) + ";");
+            } else if (!local.parameter && local.slot < function.localTypes.size()) {
+                source.line("    [[maybe_unused]] auto& " + aliasName +
+                    " = " + typedLocalExpression(local.slot) + ";");
+            }
+        }
+    }
     source.line("    goto typedBlock_0;");
 
     const auto vectorizedEcsLoops =
@@ -2026,25 +2137,42 @@ void emitTypedPrimitiveFunction(
         source.line("    {");
         const auto vecLoopIt = vectorizedEcsLoops.find(block.id);
         if (vecLoopIt != vectorizedEcsLoops.end()) {
-            emitVectorizedEcsLoop(source, function, types, vecLoopIt->second);
+            emitVectorizedEcsLoop(
+                source, module, function, types, vecLoopIt->second, options.emitLineDirectives);
         }
         const auto rawConsumeBatches =
             typedRawConsumeBatches(block, rangeAnalysis);
+        bool activeSourceLine = false;
         for (std::size_t instructionIndex = 0;
              instructionIndex < block.instructions.size();
              ++instructionIndex) {
             const auto& instruction = block.instructions[instructionIndex];
-            emitLineDirective(
-                source,
-                module,
-                findPoint(function, block.id,
-                    static_cast<std::uint32_t>(instructionIndex), false),
-                options.emitLineDirectives,
-                sourceMap,
-                function.symbolId);
+            if (activeSourceLine) {
+                emitGeneratedLineReset(source, options.emitLineDirectives);
+                activeSourceLine = false;
+            }
             emitTypedRawConsume(
                 source, rawConsumeBatches[instructionIndex], "            ");
             emitTypedConsume(source, instruction.opcode, "            ");
+            bool explicitPoint = false;
+            const auto resolvedPoint = resolveSequencePoint(
+                module,
+                function,
+                block.id,
+                static_cast<std::uint32_t>(instructionIndex),
+                false,
+                instruction.sourceSpan,
+                &explicitPoint);
+            if (emitLineDirective(
+                    source,
+                    module,
+                    resolvedPoint,
+                    options.emitLineDirectives,
+                    &sourceMap,
+                    function.symbolId,
+                    explicitPoint)) {
+                activeSourceLine = true;
+            }
             const auto result = instruction.result >= 0
                 ? typedValueExpression(instruction.result)
                 : std::string{};
@@ -2709,35 +2837,75 @@ void emitTypedPrimitiveFunction(
             }
         }
 
-        emitLineDirective(
-            source,
-            module,
-            findPoint(function, block.id,
-                static_cast<std::uint32_t>(block.instructions.size()), true),
-            options.emitLineDirectives,
-            sourceMap,
-            function.symbolId);
+        if (activeSourceLine) {
+            emitGeneratedLineReset(source, options.emitLineDirectives);
+            activeSourceLine = false;
+        }
         emitTypedRawConsume(
             source, rawConsumeBatches[block.instructions.size()], "            ");
         emitTypedConsume(source, block.terminator.kind, "            ");
+        bool explicitTermPoint = false;
+        const auto resolvedTermPoint = resolveSequencePoint(
+            module,
+            function,
+            block.id,
+            static_cast<std::uint32_t>(block.instructions.size()),
+            true,
+            block.terminator.sourceSpan,
+            &explicitTermPoint);
         switch (block.terminator.kind) {
         case mir::TerminatorKind::ReturnVoid:
+            emitLineDirective(
+                source, module, resolvedTermPoint, options.emitLineDirectives,
+                &sourceMap, function.symbolId, explicitTermPoint);
             source.line("            return true;");
             break;
         case mir::TerminatorKind::ReturnValue: {
             const auto value = typedValueExpression(block.terminator.value);
+            emitLineDirective(
+                source, module, resolvedTermPoint, options.emitLineDirectives,
+                &sourceMap, function.symbolId, explicitTermPoint);
             source.line("            typedOutResult = " + value + ";");
             source.line("            return true;");
             break;
         }
         case mir::TerminatorKind::Jump:
-            emitTypedTransfer(
-                source, function, block.terminator.target,
-                block.terminator.arguments, "typedEdge", "            ");
+            if (const auto* targetBlock = findBlock(function, block.terminator.target)) {
+                source.line("            if constexpr (FastAccounting && !TrustedRelease) {");
+                source.line("                rawAccounting.branch();");
+                source.line("            } else if constexpr (DeterminismAccounting && !TrustedRelease) {");
+                source.line("                determinismAccounting.branch(" +
+                    std::to_string(block.terminator.target) + ");");
+                source.line("            } else if constexpr (!TrustedRelease) {");
+                source.line("                if (!context.branch(" +
+                    std::to_string(block.terminator.target) + ")) return false;");
+                source.line("            }");
+                emitLineDirective(
+                    source, module, resolvedTermPoint, options.emitLineDirectives,
+                    &sourceMap, function.symbolId, explicitTermPoint);
+                for (std::size_t idx = 0;
+                     idx < block.terminator.arguments.size() && idx < targetBlock->parameters.size();
+                     ++idx) {
+                    source.line("            const auto typedEdge_" + std::to_string(idx) + " = " +
+                        typedValueExpression(block.terminator.arguments[idx]) + ";");
+                }
+                for (std::size_t idx = 0;
+                     idx < block.terminator.arguments.size() && idx < targetBlock->parameters.size();
+                     ++idx) {
+                    source.line("            " +
+                        typedValueExpression(targetBlock->parameters[idx].value) +
+                        " = typedEdge_" + std::to_string(idx) + ";");
+                }
+                source.line("            goto typedBlock_" + std::to_string(block.terminator.target) + ";");
+            }
             break;
         case mir::TerminatorKind::Branch:
+            emitLineDirective(
+                source, module, resolvedTermPoint, options.emitLineDirectives,
+                &sourceMap, function.symbolId, explicitTermPoint);
             source.line("            if (" +
                 typedValueExpression(block.terminator.condition) + ") {");
+            emitGeneratedLineReset(source, options.emitLineDirectives);
             emitTypedTransfer(
                 source, function, block.terminator.target,
                 block.terminator.arguments, "typedTrueEdge", "                ");
@@ -2751,6 +2919,7 @@ void emitTypedPrimitiveFunction(
         case mir::TerminatorKind::None:
             break;
         }
+        emitGeneratedLineReset(source, options.emitLineDirectives);
         source.line("    }");
     }
     source.line("}");
@@ -3529,19 +3698,16 @@ GeneratedProgram CppGenerator::generate(
                     source.line(indent + "}");
                 }
             };
+            bool activeSourceLine = false;
             for (std::size_t instructionIndex = 0;
                  instructionIndex < block.instructions.size();
                  ++instructionIndex) {
                 const auto& instruction = block.instructions[instructionIndex];
-                emitLineDirective(
-                    source,
-                    module,
-                    findPoint(function, block.id,
-                        static_cast<std::uint32_t>(instructionIndex), false),
-                    options.emitLineDirectives,
-                    sourceMap,
-                    function.symbolId);
                 if (!options.trustedRelease) {
+                    if (activeSourceLine) {
+                        emitGeneratedLineReset(source, options.emitLineDirectives);
+                        activeSourceLine = false;
+                    }
                     source.line("            if (!context.trustedReleaseEnabled() && !context.consume(" +
                         std::to_string(
                             runtime::determinismOperationId(
@@ -3549,6 +3715,25 @@ GeneratedProgram CppGenerator::generate(
                         "ULL, \"" +
                         escapeCppString(mir::opcodeName(instruction.opcode)) +
                         "\")) return false;");
+                }
+                bool explicitPoint = false;
+                const auto resolvedPoint = resolveSequencePoint(
+                    module,
+                    function,
+                    block.id,
+                    static_cast<std::uint32_t>(instructionIndex),
+                    false,
+                    instruction.sourceSpan,
+                    &explicitPoint);
+                if (emitLineDirective(
+                        source,
+                        module,
+                        resolvedPoint,
+                        options.emitLineDirectives,
+                        &sourceMap,
+                        function.symbolId,
+                        explicitPoint)) {
+                    activeSourceLine = true;
                 }
                 const auto result = instruction.result >= 0
                     ? valueExpression(instruction.result)
@@ -3797,15 +3982,11 @@ GeneratedProgram CppGenerator::generate(
                 }
             }
 
-            emitLineDirective(
-                source,
-                module,
-                findPoint(function, block.id,
-                    static_cast<std::uint32_t>(block.instructions.size()), true),
-                options.emitLineDirectives,
-                sourceMap,
-                function.symbolId);
             if (!options.trustedRelease) {
+                if (activeSourceLine) {
+                    emitGeneratedLineReset(source, options.emitLineDirectives);
+                    activeSourceLine = false;
+                }
                 source.line("            if (!context.trustedReleaseEnabled() && !context.consume(" +
                     std::to_string(
                         runtime::determinismOperationId(
@@ -3814,6 +3995,23 @@ GeneratedProgram CppGenerator::generate(
                     escapeCppString(mir::terminatorName(block.terminator.kind)) +
                     "\")) return false;");
             }
+            bool explicitTermPoint = false;
+            const auto resolvedTermPoint = resolveSequencePoint(
+                module,
+                function,
+                block.id,
+                static_cast<std::uint32_t>(block.instructions.size()),
+                true,
+                block.terminator.sourceSpan,
+                &explicitTermPoint);
+            emitLineDirective(
+                source,
+                module,
+                resolvedTermPoint,
+                options.emitLineDirectives,
+                &sourceMap,
+                function.symbolId,
+                explicitTermPoint);
             switch (block.terminator.kind) {
             case mir::TerminatorKind::ReturnVoid:
                 source.line("            result = std::monostate{};");
@@ -3877,6 +4075,7 @@ GeneratedProgram CppGenerator::generate(
                     "\"AOT block has no terminator\");");
                 break;
             }
+            emitGeneratedLineReset(source, options.emitLineDirectives);
             source.line("        }");
         }
         source.line("        default:");

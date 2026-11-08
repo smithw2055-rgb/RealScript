@@ -151,8 +151,10 @@ void testGeneratorDeterminismAndShape() {
                 std::string::npos,
         "AOT output did not audit range-proven checked arithmetic lowering");
     require(first.source.find("#line ") != std::string::npos &&
+            first.source.find("\"realscript_aot_generated.cpp\"") != std::string::npos &&
+            first.source.find("[[maybe_unused]] auto& dbg_") != std::string::npos &&
             first.manifest.find("sourceMapCount") != std::string::npos,
-        "AOT source mapping metadata is missing");
+        "AOT source mapping metadata, line reset, or debug local aliases are missing");
     require(first.source.find("Interpreter") == std::string::npos &&
             first.source.find("bytecode::Opcode") == std::string::npos,
         "AOT output incorrectly embeds the bytecode interpreter");
