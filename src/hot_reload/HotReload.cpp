@@ -207,7 +207,7 @@ std::uint64_t functionBodyFingerprint(const bytecode::Module& module, const byte
             append(hash, bits);
             append(hash, instruction.boolImmediate ? 1 : 0);
             append(hash, instruction.checkedArithmetic ? 1 : 0);
-            for (const auto value : instruction.stringImmediate) append(hash, static_cast<unsigned char>(value));
+            for (const auto value : instruction.activeStringImmediate()) append(hash, static_cast<unsigned char>(value));
             for (const auto operand : instruction.operands) append(hash, operand);
         }
         append(hash, static_cast<std::uint64_t>(block.terminator.kind));

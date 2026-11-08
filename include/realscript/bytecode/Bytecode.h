@@ -218,15 +218,16 @@ public:
     [[nodiscard]] const char* c_str() const noexcept { return str().c_str(); }
     [[nodiscard]] const char* data() const noexcept { return str().data(); }
     [[nodiscard]] std::size_t size() const noexcept { return str().size(); }
-    [[nodiscard]] bool empty() const noexcept { return poolId_ == 0 || str().empty(); }
+    [[nodiscard]] constexpr bool empty() const noexcept { return poolId_ == 0u; }
+    [[nodiscard]] constexpr std::uint32_t poolId() const noexcept { return poolId_; }
     [[nodiscard]] auto begin() const noexcept { return str().begin(); }
     [[nodiscard]] auto end() const noexcept { return str().end(); }
 
-    friend bool operator==(const BytecodeString& l, const BytecodeString& r) noexcept {
-        return l.poolId_ == r.poolId_ || l.str() == r.str();
+    friend constexpr bool operator==(const BytecodeString& l, const BytecodeString& r) noexcept {
+        return l.poolId_ == r.poolId_;
     }
-    friend bool operator!=(const BytecodeString& l, const BytecodeString& r) noexcept {
-        return !(l == r);
+    friend constexpr bool operator!=(const BytecodeString& l, const BytecodeString& r) noexcept {
+        return l.poolId_ != r.poolId_;
     }
     friend bool operator==(const BytecodeString& l, const std::string& r) noexcept {
         return l.str() == r;
@@ -246,17 +247,25 @@ public:
     friend bool operator==(const char* l, const BytecodeString& r) noexcept {
         return (l ? l : "") == r.str();
     }
+    friend bool operator!=(const BytecodeString& l, const char* r) noexcept {
+        return !(l == r);
+    }
+    friend bool operator!=(const char* l, const BytecodeString& r) noexcept {
+        return !(l == r);
+    }
     friend std::ostream& operator<<(std::ostream& os, const BytecodeString& s) {
         return os << s.str();
     }
 
 private:
-    std::uint16_t poolId_ = 0;
+    std::uint32_t poolId_ = 0;
 };
-static_assert(sizeof(BytecodeString) == 2, "BytecodeString must be 2 bytes");
+static_assert(sizeof(BytecodeString) == 4, "BytecodeString must be 4 bytes");
 static_assert(std::is_trivially_copyable_v<BytecodeString>);
 
 struct Instruction {
+    constexpr Instruction() noexcept = default;
+
     Opcode opcode = Opcode::ConstantInt;
     semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
     bool boolImmediate = false;
@@ -265,11 +274,12 @@ struct Instruction {
     SmallRegisterVector operands{};
     std::uint32_t index = 0;
     std::uint16_t typeIndex = 0;
-    BytecodeString stringImmediate{};
+    std::uint16_t reserved0_ = 0;
     union {
         semantic::SymbolId elementTypeId = 0;
         std::int64_t integerImmediate;
         double doubleImmediate;
+        BytecodeString stringImmediate;
     };
 
     [[nodiscard]] constexpr bool usesIntegerImmediate() const noexcept {
@@ -278,8 +288,11 @@ struct Instruction {
     [[nodiscard]] constexpr bool usesDoubleImmediate() const noexcept {
         return opcode == Opcode::ConstantDouble;
     }
+    [[nodiscard]] constexpr bool usesStringImmediate() const noexcept {
+        return opcode == Opcode::ConstantString;
+    }
     [[nodiscard]] constexpr bool usesElementTypeId() const noexcept {
-        return !usesIntegerImmediate() && !usesDoubleImmediate();
+        return !usesIntegerImmediate() && !usesDoubleImmediate() && !usesStringImmediate();
     }
     [[nodiscard]] constexpr semantic::SymbolId activeElementTypeId() const noexcept {
         return usesElementTypeId() ? elementTypeId : 0u;
@@ -289,6 +302,9 @@ struct Instruction {
     }
     [[nodiscard]] constexpr double activeDoubleImmediate() const noexcept {
         return usesDoubleImmediate() ? doubleImmediate : 0.0;
+    }
+    [[nodiscard]] constexpr BytecodeString activeStringImmediate() const noexcept {
+        return usesStringImmediate() ? stringImmediate : BytecodeString{};
     }
 };
 static_assert(sizeof(Instruction) == 32, "Instruction must be 32 bytes");

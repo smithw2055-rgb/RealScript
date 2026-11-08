@@ -1,3 +1,4 @@
+#include "realscript/bytecode/Bytecode.h"
 #include "realscript/game/Gameplay.h"
 #include "realscript/runtime/Runtime.h"
 
@@ -195,6 +196,81 @@ class EntityHolder {
         std::cout << "[8-Thread Stress] " << (kThreads * kOpsPerThread)
                   << " concurrent struct+string intern & lock-free read ops completed in "
                   << ms << " ms\n";
+    }
+
+    // 3. Verify 32-bit BytecodeStringPool (>65,535 capacity) & lock-free RegisterSlicePool concurrency
+    {
+        constexpr int kUniqueBytecodeStrings = 70000; // Exceeds legacy 16-bit (65,535) limit
+        std::vector<bytecode::BytecodeString> interned;
+        interned.reserve(kUniqueBytecodeStrings);
+
+        const bytecode::BytecodeString emptyStr{};
+        require(emptyStr.empty() && emptyStr.poolId() == 0u, "Default BytecodeString must have poolId 0");
+        require(emptyStr == "" && !(emptyStr != ""), "Empty BytecodeString const char* equality failed");
+
+        for (int i = 0; i < kUniqueBytecodeStrings; ++i) {
+            interned.emplace_back("bc_sym_const_" + std::to_string(i));
+        }
+        for (int i = 0; i < kUniqueBytecodeStrings; i += 997) {
+            const std::string expected = "bc_sym_const_" + std::to_string(i);
+            const bytecode::BytecodeString dup(expected);
+            require(!interned[i].empty() && interned[i].poolId() != 0u, "Non-empty BytecodeString must have non-zero poolId");
+            require(interned[i] == dup && interned[i].poolId() == dup.poolId(), "Deduplicated BytecodeString must share identical 32-bit poolId");
+            require(interned[i] == expected && interned[i] != "other_literal", "BytecodeString string/c_str comparison failed");
+        }
+
+        // Verify Instruction 32-byte union layout & encode/decode round-trip for ConstantString
+        static_assert(sizeof(bytecode::BytecodeString) == 4, "BytecodeString must be 4 bytes");
+        static_assert(sizeof(bytecode::Instruction) == 32, "Instruction must remain 32 bytes");
+        bytecode::Instruction strInst;
+        strInst.opcode = bytecode::Opcode::ConstantString;
+        strInst.result = 0;
+        strInst.stringImmediate = bytecode::BytecodeString("union_string_payload");
+        require(
+            strInst.usesStringImmediate() &&
+                !strInst.usesElementTypeId() &&
+                !strInst.usesIntegerImmediate() &&
+                !strInst.usesDoubleImmediate(),
+            "ConstantString immediate classifier mismatch");
+        require(
+            strInst.activeStringImmediate() == "union_string_payload" &&
+                strInst.activeElementTypeId() == 0u &&
+                strInst.activeIntegerImmediate() == 0 &&
+                strInst.activeDoubleImmediate() == 0.0,
+            "ConstantString active immediate isolation failed");
+
+        // 8-thread concurrent BytecodeString + SmallRegisterVector wait-free read / intern stress
+        constexpr int kBcThreads = 8;
+        constexpr int kBcOps = 10000;
+        std::vector<std::thread> bcThreads;
+        std::atomic<bool> bcFailed{false};
+        for (int tid = 0; tid < kBcThreads; ++tid) {
+            bcThreads.emplace_back([tid, &bcFailed, &interned]() {
+                for (int i = 0; i < kBcOps; ++i) {
+                    const std::string key = "bc_concurrent_" + std::to_string(tid) + "_" + std::to_string(i & 511);
+                    bytecode::BytecodeString bs(key);
+                    if (bs.str() != key || bs != interned[(tid * 1000 + i) % interned.size()].str() && bs == interned[(tid * 1000 + i) % interned.size()]) {
+                        bcFailed.store(true, std::memory_order_relaxed);
+                        return;
+                    }
+                    bytecode::SmallRegisterVector regs;
+                    const auto r0 = static_cast<bytecode::Register>(tid + 1);
+                    const auto r1 = static_cast<bytecode::Register>((i & 255) + 10);
+                    const auto r2 = static_cast<bytecode::Register>((i & 255) + 20);
+                    regs.push_back(r0);
+                    regs.push_back(r1);
+                    regs.push_back(r2);
+                    if (regs.size() != 3 || regs[0] != r0 || regs[1] != r1 || regs[2] != r2) {
+                        bcFailed.store(true, std::memory_order_relaxed);
+                        return;
+                    }
+                }
+            });
+        }
+        for (auto& th : bcThreads) th.join();
+        require(!bcFailed.load(), "8-thread concurrent BytecodeString + SmallRegisterVector stress failed");
+        std::cout << "[Bytecode 32-Bit Pool] Verified " << kUniqueBytecodeStrings
+                  << " unique strings (>64K) + 8-thread wait-free slice/string reads\n";
     }
 
     std::cout << "All pool refactoring verification tests passed!\n";

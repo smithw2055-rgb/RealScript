@@ -256,13 +256,14 @@ Module Lowerer::lower(const mir::Module& source) const {
                     instruction.doubleImmediate = sourceInstruction.doubleImmediate;
                 } else if (instruction.usesIntegerImmediate()) {
                     instruction.integerImmediate = sourceInstruction.integerImmediate;
+                } else if (instruction.usesStringImmediate()) {
+                    instruction.stringImmediate = sourceInstruction.stringImmediate;
                 } else {
                     instruction.elementTypeId = sourceInstruction.elementTypeId;
                 }
                 instruction.boolImmediate = sourceInstruction.boolImmediate;
                 instruction.checkedArithmetic =
                     sourceInstruction.checkedArithmetic;
-                instruction.stringImmediate = sourceInstruction.stringImmediate;
 
                 if (sourceInstruction.opcode == mir::Opcode::Call ||
                     sourceInstruction.opcode == mir::Opcode::NewDelegate) {

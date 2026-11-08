@@ -1802,11 +1802,12 @@ bool decodeModule(
                 const auto elemTypeId = reader.u64();
                 const auto intImm = reader.i64();
                 const auto dblImm = reader.f64();
+                instruction.elementTypeId = 0;
                 if (instruction.usesDoubleImmediate()) {
                     instruction.doubleImmediate = dblImm;
                 } else if (instruction.usesIntegerImmediate()) {
                     instruction.integerImmediate = intImm;
-                } else {
+                } else if (instruction.usesElementTypeId()) {
                     instruction.elementTypeId = elemTypeId;
                 }
                 const auto arithmeticFlags = reader.u8();
