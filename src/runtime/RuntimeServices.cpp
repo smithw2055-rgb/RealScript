@@ -2766,8 +2766,11 @@ bool hasAnySparseEcsTable(
     if (!heap) return false;
     for (const auto& list : {cols, withs, withouts}) {
         for (const auto& t : list) {
-            if (heap->hasNativeEcsTable(t) ||
-                heap->hasStaticField(semantic::stableTypeId("$ecs_sparse_ids::" + t))) {
+            if (heap->hasNativeEcsTable(t)) {
+                return true;
+            }
+            if (heap->hasStaticField(semantic::stableTypeId("$ecs_sparse_ids::" + t))) {
+                heap->notifySparseEcsState();
                 return true;
             }
         }
@@ -2866,47 +2869,108 @@ bool tryExecuteRuntimeIntrinsic(
         constexpr std::string_view ecsColPrefix = "ecs_col::";
         if (subOp.rfind(ecsColPrefix, 0) == 0) {
             const auto rest = subOp.substr(ecsColPrefix.size());
-            const auto sep = rest.find("::");
-            if (sep == std::string_view::npos) {
+            struct CachedEcsColSpec {
+                bool valid = false;
+                std::size_t colIdx = 0;
+                std::string specStr;
+                std::string targetType;
+                std::vector<std::string> cols;
+                std::vector<std::string> withs;
+                std::vector<std::string> withouts;
+                semantic::SymbolId denseId = 0;
+                semantic::SymbolId emptyFallbackId = 0;
+                semantic::SymbolId arrTypeId = 0;
+                semantic::SymbolId elemTypeId = 0;
+                semantic::PrimitiveType elemPrim = semantic::PrimitiveType::Struct;
+                semantic::SymbolId wbMapId = 0;
+                semantic::SymbolId wbTargetId = 0;
+            };
+            thread_local std::unordered_map<std::string, CachedEcsColSpec> colCache;
+            const std::string restKey(rest);
+            auto cacheIt = colCache.find(restKey);
+            if (cacheIt == colCache.end()) {
+                CachedEcsColSpec entry;
+                const auto sep = rest.find("::");
+                if (sep != std::string_view::npos) {
+                    entry.colIdx = static_cast<std::size_t>(
+                        std::strtoull(std::string(rest.substr(0, sep)).c_str(), nullptr, 10));
+                    const auto specView = rest.substr(sep + 2);
+                    entry.specStr = std::string(specView);
+                    parseEcsQuerySpec(specView, entry.cols, entry.withs, entry.withouts);
+                    if (entry.colIdx < entry.cols.size()) {
+                        entry.valid = true;
+                        entry.targetType = entry.cols[entry.colIdx];
+                        entry.denseId = semantic::stableTypeId("$ecs_column::" + entry.targetType);
+                        entry.emptyFallbackId = semantic::stableTypeId("$ecs_empty_col::" + entry.targetType);
+                        entry.elemPrim = semantic::PrimitiveType::Struct;
+                        entry.elemTypeId = semantic::stableTypeId(entry.targetType);
+                        entry.arrTypeId = semantic::stableTypeId(
+                            semantic::arrayTypeName(entry.elemPrim, entry.targetType));
+                        entry.wbMapId = semantic::stableTypeId("$ecs_wb_map::" + restKey);
+                        entry.wbTargetId = semantic::stableTypeId("$ecs_wb_target::" + restKey);
+                    }
+                }
+                cacheIt = colCache.emplace(restKey, std::move(entry)).first;
+            }
+            const auto& cached = cacheIt->second;
+            if (!cached.valid) {
                 errorMessage = "malformed ecs_col intrinsic";
                 return false;
             }
-            const std::size_t colIdx = static_cast<std::size_t>(
-                std::strtoull(std::string(rest.substr(0, sep)).c_str(), nullptr, 10));
-            const auto spec = rest.substr(sep + 2);
-            std::vector<std::string> cols, withs, withouts;
-            parseEcsQuerySpec(spec, cols, withs, withouts);
-            if (colIdx >= cols.size()) {
-                result = arguments.empty() ? Value{} : arguments[0];
-                return true;
-            }
-            const auto& targetType = cols[colIdx];
+            const auto getOrCreateEmptyColArray = [&]() -> Value {
+                if (!arguments.empty() && std::holds_alternative<ObjectRef>(arguments[0])) {
+                    return arguments[0];
+                }
+                if (!heap) return NullArray{};
+                if (auto existingEmpty = heap->getStaticField(cached.emptyFallbackId)) {
+                    return *existingEmpty;
+                }
+                RuntimeError allocErr;
+                Value defaultElem = makeDefaultInlineStructValue(cached.elemTypeId)
+                    .value_or(Value{StructValue{cached.elemTypeId, std::make_shared<StructStorage>()}});
+                if (const auto emptyRef = heap->allocateTypedArray(
+                        cached.arrTypeId, cached.elemPrim, cached.elemTypeId, 0, defaultElem, &allocErr)) {
+                    heap->setStaticField(cached.emptyFallbackId, *emptyRef);
+                    return *emptyRef;
+                }
+                return NullArray{};
+            };
+            const auto& targetType = cached.targetType;
+            const auto& cols = cached.cols;
+            const auto& withs = cached.withs;
+            const auto& withouts = cached.withouts;
+            const auto colIdx = cached.colIdx;
+            const std::string_view spec = cached.specStr;
             if (!hasAnySparseEcsTable(heap, cols, withs, withouts) &&
                 withs.empty() && withouts.empty()) {
-                const auto denseId = semantic::stableTypeId("$ecs_column::" + targetType);
                 if (heap) {
-                    if (auto existing = heap->getStaticField(denseId)) {
+                    if (auto existing = heap->getStaticField(cached.denseId)) {
                         result = std::move(*existing);
                         return true;
                     }
                 }
-                result = arguments.empty() ? Value{} : arguments[0];
-                if (heap) {
-                    heap->setStaticField(denseId, result);
+                result = getOrCreateEmptyColArray();
+                if (heap && std::holds_alternative<ObjectRef>(result)) {
+                    heap->setStaticField(cached.denseId, result);
                 }
                 return true;
             }
-            if (!heap || arguments.empty() || !std::holds_alternative<ObjectRef>(arguments[0])) {
-                result = arguments.empty() ? Value{} : arguments[0];
+            if (!heap) {
+                result = getOrCreateEmptyColArray();
                 return true;
             }
-            const auto tmplRef = std::get<ObjectRef>(arguments[0]);
-            const auto arrTypeId = heap->arrayTypeId(tmplRef).value_or(0);
-            const auto elemPrim = heap->arrayElementType(tmplRef).value_or(semantic::PrimitiveType::Struct);
-            const auto elemTypeId = heap->arrayElementTypeId(tmplRef).value_or(0);
+            semantic::SymbolId arrTypeId = cached.arrTypeId;
+            semantic::PrimitiveType elemPrim = cached.elemPrim;
+            semantic::SymbolId elemTypeId = cached.elemTypeId;
+            if (!arguments.empty() && std::holds_alternative<ObjectRef>(arguments[0])) {
+                const auto tmplRef = std::get<ObjectRef>(arguments[0]);
+                arrTypeId = heap->arrayTypeId(tmplRef).value_or(arrTypeId);
+                elemPrim = heap->arrayElementType(tmplRef).value_or(elemPrim);
+                elemTypeId = heap->arrayElementTypeId(tmplRef).value_or(elemTypeId);
+            }
             const auto matched = computeMatchedEcsEntities(heap, cols, withs, withouts);
             if (matched.empty()) {
-                result = tmplRef;
+                result = getOrCreateEmptyColArray();
                 return true;
             }
             const auto* nativeIds = heap->nativeEcsEntityIds(targetType);
@@ -2916,7 +2980,7 @@ bool tryExecuteRuntimeIntrinsic(
             if (!nativeIds || !nativeVals) {
                 if (!readSparseIds(heap, targetType, sparseIds, &sparseValsRef) ||
                     !sparseValsRef.valid()) {
-                    result = tmplRef;
+                    result = getOrCreateEmptyColArray();
                     return true;
                 }
             }
@@ -2946,7 +3010,7 @@ bool tryExecuteRuntimeIntrinsic(
                 }
             }
             if (matchedVals.empty()) {
-                result = tmplRef;
+                result = getOrCreateEmptyColArray();
                 return true;
             }
             RuntimeError allocErr;
@@ -2977,6 +3041,7 @@ bool tryExecuteRuntimeIntrinsic(
                     "$ecs_wb_target::" + std::to_string(colIdx) + "::" + std::string(spec);
                 heap->setStaticField(semantic::stableTypeId(wbMapKey), *mapArr);
                 heap->setStaticField(semantic::stableTypeId(wbTargetKey), sparseValsRef);
+                heap->notifySparseEcsState();
             }
             result = *outArr;
             return true;
@@ -2987,12 +3052,30 @@ bool tryExecuteRuntimeIntrinsic(
             const auto spec = subOp.substr(ecsEntPrefix.size());
             std::vector<std::string> cols, withs, withouts;
             parseEcsQuerySpec(spec, cols, withs, withouts);
-            if (!heap || arguments.empty() || !std::holds_alternative<ObjectRef>(arguments[0])) {
-                result = arguments.empty() ? Value{} : arguments[0];
+            const auto arrTypeId = (!arguments.empty() && std::holds_alternative<ObjectRef>(arguments[0]) && heap)
+                ? heap->arrayTypeId(std::get<ObjectRef>(arguments[0])).value_or(0)
+                : semantic::stableTypeId(semantic::arrayTypeName(semantic::PrimitiveType::Int, {}));
+            const auto getOrCreateEmptyEntArray = [&]() -> Value {
+                if (!arguments.empty() && std::holds_alternative<ObjectRef>(arguments[0])) {
+                    return arguments[0];
+                }
+                if (!heap) return NullArray{};
+                const auto emptyEntId = semantic::stableTypeId("$ecs_empty_ent_arr");
+                if (auto existingEmpty = heap->getStaticField(emptyEntId)) {
+                    return *existingEmpty;
+                }
+                RuntimeError allocErr;
+                if (const auto emptyRef = heap->allocateTypedArray(
+                        arrTypeId, semantic::PrimitiveType::Int, 0, 0, std::int64_t{0}, &allocErr)) {
+                    heap->setStaticField(emptyEntId, *emptyRef);
+                    return *emptyRef;
+                }
+                return NullArray{};
+            };
+            if (!heap) {
+                result = getOrCreateEmptyEntArray();
                 return true;
             }
-            const auto tmplRef = std::get<ObjectRef>(arguments[0]);
-            const auto arrTypeId = heap->arrayTypeId(tmplRef).value_or(0);
             std::vector<std::int64_t> matched;
             if (!hasAnySparseEcsTable(heap, cols, withs, withouts) &&
                 withs.empty() && withouts.empty() && !cols.empty()) {
@@ -3010,7 +3093,7 @@ bool tryExecuteRuntimeIntrinsic(
                 matched = computeMatchedEcsEntities(heap, cols, withs, withouts);
             }
             if (matched.empty()) {
-                result = tmplRef;
+                result = getOrCreateEmptyEntArray();
                 return true;
             }
             RuntimeError allocErr;
@@ -3051,8 +3134,7 @@ bool tryExecuteRuntimeIntrinsic(
     constexpr std::string_view ecsWritebackPrefix = "ecs_writeback::";
     if (op.rfind(ecsWritebackPrefix, 0) == 0) {
         const auto rest = op.substr(ecsWritebackPrefix.size());
-        const auto sep = rest.find("::");
-        if (sep == std::string_view::npos || arguments.size() < 2 || !heap) {
+        if (arguments.size() < 2 || !heap) {
             result = std::monostate{};
             return true;
         }
@@ -3061,20 +3143,56 @@ bool tryExecuteRuntimeIntrinsic(
             result = std::monostate{};
             return true;
         }
-        const auto idx = static_cast<std::size_t>(*idxPtr);
-        const std::size_t colIdx = static_cast<std::size_t>(
-            std::strtoull(std::string(rest.substr(0, sep)).c_str(), nullptr, 10));
-        const auto spec = rest.substr(sep + 2);
-        std::vector<std::string> cols, withs, withouts;
-        parseEcsQuerySpec(spec, cols, withs, withouts);
-        if (colIdx >= cols.size()) {
+        struct CachedWritebackSpec {
+            bool valid = false;
+            std::size_t colIdx = 0;
+            std::string compKey;
+            std::vector<std::string> cols;
+            std::vector<std::string> withs;
+            std::vector<std::string> withouts;
+            semantic::SymbolId wbMapId = 0;
+            semantic::SymbolId wbTargetId = 0;
+            semantic::SymbolId sparseIdsId = 0;
+        };
+        thread_local std::unordered_map<std::string, CachedWritebackSpec> wbCache;
+        const std::string restKey(rest);
+        auto cacheIt = wbCache.find(restKey);
+        if (cacheIt == wbCache.end()) {
+            CachedWritebackSpec entry;
+            const auto sep = rest.find("::");
+            if (sep != std::string_view::npos) {
+                entry.colIdx = static_cast<std::size_t>(
+                    std::strtoull(std::string(rest.substr(0, sep)).c_str(), nullptr, 10));
+                const auto spec = rest.substr(sep + 2);
+                parseEcsQuerySpec(spec, entry.cols, entry.withs, entry.withouts);
+                if (entry.colIdx < entry.cols.size()) {
+                    entry.valid = true;
+                    entry.compKey = entry.cols[entry.colIdx];
+                    entry.wbMapId = semantic::stableTypeId("$ecs_wb_map::" + restKey);
+                    entry.wbTargetId = semantic::stableTypeId("$ecs_wb_target::" + restKey);
+                    entry.sparseIdsId = semantic::stableTypeId("$ecs_sparse_ids::" + entry.compKey);
+                }
+            }
+            cacheIt = wbCache.emplace(restKey, std::move(entry)).first;
+        }
+        const auto& cached = cacheIt->second;
+        if (!cached.valid) {
             result = std::monostate{};
             return true;
         }
-        const std::string& compKey = cols[colIdx];
-        const std::string wbMapKey = "$ecs_wb_map::" + std::string(rest);
-        const std::string wbTargetKey = "$ecs_wb_target::" + std::string(rest);
-        if (const auto mapVal = heap->getStaticField(semantic::stableTypeId(wbMapKey));
+        // Fast O(1) exit for dense columns and zero-copy host C++ raw columns (StoreElement already mutated in-place)
+        if (!heap->hasSparseEcsState() &&
+            !heap->hasStaticField(cached.wbMapId) &&
+            !heap->hasStaticField(cached.sparseIdsId)) {
+            result = std::monostate{};
+            return true;
+        }
+        const auto idx = static_cast<std::size_t>(*idxPtr);
+        const std::string& compKey = cached.compKey;
+        const auto& cols = cached.cols;
+        const auto& withs = cached.withs;
+        const auto& withouts = cached.withouts;
+        if (const auto mapVal = heap->getStaticField(cached.wbMapId);
             mapVal && std::holds_alternative<ObjectRef>(*mapVal)) {
             const auto mapRef = std::get<ObjectRef>(*mapVal);
             if (const auto srcIdxVal = heap->arrayGet(mapRef, idx);
@@ -3085,7 +3203,7 @@ bool tryExecuteRuntimeIntrinsic(
                     result = std::monostate{};
                     return true;
                 }
-                const auto targetVal = heap->getStaticField(semantic::stableTypeId(wbTargetKey));
+                const auto targetVal = heap->getStaticField(cached.wbTargetId);
                 if (targetVal && std::holds_alternative<ObjectRef>(*targetVal)) {
                     const auto targetRef = std::get<ObjectRef>(*targetVal);
                     RuntimeError setErr;
@@ -3103,10 +3221,11 @@ bool tryExecuteRuntimeIntrinsic(
             result = std::monostate{};
             return true;
         }
-        if (!heap->hasStaticField(semantic::stableTypeId("$ecs_sparse_ids::" + compKey))) {
+        if (!heap->hasStaticField(cached.sparseIdsId)) {
             result = std::monostate{};
             return true;
         }
+        heap->notifySparseEcsState();
         const auto matched = computeMatchedEcsEntities(heap, cols, withs, withouts);
         if (idx < matched.size()) {
             const auto entId = matched[idx];

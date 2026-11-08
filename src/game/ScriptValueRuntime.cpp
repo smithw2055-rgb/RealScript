@@ -480,6 +480,204 @@ bool ScriptRuntime::getEcsComponentColumn(
     return true;
 }
 
+bool ScriptRuntime::bindEcsRawColumn(
+    const std::string& canonicalTypeName,
+    void* basePtr,
+    std::size_t count,
+    std::size_t strideBytes,
+    const std::vector<runtime::NativeFieldLayout>& fieldLayouts,
+    runtime::RuntimeError& error,
+    bool readOnly) const {
+    if (!heap_) {
+        error.code = runtime::ErrorCode::InvalidProgram;
+        error.message = "script runtime has no managed heap";
+        return false;
+    }
+    const auto type = findType(canonicalTypeName);
+    if (!type || type->descriptor.kind != semantic::TypeKind::Struct) {
+        error.code = runtime::ErrorCode::TypeMismatch;
+        error.message = "ECS raw column binding requires a valid script struct type '" +
+            canonicalTypeName + "'";
+        return false;
+    }
+    for (const auto& field : type->descriptor.fields) {
+        if (field.staticField) {
+            error.code = runtime::ErrorCode::TypeMismatch;
+            error.message = "ECS raw column struct '" + type->canonicalName() +
+                "' cannot contain static or const fields";
+            return false;
+        }
+    }
+    if (fieldLayouts.size() != type->descriptor.fields.size()) {
+        error.code = runtime::ErrorCode::InvalidArguments;
+        error.message = "ECS raw column field layout count does not match struct '" +
+            type->canonicalName() + "'";
+        return false;
+    }
+    runtime::NativeRawColumnView view;
+    view.basePtr = basePtr;
+    view.count = count;
+    view.strideBytes = strideBytes;
+    view.structTypeId = type->descriptor.id;
+    view.fields = fieldLayouts;
+    view.readOnly = readOnly;
+
+    const auto colSymbolId = semantic::stableTypeId("$ecs_column::" + type->canonicalName());
+    if (const auto existing = heap_->getStaticField(colSymbolId)) {
+        if (const auto* existingRef = std::get_if<runtime::ObjectRef>(&*existing)) {
+            if (heap_->updateRawColumnArray(*existingRef, view)) {
+                return true;
+            }
+        }
+    }
+    const std::string arrayName = semantic::arrayTypeName(
+        semantic::PrimitiveType::Struct, type->canonicalName());
+    const auto arrayTypeId = semantic::stableTypeId(arrayName);
+    const auto arrayRef = heap_->allocateRawColumnArray(
+        arrayTypeId, type->descriptor.id, std::move(view), &error);
+    if (!arrayRef) return false;
+    heap_->setStaticField(colSymbolId, *arrayRef);
+    return true;
+}
+
+bool ScriptRuntime::bindEcsRawColumnStandardLayout(
+    const std::string& canonicalTypeName,
+    void* basePtr,
+    std::size_t count,
+    std::size_t strideBytes,
+    runtime::RuntimeError& error,
+    bool readOnly,
+    bool useInt32ForScriptInt) const {
+    const auto type = findType(canonicalTypeName);
+    if (!type || type->descriptor.kind != semantic::TypeKind::Struct) {
+        error.code = runtime::ErrorCode::TypeMismatch;
+        error.message = "ECS raw column binding requires a valid script struct type '" +
+            canonicalTypeName + "'";
+        return false;
+    }
+    const auto buildLayouts = [&](bool intAs32, bool doubleAsFloat32,
+                                  std::vector<runtime::NativeFieldLayout>& outLayouts,
+                                  std::size_t& outTotalSize) -> bool {
+        outLayouts.clear();
+        outLayouts.reserve(type->descriptor.fields.size());
+        std::size_t offset = 0;
+        std::size_t maxAlign = 1;
+        for (const auto& field : type->descriptor.fields) {
+            if (field.staticField) {
+                return false;
+            }
+            runtime::NativeFieldLayout layout;
+            layout.scriptType = field.type;
+            layout.scriptTypeId = exactTypeId(field.type, field.typeName);
+            std::size_t fieldSize = 0;
+            std::size_t fieldAlign = 1;
+            switch (field.type) {
+            case semantic::PrimitiveType::Int:
+                layout.kind = intAs32
+                    ? runtime::NativeFieldKind::Int32
+                    : runtime::NativeFieldKind::Int64;
+                fieldSize = intAs32 ? 4 : 8;
+                fieldAlign = fieldSize;
+                break;
+            case semantic::PrimitiveType::Long:
+                layout.kind = runtime::NativeFieldKind::Int64;
+                fieldSize = 8;
+                fieldAlign = 8;
+                break;
+            case semantic::PrimitiveType::Float:
+                layout.kind = runtime::NativeFieldKind::Float32;
+                fieldSize = 4;
+                fieldAlign = 4;
+                break;
+            case semantic::PrimitiveType::Double:
+                layout.kind = doubleAsFloat32
+                    ? runtime::NativeFieldKind::Float32
+                    : runtime::NativeFieldKind::Float64;
+                fieldSize = doubleAsFloat32 ? 4 : 8;
+                fieldAlign = fieldSize;
+                break;
+            case semantic::PrimitiveType::Bool:
+                layout.kind = runtime::NativeFieldKind::Bool;
+                fieldSize = 1;
+                fieldAlign = 1;
+                break;
+            case semantic::PrimitiveType::Struct:
+                if (layout.scriptTypeId == runtime::fixedTypeId()) {
+                    layout.kind = runtime::NativeFieldKind::Fixed;
+                    fieldSize = 4;
+                    fieldAlign = 4;
+                } else if (layout.scriptTypeId == runtime::fixed16TypeId()) {
+                    layout.kind = runtime::NativeFieldKind::Fixed16;
+                    fieldSize = 2;
+                    fieldAlign = 2;
+                } else if (layout.scriptTypeId == runtime::vec2TypeId()) {
+                    layout.kind = runtime::NativeFieldKind::Vec2;
+                    fieldSize = 8;
+                    fieldAlign = 4;
+                } else if (layout.scriptTypeId == runtime::vec3TypeId()) {
+                    layout.kind = runtime::NativeFieldKind::Vec3;
+                    fieldSize = 12;
+                    fieldAlign = 4;
+                } else if (layout.scriptTypeId == runtime::quatTypeId()) {
+                    layout.kind = runtime::NativeFieldKind::Quat;
+                    fieldSize = 16;
+                    fieldAlign = 4;
+                } else {
+                    return false;
+                }
+                break;
+            default:
+                return false;
+            }
+            maxAlign = std::max(maxAlign, fieldAlign);
+            const std::size_t rem = offset % fieldAlign;
+            if (rem != 0) offset += (fieldAlign - rem);
+            layout.byteOffset = offset;
+            offset += fieldSize;
+            outLayouts.push_back(layout);
+        }
+        const std::size_t tailRem = offset % maxAlign;
+        if (tailRem != 0) offset += (maxAlign - tailRem);
+        outTotalSize = offset;
+        return true;
+    };
+
+    std::vector<runtime::NativeFieldLayout> layouts;
+    std::size_t computedSize = 0;
+    if (!buildLayouts(useInt32ForScriptInt, false, layouts, computedSize)) {
+        error.code = runtime::ErrorCode::TypeMismatch;
+        error.message = "struct '" + type->canonicalName() +
+            "' contains non-blittable fields that cannot be bound as a zero-copy raw column";
+        return false;
+    }
+    if (computedSize != strideBytes) {
+        std::vector<runtime::NativeFieldLayout> altLayouts;
+        std::size_t altSize = 0;
+        if (buildLayouts(!useInt32ForScriptInt, false, altLayouts, altSize) &&
+            altSize == strideBytes) {
+            layouts = std::move(altLayouts);
+            computedSize = altSize;
+        } else if (buildLayouts(useInt32ForScriptInt, true, altLayouts, altSize) &&
+                   altSize == strideBytes) {
+            layouts = std::move(altLayouts);
+            computedSize = altSize;
+        } else if (buildLayouts(true, true, altLayouts, altSize) &&
+                   altSize == strideBytes) {
+            layouts = std::move(altLayouts);
+            computedSize = altSize;
+        }
+    }
+    if (computedSize > strideBytes) {
+        error.code = runtime::ErrorCode::InvalidArguments;
+        error.message = "host C++ struct stride (" + std::to_string(strideBytes) +
+            " bytes) is smaller than computed layout size (" +
+            std::to_string(computedSize) + " bytes) for '" + type->canonicalName() + "'";
+        return false;
+    }
+    return bindEcsRawColumn(
+        canonicalTypeName, basePtr, count, strideBytes, layouts, error, readOnly);
+}
+
 bool ScriptRuntime::setEcsEntityComponent(
     std::uint64_t entity,
     const std::string& canonicalTypeName,

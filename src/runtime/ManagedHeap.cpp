@@ -1,7 +1,9 @@
 #include "realscript/runtime/Runtime.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstring>
 #include <deque>
 #include <limits>
 #include <sstream>
@@ -104,12 +106,14 @@ struct ManagedHeap::Impl {
         std::vector<Value> values;
         std::string stringPayload;
         std::shared_ptr<const std::vector<std::size_t>> referenceFields;
+        std::optional<NativeRawColumnView> rawColumnView;
 
         void reset() noexcept {
             header = Header{};
             values.clear(); // Retain capacity in slot pool to avoid malloc/free churn!
             stringPayload.clear();
             referenceFields.reset();
+            rawColumnView.reset();
         }
     };
 
@@ -208,6 +212,7 @@ struct ManagedHeap::Impl {
     GcPhase phase = GcPhase::Idle;
     bool requested = false;
     bool resumeSweep = false;
+    bool hasSparseEcsStaticFields = false;
     bool rootsRescannedForSweep = false;
     std::size_t sweepIndex = 0;
     std::size_t sweepLimit = 0;
@@ -683,9 +688,230 @@ std::optional<std::string_view> ManagedHeap::stringView(ObjectRef reference) con
     return std::string_view(object->stringPayload);
 }
 
+namespace {
+
+[[nodiscard]] constexpr std::size_t nativeFieldKindSize(NativeFieldKind kind) noexcept {
+    switch (kind) {
+    case NativeFieldKind::Int32: return 4;
+    case NativeFieldKind::Int64: return 8;
+    case NativeFieldKind::Float32: return 4;
+    case NativeFieldKind::Float64: return 8;
+    case NativeFieldKind::Bool: return 1;
+    case NativeFieldKind::Fixed: return 4;
+    case NativeFieldKind::Fixed16: return 2;
+    case NativeFieldKind::Vec2: return 8;
+    case NativeFieldKind::Vec3: return 12;
+    case NativeFieldKind::Quat: return 16;
+    }
+    return 0;
+}
+
+[[nodiscard]] bool validateRawColumnView(
+    const NativeRawColumnView& view,
+    semantic::SymbolId elementTypeId) noexcept {
+    if (elementTypeId == 0 || view.structTypeId != elementTypeId ||
+        view.fields.empty() || view.strideBytes == 0) {
+        return false;
+    }
+    if (view.count > 0 && !view.basePtr) {
+        return false;
+    }
+    for (const auto& f : view.fields) {
+        const auto fSize = nativeFieldKindSize(f.kind);
+        if (fSize == 0 || f.byteOffset > view.strideBytes ||
+            fSize > view.strideBytes - f.byteOffset) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] Value readNativeFieldFromBytes(
+    const std::uint8_t* elemBase,
+    const NativeFieldLayout& layout) noexcept {
+    const std::uint8_t* ptr = elemBase + layout.byteOffset;
+    switch (layout.kind) {
+    case NativeFieldKind::Int32: {
+        std::int32_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        if (layout.scriptType == semantic::PrimitiveType::Long) {
+            return LongValue{static_cast<std::int64_t>(v)};
+        }
+        return static_cast<std::int64_t>(v);
+    }
+    case NativeFieldKind::Int64: {
+        std::int64_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        if (layout.scriptType == semantic::PrimitiveType::Long) {
+            return LongValue{v};
+        }
+        return v;
+    }
+    case NativeFieldKind::Float32: {
+        float v = 0.0f;
+        std::memcpy(&v, ptr, sizeof(v));
+        if (layout.scriptType == semantic::PrimitiveType::Double) {
+            return static_cast<double>(v);
+        }
+        return FloatValue{v};
+    }
+    case NativeFieldKind::Float64: {
+        double v = 0.0;
+        std::memcpy(&v, ptr, sizeof(v));
+        if (layout.scriptType == semantic::PrimitiveType::Float) {
+            return FloatValue{static_cast<float>(v)};
+        }
+        return v;
+    }
+    case NativeFieldKind::Bool: {
+        bool v = false;
+        std::memcpy(&v, ptr, sizeof(v));
+        return v;
+    }
+    case NativeFieldKind::Fixed: {
+        std::int32_t raw = 0;
+        std::memcpy(&raw, ptr, sizeof(raw));
+        return FixedValue{raw};
+    }
+    case NativeFieldKind::Fixed16: {
+        std::int16_t raw = 0;
+        std::memcpy(&raw, ptr, sizeof(raw));
+        return Fixed16Value{raw};
+    }
+    case NativeFieldKind::Vec2: {
+        Vec2Value v{};
+        std::memcpy(&v, ptr, sizeof(v));
+        return v;
+    }
+    case NativeFieldKind::Vec3: {
+        Vec3Value v{};
+        std::memcpy(&v, ptr, sizeof(v));
+        return v;
+    }
+    case NativeFieldKind::Quat: {
+        QuatValue v{};
+        std::memcpy(&v, ptr, sizeof(v));
+        return v;
+    }
+    }
+    return std::int64_t{0};
+}
+
+bool writeNativeFieldToBytes(
+    std::uint8_t* elemBase,
+    const NativeFieldLayout& layout,
+    const Value& val) noexcept {
+    std::uint8_t* ptr = elemBase + layout.byteOffset;
+    switch (layout.kind) {
+    case NativeFieldKind::Int32: {
+        std::int32_t out = 0;
+        if (const auto* i = std::get_if<std::int64_t>(&val)) {
+            out = static_cast<std::int32_t>(*i);
+        } else if (const auto* l = std::get_if<LongValue>(&val)) {
+            out = static_cast<std::int32_t>(l->value);
+        } else {
+            return false;
+        }
+        std::memcpy(ptr, &out, sizeof(out));
+        return true;
+    }
+    case NativeFieldKind::Int64: {
+        std::int64_t out = 0;
+        if (const auto* i = std::get_if<std::int64_t>(&val)) {
+            out = *i;
+        } else if (const auto* l = std::get_if<LongValue>(&val)) {
+            out = l->value;
+        } else {
+            return false;
+        }
+        std::memcpy(ptr, &out, sizeof(out));
+        return true;
+    }
+    case NativeFieldKind::Float32: {
+        float out = 0.0f;
+        if (const auto* f = std::get_if<FloatValue>(&val)) {
+            out = f->value;
+        } else if (const auto* d = std::get_if<double>(&val)) {
+            out = static_cast<float>(*d);
+        } else {
+            return false;
+        }
+        std::memcpy(ptr, &out, sizeof(out));
+        return true;
+    }
+    case NativeFieldKind::Float64: {
+        double out = 0.0;
+        if (const auto* d = std::get_if<double>(&val)) {
+            out = *d;
+        } else if (const auto* f = std::get_if<FloatValue>(&val)) {
+            out = static_cast<double>(f->value);
+        } else {
+            return false;
+        }
+        std::memcpy(ptr, &out, sizeof(out));
+        return true;
+    }
+    case NativeFieldKind::Bool: {
+        const auto* b = std::get_if<bool>(&val);
+        if (!b) return false;
+        const bool out = *b;
+        std::memcpy(ptr, &out, sizeof(out));
+        return true;
+    }
+    case NativeFieldKind::Fixed: {
+        if (const auto* fx = std::get_if<FixedValue>(&val)) {
+            std::memcpy(ptr, &fx->raw, sizeof(fx->raw));
+            return true;
+        }
+        if (const auto f0 = loadInlineStructField(val, 0)) {
+            if (const auto* i = std::get_if<std::int64_t>(&*f0)) {
+                const auto raw = static_cast<std::int32_t>(*i);
+                std::memcpy(ptr, &raw, sizeof(raw));
+                return true;
+            }
+        }
+        return false;
+    }
+    case NativeFieldKind::Fixed16: {
+        if (const auto* fx = std::get_if<Fixed16Value>(&val)) {
+            std::memcpy(ptr, &fx->raw, sizeof(fx->raw));
+            return true;
+        }
+        return false;
+    }
+    case NativeFieldKind::Vec2: {
+        if (const auto* v = std::get_if<Vec2Value>(&val)) {
+            std::memcpy(ptr, v, sizeof(*v));
+            return true;
+        }
+        return false;
+    }
+    case NativeFieldKind::Vec3: {
+        if (const auto* v = std::get_if<Vec3Value>(&val)) {
+            std::memcpy(ptr, v, sizeof(*v));
+            return true;
+        }
+        return false;
+    }
+    case NativeFieldKind::Quat: {
+        if (const auto* v = std::get_if<QuatValue>(&val)) {
+            std::memcpy(ptr, v, sizeof(*v));
+            return true;
+        }
+        return false;
+    }
+    }
+    return false;
+}
+
+} // namespace
+
 std::optional<std::size_t> ManagedHeap::arrayLength(ObjectRef reference) const {
     const auto* object = impl_->get(reference);
     if (!object || object->header.kind != ObjectKind::Array) return std::nullopt;
+    if (object->rawColumnView.has_value()) {
+        return object->rawColumnView->count;
+    }
     return object->values.size();
 }
 
@@ -713,6 +939,24 @@ std::optional<semantic::SymbolId> ManagedHeap::arrayElementTypeId(
 std::optional<Value> ManagedHeap::arrayGet(ObjectRef reference, std::size_t index) const {
     const auto* object = impl_->get(reference);
     if (!object || object->header.kind != ObjectKind::Array) return std::nullopt;
+    if (object->rawColumnView.has_value()) {
+        const auto& view = *object->rawColumnView;
+        if (index >= view.count || (!view.basePtr && view.count > 0)) return std::nullopt;
+        const auto* elemBase = static_cast<const std::uint8_t*>(view.basePtr) + index * view.strideBytes;
+        const auto fieldCount = view.fields.size();
+        if (fieldCount <= 16) {
+            std::array<Value, 16> stackFields{};
+            for (std::size_t i = 0; i < fieldCount; ++i) {
+                stackFields[i] = readNativeFieldFromBytes(elemBase, view.fields[i]);
+            }
+            return Value{makeStructValueFromFields(view.structTypeId, ValueSpan(stackFields.data(), fieldCount))};
+        }
+        std::vector<Value> heapFields(fieldCount);
+        for (std::size_t i = 0; i < fieldCount; ++i) {
+            heapFields[i] = readNativeFieldFromBytes(elemBase, view.fields[i]);
+        }
+        return Value{makeStructValueFromFields(view.structTypeId, std::move(heapFields))};
+    }
     const auto& values = object->values;
     if (index >= values.size()) return std::nullopt;
     return values[index];
@@ -720,7 +964,8 @@ std::optional<Value> ManagedHeap::arrayGet(ObjectRef reference, std::size_t inde
 
 const Value* ManagedHeap::arrayGetFast(ObjectRef reference, std::size_t index) const noexcept {
     const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array || index >= object->values.size()) {
+    if (!object || object->header.kind != ObjectKind::Array ||
+        object->rawColumnView.has_value() || index >= object->values.size()) {
         return nullptr;
     }
     return &object->values[index];
@@ -732,7 +977,27 @@ bool ManagedHeap::arraySetPrevalidated(
     const Value& value,
     bool mayBeReference) noexcept {
     auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array || index >= object->values.size()) {
+    if (!object || object->header.kind != ObjectKind::Array) {
+        return false;
+    }
+    if (object->rawColumnView.has_value()) {
+        const auto& view = *object->rawColumnView;
+        if (view.readOnly || index >= view.count || !view.basePtr) return false;
+        const auto* s = std::get_if<StructValue>(&value);
+        if (!s || !s->valid() || s->typeId != view.structTypeId ||
+            s->fieldCount() != view.fields.size()) {
+            return false;
+        }
+        auto* elemBase = static_cast<std::uint8_t*>(view.basePtr) + index * view.strideBytes;
+        for (std::size_t i = 0; i < view.fields.size(); ++i) {
+            const auto fieldVal = structValueFieldAt(*s, i);
+            if (!fieldVal || !writeNativeFieldToBytes(elemBase, view.fields[i], *fieldVal)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (index >= object->values.size()) {
         return false;
     }
     if (mayBeReference) {
@@ -754,6 +1019,36 @@ bool ManagedHeap::arraySet(
         setHeapError(error, ErrorCode::InvalidObjectReference,
             "managed array reference is invalid");
         return false;
+    }
+    if (object->rawColumnView.has_value()) {
+        const auto& view = *object->rawColumnView;
+        if (index >= view.count) {
+            setHeapError(error, ErrorCode::IndexOutOfRange,
+                "managed array index is out of range");
+            return false;
+        }
+        if (view.readOnly || !view.basePtr) {
+            setHeapError(error, ErrorCode::CapabilityDenied,
+                "cannot write to a read-only native ECS column view");
+            return false;
+        }
+        const auto* s = std::get_if<StructValue>(&value);
+        if (!s || !s->valid() || s->typeId != view.structTypeId ||
+            s->fieldCount() != view.fields.size()) {
+            setHeapError(error, ErrorCode::TypeMismatch,
+                "managed array struct element type mismatch for raw ECS column");
+            return false;
+        }
+        auto* elemBase = static_cast<std::uint8_t*>(view.basePtr) + index * view.strideBytes;
+        for (std::size_t i = 0; i < view.fields.size(); ++i) {
+            const auto fieldVal = structValueFieldAt(*s, i);
+            if (!fieldVal || !writeNativeFieldToBytes(elemBase, view.fields[i], *fieldVal)) {
+                setHeapError(error, ErrorCode::TypeMismatch,
+                    "raw ECS column field type mismatch during in-place write");
+                return false;
+            }
+        }
+        return true;
     }
     auto& values = object->values;
     if (index >= values.size()) {
@@ -1063,6 +1358,130 @@ bool ManagedHeap::setNativeEcsComponentByDenseIndex(
     }
     pinValueInPools(component);
     found->second.values[denseIndex] = std::move(component);
+    return true;
+}
+
+std::optional<ObjectRef> ManagedHeap::allocateRawColumnArray(
+    semantic::SymbolId arrayTypeId,
+    semantic::SymbolId elementTypeId,
+    NativeRawColumnView view,
+    RuntimeError* error) {
+    if (!validateRawColumnView(view, elementTypeId)) {
+        setHeapError(error, ErrorCode::InvalidArguments,
+            "raw ECS column view metadata is invalid");
+        return std::nullopt;
+    }
+    const auto slotIndex = impl_->acquireSlot(sizeof(Impl::HeapObject), error);
+    if (!slotIndex) return std::nullopt;
+    auto& object = impl_->slots[*slotIndex].object.storage;
+    object.values.clear();
+    object.stringPayload.clear();
+    object.rawColumnView = std::move(view);
+    return impl_->finalizeSlotAllocation(
+        *slotIndex,
+        ObjectKind::Array,
+        arrayTypeId,
+        semantic::PrimitiveType::Struct,
+        elementTypeId,
+        nullptr,
+        sizeof(Impl::HeapObject));
+}
+
+bool ManagedHeap::updateRawColumnArray(
+    ObjectRef reference,
+    NativeRawColumnView view) noexcept {
+    auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array ||
+        !object->rawColumnView.has_value() ||
+        !validateRawColumnView(view, object->header.elementTypeId)) {
+        return false;
+    }
+    object->rawColumnView = std::move(view);
+    return true;
+}
+
+bool ManagedHeap::isRawColumnArray(ObjectRef reference) const noexcept {
+    const auto* object = impl_->get(reference);
+    return object && object->header.kind == ObjectKind::Array &&
+        object->rawColumnView.has_value();
+}
+
+bool ManagedHeap::hasSparseEcsState() const noexcept {
+    return !impl_->nativeEcsTables.empty() || impl_->hasSparseEcsStaticFields;
+}
+
+void ManagedHeap::notifySparseEcsState() noexcept {
+    impl_->hasSparseEcsStaticFields = true;
+}
+
+const NativeRawColumnView* ManagedHeap::rawColumnView(ObjectRef reference) const noexcept {
+    const auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array ||
+        !object->rawColumnView.has_value()) {
+        return nullptr;
+    }
+    return &*object->rawColumnView;
+}
+
+bool ManagedHeap::readRawColumnFields(
+    ObjectRef reference,
+    std::size_t index,
+    Value* outFields,
+    std::size_t maxFields,
+    std::uint8_t& outFieldCount) const noexcept {
+    const auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array ||
+        !object->rawColumnView.has_value()) {
+        return false;
+    }
+    const auto& view = *object->rawColumnView;
+    if (index >= view.count || !view.basePtr || view.fields.size() > maxFields) {
+        return false;
+    }
+    const auto* elemBase = static_cast<const std::uint8_t*>(view.basePtr) + index * view.strideBytes;
+    const auto count = view.fields.size();
+    for (std::size_t i = 0; i < count; ++i) {
+        outFields[i] = readNativeFieldFromBytes(elemBase, view.fields[i]);
+    }
+    outFieldCount = static_cast<std::uint8_t>(count);
+    return true;
+}
+
+bool ManagedHeap::writeRawColumnFields(
+    ObjectRef reference,
+    std::size_t index,
+    const Value* fields,
+    std::size_t fieldCount,
+    RuntimeError* error) noexcept {
+    auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array ||
+        !object->rawColumnView.has_value()) {
+        return false;
+    }
+    const auto& view = *object->rawColumnView;
+    if (index >= view.count) {
+        setHeapError(error, ErrorCode::IndexOutOfRange,
+            "array element index is out of range");
+        return false;
+    }
+    if (view.readOnly || !view.basePtr) {
+        setHeapError(error, ErrorCode::CapabilityDenied,
+            "cannot write to a read-only native ECS column view");
+        return false;
+    }
+    if (fieldCount != view.fields.size()) {
+        setHeapError(error, ErrorCode::TypeMismatch,
+            "raw ECS column field count mismatch");
+        return false;
+    }
+    auto* elemBase = static_cast<std::uint8_t*>(view.basePtr) + index * view.strideBytes;
+    for (std::size_t i = 0; i < fieldCount; ++i) {
+        if (!writeNativeFieldToBytes(elemBase, view.fields[i], fields[i])) {
+            setHeapError(error, ErrorCode::TypeMismatch,
+                "raw ECS column field type mismatch");
+            return false;
+        }
+    }
     return true;
 }
 

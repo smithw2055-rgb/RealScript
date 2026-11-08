@@ -197,7 +197,7 @@ ExecutionContext::ExecutionContext(
         options_.profile == nullptr && !diagnosticEventsEnabled_;
     fastAccounting_ = !determinismEventsEnabled_ &&
         options_.profile == nullptr && !diagnosticEventsEnabled_ &&
-        options_.limits.gcWorkBudget == 0;
+        (options_.limits.gcWorkBudget == 0 || options_.trustedRelease);
     if (prebuiltTypes) {
         typesPtr_ = prebuiltTypes;
     } else {
@@ -604,6 +604,18 @@ bool ExecutionContext::invoke(
                 "argument")) {
             return false;
         }
+    }
+
+    if (trustedReleaseEnabled()) {
+        ++statistics_.functionCalls;
+        if (statistics_.maximumCallDepth == 0) {
+            statistics_.maximumCallDepth = 1;
+        }
+        return function->implementation(
+            *this,
+            arguments,
+            argumentCount,
+            result);
     }
 
     const auto previousFunctionId = currentFunctionId_;
@@ -1446,23 +1458,36 @@ bool ExecutionContext::typeOperation(
 bool ExecutionContext::arrayLength(
     const runtime::Value& receiver,
     runtime::Value& result) {
+    std::int64_t len = 0;
+    if (!arrayLengthFast(receiver, len)) return false;
+    result = len;
+    return true;
+}
+
+bool ExecutionContext::arrayLengthFast(
+    const runtime::Value& receiver,
+    std::int64_t& result) {
+    if (const auto* reference = std::get_if<runtime::ObjectRef>(&receiver)) {
+        if (heap_) {
+            if (const auto length = heap_->arrayLength(*reference)) {
+                if (*length <= static_cast<std::size_t>(INT32_MAX)) {
+                    result = static_cast<std::int64_t>(*length);
+                    return true;
+                }
+            }
+        }
+        return fail(
+            runtime::ErrorCode::InvalidObjectReference,
+            "array length references an invalid managed array");
+    }
     if (std::holds_alternative<runtime::NullArray>(receiver)) {
         return fail(
             runtime::ErrorCode::NullReference,
             "array length attempted to dereference null");
     }
-    if (!expectType(receiver, semantic::PrimitiveType::Array, "array length")) {
-        return false;
-    }
-    const auto reference = std::get<runtime::ObjectRef>(receiver);
-    const auto length = heap_->arrayLength(reference);
-    if (!length || *length > static_cast<std::size_t>(INT32_MAX)) {
-        return fail(
-            runtime::ErrorCode::InvalidObjectReference,
-            "array length references an invalid managed array");
-    }
-    result = static_cast<std::int64_t>(*length);
-    return true;
+    return fail(
+        runtime::ErrorCode::TypeMismatch,
+        "array length expected 'array'");
 }
 
 bool ExecutionContext::loadElement(
@@ -1812,6 +1837,81 @@ bool ExecutionContext::storeUnboxedStructField(
     }
     result.fields[fieldIndex] = value;
     return true;
+}
+
+bool ExecutionContext::ecsWritebackBoxed(
+    const CallSignature& signature,
+    std::int64_t index,
+    const runtime::Value& boxedStruct) {
+    if (!heap_ || !signature.name) return true;
+    if (!heap_->hasSparseEcsState()) return true;
+    const std::array<runtime::Value, 2> args{{
+        runtime::Value{index},
+        boxedStruct,
+    }};
+    runtime::Value ignored;
+    return call(signature, args.data(), args.size(), ignored);
+}
+
+bool ExecutionContext::resolveEcsColumnFast(
+    semantic::SymbolId denseColSymbolId,
+    const CallSignature& fallbackSignature,
+    runtime::Value& outResult) {
+    if (!hasSparseEcsState() && denseColSymbolId != 0 && heap_) {
+        if (auto existing = heap_->getStaticField(denseColSymbolId)) {
+            outResult = std::move(*existing);
+            return true;
+        }
+    }
+    return call(fallbackSignature, nullptr, 0, outResult);
+}
+
+TypedRawColumnCache ExecutionContext::acquireRawColumnCache(
+    const runtime::Value& arrayValue,
+    semantic::SymbolId expectedStructTypeId,
+    std::size_t generatedStructSize,
+    const GeneratedFieldLayout* generatedFields,
+    std::size_t generatedFieldCount) const noexcept {
+    TypedRawColumnCache cache{};
+    if (!heap_) return cache;
+    const auto* ref = std::get_if<runtime::ObjectRef>(&arrayValue);
+    if (!ref) return cache;
+    const auto* view = heap_->rawColumnView(*ref);
+    if (!view) return cache;
+    if (expectedStructTypeId != 0 && view->structTypeId != expectedStructTypeId) {
+        return cache;
+    }
+    if (view->fields.size() > cache.fields.size()) {
+        return cache;
+    }
+    if (generatedFields && generatedFieldCount != view->fields.size()) {
+        return cache;
+    }
+    cache.basePtr = static_cast<std::uint8_t*>(view->basePtr);
+    cache.strideBytes = view->strideBytes;
+    cache.count = static_cast<std::int64_t>(view->count);
+    cache.readOnly = view->readOnly;
+    cache.fieldCount = static_cast<std::uint8_t>(view->fields.size());
+    for (std::size_t i = 0; i < view->fields.size(); ++i) {
+        cache.fields[i] = TypedRawFieldCache{
+            view->fields[i].byteOffset,
+            view->fields[i].kind,
+        };
+    }
+    if (generatedFields &&
+        generatedFieldCount == view->fields.size() &&
+        generatedStructSize == view->strideBytes) {
+        bool exact = true;
+        for (std::size_t i = 0; i < generatedFieldCount; ++i) {
+            if (view->fields[i].byteOffset != generatedFields[i].byteOffset ||
+                view->fields[i].kind != generatedFields[i].expectedKind) {
+                exact = false;
+                break;
+            }
+        }
+        cache.exactNativeLayout = exact;
+    }
+    return cache;
 }
 
 bool ExecutionContext::convert(

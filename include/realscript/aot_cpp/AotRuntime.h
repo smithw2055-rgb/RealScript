@@ -4,8 +4,10 @@
 #include "realscript/runtime/Runtime.h"
 #include "realscript/semantic/Semantic.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <climits>
 #include <exception>
 #include <functional>
@@ -19,10 +21,111 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define RS_AOT_LIKELY(x) __builtin_expect(!!(x), 1)
+#define RS_AOT_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define RS_AOT_LIKELY(x) (x)
+#define RS_AOT_UNLIKELY(x) (x)
+#endif
+
 namespace realscript::aot {
 
 constexpr std::uint32_t RuntimeAbiMajor = 1;
 constexpr std::uint32_t RuntimeAbiMinor = 2;
+
+struct GeneratedFieldLayout {
+    std::size_t byteOffset = 0;
+    std::size_t byteSize = 0;
+    runtime::NativeFieldKind expectedKind = runtime::NativeFieldKind::Int64;
+};
+
+struct TypedRawFieldCache {
+    std::size_t byteOffset = 0;
+    runtime::NativeFieldKind kind = runtime::NativeFieldKind::Int64;
+};
+
+struct TypedRawColumnCache {
+    std::uint8_t* basePtr = nullptr;
+    std::size_t strideBytes = 0;
+    std::int64_t count = -1;
+    bool readOnly = false;
+    bool exactNativeLayout = false;
+    std::uint8_t fieldCount = 0;
+    std::array<TypedRawFieldCache, 16> fields{};
+};
+
+template <typename FieldT>
+[[nodiscard]] inline FieldT readRawColumnField(
+    const std::uint8_t* elemBase,
+    const TypedRawFieldCache& field) noexcept {
+    const std::uint8_t* ptr = elemBase + field.byteOffset;
+    if constexpr (std::is_same_v<FieldT, double>) {
+        if (RS_AOT_LIKELY(field.kind == runtime::NativeFieldKind::Float64)) {
+            double v = 0.0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return v;
+        }
+        float f = 0.0f;
+        std::memcpy(&f, ptr, sizeof(f));
+        return static_cast<double>(f);
+    } else if constexpr (std::is_same_v<FieldT, float>) {
+        if (RS_AOT_LIKELY(field.kind == runtime::NativeFieldKind::Float32)) {
+            float v = 0.0f;
+            std::memcpy(&v, ptr, sizeof(v));
+            return v;
+        }
+        double d = 0.0;
+        std::memcpy(&d, ptr, sizeof(d));
+        return static_cast<float>(d);
+    } else if constexpr (std::is_same_v<FieldT, std::int64_t>) {
+        if (RS_AOT_LIKELY(field.kind == runtime::NativeFieldKind::Int64)) {
+            std::int64_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return v;
+        }
+        std::int32_t i32 = 0;
+        std::memcpy(&i32, ptr, sizeof(i32));
+        return static_cast<std::int64_t>(i32);
+    } else {
+        FieldT v{};
+        std::memcpy(&v, ptr, sizeof(FieldT));
+        return v;
+    }
+}
+
+template <typename FieldT>
+inline void writeRawColumnField(
+    std::uint8_t* elemBase,
+    const TypedRawFieldCache& field,
+    FieldT value) noexcept {
+    std::uint8_t* ptr = elemBase + field.byteOffset;
+    if constexpr (std::is_same_v<FieldT, double>) {
+        if (RS_AOT_LIKELY(field.kind == runtime::NativeFieldKind::Float64)) {
+            std::memcpy(ptr, &value, sizeof(value));
+            return;
+        }
+        const float f = static_cast<float>(value);
+        std::memcpy(ptr, &f, sizeof(f));
+    } else if constexpr (std::is_same_v<FieldT, float>) {
+        if (RS_AOT_LIKELY(field.kind == runtime::NativeFieldKind::Float32)) {
+            std::memcpy(ptr, &value, sizeof(value));
+            return;
+        }
+        const double d = static_cast<double>(value);
+        std::memcpy(ptr, &d, sizeof(d));
+    } else if constexpr (std::is_same_v<FieldT, std::int64_t>) {
+        if (RS_AOT_LIKELY(field.kind == runtime::NativeFieldKind::Int64)) {
+            std::memcpy(ptr, &value, sizeof(value));
+            return;
+        }
+        const std::int32_t i32 = static_cast<std::int32_t>(value);
+        std::memcpy(ptr, &i32, sizeof(i32));
+    } else {
+        std::memcpy(ptr, &value, sizeof(FieldT));
+    }
+}
+
 constexpr std::uint32_t GeneratedModuleVersion = 1;
 
 struct FieldDescriptor {
@@ -404,74 +507,91 @@ public:
     [[nodiscard]] bool fastAccountingEnabled() const noexcept {
         return fastAccounting_;
     }
+    [[nodiscard]] bool trustedReleaseEnabled() const noexcept {
+        return options_.trustedRelease && fastAccounting_;
+    }
     [[nodiscard]] bool typedDeterminismAccountingEnabled() const noexcept {
         return determinismOnly_ && options_.limits.gcWorkBudget == 0;
     }
-    template <bool FastAccounting, bool DeterminismAccounting>
+    template <bool FastAccounting, bool DeterminismAccounting, bool TrustedRelease = false>
     [[nodiscard]] bool enterTypedDirectCall(
         semantic::SymbolId calleeSymbolId,
         const char* calleeName,
         semantic::SymbolId& outPreviousFunctionId) {
-        if (stack_.size() >= options_.limits.recursionLimit) {
-            return fail(
-                runtime::ErrorCode::RecursionLimitExceeded,
-                "recursion limit exceeded");
-        }
-        outPreviousFunctionId = currentFunctionId_;
-        currentFunctionId_ = calleeSymbolId;
-        stack_.push_back(calleeName ? calleeName : "<aot-function>");
-        ++statistics_.functionCalls;
-        if (stack_.size() > statistics_.maximumCallDepth) {
-            statistics_.maximumCallDepth = stack_.size();
-        }
-        if constexpr (DeterminismAccounting) {
-            determinismEventDigest_ = runtime::accumulateDeterminismEvent(
-                determinismEventDigest_,
-                runtime::TraceEventKind::FunctionEnter,
-                currentFunctionId_,
-                0,
-                executed_,
-                stack_.size());
-            ++determinismEventCount_;
-        } else if constexpr (!FastAccounting) {
-            emitTrace(runtime::TraceEventKind::FunctionEnter);
-        }
-        return true;
-    }
-
-    template <bool FastAccounting, bool DeterminismAccounting, typename BoxFn>
-    void exitTypedDirectCall(
-        semantic::SymbolId previousFunctionId,
-        bool succeeded,
-        BoxFn&& boxReturnValue) {
-        if (succeeded) {
+        if constexpr (TrustedRelease) {
+            (void)calleeSymbolId;
+            (void)calleeName;
+            (void)outPreviousFunctionId;
+            return true;
+        } else {
+            if (stack_.size() >= options_.limits.recursionLimit) {
+                return fail(
+                    runtime::ErrorCode::RecursionLimitExceeded,
+                    "recursion limit exceeded");
+            }
+            outPreviousFunctionId = currentFunctionId_;
+            currentFunctionId_ = calleeSymbolId;
+            stack_.push_back(calleeName ? calleeName : "<aot-function>");
+            ++statistics_.functionCalls;
+            if (stack_.size() > statistics_.maximumCallDepth) {
+                statistics_.maximumCallDepth = stack_.size();
+            }
             if constexpr (DeterminismAccounting) {
                 determinismEventDigest_ = runtime::accumulateDeterminismEvent(
                     determinismEventDigest_,
-                    runtime::TraceEventKind::FunctionExit,
+                    runtime::TraceEventKind::FunctionEnter,
                     currentFunctionId_,
                     0,
                     executed_,
                     stack_.size());
                 ++determinismEventCount_;
             } else if constexpr (!FastAccounting) {
-                if (traceEventsEnabled_) {
-                    if (diagnosticEventsEnabled_) {
-                        const runtime::Value boxed = boxReturnValue();
-                        const auto operation =
-                            runtime::valueToString(boxed, heap_.get());
-                        emitTrace(
-                            runtime::TraceEventKind::FunctionExit,
-                            0,
-                            operation);
-                    } else {
-                        emitTrace(runtime::TraceEventKind::FunctionExit);
+                emitTrace(runtime::TraceEventKind::FunctionEnter);
+            }
+            return true;
+        }
+    }
+
+    template <bool FastAccounting, bool DeterminismAccounting, bool TrustedRelease = false, typename BoxFn>
+    void exitTypedDirectCall(
+        semantic::SymbolId previousFunctionId,
+        bool succeeded,
+        BoxFn&& boxReturnValue) {
+        if constexpr (TrustedRelease) {
+            (void)previousFunctionId;
+            (void)succeeded;
+            (void)boxReturnValue;
+            return;
+        } else {
+            if (succeeded) {
+                if constexpr (DeterminismAccounting) {
+                    determinismEventDigest_ = runtime::accumulateDeterminismEvent(
+                        determinismEventDigest_,
+                        runtime::TraceEventKind::FunctionExit,
+                        currentFunctionId_,
+                        0,
+                        executed_,
+                        stack_.size());
+                    ++determinismEventCount_;
+                } else if constexpr (!FastAccounting) {
+                    if (traceEventsEnabled_) {
+                        if (diagnosticEventsEnabled_) {
+                            const runtime::Value boxed = boxReturnValue();
+                            const auto operation =
+                                runtime::valueToString(boxed, heap_.get());
+                            emitTrace(
+                                runtime::TraceEventKind::FunctionExit,
+                                0,
+                                operation);
+                        } else {
+                            emitTrace(runtime::TraceEventKind::FunctionExit);
+                        }
                     }
                 }
             }
+            stack_.pop_back();
+            currentFunctionId_ = previousFunctionId;
         }
-        stack_.pop_back();
-        currentFunctionId_ = previousFunctionId;
     }
     [[nodiscard]] bool consumeRawTyped(std::uint64_t count = 1) {
         if (count == 0) return true;
@@ -542,6 +662,9 @@ public:
     [[nodiscard]] bool arrayLength(
         const runtime::Value& receiver,
         runtime::Value& result);
+    [[nodiscard]] bool arrayLengthFast(
+        const runtime::Value& receiver,
+        std::int64_t& result);
     [[nodiscard]] bool loadElement(
         semantic::PrimitiveType elementType,
         semantic::SymbolId elementTypeId,
@@ -578,6 +701,13 @@ public:
     [[nodiscard]] bool initUnboxedStruct(
         semantic::SymbolId typeId,
         struct UnboxedCustomStruct& result);
+    template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
+    [[nodiscard]] constexpr bool initUnboxedStruct(
+        semantic::SymbolId,
+        T& result) const noexcept {
+        result = T{};
+        return true;
+    }
     [[nodiscard]] bool loadUnboxedStructField(
         semantic::SymbolId typeId,
         std::size_t fieldIndex,
@@ -589,6 +719,23 @@ public:
         const struct UnboxedCustomStruct& receiver,
         const runtime::Value& value,
         struct UnboxedCustomStruct& result);
+    [[nodiscard]] bool ecsWritebackBoxed(
+        const CallSignature& signature,
+        std::int64_t index,
+        const runtime::Value& boxedStruct);
+    [[nodiscard]] bool resolveEcsColumnFast(
+        semantic::SymbolId denseColSymbolId,
+        const CallSignature& fallbackSignature,
+        runtime::Value& outResult);
+    [[nodiscard]] struct TypedRawColumnCache acquireRawColumnCache(
+        const runtime::Value& arrayValue,
+        semantic::SymbolId expectedStructTypeId = 0,
+        std::size_t generatedStructSize = 0,
+        const struct GeneratedFieldLayout* generatedFields = nullptr,
+        std::size_t generatedFieldCount = 0) const noexcept;
+    [[nodiscard]] bool hasSparseEcsState() const noexcept {
+        return heap_ != nullptr && heap_->hasSparseEcsState();
+    }
     [[nodiscard]] bool convert(
         semantic::ConversionKind conversion,
         semantic::PrimitiveType targetType,
@@ -1020,10 +1167,51 @@ template <bool Checked>
     return value;
 }
 
+struct EmptyGcGuards {};
+
 struct UnboxedCustomStruct {
     semantic::SymbolId typeId = 0;
     std::array<runtime::Value, 16> fields{};
     std::uint8_t fieldCount = 0;
+
+    UnboxedCustomStruct() = default;
+    explicit UnboxedCustomStruct(semantic::SymbolId id) noexcept : typeId(id) {}
+
+    UnboxedCustomStruct(const UnboxedCustomStruct& other)
+        : typeId(other.typeId), fieldCount(other.fieldCount) {
+        for (std::uint8_t i = 0; i < fieldCount; ++i) {
+            fields[i] = other.fields[i];
+        }
+    }
+
+    UnboxedCustomStruct& operator=(const UnboxedCustomStruct& other) {
+        if (this != &other) {
+            typeId = other.typeId;
+            fieldCount = other.fieldCount;
+            for (std::uint8_t i = 0; i < fieldCount; ++i) {
+                fields[i] = other.fields[i];
+            }
+        }
+        return *this;
+    }
+
+    UnboxedCustomStruct(UnboxedCustomStruct&& other) noexcept
+        : typeId(other.typeId), fieldCount(other.fieldCount) {
+        for (std::uint8_t i = 0; i < fieldCount; ++i) {
+            fields[i] = std::move(other.fields[i]);
+        }
+    }
+
+    UnboxedCustomStruct& operator=(UnboxedCustomStruct&& other) noexcept {
+        if (this != &other) {
+            typeId = other.typeId;
+            fieldCount = other.fieldCount;
+            for (std::uint8_t i = 0; i < fieldCount; ++i) {
+                fields[i] = std::move(other.fields[i]);
+            }
+        }
+        return *this;
+    }
 
     friend bool operator==(const UnboxedCustomStruct& left, const UnboxedCustomStruct& right) {
         if (left.typeId != right.typeId || left.fieldCount != right.fieldCount) return false;
@@ -1044,6 +1232,13 @@ struct UnboxedCustomStruct {
     return runtime::Value{runtime::makeStructValueFromFields(
         value.typeId,
         runtime::ValueSpan(value.fields.data(), value.fieldCount))};
+}
+
+template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType,
+    const T& value) {
+    return value.boxToValue();
 }
 
 [[nodiscard]] inline bool typedUnboxScalar(
@@ -1229,6 +1424,14 @@ struct UnboxedCustomStruct {
         return true;
     }
     return false;
+}
+
+template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType,
+    const runtime::Value& value,
+    T& out) {
+    return T::unboxFromValue(value, out);
 }
 
 template <semantic::PrimitiveType SrcType, semantic::PrimitiveType DstType, bool Checked, typename SrcT, typename DstT>

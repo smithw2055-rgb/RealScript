@@ -732,6 +732,35 @@ enum class ArrayStoreTypePolicy {
     PrevalidatedAssignableObject,
 };
 
+enum class NativeFieldKind : std::uint8_t {
+    Int32,
+    Int64,
+    Float32,
+    Float64,
+    Bool,
+    Fixed,
+    Fixed16,
+    Vec2,
+    Vec3,
+    Quat,
+};
+
+struct NativeFieldLayout {
+    std::size_t byteOffset = 0;
+    NativeFieldKind kind = NativeFieldKind::Int32;
+    semantic::PrimitiveType scriptType = semantic::PrimitiveType::Int;
+    semantic::SymbolId scriptTypeId = 0;
+};
+
+struct NativeRawColumnView {
+    void* basePtr = nullptr;
+    std::size_t count = 0;
+    std::size_t strideBytes = 0;
+    semantic::SymbolId structTypeId = 0;
+    std::vector<NativeFieldLayout> fields;
+    bool readOnly = false;
+};
+
 class ShadowStack {
 public:
     void pushFrame(
@@ -856,6 +885,32 @@ public:
         std::string_view canonicalTypeName,
         std::size_t denseIndex,
         Value component);
+
+    // Zero-Copy Host C++ Contiguous Struct Column Binding for ECS Query
+    [[nodiscard]] std::optional<ObjectRef> allocateRawColumnArray(
+        semantic::SymbolId arrayTypeId,
+        semantic::SymbolId elementTypeId,
+        NativeRawColumnView view,
+        RuntimeError* error = nullptr);
+    bool updateRawColumnArray(
+        ObjectRef reference,
+        NativeRawColumnView view) noexcept;
+    [[nodiscard]] bool isRawColumnArray(ObjectRef reference) const noexcept;
+    [[nodiscard]] bool hasSparseEcsState() const noexcept;
+    void notifySparseEcsState() noexcept;
+    [[nodiscard]] const NativeRawColumnView* rawColumnView(ObjectRef reference) const noexcept;
+    bool readRawColumnFields(
+        ObjectRef reference,
+        std::size_t index,
+        Value* outFields,
+        std::size_t maxFields,
+        std::uint8_t& outFieldCount) const noexcept;
+    bool writeRawColumnFields(
+        ObjectRef reference,
+        std::size_t index,
+        const Value* fields,
+        std::size_t fieldCount,
+        RuntimeError* error = nullptr) noexcept;
 
     void requestCollection() noexcept;
     [[nodiscard]] bool collectionRequested() const noexcept;
@@ -1120,6 +1175,7 @@ struct ExecutionOptions {
     std::shared_ptr<debug::DebugController> debugger;
     bool enforceCapabilities = false;
     std::unordered_set<std::string> grantedCapabilities;
+    bool trustedRelease = false;
 };
 
 struct ExecutionResult {

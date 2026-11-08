@@ -450,6 +450,42 @@ public:
         std::vector<runtime::Value>& outComponents,
         runtime::RuntimeError& error) const;
 
+    bool bindEcsRawColumn(
+        const std::string& canonicalTypeName,
+        void* basePtr,
+        std::size_t count,
+        std::size_t strideBytes,
+        const std::vector<runtime::NativeFieldLayout>& fieldLayouts,
+        runtime::RuntimeError& error,
+        bool readOnly = false) const;
+    bool bindEcsRawColumnStandardLayout(
+        const std::string& canonicalTypeName,
+        void* basePtr,
+        std::size_t count,
+        std::size_t strideBytes,
+        runtime::RuntimeError& error,
+        bool readOnly = false,
+        bool useInt32ForScriptInt = false) const;
+
+    template <typename HostStruct>
+    bool bindEcsRawColumnAuto(
+        const std::string& canonicalTypeName,
+        HostStruct* data,
+        std::size_t count,
+        runtime::RuntimeError& error,
+        bool useInt32ForScriptInt = false) const {
+        static_assert(std::is_standard_layout_v<HostStruct>,
+            "HostStruct must be standard-layout for zero-copy ECS binding");
+        return bindEcsRawColumnStandardLayout(
+            canonicalTypeName,
+            const_cast<std::remove_const_t<HostStruct>*>(data),
+            count,
+            sizeof(HostStruct),
+            error,
+            std::is_const_v<HostStruct>,
+            useInt32ForScriptInt);
+    }
+
     bool setEcsEntityComponent(
         std::uint64_t entity,
         const std::string& canonicalTypeName,

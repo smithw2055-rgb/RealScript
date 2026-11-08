@@ -711,24 +711,14 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
             if (value.ecsColumns.empty()) return;
             if (value.hasEcsEntityBinding) {
                 const auto entArrayTypeId = semantic::stableTypeId(value.ecsEntityCollectionVariable.typeName);
-                const auto zeroLen = emitInt(0, statement.span);
-                const auto emptyEntArr = emitValue(
-                    Opcode::NewArray, semantic::PrimitiveType::Array, {zeroLen}, statement.span);
-                auto& newArrInst = block(*currentBlockId_).instructions.back();
-                newArrInst.resultTypeId = entArrayTypeId;
-                newArrInst.elementType = semantic::PrimitiveType::Int;
-                newArrInst.elementTypeId = 0;
-                newArrInst.symbolName = value.ecsEntityCollectionVariable.typeName;
-
                 const std::string entGetName = "$intrinsic::static_get::ecs_ent::" + value.ecsQuerySpec;
                 Instruction entGetCall;
                 entGetCall.result = nextValueId_++;
                 entGetCall.resultType = semantic::PrimitiveType::Array;
                 entGetCall.resultTypeId = entArrayTypeId;
+                entGetCall.elementType = semantic::PrimitiveType::Int;
+                entGetCall.elementTypeId = 0;
                 entGetCall.opcode = Opcode::Call;
-                entGetCall.operands = {emptyEntArr};
-                entGetCall.parameterTypes = {semantic::PrimitiveType::Array};
-                entGetCall.parameterTypeIds = {entArrayTypeId};
                 entGetCall.symbolId = semantic::stableTypeId(entGetName);
                 entGetCall.symbolName = entGetName;
                 entGetCall.sourceSpan = statement.span;
@@ -742,25 +732,15 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 const auto elemTypeId = semantic::isExactType(col.elementType)
                     ? semantic::stableTypeId(col.elementTypeName)
                     : 0;
-                const auto zeroLen = emitInt(0, statement.span);
-                const auto emptyArr = emitValue(
-                    Opcode::NewArray, semantic::PrimitiveType::Array, {zeroLen}, statement.span);
-                auto& newArrInst = block(*currentBlockId_).instructions.back();
-                newArrInst.resultTypeId = arrayTypeId;
-                newArrInst.elementType = col.elementType;
-                newArrInst.elementTypeId = elemTypeId;
-                newArrInst.symbolName = col.collectionVariable.typeName;
-
                 const std::string getName =
                     "$intrinsic::static_get::ecs_col::" + std::to_string(colIdx) + "::" + value.ecsQuerySpec;
                 Instruction getCall;
                 getCall.result = nextValueId_++;
                 getCall.resultType = semantic::PrimitiveType::Array;
                 getCall.resultTypeId = arrayTypeId;
+                getCall.elementType = col.elementType;
+                getCall.elementTypeId = elemTypeId;
                 getCall.opcode = Opcode::Call;
-                getCall.operands = {emptyArr};
-                getCall.parameterTypes = {semantic::PrimitiveType::Array};
-                getCall.parameterTypeIds = {arrayTypeId};
                 getCall.symbolId = semantic::stableTypeId(getName);
                 getCall.symbolName = getName;
                 getCall.sourceSpan = statement.span;
