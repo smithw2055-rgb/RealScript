@@ -135,6 +135,11 @@ public:
     [[nodiscard]] DebugStop lastStop() const;
     [[nodiscard]] bool terminated() const;
 
+    void beginExecution();
+    void endExecution() noexcept;
+    [[nodiscard]] bool hasPendingInterruption() const noexcept;
+    void runAtSafepoint(const std::function<void()>& callback) const;
+
 private:
     struct BoundLocation {
         std::string sourcePath;
@@ -179,6 +184,19 @@ private:
     std::uint32_t nextBreakpointId_ = 1;
     DebugStop lastStop_;
     const std::vector<DebugFrameView>* activeFrameViews_ = nullptr;
+    struct ActiveThreadState {
+        std::size_t depth = 0;
+        bool stopped = false;
+    };
+
+    mutable std::mutex safepointMutex_;
+    mutable std::condition_variable safepointCv_;
+    std::unordered_map<std::thread::id, ActiveThreadState> activeThreads_;
+    std::size_t activeExecutions_ = 0;
+    std::size_t stoppedThreads_ = 0;
+    mutable bool safepointActive_ = false;
+    mutable std::thread::id safepointOwner_{};
+    mutable std::atomic<bool> safepointRequested_{false};
 };
 
 
@@ -227,6 +245,7 @@ public:
     void pause();
     void terminate();
     void join();
+    void runAtSafepoint(const std::function<void()>& callback) const;
 
 private:
     ResumeMode handleStop(const DebugStop& stop);

@@ -804,6 +804,8 @@ bool isLicmSafeOpcode(mir::Opcode opcode) noexcept {
     case mir::Opcode::SubtractDouble:
     case mir::Opcode::MultiplyDouble:
     case mir::Opcode::DivideDouble:
+    case mir::Opcode::LoadStructField:
+    case mir::Opcode::ConstantTypeId:
         return true;
     default:
         return false;
@@ -819,6 +821,25 @@ bool hoistLoopInvariants(mir::Function& function, Statistics& statistics) {
     for (std::size_t i = 0; i < function.blocks.size(); ++i) {
         blockIndexById[function.blocks[i].id] = i;
     }
+    std::vector<std::vector<std::size_t>> predecessors(function.blocks.size());
+    for (std::size_t idx = 0; idx < function.blocks.size(); ++idx) {
+        const auto& term = function.blocks[idx].terminator;
+        if (term.kind == mir::TerminatorKind::Jump) {
+            if (const auto it = blockIndexById.find(term.target); it != blockIndexById.end()) {
+                predecessors[it->second].push_back(idx);
+            }
+        } else if (term.kind == mir::TerminatorKind::Branch) {
+            if (const auto it = blockIndexById.find(term.target); it != blockIndexById.end()) {
+                predecessors[it->second].push_back(idx);
+            }
+            if (term.falseTarget != term.target) {
+                if (const auto it = blockIndexById.find(term.falseTarget);
+                    it != blockIndexById.end()) {
+                    predecessors[it->second].push_back(idx);
+                }
+            }
+        }
+    }
 
     for (std::size_t headerIdx = 1; headerIdx < function.blocks.size(); ++headerIdx) {
         const auto headerId = function.blocks[headerIdx].id;
@@ -832,56 +853,54 @@ bool hoistLoopInvariants(mir::Function& function, Statistics& statistics) {
             continue;
         }
 
-        // Find back-edge block index >= headerIdx jumping/branching to headerId
-        std::size_t latchIdx = 0;
+        // Find back-edge blocks >= headerIdx jumping/branching to headerId and
+        // construct the natural loop by walking predecessors backwards to headerIdx.
+        std::size_t latchIdx = headerIdx;
         bool hasBackEdge = false;
         bool invalidPred = false;
-        for (std::size_t idx = 0; idx < function.blocks.size(); ++idx) {
-            const auto& term = function.blocks[idx].terminator;
-            const bool edgesToHeader =
-                (term.kind == mir::TerminatorKind::Jump && term.target == headerId) ||
-                (term.kind == mir::TerminatorKind::Branch &&
-                 (term.target == headerId || term.falseTarget == headerId));
-            if (!edgesToHeader) continue;
-            if (idx == headerIdx - 1) continue;
-            if (idx < headerIdx) {
+        std::vector<bool> inNaturalLoop(function.blocks.size(), false);
+        inNaturalLoop[headerIdx] = true;
+        std::vector<std::size_t> worklist;
+        for (const auto predIdx : predecessors[headerIdx]) {
+            if (predIdx == headerIdx - 1) continue;
+            if (predIdx < headerIdx) {
                 invalidPred = true;
                 break;
             }
             hasBackEdge = true;
-            latchIdx = std::max(latchIdx, idx);
+            latchIdx = std::max(latchIdx, predIdx);
+            if (!inNaturalLoop[predIdx]) {
+                inNaturalLoop[predIdx] = true;
+                worklist.push_back(predIdx);
+            }
         }
         if (!hasBackEdge || invalidPred) continue;
 
-        // Verify no block outside [headerIdx, latchIdx] (other than preheader -> headerId)
-        // jumps into [headerIdx, latchIdx]
-        std::unordered_set<mir::BlockId> loopBlockIds;
-        for (std::size_t idx = headerIdx; idx <= latchIdx; ++idx) {
-            loopBlockIds.insert(function.blocks[idx].id);
-        }
-        for (std::size_t idx = 0; idx < function.blocks.size(); ++idx) {
-            if (idx >= headerIdx && idx <= latchIdx) continue;
-            if (idx == headerIdx - 1) continue;
-            const auto& term = function.blocks[idx].terminator;
-            if (term.kind == mir::TerminatorKind::Jump &&
-                loopBlockIds.find(term.target) != loopBlockIds.end()) {
-                invalidPred = true;
-                break;
-            }
-            if (term.kind == mir::TerminatorKind::Branch &&
-                (loopBlockIds.find(term.target) != loopBlockIds.end() ||
-                 loopBlockIds.find(term.falseTarget) != loopBlockIds.end())) {
-                invalidPred = true;
-                break;
+        while (!worklist.empty() && !invalidPred) {
+            const auto currIdx = worklist.back();
+            worklist.pop_back();
+            for (const auto predIdx : predecessors[currIdx]) {
+                if (predIdx < headerIdx) {
+                    invalidPred = true;
+                    break;
+                }
+                if (!inNaturalLoop[predIdx]) {
+                    inNaturalLoop[predIdx] = true;
+                    latchIdx = std::max(latchIdx, predIdx);
+                    worklist.push_back(predIdx);
+                }
             }
         }
         if (invalidPred) continue;
 
-        // Collect all ValueIds defined inside the loop [headerIdx, latchIdx]
+        // Collect all ValueIds defined inside the natural loop
+        // and the exact set of local variable indices written by StoreLocal.
+        // In RealScript MIR, StoreField, StoreElement, and Call never alias
+        // function-local slots (ref/out call writebacks emit explicit StoreLocal).
         std::unordered_set<mir::ValueId> loopDefinedValues;
         std::unordered_set<std::size_t> loopModifiedLocals;
-        bool loopHasCallOrStore = false;
         for (std::size_t idx = headerIdx; idx <= latchIdx; ++idx) {
+            if (!inNaturalLoop[idx]) continue;
             for (const auto& param : function.blocks[idx].parameters) {
                 loopDefinedValues.insert(param.value);
             }
@@ -892,15 +911,11 @@ bool hoistLoopInvariants(mir::Function& function, Statistics& statistics) {
                 if (inst.opcode == mir::Opcode::StoreLocal) {
                     loopModifiedLocals.insert(inst.localIndex);
                 }
-                if (inst.opcode == mir::Opcode::Call ||
-                    inst.opcode == mir::Opcode::StoreField ||
-                    inst.opcode == mir::Opcode::StoreElement) {
-                    loopHasCallOrStore = true;
-                }
             }
         }
 
         for (std::size_t blkIdx = headerIdx; blkIdx <= latchIdx; ++blkIdx) {
+            if (!inNaturalLoop[blkIdx]) continue;
             auto& loopBlock = function.blocks[blkIdx];
             std::vector<mir::Instruction> remaining;
             remaining.reserve(loopBlock.instructions.size());
@@ -916,7 +931,7 @@ bool hoistLoopInvariants(mir::Function& function, Statistics& statistics) {
                           inst.opcode == mir::Opcode::MultiplyLong) &&
                          !inst.checkedArithmetic) ||
                         (inst.opcode == mir::Opcode::LoadLocal &&
-                         !loopHasCallOrStore &&
+                         inst.resultType != semantic::PrimitiveType::Array &&
                          loopModifiedLocals.find(inst.localIndex) == loopModifiedLocals.end())) {
                         bool allOperandsOutside = true;
                         for (const auto op : inst.operands) {

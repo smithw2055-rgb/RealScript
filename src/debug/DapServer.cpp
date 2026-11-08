@@ -380,7 +380,11 @@ void DapServer::emitTerminated(std::ostream& output) {
 
 void DapServer::collectActiveStackValues(std::vector<runtime::Value>& outValues) const {
     outValues.clear();
-    if (const auto stop = session_ ? session_->currentStop() : std::nullopt) {
+    std::optional<DebugStop> stop = session_ ? session_->currentStop() : std::nullopt;
+    if (!stop && session_ && session_->controller()) {
+        stop = session_->controller()->lastStop();
+    }
+    if (stop) {
         for (const auto& frame : stop->frames) {
             for (const auto& arg : frame.arguments) outValues.push_back(arg.value);
             for (const auto& loc : frame.locals) outValues.push_back(loc.value);
@@ -465,7 +469,11 @@ std::string DapServer::describeRootInfo(
         return "[Root: ECS#" + std::to_string(root.token) + "]";
     }
     if (root.kind == "shadow") {
-        if (const auto stop = session_ ? session_->currentStop() : std::nullopt) {
+        std::optional<DebugStop> stop = session_ ? session_->currentStop() : std::nullopt;
+        if (!stop && session_ && session_->controller()) {
+            stop = session_->controller()->lastStop();
+        }
+        if (stop) {
             const auto valueContainsRef = [](const auto& self,
                                              const runtime::Value& val,
                                              runtime::ObjectRef target,
@@ -507,15 +515,33 @@ std::string DapServer::describeRootInfo(
 }
 
 std::string DapServer::formatRetainingPathReport(runtime::ObjectRef target) const {
-    if (!heap_ || !target.valid() || !heap_->isAlive(target)) {
+    if (!heap_ || !target.valid()) {
         return "Target object is not alive in ManagedHeap.";
     }
-    std::vector<runtime::Value> stackValues;
-    collectActiveStackValues(stackValues);
-    runtime::ShadowStack shadow;
-    shadow.pushFrame(nullptr, nullptr, &stackValues);
-
-    const auto snap = heap_->snapshot(&shadow);
+    bool alive = false;
+    runtime::HeapSnapshot snap;
+    std::vector<std::string> rootDescriptions;
+    const auto captureSnap = [&]() {
+        if (!heap_->isAlive(target)) return;
+        alive = true;
+        std::vector<runtime::Value> stackValues;
+        collectActiveStackValues(stackValues);
+        runtime::ShadowStack shadow;
+        shadow.pushFrame(nullptr, nullptr, &stackValues);
+        snap = heap_->snapshot(&shadow);
+        rootDescriptions.reserve(snap.roots.size());
+        for (const auto& root : snap.roots) {
+            rootDescriptions.push_back(describeRootInfo(root));
+        }
+    };
+    if (session_) {
+        session_->runAtSafepoint(captureSnap);
+    } else {
+        captureSnap();
+    }
+    if (!alive) {
+        return "Target object is not alive in ManagedHeap.";
+    }
     std::unordered_map<std::uint32_t, const runtime::HeapObjectInfo*> objMap;
     objMap.reserve(snap.objects.size());
     for (const auto& obj : snap.objects) {
@@ -531,12 +557,16 @@ std::string DapServer::formatRetainingPathReport(runtime::ObjectRef target) cons
     std::unordered_map<std::uint32_t, ParentStep> parent;
     std::unordered_set<std::uint32_t> visited;
 
-    for (const auto& root : snap.roots) {
+    for (std::size_t i = 0; i < snap.roots.size(); ++i) {
+        const auto& root = snap.roots[i];
         if (visited.insert(root.reference.slot).second) {
             queue.push_back(root.reference);
             parent.emplace(
                 root.reference.slot,
-                ParentStep{runtime::ObjectRef::InvalidSlot, {}, describeRootInfo(root)});
+                ParentStep{
+                    runtime::ObjectRef::InvalidSlot,
+                    {},
+                    i < rootDescriptions.size() ? rootDescriptions[i] : describeRootInfo(root)});
         }
     }
 
@@ -612,12 +642,24 @@ tooling::Json DapServer::buildHeapSnapshotReport(bool diffBaseline) {
         };
     }
 
-    std::vector<runtime::Value> stackValues;
-    collectActiveStackValues(stackValues);
-    runtime::ShadowStack shadow;
-    shadow.pushFrame(nullptr, nullptr, &stackValues);
-
-    const auto snap = heap_->snapshot(&shadow);
+    runtime::HeapSnapshot snap;
+    std::vector<std::string> rootDescriptions;
+    const auto captureSnap = [&]() {
+        std::vector<runtime::Value> stackValues;
+        collectActiveStackValues(stackValues);
+        runtime::ShadowStack shadow;
+        shadow.pushFrame(nullptr, nullptr, &stackValues);
+        snap = heap_->snapshot(&shadow);
+        rootDescriptions.reserve(snap.roots.size());
+        for (const auto& root : snap.roots) {
+            rootDescriptions.push_back(describeRootInfo(root));
+        }
+    };
+    if (session_) {
+        session_->runAtSafepoint(captureSnap);
+    } else {
+        captureSnap();
+    }
 
     // Precompute all shortest retaining paths in a single O(V + E) multi-source BFS over `snap`
     std::unordered_map<std::uint32_t, const runtime::HeapObjectInfo*> objMap;
@@ -636,12 +678,16 @@ tooling::Json DapServer::buildHeapSnapshotReport(bool diffBaseline) {
     parent.reserve(snap.objects.size());
     visited.reserve(snap.objects.size());
 
-    for (const auto& root : snap.roots) {
+    for (std::size_t i = 0; i < snap.roots.size(); ++i) {
+        const auto& root = snap.roots[i];
         if (visited.insert(root.reference.slot).second) {
             bfsQueue.push_back(root.reference);
             parent.emplace(
                 root.reference.slot,
-                ParentStep{runtime::ObjectRef::InvalidSlot, {}, describeRootInfo(root)});
+                ParentStep{
+                    runtime::ObjectRef::InvalidSlot,
+                    {},
+                    i < rootDescriptions.size() ? rootDescriptions[i] : describeRootInfo(root)});
         }
     }
     while (!bfsQueue.empty()) {
@@ -920,43 +966,55 @@ tooling::Json DapServer::handle(
     }
     if (command == "retainingPath" || command == "realscript/retainingPath") {
         runtime::ObjectRef targetRef;
-        if (arguments && arguments->find("variablesReference")) {
-            const auto varRef = arguments->find("variablesReference")->integerValue(0);
-            const auto ownerIt = childOwnerObjects_.find(varRef);
-            if (ownerIt != childOwnerObjects_.end()) {
-                targetRef = ownerIt->second;
-            }
-        }
-        if (!targetRef.valid() && arguments && arguments->find("expression") && session_) {
-            const auto expr = arguments->find("expression")->stringValue();
-            const auto frameId = arguments && arguments->find("frameId")
-                ? static_cast<std::uint32_t>(std::max<std::int64_t>(1, arguments->find("frameId")->integerValue(1)))
-                : 1u;
-            std::string errMsg;
-            if (const auto evalVal = session_->evaluate(expr, frameId, &errMsg)) {
-                if (const auto* ref = std::get_if<runtime::ObjectRef>(&*evalVal)) {
-                    targetRef = *ref;
+        bool isAlive = false;
+        std::string report;
+        const auto resolveTarget = [&]() {
+            if (arguments && arguments->find("variablesReference")) {
+                const auto varRef = arguments->find("variablesReference")->integerValue(0);
+                const auto ownerIt = childOwnerObjects_.find(varRef);
+                if (ownerIt != childOwnerObjects_.end()) {
+                    targetRef = ownerIt->second;
                 }
             }
-        }
-        if (!targetRef.valid() && arguments && arguments->find("slot")) {
-            const auto slot = static_cast<std::uint32_t>(
-                std::max<std::int64_t>(0, arguments->find("slot")->integerValue(0)));
-            if (heap_) {
-                const auto snap = heap_->snapshot();
-                for (const auto& obj : snap.objects) {
-                    if (obj.reference.slot == slot) {
-                        targetRef = obj.reference;
-                        break;
+            if (!targetRef.valid() && arguments && arguments->find("expression") && session_) {
+                const auto expr = arguments->find("expression")->stringValue();
+                const auto frameId = arguments && arguments->find("frameId")
+                    ? static_cast<std::uint32_t>(std::max<std::int64_t>(1, arguments->find("frameId")->integerValue(1)))
+                    : 1u;
+                std::string errMsg;
+                if (const auto evalVal = session_->evaluate(expr, frameId, &errMsg)) {
+                    if (const auto* ref = std::get_if<runtime::ObjectRef>(&*evalVal)) {
+                        targetRef = *ref;
                     }
                 }
             }
+            if (!targetRef.valid() && arguments && arguments->find("slot")) {
+                const auto slot = static_cast<std::uint32_t>(
+                    std::max<std::int64_t>(0, arguments->find("slot")->integerValue(0)));
+                if (heap_) {
+                    const auto snap = heap_->snapshot();
+                    for (const auto& obj : snap.objects) {
+                        if (obj.reference.slot == slot) {
+                            targetRef = obj.reference;
+                            break;
+                        }
+                    }
+                }
+            }
+            isAlive = targetRef.valid() && heap_ && heap_->isAlive(targetRef);
+            if (isAlive) {
+                report = formatRetainingPathReport(targetRef);
+            }
+        };
+        if (session_) {
+            session_->runAtSafepoint(resolveTarget);
+        } else {
+            resolveTarget();
         }
-        if (!targetRef.valid() || !heap_ || !heap_->isAlive(targetRef)) {
+        if (!isAlive) {
             return response(request, false, nullptr,
                 "target expression or variable does not resolve to a live ManagedHeap object");
         }
-        const std::string report = formatRetainingPathReport(targetRef);
         return response(request, true, tooling::Json::Object{
             {"slot", static_cast<std::int64_t>(targetRef.slot)},
             {"generation", static_cast<std::int64_t>(targetRef.generation)},
@@ -990,33 +1048,44 @@ tooling::Json DapServer::handle(
                 subExpr.erase(subExpr.begin());
             }
             runtime::ObjectRef targetRef;
-            if (subExpr.size() >= 2 && subExpr[0] == 'o' &&
-                std::isdigit(static_cast<unsigned char>(subExpr[1]))) {
-                const auto slot = static_cast<std::uint32_t>(
-                    std::strtoull(subExpr.c_str() + 1, nullptr, 10));
-                if (heap_) {
-                    const auto snap = heap_->snapshot();
-                    for (const auto& obj : snap.objects) {
-                        if (obj.reference.slot == slot) {
-                            targetRef = obj.reference;
-                            break;
+            std::string report;
+            const auto resolveSubExpr = [&]() {
+                if (subExpr.size() >= 2 && subExpr[0] == 'o' &&
+                    std::isdigit(static_cast<unsigned char>(subExpr[1]))) {
+                    const auto slot = static_cast<std::uint32_t>(
+                        std::strtoull(subExpr.c_str() + 1, nullptr, 10));
+                    if (heap_) {
+                        const auto snap = heap_->snapshot();
+                        for (const auto& obj : snap.objects) {
+                            if (obj.reference.slot == slot) {
+                                targetRef = obj.reference;
+                                break;
+                            }
+                        }
+                    }
+                } else if (session_) {
+                    std::string errMsg;
+                    if (const auto evalVal = session_->evaluate(subExpr, frameId, &errMsg)) {
+                        if (const auto* ref = std::get_if<runtime::ObjectRef>(&*evalVal)) {
+                            targetRef = *ref;
                         }
                     }
                 }
-            } else if (session_) {
-                std::string errMsg;
-                if (const auto evalVal = session_->evaluate(subExpr, frameId, &errMsg)) {
-                    if (const auto* ref = std::get_if<runtime::ObjectRef>(&*evalVal)) {
-                        targetRef = *ref;
-                    }
+                if (targetRef.valid()) {
+                    report = formatRetainingPathReport(targetRef);
                 }
+            };
+            if (session_) {
+                session_->runAtSafepoint(resolveSubExpr);
+            } else {
+                resolveSubExpr();
             }
             if (!targetRef.valid()) {
                 return response(request, false, nullptr,
                     "expression '" + subExpr + "' is not a live managed heap object");
             }
             return response(request, true, tooling::Json::Object{
-                {"result", formatRetainingPathReport(targetRef)},
+                {"result", report},
                 {"type", "RetainingPath"},
                 {"variablesReference", 0},
             });

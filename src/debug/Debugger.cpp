@@ -964,13 +964,25 @@ bool DebugController::shouldStop(
     runtime::ManagedHeap* heap,
     StopReason& reason,
     std::uint32_t& breakpointId) {
-    if (frames.empty() || !frames.back().point || !frames.back().module) {
+    if (frames.empty() || !frames.back().module) {
+        return false;
+    }
+    if (mode_ == ResumeMode::Terminate) {
+        terminated_ = true;
+        return false;
+    }
+    if (!frames.back().point) {
+        if (pauseRequested_.exchange(false)) {
+            reason = StopReason::Pause;
+            return true;
+        }
         return false;
     }
     const auto& current = frames.back();
     const auto depth = frames.size();
     if (entryPending_) {
         entryPending_ = false;
+        stopOnEntry_ = false;
         reason = StopReason::Entry;
         return true;
     }
@@ -1040,6 +1052,50 @@ DebugStop DebugController::capture(
 bool DebugController::onSequencePoint(
     const std::vector<DebugFrameView>& frames,
     runtime::ManagedHeap* heap) {
+    const auto tid = std::this_thread::get_id();
+    if (safepointRequested_.load(std::memory_order_acquire)) {
+        std::unique_lock<std::mutex> spLock(safepointMutex_);
+        if (safepointRequested_.load(std::memory_order_relaxed) || safepointActive_) {
+            DebugStop priorStop;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                lastHeap_ = heap;
+                priorStop = lastStop_;
+                lastStop_ = capture(StopReason::Pause, 0, frames, heap);
+                activeFrameViews_ = &frames;
+            }
+            bool incrementedStopped = false;
+            auto it = activeThreads_.find(tid);
+            if (it != activeThreads_.end()) {
+                if (!it->second.stopped) {
+                    it->second.stopped = true;
+                    ++stoppedThreads_;
+                    incrementedStopped = true;
+                }
+            } else {
+                ++stoppedThreads_;
+                incrementedStopped = true;
+            }
+            safepointCv_.notify_all();
+            safepointCv_.wait(spLock, [this] {
+                return !safepointRequested_.load(std::memory_order_relaxed) && !safepointActive_;
+            });
+            if (incrementedStopped) {
+                auto itAfter = activeThreads_.find(tid);
+                if (itAfter != activeThreads_.end()) {
+                    itAfter->second.stopped = false;
+                }
+                if (stoppedThreads_ > 0) --stoppedThreads_;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                activeFrameViews_ = nullptr;
+                lastStop_ = std::move(priorStop);
+            }
+            safepointCv_.notify_all();
+        }
+    }
+
     StopHandler handler;
     StopReason reason = StopReason::Breakpoint;
     std::uint32_t breakpointId = 0;
@@ -1053,7 +1109,38 @@ bool DebugController::onSequencePoint(
         handler = stopHandler_;
     }
 
+    bool incrementedStopped = false;
+    {
+        std::lock_guard<std::mutex> spLock(safepointMutex_);
+        auto it = activeThreads_.find(tid);
+        if (it != activeThreads_.end()) {
+            if (!it->second.stopped) {
+                it->second.stopped = true;
+                ++stoppedThreads_;
+                incrementedStopped = true;
+            }
+        } else {
+            ++stoppedThreads_;
+            incrementedStopped = true;
+        }
+        safepointCv_.notify_all();
+    }
     const auto next = handler ? handler(lastStop_) : ResumeMode::Continue;
+    {
+        std::unique_lock<std::mutex> spLock(safepointMutex_);
+        safepointCv_.wait(spLock, [this] {
+            return !safepointRequested_.load(std::memory_order_relaxed) && !safepointActive_;
+        });
+        if (incrementedStopped) {
+            auto itAfter = activeThreads_.find(tid);
+            if (itAfter != activeThreads_.end()) {
+                itAfter->second.stopped = false;
+            }
+            if (stoppedThreads_ > 0) --stoppedThreads_;
+        }
+        safepointCv_.notify_all();
+    }
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         activeFrameViews_ = nullptr;
@@ -1077,6 +1164,88 @@ DebugStop DebugController::lastStop() const {
 bool DebugController::terminated() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return terminated_;
+}
+
+void DebugController::beginExecution() {
+    const auto tid = std::this_thread::get_id();
+    std::unique_lock<std::mutex> lock(safepointMutex_);
+    auto it = activeThreads_.find(tid);
+    if (it != activeThreads_.end() && it->second.depth > 0) {
+        ++it->second.depth;
+        return;
+    }
+    safepointCv_.wait(lock, [this] {
+        return !safepointActive_ && !safepointRequested_.load(std::memory_order_relaxed);
+    });
+    activeThreads_[tid] = ActiveThreadState{1, false};
+    ++activeExecutions_;
+}
+
+void DebugController::endExecution() noexcept {
+    const auto tid = std::this_thread::get_id();
+    std::lock_guard<std::mutex> lock(safepointMutex_);
+    auto it = activeThreads_.find(tid);
+    if (it != activeThreads_.end()) {
+        if (it->second.depth > 1) {
+            --it->second.depth;
+            return;
+        }
+        if (it->second.stopped && stoppedThreads_ > 0) {
+            --stoppedThreads_;
+        }
+        activeThreads_.erase(it);
+    }
+    if (activeExecutions_ > 0) --activeExecutions_;
+    safepointCv_.notify_all();
+}
+
+bool DebugController::hasPendingInterruption() const noexcept {
+    return pauseRequested_.load(std::memory_order_relaxed) ||
+        safepointRequested_.load(std::memory_order_relaxed);
+}
+
+void DebugController::runAtSafepoint(const std::function<void()>& callback) const {
+    if (!callback) return;
+    const auto tid = std::this_thread::get_id();
+    std::unique_lock<std::mutex> lock(safepointMutex_);
+    if (safepointActive_ && safepointOwner_ == tid) {
+        lock.unlock();
+        callback();
+        return;
+    }
+    safepointCv_.wait(lock, [this] {
+        return !safepointActive_ && !safepointRequested_.load(std::memory_order_relaxed);
+    });
+    const auto selfIt = activeThreads_.find(tid);
+    const std::size_t selfUnstopped =
+        (selfIt != activeThreads_.end() && selfIt->second.depth > 0 && !selfIt->second.stopped)
+            ? 1u
+            : 0u;
+    safepointRequested_.store(true, std::memory_order_release);
+    safepointCv_.wait(lock, [this, selfUnstopped] {
+        const std::size_t required =
+            activeExecutions_ > selfUnstopped ? (activeExecutions_ - selfUnstopped) : 0u;
+        return stoppedThreads_ >= required;
+    });
+    safepointActive_ = true;
+    safepointOwner_ = tid;
+    safepointRequested_.store(false, std::memory_order_release);
+    lock.unlock();
+
+    try {
+        callback();
+    } catch (...) {
+        lock.lock();
+        safepointActive_ = false;
+        safepointOwner_ = std::thread::id{};
+        safepointCv_.notify_all();
+        throw;
+    }
+
+    lock.lock();
+    safepointActive_ = false;
+    safepointOwner_ = std::thread::id{};
+    safepointCv_.notify_all();
 }
 
 const char* stopReasonName(StopReason reason) noexcept {
@@ -1153,6 +1322,7 @@ bool DebugSession::launch(
             result_ = std::move(execution);
             finished_ = true;
             paused_ = false;
+            currentStop_.reset();
         }
         sessionCv_.notify_all();
     });
@@ -1171,6 +1341,7 @@ bool DebugSession::waitForStop(std::chrono::milliseconds timeout) {
 
 std::optional<DebugStop> DebugSession::currentStop() const {
     std::lock_guard<std::mutex> lock(sessionMutex_);
+    if (!paused_) return std::nullopt;
     return currentStop_;
 }
 
@@ -1218,6 +1389,7 @@ void DebugSession::resume(ResumeMode mode) {
         pendingMode_ = mode;
         resumePending_ = true;
         paused_ = false;
+        currentStop_.reset();
     }
     sessionCv_.notify_all();
 }
@@ -1257,6 +1429,7 @@ void DebugSession::detach() {
         resumePending_ = true;
         terminateRequested_ = false;
         paused_ = false;
+        currentStop_.reset();
         finished_ = true;
         attached_ = false;
         launched_ = false;
@@ -1288,6 +1461,7 @@ void DebugSession::terminate() {
             resumePending_ = true;
             terminateRequested_ = false;
             paused_ = false;
+            currentStop_.reset();
             finished_ = true;
             attached_ = false;
             launched_ = false;
@@ -1298,6 +1472,7 @@ void DebugSession::terminate() {
         terminateRequested_ = true;
         resumePending_ = true;
         paused_ = false;
+        currentStop_.reset();
     }
     controller_->requestPause();
     sessionCv_.notify_all();
@@ -1305,6 +1480,15 @@ void DebugSession::terminate() {
 
 void DebugSession::join() {
     if (worker_.joinable()) worker_.join();
+}
+
+void DebugSession::runAtSafepoint(const std::function<void()>& callback) const {
+    if (!callback) return;
+    if (controller_) {
+        controller_->runAtSafepoint(callback);
+    } else {
+        callback();
+    }
 }
 
 ResumeMode DebugSession::handleStop(const DebugStop& stop) {

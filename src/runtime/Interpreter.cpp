@@ -728,8 +728,10 @@ bool debugSequencePoint(
     if (!state.debugger) return true;
     const auto* point = findSequencePoint(
         function, blockId, instructionIndex, terminator);
-    if (!point) return true;
-    state.debugFrames.back().point = point;
+    if (!point && !state.debugger->hasPendingInterruption()) return true;
+    if (point) {
+        state.debugFrames.back().point = point;
+    }
     if (!state.debugger->onSequencePoint(state.debugFrames, state.heap)) {
         return fail(state, ErrorCode::ExecutionTerminated,
             "execution terminated by debugger");
@@ -4083,6 +4085,17 @@ ExecutionResult Interpreter::invoke(
     state.determinism = DeterminismSession(std::move(options.determinism));
     state.heap = heap_.get();
     state.debugger = options.debugger.get();
+    struct DebugExecutionScope {
+        debug::DebugController* debugger = nullptr;
+        explicit DebugExecutionScope(debug::DebugController* d) : debugger(d) {
+            if (debugger) debugger->beginExecution();
+        }
+        ~DebugExecutionScope() {
+            if (debugger) debugger->endExecution();
+        }
+        DebugExecutionScope(const DebugExecutionScope&) = delete;
+        DebugExecutionScope& operator=(const DebugExecutionScope&) = delete;
+    } debugExecutionScope(state.debugger);
     if (state.debugger) {
         state.debugger->bindProgram(*program_);
     }

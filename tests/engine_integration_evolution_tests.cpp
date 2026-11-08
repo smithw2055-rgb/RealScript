@@ -6336,6 +6336,222 @@ class PhysicsRunner
         "Zero-copy C++ memory writeback for int64_t/float/Vec3 fields failed");
 }
 
+void testDapSafepointHotReloadStaticFieldAndLicmHoisting() {
+    // 1. Hot-Reload [FormerlySerializedAs] static field migration + old static root cleanup
+    {
+        realscript::game::GameApi api;
+        const char* v1Src = R"RS(
+module Game.StaticReload;
+
+class ScoreTracker
+{
+    public static int s_legacyTotal = 100;
+
+    public void AddScore(int delta)
+    {
+        s_legacyTotal = s_legacyTotal + delta;
+    }
+
+    public int ReadScore()
+    {
+        return s_legacyTotal;
+    }
+}
+)RS";
+        const char* v2Src = R"RS(
+module Game.StaticReload;
+
+class ScoreTracker
+{
+    [FormerlySerializedAs("s_legacyTotal")]
+    public static int s_currentTotal = 0;
+
+    public int ReadScore()
+    {
+        return s_currentTotal;
+    }
+}
+)RS";
+        realscript::game::GameScriptCompiler compiler(api);
+        auto v1 = compiler.compile({{"static_v1.rs", v1Src}});
+        require(v1.succeeded(), "static_v1 compile failed: " + diagnosticsText(v1.diagnostics));
+        auto v2 = compiler.compile({{"static_v2.rs", v2Src}});
+        require(v2.succeeded(), "static_v2 compile failed: " + diagnosticsText(v2.diagnostics));
+
+        realscript::game::ScriptRuntime runtime(v1.program);
+        realscript::game::SceneScriptRuntime scene(runtime);
+        require(scene.attachComponent(1, "Game.StaticReload::ScoreTracker"), "attach ScoreTracker failed");
+        const auto addRes = scene.invoke(1, "AddScore", {std::int64_t{250}});
+        require(addRes.succeeded, "AddScore failed: " + addRes.error.message);
+
+        const auto oldStaticId = realscript::semantic::stableTypeId(
+            "Game.StaticReload::ScoreTracker::field:s_legacyTotal");
+        const auto newStaticId = realscript::semantic::stableTypeId(
+            "Game.StaticReload::ScoreTracker::field:s_currentTotal");
+        require(runtime.heap()->hasStaticField(oldStaticId), "expected oldStaticId before hotReload");
+
+        const auto report = scene.hotReload(v2.program);
+        require(report.succeeded, "hotReload static field failed");
+        require(report.fieldsRenamed >= 1, "expected fieldsRenamed >= 1 for [FormerlySerializedAs] static field");
+        require(runtime.heap()->hasStaticField(newStaticId), "expected newStaticId after hotReload");
+        require(!runtime.heap()->hasStaticField(oldStaticId), "expected oldStaticId root to be removed after migration");
+
+        const auto readRes = scene.invoke(1, "ReadScore", {});
+        require(
+            readRes.succeeded && std::get<std::int64_t>(readRes.value) == 350,
+            "ReadScore after [FormerlySerializedAs] static field migration must return 350");
+    }
+
+    // 2. DAP Safepoint: re-entrant Interpreter::invoke + live stack-root attribution while running
+    {
+        realscript::game::GameApi api;
+        std::function<int(int)> hostCallback;
+        require(
+            api.function("Engine.Host", "ReentrantBridge", [&hostCallback](int x) -> int {
+                return hostCallback ? hostCallback(x) : x;
+            }),
+            "failed to bind ReentrantBridge");
+
+        const char* src = R"RS(
+module Game.SafepointTest;
+import Engine.Host;
+
+class TempPayload
+{
+    public int tag = 42;
+}
+
+class Worker
+{
+    public static int Helper(int v)
+    {
+        return v + 1;
+    }
+
+    public static int RunLoop(int iterations)
+    {
+        TempPayload liveStackLocal = new TempPayload();
+        int acc = 0;
+        for (int i = 0; i < iterations; i = i + 1)
+        {
+            acc = acc + ReentrantBridge(i) + liveStackLocal.tag;
+        }
+        return acc;
+    }
+}
+)RS";
+        realscript::game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"safepoint_test.rs", src}});
+        require(compiled.succeeded(), "safepoint_test compile failed: " + diagnosticsText(compiled.diagnostics));
+
+        realscript::game::ScriptRuntime rt(compiled.program);
+        auto programPtr = compiled.program.program();
+        auto heapPtr = rt.heap();
+        auto session = std::make_shared<realscript::debug::DebugSession>(programPtr, heapPtr);
+        realscript::debug::DapServer dap(session, programPtr, heapPtr);
+        rt.setDebugger(session->controller());
+
+        const auto workerType = rt.findType("Game.SafepointTest::Worker");
+        require(workerType.has_value(), "Worker type not found");
+        const auto helperMethod = rt.findMethod(*workerType, "Helper", 1);
+        const auto runLoopMethod = rt.findMethod(*workerType, "RunLoop", 1);
+        require(helperMethod.has_value() && runLoopMethod.has_value(), "Worker methods not found");
+
+        hostCallback = [&](int x) -> int {
+            const auto res = rt.invokeStatic(
+                *helperMethod,
+                {static_cast<std::int64_t>(x)});
+            return res.succeeded ? static_cast<int>(std::get<std::int64_t>(res.value)) : x;
+        };
+
+        // Attach with stopOnEntry = true, then resume so we verify stale currentStop_ is cleared
+        require(session->attach(true), "DebugSession attach failed");
+        std::atomic<bool> workerDone{false};
+        realscript::runtime::ExecutionResult finalRes;
+        std::thread worker([&]() {
+            finalRes = rt.invokeStatic(
+                *runLoopMethod,
+                {std::int64_t{400}});
+            workerDone.store(true, std::memory_order_release);
+        });
+
+        require(session->waitForStop(std::chrono::seconds{5}), "expected stopOnEntry");
+        session->continueExecution();
+        require(!session->currentStop().has_value(), "currentStop() must be empty after continueExecution()");
+
+        bool sawLiveStackLocalRoot = false;
+        while (!workerDone.load(std::memory_order_acquire)) {
+            const auto snapJson = dap.buildHeapSnapshotReport(false);
+            const auto* summary = snapJson.find("summaryText");
+            if (summary && summary->stringValue().find("local 'liveStackLocal'") != std::string::npos) {
+                sawLiveStackLocalRoot = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        worker.join();
+        require(finalRes.succeeded, "Worker.RunLoop under safepoint failed: " + finalRes.error.message);
+        require(
+            sawLiveStackLocalRoot,
+            "expected live safepoint heapSnapshot to attribute TempPayload to stack local 'liveStackLocal'");
+    }
+
+    // 3. LICM LoadLocal + LoadStructField hoisting across StoreField/Call & natural loop exitBlock exclusion
+    {
+        realscript::game::GameApi api;
+        const char* licmSrc = R"RS(
+module Game.LicmTest;
+
+struct Config
+{
+    public int scale;
+    public int bias;
+}
+
+class AccBox
+{
+    public int total = 0;
+
+    public int Ping(int v)
+    {
+        return v + 1;
+    }
+
+    public int Compute(Config cfg, int n)
+    {
+        int i = 0;
+        while (i < n)
+        {
+            int step = cfg.scale * 2 + cfg.bias;
+            if (i > 0)
+            {
+                this.total = this.total + this.Ping(step);
+            }
+            else
+            {
+                this.total = this.total + step;
+            }
+            i = i + 1;
+        }
+        int postLoop = cfg.scale + 99;
+        return this.total + postLoop;
+    }
+}
+)RS";
+        realscript::compiler::Compilation comp({{"licm_test.rs", licmSrc}});
+        auto buildRes = comp.build();
+        require(!buildRes.diagnostics.hasErrors(), "licm_test build failed");
+        realscript::optimization::Optimizer optimizer;
+        realscript::diagnostics::DiagnosticBag optDiag;
+        realscript::optimization::Options optOptions;
+        optOptions.level = realscript::optimization::Level::Aggressive;
+        auto optRes = optimizer.optimize(std::move(buildRes.modules), optDiag, optOptions);
+        require(
+            !optDiag.hasErrors() && optRes.statistics.loopInvariantsHoisted >= 2,
+            "expected LICM to hoist invariant LoadLocal(cfg) and LoadStructField(cfg.scale/bias) across StoreField and Call");
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -6384,8 +6600,10 @@ int main() {
         testPropertyInitializersAndAutoPropertiesCompleteness();
         std::cout << "[23/24] testFlatFrameComputedGotoInterpreterCompleteness..." << std::endl;
         testFlatFrameComputedGotoInterpreterCompleteness();
-        std::cout << "[24/24] testRsbindHeaderGeneratorAndZeroCopyEcsLongField..." << std::endl;
+        std::cout << "[24/25] testRsbindHeaderGeneratorAndZeroCopyEcsLongField..." << std::endl;
         testRsbindHeaderGeneratorAndZeroCopyEcsLongField();
+        std::cout << "[25/25] testDapSafepointHotReloadStaticFieldAndLicmHoisting..." << std::endl;
+        testDapSafepointHotReloadStaticFieldAndLicmHoisting();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

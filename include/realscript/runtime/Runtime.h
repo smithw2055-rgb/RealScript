@@ -867,6 +867,8 @@ public:
     [[nodiscard]] bool hasStaticField(semantic::SymbolId id) const noexcept;
     [[nodiscard]] std::optional<Value> getStaticField(semantic::SymbolId id) const;
     void setStaticField(semantic::SymbolId id, Value value);
+    bool removeStaticField(semantic::SymbolId id) noexcept;
+    [[nodiscard]] std::vector<semantic::SymbolId> staticFieldIds() const;
 
     // O(1) Native Unmanaged Sparse-Set ECS Storage (zero per-mutation array allocation)
     bool setNativeEcsComponent(

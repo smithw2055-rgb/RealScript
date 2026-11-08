@@ -145,6 +145,7 @@ bool patchMigratedObjectRefsInValue(
         const auto mapped = refMap.find(refKey);
         if (mapped != refMap.end()) {
             *objRef = mapped->second;
+            patchMigratedObjectRefsInHeapObject(heap, *objRef, refMap, visited);
             return true;
         }
         patchMigratedObjectRefsInHeapObject(heap, *objRef, refMap, visited);
@@ -161,6 +162,7 @@ bool patchMigratedObjectRefsInValue(
         }
         if (changed) {
             structVal->storage = std::move(cloned);
+            runtime::pinValueInPools(val);
         }
         return changed;
     }
@@ -953,14 +955,53 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         }
     }
 
-    // Patch cross-component ObjectRef fields (including inside Arrays, Structs, and Assets) and delegate targets
+    // Migrate [FormerlySerializedAs] static fields on reloaded types
+    if (auto* heap = runtime_.heap().get()) {
+        if (const auto prog = runtime_.program()) {
+            for (const auto& module : prog->modules()) {
+                for (const auto& typeDesc : module.types) {
+                    const std::string canonicalType = semantic::canonicalTypeName(typeDesc);
+                    for (const auto& newField : typeDesc.fields) {
+                        if (!newField.staticField || newField.constField) continue;
+                        if (heap->hasStaticField(newField.id)) continue;
+                        const std::string oldFieldName = findRenamedFieldSource(
+                            mergedMetadata, canonicalType, newField.name);
+                        if (oldFieldName.empty()) continue;
+                        const auto oldStaticId = semantic::stableTypeId(
+                            canonicalType + "::field:" + oldFieldName);
+                        const auto oldVal = heap->getStaticField(oldStaticId);
+                        const auto newFieldTypeId = exactFieldTypeId(
+                            newField.type, newField.typeName);
+                        if (oldVal && runtime_.valueMatches(*oldVal, newField.type, newFieldTypeId)) {
+                            heap->setStaticField(newField.id, *oldVal);
+                            bool oldFieldStillDeclared = false;
+                            for (const auto& f : typeDesc.fields) {
+                                if (f.staticField && !f.constField && f.name == oldFieldName) {
+                                    oldFieldStillDeclared = true;
+                                    break;
+                                }
+                            }
+                            if (!oldFieldStillDeclared) {
+                                (void)heap->removeStaticField(oldStaticId);
+                            }
+                            ++report.fieldsMigrated;
+                            ++report.fieldsRenamed;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Patch cross-component ObjectRef fields (including inside Arrays, Structs, Assets, Static Fields, and Native ECS Tables)
     if (!migratedRefMap.empty()) {
         std::unordered_set<std::uint64_t> visited;
+        auto* heap = runtime_.heap().get();
         for (auto& [entity, components] : instances_) {
             (void)entity;
             for (auto& instance : components) {
                 patchMigratedObjectRefsInHeapObject(
-                    runtime_.heap().get(),
+                    heap,
                     instance.object.reference(),
                     migratedRefMap,
                     visited);
@@ -969,10 +1010,31 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         for (auto& [assetPath, assetObj] : runtime_.assets_) {
             (void)assetPath;
             patchMigratedObjectRefsInHeapObject(
-                runtime_.heap().get(),
+                heap,
                 assetObj.reference(),
                 migratedRefMap,
                 visited);
+        }
+        if (heap) {
+            for (const auto staticId : heap->staticFieldIds()) {
+                auto staticVal = heap->getStaticField(staticId);
+                if (!staticVal) continue;
+                if (patchMigratedObjectRefsInValue(heap, *staticVal, migratedRefMap, visited)) {
+                    heap->setStaticField(staticId, std::move(*staticVal));
+                }
+            }
+            for (const auto& tableName : heap->nativeEcsTableNames()) {
+                const auto* vals = heap->nativeEcsComponentValues(tableName);
+                if (!vals) continue;
+                const std::size_t count = vals->size();
+                for (std::size_t denseIdx = 0; denseIdx < count; ++denseIdx) {
+                    runtime::Value compVal = (*vals)[denseIdx];
+                    if (patchMigratedObjectRefsInValue(heap, compVal, migratedRefMap, visited)) {
+                        (void)heap->setNativeEcsComponentByDenseIndex(
+                            tableName, denseIdx, std::move(compVal));
+                    }
+                }
+            }
         }
     }
 

@@ -1316,6 +1316,21 @@ void ManagedHeap::setStaticField(semantic::SymbolId id, Value value) {
     impl_->staticFields[id] = std::move(value);
 }
 
+bool ManagedHeap::removeStaticField(semantic::SymbolId id) noexcept {
+    return impl_->staticFields.erase(id) != 0;
+}
+
+std::vector<semantic::SymbolId> ManagedHeap::staticFieldIds() const {
+    std::vector<semantic::SymbolId> ids;
+    ids.reserve(impl_->staticFields.size());
+    for (const auto& [id, val] : impl_->staticFields) {
+        (void)val;
+        ids.push_back(id);
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
 bool ManagedHeap::setNativeEcsComponent(
     std::string_view canonicalTypeName,
     std::int64_t entityId,
