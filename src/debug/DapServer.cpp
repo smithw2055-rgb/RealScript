@@ -10,6 +10,9 @@
 #include <streambuf>
 #include <string>
 #include <thread>
+#include <deque>
+#include <iomanip>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_WIN32)
@@ -375,6 +378,482 @@ void DapServer::emitTerminated(std::ostream& output) {
     output.flush();
 }
 
+void DapServer::collectActiveStackValues(std::vector<runtime::Value>& outValues) const {
+    outValues.clear();
+    if (const auto stop = session_ ? session_->currentStop() : std::nullopt) {
+        for (const auto& frame : stop->frames) {
+            for (const auto& arg : frame.arguments) outValues.push_back(arg.value);
+            for (const auto& loc : frame.locals) outValues.push_back(loc.value);
+        }
+    }
+}
+
+std::string DapServer::describeHeapObject(
+    const runtime::HeapObjectInfo& obj) const {
+    std::ostringstream os;
+    os << "o" << obj.reference.slot << ":" << obj.reference.generation << " ";
+    if (obj.kind == runtime::ObjectKind::String) {
+        std::string preview = obj.stringValue;
+        if (preview.size() > 36) {
+            preview = preview.substr(0, 33) + "...";
+        }
+        os << "string(\"" << preview << "\")";
+    } else if (obj.kind == runtime::ObjectKind::Array) {
+        std::string elemName = semantic::primitiveTypeName(obj.elementType);
+        if (program_ && obj.elementTypeId != 0) {
+            if (const auto* elemTypeDesc = program_->resolveType(obj.elementTypeId)) {
+                elemName = semantic::canonicalTypeName(*elemTypeDesc);
+            }
+        }
+        os << elemName << "[" << obj.valueCount << "]";
+    } else {
+        std::string typeName = "Record";
+        if (program_ && obj.typeId != 0) {
+            if (const auto* typeDesc = program_->resolveType(obj.typeId)) {
+                typeName = semantic::canonicalTypeName(*typeDesc);
+            }
+        }
+        os << typeName;
+    }
+    os << " (" << obj.sizeBytes << " B)";
+    return os.str();
+}
+
+std::string DapServer::describeEdgeLabel(
+    const runtime::HeapObjectInfo& owner,
+    const std::string& rawLabel) const {
+    if (owner.kind == runtime::ObjectKind::Record &&
+        program_ && owner.typeId != 0 &&
+        rawLabel.rfind("field[", 0) == 0) {
+        const auto closePos = rawLabel.find(']');
+        if (closePos != std::string::npos) {
+            const auto fieldIdx = static_cast<std::size_t>(
+                std::strtoull(rawLabel.substr(6, closePos - 6).c_str(), nullptr, 10));
+            if (const auto* typeDesc = program_->resolveType(owner.typeId)) {
+                if (fieldIdx < typeDesc->fields.size()) {
+                    const std::string suffix = rawLabel.substr(closePos + 1);
+                    return "." + typeDesc->fields[fieldIdx].name + suffix;
+                }
+            }
+        }
+    }
+    if (rawLabel.rfind("element[", 0) == 0) {
+        return rawLabel.substr(7); // "[i]"
+    }
+    return "." + rawLabel;
+}
+
+std::string DapServer::describeRootInfo(
+    const runtime::HeapRootInfo& root) const {
+    if (root.kind == "static" && program_) {
+        for (const auto& mod : program_->modules()) {
+            for (const auto& type : mod.types) {
+                for (const auto& fld : type.fields) {
+                    if (fld.staticField && fld.id == root.token) {
+                        return "[Root: Static " + semantic::canonicalTypeName(type) +
+                            "." + fld.name + "]";
+                    }
+                }
+            }
+        }
+        return "[Root: Static#0x" + std::to_string(root.token) + "]";
+    }
+    if (root.kind == "persistent") {
+        return "[Root: Persistent#" + std::to_string(root.token) + "]";
+    }
+    if (root.kind == "ecs") {
+        return "[Root: ECS#" + std::to_string(root.token) + "]";
+    }
+    if (root.kind == "shadow") {
+        if (const auto stop = session_ ? session_->currentStop() : std::nullopt) {
+            const auto valueContainsRef = [](const auto& self,
+                                             const runtime::Value& val,
+                                             runtime::ObjectRef target,
+                                             std::unordered_set<const runtime::StructStorage*>& visited) -> bool {
+                if (const auto* ref = std::get_if<runtime::ObjectRef>(&val)) {
+                    return *ref == target;
+                }
+                if (const auto* st = std::get_if<runtime::StructValue>(&val);
+                    st && st->storage && visited.insert(st->storage.get()).second) {
+                    for (const auto& f : st->storage->fields) {
+                        if (self(self, f, target, visited)) return true;
+                    }
+                }
+                return false;
+            };
+            std::size_t idx = 0;
+            for (const auto& frame : stop->frames) {
+                for (const auto& arg : frame.arguments) {
+                    std::unordered_set<const runtime::StructStorage*> visited;
+                    if (idx == root.token ||
+                        valueContainsRef(valueContainsRef, arg.value, root.reference, visited)) {
+                        return "[Root: Frame " + frame.function + " arg '" + arg.name + "']";
+                    }
+                    ++idx;
+                }
+                for (const auto& loc : frame.locals) {
+                    std::unordered_set<const runtime::StructStorage*> visited;
+                    if (idx == root.token ||
+                        valueContainsRef(valueContainsRef, loc.value, root.reference, visited)) {
+                        return "[Root: Frame " + frame.function + " local '" + loc.name + "']";
+                    }
+                    ++idx;
+                }
+            }
+        }
+        return "[Root: Stack#" + std::to_string(root.token) + "]";
+    }
+    return "[Root: " + root.kind + "#" + std::to_string(root.token) + "]";
+}
+
+std::string DapServer::formatRetainingPathReport(runtime::ObjectRef target) const {
+    if (!heap_ || !target.valid() || !heap_->isAlive(target)) {
+        return "Target object is not alive in ManagedHeap.";
+    }
+    std::vector<runtime::Value> stackValues;
+    collectActiveStackValues(stackValues);
+    runtime::ShadowStack shadow;
+    shadow.pushFrame(nullptr, nullptr, &stackValues);
+
+    const auto snap = heap_->snapshot(&shadow);
+    std::unordered_map<std::uint32_t, const runtime::HeapObjectInfo*> objMap;
+    objMap.reserve(snap.objects.size());
+    for (const auto& obj : snap.objects) {
+        objMap.emplace(obj.reference.slot, &obj);
+    }
+
+    struct ParentStep {
+        std::uint32_t parentSlot = runtime::ObjectRef::InvalidSlot;
+        std::string edgeText;
+        std::string rootText;
+    };
+    std::deque<runtime::ObjectRef> queue;
+    std::unordered_map<std::uint32_t, ParentStep> parent;
+    std::unordered_set<std::uint32_t> visited;
+
+    for (const auto& root : snap.roots) {
+        if (visited.insert(root.reference.slot).second) {
+            queue.push_back(root.reference);
+            parent.emplace(
+                root.reference.slot,
+                ParentStep{runtime::ObjectRef::InvalidSlot, {}, describeRootInfo(root)});
+        }
+    }
+
+    bool foundTarget = false;
+    while (!queue.empty()) {
+        const auto curr = queue.front();
+        queue.pop_front();
+        if (curr.slot == target.slot) {
+            foundTarget = true;
+            break;
+        }
+        const auto it = objMap.find(curr.slot);
+        if (it == objMap.end()) continue;
+        const auto& ownerInfo = *it->second;
+        for (const auto& edge : ownerInfo.edges) {
+            if (visited.insert(edge.target.slot).second) {
+                parent.emplace(
+                    edge.target.slot,
+                    ParentStep{curr.slot, describeEdgeLabel(ownerInfo, edge.label), {}});
+                queue.push_back(edge.target);
+            }
+        }
+    }
+
+    if (!foundTarget) {
+        const auto targetIt = objMap.find(target.slot);
+        const std::string targetDesc = targetIt != objMap.end()
+            ? describeHeapObject(*targetIt->second)
+            : ("o" + std::to_string(target.slot) + ":" + std::to_string(target.generation));
+        return "[Unrooted / Pending GC Sweep] " + targetDesc;
+    }
+
+    std::vector<std::uint32_t> chainSlots;
+    std::uint32_t cursor = target.slot;
+    while (cursor != runtime::ObjectRef::InvalidSlot) {
+        chainSlots.push_back(cursor);
+        const auto pIt = parent.find(cursor);
+        if (pIt == parent.end()) break;
+        cursor = pIt->second.parentSlot;
+    }
+    std::reverse(chainSlots.begin(), chainSlots.end());
+
+    std::ostringstream report;
+    const auto firstParentIt = parent.find(chainSlots.front());
+    if (firstParentIt != parent.end() && !firstParentIt->second.rootText.empty()) {
+        report << firstParentIt->second.rootText << " -> ";
+    }
+    for (std::size_t i = 0; i < chainSlots.size(); ++i) {
+        const auto slotId = chainSlots[i];
+        const auto objIt = objMap.find(slotId);
+        if (objIt != objMap.end()) {
+            report << describeHeapObject(*objIt->second);
+        } else {
+            report << "o" << slotId;
+        }
+        if (i + 1 < chainSlots.size()) {
+            const auto nextSlot = chainSlots[i + 1];
+            const auto nextParentIt = parent.find(nextSlot);
+            if (nextParentIt != parent.end()) {
+                report << " --(" << nextParentIt->second.edgeText << ")--> ";
+            } else {
+                report << " -> ";
+            }
+        }
+    }
+    return report.str();
+}
+
+tooling::Json DapServer::buildHeapSnapshotReport(bool diffBaseline) {
+    if (!heap_) {
+        return tooling::Json::Object{
+            {"summaryText", "No ManagedHeap bound to DapServer."},
+        };
+    }
+
+    std::vector<runtime::Value> stackValues;
+    collectActiveStackValues(stackValues);
+    runtime::ShadowStack shadow;
+    shadow.pushFrame(nullptr, nullptr, &stackValues);
+
+    const auto snap = heap_->snapshot(&shadow);
+
+    // Precompute all shortest retaining paths in a single O(V + E) multi-source BFS over `snap`
+    std::unordered_map<std::uint32_t, const runtime::HeapObjectInfo*> objMap;
+    objMap.reserve(snap.objects.size());
+    for (const auto& obj : snap.objects) {
+        objMap.emplace(obj.reference.slot, &obj);
+    }
+    struct ParentStep {
+        std::uint32_t parentSlot = runtime::ObjectRef::InvalidSlot;
+        std::string edgeText;
+        std::string rootText;
+    };
+    std::deque<runtime::ObjectRef> bfsQueue;
+    std::unordered_map<std::uint32_t, ParentStep> parent;
+    std::unordered_set<std::uint32_t> visited;
+    parent.reserve(snap.objects.size());
+    visited.reserve(snap.objects.size());
+
+    for (const auto& root : snap.roots) {
+        if (visited.insert(root.reference.slot).second) {
+            bfsQueue.push_back(root.reference);
+            parent.emplace(
+                root.reference.slot,
+                ParentStep{runtime::ObjectRef::InvalidSlot, {}, describeRootInfo(root)});
+        }
+    }
+    while (!bfsQueue.empty()) {
+        const auto curr = bfsQueue.front();
+        bfsQueue.pop_front();
+        const auto it = objMap.find(curr.slot);
+        if (it == objMap.end()) continue;
+        const auto& ownerInfo = *it->second;
+        for (const auto& edge : ownerInfo.edges) {
+            if (visited.insert(edge.target.slot).second) {
+                parent.emplace(
+                    edge.target.slot,
+                    ParentStep{curr.slot, describeEdgeLabel(ownerInfo, edge.label), {}});
+                bfsQueue.push_back(edge.target);
+            }
+        }
+    }
+
+    const auto formatPathFromBfs = [&](const runtime::HeapObjectInfo& targetObj) -> std::string {
+        if (visited.find(targetObj.reference.slot) == visited.end()) {
+            return "[Unrooted / Pending GC Sweep] " + describeHeapObject(targetObj);
+        }
+        std::vector<std::uint32_t> chainSlots;
+        std::uint32_t cursor = targetObj.reference.slot;
+        while (cursor != runtime::ObjectRef::InvalidSlot) {
+            chainSlots.push_back(cursor);
+            const auto pIt = parent.find(cursor);
+            if (pIt == parent.end()) break;
+            cursor = pIt->second.parentSlot;
+        }
+        std::reverse(chainSlots.begin(), chainSlots.end());
+        std::ostringstream report;
+        const auto firstParentIt = parent.find(chainSlots.front());
+        if (firstParentIt != parent.end() && !firstParentIt->second.rootText.empty()) {
+            report << firstParentIt->second.rootText << " -> ";
+        }
+        for (std::size_t i = 0; i < chainSlots.size(); ++i) {
+            const auto slotId = chainSlots[i];
+            const auto objIt = objMap.find(slotId);
+            if (objIt != objMap.end()) {
+                report << describeHeapObject(*objIt->second);
+            } else {
+                report << "o" << slotId;
+            }
+            if (i + 1 < chainSlots.size()) {
+                const auto nextSlot = chainSlots[i + 1];
+                const auto nextParentIt = parent.find(nextSlot);
+                if (nextParentIt != parent.end()) {
+                    report << " --(" << nextParentIt->second.edgeText << ")--> ";
+                } else {
+                    report << " -> ";
+                }
+            }
+        }
+        return report.str();
+    };
+
+    std::unordered_set<std::uint64_t> baselineObjectKeys;
+    const bool hasPriorBaseline =
+        diffBaseline && baselineSnapshot_.has_value() && baselineSnapshot_->heapId == snap.heapId;
+    if (hasPriorBaseline) {
+        for (const auto& oldObj : baselineSnapshot_->objects) {
+            const std::uint64_t key =
+                (static_cast<std::uint64_t>(oldObj.reference.slot) << 32u) |
+                static_cast<std::uint64_t>(oldObj.reference.generation);
+            baselineObjectKeys.insert(key);
+        }
+    }
+
+    struct TypeHistogramEntry {
+        std::string typeName;
+        std::size_t count = 0;
+        std::size_t totalBytes = 0;
+        std::size_t deltaCount = 0;
+        std::size_t deltaBytes = 0;
+    };
+    std::unordered_map<std::string, TypeHistogramEntry> histogramMap;
+
+    tooling::Json::Array objectsJson;
+    std::vector<std::string> retainingReports;
+    std::size_t newObjectsCount = 0;
+    std::size_t newObjectsBytes = 0;
+
+    for (const auto& obj : snap.objects) {
+        const std::uint64_t key =
+            (static_cast<std::uint64_t>(obj.reference.slot) << 32u) |
+            static_cast<std::uint64_t>(obj.reference.generation);
+        const bool isNewSinceBaseline =
+            !hasPriorBaseline || (baselineObjectKeys.find(key) == baselineObjectKeys.end());
+
+        std::string bucketName;
+        if (obj.kind == runtime::ObjectKind::String) {
+            bucketName = "string";
+        } else if (obj.kind == runtime::ObjectKind::Array) {
+            bucketName = std::string(semantic::primitiveTypeName(obj.elementType)) + "[]";
+            if (program_ && obj.elementTypeId != 0) {
+                if (const auto* elemType = program_->resolveType(obj.elementTypeId)) {
+                    bucketName = semantic::canonicalTypeName(*elemType) + "[]";
+                }
+            }
+        } else {
+            bucketName = "Record";
+            if (program_ && obj.typeId != 0) {
+                if (const auto* typeDesc = program_->resolveType(obj.typeId)) {
+                    bucketName = semantic::canonicalTypeName(*typeDesc);
+                }
+            }
+        }
+
+        auto& hist = histogramMap[bucketName];
+        hist.typeName = bucketName;
+        hist.count += 1;
+        hist.totalBytes += obj.sizeBytes;
+        if (isNewSinceBaseline) {
+            hist.deltaCount += 1;
+            hist.deltaBytes += obj.sizeBytes;
+            ++newObjectsCount;
+            newObjectsBytes += obj.sizeBytes;
+        }
+
+        const std::string chainStr = formatPathFromBfs(obj);
+        if (isNewSinceBaseline && obj.kind != runtime::ObjectKind::String &&
+            retainingReports.size() < 50) {
+            retainingReports.push_back(chainStr);
+        } else if (isNewSinceBaseline && retainingReports.size() < 20) {
+            retainingReports.push_back(chainStr);
+        }
+
+        objectsJson.emplace_back(tooling::Json::Object{
+            {"slot", static_cast<std::int64_t>(obj.reference.slot)},
+            {"generation", static_cast<std::int64_t>(obj.reference.generation)},
+            {"typeName", bucketName},
+            {"sizeBytes", static_cast<std::int64_t>(obj.sizeBytes)},
+            {"isNewSinceBaseline", isNewSinceBaseline},
+            {"retainingPath", chainStr},
+        });
+    }
+
+    std::vector<TypeHistogramEntry> sortedHistogram;
+    sortedHistogram.reserve(histogramMap.size());
+    for (auto& [k, v] : histogramMap) {
+        (void)k;
+        sortedHistogram.push_back(std::move(v));
+    }
+    std::sort(
+        sortedHistogram.begin(),
+        sortedHistogram.end(),
+        [](const TypeHistogramEntry& a, const TypeHistogramEntry& b) {
+            if (a.totalBytes != b.totalBytes) return a.totalBytes > b.totalBytes;
+            return a.typeName < b.typeName;
+        });
+
+    tooling::Json::Array histogramJson;
+    for (const auto& h : sortedHistogram) {
+        histogramJson.emplace_back(tooling::Json::Object{
+            {"typeName", h.typeName},
+            {"count", static_cast<std::int64_t>(h.count)},
+            {"bytes", static_cast<std::int64_t>(h.totalBytes)},
+            {"deltaCount", static_cast<std::int64_t>(h.deltaCount)},
+            {"deltaBytes", static_cast<std::int64_t>(h.deltaBytes)},
+        });
+    }
+
+    std::ostringstream md;
+    md << "# RealScript ManagedHeap Memory Snapshot & Retaining Path Report\n\n";
+    md << "## 1. Heap Summary\n";
+    md << "- **Heap ID**: `" << snap.heapId << "`\n";
+    md << "- **Live Objects**: `" << snap.objects.size() << "` (`" << snap.statistics.liveBytes << " B` / Peak `"
+       << snap.statistics.peakLiveBytes << " B`)\n";
+    md << "- **Active Roots**: `" << snap.roots.size()
+       << "` (Persistent / Static / ECS / Stack)\n";
+    md << "- **GC Collections**: Full `" << snap.statistics.collectionsCompleted
+       << "`, Young `" << snap.statistics.youngCollections
+       << "` (Reclaimed `" << snap.statistics.objectsReclaimed << "` objects)\n";
+    if (hasPriorBaseline) {
+        md << "- **Delta vs. Previous Snapshot**: `+" << newObjectsCount
+           << "` newly retained objects (`+" << newObjectsBytes << " B`)\n";
+    }
+    md << "\n## 2. Live Object Histogram by Type\n\n";
+    md << "| Type / Category | Live Count | Live Bytes | New Count (Delta) | New Bytes (Delta) |\n";
+    md << "|---|---:|---:|---:|---:|\n";
+    for (const auto& h : sortedHistogram) {
+        md << "| `" << h.typeName << "` | " << h.count << " | " << h.totalBytes << " B | +"
+           << h.deltaCount << " | +" << h.deltaBytes << " B |\n";
+    }
+
+    md << "\n## 3. Retaining Paths (Root -> Object Reference Chains)\n\n";
+    if (retainingReports.empty()) {
+        md << "_No live or newly retained objects found._\n";
+    } else {
+        for (const auto& chain : retainingReports) {
+            md << "- `" << chain << "`\n";
+        }
+    }
+
+    baselineSnapshot_ = snap;
+
+    return tooling::Json::Object{
+        {"heapId", static_cast<std::int64_t>(snap.heapId)},
+        {"liveObjects", static_cast<std::int64_t>(snap.objects.size())},
+        {"liveBytes", static_cast<std::int64_t>(snap.statistics.liveBytes)},
+        {"peakLiveBytes", static_cast<std::int64_t>(snap.statistics.peakLiveBytes)},
+        {"rootCount", static_cast<std::int64_t>(snap.roots.size())},
+        {"hasBaselineDiff", hasPriorBaseline},
+        {"newObjectsCount", static_cast<std::int64_t>(newObjectsCount)},
+        {"newObjectsBytes", static_cast<std::int64_t>(newObjectsBytes)},
+        {"histogram", tooling::Json(std::move(histogramJson))},
+        {"objects", tooling::Json(std::move(objectsJson))},
+        {"summaryText", md.str()},
+    };
+}
+
 tooling::Json DapServer::handle(
     const tooling::Json& request,
     std::ostream* events) {
@@ -433,12 +912,115 @@ tooling::Json DapServer::handle(
         }
         return response(request, true, tooling::Json::Object{{"breakpoints", tooling::Json(std::move(breakpoints))}});
     }
+    if (command == "heapSnapshot" || command == "realscript/heapSnapshot") {
+        const bool diffBaseline = arguments && arguments->find("diffBaseline")
+            ? arguments->find("diffBaseline")->boolValue(false)
+            : false;
+        return response(request, true, buildHeapSnapshotReport(diffBaseline));
+    }
+    if (command == "retainingPath" || command == "realscript/retainingPath") {
+        runtime::ObjectRef targetRef;
+        if (arguments && arguments->find("variablesReference")) {
+            const auto varRef = arguments->find("variablesReference")->integerValue(0);
+            const auto ownerIt = childOwnerObjects_.find(varRef);
+            if (ownerIt != childOwnerObjects_.end()) {
+                targetRef = ownerIt->second;
+            }
+        }
+        if (!targetRef.valid() && arguments && arguments->find("expression") && session_) {
+            const auto expr = arguments->find("expression")->stringValue();
+            const auto frameId = arguments && arguments->find("frameId")
+                ? static_cast<std::uint32_t>(std::max<std::int64_t>(1, arguments->find("frameId")->integerValue(1)))
+                : 1u;
+            std::string errMsg;
+            if (const auto evalVal = session_->evaluate(expr, frameId, &errMsg)) {
+                if (const auto* ref = std::get_if<runtime::ObjectRef>(&*evalVal)) {
+                    targetRef = *ref;
+                }
+            }
+        }
+        if (!targetRef.valid() && arguments && arguments->find("slot")) {
+            const auto slot = static_cast<std::uint32_t>(
+                std::max<std::int64_t>(0, arguments->find("slot")->integerValue(0)));
+            if (heap_) {
+                const auto snap = heap_->snapshot();
+                for (const auto& obj : snap.objects) {
+                    if (obj.reference.slot == slot) {
+                        targetRef = obj.reference;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!targetRef.valid() || !heap_ || !heap_->isAlive(targetRef)) {
+            return response(request, false, nullptr,
+                "target expression or variable does not resolve to a live ManagedHeap object");
+        }
+        const std::string report = formatRetainingPathReport(targetRef);
+        return response(request, true, tooling::Json::Object{
+            {"slot", static_cast<std::int64_t>(targetRef.slot)},
+            {"generation", static_cast<std::int64_t>(targetRef.generation)},
+            {"retainingPath", report},
+        });
+    }
     if (command == "evaluate") {
-        const auto expression = arguments && arguments->find("expression")
+        std::string expression = arguments && arguments->find("expression")
             ? arguments->find("expression")->stringValue() : std::string{};
         const auto frameId = arguments && arguments->find("frameId")
             ? static_cast<std::uint32_t>(std::max<std::int64_t>(1, arguments->find("frameId")->integerValue(1)))
             : 1u;
+        while (!expression.empty() && std::isspace(static_cast<unsigned char>(expression.front()))) {
+            expression.erase(expression.begin());
+        }
+        while (!expression.empty() && std::isspace(static_cast<unsigned char>(expression.back()))) {
+            expression.pop_back();
+        }
+        if (expression == ":heap" || expression == ":heap diff") {
+            const bool diffMode = (expression == ":heap diff");
+            const auto rep = buildHeapSnapshotReport(diffMode);
+            return response(request, true, tooling::Json::Object{
+                {"result", rep.find("summaryText") ? rep.find("summaryText")->stringValue() : ""},
+                {"type", "HeapSnapshotReport"},
+                {"variablesReference", 0},
+            });
+        }
+        if (expression.rfind(":retaining ", 0) == 0) {
+            std::string subExpr = expression.substr(11);
+            while (!subExpr.empty() && std::isspace(static_cast<unsigned char>(subExpr.front()))) {
+                subExpr.erase(subExpr.begin());
+            }
+            runtime::ObjectRef targetRef;
+            if (subExpr.size() >= 2 && subExpr[0] == 'o' &&
+                std::isdigit(static_cast<unsigned char>(subExpr[1]))) {
+                const auto slot = static_cast<std::uint32_t>(
+                    std::strtoull(subExpr.c_str() + 1, nullptr, 10));
+                if (heap_) {
+                    const auto snap = heap_->snapshot();
+                    for (const auto& obj : snap.objects) {
+                        if (obj.reference.slot == slot) {
+                            targetRef = obj.reference;
+                            break;
+                        }
+                    }
+                }
+            } else if (session_) {
+                std::string errMsg;
+                if (const auto evalVal = session_->evaluate(subExpr, frameId, &errMsg)) {
+                    if (const auto* ref = std::get_if<runtime::ObjectRef>(&*evalVal)) {
+                        targetRef = *ref;
+                    }
+                }
+            }
+            if (!targetRef.valid()) {
+                return response(request, false, nullptr,
+                    "expression '" + subExpr + "' is not a live managed heap object");
+            }
+            return response(request, true, tooling::Json::Object{
+                {"result", formatRetainingPathReport(targetRef)},
+                {"type", "RetainingPath"},
+                {"variablesReference", 0},
+            });
+        }
         std::string errorMessage;
         const auto evaluated = session_->evaluate(expression, frameId, &errorMessage);
         if (!evaluated) {

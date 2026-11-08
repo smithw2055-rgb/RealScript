@@ -276,6 +276,81 @@ int main()
             }),
         "LSP exposed compiler-owned native language symbols");
 
+    service.open("empty_mod.rs", R"(
+module Phase4.Empty;
+)");
+    require(service.diagnostics("empty_mod.rs").empty(),
+        "empty module produced diagnostics");
+
+    // Incremental update on native_tools.rs (which has generics/attributes/interface)
+    service.update("native_tools.rs", R"(
+module Phase4.NativeTools;
+interface IRunner { int Step(); }
+[Serializable(version = 2)]
+class Counter : IRunner
+{
+    int total;
+    public int Step() { return total; }
+}
+int main()
+{
+    var list = new List<int>();
+    list.Add(10);
+    var counter = new Counter();
+    return list.Get(0) + counter.Step();
+}
+)", 2);
+    require(service.diagnostics("native_tools.rs").empty(),
+        "incremental update with generics/attributes/interface/sequence failed");
+    {
+        const auto& built = service.build();
+        bool mathModReused = false;
+        for (const auto& bi : built.buildInfo) {
+            if (bi.name == "Phase4.Math") mathModReused = bi.reused;
+        }
+        require(mathModReused, "incremental subgraph rebuild did not reuse unaffected module");
+        require(!built.nativeGenericInstantiations.empty() &&
+                built.nativeGenericInstantiations.front().generatedName == "List__int",
+            "incremental subgraph rebuild did not record List<int> instantiation");
+    }
+
+    // Update generic instantiation from List<int> to List<string> and verify stale List__int is removed
+    service.update("native_tools.rs", R"(
+module Phase4.NativeTools;
+int main()
+{
+    var list = new List<string>();
+    list.Add("ok");
+    return list.Count();
+}
+)", 3);
+    require(service.diagnostics("native_tools.rs").empty(),
+        "second incremental update on native_tools.rs failed");
+    {
+        const auto& built = service.build();
+        require(built.nativeGenericInstantiations.size() == 1 &&
+                built.nativeGenericInstantiations.front().generatedName == "List__string",
+            "stale generic instantiation List__int was not cleaned up on incremental rebuild");
+    }
+
+    // Now edit the previously empty module after native_tools.rs shrank
+    service.update("empty_mod.rs", R"(
+module Phase4.Empty;
+int compute(int alpha, int beta) {
+    var sum = alpha + beta;
+    return sum;
+}
+int runEmpty() {
+    return compute(1, 2);
+}
+)", 2);
+    require(service.diagnostics("empty_mod.rs").empty(),
+        "incremental update on previously empty module failed");
+    require(!service.semanticTokens("empty_mod.rs").empty(),
+        "semanticTokens on updated empty module returned empty");
+    require(!service.inlayHints("empty_mod.rs").empty(),
+        "inlayHints on updated empty module returned empty");
+
     service.update("app.rs", "module Phase4.App; int main() { return missing; }", 2);
     require(!service.diagnostics("app.rs").empty(),
         "language service did not publish semantic diagnostics after an update");

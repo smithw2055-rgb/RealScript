@@ -132,8 +132,13 @@ int main() {
     const char* combatSrc = R"RS(
 module Game.Combat;
 
+class LootCache {
+    public int gold = 500;
+}
+
 class BossUnit {
     public int hp = 1000;
+    public LootCache retainedLoot = new LootCache();
 
     public int ApplyHit(int rawDamage) {
         int damage = rawDamage + 10;
@@ -183,7 +188,7 @@ class BossUnit {
     (void)readNextDapMessage(dapStream); // response
     (void)readNextDapMessage(dapStream); // initialized event
 
-    // Line 9 is `hp = hp - damage;` (after `int damage = rawDamage + 10;`)
+    // Line 14 is `hp = hp - damage;` (after `int damage = rawDamage + 10;`)
     tooling::writeProtocolMessage(dapStream, tooling::Json::Object{
         {"seq", 2},
         {"type", "request"},
@@ -191,7 +196,7 @@ class BossUnit {
         {"arguments", tooling::Json::Object{
             {"source", tooling::Json::Object{{"path", "/workspace/my_game/scripts/combat.rs"}}},
             {"breakpoints", tooling::Json::Array{
-                tooling::Json::Object{{"line", 9}, {"column", 1}},
+                tooling::Json::Object{{"line", 14}, {"column", 1}},
             }},
         }},
     });
@@ -277,6 +282,61 @@ class BossUnit {
         setVarResp.find("success")->boolValue() &&
             setVarResp.find("body")->find("value")->stringValue() == "300",
         "DAP setVariable over TCP should update live local 'damage' to 300");
+
+    // 8b. Request ManagedHeap Snapshot & Retaining Path over TCP (`heapSnapshot` + `retainingPath` + `:retaining`)
+    tooling::writeProtocolMessage(dapStream, tooling::Json::Object{
+        {"seq", 60},
+        {"type", "request"},
+        {"command", "heapSnapshot"},
+        {"arguments", tooling::Json::Object{{"diffBaseline", false}}},
+    });
+    dapStream.flush();
+    const auto snapResp = readNextDapMessage(dapStream);
+    require(
+        snapResp.find("success")->boolValue() &&
+            snapResp.find("body")->find("liveObjects")->integerValue() >= 2 &&
+            snapResp.find("body")->find("summaryText")->stringValue().find("Game.Combat::LootCache") != std::string::npos &&
+            snapResp.find("body")->find("summaryText")->stringValue().find("retainedLoot") != std::string::npos,
+        "DAP heapSnapshot must report live BossUnit & LootCache objects and .retainedLoot edge");
+
+    tooling::writeProtocolMessage(dapStream, tooling::Json::Object{
+        {"seq", 61},
+        {"type", "request"},
+        {"command", "retainingPath"},
+        {"arguments", tooling::Json::Object{
+            {"expression", "this.retainedLoot"},
+            {"frameId", 1},
+        }},
+    });
+    dapStream.flush();
+    const auto retainResp = readNextDapMessage(dapStream);
+    const std::string retainChain = retainResp.find("body") && retainResp.find("body")->find("retainingPath")
+        ? retainResp.find("body")->find("retainingPath")->stringValue()
+        : "";
+    require(
+        retainResp.find("success")->boolValue() &&
+            retainChain.find("Game.Combat::BossUnit") != std::string::npos &&
+            retainChain.find(".retainedLoot") != std::string::npos &&
+            retainChain.find("Game.Combat::LootCache") != std::string::npos,
+        "DAP retainingPath must trace Root -> BossUnit --(.retainedLoot)--> LootCache, got: " + retainChain);
+    std::cout << "[VS Code Client] Retaining Path verified: " << retainChain << "\n";
+
+    // Also verify Debug Console REPL `:retaining this.retainedLoot` and `:heap diff`
+    tooling::writeProtocolMessage(dapStream, tooling::Json::Object{
+        {"seq", 62},
+        {"type", "request"},
+        {"command", "evaluate"},
+        {"arguments", tooling::Json::Object{
+            {"expression", ":retaining this.retainedLoot"},
+            {"frameId", 1},
+        }},
+    });
+    dapStream.flush();
+    const auto replRetainResp = readNextDapMessage(dapStream);
+    require(
+        replRetainResp.find("success")->boolValue() &&
+            replRetainResp.find("body")->find("result")->stringValue() == retainChain,
+        "Debug Console REPL ':retaining this.retainedLoot' must return the exact retaining path");
 
     // 9. Send `disconnect` while paused -> must cleanly detach and resume the engine thread without terminating!
     tooling::writeProtocolMessage(dapStream, tooling::Json::Object{

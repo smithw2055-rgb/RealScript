@@ -78,46 +78,6 @@ LanguageService::DocHeaderInfo LanguageService::parseDocHeader(const Document& d
     DocHeaderInfo info;
     const auto& s = doc.content;
     info.eligibleForSubgraph = true;
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        if (i + 1 < s.size() && s[i] == '/' && s[i + 1] == '/') {
-            i += 2;
-            while (i < s.size() && s[i] != '\n') ++i;
-            continue;
-        }
-        if (i + 1 < s.size() && s[i] == '/' && s[i + 1] == '*') {
-            i += 2;
-            while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/')) ++i;
-            ++i;
-            continue;
-        }
-        if (s[i] == '"') {
-            ++i;
-            while (i < s.size() && s[i] != '"') {
-                if (s[i] == '\\' && i + 1 < s.size()) ++i;
-                ++i;
-            }
-            continue;
-        }
-        if (s[i] == '<') {
-            info.eligibleForSubgraph = false;
-            break;
-        }
-        if (s[i] == '[') {
-            const bool isArrayBrackets = (i + 1 < s.size() && s[i + 1] == ']');
-            const bool isElementAccess = (i > 0 &&
-                (std::isalnum(static_cast<unsigned char>(s[i - 1])) ||
-                 s[i - 1] == '_' || s[i - 1] == ')' || s[i - 1] == ']'));
-            if (!isArrayBrackets && !isElementAccess) {
-                info.eligibleForSubgraph = false;
-                break;
-            }
-        }
-    }
-    if (info.eligibleForSubgraph &&
-        (s.find("sequence ") != std::string::npos ||
-         s.find("interface ") != std::string::npos)) {
-        info.eligibleForSubgraph = false;
-    }
     std::size_t pos = 0;
     const auto skipWsAndComments = [&]() {
         while (pos < s.size()) {
@@ -378,6 +338,11 @@ void LanguageService::recordFullBuildGraph() {
     }
 
     // Compute per-module symbol slices in result_.symbols
+    for (const auto& [modName, paths] : moduleToPaths_) {
+        (void)paths;
+        moduleSymbolSlices_[modName] = {result_.symbols.size(), 0};
+    }
+    std::unordered_set<std::string> seenNonEmptyModules;
     std::size_t idx = 0;
     while (idx < result_.symbols.size()) {
         const auto& srcPath = result_.symbols[idx].sourceName;
@@ -394,7 +359,7 @@ void LanguageService::recordFullBuildGraph() {
             if (it2 == docHeaders_.end() || it2->second.moduleName != modName) break;
             ++idx;
         }
-        if (moduleSymbolSlices_.find(modName) == moduleSymbolSlices_.end()) {
+        if (seenNonEmptyModules.insert(modName).second) {
             moduleSymbolSlices_[modName] = {start, idx - start};
         } else {
             // Non-contiguous symbols for a module: disable fast slice replacement
@@ -408,7 +373,6 @@ void LanguageService::recordFullBuildGraph() {
 
 bool LanguageService::tryIncrementalSubgraphRebuild() {
     if (structuralDirty_ || !hasSnapshot_ || dirtyPaths_.empty() ||
-        !result_.nativeGenericInstantiations.empty() ||
         moduleSymbolSlices_.empty()) {
         return false;
     }
@@ -436,6 +400,7 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
     while (!queue.empty()) {
         auto curr = std::move(queue.back());
         queue.pop_back();
+        if (curr == "RealScript.Math" || curr == "RealScript.Fiber") continue;
         if (!subgraphModules.insert(curr).second) continue;
         if (curr != dirtyMod && snapshot_.modules.find(curr) == snapshot_.modules.end()) {
             return false;
@@ -445,8 +410,8 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
         }
     }
 
-    // If dirtyMod is at least 4 modules smaller than total workspace, run subgraph Compilation
-    if (subgraphModules.size() + 3 >= moduleToPaths_.size()) {
+    // If subgraph is smaller than total workspace, run subgraph Compilation
+    if (subgraphModules.size() >= moduleToPaths_.size()) {
         return false;
     }
 
@@ -465,15 +430,31 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
 
     auto subResult = subCompilation.build(&snapshot_);
 
+    const compiler::ModuleBuildInfo* newBuildInfo = nullptr;
+    for (const auto& sbi : subResult.buildInfo) {
+        if (sbi.name == dirtyMod) {
+            newBuildInfo = &sbi;
+        } else if (!sbi.reused) {
+            // An imported module was mutated (e.g., cross-module generic specialization):
+            // fall back to full workspace rebuild for consistency.
+            return false;
+        }
+    }
+    if (!newBuildInfo) return false;
+
     // If other modules import dirtyMod, verify dirtyMod's publicFingerprint did not change
     const auto revIt = reverseImports_.find(dirtyMod);
-    if (revIt != reverseImports_.end() && !revIt->second.empty()) {
+    const bool hasDownstreamImporters =
+        (revIt != reverseImports_.end() && !revIt->second.empty());
+    if (hasDownstreamImporters) {
         if (subResult.diagnostics.hasErrors()) return false;
         const auto snapOld = snapshot_.modules.find(dirtyMod);
         const auto snapNew = subResult.snapshot.modules.find(dirtyMod);
         if (snapOld == snapshot_.modules.end() ||
             snapNew == subResult.snapshot.modules.end() ||
-            snapOld->second.publicFingerprint != snapNew->second.publicFingerprint) {
+            snapOld->second.publicFingerprint != snapNew->second.publicFingerprint ||
+            snapOld->second.module.languageMetadata.genericInstantiations.size() !=
+                snapNew->second.module.languageMetadata.genericInstantiations.size()) {
             return false;
         }
     }
@@ -482,6 +463,10 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
     if (auto snapNew = subResult.snapshot.modules.find(dirtyMod);
         snapNew != subResult.snapshot.modules.end()) {
         snapshot_.modules[dirtyMod] = std::move(snapNew->second);
+    } else if (!hasDownstreamImporters) {
+        snapshot_.modules.erase(dirtyMod);
+    } else {
+        return false;
     }
 
     // 2. Update result_.modules for dirtyMod
@@ -511,12 +496,7 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
         if (bi.name != dirtyMod) {
             bi.reused = true;
         } else {
-            for (const auto& sbi : subResult.buildInfo) {
-                if (sbi.name == dirtyMod) {
-                    bi = sbi;
-                    break;
-                }
-            }
+            bi = *newBuildInfo;
         }
     }
 
@@ -534,6 +514,83 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
     }
     result_.diagnostics = std::move(mergedDiags);
 
+    // 4b. Update nativeAttributes, nativeSequences, nativeInterfaces, nativeGenericInstantiations for dirtyMod
+    const std::string modPrefix = dirtyMod + "::";
+    result_.nativeAttributes.erase(
+        std::remove_if(result_.nativeAttributes.begin(), result_.nativeAttributes.end(),
+            [&](const compiler::LanguageAttributeRecord& attr) {
+                return attr.target == dirtyMod || attr.target.rfind(modPrefix, 0) == 0;
+            }),
+        result_.nativeAttributes.end());
+    for (const auto& attr : subResult.nativeAttributes) {
+        if (attr.target == dirtyMod || attr.target.rfind(modPrefix, 0) == 0) {
+            result_.nativeAttributes.push_back(attr);
+        }
+    }
+
+    result_.nativeSequences.erase(
+        std::remove_if(result_.nativeSequences.begin(), result_.nativeSequences.end(),
+            [&](const compiler::LanguageSequenceRecord& seq) {
+                return seq.typeName.rfind(modPrefix, 0) == 0;
+            }),
+        result_.nativeSequences.end());
+    for (const auto& seq : subResult.nativeSequences) {
+        if (seq.typeName.rfind(modPrefix, 0) == 0) {
+            result_.nativeSequences.push_back(seq);
+        }
+    }
+
+    result_.nativeInterfaces.erase(
+        std::remove_if(result_.nativeInterfaces.begin(), result_.nativeInterfaces.end(),
+            [&](const compiler::LanguageInterfaceImplementation& impl) {
+                return impl.typeName.rfind(modPrefix, 0) == 0;
+            }),
+        result_.nativeInterfaces.end());
+    for (const auto& impl : subResult.nativeInterfaces) {
+        if (impl.typeName.rfind(modPrefix, 0) == 0) {
+            result_.nativeInterfaces.push_back(impl);
+        }
+    }
+
+    if (!result_.nativeGenericInstantiations.empty() ||
+        !subResult.nativeGenericInstantiations.empty()) {
+        std::vector<compiler::LanguageGenericInstantiation> mergedGenerics;
+        for (const auto& m : result_.modules) {
+            if (m.name == dirtyMod) continue;
+            mergedGenerics.insert(
+                mergedGenerics.end(),
+                m.languageMetadata.genericInstantiations.begin(),
+                m.languageMetadata.genericInstantiations.end());
+        }
+        mergedGenerics.insert(
+            mergedGenerics.end(),
+            subResult.nativeGenericInstantiations.begin(),
+            subResult.nativeGenericInstantiations.end());
+        std::stable_sort(
+            mergedGenerics.begin(),
+            mergedGenerics.end(),
+            [](const auto& left, const auto& right) {
+                if (left.generatedName != right.generatedName) {
+                    return left.generatedName < right.generatedName;
+                }
+                if (left.genericName != right.genericName) {
+                    return left.genericName < right.genericName;
+                }
+                return left.arguments < right.arguments;
+            });
+        mergedGenerics.erase(
+            std::unique(
+                mergedGenerics.begin(),
+                mergedGenerics.end(),
+                [](const auto& left, const auto& right) {
+                    return left.generatedName == right.generatedName &&
+                        left.genericName == right.genericName &&
+                        left.arguments == right.arguments;
+                }),
+            mergedGenerics.end());
+        result_.nativeGenericInstantiations = std::move(mergedGenerics);
+    }
+
     // 5. Update result_.symbols for dirtyMod in O(|dirtyMod symbols|) by moving dirtyMod slice to tail if needed
     std::vector<semantic::SymbolOccurrence> newModSymbols;
     for (auto& occ : subResult.symbols) {
@@ -542,7 +599,9 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
         }
     }
     auto slice = moduleSymbolSlices_[dirtyMod];
-    if (slice.first + slice.second < result_.symbols.size()) {
+    if (slice.second == 0) {
+        slice.first = result_.symbols.size();
+    } else if (slice.first + slice.second < result_.symbols.size()) {
         // Move dirtyMod slice to the end once so subsequent edits are O(1) tail resize
         const std::size_t oldStart = slice.first;
         const std::size_t oldCount = slice.second;
@@ -550,7 +609,7 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
             result_.symbols.begin() + static_cast<std::ptrdiff_t>(oldStart),
             result_.symbols.begin() + static_cast<std::ptrdiff_t>(oldStart + oldCount));
         for (auto& [mName, mSlice] : moduleSymbolSlices_) {
-            if (mName != dirtyMod && mSlice.first > oldStart) {
+            if (mName != dirtyMod && mSlice.second > 0 && mSlice.first > oldStart) {
                 mSlice.first -= oldCount;
             }
         }
@@ -874,52 +933,41 @@ std::vector<CompletionItem> LanguageService::completion(
         }
         return derivesFrom(requesterTypeId, declaringTypeId);
     };
-    const auto symbolVisible = [&](semantic::SymbolId id) {
-        for (const auto& module : result_.modules) {
-            for (const auto& type : module.types) {
-                if (type.id == id) {
-                    return type.accessibility ==
-                            semantic::Accessibility::Public ||
-                        type.moduleName == requesterModule;
-                }
-                for (const auto& field : type.fields) {
-                    if (field.id == id) {
-                        return accessAllowed(
-                            field.accessibility,
-                            field.declaringTypeId,
-                            type.moduleName);
-                    }
-                }
-                for (const auto& method : type.methods) {
-                    if (method.id == id) {
-                        return accessAllowed(
-                            method.accessibility,
-                            method.declaringTypeId,
-                            method.moduleName);
-                    }
-                }
-                for (const auto& constructor : type.constructors) {
-                    if (constructor.id == id) {
-                        return accessAllowed(
-                            constructor.accessibility,
-                            constructor.declaringTypeId,
-                            constructor.moduleName);
-                    }
-                }
-                if (type.staticConstructor && type.staticConstructor->id == id) {
-                    return true;
-                }
-                for (const auto& property : type.properties) {
-                    if (property.id == id) {
-                        return accessAllowed(
-                            property.accessibility,
-                            property.declaringTypeId,
-                            type.moduleName);
-                    }
-                }
+    struct VisibilityMeta {
+        semantic::Accessibility accessibility = semantic::Accessibility::Public;
+        semantic::SymbolId declaringTypeId = 0;
+        std::string moduleName;
+        bool isType = false;
+    };
+    std::unordered_map<semantic::SymbolId, VisibilityMeta> visibilityById;
+    for (const auto& module : result_.modules) {
+        for (const auto& type : module.types) {
+            visibilityById[type.id] = {type.accessibility, 0, type.moduleName, true};
+            for (const auto& field : type.fields) {
+                visibilityById[field.id] = {field.accessibility, field.declaringTypeId, type.moduleName, false};
+            }
+            for (const auto& method : type.methods) {
+                visibilityById[method.id] = {method.accessibility, method.declaringTypeId, method.moduleName, false};
+            }
+            for (const auto& constructor : type.constructors) {
+                visibilityById[constructor.id] = {constructor.accessibility, constructor.declaringTypeId, constructor.moduleName, false};
+            }
+            for (const auto& property : type.properties) {
+                visibilityById[property.id] = {property.accessibility, property.declaringTypeId, type.moduleName, false};
             }
         }
-        return true;
+    }
+    const auto symbolVisible = [&](semantic::SymbolId id) {
+        const auto it = visibilityById.find(id);
+        if (it == visibilityById.end()) return true;
+        if (it->second.isType) {
+            return it->second.accessibility == semantic::Accessibility::Public ||
+                it->second.moduleName == requesterModule;
+        }
+        return accessAllowed(
+            it->second.accessibility,
+            it->second.declaringTypeId,
+            it->second.moduleName);
     };
     const auto* doc = document(path);
     const auto computeByteOffset = [&](text::LinePosition pos) -> std::size_t {
@@ -1640,18 +1688,20 @@ std::vector<SemanticToken> LanguageService::semanticTokens(const std::string& pa
         return 3;
     };
 
+    (void)allDefinitionsRef();
     std::unordered_map<std::size_t, const semantic::SymbolOccurrence*> occByStart;
-    for (const auto& occ : result_.symbols) {
-        if (occ.sourceName == path && occ.span.length > 0) {
-            occByStart[occ.span.start] = &occ;
+    if (const auto pathOccIt = cachedOccByPath_.find(path); pathOccIt != cachedOccByPath_.end()) {
+        occByStart.reserve(pathOccIt->second.size());
+        for (const std::size_t occIdx : pathOccIt->second) {
+            const auto& occ = result_.symbols[occIdx];
+            if (occ.span.length > 0) {
+                occByStart[occ.span.start] = &occ;
+            }
         }
     }
 
-    text::SourceText source(doc->content, path);
-    diagnostics::DiagnosticBag diag;
-    syntax::Lexer lexer(source, diag);
     std::vector<SemanticToken> tokens;
-    for (const auto& tok : lexer.lexAll()) {
+    for (const auto& tok : documentTokens(path, *doc)) {
         if (tok.kind == syntax::SyntaxKind::EndOfFileToken || tok.span.length == 0) continue;
         const auto rng = rangeFor(path, tok.span);
         const std::size_t line0 = rng.start.line > 0 ? rng.start.line - 1 : 0;
@@ -1705,31 +1755,42 @@ std::vector<InlayHint> LanguageService::inlayHints(const std::string& path) {
     const auto* doc = document(path);
     if (!doc) return {};
 
+    (void)allDefinitionsRef();
     std::vector<InlayHint> hints;
-    text::SourceText source(doc->content, path);
-    diagnostics::DiagnosticBag diag;
-    syntax::Lexer lexer(source, diag);
-    const auto allTokens = lexer.lexAll();
+    const auto& allTokens = documentTokens(path, *doc);
+    const auto pathOccIt = cachedOccByPath_.find(path);
 
     // 1. Type inlay hints for `var name = ...` declarations
     for (std::size_t i = 0; i + 1 < allTokens.size(); ++i) {
         if (allTokens[i].text == "var" &&
             allTokens[i + 1].kind == syntax::SyntaxKind::IdentifierToken) {
             const auto& idTok = allTokens[i + 1];
-            for (const auto& occ : result_.symbols) {
-                if (occ.definition && occ.sourceName == path &&
-                    occ.span.start == idTok.span.start && !occ.detail.empty()) {
-                    const auto rng = rangeFor(path, idTok.span);
-                    const std::size_t line0 = rng.end.line > 0 ? rng.end.line - 1 : 0;
-                    const std::size_t col0 = rng.end.column > 0 ? rng.end.column - 1 : 0;
-                    hints.push_back(InlayHint{{line0, col0}, ": " + occ.detail, 1u});
-                    break;
+            if (pathOccIt != cachedOccByPath_.end()) {
+                for (const std::size_t occIdx : pathOccIt->second) {
+                    const auto& occ = result_.symbols[occIdx];
+                    if (occ.definition && occ.span.start == idTok.span.start && !occ.detail.empty()) {
+                        const auto rng = rangeFor(path, idTok.span);
+                        const std::size_t line0 = rng.end.line > 0 ? rng.end.line - 1 : 0;
+                        const std::size_t col0 = rng.end.column > 0 ? rng.end.column - 1 : 0;
+                        hints.push_back(InlayHint{{line0, col0}, ": " + occ.detail, 1u});
+                        break;
+                    }
                 }
             }
         }
     }
 
     // 2. Call-site parameter name inlay hints (`paramName:`) with arity-aware overload resolution
+    std::unordered_set<std::string> calledIdentNames;
+    for (std::size_t i = 0; i + 2 < allTokens.size(); ++i) {
+        if (allTokens[i].kind == syntax::SyntaxKind::IdentifierToken &&
+            allTokens[i + 1].kind == syntax::SyntaxKind::OpenParenToken &&
+            allTokens[i + 2].kind != syntax::SyntaxKind::CloseParenToken) {
+            calledIdentNames.insert(allTokens[i].text);
+        }
+    }
+    if (calledIdentNames.empty()) return hints;
+
     std::unordered_map<std::string, std::vector<std::vector<std::string>>> paramNamesByFunction;
     const auto addOverloadParams = [&](const std::string& name, std::vector<std::string> names) {
         if (names.empty()) return;
@@ -1740,6 +1801,7 @@ std::vector<InlayHint> LanguageService::inlayHints(const std::string& path) {
     };
     for (const auto& module : result_.modules) {
         for (const auto& fn : module.functions) {
+            if (calledIdentNames.find(fn.name) == calledIdentNames.end()) continue;
             std::vector<std::string> names;
             for (std::size_t idx = 0; idx < fn.parameterTypes.size(); ++idx) {
                 if (idx < fn.debugInfo.locals.size() && !fn.debugInfo.locals[idx].name.empty()) {
@@ -1752,7 +1814,10 @@ std::vector<InlayHint> LanguageService::inlayHints(const std::string& path) {
         }
         for (const auto& type : module.types) {
             for (const auto& method : type.methods) {
-                if (method.synthetic) continue;
+                if (method.synthetic ||
+                    calledIdentNames.find(method.name) == calledIdentNames.end()) {
+                    continue;
+                }
                 std::vector<std::string> names;
                 const std::size_t beginIdx = (method.method && !method.staticMethod) ? 1 : 0;
                 for (std::size_t idx = beginIdx; idx < method.parameters.size(); ++idx) {

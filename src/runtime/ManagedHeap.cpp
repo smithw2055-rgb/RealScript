@@ -1984,6 +1984,9 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
     for (const auto& [token, value] : impl_->persistentRoots) {
         appendRoots(value, token, "persistent");
     }
+    for (const auto& [symId, value] : impl_->staticFields) {
+        appendRoots(value, symId, "static");
+    }
     {
         std::uint64_t ecsRootIndex = 0;
         for (const auto& [typeName, table] : impl_->nativeEcsTables) {
@@ -2007,7 +2010,8 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
     std::sort(result.roots.begin(), result.roots.end(),
         [](const HeapRootInfo& left, const HeapRootInfo& right) {
             if (left.kind != right.kind) return left.kind < right.kind;
-            return left.token < right.token;
+            if (left.token != right.token) return left.token < right.token;
+            return left.reference.slot < right.reference.slot;
         });
     return result;
 }

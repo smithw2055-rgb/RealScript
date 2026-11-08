@@ -16,7 +16,10 @@
     "onDebugResolve:realscript",
     "onDebugInitialConfigurations",
     "onCommand:realscript.restartLspServer",
-    "onCommand:realscript.attachToEngine"
+    "onCommand:realscript.attachToEngine",
+    "onCommand:realscript.captureHeapSnapshot",
+    "onCommand:realscript.diffHeapSnapshot",
+    "onCommand:realscript.findRetainingPath"
   ],
   "scripts": {
     "vscode:prepublish": "npm run compile",
@@ -55,8 +58,28 @@
       {
         "command": "realscript.attachToEngine",
         "title": "RealScript: Attach Debugger to Running Game Engine"
+      },
+      {
+        "command": "realscript.captureHeapSnapshot",
+        "title": "RealScript: Capture ManagedHeap Memory Snapshot & Retaining Paths"
+      },
+      {
+        "command": "realscript.diffHeapSnapshot",
+        "title": "RealScript: Diff ManagedHeap Snapshot Against Baseline (Leak Check)"
+      },
+      {
+        "command": "realscript.findRetainingPath",
+        "title": "RealScript: Find Retaining Path (Why Object Is Alive)"
       }
     ],
+    "menus": {
+      "debug/variables/context": [
+        {
+          "command": "realscript.findRetainingPath",
+          "when": "debugType == 'realscript'"
+        }
+      ]
+    },
     "debuggers": [
       {
         "type": "realscript",

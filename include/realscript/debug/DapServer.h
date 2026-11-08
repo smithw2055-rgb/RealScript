@@ -8,6 +8,7 @@
 #include <istream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <thread>
@@ -41,6 +42,9 @@ public:
     }
     void rebindProgram(std::shared_ptr<const runtime::ProgramImage> program);
 
+    [[nodiscard]] tooling::Json buildHeapSnapshotReport(bool diffBaseline = false);
+    [[nodiscard]] std::string formatRetainingPathReport(runtime::ObjectRef target) const;
+
 private:
     [[nodiscard]] tooling::Json response(
         const tooling::Json& request,
@@ -51,6 +55,14 @@ private:
     void emitTerminated(std::ostream& output);
     void rebuildVariableReferences();
     [[nodiscard]] std::int64_t registerExpandableValue(const runtime::Value& value);
+    void collectActiveStackValues(std::vector<runtime::Value>& outValues) const;
+    [[nodiscard]] std::string describeHeapObject(
+        const runtime::HeapObjectInfo& obj) const;
+    [[nodiscard]] std::string describeEdgeLabel(
+        const runtime::HeapObjectInfo& owner,
+        const std::string& rawLabel) const;
+    [[nodiscard]] std::string describeRootInfo(
+        const runtime::HeapRootInfo& root) const;
 
     std::shared_ptr<const runtime::ProgramImage> program_;
     std::shared_ptr<runtime::ManagedHeap> heap_;
@@ -58,6 +70,7 @@ private:
     std::atomic<std::uint32_t> sequence_{1};
     std::unordered_map<std::int64_t, std::vector<DebugVariable>> variables_;
     std::unordered_map<std::int64_t, runtime::ObjectRef> childOwnerObjects_;
+    std::optional<runtime::HeapSnapshot> baselineSnapshot_;
     std::int64_t nextChildRef_ = 1000;
 };
 

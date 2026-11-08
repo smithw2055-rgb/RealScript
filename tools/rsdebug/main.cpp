@@ -25,6 +25,8 @@ std::string readFile(const std::string& path) {
 int main(int argc, char** argv) {
     std::uint16_t tcpPort = 0;
     std::string bindHost = "127.0.0.1";
+    std::string heapReportEntry;
+    bool heapReportJson = false;
     std::vector<std::string> sourceFiles;
 
     const auto parsePortArg = [](const char* raw, std::uint16_t& outPort) -> bool {
@@ -59,13 +61,19 @@ int main(int argc, char** argv) {
             bindHost = argv[++index];
         } else if (arg.rfind("--host=", 0) == 0) {
             bindHost = arg.substr(7);
+        } else if (arg == "--heap-report" && index + 1 < argc) {
+            heapReportEntry = argv[++index];
+        } else if (arg.rfind("--heap-report=", 0) == 0) {
+            heapReportEntry = arg.substr(14);
+        } else if (arg == "--json") {
+            heapReportJson = true;
         } else {
             sourceFiles.push_back(std::move(arg));
         }
     }
 
     if (sourceFiles.empty()) {
-        std::cerr << "usage: rsdebug [--port <port>] [--host <ip>] <file.rs>...\n";
+        std::cerr << "usage: rsdebug [--port <port>] [--host <ip>] [--heap-report <Module::func> [--json]] <file.rs>...\n";
         return 2;
     }
     try {
@@ -91,6 +99,23 @@ int main(int argc, char** argv) {
             return 1;
         }
         auto image = std::make_shared<const realscript::runtime::ProgramImage>(std::move(*program));
+        if (!heapReportEntry.empty()) {
+            auto heap = std::make_shared<realscript::runtime::ManagedHeap>();
+            realscript::runtime::Interpreter interpreter(image, heap);
+            const auto exec = interpreter.invoke(heapReportEntry);
+            if (!exec.succeeded) {
+                std::cerr << "rsdebug: execution failed: " << exec.error.message << '\n';
+                return 1;
+            }
+            realscript::debug::DapServer server(image, heap);
+            const auto report = server.buildHeapSnapshotReport(false);
+            if (heapReportJson) {
+                std::cout << report.dump() << '\n';
+            } else if (const auto* text = report.find("summaryText")) {
+                std::cout << text->stringValue();
+            }
+            return 0;
+        }
         realscript::debug::DapServer server(std::move(image));
         if (tcpPort != 0) {
             return server.serveTcp(tcpPort, bindHost);

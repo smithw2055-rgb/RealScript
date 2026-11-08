@@ -143,6 +143,31 @@ class RealScriptDebugAdapterDescriptorFactory implements vscode.DebugAdapterDesc
   }
 }
 
+async function requestAndShowHeapSnapshot(diffBaseline: boolean): Promise<void> {
+  const session = vscode.debug.activeDebugSession;
+  if (!session || session.type !== 'realscript') {
+    vscode.window.showWarningMessage(
+      'RealScript Heap Snapshot requires an active RealScript debug session (Launch or Attach).'
+    );
+    return;
+  }
+
+  try {
+    const response = await session.customRequest('heapSnapshot', { diffBaseline });
+    const markdownReport: string =
+      (response && typeof response.summaryText === 'string' && response.summaryText) ||
+      '# RealScript Heap Snapshot\n\n_Empty snapshot response._\n';
+
+    const doc = await vscode.workspace.openTextDocument({
+      language: 'markdown',
+      content: markdownReport,
+    });
+    await vscode.window.showTextDocument(doc, { preview: false });
+  } catch (err) {
+    vscode.window.showErrorMessage(`Failed to capture RealScript heap snapshot: ${String(err)}`);
+  }
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   // 1. Register Debug Configuration Provider & Descriptor Factory (Launch + In-Engine TCP Attach)
   const provider = new RealScriptDebugConfigurationProvider();
@@ -185,7 +210,64 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
 
-  // 3. Register LSP Restart Command & Start Language Server
+  // 3. Register ManagedHeap Memory Snapshot, Diff & Retaining Path Commands
+  context.subscriptions.push(
+    vscode.commands.registerCommand('realscript.captureHeapSnapshot', async () => {
+      await requestAndShowHeapSnapshot(false);
+    }),
+    vscode.commands.registerCommand('realscript.diffHeapSnapshot', async () => {
+      await requestAndShowHeapSnapshot(true);
+    }),
+    vscode.commands.registerCommand('realscript.findRetainingPath', async (contextArg?: any) => {
+      const session = vscode.debug.activeDebugSession;
+      if (!session || session.type !== 'realscript') {
+        vscode.window.showWarningMessage(
+          'RealScript Retaining Path requires an active RealScript debug session.'
+        );
+        return;
+      }
+
+      const requestArgs: Record<string, any> = {};
+      if (
+        contextArg &&
+        contextArg.variable &&
+        typeof contextArg.variable.variablesReference === 'number' &&
+        contextArg.variable.variablesReference >= 1000
+      ) {
+        requestArgs.variablesReference = contextArg.variable.variablesReference;
+      } else if (contextArg && contextArg.variable && typeof contextArg.variable.evaluateName === 'string') {
+        requestArgs.expression = contextArg.variable.evaluateName;
+      } else if (contextArg && contextArg.variable && typeof contextArg.variable.name === 'string') {
+        requestArgs.expression = contextArg.variable.name;
+      } else {
+        const expr = await vscode.window.showInputBox({
+          prompt: 'Enter variable expression (e.g. this.cachedTarget) or heap slot ID (e.g. 5) to trace its Retaining Path',
+          placeHolder: 'this.cachedTarget',
+        });
+        if (!expr) {
+          return;
+        }
+        const trimmed = expr.trim();
+        if (/^o?\d+$/.test(trimmed)) {
+          requestArgs.slot = Number(trimmed.replace(/^o/, ''));
+        } else {
+          requestArgs.expression = trimmed;
+        }
+      }
+
+      try {
+        const res = await session.customRequest('retainingPath', requestArgs);
+        const pathReport: string =
+          (res && typeof res.retainingPath === 'string' && res.retainingPath) ||
+          'No retaining path found.';
+        vscode.window.showInformationMessage(`Retaining Path: ${pathReport}`);
+      } catch (err) {
+        vscode.window.showErrorMessage(`Failed to resolve Retaining Path: ${String(err)}`);
+      }
+    })
+  );
+
+  // 4. Register LSP Restart Command & Start Language Server
   context.subscriptions.push(
     vscode.commands.registerCommand('realscript.restartLspServer', async () => {
       try {
