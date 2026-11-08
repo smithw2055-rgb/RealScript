@@ -2101,7 +2101,9 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                             candidate.parameters[1].type == PrimitiveType::String &&
                             candidate.parameters[2].type == PrimitiveType::Long) {
                             waitAsync = &candidate;
-                            break;
+                            if (candidate.moduleName == "RealScript.Scene") {
+                                break;
+                            }
                         }
                     }
                 }

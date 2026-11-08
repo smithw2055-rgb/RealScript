@@ -100,6 +100,19 @@ std::optional<runtime::Value> writeNativeObject(
         return std::nullopt;
     }
     if (!value) return runtime::Value{runtime::NullObject{}};
+    const auto heapId = state->heap->heapId();
+    if (const auto existingHandle = state->nativeHandles->findHandle(type->typeId, value.get())) {
+        if (const auto cachedRef = state->nativeHandles->cachedWrapper(*existingHandle, heapId);
+            cachedRef && state->heap->isAlive(*cachedRef)) {
+            return runtime::Value{*cachedRef};
+        }
+        std::vector<runtime::Value> fields;
+        fields.emplace_back(*existingHandle);
+        auto object = state->heap->allocateObject(type->typeId, std::move(fields), {}, &error);
+        if (!object) return std::nullopt;
+        (void)state->nativeHandles->setCachedWrapper(*existingHandle, *object, heapId);
+        return runtime::Value{*object};
+    }
     auto handle = state->nativeHandles->create(
         type->typeId,
         std::static_pointer_cast<void>(std::move(value)),
@@ -111,6 +124,7 @@ std::optional<runtime::Value> writeNativeObject(
         state->nativeHandles->release(handle);
         return std::nullopt;
     }
+    (void)state->nativeHandles->setCachedWrapper(handle, *object, heapId);
     return runtime::Value{*object};
 }
 

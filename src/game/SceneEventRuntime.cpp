@@ -1,5 +1,6 @@
 #include "realscript/game/GameScripting.h"
 
+#include <algorithm>
 #include <set>
 #include <utility>
 
@@ -116,8 +117,17 @@ bool SceneScriptRuntime::dispatch(const ScriptEvent& event) {
         return matchedAny && allSucceeded;
     }
     bool succeeded = true;
-    for (auto& [entity, components] : instances_) {
-        for (auto& instance : components) {
+    std::vector<SceneEntityId> sortedEntities;
+    sortedEntities.reserve(instances_.size());
+    for (const auto& [entity, _] : instances_) {
+        (void)_;
+        sortedEntities.push_back(entity);
+    }
+    std::sort(sortedEntities.begin(), sortedEntities.end());
+    for (const auto entity : sortedEntities) {
+        const auto instIt = instances_.find(entity);
+        if (instIt == instances_.end()) continue;
+        for (auto& instance : instIt->second) {
             if (!instance.enabled) continue;
             const auto* method = findCachedMethod(
                 instance.object.type(), event.callback, event.arguments.size());
@@ -293,6 +303,12 @@ void SceneFiberHostAdapter::registerConditionMember(
     conditions_[key16] = ConditionEntry{std::move(memberName), std::move(componentType)};
 }
 
+void SceneFiberHostAdapter::registerAsyncConditionKey(
+    std::uint16_t key16,
+    SceneScriptRuntime::AsyncRequestId requestId) {
+    asyncConditions_[key16] = requestId;
+}
+
 void SceneFiberHostAdapter::onHostCommand(
     runtime::FiberContext& fiber,
     std::uint8_t commandId,
@@ -342,6 +358,20 @@ bool SceneFiberHostAdapter::onEvaluateCondition(
     std::uint8_t conditionKind,
     std::uint16_t key16,
     std::uint16_t threshold16) const noexcept {
+    if (const auto asyncIt = asyncConditions_.find(key16);
+        asyncIt != asyncConditions_.end()) {
+        const std::int64_t actual = scene_.isAsyncRequestCompleted(asyncIt->second) ? 1 : 0;
+        const auto rhs = static_cast<std::int64_t>(threshold16);
+        switch (conditionKind) {
+        case 0: return actual >= rhs;
+        case 1: return actual > rhs;
+        case 2: return actual == rhs;
+        case 3: return actual < rhs;
+        case 4: return actual <= rhs;
+        case 5: return actual != rhs;
+        default: return actual >= rhs;
+        }
+    }
     const auto it = conditions_.find(key16);
     if (it == conditions_.end()) return false;
     const auto entityId = static_cast<SceneEntityId>(fiber.boundEntity.slot);
@@ -670,6 +700,56 @@ bool installSceneComponentBindings(
                     static_cast<SceneEntityId>(entityA),
                     static_cast<SceneEntityId>(entityB));
                 return contact ? contact->normal : Vec3{};
+            }) &&
+        api.function(
+            moduleName,
+            "CreateAsyncRequest",
+            [scenePtr](std::string tag) -> std::int64_t {
+                return static_cast<std::int64_t>(
+                    scenePtr->createAsyncRequest(std::move(tag)));
+            }) &&
+        api.function(
+            moduleName,
+            "CompleteAsyncRequest",
+            [scenePtr](std::int64_t requestId, std::int32_t result) -> bool {
+                if (requestId <= 0) return false;
+                return scenePtr->completeAsyncRequest(
+                    static_cast<SceneScriptRuntime::AsyncRequestId>(requestId),
+                    static_cast<std::int64_t>(result));
+            }) &&
+        api.function(
+            moduleName,
+            "IsAsyncRequestCompleted",
+            [scenePtr](std::int64_t requestId) -> bool {
+                if (requestId <= 0) return false;
+                return scenePtr->isAsyncRequestCompleted(
+                    static_cast<SceneScriptRuntime::AsyncRequestId>(requestId));
+            }) &&
+        api.function(
+            moduleName,
+            "GetAsyncRequestResultInt",
+            [scenePtr](std::int64_t requestId) -> std::int32_t {
+                if (requestId <= 0) return 0;
+                const auto res = scenePtr->getAsyncRequestResult(
+                    static_cast<SceneScriptRuntime::AsyncRequestId>(requestId));
+                if (res && std::holds_alternative<std::int64_t>(*res)) {
+                    return static_cast<std::int32_t>(std::get<std::int64_t>(*res));
+                }
+                return 0;
+            }) &&
+        api.function(
+            moduleName,
+            "WaitAsyncOperation",
+            [scenePtr](
+                std::int64_t targetEntity,
+                std::string callback,
+                std::int64_t requestId) -> std::int64_t {
+                if (targetEntity <= 0 || requestId <= 0) return 0;
+                const bool okWait = scenePtr->waitAsyncRequest(
+                    static_cast<SceneScriptRuntime::AsyncRequestId>(requestId),
+                    static_cast<SceneEntityId>(targetEntity),
+                    std::move(callback));
+                return okWait ? requestId : 0;
             });
     return ok && api.valid();
 }

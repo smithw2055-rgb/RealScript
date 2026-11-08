@@ -234,8 +234,9 @@ public:
             return std::nullopt;
         }
         const auto handleTypeId = nativeBaseTypeId(*type);
+        const auto effectiveTypeId = handleTypeId != 0 ? handleTypeId : type->descriptor.id;
         auto handle = nativeHandles_->create(
-            handleTypeId != 0 ? handleTypeId : type->descriptor.id,
+            effectiveTypeId,
             std::static_pointer_cast<void>(std::move(object)),
             std::move(debugName));
         std::vector<runtime::Value> fields(type->descriptor.fields.size());
@@ -253,6 +254,7 @@ public:
             error.message = "failed to retain native wrapper object";
             return std::nullopt;
         }
+        (void)nativeHandles_->setCachedWrapper(handle, *reference, heap_->heapId());
         return ScriptObject{*type, *reference, std::move(root)};
     }
 
@@ -286,6 +288,7 @@ public:
             nativeHandles_->release(handle);
             return false;
         }
+        (void)nativeHandles_->setCachedWrapper(handle, object.reference(), heap_->heapId());
         return true;
     }
 
@@ -1027,7 +1030,40 @@ public:
         std::uint32_t seed = 0x53434257u);
     std::uint64_t stepFibers(std::uint32_t currentTick);
 
+    // Deterministic Host Async Request Bridge (P2-3)
+    using AsyncRequestId = std::uint64_t;
+    AsyncRequestId createAsyncRequest(std::string debugTag = {});
+    bool completeAsyncRequest(
+        AsyncRequestId requestId,
+        runtime::Value result = {});
+    [[nodiscard]] bool isAsyncRequestCompleted(AsyncRequestId requestId) const noexcept;
+    [[nodiscard]] std::optional<runtime::Value> getAsyncRequestResult(
+        AsyncRequestId requestId) const;
+    bool waitAsyncRequest(
+        AsyncRequestId requestId,
+        SceneEntityId targetEntity,
+        std::string callbackMethod,
+        std::string componentType = {});
+    std::size_t flushCompletedAsyncRequests();
+
 private:
+    struct AsyncRequestWaiter {
+        SceneEntityId targetEntity = 0;
+        std::string callbackMethod;
+        std::string componentType;
+    };
+    struct AsyncRequestEntry {
+        AsyncRequestId id = 0;
+        std::string debugTag;
+        bool completed = false;
+        runtime::Value result{};
+        std::vector<AsyncRequestWaiter> waiters;
+    };
+    struct PendingAsyncCompletion {
+        AsyncRequestId id = 0;
+        runtime::Value result{};
+    };
+
     struct MethodCacheEntry {
         semantic::SymbolId typeId = 0;
         std::string name;
@@ -1110,11 +1146,11 @@ private:
     ScriptRuntime& runtime_;
     runtime::ExecutionOptions executionOptions_;
     SceneExecutionMode executionMode_ = SceneExecutionMode::Play;
-    std::map<SceneEntityId, std::vector<Instance>> instances_;
-    std::map<SceneEntityId, SceneEntityId> parentByEntity_;
-    std::map<SceneEntityId, std::vector<SceneEntityId>> childrenByEntity_;
-    std::map<SceneEntityId, bool> entityActiveSelf_;
-    std::map<SceneEntityId, Transform3D> localTransforms_;
+    std::unordered_map<SceneEntityId, std::vector<Instance>> instances_;
+    std::unordered_map<SceneEntityId, SceneEntityId> parentByEntity_;
+    std::unordered_map<SceneEntityId, std::vector<SceneEntityId>> childrenByEntity_;
+    std::unordered_map<SceneEntityId, bool> entityActiveSelf_;
+    std::unordered_map<SceneEntityId, Transform3D> localTransforms_;
     mutable std::unordered_map<SceneEntityId, Transform3D> worldTransformCache_;
     mutable bool tickOrderDirty_ = true;
     mutable std::vector<TickRef> cachedTickOrder_;
@@ -1134,14 +1170,17 @@ private:
     std::map<std::pair<SceneEntityId, SceneEntityId>, CollisionContact3D> activeContacts3D_;
     std::size_t lastBroadphasePairs3D_ = 0;
     std::vector<SceneEntityId> pendingDestroyEntities_;
-    std::map<SceneEntityId, std::string> entityNames_;
-    std::map<std::string, std::set<SceneEntityId>> groupEntities_;
+    std::unordered_map<SceneEntityId, std::string> entityNames_;
+    std::unordered_map<std::string, std::vector<SceneEntityId>> groupEntities_;
     std::unordered_map<std::uint32_t, std::uint32_t> slotGenerations_;
     std::vector<std::uint32_t> freeGenerationalSlots_;
     std::uint32_t nextGenerationalSlot_ = 1;
     SceneEntityId nextAutoEntityId_ = 1;
     runtime::FiberScheduler* fiberScheduler_ = nullptr;
-    std::map<std::size_t, std::vector<MethodCacheEntry>> methodCache_;
+    AsyncRequestId nextAsyncRequestId_ = 1;
+    std::unordered_map<AsyncRequestId, AsyncRequestEntry> asyncRequests_;
+    std::vector<PendingAsyncCompletion> pendingAsyncCompletions_;
+    std::unordered_map<std::size_t, std::vector<MethodCacheEntry>> methodCache_;
     std::vector<ScriptEvent> eventQueue_;
     std::map<std::string, ScriptTrigger> triggers_;
     std::vector<SceneScriptError> errors_;
@@ -1164,6 +1203,9 @@ public:
         std::uint16_t key16,
         std::string memberName,
         std::string componentType = {});
+    void registerAsyncConditionKey(
+        std::uint16_t key16,
+        SceneScriptRuntime::AsyncRequestId requestId);
 
     void onHostCommand(
         runtime::FiberContext& fiber,
@@ -1189,6 +1231,7 @@ private:
     SceneScriptRuntime& scene_;
     std::unordered_map<std::uint8_t, CommandEntry> commands_;
     std::unordered_map<std::uint16_t, ConditionEntry> conditions_;
+    std::unordered_map<std::uint16_t, SceneScriptRuntime::AsyncRequestId> asyncConditions_;
 };
 
 bool installSceneComponentBindings(

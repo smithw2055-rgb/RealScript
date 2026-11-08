@@ -6552,6 +6552,641 @@ class AccBox
     }
 }
 
+void testRemediationPhaseAP0Items() {
+    // 1. P0-1 & P0-2: Native Object Return Identity Cache + Direct Native Call Fast-Path
+    {
+        auto hero = std::make_shared<NativeActor>();
+        hero->health = 120;
+        realscript::game::GameApi api;
+        api.type<NativeActor>("Engine.P0", "NativeActor")
+            .method<&NativeActor::readHealth>("GetHealth")
+            .method<&NativeActor::heal>("Heal");
+        require(
+            api.function("Engine.P0", "GetMainActor", [hero]() -> std::shared_ptr<NativeActor> {
+                return hero;
+            }),
+            "P0 GetMainActor binding failed");
+        require(api.valid(), "Engine.P0 GameApi should be valid");
+
+        const char* p0Src = R"RS(
+module Game.P0Test;
+import Engine.P0;
+
+class Runner
+{
+    public static int VerifyIdentityAndFastCall()
+    {
+        NativeActor a = GetMainActor();
+        NativeActor b = GetMainActor();
+        if (a != b)
+        {
+            return -1;
+        }
+        for (int i = 0; i < 50; i = i + 1)
+        {
+            NativeActor c = GetMainActor();
+            if (c != a)
+            {
+                return -2;
+            }
+            c.Heal(1);
+        }
+        return b.GetHealth();
+    }
+}
+)RS";
+        realscript::game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"p0_test.rs", p0Src}});
+        require(
+            compiled.succeeded(),
+            "P0 script compile failed:\n" + diagnosticsText(compiled.diagnostics));
+
+        realscript::game::ScriptRuntime runtime(compiled.program);
+        const auto runnerType = runtime.findType("Game.P0Test::Runner");
+        require(runnerType.has_value(), "Runner type not found");
+        const auto verifyMethod = runtime.findMethod(*runnerType, "VerifyIdentityAndFastCall", 0);
+        require(verifyMethod.has_value(), "VerifyIdentityAndFastCall method not found");
+        const auto resFast = runtime.invokeStatic(*verifyMethod);
+        require(
+            resFast.succeeded && std::get<std::int64_t>(resFast.value) == 170,
+            "P0-1/P0-2 VerifyIdentityAndFastCall failed: " + resFast.error.message);
+        require(
+            runtime.nativeHandles()->liveCount() == 1,
+            "P0-1 repeated GetMainActor() calls must reuse single NativeHandle slot, got: " +
+                std::to_string(runtime.nativeHandles()->liveCount()));
+
+        // Verify exact parity between fastAccounting (direct native forwarder) and trace mode (slow path)
+        hero->health = 120;
+        realscript::runtime::ExecutionOptions traceOpts;
+        traceOpts.trace = [](const realscript::runtime::TraceEvent&) {};
+        const auto resSlow = runtime.invokeStatic(*verifyMethod, {}, traceOpts);
+        require(
+            resSlow.succeeded &&
+                std::get<std::int64_t>(resSlow.value) == 170 &&
+                resSlow.instructionsExecuted == resFast.instructionsExecuted &&
+                resSlow.statistics.functionCalls == resFast.statistics.functionCalls &&
+                resSlow.statistics.externalCalls == resFast.statistics.externalCalls &&
+                resSlow.statistics.maximumCallDepth == resFast.statistics.maximumCallDepth,
+            "P0-2 direct native call fast-path must match slow-path accounting 100%");
+    }
+
+    // 2. P0-3: DAP Exception Breakpoints (runtime-error & uncaught/all script exceptions) + exceptionInfo
+    {
+        realscript::game::GameApi api;
+        const char* crashSrc = R"RS(
+module Game.P0Debug;
+
+public class CustomError
+{
+    public string message;
+    public CustomError(string msg)
+    {
+        this.message = msg;
+    }
+}
+
+public int InnerCrash(int scale, int denom)
+{
+    int localState = scale * 7;
+    return localState / denom;
+}
+
+public int MainRuntimeError()
+{
+    return InnerCrash(6, 0);
+}
+
+public int MainUncaughtThrow()
+{
+    try
+    {
+        throw new CustomError("caught-first");
+    }
+    catch (CustomError e)
+    {
+    }
+    int beforeBoom = 99;
+    throw new CustomError("fatal-boom");
+}
+)RS";
+        realscript::game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"p0_debug.rs", crashSrc}});
+        require(
+            compiled.succeeded(),
+            "P0 debug script compile failed:\n" + diagnosticsText(compiled.diagnostics));
+
+        // 2a. Break on runtime-error (DivisionByZero) with live stack/variable inspection
+        {
+            realscript::debug::DebugSession session(
+                compiled.program.program(),
+                compiled.program.heap());
+            session.controller()->setExceptionBreakpoints(false, false, true);
+            require(
+                session.launch("Game.P0Debug::MainRuntimeError"),
+                "launch MainRuntimeError failed");
+            require(
+                session.waitForStop(std::chrono::seconds{5}),
+                "DebugSession should pause on runtime-error DivisionByZero");
+            const auto stop = session.currentStop();
+            require(
+                stop.has_value() &&
+                    stop->reason == realscript::debug::StopReason::Exception &&
+                    stop->errorCode == realscript::runtime::ErrorCode::DivisionByZero &&
+                    stop->exceptionId == "division-by-zero" &&
+                    stop->exceptionUncaught,
+                "DebugStop should report DivisionByZero exception stop");
+            const auto& frames = stop->frames;
+            require(
+                frames.size() >= 2 && frames[0].function.find("InnerCrash") != std::string::npos,
+                "Stack trace at DivisionByZero should have InnerCrash at top frame");
+            std::string evalErr;
+            const auto localVal = session.evaluate("localState", frames[0].id, &evalErr);
+            require(
+                localVal.has_value() && std::get<std::int64_t>(*localVal) == 42,
+                "Should inspect live localState == 42 before frame unwinds, error: " + evalErr);
+            session.continueExecution();
+            session.join();
+            require(
+                session.result().has_value() &&
+                    !session.result()->succeeded &&
+                    session.result()->error.code == realscript::runtime::ErrorCode::DivisionByZero,
+                "Execution should finish with DivisionByZero after continuing from exception stop");
+        }
+
+        // 2b. DAP Server wire test: setExceptionBreakpoints(["uncaught"]) skips caught throw, pauses on uncaught throw, serves exceptionInfo
+        {
+            realscript::debug::DapServer dap(
+                compiled.program.program(),
+                compiled.program.heap());
+            std::string parseErr;
+            std::ostringstream eventsStream;
+
+            const auto initReq = realscript::tooling::Json::parse(
+                R"({"seq":1,"type":"request","command":"initialize","arguments":{}})", parseErr);
+            const auto initResp = dap.handle(*initReq, &eventsStream).dump();
+            require(
+                initResp.find("\"supportsExceptionInfoRequest\":true") != std::string::npos &&
+                    initResp.find("\"exceptionBreakpointFilters\"") != std::string::npos,
+                "DAP initialize should advertise exceptionBreakpointFilters and supportsExceptionInfoRequest");
+
+            const auto setExcReq = realscript::tooling::Json::parse(
+                R"({"seq":2,"type":"request","command":"setExceptionBreakpoints","arguments":{"filters":["uncaught"]}})", parseErr);
+            const auto setExcResp = dap.handle(*setExcReq, &eventsStream).dump();
+            require(
+                setExcResp.find("\"success\":true") != std::string::npos,
+                "DAP setExceptionBreakpoints failed");
+
+            eventsStream.str("");
+            eventsStream.clear();
+            const auto launchReq = realscript::tooling::Json::parse(
+                R"({"seq":3,"type":"request","command":"launch","arguments":{"entry":"Game.P0Debug::MainUncaughtThrow"}})", parseErr);
+            const auto launchResp = dap.handle(*launchReq, &eventsStream).dump();
+            const std::string emittedEvents = eventsStream.str();
+            require(
+                launchResp.find("\"success\":true") != std::string::npos &&
+                    emittedEvents.find("\"event\":\"stopped\"") != std::string::npos &&
+                    emittedEvents.find("\"reason\":\"exception\"") != std::string::npos,
+                "DAP launch with uncaught filter should emit stopped(reason=exception) on uncaught throw, got: " + emittedEvents);
+
+            const auto excInfoReq = realscript::tooling::Json::parse(
+                R"({"seq":4,"type":"request","command":"exceptionInfo","arguments":{"threadId":1}})", parseErr);
+            const auto excInfoResp = dap.handle(*excInfoReq, &eventsStream).dump();
+            require(
+                excInfoResp.find("CustomError") != std::string::npos &&
+                    excInfoResp.find("fatal-boom") != std::string::npos &&
+                    excInfoResp.find("\"breakMode\":\"unhandled\"") != std::string::npos,
+                "DAP exceptionInfo should return CustomError: fatal-boom and unhandled breakMode, got: " + excInfoResp);
+
+            const auto evalReq = realscript::tooling::Json::parse(
+                R"({"seq":5,"type":"request","command":"evaluate","arguments":{"expression":"beforeBoom","frameId":1}})", parseErr);
+            const auto evalResp = dap.handle(*evalReq, &eventsStream).dump();
+            require(
+                evalResp.find("\"result\":\"99\"") != std::string::npos,
+                "DAP evaluate at uncaught throw site should read beforeBoom == 99, got: " + evalResp);
+
+            const auto discReq = realscript::tooling::Json::parse(
+                R"({"seq":6,"type":"request","command":"disconnect","arguments":{}})", parseErr);
+            (void)dap.handle(*discReq, &eventsStream);
+        }
+    }
+}
+
+struct P1NativeBoss {
+    int rageLevel = 15;
+    const int maxPhase = 3;
+    int AddBonus(unsigned int a, long long b) const {
+        return rageLevel + static_cast<int>(a) + static_cast<int>(b);
+    }
+};
+
+void testRemediationPhaseBP1Items() {
+    using namespace realscript;
+
+    // 1. P1-1: String & Array / List<T> stdlib intrinsics + .Count/.Length properties
+    {
+        game::GameApi api;
+        const char* stdlibSrc = R"RS(
+module Game.P1Stdlib;
+
+public int VerifyCollectionsAndStrings()
+{
+    string raw = "  alpha,beta,gamma  ";
+    string trimmed = raw.TrimStart().TrimEnd();
+    string[] parts = trimmed.Split(",");
+    if (parts.Length != 3) return -1;
+    if (parts[0] != "alpha" || parts[1] != "beta" || parts[2] != "gamma") return -2;
+    if (trimmed.LastIndexOf("a") != 15) return -3;
+
+    int[] nums = new int[5];
+    nums[0] = 40;
+    nums[1] = 10;
+    nums[2] = 30;
+    nums[3] = 20;
+    nums[4] = 30;
+    if (nums.IndexOf(30) != 2) return -4;
+    if (nums.LastIndexOf(30) != 4) return -5;
+    if (!nums.Contains(20) || nums.Contains(99)) return -6;
+    nums.Sort();
+    if (nums[0] != 10 || nums[1] != 20 || nums[2] != 30 || nums[3] != 30 || nums[4] != 40) return -7;
+    nums.Reverse();
+    if (nums[0] != 40 || nums[4] != 10) return -8;
+
+    List<int> list = new List<int>();
+    list.Add(50);
+    list.Add(10);
+    list.Add(30);
+    if (list.Count != 3 || list.Length != 3) return -9;
+    list.Sort();
+    if (list.Get(0) != 10 || list.Get(1) != 30 || list.Get(2) != 50) return -10;
+
+    Queue<int> q = new Queue<int>();
+    q.Enqueue(7);
+    q.Enqueue(8);
+    if (q.Count != 2) return -11;
+
+    Stack<int> st = new Stack<int>();
+    st.Push(9);
+    if (st.Count != 1) return -12;
+
+    HashSet<int> hs = new HashSet<int>();
+    hs.Add(11);
+    hs.Add(22);
+    if (hs.Count != 2) return -13;
+
+    Dictionary<string, int> dict = new Dictionary<string, int>();
+    dict.Add("k1", 100);
+    if (dict.Count != 1) return -14;
+
+    return list.Get(0) + list.Get(1) + list.Get(2) + nums[0] + dict.Get("k1");
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"p1_stdlib.rs", stdlibSrc}});
+        require(
+            compiled.succeeded(),
+            "P1 stdlib compile failed:\n" + diagnosticsText(compiled.diagnostics));
+
+        game::ScriptRuntime runtime(compiled.program);
+        const auto fn = runtime.program()->findFunction("Game.P1Stdlib::VerifyCollectionsAndStrings");
+        require(fn.has_value(), "VerifyCollectionsAndStrings not found");
+        runtime::Interpreter interp(compiled.program.program(), compiled.program.heap());
+        const auto res = interp.invoke("Game.P1Stdlib::VerifyCollectionsAndStrings");
+        require(
+            res.succeeded && std::get<std::int64_t>(res.value) == 230,
+            "VerifyCollectionsAndStrings expected 230, got error/val: " + res.error.message);
+    }
+
+    // 2. P1-2: SceneScriptRuntime Container Flattening deterministic ordering
+    {
+        game::GameApi api;
+        const char* sceneSrc = R"RS(
+module Game.P1Scene;
+
+class OrderedComponent {
+    public static int trace = 0;
+    public int weight = 1;
+
+    public void OnUpdate(double dt) {
+        OrderedComponent.trace = OrderedComponent.trace * 10 + weight;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"p1_scene.rs", sceneSrc}});
+        require(compiled.succeeded(), "P1 scene compile failed");
+
+        game::ScriptRuntime runtime(compiled.program);
+        game::SceneScriptRuntime scene(runtime);
+
+        // Attach entities in reverse order (30, 10, 20)
+        require(scene.attachComponent(30, "Game.P1Scene::OrderedComponent"), "attach 30 failed");
+        require(scene.attachComponent(10, "Game.P1Scene::OrderedComponent"), "attach 10 failed");
+        require(scene.attachComponent(20, "Game.P1Scene::OrderedComponent"), "attach 20 failed");
+
+        runtime::RuntimeError err;
+        (void)runtime.setMember(*scene.getComponent(10, "OrderedComponent"), "weight", std::int64_t{1}, err);
+        (void)runtime.setMember(*scene.getComponent(20, "OrderedComponent"), "weight", std::int64_t{2}, err);
+        (void)runtime.setMember(*scene.getComponent(30, "OrderedComponent"), "weight", std::int64_t{3}, err);
+
+        scene.setEntityName(30, "Actor_30");
+        scene.setEntityName(10, "Actor_10");
+        scene.addEntityToGroup(30, "Enemies");
+        scene.addEntityToGroup(10, "Enemies");
+        scene.addEntityToGroup(20, "Enemies");
+
+        const auto enemies = scene.getEntitiesInGroup("Enemies");
+        require(
+            enemies.size() == 3 && enemies[0] == 10 && enemies[1] == 20 && enemies[2] == 30,
+            "getEntitiesInGroup must return sorted entity IDs [10, 20, 30]");
+        require(scene.findEntityByName("Actor_10") == 10, "findEntityByName failed");
+
+        scene.start();
+        scene.update(0.016);
+        require(scene.errors().empty(), "scene.update failed");
+        const auto* compType = &scene.getComponent(10, "OrderedComponent")->type();
+        const auto traceVal = runtime.getStaticMember(*compType, "trace", err);
+        require(
+            traceVal.has_value() && std::get<std::int64_t>(*traceVal) == 123,
+            "Flattened SceneScriptRuntime must dispatch entities in deterministic ascending order (123)");
+    }
+
+    // 3. P1-3: rsbind Header Parser Hardening & NativeTypeBuilder::field<&Class::member>
+    {
+        const char* complexHeader = R"CPP(
+// Header comment with /* nested comment token */
+#pragma once
+
+namespace Engine::Gameplay {
+
+RS_EXPORT_CLASS("Engine.BossMod")
+class ENGINE_PUBLIC_API P1NativeBoss final
+    : public BaseNativeActor
+{
+public:
+    // String literal with comment-like tokens inside macro args
+    RS_EXPORT_FIELD
+    int rageLevel = 15;
+
+    RS_EXPORT_FIELD
+    const int maxPhase = 3;
+
+    [[nodiscard]]
+    RS_EXPORT_METHOD
+    virtual inline int AddBonus(
+        unsigned int a,
+        long long b = 10) const;
+};
+
+} // namespace Engine::Gameplay
+)CPP";
+        const auto gen = game::GameApi::generateBindingsFromCppHeader(complexHeader, "Engine.BossMod");
+        require(
+            gen.classesExported == 1 && gen.propertiesExported == 2 && gen.methodsExported == 1,
+            "Hardened rsbind parser should export 1 class, 2 field properties, and 1 method");
+        require(
+            gen.cppRegistrationSource.find("api.type<Engine::Gameplay::P1NativeBoss>(\"Engine.BossMod\", \"P1NativeBoss\")") != std::string::npos &&
+                gen.cppRegistrationSource.find("builder_P1NativeBoss.field<&Engine::Gameplay::P1NativeBoss::rageLevel>(\"rageLevel\")") != std::string::npos &&
+                gen.cppRegistrationSource.find("builder_P1NativeBoss.method<&Engine::Gameplay::P1NativeBoss::AddBonus>(\"AddBonus\")") != std::string::npos,
+            "Hardened rsbind C++ output mismatch:\n" + gen.cppRegistrationSource);
+
+        // Compile the generated stub + test NativeTypeBuilder::field<&P1NativeBoss::rageLevel> at runtime
+        game::GameApi api;
+        api.type<P1NativeBoss>("Engine.BossMod", "P1NativeBoss")
+            .field<&P1NativeBoss::rageLevel>("rageLevel")
+            .field<&P1NativeBoss::maxPhase>("maxPhase")
+            .method<&P1NativeBoss::AddBonus>("AddBonus");
+
+        const char* bossScript = R"RS(
+module Game.P1BossTest;
+import Engine.BossMod;
+
+public int TestBossField(P1NativeBoss boss)
+{
+    boss.rageLevel = boss.rageLevel + 5;
+    return boss.AddBonus((uint)10, 20L) + boss.maxPhase;
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"p1_boss.rs", bossScript}});
+        require(
+            compiled.succeeded(),
+            "P1 boss script compile failed:\n" + diagnosticsText(compiled.diagnostics));
+
+        game::ScriptRuntime runtime(compiled.program);
+        auto bossPtr = std::make_shared<P1NativeBoss>();
+        runtime::RuntimeError err;
+        auto bossObj = runtime.wrapNative<P1NativeBoss>("Engine.BossMod::P1NativeBoss", bossPtr, err);
+        require(bossObj.has_value(), "wrapNative P1NativeBoss failed: " + err.message);
+
+        runtime::Interpreter interp(compiled.program.program(), compiled.program.heap());
+        interp.setBindingRegistry(compiled.program.bindings());
+        const auto callRes = interp.invoke("Game.P1BossTest::TestBossField", {bossObj->value()});
+        require(
+            callRes.succeeded && std::get<std::int64_t>(callRes.value) == 53 && bossPtr->rageLevel == 20,
+            "NativeTypeBuilder::field getter/setter failed: " + callRes.error.message);
+    }
+}
+
+void testRemediationPhaseCP2Items() {
+    using namespace realscript;
+
+    // 1. P2-1: HeapObject Small-Buffer Optimization (<= 4 fields inline storage)
+    {
+        runtime::ManagedHeap heap;
+        runtime::RuntimeError err;
+        const auto smallRef = heap.allocateObject(
+            101,
+            {runtime::Value{std::int64_t{10}},
+             runtime::Value{std::int64_t{20}},
+             runtime::Value{std::int64_t{30}},
+             runtime::Value{std::int64_t{40}}},
+            {},
+            &err);
+        const auto largeRef = heap.allocateObject(
+            102,
+            {runtime::Value{std::int64_t{1}},
+             runtime::Value{std::int64_t{2}},
+             runtime::Value{std::int64_t{3}},
+             runtime::Value{std::int64_t{4}},
+             runtime::Value{std::int64_t{5}}},
+            {},
+            &err);
+        require(smallRef.has_value() && largeRef.has_value(), "SBO test allocation failed");
+        require(
+            heap.isInlineRecordObject(*smallRef),
+            "Record with <= 4 fields must use inline SBO storage");
+        require(
+            !heap.isInlineRecordObject(*largeRef),
+            "Record with > 4 fields must use dynamic vector storage");
+        require(
+            heap.fieldCount(*smallRef) == 4 &&
+                std::get<std::int64_t>(*heap.fieldGet(*smallRef, 3)) == 40,
+            "SBO fieldGet failed");
+        require(heap.fieldSet(*smallRef, 2, runtime::Value{std::int64_t{333}}, &err), "SBO fieldSet failed");
+        require(
+            std::get<std::int64_t>(*heap.fieldGet(*smallRef, 2)) == 333,
+            "SBO fieldGet after fieldSet failed");
+
+        // Snapshot & restore round-trip preserves inline SBO storage
+        auto rootSmall = heap.retain(*smallRef);
+        auto rootLarge = heap.retain(*largeRef);
+        const auto snap = heap.snapshot();
+        require(heap.restore(snap, &err), "SBO snapshot restore failed: " + err.message);
+        require(
+            heap.isInlineRecordObject(*smallRef) &&
+                std::get<std::int64_t>(*heap.fieldGet(*smallRef, 2)) == 333,
+            "SBO state after snapshot restore mismatch");
+    }
+
+    // 2. P2-2: LanguageService publicApiFingerprint & O(1) body-only incremental subgraph rebuild
+    {
+        tooling::LanguageService service;
+        service.open(
+            "core.rs",
+            "module Game.Core;\n"
+            "public class MathUtil {\n"
+            "    public static int Compute(int x) {\n"
+            "        return x + 1;\n"
+            "    }\n"
+            "}\n",
+            1);
+        service.open(
+            "combat.rs",
+            "module Game.Combat;\n"
+            "import Game.Core;\n"
+            "public class DamageCalc {\n"
+            "    public static int Hit(int a) {\n"
+            "        return MathUtil.Compute(a) * 2;\n"
+            "    }\n"
+            "}\n",
+            1);
+        service.open(
+            "ui.rs",
+            "module Game.UI;\n"
+            "import Game.Combat;\n"
+            "public class Hud {\n"
+            "    public static int Render() {\n"
+            "        return DamageCalc.Hit(5);\n"
+            "    }\n"
+            "}\n",
+            1);
+
+        const auto fpBefore = service.publicApiFingerprint("Game.Core");
+        require(fpBefore != 0, "publicApiFingerprint(Game.Core) should be non-zero");
+        require(service.lastRebuiltModuleCount() == 3, "Initial build should compile all 3 modules");
+
+        // Body-only edit in Game.Core (imported by Game.Combat and transitively by Game.UI)
+        service.update(
+            "core.rs",
+            "module Game.Core;\n"
+            "public class MathUtil {\n"
+            "    public static int Compute(int x) {\n"
+            "        int localFactor = 10;\n"
+            "        return x * localFactor;\n"
+            "    }\n"
+            "}\n",
+            2);
+        const auto fpAfterBodyEdit = service.publicApiFingerprint("Game.Core");
+        require(
+            fpAfterBodyEdit == fpBefore,
+            "Body-only edit must preserve publicApiFingerprint");
+        require(
+            service.lastRebuiltModuleCount() == 1,
+            "Body-only edit in upstream module must only rebuild 1 module (Game.Core), got: " +
+                std::to_string(service.lastRebuiltModuleCount()));
+
+        // Body-only edit with temporary diagnostic inside method body (simulating live typing)
+        service.update(
+            "core.rs",
+            "module Game.Core;\n"
+            "public class MathUtil {\n"
+            "    public static int Compute(int x) {\n"
+            "        int broken = unknownIdentifier;\n"
+            "        return x;\n"
+            "    }\n"
+            "}\n",
+            3);
+        const auto diags = service.diagnostics("core.rs");
+        require(!diags.empty(), "Expected diagnostic for unknownIdentifier in core.rs");
+        require(
+            service.publicApiFingerprint("Game.Core") == fpBefore &&
+                service.lastRebuiltModuleCount() == 1,
+            "Body-only error in upstream module must still short-circuit downstream modules");
+    }
+
+    // 3. P2-3: Deterministic Host Async Request Bridge (createAsyncRequest / completeAsyncRequest + yield wait_async)
+    {
+        auto host = std::make_shared<game::GameplayHost>(20);
+        game::GameApi api;
+        require(game::installGameplayBindings(api, host), "installGameplayBindings failed");
+
+        game::GameScriptCompiler bootstrapCompiler(api);
+        auto bootstrap = bootstrapCompiler.compile({{"empty.rs", "module Empty; void Main() {}"}});
+        game::ScriptRuntime boundRuntime(bootstrap.program);
+        game::SceneScriptRuntime activeScene(boundRuntime);
+        require(
+            game::installSceneComponentBindings(api, activeScene),
+            "installSceneComponentBindings failed");
+
+        const char* asyncSrc = R"RS(
+module Game.P2Async;
+import RealScript.Game;
+import RealScript.Scene;
+
+class LevelLoader {
+    public long requestId = 0;
+    public int stage = 0;
+    public int loadedPayload = 0;
+
+    sequence LoadZone(long selfId) {
+        stage = 1;
+        requestId = CreateAsyncRequest("zone_castle.pak");
+        yield wait_async(requestId);
+        loadedPayload = GetAsyncRequestResultInt(requestId);
+        stage = 2;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        auto finalCompiled = compiler.compile({{"p2_async.rs", asyncSrc}});
+        require(
+            finalCompiled.succeeded(),
+            "P2 async script compile failed:\n" + diagnosticsText(finalCompiled.diagnostics));
+        boundRuntime.replaceProgram(finalCompiled.program);
+
+        require(activeScene.attachComponent(1, "Game.P2Async::LevelLoader"), "attach LevelLoader failed");
+        const auto startRes = activeScene.invoke(1, "LoadZone", {runtime::LongValue{1}});
+        require(startRes.succeeded, "LoadZone start failed: " + startRes.error.message);
+
+        auto* loaderObj = activeScene.getComponent(1, "LevelLoader");
+        runtime::RuntimeError err;
+        const auto reqId = std::get<runtime::LongValue>(*boundRuntime.getMember(*loaderObj, "requestId", err)).value;
+        require(
+            reqId > 0 &&
+                std::get<std::int64_t>(*boundRuntime.getMember(*loaderObj, "stage", err)) == 1 &&
+                !activeScene.isAsyncRequestCompleted(static_cast<std::uint64_t>(reqId)),
+            "LevelLoader should suspend at stage 1 waiting on async requestId");
+
+        // Step 2 frames while async request is still pending: sequence must remain at stage 1
+        activeScene.update(0.016);
+        activeScene.update(0.016);
+        require(
+            std::get<std::int64_t>(*boundRuntime.getMember(*loaderObj, "stage", err)) == 1,
+            "LevelLoader must remain suspended before completeAsyncRequest");
+
+        // Host background thread completes the async request; next activeScene.update() flushes it deterministically
+        require(
+            activeScene.completeAsyncRequest(static_cast<std::uint64_t>(reqId), runtime::Value{std::int64_t{777}}),
+            "completeAsyncRequest failed");
+        activeScene.update(0.016);
+        require(
+            std::get<std::int64_t>(*boundRuntime.getMember(*loaderObj, "stage", err)) == 2 &&
+                std::get<std::int64_t>(*boundRuntime.getMember(*loaderObj, "loadedPayload", err)) == 777 &&
+                activeScene.isAsyncRequestCompleted(static_cast<std::uint64_t>(reqId)),
+            "LevelLoader should resume deterministically at frame boundary with loadedPayload == 777");
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -6602,8 +7237,14 @@ int main() {
         testFlatFrameComputedGotoInterpreterCompleteness();
         std::cout << "[24/25] testRsbindHeaderGeneratorAndZeroCopyEcsLongField..." << std::endl;
         testRsbindHeaderGeneratorAndZeroCopyEcsLongField();
-        std::cout << "[25/25] testDapSafepointHotReloadStaticFieldAndLicmHoisting..." << std::endl;
+        std::cout << "[25/26] testDapSafepointHotReloadStaticFieldAndLicmHoisting..." << std::endl;
         testDapSafepointHotReloadStaticFieldAndLicmHoisting();
+        std::cout << "[26/28] testRemediationPhaseAP0Items..." << std::endl;
+        testRemediationPhaseAP0Items();
+        std::cout << "[27/28] testRemediationPhaseBP1Items..." << std::endl;
+        testRemediationPhaseBP1Items();
+        std::cout << "[28/28] testRemediationPhaseCP2Items..." << std::endl;
+        testRemediationPhaseCP2Items();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

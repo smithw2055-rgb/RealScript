@@ -132,6 +132,10 @@ public:
     [[nodiscard]] std::vector<DocumentSymbol> workspaceSymbols(const std::string& query = {});
 
     [[nodiscard]] const compiler::BuildResult& build();
+    [[nodiscard]] std::uint64_t publicApiFingerprint(const std::string& moduleName);
+    [[nodiscard]] std::size_t lastRebuiltModuleCount() const noexcept {
+        return lastRebuiltModuleCount_;
+    }
 
 private:
     struct Document {
@@ -183,7 +187,9 @@ private:
     std::unordered_map<std::string, std::set<std::string>> moduleImports_;
     std::unordered_map<std::string, std::set<std::string>> reverseImports_;
     std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> moduleSymbolSlices_;
+    std::unordered_map<std::string, std::uint64_t> modulePublicFingerprints_;
     std::set<std::string> dirtyPaths_;
+    std::size_t lastRebuiltModuleCount_ = 0;
     bool structuralDirty_ = true;
 
     mutable std::vector<DocumentSymbol> cachedDefinitions_;

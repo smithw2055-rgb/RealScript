@@ -83,6 +83,7 @@ struct State {
     std::size_t valueTop = 0;
     std::array<InlineCallCacheEntry, 64> inlineCallCache;
     std::optional<Value> pendingException;
+    bool exceptionNotifiedDebugger = false;
 };
 
 struct ValueWindow {
@@ -294,12 +295,48 @@ void mergeProfile(State& state) {
     state.profile->merge(profile);
 }
 
+bool notifyDebuggerException(
+    State& state,
+    ErrorCode code,
+    std::string exceptionId,
+    std::string description,
+    bool isUncaught,
+    bool isRuntimeError) {
+    if (!state.debugger || state.exceptionNotifiedDebugger ||
+        code == ErrorCode::ExecutionTerminated || state.debugFrames.empty()) {
+        return true;
+    }
+    auto& topFrame = state.debugFrames.back();
+    if (!topFrame.point && topFrame.function &&
+        !topFrame.function->debugInfo.sequencePoints.empty()) {
+        topFrame.point = &topFrame.function->debugInfo.sequencePoints.front();
+    }
+    if (isUncaught || isRuntimeError) {
+        state.exceptionNotifiedDebugger = true;
+    }
+    return state.debugger->onException(
+        state.debugFrames,
+        state.heap,
+        code,
+        std::move(exceptionId),
+        std::move(description),
+        isUncaught,
+        isRuntimeError);
+}
+
 bool fail(State& state, ErrorCode code, std::string message) {
     state.error.code = code;
     state.error.message = std::move(message);
     state.error.stackTrace = materializeStack(state.stack);
     std::reverse(state.error.stackTrace.begin(), state.error.stackTrace.end());
     emitTrace(state, TraceEventKind::RuntimeError, 0, state.error.message);
+    notifyDebuggerException(
+        state,
+        code,
+        std::string(errorCodeName(code)),
+        state.error.message,
+        true,
+        true);
     return false;
 }
 
@@ -994,6 +1031,13 @@ bool executeCall(
         }
         state.error.stackTrace = materializeStack(state.stack);
         std::reverse(state.error.stackTrace.begin(), state.error.stackTrace.end());
+        notifyDebuggerException(
+            state,
+            state.error.code,
+            std::string(errorCodeName(state.error.code)),
+            state.error.message,
+            true,
+            true);
         return false;
     }
     if (!expectSignatureType(
@@ -2646,6 +2690,101 @@ bool executeFunction(
         }
     }
 
+    if (state.fastAccounting && execution->directNativeReference != nullptr) {
+        const std::uint64_t cost = execution->nativeForwarderInstructionCost;
+        if (state.executed > state.limits.instructionBudget ||
+            cost > state.limits.instructionBudget - state.executed) {
+            state.executed = state.limits.instructionBudget;
+            return fail(state, ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
+        }
+        state.executed += cost;
+        ++state.statistics.functionCalls;
+        ++state.statistics.externalCalls;
+        if (state.stack.size() + 1 > state.statistics.maximumCallDepth) {
+            state.statistics.maximumCallDepth = state.stack.size() + 1;
+        }
+
+        const auto& reference = *execution->directNativeReference;
+        std::array<Value, 8> stackArguments{};
+        std::vector<Value> heapArguments;
+        ValueSpan argSpan;
+        if (arguments.empty()) {
+            argSpan = ValueSpan(nullptr, 0);
+        } else if (!arguments.indices) {
+            argSpan = ValueSpan(
+                arguments.values->data() + arguments.offset,
+                arguments.count);
+        } else if (arguments.count == 1) {
+            argSpan = ValueSpan(
+                arguments.values->data() + arguments.offset + arguments.indices[0],
+                1);
+        } else {
+            bool contiguous = true;
+            const auto firstIndex = arguments.indices[0];
+            for (std::size_t index = 1; index < arguments.count; ++index) {
+                if (arguments.indices[index] != firstIndex + index) {
+                    contiguous = false;
+                    break;
+                }
+            }
+            if (contiguous) {
+                argSpan = ValueSpan(
+                    arguments.values->data() + arguments.offset + firstIndex,
+                    arguments.count);
+            } else if (arguments.count <= stackArguments.size()) {
+                for (std::size_t index = 0; index < arguments.count; ++index) {
+                    stackArguments[index] = arguments[index];
+                }
+                argSpan = ValueSpan(stackArguments.data(), arguments.count);
+            } else {
+                heapArguments.reserve(arguments.count);
+                for (std::size_t index = 0; index < arguments.count; ++index) {
+                    heapArguments.push_back(arguments[index]);
+                }
+                argSpan = ValueSpan(heapArguments);
+            }
+        }
+
+        RuntimeError externalError;
+        std::optional<Value> externalResult;
+        const ExternalFunction* fallback =
+            state.externalResolver && *state.externalResolver
+            ? state.externalResolver
+            : nullptr;
+        if (!state.determinism.invokeExternal(
+                state.bindings,
+                fallback,
+                reference,
+                argSpan,
+                externalResult,
+                externalError)) {
+            state.stack.push_back(&location.qualifiedName);
+            state.error = std::move(externalError);
+            if (state.error.code == ErrorCode::None) {
+                state.error.code = ErrorCode::ExternalFunctionUnresolved;
+                state.error.message = "external function '" + reference.name + "' failed";
+            }
+            state.error.stackTrace = materializeStack(state.stack);
+            std::reverse(state.error.stackTrace.begin(), state.error.stackTrace.end());
+            state.stack.pop_back();
+            return false;
+        }
+        if (function.returnType == semantic::PrimitiveType::Void) {
+            result = std::monostate{};
+            return true;
+        }
+        if (!expectSignatureType(
+                state,
+                *externalResult,
+                function.returnType,
+                function.returnTypeId,
+                "external return value")) {
+            return false;
+        }
+        result = std::move(*externalResult);
+        return true;
+    }
+
     if (state.fastAccounting && execution->canUseFlatFastPath) {
 #if defined(__GNUC__) || defined(__clang__)
         #define RS_FLAT_LIKELY(x) __builtin_expect(!!(x), 1)
@@ -3776,6 +3915,9 @@ L_FlatError:
 
     while (true) {
         const auto& bytecodeBlock = *block->bytecode;
+        if (state.debugger && !state.debugFrames.empty()) {
+            state.debugFrames.back().activeBlockId = bytecodeBlock.id;
+        }
         bool exceptionTransferred = false;
         for (std::size_t instructionIndex = 0;
              instructionIndex < block->instructions.size();
@@ -3870,9 +4012,77 @@ L_FlatError:
         if (terminator.kind == bytecode::TerminatorKind::Throw) {
             if (terminator.value >= registers.size() ||
                 !std::holds_alternative<ObjectRef>(registers[terminator.value])) {
-                state.stack.pop_back();
-                return fail(state, ErrorCode::NullReference,
+                const bool failed = fail(state, ErrorCode::NullReference,
                     "throw requires a non-null script object");
+                state.stack.pop_back();
+                return failed;
+            }
+            if (state.debugger) {
+                const auto excRef = std::get<ObjectRef>(registers[terminator.value]);
+                const auto actualTypeId = state.heap
+                    ? state.heap->objectTypeId(excRef)
+                    : std::optional<semantic::SymbolId>{};
+                const auto* typeDesc = actualTypeId && state.program
+                    ? state.program->resolveType(*actualTypeId)
+                    : nullptr;
+                std::string excTypeName = typeDesc && !typeDesc->name.empty()
+                    ? typeDesc->name
+                    : "Exception";
+                std::string excDescription = excTypeName;
+                if (typeDesc && state.heap) {
+                    for (std::size_t fieldIdx = 0; fieldIdx < typeDesc->fields.size(); ++fieldIdx) {
+                        if (typeDesc->fields[fieldIdx].type == semantic::PrimitiveType::String) {
+                            const auto fieldVal = state.heap->fieldGet(excRef, fieldIdx);
+                            if (fieldVal && !std::holds_alternative<NullString>(*fieldVal) &&
+                                !std::holds_alternative<std::monostate>(*fieldVal)) {
+                                const auto msg = valueToString(*fieldVal, state.heap);
+                                if (!msg.empty()) {
+                                    excDescription = excTypeName + ": " + msg;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                bool isUncaught = true;
+                if (actualTypeId) {
+                    for (auto frameIt = state.debugFrames.rbegin();
+                         frameIt != state.debugFrames.rend();
+                         ++frameIt) {
+                        if (!frameIt->function) continue;
+                        bool frameCatches = false;
+                        for (const auto& handler : frameIt->function->exceptionHandlers) {
+                            if (std::find(
+                                    handler.protectedBlocks.begin(),
+                                    handler.protectedBlocks.end(),
+                                    frameIt->activeBlockId) ==
+                                handler.protectedBlocks.end()) {
+                                continue;
+                            }
+                            if (handler.catchTypeId != 0 &&
+                                !runtimeAssignable(state, *actualTypeId, handler.catchTypeId)) {
+                                continue;
+                            }
+                            frameCatches = true;
+                            break;
+                        }
+                        if (frameCatches) {
+                            isUncaught = false;
+                            break;
+                        }
+                    }
+                }
+                if (!notifyDebuggerException(
+                        state,
+                        ErrorCode::ScriptException,
+                        std::move(excTypeName),
+                        std::move(excDescription),
+                        isUncaught,
+                        false)) {
+                    state.stack.pop_back();
+                    return fail(state, ErrorCode::ExecutionTerminated,
+                        "execution terminated by debugger");
+                }
             }
             state.pendingException = registers[terminator.value];
             if (const auto* handler = routePendingException(bytecodeBlock.id)) {

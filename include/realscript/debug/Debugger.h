@@ -23,6 +23,7 @@ enum class StopReason {
     Breakpoint,
     Step,
     Pause,
+    Exception,
 };
 
 enum class ResumeMode {
@@ -67,6 +68,10 @@ struct DebugStop {
     StopReason reason = StopReason::Breakpoint;
     std::uint32_t breakpointId = 0;
     std::vector<DebugStackFrame> frames;
+    runtime::ErrorCode errorCode = runtime::ErrorCode::None;
+    std::string exceptionId;
+    std::string exceptionDescription;
+    bool exceptionUncaught = true;
 };
 
 struct DebugValueWindow {
@@ -90,6 +95,7 @@ struct DebugFrameView {
     DebugValueWindow arguments;
     DebugValueWindow locals;
     DebugValueWindow registers;
+    bytecode::BlockId activeBlockId = 0;
 };
 
 using StopHandler = std::function<ResumeMode(const DebugStop&)>;
@@ -111,6 +117,13 @@ public:
 
     void setStopHandler(StopHandler handler);
     void stopOnEntry(bool enabled) noexcept;
+    void setExceptionBreakpoints(
+        bool breakOnThrown,
+        bool breakOnUncaught,
+        bool breakOnRuntimeError = false) noexcept;
+    [[nodiscard]] bool breakOnThrown() const noexcept;
+    [[nodiscard]] bool breakOnUncaught() const noexcept;
+    [[nodiscard]] bool breakOnRuntimeError() const noexcept;
     void requestPause() noexcept;
     void resetTermination() noexcept;
     [[nodiscard]] std::string resolveSourcePath(const std::string& enginePath) const;
@@ -118,6 +131,14 @@ public:
     [[nodiscard]] bool onSequencePoint(
         const std::vector<DebugFrameView>& frames,
         runtime::ManagedHeap* heap);
+    [[nodiscard]] bool onException(
+        const std::vector<DebugFrameView>& frames,
+        runtime::ManagedHeap* heap,
+        runtime::ErrorCode code,
+        std::string exceptionId,
+        std::string description,
+        bool isUncaught,
+        bool isRuntimeError);
 
     [[nodiscard]] std::optional<runtime::Value> evaluate(
         const std::string& expression,
@@ -179,6 +200,9 @@ private:
     SourceRange lastBreakpointLocation_;
     bool stopOnEntry_ = false;
     bool entryPending_ = false;
+    bool breakOnThrown_ = false;
+    bool breakOnUncaught_ = false;
+    bool breakOnRuntimeError_ = false;
     std::atomic<bool> pauseRequested_{false};
     bool terminated_ = false;
     std::uint32_t nextBreakpointId_ = 1;

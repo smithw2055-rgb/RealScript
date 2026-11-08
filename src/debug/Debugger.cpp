@@ -798,6 +798,31 @@ void DebugController::stopOnEntry(bool enabled) noexcept {
     entryPending_ = enabled;
 }
 
+void DebugController::setExceptionBreakpoints(
+    bool breakOnThrown,
+    bool breakOnUncaught,
+    bool breakOnRuntimeError) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    breakOnThrown_ = breakOnThrown;
+    breakOnUncaught_ = breakOnUncaught;
+    breakOnRuntimeError_ = breakOnRuntimeError;
+}
+
+bool DebugController::breakOnThrown() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return breakOnThrown_;
+}
+
+bool DebugController::breakOnUncaught() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return breakOnUncaught_;
+}
+
+bool DebugController::breakOnRuntimeError() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return breakOnRuntimeError_;
+}
+
 void DebugController::requestPause() noexcept {
     pauseRequested_.store(true);
 }
@@ -1157,6 +1182,80 @@ bool DebugController::onSequencePoint(
     return true;
 }
 
+bool DebugController::onException(
+    const std::vector<DebugFrameView>& frames,
+    runtime::ManagedHeap* heap,
+    runtime::ErrorCode code,
+    std::string exceptionId,
+    std::string description,
+    bool isUncaught,
+    bool isRuntimeError) {
+    if (frames.empty() || !frames.back().module) return true;
+    StopHandler handler;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        lastHeap_ = heap;
+        if (terminated_) return false;
+        const bool shouldBreak =
+            breakOnThrown_ ||
+            (isUncaught && breakOnUncaught_) ||
+            (isRuntimeError && breakOnRuntimeError_);
+        if (!shouldBreak) return true;
+        lastStop_ = capture(StopReason::Exception, 0, frames, heap);
+        lastStop_.errorCode = code;
+        lastStop_.exceptionId = std::move(exceptionId);
+        lastStop_.exceptionDescription = std::move(description);
+        lastStop_.exceptionUncaught = isUncaught;
+        activeFrameViews_ = &frames;
+        handler = stopHandler_;
+    }
+
+    const auto tid = std::this_thread::get_id();
+    bool incrementedStopped = false;
+    {
+        std::lock_guard<std::mutex> spLock(safepointMutex_);
+        auto it = activeThreads_.find(tid);
+        if (it != activeThreads_.end()) {
+            if (!it->second.stopped) {
+                it->second.stopped = true;
+                ++stoppedThreads_;
+                incrementedStopped = true;
+            }
+        } else {
+            ++stoppedThreads_;
+            incrementedStopped = true;
+        }
+        safepointCv_.notify_all();
+    }
+    const auto next = handler ? handler(lastStop_) : ResumeMode::Continue;
+    {
+        std::unique_lock<std::mutex> spLock(safepointMutex_);
+        safepointCv_.wait(spLock, [this] {
+            return !safepointRequested_.load(std::memory_order_relaxed) && !safepointActive_;
+        });
+        if (incrementedStopped) {
+            auto itAfter = activeThreads_.find(tid);
+            if (itAfter != activeThreads_.end()) {
+                itAfter->second.stopped = false;
+            }
+            if (stoppedThreads_ > 0) --stoppedThreads_;
+        }
+        safepointCv_.notify_all();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        activeFrameViews_ = nullptr;
+        mode_ = next;
+        stepDepth_ = frames.size();
+        if (next == ResumeMode::Terminate) {
+            terminated_ = true;
+            return false;
+        }
+    }
+    return true;
+}
+
 DebugStop DebugController::lastStop() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return lastStop_;
@@ -1254,6 +1353,7 @@ const char* stopReasonName(StopReason reason) noexcept {
     case StopReason::Breakpoint: return "breakpoint";
     case StopReason::Step: return "step";
     case StopReason::Pause: return "pause";
+    case StopReason::Exception: return "exception";
     }
     return "unknown";
 }

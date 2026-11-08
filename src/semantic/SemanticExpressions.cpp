@@ -3194,6 +3194,28 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
         call->arguments.push_back(std::move(arg));
         return call;
     }
+    if (syntaxTree.identifierToken.text == "__rs_array_sort_range" &&
+        syntaxTree.arguments.size() == 2 &&
+        syntaxTree.typeArguments.empty()) {
+        auto arrArg = bindExpression(*syntaxTree.arguments[0]);
+        auto countArg = convertExpression(
+            bindExpression(*syntaxTree.arguments[1]),
+            PrimitiveType::Int,
+            syntaxTree.arguments[1]->span(),
+            "sort count");
+        const auto arrTypeName = arrArg->typeName;
+        auto call = std::make_unique<BoundCallExpression>();
+        call->span = syntaxTree.span();
+        call->type = PrimitiveType::Void;
+        call->function = makeIntrinsicFunction(
+            "$intrinsic::array_sort_range::" + arrTypeName,
+            PrimitiveType::Void,
+            "",
+            {{PrimitiveType::Array, arrTypeName}, {PrimitiveType::Int, ""}});
+        call->arguments.push_back(std::move(arrArg));
+        call->arguments.push_back(std::move(countArg));
+        return call;
+    }
     if ((syntaxTree.identifierToken.text == "checked" ||
          syntaxTree.identifierToken.text == "unchecked") &&
         syntaxTree.arguments.size() == 1 &&
@@ -3736,21 +3758,82 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
     }
     if (!staticCall) {
         receiver = bindExpression(*syntaxTree.receiver);
-        if (receiver->type == PrimitiveType::Array &&
-            (syntaxTree.nameToken.text == "Length" ||
-             syntaxTree.nameToken.text == "Count") &&
-            arguments.empty()) {
-            auto result = std::make_unique<BoundArrayLengthExpression>();
-            result->span = syntaxTree.span();
-            result->type = PrimitiveType::Int;
-            result->receiver = std::move(receiver);
-            return applyNullConditional(
-                std::move(result), syntaxTree.dotToken, syntaxTree.span());
+        if (receiver->type == PrimitiveType::Array) {
+            const auto& methodName = syntaxTree.nameToken.text;
+            if ((methodName == "Length" || methodName == "Count") &&
+                arguments.empty()) {
+                auto result = std::make_unique<BoundArrayLengthExpression>();
+                result->span = syntaxTree.span();
+                result->type = PrimitiveType::Int;
+                result->receiver = std::move(receiver);
+                return applyNullConditional(
+                    std::move(result), syntaxTree.dotToken, syntaxTree.span());
+            }
+            PrimitiveType elemType = PrimitiveType::Error;
+            std::string elemTypeName;
+            if (decodeArrayTypeName(receiver->typeName, elemType, elemTypeName)) {
+                if (!elemTypeName.empty()) {
+                    const auto foundElem = visibleTypes_.find(elemTypeName);
+                    if (foundElem != visibleTypes_.end()) {
+                        elemType = foundElem->second.kind == TypeKind::Class
+                            ? PrimitiveType::Object
+                            : (foundElem->second.kind == TypeKind::Struct
+                                ? PrimitiveType::Struct
+                                : PrimitiveType::Enum);
+                    }
+                }
+                std::string intrinsicName;
+                PrimitiveType returnType = PrimitiveType::Error;
+                std::vector<std::pair<PrimitiveType, std::string>> expectedParams;
+                if (methodName == "IndexOf" && arguments.size() == 1) {
+                    intrinsicName = "$intrinsic::array_index_of::" + receiver->typeName;
+                    returnType = PrimitiveType::Int;
+                    expectedParams = {{elemType, elemTypeName}};
+                } else if (methodName == "LastIndexOf" && arguments.size() == 1) {
+                    intrinsicName = "$intrinsic::array_last_index_of::" + receiver->typeName;
+                    returnType = PrimitiveType::Int;
+                    expectedParams = {{elemType, elemTypeName}};
+                } else if (methodName == "Contains" && arguments.size() == 1) {
+                    intrinsicName = "$intrinsic::array_contains::" + receiver->typeName;
+                    returnType = PrimitiveType::Bool;
+                    expectedParams = {{elemType, elemTypeName}};
+                } else if (methodName == "Reverse" && arguments.empty()) {
+                    intrinsicName = "$intrinsic::array_reverse::" + receiver->typeName;
+                    returnType = PrimitiveType::Void;
+                } else if (methodName == "Sort" && arguments.empty()) {
+                    intrinsicName = "$intrinsic::array_sort::" + receiver->typeName;
+                    returnType = PrimitiveType::Void;
+                }
+                if (!intrinsicName.empty()) {
+                    std::vector<std::pair<PrimitiveType, std::string>> fullParams;
+                    fullParams.push_back({PrimitiveType::Array, receiver->typeName});
+                    for (const auto& p : expectedParams) fullParams.push_back(p);
+                    auto call = std::make_unique<BoundCallExpression>();
+                    call->span = syntaxTree.span();
+                    call->type = returnType;
+                    call->function = makeIntrinsicFunction(
+                        intrinsicName, returnType, "", fullParams);
+                    call->function.method = true;
+                    call->function.staticMethod = false;
+                    call->arguments.push_back(std::move(receiver));
+                    for (std::size_t i = 0; i < arguments.size(); ++i) {
+                        call->arguments.push_back(convertExpression(
+                            std::move(arguments[i]),
+                            expectedParams[i].first,
+                            syntaxTree.arguments[i]->span(),
+                            "array method argument",
+                            expectedParams[i].second));
+                    }
+                    return applyNullConditional(
+                        std::move(call), syntaxTree.dotToken, syntaxTree.span());
+                }
+            }
         }
         if (receiver->type == PrimitiveType::String) {
             const auto& methodName = syntaxTree.nameToken.text;
             std::string intrinsicName;
             PrimitiveType returnType = PrimitiveType::Error;
+            std::string returnTypeName;
             std::vector<std::pair<PrimitiveType, std::string>> expectedParams;
             if ((methodName == "Length" || methodName == "Count") && arguments.empty()) {
                 intrinsicName = "$intrinsic::string_length";
@@ -3774,6 +3857,10 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
                 intrinsicName = "$intrinsic::string_index_of";
                 returnType = PrimitiveType::Int;
                 expectedParams = {{PrimitiveType::String, ""}};
+            } else if (methodName == "LastIndexOf" && arguments.size() == 1) {
+                intrinsicName = "$intrinsic::string_last_index_of";
+                returnType = PrimitiveType::Int;
+                expectedParams = {{PrimitiveType::String, ""}};
             } else if (methodName == "Substring" && arguments.size() == 1) {
                 intrinsicName = "$intrinsic::string_substring_1";
                 returnType = PrimitiveType::String;
@@ -3785,6 +3872,12 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
             } else if (methodName == "Trim" && arguments.empty()) {
                 intrinsicName = "$intrinsic::string_trim";
                 returnType = PrimitiveType::String;
+            } else if (methodName == "TrimStart" && arguments.empty()) {
+                intrinsicName = "$intrinsic::string_trim_start";
+                returnType = PrimitiveType::String;
+            } else if (methodName == "TrimEnd" && arguments.empty()) {
+                intrinsicName = "$intrinsic::string_trim_end";
+                returnType = PrimitiveType::String;
             } else if (methodName == "Replace" && arguments.size() == 2) {
                 intrinsicName = "$intrinsic::string_replace";
                 returnType = PrimitiveType::String;
@@ -3795,6 +3888,11 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
             } else if (methodName == "ToLower" && arguments.empty()) {
                 intrinsicName = "$intrinsic::string_to_lower";
                 returnType = PrimitiveType::String;
+            } else if (methodName == "Split" && arguments.size() == 1) {
+                intrinsicName = "$intrinsic::string_split";
+                returnType = PrimitiveType::Array;
+                returnTypeName = arrayTypeName(PrimitiveType::String, "");
+                expectedParams = {{PrimitiveType::String, ""}};
             }
             if (!intrinsicName.empty()) {
                 std::vector<std::pair<PrimitiveType, std::string>> fullParams;
@@ -3803,8 +3901,9 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
                 auto call = std::make_unique<BoundCallExpression>();
                 call->span = syntaxTree.span();
                 call->type = returnType;
+                call->typeName = returnTypeName;
                 call->function = makeIntrinsicFunction(
-                    intrinsicName, returnType, "", fullParams);
+                    intrinsicName, returnType, returnTypeName, fullParams);
                 call->function.method = true;
                 call->function.staticMethod = false;
                 call->arguments.push_back(std::move(receiver));
@@ -4554,6 +4653,26 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAccessExpression(
         result->arguments.push_back(std::move(receiver));
         return applyNullConditional(
             std::move(result), syntaxTree.dotToken, syntaxTree.span());
+    }
+    if (syntaxTree.nameToken.text == "Count" ||
+        syntaxTree.nameToken.text == "Length") {
+        auto getterMethods = findMethods(type->second, syntaxTree.nameToken.text, false);
+        if (getterMethods.empty() && syntaxTree.nameToken.text == "Length") {
+            getterMethods = findMethods(type->second, "Count", false);
+        }
+        for (const auto* method : getterMethods) {
+            if (method->parameters.size() == visibleParameterOffset(*method) &&
+                isMemberAccessible(method->accessibility, method->declaringTypeId)) {
+                auto result = std::make_unique<BoundCallExpression>();
+                result->span = syntaxTree.span();
+                result->type = method->returnType;
+                result->typeName = method->returnTypeName;
+                result->function = *method;
+                result->arguments.push_back(std::move(receiver));
+                return applyNullConditional(
+                    std::move(result), syntaxTree.dotToken, syntaxTree.span());
+            }
+        }
     }
     diagnostics_.report("RS2406", "type '" + receiver->typeName + "' has no member '" + syntaxTree.nameToken.text + "'", syntaxTree.nameToken.span);
     return makeError(syntaxTree.span());

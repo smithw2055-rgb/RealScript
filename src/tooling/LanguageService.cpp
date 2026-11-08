@@ -310,12 +310,24 @@ const compiler::BuildResult& LanguageService::build() {
     return result_;
 }
 
+std::uint64_t LanguageService::publicApiFingerprint(const std::string& moduleName) {
+    if (dirty_) rebuild();
+    const auto it = modulePublicFingerprints_.find(moduleName);
+    return it != modulePublicFingerprints_.end() ? it->second : 0;
+}
+
 void LanguageService::recordFullBuildGraph() {
     docHeaders_.clear();
     moduleToPaths_.clear();
     moduleImports_.clear();
     reverseImports_.clear();
     moduleSymbolSlices_.clear();
+    modulePublicFingerprints_.clear();
+    lastRebuiltModuleCount_ = 0;
+    for (const auto& bi : result_.buildInfo) {
+        modulePublicFingerprints_[bi.name] = bi.publicFingerprint;
+        if (!bi.reused) ++lastRebuiltModuleCount_;
+    }
 
     for (const auto& [path, doc] : ambientDocuments_) {
         if (documents_.find(path) != documents_.end()) continue;
@@ -447,26 +459,29 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
     const bool hasDownstreamImporters =
         (revIt != reverseImports_.end() && !revIt->second.empty());
     if (hasDownstreamImporters) {
-        if (subResult.diagnostics.hasErrors()) return false;
+        const auto oldFpIt = modulePublicFingerprints_.find(dirtyMod);
         const auto snapOld = snapshot_.modules.find(dirtyMod);
-        const auto snapNew = subResult.snapshot.modules.find(dirtyMod);
-        if (snapOld == snapshot_.modules.end() ||
-            snapNew == subResult.snapshot.modules.end() ||
-            snapOld->second.publicFingerprint != snapNew->second.publicFingerprint ||
-            snapOld->second.module.languageMetadata.genericInstantiations.size() !=
-                snapNew->second.module.languageMetadata.genericInstantiations.size()) {
+        if (oldFpIt == modulePublicFingerprints_.end() ||
+            snapOld == snapshot_.modules.end() ||
+            oldFpIt->second != newBuildInfo->publicFingerprint) {
             return false;
+        }
+        if (const auto snapNew = subResult.snapshot.modules.find(dirtyMod);
+            snapNew != subResult.snapshot.modules.end()) {
+            if (snapOld->second.module.languageMetadata.genericInstantiations.size() !=
+                snapNew->second.module.languageMetadata.genericInstantiations.size()) {
+                return false;
+            }
         }
     }
 
-    // 1. Update snapshot_.modules[dirtyMod]
+    // 1. Update snapshot_.modules[dirtyMod] and modulePublicFingerprints_[dirtyMod]
+    modulePublicFingerprints_[dirtyMod] = newBuildInfo->publicFingerprint;
     if (auto snapNew = subResult.snapshot.modules.find(dirtyMod);
         snapNew != subResult.snapshot.modules.end()) {
         snapshot_.modules[dirtyMod] = std::move(snapNew->second);
     } else if (!hasDownstreamImporters) {
         snapshot_.modules.erase(dirtyMod);
-    } else {
-        return false;
     }
 
     // 2. Update result_.modules for dirtyMod
@@ -492,6 +507,7 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
     }
 
     // 3. Update result_.buildInfo
+    lastRebuiltModuleCount_ = 1;
     for (auto& bi : result_.buildInfo) {
         if (bi.name != dirtyMod) {
             bi.reused = true;
@@ -508,8 +524,12 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
         }
     }
     for (const auto& item : subResult.diagnostics.items()) {
-        if (dirtyModPaths.find(item.sourceName) != dirtyModPaths.end()) {
-            mergedDiags.report(item.code, item.message, item.span, item.severity, item.sourceName);
+        const std::string effectiveSource =
+            (!item.sourceName.empty() || dirtyModPaths.size() != 1)
+                ? item.sourceName
+                : *dirtyModPaths.begin();
+        if (effectiveSource.empty() || dirtyModPaths.find(effectiveSource) != dirtyModPaths.end()) {
+            mergedDiags.report(item.code, item.message, item.span, item.severity, effectiveSource);
         }
     }
     result_.diagnostics = std::move(mergedDiags);

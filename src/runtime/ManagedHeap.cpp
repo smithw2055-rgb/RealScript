@@ -188,20 +188,55 @@ struct ManagedHeap::Impl {
     };
 
     struct HeapObject {
+        static constexpr std::size_t InlineFieldCapacity = 4;
         Header header;
+        std::array<Value, InlineFieldCapacity> inlineValues{};
+        std::uint8_t inlineValueCount = 0;
+        bool usesInlineValues = false;
         std::vector<Value> values;
         std::string stringPayload;
         std::shared_ptr<const std::vector<std::size_t>> referenceFields;
         std::optional<NativeRawColumnView> rawColumnView;
 
+        [[nodiscard]] std::size_t valueCount() const noexcept {
+            return usesInlineValues
+                ? static_cast<std::size_t>(inlineValueCount)
+                : values.size();
+        }
+        [[nodiscard]] const Value& valueAt(std::size_t index) const noexcept {
+            return usesInlineValues ? inlineValues[index] : values[index];
+        }
+        [[nodiscard]] Value& valueAt(std::size_t index) noexcept {
+            return usesInlineValues ? inlineValues[index] : values[index];
+        }
+        void clearValues() noexcept {
+            if (usesInlineValues) {
+                for (std::uint8_t i = 0; i < inlineValueCount; ++i) {
+                    inlineValues[i] = Value{};
+                }
+                inlineValueCount = 0;
+                usesInlineValues = false;
+            }
+            values.clear();
+        }
+
         void reset() noexcept {
             header = Header{};
-            values.clear(); // Retain capacity in slot pool to avoid malloc/free churn!
+            clearValues(); // Retain capacity in slot pool to avoid malloc/free churn!
             stringPayload.clear();
             referenceFields.reset();
             rawColumnView.reset();
         }
     };
+
+    struct LegacyHeapObjectLayout {
+        Header header;
+        std::vector<Value> values;
+        std::string stringPayload;
+        std::shared_ptr<const std::vector<std::size_t>> referenceFields;
+        std::optional<NativeRawColumnView> rawColumnView;
+    };
+    static constexpr std::size_t BaseObjectSizeBytes = sizeof(LegacyHeapObjectLayout);
 
     struct InlineSlotObjectPtr {
         HeapObject storage{};
@@ -276,8 +311,9 @@ struct ManagedHeap::Impl {
         }
         for (const auto& slot : slots) {
             if (!slot.object) continue;
-            for (const auto& v : slot.object->values) {
-                markValueInPools(v);
+            const auto count = slot.object->valueCount();
+            for (std::size_t i = 0; i < count; ++i) {
+                markValueInPools(slot.object->valueAt(i));
             }
         }
     }
@@ -397,7 +433,7 @@ struct ManagedHeap::Impl {
         const auto slotIndex = acquireSlot(sizeBytes, error);
         if (!slotIndex) return std::nullopt;
         auto& object = slots[*slotIndex].object.storage;
-        object.values.clear();
+        object.clearValues();
         object.stringPayload = std::move(value);
         return finalizeSlotAllocation(
             *slotIndex, ObjectKind::String, 0,
@@ -415,6 +451,7 @@ struct ManagedHeap::Impl {
         const auto slotIndex = acquireSlot(sizeBytes, error);
         if (!slotIndex) return std::nullopt;
         auto& object = slots[*slotIndex].object.storage;
+        object.clearValues();
         object.stringPayload.clear();
         // Reuse existing vector capacity in-place without malloc/free!
         pinValueInPools(initialValue);
@@ -438,10 +475,30 @@ struct ManagedHeap::Impl {
         auto& object = slots[*slotIndex].object.storage;
         object.stringPayload.clear();
         for (const auto& v : vals) pinValueInPools(v);
-        if (object.values.capacity() >= vals.size()) {
-            object.values.assign(vals.begin(), vals.end());
+        if (kind == ObjectKind::Record &&
+            vals.size() <= HeapObject::InlineFieldCapacity) {
+            object.values.clear();
+            object.usesInlineValues = true;
+            object.inlineValueCount = static_cast<std::uint8_t>(vals.size());
+            for (std::size_t i = 0; i < vals.size(); ++i) {
+                object.inlineValues[i] = std::move(vals[i]);
+            }
+            for (std::size_t i = vals.size(); i < HeapObject::InlineFieldCapacity; ++i) {
+                object.inlineValues[i] = Value{};
+            }
         } else {
-            object.values = std::move(vals);
+            if (object.usesInlineValues) {
+                for (std::uint8_t i = 0; i < object.inlineValueCount; ++i) {
+                    object.inlineValues[i] = Value{};
+                }
+                object.inlineValueCount = 0;
+                object.usesInlineValues = false;
+            }
+            if (object.values.capacity() >= vals.size()) {
+                object.values.assign(vals.begin(), vals.end());
+            } else {
+                object.values = std::move(vals);
+            }
         }
         return finalizeSlotAllocation(
             *slotIndex, kind, typeId, elementType, elementTypeId,
@@ -526,14 +583,14 @@ struct ManagedHeap::Impl {
     void scan(ObjectRef reference) {
         const auto* object = get(reference);
         if (!object || object->header.kind == ObjectKind::String) return;
-        const auto& values = object->values;
+        const auto count = object->valueCount();
         if (object->header.kind == ObjectKind::Array) {
-            for (const auto& value : values) markValue(value);
+            for (std::size_t i = 0; i < count; ++i) markValue(object->valueAt(i));
             return;
         }
         if (object->referenceFields) {
             for (const auto index : *object->referenceFields) {
-                if (index < values.size()) markValue(values[index]);
+                if (index < count) markValue(object->valueAt(index));
             }
         }
     }
@@ -596,7 +653,7 @@ ManagedHeap& ManagedHeap::operator=(ManagedHeap&&) noexcept = default;
 std::optional<ObjectRef> ManagedHeap::allocateString(
     std::string value,
     RuntimeError* error) {
-    const auto size = sizeof(Impl::HeapObject) + value.size();
+    const auto size = Impl::BaseObjectSizeBytes + value.size();
     return impl_->allocateStringSlot(std::move(value), size, error);
 }
 
@@ -691,7 +748,7 @@ std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
         elementTypeId,
         length,
         initialValue,
-        sizeof(Impl::HeapObject) + storage,
+        Impl::BaseObjectSizeBytes + storage,
         error);
 }
 
@@ -715,7 +772,7 @@ std::optional<ObjectRef> ManagedHeap::allocateRecord(
         0,
         std::move(fields),
         std::make_shared<const std::vector<std::size_t>>(std::move(referenceFields)),
-        sizeof(Impl::HeapObject) + storage,
+        Impl::BaseObjectSizeBytes + storage,
         error);
 }
 
@@ -761,7 +818,7 @@ std::optional<ObjectRef> ManagedHeap::allocateObject(
         0,
         std::move(fields),
         std::move(sharedRefs),
-        sizeof(Impl::HeapObject) + storage,
+        Impl::BaseObjectSizeBytes + storage,
         error);
 }
 
@@ -1213,15 +1270,20 @@ std::optional<semantic::SymbolId> ManagedHeap::objectTypeId(
 std::optional<std::size_t> ManagedHeap::fieldCount(ObjectRef reference) const {
     const auto* object = impl_->get(reference);
     if (!object || object->header.kind != ObjectKind::Record) return std::nullopt;
-    return object->values.size();
+    return object->valueCount();
+}
+
+bool ManagedHeap::isInlineRecordObject(ObjectRef reference) const noexcept {
+    const auto* object = impl_->get(reference);
+    return object && object->header.kind == ObjectKind::Record &&
+        object->usesInlineValues;
 }
 
 std::optional<Value> ManagedHeap::fieldGet(ObjectRef reference, std::size_t index) const {
     const auto* object = impl_->get(reference);
     if (!object || object->header.kind != ObjectKind::Record) return std::nullopt;
-    const auto& fields = object->values;
-    if (index >= fields.size()) return std::nullopt;
-    return fields[index];
+    if (index >= object->valueCount()) return std::nullopt;
+    return object->valueAt(index);
 }
 
 bool ManagedHeap::fieldSet(
@@ -1235,8 +1297,7 @@ bool ManagedHeap::fieldSet(
             "managed record reference is invalid");
         return false;
     }
-    auto& fields = object->values;
-    if (index >= fields.size()) {
+    if (index >= object->valueCount()) {
         setHeapError(error, ErrorCode::InvalidArguments,
             "managed field index is out of range");
         return false;
@@ -1249,7 +1310,7 @@ bool ManagedHeap::fieldSet(
         impl_->writeBarrier(reference, value);
     }
     pinValueInPools(value);
-    fields[index] = std::move(value);
+    object->valueAt(index) = std::move(value);
     return true;
 }
 
@@ -1473,10 +1534,10 @@ std::optional<ObjectRef> ManagedHeap::allocateRawColumnArray(
             "raw ECS column view metadata is invalid");
         return std::nullopt;
     }
-    const auto slotIndex = impl_->acquireSlot(sizeof(Impl::HeapObject), error);
+    const auto slotIndex = impl_->acquireSlot(Impl::BaseObjectSizeBytes, error);
     if (!slotIndex) return std::nullopt;
     auto& object = impl_->slots[*slotIndex].object.storage;
-    object.values.clear();
+    object.clearValues();
     object.stringPayload.clear();
     object.rawColumnView = std::move(view);
     return impl_->finalizeSlotAllocation(
@@ -1486,7 +1547,7 @@ std::optional<ObjectRef> ManagedHeap::allocateRawColumnArray(
         semantic::PrimitiveType::Struct,
         elementTypeId,
         nullptr,
-        sizeof(Impl::HeapObject));
+        Impl::BaseObjectSizeBytes);
 }
 
 bool ManagedHeap::updateRawColumnArray(
@@ -1738,12 +1799,12 @@ std::size_t ManagedHeap::collectYoung(
     for (const auto& oldRef : impl_->rememberedSet) {
         const auto* oldObj = impl_->get(oldRef);
         if (!oldObj || oldObj->header.kind == ObjectKind::String) continue;
-        const auto& values = oldObj->values;
+        const auto count = oldObj->valueCount();
         if (oldObj->header.kind == ObjectKind::Array) {
-            for (const auto& v : values) markYoungValue(markYoungValue, v);
+            for (std::size_t i = 0; i < count; ++i) markYoungValue(markYoungValue, oldObj->valueAt(i));
         } else if (oldObj->referenceFields) {
             for (const auto idx : *oldObj->referenceFields) {
-                if (idx < values.size()) markYoungValue(markYoungValue, values[idx]);
+                if (idx < count) markYoungValue(markYoungValue, oldObj->valueAt(idx));
             }
         }
     }
@@ -1753,12 +1814,12 @@ std::size_t ManagedHeap::collectYoung(
         youngQueue.pop_back();
         const auto* obj = impl_->get(ref);
         if (!obj || obj->header.kind == ObjectKind::String) continue;
-        const auto& values = obj->values;
+        const auto count = obj->valueCount();
         if (obj->header.kind == ObjectKind::Array) {
-            for (const auto& v : values) markYoungValue(markYoungValue, v);
+            for (std::size_t i = 0; i < count; ++i) markYoungValue(markYoungValue, obj->valueAt(i));
         } else if (obj->referenceFields) {
             for (const auto idx : *obj->referenceFields) {
-                if (idx < values.size()) markYoungValue(markYoungValue, values[idx]);
+                if (idx < count) markYoungValue(markYoungValue, obj->valueAt(idx));
             }
         }
         ++impl_->statistics.markWork;
@@ -2020,9 +2081,13 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
         if (object.header.kind == ObjectKind::String) {
             info.stringValue = object.stringPayload;
         } else {
-            const auto& values = object.values;
-            info.valueCount = values.size();
-            info.values = values;
+            const auto count = object.valueCount();
+            info.valueCount = count;
+            info.values.resize(count);
+            for (std::size_t i = 0; i < count; ++i) {
+                info.values[i] = object.valueAt(i);
+            }
+            const auto& values = info.values;
             if (object.referenceFields) {
                 info.referenceFields = *object.referenceFields;
             }
@@ -2185,7 +2250,16 @@ bool ManagedHeap::restore(
                     return false;
                 }
             }
-            object.values = info.values;
+            if (info.kind == ObjectKind::Record &&
+                info.values.size() <= Impl::HeapObject::InlineFieldCapacity) {
+                object.usesInlineValues = true;
+                object.inlineValueCount = static_cast<std::uint8_t>(info.values.size());
+                for (std::size_t fi = 0; fi < info.values.size(); ++fi) {
+                    object.inlineValues[fi] = info.values[fi];
+                }
+            } else {
+                object.values = info.values;
+            }
             if (info.typeId != 0) {
                 auto& shared = impl_->sharedTypeReferenceFields[info.typeId];
                 if (!shared || *shared != info.referenceFields) {
@@ -2249,8 +2323,9 @@ bool ManagedHeap::restore(
         if (!slots[index].object) {
             freeSlots.push_back(static_cast<std::uint32_t>(index));
         } else {
-            for (const auto& v : slots[index].object->values) {
-                pinValueInPools(v);
+            const auto count = slots[index].object->valueCount();
+            for (std::size_t fi = 0; fi < count; ++fi) {
+                pinValueInPools(slots[index].object->valueAt(fi));
             }
         }
     }
@@ -2451,6 +2526,7 @@ NativeHandle NativeHandleRegistry::create(
     std::shared_ptr<void> resource,
     std::string debugNameValue) {
     if (typeId == 0 || !resource) return {};
+    const void* rawPtr = resource.get();
     std::uint32_t slotIndex = 0;
     if (!freeSlots_.empty()) {
         slotIndex = freeSlots_.back();
@@ -2465,9 +2541,52 @@ NativeHandle NativeHandleRegistry::create(
     auto& slot = slots_[slotIndex];
     if (slot.generation == 0 || slot.generation > 0xFFFFu) slot.generation = 1;
     slot.resource = std::move(resource);
+    slot.rawPointer = rawPtr;
     slot.typeId = typeId;
     slot.debugName = std::move(debugNameValue);
+    slot.cachedWrapper = {};
+    slot.cachedHeapId = 0;
+    if (rawPtr) {
+        activeSlotByPointer_[PointerTypeKey{rawPtr, typeId}] = slotIndex;
+    }
     return {slotIndex, slot.generation, typeId, registryId_};
+}
+
+std::optional<NativeHandle> NativeHandleRegistry::findHandle(
+    semantic::SymbolId typeId,
+    const void* rawPointer) const noexcept {
+    if (typeId == 0 || !rawPointer) return std::nullopt;
+    const auto it = activeSlotByPointer_.find(PointerTypeKey{rawPointer, typeId});
+    if (it == activeSlotByPointer_.end() || it->second >= slots_.size()) {
+        return std::nullopt;
+    }
+    const auto& slot = slots_[it->second];
+    if (!slot.resource || slot.rawPointer != rawPointer || slot.typeId != typeId) {
+        return std::nullopt;
+    }
+    return NativeHandle{it->second, slot.generation, typeId, registryId_};
+}
+
+std::optional<ObjectRef> NativeHandleRegistry::cachedWrapper(
+    NativeHandle handle,
+    std::uint64_t heapId) const noexcept {
+    if (!isAlive(handle)) return std::nullopt;
+    const auto& slot = slots_[handle.slot];
+    if (!slot.cachedWrapper.valid() || slot.cachedHeapId != heapId) {
+        return std::nullopt;
+    }
+    return slot.cachedWrapper;
+}
+
+bool NativeHandleRegistry::setCachedWrapper(
+    NativeHandle handle,
+    ObjectRef wrapper,
+    std::uint64_t heapId) noexcept {
+    if (!isAlive(handle)) return false;
+    auto& slot = slots_[handle.slot];
+    slot.cachedWrapper = wrapper;
+    slot.cachedHeapId = heapId;
+    return true;
 }
 
 std::shared_ptr<void> NativeHandleRegistry::resolve(
@@ -2506,9 +2625,19 @@ bool NativeHandleRegistry::isAlive(NativeHandle handle) const noexcept {
 bool NativeHandleRegistry::release(NativeHandle handle) noexcept {
     if (!isAlive(handle)) return false;
     auto& slot = slots_[handle.slot];
+    if (slot.rawPointer) {
+        const auto it = activeSlotByPointer_.find(
+            PointerTypeKey{slot.rawPointer, slot.typeId});
+        if (it != activeSlotByPointer_.end() && it->second == handle.slot) {
+            activeSlotByPointer_.erase(it);
+        }
+    }
     slot.resource.reset();
+    slot.rawPointer = nullptr;
     slot.typeId = 0;
     slot.debugName.clear();
+    slot.cachedWrapper = {};
+    slot.cachedHeapId = 0;
     ++slot.generation;
     if (slot.generation == 0 || slot.generation > 0xFFFFu) slot.generation = 1;
     freeSlots_.push_back(handle.slot);
@@ -2516,13 +2645,17 @@ bool NativeHandleRegistry::release(NativeHandle handle) noexcept {
 }
 
 void NativeHandleRegistry::clear() noexcept {
+    activeSlotByPointer_.clear();
     freeSlots_.clear();
     for (std::size_t index = 0; index < slots_.size(); ++index) {
         auto& slot = slots_[index];
         if (slot.resource) {
             slot.resource.reset();
+            slot.rawPointer = nullptr;
             slot.typeId = 0;
             slot.debugName.clear();
+            slot.cachedWrapper = {};
+            slot.cachedHeapId = 0;
             ++slot.generation;
             if (slot.generation == 0 || slot.generation > 0xFFFFu) slot.generation = 1;
         }

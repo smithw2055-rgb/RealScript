@@ -56,6 +56,12 @@ public:
         runtime::BindingDeterminism determinism =
             runtime::BindingDeterminism::Deterministic);
 
+    template <auto FieldPtr>
+    NativeTypeBuilder& field(
+        std::string name,
+        runtime::BindingDeterminism determinism =
+            runtime::BindingDeterminism::Deterministic);
+
 private:
     friend class GameApi;
     NativeTypeBuilder(std::shared_ptr<detail::GameApiState> state, std::size_t index)
@@ -477,6 +483,150 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::property(
             return std::optional<runtime::Value>{std::int64_t{0}};
         },
         determinism);
+    return *this;
+}
+
+namespace detail {
+
+template <typename>
+struct MemberFieldTraits;
+
+template <typename ClassType, typename FieldType>
+struct MemberFieldTraits<FieldType ClassType::*> {
+    using Class = ClassType;
+    using ValueType = std::remove_cv_t<FieldType>;
+    static constexpr bool IsReadOnly = std::is_const_v<FieldType>;
+};
+
+} // namespace detail
+
+template <typename T>
+template <auto FieldPtr>
+NativeTypeBuilder<T>& NativeTypeBuilder<T>::field(
+    std::string name,
+    runtime::BindingDeterminism determinism) {
+    using Traits = detail::MemberFieldTraits<decltype(FieldPtr)>;
+    static_assert(std::is_same_v<typename Traits::Class, T>,
+        "bound field must belong to the native type being registered");
+    using ValueType = typename Traits::ValueType;
+
+    auto fieldType = detail::resolveScriptType<ValueType>(state_);
+    auto& type = state_->nativeTypes[index_];
+    if (!fieldType) {
+        state_->errors.push_back(
+            "unsupported C++ type in native field '" +
+            type.moduleName + "::" + type.name + "." + name + "'");
+        return *this;
+    }
+
+    const auto getterPublicName = type.moduleName + "::" + type.name + ".get_" + name;
+    if (!state_->declarationNames.insert(getterPublicName).second) {
+        state_->errors.push_back("duplicate native field declaration for '" + name + "'");
+        return *this;
+    }
+    const auto getterNativeName = "__rs_native_" + type.name + "_get_" + name;
+    const auto getterBinding = type.moduleName + "::" + getterNativeName;
+    if (!state_->bindingNames.insert(getterBinding).second) {
+        state_->errors.push_back("duplicate native field binding for '" + name + "'");
+        return *this;
+    }
+
+    auto& module = state_->modules[type.moduleName];
+    detail::collectImports(module, *fieldType);
+    const detail::ParameterDeclaration receiver{
+        detail::ScriptTypeRef{
+            type.name,
+            type.moduleName,
+            detail::ScriptTypeCategory::NativeObject},
+        "self"};
+
+    auto state = state_;
+    state_->bindings->bind(
+        getterBinding,
+        [state](const auto&, const auto& arguments, auto& error) -> std::optional<runtime::Value> {
+            if (arguments.size() != 1) {
+                detail::setInvalidArguments(error, "native field getter received the wrong argument count");
+                return std::nullopt;
+            }
+            const auto recv = detail::readNativeObject<T>(state, arguments.front(), error);
+            if (!recv || !*recv) {
+                if (error.code == runtime::ErrorCode::None) {
+                    error.code = runtime::ErrorCode::NullReference;
+                    error.message = "native field getter receiver is null";
+                }
+                return std::nullopt;
+            }
+            return detail::writeValue(state, (**recv).*FieldPtr, error);
+        },
+        determinism);
+
+    if constexpr (Traits::IsReadOnly) {
+        type.properties.push_back(detail::PropertyDeclaration{
+            name,
+            *fieldType,
+            true,
+            false,
+            "return " + getterNativeName + "(this);",
+            {}});
+        module.functions.push_back(detail::FunctionDeclaration{
+            getterNativeName,
+            *fieldType,
+            {receiver},
+            {},
+            determinism,
+            {}});
+    } else {
+        const auto setterPublicName = type.moduleName + "::" + type.name + ".set_" + name;
+        const auto setterNativeName = "__rs_native_" + type.name + "_set_" + name;
+        const auto setterBinding = type.moduleName + "::" + setterNativeName;
+        if (!state_->declarationNames.insert(setterPublicName).second ||
+            !state_->bindingNames.insert(setterBinding).second) {
+            state_->errors.push_back("duplicate native field setter binding for '" + name + "'");
+            return *this;
+        }
+        type.properties.push_back(detail::PropertyDeclaration{
+            name,
+            *fieldType,
+            true,
+            true,
+            "return " + getterNativeName + "(this);",
+            setterNativeName + "(this, value); return;"});
+        module.functions.push_back(detail::FunctionDeclaration{
+            getterNativeName,
+            *fieldType,
+            {receiver},
+            {},
+            determinism,
+            {}});
+        module.functions.push_back(detail::FunctionDeclaration{
+            setterNativeName,
+            detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int},
+            {receiver, detail::ParameterDeclaration{*fieldType, "value"}},
+            {},
+            determinism,
+            {}});
+        state_->bindings->bind(
+            setterBinding,
+            [state](const auto&, const auto& arguments, auto& error) -> std::optional<runtime::Value> {
+                if (arguments.size() != 2) {
+                    detail::setInvalidArguments(error, "native field setter received the wrong argument count");
+                    return std::nullopt;
+                }
+                const auto recv = detail::readNativeObject<T>(state, arguments[0], error);
+                if (!recv || !*recv) {
+                    if (error.code == runtime::ErrorCode::None) {
+                        error.code = runtime::ErrorCode::NullReference;
+                        error.message = "native field setter receiver is null";
+                    }
+                    return std::nullopt;
+                }
+                auto converted = detail::readValue<ValueType>(state, arguments[1], error);
+                if (!converted) return std::nullopt;
+                ((**recv).*FieldPtr) = detail::passArgument<ValueType>(*converted);
+                return std::optional<runtime::Value>{std::int64_t{0}};
+            },
+            determinism);
+    }
     return *this;
 }
 

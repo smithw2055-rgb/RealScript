@@ -847,6 +847,7 @@ public:
         RuntimeError* error = nullptr,
         ArrayStoreTypePolicy typePolicy = ArrayStoreTypePolicy::Exact);
     [[nodiscard]] std::optional<std::size_t> fieldCount(ObjectRef reference) const;
+    [[nodiscard]] bool isInlineRecordObject(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<semantic::SymbolId> objectTypeId(
         ObjectRef reference) const;
     [[nodiscard]] std::optional<Value> fieldGet(ObjectRef reference, std::size_t index) const;
@@ -1016,6 +1017,16 @@ public:
         semantic::SymbolId typeId,
         std::shared_ptr<void> resource,
         std::string debugName = {});
+    [[nodiscard]] std::optional<NativeHandle> findHandle(
+        semantic::SymbolId typeId,
+        const void* rawPointer) const noexcept;
+    [[nodiscard]] std::optional<ObjectRef> cachedWrapper(
+        NativeHandle handle,
+        std::uint64_t heapId) const noexcept;
+    bool setCachedWrapper(
+        NativeHandle handle,
+        ObjectRef wrapper,
+        std::uint64_t heapId) noexcept;
     [[nodiscard]] std::shared_ptr<void> resolve(
         NativeHandle handle,
         semantic::SymbolId expectedTypeId = 0,
@@ -1030,13 +1041,31 @@ public:
 private:
     struct Slot {
         std::shared_ptr<void> resource;
+        const void* rawPointer = nullptr;
         semantic::SymbolId typeId = 0;
         std::uint32_t generation = 1;
         std::string debugName;
+        ObjectRef cachedWrapper{};
+        std::uint64_t cachedHeapId = 0;
+    };
+    struct PointerTypeKey {
+        const void* rawPointer = nullptr;
+        semantic::SymbolId typeId = 0;
+        bool operator==(const PointerTypeKey& other) const noexcept {
+            return rawPointer == other.rawPointer && typeId == other.typeId;
+        }
+    };
+    struct PointerTypeKeyHash {
+        std::size_t operator()(const PointerTypeKey& key) const noexcept {
+            const auto h1 = std::hash<const void*>{}(key.rawPointer);
+            const auto h2 = std::hash<semantic::SymbolId>{}(key.typeId);
+            return h1 ^ (h2 + 0x9e3779b9u + (h1 << 6u) + (h1 >> 2u));
+        }
     };
     std::uint64_t registryId_ = 0;
     std::vector<Slot> slots_;
     std::vector<std::uint32_t> freeSlots_;
+    std::unordered_map<PointerTypeKey, std::uint32_t, PointerTypeKeyHash> activeSlotByPointer_;
 };
 
 enum class DeterminismMode : std::uint8_t {

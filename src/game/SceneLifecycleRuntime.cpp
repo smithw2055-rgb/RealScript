@@ -462,8 +462,9 @@ bool SceneScriptRuntime::detach(SceneEntityId entity) {
     worldTransformCache_.erase(entity);
     entityNames_.erase(entity);
     for (auto gIt = groupEntities_.begin(); gIt != groupEntities_.end();) {
-        gIt->second.erase(entity);
-        if (gIt->second.empty()) {
+        auto& vec = gIt->second;
+        vec.erase(std::remove(vec.begin(), vec.end(), entity), vec.end());
+        if (vec.empty()) {
             gIt = groupEntities_.erase(gIt);
         } else {
             ++gIt;
@@ -704,6 +705,7 @@ void SceneScriptRuntime::start() {
 }
 
 void SceneScriptRuntime::update(double deltaTime) {
+    (void)flushCompletedAsyncRequests();
     rebuildTickOrderIfNeeded();
     const auto snapshot = cachedTickOrder_;
     for (const auto& ref : snapshot) {
@@ -912,8 +914,10 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         ++report.instancesMigrated;
     }
 
-    for (auto& [entity, components] : instances_) {
-        const auto& savedList = savedEntities[entity];
+    for (const auto& [entity, savedList] : savedEntities) {
+        auto instIt = instances_.find(entity);
+        if (instIt == instances_.end()) continue;
+        auto& components = instIt->second;
         for (std::size_t idx = 0; idx < components.size(); ++idx) {
             auto& instance = components[idx];
             const auto& saved = savedList[idx];
@@ -997,9 +1001,11 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
     if (!migratedRefMap.empty()) {
         std::unordered_set<std::uint64_t> visited;
         auto* heap = runtime_.heap().get();
-        for (auto& [entity, components] : instances_) {
-            (void)entity;
-            for (auto& instance : components) {
+        for (const auto& [entity, savedList] : savedEntities) {
+            (void)savedList;
+            auto instIt = instances_.find(entity);
+            if (instIt == instances_.end()) continue;
+            for (auto& instance : instIt->second) {
                 patchMigratedObjectRefsInHeapObject(
                     heap,
                     instance.object.reference(),
@@ -1694,8 +1700,104 @@ std::uint32_t SceneScriptRuntime::spawnEntityFiber(
 }
 
 std::uint64_t SceneScriptRuntime::stepFibers(std::uint32_t currentTick) {
+    (void)flushCompletedAsyncRequests();
     if (!fiberScheduler_) return 0;
     return fiberScheduler_->stepTick(currentTick);
+}
+
+SceneScriptRuntime::AsyncRequestId SceneScriptRuntime::createAsyncRequest(
+    std::string debugTag) {
+    const AsyncRequestId id = nextAsyncRequestId_++;
+    AsyncRequestEntry entry;
+    entry.id = id;
+    entry.debugTag = std::move(debugTag);
+    entry.completed = false;
+    asyncRequests_.emplace(id, std::move(entry));
+    return id;
+}
+
+bool SceneScriptRuntime::completeAsyncRequest(
+    AsyncRequestId requestId,
+    runtime::Value result) {
+    const auto it = asyncRequests_.find(requestId);
+    if (it == asyncRequests_.end() || it->second.completed) return false;
+    for (const auto& pending : pendingAsyncCompletions_) {
+        if (pending.id == requestId) return false;
+    }
+    pendingAsyncCompletions_.push_back(PendingAsyncCompletion{
+        requestId,
+        std::move(result),
+    });
+    return true;
+}
+
+bool SceneScriptRuntime::isAsyncRequestCompleted(
+    AsyncRequestId requestId) const noexcept {
+    const auto it = asyncRequests_.find(requestId);
+    return it != asyncRequests_.end() && it->second.completed;
+}
+
+std::optional<runtime::Value> SceneScriptRuntime::getAsyncRequestResult(
+    AsyncRequestId requestId) const {
+    const auto it = asyncRequests_.find(requestId);
+    if (it == asyncRequests_.end() || !it->second.completed) return std::nullopt;
+    return it->second.result;
+}
+
+bool SceneScriptRuntime::waitAsyncRequest(
+    AsyncRequestId requestId,
+    SceneEntityId targetEntity,
+    std::string callbackMethod,
+    std::string componentType) {
+    if (targetEntity == BroadcastTarget || callbackMethod.empty()) return false;
+    const auto it = asyncRequests_.find(requestId);
+    if (it == asyncRequests_.end()) return false;
+    if (it->second.completed) {
+        if (componentType.empty()) {
+            (void)invoke(targetEntity, callbackMethod, {});
+        } else {
+            (void)invokeComponent(targetEntity, componentType, callbackMethod, {});
+        }
+        return true;
+    }
+    it->second.waiters.push_back(AsyncRequestWaiter{
+        targetEntity,
+        std::move(callbackMethod),
+        std::move(componentType),
+    });
+    return true;
+}
+
+std::size_t SceneScriptRuntime::flushCompletedAsyncRequests() {
+    if (pendingAsyncCompletions_.empty()) return 0;
+    auto batch = std::move(pendingAsyncCompletions_);
+    pendingAsyncCompletions_.clear();
+    std::size_t completedCount = 0;
+    for (auto& item : batch) {
+        const auto it = asyncRequests_.find(item.id);
+        if (it == asyncRequests_.end() || it->second.completed) continue;
+        it->second.completed = true;
+        it->second.result = std::move(item.result);
+        ++completedCount;
+        auto waiters = std::move(it->second.waiters);
+        it->second.waiters.clear();
+        for (const auto& waiter : waiters) {
+            if (!isEntityAlive(waiter.targetEntity) ||
+                !isActiveInHierarchy(waiter.targetEntity)) {
+                continue;
+            }
+            if (waiter.componentType.empty()) {
+                (void)invoke(waiter.targetEntity, waiter.callbackMethod, {});
+            } else {
+                (void)invokeComponent(
+                    waiter.targetEntity,
+                    waiter.componentType,
+                    waiter.callbackMethod,
+                    {});
+            }
+        }
+    }
+    return completedCount;
 }
 
 std::size_t SceneScriptRuntime::emitSignal(
@@ -2971,17 +3073,16 @@ std::string SceneScriptRuntime::getEntityName(SceneEntityId entity) const {
 
 SceneEntityId SceneScriptRuntime::findEntityByName(const std::string& name) const noexcept {
     if (name.empty()) return 0;
+    SceneEntityId bestActive = 0;
+    SceneEntityId bestAny = 0;
     for (const auto& [entity, entName] : entityNames_) {
-        if (entName == name && isActiveInHierarchy(entity)) {
-            return entity;
+        if (entName != name) continue;
+        if (isActiveInHierarchy(entity)) {
+            if (bestActive == 0 || entity < bestActive) bestActive = entity;
         }
+        if (bestAny == 0 || entity < bestAny) bestAny = entity;
     }
-    for (const auto& [entity, entName] : entityNames_) {
-        if (entName == name) {
-            return entity;
-        }
-    }
-    return 0;
+    return bestActive != 0 ? bestActive : bestAny;
 }
 
 void SceneScriptRuntime::addEntityToGroup(SceneEntityId entity, const std::string& group) {
@@ -2989,37 +3090,46 @@ void SceneScriptRuntime::addEntityToGroup(SceneEntityId entity, const std::strin
     if (entityActiveSelf_.find(entity) == entityActiveSelf_.end()) {
         entityActiveSelf_[entity] = true;
     }
-    groupEntities_[group].insert(entity);
+    auto& vec = groupEntities_[group];
+    const auto it = std::lower_bound(vec.begin(), vec.end(), entity);
+    if (it == vec.end() || *it != entity) {
+        vec.insert(it, entity);
+    }
 }
 
 bool SceneScriptRuntime::removeEntityFromGroup(SceneEntityId entity, const std::string& group) {
     const auto it = groupEntities_.find(group);
     if (it == groupEntities_.end()) return false;
-    const bool removed = it->second.erase(entity) != 0;
-    if (it->second.empty()) {
+    auto& vec = it->second;
+    const auto pos = std::lower_bound(vec.begin(), vec.end(), entity);
+    if (pos == vec.end() || *pos != entity) return false;
+    vec.erase(pos);
+    if (vec.empty()) {
         groupEntities_.erase(it);
     }
-    return removed;
+    return true;
 }
 
 bool SceneScriptRuntime::isEntityInGroup(SceneEntityId entity, const std::string& group) const noexcept {
     const auto it = groupEntities_.find(group);
-    return it != groupEntities_.end() && it->second.find(entity) != it->second.end();
+    return it != groupEntities_.end() &&
+        std::binary_search(it->second.begin(), it->second.end(), entity);
 }
 
 std::vector<SceneEntityId> SceneScriptRuntime::getEntitiesInGroup(const std::string& group) const {
     const auto it = groupEntities_.find(group);
     if (it == groupEntities_.end()) return {};
-    return std::vector<SceneEntityId>(it->second.begin(), it->second.end());
+    return it->second;
 }
 
 std::vector<std::string> SceneScriptRuntime::getEntityGroups(SceneEntityId entity) const {
     std::vector<std::string> result;
     for (const auto& [group, members] : groupEntities_) {
-        if (members.find(entity) != members.end()) {
+        if (std::binary_search(members.begin(), members.end(), entity)) {
             result.push_back(group);
         }
     }
+    std::sort(result.begin(), result.end());
     return result;
 }
 

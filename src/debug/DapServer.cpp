@@ -352,18 +352,27 @@ void DapServer::emitStopped(std::ostream& output) {
     rebuildVariableReferences();
     const auto stop = session_->currentStop();
     if (!stop) return;
+    tooling::Json::Object bodyObj{
+        {"reason", stopReasonName(stop->reason)},
+        {"threadId", 1},
+        {"allThreadsStopped", true},
+        {"hitBreakpointIds", stop->breakpointId == 0
+            ? tooling::Json(tooling::Json::Array{})
+            : tooling::Json(tooling::Json::Array{static_cast<std::int64_t>(stop->breakpointId)})},
+    };
+    if (stop->reason == StopReason::Exception) {
+        bodyObj.emplace("text", stop->exceptionDescription);
+        bodyObj.emplace(
+            "description",
+            stop->exceptionDescription.empty()
+                ? std::string("Paused on exception")
+                : stop->exceptionDescription);
+    }
     tooling::writeProtocolMessage(output, tooling::Json::Object{
         {"seq", static_cast<std::int64_t>(sequence_++)},
         {"type", "event"},
         {"event", "stopped"},
-        {"body", tooling::Json::Object{
-            {"reason", stopReasonName(stop->reason)},
-            {"threadId", 1},
-            {"allThreadsStopped", true},
-            {"hitBreakpointIds", stop->breakpointId == 0
-                ? tooling::Json(tooling::Json::Array{})
-                : tooling::Json(tooling::Json::Array{static_cast<std::int64_t>(stop->breakpointId)})},
-        }},
+        {"body", std::move(bodyObj)},
     });
     output.flush();
 }
@@ -923,6 +932,75 @@ tooling::Json DapServer::handle(
             {"supportsConditionalBreakpoints", true},
             {"supportsEvaluateForHovers", true},
             {"supportTerminateDebuggee", true},
+            {"supportsExceptionInfoRequest", true},
+            {"exceptionBreakpointFilters", tooling::Json::Array{
+                tooling::Json::Object{
+                    {"filter", "all"},
+                    {"label", "All Exceptions"},
+                    {"description", "Break when any script exception is thrown or runtime error occurs"},
+                    {"default", false},
+                },
+                tooling::Json::Object{
+                    {"filter", "uncaught"},
+                    {"label", "Uncaught Exceptions"},
+                    {"description", "Break on uncaught script exceptions and runtime errors"},
+                    {"default", true},
+                },
+                tooling::Json::Object{
+                    {"filter", "runtime-error"},
+                    {"label", "Runtime Faults"},
+                    {"description", "Break on VM runtime faults (NullReference, DivisionByZero, IndexOutOfRange)"},
+                    {"default", true},
+                },
+            }},
+        });
+    }
+    if (command == "setExceptionBreakpoints") {
+        bool breakOnAll = false;
+        bool breakOnUncaught = false;
+        bool breakOnRuntimeError = false;
+        if (const auto* filters = arguments ? arguments->find("filters") : nullptr) {
+            for (const auto& f : filters->arrayValue()) {
+                const auto filterName = f.stringValue();
+                if (filterName == "all") {
+                    breakOnAll = true;
+                    breakOnUncaught = true;
+                    breakOnRuntimeError = true;
+                } else if (filterName == "uncaught") {
+                    breakOnUncaught = true;
+                } else if (filterName == "runtime-error") {
+                    breakOnRuntimeError = true;
+                }
+            }
+        }
+        if (session_ && session_->controller()) {
+            session_->controller()->setExceptionBreakpoints(
+                breakOnAll, breakOnUncaught, breakOnRuntimeError);
+        }
+        return response(request, true, tooling::Json::Object{
+            {"breakpoints", tooling::Json::Array{}},
+        });
+    }
+    if (command == "exceptionInfo") {
+        std::optional<DebugStop> stop = session_ ? session_->currentStop() : std::nullopt;
+        if (!stop && session_ && session_->controller()) {
+            stop = session_->controller()->lastStop();
+        }
+        const std::string excId = (stop && !stop->exceptionId.empty())
+            ? stop->exceptionId
+            : std::string("RuntimeError");
+        const std::string desc = stop ? stop->exceptionDescription : std::string{};
+        const std::string breakMode = (stop && !stop->exceptionUncaught)
+            ? std::string("always")
+            : std::string("unhandled");
+        return response(request, true, tooling::Json::Object{
+            {"exceptionId", excId},
+            {"description", desc},
+            {"breakMode", breakMode},
+            {"details", tooling::Json::Object{
+                {"message", desc},
+                {"typeName", excId},
+            }},
         });
     }
     if (command == "setBreakpoints") {
@@ -1111,8 +1189,11 @@ tooling::Json DapServer::handle(
         return response(request, true, tooling::Json::Object{});
     }
     if (command == "launch") {
-        const auto function = arguments && arguments->find("function")
+        std::string function = arguments && arguments->find("function")
             ? arguments->find("function")->stringValue() : std::string{};
+        if (function.empty() && arguments && arguments->find("entry")) {
+            function = arguments->find("entry")->stringValue();
+        }
         const auto stopOnEntry = arguments && arguments->find("stopOnEntry")
             ? arguments->find("stopOnEntry")->boolValue(false) : false;
         std::vector<runtime::Value> launchArguments;

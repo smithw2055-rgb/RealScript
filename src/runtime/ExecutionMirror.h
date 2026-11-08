@@ -189,6 +189,8 @@ struct ExecutionBlock {
 
 struct ExecutionFunction {
     const bytecode::Function* bytecode = nullptr;
+    const bytecode::FunctionReference* directNativeReference = nullptr;
+    std::uint16_t nativeForwarderInstructionCost = 0;
     std::size_t entry = InvalidBlockIndex;
     std::size_t edgeScratchCount = 0;
     std::uint16_t paramOffset = 0;

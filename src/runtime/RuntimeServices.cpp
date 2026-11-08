@@ -794,6 +794,96 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         for (const auto& function : module.functions) {
             const auto decoded = mirror->functions.find(&function);
             if (decoded == mirror->functions.end()) continue;
+            if (function.blocks.size() == 1 && function.exceptionHandlers.empty()) {
+                const auto& bb = function.blocks[0];
+                std::vector<int> localSourceParam(function.localTypes.size(), -1);
+                std::vector<int> regSourceParam(function.registerTypes.size(), -1);
+                const bytecode::FunctionReference* candidateRef = nullptr;
+                bytecode::Register callResultReg = bytecode::InvalidRegister;
+                bool validForwarder = !bb.instructions.empty();
+                for (std::size_t instIdx = 0;
+                     instIdx < bb.instructions.size() && validForwarder;
+                     ++instIdx) {
+                    const auto& inst = bb.instructions[instIdx];
+                    switch (inst.opcode) {
+                    case bytecode::Opcode::LoadParameter:
+                        if (inst.result < regSourceParam.size() &&
+                            inst.index < function.parameterTypes.size()) {
+                            regSourceParam[inst.result] = static_cast<int>(inst.index);
+                        } else {
+                            validForwarder = false;
+                        }
+                        break;
+                    case bytecode::Opcode::StoreLocal:
+                        if (inst.index < localSourceParam.size() &&
+                            inst.operands.size() == 1 &&
+                            inst.operands[0] < regSourceParam.size() &&
+                            regSourceParam[inst.operands[0]] >= 0) {
+                            localSourceParam[inst.index] =
+                                regSourceParam[inst.operands[0]];
+                        } else {
+                            validForwarder = false;
+                        }
+                        break;
+                    case bytecode::Opcode::LoadLocal:
+                        if (inst.result < regSourceParam.size() &&
+                            inst.index < localSourceParam.size() &&
+                            localSourceParam[inst.index] >= 0) {
+                            regSourceParam[inst.result] =
+                                localSourceParam[inst.index];
+                        } else {
+                            validForwarder = false;
+                        }
+                        break;
+                    case bytecode::Opcode::Call:
+                        if (instIdx + 1 == bb.instructions.size() &&
+                            inst.index < module.functionReferences.size()) {
+                            const auto& ref = module.functionReferences[inst.index];
+                            if (!ref.virtualDispatch && !ref.interfaceDispatch &&
+                                ref.name.rfind("__rs_native_", 0) == 0 &&
+                                functions.find(ref.symbolId) == functions.end() &&
+                                inst.operands.size() == function.parameterTypes.size() &&
+                                ref.parameterTypes == function.parameterTypes &&
+                                ref.parameterTypeIds == function.parameterTypeIds) {
+                                bool allParamsMatch = true;
+                                for (std::size_t k = 0; k < inst.operands.size(); ++k) {
+                                    if (inst.operands[k] >= regSourceParam.size() ||
+                                        regSourceParam[inst.operands[k]] !=
+                                            static_cast<int>(k)) {
+                                        allParamsMatch = false;
+                                        break;
+                                    }
+                                }
+                                if (allParamsMatch) {
+                                    candidateRef = &ref;
+                                    callResultReg = inst.result;
+                                    break;
+                                }
+                            }
+                        }
+                        validForwarder = false;
+                        break;
+                    default:
+                        validForwarder = false;
+                        break;
+                    }
+                }
+                if (validForwarder && candidateRef) {
+                    const bool returnMatches =
+                        (function.returnType == semantic::PrimitiveType::Void &&
+                         bb.terminator.kind == bytecode::TerminatorKind::ReturnVoid) ||
+                        (function.returnType != semantic::PrimitiveType::Void &&
+                         bb.terminator.kind == bytecode::TerminatorKind::ReturnValue &&
+                         bb.terminator.value == callResultReg &&
+                         candidateRef->returnType == function.returnType &&
+                         candidateRef->returnTypeId == function.returnTypeId);
+                    if (returnMatches) {
+                        decoded->second.directNativeReference = candidateRef;
+                        decoded->second.nativeForwarderInstructionCost =
+                            static_cast<std::uint16_t>(bb.instructions.size() + 1u);
+                    }
+                }
+            }
             for (auto& block : decoded->second.blocks) {
                 for (auto& instruction : block.instructions) {
                     if (instruction.bytecode->opcode !=
@@ -3414,6 +3504,58 @@ bool makeIntrinsicStringResult(
     return true;
 }
 
+bool isStringLikeValue(const Value& val) noexcept {
+    if (std::holds_alternative<std::string>(val) ||
+        std::holds_alternative<NullString>(val)) {
+        return true;
+    }
+    if (const auto* ref = std::get_if<ObjectRef>(&val)) {
+        return ref->kind == ObjectKind::String;
+    }
+    return false;
+}
+
+bool intrinsicValuesEqual(const Value& a, const Value& b, const ManagedHeap* heap) {
+    if (isStringLikeValue(a) || isStringLikeValue(b)) {
+        const bool aNull = std::holds_alternative<NullString>(a);
+        const bool bNull = std::holds_alternative<NullString>(b);
+        if (aNull || bNull) return aNull && bNull;
+        return extractIntrinsicString(a, heap) == extractIntrinsicString(b, heap);
+    }
+    return a == b;
+}
+
+bool intrinsicValueLess(const Value& a, const Value& b, const ManagedHeap* heap) {
+    if (isStringLikeValue(a) || isStringLikeValue(b)) {
+        const bool aNull = std::holds_alternative<NullString>(a);
+        const bool bNull = std::holds_alternative<NullString>(b);
+        if (aNull != bNull) return aNull;
+        if (aNull && bNull) return false;
+        return extractIntrinsicString(a, heap) < extractIntrinsicString(b, heap);
+    }
+    if (a.index() == b.index()) {
+        if (const auto* ia = std::get_if<std::int64_t>(&a)) return *ia < std::get<std::int64_t>(b);
+        if (const auto* la = std::get_if<LongValue>(&a)) return la->value < std::get<LongValue>(b).value;
+        if (const auto* uia = std::get_if<UIntValue>(&a)) return uia->value < std::get<UIntValue>(b).value;
+        if (const auto* ula = std::get_if<ULongValue>(&a)) return ula->value < std::get<ULongValue>(b).value;
+        if (const auto* bya = std::get_if<ByteValue>(&a)) return bya->value < std::get<ByteValue>(b).value;
+        if (const auto* sba = std::get_if<SByteValue>(&a)) return sba->value < std::get<SByteValue>(b).value;
+        if (const auto* sha = std::get_if<ShortValue>(&a)) return sha->value < std::get<ShortValue>(b).value;
+        if (const auto* usa = std::get_if<UShortValue>(&a)) return usa->value < std::get<UShortValue>(b).value;
+        if (const auto* cha = std::get_if<CharValue>(&a)) return cha->value < std::get<CharValue>(b).value;
+        if (const auto* ba = std::get_if<bool>(&a)) return (!*ba && std::get<bool>(b));
+        if (const auto* ena = std::get_if<EnumValue>(&a)) {
+            const auto& enb = std::get<EnumValue>(b);
+            return ena->typeId != enb.typeId ? (ena->typeId < enb.typeId) : (ena->value < enb.value);
+        }
+        if (const auto* fxa = std::get_if<FixedValue>(&a)) return fxa->raw < std::get<FixedValue>(b).raw;
+        if (const auto* f16a = std::get_if<Fixed16Value>(&a)) return f16a->raw < std::get<Fixed16Value>(b).raw;
+        if (const auto* da = std::get_if<double>(&a)) return *da < std::get<double>(b);
+        if (const auto* fla = std::get_if<FloatValue>(&a)) return fla->value < std::get<FloatValue>(b).value;
+    }
+    return valueToString(a, heap) < valueToString(b, heap);
+}
+
 } // namespace
 
 bool tryExecuteRuntimeIntrinsic(
@@ -3935,6 +4077,113 @@ bool tryExecuteRuntimeIntrinsic(
             valueToString(val, heap), heap, result, errorMessage);
     }
 
+    if (op.rfind("array_", 0) == 0) {
+        if (arguments.empty() || std::holds_alternative<NullArray>(arguments[0])) {
+            errorMessage = "cannot invoke array method on null array";
+            return false;
+        }
+        const auto* arrRef = std::get_if<ObjectRef>(&arguments[0]);
+        const auto lenOpt = (arrRef && heap) ? heap->arrayLength(*arrRef) : std::nullopt;
+        if (!lenOpt) {
+            errorMessage = "invalid array reference";
+            return false;
+        }
+        const std::size_t len = *lenOpt;
+
+        if (op.rfind("array_index_of::", 0) == 0) {
+            if (arguments.size() < 2) {
+                errorMessage = "array_index_of requires 2 arguments";
+                return false;
+            }
+            std::int64_t found = -1;
+            for (std::size_t i = 0; i < len; ++i) {
+                const auto elem = heap->arrayGet(*arrRef, i);
+                if (elem && intrinsicValuesEqual(*elem, arguments[1], heap)) {
+                    found = static_cast<std::int64_t>(i);
+                    break;
+                }
+            }
+            result = found;
+            return true;
+        }
+        if (op.rfind("array_last_index_of::", 0) == 0) {
+            if (arguments.size() < 2) {
+                errorMessage = "array_last_index_of requires 2 arguments";
+                return false;
+            }
+            std::int64_t found = -1;
+            for (std::size_t i = len; i > 0; --i) {
+                const auto elem = heap->arrayGet(*arrRef, i - 1);
+                if (elem && intrinsicValuesEqual(*elem, arguments[1], heap)) {
+                    found = static_cast<std::int64_t>(i - 1);
+                    break;
+                }
+            }
+            result = found;
+            return true;
+        }
+        if (op.rfind("array_contains::", 0) == 0) {
+            if (arguments.size() < 2) {
+                errorMessage = "array_contains requires 2 arguments";
+                return false;
+            }
+            bool found = false;
+            for (std::size_t i = 0; i < len; ++i) {
+                const auto elem = heap->arrayGet(*arrRef, i);
+                if (elem && intrinsicValuesEqual(*elem, arguments[1], heap)) {
+                    found = true;
+                    break;
+                }
+            }
+            result = found;
+            return true;
+        }
+        if (op.rfind("array_reverse::", 0) == 0) {
+            for (std::size_t i = 0; i < len / 2; ++i) {
+                const std::size_t j = len - 1 - i;
+                const auto leftVal = heap->arrayGet(*arrRef, i);
+                const auto rightVal = heap->arrayGet(*arrRef, j);
+                if (leftVal && rightVal) {
+                    RuntimeError setErr;
+                    (void)heap->arraySet(*arrRef, i, *rightVal, &setErr);
+                    (void)heap->arraySet(*arrRef, j, *leftVal, &setErr);
+                }
+            }
+            result = std::monostate{};
+            return true;
+        }
+        if (op.rfind("array_sort::", 0) == 0 || op.rfind("array_sort_range::", 0) == 0) {
+            std::size_t sortLen = len;
+            if (op.rfind("array_sort_range::", 0) == 0 && arguments.size() >= 2) {
+                const auto rawCount = std::holds_alternative<std::int64_t>(arguments[1])
+                    ? std::get<std::int64_t>(arguments[1])
+                    : 0;
+                const auto clampedCount = std::clamp<std::int64_t>(
+                    rawCount, 0, static_cast<std::int64_t>(len));
+                sortLen = static_cast<std::size_t>(clampedCount);
+            }
+            if (sortLen > 1) {
+                std::vector<Value> elems;
+                elems.reserve(sortLen);
+                for (std::size_t i = 0; i < sortLen; ++i) {
+                    elems.push_back(heap->arrayGet(*arrRef, i).value_or(Value{}));
+                }
+                std::stable_sort(
+                    elems.begin(),
+                    elems.end(),
+                    [heap](const Value& a, const Value& b) {
+                        return intrinsicValueLess(a, b, heap);
+                    });
+                RuntimeError setErr;
+                for (std::size_t i = 0; i < sortLen; ++i) {
+                    (void)heap->arraySet(*arrRef, i, elems[i], &setErr);
+                }
+            }
+            result = std::monostate{};
+            return true;
+        }
+    }
+
     if (!arguments.empty() && std::holds_alternative<NullString>(arguments[0])) {
         errorMessage = "cannot invoke string method on null string";
         return false;
@@ -3972,6 +4221,15 @@ bool tryExecuteRuntimeIntrinsic(
         const auto s = extractIntrinsicString(arguments[0], heap);
         const auto sub = extractIntrinsicString(arguments[1], heap);
         const auto pos = s.find(sub);
+        result = (pos == std::string::npos)
+            ? std::int64_t{-1}
+            : static_cast<std::int64_t>(pos);
+        return true;
+    }
+    if (op == "string_last_index_of") {
+        const auto s = extractIntrinsicString(arguments[0], heap);
+        const auto sub = extractIntrinsicString(arguments[1], heap);
+        const auto pos = s.rfind(sub);
         result = (pos == std::string::npos)
             ? std::int64_t{-1}
             : static_cast<std::int64_t>(pos);
@@ -4026,6 +4284,89 @@ bool tryExecuteRuntimeIntrinsic(
         }
         return makeIntrinsicStringResult(
             s.substr(first, last - first), heap, result, errorMessage);
+    }
+    if (op == "string_trim_start") {
+        const auto s = extractIntrinsicString(arguments[0], heap);
+        const auto isSpace = [](unsigned char c) {
+            return c == ' ' || c == '\t' || c == '\r' ||
+                   c == '\n' || c == '\v' || c == '\f';
+        };
+        std::size_t first = 0;
+        while (first < s.size() && isSpace(static_cast<unsigned char>(s[first]))) {
+            ++first;
+        }
+        return makeIntrinsicStringResult(
+            s.substr(first), heap, result, errorMessage);
+    }
+    if (op == "string_trim_end") {
+        const auto s = extractIntrinsicString(arguments[0], heap);
+        const auto isSpace = [](unsigned char c) {
+            return c == ' ' || c == '\t' || c == '\r' ||
+                   c == '\n' || c == '\v' || c == '\f';
+        };
+        std::size_t last = s.size();
+        while (last > 0 && isSpace(static_cast<unsigned char>(s[last - 1]))) {
+            --last;
+        }
+        return makeIntrinsicStringResult(
+            s.substr(0, last), heap, result, errorMessage);
+    }
+    if (op == "string_split") {
+        if (!heap) {
+            errorMessage = "string_split requires a managed heap";
+            return false;
+        }
+        const auto s = extractIntrinsicString(arguments[0], heap);
+        const auto sep = extractIntrinsicString(arguments[1], heap);
+        std::vector<std::string> parts;
+        if (sep.empty()) {
+            parts.push_back(s);
+        } else {
+            std::size_t start = 0;
+            while (true) {
+                const auto pos = s.find(sep, start);
+                if (pos == std::string::npos) {
+                    parts.push_back(s.substr(start));
+                    break;
+                }
+                parts.push_back(s.substr(start, pos - start));
+                start = pos + sep.size();
+            }
+        }
+        const auto arrTypeId = semantic::stableTypeId(
+            semantic::arrayTypeName(semantic::PrimitiveType::String, ""));
+        RuntimeError allocErr;
+        const auto defaultStrRef = heap->allocateString("", &allocErr);
+        if (!defaultStrRef) {
+            errorMessage = allocErr.message.empty()
+                ? "out of memory allocating string array"
+                : allocErr.message;
+            return false;
+        }
+        const auto arrRef = heap->allocateTypedArray(
+            arrTypeId,
+            semantic::PrimitiveType::String,
+            0,
+            parts.size(),
+            *defaultStrRef,
+            &allocErr);
+        if (!arrRef) {
+            errorMessage = allocErr.message.empty()
+                ? "out of memory allocating string array"
+                : allocErr.message;
+            return false;
+        }
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            const auto elemStrRef = heap->allocateString(std::move(parts[i]), &allocErr);
+            if (!elemStrRef || !heap->arraySet(*arrRef, i, *elemStrRef, &allocErr)) {
+                errorMessage = allocErr.message.empty()
+                    ? "out of memory populating string array"
+                    : allocErr.message;
+                return false;
+            }
+        }
+        result = *arrRef;
+        return true;
     }
     if (op == "string_replace") {
         auto s = extractIntrinsicString(arguments[0], heap);

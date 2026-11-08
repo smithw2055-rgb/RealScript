@@ -328,11 +328,23 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
         return true;
     };
 
-    // Strip C and C++ comments while preserving newlines
+    // Strip C/C++ comments and C++11/17 [[...]] attributes while preserving string literals and newlines
     std::string cleaned;
     cleaned.reserve(headerContent.size());
     for (std::size_t i = 0; i < headerContent.size();) {
-        if (i + 1 < headerContent.size() && headerContent[i] == '/' && headerContent[i + 1] == '/') {
+        if (headerContent[i] == '"' || headerContent[i] == '\'') {
+            const char quote = headerContent[i];
+            cleaned.push_back(headerContent[i++]);
+            while (i < headerContent.size()) {
+                if (headerContent[i] == '\\' && i + 1 < headerContent.size()) {
+                    cleaned.push_back(headerContent[i++]);
+                    cleaned.push_back(headerContent[i++]);
+                    continue;
+                }
+                cleaned.push_back(headerContent[i]);
+                if (headerContent[i++] == quote) break;
+            }
+        } else if (i + 1 < headerContent.size() && headerContent[i] == '/' && headerContent[i + 1] == '/') {
             i += 2;
             while (i < headerContent.size() && headerContent[i] != '\n') ++i;
         } else if (i + 1 < headerContent.size() && headerContent[i] == '/' && headerContent[i + 1] == '*') {
@@ -342,6 +354,14 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
                 ++i;
             }
             if (i + 1 < headerContent.size()) i += 2;
+        } else if (i + 1 < headerContent.size() && headerContent[i] == '[' && headerContent[i + 1] == '[') {
+            i += 2;
+            while (i + 1 < headerContent.size() && !(headerContent[i] == ']' && headerContent[i + 1] == ']')) {
+                if (headerContent[i] == '\n') cleaned.push_back('\n');
+                ++i;
+            }
+            if (i + 1 < headerContent.size()) i += 2;
+            cleaned.push_back(' ');
         } else {
             cleaned.push_back(headerContent[i]);
             ++i;
@@ -350,9 +370,16 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
 
     const auto mapCppTypeToRs = [&](std::string cppType) -> std::string {
         cppType = trim(cppType);
-        for (const char* kw : {"virtual ", "inline ", "constexpr ", "static ", "explicit ", "const "}) {
-            const std::size_t kwLen = std::strlen(kw);
-            if (cppType.rfind(kw, 0) == 0) cppType = trim(cppType.substr(kwLen));
+        bool stripped = true;
+        while (stripped) {
+            stripped = false;
+            for (const char* kw : {"virtual ", "inline ", "constexpr ", "static ", "explicit ", "const ", "volatile "}) {
+                const std::size_t kwLen = std::strlen(kw);
+                if (cppType.rfind(kw, 0) == 0) {
+                    cppType = trim(cppType.substr(kwLen));
+                    stripped = true;
+                }
+            }
         }
         if (cppType.rfind("std::shared_ptr<", 0) == 0 && cppType.back() == '>') {
             cppType = trim(cppType.substr(16, cppType.size() - 17));
@@ -365,10 +392,10 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
         if (cppType.size() > 6 && cppType.compare(cppType.size() - 6, 6, " const") == 0) {
             cppType = trim(cppType.substr(0, cppType.size() - 6));
         }
-        if (cppType == "int" || cppType == "int32_t" || cppType == "std::int32_t") return "int";
+        if (cppType == "int" || cppType == "signed int" || cppType == "int32_t" || cppType == "std::int32_t") return "int";
         if (cppType == "int64_t" || cppType == "std::int64_t" || cppType == "long" || cppType == "long long") return "long";
-        if (cppType == "uint32_t" || cppType == "std::uint32_t" || cppType == "unsigned int") return "uint";
-        if (cppType == "uint64_t" || cppType == "std::uint64_t" || cppType == "unsigned long long") return "ulong";
+        if (cppType == "uint32_t" || cppType == "std::uint32_t" || cppType == "unsigned int" || cppType == "unsigned") return "uint";
+        if (cppType == "uint64_t" || cppType == "std::uint64_t" || cppType == "unsigned long" || cppType == "unsigned long long") return "ulong";
         if (cppType == "uint8_t" || cppType == "std::uint8_t" || cppType == "unsigned char") return "byte";
         if (cppType == "int8_t" || cppType == "std::int8_t" || cppType == "signed char") return "sbyte";
         if (cppType == "int16_t" || cppType == "std::int16_t" || cppType == "short") return "short";
@@ -472,6 +499,7 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
     bool pendingEnumExport = false;
     bool pendingMethodExport = false;
     bool pendingFuncExport = false;
+    bool pendingFieldExport = false;
     bool pendingNonDeterministic = false;
     std::string pendingCapability;
     std::string pendingFuncModule = defaultModuleName;
@@ -487,8 +515,10 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
     struct EcsFieldInfo {
         std::string name;
         std::string rsType;
+        bool readOnly = false;
     };
     std::vector<EcsFieldInfo> currentEcsFields;
+    std::vector<EcsFieldInfo> pendingClassFields;
 
     std::size_t pos = 0;
     while (pos < cleaned.size()) {
@@ -525,6 +555,10 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
         }
         if (consumeMacro(line, "RS_EXPORT_ENUM", macroArgs)) {
             pendingEnumExport = true;
+            if (line.empty()) continue;
+        }
+        if (consumeMacro(line, "RS_EXPORT_FIELD", macroArgs)) {
+            pendingFieldExport = true;
             if (line.empty()) continue;
         }
         if (consumeMacro(line, "RS_EXPORT_PROPERTY", macroArgs)) {
@@ -618,16 +652,58 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
 
         if ((pendingClassExport || pendingEcsStructExport) &&
             (line.rfind("class ", 0) == 0 || line.rfind("struct ", 0) == 0)) {
+            std::string fullHeader = line;
+            while (fullHeader.find('{') == std::string::npos &&
+                   fullHeader.find(';') == std::string::npos &&
+                   pos < cleaned.size()) {
+                std::size_t nextNl = cleaned.find('\n', pos);
+                if (nextNl == std::string::npos) nextNl = cleaned.size();
+                fullHeader += " " + trim(cleaned.substr(pos, nextNl - pos));
+                pos = nextNl + 1;
+            }
+            if (fullHeader.find('{') == std::string::npos) {
+                pendingClassExport = false;
+                pendingEcsStructExport = false;
+                updateBraceDepth(fullHeader);
+                continue;
+            }
             currentIsEcsStruct = pendingEcsStructExport;
             pendingClassExport = false;
             pendingEcsStructExport = false;
             currentClassBraceDepth = braceDepth;
-            const auto spacePos = line.find(' ');
-            std::string namePart = trim(line.substr(spacePos + 1));
-            const auto endName = namePart.find_first_of(" :{");
-            currentClass = endName == std::string::npos ? namePart : namePart.substr(0, endName);
+            const auto openBrace = fullHeader.find('{');
+            std::string beforeBrace = trim(fullHeader.substr(0, openBrace));
+            const auto spacePos = beforeBrace.find(' ');
+            std::string namePart = spacePos == std::string::npos ? "" : trim(beforeBrace.substr(spacePos + 1));
+            // Find single ':' (base class list) while ignoring '::'
+            std::size_t baseColon = std::string::npos;
+            for (std::size_t ci = 0; ci < namePart.size(); ++ci) {
+                if (namePart[ci] == ':') {
+                    if (ci + 1 < namePart.size() && namePart[ci + 1] == ':') {
+                        ++ci;
+                        continue;
+                    }
+                    baseColon = ci;
+                    break;
+                }
+            }
+            if (baseColon != std::string::npos) {
+                namePart = trim(namePart.substr(0, baseColon));
+            }
+            // Extract tokens (e.g. "MY_API PlayerController final") -> take last non-"final" token
+            std::vector<std::string> headerTokens;
+            std::istringstream tokenStream(namePart);
+            std::string tok;
+            while (tokenStream >> tok) {
+                headerTokens.push_back(std::move(tok));
+            }
+            while (!headerTokens.empty() && headerTokens.back() == "final") {
+                headerTokens.pop_back();
+            }
+            currentClass = headerTokens.empty() ? namePart : headerTokens.back();
             currentClassQualified = currentNamespacePrefix() + currentClass;
             pendingClassProperties.clear();
+            pendingClassFields.clear();
             currentEcsFields.clear();
             if (currentIsEcsStruct) {
                 ++res.structsExported;
@@ -640,7 +716,7 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
                            << ">(\"" << currentClassModule << "\", \"" << currentClass << "\");\n";
                 rsBodyOut << "class " << currentClass << " {\n    handle __native;\n";
             }
-            updateBraceDepth(line);
+            updateBraceDepth(fullHeader);
             continue;
         }
 
@@ -674,6 +750,21 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
                               << "        readOnly);\n"
                               << "}\n\n";
             } else {
+                for (const auto& fld : pendingClassFields) {
+                    ++res.propertiesExported;
+                    cppBodyOut << "    builder_" << currentClass << ".field<&" << currentClassQualified
+                               << "::" << fld.name << ">(\"" << fld.name << "\");\n";
+                    if (fld.readOnly) {
+                        rsBodyOut << "    " << fld.rsType << " " << fld.name << " {\n"
+                                  << "        get { " << dummyRsReturn(fld.rsType) << " }\n"
+                                  << "    }\n";
+                    } else {
+                        rsBodyOut << "    " << fld.rsType << " " << fld.name << " {\n"
+                                  << "        get { " << dummyRsReturn(fld.rsType) << " }\n"
+                                  << "        set { return; }\n"
+                                  << "    }\n";
+                    }
+                }
                 for (const auto& prop : pendingClassProperties) {
                     ++res.propertiesExported;
                     if (!prop.setterMethod.empty()) {
@@ -694,16 +785,53 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
                 }
             }
             pendingClassProperties.clear();
+            pendingClassFields.clear();
             currentEcsFields.clear();
             currentClass.clear();
             currentClassQualified.clear();
             currentIsEcsStruct = false;
+            pendingFieldExport = false;
             rsBodyOut << "}\n\n";
+            continue;
+        }
+
+        // Parse exported fields inside RS_EXPORT_CLASS when preceded by RS_EXPORT_FIELD
+        if (!currentClass.empty() && !currentIsEcsStruct && pendingFieldExport) {
+            pendingFieldExport = false;
+            std::string fieldLine = line;
+            if (!fieldLine.empty() && fieldLine.back() == ';') {
+                fieldLine.pop_back();
+                const auto eqPos = fieldLine.find('=');
+                if (eqPos != std::string::npos) fieldLine = trim(fieldLine.substr(0, eqPos));
+                const auto bracePos = fieldLine.find('{');
+                if (bracePos != std::string::npos) fieldLine = trim(fieldLine.substr(0, bracePos));
+                if (fieldLine.find('(') == std::string::npos) {
+                    const auto lastSpace = fieldLine.rfind(' ');
+                    if (lastSpace != std::string::npos) {
+                        std::string fType = trim(fieldLine.substr(0, lastSpace));
+                        std::string fName = trim(fieldLine.substr(lastSpace + 1));
+                        while (!fName.empty() && (fName.front() == '*' || fName.front() == '&')) {
+                            fType.push_back(fName.front());
+                            fName.erase(fName.begin());
+                        }
+                        if (!fType.empty() && !fName.empty()) {
+                            const bool isConst =
+                                fType.rfind("const ", 0) == 0 ||
+                                fType.find(" const") != std::string::npos ||
+                                fType.rfind("constexpr ", 0) == 0;
+                            const std::string rsFieldType = mapCppTypeToRs(fType);
+                            pendingClassFields.push_back({fName, rsFieldType, isConst});
+                        }
+                    }
+                }
+            }
+            updateBraceDepth(line);
             continue;
         }
 
         // Parse ECS struct fields inside RS_EXPORT_ECS_COMPONENT / RS_EXPORT_STRUCT
         if (!currentClass.empty() && currentIsEcsStruct) {
+            pendingFieldExport = false;
             std::string fieldLine = line;
             if (fieldLine == "public:" || fieldLine == "private:" || fieldLine == "protected:") {
                 updateBraceDepth(line);
@@ -724,7 +852,7 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
                         std::string fName = trim(fieldLine.substr(lastSpace + 1));
                         if (!fType.empty() && !fName.empty()) {
                             const std::string rsFieldType = mapCppTypeToRs(fType);
-                            currentEcsFields.push_back({fName, rsFieldType});
+                            currentEcsFields.push_back({fName, rsFieldType, false});
                             rsBodyOut << "    public " << rsFieldType << " " << fName << ";\n";
                         }
                     }
@@ -766,6 +894,19 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
             }
             const std::string paramsStr = trim(decl.substr(openParen + 1, closeParen - openParen - 1));
 
+            const auto isCppTypeKeywordOrToken = [](const std::string& token) -> bool {
+                if (token.empty()) return true;
+                if (token.back() == '*' || token.back() == '&' || token.back() == '>') return true;
+                if (token.find("::") != std::string::npos) return true;
+                return token == "int" || token == "long" || token == "short" ||
+                    token == "char" || token == "float" || token == "double" ||
+                    token == "bool" || token == "void" || token == "unsigned" ||
+                    token == "signed" || token == "const" || token == "volatile" ||
+                    token == "int8_t" || token == "uint8_t" || token == "int16_t" ||
+                    token == "uint16_t" || token == "int32_t" || token == "uint32_t" ||
+                    token == "int64_t" || token == "uint64_t" || token == "size_t";
+            };
+
             std::vector<std::pair<std::string, std::string>> rsParams;
             if (!paramsStr.empty() && paramsStr != "void") {
                 std::size_t pStart = 0;
@@ -794,8 +935,11 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
                             pType.push_back(pName.front());
                             pName.erase(pName.begin());
                         }
-                        if (pName.empty()) pName = "arg" + std::to_string(idx);
-                        rsParams.push_back({mapCppTypeToRs(pType), std::move(pName)});
+                        if (isCppTypeKeywordOrToken(pName)) {
+                            rsParams.push_back({mapCppTypeToRs(pItem), "arg" + std::to_string(idx)});
+                        } else {
+                            rsParams.push_back({mapCppTypeToRs(pType), std::move(pName)});
+                        }
                     } else {
                         rsParams.push_back({mapCppTypeToRs(pItem), "arg" + std::to_string(idx)});
                     }

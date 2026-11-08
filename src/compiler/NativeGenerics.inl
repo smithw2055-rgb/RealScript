@@ -119,7 +119,7 @@ std::string nativeBuiltinGenericSource(
             << "while(next<needed){next=next*2;}"
             << first << "[] grown=new " << first << "[next];int i=0;"
             << "while(i<count){grown[i]=items[i];i=i+1;}items=grown;return;}"
-            << "int Count(){return count;}int Capacity(){return items.length;}"
+            << "int Count(){return count;}int Length(){return count;}int Capacity(){return items.length;}"
             << "bool IsEmpty(){return count==0;}"
             << "void Add(" << first << " value){EnsureCapacity(count+1);"
             << "items[count]=value;count=count+1;return;}"
@@ -142,6 +142,7 @@ std::string nativeBuiltinGenericSource(
             << "void Reverse(){int l=0;int r=count-1;while(l<r){"
             << first << " tmp=items[l];items[l]=items[r];items[r]=tmp;"
             << "l=l+1;r=r-1;}return;}"
+            << "void Sort(){__rs_array_sort_range(items,count);return;}"
             << first << "[] ToArray(){" << first << "[] arr=new " << first
             << "[count];int i=0;while(i<count){arr[i]=items[i];i=i+1;}return arr;}"
             << "void Clear(){count=0;return;}" << enumerator
