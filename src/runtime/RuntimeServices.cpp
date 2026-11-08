@@ -869,6 +869,477 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             }
         }
     }
+
+    // Pass 3: Build unified flat frame slot layout & direct-threaded FlatInstruction stream
+    for (const auto& module : modules) {
+        for (const auto& function : module.functions) {
+            auto found = mirror->functions.find(&function);
+            if (found == mirror->functions.end()) continue;
+            auto& execFunc = found->second;
+            execFunc.hasExceptionHandlers = !function.exceptionHandlers.empty();
+
+            const std::size_t paramCount = function.parameterTypes.size();
+            const std::size_t localCount = function.localTypes.size();
+            const std::size_t regCount = function.registerTypes.size();
+            const std::size_t totalSlots =
+                paramCount + localCount + regCount + execFunc.edgeScratchCount;
+            if (totalSlots >= InvalidCompactReg ||
+                execFunc.entry == InvalidBlockIndex) {
+                execFunc.canUseFlatFastPath = false;
+                continue;
+            }
+            execFunc.paramOffset = 0;
+            execFunc.localOffset = static_cast<std::uint16_t>(paramCount);
+            execFunc.registerOffset = static_cast<std::uint16_t>(paramCount + localCount);
+            execFunc.scratchOffset = static_cast<std::uint16_t>(paramCount + localCount + regCount);
+            execFunc.totalFrameSlots = static_cast<std::uint32_t>(totalSlots);
+
+            const auto paramSlot = [&](std::uint16_t idx) noexcept -> std::uint16_t {
+                return idx < paramCount
+                    ? static_cast<std::uint16_t>(execFunc.paramOffset + idx)
+                    : InvalidCompactReg;
+            };
+            const auto localSlot = [&](std::uint16_t idx) noexcept -> std::uint16_t {
+                return idx < localCount
+                    ? static_cast<std::uint16_t>(execFunc.localOffset + idx)
+                    : InvalidCompactReg;
+            };
+            const auto regSlot = [&](std::uint16_t idx) noexcept -> std::uint16_t {
+                return idx < regCount
+                    ? static_cast<std::uint16_t>(execFunc.registerOffset + idx)
+                    : InvalidCompactReg;
+            };
+
+            // Compute global cross-block register read counts to safely elide dead SSA temporaries
+            std::vector<std::uint32_t> globalRegReads(regCount, 0);
+            for (const auto& bb : function.blocks) {
+                for (const auto& inst : bb.instructions) {
+                    for (const auto op : inst.operands) {
+                        if (op < regCount) ++globalRegReads[op];
+                    }
+                }
+                if (bb.terminator.kind == bytecode::TerminatorKind::Branch &&
+                    bb.terminator.condition < regCount) {
+                    ++globalRegReads[bb.terminator.condition];
+                } else if ((bb.terminator.kind == bytecode::TerminatorKind::ReturnValue ||
+                            bb.terminator.kind == bytecode::TerminatorKind::Throw) &&
+                           bb.terminator.value < regCount) {
+                    ++globalRegReads[bb.terminator.value];
+                }
+                for (const auto arg : bb.terminator.arguments) {
+                    if (arg < regCount) ++globalRegReads[arg];
+                }
+                for (const auto arg : bb.terminator.falseArguments) {
+                    if (arg < regCount) ++globalRegReads[arg];
+                }
+            }
+
+            execFunc.blockStreamOffsets.assign(execFunc.blocks.size(), InvalidStreamOffset);
+            std::size_t estimatedStreamLen = 0;
+            for (const auto& blk : execFunc.blocks) {
+                estimatedStreamLen += blk.instructions.size() + 1;
+            }
+            execFunc.flatStream.reserve(estimatedStreamLen);
+
+            for (std::size_t bIdx = 0; bIdx < execFunc.blocks.size(); ++bIdx) {
+                const auto& blk = execFunc.blocks[bIdx];
+                execFunc.blockStreamOffsets[bIdx] =
+                    static_cast<std::uint32_t>(execFunc.flatStream.size());
+
+                const std::size_t nInst = blk.instructions.size();
+                for (std::size_t i = 0; i < nInst;) {
+                    const auto& inst = blk.instructions[i];
+                    FlatInstruction flat;
+                    flat.bytecode = inst.bytecode;
+                    flat.directTarget = inst.directTarget;
+                    flat.directExecution = inst.directExecution;
+                    flat.integerImmediate = inst.integerImmediate;
+                    flat.blockIndex = static_cast<std::uint32_t>(bIdx);
+                    flat.instructionIndexInBlock = static_cast<std::uint32_t>(i);
+                    flat.binaryOpcode1 = inst.binaryOpcode1;
+                    flat.binaryOpcode2 = inst.binaryOpcode2;
+                    flat.span = inst.span;
+                    flat.checkedArithmetic1 = inst.checkedArithmetic1;
+                    flat.checkedArithmetic2 = inst.checkedArithmetic2;
+
+                    // Check for loop-header branch fusion at the end of a block:
+                    // SuperOpcode::BinaryLocalIntReg (with LessInt) or BinaryLocalIntConstant (with LessInt)
+                    // at the very last instruction group of the block, followed by a no-arg Branch on superResult!
+                    const bool isAtBlockEnd = (i + inst.span == nInst);
+                    const bool canFuseTermBranch =
+                        isAtBlockEnd &&
+                        blk.terminatorKind == bytecode::TerminatorKind::Branch &&
+                        blk.conditionPrevalidatedBool &&
+                        !blk.branch.hasArguments &&
+                        !blk.falseBranch.hasArguments &&
+                        blk.branch.target != InvalidBlockIndex &&
+                        blk.falseBranch.target != InvalidBlockIndex;
+
+                    if (canFuseTermBranch &&
+                        inst.superOpcode == SuperOpcode::BinaryLocalIntReg &&
+                        inst.binaryOpcode1 == QuickOpcode::LessInt &&
+                        blk.terminatorReg == inst.superResult &&
+                        inst.result < regCount &&
+                        inst.superResult < regCount &&
+                        globalRegReads[inst.result] == 1 &&
+                        globalRegReads[inst.superResult] == 1) {
+                        flat.flatOpcode = FlatOpcode::SuperLessLocalRegBranch;
+                        flat.span = static_cast<std::uint8_t>(inst.span + 1); // 2 insts + 1 branch terminator = 3
+                        flat.src0Slot = localSlot(inst.auxReg1);
+                        flat.src1Slot = regSlot(inst.op1);
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.aux0Slot = regSlot(inst.superResult);
+                        execFunc.flatStream.push_back(flat);
+                        i += inst.span;
+                        // Skip emitting a separate terminator instruction since it is fused!
+                        goto next_block;
+                    }
+                    if (canFuseTermBranch &&
+                        inst.superOpcode == SuperOpcode::BinaryLocalIntConstant &&
+                        inst.binaryOpcode1 == QuickOpcode::LessInt &&
+                        blk.terminatorReg == inst.superResult &&
+                        inst.result < regCount &&
+                        inst.auxReg2 < regCount &&
+                        inst.superResult < regCount &&
+                        globalRegReads[inst.result] == 1 &&
+                        globalRegReads[inst.auxReg2] == 1 &&
+                        globalRegReads[inst.superResult] == 1) {
+                        flat.flatOpcode = FlatOpcode::SuperLessLocalConstBranch;
+                        flat.span = static_cast<std::uint8_t>(inst.span + 1); // 3 insts + 1 branch terminator = 4
+                        flat.src0Slot = localSlot(inst.auxReg1);
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.aux0Slot = regSlot(inst.auxReg2);
+                        flat.aux1Slot = regSlot(inst.superResult);
+                        execFunc.flatStream.push_back(flat);
+                        i += inst.span;
+                        goto next_block;
+                    }
+
+                    if (inst.superOpcode != SuperOpcode::None) {
+                        switch (inst.superOpcode) {
+                        case SuperOpcode::LoadParameterStoreLocal:
+                            flat.flatOpcode = FlatOpcode::SuperMoveParamStoreLocal;
+                            flat.src0Slot = paramSlot(inst.auxReg1);
+                            flat.dstSlot = regSlot(inst.result);
+                            flat.storeSlot = localSlot(inst.storeSlot);
+                            break;
+                        case SuperOpcode::BinaryLocalIntConstant:
+                            flat.flatOpcode = FlatOpcode::SuperBinaryLocalIntConst;
+                            flat.src0Slot = localSlot(inst.auxReg1);
+                            flat.dstSlot = regSlot(inst.result);
+                            flat.aux0Slot = regSlot(inst.auxReg2);
+                            flat.aux1Slot = regSlot(inst.superResult);
+                            break;
+                        case SuperOpcode::BinaryLocalIntConstantStoreLocal: {
+                            const bool tempsDead =
+                                inst.result < regCount &&
+                                inst.auxReg2 < regCount &&
+                                inst.superResult < regCount &&
+                                globalRegReads[inst.result] == 1 &&
+                                globalRegReads[inst.auxReg2] == 1 &&
+                                globalRegReads[inst.superResult] == 1;
+                            flat.flatOpcode = tempsDead
+                                ? FlatOpcode::SuperBinaryLocalIntConstStoreElided
+                                : FlatOpcode::SuperBinaryLocalIntConstStore;
+                            flat.src0Slot = localSlot(inst.auxReg1);
+                            flat.dstSlot = regSlot(inst.result);
+                            flat.aux0Slot = regSlot(inst.auxReg2);
+                            flat.aux1Slot = regSlot(inst.superResult);
+                            flat.storeSlot = localSlot(inst.storeSlot);
+                            break;
+                        }
+                        case SuperOpcode::BinaryLocalIntLocal:
+                            flat.flatOpcode = FlatOpcode::SuperBinaryLocalIntLocal;
+                            flat.src0Slot = localSlot(inst.auxReg1);
+                            flat.src1Slot = localSlot(inst.op1);
+                            flat.dstSlot = regSlot(inst.result);
+                            flat.aux0Slot = regSlot(inst.auxReg2);
+                            flat.aux1Slot = regSlot(inst.superResult);
+                            break;
+                        case SuperOpcode::BinaryLocalIntLocalStoreLocal: {
+                            const bool tempsDead =
+                                inst.result < regCount &&
+                                inst.auxReg2 < regCount &&
+                                inst.superResult < regCount &&
+                                globalRegReads[inst.result] == 1 &&
+                                globalRegReads[inst.auxReg2] == 1 &&
+                                globalRegReads[inst.superResult] == 1;
+                            flat.flatOpcode = tempsDead
+                                ? FlatOpcode::SuperBinaryLocalIntLocalStoreElided
+                                : FlatOpcode::SuperBinaryLocalIntLocalStore;
+                            flat.src0Slot = localSlot(inst.auxReg1);
+                            flat.src1Slot = localSlot(inst.op1);
+                            flat.dstSlot = regSlot(inst.result);
+                            flat.aux0Slot = regSlot(inst.auxReg2);
+                            flat.aux1Slot = regSlot(inst.superResult);
+                            flat.storeSlot = localSlot(inst.storeSlot);
+                            break;
+                        }
+                        case SuperOpcode::BinaryLocalIntReg:
+                            flat.flatOpcode = FlatOpcode::SuperBinaryLocalIntReg;
+                            flat.src0Slot = localSlot(inst.auxReg1);
+                            flat.src1Slot = regSlot(inst.op1);
+                            flat.dstSlot = regSlot(inst.result);
+                            flat.aux1Slot = regSlot(inst.superResult);
+                            break;
+                        case SuperOpcode::BinaryLocalIntRegStoreLocal: {
+                            const bool tempsDead =
+                                inst.result < regCount &&
+                                inst.superResult < regCount &&
+                                globalRegReads[inst.result] == 1 &&
+                                globalRegReads[inst.superResult] == 1;
+                            flat.flatOpcode = tempsDead
+                                ? FlatOpcode::SuperBinaryLocalIntRegStoreElided
+                                : FlatOpcode::SuperBinaryLocalIntRegStore;
+                            flat.src0Slot = localSlot(inst.auxReg1);
+                            flat.src1Slot = regSlot(inst.op1);
+                            flat.dstSlot = regSlot(inst.result);
+                            flat.aux1Slot = regSlot(inst.superResult);
+                            flat.storeSlot = localSlot(inst.storeSlot);
+                            break;
+                        }
+                        case SuperOpcode::BinaryLocalIntRegChainStoreLocal: {
+                            const bool tempsDead =
+                                inst.result < regCount &&
+                                inst.auxReg2 < regCount &&
+                                inst.superResult < regCount &&
+                                globalRegReads[inst.result] == 1 &&
+                                globalRegReads[inst.auxReg2] == 1 &&
+                                globalRegReads[inst.superResult] == 1;
+                            flat.flatOpcode = tempsDead
+                                ? FlatOpcode::SuperBinaryLocalIntRegChainStoreElided
+                                : FlatOpcode::SuperBinaryLocalIntRegChainStore;
+                            flat.src0Slot = localSlot(inst.auxReg1);
+                            flat.src1Slot = regSlot(inst.op1);
+                            flat.src2Slot = regSlot(inst.op2);
+                            flat.dstSlot = regSlot(inst.result);
+                            flat.aux0Slot = regSlot(inst.auxReg2);
+                            flat.aux1Slot = regSlot(inst.superResult);
+                            flat.storeSlot = localSlot(inst.storeSlot);
+                            break;
+                        }
+                        default:
+                            break;
+                        }
+                        execFunc.flatStream.push_back(flat);
+                        i += inst.span;
+                        continue;
+                    }
+
+                    // Single instruction mapping
+                    flat.span = 1;
+                    switch (inst.opcode) {
+                    case QuickOpcode::LoadParameter:
+                        flat.flatOpcode = FlatOpcode::MoveSlot;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = paramSlot(inst.auxReg1);
+                        break;
+                    case QuickOpcode::LoadLocal:
+                        flat.flatOpcode = FlatOpcode::MoveSlot;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = localSlot(inst.auxReg1);
+                        break;
+                    case QuickOpcode::StoreLocal:
+                        flat.flatOpcode = FlatOpcode::MoveSlot;
+                        flat.dstSlot = localSlot(inst.auxReg1);
+                        flat.src0Slot = regSlot(inst.op0);
+                        break;
+                    case QuickOpcode::ConstantInt:
+                        flat.flatOpcode = FlatOpcode::ConstantInt;
+                        flat.dstSlot = regSlot(inst.result);
+                        break;
+                    case QuickOpcode::AddInt:
+                        flat.flatOpcode = inst.checkedArithmetic1
+                            ? FlatOpcode::AddIntChecked
+                            : FlatOpcode::AddIntUnchecked;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::SubtractInt:
+                        flat.flatOpcode = inst.checkedArithmetic1
+                            ? FlatOpcode::SubIntChecked
+                            : FlatOpcode::SubIntUnchecked;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::MultiplyInt:
+                        flat.flatOpcode = inst.checkedArithmetic1
+                            ? FlatOpcode::MulIntChecked
+                            : FlatOpcode::MulIntUnchecked;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::DivideInt:
+                        flat.flatOpcode = FlatOpcode::DivInt;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::RemainderInt:
+                        flat.flatOpcode = FlatOpcode::RemInt;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::LessInt:
+                        flat.flatOpcode = FlatOpcode::LessInt;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::LessOrEqualInt:
+                        flat.flatOpcode = FlatOpcode::LessOrEqualInt;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::GreaterInt:
+                        flat.flatOpcode = FlatOpcode::GreaterInt;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::GreaterOrEqualInt:
+                        flat.flatOpcode = FlatOpcode::GreaterOrEqualInt;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::EqualInt:
+                        flat.flatOpcode = FlatOpcode::EqualInt;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::NotEqualInt:
+                        flat.flatOpcode = FlatOpcode::NotEqualInt;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::CheckNotNullFast:
+                        flat.flatOpcode = FlatOpcode::CheckNotNullFast;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        break;
+                    case QuickOpcode::LoadElementIntFast:
+                        flat.flatOpcode = FlatOpcode::LoadElementIntFast;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::StoreElementIntFast:
+                        flat.flatOpcode = FlatOpcode::StoreElementIntFast;
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        flat.src2Slot = regSlot(inst.op2);
+                        break;
+                    case QuickOpcode::CallDirect: {
+                        flat.dstSlot = inst.result == InvalidCompactReg
+                            ? InvalidCompactReg
+                            : regSlot(inst.result);
+                        if (inst.op0 == InvalidCompactReg) {
+                            flat.flatOpcode = FlatOpcode::CallDirect0;
+                        } else if (inst.op1 == InvalidCompactReg) {
+                            flat.flatOpcode = FlatOpcode::CallDirect1;
+                            flat.src0Slot = regSlot(inst.op0);
+                        } else if (inst.op2 == InvalidCompactReg) {
+                            flat.flatOpcode = FlatOpcode::CallDirect2;
+                            flat.src0Slot = regSlot(inst.op0);
+                            flat.src1Slot = regSlot(inst.op1);
+                        } else {
+                            flat.flatOpcode = FlatOpcode::CallDirectN;
+                        }
+                        break;
+                    }
+                    case QuickOpcode::CallPolled:
+                        flat.flatOpcode = FlatOpcode::CallPolledFast;
+                        flat.dstSlot = inst.result == InvalidCompactReg
+                            ? InvalidCompactReg
+                            : regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = inst.op1 == InvalidCompactReg
+                            ? InvalidCompactReg
+                            : regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::Generic:
+                    default:
+                        flat.flatOpcode = FlatOpcode::GenericBytecode;
+                        break;
+                    }
+                    execFunc.flatStream.push_back(flat);
+                    ++i;
+                }
+
+                // Append block terminator as a FlatInstruction
+                {
+                    FlatInstruction termInst;
+                    termInst.blockIndex = static_cast<std::uint32_t>(bIdx);
+                    termInst.instructionIndexInBlock = static_cast<std::uint32_t>(nInst);
+                    termInst.span = 1;
+                    switch (blk.terminatorKind) {
+                    case bytecode::TerminatorKind::Jump:
+                        if (!blk.branch.hasArguments &&
+                            blk.branch.target != InvalidBlockIndex) {
+                            termInst.flatOpcode = FlatOpcode::TermJumpNoArgs;
+                        } else {
+                            termInst.flatOpcode = FlatOpcode::TermBranchGeneric;
+                        }
+                        break;
+                    case bytecode::TerminatorKind::Branch:
+                        if (blk.conditionPrevalidatedBool &&
+                            !blk.branch.hasArguments &&
+                            !blk.falseBranch.hasArguments &&
+                            blk.branch.target != InvalidBlockIndex &&
+                            blk.falseBranch.target != InvalidBlockIndex &&
+                            blk.terminatorReg < regCount) {
+                            termInst.flatOpcode = FlatOpcode::TermBranchBoolNoArgs;
+                            termInst.src0Slot = regSlot(static_cast<std::uint16_t>(blk.terminatorReg));
+                        } else {
+                            termInst.flatOpcode = FlatOpcode::TermBranchGeneric;
+                        }
+                        break;
+                    case bytecode::TerminatorKind::ReturnVoid:
+                        termInst.flatOpcode = FlatOpcode::TermReturnVoid;
+                        break;
+                    case bytecode::TerminatorKind::ReturnValue:
+                        if (blk.returnPrevalidatedScalar &&
+                            blk.terminatorReg < regCount) {
+                            termInst.flatOpcode = FlatOpcode::TermReturnScalarFast;
+                            termInst.src0Slot = regSlot(static_cast<std::uint16_t>(blk.terminatorReg));
+                        } else {
+                            termInst.flatOpcode = FlatOpcode::TermReturnGeneric;
+                        }
+                        break;
+                    case bytecode::TerminatorKind::Throw:
+                    default:
+                        termInst.flatOpcode = FlatOpcode::TermThrow;
+                        break;
+                    }
+                    execFunc.flatStream.push_back(termInst);
+                }
+            next_block:;
+            }
+
+            // Patch block stream offsets into branch/jump instructions
+            execFunc.entryStreamOffset = execFunc.blockStreamOffsets[execFunc.entry];
+            for (auto& flat : execFunc.flatStream) {
+                const auto& blk = execFunc.blocks[flat.blockIndex];
+                if (blk.branch.target != InvalidBlockIndex &&
+                    blk.branch.target < execFunc.blockStreamOffsets.size()) {
+                    flat.trueTargetOffset = execFunc.blockStreamOffsets[blk.branch.target];
+                }
+                if (blk.falseBranch.target != InvalidBlockIndex &&
+                    blk.falseBranch.target < execFunc.blockStreamOffsets.size()) {
+                    flat.falseTargetOffset = execFunc.blockStreamOffsets[blk.falseBranch.target];
+                }
+            }
+            execFunc.canUseFlatFastPath = !execFunc.flatStream.empty();
+        }
+    }
     return mirror;
 }
 

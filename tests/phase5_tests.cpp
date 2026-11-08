@@ -135,12 +135,12 @@ void testGeneratorDeterminismAndShape() {
             first.source.find("context.newObject") != std::string::npos,
         "AOT output did not lower MIR control flow and runtime intrinsics");
     require(first.source.find(
-                "template <bool FastAccounting, bool DeterminismAccounting>") !=
+                "template <bool FastAccounting, bool DeterminismAccounting, bool TrustedRelease = false>") !=
                 std::string::npos &&
             first.source.find("typedRegister_") != std::string::npos &&
             first.source.find("goto typedBlock_") != std::string::npos &&
-            first.source.find("_typed<true, false>") != std::string::npos &&
-            first.source.find("_typed<false, true>") != std::string::npos &&
+            first.source.find("_typed<true, false, false>") != std::string::npos &&
+            first.source.find("_typed<false, true, false>") != std::string::npos &&
             first.source.find("rawAccounting.consume(") !=
                 std::string::npos,
         "AOT output did not select typed primitive scalar lowering");

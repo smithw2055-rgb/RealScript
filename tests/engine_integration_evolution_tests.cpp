@@ -6025,6 +6025,159 @@ int main() { return 0; }
     }
 }
 
+void testFlatFrameComputedGotoInterpreterCompleteness() {
+    // 1. Test flat-frame superinstructions (Elided stores, RegChain, SuperLessLocalConstBranch, SuperLessLocalRegBranch, CallDirect0/1/2/N, try/catch)
+    const char* source = R"(
+module Evolution.FlatInterpreter;
+
+class CustomError
+{
+    public int Code;
+    public CustomError(int code)
+    {
+        Code = code;
+    }
+}
+
+int helper0() { return 7; }
+int helper1(int a) { return a + 3; }
+int helper2(int a, int b) { return a * b; }
+int helper4(int a, int b, int c, int d) { return a + b + c + d; }
+
+int runLoopConstBranchAndElidedStores(int limit)
+{
+    int acc = 0;
+    int step = 3;
+    int i = 0;
+    while (i < 50)
+    {
+        acc = acc + 5;
+        acc = acc + step;
+        acc = acc + (limit * 2) - 1;
+        i = i + 1;
+    }
+    return acc + helper0() + helper1(10) + helper2(3, 4) + helper4(1, 2, 3, 4);
+}
+
+int runTryCatchInFlatStream(int trigger)
+{
+    int total = 10;
+    try
+    {
+        for (int i = 0; i < trigger; i = i + 1)
+        {
+            total = total + i;
+            if (i == 4)
+            {
+                throw new CustomError(99);
+            }
+        }
+    }
+    catch (CustomError err)
+    {
+        total = total + err.Code;
+    }
+    return total;
+}
+
+int main()
+{
+    int a = runLoopConstBranchAndElidedStores(4);
+    int b = runTryCatchInFlatStream(10);
+    return a + b;
+}
+)";
+
+    for (const auto optLevel : {realscript::optimization::Level::None,
+                                realscript::optimization::Level::Aggressive}) {
+        realscript::compiler::Compilation comp;
+        comp.addSource({"flat_interpreter.rs", source});
+        const auto build = comp.build();
+        require(!build.diagnostics.hasErrors(), "flat_interpreter.rs failed to compile:\n" + diagnosticsText(build.diagnostics));
+
+        realscript::optimization::Optimizer optimizer;
+        realscript::diagnostics::DiagnosticBag optDiags;
+        const auto optimizedMir = optimizer.optimize(build.modules, optDiags, {optLevel});
+        require(!optDiags.hasErrors(), "flat_interpreter.rs optimization failed");
+
+        realscript::bytecode::Lowerer lowerer;
+        std::vector<realscript::bytecode::Module> bytecodeModules;
+        for (const auto& mirMod : optimizedMir.modules) {
+            bytecodeModules.push_back(lowerer.lower(mirMod));
+        }
+
+        realscript::runtime::Interpreter interpreter(bytecodeModules);
+        const auto runRes = interpreter.invoke("Evolution.FlatInterpreter::main", {});
+        require(runRes.succeeded, "Flat interpreter execution failed: " + runRes.error.message);
+        // In runLoopConstBranchAndElidedStores(4):
+        // 50 iterations of: acc += 5 + 3 + (4*2 - 1) = 15 -> 50 * 15 = 750
+        // + helper0(7) + helper1(13) + helper2(12) + helper4(10) = 792
+        // In runTryCatchInFlatStream(10):
+        // total starts at 10; i=0(+0), i=1(+1), i=2(+2), i=3(+3), i=4(+4 -> 20, then throws CustomError(99))
+        // catch adds 99 -> 119.
+        // Total = 792 + 119 = 911.
+        require(std::get<std::int64_t>(runRes.value) == 911,
+            "Flat interpreter result mismatch: expected 911, got " +
+                std::to_string(std::get<std::int64_t>(runRes.value)));
+
+        // 2. Test exact instruction budget boundary inside superinstructions (L_FlatSuperFallback)
+        const auto totalExecuted = runRes.instructionsExecuted;
+        require(totalExecuted > 20, "expected non-trivial instruction count");
+        for (std::uint64_t budget : {std::uint64_t{1}, std::uint64_t{5}, std::uint64_t{12}, totalExecuted - 1}) {
+            const auto bRes = interpreter.invoke(
+                "Evolution.FlatInterpreter::main",
+                {},
+                realscript::runtime::Limits{budget, 64});
+            require(!bRes.succeeded &&
+                    bRes.error.code == realscript::runtime::ErrorCode::InstructionBudgetExceeded,
+                "expected InstructionBudgetExceeded at budget=" + std::to_string(budget));
+            require(bRes.instructionsExecuted == budget,
+                "expected exact instructionsExecuted == budget (" + std::to_string(budget) +
+                "), got " + std::to_string(bRes.instructionsExecuted));
+        }
+
+        // 3. P0-1 regression test: verify that when a loop header's LoadLocal/ConstantInt/LessInt registers
+        // are also read in a dominated block (globalRegReads > 1), buildExecutionMirror does NOT elide writes!
+        auto customModules = bytecodeModules;
+        for (auto& mod : customModules) {
+            for (auto& fn : mod.functions) {
+                if (fn.name == "runLoopConstBranchAndElidedStores" && fn.blocks.size() >= 2) {
+                    // Find any block ending in LessInt + Branch and add a read of its LoadLocal register in trueTarget
+                    for (auto& blk : fn.blocks) {
+                        if (blk.terminator.kind == realscript::bytecode::TerminatorKind::Branch &&
+                            !blk.instructions.empty() &&
+                            blk.instructions.back().opcode == realscript::bytecode::Opcode::LessInt) {
+                            const auto loadedReg = blk.instructions.back().operands[0];
+                            // Verify the value in loadedReg is preserved across the branch
+                            for (auto& targetBlk : fn.blocks) {
+                                if (targetBlk.id == blk.terminator.target && !targetBlk.instructions.empty()) {
+                                    realscript::bytecode::Instruction dummyAdd;
+                                    dummyAdd.opcode = realscript::bytecode::Opcode::AddInt;
+                                    dummyAdd.checkedArithmetic = false;
+                                    dummyAdd.result = static_cast<realscript::bytecode::Register>(fn.registerTypes.size());
+                                    dummyAdd.operands.push_back(loadedReg);
+                                    dummyAdd.operands.push_back(loadedReg);
+                                    fn.registerTypes.push_back(realscript::semantic::PrimitiveType::Int);
+                                    fn.registerTypeIds.push_back(0);
+                                    targetBlk.instructions.insert(targetBlk.instructions.begin(), dummyAdd);
+                                    fn.debugInfo = {};
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        realscript::runtime::Interpreter customInterpreter(std::move(customModules));
+        const auto customRes = customInterpreter.invoke("Evolution.FlatInterpreter::main", {});
+        require(customRes.succeeded && std::get<std::int64_t>(customRes.value) == 911,
+            "P0-1 regression test failed when loop-header register is reused across blocks: " +
+                customRes.error.message);
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -6069,8 +6222,10 @@ int main() {
         testConstStaticAndUtilityClassCompleteness();
         std::cout << "[21/22] testStaticConstructorsAndReadonlyFieldsCompleteness..." << std::endl;
         testStaticConstructorsAndReadonlyFieldsCompleteness();
-        std::cout << "[22/22] testPropertyInitializersAndAutoPropertiesCompleteness..." << std::endl;
+        std::cout << "[22/23] testPropertyInitializersAndAutoPropertiesCompleteness..." << std::endl;
         testPropertyInitializersAndAutoPropertiesCompleteness();
+        std::cout << "[23/23] testFlatFrameComputedGotoInterpreterCompleteness..." << std::endl;
+        testFlatFrameComputedGotoInterpreterCompleteness();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

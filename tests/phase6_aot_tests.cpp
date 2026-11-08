@@ -215,8 +215,8 @@ Fixed simulateVec2Vec3(int steps) {
 
     // Verify that all 4 functions in Phase6.ExpandedTypedAot and RealScript.Math functions lowered to _scalar
     require(
-        generated.source.find("_scalar<FastAccounting, DeterminismAccounting>(") != std::string::npos &&
-        generated.source.find("enterTypedDirectCall<FastAccounting, DeterminismAccounting>") != std::string::npos &&
+        generated.source.find("_scalar<FastAccounting, DeterminismAccounting, TrustedRelease>(") != std::string::npos &&
+        generated.source.find("enterTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>") != std::string::npos &&
         generated.source.find("runtime::Vec2Value") != std::string::npos &&
         generated.source.find("runtime::Vec3Value") != std::string::npos &&
         generated.source.find("runtime::FixedValue") != std::string::npos,
