@@ -23,7 +23,7 @@ RealScript 采用 C# 风格语法，但不是 CLR、ECMA C# 或 .NET 标准库�
 | 引用位置 | 部分支持 | ref 参数、局部、返回、字段、Indexer 与 ref `this`；无 unsafe 指针、ref property、ref struct 和完整逃逸分析。 |
 | Attribute | 部分支持 | 原生语法及编译器/Game SDK/产物元数据，自动导入 `ScriptMetadataRegistry` 与 `InspectorTypeSchema`；无可执行 Attribute Class 和完整 `AttributeUsage`。 |
 | 用户运算符/转换 | 部分支持 | 支持自定义 `operator` 重载（`+`、`-`、`*`、`/`、`%`、`==`、`!=`、`<`、`<=`、`>`、`>=`、一元 `-`、`!`、`~`）与复合赋值（`+=`、`-=`、`*=`、`/=`、`%=`）；不支持自定义隐式/显式类型转换。 |
-| `const`、`readonly`、静态字段 | 支持 | 支持编译期 `const`、构造函数内赋值的 `readonly` 字段，以及跨解释器、字节码与 C++17 AOT 的 `static` 字段及初始化器。 |
+| `const`、`readonly`、静态成员与属性初始化器 | 支持 | 支持编译期 `const`、构造函数内赋值的 `readonly` 字段、`static class`、确定性静态构造函数（`static T()`）、`static` 字段及初始化器，以及跨解释器、字节码与 C++17 AOT 的实例/静态自动属性初始化器（`{ get; set; } = expr;`）。 |
 
 ## 表达式与控制流
 
@@ -52,10 +52,10 @@ RealScript 采用 C# 风格语法，但不是 CLR、ECMA C# 或 .NET 标准库�
 | 能力 | 状态 | RealScript 语义边界 |
 |---|---|---|
 | Interpreter | 支持 | 验证过的类型化寄存器 Bytecode、预算、GC、确定性 Trace 与结构化错误。 |
-| C++17 AOT | 支持 | 生成代码与解释器共享 MIR 语义，包括委托、值类型、Pattern 和异常。 |
+| C++17 AOT | 支持 | 生成代码与解释器共享 MIR 语义，包括委托、值类型、Pattern 和异常，并支持零预算 Trusted Release（`--trusted-release`）、结构体栈标量化与 AVX2 向量化 ECS 快循环。 |
 | Toolchain JIT | 平台相关 | 配置后使用外部 C++ 工具链；不是 CLR 风格进程内机器码 JIT。 |
 | `.rsbc` | Draft、带版本 | 当前输出 0.9，Decoder 支持 0.6–0.9；格式尚未冻结。 |
-| LSP/DAP/Hot Reload | 支持受限模型 | 原始源码符号与 Sequence Point、成员 `.` 补全、`signatureHelp`、`.d.rs` 宿主声明导出、条件断点、无副作用 Watch 求值，以及带状态结构化热重载（`[FormerlySerializedAs]` 与跨组件引用迁移）。 |
+| LSP/DAP/Hot Reload | 支持受限模型 | 原始源码符号与 Sequence Point、`ParseSnapshot` 增量缓存、成员 `.` 补全、`signatureHelp`、`.d.rs` 宿主声明导出、标准流及内嵌 TCP（`--dap-port` / `EmbeddedDapServer`）DAP 调试、条件断点、无副作用 Watch 求值、`vscode-realscript` 插件，以及带状态结构化热重载（`[FormerlySerializedAs]` 与跨组件引用迁移）。 |
 | Reflection 与 `dynamic` | 不支持 | 有稳定 TypeId，但无 CLR Reflection、`dynamic`、运行时代码生成和运行时泛型构造。 |
 | 标准库 | 专用模型 | 提供确定性游戏/运行时基础能力，不是 .NET BCL。 |
 

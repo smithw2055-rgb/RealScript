@@ -31,15 +31,15 @@ RealScript 是一门面向现代 C++17 游戏引擎的嵌入式强类型脚本�
 
 | 领域 | v0.2.0+ 已实现能力 |
 |---|---|
-| 语言 | Module/import、重载、运算符重载、复合赋值、Class、单继承（含脚本类直接继承 C++ 绑定类型）、Interface、Virtual Dispatch、Delegate、Closure、Event、Generic、Collection、Enum、可变 Struct、Nullable、Boxing、Pattern、Initializer、灵活参数与结构化异常。 |
-| 控制流 | `if`、`while`、`for`、`foreach`、`do/while`、`switch`、Switch Expression、`break`、`continue`、`try/catch/finally`、确定性 `sequence`（`yield wait_ticks`、`wait_seconds`、`wait_event`、`wait_until`）与 `RealScript.Fiber` 协作式纤程。 |
-| 编译器 | Lexer、Parser、Binder、Flow Analysis、稳定诊断、经过验证的多基本块 Typed MIR，以及 O0/O1/O2 优化。 |
-| 字节码 | 类型化寄存器 VM、确定性 `.rsbc` 0.9 输出、0.6–0.8 兼容读取、防御性验证和结构化脚本调用栈。 |
-| 内存 | 代际 ObjectRef、精确根、增量 Mark/Sweep、写屏障、有界 GC Work、Snapshot、Retaining Path 和泄漏诊断。 |
-| 原生执行 | 确定性 C++17 AOT、C11 Module Query ABI、Source Map、类型化 Native Thunk、可选工具链 JIT、内容寻址缓存与 Interpreter/JIT/AOT 分层执行。 |
-| 确定性 | Off/Strict/Record/Replay、指令/递归/分配/堆预算、稳定 Digest、外部调用回放与跨后端差分验证。 |
-| Game SDK | 类型化 Binding、数学原语直接封送与快路径（`Fixed`/`Fixed16`/`Vec2`/`Vec3`）、单实体多组件、Editor/Play 模式（`[Tool]`/`[ExecuteInEditMode]`）、`OnValidate`、深度 `InspectorTypeSchema` 反射、宿主 `connectSignal`、JSON 场景/预制体序列化、`RSGS` 状态编码及零拷贝 SoA 桥接。 |
-| 工具链 | `rsc`、`rsaot`、`rsdebug`、`rslsp`、`rsbench`、DAP（条件断点与无副作用 Watch 求值）、LSP（成员 `.` 补全、`signatureHelp`、`.d.rs` 宿主声明导出）、Chrome Tracing 性能导出，以及带状态结构化热重载（`[FormerlySerializedAs]` 与跨组件引用迁移）。 |
+| 语言 | Module/import、重载、运算符重载、复合赋值、Class、`static class`、静态构造函数（`static T()`）、`readonly` 字段、自动属性初始化器、单继承（含脚本类直接继承 C++ 绑定类型）、Interface、Virtual Dispatch、Delegate、Closure、Event、Generic、Collection、Enum、可变 Struct、Nullable、Boxing、Pattern、Initializer、灵活参数与结构化异常。 |
+| 控制流 | `if`、`while`、`for`、`foreach`、`do/while`、`switch`、Switch Expression、`break`、`continue`、`try/catch/finally`、确定性 `sequence`（`yield wait_ticks`、`wait_seconds`、`wait_event`、`wait_signal`、`wait_until`）与 `RealScript.Fiber` 协作式纤程。 |
+| 编译器 | Lexer、Parser、Binder、Flow Analysis、`[Deterministic]` 静态校验、稳定诊断、经过验证的多基本块 Typed MIR，以及 O0/O1/O2 优化。 |
+| 字节码 | 类型化寄存器 VM、24B 紧凑 `Value` 与 8B `Instruction`、整数循环指令快化（Quickening）、确定性 `.rsbc` 0.9 输出、0.6–0.8 兼容读取、防御性验证和结构化脚本调用栈。 |
+| 内存 | 代际 ObjectRef、12B 内联结构体槽（`InlineStructSlot`）、`ValuePoolArena` 池化对象 GC 回收、精确根、增量 Mark/Sweep、写屏障、有界 GC Work、Snapshot、Retaining Path 和泄漏诊断。 |
+| 原生执行 | 确定性 C++17 AOT、零预算 Trusted Release AOT（`--trusted-release`）、自定义 `struct` 栈标量化（`AotStruct_<id>`）、AVX2/SIMD 向量化 ECS 循环重构（`__restrict` + `#pragma loop(ivdep)`）、C11 Module Query ABI、Source Map、类型化 Native Thunk、可选工具链 JIT、内容寻址缓存与 Interpreter/JIT/AOT 分层执行。 |
+| 确定性 | Off/Strict/Record/Replay、指令/递归/分配/堆预算、Mod 能力沙箱（Capability Sandboxing）、稳定 Digest、外部调用回放与跨后端差分验证。 |
+| Game SDK | 类型化 Binding、数学原语直接封送与快路径（`Fixed`/`Fixed16`/`Vec2`/`Vec3`/`Quat`）、C++ 宿主连续内存零拷贝 ECS 列绑定（`bindEcsRawColumnAuto<T>`）、`Query<Write<T>, Read<U>, With<V>, Without<W>>()` 与 `EntityCommandBuffer`、2D/3D 定点物理（`stepPhysics2D`/`stepPhysics3D`）、确定性 `RealScript.Input`、单实体多组件、代际实体句柄、Editor/Play 模式（`[Tool]`/`[ExecuteInEditMode]`）、`OnValidate`、深度 `InspectorTypeSchema` 反射、宿主 `connectSignal`、JSON 场景/预制体序列化与 `RSGS` 状态编码。 |
+| 工具链 | `rsc`、`rsaot`、`rsdebug`、`rslsp`、`rsbench`、DAP（标准流与内嵌 TCP `--dap-port` 附加调试、条件断点、无副作用 Watch 求值）、LSP（`ParseSnapshot` 增量缓存、成员 `.` 补全、`signatureHelp`、`.d.rs` 宿主声明导出）、`vscode-realscript` VS Code 插件、Chrome Tracing 性能导出，以及带状态结构化热重载（`[FormerlySerializedAs]` 与跨组件引用迁移）。 |
 
 完整的支持/部分支持/不支持清单见
 [C# 风格兼容矩阵](docs/zh-CN/CSHARP_COMPATIBILITY_MATRIX.md)。

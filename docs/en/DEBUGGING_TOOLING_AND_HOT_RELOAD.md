@@ -46,12 +46,20 @@ Start the adapter with the source files that form the program:
 rsdebug game.rs common.rs
 ```
 
-The adapter communicates through standard DAP `Content-Length` framing over stdin/stdout.
+Or listen on a TCP port so an IDE can attach over a socket:
+
+```bash
+rsdebug --dap-port 4711 game.rs common.rs
+```
+
+Game engines can also embed `realscript::debug::EmbeddedDapServer` (`realscript/debug/DapServer.h`) directly in-process to accept live TCP attach connections (`127.0.0.1:<port>`) without restarting the host application.
+
+The adapter communicates through standard DAP `Content-Length` framing over stdin/stdout or TCP sockets.
 
 Implemented request families include:
 
 - `initialize` (advertising `supportsConditionalBreakpoints` and `supportsEvaluateForHovers`);
-- `launch`;
+- `launch` and `attach`;
 - `configurationDone`;
 - `setBreakpoints` (including per-breakpoint `condition` expressions);
 - `threads`;
@@ -106,11 +114,17 @@ Implemented capabilities include:
 
 The initial synchronization model uses full-document updates.
 
-## Language Service Architecture
+## Language Service Architecture and VS Code Extension
 
 `LanguageService` reuses the normal compiler and `BuildSnapshot` model. It does not maintain an independent parser or type checker.
 
-Workspace changes update source inputs and rebuild only invalidated modules where possible. Symbol definitions and stable identities drive precise navigation when available. Token-level fallback is used for some cross-workspace reference and rename cases.
+Each source file maintains a cached `ParseSnapshot` (lexed tokens, parsed syntax tree, and public declaration fingerprint). Body-only edits reuse parsed syntax trees of untouched files and skip rebinding dependent modules whose imported public signatures have not changed.
+
+The repository includes an official Visual Studio Code extension under `vscode-realscript/` providing:
+
+- automatic `rslsp` Language Client startup for `.rs` and `.d.rs` files;
+- a `realscript` Debug Adapter supporting both `"request": "launch"` (`rsdebug --dap`) and `"request": "attach"` (connecting to `rsdebug --dap-port <port>` or an in-engine `EmbeddedDapServer` over TCP);
+- TextMate syntax highlighting and language configuration for RealScript keywords, attributes, `sequence` coroutines, and ECS `Query<...>()` expressions.
 
 ## Protocol Safety
 

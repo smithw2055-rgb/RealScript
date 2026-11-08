@@ -7,9 +7,49 @@ remain versioned but unfrozen until a future 1.0 release.
 
 ### Engine integration and editor dataflow
 
+- Added Zero-Budget Trusted Release AOT mode (`GenerationOptions::trustedRelease`,
+  `ExecutionOptions::trustedRelease`, `rsaot --trusted-release`, and CMake
+  `realscript_add_aot_library(... TRUSTED_RELEASE)`), compiling out
+  instruction/branch/GC accounting guards via `if constexpr (!TrustedRelease)`
+  and scalarizing custom value-type `struct`s up to 16 scalar/inline-math fields
+  into stack-allocated `AotStruct_<typeId>` C++ structs.
+- Added Zero-Copy Host C++ Contiguous Struct ECS Raw Column Binding
+  (`ObjectKind::RawColumnArray`, `NativeFieldLayout`, `NativeFieldKind`,
+  `ScriptRuntime::bindEcsRawColumn`, and `bindEcsRawColumnAuto<HostStruct>`) with
+  in-place `HeapSlot` reuse on per-frame rebind across both the Bytecode
+  Interpreter and C++17 AOT, plus AVX2/SIMD vectorized ECS query loop
+  reconstruction (`analyzeVectorizedEcsLoops` / `emitVectorizedEcsLoop` emitting
+  `__restrict` native column pointers and `#pragma GCC ivdep` /
+  `#pragma clang loop vectorize(enable)` / `#pragma loop(ivdep)`).
+- Added auto-property initializers (`public int Hp { get; set; } = 100;` and
+  `static` auto-property initializers on classes and structs), static
+  constructors (`static ClassName()`), `static class` enforcement, and
+  constructor-assigned `readonly` field enforcement across the compiler,
+  bytecode VM, and C++17 AOT.
+- Compacted `runtime::Value` to 24 bytes (`PooledStringValue`,
+  `PooledStructValue`, `PooledClosureValue`) and `bytecode::Instruction` to
+  8 bytes, added quickened integer-loop bytecode superinstructions
+  (`AddIntLocalConst`, `SubIntLocalConst`, `LessIntLocalConstBranch`), and
+  integrated `ValuePoolArena::collectGarbage` into `ManagedHeap::collect` to
+  reclaim unreferenced pooled strings, >4-field structs, and closures.
+- Added an embeddable TCP socket DAP server (`EmbeddedDapServer` in
+  `realscript/debug/DapServer.h` and `rsdebug --dap-port <port>` attach mode),
+  per-file `ParseSnapshot` incremental caching in `LanguageService`, and the
+  official `vscode-realscript` VS Code extension supporting `rslsp`, `launch`
+  (`--dap`) and `attach` (`--dap-port`) debugging, and TextMate highlighting.
+- Extended `RealScript.Physics` and `SceneScriptRuntime` with 3D fixed-point
+  colliders (`Box3D`, `Sphere3D`, `Capsule3D`), `stepPhysics3D`, spatial queries
+  (`raycast3D`, `raycastAll3D`, `overlapSphere3D`), 3D collision/trigger
+  callbacks (`OnCollisionEnter3D`/`Stay3D`/`Exit3D`,
+  `OnTriggerEnter3D`/`Stay3D`/`Exit3D`), generational entity handles
+  (`spawnGenerationalEntity`, `isStaleGenerationalEntity`), deferred entity
+  destruction (`queueDestroyEntity`, `flushDestroyedEntities`), entity names and
+  groups (`setEntityName`, `findEntityByName`, `addEntityToGroup`,
+  `getEntitiesInGroup`), and `[ExportGroup]` / `[ExportSubgroup]` /
+  `[ExportCategory]` inspector schema grouping.
 - Upgraded 12-byte `InlineStructSlot` bit-packing to support `Vec3`, `Quat`, and
   `Enum` fields inline inside `runtime::StructValue` without increasing
-  `sizeof(InlineStructSlot)` (12B) or `sizeof(Value)` (88B), and added in-place
+  `sizeof(InlineStructSlot)` (12B) or `sizeof(Value)` (24B), and added in-place
   slot updates in `Opcode::StoreStructField`.
 - Extended `Query<...>()` ECS chunk queries with multi-entity Sparse-Set
   intersection joins (`setEcsEntityComponent`, `getEcsEntityComponent`,

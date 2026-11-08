@@ -173,6 +173,44 @@ int main() {
         auto compiled = compiler.compile({{"aot_trusted_ecs_bench.rs", ecsScript}});
         requireCond(compiled.succeeded(), "ECS script compilation failed");
 
+        {
+            compiler::Compilation ecsComp({{"aot_trusted_ecs_bench.rs", ecsScript}});
+            auto ecsCompRes = ecsComp.build();
+            requireCond(!ecsCompRes.diagnostics.hasErrors(), "ECS MIR compile failed");
+
+            diagnostics::DiagnosticBag ecsOptDiags;
+            optimization::Optimizer ecsOpt;
+            optimization::Options ecsOptOpts;
+            ecsOptOpts.level = optimization::Level::Aggressive;
+            auto ecsOptRes = ecsOpt.optimize(ecsCompRes.modules, ecsOptDiags, ecsOptOpts);
+            requireCond(!ecsOptDiags.hasErrors(), "ECS MIR optimization failed");
+
+            diagnostics::DiagnosticBag diagsEcsTrusted;
+            aot::GenerationOptions genEcsTrusted;
+            genEcsTrusted.programName = "BenchProgram_ecs";
+            genEcsTrusted.cppNamespace = "bench_ns_ecs";
+            genEcsTrusted.trustedRelease = true;
+            aot::CppGenerator generator;
+            const auto outEcsTrusted = generator.generate(
+                ecsOptRes.modules, diagsEcsTrusted, genEcsTrusted);
+            requireCond(
+                !diagsEcsTrusted.hasErrors() && !outEcsTrusted.source.empty(),
+                "ECS trustedRelease AOT codegen failed");
+            requireCond(
+                outEcsTrusted.source.find("#pragma GCC target(\"avx2,fma\")") != std::string::npos,
+                "TrustedRelease AOT codegen should emit AVX2/FMA pragma block");
+            requireCond(
+                outEcsTrusted.source.find("Reconstructed Vectorized ECS Query Fast-Loop") != std::string::npos,
+                "ECS AOT codegen should reconstruct vectorized ECS fast-loop");
+            requireCond(
+                outEcsTrusted.source.find("__restrict ecsPtr_") != std::string::npos &&
+                    outEcsTrusted.source.find("#pragma loop(ivdep)") != std::string::npos,
+                "ECS AOT codegen should emit __restrict column pointers and #pragma loop(ivdep)");
+            requireCond(
+                outEcsTrusted.source.find("__builtin_expect") == std::string::npos,
+                "ECS AOT codegen must use portable RS_AOT_LIKELY instead of raw __builtin_expect");
+        }
+
         game::ScriptRuntime runtime(compiled.program);
 
         const auto ecsSystemsType = runtime.findType("ecs_bench::EcsSystems");

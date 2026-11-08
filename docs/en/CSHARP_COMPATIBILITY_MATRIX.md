@@ -26,7 +26,7 @@ deliberately smaller deterministic profile.
 | Reference locations | Partial | Ref parameters, locals, returns, fields, indexers, and ref `this`. No unsafe pointers, ref properties, ref structs, or full escape analysis. |
 | Attributes | Partial | Native syntax and versioned metadata for compiler/Game SDK/artifacts, auto-ingested into `ScriptMetadataRegistry` and `InspectorTypeSchema`. No executable attribute classes or full `AttributeUsage`. |
 | User operators/conversions | Partial | User-defined `operator` overloads (`+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, unary `-`, `!`, `~`) and compound assignments (`+=`, `-=`, `*=`, `/=`, `%=`) are supported. User-defined implicit/explicit conversions are not supported. |
-| `const`, `readonly`, static fields | Supported | Compile-time `const`, constructor-assigned `readonly` fields, and `static` fields/initializers are supported across interpreter, bytecode, and C++17 AOT. |
+| `const`, `readonly`, static members, property initializers | Supported | Compile-time `const`, constructor-assigned `readonly` fields, `static class`, deterministic `static` constructors (`static T()`), `static` fields/initializers, and instance/`static` auto-property initializers (`{ get; set; } = expr;`) are supported across interpreter, bytecode, and C++17 AOT. |
 
 ## Expressions and control flow
 
@@ -55,10 +55,10 @@ deliberately smaller deterministic profile.
 | Area | Status | RealScript contract |
 |---|---|---|
 | Interpreter | Supported | Verified typed-register bytecode with budgets, GC, deterministic tracing, and structured errors. |
-| C++17 AOT | Supported | Generated native code executes the same MIR semantics, including delegates, value types, patterns, and exceptions. |
+| C++17 AOT | Supported | Generated native code executes the same MIR semantics, including delegates, value types, patterns, and exceptions, plus Zero-Budget Trusted Release (`--trusted-release`), struct stack scalarization, and vectorized ECS fast-loops. |
 | Toolchain JIT | Platform-dependent | External C++ toolchain JIT where configured; it is not an in-process CLR-style machine-code JIT. |
 | `.rsbc` artifacts | Draft, versioned | Current output is 0.9; decoder supports 0.6–0.9. Format is not frozen. |
-| LSP/DAP/hot reload | Supported profile | Original-source symbols/sequence points, member `.` completion, `signatureHelp`, `.d.rs` host stubs, conditional breakpoints, side-effect-free watch `evaluate`, and stateful scene hot reload (`[FormerlySerializedAs]` & cross-component ref migration). |
+| LSP/DAP/hot reload | Supported profile | Original-source symbols/sequence points, incremental `ParseSnapshot` caching, member `.` completion, `signatureHelp`, `.d.rs` host stubs, stdio & embedded TCP (`--dap-port` / `EmbeddedDapServer`) DAP debugging, conditional breakpoints, side-effect-free watch `evaluate`, `vscode-realscript` extension, and stateful scene hot reload (`[FormerlySerializedAs]` & cross-component ref migration). |
 | Reflection and dynamic | Not supported | Stable compile-time/runtime TypeIds exist, but no CLR reflection, `dynamic`, runtime code emission, or runtime generic construction. |
 | Standard library | Purpose-built | Deterministic game/runtime primitives and collections, not the .NET BCL. |
 

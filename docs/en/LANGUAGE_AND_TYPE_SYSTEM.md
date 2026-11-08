@@ -136,17 +136,22 @@ Classes provide:
 
 Classes support single inheritance, base constructor calls and `base` member
 access, runtime interface values, deterministic virtual/interface dispatch,
-`abstract`/`virtual`/`override`/`sealed`, and
+`abstract`/`virtual`/`override`/`sealed`, `static class` declarations,
+deterministic `static` constructors (`static ClassName() { ... }`),
+constructor-assigned `readonly` fields, and
 `public`/`internal`/`protected`/`private` accessibility.
 
 ## Properties
 
-Explicit property accessors:
+Explicit property accessors and auto-properties (including initializers):
 
 ```csharp
 class Player
 {
     int health;
+
+    public int MaxHealth { get; set; } = 100;
+    public static int DefaultLives { get; set; } = 3;
 
     int Health
     {
@@ -156,7 +161,7 @@ class Player
 }
 ```
 
-Class auto-properties use deterministic synthetic backing fields. Accessors receive stable symbols and compile as normal direct calls.
+Class and struct auto-properties use deterministic synthetic backing fields and support both instance and `static` property initializers (`{ get; set; } = expr;` or `{ get; } = expr;`). Accessors receive stable symbols and compile as normal direct calls.
 
 ## Arrays
 
@@ -296,7 +301,7 @@ The Phase 24 implementation deliberately does not provide:
 - unsafe pointers, ref structs, ref properties, or full byref escape analysis;
 - exception filters, `using`, native exception interop, or exception unwinding
   serialized across sequence suspension;
-- operator overloads, user-defined conversions, LINQ, or the .NET base-class
+- user-defined implicit/explicit conversions, LINQ, or the .NET base-class
   library.
 
 Unsupported syntax or semantics receive explicit diagnostics.

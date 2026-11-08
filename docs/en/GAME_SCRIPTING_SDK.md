@@ -169,9 +169,28 @@ scene.connectSignal(
 - preserves active coroutine (`$sequence_*`) and event (`$event_*`) synthetic fields;
 - patches cross-component `ObjectRef` fields, arrays, and bound delegate targets so references point to the newly migrated instances.
 
-### Fast-path math marshaling and tiered execution
+### Fast-path math marshaling, zero-copy ECS columns, and tiered execution
 
-`BindingMarshal.h` and `ScriptRuntime` directly marshal `RealScript.Math` types (`Fixed`, `Fixed16`, `Vec2`, `Vec3`) between C++ (`FixedValue`, `Fixed16Value`, `Vec2Value`, `Vec3Value`) and scripts. `ScriptRuntime::getMemberVec2` and `setMemberVec2` read and mutate unshared `Vec2` struct fields in place without intermediate heap allocations.
+`BindingMarshal.h` and `ScriptRuntime` directly marshal `RealScript.Math` types (`Fixed`, `Fixed16`, `Vec2`, `Vec3`, `Quat`) between C++ (`FixedValue`, `Fixed16Value`, `Vec2Value`, `Vec3Value`, `QuatValue`) and scripts. `ScriptRuntime::getMemberVec2` and `setMemberVec2` read and mutate unshared `Vec2` struct fields in place without intermediate heap allocations.
+
+For high-throughput ECS systems (`foreach (ref var t, in var v in Query<Write<Transform>, Read<Velocity>, With<ActiveTag>, Without<FrozenTag>>())`), C++ hosts can bind contiguous native component arrays directly to script ECS columns via `ScriptRuntime::bindEcsRawColumn` or `bindEcsRawColumnAuto<HostStruct>`:
+
+```cpp
+struct HostTransform { float x, y, z; };
+struct HostVelocity  { float vx, vy, vz; };
+
+std::vector<HostTransform> transforms(10000);
+std::vector<HostVelocity>  velocities(10000);
+
+scripts.bindEcsRawColumnAuto<HostTransform>(
+    "Game::Transform", transforms.data(), transforms.size(), error);
+scripts.bindEcsRawColumnAuto<const HostVelocity>(
+    "Game::Velocity", velocities.data(), velocities.size(), error);
+```
+
+- Rebinding a column updates the existing `RawColumnArray` heap slot in place with **zero heap allocations per frame**.
+- Both the Bytecode Interpreter and C++17 AOT read and mutate the C++ host memory directly (`Int32`, `Int64`, `Float32`, `Float64`, `Bool`, `Fixed`, `Fixed16`, `Vec2`, `Vec3`, `Quat`), while C++17 AOT Trusted Release mode reconstructs vectorized native `for` loops with `__restrict` pointers.
+- Sparse per-entity components (`setEcsEntityComponent`, `getEcsEntityComponent`, `removeEcsEntityComponent`) and deferred `EntityCommandBuffer` mutations (`queueEcsSetComponent`, `queueEcsRemoveComponent`, `queueEcsDestroyEntity`, `flushEcsCommandBuffer`) remain synchronized across both backends.
 
 `ScriptRuntime::setTieredExecutionPolicy` configures automatic promotion from the bytecode interpreter to JIT/AOT execution when function invocation counts or loop back-edge budgets exceed configured thresholds.
 
