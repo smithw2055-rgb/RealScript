@@ -1708,12 +1708,29 @@ constexpr std::uint32_t kPoolLocalBits = 20u;
 constexpr std::uint32_t kPoolLocalMask = (1u << kPoolLocalBits) - 1u;
 constexpr std::uint32_t kInvalidLocalSlot = 0xFFFFFFFFu;
 
-constexpr std::uint8_t kSlotFlagOccupied = 0x01u;
-constexpr std::uint8_t kSlotFlagClock    = 0x02u;
-constexpr std::uint8_t kSlotFlagPinned   = 0x04u;
-constexpr std::uint8_t kSlotFlagGcMarked = 0x08u;
+constexpr std::uint8_t kSlotFlagOccupied  = 0x01u;
+constexpr std::uint8_t kSlotFlagClock     = 0x02u;
+constexpr std::uint8_t kSlotFlagPinned    = 0x04u;
+constexpr std::uint8_t kSlotFlagGcMarked  = 0x08u;
+constexpr std::uint8_t kSlotFlagStackRoot = 0x10u;
 
 std::atomic<bool> g_poolGcMarkInProgress{false};
+std::atomic<bool> g_anyPoolHasPinnedSlots{false};
+
+inline void noteShardPinned(std::atomic<bool>& shardFlag) noexcept {
+    if (!shardFlag.load(std::memory_order_relaxed)) {
+        shardFlag.store(true, std::memory_order_release);
+    }
+    if (!g_anyPoolHasPinnedSlots.load(std::memory_order_relaxed)) {
+        g_anyPoolHasPinnedSlots.store(true, std::memory_order_release);
+    }
+}
+
+inline void noteShardMarked(std::atomic<bool>& shardFlag) noexcept {
+    if (!shardFlag.load(std::memory_order_relaxed)) {
+        shardFlag.store(true, std::memory_order_release);
+    }
+}
 
 [[nodiscard]] inline std::uint8_t activePinFlags() noexcept {
     return kSlotFlagPinned | kSlotFlagClock |
@@ -1783,6 +1800,7 @@ struct RuntimeStringPool {
         std::uint32_t clockHand = 0u;
         std::uint32_t lastAllocatedSlot = kInvalidLocalSlot;
         std::atomic<std::uint32_t> epoch{1u};
+        std::atomic<bool> mayHavePinnedOrMarked{false};
         std::atomic<std::uint64_t> clockEvictions{0u};
         std::atomic<std::uint64_t> gcReclaimed{0u};
     };
@@ -1815,7 +1833,7 @@ struct RuntimeStringPool {
             const std::uint32_t offset = candidate & kPageMask;
             auto& fl = page->flags[offset];
             const std::uint8_t f = fl.load(std::memory_order_relaxed);
-            if ((f & (kSlotFlagPinned | kSlotFlagGcMarked)) != 0u) {
+            if ((f & (kSlotFlagPinned | kSlotFlagGcMarked | kSlotFlagStackRoot)) != 0u) {
                 continue;
             }
             if ((f & kSlotFlagClock) != 0u) {
@@ -1897,6 +1915,7 @@ struct RuntimeStringPool {
                     refreshClockBitIfUnset(fl);
                     if (pinEntry) {
                         fl.fetch_or(activePinFlags(), std::memory_order_relaxed);
+                        noteShardPinned(shard.mayHavePinnedOrMarked);
                     }
                 }
             }
@@ -1917,6 +1936,9 @@ struct RuntimeStringPool {
             const std::string& stored = page->strings[offset][bank];
             const std::uint8_t addFlags = kSlotFlagOccupied | kSlotFlagClock | (pinEntry ? activePinFlags() : 0u);
             page->flags[offset].fetch_or(addFlags, std::memory_order_relaxed);
+            if (pinEntry) {
+                noteShardPinned(shard.mayHavePinnedOrMarked);
+            }
 
             const std::uint32_t id = encodeShardedPoolId(shardIdx, localSlot);
             tls.hash = h;
@@ -1949,6 +1971,9 @@ struct RuntimeStringPool {
         page->activeBank[offset].store(nextBank, std::memory_order_release);
         const std::uint8_t initFlags = kSlotFlagOccupied | kSlotFlagClock | (pinEntry ? activePinFlags() : 0u);
         page->flags[offset].store(initFlags, std::memory_order_release);
+        if (pinEntry) {
+            noteShardPinned(shard.mayHavePinnedOrMarked);
+        }
         shard.indexByView.emplace(std::string_view(stored), localSlot);
 
         const std::uint32_t id = encodeShardedPoolId(shardIdx, localSlot);
@@ -2003,9 +2028,11 @@ struct RuntimeStringPool {
         if (!decodeShardedPoolId(id, shardIdx, localSlot)) return;
         const std::uint32_t pageIdx = localSlot >> kPageShift;
         if (pageIdx < kHardMaxPagesPerShard) {
-            if (StringPage* page = shards_[shardIdx].pages[pageIdx].load(std::memory_order_acquire)) {
+            Shard& shard = shards_[shardIdx];
+            if (StringPage* page = shard.pages[pageIdx].load(std::memory_order_acquire)) {
                 page->flags[localSlot & kPageMask].fetch_or(
                     activePinFlags(), std::memory_order_relaxed);
+                noteShardPinned(shard.mayHavePinnedOrMarked);
             }
         }
     }
@@ -2015,9 +2042,25 @@ struct RuntimeStringPool {
         if (!decodeShardedPoolId(id, shardIdx, localSlot)) return;
         const std::uint32_t pageIdx = localSlot >> kPageShift;
         if (pageIdx < kHardMaxPagesPerShard) {
-            if (StringPage* page = shards_[shardIdx].pages[pageIdx].load(std::memory_order_acquire)) {
+            Shard& shard = shards_[shardIdx];
+            if (StringPage* page = shard.pages[pageIdx].load(std::memory_order_acquire)) {
                 page->flags[localSlot & kPageMask].fetch_or(
                     kSlotFlagGcMarked | kSlotFlagPinned, std::memory_order_relaxed);
+                noteShardPinned(shard.mayHavePinnedOrMarked);
+            }
+        }
+    }
+
+    void markStackRootById(std::uint32_t id) noexcept {
+        std::uint32_t shardIdx = 0u, localSlot = 0u;
+        if (!decodeShardedPoolId(id, shardIdx, localSlot)) return;
+        const std::uint32_t pageIdx = localSlot >> kPageShift;
+        if (pageIdx < kHardMaxPagesPerShard) {
+            Shard& shard = shards_[shardIdx];
+            if (StringPage* page = shard.pages[pageIdx].load(std::memory_order_acquire)) {
+                page->flags[localSlot & kPageMask].fetch_or(
+                    kSlotFlagStackRoot | kSlotFlagClock, std::memory_order_relaxed);
+                noteShardMarked(shard.mayHavePinnedOrMarked);
             }
         }
     }
@@ -2090,6 +2133,7 @@ struct InlineStructPool {
         std::uint32_t clockHand = 0u;
         std::uint32_t lastAllocatedSlot = kInvalidLocalSlot;
         std::atomic<std::uint32_t> epoch{1u};
+        std::atomic<bool> mayHavePinnedOrMarked{false};
         std::atomic<std::uint64_t> clockEvictions{0u};
         std::atomic<std::uint64_t> gcReclaimed{0u};
     };
@@ -2135,7 +2179,7 @@ struct InlineStructPool {
             const std::uint32_t offset = candidate & kPageMask;
             auto& fl = page->flags[offset];
             const std::uint8_t f = fl.load(std::memory_order_relaxed);
-            if ((f & (kSlotFlagPinned | kSlotFlagGcMarked)) != 0u) {
+            if ((f & (kSlotFlagPinned | kSlotFlagGcMarked | kSlotFlagStackRoot)) != 0u) {
                 continue;
             }
             if ((f & kSlotFlagClock) != 0u) {
@@ -2192,6 +2236,7 @@ struct InlineStructPool {
                     refreshClockBitIfUnset(fl);
                     if (pinEntry) {
                         fl.fetch_or(activePinFlags(), std::memory_order_relaxed);
+                        noteShardPinned(shard.mayHavePinnedOrMarked);
                         pinChildSlots(entry);
                     }
                 }
@@ -2208,6 +2253,7 @@ struct InlineStructPool {
                 page->flags[localSlot & kPageMask].fetch_or(addFlags, std::memory_order_relaxed);
             }
             if (pinEntry) {
+                noteShardPinned(shard.mayHavePinnedOrMarked);
                 pinChildSlots(entry);
             }
             const std::uint32_t id = encodeShardedPoolId(shardIdx, localSlot);
@@ -2230,6 +2276,7 @@ struct InlineStructPool {
         const std::uint8_t initFlags = kSlotFlagOccupied | kSlotFlagClock | (pinEntry ? activePinFlags() : 0u);
         page->flags[offset].store(initFlags, std::memory_order_release);
         if (pinEntry) {
+            noteShardPinned(shard.mayHavePinnedOrMarked);
             pinChildSlots(entry);
         }
         shard.dedupMap.emplace(entry, localSlot);
@@ -2266,10 +2313,12 @@ struct InlineStructPool {
         if (!decodeShardedPoolId(idx, shardIdx, localSlot)) return;
         const std::uint32_t pageIdx = localSlot >> kPageShift;
         if (pageIdx < kHardMaxPagesPerShard) {
-            if (InlinePage* page = shards_[shardIdx].pages[pageIdx].load(std::memory_order_acquire)) {
+            Shard& shard = shards_[shardIdx];
+            if (InlinePage* page = shard.pages[pageIdx].load(std::memory_order_acquire)) {
                 const std::uint32_t offset = localSlot & kPageMask;
                 page->flags[offset].fetch_or(
                     activePinFlags(), std::memory_order_relaxed);
+                noteShardPinned(shard.mayHavePinnedOrMarked);
                 const std::uint8_t bank = page->activeBank[offset].load(std::memory_order_acquire) & 1u;
                 pinChildSlots(page->entries[offset][bank]);
             }
@@ -2281,15 +2330,39 @@ struct InlineStructPool {
         if (!decodeShardedPoolId(idx, shardIdx, localSlot)) return;
         const std::uint32_t pageIdx = localSlot >> kPageShift;
         if (pageIdx < kHardMaxPagesPerShard) {
-            if (InlinePage* page = shards_[shardIdx].pages[pageIdx].load(std::memory_order_acquire)) {
+            Shard& shard = shards_[shardIdx];
+            if (InlinePage* page = shard.pages[pageIdx].load(std::memory_order_acquire)) {
                 const std::uint32_t offset = localSlot & kPageMask;
                 page->flags[offset].fetch_or(
                     kSlotFlagGcMarked | kSlotFlagPinned, std::memory_order_relaxed);
+                noteShardPinned(shard.mayHavePinnedOrMarked);
                 const std::uint8_t bank = page->activeBank[offset].load(std::memory_order_acquire) & 1u;
                 const auto& entry = page->entries[offset][bank];
                 for (const auto& s : entry.slots) {
                     if (s.kind == InlineStructSlot::Kind::String && s.lo != 0u) {
                         runtimeStringPool().markById(s.lo);
+                    }
+                }
+            }
+        }
+    }
+
+    void markStackRootById(std::uint32_t idx) noexcept {
+        std::uint32_t shardIdx = 0u, localSlot = 0u;
+        if (!decodeShardedPoolId(idx, shardIdx, localSlot)) return;
+        const std::uint32_t pageIdx = localSlot >> kPageShift;
+        if (pageIdx < kHardMaxPagesPerShard) {
+            Shard& shard = shards_[shardIdx];
+            if (InlinePage* page = shard.pages[pageIdx].load(std::memory_order_acquire)) {
+                const std::uint32_t offset = localSlot & kPageMask;
+                page->flags[offset].fetch_or(
+                    kSlotFlagStackRoot | kSlotFlagClock, std::memory_order_relaxed);
+                noteShardMarked(shard.mayHavePinnedOrMarked);
+                const std::uint8_t bank = page->activeBank[offset].load(std::memory_order_acquire) & 1u;
+                const auto& entry = page->entries[offset][bank];
+                for (const auto& s : entry.slots) {
+                    if (s.kind == InlineStructSlot::Kind::String && s.lo != 0u) {
+                        runtimeStringPool().markStackRootById(s.lo);
                     }
                 }
             }
@@ -2336,6 +2409,7 @@ struct HeapStructStoragePool {
         std::uint32_t clockHand = 0u;
         std::uint32_t lastAllocatedSlot = kInvalidLocalSlot;
         std::atomic<std::uint32_t> epoch{1u};
+        std::atomic<bool> mayHavePinnedOrMarked{false};
         std::atomic<std::uint64_t> clockEvictions{0u};
         std::atomic<std::uint64_t> gcReclaimed{0u};
     };
@@ -2449,7 +2523,7 @@ struct HeapStructStoragePool {
             const std::uint32_t offset = candidate & kPageMask;
             auto& fl = page->flags[offset];
             const std::uint8_t f = fl.load(std::memory_order_relaxed);
-            if ((f & (kSlotFlagPinned | kSlotFlagGcMarked)) != 0u) {
+            if ((f & (kSlotFlagPinned | kSlotFlagGcMarked | kSlotFlagStackRoot)) != 0u) {
                 continue;
             }
             if ((f & kSlotFlagClock) != 0u) {
@@ -2501,6 +2575,7 @@ struct HeapStructStoragePool {
                     const std::uint8_t addFlags = kSlotFlagOccupied | kSlotFlagClock | (pinEntry ? activePinFlags() : 0u);
                     page->flags[offset].fetch_or(addFlags, std::memory_order_relaxed);
                     if (pinEntry) {
+                        noteShardPinned(shard.mayHavePinnedOrMarked);
                         for (const auto& f : store->fields) {
                             pinValueInPools(f);
                         }
@@ -2524,6 +2599,7 @@ struct HeapStructStoragePool {
         const std::uint8_t initFlags = kSlotFlagOccupied | kSlotFlagClock | (pinEntry ? activePinFlags() : 0u);
         page->flags[offset].store(initFlags, std::memory_order_release);
         if (pinEntry) {
+            noteShardPinned(shard.mayHavePinnedOrMarked);
             for (const auto& f : store->fields) {
                 pinValueInPools(f);
             }
@@ -2557,10 +2633,12 @@ struct HeapStructStoragePool {
         if (!decodeShardedPoolId(id, shardIdx, localSlot)) return;
         const std::uint32_t pageIdx = localSlot >> kPageShift;
         if (pageIdx < kHardMaxPagesPerShard) {
-            if (HeapStructPage* page = shards_[shardIdx].pages[pageIdx].load(std::memory_order_acquire)) {
+            Shard& shard = shards_[shardIdx];
+            if (HeapStructPage* page = shard.pages[pageIdx].load(std::memory_order_acquire)) {
                 const std::uint32_t offset = localSlot & kPageMask;
                 const std::uint8_t prev = page->flags[offset].fetch_or(
                     activePinFlags(), std::memory_order_relaxed);
+                noteShardPinned(shard.mayHavePinnedOrMarked);
                 if ((prev & kSlotFlagPinned) == 0u) {
                     const std::uint8_t bank = page->activeBank[offset].load(std::memory_order_acquire) & 1u;
                     for (const auto& f : page->storages[offset][bank].fields) {
@@ -2576,14 +2654,37 @@ struct HeapStructStoragePool {
         if (!decodeShardedPoolId(id, shardIdx, localSlot)) return;
         const std::uint32_t pageIdx = localSlot >> kPageShift;
         if (pageIdx < kHardMaxPagesPerShard) {
-            if (HeapStructPage* page = shards_[shardIdx].pages[pageIdx].load(std::memory_order_acquire)) {
+            Shard& shard = shards_[shardIdx];
+            if (HeapStructPage* page = shard.pages[pageIdx].load(std::memory_order_acquire)) {
                 const std::uint32_t offset = localSlot & kPageMask;
                 const std::uint8_t prev = page->flags[offset].fetch_or(
                     kSlotFlagGcMarked | kSlotFlagPinned, std::memory_order_relaxed);
+                noteShardPinned(shard.mayHavePinnedOrMarked);
                 if ((prev & kSlotFlagGcMarked) == 0u) {
                     const std::uint8_t bank = page->activeBank[offset].load(std::memory_order_acquire) & 1u;
                     for (const auto& f : page->storages[offset][bank].fields) {
                         markValueInPools(f);
+                    }
+                }
+            }
+        }
+    }
+
+    void markStackRootById(std::uint32_t id) noexcept {
+        std::uint32_t shardIdx = 0u, localSlot = 0u;
+        if (!decodeShardedPoolId(id, shardIdx, localSlot)) return;
+        const std::uint32_t pageIdx = localSlot >> kPageShift;
+        if (pageIdx < kHardMaxPagesPerShard) {
+            Shard& shard = shards_[shardIdx];
+            if (HeapStructPage* page = shard.pages[pageIdx].load(std::memory_order_acquire)) {
+                const std::uint32_t offset = localSlot & kPageMask;
+                const std::uint8_t prev = page->flags[offset].fetch_or(
+                    kSlotFlagStackRoot | kSlotFlagClock, std::memory_order_relaxed);
+                noteShardMarked(shard.mayHavePinnedOrMarked);
+                if ((prev & kSlotFlagStackRoot) == 0u) {
+                    const std::uint8_t bank = page->activeBank[offset].load(std::memory_order_acquire) & 1u;
+                    for (const auto& f : page->storages[offset][bank].fields) {
+                        markStackRootValueInPools(f);
                     }
                 }
             }
@@ -3963,6 +4064,10 @@ bool tryExecuteRuntimeIntrinsic(
 }
 
 
+bool hasAnyPinnedPoolValues() noexcept {
+    return g_anyPoolHasPinnedSlots.load(std::memory_order_acquire);
+}
+
 void pinValueInPools(const Value& value) noexcept {
     if (const auto* sv = std::get_if<StringValue>(&value)) {
         if (sv->id != 0u) runtimeStringPool().pinById(sv->id);
@@ -3980,36 +4085,45 @@ void pinValueInPools(const Value& value) noexcept {
 
 void beginValuePoolGcMark() noexcept {
     g_poolGcMarkInProgress.store(true, std::memory_order_release);
+    g_anyPoolHasPinnedSlots.store(false, std::memory_order_relaxed);
+    constexpr std::uint8_t clearMask =
+        static_cast<std::uint8_t>(~(kSlotFlagGcMarked | kSlotFlagStackRoot));
     auto& strPool = runtimeStringPool();
     for (std::uint32_t s = 0u; s < kPoolShardCount; ++s) {
         auto& shard = strPool.shards_[s];
+        if (!shard.mayHavePinnedOrMarked.load(std::memory_order_acquire)) continue;
+        if (!shard.pages[0].load(std::memory_order_relaxed)) continue;
         std::lock_guard<std::mutex> lock(shard.mutex);
         for (std::uint32_t slot = 0u; slot < shard.highWaterMark; ++slot) {
             if (auto* page = shard.pages[slot >> RuntimeStringPool::kPageShift].load(std::memory_order_relaxed)) {
                 page->flags[slot & RuntimeStringPool::kPageMask].fetch_and(
-                    static_cast<std::uint8_t>(~kSlotFlagGcMarked), std::memory_order_relaxed);
+                    clearMask, std::memory_order_relaxed);
             }
         }
     }
     auto& inlPool = inlineStructPool();
     for (std::uint32_t s = 0u; s < kPoolShardCount; ++s) {
         auto& shard = inlPool.shards_[s];
+        if (!shard.mayHavePinnedOrMarked.load(std::memory_order_acquire)) continue;
+        if (!shard.pages[0].load(std::memory_order_relaxed)) continue;
         std::lock_guard<std::mutex> lock(shard.mutex);
         for (std::uint32_t slot = 0u; slot < shard.highWaterMark; ++slot) {
             if (auto* page = shard.pages[slot >> InlineStructPool::kPageShift].load(std::memory_order_relaxed)) {
                 page->flags[slot & InlineStructPool::kPageMask].fetch_and(
-                    static_cast<std::uint8_t>(~kSlotFlagGcMarked), std::memory_order_relaxed);
+                    clearMask, std::memory_order_relaxed);
             }
         }
     }
     auto& hpPool = heapStructPool();
     for (std::uint32_t s = 0u; s < kPoolShardCount; ++s) {
         auto& shard = hpPool.shards_[s];
+        if (!shard.mayHavePinnedOrMarked.load(std::memory_order_acquire)) continue;
+        if (!shard.pages[0].load(std::memory_order_relaxed)) continue;
         std::lock_guard<std::mutex> lock(shard.mutex);
         for (std::uint32_t slot = 0u; slot < shard.highWaterMark; ++slot) {
             if (auto* page = shard.pages[slot >> HeapStructStoragePool::kPageShift].load(std::memory_order_relaxed)) {
                 page->flags[slot & HeapStructStoragePool::kPageMask].fetch_and(
-                    static_cast<std::uint8_t>(~kSlotFlagGcMarked), std::memory_order_relaxed);
+                    clearMask, std::memory_order_relaxed);
             }
         }
     }
@@ -4030,14 +4144,38 @@ void markValueInPools(const Value& value) noexcept {
     }
 }
 
+void markStackRootValueInPools(const Value& value) noexcept {
+    if (const auto* sv = std::get_if<StringValue>(&value)) {
+        if (sv->id != 0u) runtimeStringPool().markStackRootById(sv->id);
+        return;
+    }
+    if (const auto* st = std::get_if<StructValue>(&value)) {
+        if (st->isInline) {
+            const std::uint32_t idx = st->storage.inlineArenaIndex();
+            if (idx != 0u) inlineStructPool().markStackRootById(idx);
+        } else if (st->storage.isStoragePtr()) {
+            heapStructPool().markStackRootById(st->storage.raw_);
+        }
+    }
+}
+
 std::size_t finishValuePoolGcSweep() noexcept {
     std::size_t reclaimed = 0u;
+    bool anyPoolPinned = false;
+    constexpr std::uint8_t clearMarkBits =
+        static_cast<std::uint8_t>(~(kSlotFlagGcMarked | kSlotFlagStackRoot));
+    constexpr std::uint8_t clearPinAndMarkBits =
+        static_cast<std::uint8_t>(~(kSlotFlagGcMarked | kSlotFlagStackRoot | kSlotFlagPinned));
 
     auto& strPool = runtimeStringPool();
     for (std::uint32_t s = 0u; s < kPoolShardCount; ++s) {
         auto& shard = strPool.shards_[s];
+        if (!shard.mayHavePinnedOrMarked.load(std::memory_order_acquire)) continue;
+        if (!shard.pages[0].load(std::memory_order_relaxed)) continue;
         std::lock_guard<std::mutex> lock(shard.mutex);
+        shard.mayHavePinnedOrMarked.store(false, std::memory_order_relaxed);
         bool anyReclaimed = false;
+        bool shardStillPinned = false;
         for (std::uint32_t slot = 0u; slot < shard.highWaterMark; ++slot) {
             auto* page = shard.pages[slot >> RuntimeStringPool::kPageShift].load(std::memory_order_relaxed);
             if (!page) continue;
@@ -4045,8 +4183,13 @@ std::size_t finishValuePoolGcSweep() noexcept {
             const std::uint8_t f = page->flags[offset].load(std::memory_order_relaxed);
             if ((f & kSlotFlagOccupied) == 0u) continue;
             if ((f & kSlotFlagGcMarked) != 0u) {
-                page->flags[offset].fetch_and(
-                    static_cast<std::uint8_t>(~kSlotFlagGcMarked), std::memory_order_relaxed);
+                page->flags[offset].fetch_and(clearMarkBits, std::memory_order_relaxed);
+                shardStillPinned = true;
+                continue;
+            }
+            if ((f & kSlotFlagStackRoot) != 0u) {
+                page->flags[offset].fetch_and(clearPinAndMarkBits, std::memory_order_relaxed);
+                page->flags[offset].fetch_or(kSlotFlagClock, std::memory_order_relaxed);
                 continue;
             }
             if ((f & kSlotFlagPinned) == 0u) {
@@ -4062,6 +4205,10 @@ std::size_t finishValuePoolGcSweep() noexcept {
             anyReclaimed = true;
             ++reclaimed;
         }
+        if (shardStillPinned) {
+            shard.mayHavePinnedOrMarked.store(true, std::memory_order_release);
+            anyPoolPinned = true;
+        }
         if (anyReclaimed) {
             shard.epoch.fetch_add(1u, std::memory_order_release);
         }
@@ -4070,8 +4217,12 @@ std::size_t finishValuePoolGcSweep() noexcept {
     auto& inlPool = inlineStructPool();
     for (std::uint32_t s = 0u; s < kPoolShardCount; ++s) {
         auto& shard = inlPool.shards_[s];
+        if (!shard.mayHavePinnedOrMarked.load(std::memory_order_acquire)) continue;
+        if (!shard.pages[0].load(std::memory_order_relaxed)) continue;
         std::lock_guard<std::mutex> lock(shard.mutex);
+        shard.mayHavePinnedOrMarked.store(false, std::memory_order_relaxed);
         bool anyReclaimed = false;
+        bool shardStillPinned = false;
         for (std::uint32_t slot = 0u; slot < shard.highWaterMark; ++slot) {
             auto* page = shard.pages[slot >> InlineStructPool::kPageShift].load(std::memory_order_relaxed);
             if (!page) continue;
@@ -4079,8 +4230,13 @@ std::size_t finishValuePoolGcSweep() noexcept {
             const std::uint8_t f = page->flags[offset].load(std::memory_order_relaxed);
             if ((f & kSlotFlagOccupied) == 0u) continue;
             if ((f & kSlotFlagGcMarked) != 0u) {
-                page->flags[offset].fetch_and(
-                    static_cast<std::uint8_t>(~kSlotFlagGcMarked), std::memory_order_relaxed);
+                page->flags[offset].fetch_and(clearMarkBits, std::memory_order_relaxed);
+                shardStillPinned = true;
+                continue;
+            }
+            if ((f & kSlotFlagStackRoot) != 0u) {
+                page->flags[offset].fetch_and(clearPinAndMarkBits, std::memory_order_relaxed);
+                page->flags[offset].fetch_or(kSlotFlagClock, std::memory_order_relaxed);
                 continue;
             }
             if ((f & kSlotFlagPinned) == 0u) {
@@ -4094,6 +4250,10 @@ std::size_t finishValuePoolGcSweep() noexcept {
             anyReclaimed = true;
             ++reclaimed;
         }
+        if (shardStillPinned) {
+            shard.mayHavePinnedOrMarked.store(true, std::memory_order_release);
+            anyPoolPinned = true;
+        }
         if (anyReclaimed) {
             shard.epoch.fetch_add(1u, std::memory_order_release);
         }
@@ -4102,8 +4262,12 @@ std::size_t finishValuePoolGcSweep() noexcept {
     auto& hpPool = heapStructPool();
     for (std::uint32_t s = 0u; s < kPoolShardCount; ++s) {
         auto& shard = hpPool.shards_[s];
+        if (!shard.mayHavePinnedOrMarked.load(std::memory_order_acquire)) continue;
+        if (!shard.pages[0].load(std::memory_order_relaxed)) continue;
         std::lock_guard<std::mutex> lock(shard.mutex);
+        shard.mayHavePinnedOrMarked.store(false, std::memory_order_relaxed);
         bool anyReclaimed = false;
+        bool shardStillPinned = false;
         for (std::uint32_t slot = 0u; slot < shard.highWaterMark; ++slot) {
             auto* page = shard.pages[slot >> HeapStructStoragePool::kPageShift].load(std::memory_order_relaxed);
             if (!page) continue;
@@ -4111,8 +4275,13 @@ std::size_t finishValuePoolGcSweep() noexcept {
             const std::uint8_t f = page->flags[offset].load(std::memory_order_relaxed);
             if ((f & kSlotFlagOccupied) == 0u) continue;
             if ((f & kSlotFlagGcMarked) != 0u) {
-                page->flags[offset].fetch_and(
-                    static_cast<std::uint8_t>(~kSlotFlagGcMarked), std::memory_order_relaxed);
+                page->flags[offset].fetch_and(clearMarkBits, std::memory_order_relaxed);
+                shardStillPinned = true;
+                continue;
+            }
+            if ((f & kSlotFlagStackRoot) != 0u) {
+                page->flags[offset].fetch_and(clearPinAndMarkBits, std::memory_order_relaxed);
+                page->flags[offset].fetch_or(kSlotFlagClock, std::memory_order_relaxed);
                 continue;
             }
             if ((f & kSlotFlagPinned) == 0u) {
@@ -4126,11 +4295,18 @@ std::size_t finishValuePoolGcSweep() noexcept {
             anyReclaimed = true;
             ++reclaimed;
         }
+        if (shardStillPinned) {
+            shard.mayHavePinnedOrMarked.store(true, std::memory_order_release);
+            anyPoolPinned = true;
+        }
         if (anyReclaimed) {
             shard.epoch.fetch_add(1u, std::memory_order_release);
         }
     }
 
+    if (anyPoolPinned) {
+        g_anyPoolHasPinnedSlots.store(true, std::memory_order_release);
+    }
     g_poolGcMarkInProgress.store(false, std::memory_order_release);
     return reclaimed;
 }

@@ -156,22 +156,23 @@ public:
     explicit ArenaFrameScope(State& state)
         : state_(state), base_(state.valueTop) {}
     ~ArenaFrameScope() {
-        if (!state_.fastAccounting) {
-            std::fill(
-                state_.values.begin() + static_cast<std::ptrdiff_t>(base_),
-                state_.values.begin() + static_cast<std::ptrdiff_t>(top_),
-                Value{});
-        }
         state_.valueTop = base_;
     }
     ArenaFrameScope(const ArenaFrameScope&) = delete;
     ArenaFrameScope& operator=(const ArenaFrameScope&) = delete;
     [[nodiscard]] std::size_t base() const noexcept { return base_; }
     void allocate(std::size_t count) {
+        const std::size_t previousSize = state_.values.size();
         top_ = base_ + count;
-        if (state_.values.size() < top_) {
+        if (previousSize < top_) {
+            if (base_ < previousSize) {
+                std::fill(
+                    state_.values.begin() + static_cast<std::ptrdiff_t>(base_),
+                    state_.values.begin() + static_cast<std::ptrdiff_t>(previousSize),
+                    Value{});
+            }
             state_.values.resize(top_);
-        } else if (!state_.fastAccounting) {
+        } else {
             std::fill(
                 state_.values.begin() + static_cast<std::ptrdiff_t>(base_),
                 state_.values.begin() + static_cast<std::ptrdiff_t>(top_),
@@ -202,9 +203,10 @@ public:
         ShadowStack& shadowStack,
         const std::vector<Value>* arguments,
         const std::vector<Value>* locals,
-        const std::vector<Value>* registers)
+        const std::vector<Value>* registers,
+        const std::size_t* activeRegisterLimit = nullptr)
         : shadowStack_(shadowStack) {
-        shadowStack_.pushFrame(arguments, locals, registers);
+        shadowStack_.pushFrame(arguments, locals, registers, activeRegisterLimit);
     }
     ~ShadowFrameScope() { shadowStack_.popFrame(); }
     ShadowFrameScope(const ShadowFrameScope&) = delete;
@@ -301,6 +303,30 @@ bool fail(State& state, ErrorCode code, std::string message) {
     return false;
 }
 
+inline void stepGcIfNeeded(State& state, std::uint64_t steps = 1) {
+    if (state.limits.gcWorkBudget == 0 || !state.heap) return;
+    if (state.heap->phase() == GcPhase::Idle && !state.heap->collectionRequested()) {
+        return;
+    }
+    for (std::uint64_t i = 0; i < steps; ++i) {
+        if (state.heap->phase() == GcPhase::Idle && !state.heap->collectionRequested()) {
+            break;
+        }
+        const auto work = state.heap->step(
+            state.shadowStack,
+            state.limits.gcWorkBudget);
+        state.statistics.gcWorkPerformed += work;
+        if (work != 0 && state.traceEventsEnabled) {
+            if (state.diagnosticEventsEnabled) {
+                const auto workText = std::to_string(work);
+                emitTrace(state, TraceEventKind::GcStep, work, workText);
+            } else {
+                emitTrace(state, TraceEventKind::GcStep, work);
+            }
+        }
+    }
+}
+
 bool consume(
     State& state,
     DeterminismOperationId operationId,
@@ -310,7 +336,10 @@ bool consume(
             "instruction budget exceeded");
     }
     ++state.executed;
-    if (state.fastAccounting) return true;
+    if (state.fastAccounting) {
+        stepGcIfNeeded(state, 1);
+        return true;
+    }
     state.statistics.instructionsExecuted = state.executed;
     if (state.traceEventsEnabled && !operation.empty()) {
         if (state.determinismOnly) {
@@ -327,20 +356,7 @@ bool consume(
                 operationId, operation);
         }
     }
-    if (state.heap && state.limits.gcWorkBudget != 0) {
-        const auto work = state.heap->step(
-            state.shadowStack,
-            state.limits.gcWorkBudget);
-        state.statistics.gcWorkPerformed += work;
-        if (work != 0) {
-            if (state.diagnosticEventsEnabled) {
-                const auto workText = std::to_string(work);
-                emitTrace(state, TraceEventKind::GcStep, work, workText);
-            } else {
-                emitTrace(state, TraceEventKind::GcStep, work);
-            }
-        }
-    }
+    stepGcIfNeeded(state, 1);
     return true;
 }
 
@@ -2652,19 +2668,27 @@ bool executeFunction(
 
         const std::size_t frameOffset = state.valueTop;
         const std::size_t frameEnd = frameOffset + execution->totalFrameSlots;
-        if (RS_FLAT_UNLIKELY(frameEnd > state.values.size())) {
+        const std::size_t previousSize = state.values.size();
+        if (RS_FLAT_UNLIKELY(frameEnd > previousSize)) {
             if (frameEnd > state.values.capacity()) {
                 state.values.reserve(std::max<std::size_t>(frameEnd, state.values.capacity() * 2 + 256));
             }
             state.values.resize(frameEnd);
         }
-        state.valueTop = frameEnd;
 
         Value* __restrict frameBase = state.values.data() + frameOffset;
         const std::size_t argCount = arguments.size();
         for (std::size_t i = 0; i < argCount; ++i) {
             frameBase[i] = arguments[i];
         }
+        const std::size_t dirtyEnd = std::min(frameEnd, previousSize);
+        if (frameOffset + argCount < dirtyEnd) {
+            std::fill(
+                frameBase + argCount,
+                state.values.data() + dirtyEnd,
+                Value{});
+        }
+        state.valueTop = frameEnd;
 
         const auto routeFastException = [&](bytecode::BlockId protectedBlock) -> std::uint32_t {
             if (!state.pendingException ||
@@ -2699,11 +2723,33 @@ bool executeFunction(
         };
 
         std::uint64_t localExecuted = state.executed;
+        std::uint64_t gcAccounted = localExecuted;
+        const bool gcBudgetEnabled = (state.limits.gcWorkBudget != 0 && state.heap != nullptr);
+        bool gcActive = gcBudgetEnabled &&
+            (state.heap->phase() != GcPhase::Idle || state.heap->collectionRequested());
+        const auto flushFlatGc = [&]() {
+            if (localExecuted > gcAccounted) {
+                state.executed = localExecuted;
+                stepGcIfNeeded(state, localExecuted - gcAccounted);
+                gcAccounted = localExecuted;
+            }
+            gcActive = gcBudgetEnabled &&
+                (state.heap->phase() != GcPhase::Idle || state.heap->collectionRequested());
+        };
+        const auto syncAfterFlatSubcall = [&]() {
+            localExecuted = state.executed;
+            gcAccounted = localExecuted;
+            if (gcBudgetEnabled) {
+                gcActive = (state.heap->phase() != GcPhase::Idle || state.heap->collectionRequested());
+            }
+        };
         const std::uint64_t budgetLimit = state.limits.instructionBudget;
         const detail::FlatInstruction* const streamBase = execution->flatStream.data();
         const detail::FlatInstruction* ip = streamBase + execution->entryStreamOffset;
 
 #if defined(__GNUC__) || defined(__clang__)
+        #pragma GCC diagnostic push
+        #pragma GCC diagnostic ignored "-Wpedantic"
         static constexpr const void* kFlatDispatchTable[] = {
             &&L_MoveSlot,
             &&L_ConstantInt,
@@ -3206,6 +3252,7 @@ bool executeFunction(
                 const auto* rightPtr = std::get_if<std::int64_t>(&frameBase[ip->src1Slot]);
                 if (RS_FLAT_UNLIKELY(!leftPtr || !rightPtr)) goto L_FlatTypeMismatch;
                 localExecuted += 3;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 const bool cond = (*leftPtr < *rightPtr);
                 ++state.statistics.branchesTaken;
                 ip = streamBase + (cond ? ip->trueTargetOffset : ip->falseTargetOffset);
@@ -3219,6 +3266,7 @@ bool executeFunction(
                 const auto* leftPtr = std::get_if<std::int64_t>(&frameBase[ip->src0Slot]);
                 if (RS_FLAT_UNLIKELY(!leftPtr)) goto L_FlatTypeMismatch;
                 localExecuted += 4;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 const bool cond = (*leftPtr < ip->integerImmediate);
                 ++state.statistics.branchesTaken;
                 ip = streamBase + (cond ? ip->trueTargetOffset : ip->falseTargetOffset);
@@ -3303,6 +3351,7 @@ bool executeFunction(
 
             RS_FLAT_CASE(CallDirect0) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
                 Value callResult;
                 const ValueWindow regWin{&state.values, frameOffset + execution->registerOffset, function.registerTypes.size()};
@@ -3310,7 +3359,7 @@ bool executeFunction(
                     state, *ip->directTarget, ArgumentSource(regWin),
                     callResult, ip->directExecution, true);
                 frameBase = state.values.data() + frameOffset;
-                localExecuted = state.executed;
+                syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
                 if (ip->dstSlot != detail::InvalidCompactReg) {
                     frameBase[ip->dstSlot] = std::move(callResult);
@@ -3320,6 +3369,7 @@ bool executeFunction(
 
             RS_FLAT_CASE(CallDirect1) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
                 Value callResult;
                 const ValueWindow singleWin{&state.values, frameOffset + ip->src0Slot, 1};
@@ -3328,7 +3378,7 @@ bool executeFunction(
                     ArgumentSource(singleWin, static_cast<bytecode::Register>(0)),
                     callResult, ip->directExecution, true);
                 frameBase = state.values.data() + frameOffset;
-                localExecuted = state.executed;
+                syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
                 if (ip->dstSlot != detail::InvalidCompactReg) {
                     frameBase[ip->dstSlot] = std::move(callResult);
@@ -3338,6 +3388,7 @@ bool executeFunction(
 
             RS_FLAT_CASE(CallDirect2) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
                 Value callResult;
                 const ValueWindow baseWin{&state.values, frameOffset, execution->totalFrameSlots};
@@ -3349,7 +3400,7 @@ bool executeFunction(
                         static_cast<bytecode::Register>(ip->src1Slot)),
                     callResult, ip->directExecution, true);
                 frameBase = state.values.data() + frameOffset;
-                localExecuted = state.executed;
+                syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
                 if (ip->dstSlot != detail::InvalidCompactReg) {
                     frameBase[ip->dstSlot] = std::move(callResult);
@@ -3359,6 +3410,7 @@ bool executeFunction(
 
             RS_FLAT_CASE(CallDirectN) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
                 Value callResult;
                 const ValueWindow regWin{&state.values, frameOffset + execution->registerOffset, function.registerTypes.size()};
@@ -3367,7 +3419,7 @@ bool executeFunction(
                     ArgumentSource(regWin, ip->bytecode->operands),
                     callResult, ip->directExecution, true);
                 frameBase = state.values.data() + frameOffset;
-                localExecuted = state.executed;
+                syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
                 if (ip->dstSlot != detail::InvalidCompactReg) {
                     frameBase[ip->dstSlot] = std::move(callResult);
@@ -3377,6 +3429,7 @@ bool executeFunction(
 
             RS_FLAT_CASE(CallPolledFast) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
                 const auto& instruction = *ip->bytecode;
                 const auto* receiver = std::get_if<ObjectRef>(&frameBase[ip->src0Slot]);
@@ -3402,7 +3455,7 @@ bool executeFunction(
                                 ArgumentSource(regWin, instruction.operands),
                                 callResult, cached.execution, true);
                         frameBase = state.values.data() + frameOffset;
-                        localExecuted = state.executed;
+                        syncAfterFlatSubcall();
                         if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
                         if (ip->dstSlot != detail::InvalidCompactReg) {
                             frameBase[ip->dstSlot] = std::move(callResult);
@@ -3414,7 +3467,7 @@ bool executeFunction(
                 const ValueWindow regWin{&state.values, frameOffset + execution->registerOffset, function.registerTypes.size()};
                 const bool ok = executeCall(state, *location.module, instruction, regWin, callResult);
                 frameBase = state.values.data() + frameOffset;
-                localExecuted = state.executed;
+                syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
                 if (ip->dstSlot != detail::InvalidCompactReg) {
                     frameBase[ip->dstSlot] = std::move(callResult);
@@ -3423,6 +3476,7 @@ bool executeFunction(
             }
 
             RS_FLAT_CASE(GenericBytecode) {
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
                 const ValueWindow argWin{&state.values, frameOffset + execution->paramOffset, argCount};
                 const ValueWindow locWin{&state.values, frameOffset + execution->localOffset, function.localTypes.size()};
@@ -3430,13 +3484,14 @@ bool executeFunction(
                 const bool ok = executeInstruction(
                     state, *location.module, function, *ip->bytecode, argWin, locWin, regWin);
                 frameBase = state.values.data() + frameOffset;
-                localExecuted = state.executed;
+                syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(TermJumpNoArgs) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 ++state.statistics.branchesTaken;
                 ip = streamBase + ip->trueTargetOffset;
                 RS_FLAT_DISPATCH_AT_IP();
@@ -3444,6 +3499,7 @@ bool executeFunction(
 
             RS_FLAT_CASE(TermBranchBoolNoArgs) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 const bool cond = std::get<bool>(frameBase[ip->src0Slot]);
                 ++state.statistics.branchesTaken;
                 ip = streamBase + (cond ? ip->trueTargetOffset : ip->falseTargetOffset);
@@ -3452,6 +3508,7 @@ bool executeFunction(
 
             RS_FLAT_CASE(TermBranchGeneric) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 const auto& blk = execution->blocks[ip->blockIndex];
                 const auto& terminator = blk.bytecode->terminator;
                 const detail::ExecutionEdge* edge = &blk.branch;
@@ -3510,6 +3567,7 @@ bool executeFunction(
 
             RS_FLAT_CASE(TermReturnVoid) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 result = std::monostate{};
                 state.executed = localExecuted;
                 state.valueTop = frameOffset;
@@ -3519,6 +3577,7 @@ bool executeFunction(
 
             RS_FLAT_CASE(TermReturnScalarFast) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 result = frameBase[ip->src0Slot];
                 state.executed = localExecuted;
                 state.valueTop = frameOffset;
@@ -3528,6 +3587,7 @@ bool executeFunction(
 
             RS_FLAT_CASE(TermReturnGeneric) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 const auto& terminator = execution->blocks[ip->blockIndex].bytecode->terminator;
                 if (RS_FLAT_UNLIKELY(terminator.value >= function.registerTypes.size())) {
                     state.executed = localExecuted;
@@ -3547,6 +3607,7 @@ bool executeFunction(
 
             RS_FLAT_CASE(TermThrow) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
                 const auto& terminator = execution->blocks[ip->blockIndex].bytecode->terminator;
                 if (RS_FLAT_UNLIKELY(terminator.value >= function.registerTypes.size() ||
@@ -3567,6 +3628,7 @@ bool executeFunction(
 L_FlatSuperFallback: {
         // When instruction budget is exhausted mid-superinstruction, step the underlying single instructions
         // one by one so `state.executed` stops at the exact instruction boundary required by budget tests.
+        if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
         state.executed = localExecuted;
         const auto& blk = execution->blocks[ip->blockIndex];
         const ValueWindow argWin{&state.values, frameOffset + execution->paramOffset, argCount};
@@ -3586,13 +3648,14 @@ L_FlatSuperFallback: {
                 : executeQuickInstruction(state, *location.module, singleDec, argWin, locWin, regWin);
             frameBase = state.values.data() + frameOffset;
             if (!ok) {
-                localExecuted = state.executed;
+                syncAfterFlatSubcall();
                 goto L_FlatError;
             }
         }
-        localExecuted = state.executed;
+        syncAfterFlatSubcall();
         if (includesBranch) {
             if (++localExecuted > budgetLimit) goto L_FlatBudgetExceeded;
+            if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
             const bool cond = std::get<bool>(frameBase[ execution->registerOffset + blk.terminatorReg ]);
             ++state.statistics.branchesTaken;
             ip = streamBase + (cond ? ip->trueTargetOffset : ip->falseTargetOffset);
@@ -3602,6 +3665,8 @@ L_FlatSuperFallback: {
     }
 
 L_FlatBudgetExceeded:
+        localExecuted = budgetLimit;
+        if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
         state.executed = budgetLimit;
         fail(state, ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
         goto L_FlatError;
@@ -3612,6 +3677,7 @@ L_FlatTypeMismatch:
         goto L_FlatError;
 
 L_FlatError:
+        if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
         if (state.pendingException && execution->hasExceptionHandlers) {
             const auto protectedBlockId = execution->blocks[ip->blockIndex].bytecode->id;
             const auto handlerOffset = routeFastException(protectedBlockId);
@@ -3628,6 +3694,9 @@ L_FlatError:
         }
 #endif
 
+        #if defined(__GNUC__) || defined(__clang__)
+        #pragma GCC diagnostic pop
+        #endif
         #undef RS_FLAT_DISPATCH_NEXT
         #undef RS_FLAT_DISPATCH_AT_IP
         #undef RS_FLAT_CASE
@@ -3730,6 +3799,9 @@ L_FlatError:
                 executed = executeSuperInstruction(
                     state, decodedInstruction,
                     argumentWindow, locals, registers);
+                if (executed) {
+                    stepGcIfNeeded(state, executionSpan);
+                }
             } else if (decodedInstruction.opcode ==
                     detail::QuickOpcode::Generic) {
                 executed = executeInstruction(
@@ -3997,7 +4069,7 @@ ExecutionResult Interpreter::invoke(
         state.determinismEventsEnabled || state.profile != nullptr ||
         state.diagnosticEventsEnabled;
     state.fastAccounting = !state.traceEventsEnabled &&
-        options.limits.gcWorkBudget == 0 && options.debugger == nullptr;
+        options.debugger == nullptr;
     if (options.enforceCapabilities) {
         options.determinism.enforceCapabilities = true;
         if (options.determinism.grantedCapabilities.empty()) {
@@ -4017,7 +4089,7 @@ ExecutionResult Interpreter::invoke(
     Value value;
     ExecutionResult execution;
     ShadowFrameScope roots(
-        state.shadowStack, nullptr, nullptr, &state.values);
+        state.shadowStack, nullptr, nullptr, &state.values, &state.valueTop);
     execution.succeeded = executeFunction(state, *found, arguments, value);
     state.statistics.instructionsExecuted = state.executed;
     if (!execution.succeeded && state.pendingException &&

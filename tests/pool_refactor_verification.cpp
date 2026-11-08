@@ -159,6 +159,55 @@ class EntityHolder {
                 statsAfterGc.heapStructPinnedSlots == 0 &&
                 statsAfterGc.stringPinnedSlots == 0,
             "reclaimUnreferencedPoolValues() must unpin and reclaim all dead slots after ManagedHeap destruction");
+        require(
+            !runtime::hasAnyPinnedPoolValues() &&
+                runtime::reclaimUnreferencedPoolValues() == 0u,
+            "hasAnyPinnedPoolValues() must be false after all pinned values are reclaimed");
+
+        // Verify multi-ShadowStack root protection: a formerly-pinned pool value held on an outer active
+        // ShadowStack must survive collectFull(innerStack) without being reclaimed, and be demoted to unpinned.
+        {
+            const runtime::StringValue outerStackStr(std::string_view("OuterShadowStackProtectedString"));
+            const std::array<runtime::Value, 3> outerFields{
+                std::int64_t{42}, std::int64_t{43}, std::int64_t{44}};
+            const auto outerStruct = runtime::makeStructValueFromFields(
+                dummyInlineType, runtime::ValueSpan(outerFields.data(), outerFields.size()));
+
+            // Pin both via static fields on the heap, then overwrite static fields so the heap drops them
+            rt->heap()->setStaticField(0x999998ULL, runtime::Value{outerStackStr});
+            rt->heap()->setStaticField(0x999999ULL, runtime::Value{outerStruct});
+            require(runtime::hasAnyPinnedPoolValues(), "hasAnyPinnedPoolValues() must be true after pinning");
+            rt->heap()->setStaticField(0x999998ULL, runtime::Value{std::int64_t{0}});
+            rt->heap()->setStaticField(0x999999ULL, runtime::Value{std::int64_t{0}});
+
+            const std::vector<runtime::Value> outerLocals{
+                runtime::Value{outerStackStr},
+                runtime::Value{outerStruct}};
+            runtime::ShadowStack outerStack;
+            outerStack.pushFrame(nullptr, &outerLocals, nullptr);
+
+            // Trigger GC passing a different (empty) inner ShadowStack; outerStack must still be scanned via registry
+            runtime::ShadowStack innerStack;
+            rt->heap()->collectFull(innerStack);
+
+            require(
+                outerStackStr.str() == "OuterShadowStackProtectedString",
+                "String on outer active ShadowStack must survive collectFull(innerStack)");
+            const auto f0 = runtime::structValueFieldAt(outerStruct, 0);
+            const auto f2 = runtime::structValueFieldAt(outerStruct, 2);
+            require(
+                f0 && *f0 == runtime::Value{std::int64_t{42}} &&
+                    f2 && *f2 == runtime::Value{std::int64_t{44}},
+                "InlineStruct on outer active ShadowStack must survive collectFull(innerStack)");
+
+            const auto statsAfterStackDemote = runtime::getRuntimeValuePoolStatistics();
+            require(
+                statsAfterStackDemote.stringPinnedSlots == 0 &&
+                    statsAfterStackDemote.inlineStructPinnedSlots == 0 &&
+                    !runtime::hasAnyPinnedPoolValues(),
+                "Stack-only values must be demoted from Pinned to Clock-managed after pool GC sweep");
+            outerStack.popFrame();
+        }
     }
 
     // 2. 8-Thread Concurrent Read/Write Scalability & Lock-Free Read Verification

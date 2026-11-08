@@ -763,10 +763,18 @@ struct NativeRawColumnView {
 
 class ShadowStack {
 public:
+    ShadowStack() = default;
+    ~ShadowStack() noexcept;
+    ShadowStack(const ShadowStack& other);
+    ShadowStack& operator=(const ShadowStack& other);
+    ShadowStack(ShadowStack&& other) noexcept;
+    ShadowStack& operator=(ShadowStack&& other) noexcept;
+
     void pushFrame(
         const std::vector<Value>* arguments,
         const std::vector<Value>* locals,
-        const std::vector<Value>* registers);
+        const std::vector<Value>* registers,
+        const std::size_t* activeRegisterLimit = nullptr);
     void popFrame() noexcept;
     void visitRoots(const std::function<void(const Value&)>& visitor) const;
     [[nodiscard]] std::size_t frameCount() const noexcept;
@@ -776,6 +784,7 @@ private:
         const std::vector<Value>* arguments = nullptr;
         const std::vector<Value>* locals = nullptr;
         const std::vector<Value>* registers = nullptr;
+        const std::size_t* activeRegisterLimit = nullptr;
     };
     std::vector<FrameRoots> frames_;
 };
@@ -1440,10 +1449,13 @@ struct RuntimeValuePoolStatistics {
 };
 
 void pinValueInPools(const Value& value) noexcept;
+[[nodiscard]] bool hasAnyPinnedPoolValues() noexcept;
 void beginValuePoolGcMark() noexcept;
 void markValueInPools(const Value& value) noexcept;
+void markStackRootValueInPools(const Value& value) noexcept;
 std::size_t finishValuePoolGcSweep() noexcept;
-std::size_t reclaimUnreferencedPoolValues() noexcept;
+std::size_t reclaimUnreferencedPoolValues(
+    const ShadowStack* activeShadowStack = nullptr) noexcept;
 [[nodiscard]] RuntimeValuePoolStatistics getRuntimeValuePoolStatistics() noexcept;
 
 [[nodiscard]] bool tryExecuteRuntimeIntrinsic(

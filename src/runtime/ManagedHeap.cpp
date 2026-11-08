@@ -62,28 +62,114 @@ std::unordered_map<const void*, std::function<void()>>& liveHeapPoolMarkers() no
     return markers;
 }
 
+std::mutex& poolGcMutex() noexcept {
+    static std::mutex m;
+    return m;
+}
+
+std::mutex& activeShadowStacksMutex() noexcept {
+    static std::mutex m;
+    return m;
+}
+
+std::unordered_set<const ShadowStack*>& activeShadowStacks() noexcept {
+    static std::unordered_set<const ShadowStack*> stacks;
+    return stacks;
+}
+
+void registerActiveShadowStack(const ShadowStack* stack) noexcept {
+    std::lock_guard<std::mutex> lock(activeShadowStacksMutex());
+    activeShadowStacks().insert(stack);
+}
+
+void unregisterActiveShadowStack(const ShadowStack* stack) noexcept {
+    std::lock_guard<std::mutex> lock(activeShadowStacksMutex());
+    activeShadowStacks().erase(stack);
+}
+
 } // namespace
+
+ShadowStack::~ShadowStack() noexcept {
+    if (!frames_.empty()) {
+        unregisterActiveShadowStack(this);
+    }
+}
+
+ShadowStack::ShadowStack(const ShadowStack& other)
+    : frames_(other.frames_) {
+    if (!frames_.empty()) {
+        registerActiveShadowStack(this);
+    }
+}
+
+ShadowStack& ShadowStack::operator=(const ShadowStack& other) {
+    if (this == &other) return *this;
+    const bool wasEmpty = frames_.empty();
+    frames_ = other.frames_;
+    if (wasEmpty && !frames_.empty()) {
+        registerActiveShadowStack(this);
+    } else if (!wasEmpty && frames_.empty()) {
+        unregisterActiveShadowStack(this);
+    }
+    return *this;
+}
+
+ShadowStack::ShadowStack(ShadowStack&& other) noexcept
+    : frames_(std::move(other.frames_)) {
+    if (!frames_.empty()) {
+        unregisterActiveShadowStack(&other);
+        registerActiveShadowStack(this);
+    }
+}
+
+ShadowStack& ShadowStack::operator=(ShadowStack&& other) noexcept {
+    if (this == &other) return *this;
+    if (!frames_.empty()) {
+        unregisterActiveShadowStack(this);
+    }
+    frames_ = std::move(other.frames_);
+    if (!frames_.empty()) {
+        unregisterActiveShadowStack(&other);
+        registerActiveShadowStack(this);
+    }
+    return *this;
+}
 
 void ShadowStack::pushFrame(
     const std::vector<Value>* arguments,
     const std::vector<Value>* locals,
-    const std::vector<Value>* registers) {
-    frames_.push_back({arguments, locals, registers});
+    const std::vector<Value>* registers,
+    const std::size_t* activeRegisterLimit) {
+    const bool wasEmpty = frames_.empty();
+    frames_.push_back({arguments, locals, registers, activeRegisterLimit});
+    if (wasEmpty) {
+        registerActiveShadowStack(this);
+    }
 }
 
 void ShadowStack::popFrame() noexcept {
-    if (!frames_.empty()) frames_.pop_back();
+    if (!frames_.empty()) {
+        frames_.pop_back();
+        if (frames_.empty()) {
+            unregisterActiveShadowStack(this);
+        }
+    }
 }
 
 void ShadowStack::visitRoots(const std::function<void(const Value&)>& visitor) const {
-    const auto visitValues = [&](const std::vector<Value>* values) {
+    const auto visitValues = [&](const std::vector<Value>* values, const std::size_t* limit) {
         if (!values) return;
-        for (const auto& value : *values) visitor(value);
+        const std::size_t count = limit
+            ? std::min(*limit, values->size())
+            : values->size();
+        for (std::size_t index = 0; index < count; ++index) {
+            visitor((*values)[index]);
+        }
     };
     for (const auto& frame : frames_) {
-        visitValues(frame.arguments);
-        visitValues(frame.locals);
-        visitValues(frame.registers);
+        visitValues(frame.arguments, nullptr);
+        visitValues(frame.locals, nullptr);
+        visitValues(frame.registers, frame.activeRegisterLimit);
     }
 }
 
@@ -468,7 +554,7 @@ struct ManagedHeap::Impl {
         }
     }
 
-    void finishCollection() {
+    void finishCollection(const ShadowStack& shadowStack) {
         phase = GcPhase::Idle;
         requested = false;
         resumeSweep = false;
@@ -496,6 +582,7 @@ struct ManagedHeap::Impl {
         nextCollectionThreshold = std::max(
             config.initialCollectionThresholdBytes,
             std::min(config.maximumHeapBytes, doubled));
+        (void)reclaimUnreferencedPoolValues(&shadowStack);
     }
 };
 
@@ -1529,7 +1616,7 @@ std::size_t ManagedHeap::step(
 
         if (impl_->phase == GcPhase::Sweep) {
             if (impl_->sweepIndex >= impl_->sweepLimit) {
-                impl_->finishCollection();
+                impl_->finishCollection(shadowStack);
                 break;
             }
             auto& slot = impl_->slots[impl_->sweepIndex++];
@@ -1577,9 +1664,6 @@ void ManagedHeap::collectFull(const ShadowStack& shadowStack) {
     if (impl_->phase != GcPhase::Idle) drainCollection();
     requestCollection();
     drainCollection();
-    if (shadowStack.frameCount() == 0) {
-        (void)reclaimUnreferencedPoolValues();
-    }
 }
 
 std::size_t ManagedHeap::nurserySize() const noexcept {
@@ -1710,6 +1794,7 @@ std::size_t ManagedHeap::collectYoung(
     if (impl_->statistics.liveBytes < impl_->nextCollectionThreshold) {
         impl_->requested = false;
     }
+    (void)reclaimUnreferencedPoolValues(&shadowStack);
     return processed;
 }
 
@@ -2445,8 +2530,27 @@ std::string NativeHandleRegistry::debugName(NativeHandle handle) const {
 }
 
 
-std::size_t reclaimUnreferencedPoolValues() noexcept {
+std::size_t reclaimUnreferencedPoolValues(
+    const ShadowStack* activeShadowStack) noexcept {
+    if (!hasAnyPinnedPoolValues()) return 0u;
+    std::lock_guard<std::mutex> gcLock(poolGcMutex());
+    if (!hasAnyPinnedPoolValues()) return 0u;
     beginValuePoolGcMark();
+    if (activeShadowStack) {
+        activeShadowStack->visitRoots([](const Value& value) {
+            markStackRootValueInPools(value);
+        });
+    }
+    {
+        std::lock_guard<std::mutex> stackLock(activeShadowStacksMutex());
+        for (const ShadowStack* stack : activeShadowStacks()) {
+            if (stack && stack != activeShadowStack) {
+                stack->visitRoots([](const Value& value) {
+                    markStackRootValueInPools(value);
+                });
+            }
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(liveHeapsPoolMutex());
         for (const auto& [ptr, marker] : liveHeapPoolMarkers()) {
