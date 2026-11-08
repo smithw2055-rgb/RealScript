@@ -112,6 +112,8 @@ public:
     void setStopHandler(StopHandler handler);
     void stopOnEntry(bool enabled) noexcept;
     void requestPause() noexcept;
+    void resetTermination() noexcept;
+    [[nodiscard]] std::string resolveSourcePath(const std::string& enginePath) const;
 
     [[nodiscard]] bool onSequencePoint(
         const std::vector<DebugFrameView>& frames,
@@ -162,6 +164,7 @@ private:
     mutable std::mutex mutex_;
     std::vector<Breakpoint> breakpoints_;
     std::unordered_map<std::string, std::vector<BoundLocation>> executableLocations_;
+    std::unordered_map<std::string, std::string> clientPathAliases_;
     std::unordered_map<semantic::SymbolId, semantic::TypeSymbol> types_;
     runtime::ManagedHeap* lastHeap_ = nullptr;
     StopHandler stopHandler_;
@@ -195,6 +198,10 @@ public:
         std::vector<runtime::Value> arguments = {},
         bool stopOnEntry = false,
         runtime::Limits limits = {});
+    bool attach(bool stopOnEntry = false);
+    void detach();
+    void rebindProgram(std::shared_ptr<const runtime::ProgramImage> program);
+    [[nodiscard]] bool isAttached() const noexcept;
     [[nodiscard]] bool waitForStop(
         std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
     [[nodiscard]] std::optional<DebugStop> currentStop() const;
@@ -237,6 +244,7 @@ private:
     bool paused_ = false;
     bool finished_ = false;
     bool launched_ = false;
+    bool attached_ = false;
     bool terminateRequested_ = false;
 };
 

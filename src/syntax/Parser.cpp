@@ -556,6 +556,17 @@ PropertyDeclarationSyntax Parser::parsePropertyDeclaration(
         }
     }
     result.closeBraceToken = match(SyntaxKind::CloseBraceToken);
+    if (current().kind == SyntaxKind::EqualsToken) {
+        result.equalsToken = nextToken();
+        if (result.type.isArray() && current().kind == SyntaxKind::OpenBraceToken) {
+            result.initializer = parseBraceArrayInitializer(result.type);
+        } else {
+            result.initializer = parseExpression();
+        }
+        result.semicolonToken = match(SyntaxKind::SemicolonToken);
+    } else if (current().kind == SyntaxKind::SemicolonToken) {
+        result.semicolonToken = nextToken();
+    }
     return result;
 }
 

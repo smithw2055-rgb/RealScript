@@ -887,6 +887,8 @@ private:
         syntax::Parser parser(*unit->source, parseDiagnostics);
         unit->syntaxTree = std::make_shared<syntax::CompilationUnitSyntax>(
             parser.parseCompilationUnit());
+        unit->hasGenericSyntax =
+            (generated.str().find('<') != std::string::npos);
         unit->moduleName = targetModule;
         unit->sourceFingerprint = stableFingerprint(
             path + "\n" + generated.str());
@@ -1282,6 +1284,11 @@ private:
             for (auto& argument : value.arguments) {
                 rewriteExpression(*argument, moduleName, sourceName, queue);
             }
+            for (auto& init : value.initializers) {
+                for (auto& expr : init.expressions) {
+                    if (expr) rewriteExpression(*expr, moduleName, sourceName, queue);
+                }
+            }
             return;
         }
         case syntax::SyntaxKind::NewArrayExpression: {
@@ -1500,7 +1507,10 @@ private:
         std::vector<ParsedUnit*>& queue) {
         if (!declaration.typeParameters.empty()) return;
         for (auto& interfaceType : declaration.interfaces) rewriteType(interfaceType, moduleName, sourceName, queue);
-        for (auto& field : declaration.fields) rewriteType(field.type, moduleName, sourceName, queue);
+        for (auto& field : declaration.fields) {
+            rewriteType(field.type, moduleName, sourceName, queue);
+            if (field.initializer) rewriteExpression(*field.initializer, moduleName, sourceName, queue);
+        }
         for (auto& event : declaration.events) rewriteType(event.delegateType, moduleName, sourceName, queue);
         for (auto& method : declaration.methods) rewriteFunction(method, moduleName, sourceName, queue);
         for (auto& sequence : declaration.sequences) {
@@ -1516,12 +1526,16 @@ private:
         }
         for (auto& constructor : declaration.constructors) {
             for (auto& parameter : constructor.parameters) rewriteParameter(parameter, moduleName, sourceName, queue);
+            for (auto& baseArg : constructor.baseArguments) {
+                if (baseArg) rewriteExpression(*baseArg, moduleName, sourceName, queue);
+            }
             rewriteStatement(constructor.body, moduleName, sourceName, queue);
         }
         for (auto& property : declaration.properties) {
             rewriteType(property.type, moduleName, sourceName, queue);
             if (property.getter && property.getter->body) rewriteStatement(*property.getter->body, moduleName, sourceName, queue);
             if (property.setter && property.setter->body) rewriteStatement(*property.setter->body, moduleName, sourceName, queue);
+            if (property.initializer) rewriteExpression(*property.initializer, moduleName, sourceName, queue);
         }
     }
 

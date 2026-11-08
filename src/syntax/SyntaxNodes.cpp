@@ -284,9 +284,12 @@ text::TextSpan AccessorDeclarationSyntax::span() const noexcept {
 }
 
 text::TextSpan PropertyDeclarationSyntax::span() const noexcept {
+    const auto endSpan = semicolonToken
+        ? semicolonToken->span
+        : (initializer ? initializer->span() : closeBraceToken.span);
     return combine(
         declarationStart(attributes, type.span()),
-        closeBraceToken.span);
+        endSpan);
 }
 
 text::TextSpan ClassDeclarationSyntax::span() const noexcept {

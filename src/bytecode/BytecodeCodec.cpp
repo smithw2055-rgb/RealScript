@@ -633,6 +633,10 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         for (const auto& field : type.fields) {
             strings.add(field.declaringTypeName);
             strings.add(field.sourceName);
+            if (field.hasConstantValue &&
+                std::holds_alternative<std::string>(field.constantValue)) {
+                strings.add(std::get<std::string>(field.constantValue));
+            }
         }
         for (const auto& method : type.methods) {
             addFunctionStrings(strings, method);
@@ -752,6 +756,7 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         if (type.abstractType) flags |= 0x04u;
         if (type.sealedType) flags |= 0x08u;
         if (type.delegateType) flags |= 0x10u;
+        if (type.staticType) flags |= 0x20u;
         objectModelSection.u8(flags);
         objectModelSection.u64(type.baseTypeId);
         objectModelSection.u32(type.baseTypeName.empty()
@@ -765,6 +770,23 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
             objectModelSection.u32(strings.indexOf(field.declaringTypeName));
             objectModelSection.u32(strings.indexOf(field.sourceName));
             objectModelSection.u64(field.id);
+            if (!field.hasConstantValue) {
+                objectModelSection.u8(0u);
+            } else if (std::holds_alternative<std::int64_t>(field.constantValue)) {
+                objectModelSection.u8(1u);
+                objectModelSection.i64(std::get<std::int64_t>(field.constantValue));
+            } else if (std::holds_alternative<double>(field.constantValue)) {
+                objectModelSection.u8(2u);
+                objectModelSection.f64(std::get<double>(field.constantValue));
+            } else if (std::holds_alternative<bool>(field.constantValue)) {
+                objectModelSection.u8(3u);
+                objectModelSection.u8(std::get<bool>(field.constantValue) ? 1u : 0u);
+            } else if (std::holds_alternative<std::string>(field.constantValue)) {
+                objectModelSection.u8(4u);
+                objectModelSection.u32(strings.indexOf(std::get<std::string>(field.constantValue)));
+            } else {
+                objectModelSection.u8(0u);
+            }
         }
         objectModelSection.u32(static_cast<std::uint32_t>(type.methods.size()));
         for (const auto& method : type.methods) {
@@ -1438,7 +1460,7 @@ bool decodeModule(
             if (!reader.valid() ||
                 accessibility > static_cast<std::uint8_t>(
                     semantic::Accessibility::Private) ||
-                (flags & 0xe0u) != 0) {
+                (flags & 0xc0u) != 0) {
                 diagnostics.report("RS5004", "invalid object-model type flags", {});
                 return false;
             }
@@ -1449,6 +1471,7 @@ bool decodeModule(
             type.abstractType = (flags & 0x04u) != 0;
             type.sealedType = (flags & 0x08u) != 0;
             type.delegateType = (flags & 0x10u) != 0;
+            type.staticType = (flags & 0x20u) != 0;
             type.baseTypeId = reader.u64();
             const auto baseTypeNameIndex = reader.u32();
             if (baseTypeNameIndex != InvalidIndex) {
@@ -1495,6 +1518,42 @@ bool decodeModule(
                     fieldAccessibility);
                 field.declaringTypeName = strings[declaringNameIndex];
                 field.sourceName = strings[sourceNameIndex];
+                const auto constKind = reader.u8();
+                if (!reader.valid() || constKind > 4u) {
+                    diagnostics.report(
+                        "RS5004", "invalid field constant value tag", {});
+                    return false;
+                }
+                if (constKind == 1u) {
+                    field.hasConstantValue = true;
+                    field.constantValue = reader.i64();
+                } else if (constKind == 2u) {
+                    field.hasConstantValue = true;
+                    field.constantValue = reader.f64();
+                } else if (constKind == 3u) {
+                    const auto b = reader.u8();
+                    if (!reader.valid() || b > 1u) {
+                        diagnostics.report(
+                            "RS5004", "invalid field boolean constant value", {});
+                        return false;
+                    }
+                    field.hasConstantValue = true;
+                    field.constantValue = (b != 0u);
+                } else if (constKind == 4u) {
+                    const auto strIdx = reader.u32();
+                    if (!validStringIndex(
+                            strIdx, strings, diagnostics,
+                            "invalid field constant string index")) {
+                        return false;
+                    }
+                    field.hasConstantValue = true;
+                    field.constantValue = strings[strIdx];
+                }
+                if (!reader.valid()) {
+                    diagnostics.report(
+                        "RS5004", "truncated field constant value", {});
+                    return false;
+                }
             }
 
             const auto methodCount = reader.u32();

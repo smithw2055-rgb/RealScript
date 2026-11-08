@@ -1,6 +1,7 @@
 #pragma once
 
 #include "realscript/aot_cpp/AotRuntime.h"
+#include "realscript/debug/DapServer.h"
 #include "realscript/game/GameBindings.h"
 #include "realscript/jit/Jit.h"
 #include "realscript/runtime/FiberScheduler.h"
@@ -336,6 +337,16 @@ public:
     void setAotBackend(const aot::ProgramDescriptor* descriptor);
     void setJitBackend(std::shared_ptr<jit::Module> jitModule);
     void clearNativeBackend() noexcept;
+
+    void setDebugger(std::shared_ptr<debug::DebugController> debugger) noexcept;
+    [[nodiscard]] std::shared_ptr<debug::DebugController> debugger() const noexcept {
+        return debugger_;
+    }
+    bool startRemoteDebugger(
+        std::uint16_t port = 4711,
+        const std::string& bindAddress = "127.0.0.1");
+    void stopRemoteDebugger() noexcept;
+    [[nodiscard]] std::uint16_t remoteDebuggerPort() const noexcept;
     [[nodiscard]] ScriptExecutionBackend activeBackend() const noexcept {
         return backend_;
     }
@@ -531,6 +542,8 @@ private:
     ScriptExecutionBackend backend_ = ScriptExecutionBackend::Interpreter;
     std::shared_ptr<jit::Module> jitModule_;
     std::shared_ptr<aot::Program> nativeProgram_;
+    std::shared_ptr<debug::DebugController> debugger_;
+    std::shared_ptr<debug::EmbeddedDapServer> remoteDebugger_;
 
     struct EcsQueuedCommand {
         enum class Kind : std::uint8_t {

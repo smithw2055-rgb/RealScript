@@ -9,6 +9,45 @@
 namespace realscript::debug {
 namespace {
 
+
+std::string normalizeDebugPath(std::string_view p) {
+    std::string out;
+    out.reserve(p.size());
+    for (char ch : p) {
+        char norm = (ch == '\\') ? '/' : ch;
+#if defined(_WIN32)
+        if (norm >= 'A' && norm <= 'Z') {
+            norm = static_cast<char>(norm - 'A' + 'a');
+        }
+#endif
+        out.push_back(norm);
+    }
+#if !defined(_WIN32)
+    if (out.size() >= 2 && out[1] == ':' && out[0] >= 'A' && out[0] <= 'Z') {
+        out[0] = static_cast<char>(out[0] - 'A' + 'a');
+    }
+#endif
+    return out;
+}
+
+bool debugPathsMatch(std::string_view requestedPath, std::string_view enginePath) noexcept {
+    if (requestedPath == enginePath) return true;
+    const std::string normReq = normalizeDebugPath(requestedPath);
+    const std::string normEng = normalizeDebugPath(enginePath);
+    if (normReq == normEng) return true;
+    if (normReq.size() > normEng.size() &&
+        normReq.compare(normReq.size() - normEng.size(), normEng.size(), normEng) == 0 &&
+        normReq[normReq.size() - normEng.size() - 1] == '/') {
+        return true;
+    }
+    if (normEng.size() > normReq.size() &&
+        normEng.compare(normEng.size() - normReq.size(), normReq.size(), normReq) == 0 &&
+        normEng[normEng.size() - normReq.size() - 1] == '/') {
+        return true;
+    }
+    return false;
+}
+
 bool sameLocation(const SourceRange& left, const SourceRange& right) noexcept {
     return left.fileId == right.fileId &&
         left.start.line == right.start.line &&
@@ -654,7 +693,16 @@ void DebugController::bindModules(const std::vector<bytecode::Module>& modules) 
     }
     for (auto& breakpoint : breakpoints_) {
         breakpoint.verified = false;
-        const auto found = executableLocations_.find(breakpoint.sourcePath);
+        auto found = executableLocations_.find(breakpoint.sourcePath);
+        if (found == executableLocations_.end()) {
+            for (auto it = executableLocations_.begin(); it != executableLocations_.end(); ++it) {
+                if (debugPathsMatch(breakpoint.sourcePath, it->first)) {
+                    found = it;
+                    clientPathAliases_[it->first] = breakpoint.sourcePath;
+                    break;
+                }
+            }
+        }
         if (found == executableLocations_.end()) continue;
         const auto location = std::lower_bound(
             found->second.begin(), found->second.end(), breakpoint.line,
@@ -688,11 +736,23 @@ std::vector<Breakpoint> DebugController::setConditionalBreakpoints(
     breakpoints_.erase(
         std::remove_if(breakpoints_.begin(), breakpoints_.end(),
             [&](const Breakpoint& breakpoint) {
-                return breakpoint.sourcePath == sourcePath;
+                return debugPathsMatch(breakpoint.sourcePath, sourcePath);
             }),
         breakpoints_.end());
 
-    const auto executable = executableLocations_.find(sourcePath);
+    auto executable = executableLocations_.find(sourcePath);
+    if (executable == executableLocations_.end()) {
+        for (auto it = executableLocations_.begin(); it != executableLocations_.end(); ++it) {
+            if (debugPathsMatch(sourcePath, it->first)) {
+                executable = it;
+                clientPathAliases_[it->first] = sourcePath;
+                break;
+            }
+        }
+    } else {
+        clientPathAliases_[sourcePath] = sourcePath;
+    }
+
     for (const auto& spec : specs) {
         Breakpoint breakpoint;
         breakpoint.id = nextBreakpointId_++;
@@ -740,6 +800,21 @@ void DebugController::stopOnEntry(bool enabled) noexcept {
 
 void DebugController::requestPause() noexcept {
     pauseRequested_.store(true);
+}
+
+void DebugController::resetTermination() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    terminated_ = false;
+    mode_ = ResumeMode::Continue;
+    lastBreakpointLocation_ = {};
+    lastLocation_ = {};
+}
+
+std::string DebugController::resolveSourcePath(const std::string& enginePath) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = clientPathAliases_.find(enginePath);
+    if (it != clientPathAliases_.end()) return it->second;
+    return enginePath;
 }
 
 std::optional<runtime::Value> DebugController::evaluateInFrameUnlocked(
@@ -866,7 +941,7 @@ std::uint32_t DebugController::matchingBreakpoint(
     std::optional<DebugStackFrame> cachedFrame;
     for (const auto& breakpoint : breakpoints_) {
         if (!breakpoint.verified ||
-            breakpoint.sourcePath != source->path ||
+            !debugPathsMatch(breakpoint.sourcePath, source->path) ||
             breakpoint.line != current.point->range.start.line) {
             continue;
         }
@@ -1153,10 +1228,72 @@ void DebugSession::stepOver() { resume(ResumeMode::StepOver); }
 void DebugSession::stepOut() { resume(ResumeMode::StepOut); }
 void DebugSession::pause() { controller_->requestPause(); }
 
+bool DebugSession::attach(bool stopOnEntry) {
+    std::lock_guard<std::mutex> lock(sessionMutex_);
+    if (worker_.joinable()) return false;
+    launched_ = true;
+    attached_ = true;
+    finished_ = false;
+    resumePending_ = false;
+    terminateRequested_ = false;
+    result_.reset();
+    if (!paused_) {
+        currentStop_.reset();
+    }
+    controller_->resetTermination();
+    controller_->stopOnEntry(stopOnEntry);
+    return true;
+}
+
+void DebugSession::detach() {
+    {
+        std::lock_guard<std::mutex> lock(sessionMutex_);
+        if (!attached_) {
+            return;
+        }
+        controller_->clearBreakpoints();
+        controller_->stopOnEntry(false);
+        pendingMode_ = ResumeMode::Continue;
+        resumePending_ = true;
+        terminateRequested_ = false;
+        paused_ = false;
+        finished_ = true;
+        attached_ = false;
+        launched_ = false;
+    }
+    sessionCv_.notify_all();
+}
+
+void DebugSession::rebindProgram(std::shared_ptr<const runtime::ProgramImage> program) {
+    std::lock_guard<std::mutex> lock(sessionMutex_);
+    program_ = std::move(program);
+    if (program_ && controller_) {
+        controller_->bindProgram(*program_);
+    }
+}
+
+bool DebugSession::isAttached() const noexcept {
+    std::lock_guard<std::mutex> lock(sessionMutex_);
+    return attached_;
+}
+
 void DebugSession::terminate() {
     {
         std::lock_guard<std::mutex> lock(sessionMutex_);
         if (!launched_ || finished_) return;
+        if (attached_) {
+            controller_->clearBreakpoints();
+            controller_->stopOnEntry(false);
+            pendingMode_ = ResumeMode::Continue;
+            resumePending_ = true;
+            terminateRequested_ = false;
+            paused_ = false;
+            finished_ = true;
+            attached_ = false;
+            launched_ = false;
+            sessionCv_.notify_all();
+            return;
+        }
         pendingMode_ = ResumeMode::Terminate;
         terminateRequested_ = true;
         resumePending_ = true;

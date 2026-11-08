@@ -905,6 +905,9 @@ struct PropertyDeclarationSyntax final : SyntaxNode {
     std::unique_ptr<AccessorDeclarationSyntax> getter;
     std::unique_ptr<AccessorDeclarationSyntax> setter;
     SyntaxToken closeBraceToken;
+    std::optional<SyntaxToken> equalsToken;
+    std::unique_ptr<ExpressionSyntax> initializer;
+    std::optional<SyntaxToken> semicolonToken;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::PropertyDeclaration; }
     [[nodiscard]] text::TextSpan span() const noexcept override;

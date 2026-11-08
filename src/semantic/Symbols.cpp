@@ -109,7 +109,7 @@ bool evaluateConstantExpressionImpl(
         const TypeSymbol* curr = startType;
         while (curr && visited.insert(curr->id).second) {
             for (const auto& f : curr->fields) {
-                if (f.name == fieldName && f.hasConstantValue) {
+                if (f.name == fieldName && f.constField && f.hasConstantValue) {
                     return &f;
                 }
             }

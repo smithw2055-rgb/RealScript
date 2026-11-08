@@ -1359,6 +1359,37 @@ private:
     const ExecutionProfile& profile,
     const GcStatistics* gcStatistics = nullptr);
 
+
+struct RuntimeValuePoolStatistics {
+    std::size_t stringActiveSlots = 0;
+    std::size_t stringPinnedSlots = 0;
+    std::size_t stringFreeListSlots = 0;
+    std::size_t stringAllocatedPages = 0;
+    std::uint64_t stringClockEvictions = 0;
+    std::uint64_t stringGcReclaimed = 0;
+
+    std::size_t inlineStructActiveSlots = 0;
+    std::size_t inlineStructPinnedSlots = 0;
+    std::size_t inlineStructFreeListSlots = 0;
+    std::size_t inlineStructAllocatedPages = 0;
+    std::uint64_t inlineStructClockEvictions = 0;
+    std::uint64_t inlineStructGcReclaimed = 0;
+
+    std::size_t heapStructActiveSlots = 0;
+    std::size_t heapStructPinnedSlots = 0;
+    std::size_t heapStructFreeListSlots = 0;
+    std::size_t heapStructAllocatedPages = 0;
+    std::uint64_t heapStructClockEvictions = 0;
+    std::uint64_t heapStructGcReclaimed = 0;
+};
+
+void pinValueInPools(const Value& value) noexcept;
+void beginValuePoolGcMark() noexcept;
+void markValueInPools(const Value& value) noexcept;
+std::size_t finishValuePoolGcSweep() noexcept;
+std::size_t reclaimUnreferencedPoolValues() noexcept;
+[[nodiscard]] RuntimeValuePoolStatistics getRuntimeValuePoolStatistics() noexcept;
+
 [[nodiscard]] bool tryExecuteRuntimeIntrinsic(
     std::string_view name,
     ValueSpan arguments,

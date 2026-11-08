@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <limits>
 #include <ostream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -149,7 +150,10 @@ public:
 
     void push_back(Register value) {
         const auto curSize = static_cast<std::uint16_t>(size());
-        if (curSize >= 0xFFFu) return;
+        if (curSize >= 0xFFFu) {
+            throw std::overflow_error(
+                "SmallRegisterVector exceeded 12-bit operand count limit (4095)");
+        }
         const auto curSlice = sliceId();
         if (curSlice == 0 && curSize == 0) {
             inline0_ = value;

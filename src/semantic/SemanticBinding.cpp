@@ -399,36 +399,6 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
                 }
                 addBinding(std::move(binding));
             }
-            if (!owner.staticConstructor.has_value()) {
-                bool hasDynamicStaticFieldInit = false;
-                for (const auto& field : owner.fields) {
-                    if (field.staticField && !field.constField &&
-                        !field.hasConstantValue && field.initializerSyntax) {
-                        hasDynamicStaticFieldInit = true;
-                        break;
-                    }
-                }
-                if (hasDynamicStaticFieldInit) {
-                    FunctionBindingInput binding;
-                    binding.symbol.moduleName = input.moduleName;
-                    binding.symbol.name = ".cctor";
-                    binding.symbol.ownerTypeName = owner.name;
-                    binding.symbol.ownerTypeId = owner.id;
-                    binding.symbol.declaringTypeId = owner.id;
-                    binding.symbol.declaringTypeName = canonicalTypeName(owner);
-                    binding.symbol.returnType = PrimitiveType::Void;
-                    binding.symbol.method = true;
-                    binding.symbol.staticMethod = true;
-                    binding.symbol.constructor = true;
-                    binding.symbol.synthetic = true;
-                    binding.symbol.deterministic = owner.deterministic;
-                    binding.symbol.id = stableFunctionId(binding.symbol);
-                    binding.symbol.declarationSpan = typeSyntax.identifierToken.span;
-                    binding.symbol.bodySpan = typeSyntax.identifierToken.span;
-                    owner.staticConstructor = binding.symbol;
-                    addBinding(std::move(binding));
-                }
-            }
             for (const auto& propertySyntax : typeSyntax.properties) {
                 auto property = declarePropertySymbol(input.moduleName, propertySyntax, owner, input.visibleTypes, diagnostics_);
                 if (owner.staticType && !property.staticProperty) {
@@ -438,9 +408,35 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
                             "' in static class '" + owner.name + "'",
                         propertySyntax.identifierToken.span);
                 }
-                const bool autoProperty =
-                    (propertySyntax.getter && propertySyntax.getter->semicolonToken) ||
-                    (propertySyntax.setter && propertySyntax.setter->semicolonToken);
+                const bool getterAuto = propertySyntax.getter &&
+                    propertySyntax.getter->semicolonToken.has_value();
+                const bool setterAuto = propertySyntax.setter &&
+                    propertySyntax.setter->semicolonToken.has_value();
+                const bool getterExplicit = propertySyntax.getter &&
+                    propertySyntax.getter->body != nullptr;
+                const bool setterExplicit = propertySyntax.setter &&
+                    propertySyntax.setter->body != nullptr;
+                const bool autoProperty = getterAuto || setterAuto;
+                if (autoProperty && (getterExplicit || setterExplicit)) {
+                    diagnostics_.report(
+                        "RS2463",
+                        "property accessors cannot mix auto and explicit bodies",
+                        propertySyntax.identifierToken.span);
+                }
+                if (autoProperty && !property.getter) {
+                    diagnostics_.report(
+                        "RS2463",
+                        "auto-implemented properties must declare a get accessor",
+                        propertySyntax.identifierToken.span);
+                }
+                if (!autoProperty && propertySyntax.initializer) {
+                    diagnostics_.report(
+                        "RS2465",
+                        "only auto-implemented properties can have initializers",
+                        propertySyntax.equalsToken
+                            ? propertySyntax.equalsToken->span
+                            : propertySyntax.identifierToken.span);
+                }
                 if (autoProperty) {
                     property.backingFieldIndex = owner.fields.size();
                     FieldSymbol backing;
@@ -448,11 +444,24 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
                     backing.type = property.type;
                     backing.typeName = property.typeName;
                     backing.index = owner.fields.size();
+                    backing.declaringTypeId = owner.id;
+                    backing.declaringTypeName = canonicalTypeName(owner);
                     backing.synthetic = true;
+                    backing.staticField = property.staticProperty;
+                    backing.readonlyField = !property.setter.has_value();
+                    backing.initializerSyntax = propertySyntax.initializer.get();
                     backing.declarationSpan = propertySyntax.identifierToken.span;
                     backing.id = stableTypeId(canonicalTypeName(owner) +
                         "::field:" + backing.name);
                     owner.fields.push_back(std::move(backing));
+                    if (propertySyntax.initializer) {
+                        input.visibleTypes[owner.name] = owner;
+                        input.visibleTypes[canonicalTypeName(owner)] = owner;
+                        (void)resolveConstantFieldsPass(owner, input.visibleTypes);
+                        input.visibleTypes[owner.name] = owner;
+                        input.visibleTypes[canonicalTypeName(owner)] = owner;
+                        (void)validateConstantFields(owner, input.visibleTypes, diagnostics_);
+                    }
                 }
                 if (property.getter) {
                     FunctionBindingInput binding;
@@ -481,6 +490,85 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
                     addBinding(std::move(binding));
                 }
                 owner.properties.push_back(std::move(property));
+            }
+            if (!owner.staticConstructor.has_value()) {
+                bool hasDynamicStaticFieldInit = false;
+                for (const auto& field : owner.fields) {
+                    if (field.declaringTypeId == owner.id &&
+                        field.staticField && !field.constField &&
+                        !field.hasConstantValue && field.initializerSyntax) {
+                        hasDynamicStaticFieldInit = true;
+                        break;
+                    }
+                }
+                if (hasDynamicStaticFieldInit) {
+                    FunctionBindingInput binding;
+                    binding.symbol.moduleName = input.moduleName;
+                    binding.symbol.name = ".cctor";
+                    binding.symbol.ownerTypeName = owner.name;
+                    binding.symbol.ownerTypeId = owner.id;
+                    binding.symbol.declaringTypeId = owner.id;
+                    binding.symbol.declaringTypeName = canonicalTypeName(owner);
+                    binding.symbol.returnType = PrimitiveType::Void;
+                    binding.symbol.method = true;
+                    binding.symbol.staticMethod = true;
+                    binding.symbol.constructor = true;
+                    binding.symbol.synthetic = true;
+                    binding.symbol.deterministic = owner.deterministic;
+                    binding.symbol.id = stableFunctionId(binding.symbol);
+                    binding.symbol.declarationSpan = typeSyntax.identifierToken.span;
+                    binding.symbol.bodySpan = typeSyntax.identifierToken.span;
+                    owner.staticConstructor = binding.symbol;
+                    addBinding(std::move(binding));
+                }
+            }
+            if (owner.kind == TypeKind::Class &&
+                !owner.staticType && !owner.interfaceType &&
+                owner.constructors.empty()) {
+                bool hasOwnDynamicInstanceFieldInit = false;
+                for (const auto& field : owner.fields) {
+                    if (field.declaringTypeId == owner.id &&
+                        !field.staticField && !field.constField &&
+                        !field.hasConstantValue && field.initializerSyntax) {
+                        hasOwnDynamicInstanceFieldInit = true;
+                        break;
+                    }
+                }
+                if (hasOwnDynamicInstanceFieldInit) {
+                    FunctionBindingInput binding;
+                    binding.symbol.moduleName = input.moduleName;
+                    binding.symbol.name = ".ctor";
+                    binding.symbol.ownerTypeName = owner.name;
+                    binding.symbol.ownerTypeId = owner.id;
+                    binding.symbol.declaringTypeId = owner.id;
+                    binding.symbol.declaringTypeName = canonicalTypeName(owner);
+                    binding.symbol.returnType = PrimitiveType::Void;
+                    binding.symbol.method = true;
+                    binding.symbol.staticMethod = false;
+                    binding.symbol.constructor = true;
+                    binding.symbol.synthetic = true;
+                    binding.symbol.accessibility = Accessibility::Public;
+                    binding.symbol.deterministic = owner.deterministic;
+                    VariableSymbol self;
+                    self.name = "this";
+                    self.type = PrimitiveType::Object;
+                    self.typeName = canonicalTypeName(owner);
+                    self.index = 0;
+                    self.storageType = self.type;
+                    self.storageTypeName = self.typeName;
+                    self.parameter = true;
+                    self.declarationSpan = typeSyntax.identifierToken.span;
+                    binding.symbol.parameters.push_back(std::move(self));
+                    binding.symbol.id = stableFunctionId(binding.symbol);
+                    binding.symbol.parameters[0].id = stableTypeId(
+                        std::to_string(binding.symbol.id) + "::local:0:this");
+                    binding.symbol.declarationSpan = typeSyntax.identifierToken.span;
+                    binding.symbol.bodySpan = typeSyntax.identifierToken.span;
+                    binding.parameterNames.push_back("this");
+                    binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                    owner.constructors.push_back(binding.symbol);
+                    addBinding(std::move(binding));
+                }
             }
             for (auto& type : input.types) {
                 if (type.id == owner.id) type = owner;
@@ -661,15 +749,44 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
 
     if (input.syntheticAutoGetter || input.syntheticAutoSetter) {
         result.body = std::make_unique<BoundBlockStatement>();
-        if (!currentOwnerType_ || input.symbol.staticMethod) {
-            diagnostics_.report("RS2462", "auto properties require an instance owner", {});
+        if (!currentOwnerType_) {
+            diagnostics_.report("RS2462", "auto properties require an owner type", {});
+        } else if (input.symbol.staticMethod) {
+            if (input.syntheticAutoGetter) {
+                auto memberAccess = std::make_unique<BoundMemberAccessExpression>();
+                memberAccess->type = input.syntheticField.type;
+                memberAccess->typeName = input.syntheticField.typeName;
+                memberAccess->ownerType = *currentOwnerType_;
+                memberAccess->field = input.syntheticField;
+                if (!currentOwnerType_->staticConstructor.has_value() &&
+                    !input.syntheticField.hasConstantValue &&
+                    input.syntheticField.initializerSyntax) {
+                    memberAccess->staticInitializer = bindStaticFieldInitializer(
+                        *currentOwnerType_, input.syntheticField);
+                }
+                auto statement = std::make_unique<BoundReturnStatement>();
+                statement->expression = std::move(memberAccess);
+                result.body->statements.push_back(std::move(statement));
+            } else {
+                const auto* valueVariable = lookupVariable("value");
+                auto assignment = std::make_unique<BoundMemberAssignmentExpression>();
+                assignment->type = input.syntheticField.type;
+                assignment->typeName = input.syntheticField.typeName;
+                assignment->ownerType = *currentOwnerType_;
+                assignment->field = input.syntheticField;
+                auto value = std::make_unique<BoundVariableExpression>();
+                value->type = valueVariable->type;
+                value->typeName = valueVariable->typeName;
+                value->variable = *valueVariable;
+                assignment->expression = std::move(value);
+                auto statement = std::make_unique<BoundExpressionStatement>();
+                statement->expression = std::move(assignment);
+                result.body->statements.push_back(std::move(statement));
+            }
         } else {
             const auto* thisVariable = lookupVariable("this");
             if (input.syntheticAutoGetter) {
-                auto receiver = std::make_unique<BoundVariableExpression>();
-                receiver->type = thisVariable->type;
-                receiver->typeName = thisVariable->typeName;
-                receiver->variable = *thisVariable;
+                auto receiver = makeVariableAccess(*thisVariable, input.symbol.declarationSpan);
                 std::unique_ptr<BoundExpression> access;
                 if (currentOwnerType_->kind == TypeKind::Struct) {
                     auto structureAccess = std::make_unique<BoundStructFieldAccessExpression>();
@@ -699,10 +816,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                         "struct properties cannot declare setters in the Phase 3E value model",
                         {});
                 } else {
-                    auto receiver = std::make_unique<BoundVariableExpression>();
-                    receiver->type = thisVariable->type;
-                    receiver->typeName = thisVariable->typeName;
-                    receiver->variable = *thisVariable;
+                    auto receiver = makeVariableAccess(*thisVariable, input.symbol.declarationSpan);
                     auto assignment = std::make_unique<BoundMemberAssignmentExpression>();
                     assignment->type = input.syntheticField.type;
                     assignment->typeName = input.syntheticField.typeName;
@@ -744,19 +858,19 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     } else if (input.sequence) {
         result.body = bindSequenceSegment(input);
     } else {
-        auto initializer = input.body ? bindBaseConstructorInitializer(input) : nullptr;
+        auto initializer = (input.body || (input.symbol.constructor && !input.symbol.staticMethod))
+            ? bindBaseConstructorInitializer(input)
+            : nullptr;
         std::vector<std::unique_ptr<BoundStatement>> ctorFieldInitializers;
         if (input.symbol.constructor && currentOwnerType_) {
             if (input.symbol.staticMethod) {
                 for (const auto& field : currentOwnerType_->fields) {
-                    if (!field.staticField || field.constField || !field.initializerSyntax) {
+                    if (field.declaringTypeId != currentOwnerType_->id ||
+                        !field.staticField || field.constField || !field.initializerSyntax) {
                         continue;
                     }
-                    auto value = bindTargetExpression(
-                        *field.initializerSyntax,
-                        field.type,
-                        field.typeName,
-                        "static field initializer");
+                    auto value = bindStaticFieldInitializer(*currentOwnerType_, field);
+                    if (!value) continue;
                     auto assignment = std::make_unique<BoundMemberAssignmentExpression>();
                     assignment->span = field.declarationSpan;
                     assignment->type = field.type;
@@ -771,15 +885,13 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                 }
             } else if (const auto* thisVar = lookupVariable("this")) {
                 for (const auto& field : currentOwnerType_->fields) {
-                    if (field.staticField || field.constField ||
+                    if ((initializer && field.declaringTypeId != currentOwnerType_->id) ||
+                        field.staticField || field.constField ||
                         field.hasConstantValue || !field.initializerSyntax) {
                         continue;
                     }
-                    auto value = bindTargetExpression(
-                        *field.initializerSyntax,
-                        field.type,
-                        field.typeName,
-                        "field initializer");
+                    auto value = bindStaticFieldInitializer(*currentOwnerType_, field);
+                    if (!value) continue;
                     if (currentOwnerType_->kind == TypeKind::Struct) {
                         auto assignment = std::make_unique<BoundStructFieldAssignmentExpression>();
                         assignment->span = field.declarationSpan;

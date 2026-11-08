@@ -179,7 +179,10 @@ runtime::ExecutionResult ScriptRuntime::invokeSymbol(
             runtime::ErrorCode::InvalidProgram,
             "script runtime has no linked program image");
     }
-    if (nativeProgram_ && backend_ != ScriptExecutionBackend::Interpreter) {
+    if (!options.debugger && debugger_) {
+        options.debugger = debugger_;
+    }
+    if (!options.debugger && nativeProgram_ && backend_ != ScriptExecutionBackend::Interpreter) {
         if (nativeProgram_->hasFunction(symbolId)) {
             return nativeProgram_->invoke(symbolId, arguments, std::move(options));
         }

@@ -3175,10 +3175,24 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         return;
                     }
                     auto owner = *ownerPointer;
+                    const semantic::TypeSymbol* base = nullptr;
                     if (!owner.baseTypeName.empty()) {
-                        const auto* base = findGlobalType(
+                        base = findGlobalType(
                             modules, owner.baseTypeName);
                         if (base) {
+                            module.visibleTypes[base->name] = *base;
+                            module.visibleTypes[semantic::canonicalTypeName(*base)] = *base;
+                            std::vector<semantic::FieldSymbol> ownFields;
+                            for (const auto& f : owner.fields) {
+                                if (f.declaringTypeId == owner.id) {
+                                    ownFields.push_back(f);
+                                }
+                            }
+                            owner.fields = base->fields;
+                            for (auto& f : ownFields) {
+                                f.index = owner.fields.size();
+                                owner.fields.push_back(f);
+                            }
                             owner.methods = base->methods;
                             owner.virtualDispatchTable =
                                 base->virtualDispatchTable;
@@ -4105,38 +4119,6 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         }
                         addBinding(module, std::move(binding), constructorSyntax.identifierToken.span);
                     }
-                    if (!owner.staticConstructor.has_value()) {
-                        bool hasDynamicStaticFieldInit = false;
-                        for (const auto& field : owner.fields) {
-                            if (field.staticField && !field.constField &&
-                                !field.hasConstantValue && field.initializerSyntax) {
-                                hasDynamicStaticFieldInit = true;
-                                break;
-                            }
-                        }
-                        if (hasDynamicStaticFieldInit) {
-                            semantic::FunctionBindingInput binding;
-                            binding.symbol.moduleName = moduleName;
-                            binding.symbol.name = ".cctor";
-                            binding.symbol.ownerTypeName = owner.name;
-                            binding.symbol.ownerTypeId = owner.id;
-                            binding.symbol.declaringTypeId = owner.id;
-                            binding.symbol.declaringTypeName = semantic::canonicalTypeName(owner);
-                            binding.symbol.returnType = semantic::PrimitiveType::Void;
-                            binding.symbol.method = true;
-                            binding.symbol.staticMethod = true;
-                            binding.symbol.constructor = true;
-                            binding.symbol.synthetic = true;
-                            binding.symbol.deterministic = owner.deterministic;
-                            binding.sourceName = unit->source->name();
-                            binding.symbol.sourceName = binding.sourceName;
-                            binding.symbol.id = semantic::stableFunctionId(binding.symbol);
-                            binding.symbol.declarationSpan = typeSyntax.identifierToken.span;
-                            binding.symbol.bodySpan = typeSyntax.identifierToken.span;
-                            owner.staticConstructor = binding.symbol;
-                            addBinding(module, std::move(binding), typeSyntax.identifierToken.span);
-                        }
-                    }
                     for (const auto& propertySyntax : typeSyntax.properties) {
                         if (!propertyNames.insert(
                                 propertySyntax.identifierToken.text).second ||
@@ -4181,14 +4163,29 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             result.diagnostics.report(
                                 "RS2463",
                                 "property accessors cannot mix auto and explicit bodies",
-                                propertySyntax.identifierToken.span);
+                                propertySyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
                             module.invalid = true;
                         }
-                        if (autoProperty && property.staticProperty) {
+                        if (autoProperty && !property.getter) {
                             result.diagnostics.report(
-                                "RS2462",
-                                "auto properties require an instance owner",
-                                propertySyntax.identifierToken.span);
+                                "RS2463",
+                                "auto-implemented properties must declare a get accessor",
+                                propertySyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
+                            module.invalid = true;
+                        }
+                        if (!autoProperty && propertySyntax.initializer) {
+                            result.diagnostics.report(
+                                "RS2465",
+                                "only auto-implemented properties can have initializers",
+                                propertySyntax.equalsToken
+                                    ? propertySyntax.equalsToken->span
+                                    : propertySyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
                             module.invalid = true;
                         }
                         if (autoProperty) {
@@ -4198,13 +4195,40 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             backing.type = property.type;
                             backing.typeName = property.typeName;
                             backing.index = owner.fields.size();
+                            backing.declaringTypeId = owner.id;
+                            backing.declaringTypeName = semantic::canonicalTypeName(owner);
                             backing.synthetic = true;
+                            backing.staticField = property.staticProperty;
+                            backing.readonlyField = !property.setter.has_value();
+                            backing.initializerSyntax = propertySyntax.initializer.get();
                             backing.sourceName = unit->source->name();
                             backing.declarationSpan = propertySyntax.identifierToken.span;
                             backing.id = semantic::stableTypeId(
                                 semantic::canonicalTypeName(owner) +
                                 "::field:" + backing.name);
                             owner.fields.push_back(std::move(backing));
+                            if (propertySyntax.initializer) {
+                                module.visibleTypes[owner.name] = owner;
+                                module.visibleTypes[semantic::canonicalTypeName(owner)] = owner;
+                                (void)semantic::resolveConstantFieldsPass(
+                                    owner, module.visibleTypes);
+                                module.visibleTypes[owner.name] = owner;
+                                module.visibleTypes[semantic::canonicalTypeName(owner)] = owner;
+                                diagnostics::DiagnosticBag constDiagnostics;
+                                (void)semantic::validateConstantFields(
+                                    owner, module.visibleTypes, constDiagnostics);
+                                for (const auto& diag : constDiagnostics.items()) {
+                                    result.diagnostics.report(
+                                        diag.code,
+                                        diag.message,
+                                        diag.span,
+                                        diag.severity,
+                                        unit->source->name());
+                                    if (diag.severity == diagnostics::DiagnosticSeverity::Error) {
+                                        module.invalid = true;
+                                    }
+                                }
+                            }
                         }
                         if (property.getter) {
                             semantic::FunctionBindingInput binding;
@@ -4241,6 +4265,114 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             addBinding(module, std::move(binding), propertySyntax.identifierToken.span);
                         }
                         owner.properties.push_back(std::move(property));
+                    }
+                    if (!owner.staticConstructor.has_value()) {
+                        bool hasDynamicStaticFieldInit = false;
+                        for (const auto& field : owner.fields) {
+                            if (field.declaringTypeId == owner.id &&
+                                field.staticField && !field.constField &&
+                                !field.hasConstantValue && field.initializerSyntax) {
+                                hasDynamicStaticFieldInit = true;
+                                break;
+                            }
+                        }
+                        if (hasDynamicStaticFieldInit) {
+                            semantic::FunctionBindingInput binding;
+                            binding.symbol.moduleName = moduleName;
+                            binding.symbol.name = ".cctor";
+                            binding.symbol.ownerTypeName = owner.name;
+                            binding.symbol.ownerTypeId = owner.id;
+                            binding.symbol.declaringTypeId = owner.id;
+                            binding.symbol.declaringTypeName = semantic::canonicalTypeName(owner);
+                            binding.symbol.returnType = semantic::PrimitiveType::Void;
+                            binding.symbol.method = true;
+                            binding.symbol.staticMethod = true;
+                            binding.symbol.constructor = true;
+                            binding.symbol.synthetic = true;
+                            binding.symbol.deterministic = owner.deterministic;
+                            binding.sourceName = unit->source->name();
+                            binding.symbol.sourceName = binding.sourceName;
+                            binding.symbol.id = semantic::stableFunctionId(binding.symbol);
+                            binding.symbol.declarationSpan = typeSyntax.identifierToken.span;
+                            binding.symbol.bodySpan = typeSyntax.identifierToken.span;
+                            owner.staticConstructor = binding.symbol;
+                            addBinding(module, std::move(binding), typeSyntax.identifierToken.span);
+                        }
+                    }
+                    if (owner.kind == semantic::TypeKind::Class &&
+                        !owner.staticType && !owner.interfaceType &&
+                        owner.constructors.empty()) {
+                        bool hasOwnDynamicInstanceFieldInit = false;
+                        for (const auto& field : owner.fields) {
+                            if (field.declaringTypeId == owner.id &&
+                                !field.staticField && !field.constField &&
+                                !field.hasConstantValue && field.initializerSyntax) {
+                                hasOwnDynamicInstanceFieldInit = true;
+                                break;
+                            }
+                        }
+                        bool baseAllowsParameterlessChain = true;
+                        bool baseHasParameterlessCtor = false;
+                        if (base && !base->constructors.empty()) {
+                            baseAllowsParameterlessChain = false;
+                            for (const auto& baseCtor : base->constructors) {
+                                if (baseCtor.staticMethod ||
+                                    baseCtor.accessibility == semantic::Accessibility::Private) {
+                                    continue;
+                                }
+                                bool allDefaulted = true;
+                                for (std::size_t pi = 1; pi < baseCtor.parameters.size(); ++pi) {
+                                    if (!baseCtor.parameters[pi].hasDefaultValue &&
+                                        !baseCtor.parameters[pi].paramsArray) {
+                                        allDefaulted = false;
+                                        break;
+                                    }
+                                }
+                                if (allDefaulted) {
+                                    baseAllowsParameterlessChain = true;
+                                    baseHasParameterlessCtor = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (baseAllowsParameterlessChain &&
+                            (hasOwnDynamicInstanceFieldInit || baseHasParameterlessCtor)) {
+                            semantic::FunctionBindingInput binding;
+                            binding.symbol.moduleName = moduleName;
+                            binding.symbol.name = ".ctor";
+                            binding.symbol.ownerTypeName = owner.name;
+                            binding.symbol.ownerTypeId = owner.id;
+                            binding.symbol.declaringTypeId = owner.id;
+                            binding.symbol.declaringTypeName = semantic::canonicalTypeName(owner);
+                            binding.symbol.returnType = semantic::PrimitiveType::Void;
+                            binding.symbol.method = true;
+                            binding.symbol.staticMethod = false;
+                            binding.symbol.constructor = true;
+                            binding.symbol.synthetic = true;
+                            binding.symbol.accessibility = semantic::Accessibility::Public;
+                            binding.symbol.deterministic = owner.deterministic;
+                            binding.sourceName = unit->source->name();
+                            binding.symbol.sourceName = binding.sourceName;
+                            semantic::VariableSymbol self;
+                            self.name = "this";
+                            self.type = semantic::PrimitiveType::Object;
+                            self.typeName = semantic::canonicalTypeName(owner);
+                            self.index = 0;
+                            self.storageType = self.type;
+                            self.storageTypeName = self.typeName;
+                            self.parameter = true;
+                            self.declarationSpan = typeSyntax.identifierToken.span;
+                            binding.symbol.parameters.push_back(std::move(self));
+                            binding.symbol.id = semantic::stableFunctionId(binding.symbol);
+                            binding.symbol.parameters[0].id = semantic::stableTypeId(
+                                std::to_string(binding.symbol.id) + "::local:0:this");
+                            binding.symbol.declarationSpan = typeSyntax.identifierToken.span;
+                            binding.symbol.bodySpan = typeSyntax.identifierToken.span;
+                            binding.parameterNames.push_back("this");
+                            binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                            owner.constructors.push_back(binding.symbol);
+                            addBinding(module, std::move(binding), typeSyntax.identifierToken.span);
+                        }
                     }
                     if (!typeSyntax.events.empty()) {
                         if (owner.kind == semantic::TypeKind::Struct) {
@@ -4586,6 +4718,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     }
                     validateConcreteClassType(owner, module, result);
                     *ownerPointer = std::move(owner);
+                    module.visibleTypes[ownerPointer->name] = *ownerPointer;
+                    module.visibleTypes[semantic::canonicalTypeName(*ownerPointer)] = *ownerPointer;
             };
 
     struct MemberDeclarationWork {

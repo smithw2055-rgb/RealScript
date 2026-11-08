@@ -697,6 +697,12 @@ std::unique_ptr<BoundExpression> Binder::bindStaticFieldInitializer(
     if (!field.initializerSyntax || !bindingStaticFields_.insert(field.id).second) {
         return nullptr;
     }
+    const TypeSymbol* declType = &ownerType;
+    if (field.declaringTypeId != 0 && field.declaringTypeId != ownerType.id) {
+        if (const auto* foundDecl = findVisibleType(field.declaringTypeId)) {
+            declType = foundDecl;
+        }
+    }
     const auto savedOwner = currentOwnerType_;
     const auto savedStatic = currentStaticMethod_;
     const auto savedConstructor = currentConstructor_;
@@ -705,17 +711,17 @@ std::unique_ptr<BoundExpression> Binder::bindStaticFieldInitializer(
     std::vector<std::unordered_map<std::string, VariableSymbol>> savedAliases;
     std::swap(scopes_, savedScopes);
     std::swap(referenceAliasScopes_, savedAliases);
-    currentOwnerType_ = ownerType;
+    currentOwnerType_ = *declType;
     currentStaticMethod_ = true;
     currentConstructor_ = false;
-    if (!ownerType.moduleName.empty()) {
-        currentModuleName_ = ownerType.moduleName;
+    if (!declType->moduleName.empty()) {
+        currentModuleName_ = declType->moduleName;
     }
     auto bound = bindTargetExpression(
         *field.initializerSyntax,
         field.type,
         field.typeName,
-        "static field initializer");
+        field.staticField ? "static field initializer" : "field initializer");
     currentModuleName_ = savedModule;
     currentConstructor_ = savedConstructor;
     currentStaticMethod_ = savedStatic;
@@ -1131,11 +1137,19 @@ std::optional<FunctionSymbol> findStaticConstructorForFunction(
 
 std::unique_ptr<BoundStatement> Binder::bindBaseConstructorInitializer(
     const FunctionBindingInput& input) {
-    if (!input.constructorSyntax || input.symbol.staticMethod || !currentOwnerType_ ||
+    if ((!input.constructorSyntax && !input.symbol.constructor) ||
+        input.symbol.staticMethod || !currentOwnerType_ ||
         currentOwnerType_->kind != TypeKind::Class ||
         currentOwnerType_->baseTypeId == 0) {
         return nullptr;
     }
+
+    const auto diagSpan = input.constructorSyntax
+        ? input.constructorSyntax->identifierToken.span
+        : input.symbol.declarationSpan;
+    const auto callSpan = input.constructorSyntax
+        ? input.constructorSyntax->span()
+        : input.symbol.declarationSpan;
 
     const auto* baseType = findVisibleType(currentOwnerType_->baseTypeId);
     if (!baseType) {
@@ -1143,14 +1157,16 @@ std::unique_ptr<BoundStatement> Binder::bindBaseConstructorInitializer(
             "RS2531",
             "base constructor type is not visible for '" +
                 canonicalTypeName(*currentOwnerType_) + "'",
-            input.constructorSyntax->identifierToken.span);
+            diagSpan);
         return nullptr;
     }
 
     std::vector<std::unique_ptr<BoundExpression>> arguments;
-    arguments.reserve(input.constructorSyntax->baseArguments.size());
-    for (const auto& argument : input.constructorSyntax->baseArguments) {
-        arguments.push_back(bindExpression(*argument));
+    if (input.constructorSyntax) {
+        arguments.reserve(input.constructorSyntax->baseArguments.size());
+        for (const auto& argument : input.constructorSyntax->baseArguments) {
+            arguments.push_back(bindExpression(*argument));
+        }
     }
 
     if (baseType->constructors.empty()) {
@@ -1159,7 +1175,7 @@ std::unique_ptr<BoundStatement> Binder::bindBaseConstructorInitializer(
                 "RS2532",
                 "base type '" + canonicalTypeName(*baseType) +
                     "' has no constructor accepting the supplied arguments",
-                input.constructorSyntax->span());
+                callSpan);
         }
         return nullptr;
     }
@@ -1182,7 +1198,7 @@ std::unique_ptr<BoundStatement> Binder::bindBaseConstructorInitializer(
             "RS2532",
             "no applicable base constructor for type '" +
                 canonicalTypeName(*baseType) + "'",
-            input.constructorSyntax->span());
+            callSpan);
         return nullptr;
     }
     if (ambiguous) {
@@ -1190,26 +1206,28 @@ std::unique_ptr<BoundStatement> Binder::bindBaseConstructorInitializer(
             "RS2533",
             "base constructor call is ambiguous for type '" +
                 canonicalTypeName(*baseType) + "'",
-            input.constructorSyntax->span());
+            callSpan);
         return nullptr;
     }
 
     const auto* thisVariable = lookupVariable("this");
     if (!thisVariable) return nullptr;
     std::vector<std::optional<syntax::SyntaxToken>> modifiers;
+    const std::vector<const syntax::ExpressionSyntax*> emptySyntaxArgs;
     auto call = bindSelectedCall(
         *selected,
         std::move(arguments),
-        syntaxPointers(input.constructorSyntax->baseArguments),
+        input.constructorSyntax
+            ? syntaxPointers(input.constructorSyntax->baseArguments)
+            : emptySyntaxArgs,
         modifiers,
         {},
-        variableExpression(
-            *thisVariable, input.constructorSyntax->identifierToken.span),
-        input.constructorSyntax->span(),
+        variableExpression(*thisVariable, diagSpan),
+        callSpan,
         "base constructor argument",
         true);
     auto statement = std::make_unique<BoundExpressionStatement>();
-    statement->span = input.constructorSyntax->span();
+    statement->span = callSpan;
     statement->expression = std::move(call);
     return statement;
 }
@@ -1509,7 +1527,11 @@ std::unique_ptr<BoundExpression> Binder::bindNameExpression(
                     result->type = property->type;
                     result->typeName = property->typeName;
                     result->function = *property->getter;
-                    result->staticConstructor = currentOwnerType_->staticConstructor;
+                    result->staticConstructor = findStaticConstructorForFunction(
+                        visibleTypes_, *property->getter);
+                    if (!result->staticConstructor) {
+                        result->staticConstructor = currentOwnerType_->staticConstructor;
+                    }
                     return result;
                 }
             } else if (!currentStaticMethod_ && thisVariable && property->getter) {
@@ -1518,8 +1540,14 @@ std::unique_ptr<BoundExpression> Binder::bindNameExpression(
                 result->type = property->type;
                 result->typeName = property->typeName;
                 result->function = *property->getter;
-                result->arguments.push_back(variableExpression(*thisVariable, syntaxTree.span()));
+                result->arguments.push_back(makeVariableAccess(*thisVariable, syntaxTree.span()));
                 return result;
+            } else if (!property->staticProperty && (currentStaticMethod_ || !thisVariable)) {
+                diagnostics_.report(
+                    "RS2484",
+                    "instance property '" + property->name + "' requires a value receiver",
+                    syntaxTree.identifierToken.span);
+                return makeError(syntaxTree.span());
             }
         }
     }
@@ -2558,7 +2586,50 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                         : primitiveTypeName(property->type),
                     syntaxTree.identifierToken.span);
             }
+            if (!property->staticProperty && (currentStaticMethod_ || !thisVariable)) {
+                diagnostics_.report(
+                    "RS2484",
+                    "instance property '" + property->name + "' requires a value receiver",
+                    syntaxTree.identifierToken.span);
+                return makeError(syntaxTree.span());
+            }
             if (!property->setter) {
+                if (property->backingFieldIndex < currentOwnerType_->fields.size()) {
+                    const auto& backingField = currentOwnerType_->fields[property->backingFieldIndex];
+                    if (isReadonlyFieldWritable(
+                            backingField,
+                            currentConstructor_,
+                            currentStaticMethod_,
+                            currentOwnerType_)) {
+                        auto assigned = bindAssignedValue(
+                            property->type,
+                            property->typeName,
+                            "property assignment");
+                        if (!property->staticProperty &&
+                            currentOwnerType_->kind == TypeKind::Struct) {
+                            auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
+                            result->span = syntaxTree.span();
+                            result->type = property->type;
+                            result->typeName = property->typeName;
+                            result->variable = *thisVariable;
+                            result->ownerType = *currentOwnerType_;
+                            result->field = backingField;
+                            result->expression = std::move(assigned);
+                            return result;
+                        }
+                        auto result = std::make_unique<BoundMemberAssignmentExpression>();
+                        result->span = syntaxTree.span();
+                        result->type = property->type;
+                        result->typeName = property->typeName;
+                        if (!property->staticProperty && thisVariable) {
+                            result->receiver = makeVariableAccess(*thisVariable, syntaxTree.span());
+                        }
+                        result->ownerType = *currentOwnerType_;
+                        result->field = backingField;
+                        result->expression = std::move(assigned);
+                        return result;
+                    }
+                }
                 diagnostics_.report(
                     "RS2483",
                     "property '" + property->name + "' is read-only",
@@ -2566,11 +2637,27 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 return makeError(syntaxTree.span());
             }
             if (!property->staticProperty && currentOwnerType_->kind == TypeKind::Struct) {
-                diagnostics_.report(
-                    "RS2486",
-                    "struct properties cannot be assigned through an instance method in the Phase 3E value model",
-                    syntaxTree.identifierToken.span);
-                return makeError(syntaxTree.span());
+                if (!currentConstructor_ ||
+                    property->backingFieldIndex >= currentOwnerType_->fields.size()) {
+                    diagnostics_.report(
+                        "RS2486",
+                        "struct properties cannot be assigned through an instance method in the Phase 3E value model",
+                        syntaxTree.identifierToken.span);
+                    return makeError(syntaxTree.span());
+                }
+                const auto& backingField = currentOwnerType_->fields[property->backingFieldIndex];
+                auto assigned = bindAssignedValue(
+                    property->type,
+                    property->typeName, "property assignment");
+                auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
+                result->span = syntaxTree.span();
+                result->type = property->type;
+                result->typeName = property->typeName;
+                result->variable = *thisVariable;
+                result->ownerType = *currentOwnerType_;
+                result->field = backingField;
+                result->expression = std::move(assigned);
+                return result;
             }
             auto assigned = bindAssignedValue(
                 property->type,
@@ -2581,11 +2668,15 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
             result->typeName = property->typeName;
             result->setter = *property->setter;
             if (property->staticProperty) {
-                result->staticConstructor = currentOwnerType_->staticConstructor;
+                result->staticConstructor = findStaticConstructorForFunction(
+                    visibleTypes_, *property->setter);
+                if (!result->staticConstructor) {
+                    result->staticConstructor = currentOwnerType_->staticConstructor;
+                }
             }
             if (!property->staticProperty && thisVariable) {
                 result->arguments.push_back(
-                    variableExpression(*thisVariable, syntaxTree.span()));
+                    makeVariableAccess(*thisVariable, syntaxTree.span()));
             }
             result->assignedValue = std::move(assigned);
             return result;
@@ -3995,6 +4086,14 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
                     continue;
                 }
                 if (const auto* property = findProperty(found->second, name)) {
+                    if (property->staticProperty) {
+                        diagnostics_.report(
+                            "RS2484",
+                            "cannot initialize static property '" + property->name +
+                                "' in object initializer",
+                            syntaxInitializer.nameToken->span);
+                        continue;
+                    }
                     if (!property->setter || !isMemberAccessible(
                             property->accessibility,
                             property->declaringTypeId)) {
@@ -4073,14 +4172,12 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
                     field.hasConstantValue || !field.initializerSyntax) {
                     continue;
                 }
+                auto initExpr = bindStaticFieldInitializer(found->second, field);
+                if (!initExpr) continue;
                 BoundNewObjectExpression::Initializer defaultInit;
                 defaultInit.kind = BoundNewObjectExpression::Initializer::Kind::Field;
                 defaultInit.field = field;
-                defaultInit.arguments.push_back(bindTargetExpression(
-                    *field.initializerSyntax,
-                    field.type,
-                    field.typeName,
-                    "field initializer"));
+                defaultInit.arguments.push_back(std::move(initExpr));
                 result->defaultFieldInitializers.push_back(std::move(defaultInit));
             }
         }
@@ -4112,14 +4209,12 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
                 field.hasConstantValue || !field.initializerSyntax) {
                 continue;
             }
+            auto initExpr = bindStaticFieldInitializer(found->second, field);
+            if (!initExpr) continue;
             BoundNewObjectExpression::Initializer defaultInit;
             defaultInit.kind = BoundNewObjectExpression::Initializer::Kind::Field;
             defaultInit.field = field;
-            defaultInit.arguments.push_back(bindTargetExpression(
-                *field.initializerSyntax,
-                field.type,
-                field.typeName,
-                "field initializer"));
+            defaultInit.arguments.push_back(std::move(initExpr));
             result->defaultFieldInitializers.push_back(std::move(defaultInit));
         }
     }
@@ -4313,7 +4408,11 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAccessExpression(
                 result->type = property->type;
                 result->typeName = property->typeName;
                 result->function = *property->getter;
-                result->staticConstructor = type->second.staticConstructor;
+                result->staticConstructor = findStaticConstructorForFunction(
+                    visibleTypes_, *property->getter);
+                if (!result->staticConstructor) {
+                    result->staticConstructor = type->second.staticConstructor;
+                }
                 return result;
             }
         }
@@ -4790,12 +4889,25 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                         syntaxTree.nameToken.span);
                     return makeError(syntaxTree.span());
                 }
+                const FieldSymbol* writableBackingField = nullptr;
                 if (!property->setter) {
-                    diagnostics_.report(
-                        "RS2483",
-                        "property '" + property->name + "' is read-only",
-                        syntaxTree.nameToken.span);
-                    return makeError(syntaxTree.span());
+                    if (property->backingFieldIndex < type->second.fields.size()) {
+                        const auto& candidate = type->second.fields[property->backingFieldIndex];
+                        if (isReadonlyFieldWritable(
+                                candidate,
+                                currentConstructor_,
+                                currentStaticMethod_,
+                                currentOwnerType_)) {
+                            writableBackingField = &candidate;
+                        }
+                    }
+                    if (!writableBackingField) {
+                        diagnostics_.report(
+                            "RS2483",
+                            "property '" + property->name + "' is read-only",
+                            syntaxTree.nameToken.span);
+                        return makeError(syntaxTree.span());
+                    }
                 }
                 std::unique_ptr<BoundExpression> assigned;
                 if (compoundOp) {
@@ -4811,7 +4923,11 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                     lhsValue->type = property->type;
                     lhsValue->typeName = property->typeName;
                     lhsValue->function = *property->getter;
-                    lhsValue->staticConstructor = type->second.staticConstructor;
+                    lhsValue->staticConstructor = findStaticConstructorForFunction(
+                        visibleTypes_, *property->getter);
+                    if (!lhsValue->staticConstructor) {
+                        lhsValue->staticConstructor = type->second.staticConstructor;
+                    }
                     auto rhsValue = bindExpression(*syntaxTree.expression);
                     auto combined = bindBinaryOperation(
                         std::move(lhsValue),
@@ -4833,12 +4949,26 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                         property->typeName,
                         "property assignment");
                 }
+                if (writableBackingField) {
+                    auto result = std::make_unique<BoundMemberAssignmentExpression>();
+                    result->span = syntaxTree.span();
+                    result->type = property->type;
+                    result->typeName = property->typeName;
+                    result->ownerType = type->second;
+                    result->field = *writableBackingField;
+                    result->expression = std::move(assigned);
+                    return result;
+                }
                 auto result = std::make_unique<BoundPropertyAssignmentExpression>();
                 result->span = syntaxTree.span();
                 result->type = property->type;
                 result->typeName = property->typeName;
                 result->setter = *property->setter;
-                result->staticConstructor = type->second.staticConstructor;
+                result->staticConstructor = findStaticConstructorForFunction(
+                    visibleTypes_, *property->setter);
+                if (!result->staticConstructor) {
+                    result->staticConstructor = type->second.staticConstructor;
+                }
                 result->assignedValue = std::move(assigned);
                 return result;
             }
@@ -5077,9 +5207,25 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                 syntaxTree.nameToken.span);
             return makeError(syntaxTree.span());
         }
+        const FieldSymbol* writableBackingField = nullptr;
         if (!property->setter) {
-            diagnostics_.report("RS2483", "property '" + property->name + "' is read-only", syntaxTree.nameToken.span);
-            return makeError(syntaxTree.span());
+            const bool isOnThis =
+                receiver->kind() == BoundNodeKind::VariableExpression &&
+                static_cast<const BoundVariableExpression&>(*receiver).variable.name == "this";
+            if (isOnThis && property->backingFieldIndex < type->second.fields.size()) {
+                const auto& candidate = type->second.fields[property->backingFieldIndex];
+                if (isReadonlyFieldWritable(
+                        candidate,
+                        currentConstructor_,
+                        currentStaticMethod_,
+                        currentOwnerType_)) {
+                    writableBackingField = &candidate;
+                }
+            }
+            if (!writableBackingField) {
+                diagnostics_.report("RS2483", "property '" + property->name + "' is read-only", syntaxTree.nameToken.span);
+                return makeError(syntaxTree.span());
+            }
         }
         const auto bindPropertyAssignedValue = [&]() -> std::unique_ptr<BoundExpression> {
             if (!compoundOp) {
@@ -5141,6 +5287,17 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
             return result;
         }
         auto assigned = bindPropertyAssignedValue();
+        if (writableBackingField) {
+            auto result = std::make_unique<BoundMemberAssignmentExpression>();
+            result->span = syntaxTree.span();
+            result->type = property->type;
+            result->typeName = property->typeName;
+            result->receiver = std::move(receiver);
+            result->ownerType = type->second;
+            result->field = *writableBackingField;
+            result->expression = std::move(assigned);
+            return result;
+        }
         auto result = std::make_unique<BoundPropertyAssignmentExpression>();
         result->span = syntaxTree.span();
         result->type = property->type;

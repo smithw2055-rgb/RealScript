@@ -372,6 +372,14 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_engine_integration_evolution_tests
         realscript.engine-integration-evolution
         tests/engine_integration_evolution_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_pool_refactor_verification_tests
+        realscript.pool-refactor-verification
+        tests/pool_refactor_verification.cpp)
+    realscript_add_cpp_test(
+        realscript_dap_socket_attach_tests
+        realscript.dap-socket-attach
+        tests/dap_socket_attach_test.cpp)
     set(REALSCRIPT_PHASE20_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/phase20")
     realscript_add_aot_library(

@@ -3,13 +3,196 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include <mutex>
 #include <sstream>
+#include <streambuf>
 #include <string>
 #include <thread>
+#include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 namespace realscript::debug {
 namespace {
+
+#if defined(_WIN32)
+using SocketHandle = SOCKET;
+constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
+
+void ensureWinsockInitialized() noexcept {
+    static struct WinsockInit {
+        WinsockInit() noexcept {
+            WSADATA wsaData{};
+            (void)WSAStartup(MAKEWORD(2, 2), &wsaData);
+        }
+    } s_init;
+}
+
+void closeSocketHandle(SocketHandle sock) noexcept {
+    if (sock != kInvalidSocket) {
+        (void)shutdown(sock, SD_BOTH);
+        (void)closesocket(sock);
+    }
+}
+
+int socketRecv(SocketHandle sock, char* buf, int len) noexcept {
+    return ::recv(sock, buf, len, 0);
+}
+
+int socketSend(SocketHandle sock, const char* buf, int len) noexcept {
+    return ::send(sock, buf, len, 0);
+}
+#else
+using SocketHandle = int;
+constexpr SocketHandle kInvalidSocket = -1;
+
+void ensureWinsockInitialized() noexcept {}
+
+void closeSocketHandle(SocketHandle sock) noexcept {
+    if (sock != kInvalidSocket) {
+        (void)::shutdown(sock, SHUT_RDWR);
+        (void)::close(sock);
+    }
+}
+
+int socketRecv(SocketHandle sock, char* buf, int len) noexcept {
+    return static_cast<int>(::recv(sock, buf, static_cast<std::size_t>(len), 0));
+}
+
+int socketSend(SocketHandle sock, const char* buf, int len) noexcept {
+    int flags = 0;
+#ifdef MSG_NOSIGNAL
+    flags |= MSG_NOSIGNAL;
+#endif
+    return static_cast<int>(::send(sock, buf, static_cast<std::size_t>(len), flags));
+}
+#endif
+
+class SocketStreamBuf final : public std::streambuf {
+public:
+    explicit SocketStreamBuf(SocketHandle sock) noexcept : sock_(sock) {
+        setg(inBuf_, inBuf_, inBuf_);
+        setp(outBuf_, outBuf_ + sizeof(outBuf_));
+    }
+
+    ~SocketStreamBuf() override {
+        (void)sync();
+    }
+
+protected:
+    int_type underflow() override {
+        if (gptr() < egptr()) {
+            return traits_type::to_int_type(*gptr());
+        }
+        if (sock_ == kInvalidSocket) return traits_type::eof();
+        const int n = socketRecv(sock_, inBuf_, static_cast<int>(sizeof(inBuf_)));
+        if (n <= 0) {
+            return traits_type::eof();
+        }
+        setg(inBuf_, inBuf_, inBuf_ + n);
+        return traits_type::to_int_type(*gptr());
+    }
+
+    int_type overflow(int_type ch) override {
+        if (flushOutput() < 0) {
+            return traits_type::eof();
+        }
+        if (!traits_type::eq_int_type(ch, traits_type::eof())) {
+            *pptr() = traits_type::to_char_type(ch);
+            pbump(1);
+        }
+        return traits_type::not_eof(ch);
+    }
+
+    int sync() override {
+        return flushOutput();
+    }
+
+private:
+    int flushOutput() noexcept {
+        if (sock_ == kInvalidSocket) return -1;
+        const char* p = pbase();
+        int remaining = static_cast<int>(pptr() - pbase());
+        while (remaining > 0) {
+            const int sent = socketSend(sock_, p, remaining);
+            if (sent <= 0) return -1;
+            p += sent;
+            remaining -= sent;
+        }
+        setp(outBuf_, outBuf_ + sizeof(outBuf_));
+        return 0;
+    }
+
+    SocketHandle sock_ = kInvalidSocket;
+    char inBuf_[4096]{};
+    char outBuf_[4096]{};
+};
+
+SocketHandle createListeningTcpSocket(
+    std::uint16_t port,
+    const std::string& bindAddress,
+    std::uint16_t* outBoundPort) noexcept {
+    ensureWinsockInitialized();
+    SocketHandle listenSock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSock == kInvalidSocket) return kInvalidSocket;
+
+    int opt = 1;
+#if defined(_WIN32)
+    (void)::setsockopt(
+        listenSock, SOL_SOCKET, SO_REUSEADDR,
+        reinterpret_cast<const char*>(&opt), sizeof(opt));
+#else
+    (void)::setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (bindAddress.empty() || bindAddress == "0.0.0.0" || bindAddress == "*") {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (::inet_pton(AF_INET, bindAddress.c_str(), &addr.sin_addr) != 1) {
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    }
+
+    if (::bind(listenSock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        closeSocketHandle(listenSock);
+        return kInvalidSocket;
+    }
+    if (::listen(listenSock, 4) != 0) {
+        closeSocketHandle(listenSock);
+        return kInvalidSocket;
+    }
+
+    if (outBoundPort) {
+        sockaddr_in bound{};
+#if defined(_WIN32)
+        int len = sizeof(bound);
+#else
+        socklen_t len = sizeof(bound);
+#endif
+        if (::getsockname(listenSock, reinterpret_cast<sockaddr*>(&bound), &len) == 0) {
+            *outBoundPort = ntohs(bound.sin_port);
+        } else {
+            *outBoundPort = port;
+        }
+    }
+    return listenSock;
+}
 
 const tooling::Json* nested(
     const tooling::Json& value,
@@ -33,7 +216,22 @@ DapServer::DapServer(
     std::shared_ptr<runtime::ManagedHeap> heap)
     : program_(std::move(program)),
       heap_(heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>()),
-      session_(std::make_unique<DebugSession>(program_, heap_)) {}
+      session_(std::make_shared<DebugSession>(program_, heap_)) {}
+
+DapServer::DapServer(
+    std::shared_ptr<DebugSession> session,
+    std::shared_ptr<const runtime::ProgramImage> program,
+    std::shared_ptr<runtime::ManagedHeap> heap)
+    : program_(std::move(program)),
+      heap_(heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>()),
+      session_(session ? std::move(session) : std::make_shared<DebugSession>(program_, heap_)) {}
+
+void DapServer::rebindProgram(std::shared_ptr<const runtime::ProgramImage> program) {
+    program_ = std::move(program);
+    if (session_) {
+        session_->rebindProgram(program_);
+    }
+}
 
 tooling::Json DapServer::response(
     const tooling::Json& request,
@@ -51,7 +249,6 @@ tooling::Json DapServer::response(
     if (!message.empty()) result.emplace("message", std::move(message));
     return result;
 }
-
 
 std::int64_t DapServer::registerExpandableValue(const runtime::Value& value) {
     if (const auto* objRef = std::get_if<runtime::ObjectRef>(&value)) {
@@ -165,6 +362,7 @@ void DapServer::emitStopped(std::ostream& output) {
                 : tooling::Json(tooling::Json::Array{static_cast<std::int64_t>(stop->breakpointId)})},
         }},
     });
+    output.flush();
 }
 
 void DapServer::emitTerminated(std::ostream& output) {
@@ -174,6 +372,7 @@ void DapServer::emitTerminated(std::ostream& output) {
         {"event", "terminated"},
         {"body", tooling::Json::Object{}},
     });
+    output.flush();
 }
 
 tooling::Json DapServer::handle(
@@ -198,6 +397,7 @@ tooling::Json DapServer::handle(
             {"supportsSetVariable", true},
             {"supportsConditionalBreakpoints", true},
             {"supportsEvaluateForHovers", true},
+            {"supportTerminateDebuggee", true},
         });
     }
     if (command == "setBreakpoints") {
@@ -251,6 +451,14 @@ tooling::Json DapServer::handle(
             {"variablesReference", 0},
         });
     }
+    if (command == "attach") {
+        const auto stopOnEntry = arguments && arguments->find("stopOnEntry")
+            ? arguments->find("stopOnEntry")->boolValue(false) : false;
+        if (!session_->attach(stopOnEntry)) {
+            return response(request, false, nullptr, "cannot attach to debug session");
+        }
+        return response(request, true, tooling::Json::Object{});
+    }
     if (command == "launch") {
         const auto function = arguments && arguments->find("function")
             ? arguments->find("function")->stringValue() : std::string{};
@@ -293,13 +501,15 @@ tooling::Json DapServer::handle(
         const auto stop = session_->currentStop();
         if (stop) {
             for (const auto& frame : stop->frames) {
-                const auto path = frame.sourcePath;
+                const auto path = session_->controller()
+                    ? session_->controller()->resolveSourcePath(frame.sourcePath)
+                    : frame.sourcePath;
                 frames.emplace_back(tooling::Json::Object{
                     {"id", static_cast<std::int64_t>(frame.id)},
                     {"name", frame.function},
                     {"line", static_cast<std::int64_t>(frame.location.start.line + 1)},
                     {"column", static_cast<std::int64_t>(frame.location.start.column + 1)},
-                    {"source", tooling::Json::Object{{"name", path}, {"path", path}}},
+                    {"source", tooling::Json::Object{{"name", frame.sourcePath}, {"path", path}}},
                 });
             }
         }
@@ -440,8 +650,12 @@ tooling::Json DapServer::handle(
         return result;
     }
     if (command == "disconnect" || command == "terminate") {
-        session_->terminate();
-        session_->join();
+        if (session_->isAttached()) {
+            session_->detach();
+        } else {
+            session_->terminate();
+            session_->join();
+        }
         if (events) emitTerminated(*events);
         return response(request, true, tooling::Json::Object{});
     }
@@ -452,20 +666,26 @@ int DapServer::run(std::istream& input, std::ostream& output) {
     std::mutex outputMutex;
     std::thread monitor;
     std::atomic<bool> suppressMonitor{false};
+    std::atomic<bool> monitorActive{false};
 
     const auto joinMonitor = [&] {
         if (monitor.joinable()) monitor.join();
+        monitorActive.store(false, std::memory_order_release);
     };
     const auto startMonitor = [&] {
+        if (monitorActive.load(std::memory_order_acquire)) return;
         joinMonitor();
         suppressMonitor.store(false);
+        monitorActive.store(true, std::memory_order_release);
         monitor = std::thread([&] {
             const auto stopped = session_->waitForStop();
-            if (suppressMonitor.load()) return;
-            if (!stopped) session_->join();
-            std::lock_guard<std::mutex> lock(outputMutex);
-            if (stopped) emitStopped(output);
-            else emitTerminated(output);
+            if (!suppressMonitor.load()) {
+                if (!stopped) session_->join();
+                std::lock_guard<std::mutex> lock(outputMutex);
+                if (stopped) emitStopped(output);
+                else emitTerminated(output);
+            }
+            monitorActive.store(false, std::memory_order_release);
         });
     };
 
@@ -476,12 +696,15 @@ int DapServer::run(std::istream& input, std::ostream& output) {
         if (!request) continue;
         const auto* commandValue = request->find("command");
         const auto command = commandValue ? commandValue->stringValue() : std::string{};
-        const auto asynchronous = command == "launch" || command == "continue" ||
-            command == "next" || command == "stepIn" ||
-            command == "stepOut" || command == "pause";
+        const auto asynchronous = command == "launch" || command == "attach" ||
+            command == "continue" || command == "next" ||
+            command == "stepIn" || command == "stepOut" || command == "pause";
         const auto terminal = command == "disconnect" || command == "terminate";
 
         if (terminal) suppressMonitor.store(true);
+        if (asynchronous && !monitorActive.load(std::memory_order_acquire)) {
+            joinMonitor();
+        }
         std::ostringstream events;
         const auto responseValue = handle(*request, asynchronous ? nullptr : &events);
         if (terminal) joinMonitor();
@@ -500,11 +723,165 @@ int DapServer::run(std::istream& input, std::ostream& output) {
 
     if (monitor.joinable()) {
         suppressMonitor.store(true);
-        session_->terminate();
-        session_->join();
+        if (session_->isAttached()) {
+            session_->detach();
+        } else {
+            session_->terminate();
+            session_->join();
+        }
         joinMonitor();
     }
     return 0;
+}
+
+int DapServer::serveTcp(
+    std::uint16_t port,
+    const std::string& bindAddress,
+    std::uint16_t* outBoundPort) {
+    SocketHandle listenSock = createListeningTcpSocket(port, bindAddress, outBoundPort);
+    if (listenSock == kInvalidSocket) return 1;
+
+    sockaddr_in clientAddr{};
+#if defined(_WIN32)
+    int clientLen = sizeof(clientAddr);
+#else
+    socklen_t clientLen = sizeof(clientAddr);
+#endif
+    SocketHandle clientSock = ::accept(
+        listenSock, reinterpret_cast<sockaddr*>(&clientAddr), &clientLen);
+    closeSocketHandle(listenSock);
+    if (clientSock == kInvalidSocket) return 1;
+
+    int noDelay = 1;
+#if defined(_WIN32)
+    (void)::setsockopt(
+        clientSock, IPPROTO_TCP, TCP_NODELAY,
+        reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
+#else
+    (void)::setsockopt(clientSock, IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(noDelay));
+#endif
+
+    SocketStreamBuf streamBuf(clientSock);
+    std::iostream socketStream(&streamBuf);
+    const int rc = run(socketStream, socketStream);
+    closeSocketHandle(clientSock);
+    return rc;
+}
+
+EmbeddedDapServer::EmbeddedDapServer(
+    std::shared_ptr<const runtime::ProgramImage> program,
+    std::shared_ptr<runtime::ManagedHeap> heap)
+    : program_(std::move(program)),
+      heap_(heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>()),
+      session_(std::make_shared<DebugSession>(program_, heap_)) {}
+
+EmbeddedDapServer::~EmbeddedDapServer() {
+    stop();
+}
+
+bool EmbeddedDapServer::start(
+    std::uint16_t port,
+    const std::string& bindAddress) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (running_.load(std::memory_order_acquire)) return true;
+
+    std::uint16_t actualPort = 0;
+    SocketHandle listenSock = createListeningTcpSocket(port, bindAddress, &actualPort);
+    if (listenSock == kInvalidSocket) return false;
+
+    listenSocket_ = static_cast<std::intptr_t>(listenSock);
+    boundPort_.store(actualPort, std::memory_order_release);
+    stopRequested_.store(false, std::memory_order_release);
+    running_.store(true, std::memory_order_release);
+
+    acceptThread_ = std::thread([this, listenSock]() {
+        while (!stopRequested_.load(std::memory_order_acquire)) {
+            sockaddr_in clientAddr{};
+#if defined(_WIN32)
+            int clientLen = sizeof(clientAddr);
+#else
+            socklen_t clientLen = sizeof(clientAddr);
+#endif
+            SocketHandle clientSock = ::accept(
+                listenSock, reinterpret_cast<sockaddr*>(&clientAddr), &clientLen);
+            if (clientSock == kInvalidSocket) {
+                break;
+            }
+            if (stopRequested_.load(std::memory_order_acquire)) {
+                closeSocketHandle(clientSock);
+                break;
+            }
+            int noDelay = 1;
+#if defined(_WIN32)
+            (void)::setsockopt(
+                clientSock, IPPROTO_TCP, TCP_NODELAY,
+                reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
+#else
+            (void)::setsockopt(clientSock, IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(noDelay));
+#endif
+            {
+                std::lock_guard<std::mutex> clientLock(mutex_);
+                activeClientSocket_ = static_cast<std::intptr_t>(clientSock);
+            }
+
+            std::shared_ptr<const runtime::ProgramImage> currentProg;
+            {
+                std::lock_guard<std::mutex> progLock(mutex_);
+                currentProg = program_;
+            }
+            DapServer server(session_, currentProg, heap_);
+            SocketStreamBuf streamBuf(clientSock);
+            std::iostream socketStream(&streamBuf);
+            (void)server.run(socketStream, socketStream);
+
+            {
+                std::lock_guard<std::mutex> clientLock(mutex_);
+                if (activeClientSocket_ == static_cast<std::intptr_t>(clientSock)) {
+                    closeSocketHandle(clientSock);
+                    activeClientSocket_ = -1;
+                }
+            }
+        }
+        running_.store(false, std::memory_order_release);
+    });
+    return true;
+}
+
+void EmbeddedDapServer::stop() noexcept {
+    stopRequested_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (listenSocket_ != -1) {
+            closeSocketHandle(static_cast<SocketHandle>(listenSocket_));
+            listenSocket_ = -1;
+        }
+        if (activeClientSocket_ != -1) {
+            closeSocketHandle(static_cast<SocketHandle>(activeClientSocket_));
+            activeClientSocket_ = -1;
+        }
+    }
+    if (session_) {
+        if (session_->isAttached()) {
+            session_->detach();
+        } else {
+            session_->terminate();
+        }
+    }
+    if (acceptThread_.joinable()) {
+        acceptThread_.join();
+    }
+    running_.store(false, std::memory_order_release);
+    boundPort_.store(0, std::memory_order_release);
+}
+
+void EmbeddedDapServer::rebindProgram(std::shared_ptr<const runtime::ProgramImage> program) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        program_ = program;
+    }
+    if (session_) {
+        session_->rebindProgram(std::move(program));
+    }
 }
 
 } // namespace realscript::debug

@@ -201,7 +201,8 @@ semantic::SymbolId ScriptRuntime::nativeBaseTypeId(
 std::optional<ScriptObject> ScriptRuntime::allocateUninitializedObject(
     const ScriptType& type,
     runtime::RuntimeError& error) const {
-    if (!program_ || type.descriptor.kind != semantic::TypeKind::Class) {
+    if (!program_ || type.descriptor.kind != semantic::TypeKind::Class ||
+        type.descriptor.staticType) {
         error.code = runtime::ErrorCode::TypeMismatch;
         error.message = "script object creation requires a valid class type";
         return std::nullopt;
@@ -463,6 +464,47 @@ void ScriptRuntime::replaceProgram(const GameProgram& program) {
     interpreter_ = runtime::Interpreter(program_, heap_);
     interpreter_.setBindingRegistry(bindings_);
     clearNativeBackend();
+    if (remoteDebugger_) {
+        remoteDebugger_->rebindProgram(program_);
+    } else if (debugger_ && program_) {
+        debugger_->bindProgram(*program_);
+    }
+}
+
+void ScriptRuntime::setDebugger(std::shared_ptr<debug::DebugController> debugger) noexcept {
+    debugger_ = std::move(debugger);
+    if (debugger_ && program_) {
+        debugger_->bindProgram(*program_);
+    }
+}
+
+bool ScriptRuntime::startRemoteDebugger(
+    std::uint16_t port,
+    const std::string& bindAddress) {
+    if (!remoteDebugger_) {
+        remoteDebugger_ = std::make_shared<debug::EmbeddedDapServer>(program_, heap_);
+    } else {
+        remoteDebugger_->rebindProgram(program_);
+    }
+    if (!remoteDebugger_->start(port, bindAddress)) {
+        return false;
+    }
+    debugger_ = remoteDebugger_->controller();
+    return true;
+}
+
+void ScriptRuntime::stopRemoteDebugger() noexcept {
+    if (remoteDebugger_) {
+        if (debugger_ == remoteDebugger_->controller()) {
+            debugger_.reset();
+        }
+        remoteDebugger_->stop();
+        remoteDebugger_.reset();
+    }
+}
+
+std::uint16_t ScriptRuntime::remoteDebuggerPort() const noexcept {
+    return remoteDebugger_ ? remoteDebugger_->boundPort() : 0;
 }
 
 void ScriptRuntime::setAotBackend(const aot::ProgramDescriptor* descriptor) {

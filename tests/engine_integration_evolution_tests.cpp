@@ -1,6 +1,7 @@
 #include "realscript/hot_reload/HotReload.h"
 #include "realscript/debug/DapServer.h"
 #include "realscript/debug/Debugger.h"
+#include "realscript/game/GameBytecodeObjects.h"
 #include "realscript/game/GameProductization.h"
 #include "realscript/game/GameplayMetadata.h"
 #include "realscript/game/GameplayScripting.h"
@@ -5648,6 +5649,382 @@ class DungeonSession
     }
 }
 
+void testPropertyInitializersAndAutoPropertiesCompleteness() {
+    // 1. Positive end-to-end test:
+    //    - Instance auto-properties with initializers ({ get; set; } = ...; and { get; } = ...;)
+    //    - Array brace initializers and List<T> collection initializers on auto-properties
+    //    - Static auto-properties with initializers (both constant-folded and dynamic via .cctor)
+    //    - Getter-only auto-property assignment inside instance constructors (.ctor) and static constructors (.cctor)
+    //    - Struct auto-properties with initializers and constructor assignment
+    //    - Base/Derived class auto-property initializers and constructor chaining
+    //    - Fix P0-1/P0-2: Base dynamic property initializer calling private static helper runs ONCE, not twice,
+    //      and classes without explicit constructors calling private static helpers in property initializers
+    //    - Fix P0-3: Nested generic instantiation inside an auto-property initializer on a generic class (Box<T>)
+    const std::string source = R"(
+module Evolution.PropertyInitializersTest;
+
+public class List<T> {
+    T[] items = new T[8];
+    int count = 0;
+    public void Add(T item) {
+        items[count] = item;
+        count = count + 1;
+    }
+    public T Get(int idx) {
+        return items[idx];
+    }
+    public int Count() {
+        return count;
+    }
+}
+
+public class GenericHolder<T> {
+    public List<int> Tags { get; set; } = new List<int>() { 11, 22 };
+    public T Payload { get; set; }
+}
+
+public struct StatBlock {
+    public int BaseAttack { get; } = 15;
+    public int BonusAttack { get; }
+
+    public StatBlock(int bonus) {
+        BonusAttack = bonus;
+    }
+
+    public int Total() {
+        return BaseAttack + BonusAttack;
+    }
+}
+
+public class BaseActor {
+    public static int BaseInitCount = 0;
+    public static int BaseStaticCctorCount = 0;
+    public static int SharedRule { get; set; } = InitSharedRule();
+
+    private static int InitSharedRule() {
+        BaseStaticCctorCount = BaseStaticCctorCount + 1;
+        return 500;
+    }
+
+    private static int NextBaseHp() {
+        BaseInitCount = BaseInitCount + 1;
+        return 100;
+    }
+
+    public int BaseHp { get; set; } = NextBaseHp();
+    public string Role { get; } = "Unit";
+
+    public BaseActor() {
+    }
+
+    public BaseActor(string roleOverride) {
+        Role = roleOverride;
+    }
+}
+
+public class ImplicitCtorActor : BaseActor {
+    private static int PrivateDefaultMana() {
+        return 33;
+    }
+    public int AutoMana { get; set; } = PrivateDefaultMana();
+}
+
+public class HeroActor : BaseActor {
+    public int Mana { get; set; } = 40;
+    public int Armor { get; } = 10;
+    public int[] Milestones { get; } = { 10, 20, 30 };
+    public List<int> Buffs { get; } = new List<int>() { 5, 15 };
+
+    public static int MaxPartySize { get; } = 4;
+    public static int DynamicSeed { get; } = ComputeSeed();
+    public static int ConfiguredCap { get; }
+    public static int[] GlobalTiers { get; set; } = { 1, 2, 3, 5 };
+
+    static int ComputeSeed() {
+        return 70;
+    }
+
+    static HeroActor() {
+        ConfiguredCap = DynamicSeed + MaxPartySize;
+    }
+
+    public HeroActor() : base() {
+    }
+
+    public HeroActor(int customArmor, string roleOverride) : base(roleOverride) {
+        Armor = customArmor;
+        this.Mana = 60;
+    }
+
+    public int EvaluateScore() {
+        int sum = BaseHp + Mana + Armor + Milestones[0] + Milestones[2] + Buffs.Get(0) + Buffs.Get(1);
+        return sum;
+    }
+}
+
+public static class ConfigRegistry {
+    public static int Version { get; } = 3;
+    public static string Environment { get; set; } = "Production";
+}
+
+int runPropertyInitializerSuite() {
+    BaseActor.BaseInitCount = 0;
+    // Default constructor path uses property initializers
+    HeroActor defaultHero = new HeroActor();
+    int s1 = defaultHero.EvaluateScore(); // 100 + 40 + 10 + 10 + 30 + 5 + 15 = 210
+    if (defaultHero.Role != "Unit") return -1;
+    // P0-1 check: BaseActor's dynamic initializer NextBaseHp() must have run exactly ONCE for defaultHero!
+    if (BaseActor.BaseInitCount != 1) return -10;
+
+    // Parameterized constructor overrides getter-only Armor and Role
+    HeroActor eliteHero = new HeroActor(25, "Commander");
+    int s2 = eliteHero.EvaluateScore(); // 100 + 60 + 25 + 10 + 30 + 5 + 15 = 245
+    if (eliteHero.Role != "Commander") return -2;
+    if (BaseActor.BaseInitCount != 2) return -11;
+
+    // P0-2 check: Class without explicit constructor calling private static helper & inheriting BaseActor
+    ImplicitCtorActor implicitActor = new ImplicitCtorActor();
+    if (implicitActor.AutoMana != 33 || implicitActor.BaseHp != 100 || BaseActor.BaseInitCount != 3) {
+        return -12;
+    }
+
+    // P0-1 static .cctor check: HeroActor..cctor must NOT re-run BaseActor's InitSharedRule()
+    if (BaseActor.SharedRule != 500 || BaseActor.BaseStaticCctorCount != 1) {
+        return -13;
+    }
+
+    // P0-3 check: Nested generic instantiation inside auto-property initializer on GenericHolder<string>
+    GenericHolder<string> holder = new GenericHolder<string>();
+    if (holder.Tags.Get(0) + holder.Tags.Get(1) != 33) {
+        return -14;
+    }
+
+    // Mutate settable auto-property
+    eliteHero.BaseHp += 5;
+    if (eliteHero.BaseHp != 105) return -3;
+
+    // Static auto-properties + static constructor assignment to getter-only static property
+    int staticScore = HeroActor.MaxPartySize + HeroActor.DynamicSeed + HeroActor.ConfiguredCap + HeroActor.GlobalTiers[3];
+    // 4 + 70 + 74 + 5 = 153
+
+    // Struct auto-property initializer + constructor assignment
+    StatBlock defaultStats = new StatBlock();
+    StatBlock customStats = new StatBlock(12);
+    int structScore = defaultStats.Total() + customStats.Total(); // (15 + 0) + (15 + 12) = 42
+
+    // Static class auto-property initializer
+    if (ConfigRegistry.Environment != "Production") return -4;
+    ConfigRegistry.Environment = "Staging";
+    if (ConfigRegistry.Environment != "Staging") return -5;
+
+    return s1 + s2 + staticScore + structScore + ConfigRegistry.Version; // 210 + 245 + 153 + 42 + 3 = 653
+}
+)";
+
+    realscript::compiler::Compilation compilation;
+    compilation.addSource({"property_initializers.rs", source});
+    const auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "property initializers compilation failed: " + diagnosticsText(build.diagnostics));
+
+    realscript::bytecode::Lowerer lowerer;
+    std::vector<realscript::bytecode::Module> modules;
+    std::vector<std::vector<std::uint8_t>> encodedModules;
+    for (const auto& m : build.modules) {
+        auto lowered = lowerer.lower(m);
+        const auto encoded = realscript::bytecode::encodeModule(lowered);
+        realscript::bytecode::Module decoded;
+        realscript::diagnostics::DiagnosticBag decodeDiag;
+        require(
+            realscript::bytecode::decodeModule(encoded, decoded, decodeDiag),
+            "RSBC decode failed for property initializers module: " + diagnosticsText(decodeDiag));
+        require(
+            realscript::bytecode::encodeModule(decoded) == encoded,
+            "RSBC round-trip bytes differed for property initializers module");
+        encodedModules.push_back(encoded);
+        modules.push_back(std::move(lowered));
+    }
+    realscript::runtime::Interpreter interpreter(modules);
+    const auto res = interpreter.invoke("Evolution.PropertyInitializersTest::runPropertyInitializerSuite");
+    require(res.succeeded, "runPropertyInitializerSuite failed: " + res.error.message);
+    require(std::get<std::int64_t>(res.value) == 653,
+        "unexpected runPropertyInitializerSuite result: " +
+        std::to_string(std::get<std::int64_t>(res.value)));
+
+    // P0-4 check: Verify decoded RSBC bytecode preserves staticType and constantValue for Host C++ SDK
+    {
+        realscript::game::GameApi api;
+        auto loaded = realscript::game::loadGameObjectBytecodeModules(api, encodedModules);
+        require(loaded.succeeded(),
+            "loadGameObjectBytecodeModules failed: " + diagnosticsText(loaded.diagnostics));
+        auto sdkRuntime = loaded.package.createRuntime();
+        realscript::runtime::RuntimeError sdkErr;
+
+        // Static class ConfigRegistry must have staticType=true and reject createObject
+        const auto configType = sdkRuntime.findType("Evolution.PropertyInitializersTest::ConfigRegistry");
+        require(configType.has_value() && configType->descriptor.staticType,
+            "Decoded RSBC ConfigRegistry must preserve staticType = true");
+        require(!sdkRuntime.createObject(*configType, {}, sdkErr).has_value(),
+            "Host createObject on decoded static class ConfigRegistry must be rejected");
+        sdkErr = {};
+
+        // Constant-folded static auto-property Version (= 3) must be readable via getStaticMember from decoded RSBC
+        const auto versionVal = sdkRuntime.getStaticMember(
+            "Evolution.PropertyInitializersTest::ConfigRegistry", "$Version", sdkErr);
+        require(versionVal.has_value() && std::get<std::int64_t>(*versionVal) == 3,
+            "Decoded RSBC must preserve constantValue=3 on static auto-property backing field $Version");
+
+        // Host createObject on ImplicitCtorActor must run synthesized .ctor and populate both constant and dynamic properties
+        const auto implicitType = sdkRuntime.findType("Evolution.PropertyInitializersTest::ImplicitCtorActor");
+        require(implicitType.has_value(), "ImplicitCtorActor type not found in decoded RSBC");
+        auto implicitObj = sdkRuntime.createObject(*implicitType, {}, sdkErr);
+        require(implicitObj.has_value(), "Host createObject ImplicitCtorActor failed: " + sdkErr.message);
+        const auto roleVal = sdkRuntime.getMember(*implicitObj, "$Role", sdkErr);
+        const auto manaVal = sdkRuntime.getMember(*implicitObj, "$AutoMana", sdkErr);
+        require(roleVal.has_value() &&
+                std::holds_alternative<realscript::runtime::ObjectRef>(*roleVal) &&
+                sdkRuntime.heap()->stringView(std::get<realscript::runtime::ObjectRef>(*roleVal)) == "Unit",
+            "Decoded RSBC createObject must preserve string constantValue 'Unit' on $Role");
+        require(manaVal.has_value() && std::get<std::int64_t>(*manaVal) == 33,
+            "Decoded RSBC createObject must run synthesized .ctor and initialize $AutoMana to 33");
+    }
+
+    // P2-2 check: Cross-module base class with auto-properties inherited by a derived class in another module
+    {
+        realscript::compiler::Compilation crossModComp({
+            {"mod_a.rs", R"(
+module CrossMod.BasePkg;
+public class BaseEntity {
+    public int Health { get; set; } = 120;
+    public int Shield { get; } = 30;
+}
+)"},
+            {"mod_b.rs", R"(
+module CrossMod.DerivedPkg;
+import CrossMod.BasePkg;
+public class PlayerEntity : BaseEntity {
+    public int Stamina { get; set; } = 50;
+    public int TotalPool() {
+        return Health + Shield + Stamina;
+    }
+}
+public int testCrossMod() {
+    PlayerEntity p = new PlayerEntity();
+    p.Health += 10;
+    return p.TotalPool();
+}
+)"},
+        });
+        const auto crossBuild = crossModComp.build();
+        require(!crossBuild.diagnostics.hasErrors(),
+            "cross-module auto-property inheritance failed: " + diagnosticsText(crossBuild.diagnostics));
+        std::vector<realscript::bytecode::Module> crossBytecode;
+        for (const auto& m : crossBuild.modules) {
+            crossBytecode.push_back(lowerer.lower(m));
+        }
+        realscript::runtime::Interpreter crossInterp(std::move(crossBytecode));
+        const auto crossRes = crossInterp.invoke("CrossMod.DerivedPkg::testCrossMod");
+        require(crossRes.succeeded && std::get<std::int64_t>(crossRes.value) == 210,
+            "cross-module auto-property inheritance expected 210");
+    }
+
+    // 2. Negative semantic tests
+    const auto hasDiag = [](const realscript::diagnostics::DiagnosticBag& bag, const char* code) {
+        for (const auto& d : bag.items()) {
+            if (d.code == code) return true;
+        }
+        return false;
+    };
+
+    // 2a. Assigning to getter-only auto-property outside constructor -> RS2483
+    {
+        realscript::compiler::Compilation badComp;
+        badComp.addSource({"bad_readonly_prop.rs", R"(
+module Evolution.BadReadonlyProp;
+class Widget {
+    public int Id { get; } = 10;
+    public void Mutate() {
+        Id = 20;
+    }
+}
+int main() { return 0; }
+)"});
+        const auto badBuild = badComp.build();
+        require(hasDiag(badBuild.diagnostics, "RS2483"),
+            "expected RS2483 when assigning to getter-only auto-property in regular method");
+    }
+
+    // 2b. Assigning to static getter-only auto-property inside instance constructor -> RS2483
+    {
+        realscript::compiler::Compilation badComp;
+        badComp.addSource({"bad_static_readonly_prop.rs", R"(
+module Evolution.BadStaticReadonlyProp;
+class Widget {
+    public static int GlobalId { get; } = 10;
+    public Widget() {
+        GlobalId = 20;
+    }
+}
+int main() { return 0; }
+)"});
+        const auto badBuild = badComp.build();
+        require(hasDiag(badBuild.diagnostics, "RS2483"),
+            "expected RS2483 when assigning to static getter-only auto-property in instance constructor");
+    }
+
+    // 2c. Property initializer on non-auto property (computed property with body) -> RS2465
+    {
+        realscript::compiler::Compilation badComp;
+        badComp.addSource({"bad_computed_prop_init.rs", R"(
+module Evolution.BadComputedPropInit;
+class Widget {
+    int backing = 1;
+    public int Value {
+        get { return backing; }
+    } = 42;
+}
+int main() { return 0; }
+)"});
+        const auto badBuild = badComp.build();
+        require(hasDiag(badBuild.diagnostics, "RS2465"),
+            "expected RS2465 when specifying initializer on non-auto property");
+    }
+
+    // 2d. P1-5: Initializing a static property inside an object initializer `new Widget { GlobalCap = 20 }` -> RS2484
+    {
+        realscript::compiler::Compilation badComp;
+        badComp.addSource({"bad_static_prop_obj_init.rs", R"(
+module Evolution.BadStaticPropObjInit;
+class Widget {
+    public static int GlobalCap { get; set; } = 10;
+}
+int main() {
+    Widget w = new Widget() { GlobalCap = 20 };
+    return 0;
+}
+)"});
+        const auto badBuild = badComp.build();
+        require(hasDiag(badBuild.diagnostics, "RS2484"),
+            "expected RS2484 when initializing static property in object initializer");
+    }
+
+    // 2e. P1-6: Using a non-const static field with a literal initializer inside a `const` field declaration -> RS2407
+    {
+        realscript::compiler::Compilation badComp;
+        badComp.addSource({"bad_nonconst_in_const.rs", R"(
+module Evolution.BadNonConstInConst;
+class Rules {
+    public static int MutableLimit = 10;
+    public const int DerivedConst = MutableLimit + 5;
+}
+int main() { return 0; }
+)"});
+        const auto badBuild = badComp.build();
+        require(hasDiag(badBuild.diagnostics, "RS2407"),
+            "expected RS2407 when referencing non-const static field in a const field declaration");
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -5690,8 +6067,10 @@ int main() {
         testRound5DeepFixesAndAdvancedParity();
         std::cout << "[20/21] testConstStaticAndUtilityClassCompleteness..." << std::endl;
         testConstStaticAndUtilityClassCompleteness();
-        std::cout << "[21/21] testStaticConstructorsAndReadonlyFieldsCompleteness..." << std::endl;
+        std::cout << "[21/22] testStaticConstructorsAndReadonlyFieldsCompleteness..." << std::endl;
         testStaticConstructorsAndReadonlyFieldsCompleteness();
+        std::cout << "[22/22] testPropertyInitializersAndAutoPropertiesCompleteness..." << std::endl;
+        testPropertyInitializersAndAutoPropertiesCompleteness();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

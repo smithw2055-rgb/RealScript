@@ -50,6 +50,16 @@ const char* objectKindName(ObjectKind kind) noexcept {
     return "unknown";
 }
 
+std::mutex& liveHeapsPoolMutex() noexcept {
+    static std::mutex m;
+    return m;
+}
+
+std::unordered_map<const void*, std::function<void()>>& liveHeapPoolMarkers() noexcept {
+    static std::unordered_map<const void*, std::function<void()>> markers;
+    return markers;
+}
+
 } // namespace
 
 void ShadowStack::pushFrame(
@@ -149,12 +159,36 @@ struct ManagedHeap::Impl {
     explicit Impl(HeapConfig value)
         : config(value), heapId(nextHeapId()),
           nextCollectionThreshold(value.initialCollectionThresholdBytes) {
+        {
+            std::lock_guard<std::mutex> lock(liveHeapsPoolMutex());
+            liveHeapPoolMarkers()[this] = [this]() { this->markAllReachablePoolValues(); };
+        }
         if (config.initialCollectionThresholdBytes == 0) {
             config.initialCollectionThresholdBytes = 1;
             nextCollectionThreshold = 1;
         }
         if (config.maximumHeapBytes < config.initialCollectionThresholdBytes) {
             config.maximumHeapBytes = config.initialCollectionThresholdBytes;
+        }
+    }
+
+    ~Impl() {
+        std::lock_guard<std::mutex> lock(liveHeapsPoolMutex());
+        liveHeapPoolMarkers().erase(this);
+    }
+
+    void markAllReachablePoolValues() const {
+        for (const auto& entry : persistentRoots) markValueInPools(entry.second);
+        for (const auto& entry : staticFields) markValueInPools(entry.second);
+        for (const auto& [typeName, table] : nativeEcsTables) {
+            (void)typeName;
+            for (const auto& v : table.values) markValueInPools(v);
+        }
+        for (const auto& slot : slots) {
+            if (!slot.object) continue;
+            for (const auto& v : slot.object->values) {
+                markValueInPools(v);
+            }
         }
     }
 
@@ -292,6 +326,7 @@ struct ManagedHeap::Impl {
         auto& object = slots[*slotIndex].object.storage;
         object.stringPayload.clear();
         // Reuse existing vector capacity in-place without malloc/free!
+        pinValueInPools(initialValue);
         object.values.assign(length, initialValue);
         return finalizeSlotAllocation(
             *slotIndex, ObjectKind::Array, arrayTypeId,
@@ -311,6 +346,7 @@ struct ManagedHeap::Impl {
         if (!slotIndex) return std::nullopt;
         auto& object = slots[*slotIndex].object.storage;
         object.stringPayload.clear();
+        for (const auto& v : vals) pinValueInPools(v);
         if (object.values.capacity() >= vals.size()) {
             object.values.assign(vals.begin(), vals.end());
         } else {
@@ -702,6 +738,7 @@ bool ManagedHeap::arraySetPrevalidated(
     if (mayBeReference) {
         impl_->writeBarrier(reference, value);
     }
+    pinValueInPools(value);
     object->values[index] = value;
     return true;
 }
@@ -775,6 +812,7 @@ bool ManagedHeap::arraySet(
             return false;
         }
     }
+    pinValueInPools(value);
     impl_->writeBarrier(reference, value);
     values[index] = std::move(value);
     return true;
@@ -828,6 +866,7 @@ bool ManagedHeap::fieldSet(
             index)) {
         impl_->writeBarrier(reference, value);
     }
+    pinValueInPools(value);
     fields[index] = std::move(value);
     return true;
 }
@@ -840,6 +879,7 @@ ManagedHeap::RootToken ManagedHeap::addPersistentRoot(Value value) {
     if (!impl_->validRootValue(value)) return 0;
     auto token = impl_->nextRootToken++;
     if (token == 0) token = impl_->nextRootToken++;
+    pinValueInPools(value);
     impl_->persistentRoots.emplace(token, std::move(value));
     return token;
 }
@@ -854,6 +894,7 @@ bool ManagedHeap::updatePersistentRoot(RootToken token, Value value) {
     if (token == 0 || !impl_->validRootValue(value)) return false;
     const auto found = impl_->persistentRoots.find(token);
     if (found == impl_->persistentRoots.end()) return false;
+    pinValueInPools(value);
     found->second = std::move(value);
     return true;
 }
@@ -889,6 +930,7 @@ void ManagedHeap::setStaticField(semantic::SymbolId id, Value value) {
             impl_->resumeSweep = true;
         }
     }
+    pinValueInPools(value);
     impl_->staticFields[id] = std::move(value);
 }
 
@@ -903,6 +945,7 @@ bool ManagedHeap::setNativeEcsComponent(
             impl_->resumeSweep = true;
         }
     }
+    pinValueInPools(component);
     auto& table = impl_->nativeEcsTables[std::string(canonicalTypeName)];
     if (Impl::valueMayContainReferences(component)) {
         table.mayContainReferences = true;
@@ -1018,6 +1061,7 @@ bool ManagedHeap::setNativeEcsComponentByDenseIndex(
     if (Impl::valueMayContainReferences(component)) {
         found->second.mayContainReferences = true;
     }
+    pinValueInPools(component);
     found->second.values[denseIndex] = std::move(component);
     return true;
 }
@@ -1114,6 +1158,9 @@ void ManagedHeap::collectFull(const ShadowStack& shadowStack) {
     if (impl_->phase != GcPhase::Idle) drainCollection();
     requestCollection();
     drainCollection();
+    if (shadowStack.frameCount() == 0) {
+        (void)reclaimUnreferencedPoolValues();
+    }
 }
 
 std::size_t ManagedHeap::nurserySize() const noexcept {
@@ -1678,7 +1725,15 @@ bool ManagedHeap::restore(
     for (std::size_t index = 0; index < slots.size(); ++index) {
         if (!slots[index].object) {
             freeSlots.push_back(static_cast<std::uint32_t>(index));
+        } else {
+            for (const auto& v : slots[index].object->values) {
+                pinValueInPools(v);
+            }
         }
+    }
+    for (const auto& [token, val] : roots) {
+        (void)token;
+        pinValueInPools(val);
     }
     impl_->slots = std::move(slots);
     impl_->freeSlots = std::move(freeSlots);
@@ -1964,6 +2019,19 @@ std::uint64_t NativeHandleRegistry::registryId() const noexcept {
 
 std::string NativeHandleRegistry::debugName(NativeHandle handle) const {
     return isAlive(handle) ? slots_[handle.slot].debugName : std::string{};
+}
+
+
+std::size_t reclaimUnreferencedPoolValues() noexcept {
+    beginValuePoolGcMark();
+    {
+        std::lock_guard<std::mutex> lock(liveHeapsPoolMutex());
+        for (const auto& [ptr, marker] : liveHeapPoolMarkers()) {
+            (void)ptr;
+            if (marker) marker();
+        }
+    }
+    return finishValuePoolGcSweep();
 }
 
 } // namespace realscript::runtime
