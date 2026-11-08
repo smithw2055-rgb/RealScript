@@ -84,6 +84,7 @@ enum class SyntaxKind {
     EventKeyword,
     StaticKeyword,
     ConstKeyword,
+    ReadonlyKeyword,
     PublicKeyword,
     PrivateKeyword,
     ProtectedKeyword,
@@ -575,7 +576,12 @@ struct NewArrayExpressionSyntax final : ExpressionSyntax {
     TypeSyntax elementType;
     SyntaxToken openBracketToken;
     std::unique_ptr<ExpressionSyntax> length;
+    bool explicitLength = false;
     SyntaxToken closeBracketToken;
+    std::optional<SyntaxToken> initializerOpenBraceToken;
+    std::vector<std::unique_ptr<ExpressionSyntax>> initialValues;
+    std::vector<SyntaxToken> initializerCommaTokens;
+    std::optional<SyntaxToken> initializerCloseBraceToken;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::NewArrayExpression; }
     [[nodiscard]] text::TextSpan span() const noexcept override;
@@ -1247,6 +1253,7 @@ private:
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parsePostfixExpression();
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseCallExpression();
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseNewExpression();
+    [[nodiscard]] std::unique_ptr<NewArrayExpressionSyntax> parseBraceArrayInitializer(const TypeSyntax& arrayType);
     void parseArgumentList(
         std::vector<std::unique_ptr<ExpressionSyntax>>& arguments,
         std::vector<std::optional<SyntaxToken>>* argumentModifiers,

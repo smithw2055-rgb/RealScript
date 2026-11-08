@@ -244,6 +244,10 @@ Module Lowerer::lower(const mir::Module& source) const {
                         throw std::logic_error(
                             "MIR object instruction references missing type descriptor");
                     }
+                    if (foundType->second > 0xFFFFu) {
+                        throw std::out_of_range(
+                            "bytecode instruction typeIndex exceeds 16-bit limit");
+                    }
                     instruction.typeIndex = static_cast<std::uint16_t>(foundType->second);
                 }
                 instruction.elementType = sourceInstruction.elementType;
@@ -314,6 +318,11 @@ Module Lowerer::lower(const mir::Module& source) const {
             block.terminator.value = sourceBlock.terminator.value < 0
                 ? InvalidRegister
                 : static_cast<Register>(sourceBlock.terminator.value);
+            if (sourceBlock.terminator.target > 0xFFFFu ||
+                sourceBlock.terminator.falseTarget > 0xFFFFu) {
+                throw std::out_of_range(
+                    "bytecode terminator block target exceeds 16-bit limit");
+            }
             block.terminator.target = static_cast<std::uint16_t>(sourceBlock.terminator.target);
             block.terminator.falseTarget = static_cast<std::uint16_t>(sourceBlock.terminator.falseTarget);
             for (const auto argument : sourceBlock.terminator.arguments) {

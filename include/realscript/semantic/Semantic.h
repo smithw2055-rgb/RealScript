@@ -109,6 +109,8 @@ struct VariableSymbol {
     std::size_t index = 0;
     bool parameter = false;
     bool isConst = false;
+    bool hasConstantValue = false;
+    syntax::TokenValue constantValue;
     text::TextSpan declarationSpan;
     text::TextSpan scopeSpan;
     SymbolId id = 0;
@@ -139,6 +141,7 @@ struct FieldSymbol {
     bool synthetic = false;
     bool staticField = false;
     bool constField = false;
+    bool readonlyField = false;
     bool hasConstantValue = false;
     syntax::TokenValue constantValue;
     const syntax::ExpressionSyntax* initializerSyntax = nullptr;
@@ -277,6 +280,7 @@ struct TypeSymbol {
     bool interfaceType = false;
     bool abstractType = false;
     bool sealedType = false;
+    bool staticType = false;
     bool deterministic = false;
     SymbolId baseTypeId = 0;
     std::string baseTypeName;
@@ -287,6 +291,7 @@ struct TypeSymbol {
     std::vector<SymbolId> virtualDispatchTable;
     std::vector<InterfaceDispatchMap> interfaceDispatchMaps;
     std::vector<FunctionSymbol> constructors;
+    std::optional<FunctionSymbol> staticConstructor;
     std::vector<PropertySymbol> properties;
     std::vector<EventSymbol> events;
     std::vector<EnumMemberSymbol> enumMembers;
@@ -345,16 +350,32 @@ using FunctionOverloadMap =
 [[nodiscard]] TypeSymbol declareTypeShell(
     const std::string& moduleName,
     const syntax::EnumDeclarationSyntax& syntax);
+[[nodiscard]] bool evaluateConstantSyntaxExpression(
+    const syntax::ExpressionSyntax& expr,
+    const TypeSymbol* currentType,
+    const TypeSymbolMap& visibleTypes,
+    syntax::TokenValue& outValue,
+    PrimitiveType& outType,
+    const std::vector<std::unordered_map<std::string, VariableSymbol>>* localScopes = nullptr);
+[[nodiscard]] bool resolveConstantFieldsPass(
+    TypeSymbol& type,
+    const TypeSymbolMap& visibleTypes);
+[[nodiscard]] bool validateConstantFields(
+    TypeSymbol& type,
+    const TypeSymbolMap& visibleTypes,
+    diagnostics::DiagnosticBag& diagnostics);
 [[nodiscard]] bool populateTypeFields(
     TypeSymbol& type,
     const syntax::ClassDeclarationSyntax& syntax,
     const TypeSymbolMap& visibleTypes,
-    diagnostics::DiagnosticBag& diagnostics);
+    diagnostics::DiagnosticBag& diagnostics,
+    bool deferConstValidation = false);
 [[nodiscard]] bool populateTypeFields(
     TypeSymbol& type,
     const syntax::StructDeclarationSyntax& syntax,
     const TypeSymbolMap& visibleTypes,
-    diagnostics::DiagnosticBag& diagnostics);
+    diagnostics::DiagnosticBag& diagnostics,
+    bool deferConstValidation = false);
 [[nodiscard]] bool populateEnumMembers(
     TypeSymbol& type,
     const syntax::EnumDeclarationSyntax& syntax,
@@ -681,6 +702,7 @@ struct BoundDelegateCombinationExpression final : BoundExpression {
 
 struct BoundCallExpression final : BoundExpression {
     FunctionSymbol function;
+    std::optional<FunctionSymbol> staticConstructor;
     bool virtualDispatch = false;
     std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
     bool interfaceDispatch = false;
@@ -734,6 +756,7 @@ struct BoundReferenceCallArgument {
 
 struct BoundReferenceCallExpression final : BoundExpression {
     FunctionSymbol function;
+    std::optional<FunctionSymbol> staticConstructor;
     bool virtualDispatch = false;
     std::uint32_t virtualSlot = std::numeric_limits<std::uint32_t>::max();
     bool interfaceDispatch = false;
@@ -780,6 +803,7 @@ struct BoundNewStructExpression final : BoundExpression {
     std::optional<FunctionSymbol> constructor;
     std::vector<std::unique_ptr<BoundExpression>> arguments;
     std::vector<std::size_t> argumentEvaluationOrder;
+    std::vector<Initializer> defaultFieldInitializers;
     std::vector<Initializer> initializers;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::NewStructExpression;
@@ -803,6 +827,10 @@ struct BoundStructFieldAssignmentExpression final : BoundExpression {
     bool wrappedVariable = false;
     TypeSymbol wrapperType;
     FieldSymbol wrapperValueField;
+    bool staticFieldReceiver = false;
+    TypeSymbol staticReceiverOwnerType;
+    FieldSymbol staticReceiverField;
+    std::unique_ptr<BoundExpression> staticReceiverInitializer;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::StructFieldAssignmentExpression;
     }
@@ -864,6 +892,7 @@ struct BoundMemberAssignmentExpression final : BoundExpression {
 
 struct BoundPropertyAssignmentExpression final : BoundExpression {
     FunctionSymbol setter;
+    std::optional<FunctionSymbol> staticConstructor;
     std::vector<std::unique_ptr<BoundExpression>> arguments;
     std::unique_ptr<BoundExpression> assignedValue;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
@@ -1210,6 +1239,9 @@ private:
         const syntax::NewArrayExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindElementAccessExpression(
         const syntax::ElementAccessExpressionSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundExpression> bindStaticFieldInitializer(
+        const TypeSymbol& ownerType,
+        const FieldSymbol& field);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindMemberAccessExpression(
         const syntax::MemberAccessExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> applyNullConditional(
@@ -1281,6 +1313,7 @@ private:
     std::size_t breakableDepth_ = 0;
     bool checkedArithmetic_ = true;
     bool currentDeterministicContext_ = false;
+    std::unordered_set<SymbolId> bindingStaticFields_;
 };
 
 } // namespace realscript::semantic

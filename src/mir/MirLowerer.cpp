@@ -119,6 +119,43 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
     exceptionCleanupBlocks_.clear();
     collectLocalTypes(*function.body);
     const auto entry = createBlock(); setCurrentBlock(entry);
+    if (function.symbol.constructor && function.symbol.staticMethod) {
+        const auto guardId = semantic::stableTypeId(
+            function.symbol.declaringTypeName + "::cctor_guard");
+        const auto hasName = "$intrinsic::static_has::" + std::to_string(guardId);
+        Instruction hasCall;
+        hasCall.result = nextValueId_++;
+        hasCall.resultType = semantic::PrimitiveType::Bool;
+        hasCall.opcode = Opcode::Call;
+        hasCall.symbolId = semantic::stableTypeId(hasName);
+        hasCall.symbolName = hasName;
+        hasCall.sourceSpan = function.symbol.declarationSpan;
+        const auto hasVal = hasCall.result;
+        block(*currentBlockId_).instructions.push_back(std::move(hasCall));
+
+        const auto returnBlock = createBlock();
+        const auto runBlock = createBlock();
+        emitBranch(hasVal, returnBlock, runBlock, {}, {}, function.symbol.declarationSpan);
+
+        setCurrentBlock(returnBlock);
+        emitReturn(std::nullopt, function.symbol.declarationSpan);
+
+        setCurrentBlock(runBlock);
+        const auto trueVal = emitValue(
+            Opcode::ConstantBool, semantic::PrimitiveType::Bool, {}, function.symbol.declarationSpan);
+        block(*currentBlockId_).instructions.back().boolImmediate = true;
+        const auto setName = "$intrinsic::static_set::" + std::to_string(guardId);
+        Instruction setCall;
+        setCall.resultType = semantic::PrimitiveType::Void;
+        setCall.opcode = Opcode::Call;
+        setCall.operands = {trueVal};
+        setCall.parameterTypes = {semantic::PrimitiveType::Bool};
+        setCall.parameterTypeIds = {0};
+        setCall.symbolId = semantic::stableTypeId(setName);
+        setCall.symbolName = setName;
+        setCall.sourceSpan = function.symbol.declarationSpan;
+        block(*currentBlockId_).instructions.push_back(std::move(setCall));
+    }
     for (std::size_t i = 0; i < function.symbol.parameters.size(); ++i) {
         const auto& parameter = function.symbol.parameters[i];
         const auto storageType = semantic::storageTypeOf(parameter);

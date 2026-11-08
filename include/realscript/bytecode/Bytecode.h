@@ -192,7 +192,7 @@ private:
         std::uint32_t id,
         Register firstInline,
         std::uint16_t currentSize,
-        Register value) noexcept;
+        Register value);
 
     std::uint32_t sizeAndSlice_ = 0;
     Register inline0_ = 0;

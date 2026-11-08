@@ -138,6 +138,9 @@ inline void rehydrateGameObjectMetadata(
             for (const auto& constructor : type.constructors) {
                 existing.insert(constructor.id);
             }
+            if (type.staticConstructor) {
+                existing.insert(type.staticConstructor->id);
+            }
             for (const auto& property : type.properties) {
                 if (property.getter) existing.insert(property.getter->id);
                 if (property.setter) existing.insert(property.setter->id);

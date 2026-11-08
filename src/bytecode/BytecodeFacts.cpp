@@ -4,6 +4,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
 
@@ -122,7 +123,7 @@ struct RegisterSlicePool {
         const auto found = indexByVec.find(vec);
         if (found != indexByVec.end()) return found->second;
         if (entries.size() >= 0xFFFFFu) {
-            return static_cast<std::uint32_t>(entries.size() - 1u);
+            throw std::overflow_error("bytecode register slice pool exceeded 20-bit capacity");
         }
         const auto id = static_cast<std::uint32_t>(entries.size());
         entries.push_back(std::move(vec));
@@ -152,7 +153,7 @@ struct BytecodeStringPool {
 
     BytecodeStringPool() {
         entries.emplace_back("");
-        indexByView.emplace(entries.front(), 0u);
+        indexByView.emplace(entries.front(), static_cast<std::uint16_t>(0u));
     }
 
     std::uint16_t intern(std::string_view text) {
@@ -161,7 +162,7 @@ struct BytecodeStringPool {
         const auto found = indexByView.find(text);
         if (found != indexByView.end()) return found->second;
         if (entries.size() >= 0xFFFFu) {
-            return 0xFFFFu;
+            throw std::overflow_error("bytecode string pool exceeded 16-bit capacity");
         }
         const auto id = static_cast<std::uint16_t>(entries.size());
         entries.emplace_back(text);
@@ -191,7 +192,7 @@ std::uint32_t SmallRegisterVector::appendToSlice(
     std::uint32_t id,
     Register firstInline,
     std::uint16_t currentSize,
-    Register value) noexcept {
+    Register value) {
     std::vector<Register> next;
     next.reserve(static_cast<std::size_t>(currentSize) + 1u);
     if (id == 0u) {

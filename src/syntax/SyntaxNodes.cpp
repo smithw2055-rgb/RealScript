@@ -148,7 +148,9 @@ text::TextSpan InitializerElementSyntax::span() const noexcept {
 }
 
 text::TextSpan NewArrayExpressionSyntax::span() const noexcept {
-    return combine(newKeyword.span, closeBracketToken.span);
+    return combine(
+        newKeyword.span,
+        initializerCloseBraceToken ? initializerCloseBraceToken->span : closeBracketToken.span);
 }
 
 text::TextSpan ParenthesizedExpressionSyntax::span() const noexcept {

@@ -96,12 +96,31 @@ std::string tokenValueToString(const syntax::TokenValue& val) {
     return "null";
 }
 
-bool evaluateConstantExpression(
+bool evaluateConstantExpressionImpl(
     const syntax::ExpressionSyntax& expr,
-    const TypeSymbol& currentType,
+    const TypeSymbol* currentType,
     const TypeSymbolMap& visibleTypes,
     syntax::TokenValue& outValue,
-    PrimitiveType& outType) {
+    PrimitiveType& outType,
+    const std::vector<std::unordered_map<std::string, VariableSymbol>>* localScopes) {
+    const auto findConstantFieldInHierarchy = [&](const TypeSymbol* startType,
+                                                  const std::string& fieldName) -> const FieldSymbol* {
+        std::unordered_set<SymbolId> visited;
+        const TypeSymbol* curr = startType;
+        while (curr && visited.insert(curr->id).second) {
+            for (const auto& f : curr->fields) {
+                if (f.name == fieldName && f.hasConstantValue) {
+                    return &f;
+                }
+            }
+            if (curr->baseTypeName.empty()) break;
+            const auto baseIt = visibleTypes.find(curr->baseTypeName);
+            if (baseIt == visibleTypes.end()) break;
+            curr = &baseIt->second;
+        }
+        return nullptr;
+    };
+
     switch (expr.kind()) {
     case syntax::SyntaxKind::LiteralExpression: {
         const auto& lit = static_cast<const syntax::LiteralExpressionSyntax&>(expr).literalToken;
@@ -125,17 +144,28 @@ bool evaluateConstantExpression(
         }
     }
     case syntax::SyntaxKind::ParenthesizedExpression:
-        return evaluateConstantExpression(
+        return evaluateConstantExpressionImpl(
             *static_cast<const syntax::ParenthesizedExpressionSyntax&>(expr).expression,
-            currentType, visibleTypes, outValue, outType);
+            currentType, visibleTypes, outValue, outType, localScopes);
     case syntax::SyntaxKind::NameExpression: {
         const auto& name = static_cast<const syntax::NameExpressionSyntax&>(expr).identifierToken.text;
-        for (const auto& f : currentType.fields) {
-            if (f.name == name && f.hasConstantValue) {
-                outValue = f.constantValue;
-                outType = f.type;
-                return true;
+        if (localScopes) {
+            for (auto it = localScopes->rbegin(); it != localScopes->rend(); ++it) {
+                const auto found = it->find(name);
+                if (found != it->end()) {
+                    if (found->second.isConst && found->second.hasConstantValue) {
+                        outValue = found->second.constantValue;
+                        outType = found->second.type;
+                        return true;
+                    }
+                    return false;
+                }
             }
+        }
+        if (const auto* f = findConstantFieldInHierarchy(currentType, name)) {
+            outValue = f->constantValue;
+            outType = f->type;
+            return true;
         }
         return false;
     }
@@ -144,19 +174,17 @@ bool evaluateConstantExpression(
         if (member.receiver->kind() == syntax::SyntaxKind::NameExpression) {
             const auto& typeName = static_cast<const syntax::NameExpressionSyntax&>(*member.receiver).identifierToken.text;
             const TypeSymbol* targetType = nullptr;
-            if (typeName == currentType.name) {
-                targetType = &currentType;
+            if (currentType && (typeName == currentType->name || typeName == canonicalTypeName(*currentType))) {
+                targetType = currentType;
             } else {
                 const auto it = visibleTypes.find(typeName);
                 if (it != visibleTypes.end()) targetType = &it->second;
             }
             if (targetType) {
-                for (const auto& f : targetType->fields) {
-                    if (f.name == member.nameToken.text && f.hasConstantValue) {
-                        outValue = f.constantValue;
-                        outType = f.type;
-                        return true;
-                    }
+                if (const auto* f = findConstantFieldInHierarchy(targetType, member.nameToken.text)) {
+                    outValue = f->constantValue;
+                    outType = f->type;
+                    return true;
                 }
                 for (const auto& em : targetType->enumMembers) {
                     if (em.name == member.nameToken.text) {
@@ -169,11 +197,74 @@ bool evaluateConstantExpression(
         }
         return false;
     }
+    case syntax::SyntaxKind::CastExpression: {
+        const auto& castExpr = static_cast<const syntax::CastExpressionSyntax&>(expr);
+        syntax::TokenValue subVal;
+        PrimitiveType subType = PrimitiveType::Error;
+        if (!evaluateConstantExpressionImpl(
+                *castExpr.expression, currentType, visibleTypes, subVal, subType, localScopes)) {
+            return false;
+        }
+        const auto resolved = resolveType(castExpr.type, visibleTypes, false);
+        if (resolved.type == PrimitiveType::Error) return false;
+        if (isIntegralType(resolved.type) || resolved.type == PrimitiveType::Enum) {
+            if (const auto* i = std::get_if<std::int64_t>(&subVal)) {
+                outValue = *i;
+                outType = resolved.type;
+                return true;
+            }
+            if (const auto* d = std::get_if<double>(&subVal)) {
+                outValue = static_cast<std::int64_t>(*d);
+                outType = resolved.type;
+                return true;
+            }
+            return false;
+        }
+        if (isFloatingPointType(resolved.type)) {
+            if (const auto* d = std::get_if<double>(&subVal)) {
+                outValue = *d;
+                outType = resolved.type;
+                return true;
+            }
+            if (const auto* i = std::get_if<std::int64_t>(&subVal)) {
+                outValue = static_cast<double>(*i);
+                outType = resolved.type;
+                return true;
+            }
+            return false;
+        }
+        if (resolved.type == PrimitiveType::Bool && std::holds_alternative<bool>(subVal)) {
+            outValue = subVal;
+            outType = PrimitiveType::Bool;
+            return true;
+        }
+        if (resolved.type == PrimitiveType::String && std::holds_alternative<std::string>(subVal)) {
+            outValue = subVal;
+            outType = PrimitiveType::String;
+            return true;
+        }
+        return false;
+    }
+    case syntax::SyntaxKind::ConditionalExpression: {
+        const auto& condExpr = static_cast<const syntax::ConditionalExpressionSyntax&>(expr);
+        syntax::TokenValue condVal;
+        PrimitiveType condType = PrimitiveType::Error;
+        if (!evaluateConstantExpressionImpl(
+                *condExpr.condition, currentType, visibleTypes, condVal, condType, localScopes) ||
+            condType != PrimitiveType::Bool ||
+            !std::holds_alternative<bool>(condVal)) {
+            return false;
+        }
+        const auto& branch = std::get<bool>(condVal) ? *condExpr.whenTrue : *condExpr.whenFalse;
+        return evaluateConstantExpressionImpl(
+            branch, currentType, visibleTypes, outValue, outType, localScopes);
+    }
     case syntax::SyntaxKind::UnaryExpression: {
         const auto& unary = static_cast<const syntax::UnaryExpressionSyntax&>(expr);
         syntax::TokenValue subVal;
         PrimitiveType subType = PrimitiveType::Error;
-        if (!evaluateConstantExpression(*unary.operand, currentType, visibleTypes, subVal, subType)) {
+        if (!evaluateConstantExpressionImpl(
+                *unary.operand, currentType, visibleTypes, subVal, subType, localScopes)) {
             return false;
         }
         if (unary.operatorToken.kind == syntax::SyntaxKind::PlusToken) {
@@ -208,8 +299,10 @@ bool evaluateConstantExpression(
         const auto& bin = static_cast<const syntax::BinaryExpressionSyntax&>(expr);
         syntax::TokenValue leftVal, rightVal;
         PrimitiveType leftType = PrimitiveType::Error, rightType = PrimitiveType::Error;
-        if (!evaluateConstantExpression(*bin.left, currentType, visibleTypes, leftVal, leftType) ||
-            !evaluateConstantExpression(*bin.right, currentType, visibleTypes, rightVal, rightType)) {
+        if (!evaluateConstantExpressionImpl(
+                *bin.left, currentType, visibleTypes, leftVal, leftType, localScopes) ||
+            !evaluateConstantExpressionImpl(
+                *bin.right, currentType, visibleTypes, rightVal, rightType, localScopes)) {
             return false;
         }
         if (bin.operatorToken.kind == syntax::SyntaxKind::PlusToken &&
@@ -217,6 +310,35 @@ bool evaluateConstantExpression(
             outValue = tokenValueToString(leftVal) + tokenValueToString(rightVal);
             outType = PrimitiveType::String;
             return true;
+        }
+        if (leftType == PrimitiveType::String && rightType == PrimitiveType::String) {
+            const auto* ls = std::get_if<std::string>(&leftVal);
+            const auto* rs = std::get_if<std::string>(&rightVal);
+            if (!ls || !rs) return false;
+            if (bin.operatorToken.kind == syntax::SyntaxKind::EqualsEqualsToken) {
+                outValue = (*ls == *rs);
+                outType = PrimitiveType::Bool;
+                return true;
+            }
+            if (bin.operatorToken.kind == syntax::SyntaxKind::BangEqualsToken) {
+                outValue = (*ls != *rs);
+                outType = PrimitiveType::Bool;
+                return true;
+            }
+            return false;
+        }
+        if (leftType == PrimitiveType::Bool && rightType == PrimitiveType::Bool) {
+            const auto* lb = std::get_if<bool>(&leftVal);
+            const auto* rb = std::get_if<bool>(&rightVal);
+            if (!lb || !rb) return false;
+            outType = PrimitiveType::Bool;
+            switch (bin.operatorToken.kind) {
+            case syntax::SyntaxKind::AmpersandAmpersandToken: outValue = (*lb && *rb); return true;
+            case syntax::SyntaxKind::PipePipeToken: outValue = (*lb || *rb); return true;
+            case syntax::SyntaxKind::EqualsEqualsToken: outValue = (*lb == *rb); return true;
+            case syntax::SyntaxKind::BangEqualsToken: outValue = (*lb != *rb); return true;
+            default: return false;
+            }
         }
         if (isFloatingPointType(leftType) || isFloatingPointType(rightType)) {
             const auto toDouble = [](const syntax::TokenValue& v, double& out) -> bool {
@@ -226,15 +348,25 @@ bool evaluateConstantExpression(
             };
             double l = 0.0, r = 0.0;
             if (!toDouble(leftVal, l) || !toDouble(rightVal, r)) return false;
+            const PrimitiveType floatOutType =
+                (leftType == PrimitiveType::Float && rightType == PrimitiveType::Float)
+                ? PrimitiveType::Float
+                : PrimitiveType::Double;
             switch (bin.operatorToken.kind) {
-            case syntax::SyntaxKind::PlusToken: outValue = l + r; outType = PrimitiveType::Double; return true;
-            case syntax::SyntaxKind::MinusToken: outValue = l - r; outType = PrimitiveType::Double; return true;
-            case syntax::SyntaxKind::StarToken: outValue = l * r; outType = PrimitiveType::Double; return true;
+            case syntax::SyntaxKind::PlusToken: outValue = l + r; outType = floatOutType; return true;
+            case syntax::SyntaxKind::MinusToken: outValue = l - r; outType = floatOutType; return true;
+            case syntax::SyntaxKind::StarToken: outValue = l * r; outType = floatOutType; return true;
             case syntax::SyntaxKind::SlashToken:
                 if (r == 0.0) return false;
                 outValue = l / r;
-                outType = PrimitiveType::Double;
+                outType = floatOutType;
                 return true;
+            case syntax::SyntaxKind::EqualsEqualsToken: outValue = (l == r); outType = PrimitiveType::Bool; return true;
+            case syntax::SyntaxKind::BangEqualsToken: outValue = (l != r); outType = PrimitiveType::Bool; return true;
+            case syntax::SyntaxKind::LessToken: outValue = (l < r); outType = PrimitiveType::Bool; return true;
+            case syntax::SyntaxKind::LessOrEqualsToken: outValue = (l <= r); outType = PrimitiveType::Bool; return true;
+            case syntax::SyntaxKind::GreaterToken: outValue = (l > r); outType = PrimitiveType::Bool; return true;
+            case syntax::SyntaxKind::GreaterOrEqualsToken: outValue = (l >= r); outType = PrimitiveType::Bool; return true;
             default: return false;
             }
         }
@@ -243,18 +375,36 @@ bool evaluateConstantExpression(
                 outType = (leftType == PrimitiveType::Long || rightType == PrimitiveType::Long)
                     ? PrimitiveType::Long
                     : PrimitiveType::Int;
+                const auto ul = static_cast<std::uint64_t>(*l);
+                const auto ur = static_cast<std::uint64_t>(*r);
                 switch (bin.operatorToken.kind) {
-                case syntax::SyntaxKind::PlusToken: outValue = *l + *r; return true;
-                case syntax::SyntaxKind::MinusToken: outValue = *l - *r; return true;
-                case syntax::SyntaxKind::StarToken: outValue = *l * *r; return true;
+                case syntax::SyntaxKind::PlusToken:
+                    outValue = static_cast<std::int64_t>(ul + ur);
+                    return true;
+                case syntax::SyntaxKind::MinusToken:
+                    outValue = static_cast<std::int64_t>(ul - ur);
+                    return true;
+                case syntax::SyntaxKind::StarToken:
+                    outValue = static_cast<std::int64_t>(ul * ur);
+                    return true;
                 case syntax::SyntaxKind::SlashToken:
-                    if (*r == 0) return false;
+                    if (*r == 0 || (*l == std::numeric_limits<std::int64_t>::min() && *r == -1)) {
+                        return false;
+                    }
                     outValue = *l / *r;
                     return true;
                 case syntax::SyntaxKind::PercentToken:
-                    if (*r == 0) return false;
+                    if (*r == 0 || (*l == std::numeric_limits<std::int64_t>::min() && *r == -1)) {
+                        return false;
+                    }
                     outValue = *l % *r;
                     return true;
+                case syntax::SyntaxKind::EqualsEqualsToken: outValue = (*l == *r); outType = PrimitiveType::Bool; return true;
+                case syntax::SyntaxKind::BangEqualsToken: outValue = (*l != *r); outType = PrimitiveType::Bool; return true;
+                case syntax::SyntaxKind::LessToken: outValue = (*l < *r); outType = PrimitiveType::Bool; return true;
+                case syntax::SyntaxKind::LessOrEqualsToken: outValue = (*l <= *r); outType = PrimitiveType::Bool; return true;
+                case syntax::SyntaxKind::GreaterToken: outValue = (*l > *r); outType = PrimitiveType::Bool; return true;
+                case syntax::SyntaxKind::GreaterOrEqualsToken: outValue = (*l >= *r); outType = PrimitiveType::Bool; return true;
                 default: return false;
                 }
             }
@@ -266,12 +416,71 @@ bool evaluateConstantExpression(
     }
 }
 
+bool tryApplyEvaluatedConstantToField(
+    FieldSymbol& field,
+    syntax::TokenValue constVal,
+    PrimitiveType constType,
+    diagnostics::DiagnosticBag* diagnostics) {
+    const auto conv = classifyConversion(constType, field.type);
+    const bool nullRef = constType == PrimitiveType::Null && isReferenceType(field.type);
+    bool implicitNumericConst = false;
+    if ((constType == PrimitiveType::Int || constType == PrimitiveType::Long ||
+         constType == PrimitiveType::Enum) &&
+        std::holds_alternative<std::int64_t>(constVal)) {
+        const auto v = std::get<std::int64_t>(constVal);
+        switch (field.type) {
+        case PrimitiveType::Byte: implicitNumericConst = (v >= 0 && v <= 255); break;
+        case PrimitiveType::SByte: implicitNumericConst = (v >= -128 && v <= 127); break;
+        case PrimitiveType::Short: implicitNumericConst = (v >= -32768 && v <= 32767); break;
+        case PrimitiveType::UShort:
+        case PrimitiveType::Char: implicitNumericConst = (v >= 0 && v <= 65535); break;
+        case PrimitiveType::Int:
+            implicitNumericConst =
+                (constType == PrimitiveType::Enum) ||
+                (v >= std::numeric_limits<std::int32_t>::min() &&
+                 v <= std::numeric_limits<std::int32_t>::max());
+            break;
+        case PrimitiveType::UInt:
+        case PrimitiveType::ULong: implicitNumericConst = (v >= 0); break;
+        case PrimitiveType::Long: implicitNumericConst = true; break;
+        case PrimitiveType::Float:
+        case PrimitiveType::Double: implicitNumericConst = true; break;
+        default: break;
+        }
+    } else if (constType == PrimitiveType::Double &&
+               field.type == PrimitiveType::Float &&
+               std::holds_alternative<double>(constVal)) {
+        const auto v = std::get<double>(constVal);
+        implicitNumericConst =
+            std::isfinite(v) && std::abs(v) <= std::numeric_limits<float>::max();
+    }
+    if (conv != ConversionKind::None || nullRef || constType == field.type ||
+        implicitNumericConst) {
+        if (isFloatingPointType(field.type) &&
+            std::holds_alternative<std::int64_t>(constVal)) {
+            constVal = static_cast<double>(std::get<std::int64_t>(constVal));
+        }
+        field.hasConstantValue = true;
+        field.constantValue = std::move(constVal);
+        return true;
+    }
+    if (diagnostics && (field.constField || field.type != PrimitiveType::Struct)) {
+        diagnostics->report(
+            "RS2408",
+            "cannot convert constant field initializer for '" + field.name + "' to '" +
+                displayType(field.type, field.typeName) + "'",
+            field.initializerSyntax ? field.initializerSyntax->span() : field.declarationSpan);
+    }
+    return false;
+}
+
 template <typename T>
 bool populateFields(
     TypeSymbol& type,
     const T& syntaxTree,
     const TypeSymbolMap& visibleTypes,
-    diagnostics::DiagnosticBag& diagnostics) {
+    diagnostics::DiagnosticBag& diagnostics,
+    bool deferConstValidation = false) {
     bool valid = true;
     std::unordered_set<std::string> fieldNames;
     type.fields.clear();
@@ -306,63 +515,28 @@ bool populateFields(
             fieldSyntax.modifiers, syntax::SyntaxKind::StaticKeyword);
         field.constField = hasModifier(
             fieldSyntax.modifiers, syntax::SyntaxKind::ConstKeyword);
+        field.readonlyField = hasModifier(
+            fieldSyntax.modifiers, syntax::SyntaxKind::ReadonlyKeyword);
+        if (field.constField && field.readonlyField) {
+            diagnostics.report(
+                "RS2483",
+                "field '" + field.name + "' cannot be both const and readonly",
+                fieldSyntax.identifierToken.span);
+            valid = false;
+        }
         if (field.constField) {
             field.staticField = true;
         }
+        if (type.staticType && !field.staticField && !field.constField) {
+            diagnostics.report(
+                "RS2489",
+                "cannot declare instance field '" + field.name +
+                    "' in static class '" + type.name + "'",
+                fieldSyntax.identifierToken.span);
+            valid = false;
+        }
         field.initializerSyntax = fieldSyntax.initializer.get();
-        if (fieldSyntax.initializer) {
-            syntax::TokenValue constVal;
-            PrimitiveType constType = PrimitiveType::Error;
-            if (evaluateConstantExpression(
-                    *fieldSyntax.initializer, type, visibleTypes, constVal, constType)) {
-                const auto conv = classifyConversion(constType, field.type);
-                const bool nullRef = constType == PrimitiveType::Null && isReferenceType(field.type);
-                bool implicitNumericConst = false;
-                if (constType == PrimitiveType::Int &&
-                    std::holds_alternative<std::int64_t>(constVal)) {
-                    const auto v = std::get<std::int64_t>(constVal);
-                    switch (field.type) {
-                    case PrimitiveType::Byte: implicitNumericConst = (v >= 0 && v <= 255); break;
-                    case PrimitiveType::SByte: implicitNumericConst = (v >= -128 && v <= 127); break;
-                    case PrimitiveType::Short: implicitNumericConst = (v >= -32768 && v <= 32767); break;
-                    case PrimitiveType::UShort:
-                    case PrimitiveType::Char: implicitNumericConst = (v >= 0 && v <= 65535); break;
-                    case PrimitiveType::UInt:
-                    case PrimitiveType::ULong: implicitNumericConst = (v >= 0); break;
-                    case PrimitiveType::Float: implicitNumericConst = true; break;
-                    default: break;
-                    }
-                } else if (constType == PrimitiveType::Double &&
-                           field.type == PrimitiveType::Float &&
-                           std::holds_alternative<double>(constVal)) {
-                    const auto v = std::get<double>(constVal);
-                    implicitNumericConst =
-                        std::isfinite(v) && std::abs(v) <= std::numeric_limits<float>::max();
-                }
-                if (conv != ConversionKind::None || nullRef || constType == field.type ||
-                    implicitNumericConst) {
-                    if (isFloatingPointType(field.type) &&
-                        std::holds_alternative<std::int64_t>(constVal)) {
-                        constVal = static_cast<double>(std::get<std::int64_t>(constVal));
-                    }
-                    field.hasConstantValue = true;
-                    field.constantValue = std::move(constVal);
-                } else if (field.constField || field.type != PrimitiveType::Struct) {
-                    diagnostics.report(
-                        "RS2408",
-                        "cannot convert constant field initializer for '" + field.name + "' to '" +
-                            displayType(field.type, field.typeName) + "'",
-                        fieldSyntax.initializer->span());
-                    valid = false;
-                }
-            } else if (field.constField) {
-                diagnostics.report(
-                    "RS2407",
-                    "const field '" + field.name + "' requires a compile-time constant initializer",
-                    fieldSyntax.initializer->span());
-                valid = false;
-            }
-        } else if (field.constField) {
+        if (!fieldSyntax.initializer && field.constField) {
             diagnostics.report(
                 "RS2407",
                 "const field '" + field.name + "' requires an initializer",
@@ -372,6 +546,13 @@ bool populateFields(
         field.declarationSpan = fieldSyntax.identifierToken.span;
         field.id = fnv1a(canonicalTypeName(type) + "::field:" + field.name);
         type.fields.push_back(std::move(field));
+    }
+
+    while (resolveConstantFieldsPass(type, visibleTypes)) {}
+    if (!deferConstValidation) {
+        if (!validateConstantFields(type, visibleTypes, diagnostics)) {
+            valid = false;
+        }
     }
     return valid;
 }
@@ -836,9 +1017,11 @@ TypeSymbol declareTypeShell(
     TypeSymbol result;
     result.kind = TypeKind::Class;
     result.accessibility = accessibilityFromModifiers(syntaxTree.modifiers);
+    result.staticType = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::StaticKeyword);
     result.abstractType = hasModifier(
         syntaxTree.modifiers, syntax::SyntaxKind::AbstractKeyword);
-    result.sealedType = hasModifier(
+    result.sealedType = result.staticType || hasModifier(
         syntaxTree.modifiers, syntax::SyntaxKind::SealedKeyword);
     result.deterministic = hasAttributeName(
         syntaxTree.attributes, "Deterministic");
@@ -879,20 +1062,79 @@ TypeSymbol declareTypeShell(
     return result;
 }
 
+bool evaluateConstantSyntaxExpression(
+    const syntax::ExpressionSyntax& expr,
+    const TypeSymbol* currentType,
+    const TypeSymbolMap& visibleTypes,
+    syntax::TokenValue& outValue,
+    PrimitiveType& outType,
+    const std::vector<std::unordered_map<std::string, VariableSymbol>>* localScopes) {
+    return evaluateConstantExpressionImpl(
+        expr, currentType, visibleTypes, outValue, outType, localScopes);
+}
+
+bool resolveConstantFieldsPass(
+    TypeSymbol& type,
+    const TypeSymbolMap& visibleTypes) {
+    bool progressed = false;
+    for (auto& field : type.fields) {
+        if (field.hasConstantValue || !field.initializerSyntax) continue;
+        syntax::TokenValue constVal;
+        PrimitiveType constType = PrimitiveType::Error;
+        if (evaluateConstantExpressionImpl(
+                *field.initializerSyntax, &type, visibleTypes, constVal, constType, nullptr)) {
+            if (tryApplyEvaluatedConstantToField(field, std::move(constVal), constType, nullptr)) {
+                progressed = true;
+            }
+        }
+    }
+    return progressed;
+}
+
+bool validateConstantFields(
+    TypeSymbol& type,
+    const TypeSymbolMap& visibleTypes,
+    diagnostics::DiagnosticBag& diagnostics) {
+    bool valid = true;
+    for (auto& field : type.fields) {
+        if (field.hasConstantValue || !field.initializerSyntax) continue;
+        syntax::TokenValue constVal;
+        PrimitiveType constType = PrimitiveType::Error;
+        if (evaluateConstantExpressionImpl(
+                *field.initializerSyntax, &type, visibleTypes, constVal, constType, nullptr)) {
+            if (!tryApplyEvaluatedConstantToField(
+                    field, std::move(constVal), constType, &diagnostics)) {
+                if (field.constField || field.type != PrimitiveType::Struct) {
+                    valid = false;
+                }
+            }
+        } else if (field.constField) {
+            diagnostics.report(
+                "RS2407",
+                "const field '" + field.name + "' requires a compile-time constant initializer",
+                field.initializerSyntax->span());
+            valid = false;
+        }
+    }
+    return valid;
+}
+
 bool populateTypeFields(
     TypeSymbol& type,
     const syntax::ClassDeclarationSyntax& syntaxTree,
     const TypeSymbolMap& visibleTypes,
-    diagnostics::DiagnosticBag& diagnostics) {
-    return populateFields(type, syntaxTree, visibleTypes, diagnostics);
+    diagnostics::DiagnosticBag& diagnostics,
+    bool deferConstValidation) {
+    return populateFields(type, syntaxTree, visibleTypes, diagnostics, deferConstValidation);
 }
 
 bool populateTypeFields(
     TypeSymbol& type,
     const syntax::StructDeclarationSyntax& syntaxTree,
     const TypeSymbolMap& visibleTypes,
-    diagnostics::DiagnosticBag& diagnostics) {
-    return populateFields(type, syntaxTree, visibleTypes, diagnostics);
+    diagnostics::DiagnosticBag& diagnostics,
+    bool deferConstValidation) {
+    return populateFields(type, syntaxTree, visibleTypes, diagnostics, deferConstValidation);
 }
 
 bool populateEnumMembers(
@@ -1075,13 +1317,15 @@ FunctionSymbol declareConstructorSymbol(
     diagnostics::DiagnosticBag& diagnostics) {
     FunctionSymbol result;
     result.moduleName = moduleName;
-    result.name = ".ctor";
+    result.staticMethod = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::StaticKeyword);
+    result.name = result.staticMethod ? ".cctor" : ".ctor";
     result.ownerTypeName = owner.name;
     result.ownerTypeId = owner.id;
-    result.returnType = owner.kind == TypeKind::Struct
+    result.returnType = (!result.staticMethod && owner.kind == TypeKind::Struct)
         ? PrimitiveType::Struct
         : PrimitiveType::Void;
-    result.returnTypeName = owner.kind == TypeKind::Struct
+    result.returnTypeName = (!result.staticMethod && owner.kind == TypeKind::Struct)
         ? canonicalTypeName(owner)
         : std::string{};
     result.method = true;
@@ -1095,8 +1339,33 @@ FunctionSymbol declareConstructorSymbol(
         syntaxTree.modifiers);
     result.declaringTypeId = owner.id;
     result.declaringTypeName = canonicalTypeName(owner);
+    if (result.staticMethod) {
+        if (hasModifier(syntaxTree.modifiers, syntax::SyntaxKind::PublicKeyword) ||
+            hasModifier(syntaxTree.modifiers, syntax::SyntaxKind::PrivateKeyword) ||
+            hasModifier(syntaxTree.modifiers, syntax::SyntaxKind::ProtectedKeyword) ||
+            hasModifier(syntaxTree.modifiers, syntax::SyntaxKind::InternalKeyword)) {
+            diagnostics.report(
+                "RS2497",
+                "access modifiers are not allowed on static constructors",
+                syntaxTree.identifierToken.span);
+        }
+        if (!syntaxTree.parameters.empty()) {
+            diagnostics.report(
+                "RS2497",
+                "a static constructor must be parameterless",
+                syntaxTree.identifierToken.span);
+        }
+        if (syntaxTree.baseKeyword) {
+            diagnostics.report(
+                "RS2497",
+                "a static constructor cannot have a base constructor initializer",
+                syntaxTree.baseKeyword->span);
+        }
+    }
     appendImplicitThis(result, owner);
-    appendSyntaxParameters(result, syntaxTree.parameters, visibleTypes, diagnostics);
+    if (!result.staticMethod) {
+        appendSyntaxParameters(result, syntaxTree.parameters, visibleTypes, diagnostics);
+    }
     result.id = stableFunctionId(result);
     result.declarationSpan = syntaxTree.identifierToken.span;
     result.bodySpan = syntaxTree.body.span();
@@ -1134,6 +1403,8 @@ PropertySymbol declarePropertySymbol(
         getter.name = "get_" + result.name;
         getter.ownerTypeName = owner.name;
         getter.ownerTypeId = owner.id;
+        getter.declaringTypeId = owner.id;
+        getter.declaringTypeName = canonicalTypeName(owner);
         getter.returnType = result.type;
         getter.returnTypeName = result.typeName;
         getter.method = true;
@@ -1156,6 +1427,8 @@ PropertySymbol declarePropertySymbol(
         setter.name = "set_" + result.name;
         setter.ownerTypeName = owner.name;
         setter.ownerTypeId = owner.id;
+        setter.declaringTypeId = owner.id;
+        setter.declaringTypeName = canonicalTypeName(owner);
         setter.returnType = PrimitiveType::Void;
         setter.method = true;
         setter.staticMethod = result.staticProperty;

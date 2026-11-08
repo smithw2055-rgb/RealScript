@@ -943,11 +943,19 @@ private:
             }
             for (const auto& value : unit->syntaxTree->classes) {
                 if (value.identifierToken.text != name) continue;
-                bool defaultConstructor = value.constructors.empty();
+                bool hasInstanceConstructor = false;
+                bool defaultConstructor = false;
                 for (const auto& constructor : value.constructors) {
+                    if (semantic::hasModifier(
+                            constructor.modifiers,
+                            syntax::SyntaxKind::StaticKeyword)) {
+                        continue;
+                    }
+                    hasInstanceConstructor = true;
                     defaultConstructor = defaultConstructor ||
                         constructor.parameters.empty();
                 }
+                if (!hasInstanceConstructor) defaultConstructor = true;
                 return {true, false, true, defaultConstructor};
             }
             for (const auto& value : unit->syntaxTree->interfaces) {
@@ -1279,7 +1287,12 @@ private:
         case syntax::SyntaxKind::NewArrayExpression: {
             auto& value = static_cast<syntax::NewArrayExpressionSyntax&>(expression);
             rewriteType(value.elementType, moduleName, sourceName, queue);
-            rewriteExpression(*value.length, moduleName, sourceName, queue);
+            if (value.length) {
+                rewriteExpression(*value.length, moduleName, sourceName, queue);
+            }
+            for (auto& item : value.initialValues) {
+                if (item) rewriteExpression(*item, moduleName, sourceName, queue);
+            }
             return;
         }
         default:

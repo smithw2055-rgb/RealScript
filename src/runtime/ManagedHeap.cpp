@@ -1885,6 +1885,7 @@ NativeHandle NativeHandleRegistry::create(
         slots_.push_back({});
     }
     auto& slot = slots_[slotIndex];
+    if (slot.generation == 0 || slot.generation > 0xFFFFu) slot.generation = 1;
     slot.resource = std::move(resource);
     slot.typeId = typeId;
     slot.debugName = std::move(debugNameValue);

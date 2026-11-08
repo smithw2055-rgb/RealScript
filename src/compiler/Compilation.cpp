@@ -120,6 +120,7 @@ struct CachedModuleFrontend {
     std::vector<LanguageAttributeRecord> nativeAttributes;
     std::vector<LanguageSequenceRecord> nativeSequences;
     std::vector<LanguageInterfaceImplementation> nativeInterfaces;
+    std::vector<std::shared_ptr<syntax::CompilationUnitSyntax>> keptSyntaxTrees;
 };
 
 #include "NativeGenerics.inl"
@@ -1138,6 +1139,9 @@ std::string typeSignature(const semantic::TypeSymbol& type) {
     }
     for (const auto& constructor : type.constructors) {
         out << "ctor:" << semantic::canonicalFunctionSignature(constructor) << ';';
+    }
+    if (type.staticConstructor) {
+        out << "cctor:" << semantic::canonicalFunctionSignature(*type.staticConstructor) << ';';
     }
     for (const auto& method : type.methods) {
         out << "method:" << (method.staticMethod ? "static:" : "instance:")
@@ -2639,7 +2643,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     prevIt->second.sourceFingerprint != module.sourceFingerprint) {
                     continue;
                 }
-                const auto fcIt = sModuleFrontendCache.find(moduleName);
+                const std::string cacheKey =
+                    moduleName + "#" + std::to_string(module.transitiveSourceFingerprint);
+                const auto fcIt = sModuleFrontendCache.find(cacheKey);
                 if (fcIt == sModuleFrontendCache.end() ||
                     fcIt->second.transitiveSourceFingerprint != module.transitiveSourceFingerprint ||
                     fcIt->second.sourceFingerprint != module.sourceFingerprint ||
@@ -2680,7 +2686,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             }
             for (auto& [moduleName, module] : modules) {
                 if (module.frontendCached && module.neededByDirtyModule) {
-                    const auto& fc = sModuleFrontendCache.at(moduleName);
+                    const std::string cacheKey =
+                        moduleName + "#" + std::to_string(module.transitiveSourceFingerprint);
+                    const auto& fc = sModuleFrontendCache.at(cacheKey);
                     module.types = fc.types;
                     module.interfaces = fc.interfaces;
                     module.delegates = fc.delegates;
@@ -3013,33 +3021,11 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         refreshVisibleDelegates(modules, module);
     }
 
-    // Resolve all field layouts and enum values before declaring member signatures.
+    // Resolve all enum values first, then field layouts and cross-type constants.
     for (auto& [moduleName, module] : modules) {
         (void)moduleName;
         if (module.frontendCached) continue;
         for (const auto* unit : module.units) {
-            for (const auto& node : unit->syntaxTree->classes) {
-                if (!node.typeParameters.empty()) continue;
-                auto* type = findOwnType(module, node.identifierToken.text);
-                if (!type || !semantic::populateTypeFields(
-                        *type, node, module.visibleTypes, result.diagnostics)) {
-                    module.invalid = true;
-                } else {
-                    type->sourceName = unit->source->name();
-                    for (auto& field : type->fields) field.sourceName = unit->source->name();
-                }
-            }
-            for (const auto& node : unit->syntaxTree->structs) {
-                if (!node.typeParameters.empty()) continue;
-                auto* type = findOwnType(module, node.identifierToken.text);
-                if (!type || !semantic::populateTypeFields(
-                        *type, node, module.visibleTypes, result.diagnostics)) {
-                    module.invalid = true;
-                } else {
-                    type->sourceName = unit->source->name();
-                    for (auto& field : type->fields) field.sourceName = unit->source->name();
-                }
-            }
             for (const auto& node : unit->syntaxTree->enums) {
                 auto* type = findOwnType(module, node.identifierToken.text);
                 if (!type || !semantic::populateEnumMembers(
@@ -3052,7 +3038,86 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             }
         }
     }
+    for (auto& [moduleName, module] : modules) {
+        (void)moduleName;
+        if (module.frontendCached) continue;
+        refreshVisibleTypes(modules, module);
+    }
+    for (auto& [moduleName, module] : modules) {
+        (void)moduleName;
+        if (module.frontendCached) continue;
+        for (const auto* unit : module.units) {
+            for (const auto& node : unit->syntaxTree->classes) {
+                if (!node.typeParameters.empty()) continue;
+                auto* type = findOwnType(module, node.identifierToken.text);
+                if (!type || !semantic::populateTypeFields(
+                        *type, node, module.visibleTypes, result.diagnostics, true)) {
+                    module.invalid = true;
+                } else {
+                    type->sourceName = unit->source->name();
+                    for (auto& field : type->fields) field.sourceName = unit->source->name();
+                }
+            }
+            for (const auto& node : unit->syntaxTree->structs) {
+                if (!node.typeParameters.empty()) continue;
+                auto* type = findOwnType(module, node.identifierToken.text);
+                if (!type || !semantic::populateTypeFields(
+                        *type, node, module.visibleTypes, result.diagnostics, true)) {
+                    module.invalid = true;
+                } else {
+                    type->sourceName = unit->source->name();
+                    for (auto& field : type->fields) field.sourceName = unit->source->name();
+                }
+            }
+        }
+    }
     applyInheritedFieldLayouts(modules, result);
+    {
+        bool constProgressed = true;
+        while (constProgressed) {
+            constProgressed = false;
+            for (auto& [moduleName, module] : modules) {
+                (void)moduleName;
+                if (module.frontendCached) continue;
+                bool moduleProgressed = false;
+                for (auto& type : module.types) {
+                    if (type.kind != semantic::TypeKind::Class &&
+                        type.kind != semantic::TypeKind::Struct) {
+                        continue;
+                    }
+                    if (semantic::resolveConstantFieldsPass(type, module.visibleTypes)) {
+                        moduleProgressed = true;
+                        constProgressed = true;
+                    }
+                }
+                if (moduleProgressed) {
+                    refreshVisibleTypes(modules, module);
+                }
+            }
+            if (constProgressed) {
+                for (auto& [moduleName, module] : modules) {
+                    (void)moduleName;
+                    if (module.frontendCached) continue;
+                    refreshVisibleTypes(modules, module);
+                }
+            }
+        }
+        for (auto& [moduleName, module] : modules) {
+            (void)moduleName;
+            if (module.frontendCached) continue;
+            for (auto& type : module.types) {
+                if (type.kind != semantic::TypeKind::Class &&
+                    type.kind != semantic::TypeKind::Struct) {
+                    continue;
+                }
+                if (!semantic::validateConstantFields(
+                        type, module.visibleTypes, result.diagnostics)) {
+                    module.invalid = true;
+                }
+            }
+            refreshVisibleTypes(modules, module);
+        }
+    }
 
     // Declare free functions before member signatures. Member declarations
     // are then processed in one global inheritance order so file and module
@@ -3177,6 +3242,17 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         binding.symbol = semantic::declareFunctionSymbol(
                             moduleName, methodSyntax, module.visibleTypes,
                             result.diagnostics, &owner);
+                        if (owner.staticType && !binding.symbol.staticMethod) {
+                            result.diagnostics.report(
+                                "RS2489",
+                                "cannot declare instance method '" +
+                                    methodSyntax.identifierToken.text +
+                                    "' in static class '" + owner.name + "'",
+                                methodSyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
+                            module.invalid = true;
+                        }
                         const auto plannedVirtualSlot =
                             plannedVirtualSlots.find(binding.symbol.id);
                         if (plannedVirtualSlot !=
@@ -3211,6 +3287,18 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             sequence.identifierToken.text);
                     }
                     for (const auto& sequenceSyntax : typeSyntax.sequences) {
+                        if (owner.staticType) {
+                            result.diagnostics.report(
+                                "RS2489",
+                                "cannot declare sequence method '" +
+                                    sequenceSyntax.identifierToken.text +
+                                    "' in static class '" + owner.name + "'",
+                                sequenceSyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
+                            module.invalid = true;
+                            return;
+                        }
                         if (owner.kind == semantic::TypeKind::Struct) {
                             result.diagnostics.report(
                                 "RS2491",
@@ -3977,6 +4065,18 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         result.nativeSequences.push_back(std::move(record));
                     }
                     for (const auto& constructorSyntax : typeSyntax.constructors) {
+                        const bool isStaticCtor = semantic::hasModifier(
+                            constructorSyntax.modifiers, syntax::SyntaxKind::StaticKeyword);
+                        if (owner.staticType && !isStaticCtor) {
+                            result.diagnostics.report(
+                                "RS2489",
+                                "static class '" + owner.name +
+                                    "' cannot declare instance constructors",
+                                constructorSyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
+                            module.invalid = true;
+                        }
                         semantic::FunctionBindingInput binding;
                         binding.symbol = semantic::declareConstructorSymbol(
                             moduleName, constructorSyntax, owner,
@@ -3985,11 +4085,57 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         binding.symbol.sourceName = binding.sourceName;
                         binding.body = &constructorSyntax.body;
                         binding.constructorSyntax = &constructorSyntax;
-                        binding.parameterNames.push_back("this");
-                        binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
-                        appendParameters(binding, constructorSyntax.parameters);
-                        owner.constructors.push_back(binding.symbol);
+                        if (!binding.symbol.staticMethod) {
+                            binding.parameterNames.push_back("this");
+                            binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                            appendParameters(binding, constructorSyntax.parameters);
+                            owner.constructors.push_back(binding.symbol);
+                        } else {
+                            if (owner.staticConstructor.has_value()) {
+                                result.diagnostics.report(
+                                    "RS2497",
+                                    "type '" + owner.name +
+                                        "' cannot declare more than one static constructor",
+                                    constructorSyntax.identifierToken.span,
+                                    diagnostics::DiagnosticSeverity::Error,
+                                    unit->source->name());
+                                module.invalid = true;
+                            }
+                            owner.staticConstructor = binding.symbol;
+                        }
                         addBinding(module, std::move(binding), constructorSyntax.identifierToken.span);
+                    }
+                    if (!owner.staticConstructor.has_value()) {
+                        bool hasDynamicStaticFieldInit = false;
+                        for (const auto& field : owner.fields) {
+                            if (field.staticField && !field.constField &&
+                                !field.hasConstantValue && field.initializerSyntax) {
+                                hasDynamicStaticFieldInit = true;
+                                break;
+                            }
+                        }
+                        if (hasDynamicStaticFieldInit) {
+                            semantic::FunctionBindingInput binding;
+                            binding.symbol.moduleName = moduleName;
+                            binding.symbol.name = ".cctor";
+                            binding.symbol.ownerTypeName = owner.name;
+                            binding.symbol.ownerTypeId = owner.id;
+                            binding.symbol.declaringTypeId = owner.id;
+                            binding.symbol.declaringTypeName = semantic::canonicalTypeName(owner);
+                            binding.symbol.returnType = semantic::PrimitiveType::Void;
+                            binding.symbol.method = true;
+                            binding.symbol.staticMethod = true;
+                            binding.symbol.constructor = true;
+                            binding.symbol.synthetic = true;
+                            binding.symbol.deterministic = owner.deterministic;
+                            binding.sourceName = unit->source->name();
+                            binding.symbol.sourceName = binding.sourceName;
+                            binding.symbol.id = semantic::stableFunctionId(binding.symbol);
+                            binding.symbol.declarationSpan = typeSyntax.identifierToken.span;
+                            binding.symbol.bodySpan = typeSyntax.identifierToken.span;
+                            owner.staticConstructor = binding.symbol;
+                            addBinding(module, std::move(binding), typeSyntax.identifierToken.span);
+                        }
                     }
                     for (const auto& propertySyntax : typeSyntax.properties) {
                         if (!propertyNames.insert(
@@ -4008,6 +4154,17 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         auto property = semantic::declarePropertySymbol(
                             moduleName, propertySyntax, owner,
                             module.visibleTypes, result.diagnostics);
+                        if (owner.staticType && !property.staticProperty) {
+                            result.diagnostics.report(
+                                "RS2489",
+                                "cannot declare instance property '" +
+                                    property.name + "' in static class '" +
+                                    owner.name + "'",
+                                propertySyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
+                            module.invalid = true;
+                        }
                         property.sourceName = unit->source->name();
                         if (property.getter) property.getter->sourceName = unit->source->name();
                         if (property.setter) property.setter->sourceName = unit->source->name();
@@ -5336,6 +5493,11 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             fc.interfaces = module.interfaces;
             fc.delegates = module.delegates;
             fc.declarations = module.declarations;
+            for (const auto* u : module.units) {
+                if (u && u->syntaxTree) {
+                    fc.keptSyntaxTrees.push_back(u->syntaxTree);
+                }
+            }
             const std::string prefix = moduleName + "::";
             for (const auto& attr : result.nativeAttributes) {
                 if (attr.target == moduleName || attr.target.rfind(prefix, 0) == 0) {
@@ -5352,7 +5514,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     fc.nativeInterfaces.push_back(impl);
                 }
             }
-            sModuleFrontendCache[moduleName] = std::move(fc);
+            const std::string cacheKey =
+                moduleName + "#" + std::to_string(module.transitiveSourceFingerprint);
+            sModuleFrontendCache[cacheKey] = std::move(fc);
         }
     }
 

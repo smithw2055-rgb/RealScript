@@ -77,13 +77,46 @@ const std::vector<syntax::SyntaxToken>& LanguageService::documentTokens(
 LanguageService::DocHeaderInfo LanguageService::parseDocHeader(const Document& doc) {
     DocHeaderInfo info;
     const auto& s = doc.content;
-    if (s.find('<') != std::string::npos ||
-        s.find('[') != std::string::npos ||
-        s.find("sequence ") != std::string::npos ||
-        s.find("interface ") != std::string::npos) {
+    info.eligibleForSubgraph = true;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (i + 1 < s.size() && s[i] == '/' && s[i + 1] == '/') {
+            i += 2;
+            while (i < s.size() && s[i] != '\n') ++i;
+            continue;
+        }
+        if (i + 1 < s.size() && s[i] == '/' && s[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/')) ++i;
+            ++i;
+            continue;
+        }
+        if (s[i] == '"') {
+            ++i;
+            while (i < s.size() && s[i] != '"') {
+                if (s[i] == '\\' && i + 1 < s.size()) ++i;
+                ++i;
+            }
+            continue;
+        }
+        if (s[i] == '<') {
+            info.eligibleForSubgraph = false;
+            break;
+        }
+        if (s[i] == '[') {
+            const bool isArrayBrackets = (i + 1 < s.size() && s[i + 1] == ']');
+            const bool isElementAccess = (i > 0 &&
+                (std::isalnum(static_cast<unsigned char>(s[i - 1])) ||
+                 s[i - 1] == '_' || s[i - 1] == ')' || s[i - 1] == ']'));
+            if (!isArrayBrackets && !isElementAccess) {
+                info.eligibleForSubgraph = false;
+                break;
+            }
+        }
+    }
+    if (info.eligibleForSubgraph &&
+        (s.find("sequence ") != std::string::npos ||
+         s.find("interface ") != std::string::npos)) {
         info.eligibleForSubgraph = false;
-    } else {
-        info.eligibleForSubgraph = true;
     }
     std::size_t pos = 0;
     const auto skipWsAndComments = [&]() {
@@ -673,6 +706,11 @@ const std::vector<DocumentSymbol>& LanguageService::allDefinitionsRef() const {
                 append(constructor.id, semantic::SymbolKind::Function, type.name,
                     functionDetail(constructor), constructor.sourceName, constructor.declarationSpan);
             }
+            if (type.staticConstructor && !type.staticConstructor->synthetic) {
+                append(type.staticConstructor->id, semantic::SymbolKind::Function, type.name,
+                    functionDetail(*type.staticConstructor), type.staticConstructor->sourceName,
+                    type.staticConstructor->declarationSpan);
+            }
         }
         for (const auto& function : module.functions) {
             append(function.symbolId, semantic::SymbolKind::Function, function.name,
@@ -801,6 +839,9 @@ std::vector<CompletionItem> LanguageService::completion(
             for (const auto& constructor : type.constructors) {
                 if (containsCursor(constructor)) requesterTypeId = type.id;
             }
+            if (type.staticConstructor && containsCursor(*type.staticConstructor)) {
+                requesterTypeId = type.id;
+            }
             for (const auto& property : type.properties) {
                 if ((property.getter && containsCursor(*property.getter)) ||
                     (property.setter && containsCursor(*property.setter))) {
@@ -864,6 +905,9 @@ std::vector<CompletionItem> LanguageService::completion(
                             constructor.declaringTypeId,
                             constructor.moduleName);
                     }
+                }
+                if (type.staticConstructor && type.staticConstructor->id == id) {
+                    return true;
                 }
                 for (const auto& property : type.properties) {
                     if (property.id == id) {
@@ -1315,7 +1359,7 @@ std::vector<CompletionItem> LanguageService::completion(
     const std::vector<std::string> keywords = {
         "module", "import", "class", "struct", "enum", "interface",
         "delegate", "event", "sequence", "yield", "wait_ticks", "wait_seconds", "wait_event", "wait_until",
-        "static", "const",
+        "static", "const", "readonly",
         "public", "private", "protected", "internal", "abstract", "virtual",
         "override", "sealed", "base", "return", "if", "else", "while",
         "for", "foreach", "do", "break", "continue", "switch", "case",

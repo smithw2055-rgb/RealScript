@@ -361,6 +361,28 @@ public:
         const std::string& name,
         runtime::RuntimeError& error,
         runtime::ExecutionOptions options = {}) const;
+    bool setStaticMember(
+        const ScriptType& type,
+        const std::string& name,
+        runtime::Value value,
+        runtime::RuntimeError& error,
+        runtime::ExecutionOptions options = {}) const;
+    bool setStaticMember(
+        const std::string& canonicalTypeName,
+        const std::string& name,
+        runtime::Value value,
+        runtime::RuntimeError& error,
+        runtime::ExecutionOptions options = {}) const;
+    [[nodiscard]] std::optional<runtime::Value> getStaticMember(
+        const ScriptType& type,
+        const std::string& name,
+        runtime::RuntimeError& error,
+        runtime::ExecutionOptions options = {}) const;
+    [[nodiscard]] std::optional<runtime::Value> getStaticMember(
+        const std::string& canonicalTypeName,
+        const std::string& name,
+        runtime::RuntimeError& error,
+        runtime::ExecutionOptions options = {}) const;
 
     [[nodiscard]] static runtime::Value makeFixed(Fixed value);
     [[nodiscard]] static runtime::Value makeVec2(Vec2 value);

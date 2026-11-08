@@ -515,13 +515,13 @@ static_assert(std::is_trivially_destructible_v<Value>, "runtime::Value must be t
 } // namespace realscript::runtime
 
 namespace std {
-template <>
-inline constexpr bool holds_alternative<std::string>(
+template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
+inline constexpr bool holds_alternative(
     const realscript::runtime::Value& value) noexcept {
     return std::holds_alternative<realscript::runtime::StringValue>(value);
 }
-template <>
-inline const std::string* get_if<std::string>(
+template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
+inline const std::string* get_if(
     const realscript::runtime::Value* value) noexcept {
     if (!value) return nullptr;
     if (const auto* sv = std::get_if<realscript::runtime::StringValue>(value)) {
@@ -529,8 +529,8 @@ inline const std::string* get_if<std::string>(
     }
     return nullptr;
 }
-template <>
-inline std::string* get_if<std::string>(
+template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
+inline std::string* get_if(
     realscript::runtime::Value* value) noexcept {
     if (!value) return nullptr;
     if (const auto* sv = std::get_if<realscript::runtime::StringValue>(value)) {
@@ -542,13 +542,13 @@ inline std::string* get_if<std::string>(
     }
     return nullptr;
 }
-template <>
-inline const std::string& get<std::string>(
+template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
+inline const std::string& get(
     const realscript::runtime::Value& value) {
     return std::get<realscript::runtime::StringValue>(value).str();
 }
-template <>
-inline std::string& get<std::string>(
+template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
+inline std::string& get(
     realscript::runtime::Value& value) {
     thread_local std::array<std::string, 64> sMutableRing{};
     thread_local std::size_t sRingCursor = 0;
@@ -556,13 +556,13 @@ inline std::string& get<std::string>(
     slot = std::get<realscript::runtime::StringValue>(value).str();
     return slot;
 }
-template <>
-inline const std::string&& get<std::string>(
+template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
+inline const std::string&& get(
     const realscript::runtime::Value&& value) {
     return std::move(std::get<realscript::runtime::StringValue>(value).str());
 }
-template <>
-inline std::string&& get<std::string>(
+template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
+inline std::string&& get(
     realscript::runtime::Value&& value) {
     thread_local std::array<std::string, 64> sMutableRing{};
     thread_local std::size_t sRingCursor = 0;

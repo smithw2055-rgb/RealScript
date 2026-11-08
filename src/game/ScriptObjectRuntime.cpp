@@ -315,6 +315,13 @@ bool ScriptRuntime::runObjectConstructor(
     runtime::RuntimeError& error,
     runtime::ExecutionOptions options) const {
     const auto& type = object.type();
+    if (type.descriptor.staticConstructor) {
+        auto cctorExec = invokeSymbol(type.descriptor.staticConstructor->id, {}, options);
+        if (!cctorExec.succeeded) {
+            error = std::move(cctorExec.error);
+            return false;
+        }
+    }
     if (!constructorArguments.empty() || !type.descriptor.constructors.empty()) {
         const auto constructor = findConstructor(type, constructorArguments);
         if (!constructor) {

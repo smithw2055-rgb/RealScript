@@ -5004,6 +5004,650 @@ int InspectHierarchy() {
     }
 }
 
+void testConstStaticAndUtilityClassCompleteness() {
+    using namespace realscript;
+    game::GameApi api;
+
+    // 1. Negative diagnostics: instantiating a static class (RS2488) and declaring instance members in a static class (RS2489)
+    {
+        const char* badStaticClassSrc = R"RS(
+module Game.BadStaticClass;
+
+public static class MathUtil
+{
+    public int badInstanceField = 1;
+    public int BadInstanceMethod() { return 2; }
+}
+
+class Caller
+{
+    public int Run()
+    {
+        MathUtil u = new MathUtil();
+        return 0;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        const auto badBuild = compiler.compile({{"bad_static_class.rs", badStaticClassSrc}});
+        require(!badBuild.succeeded(), "instantiating or adding instance members to static class must fail");
+        bool sawRS2488 = false;
+        bool sawRS2489 = false;
+        for (const auto& d : badBuild.diagnostics.items()) {
+            if (d.code == "RS2488") sawRS2488 = true;
+            if (d.code == "RS2489") sawRS2489 = true;
+        }
+        require(sawRS2488, "expected RS2488 when instantiating static class");
+        require(sawRS2489, "expected RS2489 when declaring instance field/method in static class");
+    }
+
+    // 2. Standalone single-AST SemanticBinding (Binder::bind) verification for out-of-order const, static class,
+    //    array initializers, compound assignment in static methods, and static struct field mutation.
+    {
+        const char* singleAstSrc = R"RS(
+module Standalone.BinderTest;
+
+struct Bounds2D
+{
+    public const int DefaultPadding = BaseRule.UnitSize * 2;
+    public int width;
+    public int height;
+
+    public void Expand(int dx, int dy)
+    {
+        width += dx;
+        height += dy;
+    }
+}
+
+public static class BaseRule
+{
+    public const int TotalCap = DoubleCap + (IsProd ? 10 : 5);
+    public const int DoubleCap = UnitSize * 4;
+    public const int UnitSize = 25;
+    public const bool IsProd = UnitSize >= 20 && true;
+
+    public static int Counter = InitCounter();
+    public static int[] Curve = { 10, 20, 30, TotalCap };
+    public static Bounds2D WorldBounds = new Bounds2D { width = 100, height = 200 };
+
+    private static int InitCounter()
+    {
+        return UnitSize + Bounds2D.DefaultPadding;
+    }
+
+    private static int ClampVal(int v, int lo, int hi)
+    {
+        if (v < lo) return lo;
+        if (v > hi) return hi;
+        return v;
+    }
+
+    public static void BumpByRef(ref int target, int delta)
+    {
+        target += ClampVal(delta, 1, 50);
+    }
+
+    public static int StepAll(int delta)
+    {
+        Counter += delta;
+        BumpByRef(ref Counter, 15);
+        WorldBounds.width = WorldBounds.width + Curve[0];
+        WorldBounds.height += Curve[3];
+        WorldBounds.Expand(5, 10);
+        return Counter + WorldBounds.width + WorldBounds.height + Bounds2D.DefaultPadding;
+    }
+}
+
+int main()
+{
+    return BaseRule.StepAll(5);
+}
+)RS";
+        diagnostics::DiagnosticBag diags;
+        text::SourceText srcText(singleAstSrc, "standalone.rs");
+        syntax::Parser parser(srcText, diags);
+        const auto unit = parser.parseCompilationUnit();
+        require(!diags.hasErrors(), "standalone parser failed: " + diagnosticsText(diags));
+        semantic::Binder binder(diags);
+        const auto model = binder.bind(unit);
+        require(!diags.hasErrors(), "standalone Binder::bind failed: " + diagnosticsText(diags));
+        mir::Lowerer mirLowerer;
+        const auto mirMod = mirLowerer.lower(model);
+        require(mir::verifyModule(mirMod, diags) && !diags.hasErrors(),
+            "standalone MIR verification failed: " + diagnosticsText(diags));
+        compiler::Compilation standaloneComp({{"standalone.rs", singleAstSrc}});
+        const auto standaloneBuilt = standaloneComp.build();
+        require(!standaloneBuilt.diagnostics.hasErrors(),
+            "standalone Compilation::build failed: " + diagnosticsText(standaloneBuilt.diagnostics));
+        bytecode::Lowerer bcLowerer;
+        const auto bcMod = bcLowerer.lower(standaloneBuilt.modules.front());
+        runtime::Interpreter interp(std::vector<bytecode::Module>{bcMod});
+        const auto exec = interp.invoke("Standalone.BinderTest::main");
+        // InitCounter() = 25 + 50 = 75; Counter += 5 -> 80; BumpByRef(+15) -> 95
+        // TotalCap = 100 + 10 = 110; Curve = {10, 20, 30, 110}
+        // WorldBounds.width = 100 + 10 + 5 = 115; WorldBounds.height = 200 + 110 + 10 = 320
+        // Result = 95 + 115 + 320 + 50 = 580
+        require(
+            exec.succeeded && std::holds_alternative<std::int64_t>(exec.value) &&
+                std::get<std::int64_t>(exec.value) == 580,
+            "standalone Binder::bind execution expected 580, got " +
+                (exec.succeeded ? std::to_string(std::get<std::int64_t>(exec.value)) : exec.error.message));
+    }
+
+    // 3. Full multi-type / gameplay compiler & ManagedHeap::staticFields integration:
+    //    - Cross-class/struct/enum out-of-order const expressions (including $"..." const interpolation & cast)
+    //    - Static config tables (new int[] {...}, new string[3] {...}, bare {...}, Vec2[] struct array)
+    //    - Static utility class methods calling sibling static helpers unqualified
+    //    - Static struct field mutation & ref/out on static fields
+    //    - Host C++ getStaticMember / setStaticMember on both static class and struct
+    {
+        const char* gameConfigSrc = R"RS(
+module Game.ConfigAndUtils;
+import RealScript.Math;
+
+public static class MathHelper
+{
+    public const int VersionMajor = 2;
+    public const int VersionMinor = 5;
+    public const string VersionTag = $"v{VersionMajor}.{VersionMinor}";
+
+    public static int MinInt(int a, int b)
+    {
+        return a < b ? a : b;
+    }
+
+    public static int MaxInt(int a, int b)
+    {
+        return a > b ? a : b;
+    }
+
+    public static int ClampInt(int val, int lo, int hi)
+    {
+        // Unqualified call to sibling static methods inside static class
+        return MinInt(MaxInt(val, lo), hi);
+    }
+}
+
+public class GameplayBalance
+{
+    // Forward reference to StructConst and TierKind declared AFTER GameplayBalance
+    public const int BaseHp = StructLimits.MinHp + (int)TierKind.Elite * 50;
+    public const int MaxHp = BaseHp * (StructLimits.IsHardcore ? 3 : 2);
+    public const int CastedConst = (int)3.9 + MaxHp;
+
+    public static int[] LevelXpTable = new int[] { 100, 250, 500, MaxHp };
+    public static int[] ShorthandTable = { 10, 20, BaseHp };
+    public static string[] TierNames = new string[3] { "Normal", "Elite", MathHelper.VersionTag };
+    public static int ActiveSessions = SeedInitialSessions();
+    public static int LastOutCode = 0;
+
+    private static int SeedInitialSessions()
+    {
+        return BaseHp / 10;
+    }
+
+    public static void AddSessions(ref int target, out int statusOut, int rawDelta)
+    {
+        int clamped = MathHelper.ClampInt(rawDelta, 1, 100);
+        target += clamped;
+        statusOut = target + ShorthandTable[2];
+    }
+
+    public static int RunSessionStep(int delta)
+    {
+        // Unqualified compound assignment in static method
+        ActiveSessions += delta;
+        // Pass static fields by ref and out
+        AddSessions(ref ActiveSessions, out LastOutCode, 25);
+        LevelXpTable[1] = LevelXpTable[1] + 50;
+        const int localBase = BaseHp + 5;
+        const int localScaled = localBase * 2;
+        return ActiveSessions + LastOutCode + LevelXpTable[1] + LevelXpTable[3] + localScaled;
+    }
+}
+
+public struct StructLimits
+{
+    public const int MinHp = 100;
+    public const bool IsHardcore = MinHp >= 100 && MathHelper.VersionMajor == 2;
+    public static Vec2 DefaultSpawn = new Vec2(FixedFromInt(4), FixedFromInt(6));
+    public static int StructStaticCounter = 7;
+
+    public static int MutateSpawn(int dx, int dy)
+    {
+        DefaultSpawn.x = DefaultSpawn.x + FixedFromInt(dx);
+        DefaultSpawn.y += FixedFromInt(dy);
+        StructStaticCounter += 3;
+        return DefaultSpawn.x.ToInt() * 100 + DefaultSpawn.y.ToInt() + StructStaticCounter;
+    }
+}
+
+public enum TierKind
+{
+    Normal = 1,
+    Elite = 2,
+    Boss = 3
+}
+
+public class Runner
+{
+    public int ExecuteCheck()
+    {
+        if (MathHelper.VersionTag != "v2.5") return -1;
+        if (GameplayBalance.TierNames[2] != "v2.5") return -2;
+        if (GameplayBalance.CastedConst != 603) return -3;
+        int stepVal = GameplayBalance.RunSessionStep(5);
+        int spawnVal = StructLimits.MutateSpawn(10, 20);
+        return stepVal + spawnVal;
+    }
+}
+)RS";
+        game::GameScriptCompiler compiler(api);
+        const auto compiled = compiler.compile({{"game_config.rs", gameConfigSrc}});
+        require(
+            compiled.succeeded(),
+            "Game.ConfigAndUtils compilation failed: " + diagnosticsText(compiled.diagnostics));
+
+        game::ScriptRuntime runtime(compiled.program);
+        runtime::RuntimeError err;
+
+        // Verify host C++ getStaticMember / setStaticMember on static class, normal class, and struct
+        const auto verTagVal = runtime.getStaticMember(
+            "Game.ConfigAndUtils::MathHelper", "VersionTag", err);
+        require(verTagVal.has_value(), "getStaticMember VersionTag failed: " + err.message);
+
+        const auto maxHpVal = runtime.getStaticMember(
+            "Game.ConfigAndUtils::GameplayBalance", "MaxHp", err);
+        // BaseHp = 100 + 2 * 50 = 200; IsHardcore = true -> MaxHp = 200 * 3 = 600
+        require(
+            maxHpVal.has_value() && std::holds_alternative<std::int64_t>(*maxHpVal) &&
+                std::get<std::int64_t>(*maxHpVal) == 600,
+            "getStaticMember MaxHp expected 600");
+
+        const auto structCounterBefore = runtime.getStaticMember(
+            "Game.ConfigAndUtils::StructLimits", "StructStaticCounter", err);
+        require(
+            structCounterBefore.has_value() &&
+                std::holds_alternative<std::int64_t>(*structCounterBefore) &&
+                std::get<std::int64_t>(*structCounterBefore) == 7,
+            "getStaticMember on struct static field StructStaticCounter should trigger synthesized .cctor and return 7");
+
+        const auto activeSessionsBefore = runtime.getStaticMember(
+            "Game.ConfigAndUtils::GameplayBalance", "ActiveSessions", err);
+        require(
+            activeSessionsBefore.has_value() &&
+                std::holds_alternative<std::int64_t>(*activeSessionsBefore) &&
+                std::get<std::int64_t>(*activeSessionsBefore) == 20,
+            "getStaticMember on dynamic static field ActiveSessions before script execution should trigger synthesized .cctor and return 20");
+
+        const auto runnerType = runtime.findType("Game.ConfigAndUtils::Runner");
+        require(runnerType.has_value(), "Runner type not found");
+        auto runnerObj = runtime.createObject(*runnerType, {}, err);
+        require(runnerObj.has_value(), "createObject Runner failed: " + err.message);
+        const auto execMethod = runtime.findMethod(*runnerType, "ExecuteCheck", 0);
+        require(execMethod.has_value(), "ExecuteCheck method not found");
+        const auto execRes = runtime.invoke(*runnerObj, *execMethod, {});
+        require(execRes.succeeded, "ExecuteCheck failed: " + execRes.error.message);
+
+        // Let's verify the exact arithmetic:
+        // BaseHp = 200, MaxHp = 600
+        // SeedInitialSessions() = 200 / 10 = 20
+        // ActiveSessions += 5 -> 25; AddSessions(ref ActiveSessions, out LastOutCode, 25):
+        //   ActiveSessions = 25 + 25 = 50
+        //   LastOutCode = 50 + ShorthandTable[2] (200) = 250
+        // LevelXpTable[1] = 250 + 50 = 300; LevelXpTable[3] = 600
+        // localBase = 205; localScaled = 410
+        // stepVal = 50 + 250 + 300 + 600 + 410 = 1610
+        // MutateSpawn(10, 20): DefaultSpawn.x = 4 + 10 = 14, DefaultSpawn.y = 6 + 20 = 26, StructStaticCounter = 7 + 3 = 10
+        // spawnVal = 14 * 100 + 26 + 10 = 1436
+        // Total = 1610 + 1436 = 3046
+        require(
+            std::holds_alternative<std::int64_t>(execRes.value) &&
+                std::get<std::int64_t>(execRes.value) == 3046,
+            "ExecuteCheck expected 3046, got " +
+                std::to_string(std::get<std::int64_t>(execRes.value)));
+
+        // Verify ManagedHeap::staticFields holds the updated static values and host setStaticMember mutates them
+        const auto sessionsAfter = runtime.getStaticMember(
+            "Game.ConfigAndUtils::GameplayBalance", "ActiveSessions", err);
+        require(
+            sessionsAfter.has_value() &&
+                std::holds_alternative<std::int64_t>(*sessionsAfter) &&
+                std::get<std::int64_t>(*sessionsAfter) == 50,
+            "ManagedHeap::staticFields ActiveSessions expected 50");
+
+        require(
+            runtime.setStaticMember(
+                "Game.ConfigAndUtils::GameplayBalance", "ActiveSessions", std::int64_t{100}, err),
+            "setStaticMember ActiveSessions failed: " + err.message);
+        const auto sessionsHostUpdated = runtime.getStaticMember(
+            "Game.ConfigAndUtils::GameplayBalance", "ActiveSessions", err);
+        require(
+            sessionsHostUpdated.has_value() &&
+                std::get<std::int64_t>(*sessionsHostUpdated) == 100,
+            "getStaticMember ActiveSessions after host setStaticMember expected 100");
+    }
+}
+
+
+void testStaticConstructorsAndReadonlyFieldsCompleteness() {
+    const auto hasDiagnostic = [](const realscript::diagnostics::DiagnosticBag& bag, std::string_view code) {
+        for (const auto& item : bag.items()) {
+            if (item.code == code) return true;
+        }
+        return false;
+    };
+    // 1. Negative diagnostic checks for readonly / static readonly and static TypeName()
+    {
+        realscript::game::GameApi api;
+        realscript::game::GameScriptCompiler compiler(api);
+
+        // 1a: Cannot assign to instance readonly field outside instance constructor
+        auto bad1 = compiler.compile({{"bad_readonly_method.rs", R"(
+module Game.BadReadonly1;
+class Hero {
+    public readonly int MaxLives = 3;
+    public void Hack() { MaxLives = 99; }
+}
+)"}});
+        require(!bad1.succeeded() && hasDiagnostic(bad1.diagnostics, "RS2483"),
+            "Assigning to instance readonly field in method must report RS2483");
+
+        // 1b: Cannot assign to static readonly field inside instance constructor or normal method
+        auto bad2 = compiler.compile({{"bad_static_readonly_ctor.rs", R"(
+module Game.BadReadonly2;
+class Hero {
+    public static readonly int GlobalCap = 100;
+    public Hero() { GlobalCap = 200; }
+}
+)"}});
+        require(!bad2.succeeded() && hasDiagnostic(bad2.diagnostics, "RS2483"),
+            "Assigning to static readonly field in instance constructor must report RS2483");
+
+        // 1c: Cannot assign to instance readonly field inside static constructor
+        auto bad3 = compiler.compile({{"bad_instance_readonly_cctor.rs", R"(
+module Game.BadReadonly3;
+class Hero {
+    public readonly int Id = 1;
+    static Hero() {
+        Hero h = new Hero();
+        h.Id = 2;
+    }
+}
+)"}});
+        require(!bad3.succeeded() && hasDiagnostic(bad3.diagnostics, "RS2483"),
+            "Assigning to instance readonly field in static constructor must report RS2483");
+
+        // 1d: Cannot assign to readonly field in object initializer
+        auto bad4 = compiler.compile({{"bad_readonly_obj_init.rs", R"(
+module Game.BadReadonly4;
+class Hero {
+    public readonly int Id = 1;
+    public static Hero Make() { return new Hero { Id = 2 }; }
+}
+)"}});
+        require(!bad4.succeeded() && hasDiagnostic(bad4.diagnostics, "RS2483"),
+            "Assigning to readonly field in object initializer must report RS2483");
+
+        // 1e: Cannot pass readonly or static readonly field as ref/out outside its constructor
+        auto bad5 = compiler.compile({{"bad_readonly_ref.rs", R"(
+module Game.BadReadonly5;
+class Hero {
+    public static readonly int GlobalCap = 100;
+    public static void Bump(ref int x) { x += 1; }
+    public static void TryBump() { Bump(ref GlobalCap); }
+}
+)"}});
+        require(!bad5.succeeded() && hasDiagnostic(bad5.diagnostics, "RS2483"),
+            "Passing static readonly field as ref outside static constructor must report RS2483");
+
+        // 1f: Cannot mutate struct sub-field of static readonly struct outside static constructor
+        auto bad6 = compiler.compile({{"bad_readonly_struct_subfield.rs", R"(
+module Game.BadReadonly6;
+struct Vec2i { public int x; public int y; }
+class World {
+    public static readonly Vec2i Spawn;
+    public static void MoveSpawn() { Spawn.x = 10; }
+}
+)"}});
+        require(!bad6.succeeded() && hasDiagnostic(bad6.diagnostics, "RS2483"),
+            "Mutating sub-field of static readonly struct outside static constructor must report RS2483");
+
+        // 1g: Field cannot be both const and readonly
+        auto bad7 = compiler.compile({{"bad_const_readonly.rs", R"(
+module Game.BadReadonly7;
+class World {
+    public const readonly int Limit = 10;
+}
+)"}});
+        require(!bad7.succeeded() && hasDiagnostic(bad7.diagnostics, "RS2483"),
+            "Declaring field as both const and readonly must report RS2483");
+
+        // 1h: Static constructor cannot have access modifiers or parameters
+        auto bad8 = compiler.compile({{"bad_cctor_sig.rs", R"(
+module Game.BadCctor1;
+class World {
+    public static World(int x) {}
+}
+)"}});
+        require(!bad8.succeeded() && hasDiagnostic(bad8.diagnostics, "RS2497"),
+            "Static constructor with access modifier or parameters must report RS2497");
+
+        // 1i: Duplicate static constructor must report RS2497
+        auto bad9 = compiler.compile({{"bad_cctor_dup.rs", R"(
+module Game.BadCctor2;
+class World {
+    static World() {}
+    static World() {}
+}
+)"}});
+        require(!bad9.succeeded() && hasDiagnostic(bad9.diagnostics, "RS2497"),
+            "Duplicate static constructor must report RS2497");
+
+        // 1j: Explicit array size mismatch with initializer list must report RS2421
+        auto bad10 = compiler.compile({{"bad_array_init_len.rs", R"(
+module Game.BadArrayInitLen;
+class World {
+    public static int[] Data = new int[2] { 10, 20, 30 };
+}
+)"}});
+        require(!bad10.succeeded() && hasDiagnostic(bad10.diagnostics, "RS2421"),
+            "Explicit array size mismatch with initializer list must report RS2421");
+    }
+
+    // 2. Full End-to-End Execution: static constructors (.cctor) and readonly / static readonly fields
+    {
+        const char* source = R"(
+module Game.CctorReadonly;
+
+struct GridCoord
+{
+    public int x;
+    public int y;
+    public readonly int tag = 7;
+    public static readonly int DefaultScale;
+    public static int StructCctorCount = 0;
+
+    static GridCoord()
+    {
+        StructCctorCount += 1;
+        DefaultScale = 10;
+    }
+
+    public GridCoord(int px, int py, int ptag)
+    {
+        x = px;
+        y = py;
+        tag = ptag;
+    }
+
+    public int MutateSelfAndReturn(int dx)
+    {
+        x += dx;
+        return x * DefaultScale + y + tag;
+    }
+}
+
+static class LootTableRegistry
+{
+    public static int CctorRunCount = 0;
+    public static readonly int BaseDropRate = 15;
+    public static readonly int RareDropRate;
+    public static readonly int[] TierWeights = { 50, 30, 15, 5 };
+    public static readonly GridCoord BossSpawn;
+
+    public static void InitRare(out int target, int baseVal)
+    {
+        // Re-entrant call into LootTableRegistry during .cctor must not re-run .cctor!
+        target = baseVal * 2 + 5;
+    }
+
+    static LootTableRegistry()
+    {
+        CctorRunCount += 1;
+        InitRare(out RareDropRate, BaseDropRate);
+        TierWeights[3] = RareDropRate;
+        BossSpawn.x = 12;
+        BossSpawn.y = 34;
+    }
+
+    public static int TotalWeight()
+    {
+        int sum = 0;
+        for (int i = 0; i < TierWeights.Length; i = i + 1)
+        {
+            sum += TierWeights[i];
+        }
+        return sum;
+    }
+}
+
+class DungeonSession
+{
+    public static int SessionCctorCount = 0;
+    public static readonly int MaxPartySize = 4;
+    public static readonly int BonusLootMultiplier;
+
+    public readonly int SessionId;
+    public readonly GridCoord Entrance;
+    public readonly int[] Checkpoints = { 1, 2, 3 };
+
+    static DungeonSession()
+    {
+        SessionCctorCount += 1;
+        BonusLootMultiplier = MaxPartySize * 3;
+    }
+
+    public DungeonSession(int id, int ex, int ey)
+    {
+        SessionId = id + BonusLootMultiplier;
+        Entrance = new GridCoord(ex, ey, 9);
+        Checkpoints[0] = SessionId;
+    }
+
+    public int EvaluateSession()
+    {
+        // Calling MutateSelfAndReturn on readonly struct Entrance or BossSpawn must operate on a defensive copy!
+        int copyResult1 = Entrance.MutateSelfAndReturn(100);
+        int copyResult2 = LootTableRegistry.BossSpawn.MutateSelfAndReturn(100);
+
+        // Verify Entrance.x and BossSpawn.x were NOT mutated by the defensive-copy method calls
+        int unchangedCheck = Entrance.x * 100 + LootTableRegistry.BossSpawn.x;
+
+        int weightSum = LootTableRegistry.TotalWeight();
+        int cctorCounts =
+            LootTableRegistry.CctorRunCount * 100 +
+            DungeonSession.SessionCctorCount * 10 +
+            GridCoord.StructCctorCount;
+
+        return SessionId + copyResult1 + copyResult2 + unchangedCheck + weightSum + cctorCounts;
+    }
+}
+)";
+
+        realscript::game::GameApi api;
+        realscript::game::GameScriptCompiler compiler(api);
+        auto compiled = compiler.compile({{"cctor_readonly.rs", source}});
+        require(
+            compiled.succeeded(),
+            "Game.CctorReadonly compilation failed: " + diagnosticsText(compiled.diagnostics));
+
+        // Verify RSBC bytecode encode/decode round-trip preserves staticConstructor and readonlyField
+        realscript::compiler::Compilation rawComp({{"cctor_readonly.rs", source}});
+        const auto rawBuilt = rawComp.build();
+        for (const auto& mirMod : rawBuilt.modules) {
+            realscript::bytecode::Lowerer bcLowerer;
+            const auto mod = bcLowerer.lower(mirMod);
+            const auto encoded = realscript::bytecode::encodeModule(mod);
+            realscript::bytecode::Module decoded;
+            realscript::diagnostics::DiagnosticBag decodeDiag;
+            require(
+                realscript::bytecode::decodeModule(encoded, decoded, decodeDiag),
+                "RSBC decode failed for module with staticConstructor/readonlyField: " + diagnosticsText(decodeDiag));
+            require(
+                realscript::bytecode::encodeModule(decoded) == encoded,
+                "RSBC round-trip bytes differed for module with staticConstructor/readonlyField");
+        }
+
+        realscript::game::ScriptRuntime runtime(compiled.program);
+        realscript::runtime::RuntimeError err;
+
+        // Reading static readonly member from Host C++ should automatically trigger LootTableRegistry..cctor()
+        const auto rareRateVal = runtime.getStaticMember(
+            "Game.CctorReadonly::LootTableRegistry", "RareDropRate", err);
+        // BaseDropRate = 15 -> InitRare sets RareDropRate = 15 * 2 + 5 = 35
+        require(
+            rareRateVal.has_value() &&
+                std::holds_alternative<std::int64_t>(*rareRateVal) &&
+                std::get<std::int64_t>(*rareRateVal) == 35,
+            "Host getStaticMember RareDropRate should trigger .cctor and return 35");
+
+        // Host C++ setStaticMember on static readonly field must be rejected
+        require(
+            !runtime.setStaticMember(
+                "Game.CctorReadonly::LootTableRegistry", "RareDropRate", std::int64_t{999}, err) &&
+                err.code == realscript::runtime::ErrorCode::InvalidArguments,
+            "Host setStaticMember on static readonly field must fail with InvalidArguments");
+        err = {};
+
+        const auto sessionType = runtime.findType("Game.CctorReadonly::DungeonSession");
+        require(sessionType.has_value(), "DungeonSession type not found");
+        auto sessionObj = runtime.createObject(
+            *sessionType, {std::int64_t{8}, std::int64_t{5}, std::int64_t{6}}, err);
+        require(sessionObj.has_value(), "createObject DungeonSession failed: " + err.message);
+
+        // Host C++ setMember on instance readonly field must be rejected
+        require(
+            !runtime.setMember(*sessionObj, "SessionId", std::int64_t{777}, err) &&
+                err.code == realscript::runtime::ErrorCode::InvalidArguments,
+            "Host setMember on instance readonly field must fail with InvalidArguments");
+        err = {};
+
+        const auto evalMethod = runtime.findMethod(*sessionType, "EvaluateSession", 0);
+        require(evalMethod.has_value(), "EvaluateSession method not found");
+        const auto evalRes = runtime.invoke(*sessionObj, *evalMethod, {});
+        require(evalRes.succeeded, "EvaluateSession failed: " + evalRes.error.message);
+
+        // Expected breakdown:
+        // BonusLootMultiplier = 4 * 3 = 12
+        // SessionId = 8 + 12 = 20
+        // Entrance = (5, 6, tag=9)
+        // copyResult1 = (5 + 100) * 10 + 6 + 9 = 1065
+        // BossSpawn = (12, 34, tag=0)
+        // copyResult2 = (12 + 100) * 10 + 34 + 0 = 1154
+        // unchangedCheck = 5 * 100 + 12 = 512
+        // TierWeights = { 50, 30, 15, 35 } -> weightSum = 130
+        // cctorCounts = 1 * 100 + 1 * 10 + 1 = 111
+        // Total = 20 + 1065 + 1154 + 512 + 130 + 111 = 2992
+        require(
+            std::holds_alternative<std::int64_t>(evalRes.value) &&
+                std::get<std::int64_t>(evalRes.value) == 2992,
+            "EvaluateSession expected 2992, got " +
+                std::to_string(std::get<std::int64_t>(evalRes.value)));
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -5042,8 +5686,12 @@ int main() {
         testRound3AuditFixesAndGodotUnityParity();
         std::cout << "[18/18] testRound4RoadmapP0ToP2All10Items..." << std::endl;
         testRound4RoadmapP0ToP2All10Items();
-        std::cout << "[19/19] testRound5DeepFixesAndAdvancedParity..." << std::endl;
+        std::cout << "[19/20] testRound5DeepFixesAndAdvancedParity..." << std::endl;
         testRound5DeepFixesAndAdvancedParity();
+        std::cout << "[20/21] testConstStaticAndUtilityClassCompleteness..." << std::endl;
+        testConstStaticAndUtilityClassCompleteness();
+        std::cout << "[21/21] testStaticConstructorsAndReadonlyFieldsCompleteness..." << std::endl;
+        testStaticConstructorsAndReadonlyFieldsCompleteness();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

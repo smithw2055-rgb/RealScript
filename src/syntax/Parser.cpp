@@ -359,7 +359,11 @@ FieldDeclarationSyntax Parser::parseFieldDeclaration(
     result.identifierToken = std::move(identifier);
     if (current().kind == SyntaxKind::EqualsToken) {
         result.equalsToken = nextToken();
-        result.initializer = parseExpression();
+        if (result.type.isArray() && current().kind == SyntaxKind::OpenBraceToken) {
+            result.initializer = parseBraceArrayInitializer(result.type);
+        } else {
+            result.initializer = parseExpression();
+        }
     }
     result.semicolonToken = match(SyntaxKind::SemicolonToken);
     return result;
@@ -631,7 +635,7 @@ ClassDeclarationSyntax Parser::parseClassDeclaration(
         if (!isStatic && current().kind == SyntaxKind::SequenceKeyword) {
             result.sequences.push_back(parseSequenceDeclaration(
                 std::move(memberAttributes), std::move(memberModifiers)));
-        } else if (!isStatic && current().kind == SyntaxKind::IdentifierToken &&
+        } else if (current().kind == SyntaxKind::IdentifierToken &&
             current().text == typeName && peek(1).kind == SyntaxKind::OpenParenToken) {
             result.constructors.push_back(parseConstructorDeclaration(
                 std::move(memberAttributes), std::move(memberModifiers)));
@@ -854,7 +858,7 @@ StructDeclarationSyntax Parser::parseStructDeclaration(
         if (!isStatic && current().kind == SyntaxKind::SequenceKeyword) {
             result.sequences.push_back(parseSequenceDeclaration(
                 std::move(memberAttributes), std::move(memberModifiers)));
-        } else if (!isStatic && current().kind == SyntaxKind::IdentifierToken &&
+        } else if (current().kind == SyntaxKind::IdentifierToken &&
             current().text == typeName && peek(1).kind == SyntaxKind::OpenParenToken) {
             result.constructors.push_back(parseConstructorDeclaration(
                 std::move(memberAttributes), std::move(memberModifiers)));
@@ -1629,7 +1633,12 @@ std::unique_ptr<StatementSyntax> Parser::parseVariableDeclarationStatement() {
         if (result->refKeyword && current().kind == SyntaxKind::RefKeyword) {
             result->initializerRefKeyword = nextToken();
         }
-        result->initializer = parseExpression();
+        if (!result->refKeyword && result->type.isArray() &&
+            current().kind == SyntaxKind::OpenBraceToken) {
+            result->initializer = parseBraceArrayInitializer(result->type);
+        } else {
+            result->initializer = parseExpression();
+        }
     }
     result->semicolonToken = match(SyntaxKind::SemicolonToken);
     return result;
@@ -1899,8 +1908,9 @@ std::unique_ptr<ExpressionSyntax> Parser::parseNewExpression() {
     const auto newKeyword = match(SyntaxKind::NewKeyword);
     auto type = parseType();
 
-    if (current().kind == SyntaxKind::OpenParenToken ||
-        current().kind == SyntaxKind::OpenBraceToken) {
+    if (!type.isArray() &&
+        (current().kind == SyntaxKind::OpenParenToken ||
+         current().kind == SyntaxKind::OpenBraceToken)) {
         auto result = std::make_unique<NewObjectExpressionSyntax>();
         result->newKeyword = newKeyword;
         result->type = std::move(type);
@@ -1958,11 +1968,82 @@ std::unique_ptr<ExpressionSyntax> Parser::parseNewExpression() {
 
     auto result = std::make_unique<NewArrayExpressionSyntax>();
     result->newKeyword = newKeyword;
-    result->elementType = std::move(type);
-    result->openBracketToken = match(SyntaxKind::OpenBracketToken);
-    result->length = parseExpression();
-    result->closeBracketToken = match(SyntaxKind::CloseBracketToken);
+    if (type.isArray()) {
+        result->openBracketToken = *type.openBracketToken;
+        result->closeBracketToken = *type.closeBracketToken;
+        type.openBracketToken.reset();
+        type.closeBracketToken.reset();
+        result->elementType = std::move(type);
+    } else {
+        result->elementType = std::move(type);
+        result->openBracketToken = match(SyntaxKind::OpenBracketToken);
+        if (current().kind != SyntaxKind::CloseBracketToken) {
+            result->length = parseExpression();
+            result->explicitLength = true;
+        }
+        result->closeBracketToken = match(SyntaxKind::CloseBracketToken);
+    }
+    if (current().kind == SyntaxKind::OpenBraceToken) {
+        result->initializerOpenBraceToken = nextToken();
+        while (current().kind != SyntaxKind::CloseBraceToken &&
+               current().kind != SyntaxKind::EndOfFileToken) {
+            result->initialValues.push_back(parseExpression());
+            if (current().kind != SyntaxKind::CommaToken) break;
+            result->initializerCommaTokens.push_back(nextToken());
+            if (current().kind == SyntaxKind::CloseBraceToken) break;
+        }
+        result->initializerCloseBraceToken = match(SyntaxKind::CloseBraceToken);
+    }
+    if (!result->length) {
+        if (!result->initializerOpenBraceToken) {
+            diagnostics_.report(
+                "RS1100",
+                "array creation must specify an array size or array initializer",
+                result->closeBracketToken.span);
+        }
+        auto lenLit = std::make_unique<LiteralExpressionSyntax>();
+        const auto countVal = static_cast<std::int64_t>(result->initialValues.size());
+        lenLit->literalToken = SyntaxToken{
+            SyntaxKind::IntegerLiteralToken,
+            result->closeBracketToken.span,
+            std::to_string(countVal),
+            countVal,
+            true};
+        result->length = std::move(lenLit);
+    }
     return result;
+}
+
+std::unique_ptr<NewArrayExpressionSyntax> Parser::parseBraceArrayInitializer(
+    const TypeSyntax& arrayType) {
+    auto arr = std::make_unique<NewArrayExpressionSyntax>();
+    arr->newKeyword = SyntaxToken{
+        SyntaxKind::NewKeyword, {current().span.start, 0}, "new", {}, true};
+    arr->elementType = arrayType;
+    arr->elementType.openBracketToken.reset();
+    arr->elementType.closeBracketToken.reset();
+    arr->openBracketToken = *arrayType.openBracketToken;
+    arr->closeBracketToken = *arrayType.closeBracketToken;
+    arr->initializerOpenBraceToken = nextToken();
+    while (current().kind != SyntaxKind::CloseBraceToken &&
+           current().kind != SyntaxKind::EndOfFileToken) {
+        arr->initialValues.push_back(parseExpression());
+        if (current().kind != SyntaxKind::CommaToken) break;
+        arr->initializerCommaTokens.push_back(nextToken());
+        if (current().kind == SyntaxKind::CloseBraceToken) break;
+    }
+    arr->initializerCloseBraceToken = match(SyntaxKind::CloseBraceToken);
+    auto lenLit = std::make_unique<LiteralExpressionSyntax>();
+    const auto countVal = static_cast<std::int64_t>(arr->initialValues.size());
+    lenLit->literalToken = SyntaxToken{
+        SyntaxKind::IntegerLiteralToken,
+        arr->initializerOpenBraceToken->span,
+        std::to_string(countVal),
+        countVal,
+        true};
+    arr->length = std::move(lenLit);
+    arr->explicitLength = false;
+    return arr;
 }
 
 std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {

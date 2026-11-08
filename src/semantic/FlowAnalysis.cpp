@@ -143,6 +143,7 @@ private:
                     analyzeExpression(*argument.value, assigned);
                 }
                 if (!argument.forwarded &&
+                    argument.targetKind == ReferenceTargetKind::Variable &&
                     (argument.modifier == ParameterModifier::Ref ||
                      argument.modifier == ParameterModifier::Out)) {
                     assigned.insert(argument.variable.index);
@@ -263,6 +264,19 @@ private:
             const auto& value = static_cast<const BoundMemberAssignmentExpression&>(expression);
             if (value.receiver) analyzeExpression(*value.receiver, assigned);
             analyzeExpression(*value.expression, assigned);
+            return;
+        }
+        case BoundNodeKind::StructFieldAccessExpression: {
+            const auto& value = static_cast<const BoundStructFieldAccessExpression&>(expression);
+            if (value.receiver) analyzeExpression(*value.receiver, assigned);
+            return;
+        }
+        case BoundNodeKind::StructFieldAssignmentExpression: {
+            const auto& value = static_cast<const BoundStructFieldAssignmentExpression&>(expression);
+            if (value.staticReceiverInitializer) {
+                analyzeExpression(*value.staticReceiverInitializer, assigned);
+            }
+            if (value.expression) analyzeExpression(*value.expression, assigned);
             return;
         }
         case BoundNodeKind::ArrayLengthExpression:

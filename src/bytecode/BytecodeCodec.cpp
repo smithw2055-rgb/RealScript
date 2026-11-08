@@ -640,6 +640,9 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         for (const auto& constructor : type.constructors) {
             addFunctionStrings(strings, constructor);
         }
+        if (type.staticConstructor) {
+            addFunctionStrings(strings, *type.staticConstructor);
+        }
         for (const auto& property : type.properties) {
             addPropertyStrings(strings, property);
         }
@@ -713,7 +716,12 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
                 ? InvalidIndex
                 : strings.indexOf(field.typeName));
             typeSection.u32(static_cast<std::uint32_t>(field.index));
-            typeSection.u8(field.synthetic ? 1 : 0);
+            std::uint8_t fieldFlags = 0;
+            if (field.synthetic) fieldFlags |= 0x01u;
+            if (field.staticField) fieldFlags |= 0x02u;
+            if (field.constField) fieldFlags |= 0x04u;
+            if (field.readonlyField) fieldFlags |= 0x08u;
+            typeSection.u8(fieldFlags);
         }
         typeSection.u32(static_cast<std::uint32_t>(type.enumMembers.size()));
         for (const auto& member : type.enumMembers) {
@@ -763,9 +771,12 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
             writeFunctionSymbol(objectModelSection, strings, method);
         }
         objectModelSection.u32(static_cast<std::uint32_t>(
-            type.constructors.size()));
+            type.constructors.size() + (type.staticConstructor ? 1u : 0u)));
         for (const auto& constructor : type.constructors) {
             writeFunctionSymbol(objectModelSection, strings, constructor);
+        }
+        if (type.staticConstructor) {
+            writeFunctionSymbol(objectModelSection, strings, *type.staticConstructor);
         }
         objectModelSection.u32(static_cast<std::uint32_t>(
             type.properties.size()));
@@ -1340,7 +1351,11 @@ bool decodeModule(
                     field.typeName = strings[typeNameIndex];
                 }
                 field.index = reader.u32();
-                field.synthetic = reader.u8() != 0;
+                const auto fieldFlags = reader.u8();
+                field.synthetic = (fieldFlags & 0x01u) != 0;
+                field.staticField = (fieldFlags & 0x02u) != 0;
+                field.constField = (fieldFlags & 0x04u) != 0;
+                field.readonlyField = (fieldFlags & 0x08u) != 0;
                 type.fields.push_back(std::move(field));
             }
             const auto enumCount = reader.u32();
@@ -1514,7 +1529,11 @@ bool decodeModule(
                         reader, strings, constructor, diagnostics)) {
                     return false;
                 }
-                type.constructors.push_back(std::move(constructor));
+                if (constructor.staticMethod) {
+                    type.staticConstructor = std::move(constructor);
+                } else {
+                    type.constructors.push_back(std::move(constructor));
+                }
             }
 
             const auto propertyCount = reader.u32();
@@ -1712,7 +1731,11 @@ bool decodeModule(
                 }
                 instruction.index = reader.u32();
                 const auto rawTypeIdx = reader.u32();
-                instruction.typeIndex = rawTypeIdx > 0xFFFFu ? 0xFFFFu : static_cast<std::uint16_t>(rawTypeIdx);
+                if (rawTypeIdx > 0xFFFFu) {
+                    diagnostics.report("RS5004", "instruction type index exceeds 16-bit limit", {});
+                    return false;
+                }
+                instruction.typeIndex = static_cast<std::uint16_t>(rawTypeIdx);
                 if (!decodeOptionalType(reader.u8(), instruction.elementType)) {
                     diagnostics.report("RS5004", "invalid instruction element type", {});
                     return false;
@@ -1759,8 +1782,12 @@ bool decodeModule(
             block.terminator.value = reader.u32();
             const auto rawTarget = reader.u32();
             const auto rawFalseTarget = reader.u32();
-            block.terminator.target = rawTarget > 0xFFFFu ? 0xFFFFu : static_cast<std::uint16_t>(rawTarget);
-            block.terminator.falseTarget = rawFalseTarget > 0xFFFFu ? 0xFFFFu : static_cast<std::uint16_t>(rawFalseTarget);
+            if (rawTarget > 0xFFFFu || rawFalseTarget > 0xFFFFu) {
+                diagnostics.report("RS5004", "terminator target block index exceeds 16-bit limit", {});
+                return false;
+            }
+            block.terminator.target = static_cast<std::uint16_t>(rawTarget);
+            block.terminator.falseTarget = static_cast<std::uint16_t>(rawFalseTarget);
             if (!readRegisters(reader, block.terminator.arguments) ||
                 !readRegisters(reader, block.terminator.falseArguments)) {
                 diagnostics.report("RS5003", "truncated bytecode terminator", {});

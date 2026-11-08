@@ -1252,6 +1252,10 @@ struct RuntimeStringPool {
         const auto id = static_cast<std::uint32_t>(entries.size());
         entries.emplace_back(text);
         const auto& stored = entries.back();
+        if (indexByView.size() > 262144u) {
+            indexByView.clear();
+            indexByView.emplace(entries.front(), 0u);
+        }
         indexByView.emplace(std::string_view(stored), id);
         StringValue sv;
         sv.id = id;
@@ -1775,13 +1779,9 @@ std::optional<Value> storeInlineStructField(
                     unpacked[i] = *existing;
                 }
             }
-            StructValue updated;
-            if (tryPackInlineStructFields(
-                    s->typeId,
-                    ValueSpan(unpacked.data(), s->inlineCount),
-                    updated)) {
-                return Value{updated};
-            }
+            return Value{makeStructValueFromFields(
+                s->typeId,
+                ValueSpan(unpacked.data(), s->inlineCount))};
         }
         return std::nullopt;
     }
