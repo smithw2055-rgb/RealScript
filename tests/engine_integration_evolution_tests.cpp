@@ -7610,6 +7610,173 @@ void testV2RoadmapP0SlicePoolAndRsbindEvolution() {
         "App.P0Test::runP0SquadTest must return 162");
 }
 
+void testV3NextStageFlatDoubleFieldsInlinerOverloadsAndHotReloadBreakpoints() {
+    using namespace realscript;
+
+    // 1. Verify FlatOpcode Double arithmetic + Object/Struct field fast paths & MIR -O2 auto-property/void-method inlining
+    {
+        const char* srcCode = R"RS(
+            module App.V3Perf;
+
+            public struct Vec2D {
+                public double x;
+                public double y;
+            }
+
+            public class Actor {
+                public double Speed { get; set; } = 2.5;
+                public int Bonus { get; set; } = 10;
+
+                public void AddBonus(int delta) {
+                    this.Bonus = this.Bonus + delta;
+                }
+            }
+
+            public double simulate(int steps) {
+                Actor a = new Actor();
+                a.AddBonus(5);
+                Vec2D pos = new Vec2D();
+                pos.x = 1.0;
+                pos.y = 2.0;
+                double dt = 0.5;
+                for (int i = 0; i < steps; i = i + 1) {
+                    pos.x = pos.x + a.Speed * dt;
+                    pos.y = pos.y + (double)a.Bonus * 0.1;
+                }
+                if (pos.x > 0.0 && pos.y >= 2.0 && pos.x <= 1000.0 && pos.y < 1000.0) {
+                    return pos.x + pos.y;
+                }
+                return -1.0;
+            }
+        )RS";
+
+        compiler::Compilation comp({{"v3_perf.rs", srcCode}});
+        auto build = comp.build();
+        require(!build.diagnostics.hasErrors(), "V3Perf source must compile");
+
+        diagnostics::DiagnosticBag optDiags;
+        optimization::Options optOpts;
+        optOpts.level = optimization::Level::Aggressive;
+        optOpts.enableInlining = true;
+        auto optRes = optimization::Optimizer{}.optimize(build.modules, optDiags, optOpts);
+        require(!optDiags.hasErrors(), "V3Perf MIR optimization must succeed");
+        require(
+            optRes.statistics.functionsInlined >= 3,
+            "MIR -O2 inliner must inline Actor.AddBonus (ReturnVoid + LoadField/StoreField), Actor.get_Speed, and Actor.get_Bonus");
+
+        bytecode::Lowerer lowerer;
+        std::vector<bytecode::Module> bcMods;
+        for (const auto& m : optRes.modules) bcMods.push_back(lowerer.lower(m));
+        runtime::Interpreter interp(std::move(bcMods));
+        const auto execRes = interp.invoke("App.V3Perf::simulate", {std::int64_t{4}});
+        require(execRes.succeeded, "App.V3Perf::simulate must succeed: " + execRes.error.message);
+        // initial pos=(1.0, 2.0); Speed=2.5, Bonus=15; per step: x += 1.25 (4 steps -> +5.0 = 6.0), y += 1.5 (4 steps -> +6.0 = 8.0) -> sum = 14.0
+        const double val = std::get<double>(execRes.value);
+        require(val > 13.999 && val < 14.001, "App.V3Perf::simulate expected 14.0");
+    }
+
+    // 2. Verify GameBindings & rsbind same-name constructor, method, and function overloading
+    {
+        const char* overloadHeader = R"CPP(
+            namespace game::units {
+            RS_EXPORT_CLASS("Game.Units")
+            class NativeP0Squad {
+            public:
+                RS_EXPORT_CONSTRUCTOR
+                NativeP0Squad();
+
+                RS_EXPORT_CONSTRUCTOR
+                NativeP0Squad(int id, const std::string& tag);
+
+                RS_EXPORT_CONSTRUCTOR
+                NativeP0Squad(int id, const std::vector<int>& scores);
+            };
+            }
+        )CPP";
+        const auto overloadGen = game::GameApi::generateBindingsFromCppHeader(overloadHeader, "Game.Units");
+        require(
+            overloadGen.constructorsExported == 3 &&
+            overloadGen.cppRegistrationSource.find("builder_NativeP0Squad.constructor<>(\"Create\")") != std::string::npos &&
+            overloadGen.cppRegistrationSource.find("builder_NativeP0Squad.constructor<int, const std::string&>(\"Create\")") != std::string::npos &&
+            overloadGen.cppRegistrationSource.find("builder_NativeP0Squad.constructor<int, const std::vector<int>&>(\"Create\")") != std::string::npos,
+            "rsbind must emit overloaded Create constructors when RS_EXPORT_CONSTRUCTOR has no explicit factory override");
+
+        game::GameApi api;
+        api.type<NativeP0Squad>("Game.Units", "NativeP0Squad")
+            .constructor<>("Create")
+            .constructor<int, const std::string&>("Create")
+            .constructor<int, const std::vector<int>&>("Create")
+            .staticMethod<&NativeP0Squad::ComputeBonus>("ComputeBonus")
+            .method<&NativeP0Squad::GetScaledScores>("GetScaledScores")
+            .property<&NativeP0Squad::GetId>("Id");
+        api.function("Game.Units", "EvalTag", [](int x) -> int { return x * 2; });
+        api.function("Game.Units", "EvalTag", [](int x, int y) -> int { return x + y; });
+        require(api.valid(), "GameApi with overloaded constructors and functions sharing the same name must be valid");
+
+        game::GameScriptCompiler compiler(api);
+        const auto compiled = compiler.compile({
+            {"v3_overload.rs", R"RS(
+                module App.V3Overload;
+                import Game.Units;
+
+                int runOverloadTest() {
+                    NativeP0Squad s0 = NativeP0Squad.Create();
+                    NativeP0Squad s1 = NativeP0Squad.Create(10, "Alpha");
+                    int[] arr = new int[2] { 4, 6 };
+                    NativeP0Squad s2 = NativeP0Squad.Create(20, arr);
+                    int f1 = EvalTag(5);
+                    int f2 = EvalTag(5, 7);
+                    return s0.Id + s1.Id + s2.Id + f1 + f2;
+                }
+            )RS"}
+        });
+        require(!compiled.diagnostics.hasErrors(), "Overloaded Create() and EvalTag() script must compile");
+        runtime::Interpreter interp(compiled.program.program(), api.heap());
+        interp.setBindingRegistry(api.bindings());
+        const auto res = interp.invoke("App.V3Overload::runOverloadTest");
+        require(res.succeeded && std::get<std::int64_t>(res.value) == 52, "runOverloadTest must return 0 + 10 + 20 + 10 + 12 = 52");
+    }
+
+    // 3. Verify DebugController hot-reload breakpoint requestedLine preservation (no downward drift & no spurious stopOnEntry re-trigger)
+    {
+        const char* v1Src = R"RS(module App.BpReload;
+public int calc(int x) {
+    // Line 3 is a comment in v1
+    // Line 4 is a comment in v1
+    int y = x + 10;
+    return y;
+}
+)RS";
+        const char* v2Src = R"RS(module App.BpReload;
+public int calc(int x) {
+    int y = x + 20;
+    return y;
+}
+)RS";
+        compiler::Compilation c1({{"bp_reload.rs", v1Src}});
+        auto b1 = c1.build();
+        bytecode::Lowerer lowerer;
+        std::vector<bytecode::Module> m1{lowerer.lower(b1.modules.front())};
+
+        debug::DebugController ctrl;
+        ctrl.stopOnEntry(true);
+        ctrl.bindModules(m1);
+        // Set breakpoint on line 3 (comment in v1 -> snaps to line 5 in v1)
+        const auto bpsV1 = ctrl.setBreakpoints("bp_reload.rs", {{2, 0}}); // 0-based line 2 = 1-based line 3
+        require(bpsV1.size() == 1 && bpsV1[0].verified && bpsV1[0].line == 4 && bpsV1[0].requestedLine == 2,
+            "v1 breakpoint requested at 0-based line 2 must snap to 0-based line 4 while preserving requestedLine == 2");
+
+        // Now hot-reload v2 where 0-based line 2 has executable code `int y = x + 20;`
+        compiler::Compilation c2({{"bp_reload.rs", v2Src}});
+        auto b2 = c2.build();
+        std::vector<bytecode::Module> m2{lowerer.lower(b2.modules.front())};
+        ctrl.bindModules(m2);
+        const auto& bpsV2 = ctrl.breakpoints();
+        require(bpsV2.size() == 1 && bpsV2[0].verified && bpsV2[0].line == 2,
+            "After hot-reload to v2, breakpoint must snap back to requestedLine (0-based line 2) instead of drifting");
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -7670,8 +7837,10 @@ int main() {
         testRemediationPhaseCP2Items();
         std::cout << "[29/30] testAuditFixesMultiInterfaceConversionsAndAotSourceMap..." << std::endl;
         testAuditFixesMultiInterfaceConversionsAndAotSourceMap();
-        std::cout << "[30/30] testV2RoadmapP0SlicePoolAndRsbindEvolution..." << std::endl;
+        std::cout << "[30/31] testV2RoadmapP0SlicePoolAndRsbindEvolution..." << std::endl;
         testV2RoadmapP0SlicePoolAndRsbindEvolution();
+        std::cout << "[31/31] testV3NextStageFlatDoubleFieldsInlinerOverloadsAndHotReloadBreakpoints..." << std::endl;
+        testV3NextStageFlatDoubleFieldsInlinerOverloadsAndHotReloadBreakpoints();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

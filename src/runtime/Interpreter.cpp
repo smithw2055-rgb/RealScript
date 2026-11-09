@@ -3023,6 +3023,19 @@ bool executeFunction(
             &&L_CallDirect2,
             &&L_CallDirectN,
             &&L_CallPolledFast,
+            &&L_ConstantDouble,
+            &&L_AddDouble,
+            &&L_SubDouble,
+            &&L_MulDouble,
+            &&L_DivDouble,
+            &&L_LessDouble,
+            &&L_LessOrEqualDouble,
+            &&L_GreaterDouble,
+            &&L_GreaterOrEqualDouble,
+            &&L_LoadFieldFast,
+            &&L_StoreFieldFast,
+            &&L_LoadStructFieldFast,
+            &&L_StoreStructFieldFast,
             &&L_GenericBytecode,
             &&L_TermJumpNoArgs,
             &&L_TermBranchBoolNoArgs,
@@ -3709,7 +3722,153 @@ bool executeFunction(
                 RS_FLAT_DISPATCH_NEXT();
             }
 
+            RS_FLAT_CASE(ConstantDouble) {
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = ip->bytecode->activeDoubleImmediate();
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(AddDouble) {
+                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
+                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
+                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = (*aPtr + *bPtr);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(SubDouble) {
+                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
+                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
+                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = (*aPtr - *bPtr);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(MulDouble) {
+                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
+                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
+                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = (*aPtr * *bPtr);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(DivDouble) {
+                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
+                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
+                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = (*aPtr / *bPtr);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(LessDouble) {
+                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
+                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
+                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = (*aPtr < *bPtr);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(LessOrEqualDouble) {
+                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
+                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
+                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = (*aPtr <= *bPtr);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(GreaterDouble) {
+                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
+                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
+                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = (*aPtr > *bPtr);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(GreaterOrEqualDouble) {
+                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
+                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
+                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = (*aPtr >= *bPtr);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(LoadFieldFast) {
+                const auto* ref = std::get_if<ObjectRef>(&frameBase[ip->src0Slot]);
+                if (RS_FLAT_LIKELY(ref != nullptr && ref->kind == ObjectKind::Record && state.heap)) {
+                    const auto* type = typeDescriptor(*location.module, ip->aux1Slot);
+                    const auto actualTid = state.heap->objectTypeId(*ref);
+                    if (RS_FLAT_LIKELY(type && actualTid &&
+                        (*actualTid == type->id || runtimeAssignable(state, *actualTid, type->id)))) {
+                        if (auto val = state.heap->fieldGet(*ref, ip->aux0Slot);
+                            RS_FLAT_LIKELY(val.has_value() && valueType(*val) == type->fields[ip->aux0Slot].type)) {
+                            if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                            frameBase[ip->dstSlot] = std::move(*val);
+                            RS_FLAT_DISPATCH_NEXT();
+                        }
+                    }
+                }
+                goto L_FlatGenericFallback;
+            }
+
+            RS_FLAT_CASE(StoreFieldFast) {
+                const auto* ref = std::get_if<ObjectRef>(&frameBase[ip->src0Slot]);
+                if (RS_FLAT_LIKELY(ref != nullptr && ref->kind == ObjectKind::Record && state.heap)) {
+                    const auto* type = typeDescriptor(*location.module, ip->aux1Slot);
+                    const auto actualTid = state.heap->objectTypeId(*ref);
+                    if (RS_FLAT_LIKELY(type && actualTid &&
+                        (*actualTid == type->id || runtimeAssignable(state, *actualTid, type->id)))) {
+                        const auto& rhs = frameBase[ip->src1Slot];
+                        if (RS_FLAT_LIKELY(valueType(rhs) == type->fields[ip->aux0Slot].type &&
+                            state.heap->fieldSet(*ref, ip->aux0Slot, rhs, nullptr))) {
+                            if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                            RS_FLAT_DISPATCH_NEXT();
+                        }
+                    }
+                }
+                goto L_FlatGenericFallback;
+            }
+
+            RS_FLAT_CASE(LoadStructFieldFast) {
+                const auto* type = typeDescriptor(*location.module, ip->bytecode->typeIndex);
+                const auto& recv = frameBase[ip->src0Slot];
+                if (RS_FLAT_LIKELY(type != nullptr && structValueTypeId(recv) == type->id)) {
+                    if (auto inlinedField = loadInlineStructField(recv, ip->aux0Slot);
+                        RS_FLAT_LIKELY(inlinedField.has_value() &&
+                        valueType(*inlinedField) == type->fields[ip->aux0Slot].type)) {
+                        if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                        frameBase[ip->dstSlot] = std::move(*inlinedField);
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                }
+                goto L_FlatGenericFallback;
+            }
+
+            RS_FLAT_CASE(StoreStructFieldFast) {
+                const auto* type = typeDescriptor(*location.module, ip->bytecode->typeIndex);
+                const auto& recv = frameBase[ip->src0Slot];
+                const auto& rhs = frameBase[ip->src1Slot];
+                if (RS_FLAT_LIKELY(type != nullptr && structValueTypeId(recv) == type->id &&
+                    valueType(rhs) == type->fields[ip->aux0Slot].type)) {
+                    if (auto updated = storeInlineStructField(recv, ip->aux0Slot, rhs);
+                        RS_FLAT_LIKELY(updated.has_value())) {
+                        if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                        frameBase[ip->dstSlot] = std::move(*updated);
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                }
+                goto L_FlatGenericFallback;
+            }
+
             RS_FLAT_CASE(GenericBytecode) {
+            L_FlatGenericFallback:
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
                 const ValueWindow argWin{&state.values, frameOffset + execution->paramOffset, argCount};
@@ -3877,7 +4036,8 @@ L_FlatSuperFallback: {
             : static_cast<std::size_t>(ip->span);
         for (std::size_t k = 0; k < instSpan; ++k) {
             const auto& singleDec = blk.instructions[startIdx + k];
-            const bool ok = (singleDec.opcode == detail::QuickOpcode::Generic)
+            const bool ok = (singleDec.opcode == detail::QuickOpcode::Generic ||
+                             singleDec.opcode >= detail::QuickOpcode::ConstantDouble)
                 ? executeInstruction(state, *location.module, function, *singleDec.bytecode, argWin, locWin, regWin)
                 : executeQuickInstruction(state, *location.module, singleDec, argWin, locWin, regWin);
             frameBase = state.values.data() + frameOffset;
@@ -4053,7 +4213,8 @@ L_FlatError:
                     stepGcIfNeeded(state, executionSpan);
                 }
             } else if (decodedInstruction.opcode ==
-                    detail::QuickOpcode::Generic) {
+                    detail::QuickOpcode::Generic ||
+                    decodedInstruction.opcode >= detail::QuickOpcode::ConstantDouble) {
                 executed = executeInstruction(
                     state, *location.module, function, *decodedInstruction.bytecode,
                     argumentWindow, locals, registers);

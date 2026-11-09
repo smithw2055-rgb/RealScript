@@ -35,6 +35,53 @@
 
 namespace realscript::game {
 
+namespace detail {
+
+inline std::string parameterSignatureKey(
+    const std::vector<ParameterDeclaration>& parameters) {
+    std::string out = "(";
+    for (std::size_t i = 0; i < parameters.size(); ++i) {
+        if (i != 0) out += ",";
+        if (!parameters[i].type.moduleName.empty()) {
+            out += parameters[i].type.moduleName + "::";
+        }
+        out += parameters[i].type.sourceName;
+    }
+    out += ")";
+    return out;
+}
+
+inline std::string allocateOverloadNativeName(
+    const std::unordered_set<std::string>& bindingNames,
+    const std::string& moduleName,
+    const std::string& baseNativeName,
+    const std::vector<ParameterDeclaration>& parameters) {
+    if (bindingNames.find(moduleName + "::" + baseNativeName) == bindingNames.end()) {
+        return baseNativeName;
+    }
+    std::string suffix = "__ov" + std::to_string(parameters.size());
+    for (const auto& p : parameters) {
+        suffix += "_";
+        for (const char ch : p.type.sourceName) {
+            if ((ch >= 'a' && ch <= 'z') ||
+                (ch >= 'A' && ch <= 'Z') ||
+                (ch >= '0' && ch <= '9')) {
+                suffix.push_back(ch);
+            } else if (ch == '[') {
+                suffix += "Arr";
+            }
+        }
+    }
+    std::string candidate = baseNativeName + suffix;
+    std::size_t disambig = 2;
+    while (bindingNames.find(moduleName + "::" + candidate) != bindingNames.end()) {
+        candidate = baseNativeName + suffix + "_" + std::to_string(disambig++);
+    }
+    return candidate;
+}
+
+} // namespace detail
+
 class GameApi;
 
 template <typename T>
@@ -144,9 +191,10 @@ public:
             return false;
         }
 
-        const auto publicName = moduleName + "::" + name;
+        const auto publicName = moduleName + "::" + name +
+            detail::parameterSignatureKey(*parameters);
         if (!state_->declarationNames.insert(publicName).second) {
-            state_->errors.push_back("duplicate native declaration '" + publicName + "'");
+            state_->errors.push_back("duplicate native declaration '" + moduleName + "::" + name + "'");
             return false;
         }
 
@@ -158,7 +206,8 @@ public:
         }
         auto sharedCallable = std::make_shared<CallableType>(std::move(callable));
         auto state = state_;
-        const auto nativeName = "__rs_native_" + name;
+        const auto nativeName = detail::allocateOverloadNativeName(
+            state_->bindingNames, moduleName, "__rs_native_" + name, *parameters);
         const auto bindingName = moduleName + "::" + nativeName;
         if (!state_->bindingNames.insert(bindingName).second) {
             state_->errors.push_back("duplicate native binding '" + bindingName + "'");
@@ -271,9 +320,11 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::method(
         return *this;
     }
 
-    const auto publicName = type.moduleName + "::" + type.name + "." + name;
+    const auto publicName = type.moduleName + "::" + type.name + "." + name +
+        detail::parameterSignatureKey(*parameters);
     if (!state_->declarationNames.insert(publicName).second) {
-        state_->errors.push_back("duplicate native declaration '" + publicName + "'");
+        state_->errors.push_back(
+            "duplicate native declaration '" + type.moduleName + "::" + type.name + "." + name + "'");
         return *this;
     }
 
@@ -283,7 +334,8 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::method(
         detail::collectImports(module, parameter.type);
     }
     auto state = state_;
-    const auto nativeName = "__rs_native_" + type.name + "_" + name;
+    const auto nativeName = detail::allocateOverloadNativeName(
+        state_->bindingNames, type.moduleName, "__rs_native_" + type.name + "_" + name, *parameters);
     const auto bindingName = type.moduleName + "::" + nativeName;
     if (!state_->bindingNames.insert(bindingName).second) {
         state_->errors.push_back("duplicate native binding '" + bindingName + "'");
@@ -430,9 +482,11 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::constructor(
         return *this;
     }
 
-    const auto publicName = type.moduleName + "::" + type.name + "." + factoryName;
+    const auto publicName = type.moduleName + "::" + type.name + "." + factoryName +
+        detail::parameterSignatureKey(*parameters);
     if (!state_->declarationNames.insert(publicName).second) {
-        state_->errors.push_back("duplicate native constructor declaration '" + publicName + "'");
+        state_->errors.push_back(
+            "duplicate native constructor declaration '" + type.moduleName + "::" + type.name + "." + factoryName + "'");
         return *this;
     }
 
@@ -441,7 +495,8 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::constructor(
     for (const auto& parameter : *parameters) {
         detail::collectImports(module, parameter.type);
     }
-    const auto nativeName = "__rs_native_" + type.name + "_ctor_" + factoryName;
+    const auto nativeName = detail::allocateOverloadNativeName(
+        state_->bindingNames, type.moduleName, "__rs_native_" + type.name + "_ctor_" + factoryName, *parameters);
     const auto bindingName = type.moduleName + "::" + nativeName;
     if (!state_->bindingNames.insert(bindingName).second) {
         state_->errors.push_back("duplicate native constructor binding '" + bindingName + "'");

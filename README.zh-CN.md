@@ -30,8 +30,8 @@ RealScript 是一门面向现代 C++17 游戏引擎的嵌入式强类型脚本�
 |---|---|
 | 语言 | Module/import、重载、运算符重载、复合赋值、Class、`static class`、静态构造函数（`static T()`）、`readonly` 字段、自动属性初始化器（`public int Hp { get; set; } = 100;`）、单继承（含脚本类直接继承 C++ 绑定类型）、Interface、Virtual Dispatch、Delegate、Closure、Event、Generic、Collection、Enum、可变 Struct、Nullable、Boxing、Pattern、Initializer、灵活参数与结构化异常。 |
 | 控制流 | `if`、`while`、`for`、`foreach`、`do/while`、`switch`、Switch Expression、`break`、`continue`、`try/catch/finally`、确定性 `sequence`（`yield wait_ticks`、`wait_seconds`、`wait_event`、`wait_signal`、`wait_until`）与 `RealScript.Fiber` 协作式纤程。 |
-| 编译器 | Lexer、Parser、Binder、Flow Analysis、`[Deterministic]` 静态校验、稳定诊断、经过验证的多基本块 Typed MIR、自然循环 LICM 变量加载外提，以及 O0/O1/O2 优化。 |
-| 字节码 | 类型化寄存器 VM、统一扁平栈帧布局（Unified Flat Frame）、Computed-goto 线程化派发、24B 紧凑 `Value` 与 8B `Instruction`、32 位拓宽 `BytecodeString` 及无锁池、整数循环指令快化（Quickening）、确定性 `.rsbc` 0.9 输出、0.6–0.8 兼容读取、防御性验证和结构化脚本调用栈。 |
+| 编译器 | Lexer、Parser、Binder、Flow Analysis、`[Deterministic]` 静态校验、稳定诊断、经过验证的多基本块 Typed MIR、自然循环 LICM 变量加载外提、`-O2` 自动属性与 `void` 小函数内联，以及 O0/O1/O2 优化。 |
+| 字节码 | 类型化寄存器 VM、统一扁平栈帧布局（Unified Flat Frame）、Computed-goto 线程化派发（含 `double` 运算与对象/结构体字段读写 `FlatOpcode` 快路径）、24B 紧凑 `Value` 与 8B `Instruction`、32 位拓宽 `BytecodeString` 及无锁池、整数循环指令快化（Quickening）、确定性 `.rsbc` 0.9 输出、0.6–0.8 兼容读取、防御性验证和结构化脚本调用栈。 |
 | 内存 | 代际 ObjectRef、12B 内联结构体槽（`InlineStructSlot`）、HeapObject 小缓冲区优化（SBO）、`ValuePoolArena` 池化对象 GC 回收、精确根、带阴影栈保护的增量 Mark/Sweep GC 步进、写屏障、有界 GC Work、Snapshot、Retaining Path 和泄漏诊断。 |
 | 原生执行 | 确定性 C++17 AOT、零预算 Trusted Release AOT（`--trusted-release`）、`#line` 源码行号映射指令、自定义 `struct` 栈标量化（`AotStruct_<id>`）、AVX2/SIMD 向量化 ECS 循环重构（`__restrict` + `#pragma loop(ivdep)`）、C11 Module Query ABI、Source Map、类型化 Native Thunk、原生快速路径与对象标识缓存（Identity Cache）、可选工具链 JIT、内容寻址缓存与 Interpreter/JIT/AOT 分层执行。 |
 | 确定性 | Off/Strict/Record/Replay、指令/递归/分配/堆预算、Mod 能力沙箱（Capability Sandboxing）、稳定 Digest、外部调用回放与跨后端差分验证。 |

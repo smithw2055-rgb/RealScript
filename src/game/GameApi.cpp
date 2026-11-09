@@ -982,9 +982,7 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
             if (isCtor) {
                 retCpp = currentClass;
                 fnName = ctorFactoryOverride.empty()
-                    ? (currentClassCtorCount == 0
-                        ? std::string("Create")
-                        : ("Create" + std::to_string(currentClassCtorCount + 1)))
+                    ? std::string("Create")
                     : ctorFactoryOverride;
                 ++currentClassCtorCount;
                 isStaticMethod = true;

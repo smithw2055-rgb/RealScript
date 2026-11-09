@@ -661,6 +661,7 @@ void DebugController::bindProgram(const runtime::ProgramImage& program) {
 
 void DebugController::bindModules(const std::vector<bytecode::Module>& modules) {
     std::lock_guard<std::mutex> lock(mutex_);
+    const bool hadModulesBefore = !executableLocations_.empty();
     executableLocations_.clear();
     types_.clear();
     for (const auto& module : modules) {
@@ -704,8 +705,10 @@ void DebugController::bindModules(const std::vector<bytecode::Module>& modules) 
             }
         }
         if (found == executableLocations_.end()) continue;
+        const std::size_t targetLine =
+            breakpoint.requestedLine != 0 ? breakpoint.requestedLine : breakpoint.line;
         const auto location = std::lower_bound(
-            found->second.begin(), found->second.end(), breakpoint.line,
+            found->second.begin(), found->second.end(), targetLine,
             [](const BoundLocation& value, std::size_t line) {
                 return value.line < line;
             });
@@ -715,7 +718,9 @@ void DebugController::bindModules(const std::vector<bytecode::Module>& modules) 
             breakpoint.verified = true;
         }
     }
-    entryPending_ = stopOnEntry_;
+    if (!hadModulesBefore) {
+        entryPending_ = stopOnEntry_;
+    }
 }
 
 std::vector<Breakpoint> DebugController::setBreakpoints(
@@ -759,6 +764,8 @@ std::vector<Breakpoint> DebugController::setConditionalBreakpoints(
         breakpoint.sourcePath = sourcePath;
         breakpoint.line = spec.position.line;
         breakpoint.column = spec.position.column;
+        breakpoint.requestedLine = spec.position.line;
+        breakpoint.requestedColumn = spec.position.column;
         breakpoint.condition = spec.condition;
         if (executable != executableLocations_.end()) {
             const auto exact = std::lower_bound(
@@ -1543,6 +1550,11 @@ void DebugSession::rebindProgram(std::shared_ptr<const runtime::ProgramImage> pr
     if (program_ && controller_) {
         controller_->bindProgram(*program_);
     }
+}
+
+std::shared_ptr<const runtime::ProgramImage> DebugSession::program() const noexcept {
+    std::lock_guard<std::mutex> lock(sessionMutex_);
+    return program_;
 }
 
 bool DebugSession::isAttached() const noexcept {

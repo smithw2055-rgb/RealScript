@@ -996,6 +996,10 @@ bool isInlineSafeInstruction(const mir::Instruction& inst) noexcept {
     case mir::Opcode::NewStruct:
     case mir::Opcode::LoadStructField:
     case mir::Opcode::StoreStructField:
+    case mir::Opcode::CheckNotNull:
+    case mir::Opcode::LoadField:
+    case mir::Opcode::StoreField:
+    case mir::Opcode::ConvertNumeric:
     case mir::Opcode::Parameter:
     case mir::Opcode::LoadLocal:
     case mir::Opcode::StoreLocal:
@@ -1038,11 +1042,15 @@ bool inlineSmallFunctions(
     std::unordered_map<semantic::SymbolId, const mir::Function*> inlineCandidates;
     for (const auto& func : module.functions) {
         if (func.blocks.size() != 1 ||
-            !func.exceptionHandlers.empty()) {
+            !func.exceptionHandlers.empty() ||
+            func.name.find("..ctor") != std::string::npos ||
+            func.name.find("..cctor") != std::string::npos ||
+            func.name.find("$") != std::string::npos) {
             continue;
         }
         const auto& entry = func.blocks.front();
-        if (entry.terminator.kind != mir::TerminatorKind::ReturnValue ||
+        if ((entry.terminator.kind != mir::TerminatorKind::ReturnValue &&
+             entry.terminator.kind != mir::TerminatorKind::ReturnVoid) ||
             entry.instructions.size() > options.maxInlineInstructions ||
             !entry.parameters.empty()) {
             continue;
@@ -1064,18 +1072,18 @@ bool inlineSmallFunctions(
     for (auto& caller : module.functions) {
         mir::ValueId nextId = findMaxValueId(caller) + 1;
         bool callerChanged = false;
+        std::unordered_map<mir::ValueId, mir::ValueId> replacements;
+        const auto resolveVal = [&](mir::ValueId v) {
+            while (v >= 0) {
+                const auto it = replacements.find(v);
+                if (it == replacements.end() || it->second == v) break;
+                v = it->second;
+            }
+            return v;
+        };
         for (auto& block : caller.blocks) {
             std::vector<mir::Instruction> expanded;
             expanded.reserve(block.instructions.size());
-            std::unordered_map<mir::ValueId, mir::ValueId> replacements;
-            const auto resolveVal = [&](mir::ValueId v) {
-                while (v >= 0) {
-                    const auto it = replacements.find(v);
-                    if (it == replacements.end() || it->second == v) break;
-                    v = it->second;
-                }
-                return v;
-            };
             for (auto& inst : block.instructions) {
                 for (auto& op : inst.operands) op = resolveVal(op);
                 if (inst.opcode == mir::Opcode::Call &&
@@ -1140,29 +1148,46 @@ bool inlineSmallFunctions(
                             }
                             stagedClones.push_back(std::move(cloned));
                         }
-                        const auto retVal = calleeBlock.terminator.value;
-                        const auto mappedRet = valueMap.find(retVal);
-                        if (inlineOk && mappedRet != valueMap.end()) {
-                            for (auto& sc : stagedClones) {
-                                expanded.push_back(std::move(sc));
+                        if (calleeBlock.terminator.kind == mir::TerminatorKind::ReturnVoid) {
+                            if (inlineOk && inst.resultType == semantic::PrimitiveType::Void) {
+                                for (auto& sc : stagedClones) {
+                                    expanded.push_back(std::move(sc));
+                                }
+                                ++statistics.functionsInlined;
+                                callerChanged = true;
+                                anyInlined = true;
+                                continue;
                             }
-                            replacements[inst.result] = mappedRet->second;
-                            ++statistics.functionsInlined;
-                            callerChanged = true;
-                            anyInlined = true;
-                            continue;
+                        } else {
+                            const auto retVal = calleeBlock.terminator.value;
+                            const auto mappedRet = valueMap.find(retVal);
+                            if (inlineOk && mappedRet != valueMap.end()) {
+                                for (auto& sc : stagedClones) {
+                                    expanded.push_back(std::move(sc));
+                                }
+                                replacements[inst.result] = mappedRet->second;
+                                ++statistics.functionsInlined;
+                                callerChanged = true;
+                                anyInlined = true;
+                                continue;
+                            }
                         }
                     }
                 }
                 expanded.push_back(std::move(inst));
             }
-            if (!replacements.empty()) {
+            block.instructions = std::move(expanded);
+        }
+        if (!replacements.empty()) {
+            for (auto& block : caller.blocks) {
+                for (auto& inst : block.instructions) {
+                    for (auto& op : inst.operands) op = resolveVal(op);
+                }
                 block.terminator.condition = resolveVal(block.terminator.condition);
                 block.terminator.value = resolveVal(block.terminator.value);
                 for (auto& arg : block.terminator.arguments) arg = resolveVal(arg);
                 for (auto& arg : block.terminator.falseArguments) arg = resolveVal(arg);
             }
-            block.instructions = std::move(expanded);
         }
         if (callerChanged) {
             compactValueIds(caller);

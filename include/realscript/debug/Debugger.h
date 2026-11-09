@@ -46,6 +46,8 @@ struct Breakpoint {
     std::size_t column = 0;
     bool verified = false;
     std::string condition;
+    std::size_t requestedLine = 0;
+    std::size_t requestedColumn = 0;
 };
 
 struct DebugVariable {
@@ -243,6 +245,7 @@ public:
     bool attach(bool stopOnEntry = false);
     void detach();
     void rebindProgram(std::shared_ptr<const runtime::ProgramImage> program);
+    [[nodiscard]] std::shared_ptr<const runtime::ProgramImage> program() const noexcept;
     [[nodiscard]] bool isAttached() const noexcept;
     [[nodiscard]] bool waitForStop(
         std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
