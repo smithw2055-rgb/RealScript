@@ -159,10 +159,16 @@ std::string attributeValueText(
     const syntax::AttributeArgumentSyntax& argument,
     const text::SourceText& source) {
     const auto span = argument.valueSpan();
-    if (span.empty()) {
+    if (span.empty() || argument.valueTokens.empty()) {
         return std::string{};
     }
-    if (span.start + span.length <= source.size()) {
+    const auto& firstTok = argument.valueTokens.front();
+    const auto& lastTok = argument.valueTokens.back();
+    if (span.start + span.length <= source.size() &&
+        firstTok.span.start + firstTok.span.length <= source.size() &&
+        lastTok.span.start + lastTok.span.length <= source.size() &&
+        source.view(firstTok.span) == firstTok.text &&
+        source.view(lastTok.span) == lastTok.text) {
         return std::string(source.view(span));
     }
     std::string fallback;

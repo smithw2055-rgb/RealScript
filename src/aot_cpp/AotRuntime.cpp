@@ -755,6 +755,7 @@ bool ExecutionContext::invoke(
     emitTrace(runtime::TraceEventKind::FunctionEnter);
 
     bool succeeded = false;
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
     try {
         succeeded = function->implementation(
             *this,
@@ -771,6 +772,13 @@ bool ExecutionContext::invoke(
         succeeded = fail(runtime::ErrorCode::InvalidProgram,
             "AOT execution threw an unknown exception");
     }
+#else
+    succeeded = function->implementation(
+        *this,
+        arguments,
+        argumentCount,
+        result);
+#endif
     if (!succeeded) {
         if (!stack_.empty()) stack_.pop_back();
         if (!stackSites_.empty()) stackSites_.pop_back();
@@ -1113,14 +1121,30 @@ bool ExecutionContext::combineDelegates(
         const auto* flags = flagsValue
             ? std::get_if<std::int64_t>(&*flagsValue)
             : nullptr;
+        const std::int64_t baseFlags = flags
+            ? (*flags & ~runtime::ManagedHeap::DelegateWeakTargetFlag)
+            : -1;
+        const bool isWeakTarget = flags &&
+            ((*flags & runtime::ManagedHeap::DelegateWeakTargetFlag) != 0);
         if (!reference || !type || *type != delegateTypeId ||
             heap_->fieldCount(*reference) != 8u || !flags ||
-            *flags < 0 || *flags > 4) {
+            baseFlags < 0 || baseFlags > 4) {
             return fail(
                 runtime::ErrorCode::InvalidProgram,
                 "AOT delegate invocation-list metadata is corrupt");
         }
-        if (*flags != 4) {
+        if (baseFlags != 4) {
+            if (isWeakTarget) {
+                const auto targetVal = heap_->fieldGet(*reference, 0u);
+                if (targetVal) {
+                    if (const auto* targetRef =
+                            std::get_if<runtime::ObjectRef>(&*targetVal)) {
+                        if (!heap_->isAlive(*targetRef)) {
+                            return true;
+                        }
+                    }
+                }
+            }
             leaves.push_back(value);
             return true;
         }
@@ -1235,56 +1259,11 @@ bool ExecutionContext::invokeDelegate(
             runtime::ErrorCode::TypeMismatch,
             "AOT delegate invocation received an incompatible value");
     }
-    const auto rootFlagsValue = heap_->fieldGet(*delegateRef, 3u);
-    const auto* rootFlags = rootFlagsValue
-        ? std::get_if<std::int64_t>(&*rootFlagsValue)
-        : nullptr;
-    if (rootFlags && *rootFlags == 4) {
-        std::vector<runtime::Value> leaves;
-        const auto flatten = [&](const auto& self,
-                                 const runtime::Value& value,
-                                 std::size_t depth) -> bool {
-            if (depth > 1024) return false;
-            const auto* reference =
-                std::get_if<runtime::ObjectRef>(&value);
-            const auto flagsValue = reference
-                ? heap_->fieldGet(*reference, 3u)
-                : std::optional<runtime::Value>{};
-            const auto* flags = flagsValue
-                ? std::get_if<std::int64_t>(&*flagsValue)
-                : nullptr;
-            if (!reference || !flags) return false;
-            if (*flags != 4) {
-                leaves.push_back(value);
-                return true;
-            }
-            const auto first = heap_->fieldGet(*reference, 0u);
-            const auto second = heap_->fieldGet(*reference, 7u);
-            return first && second &&
-                self(self, *first, depth + 1) &&
-                self(self, *second, depth + 1);
-        };
-        if (!flatten(flatten, arguments[0], 0)) {
-            return fail(
-                runtime::ErrorCode::InvalidProgram,
-                "AOT delegate invocation list is corrupt");
-        }
-        std::vector<runtime::Value> nested(
-            arguments, arguments + argumentCount);
-        for (const auto& leaf : leaves) {
-            nested[0] = leaf;
-            if (!consume("invoke.delegate")) return false;
-            if (!invokeDelegate(
-                    delegateTypeId, nested.data(), nested.size(), result)) {
-                return false;
-            }
-        }
-        return true;
-    }
-    const auto readId = [&](std::size_t lowIndex,
-                            semantic::SymbolId& value) {
-        const auto low = heap_->fieldGet(*delegateRef, lowIndex);
-        const auto high = heap_->fieldGet(*delegateRef, lowIndex + 1u);
+    const auto readIdFromRef = [&](runtime::ObjectRef ref,
+                                   std::size_t lowIndex,
+                                   semantic::SymbolId& value) {
+        const auto low = heap_->fieldGet(ref, lowIndex);
+        const auto high = heap_->fieldGet(ref, lowIndex + 1u);
         const auto* lowValue = low
             ? std::get_if<std::int64_t>(&*low)
             : nullptr;
@@ -1303,6 +1282,109 @@ bool ExecutionContext::invokeDelegate(
                 static_cast<std::uint32_t>(*highValue)) << 32u);
         return true;
     };
+    const auto readId = [&](std::size_t lowIndex,
+                            semantic::SymbolId& value) {
+        return readIdFromRef(*delegateRef, lowIndex, value);
+    };
+    const auto rootFlagsValue = heap_->fieldGet(*delegateRef, 3u);
+    const auto* rootFlags = rootFlagsValue
+        ? std::get_if<std::int64_t>(&*rootFlagsValue)
+        : nullptr;
+    if (rootFlags &&
+        (*rootFlags & ~runtime::ManagedHeap::DelegateWeakTargetFlag) == 4) {
+        std::vector<runtime::Value> leaves;
+        std::optional<runtime::ObjectRef> anyLeafRef;
+        const auto flatten = [&](const auto& self,
+                                 const runtime::Value& value,
+                                 std::size_t depth) -> bool {
+            if (depth > 1024) return false;
+            const auto* reference =
+                std::get_if<runtime::ObjectRef>(&value);
+            const auto flagsValue = reference
+                ? heap_->fieldGet(*reference, 3u)
+                : std::optional<runtime::Value>{};
+            const auto* flags = flagsValue
+                ? std::get_if<std::int64_t>(&*flagsValue)
+                : nullptr;
+            if (!reference || !flags) return false;
+            const std::int64_t baseFlags =
+                *flags & ~runtime::ManagedHeap::DelegateWeakTargetFlag;
+            const bool isWeakTarget =
+                (*flags & runtime::ManagedHeap::DelegateWeakTargetFlag) != 0;
+            if (baseFlags < 0 || baseFlags > 4) return false;
+            if (baseFlags != 4) {
+                if (!anyLeafRef) {
+                    anyLeafRef = *reference;
+                }
+                if (isWeakTarget) {
+                    const auto targetVal = heap_->fieldGet(*reference, 0u);
+                    if (targetVal) {
+                        if (const auto* targetRef =
+                                std::get_if<runtime::ObjectRef>(&*targetVal)) {
+                            if (!heap_->isAlive(*targetRef)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                leaves.push_back(value);
+                return true;
+            }
+            const auto first = heap_->fieldGet(*reference, 0u);
+            const auto second = heap_->fieldGet(*reference, 7u);
+            return first && second &&
+                self(self, *first, depth + 1) &&
+                self(self, *second, depth + 1);
+        };
+        if (!flatten(flatten, arguments[0], 0)) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT delegate invocation list is corrupt");
+        }
+        std::vector<runtime::Value> nested(
+            arguments, arguments + argumentCount);
+        bool hasResult = false;
+        for (const auto& leaf : leaves) {
+            if (const auto* leafRef = std::get_if<runtime::ObjectRef>(&leaf)) {
+                const auto leafFlagsVal = heap_->fieldGet(*leafRef, 3u);
+                const auto* leafFlags = leafFlagsVal
+                    ? std::get_if<std::int64_t>(&*leafFlagsVal)
+                    : nullptr;
+                if (leafFlags &&
+                    (*leafFlags & runtime::ManagedHeap::DelegateWeakTargetFlag) != 0) {
+                    const auto leafTarget = heap_->fieldGet(*leafRef, 0u);
+                    if (leafTarget) {
+                        if (const auto* targetRef =
+                                std::get_if<runtime::ObjectRef>(&*leafTarget)) {
+                            if (!heap_->isAlive(*targetRef)) {
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            nested[0] = leaf;
+            if (!consume("invoke.delegate")) return false;
+            runtime::Value leafResult;
+            if (!invokeDelegate(
+                    delegateTypeId, nested.data(), nested.size(), leafResult)) {
+                return false;
+            }
+            result = std::move(leafResult);
+            hasResult = true;
+        }
+        if (!hasResult) {
+            semantic::SymbolId fallbackFnId = 0;
+            if (anyLeafRef && readIdFromRef(*anyLeafRef, 1u, fallbackFnId)) {
+                if (const auto* fn = findFunction(fallbackFnId)) {
+                    result = defaultValue(fn->returnType, fn->returnTypeId);
+                    return true;
+                }
+            }
+            result = runtime::Value{};
+        }
+        return true;
+    }
     semantic::SymbolId targetSymbolId = 0;
     if (!readId(1u, targetSymbolId)) {
         return fail(
@@ -1318,12 +1400,28 @@ bool ExecutionContext::invokeDelegate(
     const auto* slot = slotValue
         ? std::get_if<std::int64_t>(&*slotValue)
         : nullptr;
-    if (!target || !flags || !slot || *flags < 0 || *flags > 3 ||
+    const std::int64_t dispatchFlags = flags
+        ? (*flags & ~runtime::ManagedHeap::DelegateWeakTargetFlag)
+        : -1;
+    const bool isWeakTarget = flags &&
+        ((*flags & runtime::ManagedHeap::DelegateWeakTargetFlag) != 0);
+    if (!target || !flags || !slot || dispatchFlags < 0 || dispatchFlags > 3 ||
         *slot < 0 ||
         *slot > std::numeric_limits<std::uint32_t>::max()) {
         return fail(
             runtime::ErrorCode::InvalidProgram,
             "AOT delegate dispatch metadata is corrupt");
+    }
+    if (isWeakTarget) {
+        if (const auto* targetRef = std::get_if<runtime::ObjectRef>(&*target)) {
+            if (!heap_->isAlive(*targetRef)) {
+                const auto* fn = findFunction(targetSymbolId);
+                result = fn
+                    ? defaultValue(fn->returnType, fn->returnTypeId)
+                    : runtime::Value{};
+                return true;
+            }
+        }
     }
     std::vector<runtime::Value> values;
     if (argumentCount > 1) {
@@ -1332,8 +1430,8 @@ bool ExecutionContext::invokeDelegate(
     if (!std::holds_alternative<runtime::NullObject>(*target)) {
         values.insert(values.begin(), *target);
     }
-    const bool virtualDispatch = (*flags & 1) != 0;
-    const bool interfaceDispatch = (*flags & 2) != 0;
+    const bool virtualDispatch = (dispatchFlags & 1) != 0;
+    const bool interfaceDispatch = (dispatchFlags & 2) != 0;
     if (virtualDispatch && interfaceDispatch) {
         return fail(
             runtime::ErrorCode::InvalidProgram,

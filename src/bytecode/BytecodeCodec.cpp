@@ -2019,6 +2019,69 @@ bool decodeModule(
             return false;
         }
     }
+
+    if (!module.languageMetadata.attributes.empty()) {
+        std::unordered_map<std::string, bool> observableTargets;
+        for (const auto& attr : module.languageMetadata.attributes) {
+            if (attr.name == "Observable" || attr.name == "ObservableAttribute") {
+                observableTargets[attr.target] = true;
+            }
+        }
+        if (!observableTargets.empty()) {
+            for (auto& type : module.types) {
+                if (type.kind != semantic::TypeKind::Class) continue;
+                const std::string typeTarget = semantic::canonicalTypeName(type);
+                type.observable = observableTargets.find(typeTarget) != observableTargets.end();
+                type.nextObservableBitIndex = 0;
+                for (auto& prop : type.properties) {
+                    const std::string ownerTarget = prop.declaringTypeName.empty()
+                        ? typeTarget
+                        : prop.declaringTypeName;
+                    const bool ownerObservable =
+                        observableTargets.find(ownerTarget) != observableTargets.end();
+                    prop.observable = !prop.staticProperty &&
+                        (ownerObservable ||
+                         observableTargets.find(ownerTarget + "::property:" + prop.name) !=
+                             observableTargets.end());
+                    prop.observableBitIndex = 0xFFu;
+                }
+                for (auto& field : type.fields) {
+                    const std::string ownerTarget = field.declaringTypeName.empty()
+                        ? typeTarget
+                        : field.declaringTypeName;
+                    const bool ownerObservable =
+                        observableTargets.find(ownerTarget) != observableTargets.end();
+                    semantic::PropertySymbol* backedProperty = nullptr;
+                    for (auto& prop : type.properties) {
+                        if (prop.backingFieldIndex == field.index) {
+                            backedProperty = &prop;
+                            break;
+                        }
+                    }
+                    if (backedProperty) {
+                        field.observable = backedProperty->observable;
+                    } else if (!field.synthetic) {
+                        field.observable = !field.staticField && !field.constField &&
+                            (ownerObservable ||
+                             observableTargets.find(ownerTarget + "::field:" + field.name) !=
+                                 observableTargets.end());
+                    } else {
+                        field.observable = false;
+                    }
+                    if (field.observable) {
+                        field.observableBitIndex = (type.nextObservableBitIndex < 63u)
+                            ? type.nextObservableBitIndex++
+                            : 63u;
+                        if (backedProperty) {
+                            backedProperty->observableBitIndex = field.observableBitIndex;
+                        }
+                    } else {
+                        field.observableBitIndex = 0xFFu;
+                    }
+                }
+            }
+        }
+    }
     return true;
 }
 

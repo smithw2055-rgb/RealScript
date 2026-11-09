@@ -1016,6 +1016,7 @@ runtime::ExternalFunction makeNativeThunk(Result (*function)(Args...)) {
         const bytecode::FunctionReference&,
         runtime::ValueSpan arguments,
         runtime::RuntimeError& error) -> std::optional<runtime::Value> {
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
         try {
             return invokeNativeTypedImpl(
                 function,
@@ -1031,6 +1032,13 @@ runtime::ExternalFunction makeNativeThunk(Result (*function)(Args...)) {
             error.message = "native thunk threw an unknown exception";
             return std::nullopt;
         }
+#else
+        return invokeNativeTypedImpl(
+            function,
+            arguments,
+            error,
+            std::index_sequence_for<Args...>{});
+#endif
     };
 }
 

@@ -143,6 +143,29 @@ bool ExecutionDomainContext::writeObjectField(
             "CrossHeapWriteViolation: SimDeterministic domain cannot mutate UiHeap object directly");
         return false;
     }
+    if (const auto* valRef = std::get_if<ObjectRef>(&newValue)) {
+        if (targetHeap == simHeap_.get() && isUiObject(*valRef)) {
+            setDomainError(
+                error,
+                ErrorCode::CapabilityDenied,
+                "CrossHeapReferenceViolation: SimDeterministic heap object cannot hold a reference to a UiHeap object");
+            return false;
+        }
+        if (valRef->kind == ObjectKind::String &&
+            valRef->heapId != static_cast<std::uint32_t>(targetHeap->heapId())) {
+            if (const auto sv = stringViewAcrossDomains(*valRef)) {
+                const auto interned = targetHeap->internString(*sv, error);
+                if (!interned) return false;
+                newValue = Value{*interned};
+            } else {
+                setDomainError(
+                    error,
+                    ErrorCode::InvalidObjectReference,
+                    "cross-heap string reference is invalid or collected");
+                return false;
+            }
+        }
+    }
     if (const auto* sv = std::get_if<StringValue>(&newValue)) {
         const auto interned = targetHeap->internString(sv->str(), error);
         if (!interned) return false;
@@ -299,7 +322,30 @@ bool ExecutionDomainContext::writePropertySlotFast(
     }
 
     Value writeVal = value;
-    if (const auto* sv = std::get_if<StringValue>(&value)) {
+    if (const auto* valRef = std::get_if<ObjectRef>(&writeVal)) {
+        if (targetHeap == simHeap_.get() && isUiObject(*valRef)) {
+            setDomainError(
+                error,
+                ErrorCode::CapabilityDenied,
+                "CrossHeapReferenceViolation: SimDeterministic heap object cannot hold a reference to a UiHeap object");
+            return false;
+        }
+        if (valRef->kind == ObjectKind::String &&
+            valRef->heapId != static_cast<std::uint32_t>(targetHeap->heapId())) {
+            if (const auto sv = stringViewAcrossDomains(*valRef)) {
+                const auto interned = targetHeap->internString(*sv, error);
+                if (!interned) return false;
+                writeVal = Value{*interned};
+            } else {
+                setDomainError(
+                    error,
+                    ErrorCode::InvalidObjectReference,
+                    "cross-heap string reference is invalid or collected");
+                return false;
+            }
+        }
+    }
+    if (const auto* sv = std::get_if<StringValue>(&writeVal)) {
         const auto interned = targetHeap->internString(sv->str(), error);
         if (!interned) return false;
         writeVal = Value{*interned};

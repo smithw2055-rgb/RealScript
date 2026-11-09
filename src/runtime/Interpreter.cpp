@@ -2313,19 +2313,50 @@ bool executeInstruction(
             return fail(state, ErrorCode::TypeMismatch,
                 "delegate invocation received an incompatible value");
         }
+        const semantic::FunctionSymbol* invoke = nullptr;
+        for (const auto& method : type->methods) {
+            if (method.name == "Invoke") {
+                invoke = &method;
+                break;
+            }
+        }
+        if (!invoke || invoke->parameters.empty() ||
+            instruction.operands.size() != invoke->parameters.size()) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "delegate invocation signature is invalid");
+        }
         const auto rootFlagsValue = state.heap->fieldGet(
             *delegateRef, 3u);
         const auto* rootFlags = rootFlagsValue
             ? std::get_if<std::int64_t>(&*rootFlagsValue)
             : nullptr;
-        if (rootFlags && *rootFlags == 4) {
+        if (rootFlags &&
+            (*rootFlags & ~ManagedHeap::DelegateWeakTargetFlag) == 4) {
             std::vector<Value> leaves;
             if (!flattenDelegate(
                     state, type->id, *delegateValue, leaves)) {
                 return false;
             }
             Value lastResult;
+            bool hasResult = false;
             for (const auto& leaf : leaves) {
+                if (const auto* leafRef = std::get_if<ObjectRef>(&leaf)) {
+                    const auto leafFlagsVal = state.heap->fieldGet(*leafRef, 3u);
+                    const auto* leafFlags = leafFlagsVal
+                        ? std::get_if<std::int64_t>(&*leafFlagsVal)
+                        : nullptr;
+                    if (leafFlags &&
+                        (*leafFlags & ManagedHeap::DelegateWeakTargetFlag) != 0) {
+                        const auto leafTarget = state.heap->fieldGet(*leafRef, 0u);
+                        if (leafTarget) {
+                            if (const auto* targetRef = std::get_if<ObjectRef>(&*leafTarget)) {
+                                if (!state.heap->isAlive(*targetRef)) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
                 std::vector<Value> nestedRegisterValues;
                 nestedRegisterValues.reserve(registers.size());
                 for (std::size_t index = 0; index < registers.size(); ++index) {
@@ -2342,25 +2373,20 @@ bool executeInstruction(
                 if (instruction.result !=
                     bytecode::InvalidRegister) {
                     lastResult = nestedRegisters[instruction.result];
+                    hasResult = true;
                 }
             }
             if (instruction.result ==
                 bytecode::InvalidRegister) {
                 return true;
             }
-            return storeResult(std::move(lastResult));
-        }
-        const semantic::FunctionSymbol* invoke = nullptr;
-        for (const auto& method : type->methods) {
-            if (method.name == "Invoke") {
-                invoke = &method;
-                break;
+            if (!hasResult) {
+                lastResult = defaultValue(
+                    module,
+                    invoke->returnType,
+                    exactTypeId(invoke->returnType, invoke->returnTypeName));
             }
-        }
-        if (!invoke || invoke->parameters.empty() ||
-            instruction.operands.size() != invoke->parameters.size()) {
-            return fail(state, ErrorCode::InvalidProgram,
-                "delegate invocation signature is invalid");
+            return storeResult(std::move(lastResult));
         }
         std::vector<Value> delegateArguments;
         delegateArguments.reserve(instruction.operands.size());
