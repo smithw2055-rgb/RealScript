@@ -10,6 +10,7 @@ option(REALSCRIPT_BUILD_BENCHMARKS "Build RealScript performance benchmarks" OFF
 option(REALSCRIPT_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS "Run external C++ toolchain JIT integration tests" ON)
 option(REALSCRIPT_INSTALL_SDK "Generate installable RealScript SDK targets" ON)
+option(REALSCRIPT_SLIM_RUNTIME "Build slim RealScript AOT/VM runtime for Wasm/embedded targets" OFF)
 
 # v0.98 keeps one implementation archive so existing applications retain the
 # exact same link behavior. Productized component targets below provide a
@@ -90,6 +91,7 @@ function(realscript_add_component target export_name)
 endfunction()
 
 realscript_add_component(realscript_runtime Runtime)
+realscript_add_component(realscript_slim_runtime SlimRuntime)
 realscript_add_component(realscript_compiler Compiler)
 realscript_add_component(realscript_game_runtime GameRuntime)
 realscript_add_component(realscript_game_compiler GameCompiler)
@@ -640,6 +642,7 @@ if(REALSCRIPT_INSTALL_SDK)
         TARGETS
             realscript_frontend
             realscript_runtime
+            realscript_slim_runtime
             realscript_compiler
             realscript_game_runtime
             realscript_game_compiler

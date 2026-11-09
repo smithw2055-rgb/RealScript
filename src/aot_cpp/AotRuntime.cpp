@@ -149,6 +149,35 @@ std::int64_t signedFromBits(std::uint64_t bits) noexcept {
 
 } // namespace
 
+void registerAotProgramObservableTypes(
+    runtime::ManagedHeap& heap,
+    const ProgramDescriptor& program) {
+    if (!program.types || program.typeCount == 0) return;
+    for (std::uint32_t index = 0; index < program.typeCount; ++index) {
+        const auto& type = program.types[index];
+        if (type.kind != semantic::TypeKind::Class ||
+            type.fieldCount == 0 ||
+            !type.fields) {
+            continue;
+        }
+        bool hasAnyObservable = type.observable;
+        for (std::uint32_t f = 0; f < type.fieldCount; ++f) {
+            if (type.fields[f].observable || type.fields[f].observableBitIndex < 64u) {
+                hasAnyObservable = true;
+                break;
+            }
+        }
+        if (!hasAnyObservable) continue;
+        std::vector<std::uint8_t> bits(type.fieldCount, 0xFFu);
+        for (std::uint32_t f = 0; f < type.fieldCount; ++f) {
+            if (type.fields[f].observableBitIndex < 64u) {
+                bits[f] = static_cast<std::uint8_t>(type.fields[f].observableBitIndex);
+            }
+        }
+        heap.registerTypeObservableBits(type.id, std::move(bits));
+    }
+}
+
 FrameScope::FrameScope(
     ExecutionContext& context,
     const std::vector<runtime::Value>& arguments,
@@ -156,6 +185,15 @@ FrameScope::FrameScope(
     const std::vector<runtime::Value>& registers)
     : context_(&context) {
     context_->shadowStack().pushFrame(&arguments, &locals, &registers);
+}
+
+FrameScope::FrameScope(
+    ExecutionContext& context,
+    runtime::ValueSpan arguments,
+    runtime::ValueSpan locals,
+    runtime::ValueSpan registers)
+    : context_(&context) {
+    context_->shadowStack().pushSpanFrame(arguments, locals, registers);
 }
 
 FrameScope::~FrameScope() {
@@ -186,6 +224,9 @@ ExecutionContext::ExecutionContext(
           return std::move(options);
       }()),
       determinism_(options_.determinism) {
+    if (heap_) {
+        registerAotProgramObservableTypes(*heap_, program);
+    }
     traceEventsEnabled_ =
         options_.determinism.mode != runtime::DeterminismMode::Off ||
         options_.profile != nullptr || static_cast<bool>(options_.trace);
@@ -546,12 +587,42 @@ void ExecutionContext::reportUnhandledScriptException() {
     }
 }
 
+runtime::ManagedHeap* ExecutionContext::resolveHeap(
+    runtime::ObjectRef reference) const noexcept {
+    if (domainContext_) {
+        if (auto* h = domainContext_->heapForObject(reference)) {
+            return h;
+        }
+    }
+    return heap_.get();
+}
+
+runtime::Value ExecutionContext::sanitizeCrossHeapFieldValue(
+    runtime::ManagedHeap* sourceHeap,
+    runtime::Value value) {
+    if (sourceHeap && heap_ && sourceHeap != heap_.get()) {
+        if (const auto* strRef = std::get_if<runtime::ObjectRef>(&value)) {
+            if (strRef->kind == runtime::ObjectKind::String) {
+                if (const auto sv = sourceHeap->stringView(*strRef)) {
+                    runtime::RuntimeError err;
+                    if (const auto interned = heap_->internString(*sv, &err)) {
+                        return runtime::Value{*interned};
+                    }
+                    return runtime::Value{runtime::StringValue(std::string(*sv))};
+                }
+            }
+        }
+    }
+    return value;
+}
+
 bool ExecutionContext::expectType(
     const runtime::Value& value,
     semantic::PrimitiveType type,
     std::string_view context) {
     if (const auto* reference = std::get_if<runtime::ObjectRef>(&value)) {
-        if (!heap_ || !heap_->isAlive(*reference)) {
+        const auto* targetHeap = resolveHeap(*reference);
+        if (!targetHeap || !targetHeap->isAlive(*reference)) {
             return fail(
                 runtime::ErrorCode::InvalidObjectReference,
                 std::string(context) +
@@ -586,8 +657,9 @@ bool ExecutionContext::expectSignatureType(
             return true;
         }
         const auto* reference = std::get_if<runtime::ObjectRef>(&value);
-        const auto actual = reference && heap_
-            ? heap_->objectTypeId(*reference)
+        const auto* targetHeap = reference ? resolveHeap(*reference) : nullptr;
+        const auto actual = reference && targetHeap
+            ? targetHeap->objectTypeId(*reference)
             : std::optional<semantic::SymbolId>{};
         if (!actual || !isAssignable(*actual, typeId)) {
             return fail(
@@ -599,8 +671,9 @@ bool ExecutionContext::expectSignatureType(
             return true;
         }
         const auto* reference = std::get_if<runtime::ObjectRef>(&value);
-        const auto actual = reference && heap_
-            ? heap_->arrayTypeId(*reference)
+        const auto* targetHeap = reference ? resolveHeap(*reference) : nullptr;
+        const auto actual = reference && targetHeap
+            ? targetHeap->arrayTypeId(*reference)
             : std::optional<semantic::SymbolId>{};
         if (!actual || *actual != typeId) {
             return fail(
@@ -722,6 +795,28 @@ bool ExecutionContext::invoke(
                 "argument")) {
             return false;
         }
+    }
+
+    if (function->simCommand &&
+        domainContext_ != nullptr &&
+        domainKind_ == runtime::DomainKind::UiPresentation) {
+        runtime::SimCommandEnvelope envelope;
+        envelope.commandTypeId = function->symbolId;
+        std::size_t startIdx = 0;
+        if (argumentCount > 0 && std::holds_alternative<runtime::ObjectRef>(arguments[0])) {
+            const auto recvRef = std::get<runtime::ObjectRef>(arguments[0]);
+            if (recvRef.kind == runtime::ObjectKind::Record) {
+                envelope.targetObject = recvRef;
+                startIdx = 1;
+            }
+        }
+        envelope.payload.reserve(argumentCount - startIdx);
+        for (std::size_t i = startIdx; i < argumentCount; ++i) {
+            envelope.payload.push_back(arguments[i]);
+        }
+        domainContext_->enqueueSimCommand(std::move(envelope));
+        result = defaultValue(function->returnType, function->returnTypeId);
+        return true;
     }
 
     if (trustedReleaseEnabled()) {
@@ -1696,8 +1791,8 @@ bool ExecutionContext::arrayLengthFast(
     const runtime::Value& receiver,
     std::int64_t& result) {
     if (const auto* reference = std::get_if<runtime::ObjectRef>(&receiver)) {
-        if (heap_) {
-            if (const auto length = heap_->arrayLength(*reference)) {
+        if (const auto* targetHeap = resolveHeap(*reference)) {
+            if (const auto length = targetHeap->arrayLength(*reference)) {
                 if (*length <= static_cast<std::size_t>(INT32_MAX)) {
                     result = static_cast<std::int64_t>(*length);
                     return true;
@@ -1735,7 +1830,8 @@ bool ExecutionContext::loadElement(
     }
     const auto numericIndex = std::get<std::int64_t>(index);
     const auto reference = std::get<runtime::ObjectRef>(receiver);
-    const auto length = heap_->arrayLength(reference);
+    auto* targetHeap = resolveHeap(reference);
+    const auto length = targetHeap ? targetHeap->arrayLength(reference) : std::nullopt;
     if (!length) {
         return fail(
             runtime::ErrorCode::InvalidObjectReference,
@@ -1747,17 +1843,20 @@ bool ExecutionContext::loadElement(
             runtime::ErrorCode::IndexOutOfRange,
             "array element index is out of range");
     }
-    const auto actualType = heap_->arrayElementType(reference);
-    const auto actualTypeId = heap_->arrayElementTypeId(reference);
+    const auto actualType = targetHeap->arrayElementType(reference);
+    const auto actualTypeId = targetHeap->arrayElementTypeId(reference);
     if (!actualType || !actualTypeId ||
         *actualType != elementType || *actualTypeId != elementTypeId) {
         return fail(
             runtime::ErrorCode::TypeMismatch,
             "array element metadata does not match the AOT operation");
     }
-    const auto value = heap_->arrayGet(
+    auto value = targetHeap->arrayGet(
         reference,
         static_cast<std::size_t>(numericIndex));
+    if (value) {
+        *value = sanitizeCrossHeapFieldValue(targetHeap, std::move(*value));
+    }
     if (!value || !expectSignatureType(
             *value,
             elementType,
@@ -1789,6 +1888,13 @@ bool ExecutionContext::storeElement(
     }
     const auto numericIndex = std::get<std::int64_t>(index);
     const auto reference = std::get<runtime::ObjectRef>(receiver);
+    if (domainKind_ == runtime::DomainKind::UiPresentation &&
+        heap_ &&
+        reference.heapId != static_cast<std::uint32_t>(heap_->heapId())) {
+        return fail(
+            runtime::ErrorCode::CapabilityDenied,
+            "CrossHeapWriteViolation: UiPresentation domain cannot mutate SimHeap array");
+    }
     const auto length = heap_->arrayLength(reference);
     if (!length) {
         return fail(
@@ -1809,15 +1915,22 @@ bool ExecutionContext::storeElement(
             runtime::ErrorCode::TypeMismatch,
             "array element metadata does not match the AOT operation");
     }
-    runtime::RuntimeError arrayError;
+    const auto storePolicy = elementType == semantic::PrimitiveType::Object
+        ? runtime::ArrayStoreTypePolicy::PrevalidatedAssignableObject
+        : runtime::ArrayStoreTypePolicy::Exact;
     if (!heap_->arraySet(
             reference,
             static_cast<std::size_t>(numericIndex),
             value,
+            nullptr,
+            storePolicy)) {
+        runtime::RuntimeError arrayError;
+        (void)heap_->arraySet(
+            reference,
+            static_cast<std::size_t>(numericIndex),
+            value,
             &arrayError,
-            elementType == semantic::PrimitiveType::Object
-                ? runtime::ArrayStoreTypePolicy::PrevalidatedAssignableObject
-                : runtime::ArrayStoreTypePolicy::Exact)) {
+            storePolicy);
         return fail(
             arrayError.code == runtime::ErrorCode::None
                 ? runtime::ErrorCode::InvalidProgram
@@ -1843,14 +1956,15 @@ bool ExecutionContext::loadField(
     }
     runtime::Value checked;
     if (!checkNotNull(typeId, receiver, checked)) return false;
-    const auto value = heap_->fieldGet(
-        std::get<runtime::ObjectRef>(checked),
-        fieldIndex);
+    const auto reference = std::get<runtime::ObjectRef>(checked);
+    auto* targetHeap = resolveHeap(reference);
+    auto value = targetHeap ? targetHeap->fieldGet(reference, fieldIndex) : std::nullopt;
     if (!value) {
         return fail(
             runtime::ErrorCode::InvalidProgram,
             "field load references an invalid field slot");
     }
+    *value = sanitizeCrossHeapFieldValue(targetHeap, std::move(*value));
     const auto& field = type->fields[fieldIndex];
     if (!expectSignatureType(
             *value,
@@ -1877,6 +1991,7 @@ bool ExecutionContext::storeField(
     }
     runtime::Value checked;
     if (!checkNotNull(typeId, receiver, checked)) return false;
+    const auto reference = std::get<runtime::ObjectRef>(checked);
     const auto& field = type->fields[fieldIndex];
     if (!expectSignatureType(
             value,
@@ -1885,12 +2000,21 @@ bool ExecutionContext::storeField(
             "field store value")) {
         return false;
     }
-    runtime::RuntimeError fieldError;
+    if (domainKind_ == runtime::DomainKind::UiPresentation &&
+        ((heap_ && reference.heapId != static_cast<std::uint32_t>(heap_->heapId())) ||
+         type->simState || field.simState)) {
+        return fail(
+            runtime::ErrorCode::CapabilityDenied,
+            std::string("CrossHeapWriteViolation: UiPresentation domain cannot mutate [SimState] or SimHeap field '") +
+                (field.name ? field.name : "") + "'");
+    }
     if (!heap_->fieldSet(
-            std::get<runtime::ObjectRef>(checked),
+            reference,
             fieldIndex,
             value,
-            &fieldError)) {
+            nullptr)) {
+        runtime::RuntimeError fieldError;
+        (void)heap_->fieldSet(reference, fieldIndex, value, &fieldError);
         return fail(
             fieldError.code == runtime::ErrorCode::None
                 ? runtime::ErrorCode::InvalidProgram
@@ -2280,7 +2404,8 @@ bool ExecutionContext::binary(
                     }
                     if (const auto* reference =
                             std::get_if<runtime::ObjectRef>(&value)) {
-                        return heap_->stringView(*reference);
+                        const auto* targetHeap = resolveHeap(*reference);
+                        return targetHeap ? targetHeap->stringView(*reference) : std::nullopt;
                     }
                     return std::nullopt;
                 };
@@ -2294,12 +2419,15 @@ bool ExecutionContext::binary(
                 equal = *a == *b;
             }
         } else {
+            const auto checkAliveRef = [&](const runtime::Value& val) {
+                const auto* ref = std::get_if<runtime::ObjectRef>(&val);
+                if (!ref) return true;
+                const auto* targetHeap = resolveHeap(*ref);
+                return targetHeap != nullptr && targetHeap->isAlive(*ref);
+            };
             if ((runtime::valueType(left) == semantic::PrimitiveType::Object ||
                  runtime::valueType(left) == semantic::PrimitiveType::Array) &&
-                ((!std::get_if<runtime::ObjectRef>(&left) ||
-                  heap_->isAlive(std::get<runtime::ObjectRef>(left))) == false ||
-                 (!std::get_if<runtime::ObjectRef>(&right) ||
-                  heap_->isAlive(std::get<runtime::ObjectRef>(right))) == false)) {
+                (!checkAliveRef(left) || !checkAliveRef(right))) {
                 return fail(
                     runtime::ErrorCode::InvalidObjectReference,
                     "reference equality encountered an invalid managed reference");
@@ -2527,6 +2655,17 @@ std::shared_ptr<runtime::ManagedHeap> ExecutionContext::heap() const noexcept {
     return heap_;
 }
 
+void ExecutionContext::setDomainContext(
+    runtime::ExecutionDomainContext* domains,
+    runtime::DomainKind domainKind) noexcept {
+    domainContext_ = domains;
+    domainKind_ = domainKind;
+    if (domains && program_) {
+        registerAotProgramObservableTypes(domains->simHeap(), *program_);
+        registerAotProgramObservableTypes(domains->uiHeap(), *program_);
+    }
+}
+
 runtime::ShadowStack& ExecutionContext::shadowStack() noexcept {
     return shadowStack_;
 }
@@ -2711,6 +2850,9 @@ Program::Program(const ProgramDescriptor& descriptor)
             RS_AOT_THROW_INVALID_ARG("AOT program contains an invalid source map");
         }
     }
+    if (heap_) {
+        registerAotProgramObservableTypes(*heap_, descriptor);
+    }
 }
 
 #undef RS_AOT_THROW_INVALID_ARG
@@ -2722,10 +2864,24 @@ void Program::setBindings(
 
 void Program::setHeap(std::shared_ptr<runtime::ManagedHeap> heap) {
     heap_ = heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>();
+    if (heap_ && descriptor_) {
+        registerAotProgramObservableTypes(*heap_, *descriptor_);
+    }
 }
 
 std::shared_ptr<runtime::ManagedHeap> Program::heap() const noexcept {
     return heap_;
+}
+
+void Program::setDomainContext(
+    runtime::ExecutionDomainContext* domains,
+    runtime::DomainKind domainKind) noexcept {
+    domainContext_ = domains;
+    domainKind_ = domainKind;
+    if (domains && descriptor_) {
+        registerAotProgramObservableTypes(domains->simHeap(), *descriptor_);
+        registerAotProgramObservableTypes(domains->uiHeap(), *descriptor_);
+    }
 }
 
 const ProgramDescriptor& Program::descriptor() const noexcept {
@@ -2743,6 +2899,9 @@ runtime::ExecutionResult Program::invoke(
         std::move(options),
         &types_,
         &functions_);
+    if (domainContext_) {
+        context.setDomainContext(domainContext_, domainKind_);
+    }
     runtime::Value value;
     runtime::ExecutionResult execution;
     execution.succeeded = context.invoke(

@@ -90,49 +90,35 @@ void unregisterActiveShadowStack(const ShadowStack* stack) noexcept {
 
 } // namespace
 
+ShadowStack::ShadowStack() {
+    frames_.reserve(32);
+    registerActiveShadowStack(this);
+}
+
 ShadowStack::~ShadowStack() noexcept {
-    if (!frames_.empty()) {
-        unregisterActiveShadowStack(this);
-    }
+    unregisterActiveShadowStack(this);
 }
 
 ShadowStack::ShadowStack(const ShadowStack& other)
     : frames_(other.frames_) {
-    if (!frames_.empty()) {
-        registerActiveShadowStack(this);
-    }
+    frames_.reserve(32);
+    registerActiveShadowStack(this);
 }
 
 ShadowStack& ShadowStack::operator=(const ShadowStack& other) {
     if (this == &other) return *this;
-    const bool wasEmpty = frames_.empty();
     frames_ = other.frames_;
-    if (wasEmpty && !frames_.empty()) {
-        registerActiveShadowStack(this);
-    } else if (!wasEmpty && frames_.empty()) {
-        unregisterActiveShadowStack(this);
-    }
     return *this;
 }
 
 ShadowStack::ShadowStack(ShadowStack&& other) noexcept
     : frames_(std::move(other.frames_)) {
-    if (!frames_.empty()) {
-        unregisterActiveShadowStack(&other);
-        registerActiveShadowStack(this);
-    }
+    registerActiveShadowStack(this);
 }
 
 ShadowStack& ShadowStack::operator=(ShadowStack&& other) noexcept {
     if (this == &other) return *this;
-    if (!frames_.empty()) {
-        unregisterActiveShadowStack(this);
-    }
     frames_ = std::move(other.frames_);
-    if (!frames_.empty()) {
-        unregisterActiveShadowStack(&other);
-        registerActiveShadowStack(this);
-    }
     return *this;
 }
 
@@ -141,36 +127,63 @@ void ShadowStack::pushFrame(
     const std::vector<Value>* locals,
     const std::vector<Value>* registers,
     const std::size_t* activeRegisterLimit) {
-    const bool wasEmpty = frames_.empty();
-    frames_.push_back({arguments, locals, registers, activeRegisterLimit});
-    if (wasEmpty) {
-        registerActiveShadowStack(this);
-    }
+    FrameRoots roots{};
+    roots.arguments = arguments;
+    roots.locals = locals;
+    roots.registers = registers;
+    roots.activeRegisterLimit = activeRegisterLimit;
+    frames_.push_back(roots);
+}
+
+void ShadowStack::pushSpanFrame(
+    ValueSpan arguments,
+    ValueSpan locals,
+    ValueSpan registers,
+    const std::size_t* activeRegisterLimit) {
+    FrameRoots roots{};
+    roots.argumentsPtr = arguments.data();
+    roots.argumentsCount = arguments.size();
+    roots.localsPtr = locals.data();
+    roots.localsCount = locals.size();
+    roots.registersPtr = registers.data();
+    roots.registersCount = registers.size();
+    roots.activeRegisterLimit = activeRegisterLimit;
+    frames_.push_back(roots);
 }
 
 void ShadowStack::popFrame() noexcept {
     if (!frames_.empty()) {
         frames_.pop_back();
-        if (frames_.empty()) {
-            unregisterActiveShadowStack(this);
-        }
     }
 }
 
 void ShadowStack::visitRoots(const std::function<void(const Value&)>& visitor) const {
-    const auto visitValues = [&](const std::vector<Value>* values, const std::size_t* limit) {
-        if (!values) return;
-        const std::size_t count = limit
-            ? std::min(*limit, values->size())
-            : values->size();
-        for (std::size_t index = 0; index < count; ++index) {
-            visitor((*values)[index]);
+    const auto visitValues = [&](const std::vector<Value>* values,
+                                 const Value* rawPtr,
+                                 std::size_t rawCount,
+                                 const std::size_t* limit) {
+        if (values) {
+            const std::size_t count = limit
+                ? std::min(*limit, values->size())
+                : values->size();
+            for (std::size_t index = 0; index < count; ++index) {
+                visitor((*values)[index]);
+            }
+            return;
+        }
+        if (rawPtr && rawCount != 0) {
+            const std::size_t count = limit
+                ? std::min(*limit, rawCount)
+                : rawCount;
+            for (std::size_t index = 0; index < count; ++index) {
+                visitor(rawPtr[index]);
+            }
         }
     };
     for (const auto& frame : frames_) {
-        visitValues(frame.arguments, nullptr);
-        visitValues(frame.locals, nullptr);
-        visitValues(frame.registers, frame.activeRegisterLimit);
+        visitValues(frame.arguments, frame.argumentsPtr, frame.argumentsCount, nullptr);
+        visitValues(frame.locals, frame.localsPtr, frame.localsCount, nullptr);
+        visitValues(frame.registers, frame.registersPtr, frame.registersCount, frame.activeRegisterLimit);
     }
 }
 

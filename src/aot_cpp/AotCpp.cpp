@@ -845,7 +845,7 @@ TypedRangeAnalysis analyzeTypedIntegerRanges(const mir::Function& function) {
 bool supportsTypedPrimitiveAot(
     const mir::Function& function,
     const std::unordered_set<semantic::SymbolId>& customStructs) {
-    if (!function.exceptionHandlers.empty()) {
+    if (!function.exceptionHandlers.empty() || function.simCommand) {
         return false;
     }
     if (function.returnType != semantic::PrimitiveType::Void &&
@@ -3082,7 +3082,16 @@ std::string canonicalInput(
                 ":abstract=" + (type.abstractType ? "1" : "0") +
                 ":sealed=" + (type.sealedType ? "1" : "0") +
                 ":delegate=" + (type.delegateType ? "1" : "0") +
-                ":interface=" + (type.interfaceType ? "1" : "0") + ":";
+                ":interface=" + (type.interfaceType ? "1" : "0") +
+                ":partial=" + (type.partialType ? "1" : "0") +
+                ":observable=" + (type.observable ? "1" : "0") +
+                ":simState=" + (type.simState ? "1" : "0") + ":";
+            for (const auto& field : type.fields) {
+                value += field.name + "#" +
+                    (field.observable ? "1" : "0") + "," +
+                    std::to_string(field.observableBitIndex) + "," +
+                    (field.simState ? "1" : "0") + ";";
+            }
             for (const auto symbolId : type.virtualDispatchTable) {
                 value += std::to_string(symbolId) + ";";
             }
@@ -3095,6 +3104,11 @@ std::string canonicalInput(
                 value += "]";
             }
             value += "\n";
+        }
+        for (const auto& fn : module->functions) {
+            if (fn.simCommand) {
+                value += "sim-command:" + fn.name + ":" + std::to_string(fn.symbolId) + "\n";
+            }
         }
         for (const auto& attribute : module->languageMetadata.attributes) {
             value += "attribute:" + attribute.target + ":" + attribute.name + ":" +
@@ -3231,10 +3245,15 @@ GeneratedProgram CppGenerator::generate(
             const auto inserted = types.emplace(
                 type.id,
                 TypeView{&type, "type_" + hexId(type.id)});
-            if (!inserted.second &&
-                semantic::canonicalTypeName(*inserted.first->second.type) !=
-                    semantic::canonicalTypeName(type)) {
-                diagnostics.report("RS7003", "duplicate AOT TypeId has incompatible names", {});
+            if (!inserted.second) {
+                if (semantic::canonicalTypeName(*inserted.first->second.type) !=
+                        semantic::canonicalTypeName(type)) {
+                    diagnostics.report("RS7003", "duplicate AOT TypeId has incompatible names", {});
+                } else if (type.fields.size() > inserted.first->second.type->fields.size() ||
+                           type.virtualDispatchTable.size() >
+                               inserted.first->second.type->virtualDispatchTable.size()) {
+                    inserted.first->second.type = &type;
+                }
             }
         }
         for (const auto& function : module.functions) {
@@ -3336,7 +3355,10 @@ GeneratedProgram CppGenerator::generate(
                     primitiveExpression(field.type) + ", 0x" +
                     hexId(exactTypeId(field.type, field.typeName)) + "ULL, " +
                     std::to_string(field.index) + "u, " +
-                    (field.synthetic ? "true" : "false") + "},");
+                    (field.synthetic ? "true" : "false") + ", " +
+                    (field.observable ? "true" : "false") + ", " +
+                    std::to_string(static_cast<unsigned>(field.observableBitIndex)) + "u, " +
+                    (field.simState ? "true" : "false") + "},");
             }
             source.line("};");
         }
@@ -3414,7 +3436,10 @@ GeneratedProgram CppGenerator::generate(
                     ? "nullptr"
                     : view.cppName + "_interfaceMaps") +
                 ", " + std::to_string(type.interfaceDispatchMaps.size()) +
-                "u, " + (type.delegateType ? "true" : "false") + "},");
+                "u, " + (type.delegateType ? "true" : "false") + ", " +
+                (type.observable ? "true" : "false") + ", " +
+                (type.simState ? "true" : "false") + ", " +
+                (type.partialType ? "true" : "false") + "},");
         }
         source.line("};");
     }
@@ -3662,13 +3687,16 @@ GeneratedProgram CppGenerator::generate(
         source.line("    std::size_t argumentCount,");
         source.line("    runtime::Value& result) {");
         source.line("    (void)result;");
-        source.line("    std::vector<runtime::Value> argumentValues;");
-        source.line("    if (argumentCount != 0) {");
-        source.line("        argumentValues.assign(arguments, arguments + argumentCount);");
-        source.line("    }");
-        source.line("    std::vector<runtime::Value> locals(" +
-            std::to_string(function.localTypes.size()) + ");");
-        for (std::size_t index = 0; index < function.localTypes.size(); ++index) {
+        source.line("    const runtime::ValueSpan argumentValues(arguments, argumentCount);");
+        const std::size_t localCount = function.localTypes.size();
+        if (localCount <= 32) {
+            source.line("    std::array<runtime::Value, " +
+                std::to_string(std::max<std::size_t>(1, localCount)) + "> locals{};");
+        } else {
+            source.line("    std::vector<runtime::Value> locals(" +
+                std::to_string(localCount) + ");");
+        }
+        for (std::size_t index = 0; index < localCount; ++index) {
             const auto typeId = index < function.localTypeIds.size()
                 ? function.localTypeIds[index]
                 : 0;
@@ -3677,9 +3705,17 @@ GeneratedProgram CppGenerator::generate(
                 primitiveExpression(function.localTypes[index]) + ", 0x" +
                 hexId(typeId) + "ULL);");
         }
-        source.line("    std::vector<runtime::Value> registers(" +
-            std::to_string(registerCount(function)) + ");");
-        source.line("    FrameScope frame(context, argumentValues, locals, registers);");
+        const std::size_t regCount = registerCount(function);
+        if (regCount <= 64) {
+            source.line("    std::array<runtime::Value, " +
+                std::to_string(std::max<std::size_t>(1, regCount)) + "> registers{};");
+        } else {
+            source.line("    std::vector<runtime::Value> registers(" +
+                std::to_string(regCount) + ");");
+        }
+        source.line("    FrameScope frame(context, argumentValues, runtime::ValueSpan(locals.data(), " +
+            std::to_string(localCount) + "u), runtime::ValueSpan(registers.data(), " +
+            std::to_string(regCount) + "u));");
         source.line("    std::uint32_t currentBlock = 0;");
         source.line("    for (;;) {");
         source.line("        switch (currentBlock) {");
@@ -4148,7 +4184,8 @@ GeneratedProgram CppGenerator::generate(
                 ? std::string("nullptr")
                 : view.cppName + "_parameterTypeIds") + ", " +
             std::to_string(function.parameterTypes.size()) + "u, &" +
-            view.cppName + ", nullptr},");
+            view.cppName + ", nullptr, " +
+            (function.simCommand ? "true" : "false") + "},");
     }
     source.line("};");
 

@@ -803,7 +803,7 @@ struct NativeRawColumnView {
 
 class ShadowStack {
 public:
-    ShadowStack() = default;
+    ShadowStack();
     ~ShadowStack() noexcept;
     ShadowStack(const ShadowStack& other);
     ShadowStack& operator=(const ShadowStack& other);
@@ -815,6 +815,11 @@ public:
         const std::vector<Value>* locals,
         const std::vector<Value>* registers,
         const std::size_t* activeRegisterLimit = nullptr);
+    void pushSpanFrame(
+        ValueSpan arguments,
+        ValueSpan locals,
+        ValueSpan registers,
+        const std::size_t* activeRegisterLimit = nullptr);
     void popFrame() noexcept;
     void visitRoots(const std::function<void(const Value&)>& visitor) const;
     [[nodiscard]] std::size_t frameCount() const noexcept;
@@ -824,6 +829,12 @@ private:
         const std::vector<Value>* arguments = nullptr;
         const std::vector<Value>* locals = nullptr;
         const std::vector<Value>* registers = nullptr;
+        const Value* argumentsPtr = nullptr;
+        std::size_t argumentsCount = 0;
+        const Value* localsPtr = nullptr;
+        std::size_t localsCount = 0;
+        const Value* registersPtr = nullptr;
+        std::size_t registersCount = 0;
         const std::size_t* activeRegisterLimit = nullptr;
     };
     std::vector<FrameRoots> frames_;

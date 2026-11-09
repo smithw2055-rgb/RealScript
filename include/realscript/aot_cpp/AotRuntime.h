@@ -1,6 +1,7 @@
 #pragma once
 
 #include "realscript/aot_cpp/RuntimeAbi.h"
+#include "realscript/runtime/ExecutionDomain.h"
 #include "realscript/runtime/Runtime.h"
 #include "realscript/semantic/Semantic.h"
 
@@ -134,6 +135,9 @@ struct FieldDescriptor {
     semantic::SymbolId typeId = 0;
     std::uint32_t index = 0;
     bool synthetic = false;
+    bool observable = false;
+    std::uint16_t observableBitIndex = 0xFFFFu;
+    bool simState = false;
 };
 
 struct EnumMemberDescriptor {
@@ -163,6 +167,9 @@ struct TypeDescriptor {
     const InterfaceDispatchDescriptor* interfaceDispatchMaps = nullptr;
     std::uint32_t interfaceDispatchMapCount = 0;
     bool delegateType = false;
+    bool observable = false;
+    bool simState = false;
+    bool partialType = false;
 };
 
 class ExecutionContext;
@@ -183,6 +190,7 @@ struct FunctionDescriptor {
     std::uint32_t parameterCount = 0;
     FunctionImplementation implementation = nullptr;
     const debug::FunctionDebugInfo* debugInfo = nullptr;
+    bool simCommand = false;
 };
 
 struct SourceMapEntry {
@@ -261,6 +269,10 @@ enum class BinaryOperation : std::uint8_t {
     GreaterOrEqualDouble,
 };
 
+void registerAotProgramObservableTypes(
+    runtime::ManagedHeap& heap,
+    const ProgramDescriptor& program);
+
 class FrameScope {
 public:
     FrameScope(
@@ -268,6 +280,11 @@ public:
         const std::vector<runtime::Value>& arguments,
         const std::vector<runtime::Value>& locals,
         const std::vector<runtime::Value>& registers);
+    FrameScope(
+        ExecutionContext& context,
+        runtime::ValueSpan arguments,
+        runtime::ValueSpan locals,
+        runtime::ValueSpan registers);
     ~FrameScope();
     FrameScope(const FrameScope&) = delete;
     FrameScope& operator=(const FrameScope&) = delete;
@@ -773,6 +790,15 @@ public:
 
     [[nodiscard]] const ProgramDescriptor& program() const noexcept;
     [[nodiscard]] std::shared_ptr<runtime::ManagedHeap> heap() const noexcept;
+    void setDomainContext(
+        runtime::ExecutionDomainContext* domains,
+        runtime::DomainKind domainKind) noexcept;
+    [[nodiscard]] runtime::ExecutionDomainContext* domainContext() const noexcept {
+        return domainContext_;
+    }
+    [[nodiscard]] runtime::DomainKind domainKind() const noexcept {
+        return domainKind_;
+    }
     [[nodiscard]] runtime::ShadowStack& shadowStack() noexcept;
     [[nodiscard]] const runtime::RuntimeError& error() const noexcept;
     [[nodiscard]] const runtime::RuntimeStatistics& statistics() const noexcept;
@@ -785,6 +811,11 @@ public:
 
 private:
     friend class FrameScope;
+    [[nodiscard]] runtime::ManagedHeap* resolveHeap(
+        runtime::ObjectRef reference) const noexcept;
+    [[nodiscard]] runtime::Value sanitizeCrossHeapFieldValue(
+        runtime::ManagedHeap* sourceHeap,
+        runtime::Value value);
     [[nodiscard]] const TypeDescriptor* findType(semantic::SymbolId typeId) const;
     [[nodiscard]] const FunctionDescriptor* findFunction(
         semantic::SymbolId symbolId) const;
@@ -831,6 +862,8 @@ private:
     const std::unordered_map<semantic::SymbolId, const TypeDescriptor*>* typesPtr_ = nullptr;
     const std::unordered_map<semantic::SymbolId, const FunctionDescriptor*>* functionsPtr_ = nullptr;
     std::optional<runtime::Value> pendingException_;
+    runtime::ExecutionDomainContext* domainContext_ = nullptr;
+    runtime::DomainKind domainKind_ = runtime::DomainKind::SimDeterministic;
 };
 
 class Program {
@@ -840,6 +873,15 @@ public:
     void setBindings(std::shared_ptr<const runtime::BindingRegistry> bindings);
     void setHeap(std::shared_ptr<runtime::ManagedHeap> heap);
     [[nodiscard]] std::shared_ptr<runtime::ManagedHeap> heap() const noexcept;
+    void setDomainContext(
+        runtime::ExecutionDomainContext* domains,
+        runtime::DomainKind domainKind) noexcept;
+    [[nodiscard]] runtime::ExecutionDomainContext* domainContext() const noexcept {
+        return domainContext_;
+    }
+    [[nodiscard]] runtime::DomainKind domainKind() const noexcept {
+        return domainKind_;
+    }
     [[nodiscard]] const ProgramDescriptor& descriptor() const noexcept;
     [[nodiscard]] bool hasFunction(semantic::SymbolId symbolId) const noexcept {
         return functions_.find(symbolId) != functions_.end();
@@ -866,6 +908,8 @@ private:
     const ProgramDescriptor* descriptor_ = nullptr;
     std::shared_ptr<const runtime::BindingRegistry> bindings_;
     std::shared_ptr<runtime::ManagedHeap> heap_;
+    runtime::ExecutionDomainContext* domainContext_ = nullptr;
+    runtime::DomainKind domainKind_ = runtime::DomainKind::SimDeterministic;
     std::unordered_map<std::string, semantic::SymbolId> names_;
     std::unordered_map<semantic::SymbolId, const TypeDescriptor*> types_;
     std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> functions_;
