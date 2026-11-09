@@ -2,7 +2,9 @@
 #include "realscript/runtime/FiberScheduler.h"
 #include "realscript/mir/Mir.h"
 
+#include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -12,6 +14,82 @@
 namespace realscript::runtime {
 
 using Opcode = FiberOpcode;
+
+struct FiberScheduler::ParallelWorkerPool {
+    std::mutex dispatchMutex;
+    std::mutex mutex;
+    std::condition_variable cvStart;
+    std::condition_variable cvDone;
+    std::vector<std::thread> threads;
+    std::function<void(std::size_t, std::size_t)> currentTask;
+    std::size_t activeWorkerCount = 0;
+    std::size_t completedWorkers = 0;
+    std::uint64_t generation = 0;
+    bool stop = false;
+
+    ~ParallelWorkerPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+            ++generation;
+        }
+        cvStart.notify_all();
+        for (auto& t : threads) {
+            if (t.joinable()) t.join();
+        }
+    }
+
+    void ensureThreads(std::size_t bgCount) {
+        while (threads.size() < bgCount) {
+            const std::size_t workerIdx = threads.size() + 1;
+            const std::uint64_t initialGen = generation;
+            threads.emplace_back([this, workerIdx, initialGen]() {
+                std::uint64_t seenGen = initialGen;
+                std::unique_lock<std::mutex> lock(mutex);
+                for (;;) {
+                    cvStart.wait(lock, [&]() { return stop || generation != seenGen; });
+                    if (stop) return;
+                    seenGen = generation;
+                    if (workerIdx < activeWorkerCount && currentTask) {
+                        const auto task = currentTask;
+                        const std::size_t total = activeWorkerCount;
+                        lock.unlock();
+                        task(workerIdx, total);
+                        lock.lock();
+                        if (++completedWorkers == activeWorkerCount - 1) {
+                            cvDone.notify_one();
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    void dispatch(
+        std::size_t numThreads,
+        const std::function<void(std::size_t, std::size_t)>& task) {
+        if (numThreads <= 1) {
+            task(0, 1);
+            return;
+        }
+        std::lock_guard<std::mutex> dispatchLock(dispatchMutex);
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            ensureThreads(numThreads - 1);
+            currentTask = task;
+            activeWorkerCount = numThreads;
+            completedWorkers = 0;
+            ++generation;
+        }
+        cvStart.notify_all();
+        task(0, numThreads);
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            cvDone.wait(lock, [&]() { return completedWorkers == numThreads - 1; });
+            currentTask = nullptr;
+        }
+    }
+};
 
 FiberScheduler::FiberScheduler(IFiberHostCallbacks* hostCallbacks) noexcept
     : host_(hostCallbacks) {
@@ -588,17 +666,19 @@ std::uint64_t FiberScheduler::stepTickParallel(
     };
 
     const std::size_t numThreads = std::min<std::size_t>(workerCount, batch.size());
-    std::vector<std::thread> workers;
-    workers.reserve(numThreads);
-    for (std::size_t t = 0; t < numThreads; ++t) {
-        workers.emplace_back([&, t, numThreads]() {
-            for (std::size_t idx = t; idx < batch.size(); idx += numThreads) {
+    if (numThreads <= 1 || batch.size() <= 8) {
+        for (std::size_t idx = 0; idx < batch.size(); ++idx) {
+            runIsolatedFiber(idx);
+        }
+    } else {
+        if (!workerPool_) {
+            workerPool_ = std::make_shared<ParallelWorkerPool>();
+        }
+        workerPool_->dispatch(numThreads, [&](std::size_t t, std::size_t total) {
+            for (std::size_t idx = t; idx < batch.size(); idx += total) {
                 runIsolatedFiber(idx);
             }
         });
-    }
-    for (auto& w : workers) {
-        if (w.joinable()) w.join();
     }
 
     std::uint64_t totalInstr = 0;

@@ -1040,7 +1040,15 @@ tooling::Json DapServer::handle(
         const bool diffBaseline = arguments && arguments->find("diffBaseline")
             ? arguments->find("diffBaseline")->boolValue(false)
             : false;
-        return response(request, true, buildHeapSnapshotReport(diffBaseline));
+        tooling::Json report;
+        if (session_) {
+            session_->runAtSafepoint([&]() {
+                report = buildHeapSnapshotReport(diffBaseline);
+            });
+        } else {
+            report = buildHeapSnapshotReport(diffBaseline);
+        }
+        return response(request, true, std::move(report));
     }
     if (command == "retainingPath" || command == "realscript/retainingPath") {
         runtime::ObjectRef targetRef;
@@ -1113,7 +1121,14 @@ tooling::Json DapServer::handle(
         }
         if (expression == ":heap" || expression == ":heap diff") {
             const bool diffMode = (expression == ":heap diff");
-            const auto rep = buildHeapSnapshotReport(diffMode);
+            tooling::Json rep;
+            if (session_) {
+                session_->runAtSafepoint([&]() {
+                    rep = buildHeapSnapshotReport(diffMode);
+                });
+            } else {
+                rep = buildHeapSnapshotReport(diffMode);
+            }
             return response(request, true, tooling::Json::Object{
                 {"result", rep.find("summaryText") ? rep.find("summaryText")->stringValue() : ""},
                 {"type", "HeapSnapshotReport"},
@@ -1169,14 +1184,28 @@ tooling::Json DapServer::handle(
             });
         }
         std::string errorMessage;
-        const auto evaluated = session_->evaluate(expression, frameId, &errorMessage);
+        std::optional<runtime::Value> evaluated;
+        std::string evalText;
+        std::string evalTypeName;
+        const auto runEval = [&]() {
+            evaluated = session_->evaluate(expression, frameId, &errorMessage);
+            if (evaluated) {
+                evalText = runtime::valueToString(*evaluated, heap_.get());
+                evalTypeName = semantic::primitiveTypeName(runtime::valueType(*evaluated));
+            }
+        };
+        if (session_) {
+            session_->runAtSafepoint(runEval);
+        } else {
+            runEval();
+        }
         if (!evaluated) {
             return response(request, false, nullptr,
                 errorMessage.empty() ? "failed to evaluate expression" : errorMessage);
         }
         return response(request, true, tooling::Json::Object{
-            {"result", runtime::valueToString(*evaluated, heap_.get())},
-            {"type", semantic::primitiveTypeName(runtime::valueType(*evaluated))},
+            {"result", std::move(evalText)},
+            {"type", std::move(evalTypeName)},
             {"variablesReference", 0},
         });
     }
@@ -1262,18 +1291,25 @@ tooling::Json DapServer::handle(
         const auto reference = arguments && arguments->find("variablesReference")
             ? arguments->find("variablesReference")->integerValue() : 0;
         tooling::Json::Array values;
-        const auto found = variables_.find(reference);
-        if (found != variables_.end()) {
-            const auto listCopy = found->second;
-            for (const auto& variable : listCopy) {
-                const auto childRef = registerExpandableValue(variable.value);
-                values.emplace_back(tooling::Json::Object{
-                    {"name", variable.name},
-                    {"value", runtime::valueToString(variable.value, heap_.get())},
-                    {"type", semantic::primitiveTypeName(variable.type)},
-                    {"variablesReference", childRef},
-                });
+        const auto collectVariables = [&]() {
+            const auto found = variables_.find(reference);
+            if (found != variables_.end()) {
+                const auto listCopy = found->second;
+                for (const auto& variable : listCopy) {
+                    const auto childRef = registerExpandableValue(variable.value);
+                    values.emplace_back(tooling::Json::Object{
+                        {"name", variable.name},
+                        {"value", runtime::valueToString(variable.value, heap_.get())},
+                        {"type", semantic::primitiveTypeName(variable.type)},
+                        {"variablesReference", childRef},
+                    });
+                }
             }
+        };
+        if (session_) {
+            session_->runAtSafepoint(collectVariables);
+        } else {
+            collectVariables();
         }
         return response(request, true, tooling::Json::Object{{"variables", tooling::Json(std::move(values))}});
     }
@@ -1284,6 +1320,8 @@ tooling::Json DapServer::handle(
             ? arguments->find("name")->stringValue() : std::string{};
         const auto valExpr = arguments && arguments->find("value")
             ? arguments->find("value")->stringValue() : std::string{};
+        tooling::Json result;
+        const auto doSetVariable = [&]() -> tooling::Json {
         if (reference >= 1000) {
             const auto ownerIt = childOwnerObjects_.find(reference);
             if (ownerIt == childOwnerObjects_.end() || !heap_ || !heap_->isAlive(ownerIt->second)) {
@@ -1362,6 +1400,15 @@ tooling::Json DapServer::handle(
             {"type", semantic::primitiveTypeName(runtime::valueType(updatedVal))},
             {"variablesReference", childRef},
         });
+        };
+        if (session_) {
+            session_->runAtSafepoint([&]() {
+                result = doSetVariable();
+            });
+        } else {
+            result = doSetVariable();
+        }
+        return result;
     }
     if (command == "continue" || command == "next" ||
         command == "stepIn" || command == "stepOut") {
