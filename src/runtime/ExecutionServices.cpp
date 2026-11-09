@@ -135,6 +135,22 @@ void hashValue(
         hashScalar(hash, v->y);
         hashScalar(hash, v->z);
         hashScalar(hash, v->w);
+    } else if (const auto* v = std::get_if<Float4Value>(&value)) {
+        const auto hashFloat = [&](float f) {
+            std::uint32_t bits = 0;
+            if (canonicalizeFloatingPoint && std::isnan(f)) {
+                bits = 0x7fc00000U;
+            } else if (canonicalizeFloatingPoint && f == 0.0f) {
+                bits = 0;
+            } else {
+                std::memcpy(&bits, &f, sizeof(bits));
+            }
+            hashScalar(hash, bits);
+        };
+        hashFloat(v->x);
+        hashFloat(v->y);
+        hashFloat(v->z);
+        hashFloat(v->w);
     } else if (const auto* v = std::get_if<StructValue>(&value)) {
         hashScalar(hash, v->typeId);
         const auto count = static_cast<std::uint64_t>(v->fieldCount());

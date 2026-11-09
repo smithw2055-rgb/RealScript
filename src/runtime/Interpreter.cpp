@@ -1196,21 +1196,48 @@ bool flattenDelegate(
     const auto* flags = flagsValue
         ? std::get_if<std::int64_t>(&*flagsValue)
         : nullptr;
-    if (!flags || *flags < 0 || *flags > 4) {
+    const std::int64_t modeFlags = flags
+        ? (*flags & ~ManagedHeap::DelegateWeakTargetFlag)
+        : -1;
+    const bool isWeakTarget = flags &&
+        ((*flags & ManagedHeap::DelegateWeakTargetFlag) != 0);
+    if (!flags || modeFlags < 0 || modeFlags > 4) {
         return fail(state, ErrorCode::InvalidProgram,
             "delegate invocation-list metadata is corrupt");
     }
-    if (*flags != 4) {
+    if (modeFlags != 4) {
+        if (isWeakTarget) {
+            const auto targetVal = state.heap->fieldGet(*reference, 0u);
+            if (targetVal) {
+                if (const auto* targetRef = std::get_if<ObjectRef>(&*targetVal)) {
+                    if (!state.heap->isAlive(*targetRef)) {
+                        return true;
+                    }
+                }
+            }
+        }
         leaves.push_back(value);
         return true;
     }
     const auto left = state.heap->fieldGet(*reference, 0u);
     const auto right = state.heap->fieldGet(*reference, 7u);
-    return left && right &&
-        flattenDelegate(
-            state, delegateTypeId, *left, leaves, depth + 1) &&
-        flattenDelegate(
-            state, delegateTypeId, *right, leaves, depth + 1);
+    if (!left || !right) return false;
+    const std::size_t beforeLeft = leaves.size();
+    if (!flattenDelegate(state, delegateTypeId, *left, leaves, depth + 1)) {
+        return false;
+    }
+    const std::size_t afterLeft = leaves.size();
+    if (!flattenDelegate(state, delegateTypeId, *right, leaves, depth + 1)) {
+        return false;
+    }
+    const std::size_t afterRight = leaves.size();
+    if (afterLeft == beforeLeft && !std::holds_alternative<NullObject>(*left)) {
+        (void)state.heap->fieldSet(*reference, 0u, Value{NullObject{}});
+    }
+    if (afterRight == afterLeft && !std::holds_alternative<NullObject>(*right)) {
+        (void)state.heap->fieldSet(*reference, 7u, Value{NullObject{}});
+    }
+    return true;
 }
 
 bool sameDelegateLeaf(
@@ -2368,14 +2395,30 @@ bool executeInstruction(
         const auto* slot = slotValue
             ? std::get_if<std::int64_t>(&*slotValue)
             : nullptr;
-        if (!target || !flags || !slot || *flags < 0 || *flags > 3 ||
+        const std::int64_t dispatchFlags = flags
+            ? (*flags & ~ManagedHeap::DelegateWeakTargetFlag)
+            : -1;
+        const bool isWeakTarget = flags &&
+            ((*flags & ManagedHeap::DelegateWeakTargetFlag) != 0);
+        if (!target || !flags || !slot || dispatchFlags < 0 || dispatchFlags > 3 ||
             *slot < 0 ||
             *slot > std::numeric_limits<std::uint32_t>::max()) {
             return fail(state, ErrorCode::InvalidProgram,
                 "delegate dispatch metadata is corrupt");
         }
-        const bool virtualDispatch = (*flags & 1) != 0;
-        const bool interfaceDispatch = (*flags & 2) != 0;
+        if (isWeakTarget) {
+            if (const auto* targetRef = std::get_if<ObjectRef>(&*target)) {
+                if (!state.heap->isAlive(*targetRef)) {
+                    if (instruction.result == bytecode::InvalidRegister) return true;
+                    return storeResult(defaultValue(
+                        module,
+                        invoke->returnType,
+                        exactTypeId(invoke->returnType, invoke->returnTypeName)));
+                }
+            }
+        }
+        const bool virtualDispatch = (dispatchFlags & 1) != 0;
+        const bool interfaceDispatch = (dispatchFlags & 2) != 0;
         if (virtualDispatch && interfaceDispatch) {
             return fail(state, ErrorCode::InvalidProgram,
                 "delegate dispatch modes conflict");
@@ -4727,6 +4770,9 @@ ExecutionResult Interpreter::invoke(
     }
     state.determinism = DeterminismSession(std::move(options.determinism));
     state.heap = heap_.get();
+    if (state.heap && state.program) {
+        state.heap->registerProgramObservableTypes(*state.program);
+    }
     state.debugger = options.debugger.get();
     struct DebugExecutionScope {
         debug::DebugController* debugger = nullptr;
@@ -5014,6 +5060,7 @@ semantic::PrimitiveType valueType(const Value& value) noexcept {
         std::holds_alternative<Vec2Value>(value) ||
         std::holds_alternative<Vec3Value>(value) ||
         std::holds_alternative<QuatValue>(value) ||
+        std::holds_alternative<Float4Value>(value) ||
         std::holds_alternative<StructValue>(value)) {
         return semantic::PrimitiveType::Struct;
     }
@@ -5066,6 +5113,10 @@ std::string valueToString(const Value& value, const ManagedHeap* heap) {
     if (const auto* q = std::get_if<QuatValue>(&value)) {
         return "<Quat:" + std::to_string(q->x) + "," + std::to_string(q->y) + "," +
             std::to_string(q->z) + "," + std::to_string(q->w) + ">";
+    }
+    if (const auto* f4 = std::get_if<Float4Value>(&value)) {
+        return "<Float4:" + std::to_string(f4->x) + "," + std::to_string(f4->y) + "," +
+            std::to_string(f4->z) + "," + std::to_string(f4->w) + ">";
     }
     if (const auto* structure = std::get_if<StructValue>(&value)) {
         return "<struct:type=0x" + std::to_string(structure->typeId) + ":fields=" +

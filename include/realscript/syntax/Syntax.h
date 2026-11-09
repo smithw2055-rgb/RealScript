@@ -93,6 +93,7 @@ enum class SyntaxKind {
     VirtualKeyword,
     OverrideKeyword,
     SealedKeyword,
+    PartialKeyword,
     BaseKeyword,
     GetKeyword,
     SetKeyword,

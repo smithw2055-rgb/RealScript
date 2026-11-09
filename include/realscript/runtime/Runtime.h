@@ -234,6 +234,21 @@ struct QuatValue {
     }
 };
 
+struct Float4Value {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float w = 0.0f;
+    friend constexpr bool operator==(Float4Value left, Float4Value right) noexcept {
+        return left.x == right.x && left.y == right.y &&
+            left.z == right.z && left.w == right.w;
+    }
+    friend constexpr bool operator!=(Float4Value left, Float4Value right) noexcept {
+        return !(left == right);
+    }
+};
+static_assert(sizeof(Float4Value) == 16, "Float4Value must be 16 bytes");
+
 struct StructStorage;
 class ValueSpan;
 
@@ -504,6 +519,7 @@ using Value = std::variant<
     Vec2Value,
     Vec3Value,
     QuatValue,
+    Float4Value,
     StructValue,
     StringValue,
     ObjectRef,
@@ -879,11 +895,33 @@ public:
     [[nodiscard]] std::optional<semantic::SymbolId> objectTypeId(
         ObjectRef reference) const;
     [[nodiscard]] std::optional<Value> fieldGet(ObjectRef reference, std::size_t index) const;
+    [[nodiscard]] const Value* fieldGetFast(ObjectRef reference, std::size_t index) const noexcept;
+    bool fieldSetFast(ObjectRef reference, std::size_t index, const Value& value) noexcept;
     bool fieldSet(
         ObjectRef reference,
         std::size_t index,
         Value value,
         RuntimeError* error = nullptr);
+
+    void registerTypeObservableBits(
+        semantic::SymbolId typeId,
+        std::vector<std::uint8_t> fieldObservableBits);
+    void registerProgramObservableTypes(const class ProgramImage& program);
+    [[nodiscard]] std::uint64_t dirtyFieldMask(ObjectRef reference) const noexcept;
+    void clearDirtyFieldMask(ObjectRef reference) noexcept;
+    void addUiObserver(ObjectRef reference) noexcept;
+    void removeUiObserver(ObjectRef reference) noexcept;
+    [[nodiscard]] std::uint16_t uiObserverCount(ObjectRef reference) const noexcept;
+    [[nodiscard]] std::vector<ObjectRef> consumeDirtyObjects();
+
+    static constexpr std::int64_t DelegateWeakTargetFlag = 8;
+    [[nodiscard]] std::optional<ObjectRef> allocateWeakDelegate(
+        semantic::SymbolId delegateTypeId,
+        ObjectRef target,
+        semantic::SymbolId functionId,
+        std::int64_t baseFlags = 0,
+        RuntimeError* error = nullptr);
+    [[nodiscard]] Value pruneDelegateChain(const Value& delegateVal);
 
     [[nodiscard]] RootToken addPersistentRoot(ObjectRef reference);
     [[nodiscard]] RootToken addPersistentRoot(Value value);
@@ -956,6 +994,7 @@ public:
     [[nodiscard]] bool collectionRequested() const noexcept;
     [[nodiscard]] GcPhase phase() const noexcept;
     std::size_t step(const ShadowStack& shadowStack, std::size_t workBudget);
+    std::size_t stepIdleForDuration(const ShadowStack& shadowStack, double maxMilliseconds);
     void collectFull(const ShadowStack& shadowStack);
     std::size_t collectYoung(const ShadowStack& shadowStack, std::size_t workBudget = 0);
     [[nodiscard]] std::size_t nurserySize() const noexcept;
@@ -1033,6 +1072,20 @@ private:
     Value value_{};
 };
 
+struct WeakRef {
+    ObjectRef ref{};
+
+    constexpr WeakRef() noexcept = default;
+    constexpr explicit WeakRef(ObjectRef target) noexcept : ref(target) {}
+
+    [[nodiscard]] constexpr bool empty() const noexcept { return !ref.valid(); }
+    void reset() noexcept { ref = ObjectRef{}; }
+    [[nodiscard]] std::optional<ObjectRef> lock(const ManagedHeap& heap) const noexcept {
+        if (!ref.valid() || !heap.isAlive(ref)) return std::nullopt;
+        return ref;
+    }
+};
+
 class NativeHandleRegistry {
 public:
     NativeHandleRegistry();
@@ -1045,6 +1098,10 @@ public:
         semantic::SymbolId typeId,
         std::shared_ptr<void> resource,
         std::string debugName = {});
+    [[nodiscard]] NativeHandle createBorrowed(
+        semantic::SymbolId typeId,
+        void* rawPointer,
+        bool indexPointer = false);
     [[nodiscard]] std::optional<NativeHandle> findHandle(
         semantic::SymbolId typeId,
         const void* rawPointer) const noexcept;
@@ -1059,6 +1116,12 @@ public:
         NativeHandle handle,
         semantic::SymbolId expectedTypeId = 0,
         RuntimeError* error = nullptr) const;
+    [[nodiscard]] void* resolveRawFast(
+        NativeHandle handle,
+        semantic::SymbolId expectedTypeId = 0) const noexcept;
+    void visitCachedWrappers(
+        std::uint64_t heapId,
+        const std::function<void(NativeHandle, ObjectRef, const void*)>& visitor) const;
     [[nodiscard]] bool isAlive(NativeHandle handle) const noexcept;
     bool release(NativeHandle handle) noexcept;
     void clear() noexcept;

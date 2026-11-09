@@ -439,6 +439,11 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
                 }
                 if (autoProperty) {
                     property.backingFieldIndex = owner.fields.size();
+                    if (property.observable) {
+                        property.observableBitIndex = (owner.nextObservableBitIndex < 63u)
+                            ? owner.nextObservableBitIndex++
+                            : 63u;
+                    }
                     FieldSymbol backing;
                     backing.name = "$" + property.name;
                     backing.type = property.type;
@@ -449,6 +454,8 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
                     backing.synthetic = true;
                     backing.staticField = property.staticProperty;
                     backing.readonlyField = !property.setter.has_value();
+                    backing.observable = property.observable;
+                    backing.observableBitIndex = property.observableBitIndex;
                     backing.initializerSyntax = propertySyntax.initializer.get();
                     backing.declarationSpan = propertySyntax.identifierToken.span;
                     backing.id = stableTypeId(canonicalTypeName(owner) +

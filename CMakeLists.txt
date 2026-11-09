@@ -52,6 +52,7 @@ add_library(realscript_frontend STATIC
     src/runtime/RuntimeServices.cpp
     src/runtime/ExecutionServices.cpp
     src/runtime/ManagedHeap.cpp
+    src/runtime/ExecutionDomain.cpp
     src/runtime/FiberScheduler.cpp
     src/game/GameApi.cpp
     src/game/ScriptObjectRuntime.cpp

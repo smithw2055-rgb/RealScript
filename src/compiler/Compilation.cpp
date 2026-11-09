@@ -159,9 +159,17 @@ std::string attributeValueText(
     const syntax::AttributeArgumentSyntax& argument,
     const text::SourceText& source) {
     const auto span = argument.valueSpan();
-    return span.empty()
-        ? std::string{}
-        : std::string(source.view(span));
+    if (span.empty()) {
+        return std::string{};
+    }
+    if (span.start + span.length <= source.size()) {
+        return std::string(source.view(span));
+    }
+    std::string fallback;
+    for (const auto& token : argument.valueTokens) {
+        fallback += token.text;
+    }
+    return fallback;
 }
 
 #include "ClassInheritance.inl"
@@ -2505,9 +2513,10 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
 
     const auto addSourceUnit = [&](const SourceFile& sourceFile) {
         const auto fp = stableFingerprint(sourceFile.path + "\n" + sourceFile.content);
+        const bool hasPartialKeyword = (sourceFile.content.find("partial") != std::string::npos);
         auto unit = std::make_unique<ParsedUnit>();
         bool cacheHit = false;
-        {
+        if (!hasPartialKeyword) {
             std::lock_guard<std::mutex> lock(sParsedUnitCacheMutex);
             const auto found = sParsedUnitCache.find(fp);
             if (found != sParsedUnitCache.end() &&
@@ -2542,7 +2551,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 }
             }
             unit->hasGenericSyntax = (sourceFile.content.find('<') != std::string::npos);
-            {
+            if (!hasPartialKeyword) {
                 std::lock_guard<std::mutex> lock(sParsedUnitCacheMutex);
                 if (sParsedUnitCache.size() > 8192) sParsedUnitCache.clear();
                 sParsedUnitCache[fp] = *unit;
@@ -2586,6 +2595,102 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         addSourceUnit(SourceFile{
             "$builtin/RealScript.Fiber.rs",
             builtinFiberModuleSource()});
+    }
+
+    // Merge partial classes within each module in deterministic source order before specialization.
+    for (auto& [moduleName, module] : modules) {
+        (void)moduleName;
+        std::sort(module.units.begin(), module.units.end(),
+            [](const ParsedUnit* left, const ParsedUnit* right) {
+                return left->source->name() < right->source->name();
+            });
+        const auto isPartialClass = [](const syntax::ClassDeclarationSyntax& cls) {
+            for (const auto& mod : cls.modifiers) {
+                if (mod.kind == syntax::SyntaxKind::PartialKeyword) return true;
+            }
+            return false;
+        };
+        std::unordered_map<std::string, std::pair<ParsedUnit*, std::size_t>> primaryPartials;
+        for (auto* unit : module.units) {
+            if (!unit || !unit->syntaxTree) continue;
+            auto& classes = unit->syntaxTree->classes;
+            std::size_t writeIdx = 0;
+            for (std::size_t readIdx = 0; readIdx < classes.size(); ++readIdx) {
+                auto& cls = classes[readIdx];
+                if (isPartialClass(cls)) {
+                    const std::string key = cls.identifierToken.text + "#" +
+                        std::to_string(cls.typeParameters.size());
+                    auto found = primaryPartials.find(key);
+                    if (found == primaryPartials.end()) {
+                        if (writeIdx != readIdx) {
+                            classes[writeIdx] = std::move(cls);
+                        }
+                        primaryPartials.emplace(key, std::make_pair(unit, writeIdx));
+                        ++writeIdx;
+                    } else {
+                        auto& dst = found->second.first->syntaxTree->classes[found->second.second];
+                        dst.attributes.insert(
+                            dst.attributes.end(),
+                            std::make_move_iterator(cls.attributes.begin()),
+                            std::make_move_iterator(cls.attributes.end()));
+                        for (const auto& mod : cls.modifiers) {
+                            bool exists = false;
+                            for (const auto& existingMod : dst.modifiers) {
+                                if (existingMod.kind == mod.kind) {
+                                    exists = true;
+                                    break;
+                                }
+                            }
+                            if (!exists) dst.modifiers.push_back(mod);
+                        }
+                        if (!dst.colonToken && cls.colonToken) {
+                            dst.colonToken = cls.colonToken;
+                        }
+                        for (auto& iface : cls.interfaces) {
+                            bool exists = false;
+                            for (const auto& existingIface : dst.interfaces) {
+                                if (existingIface.name.text == iface.name.text &&
+                                    existingIface.typeArguments.size() == iface.typeArguments.size()) {
+                                    exists = true;
+                                    break;
+                                }
+                            }
+                            if (!exists) dst.interfaces.push_back(std::move(iface));
+                        }
+                        dst.fields.insert(
+                            dst.fields.end(),
+                            std::make_move_iterator(cls.fields.begin()),
+                            std::make_move_iterator(cls.fields.end()));
+                        dst.events.insert(
+                            dst.events.end(),
+                            std::make_move_iterator(cls.events.begin()),
+                            std::make_move_iterator(cls.events.end()));
+                        dst.methods.insert(
+                            dst.methods.end(),
+                            std::make_move_iterator(cls.methods.begin()),
+                            std::make_move_iterator(cls.methods.end()));
+                        dst.sequences.insert(
+                            dst.sequences.end(),
+                            std::make_move_iterator(cls.sequences.begin()),
+                            std::make_move_iterator(cls.sequences.end()));
+                        dst.constructors.insert(
+                            dst.constructors.end(),
+                            std::make_move_iterator(cls.constructors.begin()),
+                            std::make_move_iterator(cls.constructors.end()));
+                        dst.properties.insert(
+                            dst.properties.end(),
+                            std::make_move_iterator(cls.properties.begin()),
+                            std::make_move_iterator(cls.properties.end()));
+                    }
+                } else {
+                    if (writeIdx != readIdx) {
+                        classes[writeIdx] = std::move(cls);
+                    }
+                    ++writeIdx;
+                }
+            }
+            classes.resize(writeIdx);
+        }
     }
 
     specializeNativeGenerics(units, modules, result);
@@ -3189,8 +3294,14 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                                 }
                             }
                             owner.fields = base->fields;
+                            owner.nextObservableBitIndex = base->nextObservableBitIndex;
                             for (auto& f : ownFields) {
                                 f.index = owner.fields.size();
+                                if (f.observable) {
+                                    f.observableBitIndex = (owner.nextObservableBitIndex < 63u)
+                                        ? owner.nextObservableBitIndex++
+                                        : 63u;
+                                }
                                 owner.fields.push_back(f);
                             }
                             owner.methods = base->methods;
@@ -4190,6 +4301,11 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         }
                         if (autoProperty) {
                             property.backingFieldIndex = owner.fields.size();
+                            if (property.observable) {
+                                property.observableBitIndex = (owner.nextObservableBitIndex < 63u)
+                                    ? owner.nextObservableBitIndex++
+                                    : 63u;
+                            }
                             semantic::FieldSymbol backing;
                             backing.name = "$" + property.name;
                             backing.type = property.type;
@@ -4200,6 +4316,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             backing.synthetic = true;
                             backing.staticField = property.staticProperty;
                             backing.readonlyField = !property.setter.has_value();
+                            backing.observable = property.observable;
+                            backing.observableBitIndex = property.observableBitIndex;
                             backing.initializerSyntax = propertySyntax.initializer.get();
                             backing.sourceName = unit->source->name();
                             backing.declarationSpan = propertySyntax.identifierToken.span;
@@ -5036,7 +5154,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                      ++interfaceIndex) {
                     const auto& interfaceSyntax =
                         typeSyntax.interfaces[interfaceIndex];
-                    if (interfaceIndex == 0 &&
+                    if ((interfaceIndex == 0 || owner->partialType) &&
                         !owner->baseTypeName.empty()) {
                         const auto candidate = module.visibleTypes.find(
                             interfaceSyntax.name.text);

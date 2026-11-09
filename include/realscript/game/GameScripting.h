@@ -4,6 +4,7 @@
 #include "realscript/debug/DapServer.h"
 #include "realscript/game/GameBindings.h"
 #include "realscript/jit/Jit.h"
+#include "realscript/runtime/ExecutionDomain.h"
 #include "realscript/runtime/FiberScheduler.h"
 
 namespace realscript::game {
@@ -397,6 +398,21 @@ public:
         const std::string& name,
         runtime::RuntimeError& error,
         runtime::ExecutionOptions options = {}) const;
+
+    // P1-3: Zero-Boxing Property Slot Access ABI (O(1) slot resolution & read/write)
+    [[nodiscard]] runtime::PropertySlotHandle resolvePropertySlot(
+        semantic::SymbolId typeId,
+        std::string_view propertyOrFieldName) const noexcept;
+    [[nodiscard]] bool readPropertySlotFast(
+        runtime::ObjectRef target,
+        runtime::PropertySlotHandle slot,
+        runtime::Value& outValue,
+        runtime::RuntimeError* error = nullptr) const;
+    [[nodiscard]] bool writePropertySlotFast(
+        runtime::ObjectRef target,
+        runtime::PropertySlotHandle slot,
+        runtime::Value newValue,
+        runtime::RuntimeError* error = nullptr) const;
 
     [[nodiscard]] static runtime::Value makeFixed(Fixed value);
     [[nodiscard]] static runtime::Value makeVec2(Vec2 value);

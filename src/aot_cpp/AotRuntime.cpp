@@ -2474,26 +2474,32 @@ std::size_t ExecutionContext::replayEntriesConsumed() const noexcept {
     return determinism_.replayEntriesConsumed();
 }
 
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+#define RS_AOT_THROW_INVALID_ARG(msg) throw std::invalid_argument(msg)
+#else
+#define RS_AOT_THROW_INVALID_ARG(msg) std::abort()
+#endif
+
 Program::Program(const ProgramDescriptor& descriptor)
     : descriptor_(&descriptor),
       heap_(std::make_shared<runtime::ManagedHeap>()) {
     if (descriptor.abiMajor != RuntimeAbiMajor ||
         descriptor.abiMinor > RuntimeAbiMinor) {
-        throw std::invalid_argument("AOT program requires an incompatible runtime ABI");
+        RS_AOT_THROW_INVALID_ARG("AOT program requires an incompatible runtime ABI");
     }
     if (!descriptor.name || descriptor.name[0] == '\0' ||
         descriptor.moduleCount == 0 || !descriptor.moduleNames ||
         descriptor.functionCount == 0 || !descriptor.functions ||
         (descriptor.typeCount != 0 && !descriptor.types) ||
         (descriptor.sourceMapCount != 0 && !descriptor.sourceMap)) {
-        throw std::invalid_argument("AOT program descriptor is incomplete");
+        RS_AOT_THROW_INVALID_ARG("AOT program descriptor is incomplete");
     }
 
     std::unordered_set<std::string> moduleNames;
     for (std::uint32_t index = 0; index < descriptor.moduleCount; ++index) {
         const auto* name = descriptor.moduleNames[index];
         if (!name || name[0] == '\0' || !moduleNames.emplace(name).second) {
-            throw std::invalid_argument("AOT program contains an invalid module table");
+            RS_AOT_THROW_INVALID_ARG("AOT program contains an invalid module table");
         }
     }
 
@@ -2505,7 +2511,7 @@ Program::Program(const ProgramDescriptor& descriptor)
             !typeIds.insert(type.id).second ||
             (type.fieldCount != 0 && !type.fields) ||
             (type.enumMemberCount != 0 && !type.enumMembers)) {
-            throw std::invalid_argument("AOT program contains an invalid type table");
+            RS_AOT_THROW_INVALID_ARG("AOT program contains an invalid type table");
         }
         if (moduleNames.count(type.moduleName) == 0 ||
             (type.kind != semantic::TypeKind::Class &&
@@ -2514,7 +2520,7 @@ Program::Program(const ProgramDescriptor& descriptor)
             (type.kind == semantic::TypeKind::Enum && type.fieldCount != 0) ||
             (type.kind != semantic::TypeKind::Enum &&
              type.enumMemberCount != 0)) {
-            throw std::invalid_argument("AOT type descriptor kind is inconsistent");
+            RS_AOT_THROW_INVALID_ARG("AOT type descriptor kind is inconsistent");
         }
         std::unordered_set<std::string> fieldNames;
         for (std::uint32_t fieldIndex = 0;
@@ -2526,7 +2532,7 @@ Program::Program(const ProgramDescriptor& descriptor)
                 !validStorageType(field.type) ||
                 !validSignatureIdentity(field.type, field.typeId) ||
                 !fieldNames.emplace(field.name).second) {
-                throw std::invalid_argument("AOT program contains an invalid field table");
+                RS_AOT_THROW_INVALID_ARG("AOT program contains an invalid field table");
             }
         }
         std::unordered_set<std::string> enumNames;
@@ -2536,7 +2542,7 @@ Program::Program(const ProgramDescriptor& descriptor)
             const auto& member = type.enumMembers[memberIndex];
             if (!member.name || member.name[0] == '\0' ||
                 !enumNames.emplace(member.name).second) {
-                throw std::invalid_argument("AOT program contains an invalid enum table");
+                RS_AOT_THROW_INVALID_ARG("AOT program contains an invalid enum table");
             }
         }
     }
@@ -2550,7 +2556,7 @@ Program::Program(const ProgramDescriptor& descriptor)
             const auto& field = type.fields[fieldIndex];
             if (requiresDescriptor(field.type) &&
                 typeIds.count(field.typeId) == 0) {
-                throw std::invalid_argument(
+                RS_AOT_THROW_INVALID_ARG(
                     "AOT field references an unknown exact type");
             }
         }
@@ -2576,7 +2582,7 @@ Program::Program(const ProgramDescriptor& descriptor)
              typeIds.count(function.returnTypeId) == 0) ||
             (function.parameterCount != 0 &&
              (!function.parameterTypes || !function.parameterTypeIds))) {
-            throw std::invalid_argument("AOT program contains an invalid function table");
+            RS_AOT_THROW_INVALID_ARG("AOT program contains an invalid function table");
         }
         // Overloads intentionally share a qualified source name. Calls emitted
         // by the compiler use SymbolId; the name-only embedding convenience API
@@ -2592,7 +2598,7 @@ Program::Program(const ProgramDescriptor& descriptor)
                     function.parameterTypeIds[parameter]) ||
                 (requiresDescriptor(function.parameterTypes[parameter]) &&
                  typeIds.count(function.parameterTypeIds[parameter]) == 0)) {
-                throw std::invalid_argument(
+                RS_AOT_THROW_INVALID_ARG(
                     "AOT program contains an invalid function signature");
             }
         }
@@ -2604,10 +2610,12 @@ Program::Program(const ProgramDescriptor& descriptor)
             entry.generatedLine == 0 || !entry.sourcePath ||
             entry.sourcePath[0] == '\0' || entry.sourceLine == 0 ||
             entry.sourceColumn == 0) {
-            throw std::invalid_argument("AOT program contains an invalid source map");
+            RS_AOT_THROW_INVALID_ARG("AOT program contains an invalid source map");
         }
     }
 }
+
+#undef RS_AOT_THROW_INVALID_ARG
 
 void Program::setBindings(
     std::shared_ptr<const runtime::BindingRegistry> bindings) {

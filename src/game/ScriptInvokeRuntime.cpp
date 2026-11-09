@@ -198,6 +198,141 @@ bool ScriptRuntime::setMember(
     return false;
 }
 
+runtime::PropertySlotHandle ScriptRuntime::resolvePropertySlot(
+    semantic::SymbolId typeId,
+    std::string_view propertyOrFieldName) const noexcept {
+    runtime::PropertySlotHandle handle{};
+    if (!program_) return handle;
+    const auto* type = findTypeById(typeId);
+    if (!type) return handle;
+
+    for (const auto& field : type->fields) {
+        if (field.name == propertyOrFieldName && !field.staticField) {
+            handle.typeId = type->id;
+            handle.backingFieldIndex = static_cast<std::uint32_t>(field.index);
+            handle.isAutoProperty = true;
+            if (field.observable && field.observableBitIndex < 64u) {
+                handle.isObservable = true;
+                handle.observableBitIndex = static_cast<std::uint8_t>(field.observableBitIndex);
+            }
+            handle.isReadOnly = field.readonlyField || field.constField;
+            return handle;
+        }
+    }
+
+    std::unordered_set<semantic::SymbolId> visited;
+    const semantic::TypeSymbol* current = type;
+    while (current && visited.insert(current->id).second) {
+        for (const auto& prop : current->properties) {
+            if (prop.name != propertyOrFieldName || prop.staticProperty) continue;
+            handle.typeId = type->id;
+            handle.getterSymbolId = prop.getter ? prop.getter->id : 0;
+            handle.setterSymbolId = prop.setter ? prop.setter->id : 0;
+            handle.isReadOnly = !prop.setter.has_value();
+            if (prop.observable && prop.observableBitIndex < 64u) {
+                handle.isObservable = true;
+                handle.observableBitIndex = static_cast<std::uint8_t>(prop.observableBitIndex);
+            }
+            if (prop.backingFieldIndex != std::numeric_limits<std::size_t>::max() &&
+                prop.backingFieldIndex < type->fields.size()) {
+                handle.backingFieldIndex = static_cast<std::uint32_t>(prop.backingFieldIndex);
+                handle.isAutoProperty = true;
+                const auto& backing = type->fields[prop.backingFieldIndex];
+                if (backing.observable && backing.observableBitIndex < 64u) {
+                    handle.isObservable = true;
+                    handle.observableBitIndex = static_cast<std::uint8_t>(backing.observableBitIndex);
+                }
+            }
+            return handle;
+        }
+        const semantic::SymbolId baseId = current->baseTypeId != 0
+            ? current->baseTypeId
+            : (!current->baseTypeName.empty()
+                   ? semantic::stableTypeId(current->baseTypeName)
+                   : 0);
+        current = findTypeById(baseId);
+    }
+    return handle;
+}
+
+bool ScriptRuntime::readPropertySlotFast(
+    runtime::ObjectRef target,
+    runtime::PropertySlotHandle slot,
+    runtime::Value& outValue,
+    runtime::RuntimeError* error) const {
+    if (!slot.valid() || !heap_) {
+        if (error) {
+            error->code = runtime::ErrorCode::InvalidArguments;
+            error->message = "invalid PropertySlotHandle or missing heap";
+        }
+        return false;
+    }
+    if (slot.isAutoBacked()) {
+        const auto* val = heap_->fieldGetFast(target, slot.backingFieldIndex);
+        if (!val) {
+            if (error) {
+                error->code = runtime::ErrorCode::InvalidObjectReference;
+                error->message = "target object is dead or slot index is out of range";
+            }
+            return false;
+        }
+        outValue = *val;
+        return true;
+    }
+    if (slot.getterSymbolId != 0) {
+        const auto res = invokeSymbol(slot.getterSymbolId, {runtime::Value{target}}, {});
+        if (!res.succeeded) {
+            if (error) *error = res.error;
+            return false;
+        }
+        outValue = res.value;
+        return true;
+    }
+    if (error) {
+        error->code = runtime::ErrorCode::FunctionNotFound;
+        error->message = "property slot has no backing field or getter";
+    }
+    return false;
+}
+
+bool ScriptRuntime::writePropertySlotFast(
+    runtime::ObjectRef target,
+    runtime::PropertySlotHandle slot,
+    runtime::Value newValue,
+    runtime::RuntimeError* error) const {
+    if (!slot.valid() || !heap_) {
+        if (error) {
+            error->code = runtime::ErrorCode::InvalidArguments;
+            error->message = "invalid PropertySlotHandle or missing heap";
+        }
+        return false;
+    }
+    if (slot.isReadOnly) {
+        if (error) {
+            error->code = runtime::ErrorCode::InvalidArguments;
+            error->message = "property slot is read-only";
+        }
+        return false;
+    }
+    if (slot.isAutoBacked()) {
+        return heap_->fieldSet(target, slot.backingFieldIndex, std::move(newValue), error);
+    }
+    if (slot.setterSymbolId != 0) {
+        const auto res = invokeSymbol(
+            slot.setterSymbolId, {runtime::Value{target}, std::move(newValue)}, {});
+        if (!res.succeeded) {
+            if (error) *error = res.error;
+            return false;
+        }
+        return true;
+    }
+    if (error) {
+        error->code = runtime::ErrorCode::FunctionNotFound;
+        error->message = "property slot has no backing field or setter";
+    }
+    return false;
+}
+
 std::optional<runtime::Value> ScriptRuntime::getMember(
     const ScriptObject& object,
     const std::string& name,

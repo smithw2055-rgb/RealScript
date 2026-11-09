@@ -474,6 +474,17 @@ bool tryApplyEvaluatedConstantToField(
     return false;
 }
 
+bool hasAttributeName(
+    const std::vector<syntax::AttributeListSyntax>& lists,
+    std::string_view name) noexcept {
+    for (const auto& list : lists) {
+        for (const auto& attribute : list.attributes) {
+            if (attribute.nameToken.text == name) return true;
+        }
+    }
+    return false;
+}
+
 template <typename T>
 bool populateFields(
     TypeSymbol& type,
@@ -526,6 +537,13 @@ bool populateFields(
         }
         if (field.constField) {
             field.staticField = true;
+        }
+        field.observable = !field.staticField && !field.constField &&
+            (type.observable || hasAttributeName(fieldSyntax.attributes, "Observable"));
+        if (field.observable) {
+            field.observableBitIndex = (type.nextObservableBitIndex < 63u)
+                ? type.nextObservableBitIndex++
+                : 63u;
         }
         if (type.staticType && !field.staticField && !field.constField) {
             diagnostics.report(
@@ -718,21 +736,6 @@ void appendSyntaxParameters(
             parameterSyntax.identifierToken.span;
         result.parameters.push_back(std::move(parameter));
     }
-}
-
-} // namespace
-
-namespace {
-
-bool hasAttributeName(
-    const std::vector<syntax::AttributeListSyntax>& lists,
-    std::string_view name) noexcept {
-    for (const auto& list : lists) {
-        for (const auto& attribute : list.attributes) {
-            if (attribute.nameToken.text == name) return true;
-        }
-    }
-    return false;
 }
 
 } // namespace
@@ -1023,6 +1026,10 @@ TypeSymbol declareTypeShell(
         syntaxTree.modifiers, syntax::SyntaxKind::AbstractKeyword);
     result.sealedType = result.staticType || hasModifier(
         syntaxTree.modifiers, syntax::SyntaxKind::SealedKeyword);
+    result.partialType = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::PartialKeyword);
+    result.observable = hasAttributeName(
+        syntaxTree.attributes, "Observable");
     result.deterministic = hasAttributeName(
         syntaxTree.attributes, "Deterministic");
     result.moduleName = moduleName;
@@ -1397,6 +1404,8 @@ PropertySymbol declarePropertySymbol(
     result.declarationSpan = syntaxTree.identifierToken.span;
     result.id = fnv1a(canonicalTypeName(owner) + "::property:" + result.name);
     result.staticProperty = syntaxTree.staticKeyword.has_value();
+    result.observable = !result.staticProperty &&
+        (owner.observable || hasAttributeName(syntaxTree.attributes, "Observable"));
     const auto resolved = resolveType(syntaxTree.type, visibleTypes, false);
     result.type = resolved.type;
     result.typeName = resolved.name;

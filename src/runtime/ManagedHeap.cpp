@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -184,6 +185,9 @@ struct ManagedHeap::Impl {
         bool marked = false;
         bool inNursery = true;
         bool inRememberedSet = false;
+        bool inDirtyQueue = false;
+        std::uint16_t uiObserverCount = 0;
+        std::uint64_t dirtyFieldMask = 0;
         std::size_t sizeBytes = 0;
     };
 
@@ -330,6 +334,8 @@ struct ManagedHeap::Impl {
     std::unordered_map<std::string, NativeEcsColumnTable> nativeEcsTables;
     std::unordered_map<std::string, ObjectRef> internedStrings;
     std::unordered_map<semantic::SymbolId, std::shared_ptr<const std::vector<std::size_t>>> sharedTypeReferenceFields;
+    std::unordered_map<semantic::SymbolId, std::vector<std::uint8_t>> typeObservableBits;
+    std::vector<ObjectRef> dirtyObjects;
     RootToken nextRootToken = 1;
     GcPhase phase = GcPhase::Idle;
     bool requested = false;
@@ -402,6 +408,9 @@ struct ManagedHeap::Impl {
         object.header.marked = phase != GcPhase::Idle;
         object.header.inNursery = true;
         object.header.inRememberedSet = false;
+        object.header.inDirtyQueue = false;
+        object.header.uiObserverCount = 0;
+        object.header.dirtyFieldMask = 0;
         object.header.sizeBytes = sizeBytes;
         object.referenceFields = std::move(referenceFields);
         slot.object.occupied = true;
@@ -1286,6 +1295,22 @@ std::optional<Value> ManagedHeap::fieldGet(ObjectRef reference, std::size_t inde
     return object->valueAt(index);
 }
 
+const Value* ManagedHeap::fieldGetFast(ObjectRef reference, std::size_t index) const noexcept {
+    const auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Record ||
+        index >= object->valueCount()) {
+        return nullptr;
+    }
+    return &object->valueAt(index);
+}
+
+bool ManagedHeap::fieldSetFast(
+    ObjectRef reference,
+    std::size_t index,
+    const Value& value) noexcept {
+    return fieldSet(reference, index, value, nullptr);
+}
+
 bool ManagedHeap::fieldSet(
     ObjectRef reference,
     std::size_t index,
@@ -1302,6 +1327,10 @@ bool ManagedHeap::fieldSet(
             "managed field index is out of range");
         return false;
     }
+    auto& slotVal = object->valueAt(index);
+    if (slotVal == value) {
+        return true;
+    }
     if (object->referenceFields &&
         std::binary_search(
             object->referenceFields->begin(),
@@ -1310,8 +1339,180 @@ bool ManagedHeap::fieldSet(
         impl_->writeBarrier(reference, value);
     }
     pinValueInPools(value);
-    object->valueAt(index) = std::move(value);
+    slotVal = std::move(value);
+
+    std::uint8_t observableBit = 0xFFu;
+    if (object->header.typeId != 0) {
+        const auto foundBits = impl_->typeObservableBits.find(object->header.typeId);
+        if (foundBits != impl_->typeObservableBits.end() &&
+            index < foundBits->second.size()) {
+            observableBit = foundBits->second[index];
+        } else if (object->header.uiObserverCount > 0) {
+            observableBit = static_cast<std::uint8_t>(index < 63u ? index : 63u);
+        }
+    } else if (object->header.uiObserverCount > 0) {
+        observableBit = static_cast<std::uint8_t>(index < 63u ? index : 63u);
+    }
+    if (observableBit != 0xFFu) {
+        const std::uint8_t safeBit = observableBit < 63u ? observableBit : 63u;
+        object->header.dirtyFieldMask |= (1ULL << safeBit);
+        if (!object->header.inDirtyQueue) {
+            object->header.inDirtyQueue = true;
+            impl_->dirtyObjects.push_back(reference);
+        }
+    }
     return true;
+}
+
+void ManagedHeap::registerTypeObservableBits(
+    semantic::SymbolId typeId,
+    std::vector<std::uint8_t> fieldObservableBits) {
+    if (typeId == 0) return;
+    impl_->typeObservableBits[typeId] = std::move(fieldObservableBits);
+}
+
+void ManagedHeap::registerProgramObservableTypes(const ProgramImage& program) {
+    for (const auto& mod : program.modules()) {
+        for (const auto& type : mod.types) {
+            if (type.kind != semantic::TypeKind::Class ||
+                (!type.observable && type.nextObservableBitIndex == 0)) {
+                continue;
+            }
+            if (impl_->typeObservableBits.find(type.id) != impl_->typeObservableBits.end()) {
+                continue;
+            }
+            std::vector<std::uint8_t> bits(type.fields.size(), 0xFFu);
+            bool anyObservable = false;
+            for (const auto& f : type.fields) {
+                if (f.observable && f.index < bits.size()) {
+                    bits[f.index] = static_cast<std::uint8_t>(
+                        f.observableBitIndex < 63u ? f.observableBitIndex : 63u);
+                    anyObservable = true;
+                }
+            }
+            if (anyObservable) {
+                impl_->typeObservableBits.emplace(type.id, std::move(bits));
+            }
+        }
+    }
+}
+
+std::uint64_t ManagedHeap::dirtyFieldMask(ObjectRef reference) const noexcept {
+    const auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Record) return 0;
+    return object->header.dirtyFieldMask;
+}
+
+void ManagedHeap::clearDirtyFieldMask(ObjectRef reference) noexcept {
+    if (auto* object = impl_->get(reference)) {
+        object->header.dirtyFieldMask = 0;
+        object->header.inDirtyQueue = false;
+    }
+}
+
+void ManagedHeap::addUiObserver(ObjectRef reference) noexcept {
+    if (auto* object = impl_->get(reference)) {
+        if (object->header.uiObserverCount < 0xFFFFu) {
+            ++object->header.uiObserverCount;
+        }
+    }
+}
+
+void ManagedHeap::removeUiObserver(ObjectRef reference) noexcept {
+    if (auto* object = impl_->get(reference)) {
+        if (object->header.uiObserverCount > 0) {
+            --object->header.uiObserverCount;
+        }
+    }
+}
+
+std::uint16_t ManagedHeap::uiObserverCount(ObjectRef reference) const noexcept {
+    const auto* object = impl_->get(reference);
+    return object ? object->header.uiObserverCount : 0;
+}
+
+std::vector<ObjectRef> ManagedHeap::consumeDirtyObjects() {
+    std::vector<ObjectRef> result;
+    result.reserve(impl_->dirtyObjects.size());
+    for (const auto& ref : impl_->dirtyObjects) {
+        if (auto* obj = impl_->get(ref)) {
+            obj->header.inDirtyQueue = false;
+            if (obj->header.dirtyFieldMask != 0) {
+                result.push_back(ref);
+            }
+        }
+    }
+    impl_->dirtyObjects.clear();
+    return result;
+}
+
+std::optional<ObjectRef> ManagedHeap::allocateWeakDelegate(
+    semantic::SymbolId delegateTypeId,
+    ObjectRef target,
+    semantic::SymbolId functionId,
+    std::int64_t baseFlags,
+    RuntimeError* error) {
+    if (delegateTypeId == 0) {
+        setHeapError(error, ErrorCode::InvalidArguments,
+            "delegate type ID must be non-zero");
+        return std::nullopt;
+    }
+    const auto loWord = static_cast<std::int64_t>(static_cast<std::uint32_t>(functionId));
+    const auto hiWord = static_cast<std::int64_t>(static_cast<std::uint32_t>(functionId >> 32u));
+    std::vector<Value> fields{
+        Value{target},
+        Value{loWord},
+        Value{hiWord},
+        Value{(baseFlags & 3) | DelegateWeakTargetFlag},
+        Value{std::int64_t{0}},
+        Value{std::int64_t{0}},
+        Value{std::int64_t{0}},
+        Value{NullObject{}},
+    };
+    const auto storage = estimateValueStorage(fields.size());
+    return impl_->allocateValuesSlot(
+        ObjectKind::Record,
+        delegateTypeId,
+        semantic::PrimitiveType::Error,
+        0,
+        std::move(fields),
+        std::make_shared<const std::vector<std::size_t>>(std::vector<std::size_t>{7u}),
+        Impl::BaseObjectSizeBytes + storage,
+        error);
+}
+
+Value ManagedHeap::pruneDelegateChain(const Value& delegateVal) {
+    if (std::holds_alternative<NullObject>(delegateVal)) return delegateVal;
+    const auto* ref = std::get_if<ObjectRef>(&delegateVal);
+    if (!ref || !isAlive(*ref) || fieldCount(*ref) != 8u) return Value{NullObject{}};
+    const auto* flagsVal = fieldGetFast(*ref, 3u);
+    const auto* flags = flagsVal ? std::get_if<std::int64_t>(flagsVal) : nullptr;
+    if (!flags) return Value{NullObject{}};
+    const std::int64_t mode = (*flags & 7);
+    const bool isWeak = ((*flags & DelegateWeakTargetFlag) != 0);
+    if (mode != 4) {
+        if (isWeak) {
+            const auto* targetVal = fieldGetFast(*ref, 0u);
+            if (const auto* targetRef = targetVal ? std::get_if<ObjectRef>(targetVal) : nullptr) {
+                if (!isAlive(*targetRef)) {
+                    return Value{NullObject{}};
+                }
+            }
+        }
+        return delegateVal;
+    }
+    const Value leftVal = fieldGet(*ref, 0u).value_or(Value{NullObject{}});
+    const Value rightVal = fieldGet(*ref, 7u).value_or(Value{NullObject{}});
+    const Value prunedLeft = pruneDelegateChain(leftVal);
+    const Value prunedRight = pruneDelegateChain(rightVal);
+    const bool leftNull = std::holds_alternative<NullObject>(prunedLeft);
+    const bool rightNull = std::holds_alternative<NullObject>(prunedRight);
+    if (leftNull && rightNull) return Value{NullObject{}};
+    if (leftNull) return prunedRight;
+    if (rightNull) return prunedLeft;
+    if (!(prunedLeft == leftVal)) (void)fieldSet(*ref, 0u, prunedLeft);
+    if (!(prunedRight == rightVal)) (void)fieldSet(*ref, 7u, prunedRight);
+    return delegateVal;
 }
 
 ManagedHeap::RootToken ManagedHeap::addPersistentRoot(ObjectRef reference) {
@@ -1724,6 +1925,29 @@ std::size_t ManagedHeap::step(
         break;
     }
     return performed;
+}
+
+std::size_t ManagedHeap::stepIdleForDuration(
+    const ShadowStack& shadowStack,
+    double maxMilliseconds) {
+    if (maxMilliseconds <= 0.0) return 0;
+    const auto start = std::chrono::steady_clock::now();
+    std::size_t totalWork = 0;
+    if (impl_->phase == GcPhase::Idle && !impl_->requested && !impl_->nurserySlots.empty()) {
+        totalWork += collectYoung(shadowStack, 64);
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double, std::milli>(now - start).count() >= maxMilliseconds) {
+            return totalWork;
+        }
+    }
+    while (impl_->phase != GcPhase::Idle || impl_->requested) {
+        totalWork += step(shadowStack, 32);
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double, std::milli>(now - start).count() >= maxMilliseconds) {
+            break;
+        }
+    }
+    return totalWork;
 }
 
 void ManagedHeap::collectFull(const ShadowStack& shadowStack) {
@@ -2519,7 +2743,10 @@ PersistentRoot::PersistentRoot(
     : heap_(heap), token_(token), value_(std::move(value)) {}
 
 NativeHandleRegistry::NativeHandleRegistry()
-    : registryId_(nextRegistryId()) {}
+    : registryId_(nextRegistryId()) {
+    slots_.reserve(256);
+    freeSlots_.reserve(256);
+}
 
 NativeHandle NativeHandleRegistry::create(
     semantic::SymbolId typeId,
@@ -2548,6 +2775,36 @@ NativeHandle NativeHandleRegistry::create(
     slot.cachedHeapId = 0;
     if (rawPtr) {
         activeSlotByPointer_[PointerTypeKey{rawPtr, typeId}] = slotIndex;
+    }
+    return {slotIndex, slot.generation, typeId, registryId_};
+}
+
+NativeHandle NativeHandleRegistry::createBorrowed(
+    semantic::SymbolId typeId,
+    void* rawPointer,
+    bool indexPointer) {
+    if (typeId == 0 || !rawPointer) return {};
+    std::uint32_t slotIndex = 0;
+    if (!freeSlots_.empty()) {
+        slotIndex = freeSlots_.back();
+        freeSlots_.pop_back();
+    } else {
+        if (slots_.size() >= static_cast<std::size_t>(NativeHandle::InvalidSlot)) {
+            return {};
+        }
+        slotIndex = static_cast<std::uint32_t>(slots_.size());
+        slots_.push_back({});
+    }
+    auto& slot = slots_[slotIndex];
+    if (slot.generation == 0 || slot.generation > 0xFFFFu) slot.generation = 1;
+    slot.resource = std::shared_ptr<void>(std::shared_ptr<void>{}, rawPointer);
+    slot.rawPointer = rawPointer;
+    slot.typeId = typeId;
+    slot.debugName.clear();
+    slot.cachedWrapper = {};
+    slot.cachedHeapId = 0;
+    if (indexPointer) {
+        activeSlotByPointer_[PointerTypeKey{rawPointer, typeId}] = slotIndex;
     }
     return {slotIndex, slot.generation, typeId, registryId_};
 }
@@ -2612,6 +2869,42 @@ std::shared_ptr<void> NativeHandleRegistry::resolve(
         return {};
     }
     return slot.resource;
+}
+
+void* NativeHandleRegistry::resolveRawFast(
+    NativeHandle handle,
+    semantic::SymbolId expectedTypeId) const noexcept {
+    if (!handle.valid() ||
+        handle.registryId != ((registryId_ == 0) ? 0u : (((registryId_ - 1u) % 65535u) + 1u)) ||
+        handle.slot >= slots_.size()) {
+        return nullptr;
+    }
+    const auto& slot = slots_[handle.slot];
+    if (!slot.rawPointer || slot.generation != handle.generation) {
+        return nullptr;
+    }
+    if (expectedTypeId != 0 && slot.typeId != expectedTypeId) {
+        return nullptr;
+    }
+    return const_cast<void*>(slot.rawPointer);
+}
+
+void NativeHandleRegistry::visitCachedWrappers(
+    std::uint64_t heapId,
+    const std::function<void(NativeHandle, ObjectRef, const void*)>& visitor) const {
+    if (!visitor) return;
+    for (std::size_t i = 0; i < slots_.size(); ++i) {
+        const auto& slot = slots_[i];
+        if (slot.rawPointer && slot.cachedWrapper.valid() &&
+            (heapId == 0 || slot.cachedHeapId == heapId)) {
+            NativeHandle h{
+                static_cast<std::uint32_t>(i),
+                slot.generation,
+                slot.typeId,
+                registryId_};
+            visitor(h, slot.cachedWrapper, slot.rawPointer);
+        }
+    }
 }
 
 bool NativeHandleRegistry::isAlive(NativeHandle handle) const noexcept {

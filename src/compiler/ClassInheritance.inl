@@ -36,36 +36,42 @@ void resolveClassInheritance(
                 auto* type = findOwnClassOrType(
                     module, declaration.identifierToken.text);
                 if (!type || declaration.interfaces.empty()) continue;
-                const auto& candidate = declaration.interfaces.front();
-                const auto found = module.visibleTypes.find(candidate.name.text);
-                if (found == module.visibleTypes.end()) continue;
-                if (found->second.kind != semantic::TypeKind::Class ||
-                    found->second.interfaceType) {
-                    continue;
+                const std::size_t maxCheck = type->partialType
+                    ? declaration.interfaces.size()
+                    : 1u;
+                for (std::size_t idx = 0; idx < maxCheck; ++idx) {
+                    const auto& candidate = declaration.interfaces[idx];
+                    const auto found = module.visibleTypes.find(candidate.name.text);
+                    if (found == module.visibleTypes.end()) continue;
+                    if (found->second.kind != semantic::TypeKind::Class ||
+                        found->second.interfaceType) {
+                        continue;
+                    }
+                    if (found->second.id == type->id) {
+                        result.diagnostics.report(
+                            "RS2500", "class cannot inherit from itself",
+                            candidate.span(),
+                            diagnostics::DiagnosticSeverity::Error,
+                            unit->source->name());
+                        module.invalid = true;
+                        break;
+                    }
+                    if (found->second.sealedType) {
+                        result.diagnostics.report(
+                            "RS2501",
+                            "cannot inherit from sealed class '" +
+                                semantic::canonicalTypeName(found->second) + "'",
+                            candidate.span(),
+                            diagnostics::DiagnosticSeverity::Error,
+                            unit->source->name());
+                        module.invalid = true;
+                        break;
+                    }
+                    type->baseTypeId = found->second.id;
+                    type->baseTypeName =
+                        semantic::canonicalTypeName(found->second);
+                    break;
                 }
-                if (found->second.id == type->id) {
-                    result.diagnostics.report(
-                        "RS2500", "class cannot inherit from itself",
-                        candidate.span(),
-                        diagnostics::DiagnosticSeverity::Error,
-                        unit->source->name());
-                    module.invalid = true;
-                    continue;
-                }
-                if (found->second.sealedType) {
-                    result.diagnostics.report(
-                        "RS2501",
-                        "cannot inherit from sealed class '" +
-                            semantic::canonicalTypeName(found->second) + "'",
-                        candidate.span(),
-                        diagnostics::DiagnosticSeverity::Error,
-                        unit->source->name());
-                    module.invalid = true;
-                    continue;
-                }
-                type->baseTypeId = found->second.id;
-                type->baseTypeName =
-                    semantic::canonicalTypeName(found->second);
             }
         }
     }
@@ -141,6 +147,7 @@ void applyInheritedFieldLayouts(
                     apply(*baseModule, *base);
                     auto ownFields = type.fields;
                     type.fields = base->fields;
+                    type.nextObservableBitIndex = base->nextObservableBitIndex;
                     std::unordered_set<std::string> names;
                     for (const auto& field : type.fields) {
                         names.insert(field.name);
@@ -158,6 +165,11 @@ void applyInheritedFieldLayouts(
                             continue;
                         }
                         field.index = type.fields.size();
+                        if (field.observable) {
+                            field.observableBitIndex = (type.nextObservableBitIndex < 63u)
+                                ? type.nextObservableBitIndex++
+                                : 63u;
+                        }
                         type.fields.push_back(std::move(field));
                     }
                 }
