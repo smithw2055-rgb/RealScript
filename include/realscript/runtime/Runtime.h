@@ -554,15 +554,11 @@ inline const std::string* get_if(
     return nullptr;
 }
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
-inline std::string* get_if(
+inline const std::string* get_if(
     realscript::runtime::Value* value) noexcept {
     if (!value) return nullptr;
     if (const auto* sv = std::get_if<realscript::runtime::StringValue>(value)) {
-        thread_local std::array<std::string, 64> sMutableRing{};
-        thread_local std::size_t sRingCursor = 0;
-        auto& slot = sMutableRing[sRingCursor++ & 63u];
-        slot = sv->str();
-        return &slot;
+        return &sv->str();
     }
     return nullptr;
 }
@@ -572,27 +568,19 @@ inline const std::string& get(
     return std::get<realscript::runtime::StringValue>(value).str();
 }
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
-inline std::string& get(
+inline const std::string& get(
     realscript::runtime::Value& value) {
-    thread_local std::array<std::string, 64> sMutableRing{};
-    thread_local std::size_t sRingCursor = 0;
-    auto& slot = sMutableRing[sRingCursor++ & 63u];
-    slot = std::get<realscript::runtime::StringValue>(value).str();
-    return slot;
+    return std::get<realscript::runtime::StringValue>(value).str();
 }
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
-inline const std::string&& get(
+inline const std::string& get(
     const realscript::runtime::Value&& value) {
-    return std::move(std::get<realscript::runtime::StringValue>(value).str());
+    return std::get<realscript::runtime::StringValue>(value).str();
 }
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
-inline std::string&& get(
+inline const std::string& get(
     realscript::runtime::Value&& value) {
-    thread_local std::array<std::string, 64> sMutableRing{};
-    thread_local std::size_t sRingCursor = 0;
-    auto& slot = sMutableRing[sRingCursor++ & 63u];
-    slot = std::get<realscript::runtime::StringValue>(value).str();
-    return std::move(slot);
+    return std::get<realscript::runtime::StringValue>(value).str();
 }
 } // namespace std
 
