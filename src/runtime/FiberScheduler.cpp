@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "realscript/runtime/FiberScheduler.h"
 #include "realscript/mir/Mir.h"
 
@@ -34,6 +35,111 @@ std::uint32_t FiberScheduler::registerProgram(std::vector<CompactInstruction> co
 
 std::uint32_t FiberScheduler::registerModule(const CompiledFiberModule& module) {
     return registerProgram(module.instructions);
+}
+
+bool FiberScheduler::reloadProgram(
+    std::uint32_t programId,
+    std::vector<CompactInstruction> newCodeStream) {
+    if (programId == 0 || programId >= programs_.size() || newCodeStream.empty()) {
+        return false;
+    }
+    const auto newSize = static_cast<std::uint32_t>(newCodeStream.size());
+    programs_[programId] = std::move(newCodeStream);
+    externalStreamCache_[programId] = nullptr;
+    for (std::size_t i = 1; i < fibers_.size(); ++i) {
+        auto& f = fibers_[i];
+        if (f.programId != programId ||
+            f.status == FiberStatus::Inactive ||
+            f.status == FiberStatus::Terminated) {
+            continue;
+        }
+        bool callStackInvalid = (f.pc >= newSize);
+        for (std::uint8_t d = 0; !callStackInvalid && d < f.callDepth && d < f.callStack.size(); ++d) {
+            if (f.callStack[d] >= newSize) {
+                callStackInvalid = true;
+            }
+        }
+        if (callStackInvalid) {
+            f.pc = 0;
+            f.callDepth = 0;
+        }
+    }
+    return true;
+}
+
+bool FiberScheduler::reloadModule(
+    std::uint32_t programId,
+    const CompiledFiberModule& oldModule,
+    const CompiledFiberModule& newModule) {
+    if (programId == 0 || programId >= programs_.size() || newModule.instructions.empty()) {
+        return false;
+    }
+    struct FuncRange {
+        std::string name;
+        std::uint32_t startPc = 0;
+        std::uint32_t endPc = 0;
+    };
+    std::vector<FuncRange> oldRanges;
+    oldRanges.reserve(oldModule.entryPoints.size());
+    for (const auto& kv : oldModule.entryPoints) {
+        oldRanges.push_back(FuncRange{kv.first, kv.second, static_cast<std::uint32_t>(oldModule.instructions.size())});
+    }
+    std::sort(oldRanges.begin(), oldRanges.end(), [](const FuncRange& a, const FuncRange& b) {
+        return a.startPc < b.startPc;
+    });
+    for (std::size_t i = 0; i + 1 < oldRanges.size(); ++i) {
+        oldRanges[i].endPc = oldRanges[i + 1].startPc;
+    }
+
+    std::vector<FuncRange> newRanges;
+    newRanges.reserve(newModule.entryPoints.size());
+    for (const auto& kv : newModule.entryPoints) {
+        newRanges.push_back(FuncRange{kv.first, kv.second, static_cast<std::uint32_t>(newModule.instructions.size())});
+    }
+    std::sort(newRanges.begin(), newRanges.end(), [](const FuncRange& a, const FuncRange& b) {
+        return a.startPc < b.startPc;
+    });
+    for (std::size_t i = 0; i + 1 < newRanges.size(); ++i) {
+        newRanges[i].endPc = newRanges[i + 1].startPc;
+    }
+    std::unordered_map<std::string, FuncRange> newRangeByName;
+    for (const auto& nr : newRanges) {
+        newRangeByName.emplace(nr.name, nr);
+    }
+
+    const auto remapPc = [&](std::uint32_t oldPc) -> std::uint32_t {
+        for (const auto& orng : oldRanges) {
+            if (oldPc >= orng.startPc && oldPc < orng.endPc) {
+                const auto nit = newRangeByName.find(orng.name);
+                if (nit != newRangeByName.end()) {
+                    const std::uint32_t relOffset = oldPc - orng.startPc;
+                    const std::uint32_t candidate = nit->second.startPc + relOffset;
+                    if (candidate < nit->second.endPc) {
+                        return candidate;
+                    }
+                    return nit->second.startPc;
+                }
+                return 0u;
+            }
+        }
+        return oldPc < newModule.instructions.size() ? oldPc : 0u;
+    };
+
+    programs_[programId] = newModule.instructions;
+    externalStreamCache_[programId] = nullptr;
+    for (std::size_t i = 1; i < fibers_.size(); ++i) {
+        auto& f = fibers_[i];
+        if (f.programId != programId ||
+            f.status == FiberStatus::Inactive ||
+            f.status == FiberStatus::Terminated) {
+            continue;
+        }
+        f.pc = remapPc(f.pc);
+        for (std::uint8_t d = 0; d < f.callDepth && d < f.callStack.size(); ++d) {
+            f.callStack[d] = remapPc(f.callStack[d]);
+        }
+    }
+    return true;
 }
 
 std::uint32_t FiberScheduler::spawnFiberByProgram(
@@ -143,19 +249,12 @@ void FiberScheduler::killFiberTree(std::uint32_t rootFiberId) noexcept {
 
 std::size_t FiberScheduler::killEntityFibers(GenerationalEntityHandle entity) noexcept {
     if (!entity.valid()) return 0;
-    std::vector<std::uint32_t> roots;
+    std::size_t killed = 0;
     for (std::size_t i = 1; i < fibers_.size(); ++i) {
         if (fibers_[i].boundEntity == entity &&
             fibers_[i].status != FiberStatus::Terminated &&
             fibers_[i].status != FiberStatus::Inactive) {
-            roots.push_back(static_cast<std::uint32_t>(i));
-        }
-    }
-    std::size_t killed = 0;
-    for (std::uint32_t fid : roots) {
-        if (fibers_[fid].status != FiberStatus::Terminated &&
-            fibers_[fid].status != FiberStatus::Inactive) {
-            killFiberTree(fid);
+            killFiberTree(static_cast<std::uint32_t>(i));
             ++killed;
         }
     }
@@ -164,19 +263,12 @@ std::size_t FiberScheduler::killEntityFibers(GenerationalEntityHandle entity) no
 
 std::size_t FiberScheduler::killEntityFibersBySlot(std::uint32_t entitySlot) noexcept {
     if (entitySlot == 0 || entitySlot == GenerationalEntityHandle::InvalidSlot) return 0;
-    std::vector<std::uint32_t> roots;
+    std::size_t killed = 0;
     for (std::size_t i = 1; i < fibers_.size(); ++i) {
         if (fibers_[i].boundEntity.slot == entitySlot &&
             fibers_[i].status != FiberStatus::Terminated &&
             fibers_[i].status != FiberStatus::Inactive) {
-            roots.push_back(static_cast<std::uint32_t>(i));
-        }
-    }
-    std::size_t killed = 0;
-    for (std::uint32_t fid : roots) {
-        if (fibers_[fid].status != FiberStatus::Terminated &&
-            fibers_[fid].status != FiberStatus::Inactive) {
-            killFiberTree(fid);
+            killFiberTree(static_cast<std::uint32_t>(i));
             ++killed;
         }
     }
@@ -197,8 +289,9 @@ std::uint64_t FiberScheduler::stepTick(std::uint32_t currentTick) {
     // 1. Pop all fibers due in the current O(1) Timing Wheel slot
     std::size_t slot = static_cast<std::size_t>(currentTick) & WHEEL_MASK;
     auto& bucket = timingWheel_[slot];
-    std::vector<std::uint32_t> remainingInBucket;
-    for (std::uint32_t fid : bucket) {
+    std::size_t writeIdx = 0;
+    for (std::size_t i = 0; i < bucket.size(); ++i) {
+        const std::uint32_t fid = bucket[i];
         if (fid >= fibers_.size()) continue;
         auto& f = fibers_[fid];
         if (f.status == FiberStatus::SleepingTicks) {
@@ -206,12 +299,12 @@ std::uint64_t FiberScheduler::stepTick(std::uint32_t currentTick) {
                 f.status = FiberStatus::Ready;
                 readyQueue_.push_back(fid);
             } else {
-                // Multi-rotation long wait (> 4096 ticks)
-                remainingInBucket.push_back(fid);
+                // Multi-rotation long wait (> 4096 ticks) compacted in-place without heap allocation
+                bucket[writeIdx++] = fid;
             }
         }
     }
-    bucket.swap(remainingInBucket);
+    bucket.resize(writeIdx);
 
     // 2. Drain readyQueue_ (note: ForkFiber may append new child fibers during loop)
     for (std::size_t idx = 0; idx < readyQueue_.size(); ++idx) {
@@ -236,8 +329,9 @@ std::uint64_t FiberScheduler::stepTickParallel(
 
     const std::size_t slot = static_cast<std::size_t>(currentTick) & WHEEL_MASK;
     auto& bucket = timingWheel_[slot];
-    std::vector<std::uint32_t> remainingInBucket;
-    for (std::uint32_t fid : bucket) {
+    std::size_t writeIdx = 0;
+    for (std::size_t i = 0; i < bucket.size(); ++i) {
+        const std::uint32_t fid = bucket[i];
         if (fid >= fibers_.size()) continue;
         auto& f = fibers_[fid];
         if (f.status == FiberStatus::SleepingTicks) {
@@ -245,11 +339,11 @@ std::uint64_t FiberScheduler::stepTickParallel(
                 f.status = FiberStatus::Ready;
                 readyQueue_.push_back(fid);
             } else {
-                remainingInBucket.push_back(fid);
+                bucket[writeIdx++] = fid;
             }
         }
     }
-    bucket.swap(remainingInBucket);
+    bucket.resize(writeIdx);
 
     if (readyQueue_.size() < 2) {
         std::uint64_t instrExecuted = 0;

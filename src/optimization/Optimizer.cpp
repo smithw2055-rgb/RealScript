@@ -39,8 +39,8 @@ bool isValueInstruction(const mir::Instruction& instruction) noexcept {
         instruction.resultType != semantic::PrimitiveType::Void;
 }
 
-bool isRemovableWhenUnused(mir::Opcode opcode) noexcept {
-    switch (opcode) {
+bool isRemovableWhenUnused(const mir::Instruction& instruction) noexcept {
+    switch (instruction.opcode) {
     case mir::Opcode::Parameter:
     case mir::Opcode::ConstantInt:
     case mir::Opcode::ConstantDouble:
@@ -78,6 +78,16 @@ bool isRemovableWhenUnused(mir::Opcode opcode) noexcept {
     case mir::Opcode::LoadStructField:
     case mir::Opcode::StoreStructField:
         return true;
+    case mir::Opcode::AddInt:
+    case mir::Opcode::SubtractInt:
+    case mir::Opcode::MultiplyInt:
+    case mir::Opcode::AddLong:
+    case mir::Opcode::SubtractLong:
+    case mir::Opcode::MultiplyLong:
+    case mir::Opcode::NegateInt:
+    case mir::Opcode::NegateLong:
+    case mir::Opcode::ConvertNumeric:
+        return !instruction.checkedArithmetic;
     default:
         return false;
     }
@@ -403,11 +413,44 @@ bool foldConstants(
     bool changed = false;
     std::unordered_map<mir::ValueId, Constant> constants;
     std::unordered_map<mir::ValueId, std::unordered_map<std::size_t, Constant>> structFieldConstants;
+    std::unordered_map<mir::ValueId, std::unordered_map<std::size_t, mir::ValueId>> blockStructFieldValues;
+    std::unordered_map<mir::BlockId, std::size_t> predCount;
+    if (!function.blocks.empty()) {
+        ++predCount[function.blocks.front().id];
+    }
+    for (const auto& b : function.blocks) {
+        if (b.terminator.kind == mir::TerminatorKind::Jump) {
+            ++predCount[b.terminator.target];
+        } else if (b.terminator.kind == mir::TerminatorKind::Branch) {
+            ++predCount[b.terminator.target];
+            if (b.terminator.falseTarget != b.terminator.target) {
+                ++predCount[b.terminator.falseTarget];
+            }
+        }
+        for (const auto& h : function.exceptionHandlers) {
+            for (const auto pb : h.protectedBlocks) {
+                if (pb == b.id) ++predCount[h.handlerBlock];
+            }
+        }
+    }
+    std::unordered_map<mir::BlockId, std::unordered_map<std::size_t, Constant>> outLocalConstants;
+    std::unordered_map<mir::BlockId, std::unordered_map<std::size_t, std::unordered_map<std::size_t, Constant>>> outLocalStructFields;
+    std::unordered_map<mir::BlockId, std::unordered_map<std::size_t, std::unordered_map<std::size_t, mir::ValueId>>> outLocalStructFieldValues;
     for (auto& block : function.blocks) {
         std::unordered_map<std::size_t, Constant> localConstants;
         std::unordered_map<std::size_t, std::unordered_map<std::size_t, Constant>> localStructFields;
-        std::unordered_map<mir::ValueId, std::unordered_map<std::size_t, mir::ValueId>> blockStructFieldValues;
         std::unordered_map<std::size_t, std::unordered_map<std::size_t, mir::ValueId>> localStructFieldValues;
+        if (predCount[block.id] == 1) {
+            if (const auto it = outLocalConstants.find(block.id); it != outLocalConstants.end()) {
+                localConstants = it->second;
+            }
+            if (const auto it = outLocalStructFields.find(block.id); it != outLocalStructFields.end()) {
+                localStructFields = it->second;
+            }
+            if (const auto it = outLocalStructFieldValues.find(block.id); it != outLocalStructFieldValues.end()) {
+                localStructFieldValues = it->second;
+            }
+        }
         std::unordered_map<mir::ValueId, mir::ValueId> valueReplacements;
 
         const auto resolveReplacement = [&](mir::ValueId v) {
@@ -578,6 +621,12 @@ bool foldConstants(
                 }
             }
         }
+        if (block.terminator.kind == mir::TerminatorKind::Jump &&
+            predCount[block.terminator.target] == 1) {
+            outLocalConstants[block.terminator.target] = localConstants;
+            outLocalStructFields[block.terminator.target] = localStructFields;
+            outLocalStructFieldValues[block.terminator.target] = localStructFieldValues;
+        }
     }
     return changed;
 }
@@ -647,7 +696,7 @@ bool eliminateDeadInstructions(mir::Function& function, Statistics& statistics) 
     std::unordered_set<mir::ValueId> used;
     for (const auto& block : function.blocks) {
         for (const auto& instruction : block.instructions) {
-            if (!isRemovableWhenUnused(instruction.opcode)) {
+            if (!isRemovableWhenUnused(instruction)) {
                 used.insert(instruction.operands.begin(), instruction.operands.end());
             }
         }
@@ -687,7 +736,7 @@ bool eliminateDeadInstructions(mir::Function& function, Statistics& statistics) 
                 block.instructions.end(),
                 [&](const mir::Instruction& instruction) {
                     return isValueInstruction(instruction) &&
-                        isRemovableWhenUnused(instruction.opcode) &&
+                        isRemovableWhenUnused(instruction) &&
                         used.find(instruction.result) == used.end();
                 }),
             block.instructions.end());
@@ -1044,6 +1093,37 @@ bool inlineSmallFunctions(
     for (const auto& t : module.types) {
         if (t.id != 0) moduleTypeIds.insert(t.id);
     }
+    std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> importableValueTypes;
+    if (allModules) {
+        for (const auto& m : *allModules) {
+            for (const auto& t : m.types) {
+                if (t.id != 0 &&
+                    (t.kind == semantic::TypeKind::Struct || t.kind == semantic::TypeKind::Enum)) {
+                    importableValueTypes.emplace(t.id, &t);
+                }
+            }
+        }
+    }
+    const auto isTypeAvailableOrImportable = [&](semantic::SymbolId tid) noexcept {
+        if (tid == 0) return true;
+        return moduleTypeIds.find(tid) != moduleTypeIds.end() ||
+            importableValueTypes.find(tid) != importableValueTypes.end();
+    };
+    const std::function<void(semantic::SymbolId)> ensureTypeImported = [&](semantic::SymbolId tid) {
+        if (tid == 0 || moduleTypeIds.find(tid) != moduleTypeIds.end()) return;
+        const auto it = importableValueTypes.find(tid);
+        if (it != importableValueTypes.end()) {
+            moduleTypeIds.insert(tid);
+            module.types.push_back(*it->second);
+            for (const auto& field : it->second->fields) {
+                if ((field.type == semantic::PrimitiveType::Struct ||
+                     field.type == semantic::PrimitiveType::Enum) &&
+                    !field.typeName.empty()) {
+                    ensureTypeImported(semantic::stableTypeId(field.typeName));
+                }
+            }
+        }
+    };
     std::unordered_map<semantic::SymbolId, const mir::Function*> inlineCandidates;
     const auto collectFromModule = [&](const mir::Module& candMod) {
         for (const auto& func : candMod.functions) {
@@ -1057,20 +1137,25 @@ bool inlineSmallFunctions(
             const auto& entry = func.blocks.front();
             if ((entry.terminator.kind != mir::TerminatorKind::ReturnValue &&
                  entry.terminator.kind != mir::TerminatorKind::ReturnVoid) ||
-                entry.instructions.size() > options.maxInlineInstructions ||
                 !entry.parameters.empty()) {
                 continue;
             }
+            std::size_t materializedCount = 0;
             bool allSafe = true;
             for (const auto& inst : entry.instructions) {
                 if (!isInlineSafeInstruction(inst) ||
-                    (inst.typeId != 0 && moduleTypeIds.find(inst.typeId) == moduleTypeIds.end()) ||
-                    (inst.resultTypeId != 0 && moduleTypeIds.find(inst.resultTypeId) == moduleTypeIds.end())) {
+                    !isTypeAvailableOrImportable(inst.typeId) ||
+                    !isTypeAvailableOrImportable(inst.resultTypeId)) {
                     allSafe = false;
                     break;
                 }
+                if (inst.opcode != mir::Opcode::Parameter &&
+                    inst.opcode != mir::Opcode::LoadLocal &&
+                    inst.opcode != mir::Opcode::StoreLocal) {
+                    ++materializedCount;
+                }
             }
-            if (allSafe) {
+            if (allSafe && materializedCount <= options.maxInlineInstructions) {
                 inlineCandidates[func.symbolId] = &func;
             }
         }
@@ -1170,6 +1255,8 @@ bool inlineSmallFunctions(
                         if (calleeBlock.terminator.kind == mir::TerminatorKind::ReturnVoid) {
                             if (inlineOk && inst.resultType == semantic::PrimitiveType::Void) {
                                 for (auto& sc : stagedClones) {
+                                    ensureTypeImported(sc.typeId);
+                                    ensureTypeImported(sc.resultTypeId);
                                     expanded.push_back(std::move(sc));
                                 }
                                 ++statistics.functionsInlined;
@@ -1182,6 +1269,8 @@ bool inlineSmallFunctions(
                             const auto mappedRet = valueMap.find(retVal);
                             if (inlineOk && mappedRet != valueMap.end()) {
                                 for (auto& sc : stagedClones) {
+                                    ensureTypeImported(sc.typeId);
+                                    ensureTypeImported(sc.resultTypeId);
                                     expanded.push_back(std::move(sc));
                                 }
                                 replacements[inst.result] = mappedRet->second;
@@ -1260,12 +1349,18 @@ Result Optimizer::optimize(
     Result result;
     Options innerOptions = options;
     if (options.level == Level::Aggressive && options.enableInlining && modules.size() > 1) {
-        const auto unmutatedSnapshot = modules;
-        for (auto& module : modules) {
-            diagnostics::DiagnosticBag checkDiag;
-            if (mir::verifyModule(module, checkDiag)) {
-                (void)inlineSmallFunctions(module, options, result.statistics, &unmutatedSnapshot);
+        for (std::size_t inlinePass = 0; inlinePass < 2; ++inlinePass) {
+            const auto snapshot = modules;
+            bool anyPassInlined = false;
+            for (auto& module : modules) {
+                diagnostics::DiagnosticBag checkDiag;
+                if (mir::verifyModule(module, checkDiag)) {
+                    if (inlineSmallFunctions(module, options, result.statistics, &snapshot)) {
+                        anyPassInlined = true;
+                    }
+                }
             }
+            if (!anyPassInlined) break;
         }
         innerOptions.enableInlining = false;
     }
@@ -1295,7 +1390,9 @@ mir::Module Optimizer::optimizeModule(
             return module;
         }
         if (options.level == Level::Aggressive && options.enableInlining) {
-            (void)inlineSmallFunctions(module, options, target);
+            for (std::size_t inlinePass = 0; inlinePass < 2; ++inlinePass) {
+                if (!inlineSmallFunctions(module, options, target)) break;
+            }
         }
         for (auto& function : module.functions) {
             (void)optimizeFunction(function, options, target);

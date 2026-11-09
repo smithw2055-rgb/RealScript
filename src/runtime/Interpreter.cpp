@@ -3047,6 +3047,9 @@ bool executeFunction(
             &&L_SuperBinaryLocalDoubleConstStoreElided,
             &&L_SuperBinaryLocalDoubleLocalStore,
             &&L_SuperBinaryLocalDoubleLocalStoreElided,
+            &&L_NegateIntUnchecked,
+            &&L_NegateDouble,
+            &&L_LogicalNot,
             &&L_GenericBytecode,
             &&L_TermJumpNoArgs,
             &&L_TermBranchBoolNoArgs,
@@ -3511,7 +3514,16 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(!leftPtr || !rightPtr)) goto L_FlatTypeMismatch;
                 localExecuted += 3;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
-                const bool cond = (*leftPtr < *rightPtr);
+                bool cond = false;
+                switch (ip->binaryOpcode1) {
+                case detail::QuickOpcode::LessInt: cond = (*leftPtr < *rightPtr); break;
+                case detail::QuickOpcode::LessOrEqualInt: cond = (*leftPtr <= *rightPtr); break;
+                case detail::QuickOpcode::GreaterInt: cond = (*leftPtr > *rightPtr); break;
+                case detail::QuickOpcode::GreaterOrEqualInt: cond = (*leftPtr >= *rightPtr); break;
+                case detail::QuickOpcode::EqualInt: cond = (*leftPtr == *rightPtr); break;
+                case detail::QuickOpcode::NotEqualInt: cond = (*leftPtr != *rightPtr); break;
+                default: goto L_FlatSuperFallback;
+                }
                 ++state.statistics.branchesTaken;
                 ip = streamBase + (cond ? ip->trueTargetOffset : ip->falseTargetOffset);
                 RS_FLAT_DISPATCH_AT_IP();
@@ -3525,7 +3537,17 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(!leftPtr)) goto L_FlatTypeMismatch;
                 localExecuted += 4;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
-                const bool cond = (*leftPtr < ip->integerImmediate);
+                const std::int64_t right = ip->integerImmediate;
+                bool cond = false;
+                switch (ip->binaryOpcode1) {
+                case detail::QuickOpcode::LessInt: cond = (*leftPtr < right); break;
+                case detail::QuickOpcode::LessOrEqualInt: cond = (*leftPtr <= right); break;
+                case detail::QuickOpcode::GreaterInt: cond = (*leftPtr > right); break;
+                case detail::QuickOpcode::GreaterOrEqualInt: cond = (*leftPtr >= right); break;
+                case detail::QuickOpcode::EqualInt: cond = (*leftPtr == right); break;
+                case detail::QuickOpcode::NotEqualInt: cond = (*leftPtr != right); break;
+                default: goto L_FlatSuperFallback;
+                }
                 ++state.statistics.branchesTaken;
                 ip = streamBase + (cond ? ip->trueTargetOffset : ip->falseTargetOffset);
                 RS_FLAT_DISPATCH_AT_IP();
@@ -4019,6 +4041,32 @@ bool executeFunction(
                 }
                 localExecuted += 4;
                 frameBase[ip->storeSlot] = out;
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(NegateIntUnchecked) {
+                const auto* vPtr = std::get_if<std::int64_t>(&frameBase[ip->src0Slot]);
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = (*vPtr == std::numeric_limits<std::int32_t>::min())
+                    ? *vPtr
+                    : -(*vPtr);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(NegateDouble) {
+                const auto* vPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = -(*vPtr);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(LogicalNot) {
+                const auto* vPtr = std::get_if<bool>(&frameBase[ip->src0Slot]);
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = !(*vPtr);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
