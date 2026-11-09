@@ -143,7 +143,8 @@ public:
     [[nodiscard]] const Register* end() const noexcept { return data() + size(); }
 
     [[nodiscard]] const Register& operator[](std::size_t index) const noexcept {
-        return data()[index];
+        const std::uint32_t id = sliceId();
+        return id == 0 ? inline0_ : sliceData(id)[index];
     }
     [[nodiscard]] const Register& front() const noexcept { return (*this)[0]; }
     [[nodiscard]] const Register& back() const noexcept { return (*this)[size() - 1]; }

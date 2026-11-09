@@ -4133,11 +4133,14 @@ L_FlatError:
             }
             if (state.debugger) {
                 const auto excRef = std::get<ObjectRef>(registers[terminator.value]);
-                const auto actualTypeId = state.heap
-                    ? state.heap->objectTypeId(excRef)
-                    : std::optional<semantic::SymbolId>{};
-                const auto* typeDesc = actualTypeId && state.program
-                    ? state.program->resolveType(*actualTypeId)
+                semantic::SymbolId actualTypeId = 0;
+                if (state.heap) {
+                    if (const auto tid = state.heap->objectTypeId(excRef)) {
+                        actualTypeId = *tid;
+                    }
+                }
+                const auto* typeDesc = (actualTypeId != 0 && state.program)
+                    ? state.program->resolveType(actualTypeId)
                     : nullptr;
                 std::string excTypeName = typeDesc && !typeDesc->name.empty()
                     ? typeDesc->name
@@ -4159,7 +4162,7 @@ L_FlatError:
                     }
                 }
                 bool isUncaught = true;
-                if (actualTypeId) {
+                if (actualTypeId != 0) {
                     for (auto frameIt = state.debugFrames.rbegin();
                          frameIt != state.debugFrames.rend();
                          ++frameIt) {
@@ -4174,7 +4177,7 @@ L_FlatError:
                                 continue;
                             }
                             if (handler.catchTypeId != 0 &&
-                                !runtimeAssignable(state, *actualTypeId, handler.catchTypeId)) {
+                                !runtimeAssignable(state, actualTypeId, handler.catchTypeId)) {
                                 continue;
                             }
                             frameCatches = true;

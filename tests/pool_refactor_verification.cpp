@@ -298,7 +298,7 @@ class EntityHolder {
                 for (int i = 0; i < kBcOps; ++i) {
                     const std::string key = "bc_concurrent_" + std::to_string(tid) + "_" + std::to_string(i & 511);
                     bytecode::BytecodeString bs(key);
-                    if (bs.str() != key || bs != interned[(tid * 1000 + i) % interned.size()].str() && bs == interned[(tid * 1000 + i) % interned.size()]) {
+                    if (bs.str() != key || (bs != interned[(tid * 1000 + i) % interned.size()].str() && bs == interned[(tid * 1000 + i) % interned.size()])) {
                         bcFailed.store(true, std::memory_order_relaxed);
                         return;
                     }
