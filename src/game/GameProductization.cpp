@@ -687,12 +687,36 @@ const semantic::TypeSymbol* findProgramTypeById(
     return nullptr;
 }
 
+bool valueToJsonImpl(
+    const ScriptRuntime& runtime,
+    const SceneScriptRuntime* scene,
+    const runtime::Value& value,
+    const ScriptStatePolicy& policy,
+    std::size_t depth,
+    std::unordered_set<std::uint64_t>& activeObjects,
+    tooling::Json& out,
+    runtime::RuntimeError& error);
+
 bool valueToJson(
     const ScriptRuntime& runtime,
     const SceneScriptRuntime* scene,
     const runtime::Value& value,
     const ScriptStatePolicy& policy,
     std::size_t depth,
+    tooling::Json& out,
+    runtime::RuntimeError& error) {
+    std::unordered_set<std::uint64_t> activeObjects;
+    return valueToJsonImpl(
+        runtime, scene, value, policy, depth, activeObjects, out, error);
+}
+
+bool valueToJsonImpl(
+    const ScriptRuntime& runtime,
+    const SceneScriptRuntime* scene,
+    const runtime::Value& value,
+    const ScriptStatePolicy& policy,
+    std::size_t depth,
+    std::unordered_set<std::uint64_t>& activeObjects,
     tooling::Json& out,
     runtime::RuntimeError& error) {
     const auto* program = runtime.program().get();
@@ -728,6 +752,28 @@ bool valueToJson(
             out = tooling::Json(std::string(*view));
             return true;
         }
+        if (scene) {
+            if (const auto loc = scene->findObjectLocation(*objRef)) {
+                tooling::Json::Object refObj;
+                refObj["$entity"] = static_cast<std::int64_t>(loc->entity);
+                refObj["$component"] = loc->canonicalTypeName;
+                out = tooling::Json(std::move(refObj));
+                return true;
+            }
+        }
+        const std::uint64_t objKey =
+            (static_cast<std::uint64_t>(objRef->generation) << 32u) | objRef->slot;
+        if (!activeObjects.insert(objKey).second) {
+            // Break object graph cycles cleanly instead of recursing to maximumStructDepth
+            out = tooling::Json(nullptr);
+            return true;
+        }
+        struct ActiveObjectGuard {
+            std::unordered_set<std::uint64_t>& set;
+            std::uint64_t key;
+            ~ActiveObjectGuard() { set.erase(key); }
+        } guard{activeObjects, objKey};
+
         if (objRef->kind == runtime::ObjectKind::Array) {
             const auto len = runtime.heap()->arrayLength(*objRef);
             if (!len) {
@@ -741,23 +787,14 @@ bool valueToJson(
                 const auto elem = runtime.heap()->arrayGet(*objRef, i);
                 if (!elem) return false;
                 tooling::Json elemJson;
-                if (!valueToJson(
-                        runtime, scene, *elem, policy, depth + 1, elemJson, error)) {
+                if (!valueToJsonImpl(
+                        runtime, scene, *elem, policy, depth + 1, activeObjects, elemJson, error)) {
                     return false;
                 }
                 arr.push_back(std::move(elemJson));
             }
             out = tooling::Json(std::move(arr));
             return true;
-        }
-        if (scene) {
-            if (const auto loc = scene->findObjectLocation(*objRef)) {
-                tooling::Json::Object refObj;
-                refObj["$entity"] = static_cast<std::int64_t>(loc->entity);
-                refObj["$component"] = loc->canonicalTypeName;
-                out = tooling::Json(std::move(refObj));
-                return true;
-            }
         }
         if (const auto objTypeId = runtime.heap()->objectTypeId(*objRef)) {
             if (const auto* objDesc = findProgramTypeById(program, *objTypeId)) {
@@ -771,7 +808,8 @@ bool valueToJson(
                     const auto fVal = runtime.heap()->fieldGet(*objRef, i);
                     if (!fVal) continue;
                     tooling::Json fieldJson;
-                    if (!valueToJson(runtime, scene, *fVal, policy, depth + 1, fieldJson, error)) {
+                    if (!valueToJsonImpl(
+                            runtime, scene, *fVal, policy, depth + 1, activeObjects, fieldJson, error)) {
                         return false;
                     }
                     instObj[fld.name] = std::move(fieldJson);
@@ -828,12 +866,13 @@ bool valueToJson(
                     const auto elem = runtime::structValueFieldAt(*structItem, idx);
                     if (!elem) return false;
                     tooling::Json fieldJson;
-                    if (!valueToJson(
+                    if (!valueToJsonImpl(
                             runtime,
                             scene,
                             *elem,
                             policy,
                             depth + 1,
+                            activeObjects,
                             fieldJson,
                             error)) {
                         return false;
@@ -848,7 +887,8 @@ bool valueToJson(
                     const auto elem = runtime::structValueFieldAt(*structItem, idx);
                     if (!elem) return false;
                     tooling::Json fieldJson;
-                    if (!valueToJson(runtime, scene, *elem, policy, depth + 1, fieldJson, error)) {
+                    if (!valueToJsonImpl(
+                            runtime, scene, *elem, policy, depth + 1, activeObjects, fieldJson, error)) {
                         return false;
                     }
                     arr.push_back(std::move(fieldJson));
@@ -861,12 +901,13 @@ bool valueToJson(
                 const auto fieldVal = runtime::loadInlineStructField(value, idx);
                 if (!fieldVal) return false;
                 tooling::Json fieldJson;
-                if (!valueToJson(
+                if (!valueToJsonImpl(
                         runtime,
                         scene,
                         *fieldVal,
                         policy,
                         depth + 1,
+                        activeObjects,
                         fieldJson,
                         error)) {
                     return false;
@@ -880,7 +921,8 @@ bool valueToJson(
                 const auto fieldVal = runtime::loadInlineStructField(value, idx);
                 if (!fieldVal) break;
                 tooling::Json fieldJson;
-                if (!valueToJson(runtime, scene, *fieldVal, policy, depth + 1, fieldJson, error)) {
+                if (!valueToJsonImpl(
+                        runtime, scene, *fieldVal, policy, depth + 1, activeObjects, fieldJson, error)) {
                     return false;
                 }
                 arr.push_back(std::move(fieldJson));
@@ -893,6 +935,18 @@ bool valueToJson(
     return true;
 }
 
+bool jsonToValueImpl(
+    ScriptRuntime& runtime,
+    SceneScriptRuntime* scene,
+    const tooling::Json& json,
+    semantic::PrimitiveType expectedType,
+    const std::string& expectedTypeName,
+    const ScriptStatePolicy& policy,
+    std::size_t depth,
+    std::vector<runtime::PersistentRoot>& tempRoots,
+    runtime::Value& out,
+    runtime::RuntimeError& error);
+
 bool jsonToValue(
     ScriptRuntime& runtime,
     SceneScriptRuntime* scene,
@@ -901,6 +955,22 @@ bool jsonToValue(
     const std::string& expectedTypeName,
     const ScriptStatePolicy& policy,
     std::size_t depth,
+    runtime::Value& out,
+    runtime::RuntimeError& error) {
+    std::vector<runtime::PersistentRoot> tempRoots;
+    return jsonToValueImpl(
+        runtime, scene, json, expectedType, expectedTypeName, policy, depth, tempRoots, out, error);
+}
+
+bool jsonToValueImpl(
+    ScriptRuntime& runtime,
+    SceneScriptRuntime* scene,
+    const tooling::Json& json,
+    semantic::PrimitiveType expectedType,
+    const std::string& expectedTypeName,
+    const ScriptStatePolicy& policy,
+    std::size_t depth,
+    std::vector<runtime::PersistentRoot>& tempRoots,
     runtime::Value& out,
     runtime::RuntimeError& error) {
     const auto* program = runtime.program().get();
@@ -995,21 +1065,29 @@ bool jsonToValue(
             }
             if (!targetType.empty()) {
                 auto created = runtime.createObject(targetType, error);
+                if (!created) {
+                    if (const auto fallbackType = runtime.findType(targetType)) {
+                        error = {};
+                        created = runtime.allocateUninitializedObject(*fallbackType, error);
+                    }
+                }
                 if (!created) return false;
-                if (const auto* objDesc = findProgramTypeById(program, semantic::stableTypeId(targetType))) {
-                    for (std::size_t i = 0; i < objDesc->fields.size(); ++i) {
-                        const auto& fld = objDesc->fields[i];
-                        if (fld.staticField || fld.constField || fld.synthetic) continue;
-                        if (const auto* fJson = json.find(fld.name)) {
-                            runtime::Value fVal{};
-                            if (!jsonToValue(
-                                    runtime, scene, *fJson, fld.type, fld.typeName,
-                                    policy, depth + 1, fVal, error)) {
-                                return false;
-                            }
-                            if (!runtime.heap()->fieldSet(created->reference(), i, fVal, &error)) {
-                                return false;
-                            }
+                if (runtime.heap()) {
+                    tempRoots.push_back(runtime.heap()->retain(created->reference()));
+                }
+                const auto& objDesc = created->type().descriptor;
+                for (std::size_t i = 0; i < objDesc.fields.size(); ++i) {
+                    const auto& fld = objDesc.fields[i];
+                    if (fld.staticField || fld.constField || fld.synthetic) continue;
+                    if (const auto* fJson = json.find(fld.name)) {
+                        runtime::Value fVal{};
+                        if (!jsonToValueImpl(
+                                runtime, scene, *fJson, fld.type, fld.typeName,
+                                policy, depth + 1, tempRoots, fVal, error)) {
+                            return false;
+                        }
+                        if (!runtime.heap()->fieldSet(created->reference(), i, fVal, &error)) {
+                            return false;
                         }
                     }
                 }
@@ -1037,7 +1115,7 @@ bool jsonToValue(
         const auto& items = json.arrayValue();
         std::vector<runtime::Value> decodedElements(items.size());
         for (std::size_t i = 0; i < items.size(); ++i) {
-            if (!jsonToValue(
+            if (!jsonToValueImpl(
                     runtime,
                     scene,
                     items[i],
@@ -1045,6 +1123,7 @@ bool jsonToValue(
                     elemTypeName,
                     policy,
                     depth + 1,
+                    tempRoots,
                     decodedElements[i],
                     error)) {
                 return false;
@@ -1056,6 +1135,9 @@ bool jsonToValue(
         const auto arrRef = runtime.heap()->allocateTypedArray(
             typeId, elemPrim, elemTypeId, items.size(), defaultElem, &error);
         if (!arrRef) return false;
+        if (runtime.heap()) {
+            tempRoots.push_back(runtime.heap()->retain(*arrRef));
+        }
         for (std::size_t i = 0; i < decodedElements.size(); ++i) {
             if (!runtime.heap()->arraySet(*arrRef, i, decodedElements[i], &error)) {
                 return false;
@@ -1094,7 +1176,7 @@ bool jsonToValue(
             for (std::size_t idx = 0; idx < structDesc->fields.size(); ++idx) {
                 const auto& fDesc = structDesc->fields[idx];
                 const auto* fJson = json.find(fDesc.name);
-                if (!fJson || !jsonToValue(
+                if (!fJson || !jsonToValueImpl(
                         runtime,
                         scene,
                         *fJson,
@@ -1102,6 +1184,7 @@ bool jsonToValue(
                         fDesc.typeName,
                         policy,
                         depth + 1,
+                        tempRoots,
                         storage->fields[idx],
                         error)) {
                     return false;
@@ -1111,7 +1194,7 @@ bool jsonToValue(
             decoded = true;
             for (std::size_t idx = 0; idx < structDesc->fields.size(); ++idx) {
                 const auto& fDesc = structDesc->fields[idx];
-                if (!jsonToValue(
+                if (!jsonToValueImpl(
                         runtime,
                         scene,
                         json.arrayValue()[idx],
@@ -1119,6 +1202,7 @@ bool jsonToValue(
                         fDesc.typeName,
                         policy,
                         depth + 1,
+                        tempRoots,
                         storage->fields[idx],
                         error)) {
                     return false;
@@ -1237,6 +1321,7 @@ bool importScriptObjectJson(
     }
 
     std::vector<std::pair<std::string, runtime::Value>> decodedFields;
+    std::vector<runtime::PersistentRoot> tempRoots;
     decodedFields.reserve(descriptors.size());
     for (const auto& desc : descriptors) {
         if (desc.synthetic || desc.staticField || desc.constField ||
@@ -1252,7 +1337,7 @@ bool importScriptObjectJson(
             continue;
         }
         runtime::Value decodedValue;
-        if (!jsonToValue(
+        if (!jsonToValueImpl(
                 runtime,
                 scene,
                 *fieldJson,
@@ -1260,6 +1345,7 @@ bool importScriptObjectJson(
                 desc.typeName,
                 policy,
                 0,
+                tempRoots,
                 decodedValue,
                 error)) {
             if (error.code == runtime::ErrorCode::None) {
@@ -1391,6 +1477,8 @@ std::string exportSceneJson(
             tooling::Json::Object compJson;
             compJson["type"] = compObj->type().canonicalName();
             compJson["enabled"] = scene.isComponentEnabled(
+                entityId, compObj->type().canonicalName());
+            compJson["started"] = scene.isComponentStarted(
                 entityId, compObj->type().canonicalName());
             compJson["fields"] = tooling::Json(std::move(fieldsObj));
             compsArr.push_back(tooling::Json(std::move(compJson)));
@@ -1573,14 +1661,8 @@ bool importSceneJson(
         }
     }
 
-    // Clear existing entities and scene-wide physics/input/ECS state
-    for (const auto existingId : scene.entities()) {
-        (void)scene.detach(existingId);
-    }
-    scene.resetGenerationalSlots();
-    scene.restorePhysicsOverlapState({}, {});
-    scene.restorePhysicsOverlapState3D({}, {});
-    scene.restoreInputSnapshot({}, {}, {});
+    // Clear existing entities and scene-wide physics/input/ECS state without firing OnDisable/OnDestroy
+    scene.clearForSnapshotImport();
     if (scene.runtime().heap()) {
         scene.runtime().heap()->clearNativeEcsTables();
     }
@@ -1695,9 +1777,12 @@ bool importSceneJson(
                 const bool compEnabled = (!enabledJson || !enabledJson->isBool())
                     ? true
                     : enabledJson->boolValue();
-                SceneScriptOptions opts;
-                opts.enabled = compEnabled;
-                if (!scene.attachComponent(entityId, typeJson->stringValue(), std::move(opts))) {
+                const auto* startedJson = compItem.find("started");
+                const bool compStarted = (startedJson && startedJson->isBool())
+                    ? startedJson->boolValue()
+                    : false;
+                if (!scene.restoreComponentWithoutLifecycle(
+                        entityId, typeJson->stringValue(), compEnabled, compStarted)) {
                     fail(error, runtime::ErrorCode::InvalidProgram,
                         "failed to attach component '" + typeJson->stringValue() + "'");
                     return false;
@@ -1799,11 +1884,9 @@ bool importSceneJson(
         }
     }
 
-    // Pass 5: Restore entity-level activeSelf states
+    // Pass 5: Restore entity-level activeSelf states without firing OnDisable/OnEnable
     for (const auto& [entId, activeSelf] : deferredEntityActive) {
-        if (!activeSelf) {
-            (void)scene.setEntityActive(entId, false);
-        }
+        scene.restoreEntityActiveWithoutLifecycle(entId, activeSelf);
     }
 
     // Pass 6: Restore active 2D/3D physics overlaps and deterministic input snapshot

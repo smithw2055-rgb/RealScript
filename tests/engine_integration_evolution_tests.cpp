@@ -8121,6 +8121,201 @@ void testV5EvolutionCrossModuleStructInliningFiberHotReloadAndBranchFusion() {
     }
 }
 
+void testRound3SevenFixesVerification() {
+    using namespace realscript;
+    // 1. Generational entity handle resolution in SceneFiberHostAdapter (#1)
+    //    and setParent hierarchy active propagation (#2)
+    //    and snapshot import without re-firing OnCreate/OnEnable/OnDisable/OnDestroy (#3)
+    {
+        game::GameApi api;
+        game::GameScriptCompiler compiler(api);
+        const auto compiled = compiler.compile({
+            {"round3_scene.rs", R"RS(
+                module Game.Round3;
+
+                public class TrackedActor {
+                    public int createCount = 0;
+                    public int enableCount = 0;
+                    public int disableCount = 0;
+                    public int destroyCount = 0;
+                    public int startCount = 0;
+                    public int cmdArg = 0;
+                    public int condValue = 7;
+
+                    public void OnCreate() {
+                        this.createCount = this.createCount + 1;
+                    }
+                    public void OnEnable() {
+                        this.enableCount = this.enableCount + 1;
+                    }
+                    public void OnDisable() {
+                        this.disableCount = this.disableCount + 1;
+                    }
+                    public void OnDestroy() {
+                        this.destroyCount = this.destroyCount + 1;
+                    }
+                    public void OnStart() {
+                        this.startCount = this.startCount + 1;
+                    }
+                    public void OnFiberCmd(int a16, int a32) {
+                        this.cmdArg = a16 + a32;
+                    }
+                }
+            )RS"}
+        });
+        require(compiled.succeeded(), "Game.Round3 must compile");
+
+        game::ScriptRuntime rt(compiled.program);
+        game::SceneScriptRuntime scene(rt);
+        game::SceneFiberHostAdapter adapter(scene);
+        adapter.registerCommandCallback(1, "OnFiberCmd", "Game.Round3::TrackedActor");
+        adapter.registerConditionMember(10, "condValue", "Game.Round3::TrackedActor");
+
+        runtime::FiberScheduler sched(&adapter);
+        scene.setFiberScheduler(&sched);
+
+        const auto genEnt = scene.spawnGenerationalEntity("GenActor");
+        require(game::entityIdGeneration(genEnt) >= 1, "spawnGenerationalEntity must have generation >= 1");
+        require(scene.attachComponent(genEnt, "Game.Round3::TrackedActor"), "attach TrackedActor to genEnt");
+
+        runtime::CompiledFiberModule fMod;
+        fMod.moduleName = "AI.GenTest";
+        fMod.entryPoints["Run"] = 0;
+        fMod.instructions = {
+            runtime::CompactInstruction(runtime::FiberOpcode::HostCondJump, 0, 2, 10, 5), // if condValue(key=10) >= 5 jump to pc 2
+            runtime::CompactInstruction(runtime::FiberOpcode::Return, 0, 0, 0),
+            runtime::CompactInstruction(runtime::FiberOpcode::HostCommand, 1, 10, 32),    // cmdArg = 10 + 32 = 42
+            runtime::CompactInstruction(runtime::FiberOpcode::Return, 0, 0, 0),
+        };
+        const auto fid = scene.spawnEntityFiber(genEnt, fMod, "Run");
+        require(fid != 0, "spawnEntityFiber on generational entity must succeed");
+        scene.stepFibers(1);
+
+        runtime::RuntimeError err;
+        auto* genComp = scene.getComponent(genEnt, "Game.Round3::TrackedActor");
+        require(genComp != nullptr, "genComp must exist");
+        require(std::get<std::int64_t>(*rt.getMember(*genComp, "cmdArg", err)) == 42,
+            "SceneFiberHostAdapter must resolve full 64-bit generational entity handle for HostCondJump and HostCommand");
+
+        // Test #2: setParent under inactive parent triggers OnDisable, and reparenting back to active triggers OnEnable
+        const auto inactiveParent = scene.spawnEntity("InactiveParent");
+        require(scene.setEntityActive(inactiveParent, false), "deactivate InactiveParent");
+        require(std::get<std::int64_t>(*rt.getMember(*genComp, "disableCount", err)) == 0,
+            "disableCount must be 0 before reparenting");
+        require(scene.setParent(genEnt, inactiveParent), "setParent under inactive parent");
+        require(!scene.isActiveInHierarchy(genEnt), "genEnt must be inactive in hierarchy under inactiveParent");
+        require(std::get<std::int64_t>(*rt.getMember(*genComp, "disableCount", err)) == 1,
+            "setParent under inactive parent must fire OnDisable on child");
+
+        // Test #3: Export scene while inactiveParent (and child) is inactive, and verify importSceneJson
+        // does NOT re-trigger OnCreate, OnEnable, OnDisable, or OnDestroy
+        scene.start();
+        const std::string snapJson = game::exportSceneJson(scene, err);
+        require(err.code == runtime::ErrorCode::None && !snapJson.empty(), "exportSceneJson must succeed");
+
+        require(game::importSceneJson(scene, snapJson, err), "importSceneJson must succeed: " + err.message);
+        auto* restoredComp = scene.getComponent(genEnt, "Game.Round3::TrackedActor");
+        require(restoredComp != nullptr, "restoredComp must exist after importSceneJson");
+        require(!scene.isEntityActiveSelf(inactiveParent), "inactiveParent activeSelf must remain false after import");
+        require(!scene.isActiveInHierarchy(genEnt), "genEnt must remain inactive in hierarchy after import");
+        require(std::get<std::int64_t>(*rt.getMember(*restoredComp, "createCount", err)) == 1,
+            "importSceneJson must not re-fire OnCreate");
+        require(std::get<std::int64_t>(*rt.getMember(*restoredComp, "enableCount", err)) == 1,
+            "importSceneJson must not re-fire OnEnable");
+        require(std::get<std::int64_t>(*rt.getMember(*restoredComp, "disableCount", err)) == 1,
+            "importSceneJson Pass 5 must not re-fire OnDisable on inactive entities");
+        require(std::get<std::int64_t>(*rt.getMember(*restoredComp, "destroyCount", err)) == 0,
+            "importSceneJson must not fire OnDestroy");
+    }
+
+    // 2. Object cycle detection in valueToJson, non-default ctor fallback & tempRoots in jsonToValue (#4),
+    //    and staticConstructor invocation on instance getMember/setMember (#6)
+    {
+        game::GameApi api;
+        game::GameScriptCompiler compiler(api);
+        const auto compiled = compiler.compile({
+            {"round3_state.rs", R"RS(
+                module Game.Round3State;
+
+                public class NodeWithCtor {
+                    public int payload = 0;
+                    public NodeWithCtor next = null;
+                    public NodeWithCtor(int p) {
+                        this.payload = p;
+                    }
+                }
+
+                public class Holder {
+                    public static int StaticSeed = 0;
+                    static Holder() {
+                        Holder.StaticSeed = 99;
+                    }
+                    public NodeWithCtor first = null;
+                    public NodeWithCtor second = null;
+                }
+            )RS"}
+        });
+        require(compiled.succeeded(), "Game.Round3State must compile");
+
+        game::ScriptRuntime rt(compiled.program);
+        runtime::RuntimeError err;
+        auto holder = rt.createObject("Game.Round3State::Holder", err);
+        require(holder.has_value(), "create Holder");
+
+        // Verify #6: static field read on uninitialized object triggers staticConstructor
+        const auto holderType = rt.findType("Game.Round3State::Holder");
+        require(holderType.has_value(), "find Holder type");
+        game::ScriptRuntime freshRt(compiled.program);
+        auto uninitHolder = freshRt.allocateUninitializedObject(*holderType, err);
+        require(uninitHolder.has_value(), "allocateUninitializedObject Holder");
+        const auto staticVal = freshRt.getMember(*uninitHolder, "StaticSeed", err);
+        require(staticVal.has_value() && std::get<std::int64_t>(*staticVal) == 99,
+            "getMember on static field must invoke staticConstructor");
+
+        // Verify #4: cycle in NodeWithCtor does not fail valueToJson, and jsonToValue falls back to
+        // allocateUninitializedObject for NodeWithCtor (which has only a 1-arg constructor)
+        const auto nodeType = rt.findType("Game.Round3State::NodeWithCtor");
+        require(nodeType.has_value(), "find NodeWithCtor");
+        auto nodeA = rt.createObject(*nodeType, {std::int64_t{11}}, err);
+        auto nodeB = rt.createObject(*nodeType, {std::int64_t{22}}, err);
+        require(nodeA.has_value() && nodeB.has_value(), "create nodeA and nodeB");
+        require(rt.setMember(*nodeA, "next", nodeB->value(), err), "nodeA.next = nodeB");
+        require(rt.setMember(*nodeB, "next", nodeA->value(), err), "nodeB.next = nodeA (cycle)");
+        require(rt.setMember(*holder, "first", nodeA->value(), err), "holder.first = nodeA");
+        require(rt.setMember(*holder, "second", nodeB->value(), err), "holder.second = nodeB");
+
+        const std::string holderJson = game::exportScriptObjectJson(rt, *holder, err);
+        require(err.code == runtime::ErrorCode::None && !holderJson.empty(),
+            "exportScriptObjectJson must break object graph cycles cleanly: " + err.message);
+
+        auto targetHolder = rt.createObject("Game.Round3State::Holder", err);
+        require(targetHolder.has_value(), "create targetHolder");
+        require(game::importScriptObjectJson(rt, *targetHolder, holderJson, err),
+            "importScriptObjectJson must decode NodeWithCtor without 0-arg ctor: " + err.message);
+    }
+
+    // 3. LanguageService incremental rebuild module eviction on compile error & sourceless diagnostic deduplication (#7)
+    {
+        tooling::LanguageService ls;
+        ls.open("a.rs", "module ModA;\npublic int GetA() { return 1; }\n", 1);
+        ls.open("b.rs", "module ModB;\nimport ModA;\npublic int GetB() { return GetA() + 2; }\n", 1);
+        ls.open("c.rs", "module ModC;\npublic int GetC() { return 3; }\n", 1);
+        const auto& build1 = ls.build();
+        require(!build1.diagnostics.hasErrors() && build1.modules.size() == 3, "initial build has 3 modules");
+
+        // Break leaf module ModB with a return type mismatch (subgraph {ModA, ModB} < 3 total modules)
+        ls.update("b.rs", "module ModB;\nimport ModA;\npublic int GetB() { return \"bad\"; }\n", 2);
+        const auto& build2 = ls.build();
+        require(build2.diagnostics.hasErrors(), "build2 must have error");
+        require(ls.lastRebuiltModuleCount() == 1, "incremental subgraph rebuild must have run for ModB");
+        bool foundStaleModB = false;
+        for (const auto& m : build2.modules) {
+            if (m.name == "ModB") foundStaleModB = true;
+        }
+        require(!foundStaleModB, "Failed incremental subgraph rebuild must evict stale mir::Module for ModB");
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -8187,8 +8382,10 @@ int main() {
         testV3NextStageFlatDoubleFieldsInlinerOverloadsAndHotReloadBreakpoints();
         std::cout << "[32/33] testV4EvolutionCustomStructMarshalingDoubleSuperinstructionsAndCrossModuleInlining..." << std::endl;
         testV4EvolutionCustomStructMarshalingDoubleSuperinstructionsAndCrossModuleInlining();
-        std::cout << "[33/33] testV5EvolutionCrossModuleStructInliningFiberHotReloadAndBranchFusion..." << std::endl;
+        std::cout << "[33/34] testV5EvolutionCrossModuleStructInliningFiberHotReloadAndBranchFusion..." << std::endl;
         testV5EvolutionCrossModuleStructInliningFiberHotReloadAndBranchFusion();
+        std::cout << "[34/34] testRound3SevenFixesVerification..." << std::endl;
+        testRound3SevenFixesVerification();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

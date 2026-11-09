@@ -556,11 +556,8 @@ inline const std::string* get_if(
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
 inline const std::string* get_if(
     realscript::runtime::Value* value) noexcept {
-    if (!value) return nullptr;
-    if (const auto* sv = std::get_if<realscript::runtime::StringValue>(value)) {
-        return &sv->str();
-    }
-    return nullptr;
+    return std::get_if<std::string>(
+        static_cast<const realscript::runtime::Value*>(value));
 }
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
 inline const std::string& get(
@@ -570,7 +567,8 @@ inline const std::string& get(
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
 inline const std::string& get(
     realscript::runtime::Value& value) {
-    return std::get<realscript::runtime::StringValue>(value).str();
+    return std::get<realscript::runtime::StringValue>(
+        static_cast<const realscript::runtime::Value&>(value)).str();
 }
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
 inline const std::string& get(
@@ -578,7 +576,7 @@ inline const std::string& get(
     return std::get<realscript::runtime::StringValue>(value).str();
 }
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
-inline const std::string& get(
+inline std::string get(
     realscript::runtime::Value&& value) {
     return std::get<realscript::runtime::StringValue>(value).str();
 }

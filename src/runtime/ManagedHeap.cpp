@@ -618,6 +618,7 @@ struct ManagedHeap::Impl {
     }
 
     void writeBarrier(ObjectRef owner, const Value& value) {
+        if (!valueMayContainReferences(value)) return;
         if (auto* ownerObj = get(owner);
             ownerObj && !ownerObj->header.inNursery && !ownerObj->header.inRememberedSet) {
             ownerObj->header.inRememberedSet = true;
@@ -2107,7 +2108,6 @@ std::size_t ManagedHeap::collectYoung(
     if (impl_->statistics.liveBytes < impl_->nextCollectionThreshold) {
         impl_->requested = false;
     }
-    (void)reclaimUnreferencedPoolValues(&shadowStack);
     return processed;
 }
 
@@ -2467,6 +2467,8 @@ bool ManagedHeap::restore(
         object.header.elementType = info.elementType;
         object.header.elementTypeId = info.elementTypeId;
         object.header.sizeBytes = info.sizeBytes;
+        object.header.inNursery = false;
+        object.header.inRememberedSet = false;
         if (info.kind == ObjectKind::String) {
             if (!info.values.empty() || info.valueCount != 0) {
                 setHeapError(error, ErrorCode::InvalidProgram,
@@ -2576,6 +2578,10 @@ bool ManagedHeap::restore(
     impl_->nextRootToken = nextRootToken;
     impl_->internedStrings.clear();
     impl_->markStack.clear();
+    impl_->nurserySlots.clear();
+    impl_->rememberedSet.clear();
+    impl_->dirtyObjects.clear();
+    impl_->phase = GcPhase::Idle;
     impl_->requested = false;
     impl_->sweepIndex = 0;
     impl_->resumeSweep = false;

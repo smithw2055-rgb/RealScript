@@ -561,13 +561,14 @@ public:
         return nativeHandles_;
     }
 
+    [[nodiscard]] std::optional<ScriptObject> allocateUninitializedObject(
+        const ScriptType& type,
+        runtime::RuntimeError& error) const;
+
 private:
     friend class SceneScriptRuntime;
     [[nodiscard]] semantic::SymbolId nativeBaseTypeId(
         const ScriptType& type) const noexcept;
-    [[nodiscard]] std::optional<ScriptObject> allocateUninitializedObject(
-        const ScriptType& type,
-        runtime::RuntimeError& error) const;
     bool runObjectConstructor(
         ScriptObject& object,
         const std::vector<runtime::Value>& constructorArguments,
@@ -778,6 +779,18 @@ public:
     [[nodiscard]] bool isComponentEnabled(
         SceneEntityId entity,
         const std::string& scriptType) const noexcept;
+    [[nodiscard]] bool isComponentStarted(
+        SceneEntityId entity,
+        const std::string& scriptType) const noexcept;
+    bool restoreComponentWithoutLifecycle(
+        SceneEntityId entity,
+        const std::string& scriptType,
+        bool enabled = true,
+        bool started = false);
+    void restoreEntityActiveWithoutLifecycle(
+        SceneEntityId entity,
+        bool active);
+    void clearForSnapshotImport();
     void start();
     void update(double deltaTime);
     void fixedUpdate(double fixedDeltaTime);

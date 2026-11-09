@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -390,6 +391,9 @@ public:
 private:
     void executeFiberSlice(FiberContext& fiber, std::uint32_t currentTick, std::uint64_t& instrCounter);
     void scheduleAtTick(std::uint32_t fiberId, std::uint32_t wakeTick);
+
+    struct ParallelWorkerPool;
+    mutable std::shared_ptr<ParallelWorkerPool> workerPool_;
 
     IFiberHostCallbacks* host_{nullptr};
     std::uint32_t currentTick_{0};
