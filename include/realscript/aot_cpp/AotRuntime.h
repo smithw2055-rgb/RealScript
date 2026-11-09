@@ -1252,7 +1252,14 @@ template <bool Checked>
     return value;
 }
 
-struct EmptyGcGuards {};
+struct EmptyGcGuards {
+    constexpr EmptyGcGuards() noexcept = default;
+    constexpr EmptyGcGuards(
+        ExecutionContext&,
+        runtime::ValueSpan,
+        runtime::ValueSpan,
+        runtime::ValueSpan) noexcept {}
+};
 
 struct UnboxedCustomStruct {
     semantic::SymbolId typeId = 0;

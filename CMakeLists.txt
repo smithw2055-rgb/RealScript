@@ -16,36 +16,15 @@ option(REALSCRIPT_SLIM_RUNTIME "Build slim RealScript AOT/VM runtime for Wasm/em
 # exact same link behavior. Productized component targets below provide a
 # stable consumer surface and allow the implementation to be split later
 # without changing downstream CMake files.
-add_library(realscript_frontend STATIC
+set(REALSCRIPT_SLIM_RUNTIME_SOURCES
     src/text/Text.cpp
     src/diagnostics/Diagnostic.cpp
     src/aot_cpp/AotRuntime.cpp
-    src/aot_cpp/AotCpp.cpp
-    src/optimization/Optimizer.cpp
-    src/jit/Jit.cpp
     src/debug/DebugInfo.cpp
-    src/debug/Debugger.cpp
-    src/debug/DapServer.cpp
-    src/hot_reload/HotReload.cpp
-    src/tooling/Json.cpp
-    src/tooling/LanguageService.cpp
-    src/tooling/LspServer.cpp
     src/syntax/SyntaxFacts.cpp
-    src/syntax/Lexer.cpp
     src/syntax/SyntaxNodes.cpp
-    src/syntax/Parser.cpp
     src/semantic/Symbols.cpp
-    src/semantic/FlowAnalysis.cpp
-    src/semantic/SemanticBinding.cpp
-    src/semantic/SemanticExpressions.cpp
-    src/mir/MirFacts.cpp
-    src/mir/MirLowerer.cpp
-    src/mir/MirExpressions.cpp
-    src/mir/MirVerifier.cpp
-    src/mir/MirPrinter.cpp
-    src/compiler/Compilation.cpp
     src/bytecode/BytecodeFacts.cpp
-    src/bytecode/BytecodeLowerer.cpp
     src/bytecode/BytecodeVerifier.cpp
     src/bytecode/BytecodeDisassembler.cpp
     src/bytecode/BytecodeCodec.cpp
@@ -61,12 +40,46 @@ add_library(realscript_frontend STATIC
     src/game/ScriptValueRuntime.cpp
     src/game/SceneLifecycleRuntime.cpp
     src/game/SceneEventRuntime.cpp
-    src/game/GameProductization.cpp
     src/game/GameplayPrimitives.cpp
     src/game/GameplayMetadata.cpp
     src/game/GameplayScripting.cpp
     src/game/GameplayStateCodec.cpp
 )
+
+set(REALSCRIPT_COMPILER_TOOLING_SOURCES
+    src/aot_cpp/AotCpp.cpp
+    src/optimization/Optimizer.cpp
+    src/jit/Jit.cpp
+    src/debug/Debugger.cpp
+    src/debug/DapServer.cpp
+    src/hot_reload/HotReload.cpp
+    src/tooling/Json.cpp
+    src/tooling/LanguageService.cpp
+    src/tooling/LspServer.cpp
+    src/syntax/Lexer.cpp
+    src/syntax/Parser.cpp
+    src/semantic/FlowAnalysis.cpp
+    src/semantic/SemanticBinding.cpp
+    src/semantic/SemanticExpressions.cpp
+    src/mir/MirFacts.cpp
+    src/mir/MirLowerer.cpp
+    src/mir/MirExpressions.cpp
+    src/mir/MirVerifier.cpp
+    src/mir/MirPrinter.cpp
+    src/compiler/Compilation.cpp
+    src/bytecode/BytecodeLowerer.cpp
+    src/game/GameProductization.cpp
+)
+
+if(REALSCRIPT_SLIM_RUNTIME)
+    add_library(realscript_frontend STATIC ${REALSCRIPT_SLIM_RUNTIME_SOURCES})
+    target_compile_definitions(realscript_frontend PUBLIC REALSCRIPT_SLIM_RUNTIME_BUILD=1)
+else()
+    add_library(realscript_frontend STATIC
+        ${REALSCRIPT_SLIM_RUNTIME_SOURCES}
+        ${REALSCRIPT_COMPILER_TOOLING_SOURCES}
+    )
+endif()
 set_target_properties(realscript_frontend PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     EXPORT_NAME Frontend
@@ -116,49 +129,56 @@ function(realscript_enable_cxx_warnings target)
 endfunction()
 
 if(MSVC)
-    set_source_files_properties(
-        src/aot_cpp/AotCpp.cpp
-        PROPERTIES COMPILE_OPTIONS "/wd4267"
-    )
+    if(NOT REALSCRIPT_SLIM_RUNTIME)
+        set_source_files_properties(
+            src/aot_cpp/AotCpp.cpp
+            PROPERTIES COMPILE_OPTIONS "/wd4267"
+        )
+        set_source_files_properties(
+            src/optimization/Optimizer.cpp
+            src/game/GameProductization.cpp
+            PROPERTIES COMPILE_OPTIONS "/wd4456"
+        )
+    endif()
     # MSVC diagnoses repeated if-initializer names across mutually exclusive
     # branches as C4456. These translation units intentionally use that pattern.
     set_source_files_properties(
-        src/optimization/Optimizer.cpp
         src/runtime/ExecutionServices.cpp
-        src/game/GameProductization.cpp
         src/game/GameplayStateCodec.cpp
         PROPERTIES COMPILE_OPTIONS "/wd4456"
     )
 endif()
 realscript_enable_cxx_warnings(realscript_frontend)
 
-add_executable(rsc tools/rsc/main.cpp)
-target_link_libraries(rsc PRIVATE RealScript::Compiler RealScript::Runtime)
-target_compile_features(rsc PRIVATE cxx_std_17)
+if(NOT REALSCRIPT_SLIM_RUNTIME)
+    add_executable(rsc tools/rsc/main.cpp)
+    target_link_libraries(rsc PRIVATE RealScript::Compiler RealScript::Runtime)
+    target_compile_features(rsc PRIVATE cxx_std_17)
 
-add_executable(rsdebug tools/rsdebug/main.cpp)
-target_link_libraries(rsdebug PRIVATE RealScript::Debug)
-target_compile_features(rsdebug PRIVATE cxx_std_17)
+    add_executable(rsdebug tools/rsdebug/main.cpp)
+    target_link_libraries(rsdebug PRIVATE RealScript::Debug)
+    target_compile_features(rsdebug PRIVATE cxx_std_17)
 
-add_executable(rslsp tools/rslsp/main.cpp)
-target_link_libraries(rslsp PRIVATE RealScript::Tooling)
-target_compile_features(rslsp PRIVATE cxx_std_17)
+    add_executable(rslsp tools/rslsp/main.cpp)
+    target_link_libraries(rslsp PRIVATE RealScript::Tooling)
+    target_compile_features(rslsp PRIVATE cxx_std_17)
 
-add_executable(rsaot tools/rsaot/main.cpp)
-target_link_libraries(rsaot PRIVATE RealScript::Compiler RealScript::AotSupport)
-target_compile_features(rsaot PRIVATE cxx_std_17)
+    add_executable(rsaot tools/rsaot/main.cpp)
+    target_link_libraries(rsaot PRIVATE RealScript::Compiler RealScript::AotSupport)
+    target_compile_features(rsaot PRIVATE cxx_std_17)
 
-add_executable(rsbench tools/rsbench/main.cpp)
-target_link_libraries(rsbench PRIVATE RealScript::Compiler RealScript::Runtime)
-target_compile_features(rsbench PRIVATE cxx_std_17)
+    add_executable(rsbench tools/rsbench/main.cpp)
+    target_link_libraries(rsbench PRIVATE RealScript::Compiler RealScript::Runtime)
+    target_compile_features(rsbench PRIVATE cxx_std_17)
 
-add_executable(rsbind tools/rsbind/main.cpp)
-target_link_libraries(rsbind PRIVATE RealScript::GameSdk)
-target_compile_features(rsbind PRIVATE cxx_std_17)
+    add_executable(rsbind tools/rsbind/main.cpp)
+    target_link_libraries(rsbind PRIVATE RealScript::GameSdk)
+    target_compile_features(rsbind PRIVATE cxx_std_17)
 
-foreach(realscript_tool IN ITEMS rsc rsdebug rslsp rsaot rsbench rsbind)
-    realscript_enable_cxx_warnings(${realscript_tool})
-endforeach()
+    foreach(realscript_tool IN ITEMS rsc rsdebug rslsp rsaot rsbench rsbind)
+        realscript_enable_cxx_warnings(${realscript_tool})
+    endforeach()
+endif()
 
 include(cmake/RealScriptAot.cmake)
 

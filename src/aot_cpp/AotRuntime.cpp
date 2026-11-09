@@ -561,8 +561,10 @@ bool ExecutionContext::pendingExceptionMatches(
     if (typeId == 0) return true;
     const auto* reference = std::get_if<runtime::ObjectRef>(
         &*pendingException_);
-    if (!reference || !heap_) return false;
-    const auto actual = heap_->objectTypeId(*reference);
+    if (!reference) return false;
+    const auto* targetHeap = resolveHeap(*reference);
+    if (!targetHeap) return false;
+    const auto actual = targetHeap->objectTypeId(*reference);
     return actual && isAssignable(*actual, typeId);
 }
 
@@ -950,8 +952,9 @@ bool ExecutionContext::call(
         }
         const auto* receiver =
             std::get_if<runtime::ObjectRef>(&arguments[0]);
-        const auto actualTypeId = receiver && heap_
-            ? heap_->objectTypeId(*receiver)
+        const auto* targetHeap = receiver ? resolveHeap(*receiver) : nullptr;
+        const auto actualTypeId = receiver && targetHeap
+            ? targetHeap->objectTypeId(*receiver)
             : std::optional<semantic::SymbolId>{};
         const auto* actualType = actualTypeId
             ? findType(*actualTypeId)
@@ -993,8 +996,9 @@ bool ExecutionContext::call(
         }
         const auto* receiver =
             std::get_if<runtime::ObjectRef>(&arguments[0]);
-        const auto actualTypeId = receiver && heap_
-            ? heap_->objectTypeId(*receiver)
+        const auto* targetHeap = receiver ? resolveHeap(*receiver) : nullptr;
+        const auto actualTypeId = receiver && targetHeap
+            ? targetHeap->objectTypeId(*receiver)
             : std::optional<semantic::SymbolId>{};
         const auto* actualType = actualTypeId
             ? findType(*actualTypeId)
@@ -1536,8 +1540,9 @@ bool ExecutionContext::invokeDelegate(
         const auto* receiver = values.empty()
             ? nullptr
             : std::get_if<runtime::ObjectRef>(&values.front());
-        const auto runtimeTypeId = receiver
-            ? heap_->objectTypeId(*receiver)
+        const auto* targetHeap = receiver ? resolveHeap(*receiver) : nullptr;
+        const auto runtimeTypeId = receiver && targetHeap
+            ? targetHeap->objectTypeId(*receiver)
             : std::optional<semantic::SymbolId>{};
         const auto* runtimeType = runtimeTypeId
             ? findType(*runtimeTypeId)
@@ -1748,14 +1753,16 @@ bool ExecutionContext::typeOperation(
     if (!nullValue) {
         if (targetType == semantic::PrimitiveType::Object) {
             const auto* reference = std::get_if<runtime::ObjectRef>(&value);
-            const auto actual = reference && heap_
-                ? heap_->objectTypeId(*reference)
+            const auto* targetHeap = reference ? resolveHeap(*reference) : nullptr;
+            const auto actual = reference && targetHeap
+                ? targetHeap->objectTypeId(*reference)
                 : std::optional<semantic::SymbolId>{};
             matches = actual && isAssignable(*actual, targetTypeId);
         } else if (targetType == semantic::PrimitiveType::Array) {
             const auto* reference = std::get_if<runtime::ObjectRef>(&value);
-            const auto actual = reference && heap_
-                ? heap_->arrayTypeId(*reference)
+            const auto* targetHeap = reference ? resolveHeap(*reference) : nullptr;
+            const auto actual = reference && targetHeap
+                ? targetHeap->arrayTypeId(*reference)
                 : std::optional<semantic::SymbolId>{};
             matches = actual && *actual == targetTypeId;
         } else {
@@ -2225,10 +2232,11 @@ TypedRawColumnCache ExecutionContext::acquireRawColumnCache(
     const GeneratedFieldLayout* generatedFields,
     std::size_t generatedFieldCount) const noexcept {
     TypedRawColumnCache cache{};
-    if (!heap_) return cache;
     const auto* ref = std::get_if<runtime::ObjectRef>(&arrayValue);
     if (!ref) return cache;
-    const auto* view = heap_->rawColumnView(*ref);
+    const auto* targetHeap = resolveHeap(*ref);
+    if (!targetHeap) return cache;
+    const auto* view = targetHeap->rawColumnView(*ref);
     if (!view) return cache;
     if (expectedStructTypeId != 0 && view->structTypeId != expectedStructTypeId) {
         return cache;
@@ -2242,7 +2250,10 @@ TypedRawColumnCache ExecutionContext::acquireRawColumnCache(
     cache.basePtr = static_cast<std::uint8_t*>(view->basePtr);
     cache.strideBytes = view->strideBytes;
     cache.count = static_cast<std::int64_t>(view->count);
-    cache.readOnly = view->readOnly;
+    cache.readOnly = view->readOnly ||
+        (domainKind_ == runtime::DomainKind::UiPresentation &&
+         heap_ &&
+         ref->heapId != static_cast<std::uint32_t>(heap_->heapId()));
     cache.fieldCount = static_cast<std::uint8_t>(view->fields.size());
     for (std::size_t i = 0; i < view->fields.size(); ++i) {
         cache.fields[i] = TypedRawFieldCache{

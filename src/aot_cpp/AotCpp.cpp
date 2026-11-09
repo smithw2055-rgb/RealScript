@@ -47,6 +47,7 @@ struct FunctionView {
 };
 
 struct TypeView {
+    semantic::TypeSymbol mergedType;
     const semantic::TypeSymbol* type = nullptr;
     std::string cppName;
 };
@@ -2036,8 +2037,41 @@ void emitTypedPrimitiveFunction(
     }
     source.line("    ExecutionContext::TypedRawAccountingScope<FastAccounting && !TrustedRelease> rawAccounting(context);");
     source.line("    ExecutionContext::TypedDeterminismAccountingScope<DeterminismAccounting && !TrustedRelease> determinismAccounting(context);");
-    source.line("    std::conditional_t<!FastAccounting && !DeterminismAccounting && !TrustedRelease, std::vector<runtime::PersistentRoot>, aot::EmptyGcGuards> typedLocalGcGuards;");
-    source.line("    (void)typedLocalGcGuards;");
+    std::size_t typedRefSlotCount = 0;
+    for (const auto paramType : function.parameterTypes) {
+        if (paramType == semantic::PrimitiveType::Object ||
+            paramType == semantic::PrimitiveType::Array) {
+            ++typedRefSlotCount;
+        }
+    }
+    for (const auto localType : function.localTypes) {
+        if (localType == semantic::PrimitiveType::Object ||
+            localType == semantic::PrimitiveType::Array) {
+            ++typedRefSlotCount;
+        }
+    }
+    for (const auto& regSlot : types) {
+        if (regSlot.primitive == semantic::PrimitiveType::Object ||
+            regSlot.primitive == semantic::PrimitiveType::Array) {
+            ++typedRefSlotCount;
+        }
+    }
+    if (typedRefSlotCount > 0) {
+        source.line("    std::array<runtime::Value, " + std::to_string(typedRefSlotCount) + "> typedRefFrame{};");
+        std::size_t paramRefSlot = 0;
+        for (std::size_t index = 0; index < function.parameterTypes.size(); ++index) {
+            if (function.parameterTypes[index] == semantic::PrimitiveType::Object ||
+                function.parameterTypes[index] == semantic::PrimitiveType::Array) {
+                source.line("    typedRefFrame[" + std::to_string(paramRefSlot++) + "] = typedArg_" + std::to_string(index) + ";");
+            }
+        }
+        source.line("    std::conditional_t<!FastAccounting && !DeterminismAccounting && !TrustedRelease, FrameScope, aot::EmptyGcGuards> typedLocalGcGuards(");
+        source.line("        context,");
+        source.line("        runtime::ValueSpan{},");
+        source.line("        runtime::ValueSpan(typedRefFrame.data(), typedRefFrame.size()),");
+        source.line("        runtime::ValueSpan{});");
+        source.line("    (void)typedLocalGcGuards;");
+    }
     source.line("    std::uint32_t typedActiveGenLine = 0;");
     source.line("    (void)typedActiveGenLine;");
     source.line("    const auto typedFail = [&](runtime::ErrorCode code, const char* message) {");
@@ -2083,14 +2117,29 @@ void emitTypedPrimitiveFunction(
             }
         }
     }
+    std::size_t currentRefSlot = 0;
+    for (const auto paramType : function.parameterTypes) {
+        if (paramType == semantic::PrimitiveType::Object ||
+            paramType == semantic::PrimitiveType::Array) {
+            ++currentRefSlot;
+        }
+    }
     for (std::size_t index = 0; index < function.localTypes.size(); ++index) {
         const auto typeId = index < function.localTypeIds.size()
             ? function.localTypeIds[index]
             : 0;
         const TypedSlotType localSlot{function.localTypes[index], typeId};
-        source.line("    " + typedCppType(localSlot) + " " +
-            typedLocalExpression(index) + " = " +
-            typedDefaultValue(localSlot) + ";");
+        if (localSlot.primitive == semantic::PrimitiveType::Object ||
+            localSlot.primitive == semantic::PrimitiveType::Array) {
+            source.line("    runtime::Value& " + typedLocalExpression(index) +
+                " = typedRefFrame[" + std::to_string(currentRefSlot++) + "];");
+            source.line("    " + typedLocalExpression(index) + " = " +
+                typedDefaultValue(localSlot) + ";");
+        } else {
+            source.line("    " + typedCppType(localSlot) + " " +
+                typedLocalExpression(index) + " = " +
+                typedDefaultValue(localSlot) + ";");
+        }
         if (function.localTypes[index] == semantic::PrimitiveType::Array) {
             source.line("    aot::TypedRawColumnCache typedLocalRawCol_" +
                 std::to_string(index) + "{};");
@@ -2098,8 +2147,15 @@ void emitTypedPrimitiveFunction(
         }
     }
     for (std::size_t index = 0; index < types.size(); ++index) {
-        source.line("    " + typedCppType(types[index]) + " " +
-            typedValueExpression(static_cast<mir::ValueId>(index)) + "{};");
+        if (types[index].primitive == semantic::PrimitiveType::Object ||
+            types[index].primitive == semantic::PrimitiveType::Array) {
+            source.line("    runtime::Value& " +
+                typedValueExpression(static_cast<mir::ValueId>(index)) +
+                " = typedRefFrame[" + std::to_string(currentRefSlot++) + "];");
+        } else {
+            source.line("    " + typedCppType(types[index]) + " " +
+                typedValueExpression(static_cast<mir::ValueId>(index)) + "{};");
+        }
     }
     if (options.emitLineDirectives && !function.debugInfo.locals.empty()) {
         std::unordered_map<std::string, std::size_t> debugNameCounts;
@@ -2250,11 +2306,6 @@ void emitTypedPrimitiveFunction(
                     hexId(instruction.elementTypeId) + "ULL, runtime::Value{" +
                     operand(0) + "}, " + result +
                     ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
-                source.line("            if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
-                source.line("                if (context.heap() != nullptr && std::holds_alternative<runtime::ObjectRef>(" + result + ")) {");
-                source.line("                    typedLocalGcGuards.push_back(context.heap()->retain(" + result + "));");
-                source.line("                }");
-                source.line("            }");
                 break;
             }
             case mir::Opcode::ArrayLength: {
@@ -2786,13 +2837,6 @@ void emitTypedPrimitiveFunction(
                         source.line("                determinismAccounting.resumeAfterCall();");
                         source.line("            }");
                         source.line("            if (!colOk_" + suffix + ") return false;");
-                        if (!options.trustedRelease) {
-                            source.line("            if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
-                            source.line("                if (context.heap() != nullptr && std::holds_alternative<runtime::ObjectRef>(" + result + ")) {");
-                            source.line("                    typedLocalGcGuards.push_back(context.heap()->retain(" + result + "));");
-                            source.line("                }");
-                            source.line("            }");
-                        }
                     } else {
                         std::string argPtr = "nullptr";
                         if (!instruction.operands.empty()) {
@@ -2827,14 +2871,6 @@ void emitTypedPrimitiveFunction(
                                 ", bridgeRes_" + suffix + ", " + result +
                                 ")) return typedFail(runtime::ErrorCode::TypeMismatch, "
                                 "\"AOT call return type mismatch\");");
-                            if (instruction.resultType == semantic::PrimitiveType::Array ||
-                                instruction.resultType == semantic::PrimitiveType::Object) {
-                                source.line("            if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
-                                source.line("                if (context.heap() != nullptr && std::holds_alternative<runtime::ObjectRef>(" + result + ")) {");
-                                source.line("                    typedLocalGcGuards.push_back(context.heap()->retain(" + result + "));");
-                                source.line("                }");
-                                source.line("            }");
-                            }
                         }
                     }
                 }
@@ -2941,16 +2977,6 @@ void emitTypedPrimitiveFunction(
     source.line("    (void)arguments;");
     source.line("    (void)argumentCount;");
     source.line("    (void)result;");
-    source.line("    std::conditional_t<!FastAccounting && !DeterminismAccounting && !TrustedRelease, std::vector<runtime::PersistentRoot>, aot::EmptyGcGuards> typedGcGuards;");
-    source.line("    if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
-    source.line("        if (context.heap() != nullptr) {");
-    source.line("            for (std::size_t idx = 0; idx < argumentCount; ++idx) {");
-    source.line("                if (std::holds_alternative<runtime::ObjectRef>(arguments[idx])) {");
-    source.line("                    typedGcGuards.push_back(context.heap()->retain(arguments[idx]));");
-    source.line("                }");
-    source.line("            }");
-    source.line("        }");
-    source.line("    }");
     for (std::size_t index = 0; index < function.parameterTypes.size(); ++index) {
         const auto typeId = index < function.parameterTypeIds.size()
             ? function.parameterTypeIds[index]
@@ -3244,15 +3270,88 @@ GeneratedProgram CppGenerator::generate(
         for (const auto& type : module.types) {
             const auto inserted = types.emplace(
                 type.id,
-                TypeView{&type, "type_" + hexId(type.id)});
+                TypeView{type, nullptr, "type_" + hexId(type.id)});
+            inserted.first->second.type = &inserted.first->second.mergedType;
             if (!inserted.second) {
-                if (semantic::canonicalTypeName(*inserted.first->second.type) !=
+                auto& dst = inserted.first->second.mergedType;
+                if (semantic::canonicalTypeName(dst) !=
                         semantic::canonicalTypeName(type)) {
                     diagnostics.report("RS7003", "duplicate AOT TypeId has incompatible names", {});
-                } else if (type.fields.size() > inserted.first->second.type->fields.size() ||
-                           type.virtualDispatchTable.size() >
-                               inserted.first->second.type->virtualDispatchTable.size()) {
-                    inserted.first->second.type = &type;
+                } else {
+                    const bool prevObservable = dst.observable;
+                    const bool prevSimState = dst.simState;
+                    const bool prevPartial = dst.partialType;
+                    const bool prevAbstract = dst.abstractType;
+                    const bool prevSealed = dst.sealedType;
+                    const auto prevFields = dst.fields;
+                    if (type.fields.size() > dst.fields.size() ||
+                        type.virtualDispatchTable.size() >
+                            dst.virtualDispatchTable.size()) {
+                        dst = type;
+                    }
+                    dst.observable = prevObservable || type.observable;
+                    dst.simState = prevSimState || type.simState;
+                    dst.partialType = prevPartial || type.partialType;
+                    dst.abstractType = prevAbstract || type.abstractType;
+                    dst.sealedType = prevSealed || type.sealedType;
+                    if (dst.baseTypeId == 0 && type.baseTypeId != 0) {
+                        dst.baseTypeId = type.baseTypeId;
+                        dst.baseTypeName = type.baseTypeName;
+                    }
+                    const auto& extraFields = (&dst.fields == &prevFields)
+                        ? type.fields
+                        : prevFields;
+                    for (const auto& extra : extraFields) {
+                        auto foundIt = std::find_if(
+                            dst.fields.begin(),
+                            dst.fields.end(),
+                            [&](const semantic::FieldSymbol& f) {
+                                return f.name == extra.name;
+                            });
+                        if (foundIt == dst.fields.end()) {
+                            auto added = extra;
+                            added.index = dst.fields.size();
+                            dst.fields.push_back(std::move(added));
+                        } else {
+                            foundIt->observable = foundIt->observable || extra.observable;
+                            foundIt->simState = foundIt->simState || extra.simState;
+                            if (foundIt->observableBitIndex == 0xFFu &&
+                                extra.observableBitIndex != 0xFFu) {
+                                foundIt->observableBitIndex = extra.observableBitIndex;
+                            }
+                        }
+                    }
+                    if (dst.observable) {
+                        std::uint8_t nextBit = 0;
+                        for (const auto& f : dst.fields) {
+                            if (f.observable && f.observableBitIndex != 0xFFu &&
+                                f.observableBitIndex >= nextBit) {
+                                nextBit = static_cast<std::uint8_t>(f.observableBitIndex + 1u);
+                            }
+                        }
+                        for (auto& f : dst.fields) {
+                            if (!f.staticField && !f.constField && !f.observable) {
+                                f.observable = true;
+                                if (f.observableBitIndex == 0xFFu && nextBit < 64u) {
+                                    f.observableBitIndex = nextBit++;
+                                }
+                            }
+                        }
+                    }
+                    if (type.virtualDispatchTable.size() > dst.virtualDispatchTable.size()) {
+                        dst.virtualDispatchTable = type.virtualDispatchTable;
+                    }
+                    for (const auto& iface : type.interfaceDispatchMaps) {
+                        const bool hasIface = std::any_of(
+                            dst.interfaceDispatchMaps.begin(),
+                            dst.interfaceDispatchMaps.end(),
+                            [&](const auto& existing) {
+                                return existing.interfaceTypeId == iface.interfaceTypeId;
+                            });
+                        if (!hasIface) {
+                            dst.interfaceDispatchMaps.push_back(iface);
+                        }
+                    }
                 }
             }
         }
