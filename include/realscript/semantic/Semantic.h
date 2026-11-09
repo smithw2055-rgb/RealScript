@@ -144,6 +144,7 @@ struct FieldSymbol {
     bool readonlyField = false;
     bool observable = false;
     std::uint16_t observableBitIndex = 0xFFFFu;
+    bool simState = false;
     bool hasConstantValue = false;
     syntax::TokenValue constantValue;
     const syntax::ExpressionSyntax* initializerSyntax = nullptr;
@@ -183,6 +184,7 @@ struct FunctionSymbol {
     bool synthetic = false;
     bool deterministic = false;
     bool nonDeterministic = false;
+    bool simCommand = false;
     std::string sourceName;
     text::TextSpan declarationSpan;
     text::TextSpan bodySpan;
@@ -241,6 +243,7 @@ struct PropertySymbol {
     bool staticProperty = false;
     bool observable = false;
     std::uint16_t observableBitIndex = 0xFFFFu;
+    bool simState = false;
     std::optional<FunctionSymbol> getter;
     std::optional<FunctionSymbol> setter;
     std::size_t backingFieldIndex = std::numeric_limits<std::size_t>::max();
@@ -288,6 +291,7 @@ struct TypeSymbol {
     bool partialType = false;
     bool observable = false;
     std::uint16_t nextObservableBitIndex = 0;
+    bool simState = false;
     bool deterministic = false;
     SymbolId baseTypeId = 0;
     std::string baseTypeName;

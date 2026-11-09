@@ -447,6 +447,7 @@ struct StringValue {
     StringValue(std::string_view value);
 
     [[nodiscard]] const std::string& str() const noexcept;
+    [[nodiscard]] std::string_view view() const noexcept { return str(); }
     operator const std::string&() const noexcept { return str(); }
     operator std::string_view() const noexcept { return str(); }
     [[nodiscard]] const char* c_str() const noexcept { return str().c_str(); }
@@ -455,6 +456,13 @@ struct StringValue {
     [[nodiscard]] bool empty() const noexcept { return str().empty(); }
     [[nodiscard]] auto begin() const noexcept { return str().begin(); }
     [[nodiscard]] auto end() const noexcept { return str().end(); }
+    [[nodiscard]] bool isAsciiFast() const noexcept;
+    [[nodiscard]] std::size_t codePointLength() const noexcept;
+    [[nodiscard]] std::string_view codePointSlice(
+        std::size_t startCodePoint,
+        std::size_t codePointCount = std::string_view::npos) const noexcept;
+    [[nodiscard]] std::int64_t codePointIndexOf(std::string_view needle) const noexcept;
+    [[nodiscard]] std::int64_t codePointLastIndexOf(std::string_view needle) const noexcept;
 
     friend bool operator==(const StringValue& left, const StringValue& right) noexcept {
         if (left.id != 0 && left.id == right.id) return true;
@@ -1445,6 +1453,9 @@ private:
     std::shared_ptr<const detail::ExecutionMirror> executionMirror_;
 };
 
+class ExecutionDomainContext;
+enum class DomainKind : std::uint8_t;
+
 class Interpreter {
 public:
     explicit Interpreter(std::vector<bytecode::Module> modules);
@@ -1457,6 +1468,11 @@ public:
     void setBindingRegistry(std::shared_ptr<const BindingRegistry> bindings);
     void setHeap(std::shared_ptr<ManagedHeap> heap);
     [[nodiscard]] std::shared_ptr<ManagedHeap> heap() const noexcept;
+    void setExecutionDomainContext(
+        ExecutionDomainContext* context,
+        DomainKind domainKind) noexcept;
+    [[nodiscard]] ExecutionDomainContext* executionDomainContext() const noexcept;
+    [[nodiscard]] DomainKind domainKind() const noexcept;
 
     [[nodiscard]] ExecutionResult invoke(
         semantic::SymbolId symbolId,
@@ -1481,6 +1497,8 @@ private:
     ExternalFunction externalResolver_;
     std::shared_ptr<const BindingRegistry> bindings_;
     std::shared_ptr<ManagedHeap> heap_;
+    ExecutionDomainContext* domainContext_ = nullptr;
+    std::uint8_t domainKind_ = 0;
 };
 
 class EngineRuntime {
@@ -1536,6 +1554,18 @@ private:
     bool checkedArithmetic = true) noexcept;
 [[nodiscard]] std::string valueToString(const Value& value);
 [[nodiscard]] std::string valueToString(const Value& value, const ManagedHeap* heap);
+[[nodiscard]] bool utf8IsAsciiFast(std::string_view text) noexcept;
+[[nodiscard]] std::size_t utf8CodePointLength(std::string_view text) noexcept;
+[[nodiscard]] std::string_view utf8CodePointSlice(
+    std::string_view text,
+    std::size_t startCodePoint,
+    std::size_t codePointCount = std::string_view::npos) noexcept;
+[[nodiscard]] std::int64_t utf8CodePointIndexOf(
+    std::string_view text,
+    std::string_view needle) noexcept;
+[[nodiscard]] std::int64_t utf8CodePointLastIndexOf(
+    std::string_view text,
+    std::string_view needle) noexcept;
 [[nodiscard]] std::uint64_t stableValueHash(const Value& value) noexcept;
 [[nodiscard]] bool isReplayStableValue(const Value& value) noexcept;
 [[nodiscard]] const char* determinismModeName(DeterminismMode mode) noexcept;

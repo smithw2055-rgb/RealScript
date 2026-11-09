@@ -3301,8 +3301,10 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             }
                             owner.fields = base->fields;
                             owner.nextObservableBitIndex = base->nextObservableBitIndex;
+                            owner.simState = owner.simState || base->simState;
                             for (auto& f : ownFields) {
                                 f.index = owner.fields.size();
+                                if (owner.simState) f.simState = true;
                                 if (f.observable) {
                                     f.observableBitIndex = (owner.nextObservableBitIndex < 63u)
                                         ? owner.nextObservableBitIndex++
@@ -4324,6 +4326,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             backing.readonlyField = !property.setter.has_value();
                             backing.observable = property.observable;
                             backing.observableBitIndex = property.observableBitIndex;
+                            backing.simState = property.simState;
                             backing.initializerSyntax = propertySyntax.initializer.get();
                             backing.sourceName = unit->source->name();
                             backing.declarationSpan = propertySyntax.identifierToken.span;

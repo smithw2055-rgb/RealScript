@@ -9,6 +9,8 @@
 
 namespace realscript::game {
 
+using PropertySlotHandle = runtime::PropertySlotHandle;
+
 class ScriptMetadataRegistry;
 
 enum class ScriptExecutionBackend {

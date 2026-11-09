@@ -4,9 +4,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace realscript::runtime {
@@ -29,6 +33,8 @@ struct PropertySlotHandle {
     bool isAutoProperty = false;
     bool isObservable = false;
     bool isReadOnly = false;
+    bool isSimState = false;
+    bool isSimCommand = false;
 
     [[nodiscard]] constexpr bool valid() const noexcept {
         return typeId != 0 &&
@@ -45,6 +51,18 @@ struct SimCommandEnvelope {
     std::vector<Value> payload;
     std::uint64_t clientFrameTick = 0;
 };
+
+using UiTaskId = std::uint64_t;
+
+enum class UiTaskStatus : std::uint8_t {
+    Pending = 0,
+    Suspended = 1,
+    Completed = 2,
+    Cancelled = 3,
+    Faulted = 4,
+};
+
+using UiAsyncStepCallback = std::function<bool(std::uint32_t stepIndex, Value& inOutResult)>;
 
 class ExecutionDomainContext {
 public:
@@ -151,16 +169,68 @@ public:
     [[nodiscard]] std::size_t pendingSimCommandCount() const noexcept {
         return pendingSimCommands_.size();
     }
+    std::size_t flushSimCommands(
+        const Interpreter& simInterpreter,
+        RuntimeError* error = nullptr);
+
+    // Heap-allocated reentrant UI async tasks with control-unload cancellation safety
+    UiTaskId spawnReentrantSequenceTask(
+        const ProgramImage& program,
+        const Interpreter& uiInterpreter,
+        ObjectRef targetObject,
+        std::string_view sequenceName,
+        std::vector<Value> arguments = {},
+        NativeHandle boundControl = {},
+        UiTaskId awaitPrerequisite = 0);
+
+    UiTaskId spawnCallbackTask(
+        UiAsyncStepCallback stepCallback,
+        NativeHandle boundControl = {},
+        UiTaskId awaitPrerequisite = 0);
+
+    bool stepUiTask(UiTaskId taskId, const Interpreter* uiInterpreter = nullptr);
+    std::size_t stepAllUiTasks(const Interpreter* uiInterpreter = nullptr);
+    bool cancelUiTask(UiTaskId taskId) noexcept;
+    std::size_t cancelUiTasksForControl(NativeHandle boundControl) noexcept;
+    [[nodiscard]] UiTaskStatus uiTaskStatus(UiTaskId taskId) const noexcept;
+    [[nodiscard]] std::optional<Value> uiTaskResult(UiTaskId taskId) const;
+    [[nodiscard]] std::size_t activeUiTaskCount() const noexcept;
 
     std::size_t stepUiIdleGc(const ShadowStack& shadowStack, double maxMilliseconds);
     std::size_t stepUiIdleGc(double maxMilliseconds);
 
 private:
+    struct UiAsyncTaskFrame {
+        UiTaskId taskId = 0;
+        UiTaskStatus status = UiTaskStatus::Pending;
+        UiTaskId prerequisiteTaskId = 0;
+        WeakRef targetWeakRef{};
+        NativeHandle boundControl{};
+        std::uint32_t stepIndex = 0;
+        Value result{};
+        RuntimeError error{};
+        // For sequence-backed tasks: isolated per-instance synthetic fields on the heap
+        bool isSequenceTask = false;
+        semantic::SymbolId sequenceEntrySymbolId = 0;
+        semantic::SymbolId sequenceStepSymbolId = 0;
+        std::int64_t sequenceTargetId = 0;
+        std::vector<Value> sequenceEntryArgs;
+        std::size_t stateFieldIndex = PropertySlotHandle::InvalidIndex;
+        std::size_t completedFieldIndex = PropertySlotHandle::InvalidIndex;
+        std::size_t resultFieldIndex = PropertySlotHandle::InvalidIndex;
+        std::vector<std::pair<std::size_t, Value>> isolatedSequenceFields;
+        // For callback-backed tasks
+        UiAsyncStepCallback stepCallback;
+    };
+
     std::shared_ptr<ManagedHeap> simHeap_;
     std::shared_ptr<ManagedHeap> uiHeap_;
     std::shared_ptr<NativeHandleRegistry> nativeHandles_;
     DomainKind activeDomain_ = DomainKind::UiPresentation;
     std::vector<SimCommandEnvelope> pendingSimCommands_;
+    UiTaskId nextUiTaskId_ = 1;
+    std::vector<std::unique_ptr<UiAsyncTaskFrame>> uiTasks_;
+    std::unordered_set<std::uint32_t> cancelledControlSlots_;
 };
 
 } // namespace realscript::runtime

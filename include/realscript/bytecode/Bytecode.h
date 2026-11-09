@@ -394,6 +394,7 @@ struct Function {
     std::string name;
     semantic::PrimitiveType returnType = semantic::PrimitiveType::Error;
     semantic::SymbolId returnTypeId = 0;
+    bool simCommand = false;
     std::vector<semantic::PrimitiveType> parameterTypes;
     std::vector<semantic::SymbolId> parameterTypeIds;
     std::vector<semantic::PrimitiveType> localTypes;

@@ -3712,12 +3712,26 @@ const char* traceEventKindName(TraceEventKind kind) noexcept {
 
 namespace {
 
+std::optional<std::string_view> extractIntrinsicStringView(
+    const Value& val,
+    const ManagedHeap* heap) noexcept {
+    if (const auto* sv = std::get_if<StringValue>(&val)) {
+        return sv->view();
+    }
+    if (const auto* ref = std::get_if<ObjectRef>(&val)) {
+        if (heap && ref->kind == ObjectKind::String) {
+            return heap->stringView(*ref);
+        }
+    }
+    return std::nullopt;
+}
+
 std::string extractIntrinsicString(const Value& val, const ManagedHeap* heap) {
     if (std::holds_alternative<NullString>(val) ||
         std::holds_alternative<std::monostate>(val)) {
         return {};
     }
-    if (const auto* s = std::get_if<std::string>(&val)) return *s;
+    if (const auto* sv = std::get_if<StringValue>(&val)) return sv->str();
     if (const auto* ref = std::get_if<ObjectRef>(&val)) {
         if (heap) {
             if (const auto sv = heap->stringView(*ref)) {
@@ -4575,11 +4589,19 @@ bool tryExecuteRuntimeIntrinsic(
     }
 
     if (op == "string_length") {
-        result = static_cast<std::int64_t>(
-            extractIntrinsicString(arguments[0], heap).size());
+        if (const auto svOpt = extractIntrinsicStringView(arguments[0], heap)) {
+            result = static_cast<std::int64_t>(utf8CodePointLength(*svOpt));
+            return true;
+        }
+        const auto s = extractIntrinsicString(arguments[0], heap);
+        result = static_cast<std::int64_t>(utf8CodePointLength(s));
         return true;
     }
     if (op == "string_is_empty") {
+        if (const auto svOpt = extractIntrinsicStringView(arguments[0], heap)) {
+            result = svOpt->empty();
+            return true;
+        }
         result = extractIntrinsicString(arguments[0], heap).empty();
         return true;
     }
@@ -4605,19 +4627,13 @@ bool tryExecuteRuntimeIntrinsic(
     if (op == "string_index_of") {
         const auto s = extractIntrinsicString(arguments[0], heap);
         const auto sub = extractIntrinsicString(arguments[1], heap);
-        const auto pos = s.find(sub);
-        result = (pos == std::string::npos)
-            ? std::int64_t{-1}
-            : static_cast<std::int64_t>(pos);
+        result = utf8CodePointIndexOf(s, sub);
         return true;
     }
     if (op == "string_last_index_of") {
         const auto s = extractIntrinsicString(arguments[0], heap);
         const auto sub = extractIntrinsicString(arguments[1], heap);
-        const auto pos = s.rfind(sub);
-        result = (pos == std::string::npos)
-            ? std::int64_t{-1}
-            : static_cast<std::int64_t>(pos);
+        result = utf8CodePointLastIndexOf(s, sub);
         return true;
     }
     if (op == "string_substring_1") {
@@ -4625,10 +4641,9 @@ bool tryExecuteRuntimeIntrinsic(
         const auto rawStart = std::holds_alternative<std::int64_t>(arguments[1])
             ? std::get<std::int64_t>(arguments[1])
             : 0;
-        const auto clampedStart = std::clamp<std::int64_t>(
-            rawStart, 0, static_cast<std::int64_t>(s.size()));
+        const auto safeStart = static_cast<std::size_t>(std::max<std::int64_t>(0, rawStart));
         return makeIntrinsicStringResult(
-            s.substr(static_cast<std::size_t>(clampedStart)),
+            std::string(utf8CodePointSlice(s, safeStart)),
             heap,
             result,
             errorMessage);
@@ -4641,14 +4656,10 @@ bool tryExecuteRuntimeIntrinsic(
         const auto rawLen = std::holds_alternative<std::int64_t>(arguments[2])
             ? std::get<std::int64_t>(arguments[2])
             : 0;
-        const auto clampedStart = std::clamp<std::int64_t>(
-            rawStart, 0, static_cast<std::int64_t>(s.size()));
-        const auto clampedLen = std::clamp<std::int64_t>(
-            rawLen, 0, static_cast<std::int64_t>(s.size()) - clampedStart);
+        const auto safeStart = static_cast<std::size_t>(std::max<std::int64_t>(0, rawStart));
+        const auto safeLen = static_cast<std::size_t>(std::max<std::int64_t>(0, rawLen));
         return makeIntrinsicStringResult(
-            s.substr(
-                static_cast<std::size_t>(clampedStart),
-                static_cast<std::size_t>(clampedLen)),
+            std::string(utf8CodePointSlice(s, safeStart, safeLen)),
             heap,
             result,
             errorMessage);
@@ -5098,6 +5109,126 @@ RuntimeValuePoolStatistics getRuntimeValuePoolStatistics() noexcept {
     }
 
     return stats;
+}
+
+bool utf8IsAsciiFast(std::string_view text) noexcept {
+    const char* ptr = text.data();
+    const std::size_t n = text.size();
+    std::size_t i = 0;
+    while (i + 8 <= n) {
+        std::uint64_t word = 0;
+        std::memcpy(&word, ptr + i, sizeof(word));
+        if ((word & 0x8080808080808080ULL) != 0) {
+            return false;
+        }
+        i += 8;
+    }
+    for (; i < n; ++i) {
+        if ((static_cast<unsigned char>(ptr[i]) & 0x80u) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::size_t utf8CodePointLength(std::string_view text) noexcept {
+    if (utf8IsAsciiFast(text)) {
+        return text.size();
+    }
+    std::size_t count = 0;
+    for (unsigned char ch : text) {
+        if ((ch & 0xC0u) != 0x80u) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+std::string_view utf8CodePointSlice(
+    std::string_view text,
+    std::size_t startCodePoint,
+    std::size_t codePointCount) noexcept {
+    if (utf8IsAsciiFast(text)) {
+        const std::size_t clampedStart = std::min(startCodePoint, text.size());
+        if (codePointCount == std::string_view::npos) {
+            return text.substr(clampedStart);
+        }
+        const std::size_t clampedLen = std::min(codePointCount, text.size() - clampedStart);
+        return text.substr(clampedStart, clampedLen);
+    }
+    const std::size_t n = text.size();
+    std::size_t byteIdx = 0;
+    std::size_t cpIdx = 0;
+    while (byteIdx < n && cpIdx < startCodePoint) {
+        ++byteIdx;
+        while (byteIdx < n &&
+               (static_cast<unsigned char>(text[byteIdx]) & 0xC0u) == 0x80u) {
+            ++byteIdx;
+        }
+        ++cpIdx;
+    }
+    const std::size_t startByte = byteIdx;
+    if (codePointCount == std::string_view::npos) {
+        return text.substr(startByte);
+    }
+    std::size_t taken = 0;
+    while (byteIdx < n && taken < codePointCount) {
+        ++byteIdx;
+        while (byteIdx < n &&
+               (static_cast<unsigned char>(text[byteIdx]) & 0xC0u) == 0x80u) {
+            ++byteIdx;
+        }
+        ++taken;
+    }
+    return text.substr(startByte, byteIdx - startByte);
+}
+
+std::int64_t utf8CodePointIndexOf(
+    std::string_view text,
+    std::string_view needle) noexcept {
+    const std::size_t bytePos = text.find(needle);
+    if (bytePos == std::string_view::npos) {
+        return -1;
+    }
+    if (bytePos == 0) {
+        return 0;
+    }
+    return static_cast<std::int64_t>(utf8CodePointLength(text.substr(0, bytePos)));
+}
+
+std::int64_t utf8CodePointLastIndexOf(
+    std::string_view text,
+    std::string_view needle) noexcept {
+    const std::size_t bytePos = text.rfind(needle);
+    if (bytePos == std::string_view::npos) {
+        return -1;
+    }
+    if (bytePos == 0) {
+        return 0;
+    }
+    return static_cast<std::int64_t>(utf8CodePointLength(text.substr(0, bytePos)));
+}
+
+bool StringValue::isAsciiFast() const noexcept {
+    return utf8IsAsciiFast(view());
+}
+
+std::size_t StringValue::codePointLength() const noexcept {
+    return utf8CodePointLength(view());
+}
+
+std::string_view StringValue::codePointSlice(
+    std::size_t startCodePoint,
+    std::size_t codePointCount) const noexcept {
+    return utf8CodePointSlice(view(), startCodePoint, codePointCount);
+}
+
+std::int64_t StringValue::codePointIndexOf(std::string_view needle) const noexcept {
+    return utf8CodePointIndexOf(view(), needle);
+}
+
+std::int64_t StringValue::codePointLastIndexOf(std::string_view needle) const noexcept {
+    return utf8CodePointLastIndexOf(view(), needle);
 }
 
 } // namespace realscript::runtime

@@ -428,6 +428,7 @@ void writeFunctionSymbol(
     if (function.propertyGetter) secondaryFlags |= 0x01u;
     if (function.propertySetter) secondaryFlags |= 0x02u;
     if (function.synthetic) secondaryFlags |= 0x04u;
+    if (function.simCommand) secondaryFlags |= 0x08u;
     writer.u8(secondaryFlags);
     writer.u32(function.virtualSlot);
     writer.u32(function.interfaceSlot);
@@ -479,7 +480,7 @@ bool readFunctionSymbol(
     if (!reader.valid() ||
         accessibility > static_cast<std::uint8_t>(
             semantic::Accessibility::Private) ||
-        (secondaryFlags & 0xf8u) != 0) {
+        (secondaryFlags & 0xf0u) != 0) {
         diagnostics.report("RS5004", "invalid method descriptor flags", {});
         return false;
     }
@@ -496,6 +497,7 @@ bool readFunctionSymbol(
     function.propertyGetter = (secondaryFlags & 0x01u) != 0;
     function.propertySetter = (secondaryFlags & 0x02u) != 0;
     function.synthetic = (secondaryFlags & 0x04u) != 0;
+    function.simCommand = (secondaryFlags & 0x08u) != 0;
     function.virtualSlot = reader.u32();
     function.interfaceSlot = reader.u32();
     if (!readString(function.moduleName, "invalid method module string index") ||
@@ -2022,35 +2024,58 @@ bool decodeModule(
 
     if (!module.languageMetadata.attributes.empty()) {
         std::unordered_map<std::string, bool> observableTargets;
+        std::unordered_map<std::string, bool> simStateTargets;
+        std::unordered_map<std::string, bool> simCommandTargets;
         for (const auto& attr : module.languageMetadata.attributes) {
             if (attr.name == "Observable" || attr.name == "ObservableAttribute") {
                 observableTargets[attr.target] = true;
+            } else if (attr.name == "SimState" || attr.name == "SimStateAttribute") {
+                simStateTargets[attr.target] = true;
+            } else if (attr.name == "SimCommand" || attr.name == "SimCommandAttribute") {
+                simCommandTargets[attr.target] = true;
             }
         }
-        if (!observableTargets.empty()) {
+        if (!observableTargets.empty() || !simStateTargets.empty() || !simCommandTargets.empty()) {
             for (auto& type : module.types) {
-                if (type.kind != semantic::TypeKind::Class) continue;
+                if (type.kind != semantic::TypeKind::Class &&
+                    type.kind != semantic::TypeKind::Struct) {
+                    continue;
+                }
                 const std::string typeTarget = semantic::canonicalTypeName(type);
-                type.observable = observableTargets.find(typeTarget) != observableTargets.end();
+                type.observable = (type.kind == semantic::TypeKind::Class) &&
+                    (observableTargets.find(typeTarget) != observableTargets.end());
+                type.simState = simStateTargets.find(typeTarget) != simStateTargets.end();
                 type.nextObservableBitIndex = 0;
                 for (auto& prop : type.properties) {
                     const std::string ownerTarget = prop.declaringTypeName.empty()
                         ? typeTarget
                         : prop.declaringTypeName;
-                    const bool ownerObservable =
-                        observableTargets.find(ownerTarget) != observableTargets.end();
+                    const bool ownerObservable = (type.kind == semantic::TypeKind::Class) &&
+                        (observableTargets.find(ownerTarget) != observableTargets.end());
+                    const bool ownerSimState =
+                        simStateTargets.find(ownerTarget) != simStateTargets.end();
                     prop.observable = !prop.staticProperty &&
                         (ownerObservable ||
                          observableTargets.find(ownerTarget + "::property:" + prop.name) !=
                              observableTargets.end());
-                    prop.observableBitIndex = 0xFFu;
+                    prop.simState = type.simState || ownerSimState ||
+                        (simStateTargets.find(ownerTarget + "::property:" + prop.name) !=
+                         simStateTargets.end());
+                    prop.observableBitIndex = 0xFFFFu;
+                    if (prop.setter &&
+                        simCommandTargets.find(ownerTarget + "::property:" + prop.name) !=
+                            simCommandTargets.end()) {
+                        prop.setter->simCommand = true;
+                    }
                 }
                 for (auto& field : type.fields) {
                     const std::string ownerTarget = field.declaringTypeName.empty()
                         ? typeTarget
                         : field.declaringTypeName;
-                    const bool ownerObservable =
-                        observableTargets.find(ownerTarget) != observableTargets.end();
+                    const bool ownerObservable = (type.kind == semantic::TypeKind::Class) &&
+                        (observableTargets.find(ownerTarget) != observableTargets.end());
+                    const bool ownerSimState =
+                        simStateTargets.find(ownerTarget) != simStateTargets.end();
                     semantic::PropertySymbol* backedProperty = nullptr;
                     for (auto& prop : type.properties) {
                         if (prop.backingFieldIndex == field.index) {
@@ -2060,13 +2085,18 @@ bool decodeModule(
                     }
                     if (backedProperty) {
                         field.observable = backedProperty->observable;
+                        field.simState = backedProperty->simState;
                     } else if (!field.synthetic) {
                         field.observable = !field.staticField && !field.constField &&
                             (ownerObservable ||
                              observableTargets.find(ownerTarget + "::field:" + field.name) !=
                                  observableTargets.end());
+                        field.simState = type.simState || ownerSimState ||
+                            (simStateTargets.find(ownerTarget + "::field:" + field.name) !=
+                             simStateTargets.end());
                     } else {
                         field.observable = false;
+                        field.simState = type.simState || ownerSimState;
                     }
                     if (field.observable) {
                         field.observableBitIndex = (type.nextObservableBitIndex < 63u)
@@ -2076,8 +2106,32 @@ bool decodeModule(
                             backedProperty->observableBitIndex = field.observableBitIndex;
                         }
                     } else {
-                        field.observableBitIndex = 0xFFu;
+                        field.observableBitIndex = 0xFFFFu;
                     }
+                }
+            }
+        }
+        std::unordered_map<semantic::SymbolId, bool> simCommandBySymbolId;
+        for (const auto& type : module.types) {
+            for (const auto& method : type.methods) {
+                if (method.simCommand) {
+                    simCommandBySymbolId[method.id] = true;
+                }
+            }
+            for (const auto& prop : type.properties) {
+                if (prop.setter && prop.setter->simCommand) {
+                    simCommandBySymbolId[prop.setter->id] = true;
+                }
+            }
+        }
+        for (auto& fn : module.functions) {
+            if (simCommandBySymbolId.find(fn.symbolId) != simCommandBySymbolId.end()) {
+                fn.simCommand = true;
+            } else if (!simCommandTargets.empty()) {
+                const std::string targetKey = module.name + "::function:" + fn.name +
+                    "(" + std::to_string(fn.parameterTypes.size()) + ")";
+                if (simCommandTargets.find(targetKey) != simCommandTargets.end()) {
+                    fn.simCommand = true;
                 }
             }
         }

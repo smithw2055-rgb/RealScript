@@ -1,5 +1,6 @@
 #include <cstring>
 #include "realscript/runtime/Runtime.h"
+#include "realscript/runtime/ExecutionDomain.h"
 
 #include "ExecutionMirror.h"
 #include "realscript/debug/Debugger.h"
@@ -85,7 +86,40 @@ struct State {
     std::array<InlineCallCacheEntry, 64> inlineCallCache;
     std::optional<Value> pendingException;
     bool exceptionNotifiedDebugger = false;
+    ExecutionDomainContext* domainContext = nullptr;
+    DomainKind domainKind = DomainKind::SimDeterministic;
 };
+
+[[nodiscard]] inline ManagedHeap* resolveHeap(
+    const State& state,
+    ObjectRef ref) noexcept {
+    if (state.domainContext) {
+        if (auto* h = state.domainContext->heapForObject(ref)) {
+            return h;
+        }
+    }
+    return state.heap;
+}
+
+[[nodiscard]] inline Value sanitizeCrossHeapFieldValue(
+    State& state,
+    ManagedHeap* sourceHeap,
+    Value val) {
+    if (sourceHeap && state.heap && sourceHeap != state.heap) {
+        if (const auto* strRef = std::get_if<ObjectRef>(&val)) {
+            if (strRef->kind == ObjectKind::String) {
+                if (const auto sv = sourceHeap->stringView(*strRef)) {
+                    RuntimeError err;
+                    if (const auto interned = state.heap->internString(*sv, &err)) {
+                        return Value{*interned};
+                    }
+                    return Value{StringValue(std::string(*sv))};
+                }
+            }
+        }
+    }
+    return val;
+}
 
 struct ValueWindow {
     std::vector<Value>* values = nullptr;
@@ -495,7 +529,8 @@ bool expectType(
     semantic::PrimitiveType type,
     const std::string& context) {
     if (const auto* reference = std::get_if<ObjectRef>(&value)) {
-        if (!state.heap || !state.heap->isAlive(*reference)) {
+        const auto* targetHeap = resolveHeap(state, *reference);
+        if (!targetHeap || !targetHeap->isAlive(*reference)) {
             return fail(state, ErrorCode::InvalidObjectReference,
                 context + " contains an invalid managed object reference");
         }
@@ -587,11 +622,12 @@ bool expectObject(
         return fail(state, ErrorCode::TypeMismatch,
             context + " expected object '" + semantic::canonicalTypeName(type) + "'");
     }
-    if (!state.heap || !state.heap->isAlive(*reference)) {
+    const auto* targetHeap = resolveHeap(state, *reference);
+    if (!targetHeap || !targetHeap->isAlive(*reference)) {
         return fail(state, ErrorCode::InvalidObjectReference,
             context + " contains an invalid managed object reference");
     }
-    const auto actual = state.heap->objectTypeId(*reference);
+    const auto actual = targetHeap->objectTypeId(*reference);
     if (!actual || !runtimeAssignable(state, *actual, type.id)) {
         return fail(state, ErrorCode::TypeMismatch,
             context + " expected object '" + semantic::canonicalTypeName(type) + "'");
@@ -609,8 +645,9 @@ bool expectSignatureType(
     if (type == semantic::PrimitiveType::Object) {
         if (std::holds_alternative<NullObject>(value) || typeId == 0) return true;
         const auto* reference = std::get_if<ObjectRef>(&value);
-        const auto actual = reference && state.heap
-            ? state.heap->objectTypeId(*reference)
+        const auto* targetHeap = reference ? resolveHeap(state, *reference) : nullptr;
+        const auto actual = reference && targetHeap
+            ? targetHeap->objectTypeId(*reference)
             : std::optional<semantic::SymbolId>{};
         if (!actual || !runtimeAssignable(state, *actual, typeId)) {
             return fail(state, ErrorCode::TypeMismatch,
@@ -619,8 +656,9 @@ bool expectSignatureType(
     } else if (type == semantic::PrimitiveType::Array) {
         if (std::holds_alternative<NullArray>(value) || typeId == 0) return true;
         const auto* reference = std::get_if<ObjectRef>(&value);
-        const auto actual = reference && state.heap
-            ? state.heap->arrayTypeId(*reference)
+        const auto* targetHeap = reference ? resolveHeap(state, *reference) : nullptr;
+        const auto actual = reference && targetHeap
+            ? targetHeap->arrayTypeId(*reference)
             : std::optional<semantic::SymbolId>{};
         if (!actual || *actual != typeId) {
             return fail(state, ErrorCode::TypeMismatch,
@@ -950,8 +988,9 @@ bool executeCall(
                 return *cached;
             }
         }
-        const auto actualTypeId = receiver && state.heap
-            ? state.heap->objectTypeId(*receiver)
+        const auto* targetHeap = receiver ? resolveHeap(state, *receiver) : nullptr;
+        const auto actualTypeId = receiver && targetHeap
+            ? targetHeap->objectTypeId(*receiver)
             : std::optional<semantic::SymbolId>{};
         if (!actualTypeId || !state.program) {
             return fail(state, ErrorCode::InvalidObjectReference,
@@ -996,8 +1035,9 @@ bool executeCall(
                 return *cached;
             }
         }
-        const auto actualTypeId = receiver && state.heap
-            ? state.heap->objectTypeId(*receiver)
+        const auto* targetHeap = receiver ? resolveHeap(state, *receiver) : nullptr;
+        const auto actualTypeId = receiver && targetHeap
+            ? targetHeap->objectTypeId(*receiver)
             : std::optional<semantic::SymbolId>{};
         if (!actualTypeId) {
             return fail(state, ErrorCode::InvalidObjectReference,
@@ -1029,8 +1069,9 @@ bool executeCall(
         if ((reference.virtualDispatch || reference.interfaceDispatch) &&
             execution) {
             const auto* receiver = std::get_if<ObjectRef>(&arguments.front());
-            const auto receiverTypeId = receiver && state.heap
-                ? state.heap->objectTypeId(*receiver)
+            const auto* targetHeap = receiver ? resolveHeap(state, *receiver) : nullptr;
+            const auto receiverTypeId = receiver && targetHeap
+                ? targetHeap->objectTypeId(*receiver)
                 : std::optional<semantic::SymbolId>{};
             if (receiverTypeId) {
                 state.inlineCallCache[cacheIndex()] = {
@@ -1390,7 +1431,8 @@ bool executeQuickInstruction(
     case detail::QuickOpcode::CheckNotNullFast: {
         const auto& val = registers[decoded.op0];
         if (const auto* ref = std::get_if<ObjectRef>(&val)) {
-            if (state.heap && state.heap->isAlive(*ref)) {
+            const auto* targetHeap = resolveHeap(state, *ref);
+            if (targetHeap && targetHeap->isAlive(*ref)) {
                 registers[decoded.result] = val;
                 return true;
             }
@@ -1406,15 +1448,16 @@ bool executeQuickInstruction(
         const auto& arrVal = registers[decoded.op0];
         const auto& idxVal = registers[decoded.op1];
         if (const auto* ref = std::get_if<ObjectRef>(&arrVal)) {
+            auto* targetHeap = resolveHeap(state, *ref);
             const auto idx = std::get<std::int64_t>(idxVal);
-            if (idx >= 0 && state.heap) {
-                if (const auto* elem = state.heap->arrayGetFast(
+            if (idx >= 0 && targetHeap) {
+                if (const auto* elem = targetHeap->arrayGetFast(
                         *ref, static_cast<std::size_t>(idx))) {
-                    registers[decoded.result] = *elem;
+                    registers[decoded.result] = sanitizeCrossHeapFieldValue(state, targetHeap, *elem);
                     return true;
                 }
             }
-            if (!state.heap || !state.heap->arrayLength(*ref)) {
+            if (!targetHeap || !targetHeap->arrayLength(*ref)) {
                 return fail(state, ErrorCode::InvalidObjectReference,
                     "array element load references an invalid managed array");
             }
@@ -1433,6 +1476,12 @@ bool executeQuickInstruction(
         const auto& idxVal = registers[decoded.op1];
         const auto& storeVal = registers[decoded.op2];
         if (const auto* ref = std::get_if<ObjectRef>(&arrVal)) {
+            if (state.domainKind == DomainKind::UiPresentation &&
+                state.heap &&
+                ref->heapId != static_cast<std::uint32_t>(state.heap->heapId())) {
+                return fail(state, ErrorCode::CapabilityDenied,
+                    "CrossHeapWriteViolation: UiPresentation domain cannot mutate SimHeap array");
+            }
             const auto idx = std::get<std::int64_t>(idxVal);
             if (idx >= 0 && state.heap &&
                 state.heap->arraySetPrevalidated(
@@ -1943,8 +1992,9 @@ bool executeInstruction(
             return false;
         }
         const auto* reference = std::get_if<ObjectRef>(receiver);
-        const auto length = reference && state.heap
-            ? state.heap->arrayLength(*reference)
+        const auto* targetHeap = reference ? resolveHeap(state, *reference) : nullptr;
+        const auto length = reference && targetHeap
+            ? targetHeap->arrayLength(*reference)
             : std::optional<std::size_t>{};
         if (!length || *length >
                 static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -1969,7 +2019,8 @@ bool executeInstruction(
         }
         const auto index = std::get<std::int64_t>(*indexValue);
         const auto reference = std::get<ObjectRef>(*receiver);
-        const auto length = state.heap->arrayLength(reference);
+        auto* targetHeap = resolveHeap(state, reference);
+        const auto length = targetHeap ? targetHeap->arrayLength(reference) : std::nullopt;
         if (!length) {
             return fail(state, ErrorCode::InvalidObjectReference,
                 "array element load references an invalid managed array");
@@ -1978,16 +2029,19 @@ bool executeInstruction(
             return fail(state, ErrorCode::IndexOutOfRange,
                 "array element index is out of range");
         }
-        const auto elementType = state.heap->arrayElementType(reference);
-        const auto elementTypeId = state.heap->arrayElementTypeId(reference);
+        const auto elementType = targetHeap->arrayElementType(reference);
+        const auto elementTypeId = targetHeap->arrayElementTypeId(reference);
         if (!elementType || !elementTypeId ||
             *elementType != instruction.elementType ||
             *elementTypeId != instruction.elementTypeId) {
             return fail(state, ErrorCode::TypeMismatch,
                 "array element metadata does not match the bytecode operation");
         }
-        const auto value = state.heap->arrayGet(
+        auto value = targetHeap->arrayGet(
             reference, static_cast<std::size_t>(index));
+        if (value) {
+            *value = sanitizeCrossHeapFieldValue(state, targetHeap, std::move(*value));
+        }
         if (!value || !expectSignatureType(
                 state, *value, instruction.elementType,
                 instruction.elementTypeId, "array element value")) {
@@ -2014,6 +2068,12 @@ bool executeInstruction(
         }
         const auto index = std::get<std::int64_t>(*indexValue);
         const auto reference = std::get<ObjectRef>(*receiver);
+        if (state.domainKind == DomainKind::UiPresentation &&
+            state.heap &&
+            reference.heapId != static_cast<std::uint32_t>(state.heap->heapId())) {
+            return fail(state, ErrorCode::CapabilityDenied,
+                "CrossHeapWriteViolation: UiPresentation domain cannot mutate SimHeap array");
+        }
         const auto length = state.heap->arrayLength(reference);
         if (!length) {
             return fail(state, ErrorCode::InvalidObjectReference,
@@ -2067,11 +2127,13 @@ bool executeInstruction(
             return false;
         }
         const auto reference = std::get<ObjectRef>(*receiver);
-        const auto value = state.heap->fieldGet(reference, instruction.index);
+        auto* targetHeap = resolveHeap(state, reference);
+        auto value = targetHeap ? targetHeap->fieldGet(reference, instruction.index) : std::nullopt;
         if (!value) {
             return fail(state, ErrorCode::InvalidProgram,
                 "field load references an invalid field slot");
         }
+        *value = sanitizeCrossHeapFieldValue(state, targetHeap, std::move(*value));
         const auto& field = type->fields[instruction.index];
         if (!expectSignatureType(
                 state,
@@ -2100,9 +2162,20 @@ bool executeInstruction(
                 "field store value")) {
             return false;
         }
+        const auto reference = std::get<ObjectRef>(*receiver);
+        const auto& field = type->fields[instruction.index];
+        if (state.domainKind == DomainKind::UiPresentation &&
+            ((state.heap && reference.heapId != static_cast<std::uint32_t>(state.heap->heapId())) ||
+             type->simState || field.simState)) {
+            return fail(
+                state,
+                ErrorCode::CapabilityDenied,
+                "CrossHeapWriteViolation: UiPresentation domain cannot mutate [SimState] or SimHeap field '" +
+                    field.name + "'");
+        }
         RuntimeError fieldError;
         if (!state.heap->fieldSet(
-                std::get<ObjectRef>(*receiver),
+                reference,
                 instruction.index,
                 *value,
                 &fieldError)) {
@@ -2850,6 +2923,28 @@ bool executeFunction(
                 return false;
             }
         }
+    }
+
+    if (function.simCommand &&
+        state.domainContext != nullptr &&
+        state.domainKind == DomainKind::UiPresentation) {
+        SimCommandEnvelope envelope;
+        envelope.commandTypeId = function.symbolId;
+        std::size_t startIdx = 0;
+        if (!arguments.empty() && std::holds_alternative<ObjectRef>(arguments[0])) {
+            const auto recvRef = std::get<ObjectRef>(arguments[0]);
+            if (recvRef.kind == ObjectKind::Record) {
+                envelope.targetObject = recvRef;
+                startIdx = 1;
+            }
+        }
+        envelope.payload.reserve(arguments.size() - startIdx);
+        for (std::size_t i = startIdx; i < arguments.size(); ++i) {
+            envelope.payload.push_back(arguments[i]);
+        }
+        state.domainContext->enqueueSimCommand(std::move(envelope));
+        result = defaultValue(*location.module, function.returnType, function.returnTypeId);
+        return true;
     }
 
     if (state.fastAccounting && execution->directNativeReference != nullptr) {
@@ -3626,7 +3721,8 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
                 const auto& val = frameBase[ip->src0Slot];
                 if (const auto* ref = std::get_if<ObjectRef>(&val); RS_FLAT_LIKELY(ref != nullptr)) {
-                    if (RS_FLAT_LIKELY(state.heap && state.heap->isAlive(*ref))) {
+                    const auto* targetHeap = resolveHeap(state, *ref);
+                    if (RS_FLAT_LIKELY(targetHeap && targetHeap->isAlive(*ref))) {
                         frameBase[ip->dstSlot] = val;
                         RS_FLAT_DISPATCH_NEXT();
                     }
@@ -3645,16 +3741,17 @@ bool executeFunction(
                 const auto& arrVal = frameBase[ip->src0Slot];
                 const auto& idxVal = frameBase[ip->src1Slot];
                 if (const auto* ref = std::get_if<ObjectRef>(&arrVal); RS_FLAT_LIKELY(ref != nullptr)) {
+                    auto* targetHeap = resolveHeap(state, *ref);
                     const auto idx = std::get<std::int64_t>(idxVal);
-                    if (RS_FLAT_LIKELY(idx >= 0 && state.heap)) {
-                        if (const auto* elem = state.heap->arrayGetFast(*ref, static_cast<std::size_t>(idx));
+                    if (RS_FLAT_LIKELY(idx >= 0 && targetHeap)) {
+                        if (const auto* elem = targetHeap->arrayGetFast(*ref, static_cast<std::size_t>(idx));
                             RS_FLAT_LIKELY(elem != nullptr)) {
-                            frameBase[ip->dstSlot] = *elem;
+                            frameBase[ip->dstSlot] = sanitizeCrossHeapFieldValue(state, targetHeap, *elem);
                             RS_FLAT_DISPATCH_NEXT();
                         }
                     }
                     state.executed = localExecuted;
-                    if (!state.heap || !state.heap->arrayLength(*ref)) {
+                    if (!targetHeap || !targetHeap->arrayLength(*ref)) {
                         fail(state, ErrorCode::InvalidObjectReference, "array element load references an invalid managed array");
                     } else {
                         fail(state, ErrorCode::IndexOutOfRange, "array element index is out of range");
@@ -3676,6 +3773,13 @@ bool executeFunction(
                 const auto& idxVal = frameBase[ip->src1Slot];
                 const auto& storeVal = frameBase[ip->src2Slot];
                 if (const auto* ref = std::get_if<ObjectRef>(&arrVal); RS_FLAT_LIKELY(ref != nullptr)) {
+                    if (RS_FLAT_UNLIKELY(state.domainKind == DomainKind::UiPresentation &&
+                        state.heap &&
+                        ref->heapId != static_cast<std::uint32_t>(state.heap->heapId()))) {
+                        state.executed = localExecuted;
+                        fail(state, ErrorCode::CapabilityDenied, "CrossHeapWriteViolation: UiPresentation domain cannot mutate SimHeap array");
+                        goto L_FlatError;
+                    }
                     const auto idx = std::get<std::int64_t>(idxVal);
                     if (RS_FLAT_LIKELY(idx >= 0 && state.heap &&
                         state.heap->arraySetPrevalidated(*ref, static_cast<std::size_t>(idx), storeVal, false))) {
@@ -3904,16 +4008,22 @@ bool executeFunction(
 
             RS_FLAT_CASE(LoadFieldFast) {
                 const auto* ref = std::get_if<ObjectRef>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_LIKELY(ref != nullptr && ref->kind == ObjectKind::Record && state.heap)) {
-                    const auto* type = typeDescriptor(*location.module, ip->aux1Slot);
-                    const auto actualTid = state.heap->objectTypeId(*ref);
-                    if (RS_FLAT_LIKELY(type && actualTid &&
-                        (*actualTid == type->id || runtimeAssignable(state, *actualTid, type->id)))) {
-                        if (auto val = state.heap->fieldGet(*ref, ip->aux0Slot);
-                            RS_FLAT_LIKELY(val.has_value() && valueType(*val) == type->fields[ip->aux0Slot].type)) {
-                            if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                            frameBase[ip->dstSlot] = std::move(*val);
-                            RS_FLAT_DISPATCH_NEXT();
+                if (RS_FLAT_LIKELY(ref != nullptr && ref->kind == ObjectKind::Record)) {
+                    auto* targetHeap = resolveHeap(state, *ref);
+                    if (RS_FLAT_LIKELY(targetHeap != nullptr)) {
+                        const auto* type = typeDescriptor(*location.module, ip->aux1Slot);
+                        const auto actualTid = targetHeap->objectTypeId(*ref);
+                        if (RS_FLAT_LIKELY(type && actualTid &&
+                            (*actualTid == type->id || runtimeAssignable(state, *actualTid, type->id)))) {
+                            if (auto val = targetHeap->fieldGet(*ref, ip->aux0Slot);
+                                RS_FLAT_LIKELY(val.has_value())) {
+                                *val = sanitizeCrossHeapFieldValue(state, targetHeap, std::move(*val));
+                                if (RS_FLAT_LIKELY(valueType(*val) == type->fields[ip->aux0Slot].type)) {
+                                    if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                                    frameBase[ip->dstSlot] = std::move(*val);
+                                    RS_FLAT_DISPATCH_NEXT();
+                                }
+                            }
                         }
                     }
                 }
@@ -3924,6 +4034,11 @@ bool executeFunction(
                 const auto* ref = std::get_if<ObjectRef>(&frameBase[ip->src0Slot]);
                 if (RS_FLAT_LIKELY(ref != nullptr && ref->kind == ObjectKind::Record && state.heap)) {
                     const auto* type = typeDescriptor(*location.module, ip->aux1Slot);
+                    if (RS_FLAT_UNLIKELY(state.domainKind == DomainKind::UiPresentation &&
+                        (ref->heapId != static_cast<std::uint32_t>(state.heap->heapId()) ||
+                         (type && (type->simState || type->fields[ip->aux0Slot].simState))))) {
+                        goto L_FlatGenericFallback;
+                    }
                     const auto actualTid = state.heap->objectTypeId(*ref);
                     if (RS_FLAT_LIKELY(type && actualTid &&
                         (*actualTid == type->id || runtimeAssignable(state, *actualTid, type->id)))) {
@@ -3983,13 +4098,16 @@ bool executeFunction(
 
             RS_FLAT_CASE(ArrayLengthFast) {
                 const auto* ref = std::get_if<ObjectRef>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_LIKELY(ref != nullptr && state.heap)) {
-                    if (const auto len = state.heap->arrayLength(*ref);
-                        RS_FLAT_LIKELY(len.has_value() &&
-                        *len <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))) {
-                        if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                        frameBase[ip->dstSlot] = static_cast<std::int64_t>(*len);
-                        RS_FLAT_DISPATCH_NEXT();
+                if (RS_FLAT_LIKELY(ref != nullptr)) {
+                    const auto* targetHeap = resolveHeap(state, *ref);
+                    if (RS_FLAT_LIKELY(targetHeap != nullptr)) {
+                        if (const auto len = targetHeap->arrayLength(*ref);
+                            RS_FLAT_LIKELY(len.has_value() &&
+                            *len <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))) {
+                            if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                            frameBase[ip->dstSlot] = static_cast<std::int64_t>(*len);
+                            RS_FLAT_DISPATCH_NEXT();
+                        }
                     }
                 }
                 goto L_FlatGenericFallback;
@@ -4785,6 +4903,21 @@ void Interpreter::setBindingRegistry(std::shared_ptr<const BindingRegistry> bind
     bindings_ = std::move(bindings);
 }
 
+void Interpreter::setExecutionDomainContext(
+    ExecutionDomainContext* context,
+    DomainKind domainKind) noexcept {
+    domainContext_ = context;
+    domainKind_ = static_cast<std::uint8_t>(domainKind);
+}
+
+ExecutionDomainContext* Interpreter::executionDomainContext() const noexcept {
+    return domainContext_;
+}
+
+DomainKind Interpreter::domainKind() const noexcept {
+    return static_cast<DomainKind>(domainKind_);
+}
+
 ExecutionResult Interpreter::invoke(
     semantic::SymbolId symbolId,
     const std::vector<Value>& arguments,
@@ -4844,6 +4977,8 @@ ExecutionResult Interpreter::invoke(
     }
     state.determinism = DeterminismSession(std::move(options.determinism));
     state.heap = heap_.get();
+    state.domainContext = domainContext_;
+    state.domainKind = static_cast<DomainKind>(domainKind_);
     if (state.heap && state.program) {
         state.heap->registerProgramObservableTypes(*state.program);
     }

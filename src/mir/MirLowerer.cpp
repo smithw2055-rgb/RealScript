@@ -62,6 +62,7 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
     result.name = function.symbol.ownerTypeName.empty() ? function.symbol.name
         : function.symbol.ownerTypeName + "." + function.symbol.name;
     result.returnType = semantic::storageReturnTypeOf(function.symbol);
+    result.simCommand = function.symbol.simCommand;
     result.debugInfo.sourceName = function.symbol.sourceName;
     result.debugInfo.declaration.span = function.symbol.declarationSpan;
     result.debugInfo.body.span = function.body ? function.body->span : function.symbol.bodySpan;

@@ -477,9 +477,13 @@ bool tryApplyEvaluatedConstantToField(
 bool hasAttributeName(
     const std::vector<syntax::AttributeListSyntax>& lists,
     std::string_view name) noexcept {
+    const std::string withSuffix = std::string(name) + "Attribute";
     for (const auto& list : lists) {
         for (const auto& attribute : list.attributes) {
-            if (attribute.nameToken.text == name) return true;
+            if (attribute.nameToken.text == name ||
+                attribute.nameToken.text == withSuffix) {
+                return true;
+            }
         }
     }
     return false;
@@ -545,6 +549,7 @@ bool populateFields(
                 ? type.nextObservableBitIndex++
                 : 63u;
         }
+        field.simState = type.simState || hasAttributeName(fieldSyntax.attributes, "SimState");
         if (type.staticType && !field.staticField && !field.constField) {
             diagnostics.report(
                 "RS2489",
@@ -1030,6 +1035,8 @@ TypeSymbol declareTypeShell(
         syntaxTree.modifiers, syntax::SyntaxKind::PartialKeyword);
     result.observable = hasAttributeName(
         syntaxTree.attributes, "Observable");
+    result.simState = hasAttributeName(
+        syntaxTree.attributes, "SimState");
     result.deterministic = hasAttributeName(
         syntaxTree.attributes, "Deterministic");
     result.moduleName = moduleName;
@@ -1046,6 +1053,8 @@ TypeSymbol declareTypeShell(
     result.kind = TypeKind::Struct;
     result.accessibility = accessibilityFromModifiers(syntaxTree.modifiers);
     result.sealedType = true;
+    result.simState = hasAttributeName(
+        syntaxTree.attributes, "SimState");
     result.deterministic = hasAttributeName(
         syntaxTree.attributes, "Deterministic");
     result.moduleName = moduleName;
@@ -1248,6 +1257,8 @@ FunctionSymbol declareFunctionSymbol(
     result.deterministic = !result.nonDeterministic &&
         ((owner && owner->deterministic) ||
          hasAttributeName(syntaxTree.attributes, "Deterministic"));
+    result.simCommand = hasAttributeName(
+        syntaxTree.attributes, "SimCommand");
     if (owner) {
         result.declaringTypeId = owner->id;
         result.declaringTypeName = canonicalTypeName(*owner);
@@ -1406,6 +1417,8 @@ PropertySymbol declarePropertySymbol(
     result.staticProperty = syntaxTree.staticKeyword.has_value();
     result.observable = !result.staticProperty &&
         (owner.observable || hasAttributeName(syntaxTree.attributes, "Observable"));
+    result.simState = owner.simState || hasAttributeName(syntaxTree.attributes, "SimState");
+    const bool propSimCommand = hasAttributeName(syntaxTree.attributes, "SimCommand");
     const auto resolved = resolveType(syntaxTree.type, visibleTypes, false);
     result.type = resolved.type;
     result.typeName = resolved.name;
@@ -1449,6 +1462,7 @@ PropertySymbol declarePropertySymbol(
         setter.staticMethod = result.staticProperty;
         setter.propertySetter = true;
         setter.deterministic = owner.deterministic;
+        setter.simCommand = propSimCommand;
         appendImplicitThis(setter, owner);
         VariableSymbol valueParameter;
         valueParameter.name = "value";

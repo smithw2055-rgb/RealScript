@@ -171,6 +171,7 @@ Module Lowerer::lower(const mir::Module& source) const {
         function.name = sourceFunction.name;
         function.returnType = sourceFunction.returnType;
         function.returnTypeId = sourceFunction.returnTypeId;
+        function.simCommand = sourceFunction.simCommand;
         function.parameterTypes = sourceFunction.parameterTypes;
         function.parameterTypeIds = sourceFunction.parameterTypeIds;
         function.localTypes = sourceFunction.localTypes;
