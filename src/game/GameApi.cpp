@@ -94,6 +94,15 @@ std::vector<compiler::SourceFile> GameApi::generatedSources() const {
         }
         if (!module.imports.empty()) out << '\n';
 
+        for (const auto structIndex : module.nativeStructs) {
+            if (structIndex >= state_->nativeStructs.size()) continue;
+            const auto& st = state_->nativeStructs[structIndex];
+            out << "public struct " << st.name << "\n{\n";
+            for (const auto& fld : st.fields) {
+                out << "    public " << fld.type.sourceName << " " << fld.name << ";\n";
+            }
+            out << "}\n\n";
+        }
         for (const auto typeIndex : module.nativeTypes) {
             if (typeIndex >= state_->nativeTypes.size()) continue;
             const auto& type = state_->nativeTypes[typeIndex];
@@ -146,6 +155,15 @@ std::vector<compiler::SourceFile> GameApi::exportDeclarationStubs() const {
         }
         if (!module.imports.empty()) out << '\n';
 
+        for (const auto structIndex : module.nativeStructs) {
+            if (structIndex >= state_->nativeStructs.size()) continue;
+            const auto& st = state_->nativeStructs[structIndex];
+            out << "public struct " << st.name << "\n{\n";
+            for (const auto& fld : st.fields) {
+                out << "    public " << fld.type.sourceName << " " << fld.name << ";\n";
+            }
+            out << "}\n\n";
+        }
         for (const auto typeIndex : module.nativeTypes) {
             if (typeIndex >= state_->nativeTypes.size()) continue;
             const auto& type = state_->nativeTypes[typeIndex];
@@ -524,6 +542,10 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
     bool pendingCtorExport = false;
     std::string pendingCtorFactoryName;
     std::size_t currentClassCtorCount = 0;
+    std::unordered_map<std::string, std::size_t> classMethodCounts;
+    std::unordered_map<std::string, std::pair<std::string, std::string>> firstClassMethodCastUpgrade;
+    std::unordered_map<std::string, std::size_t> freeFuncCounts;
+    std::unordered_map<std::string, std::pair<std::string, std::string>> firstFreeFuncCastUpgrade;
     bool pendingFuncExport = false;
     bool pendingFieldExport = false;
     bool pendingNonDeterministic = false;
@@ -739,6 +761,8 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
             pendingClassFields.clear();
             currentEcsFields.clear();
             currentClassCtorCount = 0;
+            classMethodCounts.clear();
+            firstClassMethodCastUpgrade.clear();
             if (currentIsEcsStruct) {
                 ++res.structsExported;
                 exportedStructs.insert(currentClass);
@@ -760,6 +784,12 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
                 continue;
             }
             if (currentIsEcsStruct) {
+                cppBodyOut << "    auto struct_" << currentClass << " = api.structType<" << currentClassQualified
+                           << ">(\"" << currentClassModule << "\", \"" << currentClass << "\");\n";
+                for (const auto& f : currentEcsFields) {
+                    cppBodyOut << "    struct_" << currentClass << ".field<&" << currentClassQualified
+                               << "::" << f.name << ">(\"" << f.name << "\");\n";
+                }
                 cppHelpersOut << "inline bool bindEcsColumn_" << currentClass << "(\n"
                               << "    realscript::game::ScriptRuntime& runtime,\n"
                               << "    " << currentClassQualified << "* data,\n"
@@ -1104,14 +1134,88 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
                 rsBodyOut << "    public static " << rsRet << " " << fnName << "(";
             } else if (isMethod) {
                 ++res.methodsExported;
-                cppBodyOut << "    builder_" << currentClass << ".method<&" << currentClassQualified
-                           << "::" << fnName << ">(\"" << fnName << "\"" << detArg << ");\n";
+                const std::size_t mCount = ++classMethodCounts[fnName];
+                std::string cleanRetCpp = retCpp;
+                for (const char* kw : {"virtual ", "inline ", "constexpr ", "static ", "explicit "}) {
+                    const std::size_t kwLen = std::strlen(kw);
+                    if (cleanRetCpp.rfind(kw, 0) == 0) cleanRetCpp = trim(cleanRetCpp.substr(kwLen));
+                }
+                const std::string afterClose = trim(decl.substr(closeParen + 1));
+                const bool isConstMethod = !isStaticMethod &&
+                    (afterClose.rfind("const", 0) == 0 &&
+                     (afterClose.size() == 5 || !std::isalnum(static_cast<unsigned char>(afterClose[5]))));
+                std::ostringstream sig;
+                if (isStaticMethod) {
+                    sig << "static_cast<" << cleanRetCpp << " (*)(";
+                } else {
+                    sig << "static_cast<" << cleanRetCpp << " (" << currentClassQualified << "::*)(";
+                }
+                for (std::size_t i = 0; i < rawCppParamTypes.size(); ++i) {
+                    if (i != 0) sig << ", ";
+                    sig << rawCppParamTypes[i];
+                }
+                sig << ")" << (isConstMethod ? " const" : "") << ">(&" << currentClassQualified << "::" << fnName << ")";
+                const std::string castLine = "    builder_" + currentClass + ".method<" + sig.str() +
+                    ">(\"" + fnName + "\"" + detArg + ");\n";
+                const std::string plainLine = "    builder_" + currentClass + ".method<&" + currentClassQualified +
+                    "::" + fnName + ">(\"" + fnName + "\"" + detArg + ");\n";
+                if (mCount == 1) {
+                    firstClassMethodCastUpgrade[fnName] = {plainLine, castLine};
+                    cppBodyOut << plainLine;
+                } else {
+                    if (mCount == 2) {
+                        const auto upIt = firstClassMethodCastUpgrade.find(fnName);
+                        if (upIt != firstClassMethodCastUpgrade.end()) {
+                            std::string cur = cppBodyOut.str();
+                            const auto foundPos = cur.find(upIt->second.first);
+                            if (foundPos != std::string::npos) {
+                                cur.replace(foundPos, upIt->second.first.size(), upIt->second.second);
+                                cppBodyOut.str(std::move(cur));
+                                cppBodyOut.seekp(0, std::ios_base::end);
+                            }
+                        }
+                    }
+                    cppBodyOut << castLine;
+                }
                 rsBodyOut << "    " << (isStaticMethod ? "public static " : "") << rsRet << " " << fnName << "(";
             } else {
                 ++res.functionsExported;
                 const std::string qualifiedFn = currentNamespacePrefix() + fnName;
-                cppBodyOut << "    api.function(\"" << pendingFuncModule << "\", \""
-                           << fnName << "\", &" << qualifiedFn << detArg << ");\n";
+                const std::size_t fCount = ++freeFuncCounts[qualifiedFn];
+                std::string cleanRetCpp = retCpp;
+                for (const char* kw : {"inline ", "constexpr ", "static "}) {
+                    const std::size_t kwLen = std::strlen(kw);
+                    if (cleanRetCpp.rfind(kw, 0) == 0) cleanRetCpp = trim(cleanRetCpp.substr(kwLen));
+                }
+                std::ostringstream sig;
+                sig << "static_cast<" << cleanRetCpp << " (*)(";
+                for (std::size_t i = 0; i < rawCppParamTypes.size(); ++i) {
+                    if (i != 0) sig << ", ";
+                    sig << rawCppParamTypes[i];
+                }
+                sig << ")>(&" << qualifiedFn << ")";
+                const std::string castLine = "    api.function(\"" + pendingFuncModule + "\", \"" +
+                    fnName + "\", " + sig.str() + detArg + ");\n";
+                const std::string plainLine = "    api.function(\"" + pendingFuncModule + "\", \"" +
+                    fnName + "\", &" + qualifiedFn + detArg + ");\n";
+                if (fCount == 1) {
+                    firstFreeFuncCastUpgrade[qualifiedFn] = {plainLine, castLine};
+                    cppBodyOut << plainLine;
+                } else {
+                    if (fCount == 2) {
+                        const auto upIt = firstFreeFuncCastUpgrade.find(qualifiedFn);
+                        if (upIt != firstFreeFuncCastUpgrade.end()) {
+                            std::string cur = cppBodyOut.str();
+                            const auto foundPos = cur.find(upIt->second.first);
+                            if (foundPos != std::string::npos) {
+                                cur.replace(foundPos, upIt->second.first.size(), upIt->second.second);
+                                cppBodyOut.str(std::move(cur));
+                                cppBodyOut.seekp(0, std::ios_base::end);
+                            }
+                        }
+                    }
+                    cppBodyOut << castLine;
+                }
                 rsBodyOut << rsRet << " " << fnName << "(";
             }
             for (std::size_t i = 0; i < rsParams.size(); ++i) {

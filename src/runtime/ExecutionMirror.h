@@ -61,6 +61,12 @@ enum class QuickOpcode : std::uint8_t {
     StoreFieldFast,
     LoadStructFieldFast,
     StoreStructFieldFast,
+    ConstantBool,
+    ConstantLong,
+    ArrayLengthFast,
+    ConvertIntToLongFast,
+    ConvertIntToDoubleFast,
+    ConvertLongToDoubleFast,
 };
 
 enum class SuperOpcode : std::uint8_t {
@@ -132,6 +138,16 @@ enum class FlatOpcode : std::uint8_t {
     StoreFieldFast,
     LoadStructFieldFast,
     StoreStructFieldFast,
+    ConstantBool,
+    ConstantLong,
+    ArrayLengthFast,
+    ConvertIntToLongFast,
+    ConvertIntToDoubleFast,
+    ConvertLongToDoubleFast,
+    SuperBinaryLocalDoubleConstStore,
+    SuperBinaryLocalDoubleConstStoreElided,
+    SuperBinaryLocalDoubleLocalStore,
+    SuperBinaryLocalDoubleLocalStoreElided,
     GenericBytecode,
     // 6. Flattened block terminators
     TermJumpNoArgs,

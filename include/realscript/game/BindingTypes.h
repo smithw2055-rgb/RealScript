@@ -79,10 +79,33 @@ struct NativeTypeDeclaration {
     std::vector<PropertyDeclaration> properties;
 };
 
+struct NativeStructFieldDeclaration {
+    std::string name;
+    ScriptTypeRef type;
+    std::function<std::optional<runtime::Value>(
+        const std::shared_ptr<struct GameApiState>&,
+        const void*,
+        runtime::RuntimeError&)> readField;
+    std::function<bool(
+        const std::shared_ptr<struct GameApiState>&,
+        void*,
+        const runtime::Value&,
+        runtime::RuntimeError&)> writeField;
+};
+
+struct NativeStructDeclaration {
+    std::type_index cppType = typeid(void);
+    std::string moduleName;
+    std::string name;
+    semantic::SymbolId typeId = 0;
+    std::vector<NativeStructFieldDeclaration> fields;
+};
+
 struct ModuleDeclaration {
     std::string name;
     std::vector<FunctionDeclaration> functions;
     std::vector<std::size_t> nativeTypes;
+    std::vector<std::size_t> nativeStructs;
     std::set<std::string> imports;
 };
 
@@ -95,6 +118,8 @@ struct GameApiState {
         std::make_shared<runtime::NativeHandleRegistry>();
     std::vector<NativeTypeDeclaration> nativeTypes;
     std::unordered_map<std::type_index, std::size_t> nativeTypeByCppType;
+    std::vector<NativeStructDeclaration> nativeStructs;
+    std::unordered_map<std::type_index, std::size_t> nativeStructByCppType;
     std::map<std::string, ModuleDeclaration> modules;
     std::unordered_set<std::string> bindingNames;
     std::unordered_set<std::string> declarationNames;
@@ -223,6 +248,11 @@ std::optional<ScriptTypeRef> resolveScriptType(
             elemRef->sourceName + "[]",
             elemRef->moduleName,
             ScriptTypeCategory::Array};
+    } else if constexpr (std::is_class_v<ValueType> && std::is_default_constructible_v<ValueType>) {
+        const auto found = state->nativeStructByCppType.find(std::type_index(typeid(ValueType)));
+        if (found == state->nativeStructByCppType.end()) return std::nullopt;
+        const auto& st = state->nativeStructs[found->second];
+        return ScriptTypeRef{st.name, st.moduleName, ScriptTypeCategory::Struct};
     } else {
         return std::nullopt;
     }

@@ -84,6 +84,21 @@ inline std::string allocateOverloadNativeName(
 
 class GameApi;
 
+template <typename S>
+class NativeStructBuilder {
+public:
+    template <auto FieldPtr>
+    NativeStructBuilder& field(std::string name);
+
+private:
+    friend class GameApi;
+    NativeStructBuilder(std::shared_ptr<detail::GameApiState> state, std::size_t index)
+        : state_(std::move(state)), index_(index) {}
+
+    std::shared_ptr<detail::GameApiState> state_;
+    std::size_t index_ = 0;
+};
+
 template <typename T>
 class NativeTypeBuilder {
 public:
@@ -143,6 +158,36 @@ public:
     GameApi(
         std::shared_ptr<runtime::ManagedHeap> heap,
         std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles);
+
+    template <typename S>
+    NativeStructBuilder<S> structType(std::string moduleName, std::string name) {
+        static_assert(std::is_class_v<S> && std::is_default_constructible_v<S>,
+            "registered native struct must be a default-constructible C++ struct/class");
+        const auto key = std::type_index(typeid(S));
+        const auto existing = state_->nativeStructByCppType.find(key);
+        if (existing != state_->nativeStructByCppType.end()) {
+            const auto& registered = state_->nativeStructs[existing->second];
+            if (registered.moduleName != moduleName || registered.name != name) {
+                state_->errors.push_back(
+                    "C++ native struct was registered more than once with different script names");
+            }
+            return NativeStructBuilder<S>(state_, existing->second);
+        }
+
+        detail::NativeStructDeclaration declaration;
+        declaration.cppType = key;
+        declaration.moduleName = std::move(moduleName);
+        declaration.name = std::move(name);
+        declaration.typeId = semantic::stableTypeId(
+            declaration.moduleName + "::" + declaration.name);
+        const auto index = state_->nativeStructs.size();
+        state_->nativeStructByCppType.emplace(key, index);
+        state_->nativeStructs.push_back(std::move(declaration));
+        auto& module = state_->modules[state_->nativeStructs.back().moduleName];
+        module.name = state_->nativeStructs.back().moduleName;
+        module.nativeStructs.push_back(index);
+        return NativeStructBuilder<S>(state_, index);
+    }
 
     template <typename T>
     NativeTypeBuilder<T> type(std::string moduleName, std::string name) {
@@ -292,6 +337,8 @@ public:
     }
 
 private:
+    template <typename S>
+    friend class NativeStructBuilder;
     template <typename T>
     friend class NativeTypeBuilder;
     std::shared_ptr<detail::GameApiState> state_;
@@ -832,6 +879,52 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::field(
             },
             determinism);
     }
+    return *this;
+}
+
+template <typename S>
+template <auto FieldPtr>
+NativeStructBuilder<S>& NativeStructBuilder<S>::field(std::string name) {
+    using Traits = detail::MemberFieldTraits<decltype(FieldPtr)>;
+    static_assert(std::is_same_v<typename Traits::Class, S>,
+        "bound struct field must belong to the native struct being registered");
+    using ValueType = typename Traits::ValueType;
+
+    auto fieldType = detail::resolveScriptType<ValueType>(state_);
+    auto& st = state_->nativeStructs[index_];
+    if (!fieldType) {
+        state_->errors.push_back(
+            "unsupported C++ type in native struct field '" +
+            st.moduleName + "::" + st.name + "." + name + "'");
+        return *this;
+    }
+    const auto publicName = st.moduleName + "::" + st.name + ".field." + name;
+    if (!state_->declarationNames.insert(publicName).second) {
+        state_->errors.push_back("duplicate native struct field declaration for '" + name + "'");
+        return *this;
+    }
+    auto& module = state_->modules[st.moduleName];
+    detail::collectImports(module, *fieldType);
+    detail::NativeStructFieldDeclaration decl;
+    decl.name = std::move(name);
+    decl.type = *fieldType;
+    decl.readField = [](const std::shared_ptr<detail::GameApiState>& stState,
+                        const void* rawStruct,
+                        runtime::RuntimeError& error) -> std::optional<runtime::Value> {
+        const auto* typed = static_cast<const S*>(rawStruct);
+        return detail::writeValue(stState, typed->*FieldPtr, error);
+    };
+    decl.writeField = [](const std::shared_ptr<detail::GameApiState>& stState,
+                         void* rawStruct,
+                         const runtime::Value& val,
+                         runtime::RuntimeError& error) -> bool {
+        auto converted = detail::readValue<ValueType>(stState, val, error);
+        if (!converted) return false;
+        auto* typed = static_cast<S*>(rawStruct);
+        typed->*FieldPtr = detail::passArgument<ValueType>(*converted);
+        return true;
+    };
+    st.fields.push_back(std::move(decl));
     return *this;
 }
 

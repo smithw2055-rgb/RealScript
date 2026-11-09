@@ -1,3 +1,4 @@
+#include <cstring>
 #include "realscript/runtime/Runtime.h"
 
 #include "ExecutionMirror.h"
@@ -3036,6 +3037,16 @@ bool executeFunction(
             &&L_StoreFieldFast,
             &&L_LoadStructFieldFast,
             &&L_StoreStructFieldFast,
+            &&L_ConstantBool,
+            &&L_ConstantLong,
+            &&L_ArrayLengthFast,
+            &&L_ConvertIntToLongFast,
+            &&L_ConvertIntToDoubleFast,
+            &&L_ConvertLongToDoubleFast,
+            &&L_SuperBinaryLocalDoubleConstStore,
+            &&L_SuperBinaryLocalDoubleConstStoreElided,
+            &&L_SuperBinaryLocalDoubleLocalStore,
+            &&L_SuperBinaryLocalDoubleLocalStoreElided,
             &&L_GenericBytecode,
             &&L_TermJumpNoArgs,
             &&L_TermBranchBoolNoArgs,
@@ -3865,6 +3876,150 @@ bool executeFunction(
                     }
                 }
                 goto L_FlatGenericFallback;
+            }
+
+            RS_FLAT_CASE(ConstantBool) {
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = (ip->integerImmediate != 0);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(ConstantLong) {
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = LongValue{ip->integerImmediate};
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(ArrayLengthFast) {
+                const auto* ref = std::get_if<ObjectRef>(&frameBase[ip->src0Slot]);
+                if (RS_FLAT_LIKELY(ref != nullptr && state.heap)) {
+                    if (const auto len = state.heap->arrayLength(*ref);
+                        RS_FLAT_LIKELY(len.has_value() &&
+                        *len <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))) {
+                        if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                        frameBase[ip->dstSlot] = static_cast<std::int64_t>(*len);
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                }
+                goto L_FlatGenericFallback;
+            }
+
+            RS_FLAT_CASE(ConvertIntToLongFast) {
+                const auto* vPtr = std::get_if<std::int64_t>(&frameBase[ip->src0Slot]);
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = LongValue{*vPtr};
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(ConvertIntToDoubleFast) {
+                const auto* vPtr = std::get_if<std::int64_t>(&frameBase[ip->src0Slot]);
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = static_cast<double>(*vPtr);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(ConvertLongToDoubleFast) {
+                const auto* vPtr = std::get_if<LongValue>(&frameBase[ip->src0Slot]);
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = static_cast<double>(vPtr->value);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(SuperBinaryLocalDoubleConstStore) {
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || 4u > budgetLimit - localExecuted)) {
+                    goto L_FlatSuperFallback;
+                }
+                const auto* leftPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
+                if (RS_FLAT_UNLIKELY(!leftPtr)) goto L_FlatSuperFallback;
+                const double left = *leftPtr;
+                double right = 0.0;
+                std::memcpy(&right, &ip->integerImmediate, sizeof(double));
+                double out = 0.0;
+                switch (ip->binaryOpcode1) {
+                case detail::QuickOpcode::AddDouble: out = left + right; break;
+                case detail::QuickOpcode::SubtractDouble: out = left - right; break;
+                case detail::QuickOpcode::MultiplyDouble: out = left * right; break;
+                case detail::QuickOpcode::DivideDouble: out = left / right; break;
+                default: goto L_FlatSuperFallback;
+                }
+                localExecuted += 4;
+                frameBase[ip->dstSlot] = left;
+                frameBase[ip->aux0Slot] = right;
+                frameBase[ip->aux1Slot] = out;
+                frameBase[ip->storeSlot] = out;
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(SuperBinaryLocalDoubleConstStoreElided) {
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || 4u > budgetLimit - localExecuted)) {
+                    goto L_FlatSuperFallback;
+                }
+                const auto* leftPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
+                if (RS_FLAT_UNLIKELY(!leftPtr)) goto L_FlatSuperFallback;
+                const double left = *leftPtr;
+                double right = 0.0;
+                std::memcpy(&right, &ip->integerImmediate, sizeof(double));
+                double out = 0.0;
+                switch (ip->binaryOpcode1) {
+                case detail::QuickOpcode::AddDouble: out = left + right; break;
+                case detail::QuickOpcode::SubtractDouble: out = left - right; break;
+                case detail::QuickOpcode::MultiplyDouble: out = left * right; break;
+                case detail::QuickOpcode::DivideDouble: out = left / right; break;
+                default: goto L_FlatSuperFallback;
+                }
+                localExecuted += 4;
+                frameBase[ip->storeSlot] = out;
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(SuperBinaryLocalDoubleLocalStore) {
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || 4u > budgetLimit - localExecuted)) {
+                    goto L_FlatSuperFallback;
+                }
+                const auto* leftPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
+                const auto* rightPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
+                if (RS_FLAT_UNLIKELY(!leftPtr || !rightPtr)) goto L_FlatSuperFallback;
+                const double left = *leftPtr;
+                const double right = *rightPtr;
+                double out = 0.0;
+                switch (ip->binaryOpcode1) {
+                case detail::QuickOpcode::AddDouble: out = left + right; break;
+                case detail::QuickOpcode::SubtractDouble: out = left - right; break;
+                case detail::QuickOpcode::MultiplyDouble: out = left * right; break;
+                case detail::QuickOpcode::DivideDouble: out = left / right; break;
+                default: goto L_FlatSuperFallback;
+                }
+                localExecuted += 4;
+                frameBase[ip->dstSlot] = left;
+                frameBase[ip->aux0Slot] = right;
+                frameBase[ip->aux1Slot] = out;
+                frameBase[ip->storeSlot] = out;
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(SuperBinaryLocalDoubleLocalStoreElided) {
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || 4u > budgetLimit - localExecuted)) {
+                    goto L_FlatSuperFallback;
+                }
+                const auto* leftPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
+                const auto* rightPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
+                if (RS_FLAT_UNLIKELY(!leftPtr || !rightPtr)) goto L_FlatSuperFallback;
+                const double left = *leftPtr;
+                const double right = *rightPtr;
+                double out = 0.0;
+                switch (ip->binaryOpcode1) {
+                case detail::QuickOpcode::AddDouble: out = left + right; break;
+                case detail::QuickOpcode::SubtractDouble: out = left - right; break;
+                case detail::QuickOpcode::MultiplyDouble: out = left * right; break;
+                case detail::QuickOpcode::DivideDouble: out = left / right; break;
+                default: goto L_FlatSuperFallback;
+                }
+                localExecuted += 4;
+                frameBase[ip->storeSlot] = out;
+                RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(GenericBytecode) {

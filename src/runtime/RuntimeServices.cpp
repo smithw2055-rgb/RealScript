@@ -471,12 +471,72 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                             semantic::PrimitiveType::Int) {
                         return QuickOpcode::ConstantInt;
                     }
+                    if (validRes &&
+                        function.registerTypes[instruction.result] ==
+                            semantic::PrimitiveType::Long) {
+                        return QuickOpcode::ConstantLong;
+                    }
+                    return QuickOpcode::Generic;
+                case bytecode::Opcode::ConstantBool:
+                    if (validRes &&
+                        function.registerTypes[instruction.result] ==
+                            semantic::PrimitiveType::Bool) {
+                        return QuickOpcode::ConstantBool;
+                    }
                     return QuickOpcode::Generic;
                 case bytecode::Opcode::ConstantDouble:
                     if (validRes &&
                         function.registerTypes[instruction.result] ==
                             semantic::PrimitiveType::Double) {
                         return QuickOpcode::ConstantDouble;
+                    }
+                    return QuickOpcode::Generic;
+                case bytecode::Opcode::ArrayLength:
+                    if (validRes &&
+                        instruction.operands.size() == 1 &&
+                        instruction.operands[0] < function.registerTypes.size() &&
+                        instruction.operands[0] < InvalidCompactReg &&
+                        function.registerTypes[instruction.operands[0]] ==
+                            semantic::PrimitiveType::Array &&
+                        function.registerTypes[instruction.result] ==
+                            semantic::PrimitiveType::Int) {
+                        return QuickOpcode::ArrayLengthFast;
+                    }
+                    return QuickOpcode::Generic;
+                case bytecode::Opcode::ConvertIntToLong:
+                    if (validRes &&
+                        instruction.operands.size() == 1 &&
+                        instruction.operands[0] < function.registerTypes.size() &&
+                        instruction.operands[0] < InvalidCompactReg &&
+                        function.registerTypes[instruction.operands[0]] ==
+                            semantic::PrimitiveType::Int &&
+                        function.registerTypes[instruction.result] ==
+                            semantic::PrimitiveType::Long) {
+                        return QuickOpcode::ConvertIntToLongFast;
+                    }
+                    return QuickOpcode::Generic;
+                case bytecode::Opcode::ConvertIntToDouble:
+                    if (validRes &&
+                        instruction.operands.size() == 1 &&
+                        instruction.operands[0] < function.registerTypes.size() &&
+                        instruction.operands[0] < InvalidCompactReg &&
+                        function.registerTypes[instruction.operands[0]] ==
+                            semantic::PrimitiveType::Int &&
+                        function.registerTypes[instruction.result] ==
+                            semantic::PrimitiveType::Double) {
+                        return QuickOpcode::ConvertIntToDoubleFast;
+                    }
+                    return QuickOpcode::Generic;
+                case bytecode::Opcode::ConvertLongToDouble:
+                    if (validRes &&
+                        instruction.operands.size() == 1 &&
+                        instruction.operands[0] < function.registerTypes.size() &&
+                        instruction.operands[0] < InvalidCompactReg &&
+                        function.registerTypes[instruction.operands[0]] ==
+                            semantic::PrimitiveType::Long &&
+                        function.registerTypes[instruction.result] ==
+                            semantic::PrimitiveType::Double) {
+                        return QuickOpcode::ConvertLongToDoubleFast;
                     }
                     return QuickOpcode::Generic;
                 case bytecode::Opcode::LoadLocal:
@@ -1324,6 +1384,60 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         continue;
                     }
 
+                    // Pass 3 fusion for 4-instruction double local arithmetic:
+                    // LoadLocal(double) + (ConstantDouble | LoadLocal(double)) + (AddDouble..DivideDouble) + StoreLocal(double)
+                    if (i + 3 < nInst &&
+                        inst.opcode == QuickOpcode::LoadLocal &&
+                        inst.result < regCount &&
+                        function.registerTypes[inst.result] == semantic::PrimitiveType::Double) {
+                        const auto& second = blk.instructions[i + 1];
+                        const auto& binary = blk.instructions[i + 2];
+                        const auto& store = blk.instructions[i + 3];
+                        const bool isSecondConst = (second.opcode == QuickOpcode::ConstantDouble);
+                        const bool isSecondLocal = (second.opcode == QuickOpcode::LoadLocal &&
+                            second.result < regCount &&
+                            function.registerTypes[second.result] == semantic::PrimitiveType::Double);
+                        const bool isDoubleArith =
+                            binary.opcode >= QuickOpcode::AddDouble &&
+                            binary.opcode <= QuickOpcode::DivideDouble;
+                        if ((isSecondConst || isSecondLocal) &&
+                            isDoubleArith &&
+                            store.opcode == QuickOpcode::StoreLocal &&
+                            inst.result != second.result &&
+                            binary.op0 == inst.result &&
+                            binary.op1 == second.result &&
+                            store.op0 == binary.result &&
+                            second.result < regCount &&
+                            binary.result < regCount) {
+                            const bool tempsDead =
+                                globalRegReads[inst.result] == 1 &&
+                                globalRegReads[second.result] == 1 &&
+                                globalRegReads[binary.result] == 1;
+                            flat.span = 4;
+                            flat.binaryOpcode1 = binary.opcode;
+                            flat.src0Slot = localSlot(inst.auxReg1);
+                            flat.dstSlot = regSlot(inst.result);
+                            flat.aux0Slot = regSlot(second.result);
+                            flat.aux1Slot = regSlot(binary.result);
+                            flat.storeSlot = localSlot(store.auxReg1);
+                            if (isSecondConst) {
+                                const double dImm = second.bytecode->activeDoubleImmediate();
+                                std::memcpy(&flat.integerImmediate, &dImm, sizeof(double));
+                                flat.flatOpcode = tempsDead
+                                    ? FlatOpcode::SuperBinaryLocalDoubleConstStoreElided
+                                    : FlatOpcode::SuperBinaryLocalDoubleConstStore;
+                            } else {
+                                flat.src1Slot = localSlot(second.auxReg1);
+                                flat.flatOpcode = tempsDead
+                                    ? FlatOpcode::SuperBinaryLocalDoubleLocalStoreElided
+                                    : FlatOpcode::SuperBinaryLocalDoubleLocalStore;
+                            }
+                            execFunc.flatStream.push_back(flat);
+                            i += 4;
+                            continue;
+                        }
+                    }
+
                     // Single instruction mapping
                     flat.span = 1;
                     switch (inst.opcode) {
@@ -1541,6 +1655,35 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         flat.src0Slot = regSlot(inst.op0);
                         flat.src1Slot = regSlot(inst.op1);
                         flat.aux0Slot = inst.auxReg1;
+                        break;
+                    case QuickOpcode::ConstantBool:
+                        flat.flatOpcode = FlatOpcode::ConstantBool;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.integerImmediate = inst.bytecode->boolImmediate ? 1 : 0;
+                        break;
+                    case QuickOpcode::ConstantLong:
+                        flat.flatOpcode = FlatOpcode::ConstantLong;
+                        flat.dstSlot = regSlot(inst.result);
+                        break;
+                    case QuickOpcode::ArrayLengthFast:
+                        flat.flatOpcode = FlatOpcode::ArrayLengthFast;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        break;
+                    case QuickOpcode::ConvertIntToLongFast:
+                        flat.flatOpcode = FlatOpcode::ConvertIntToLongFast;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        break;
+                    case QuickOpcode::ConvertIntToDoubleFast:
+                        flat.flatOpcode = FlatOpcode::ConvertIntToDoubleFast;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        break;
+                    case QuickOpcode::ConvertLongToDoubleFast:
+                        flat.flatOpcode = FlatOpcode::ConvertLongToDoubleFast;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
                         break;
                     case QuickOpcode::Generic:
                     default:

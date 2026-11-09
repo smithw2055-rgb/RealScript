@@ -7777,6 +7777,180 @@ public int calc(int x) {
     }
 }
 
+
+struct CustomDamagePacket {
+    std::int64_t amount = 0;
+    double multiplier = 1.0;
+    bool critical = false;
+};
+
+CustomDamagePacket scaleDamagePacket(CustomDamagePacket pkt, double factor) {
+    pkt.multiplier *= factor;
+    if (pkt.critical) {
+        pkt.amount *= 2;
+    }
+    return pkt;
+}
+
+std::int64_t sumDamageBatch(const std::vector<CustomDamagePacket>& batch) {
+    std::int64_t total = 0;
+    for (const auto& p : batch) {
+        total += static_cast<std::int64_t>(static_cast<double>(p.amount) * p.multiplier) + (p.critical ? 10 : 0);
+    }
+    return total;
+}
+
+void testV4EvolutionCustomStructMarshalingDoubleSuperinstructionsAndCrossModuleInlining() {
+    using namespace realscript;
+
+    // 1. Custom C++ value-type struct marshaling (by-value & std::vector<CustomStruct> <-> CustomStruct[])
+    {
+        game::GameApi api;
+        api.structType<CustomDamagePacket>("Combat", "DamagePacket")
+            .field<&CustomDamagePacket::amount>("amount")
+            .field<&CustomDamagePacket::multiplier>("multiplier")
+            .field<&CustomDamagePacket::critical>("critical");
+        api.function("Combat", "ScaleDamage", &scaleDamagePacket);
+        api.function("Combat", "SumBatch", &sumDamageBatch);
+        require(api.valid(), "GameApi with custom C++ value-type struct DamagePacket must be valid");
+
+        game::GameScriptCompiler compiler(api);
+        const auto compiled = compiler.compile({
+            {"v4_struct.rs", R"RS(
+                module App.V4Struct;
+                import Combat;
+
+                int RunStructTest() {
+                    DamagePacket p = new DamagePacket();
+                    p.amount = 25L;
+                    p.multiplier = 1.5;
+                    p.critical = true;
+                    DamagePacket scaled = ScaleDamage(p, 2.0);
+                    DamagePacket[] arr = new DamagePacket[2];
+                    arr[0] = scaled;
+                    DamagePacket p2 = new DamagePacket();
+                    p2.amount = 10L;
+                    p2.multiplier = 1.0;
+                    p2.critical = false;
+                    arr[1] = p2;
+                    return (int)SumBatch(arr) + arr.Length;
+                }
+            )RS"}
+        });
+        require(!compiled.diagnostics.hasErrors(), "Custom C++ struct marshaling script must compile cleanly");
+        runtime::Interpreter interp(compiled.program.program(), api.heap());
+        interp.setBindingRegistry(api.bindings());
+        const auto res = interp.invoke("App.V4Struct::RunStructTest");
+        require(res.succeeded, "RunStructTest must execute cleanly: " + res.error.message);
+        // scaled: amount=50, multiplier=3.0, critical=true -> 50*3 + 10 = 160
+        // p2: amount=10, multiplier=1.0, critical=false -> 10*1 + 0 = 10
+        // SumBatch = 170, + arr.Length (2) = 172
+        require(std::get<std::int64_t>(res.value) == 172,
+            "expected RunStructTest() == 172, got " + std::to_string(std::get<std::int64_t>(res.value)));
+    }
+
+    // 2. rsbind auto-struct registration + static_cast on all overloads of overloaded methods/functions
+    {
+        const std::string header = R"(
+namespace demo {
+RS_EXPORT_STRUCT("Physics")
+struct RayHit {
+    RS_EXPORT_FIELD int entityId;
+    RS_EXPORT_FIELD double distance;
+    RS_EXPORT_FIELD bool hit;
+};
+
+RS_EXPORT_CLASS("Physics")
+class Solver {
+public:
+    RS_EXPORT_METHOD int Step(int iterations);
+    RS_EXPORT_METHOD int Step(int iterations, double dt) const;
+    RS_EXPORT_METHOD RayHit CastRay(RayHit input);
+};
+
+RS_EXPORT_FUNCTION("Physics")
+int EvalImpulse(int mass);
+RS_EXPORT_FUNCTION("Physics")
+int EvalImpulse(int mass, double velocity);
+}
+)";
+        const auto gen = game::GameApi::generateBindingsFromCppHeader(header, "Physics");
+        require((gen.classesExported == 1 && gen.structsExported == 1 && gen.functionsExported == 2), "rsbind v4 header generation must succeed");
+        require(gen.cppRegistrationSource.find("api.structType<demo::RayHit>(\"Physics\", \"RayHit\")") != std::string::npos,
+            "rsbind must emit api.structType<demo::RayHit>");
+        require(gen.cppRegistrationSource.find(".field<&demo::RayHit::entityId>(\"entityId\")") != std::string::npos,
+            "rsbind must emit field registration for RayHit::entityId");
+        require(gen.cppRegistrationSource.find("static_cast<int (demo::Solver::*)(int)>(&demo::Solver::Step)") != std::string::npos,
+            "rsbind must emit static_cast for the FIRST overload of Solver::Step");
+        require(gen.cppRegistrationSource.find("static_cast<int (demo::Solver::*)(int, double) const>(&demo::Solver::Step)") != std::string::npos,
+            "rsbind must emit static_cast with const for the SECOND overload of Solver::Step");
+        require(gen.cppRegistrationSource.find("builder_Solver.method<&demo::Solver::CastRay>(\"CastRay\")") != std::string::npos,
+            "non-overloaded method CastRay must keep direct pointer-to-member syntax");
+        require(gen.cppRegistrationSource.find("static_cast<int (*)(int)>(&demo::EvalImpulse)") != std::string::npos,
+            "rsbind must emit static_cast for first overload of free function EvalImpulse");
+        require(gen.cppRegistrationSource.find("static_cast<int (*)(int, double)>(&demo::EvalImpulse)") != std::string::npos,
+            "rsbind must emit static_cast for second overload of free function EvalImpulse");
+    }
+
+    // 3. Cross-module -O2 MIR inlining + FlatOpcode double superinstructions & conversion/array-length fast paths
+    {
+        compiler::Compilation comp({
+            {"math_util.rs", R"RS(
+                module MathUtil;
+                public double FmaStep(double x, double scale, double bias) {
+                    return x * scale + bias;
+                }
+                public long WidenedBias(int v) {
+                    return v + 10L;
+                }
+            )RS"},
+            {"sim.rs", R"RS(
+                module Sim;
+                import MathUtil;
+                public double RunSim(int n) {
+                    int[] weights = new int[4];
+                    weights[0] = 1;
+                    weights[1] = 2;
+                    weights[2] = 3;
+                    weights[3] = 4;
+                    double acc = 0.0;
+                    double step = 0.5;
+                    for (int i = 0; i < n; i = i + 1) {
+                        acc = acc + 1.25;
+                        acc = acc + step;
+                        acc = FmaStep(acc, 1.0, 0.25);
+                    }
+                    long w = WidenedBias(weights.Length);
+                    double bonus = w;
+                    return acc + bonus;
+                }
+            )RS"}
+        });
+        auto build = comp.build();
+        require(!build.diagnostics.hasErrors(), "Cross-module inlining & double superinstruction modules must build cleanly");
+
+        diagnostics::DiagnosticBag optDiags;
+        optimization::Options optOpts;
+        optOpts.level = optimization::Level::Aggressive;
+        optOpts.enableInlining = true;
+        auto optRes = optimization::Optimizer{}.optimize(build.modules, optDiags, optOpts);
+        require(!optDiags.hasErrors(), "Cross-module MIR -O2 optimization must succeed");
+        require(optRes.statistics.functionsInlined >= 2,
+            "Expected cross-module -O2 inliner to inline FmaStep and WidenedBias across modules");
+
+        bytecode::Lowerer lowerer;
+        std::vector<bytecode::Module> bcMods;
+        for (const auto& m : optRes.modules) bcMods.push_back(lowerer.lower(m));
+        runtime::Interpreter interp(std::move(bcMods));
+        const auto execRes = interp.invoke("Sim::RunSim", {std::int64_t{10}});
+        require(execRes.succeeded, "Sim::RunSim must execute cleanly: " + execRes.error.message);
+        // Each iteration adds 1.25 + 0.5 + 0.25 = 2.0; 10 iterations = 20.0.
+        // weights.Length = 4 -> WidenedBias(4) = 14L -> bonus = 14.0 -> total = 34.0
+        const double val = std::get<double>(execRes.value);
+        require(val > 33.999 && val < 34.001, "expected Sim::RunSim(10) == 34.0");
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -7839,8 +8013,10 @@ int main() {
         testAuditFixesMultiInterfaceConversionsAndAotSourceMap();
         std::cout << "[30/31] testV2RoadmapP0SlicePoolAndRsbindEvolution..." << std::endl;
         testV2RoadmapP0SlicePoolAndRsbindEvolution();
-        std::cout << "[31/31] testV3NextStageFlatDoubleFieldsInlinerOverloadsAndHotReloadBreakpoints..." << std::endl;
+        std::cout << "[31/32] testV3NextStageFlatDoubleFieldsInlinerOverloadsAndHotReloadBreakpoints..." << std::endl;
         testV3NextStageFlatDoubleFieldsInlinerOverloadsAndHotReloadBreakpoints();
+        std::cout << "[32/32] testV4EvolutionCustomStructMarshalingDoubleSuperinstructionsAndCrossModuleInlining..." << std::endl;
+        testV4EvolutionCustomStructMarshalingDoubleSuperinstructionsAndCrossModuleInlining();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

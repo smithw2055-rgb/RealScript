@@ -1035,35 +1035,50 @@ mir::ValueId findMaxValueId(const mir::Function& function) noexcept {
 bool inlineSmallFunctions(
     mir::Module& module,
     const Options& options,
-    Statistics& statistics) {
+    Statistics& statistics,
+    const std::vector<mir::Module>* allModules = nullptr) {
     if (options.level != Level::Aggressive || !options.enableInlining) {
         return false;
     }
+    std::unordered_set<semantic::SymbolId> moduleTypeIds;
+    for (const auto& t : module.types) {
+        if (t.id != 0) moduleTypeIds.insert(t.id);
+    }
     std::unordered_map<semantic::SymbolId, const mir::Function*> inlineCandidates;
-    for (const auto& func : module.functions) {
-        if (func.blocks.size() != 1 ||
-            !func.exceptionHandlers.empty() ||
-            func.name.find("..ctor") != std::string::npos ||
-            func.name.find("..cctor") != std::string::npos ||
-            func.name.find("$") != std::string::npos) {
-            continue;
-        }
-        const auto& entry = func.blocks.front();
-        if ((entry.terminator.kind != mir::TerminatorKind::ReturnValue &&
-             entry.terminator.kind != mir::TerminatorKind::ReturnVoid) ||
-            entry.instructions.size() > options.maxInlineInstructions ||
-            !entry.parameters.empty()) {
-            continue;
-        }
-        bool allSafe = true;
-        for (const auto& inst : entry.instructions) {
-            if (!isInlineSafeInstruction(inst)) {
-                allSafe = false;
-                break;
+    const auto collectFromModule = [&](const mir::Module& candMod) {
+        for (const auto& func : candMod.functions) {
+            if (func.blocks.size() != 1 ||
+                !func.exceptionHandlers.empty() ||
+                func.name.find("..ctor") != std::string::npos ||
+                func.name.find("..cctor") != std::string::npos ||
+                func.name.find("$") != std::string::npos) {
+                continue;
+            }
+            const auto& entry = func.blocks.front();
+            if ((entry.terminator.kind != mir::TerminatorKind::ReturnValue &&
+                 entry.terminator.kind != mir::TerminatorKind::ReturnVoid) ||
+                entry.instructions.size() > options.maxInlineInstructions ||
+                !entry.parameters.empty()) {
+                continue;
+            }
+            bool allSafe = true;
+            for (const auto& inst : entry.instructions) {
+                if (!isInlineSafeInstruction(inst) ||
+                    (inst.typeId != 0 && moduleTypeIds.find(inst.typeId) == moduleTypeIds.end()) ||
+                    (inst.resultTypeId != 0 && moduleTypeIds.find(inst.resultTypeId) == moduleTypeIds.end())) {
+                    allSafe = false;
+                    break;
+                }
+            }
+            if (allSafe) {
+                inlineCandidates[func.symbolId] = &func;
             }
         }
-        if (allSafe) {
-            inlineCandidates[func.symbolId] = &func;
+    };
+    collectFromModule(module);
+    if (allModules) {
+        for (const auto& m : *allModules) {
+            if (&m != &module) collectFromModule(m);
         }
     }
     if (inlineCandidates.empty()) return false;
@@ -1132,6 +1147,10 @@ bool inlineSmallFunctions(
                                 break;
                             }
                             mir::Instruction cloned = calleeInst;
+                            if (callee.moduleName != caller.moduleName ||
+                                callee.debugInfo.sourceFileId != caller.debugInfo.sourceFileId) {
+                                cloned.sourceSpan = inst.sourceSpan;
+                            }
                             for (auto& op : cloned.operands) {
                                 const auto m = valueMap.find(op);
                                 if (m == valueMap.end()) {
@@ -1239,10 +1258,21 @@ Result Optimizer::optimize(
     diagnostics::DiagnosticBag& diagnostics,
     Options options) const {
     Result result;
+    Options innerOptions = options;
+    if (options.level == Level::Aggressive && options.enableInlining && modules.size() > 1) {
+        const auto unmutatedSnapshot = modules;
+        for (auto& module : modules) {
+            diagnostics::DiagnosticBag checkDiag;
+            if (mir::verifyModule(module, checkDiag)) {
+                (void)inlineSmallFunctions(module, options, result.statistics, &unmutatedSnapshot);
+            }
+        }
+        innerOptions.enableInlining = false;
+    }
     result.modules.reserve(modules.size());
     for (auto& module : modules) {
         result.modules.push_back(optimizeModule(
-            std::move(module), diagnostics, options, &result.statistics));
+            std::move(module), diagnostics, innerOptions, &result.statistics));
     }
     return result;
 }
