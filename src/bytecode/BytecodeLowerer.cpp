@@ -244,16 +244,26 @@ Module Lowerer::lower(const mir::Module& source) const {
                         throw std::logic_error(
                             "MIR object instruction references missing type descriptor");
                     }
-                    instruction.typeIndex = foundType->second;
+                    if (foundType->second > 0xFFFFu) {
+                        throw std::out_of_range(
+                            "bytecode instruction typeIndex exceeds 16-bit limit");
+                    }
+                    instruction.typeIndex = static_cast<std::uint16_t>(foundType->second);
                 }
                 instruction.elementType = sourceInstruction.elementType;
-                instruction.elementTypeId = sourceInstruction.elementTypeId;
-                instruction.integerImmediate = sourceInstruction.integerImmediate;
-                instruction.doubleImmediate = sourceInstruction.doubleImmediate;
+                instruction.elementTypeId = 0;
+                if (instruction.usesDoubleImmediate()) {
+                    instruction.doubleImmediate = sourceInstruction.doubleImmediate;
+                } else if (instruction.usesIntegerImmediate()) {
+                    instruction.integerImmediate = sourceInstruction.integerImmediate;
+                } else if (instruction.usesStringImmediate()) {
+                    instruction.stringImmediate = sourceInstruction.stringImmediate;
+                } else {
+                    instruction.elementTypeId = sourceInstruction.elementTypeId;
+                }
                 instruction.boolImmediate = sourceInstruction.boolImmediate;
                 instruction.checkedArithmetic =
                     sourceInstruction.checkedArithmetic;
-                instruction.stringImmediate = sourceInstruction.stringImmediate;
 
                 if (sourceInstruction.opcode == mir::Opcode::Call ||
                     sourceInstruction.opcode == mir::Opcode::NewDelegate) {
@@ -309,8 +319,13 @@ Module Lowerer::lower(const mir::Module& source) const {
             block.terminator.value = sourceBlock.terminator.value < 0
                 ? InvalidRegister
                 : static_cast<Register>(sourceBlock.terminator.value);
-            block.terminator.target = sourceBlock.terminator.target;
-            block.terminator.falseTarget = sourceBlock.terminator.falseTarget;
+            if (sourceBlock.terminator.target > 0xFFFFu ||
+                sourceBlock.terminator.falseTarget > 0xFFFFu) {
+                throw std::out_of_range(
+                    "bytecode terminator block target exceeds 16-bit limit");
+            }
+            block.terminator.target = static_cast<std::uint16_t>(sourceBlock.terminator.target);
+            block.terminator.falseTarget = static_cast<std::uint16_t>(sourceBlock.terminator.falseTarget);
             for (const auto argument : sourceBlock.terminator.arguments) {
                 block.terminator.arguments.push_back(
                     static_cast<Register>(argument));

@@ -157,6 +157,22 @@ std::string compileCommand(
     }
     command << " > " << quote(log) << " 2>&1";
 #if defined(_WIN32)
+    if (looksLikeMsvc(options.compiler)) {
+        if (GetEnvironmentVariableA("INCLUDE", nullptr, 0) == 0) {
+            auto dir = options.compiler.parent_path();
+            for (int depth = 0; depth < 8 && !dir.empty(); ++depth) {
+                const auto vcvars = dir / "Auxiliary" / "Build" / "vcvars64.bat";
+                std::error_code ec;
+                if (std::filesystem::exists(vcvars, ec)) {
+                    return "cmd.exe /D /S /C \"call " + quote(vcvars) +
+                        " >nul 2>&1 && " + command.str() + "\"";
+                }
+                const auto parent = dir.parent_path();
+                if (parent == dir) break;
+                dir = parent;
+            }
+        }
+    }
     return "cmd.exe /D /S /C \"" + command.str() + "\"";
 #else
     return command.str();

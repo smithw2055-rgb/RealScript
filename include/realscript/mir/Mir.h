@@ -237,6 +237,8 @@ private:
     std::vector<std::size_t> breakFinalizerDepths_;
     std::vector<std::size_t> continueFinalizerDepths_;
     std::vector<const semantic::BoundStatement*> finalizers_;
+    std::vector<const semantic::BoundForeachStatement*> ecsWriteBacks_;
+    std::vector<std::size_t> breakEcsWriteBackDepths_;
     std::vector<BlockId> exceptionCleanupBlocks_;
 };
 

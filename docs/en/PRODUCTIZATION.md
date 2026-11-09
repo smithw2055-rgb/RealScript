@@ -107,6 +107,22 @@ The default policy rejects:
 
 State encoding is little-endian, versioned, bounded, duplicate-field checked, and protected by a canonical state hash. Restore requires an exact script type and field layout match.
 
+## Human-readable JSON scene and prefab serialization
+
+For editor scene files, prefabs, and Git-friendly diffs, `GameProductization.h` provides `exportScriptObjectJson` and `importScriptObjectJson`:
+
+```cpp
+auto json = exportScriptObjectJson(runtime, object, error, policy, &scene);
+importScriptObjectJson(runtime, targetObject, *json, error, policy, &scene);
+```
+
+JSON serialization supports:
+
+- primitive fields, strings, enums, and nested structs;
+- 1D array fields (`[...]`);
+- cross-entity component `ObjectRef` references encoded as `{"$entity": 1001, "$component": "Game::TargetComponent"}` when a `SceneScriptRuntime*` is supplied;
+- tolerant field import (added or removed fields in scripts do not break existing JSON assets).
+
 ## Compatibility boundary
 
 RS0 does not freeze the source language, `.rsbc` format, object ABI, or native module ABI. It establishes the APIs an engine can build on while continuing to pin the exact RealScript SDK identity. A future compatibility bump must update the constants in `Version.h` and the related regression fixtures.

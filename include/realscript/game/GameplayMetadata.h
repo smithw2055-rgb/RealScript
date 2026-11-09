@@ -37,6 +37,12 @@ public:
         std::string canonicalTypeName,
         std::string memberName,
         ScriptAttribute attribute);
+    std::size_t populateFromLanguageMetadata(
+        const GameLanguageMetadata& metadata);
+    std::size_t populateFromProgramImage(
+        const runtime::ProgramImage& program);
+    std::size_t populateFromProgram(
+        const GameProgram& program);
 
     [[nodiscard]] const std::vector<ScriptAttribute>* typeAttributes(
         const std::string& canonicalTypeName) const noexcept;
@@ -93,5 +99,64 @@ struct ScriptContractReport {
     const ScriptContract& contract);
 
 [[nodiscard]] ScriptContract sceneBehaviorContract();
+
+struct InspectorFieldSchema;
+
+enum class InspectorReferenceKind {
+    None,
+    Entity,
+    Component,
+    Asset,
+};
+
+struct InspectorEnumOption {
+    std::string name;
+    std::int64_t value = 0;
+};
+
+struct InspectorSignalParameter {
+    std::string name;
+    semantic::PrimitiveType type = semantic::PrimitiveType::Error;
+    std::string typeName;
+};
+
+struct InspectorSignalSchema {
+    std::string name;
+    std::string delegateTypeName;
+    std::vector<InspectorSignalParameter> parameters;
+};
+
+struct InspectorFieldSchema {
+    std::string name;
+    semantic::PrimitiveType type = semantic::PrimitiveType::Error;
+    std::string typeName;
+    runtime::Value defaultValue;
+    bool exported = false;
+    bool hiddenInInspector = false;
+    std::optional<std::int64_t> rangeMin;
+    std::optional<std::int64_t> rangeMax;
+    std::string tooltip;
+    std::string formerlySerializedAs;
+    InspectorReferenceKind referenceKind = InspectorReferenceKind::None;
+    std::string referencedTypeName;
+    bool isCollection = false;
+    std::string elementTypeName;
+    std::string keyTypeName;
+    std::vector<InspectorEnumOption> enumOptions;
+    std::vector<InspectorFieldSchema> nestedFields;
+};
+
+struct InspectorTypeSchema {
+    std::string canonicalTypeName;
+    bool executeInEditMode = false;
+    bool hasOnValidate = false;
+    std::vector<InspectorFieldSchema> fields;
+    std::vector<InspectorSignalSchema> signals;
+};
+
+[[nodiscard]] std::optional<InspectorTypeSchema> inspectTypeSchema(
+    const ScriptRuntime& runtime,
+    const ScriptMetadataRegistry& metadata,
+    const std::string& canonicalTypeName);
 
 } // namespace realscript::game

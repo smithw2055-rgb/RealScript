@@ -174,12 +174,62 @@ SubscriptionId GameplayHost::subscribe(
     }
     const auto id = nextSubscriptionId_++;
     subscriptions_.emplace(id, ScriptEventSubscription{
-        id, std::move(topic), target, std::move(callback), priority});
+        id, std::move(topic), target, std::move(callback), priority, false});
+    return id;
+}
+
+SubscriptionId GameplayHost::subscribeOnce(
+    std::string topic,
+    SceneEntityId target,
+    std::string callback,
+    std::int32_t priority) {
+    if (topic.empty() || target == 0 || callback.empty() ||
+        nextSubscriptionId_ == 0) {
+        return 0;
+    }
+    const auto id = nextSubscriptionId_++;
+    subscriptions_.emplace(id, ScriptEventSubscription{
+        id, std::move(topic), target, std::move(callback), priority, true});
     return id;
 }
 
 bool GameplayHost::unsubscribe(SubscriptionId subscriptionId) {
     return subscriptions_.erase(subscriptionId) != 0;
+}
+
+std::size_t GameplayHost::subscriberCount(std::string_view topic) const noexcept {
+    std::size_t count = 0;
+    for (const auto& [id, sub] : subscriptions_) {
+        (void)id;
+        if (sub.topic == topic) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+std::size_t GameplayHost::cancelEntityCalls(SceneEntityId target) {
+    if (target == 0) return 0;
+    std::vector<TimerId> timersToCancel;
+    for (const auto& [payloadId, call] : calls_) {
+        (void)payloadId;
+        if (call.target == target) {
+            timersToCancel.push_back(call.timerId);
+        }
+    }
+    std::size_t cancelled = 0;
+    for (const auto timerId : timersToCancel) {
+        if (cancelCall(timerId)) ++cancelled;
+    }
+    for (auto it = subscriptions_.begin(); it != subscriptions_.end();) {
+        if (it->second.target == target) {
+            it = subscriptions_.erase(it);
+            ++cancelled;
+        } else {
+            ++it;
+        }
+    }
+    return cancelled;
 }
 
 EventSequence GameplayHost::publish(
@@ -192,6 +242,54 @@ EventSequence GameplayHost::publish(
         0,
         std::move(topic),
         std::move(arguments)});
+}
+
+AsyncOperationId GameplayHost::createAsyncOperation(std::string name) {
+    if (nextAsyncOpId_ == 0) return 0;
+    const auto id = nextAsyncOpId_++;
+    asyncOps_.emplace(id, ScriptAsyncOperationState{
+        id, std::move(name), false, GameplayValue{std::monostate{}}});
+    return id;
+}
+
+bool GameplayHost::completeAsyncOperation(
+    AsyncOperationId operationId,
+    GameplayValue result,
+    GameTick delayTicks) {
+    const auto found = asyncOps_.find(operationId);
+    if (found == asyncOps_.end() || found->second.completed) return false;
+    found->second.completed = true;
+    found->second.result = std::move(result);
+    (void)publish("$async_op_" + std::to_string(operationId), {}, delayTicks);
+    return true;
+}
+
+bool GameplayHost::isAsyncOperationCompleted(AsyncOperationId operationId) const noexcept {
+    const auto found = asyncOps_.find(operationId);
+    return found != asyncOps_.end() && found->second.completed;
+}
+
+std::optional<GameplayValue> GameplayHost::getAsyncOperationResult(
+    AsyncOperationId operationId) const {
+    const auto found = asyncOps_.find(operationId);
+    if (found == asyncOps_.end() || !found->second.completed) return std::nullopt;
+    return found->second.result;
+}
+
+SubscriptionId GameplayHost::waitAsyncOperation(
+    AsyncOperationId operationId,
+    SceneEntityId target,
+    std::string callback) {
+    if (operationId == 0 || target == 0 || callback.empty()) return 0;
+    const auto found = asyncOps_.find(operationId);
+    if (found == asyncOps_.end()) return 0;
+    if (found->second.completed) {
+        return scheduleCall(target, std::move(callback), 1);
+    }
+    return subscribeOnce(
+        "$async_op_" + std::to_string(operationId),
+        target,
+        std::move(callback));
 }
 
 EventSequence GameplayHost::enqueueDirect(
@@ -267,6 +365,7 @@ ScriptDispatchBatch GameplayHost::drainDue(
                 return left->priority < right->priority ||
                     (left->priority == right->priority && left->id < right->id);
             });
+        std::vector<SubscriptionId> oneShotConsumed;
         for (const auto* subscriber : subscribers) {
             batch.calls.push_back(ScriptDispatchCall{
                 subscriber->target,
@@ -274,6 +373,12 @@ ScriptDispatchBatch GameplayHost::drainDue(
                 event.arguments,
                 0,
                 event.sequence});
+            if (subscriber->once) {
+                oneShotConsumed.push_back(subscriber->id);
+            }
+        }
+        for (const auto subId : oneShotConsumed) {
+            subscriptions_.erase(subId);
         }
     }
     return batch;
@@ -285,6 +390,7 @@ GameplayHost::State GameplayHost::snapshot() const {
     state.nextPayloadId = nextPayloadId_;
     state.nextSubscriptionId = nextSubscriptionId_;
     state.nextSequenceId = nextSequenceId_;
+    state.nextAsyncOpId = nextAsyncOpId_;
     state.calls.reserve(calls_.size());
     for (const auto& entry : calls_) state.calls.push_back(entry.second);
     state.subscriptions.reserve(subscriptions_.size());
@@ -293,12 +399,14 @@ GameplayHost::State GameplayHost::snapshot() const {
     }
     state.sequences.reserve(sequences_.size());
     for (const auto& entry : sequences_) state.sequences.push_back(entry.second);
+    state.asyncOps.reserve(asyncOps_.size());
+    for (const auto& entry : asyncOps_) state.asyncOps.push_back(entry.second);
     return state;
 }
 
 bool GameplayHost::restore(const State& state) {
     if (state.nextPayloadId == 0 || state.nextSubscriptionId == 0 ||
-        state.nextSequenceId == 0) {
+        state.nextSequenceId == 0 || state.nextAsyncOpId == 0) {
         return false;
     }
 
@@ -356,15 +464,27 @@ bool GameplayHost::restore(const State& state) {
     }
     if (state.nextSequenceId <= maximumSequence) return false;
 
+    std::map<AsyncOperationId, ScriptAsyncOperationState> asyncOps;
+    AsyncOperationId maximumAsyncOp = 0;
+    for (const auto& op : state.asyncOps) {
+        if (op.id == 0 || !asyncOps.emplace(op.id, op).second) {
+            return false;
+        }
+        maximumAsyncOp = std::max(maximumAsyncOp, op.id);
+    }
+    if (state.nextAsyncOpId <= maximumAsyncOp) return false;
+
     core_ = std::move(core);
     nextPayloadId_ = state.nextPayloadId;
     nextSubscriptionId_ = state.nextSubscriptionId;
     nextSequenceId_ = state.nextSequenceId;
+    nextAsyncOpId_ = state.nextAsyncOpId;
     calls_ = std::move(calls);
     timerToPayload_ = std::move(timerToPayload);
     subscriptions_ = std::move(subscriptions);
     sequences_ = std::move(sequences);
     timerToSequence_ = std::move(timerToSequence);
+    asyncOps_ = std::move(asyncOps);
     return true;
 }
 
@@ -374,6 +494,7 @@ std::uint64_t GameplayHost::stableHash() const noexcept {
     hashU64(hash, nextPayloadId_);
     hashU64(hash, nextSubscriptionId_);
     hashU64(hash, nextSequenceId_);
+    hashU64(hash, nextAsyncOpId_);
     hashU64(hash, calls_.size());
     for (const auto& entry : calls_) {
         const auto& call = entry.second;
@@ -394,12 +515,21 @@ std::uint64_t GameplayHost::stableHash() const noexcept {
         hashU64(hash, subscription.target);
         hashString(hash, subscription.callback);
         hashU64(hash, static_cast<std::uint32_t>(subscription.priority));
+        hashU64(hash, subscription.once ? 1u : 0u);
     }
     hashU64(hash, sequences_.size());
     for (const auto& entry : sequences_) {
         hashU64(hash, entry.second.id);
         hashU64(hash, entry.second.timers.size());
         for (const auto timerId : entry.second.timers) hashU64(hash, timerId);
+    }
+    hashU64(hash, asyncOps_.size());
+    for (const auto& entry : asyncOps_) {
+        const auto& op = entry.second;
+        hashU64(hash, op.id);
+        hashString(hash, op.name);
+        hashU64(hash, op.completed ? 1u : 0u);
+        hashU64(hash, stableGameplayValueHash(op.result));
     }
     return hash;
 }
@@ -446,7 +576,16 @@ std::optional<GameplayValue> toGameplayValue(const runtime::Value& value) {
 SceneGameplayDriver::SceneGameplayDriver(
     SceneScriptRuntime& scene,
     std::shared_ptr<GameplayHost> host)
-    : scene_(scene), host_(std::move(host)) {}
+    : scene_(scene), host_(std::move(host)) {
+    if (host_) {
+        auto h = host_;
+        scene_.setSignalTopicPublisherCounted([h](const std::string& topic) -> std::size_t {
+            const auto matched = h->subscriberCount(topic);
+            (void)h->publish(topic, {}, 1);
+            return matched;
+        });
+    }
+}
 
 SceneGameplayDriver::StepResult SceneGameplayDriver::step() {
     return step(Options{});
@@ -535,6 +674,9 @@ bool installGameplayBindings(
     valid = api.function(moduleName, "CurrentTick", [host] {
         return static_cast<std::int64_t>(host->core().clock().tick());
     }) && valid;
+    valid = api.function(moduleName, "TicksPerSecond", [host] {
+        return static_cast<int>(host->core().clock().ticksPerSecond());
+    }) && valid;
     valid = api.function(moduleName, "CreateEntity", [host] {
         const auto entity = host->core().entities().create();
         return entity.valid()
@@ -587,8 +729,30 @@ bool installGameplayBindings(
                 static_cast<std::uint32_t>(repeatCount)));
         }) && valid;
     valid = api.function(moduleName, "CancelTimer", [host](std::int64_t timerId) {
-        return timerId > 0 && host->cancelCall(static_cast<TimerId>(timerId));
+        if (timerId <= 0) return false;
+        return host->cancelCall(static_cast<TimerId>(timerId)) ||
+            host->unsubscribe(static_cast<SubscriptionId>(timerId));
     }) && valid;
+    valid = api.function(
+        moduleName,
+        "SubscribeOnce",
+        [host](std::int64_t target, std::string callback, std::string topic) {
+            if (target <= 0 || callback.empty() || topic.empty()) {
+                return std::int64_t{0};
+            }
+            return static_cast<std::int64_t>(host->subscribeOnce(
+                std::move(topic),
+                static_cast<SceneEntityId>(target),
+                std::move(callback)));
+        }) && valid;
+    valid = api.function(
+        moduleName,
+        "CancelEntityTimers",
+        [host](std::int64_t target) {
+            if (target <= 0) return 0;
+            return static_cast<int>(
+                host->cancelEntityCalls(static_cast<SceneEntityId>(target)));
+        }) && valid;
     valid = api.function(
         moduleName,
         "Publish",
@@ -596,6 +760,55 @@ bool installGameplayBindings(
             if (delayTicks < 0) return std::int64_t{0};
             return static_cast<std::int64_t>(host->publish(
                 std::move(topic), {}, static_cast<GameTick>(delayTicks)));
+        }) && valid;
+    valid = api.function(
+        moduleName,
+        "CreateAsyncOperation",
+        [host](std::string name) {
+            return static_cast<std::int64_t>(
+                host->createAsyncOperation(std::move(name)));
+        }) && valid;
+    valid = api.function(
+        moduleName,
+        "CompleteAsyncOperation",
+        [host](std::int64_t opId, int resultValue) {
+            if (opId <= 0) return false;
+            return host->completeAsyncOperation(
+                static_cast<AsyncOperationId>(opId),
+                GameplayValue{static_cast<std::int32_t>(resultValue)},
+                1);
+        }) && valid;
+    valid = api.function(
+        moduleName,
+        "IsAsyncOperationCompleted",
+        [host](std::int64_t opId) {
+            if (opId <= 0) return false;
+            return host->isAsyncOperationCompleted(
+                static_cast<AsyncOperationId>(opId));
+        }) && valid;
+    valid = api.function(
+        moduleName,
+        "GetAsyncOperationResultInt",
+        [host](std::int64_t opId) -> int {
+            if (opId <= 0) return 0;
+            const auto res = host->getAsyncOperationResult(
+                static_cast<AsyncOperationId>(opId));
+            if (!res) return 0;
+            if (const auto* iv = std::get_if<std::int32_t>(&*res)) return *iv;
+            if (const auto* lv = std::get_if<std::int64_t>(&*res)) return static_cast<int>(*lv);
+            return 0;
+        }) && valid;
+    valid = api.function(
+        moduleName,
+        "WaitAsyncOperation",
+        [host](std::int64_t target, std::string callback, std::int64_t opId) {
+            if (target <= 0 || callback.empty() || opId <= 0) {
+                return std::int64_t{0};
+            }
+            return static_cast<std::int64_t>(host->waitAsyncOperation(
+                static_cast<AsyncOperationId>(opId),
+                static_cast<SceneEntityId>(target),
+                std::move(callback)));
         }) && valid;
     return valid;
 }

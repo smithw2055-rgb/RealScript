@@ -148,7 +148,9 @@ text::TextSpan InitializerElementSyntax::span() const noexcept {
 }
 
 text::TextSpan NewArrayExpressionSyntax::span() const noexcept {
-    return combine(newKeyword.span, closeBracketToken.span);
+    return combine(
+        newKeyword.span,
+        initializerCloseBraceToken ? initializerCloseBraceToken->span : closeBracketToken.span);
 }
 
 text::TextSpan ParenthesizedExpressionSyntax::span() const noexcept {
@@ -239,7 +241,7 @@ text::TextSpan EventSubscriptionStatementSyntax::span() const noexcept {
 
 text::TextSpan VariableDeclarationStatementSyntax::span() const noexcept {
     return combine(
-        refKeyword ? refKeyword->span : type.span(),
+        constKeyword ? constKeyword->span : (refKeyword ? refKeyword->span : type.span()),
         semicolonToken.span);
 }
 
@@ -282,9 +284,12 @@ text::TextSpan AccessorDeclarationSyntax::span() const noexcept {
 }
 
 text::TextSpan PropertyDeclarationSyntax::span() const noexcept {
+    const auto endSpan = semicolonToken
+        ? semicolonToken->span
+        : (initializer ? initializer->span() : closeBraceToken.span);
     return combine(
         declarationStart(attributes, type.span()),
-        closeBraceToken.span);
+        endSpan);
 }
 
 text::TextSpan ClassDeclarationSyntax::span() const noexcept {

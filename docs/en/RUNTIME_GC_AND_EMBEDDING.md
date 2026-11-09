@@ -55,6 +55,12 @@ The runtime `Value` model supports:
 
 Type validation occurs at function boundaries and relevant operations.
 
+`runtime::Value` uses a compact 24-byte representation (`sizeof(runtime::Value) == 24`):
+
+- Custom value-type `struct`s with up to 4 scalar, `Enum`, or `RealScript.Math` (`Fixed`, `Fixed16`, `Vec2`, `Vec3`, `Quat`) fields are bit-packed inline inside a 12-byte `InlineStructSlot` with zero heap allocation.
+- Larger structs (>4 fields), dynamic strings, and closures are stored in a thread-local `ValuePoolArena` (`PooledStringValue`, `PooledStructValue`, `PooledClosureValue`) whose unreferenced entries are automatically reclaimed during `ManagedHeap::collect` (`ValuePoolArena::collectGarbage`).
+- Non-owning host ECS column views (`ObjectKind::RawColumnArray`) expose contiguous C++ struct buffers directly to both the interpreter and C++17 AOT without copying elements into `std::vector<Value>`.
+
 ## Interpreter
 
 The interpreter executes typed registers, local slots, basic blocks, and explicit terminators. Each frame records:

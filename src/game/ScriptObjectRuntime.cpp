@@ -114,30 +114,39 @@ std::optional<ScriptMethod> ScriptRuntime::findMethod(
     const ScriptType& type,
     const std::string& name,
     std::size_t visibleArity) const {
-    for (const auto& method : type.descriptor.methods) {
-        ScriptMethod candidate{method};
-        if (method.name == name && candidate.visibleArity() == visibleArity) {
-            return candidate;
+    std::unordered_set<semantic::SymbolId> visited;
+    const semantic::TypeSymbol* current = &type.descriptor;
+    while (current && visited.insert(current->id).second) {
+        for (const auto& method : current->methods) {
+            ScriptMethod candidate{method};
+            if (method.name == name && candidate.visibleArity() == visibleArity) {
+                return candidate;
+            }
         }
+        for (const auto& property : current->properties) {
+            if (property.getter && property.getter->name == name) {
+                ScriptMethod candidate{*property.getter};
+                if (candidate.visibleArity() == visibleArity) return candidate;
+            }
+            if (property.setter && property.setter->name == name) {
+                ScriptMethod candidate{*property.setter};
+                if (candidate.visibleArity() == visibleArity) return candidate;
+            }
+        }
+        if (program_) {
+            if (auto reflected = reflectedBytecodeMethod(
+                    *program_, ScriptType{*current}, name, visibleArity)) {
+                return reflected;
+            }
+        }
+        const semantic::SymbolId baseId = current->baseTypeId != 0
+            ? current->baseTypeId
+            : (!current->baseTypeName.empty()
+                   ? semantic::stableTypeId(current->baseTypeName)
+                   : 0);
+        current = findTypeById(baseId);
     }
-    for (const auto& property : type.descriptor.properties) {
-        if (property.getter && property.getter->name == name) {
-            ScriptMethod candidate{*property.getter};
-            if (candidate.visibleArity() == visibleArity) return candidate;
-        }
-        if (property.setter && property.setter->name == name) {
-            ScriptMethod candidate{*property.setter};
-            if (candidate.visibleArity() == visibleArity) return candidate;
-        }
-    }
-    // Bytecode format 0.5 preserved class layout but did not persist the
-    // TypeSymbol method lists. Productized .rsbc modules still retain each
-    // lowered function's owner-qualified name, receiver TypeId and signature,
-    // which is sufficient to reconstruct an instance method descriptor without
-    // changing the bytecode wire format or invalidating existing modules.
-    return program_
-        ? reflectedBytecodeMethod(*program_, type, name, visibleArity)
-        : std::nullopt;
+    return std::nullopt;
 }
 
 std::optional<ScriptMethod> ScriptRuntime::findConstructor(
@@ -161,12 +170,39 @@ std::optional<ScriptMethod> ScriptRuntime::findConstructor(
     return std::nullopt;
 }
 
-std::optional<ScriptObject> ScriptRuntime::createObject(
+semantic::SymbolId ScriptRuntime::nativeBaseTypeId(
+    const ScriptType& type) const noexcept {
+    if (type.descriptor.kind != semantic::TypeKind::Class ||
+        type.descriptor.fields.empty() ||
+        type.descriptor.fields.front().type != semantic::PrimitiveType::Handle) {
+        return 0;
+    }
+    if (type.descriptor.fields.front().declaringTypeId != 0) {
+        return type.descriptor.fields.front().declaringTypeId;
+    }
+    semantic::SymbolId candidateId = type.descriptor.id;
+    std::unordered_set<semantic::SymbolId> visited;
+    const semantic::TypeSymbol* current = &type.descriptor;
+    while (current && visited.insert(current->id).second) {
+        if (!current->fields.empty() &&
+            current->fields.front().type == semantic::PrimitiveType::Handle) {
+            candidateId = current->id;
+        }
+        const semantic::SymbolId baseId = current->baseTypeId != 0
+            ? current->baseTypeId
+            : (!current->baseTypeName.empty()
+                   ? semantic::stableTypeId(current->baseTypeName)
+                   : 0);
+        current = findTypeById(baseId);
+    }
+    return candidateId;
+}
+
+std::optional<ScriptObject> ScriptRuntime::allocateUninitializedObject(
     const ScriptType& type,
-    const std::vector<runtime::Value>& constructorArguments,
-    runtime::RuntimeError& error,
-    runtime::ExecutionOptions options) const {
-    if (!program_ || type.descriptor.kind != semantic::TypeKind::Class) {
+    runtime::RuntimeError& error) const {
+    if (!program_ || type.descriptor.kind != semantic::TypeKind::Class ||
+        type.descriptor.staticType) {
         error.code = runtime::ErrorCode::TypeMismatch;
         error.message = "script object creation requires a valid class type";
         return std::nullopt;
@@ -179,7 +215,73 @@ std::optional<ScriptObject> ScriptRuntime::createObject(
         const auto& field = type.descriptor.fields[index];
         const auto fieldTypeId = exactTypeId(field.type, field.typeName);
         std::unordered_set<semantic::SymbolId> visiting;
-        fields.push_back(defaultValue(field.type, fieldTypeId, visiting));
+        runtime::Value initialValue = defaultValue(field.type, fieldTypeId, visiting);
+        if (!field.staticField && !field.constField && field.hasConstantValue) {
+            if (std::holds_alternative<std::int64_t>(field.constantValue)) {
+                const auto raw = std::get<std::int64_t>(field.constantValue);
+                switch (field.type) {
+                case semantic::PrimitiveType::Byte:
+                    initialValue = runtime::ByteValue{static_cast<std::uint8_t>(raw)};
+                    break;
+                case semantic::PrimitiveType::SByte:
+                    initialValue = runtime::SByteValue{static_cast<std::int8_t>(raw)};
+                    break;
+                case semantic::PrimitiveType::Short:
+                    initialValue = runtime::ShortValue{static_cast<std::int16_t>(raw)};
+                    break;
+                case semantic::PrimitiveType::UShort:
+                    initialValue = runtime::UShortValue{static_cast<std::uint16_t>(raw)};
+                    break;
+                case semantic::PrimitiveType::Int:
+                    initialValue = raw;
+                    break;
+                case semantic::PrimitiveType::UInt:
+                    initialValue = runtime::UIntValue{static_cast<std::uint32_t>(raw)};
+                    break;
+                case semantic::PrimitiveType::Long:
+                    initialValue = runtime::LongValue{raw};
+                    break;
+                case semantic::PrimitiveType::ULong:
+                    initialValue = runtime::ULongValue{static_cast<std::uint64_t>(raw)};
+                    break;
+                case semantic::PrimitiveType::Char:
+                    initialValue = runtime::CharValue{static_cast<char16_t>(raw)};
+                    break;
+                case semantic::PrimitiveType::Enum:
+                    initialValue = runtime::EnumValue{fieldTypeId, raw};
+                    break;
+                case semantic::PrimitiveType::Float:
+                    initialValue = runtime::FloatValue{static_cast<float>(raw)};
+                    break;
+                case semantic::PrimitiveType::Double:
+                    initialValue = static_cast<double>(raw);
+                    break;
+                default:
+                    break;
+                }
+            } else if (std::holds_alternative<double>(field.constantValue)) {
+                const auto raw = std::get<double>(field.constantValue);
+                if (field.type == semantic::PrimitiveType::Float) {
+                    initialValue = runtime::FloatValue{static_cast<float>(raw)};
+                } else {
+                    initialValue = raw;
+                }
+            } else if (std::holds_alternative<bool>(field.constantValue)) {
+                initialValue = std::get<bool>(field.constantValue);
+            } else if (std::holds_alternative<std::string>(field.constantValue)) {
+                const auto& strVal = std::get<std::string>(field.constantValue);
+                if (heap_) {
+                    if (const auto strRef = heap_->allocateString(strVal, &error)) {
+                        initialValue = *strRef;
+                    } else {
+                        return std::nullopt;
+                    }
+                } else {
+                    initialValue = strVal;
+                }
+            }
+        }
+        fields.push_back(std::move(initialValue));
         if (field.type == semantic::PrimitiveType::String ||
             field.type == semantic::PrimitiveType::Object ||
             field.type == semantic::PrimitiveType::Array) {
@@ -205,14 +307,28 @@ std::optional<ScriptObject> ScriptRuntime::createObject(
         error.message = "failed to retain the new script object";
         return std::nullopt;
     }
-    ScriptObject object{type, *reference, std::move(root)};
+    return ScriptObject{type, *reference, std::move(root)};
+}
 
+bool ScriptRuntime::runObjectConstructor(
+    ScriptObject& object,
+    const std::vector<runtime::Value>& constructorArguments,
+    runtime::RuntimeError& error,
+    runtime::ExecutionOptions options) const {
+    const auto& type = object.type();
+    if (type.descriptor.staticConstructor) {
+        auto cctorExec = invokeSymbol(type.descriptor.staticConstructor->id, {}, options);
+        if (!cctorExec.succeeded) {
+            error = std::move(cctorExec.error);
+            return false;
+        }
+    }
     if (!constructorArguments.empty() || !type.descriptor.constructors.empty()) {
         const auto constructor = findConstructor(type, constructorArguments);
         if (!constructor) {
             error.code = runtime::ErrorCode::InvalidArguments;
             error.message = "no script constructor matches the supplied arguments";
-            return std::nullopt;
+            return false;
         }
         std::vector<runtime::Value> arguments;
         arguments.reserve(constructorArguments.size() + 1);
@@ -223,8 +339,21 @@ std::optional<ScriptObject> ScriptRuntime::createObject(
             constructor->descriptor.id, arguments, std::move(options));
         if (!execution.succeeded) {
             error = std::move(execution.error);
-            return std::nullopt;
+            return false;
         }
+    }
+    return true;
+}
+
+std::optional<ScriptObject> ScriptRuntime::createObject(
+    const ScriptType& type,
+    const std::vector<runtime::Value>& constructorArguments,
+    runtime::RuntimeError& error,
+    runtime::ExecutionOptions options) const {
+    auto object = allocateUninitializedObject(type, error);
+    if (!object) return std::nullopt;
+    if (!runObjectConstructor(*object, constructorArguments, error, std::move(options))) {
+        return std::nullopt;
     }
     return object;
 }
@@ -240,6 +369,225 @@ std::optional<ScriptObject> ScriptRuntime::createObject(
         return std::nullopt;
     }
     return createObject(*type, {}, error, std::move(options));
+}
+
+std::optional<ScriptObject> ScriptRuntime::createPrototypeObject(
+    const ScriptType& type,
+    runtime::RuntimeError& error) const {
+    if (nativeBaseTypeId(type) == 0) {
+        runtime::RuntimeError ctorError;
+        if (auto obj = createObject(type, {}, ctorError)) {
+            return obj;
+        }
+    }
+    return allocateUninitializedObject(type, error);
+}
+
+bool ScriptRuntime::isNativeAlive(const ScriptObject& object) const noexcept {
+    if (!object.valid() || !heap_ || !nativeHandles_ ||
+        object.type().descriptor.fields.empty() ||
+        object.type().descriptor.fields.front().type !=
+            semantic::PrimitiveType::Handle) {
+        return false;
+    }
+    const auto field = heap_->fieldGet(object.reference(), 0);
+    if (!field) return false;
+    const auto* handle = std::get_if<runtime::NativeHandle>(&*field);
+    if (!handle || !handle->valid()) return false;
+    return nativeHandles_->isAlive(*handle);
+}
+
+bool ScriptRuntime::releaseNative(ScriptObject& object) const noexcept {
+    if (!object.valid() || !heap_ || !nativeHandles_ ||
+        object.type().descriptor.fields.empty() ||
+        object.type().descriptor.fields.front().type !=
+            semantic::PrimitiveType::Handle) {
+        return false;
+    }
+    const auto field = heap_->fieldGet(object.reference(), 0);
+    if (!field) return false;
+    const auto* handle = std::get_if<runtime::NativeHandle>(&*field);
+    if (!handle || !handle->valid()) return false;
+    return nativeHandles_->release(*handle);
+}
+
+bool ScriptRuntime::isTypeAssignable(
+    semantic::SymbolId actualTypeId,
+    semantic::SymbolId expectedTypeId) const noexcept {
+    if (expectedTypeId == 0 || actualTypeId == expectedTypeId) return true;
+    if (actualTypeId == 0 || !program_) return false;
+
+    std::unordered_set<semantic::SymbolId> visited;
+    const semantic::TypeSymbol* current = findTypeById(actualTypeId);
+    while (current && visited.insert(current->id).second) {
+        if (current->id == expectedTypeId) return true;
+        for (const auto& iface : current->interfaceDispatchMaps) {
+            if (iface.interfaceTypeId == expectedTypeId) return true;
+        }
+        const semantic::SymbolId baseId = current->baseTypeId != 0
+            ? current->baseTypeId
+            : (!current->baseTypeName.empty()
+                   ? semantic::stableTypeId(current->baseTypeName)
+                   : 0);
+        if (baseId == expectedTypeId) return true;
+        current = findTypeById(baseId);
+    }
+
+    const auto* actualDesc = findTypeById(actualTypeId);
+    const auto* expectedDesc = findTypeById(expectedTypeId);
+    if (actualDesc && expectedDesc && program_) {
+        const auto actualCanonical = semantic::canonicalTypeName(*actualDesc);
+        const auto expectedCanonical = semantic::canonicalTypeName(*expectedDesc);
+        for (const auto& module : program_->modules()) {
+            for (const auto& impl : module.languageMetadata.interfaces) {
+                if (impl.typeName != actualCanonical &&
+                    impl.typeName != actualDesc->name) {
+                    continue;
+                }
+                for (const auto& ifaceName : impl.interfaces) {
+                    if (ifaceName == expectedCanonical ||
+                        ifaceName == expectedDesc->name) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+void ScriptRuntime::replaceProgram(const GameProgram& program) {
+    program_ = program.program();
+    if (program.bindings()) {
+        bindings_ = program.bindings();
+    }
+    interpreter_ = runtime::Interpreter(program_, heap_);
+    interpreter_.setBindingRegistry(bindings_);
+    clearNativeBackend();
+    if (remoteDebugger_) {
+        remoteDebugger_->rebindProgram(program_);
+    } else if (debugger_ && program_) {
+        debugger_->bindProgram(*program_);
+    }
+}
+
+void ScriptRuntime::setDebugger(std::shared_ptr<debug::DebugController> debugger) noexcept {
+    debugger_ = std::move(debugger);
+    if (debugger_ && program_) {
+        debugger_->bindProgram(*program_);
+    }
+}
+
+bool ScriptRuntime::startRemoteDebugger(
+    std::uint16_t port,
+    const std::string& bindAddress) {
+    if (!remoteDebugger_) {
+        remoteDebugger_ = std::make_shared<debug::EmbeddedDapServer>(program_, heap_);
+    } else {
+        remoteDebugger_->rebindProgram(program_);
+    }
+    if (!remoteDebugger_->start(port, bindAddress)) {
+        return false;
+    }
+    debugger_ = remoteDebugger_->controller();
+    return true;
+}
+
+void ScriptRuntime::stopRemoteDebugger() noexcept {
+    if (remoteDebugger_) {
+        if (debugger_ == remoteDebugger_->controller()) {
+            debugger_.reset();
+        }
+        remoteDebugger_->stop();
+        remoteDebugger_.reset();
+    }
+}
+
+std::uint16_t ScriptRuntime::remoteDebuggerPort() const noexcept {
+    return remoteDebugger_ ? remoteDebugger_->boundPort() : 0;
+}
+
+void ScriptRuntime::setAotBackend(const aot::ProgramDescriptor* descriptor) {
+    jitModule_.reset();
+    if (!descriptor) {
+        nativeProgram_.reset();
+        backend_ = ScriptExecutionBackend::Interpreter;
+        return;
+    }
+    nativeProgram_ = std::make_shared<aot::Program>(*descriptor);
+    nativeProgram_->setBindings(bindings_);
+    nativeProgram_->setHeap(heap_);
+    backend_ = ScriptExecutionBackend::Aot;
+}
+
+void ScriptRuntime::setJitBackend(std::shared_ptr<jit::Module> jitModule) {
+    if (!jitModule || !jitModule->valid() || !jitModule->descriptor()) {
+        clearNativeBackend();
+        return;
+    }
+    jitModule_ = std::move(jitModule);
+    jitModule_->setBindings(bindings_);
+    jitModule_->setHeap(heap_);
+    nativeProgram_ = std::make_shared<aot::Program>(*jitModule_->descriptor());
+    nativeProgram_->setBindings(bindings_);
+    nativeProgram_->setHeap(heap_);
+    backend_ = ScriptExecutionBackend::Jit;
+}
+
+void ScriptRuntime::clearNativeBackend() noexcept {
+    jitModule_.reset();
+    nativeProgram_.reset();
+    backend_ = ScriptExecutionBackend::Interpreter;
+}
+
+std::optional<ScriptObject> ScriptRuntime::createAsset(
+    const std::string& assetPath,
+    const std::string& canonicalTypeName,
+    runtime::RuntimeError& error,
+    const std::map<std::string, runtime::Value>& initialFields) {
+    if (assetPath.empty()) {
+        error.code = runtime::ErrorCode::InvalidArguments;
+        error.message = "asset path must not be empty";
+        return std::nullopt;
+    }
+    auto obj = createObject(canonicalTypeName, error);
+    if (!obj) return std::nullopt;
+    for (const auto& [fieldName, fieldVal] : initialFields) {
+        if (!setMember(*obj, fieldName, fieldVal, error)) {
+            return std::nullopt;
+        }
+    }
+    if (const auto validateMethod = findMethod(obj->type(), "OnValidate", 0)) {
+        const auto valExec = invoke(*obj, *validateMethod);
+        if (!valExec.succeeded) {
+            error = valExec.error;
+            return std::nullopt;
+        }
+    }
+    if (heap_) {
+        // Retain another root referencing the exact same ObjectRef in assets_ registry
+        auto assetRoot = heap_->retain(obj->reference());
+        if (assetRoot.valid()) {
+            assets_.insert_or_assign(
+                assetPath,
+                ScriptObject{obj->type(), obj->reference(), std::move(assetRoot)});
+        }
+    }
+    return obj;
+}
+
+ScriptObject* ScriptRuntime::findAsset(const std::string& assetPath) {
+    const auto it = assets_.find(assetPath);
+    return it != assets_.end() ? &it->second : nullptr;
+}
+
+const ScriptObject* ScriptRuntime::findAsset(const std::string& assetPath) const {
+    const auto it = assets_.find(assetPath);
+    return it != assets_.end() ? &it->second : nullptr;
+}
+
+bool ScriptRuntime::unloadAsset(const std::string& assetPath) {
+    return assets_.erase(assetPath) != 0;
 }
 
 } // namespace realscript::game

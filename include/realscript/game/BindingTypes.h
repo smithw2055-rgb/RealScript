@@ -2,6 +2,7 @@
 
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
+#include "realscript/game/DeterministicMath.h"
 #include "realscript/runtime/Runtime.h"
 
 #include <algorithm>
@@ -33,6 +34,7 @@ enum class ScriptTypeCategory {
     Long,
     Double,
     String,
+    Struct,
     NativeObject,
 };
 
@@ -52,6 +54,9 @@ struct FunctionDeclaration {
     ScriptTypeRef returnType;
     std::vector<ParameterDeclaration> parameters;
     std::string body;
+    runtime::BindingDeterminism determinism =
+        runtime::BindingDeterminism::Deterministic;
+    std::string requiredCapability;
 };
 
 struct PropertyDeclaration {
@@ -172,6 +177,16 @@ std::optional<ScriptTypeRef> resolveScriptType(
         std::is_same_v<ValueType, std::string> ||
         std::is_same_v<ValueType, std::string_view>) {
         return ScriptTypeRef{"string", {}, ScriptTypeCategory::String};
+    } else if constexpr (std::is_same_v<ValueType, Fixed>) {
+        return ScriptTypeRef{"Fixed", "RealScript.Math", ScriptTypeCategory::Struct};
+    } else if constexpr (std::is_same_v<ValueType, Fixed16>) {
+        return ScriptTypeRef{"Fixed16", "RealScript.Math", ScriptTypeCategory::Struct};
+    } else if constexpr (std::is_same_v<ValueType, Vec2>) {
+        return ScriptTypeRef{"Vec2", "RealScript.Math", ScriptTypeCategory::Struct};
+    } else if constexpr (std::is_same_v<ValueType, Vec3>) {
+        return ScriptTypeRef{"Vec3", "RealScript.Math", ScriptTypeCategory::Struct};
+    } else if constexpr (std::is_same_v<ValueType, Quat>) {
+        return ScriptTypeRef{"Quat", "RealScript.Math", ScriptTypeCategory::Struct};
     } else if constexpr (IsSharedPtr<ValueType>::value) {
         using Element = typename IsSharedPtr<ValueType>::Element;
         const auto found = state->nativeTypeByCppType.find(std::type_index(typeid(Element)));

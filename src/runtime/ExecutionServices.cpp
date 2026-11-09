@@ -119,15 +119,29 @@ void hashValue(
     } else if (const auto* v = std::get_if<EnumValue>(&value)) {
         hashScalar(hash, v->typeId);
         hashScalar(hash, v->value);
+    } else if (const auto* v = std::get_if<FixedValue>(&value)) {
+        hashScalar(hash, v->raw);
+    } else if (const auto* v = std::get_if<Fixed16Value>(&value)) {
+        hashScalar(hash, v->raw);
+    } else if (const auto* v = std::get_if<Vec2Value>(&value)) {
+        hashScalar(hash, v->x);
+        hashScalar(hash, v->y);
+    } else if (const auto* v = std::get_if<Vec3Value>(&value)) {
+        hashScalar(hash, v->x);
+        hashScalar(hash, v->y);
+        hashScalar(hash, v->z);
+    } else if (const auto* v = std::get_if<QuatValue>(&value)) {
+        hashScalar(hash, v->x);
+        hashScalar(hash, v->y);
+        hashScalar(hash, v->z);
+        hashScalar(hash, v->w);
     } else if (const auto* v = std::get_if<StructValue>(&value)) {
         hashScalar(hash, v->typeId);
-        const auto count = v->storage
-            ? static_cast<std::uint64_t>(v->storage->fields.size())
-            : 0;
+        const auto count = static_cast<std::uint64_t>(v->fieldCount());
         hashScalar(hash, count);
-        if (v->storage) {
-            for (const auto& field : v->storage->fields) {
-                hashValue(hash, field, canonicalizeFloatingPoint);
+        for (std::size_t i = 0; i < v->fieldCount(); ++i) {
+            if (const auto f = structValueFieldAt(*v, i)) {
+                hashValue(hash, *f, canonicalizeFloatingPoint);
             }
         }
     } else if (const auto* v = std::get_if<std::string>(&value)) {
@@ -149,7 +163,7 @@ bool replayStable(const Value& value) noexcept {
         return false;
     }
     if (const auto* structure = std::get_if<StructValue>(&value)) {
-        if (!structure->storage) return true;
+        if (structure->isInline || !structure->storage) return true;
         return std::all_of(
             structure->storage->fields.begin(),
             structure->storage->fields.end(),
@@ -159,7 +173,7 @@ bool replayStable(const Value& value) noexcept {
 }
 
 std::uint64_t argumentsHash(
-    const std::vector<Value>& arguments,
+    ValueSpan arguments,
     bool canonicalizeFloatingPoint) noexcept {
     auto hash = FnvOffset;
     const auto count = static_cast<std::uint64_t>(arguments.size());
@@ -319,24 +333,44 @@ bool DeterminismSession::invokeExternal(
     const BindingRegistry* bindings,
     const ExternalFunction* fallback,
     const bytecode::FunctionReference& reference,
-    const std::vector<Value>& arguments,
+    ValueSpan arguments,
     std::optional<Value>& result,
     RuntimeError& error) {
     if (!impl_) return false;
     const auto mode = impl_->options.mode;
     auto policy = BindingDeterminism::NonDeterministic;
+    std::string requiredCapability;
     const ExternalFunction* function = fallback;
+    bool resolvedFromRegistry = false;
     if (bindings) {
         if (const auto resolved = bindings->resolve(reference)) {
             function = resolved->function;
             policy = resolved->determinism;
+            requiredCapability = resolved->requiredCapability;
+            resolvedFromRegistry = true;
         }
     }
-    const auto argumentHash = argumentsHash(
-        arguments, impl_->options.canonicalizeFloatingPoint);
-    hashScalar(impl_->digest, reference.symbolId);
-    hashString(impl_->digest, reference.name);
-    hashScalar(impl_->digest, argumentHash);
+    if (impl_->options.enforceCapabilities) {
+        if (!resolvedFromRegistry && function && *function) {
+            requiredCapability = "Host.UnregisteredExternal";
+        }
+        if (!requiredCapability.empty() &&
+            impl_->options.grantedCapabilities.find(requiredCapability) ==
+                impl_->options.grantedCapabilities.end()) {
+            error.code = ErrorCode::CapabilityDenied;
+            error.message = "external function '" + reference.name +
+                "' requires capability '" + requiredCapability + "'";
+            return false;
+        }
+    }
+    std::uint64_t argumentHash = 0;
+    if (mode != DeterminismMode::Off) {
+        argumentHash = argumentsHash(
+            arguments, impl_->options.canonicalizeFloatingPoint);
+        hashScalar(impl_->digest, reference.symbolId);
+        hashString(impl_->digest, reference.name);
+        hashScalar(impl_->digest, argumentHash);
+    }
 
     if (mode == DeterminismMode::Strict &&
         policy != BindingDeterminism::Deterministic) {
@@ -422,13 +456,17 @@ bool DeterminismSession::invokeExternal(
     }
     if (!succeeded) {
         error = std::move(invocationError);
-        hashScalar(impl_->digest, static_cast<std::uint16_t>(error.code));
-        hashString(impl_->digest, error.message);
+        if (mode != DeterminismMode::Off) {
+            hashScalar(impl_->digest, static_cast<std::uint16_t>(error.code));
+            hashString(impl_->digest, error.message);
+        }
         return false;
     }
     result = std::move(invocationResult);
-    hashValue(impl_->digest, *result,
-                impl_->options.canonicalizeFloatingPoint);
+    if (mode != DeterminismMode::Off) {
+        hashValue(impl_->digest, *result,
+            impl_->options.canonicalizeFloatingPoint);
+    }
     return true;
 }
 
@@ -544,6 +582,71 @@ std::string profileToJson(const ExecutionProfile& profile) {
             << ",\"maximumCallDepth\":" << function.maximumCallDepth
             << '}';
     }
+    out << "]}";
+    return out.str();
+}
+
+std::string exportChromeTraceJson(
+    const ExecutionProfile& profile,
+    const GcStatistics* gcStatistics) {
+    std::ostringstream out;
+    out << "{\"traceEvents\":[";
+    bool first = true;
+    const auto comma = [&] {
+        if (!first) out << ',';
+        first = false;
+    };
+
+    comma();
+    out << "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1,"
+        << "\"args\":{\"name\":\"RealScript VM\"}}";
+    comma();
+    out << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1,"
+        << "\"args\":{\"name\":\"Script Main Thread\"}}";
+
+    std::uint64_t cursorUs = 0;
+    for (const auto& function : profile.functions) {
+        const std::uint64_t durationUs = std::max<std::uint64_t>(
+            1,
+            function.instructions + function.externalCalls * 2 + function.gcSteps * 5);
+        const std::string name = function.function.empty()
+            ? "<runtime>"
+            : escapeJson(function.function);
+        comma();
+        out << "{\"name\":\"" << name << "\",\"cat\":\"script\",\"ph\":\"X\","
+            << "\"pid\":1,\"tid\":1,\"ts\":" << cursorUs
+            << ",\"dur\":" << durationUs
+            << ",\"args\":{\"calls\":" << function.calls
+            << ",\"returns\":" << function.returns
+            << ",\"instructions\":" << function.instructions
+            << ",\"branches\":" << function.branches
+            << ",\"externalCalls\":" << function.externalCalls
+            << ",\"gcSteps\":" << function.gcSteps
+            << ",\"runtimeErrors\":" << function.runtimeErrors
+            << ",\"maximumCallDepth\":" << function.maximumCallDepth
+            << "}}";
+        cursorUs += durationUs;
+    }
+
+    if (gcStatistics) {
+        comma();
+        out << "{\"name\":\"GC Memory\",\"cat\":\"gc\",\"ph\":\"C\","
+            << "\"pid\":1,\"tid\":1,\"ts\":" << cursorUs
+            << ",\"args\":{\"liveBytes\":" << gcStatistics->liveBytes
+            << ",\"peakLiveBytes\":" << gcStatistics->peakLiveBytes
+            << ",\"bytesAllocated\":" << gcStatistics->bytesAllocated
+            << ",\"bytesReclaimed\":" << gcStatistics->bytesReclaimed
+            << "}}";
+        comma();
+        out << "{\"name\":\"GC Objects\",\"cat\":\"gc\",\"ph\":\"C\","
+            << "\"pid\":1,\"tid\":1,\"ts\":" << cursorUs
+            << ",\"args\":{\"liveObjects\":" << gcStatistics->liveObjects
+            << ",\"objectsAllocated\":" << gcStatistics->objectsAllocated
+            << ",\"objectsReclaimed\":" << gcStatistics->objectsReclaimed
+            << ",\"collectionsCompleted\":" << gcStatistics->collectionsCompleted
+            << "}}";
+    }
+
     out << "]}";
     return out.str();
 }

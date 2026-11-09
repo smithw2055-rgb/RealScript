@@ -12,6 +12,7 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(IntegerLiteralToken);
         RS_KIND(FloatLiteralToken);
         RS_KIND(StringLiteralToken);
+        RS_KIND(InterpolatedStringToken);
         RS_KIND(PlusToken);
         RS_KIND(PlusEqualsToken);
         RS_KIND(MinusToken);
@@ -73,6 +74,8 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(DelegateKeyword);
         RS_KIND(EventKeyword);
         RS_KIND(StaticKeyword);
+        RS_KIND(ConstKeyword);
+        RS_KIND(ReadonlyKeyword);
         RS_KIND(PublicKeyword);
         RS_KIND(PrivateKeyword);
         RS_KIND(ProtectedKeyword);
@@ -212,6 +215,8 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"delegate", SyntaxKind::DelegateKeyword},
         {"event", SyntaxKind::EventKeyword},
         {"static", SyntaxKind::StaticKeyword},
+        {"const", SyntaxKind::ConstKeyword},
+        {"readonly", SyntaxKind::ReadonlyKeyword},
         {"public", SyntaxKind::PublicKeyword},
         {"private", SyntaxKind::PrivateKeyword},
         {"protected", SyntaxKind::ProtectedKeyword},
@@ -296,6 +301,8 @@ int binaryPrecedence(SyntaxKind kind) noexcept {
 bool isDeclarationModifier(SyntaxKind kind) noexcept {
     switch (kind) {
     case SyntaxKind::StaticKeyword:
+    case SyntaxKind::ConstKeyword:
+    case SyntaxKind::ReadonlyKeyword:
     case SyntaxKind::PublicKeyword:
     case SyntaxKind::PrivateKeyword:
     case SyntaxKind::ProtectedKeyword:

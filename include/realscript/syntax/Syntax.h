@@ -19,6 +19,7 @@ enum class SyntaxKind {
     IntegerLiteralToken,
     FloatLiteralToken,
     StringLiteralToken,
+    InterpolatedStringToken,
 
     PlusToken,
     PlusEqualsToken,
@@ -82,6 +83,8 @@ enum class SyntaxKind {
     DelegateKeyword,
     EventKeyword,
     StaticKeyword,
+    ConstKeyword,
+    ReadonlyKeyword,
     PublicKeyword,
     PrivateKeyword,
     ProtectedKeyword,
@@ -219,6 +222,7 @@ private:
     [[nodiscard]] SyntaxToken lexNumber();
     [[nodiscard]] SyntaxToken lexIdentifierOrKeyword();
     [[nodiscard]] SyntaxToken lexString();
+    [[nodiscard]] SyntaxToken lexInterpolatedString();
     [[nodiscard]] char current() const noexcept;
     [[nodiscard]] char peek(std::size_t offset) const noexcept;
     void advance(std::size_t count = 1) noexcept;
@@ -572,7 +576,12 @@ struct NewArrayExpressionSyntax final : ExpressionSyntax {
     TypeSyntax elementType;
     SyntaxToken openBracketToken;
     std::unique_ptr<ExpressionSyntax> length;
+    bool explicitLength = false;
     SyntaxToken closeBracketToken;
+    std::optional<SyntaxToken> initializerOpenBraceToken;
+    std::vector<std::unique_ptr<ExpressionSyntax>> initialValues;
+    std::vector<SyntaxToken> initializerCommaTokens;
+    std::optional<SyntaxToken> initializerCloseBraceToken;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::NewArrayExpression; }
     [[nodiscard]] text::TextSpan span() const noexcept override;
@@ -627,11 +636,20 @@ struct ForStatementSyntax final : StatementSyntax {
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
+struct ForeachBindingSyntax {
+    std::optional<SyntaxToken> modifierToken;
+    TypeSyntax type;
+    SyntaxToken identifierToken;
+};
+
 struct ForeachStatementSyntax final : StatementSyntax {
     SyntaxToken foreachKeyword;
     SyntaxToken openParenToken;
+    std::optional<SyntaxToken> modifierToken;
     TypeSyntax type;
     SyntaxToken identifierToken;
+    std::vector<SyntaxToken> bindingCommaTokens;
+    std::vector<ForeachBindingSyntax> additionalBindings;
     SyntaxToken inKeyword;
     std::unique_ptr<ExpressionSyntax> collection;
     SyntaxToken closeParenToken;
@@ -713,6 +731,8 @@ struct YieldWaitStatementSyntax final : StatementSyntax {
     SyntaxToken waitTicksToken;
     SyntaxToken openParenToken;
     std::unique_ptr<ExpressionSyntax> delay;
+    std::optional<SyntaxToken> commaToken;
+    std::unique_ptr<ExpressionSyntax> secondArgument;
     SyntaxToken closeParenToken;
     SyntaxToken semicolonToken;
 
@@ -748,6 +768,7 @@ struct EventSubscriptionStatementSyntax final : StatementSyntax {
 };
 
 struct VariableDeclarationStatementSyntax final : StatementSyntax {
+    std::optional<SyntaxToken> constKeyword;
     std::optional<SyntaxToken> refKeyword;
     TypeSyntax type;
     SyntaxToken identifierToken;
@@ -820,6 +841,8 @@ struct FieldDeclarationSyntax final : SyntaxNode {
     std::vector<SyntaxToken> modifiers;
     TypeSyntax type;
     SyntaxToken identifierToken;
+    std::optional<SyntaxToken> equalsToken;
+    std::unique_ptr<ExpressionSyntax> initializer;
     SyntaxToken semicolonToken;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::FieldDeclaration; }
@@ -882,6 +905,9 @@ struct PropertyDeclarationSyntax final : SyntaxNode {
     std::unique_ptr<AccessorDeclarationSyntax> getter;
     std::unique_ptr<AccessorDeclarationSyntax> setter;
     SyntaxToken closeBraceToken;
+    std::optional<SyntaxToken> equalsToken;
+    std::unique_ptr<ExpressionSyntax> initializer;
+    std::optional<SyntaxToken> semicolonToken;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::PropertyDeclaration; }
     [[nodiscard]] text::TextSpan span() const noexcept override;
@@ -1080,6 +1106,7 @@ struct SequenceDeclarationSyntax final : SyntaxNode {
 };
 
 struct ModuleDeclarationSyntax final : SyntaxNode {
+    std::vector<AttributeListSyntax> attributes;
     SyntaxToken moduleKeyword;
     std::vector<SyntaxToken> nameParts;
     std::vector<SyntaxToken> dotTokens;
@@ -1229,6 +1256,7 @@ private:
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parsePostfixExpression();
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseCallExpression();
     [[nodiscard]] std::unique_ptr<ExpressionSyntax> parseNewExpression();
+    [[nodiscard]] std::unique_ptr<NewArrayExpressionSyntax> parseBraceArrayInitializer(const TypeSyntax& arrayType);
     void parseArgumentList(
         std::vector<std::unique_ptr<ExpressionSyntax>>& arguments,
         std::vector<std::optional<SyntaxToken>>* argumentModifiers,

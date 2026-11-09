@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -72,12 +73,15 @@ struct DelegateDeclarationInput {
 using DelegateMap = std::map<std::string, DelegateContract>;
 
 struct ParsedUnit {
-    std::unique_ptr<text::SourceText> source;
-    std::unique_ptr<syntax::CompilationUnitSyntax> syntaxTree;
+    std::shared_ptr<text::SourceText> source;
+    std::shared_ptr<syntax::CompilationUnitSyntax> syntaxTree;
     std::string moduleName;
     std::vector<std::string> imports;
+    std::vector<diagnostics::Diagnostic> parseDiagnostics;
     std::uint64_t sourceFingerprint = 0;
     bool invalid = false;
+    bool deterministic = false;
+    bool hasGenericSyntax = false;
 };
 
 struct ModuleWork {
@@ -95,9 +99,28 @@ struct ModuleWork {
     std::vector<semantic::FunctionSymbol> declarations;
     std::vector<semantic::FunctionBindingInput> functionBindings;
     std::uint64_t sourceFingerprint = 0;
+    std::uint64_t transitiveSourceFingerprint = 0;
     std::uint64_t publicFingerprint = 0;
     std::uint64_t dependencyFingerprint = 0;
     bool invalid = false;
+    bool deterministic = false;
+    bool frontendCached = false;
+    bool neededByDirtyModule = false;
+};
+
+struct CachedModuleFrontend {
+    std::uint64_t sourceFingerprint = 0;
+    std::uint64_t transitiveSourceFingerprint = 0;
+    std::uint64_t publicFingerprint = 0;
+    std::uint64_t dependencyFingerprint = 0;
+    std::vector<semantic::TypeSymbol> types;
+    InterfaceMap interfaces;
+    DelegateMap delegates;
+    std::vector<semantic::FunctionSymbol> declarations;
+    std::vector<LanguageAttributeRecord> nativeAttributes;
+    std::vector<LanguageSequenceRecord> nativeSequences;
+    std::vector<LanguageInterfaceImplementation> nativeInterfaces;
+    std::vector<std::shared_ptr<syntax::CompilationUnitSyntax>> keptSyntaxTrees;
 };
 
 #include "NativeGenerics.inl"
@@ -353,6 +376,7 @@ semantic::FunctionSymbol makeSequenceFunction(
     result.ownerTypeId = owner.id;
     result.returnType = semantic::PrimitiveType::Void;
     result.method = true;
+    result.deterministic = owner.deterministic;
     result.sourceName = sourceName;
     result.declarationSpan = sequence.identifierToken.span;
     result.bodySpan = sequence.body.span();
@@ -834,6 +858,80 @@ std::optional<semantic::FieldSymbol> makeSequenceLocalField(
     semantic::PrimitiveType type = semantic::resolvePrimitiveType(
         declaration.type.name.text);
     std::string typeName;
+    if (declaration.type.name.text == "var" && declaration.initializer) {
+        std::function<void(const syntax::ExpressionSyntax&)> inferVar;
+        inferVar = [&](const syntax::ExpressionSyntax& expr) {
+            switch (expr.kind()) {
+            case syntax::SyntaxKind::LiteralExpression: {
+                const auto& lit = static_cast<const syntax::LiteralExpressionSyntax&>(expr);
+                switch (lit.literalToken.kind) {
+                case syntax::SyntaxKind::TrueKeyword:
+                case syntax::SyntaxKind::FalseKeyword:
+                    type = semantic::PrimitiveType::Bool;
+                    return;
+                case syntax::SyntaxKind::StringLiteralToken:
+                    type = semantic::PrimitiveType::String;
+                    return;
+                case syntax::SyntaxKind::IntegerLiteralToken: {
+                    const auto& txt = lit.literalToken.text;
+                    type = (!txt.empty() && (txt.back() == 'L' || txt.back() == 'l'))
+                        ? semantic::PrimitiveType::Long
+                        : semantic::PrimitiveType::Int;
+                    return;
+                }
+                case syntax::SyntaxKind::FloatLiteralToken: {
+                    const auto& txt = lit.literalToken.text;
+                    type = (!txt.empty() && (txt.back() == 'f' || txt.back() == 'F'))
+                        ? semantic::PrimitiveType::Float
+                        : semantic::PrimitiveType::Double;
+                    return;
+                }
+                default:
+                    return;
+                }
+            }
+            case syntax::SyntaxKind::ParenthesizedExpression:
+                inferVar(*static_cast<const syntax::ParenthesizedExpressionSyntax&>(expr).expression);
+                return;
+            case syntax::SyntaxKind::UnaryExpression:
+                inferVar(*static_cast<const syntax::UnaryExpressionSyntax&>(expr).operand);
+                return;
+            case syntax::SyntaxKind::BinaryExpression: {
+                const auto& bin = static_cast<const syntax::BinaryExpressionSyntax&>(expr);
+                inferVar(*bin.left);
+                return;
+            }
+            case syntax::SyntaxKind::NewObjectExpression: {
+                const auto& nw = static_cast<const syntax::NewObjectExpressionSyntax&>(expr);
+                const auto found = visibleTypes.find(nw.type.name.text);
+                if (found != visibleTypes.end()) {
+                    type = found->second.kind == semantic::TypeKind::Struct
+                        ? semantic::PrimitiveType::Struct
+                        : (found->second.kind == semantic::TypeKind::Enum
+                            ? semantic::PrimitiveType::Enum
+                            : semantic::PrimitiveType::Object);
+                    typeName = semantic::canonicalTypeName(found->second);
+                }
+                return;
+            }
+            case syntax::SyntaxKind::CallExpression: {
+                const auto& call = static_cast<const syntax::CallExpressionSyntax&>(expr);
+                if (call.identifierToken.text == "FixedFromInt" ||
+                    call.identifierToken.text == "FixedFromRatio") {
+                    const auto found = visibleTypes.find("Fixed");
+                    if (found != visibleTypes.end()) {
+                        type = semantic::PrimitiveType::Struct;
+                        typeName = semantic::canonicalTypeName(found->second);
+                    }
+                }
+                return;
+            }
+            default:
+                return;
+            }
+        };
+        inferVar(*declaration.initializer);
+    }
     if (type == semantic::PrimitiveType::Error) {
         const auto found = visibleTypes.find(declaration.type.name.text);
         if (found == visibleTypes.end()) {
@@ -1042,6 +1140,9 @@ std::string typeSignature(const semantic::TypeSymbol& type) {
     for (const auto& constructor : type.constructors) {
         out << "ctor:" << semantic::canonicalFunctionSignature(constructor) << ';';
     }
+    if (type.staticConstructor) {
+        out << "cctor:" << semantic::canonicalFunctionSignature(*type.staticConstructor) << ';';
+    }
     for (const auto& method : type.methods) {
         out << "method:" << (method.staticMethod ? "static:" : "instance:")
             << semantic::canonicalFunctionSignature(method);
@@ -1239,6 +1340,34 @@ public class Math {
         }
         return ans;
     }
+
+    public static Fixed Pi() {
+        return new Fixed(804);
+    }
+
+    public static Fixed HalfPi() {
+        return new Fixed(402);
+    }
+
+    public static Fixed TwoPi() {
+        return new Fixed(1608);
+    }
+
+    public static Fixed Sin(Fixed radians) {
+        return Fixed.Sin(radians);
+    }
+
+    public static Fixed Cos(Fixed radians) {
+        return Fixed.Cos(radians);
+    }
+
+    public static Fixed Atan2(Fixed y, Fixed x) {
+        return Fixed.Atan2(y, x);
+    }
+
+    public static Fixed Lerp(Fixed a, Fixed b, Fixed t) {
+        return Fixed.Lerp(a, b, t);
+    }
 }
 
 public struct Fixed {
@@ -1258,6 +1387,18 @@ public struct Fixed {
 
     public static Fixed Half() {
         return new Fixed(128);
+    }
+
+    public static Fixed Pi() {
+        return new Fixed(804);
+    }
+
+    public static Fixed HalfPi() {
+        return new Fixed(402);
+    }
+
+    public static Fixed TwoPi() {
+        return new Fixed(1608);
     }
 
     public static Fixed Raw(int rawValue) {
@@ -1313,6 +1454,35 @@ public struct Fixed {
     public static Fixed Sqrt(Fixed v) {
         if (v.raw <= 0) return new Fixed(0);
         return new Fixed((int)Math.Sqrt64((long)v.raw * 256));
+    }
+
+    public static Fixed Sin(Fixed radians) {
+        int r = radians.raw % 1608;
+        if (r > 804) r = r - 1608;
+        if (r < -804) r = r + 1608;
+        int absR = r < 0 ? -r : r;
+        long y0 = ((long)r * (long)(804 - absR) * 262144) / (804 * 804);
+        long absY0 = y0 < 0 ? -y0 : y0;
+        long y = (y0 * 775 + ((y0 * absY0) / 65536) * 225) / 1000;
+        return new Fixed((int)(y / 256));
+    }
+
+    public static Fixed Cos(Fixed radians) {
+        return Fixed.Sin(new Fixed(radians.raw + 402));
+    }
+
+    public static Fixed Atan2(Fixed y, Fixed x) {
+        if (x.raw == 0 && y.raw == 0) return new Fixed(0);
+        long ax = x.raw < 0 ? -(long)x.raw : (long)x.raw;
+        long ay = y.raw < 0 ? -(long)y.raw : (long)y.raw;
+        long mn = ax < ay ? ax : ay;
+        long mx = ax > ay ? ax : ay;
+        long z = (mn * 65536) / mx;
+        long angle = (201 * z + (70 * z * (65536 - z)) / 65536) / 65536;
+        if (ay > ax) angle = 402 - angle;
+        if (x.raw < 0) angle = 804 - angle;
+        if (y.raw < 0) angle = -angle;
+        return new Fixed((int)angle);
     }
 
     public static Fixed operator +(Fixed a) {
@@ -1447,6 +1617,18 @@ public struct Fixed16 {
         return new Fixed16(32768);
     }
 
+    public static Fixed16 Pi() {
+        return new Fixed16(205887);
+    }
+
+    public static Fixed16 HalfPi() {
+        return new Fixed16(102944);
+    }
+
+    public static Fixed16 TwoPi() {
+        return new Fixed16(411775);
+    }
+
     public static Fixed16 Raw(int rawValue) {
         return new Fixed16(rawValue);
     }
@@ -1500,6 +1682,35 @@ public struct Fixed16 {
     public static Fixed16 Sqrt(Fixed16 v) {
         if (v.raw <= 0) return new Fixed16(0);
         return new Fixed16((int)Math.Sqrt64((long)v.raw * 65536));
+    }
+
+    public static Fixed16 Sin(Fixed16 radians) {
+        int r = radians.raw % 411775;
+        if (r > 205887) r = r - 411775;
+        if (r < -205887) r = r + 411775;
+        int absR = r < 0 ? -r : r;
+        long y0 = (((long)r * (long)(205887 - absR)) / 205887) * 262144 / 205887;
+        long absY0 = y0 < 0 ? -y0 : y0;
+        long y = (y0 * 775 + ((y0 * absY0) / 65536) * 225) / 1000;
+        return new Fixed16((int)y);
+    }
+
+    public static Fixed16 Cos(Fixed16 radians) {
+        return Fixed16.Sin(new Fixed16(radians.raw + 102944));
+    }
+
+    public static Fixed16 Atan2(Fixed16 y, Fixed16 x) {
+        if (x.raw == 0 && y.raw == 0) return new Fixed16(0);
+        long ax = x.raw < 0 ? -(long)x.raw : (long)x.raw;
+        long ay = y.raw < 0 ? -(long)y.raw : (long)y.raw;
+        long mn = ax < ay ? ax : ay;
+        long mx = ax > ay ? ax : ay;
+        long z = (mn * 65536) / mx;
+        long angle = (51472 * z + (17891 * z * (65536 - z)) / 65536) / 65536;
+        if (ay > ax) angle = 102944 - angle;
+        if (x.raw < 0) angle = 205887 - angle;
+        if (y.raw < 0) angle = -angle;
+        return new Fixed16((int)angle);
     }
 
     public static Fixed16 operator +(Fixed16 a) {
@@ -1861,6 +2072,393 @@ public struct Vec3 {
         return a.x != b.x || a.y != b.y || a.z != b.z;
     }
 }
+
+public struct Quat {
+    public Fixed x;
+    public Fixed y;
+    public Fixed z;
+    public Fixed w;
+
+    public Quat(Fixed xVal, Fixed yVal, Fixed zVal, Fixed wVal) {
+        x = xVal;
+        y = yVal;
+        z = zVal;
+        w = wVal;
+    }
+
+    public Quat(int xInt, int yInt, int zInt, int wInt) {
+        x = new Fixed(xInt * 256);
+        y = new Fixed(yInt * 256);
+        z = new Fixed(zInt * 256);
+        w = new Fixed(wInt * 256);
+    }
+
+    public static Quat Identity() {
+        return new Quat(new Fixed(0), new Fixed(0), new Fixed(0), new Fixed(256));
+    }
+
+    public static Quat Raw(int xRaw, int yRaw, int zRaw, int wRaw) {
+        return new Quat(
+            new Fixed(xRaw),
+            new Fixed(yRaw),
+            new Fixed(zRaw),
+            new Fixed(wRaw));
+    }
+
+    public static Quat FromAxisAngle(Vec3 axis, Fixed angle) {
+        Vec3 n = axis.Normalized();
+        Fixed half = angle / 2;
+        Fixed s = Fixed.Sin(half);
+        Fixed c = Fixed.Cos(half);
+        return new Quat(n.x * s, n.y * s, n.z * s, c);
+    }
+
+    public static Quat FromEuler(Fixed pitch, Fixed yaw, Fixed roll) {
+        Fixed hp = pitch / 2;
+        Fixed hy = yaw / 2;
+        Fixed hr = roll / 2;
+        Fixed sp = Fixed.Sin(hp);
+        Fixed cp = Fixed.Cos(hp);
+        Fixed sy = Fixed.Sin(hy);
+        Fixed cy = Fixed.Cos(hy);
+        Fixed sr = Fixed.Sin(hr);
+        Fixed cr = Fixed.Cos(hr);
+        return new Quat(
+            cy * sp * cr + sy * cp * sr,
+            sy * cp * cr - cy * sp * sr,
+            cy * cp * sr - sy * sp * cr,
+            cy * cp * cr + sy * sp * sr);
+    }
+
+    public static Fixed Dot(Quat a, Quat b) {
+        return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+
+    public Fixed LengthSq() {
+        return x * x + y * y + z * z + w * w;
+    }
+
+    public Fixed Length() {
+        long r2 =
+            (long)x.raw * (long)x.raw +
+            (long)y.raw * (long)y.raw +
+            (long)z.raw * (long)z.raw +
+            (long)w.raw * (long)w.raw;
+        return new Fixed((int)Math.Sqrt64(r2));
+    }
+
+    public Quat Normalized() {
+        Fixed len = Length();
+        if (len.raw <= 0) return Quat.Identity();
+        return new Quat(x / len, y / len, z / len, w / len);
+    }
+
+    public Quat Conjugate() {
+        return new Quat(-x, -y, -z, w);
+    }
+
+    public Quat Inverse() {
+        Fixed lsq = LengthSq();
+        if (lsq.raw <= 0) return Quat.Identity();
+        Quat c = Conjugate();
+        return new Quat(c.x / lsq, c.y / lsq, c.z / lsq, c.w / lsq);
+    }
+
+    public Vec3 Rotate(Vec3 v) {
+        Vec3 u = new Vec3(x, y, z);
+        Vec3 uv = Vec3.Cross(u, v);
+        Vec3 uuv = Vec3.Cross(u, uv);
+        return v + (uv * w + uuv) * 2;
+    }
+
+    public static Quat Lerp(Quat a, Quat b, Fixed t) {
+        Quat target = b;
+        if (Quat.Dot(a, b).raw < 0) {
+            target = new Quat(-b.x, -b.y, -b.z, -b.w);
+        }
+        Quat res = new Quat(
+            a.x + (target.x - a.x) * t,
+            a.y + (target.y - a.y) * t,
+            a.z + (target.z - a.z) * t,
+            a.w + (target.w - a.w) * t);
+        return res.Normalized();
+    }
+
+    public static Quat Slerp(Quat a, Quat b, Fixed t) {
+        Quat qa = a.Normalized();
+        Quat qb = b.Normalized();
+        Fixed cosTheta = Quat.Dot(qa, qb);
+        if (cosTheta.raw < 0) {
+            qb = new Quat(-qb.x, -qb.y, -qb.z, -qb.w);
+            cosTheta = -cosTheta;
+        }
+        if (cosTheta.raw >= 250) {
+            return Quat.Lerp(qa, qb, t);
+        }
+        long sin2Raw = 65536 - (long)cosTheta.raw * (long)cosTheta.raw;
+        Fixed sinTheta = new Fixed((int)Math.Sqrt64(sin2Raw > 0 ? sin2Raw : 0));
+        if (sinTheta.raw <= 4) {
+            return Quat.Lerp(qa, qb, t);
+        }
+        Fixed theta = Fixed.Atan2(sinTheta, cosTheta);
+        Fixed s0 = Fixed.Sin((Fixed.One() - t) * theta) / sinTheta;
+        Fixed s1 = Fixed.Sin(t * theta) / sinTheta;
+        Quat res = new Quat(
+            qa.x * s0 + qb.x * s1,
+            qa.y * s0 + qb.y * s1,
+            qa.z * s0 + qb.z * s1,
+            qa.w * s0 + qb.w * s1);
+        return res.Normalized();
+    }
+
+    public static Quat operator *(Quat a, Quat b) {
+        return new Quat(
+            a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z);
+    }
+
+    public static Vec3 operator *(Quat q, Vec3 v) {
+        return q.Rotate(v);
+    }
+
+    public static bool operator ==(Quat a, Quat b) {
+        return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
+    }
+
+    public static bool operator !=(Quat a, Quat b) {
+        return a.x != b.x || a.y != b.y || a.z != b.z || a.w != b.w;
+    }
+}
+
+public Fixed FixedZero() { return Fixed.Zero(); }
+public Fixed FixedOne() { return Fixed.One(); }
+public Fixed FixedHalf() { return Fixed.Half(); }
+public Fixed FixedFromRaw(int rawValue) { return Fixed.Raw(rawValue); }
+public Fixed FixedFromInt(int whole) { return Fixed.Of(whole); }
+public Fixed FixedFromRatio(int num, int den) { return Fixed.Ratio(num, den); }
+public Fixed Pi() { return Fixed.Pi(); }
+public Fixed HalfPi() { return Fixed.HalfPi(); }
+public Fixed TwoPi() { return Fixed.TwoPi(); }
+public Fixed Abs(Fixed v) { return Fixed.Abs(v); }
+public Fixed Sin(Fixed radians) { return Fixed.Sin(radians); }
+public Fixed Cos(Fixed radians) { return Fixed.Cos(radians); }
+public Fixed Atan2(Fixed y, Fixed x) { return Fixed.Atan2(y, x); }
+public Fixed Lerp(Fixed a, Fixed b, Fixed t) { return Fixed.Lerp(a, b, t); }
+public Quat QuatIdentity() { return Quat.Identity(); }
+public Quat QuatFromAxisAngle(Vec3 axis, Fixed angle) { return Quat.FromAxisAngle(axis, angle); }
+public Quat QuatFromEuler(Fixed pitch, Fixed yaw, Fixed roll) { return Quat.FromEuler(pitch, yaw, roll); }
+public Quat QuatNormalize(Quat q) { return q.Normalized(); }
+public Vec3 QuatRotateVec3(Quat q, Vec3 v) { return q.Rotate(v); }
+public Quat QuatLerp(Quat a, Quat b, Fixed t) { return Quat.Lerp(a, b, t); }
+public Quat QuatSlerp(Quat a, Quat b, Fixed t) { return Quat.Slerp(a, b, t); }
+
+public struct Fixed64 {
+    public long raw;
+
+    public Fixed64(long rawValue) {
+        raw = rawValue;
+    }
+
+    public static Fixed64 Zero() {
+        return new Fixed64(0);
+    }
+
+    public static Fixed64 One() {
+        return new Fixed64(4294967296);
+    }
+
+    public static Fixed64 Half() {
+        return new Fixed64(2147483648);
+    }
+
+    public static Fixed64 Raw(long rawValue) {
+        return new Fixed64(rawValue);
+    }
+
+    public static Fixed64 Of(long whole) {
+        return new Fixed64(whole * 4294967296);
+    }
+
+    public long ToInt() {
+        return raw >= 0 ? raw / 4294967296 : (raw - 4294967295) / 4294967296;
+    }
+
+    public static Fixed64 operator +(Fixed64 a, Fixed64 b) {
+        return new Fixed64(a.raw + b.raw);
+    }
+
+    public static Fixed64 operator -(Fixed64 a, Fixed64 b) {
+        return new Fixed64(a.raw - b.raw);
+    }
+
+    public static Fixed64 operator -(Fixed64 a) {
+        return new Fixed64(-a.raw);
+    }
+
+    public static Fixed64 operator *(Fixed64 a, Fixed64 b) {
+        long scale = 4294967296;
+        long aHi = a.raw >= 0 ? a.raw / scale : (a.raw - (scale - 1)) / scale;
+        long aLo = a.raw - aHi * scale;
+        long bHi = b.raw >= 0 ? b.raw / scale : (b.raw - (scale - 1)) / scale;
+        long bLo = b.raw - bHi * scale;
+        long aLoHi = aLo / 65536;
+        long aLoLo = aLo - aLoHi * 65536;
+        long bLoHi = bLo / 65536;
+        long bLoLo = bLo - bLoHi * 65536;
+        long loCarry = (aLoHi * bLoLo + aLoLo * bLoHi + (aLoLo * bLoLo) / 65536) / 65536;
+        long loProd = aLoHi * bLoHi + loCarry;
+        return new Fixed64(aHi * bHi * scale + aHi * bLo + aLo * bHi + loProd);
+    }
+
+    public static Fixed64 operator /(Fixed64 a, Fixed64 b) {
+        if (b.raw == 0) return new Fixed64(0);
+        bool neg = (a.raw < 0) != (b.raw < 0);
+        long ua = a.raw < 0 ? -a.raw : a.raw;
+        long ub = b.raw < 0 ? -b.raw : b.raw;
+        long qHi = ua / ub;
+        long rem = ua - qHi * ub;
+        long qLo = 0;
+        int bit = 0;
+        while (bit < 32) {
+            qLo = qLo * 2;
+            if (rem >= ub - rem) {
+                rem = rem - (ub - rem);
+                qLo = qLo + 1;
+            } else {
+                rem = rem * 2;
+            }
+            bit = bit + 1;
+        }
+        long q = qHi * 4294967296 + qLo;
+        return new Fixed64(neg ? -q : q);
+    }
+
+    public static bool operator ==(Fixed64 a, Fixed64 b) {
+        return a.raw == b.raw;
+    }
+
+    public static bool operator !=(Fixed64 a, Fixed64 b) {
+        return a.raw != b.raw;
+    }
+
+    public static bool operator <(Fixed64 a, Fixed64 b) {
+        return a.raw < b.raw;
+    }
+
+    public static bool operator <=(Fixed64 a, Fixed64 b) {
+        return a.raw <= b.raw;
+    }
+
+    public static bool operator >(Fixed64 a, Fixed64 b) {
+        return a.raw > b.raw;
+    }
+
+    public static bool operator >=(Fixed64 a, Fixed64 b) {
+        return a.raw >= b.raw;
+    }
+}
+
+public struct Vec4 {
+    public Fixed x;
+    public Fixed y;
+    public Fixed z;
+    public Fixed w;
+
+    public Vec4(Fixed xVal, Fixed yVal, Fixed zVal, Fixed wVal) {
+        x = xVal;
+        y = yVal;
+        z = zVal;
+        w = wVal;
+    }
+
+    public static Vec4 Of(int xInt, int yInt, int zInt, int wInt) {
+        return new Vec4(Fixed.Of(xInt), Fixed.Of(yInt), Fixed.Of(zInt), Fixed.Of(wInt));
+    }
+
+    public static Fixed Dot(Vec4 a, Vec4 b) {
+        return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+
+    public Vec3 Xyz() {
+        return new Vec3(x, y, z);
+    }
+}
+
+public struct Transform3D {
+    public Vec3 position;
+    public Quat rotation;
+    public Vec3 scale;
+
+    public Transform3D(Vec3 pos, Quat rot, Vec3 scl) {
+        position = pos;
+        rotation = rot;
+        scale = scl;
+    }
+
+    public static Transform3D Identity() {
+        return new Transform3D(Vec3.Zero(), Quat.Identity(), Vec3.One());
+    }
+
+    public Vec3 TransformPoint(Vec3 localPoint) {
+        Vec3 scaled = new Vec3(
+            localPoint.x * scale.x,
+            localPoint.y * scale.y,
+            localPoint.z * scale.z);
+        return position + rotation.Rotate(scaled);
+    }
+
+    public static Transform3D Combine(Transform3D parent, Transform3D local) {
+        return new Transform3D(
+            parent.TransformPoint(local.position),
+            (parent.rotation * local.rotation).Normalized(),
+            new Vec3(
+                parent.scale.x * local.scale.x,
+                parent.scale.y * local.scale.y,
+                parent.scale.z * local.scale.z));
+    }
+}
+
+public struct AABB {
+    public Vec3 min;
+    public Vec3 max;
+
+    public AABB(Vec3 minVal, Vec3 maxVal) {
+        min = minVal;
+        max = maxVal;
+    }
+
+    public static AABB FromCenterExtents(Vec3 center, Vec3 extents) {
+        return new AABB(center - extents, center + extents);
+    }
+
+    public bool Contains(Vec3 p) {
+        return p.x >= min.x && p.x <= max.x &&
+               p.y >= min.y && p.y <= max.y &&
+               p.z >= min.z && p.z <= max.z;
+    }
+
+    public bool Intersects(AABB other) {
+        return min.x <= other.max.x && max.x >= other.min.x &&
+               min.y <= other.max.y && max.y >= other.min.y &&
+               min.z <= other.max.z && max.z >= other.min.z;
+    }
+}
+
+public struct Ray {
+    public Vec3 origin;
+    public Vec3 direction;
+
+    public Ray(Vec3 orig, Vec3 dir) {
+        origin = orig;
+        direction = dir;
+    }
+
+    public Vec3 At(Fixed t) {
+        return origin + direction * t;
+    }
+}
 )RS";
     return kSource;
 }
@@ -1900,28 +2498,64 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     std::vector<std::unique_ptr<ParsedUnit>> units;
     std::map<std::string, ModuleWork> modules;
 
+    static std::mutex sParsedUnitCacheMutex;
+    static std::unordered_map<std::uint64_t, ParsedUnit> sParsedUnitCache;
+    static std::mutex sModuleFrontendCacheMutex;
+    static std::unordered_map<std::string, CachedModuleFrontend> sModuleFrontendCache;
+
     const auto addSourceUnit = [&](const SourceFile& sourceFile) {
+        const auto fp = stableFingerprint(sourceFile.path + "\n" + sourceFile.content);
         auto unit = std::make_unique<ParsedUnit>();
-        unit->source = std::make_unique<text::SourceText>(sourceFile.content, sourceFile.path);
-        diagnostics::DiagnosticBag parseDiagnostics;
-        syntax::Parser parser(*unit->source, parseDiagnostics);
-        unit->syntaxTree = std::make_unique<syntax::CompilationUnitSyntax>(
-            parser.parseCompilationUnit());
-        unit->moduleName = unit->syntaxTree->moduleDeclaration
-            ? unit->syntaxTree->moduleDeclaration->fullName()
-            : "$global";
-        unit->sourceFingerprint = stableFingerprint(sourceFile.path + "\n" + sourceFile.content);
-        for (const auto& import : unit->syntaxTree->imports) {
-            unit->imports.push_back(import.fullName());
+        bool cacheHit = false;
+        {
+            std::lock_guard<std::mutex> lock(sParsedUnitCacheMutex);
+            const auto found = sParsedUnitCache.find(fp);
+            if (found != sParsedUnitCache.end() &&
+                found->second.source &&
+                found->second.source->name() == sourceFile.path) {
+                *unit = found->second;
+                cacheHit = true;
+            }
         }
-        for (const auto& diagnostic : parseDiagnostics.items()) {
+        if (!cacheHit) {
+            unit->source = std::make_shared<text::SourceText>(sourceFile.content, sourceFile.path);
+            diagnostics::DiagnosticBag parseDiagnostics;
+            syntax::Parser parser(*unit->source, parseDiagnostics);
+            unit->syntaxTree = std::make_shared<syntax::CompilationUnitSyntax>(
+                parser.parseCompilationUnit());
+            unit->moduleName = unit->syntaxTree->moduleDeclaration
+                ? unit->syntaxTree->moduleDeclaration->fullName()
+                : "$global";
+            unit->sourceFingerprint = fp;
+            for (const auto& import : unit->syntaxTree->imports) {
+                unit->imports.push_back(import.fullName());
+            }
+            unit->parseDiagnostics = parseDiagnostics.items();
+            unit->invalid = parseDiagnostics.hasErrors();
+            if (unit->syntaxTree->moduleDeclaration) {
+                for (const auto& list : unit->syntaxTree->moduleDeclaration->attributes) {
+                    for (const auto& attr : list.attributes) {
+                        if (attr.nameToken.text == "Deterministic") {
+                            unit->deterministic = true;
+                        }
+                    }
+                }
+            }
+            unit->hasGenericSyntax = (sourceFile.content.find('<') != std::string::npos);
+            {
+                std::lock_guard<std::mutex> lock(sParsedUnitCacheMutex);
+                if (sParsedUnitCache.size() > 8192) sParsedUnitCache.clear();
+                sParsedUnitCache[fp] = *unit;
+            }
+        }
+        for (const auto& diagnostic : unit->parseDiagnostics) {
             result.diagnostics.report(
                 diagnostic.code, diagnostic.message, diagnostic.span,
                 diagnostic.severity, sourceFile.path);
         }
-        unit->invalid = parseDiagnostics.hasErrors();
         auto& module = modules[unit->moduleName];
         module.name = unit->moduleName;
+        if (unit->deterministic) module.deterministic = true;
         module.units.push_back(unit.get());
         module.invalid = module.invalid || unit->invalid;
         module.imports.insert(unit->imports.begin(), unit->imports.end());
@@ -1956,18 +2590,123 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
 
     specializeNativeGenerics(units, modules, result);
 
-    // Stable source order and named-type shells.
-    for (auto& moduleEntry : modules) {
-        const auto& moduleName = moduleEntry.first;
-        auto& module = moduleEntry.second;
+    // Stable source order, source fingerprints, and incremental module frontend cache check.
+    for (auto& [moduleName, module] : modules) {
+        (void)moduleName;
         std::sort(module.units.begin(), module.units.end(),
             [](const ParsedUnit* left, const ParsedUnit* right) {
                 return left->source->name() < right->source->name();
             });
         std::uint64_t sourceFingerprint = 14695981039346656037ull;
+        for (const auto* unit : module.units) {
+            sourceFingerprint = combineFingerprint(sourceFingerprint, unit->sourceFingerprint);
+        }
+        module.sourceFingerprint = sourceFingerprint;
+    }
+
+    if (result.nativeGenericInstantiations.empty()) {
+        std::unordered_map<std::string, int> fpState;
+        std::function<std::uint64_t(const std::string&)> computeTransitiveFp =
+            [&](const std::string& modName) -> std::uint64_t {
+            const auto it = modules.find(modName);
+            if (it == modules.end() || it->second.invalid) return 0;
+            const int st = fpState[modName];
+            if (st == 1) return 0;
+            if (st == 2) return it->second.transitiveSourceFingerprint;
+            fpState[modName] = 1;
+            std::uint64_t tfp = combineFingerprint(
+                it->second.sourceFingerprint,
+                stableFingerprint(modName + (it->second.deterministic ? ":det" : ":std")));
+            for (const auto& imp : it->second.imports) {
+                const auto impFp = computeTransitiveFp(imp);
+                if (impFp == 0) {
+                    fpState[modName] = 2;
+                    it->second.transitiveSourceFingerprint = 0;
+                    return 0;
+                }
+                tfp = combineFingerprint(tfp, impFp);
+            }
+            fpState[modName] = 2;
+            it->second.transitiveSourceFingerprint = tfp;
+            return tfp;
+        };
+        for (auto& [moduleName, module] : modules) {
+            (void)module;
+            (void)computeTransitiveFp(moduleName);
+        }
+        if (previous) {
+            std::lock_guard<std::mutex> lock(sModuleFrontendCacheMutex);
+            for (auto& [moduleName, module] : modules) {
+                if (moduleName == "$global" || module.invalid || module.transitiveSourceFingerprint == 0) continue;
+                const auto prevIt = previous->modules.find(moduleName);
+                if (prevIt == previous->modules.end() ||
+                    prevIt->second.sourceFingerprint != module.sourceFingerprint) {
+                    continue;
+                }
+                const std::string cacheKey =
+                    moduleName + "#" + std::to_string(module.transitiveSourceFingerprint);
+                const auto fcIt = sModuleFrontendCache.find(cacheKey);
+                if (fcIt == sModuleFrontendCache.end() ||
+                    fcIt->second.transitiveSourceFingerprint != module.transitiveSourceFingerprint ||
+                    fcIt->second.sourceFingerprint != module.sourceFingerprint ||
+                    fcIt->second.publicFingerprint != prevIt->second.publicFingerprint ||
+                    fcIt->second.dependencyFingerprint != prevIt->second.dependencyFingerprint) {
+                    continue;
+                }
+                module.frontendCached = true;
+                module.publicFingerprint = fcIt->second.publicFingerprint;
+                module.dependencyFingerprint = fcIt->second.dependencyFingerprint;
+                result.nativeAttributes.insert(
+                    result.nativeAttributes.end(),
+                    fcIt->second.nativeAttributes.begin(),
+                    fcIt->second.nativeAttributes.end());
+                result.nativeSequences.insert(
+                    result.nativeSequences.end(),
+                    fcIt->second.nativeSequences.begin(),
+                    fcIt->second.nativeSequences.end());
+                result.nativeInterfaces.insert(
+                    result.nativeInterfaces.end(),
+                    fcIt->second.nativeInterfaces.begin(),
+                    fcIt->second.nativeInterfaces.end());
+            }
+            // Mark frontendCached modules that are transitively imported by any non-frontendCached module
+            std::vector<std::string> dirtyQueue;
+            for (const auto& [moduleName, module] : modules) {
+                if (!module.frontendCached) {
+                    for (const auto& imp : module.imports) dirtyQueue.push_back(imp);
+                }
+            }
+            while (!dirtyQueue.empty()) {
+                auto curr = std::move(dirtyQueue.back());
+                dirtyQueue.pop_back();
+                auto it = modules.find(curr);
+                if (it == modules.end() || it->second.neededByDirtyModule) continue;
+                it->second.neededByDirtyModule = true;
+                for (const auto& imp : it->second.imports) dirtyQueue.push_back(imp);
+            }
+            for (auto& [moduleName, module] : modules) {
+                if (module.frontendCached && module.neededByDirtyModule) {
+                    const std::string cacheKey =
+                        moduleName + "#" + std::to_string(module.transitiveSourceFingerprint);
+                    const auto& fc = sModuleFrontendCache.at(cacheKey);
+                    module.types = fc.types;
+                    module.interfaces = fc.interfaces;
+                    module.delegates = fc.delegates;
+                    module.declarations = fc.declarations;
+                }
+            }
+        }
+    }
+
+    // Stable source order and named-type shells.
+    for (auto& moduleEntry : modules) {
+        const auto& moduleName = moduleEntry.first;
+        auto& module = moduleEntry.second;
+        if (module.frontendCached) continue;
         std::unordered_set<std::string> typeNames;
         const auto addShell = [&](auto const& syntaxNode, auto declare) {
             auto type = declare(moduleName, syntaxNode);
+            if (module.deterministic) type.deterministic = true;
             if (!typeNames.insert(type.name).second) {
                 result.diagnostics.report(
                     "RS4004", "duplicate type '" + type.name + "'",
@@ -1979,7 +2718,6 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             module.types.push_back(std::move(type));
         };
         for (const auto* unit : module.units) {
-            sourceFingerprint = combineFingerprint(sourceFingerprint, unit->sourceFingerprint);
             for (const auto& node : unit->syntaxTree->classes) {
                 if (!node.typeParameters.empty()) continue;
                 const auto before = module.types.size();
@@ -2069,16 +2807,17 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     DelegateDeclarationInput{&node, unit->source->name()});
             }
         }
-        module.sourceFingerprint = sourceFingerprint;
     }
 
     for (auto& [name, module] : modules) {
         (void)name;
+        if (module.frontendCached) continue;
         refreshVisibleTypes(modules, module);
     }
 
     // Resolve native interface contracts after all named type shells exist.
     for (auto& [moduleName, module] : modules) {
+        if (module.frontendCached) continue;
         for (const auto& input : module.interfaceInputs) {
             if (!input.syntax) continue;
             InterfaceContract contract;
@@ -2161,16 +2900,19 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     }
     for (auto& [name, module] : modules) {
         (void)name;
+        if (module.frontendCached) continue;
         refreshVisibleInterfaces(modules, module);
     }
     resolveClassInheritance(modules, result);
     for (auto& [name, module] : modules) {
         (void)name;
+        if (module.frontendCached) continue;
         refreshVisibleTypes(modules, module);
     }
 
     // Resolve native delegate contracts after all named type shells exist.
     for (auto& [moduleName, module] : modules) {
+        if (module.frontendCached) continue;
         for (const auto& input : module.delegateInputs) {
             if (!input.syntax) continue;
             DelegateContract contract;
@@ -2275,35 +3017,15 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     }
     for (auto& [name, module] : modules) {
         (void)name;
+        if (module.frontendCached) continue;
         refreshVisibleDelegates(modules, module);
     }
 
-    // Resolve all field layouts and enum values before declaring member signatures.
+    // Resolve all enum values first, then field layouts and cross-type constants.
     for (auto& [moduleName, module] : modules) {
         (void)moduleName;
+        if (module.frontendCached) continue;
         for (const auto* unit : module.units) {
-            for (const auto& node : unit->syntaxTree->classes) {
-                if (!node.typeParameters.empty()) continue;
-                auto* type = findOwnType(module, node.identifierToken.text);
-                if (!type || !semantic::populateTypeFields(
-                        *type, node, module.visibleTypes, result.diagnostics)) {
-                    module.invalid = true;
-                } else {
-                    type->sourceName = unit->source->name();
-                    for (auto& field : type->fields) field.sourceName = unit->source->name();
-                }
-            }
-            for (const auto& node : unit->syntaxTree->structs) {
-                if (!node.typeParameters.empty()) continue;
-                auto* type = findOwnType(module, node.identifierToken.text);
-                if (!type || !semantic::populateTypeFields(
-                        *type, node, module.visibleTypes, result.diagnostics)) {
-                    module.invalid = true;
-                } else {
-                    type->sourceName = unit->source->name();
-                    for (auto& field : type->fields) field.sourceName = unit->source->name();
-                }
-            }
             for (const auto& node : unit->syntaxTree->enums) {
                 auto* type = findOwnType(module, node.identifierToken.text);
                 if (!type || !semantic::populateEnumMembers(
@@ -2316,7 +3038,86 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             }
         }
     }
+    for (auto& [moduleName, module] : modules) {
+        (void)moduleName;
+        if (module.frontendCached) continue;
+        refreshVisibleTypes(modules, module);
+    }
+    for (auto& [moduleName, module] : modules) {
+        (void)moduleName;
+        if (module.frontendCached) continue;
+        for (const auto* unit : module.units) {
+            for (const auto& node : unit->syntaxTree->classes) {
+                if (!node.typeParameters.empty()) continue;
+                auto* type = findOwnType(module, node.identifierToken.text);
+                if (!type || !semantic::populateTypeFields(
+                        *type, node, module.visibleTypes, result.diagnostics, true)) {
+                    module.invalid = true;
+                } else {
+                    type->sourceName = unit->source->name();
+                    for (auto& field : type->fields) field.sourceName = unit->source->name();
+                }
+            }
+            for (const auto& node : unit->syntaxTree->structs) {
+                if (!node.typeParameters.empty()) continue;
+                auto* type = findOwnType(module, node.identifierToken.text);
+                if (!type || !semantic::populateTypeFields(
+                        *type, node, module.visibleTypes, result.diagnostics, true)) {
+                    module.invalid = true;
+                } else {
+                    type->sourceName = unit->source->name();
+                    for (auto& field : type->fields) field.sourceName = unit->source->name();
+                }
+            }
+        }
+    }
     applyInheritedFieldLayouts(modules, result);
+    {
+        bool constProgressed = true;
+        while (constProgressed) {
+            constProgressed = false;
+            for (auto& [moduleName, module] : modules) {
+                (void)moduleName;
+                if (module.frontendCached) continue;
+                bool moduleProgressed = false;
+                for (auto& type : module.types) {
+                    if (type.kind != semantic::TypeKind::Class &&
+                        type.kind != semantic::TypeKind::Struct) {
+                        continue;
+                    }
+                    if (semantic::resolveConstantFieldsPass(type, module.visibleTypes)) {
+                        moduleProgressed = true;
+                        constProgressed = true;
+                    }
+                }
+                if (moduleProgressed) {
+                    refreshVisibleTypes(modules, module);
+                }
+            }
+            if (constProgressed) {
+                for (auto& [moduleName, module] : modules) {
+                    (void)moduleName;
+                    if (module.frontendCached) continue;
+                    refreshVisibleTypes(modules, module);
+                }
+            }
+        }
+        for (auto& [moduleName, module] : modules) {
+            (void)moduleName;
+            if (module.frontendCached) continue;
+            for (auto& type : module.types) {
+                if (type.kind != semantic::TypeKind::Class &&
+                    type.kind != semantic::TypeKind::Struct) {
+                    continue;
+                }
+                if (!semantic::validateConstantFields(
+                        type, module.visibleTypes, result.diagnostics)) {
+                    module.invalid = true;
+                }
+            }
+            refreshVisibleTypes(modules, module);
+        }
+    }
 
     // Declare free functions before member signatures. Member declarations
     // are then processed in one global inheritance order so file and module
@@ -2326,6 +3127,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         ModuleWork& module,
         semantic::FunctionBindingInput binding,
         text::TextSpan span) {
+        if (module.deterministic && !binding.symbol.nonDeterministic) {
+            binding.symbol.deterministic = true;
+        }
         const auto key = semantic::canonicalFunctionKey(binding.symbol);
         auto& keys = functionKeys[module.name];
         if (!keys.insert(key).second) {
@@ -2340,6 +3144,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     };
 
     for (auto& [moduleName, module] : modules) {
+        if (module.frontendCached) continue;
         for (const auto* unit : module.units) {
             for (const auto& functionSyntax : unit->syntaxTree->functions) {
                 if (!functionSyntax.typeParameters.empty()) continue;
@@ -2370,10 +3175,24 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         return;
                     }
                     auto owner = *ownerPointer;
+                    const semantic::TypeSymbol* base = nullptr;
                     if (!owner.baseTypeName.empty()) {
-                        const auto* base = findGlobalType(
+                        base = findGlobalType(
                             modules, owner.baseTypeName);
                         if (base) {
+                            module.visibleTypes[base->name] = *base;
+                            module.visibleTypes[semantic::canonicalTypeName(*base)] = *base;
+                            std::vector<semantic::FieldSymbol> ownFields;
+                            for (const auto& f : owner.fields) {
+                                if (f.declaringTypeId == owner.id) {
+                                    ownFields.push_back(f);
+                                }
+                            }
+                            owner.fields = base->fields;
+                            for (auto& f : ownFields) {
+                                f.index = owner.fields.size();
+                                owner.fields.push_back(f);
+                            }
                             owner.methods = base->methods;
                             owner.virtualDispatchTable =
                                 base->virtualDispatchTable;
@@ -2437,6 +3256,17 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         binding.symbol = semantic::declareFunctionSymbol(
                             moduleName, methodSyntax, module.visibleTypes,
                             result.diagnostics, &owner);
+                        if (owner.staticType && !binding.symbol.staticMethod) {
+                            result.diagnostics.report(
+                                "RS2489",
+                                "cannot declare instance method '" +
+                                    methodSyntax.identifierToken.text +
+                                    "' in static class '" + owner.name + "'",
+                                methodSyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
+                            module.invalid = true;
+                        }
                         const auto plannedVirtualSlot =
                             plannedVirtualSlots.find(binding.symbol.id);
                         if (plannedVirtualSlot !=
@@ -2471,6 +3301,18 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             sequence.identifierToken.text);
                     }
                     for (const auto& sequenceSyntax : typeSyntax.sequences) {
+                        if (owner.staticType) {
+                            result.diagnostics.report(
+                                "RS2489",
+                                "cannot declare sequence method '" +
+                                    sequenceSyntax.identifierToken.text +
+                                    "' in static class '" + owner.name + "'",
+                                sequenceSyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
+                            module.invalid = true;
+                            return;
+                        }
                         if (owner.kind == semantic::TypeKind::Struct) {
                             result.diagnostics.report(
                                 "RS2491",
@@ -3041,6 +3883,18 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             true,
                             unit->source->name(),
                             sequenceParameterTypes);
+                        bool seqDeterministic = module.deterministic || owner.deterministic;
+                        for (const auto& list : sequenceSyntax.attributes) {
+                            for (const auto& attr : list.attributes) {
+                                if (attr.nameToken.text == "Deterministic") {
+                                    seqDeterministic = true;
+                                }
+                            }
+                        }
+                        entry.deterministic = seqDeterministic;
+                        for (auto& cb : callbacks) {
+                            cb.deterministic = seqDeterministic;
+                        }
                         semantic::FunctionBindingInput entryBinding;
                         entryBinding.symbol = entry;
                         entryBinding.sourceName = unit->source->name();
@@ -3225,6 +4079,18 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         result.nativeSequences.push_back(std::move(record));
                     }
                     for (const auto& constructorSyntax : typeSyntax.constructors) {
+                        const bool isStaticCtor = semantic::hasModifier(
+                            constructorSyntax.modifiers, syntax::SyntaxKind::StaticKeyword);
+                        if (owner.staticType && !isStaticCtor) {
+                            result.diagnostics.report(
+                                "RS2489",
+                                "static class '" + owner.name +
+                                    "' cannot declare instance constructors",
+                                constructorSyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
+                            module.invalid = true;
+                        }
                         semantic::FunctionBindingInput binding;
                         binding.symbol = semantic::declareConstructorSymbol(
                             moduleName, constructorSyntax, owner,
@@ -3233,10 +4099,24 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         binding.symbol.sourceName = binding.sourceName;
                         binding.body = &constructorSyntax.body;
                         binding.constructorSyntax = &constructorSyntax;
-                        binding.parameterNames.push_back("this");
-                        binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
-                        appendParameters(binding, constructorSyntax.parameters);
-                        owner.constructors.push_back(binding.symbol);
+                        if (!binding.symbol.staticMethod) {
+                            binding.parameterNames.push_back("this");
+                            binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                            appendParameters(binding, constructorSyntax.parameters);
+                            owner.constructors.push_back(binding.symbol);
+                        } else {
+                            if (owner.staticConstructor.has_value()) {
+                                result.diagnostics.report(
+                                    "RS2497",
+                                    "type '" + owner.name +
+                                        "' cannot declare more than one static constructor",
+                                    constructorSyntax.identifierToken.span,
+                                    diagnostics::DiagnosticSeverity::Error,
+                                    unit->source->name());
+                                module.invalid = true;
+                            }
+                            owner.staticConstructor = binding.symbol;
+                        }
                         addBinding(module, std::move(binding), constructorSyntax.identifierToken.span);
                     }
                     for (const auto& propertySyntax : typeSyntax.properties) {
@@ -3256,6 +4136,17 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         auto property = semantic::declarePropertySymbol(
                             moduleName, propertySyntax, owner,
                             module.visibleTypes, result.diagnostics);
+                        if (owner.staticType && !property.staticProperty) {
+                            result.diagnostics.report(
+                                "RS2489",
+                                "cannot declare instance property '" +
+                                    property.name + "' in static class '" +
+                                    owner.name + "'",
+                                propertySyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
+                            module.invalid = true;
+                        }
                         property.sourceName = unit->source->name();
                         if (property.getter) property.getter->sourceName = unit->source->name();
                         if (property.setter) property.setter->sourceName = unit->source->name();
@@ -3272,14 +4163,29 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             result.diagnostics.report(
                                 "RS2463",
                                 "property accessors cannot mix auto and explicit bodies",
-                                propertySyntax.identifierToken.span);
+                                propertySyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
                             module.invalid = true;
                         }
-                        if (autoProperty && property.staticProperty) {
+                        if (autoProperty && !property.getter) {
                             result.diagnostics.report(
-                                "RS2462",
-                                "auto properties require an instance owner",
-                                propertySyntax.identifierToken.span);
+                                "RS2463",
+                                "auto-implemented properties must declare a get accessor",
+                                propertySyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
+                            module.invalid = true;
+                        }
+                        if (!autoProperty && propertySyntax.initializer) {
+                            result.diagnostics.report(
+                                "RS2465",
+                                "only auto-implemented properties can have initializers",
+                                propertySyntax.equalsToken
+                                    ? propertySyntax.equalsToken->span
+                                    : propertySyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                unit->source->name());
                             module.invalid = true;
                         }
                         if (autoProperty) {
@@ -3289,13 +4195,40 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             backing.type = property.type;
                             backing.typeName = property.typeName;
                             backing.index = owner.fields.size();
+                            backing.declaringTypeId = owner.id;
+                            backing.declaringTypeName = semantic::canonicalTypeName(owner);
                             backing.synthetic = true;
+                            backing.staticField = property.staticProperty;
+                            backing.readonlyField = !property.setter.has_value();
+                            backing.initializerSyntax = propertySyntax.initializer.get();
                             backing.sourceName = unit->source->name();
                             backing.declarationSpan = propertySyntax.identifierToken.span;
                             backing.id = semantic::stableTypeId(
                                 semantic::canonicalTypeName(owner) +
                                 "::field:" + backing.name);
                             owner.fields.push_back(std::move(backing));
+                            if (propertySyntax.initializer) {
+                                module.visibleTypes[owner.name] = owner;
+                                module.visibleTypes[semantic::canonicalTypeName(owner)] = owner;
+                                (void)semantic::resolveConstantFieldsPass(
+                                    owner, module.visibleTypes);
+                                module.visibleTypes[owner.name] = owner;
+                                module.visibleTypes[semantic::canonicalTypeName(owner)] = owner;
+                                diagnostics::DiagnosticBag constDiagnostics;
+                                (void)semantic::validateConstantFields(
+                                    owner, module.visibleTypes, constDiagnostics);
+                                for (const auto& diag : constDiagnostics.items()) {
+                                    result.diagnostics.report(
+                                        diag.code,
+                                        diag.message,
+                                        diag.span,
+                                        diag.severity,
+                                        unit->source->name());
+                                    if (diag.severity == diagnostics::DiagnosticSeverity::Error) {
+                                        module.invalid = true;
+                                    }
+                                }
+                            }
                         }
                         if (property.getter) {
                             semantic::FunctionBindingInput binding;
@@ -3332,6 +4265,114 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             addBinding(module, std::move(binding), propertySyntax.identifierToken.span);
                         }
                         owner.properties.push_back(std::move(property));
+                    }
+                    if (!owner.staticConstructor.has_value()) {
+                        bool hasDynamicStaticFieldInit = false;
+                        for (const auto& field : owner.fields) {
+                            if (field.declaringTypeId == owner.id &&
+                                field.staticField && !field.constField &&
+                                !field.hasConstantValue && field.initializerSyntax) {
+                                hasDynamicStaticFieldInit = true;
+                                break;
+                            }
+                        }
+                        if (hasDynamicStaticFieldInit) {
+                            semantic::FunctionBindingInput binding;
+                            binding.symbol.moduleName = moduleName;
+                            binding.symbol.name = ".cctor";
+                            binding.symbol.ownerTypeName = owner.name;
+                            binding.symbol.ownerTypeId = owner.id;
+                            binding.symbol.declaringTypeId = owner.id;
+                            binding.symbol.declaringTypeName = semantic::canonicalTypeName(owner);
+                            binding.symbol.returnType = semantic::PrimitiveType::Void;
+                            binding.symbol.method = true;
+                            binding.symbol.staticMethod = true;
+                            binding.symbol.constructor = true;
+                            binding.symbol.synthetic = true;
+                            binding.symbol.deterministic = owner.deterministic;
+                            binding.sourceName = unit->source->name();
+                            binding.symbol.sourceName = binding.sourceName;
+                            binding.symbol.id = semantic::stableFunctionId(binding.symbol);
+                            binding.symbol.declarationSpan = typeSyntax.identifierToken.span;
+                            binding.symbol.bodySpan = typeSyntax.identifierToken.span;
+                            owner.staticConstructor = binding.symbol;
+                            addBinding(module, std::move(binding), typeSyntax.identifierToken.span);
+                        }
+                    }
+                    if (owner.kind == semantic::TypeKind::Class &&
+                        !owner.staticType && !owner.interfaceType &&
+                        owner.constructors.empty()) {
+                        bool hasOwnDynamicInstanceFieldInit = false;
+                        for (const auto& field : owner.fields) {
+                            if (field.declaringTypeId == owner.id &&
+                                !field.staticField && !field.constField &&
+                                !field.hasConstantValue && field.initializerSyntax) {
+                                hasOwnDynamicInstanceFieldInit = true;
+                                break;
+                            }
+                        }
+                        bool baseAllowsParameterlessChain = true;
+                        bool baseHasParameterlessCtor = false;
+                        if (base && !base->constructors.empty()) {
+                            baseAllowsParameterlessChain = false;
+                            for (const auto& baseCtor : base->constructors) {
+                                if (baseCtor.staticMethod ||
+                                    baseCtor.accessibility == semantic::Accessibility::Private) {
+                                    continue;
+                                }
+                                bool allDefaulted = true;
+                                for (std::size_t pi = 1; pi < baseCtor.parameters.size(); ++pi) {
+                                    if (!baseCtor.parameters[pi].hasDefaultValue &&
+                                        !baseCtor.parameters[pi].paramsArray) {
+                                        allDefaulted = false;
+                                        break;
+                                    }
+                                }
+                                if (allDefaulted) {
+                                    baseAllowsParameterlessChain = true;
+                                    baseHasParameterlessCtor = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (baseAllowsParameterlessChain &&
+                            (hasOwnDynamicInstanceFieldInit || baseHasParameterlessCtor)) {
+                            semantic::FunctionBindingInput binding;
+                            binding.symbol.moduleName = moduleName;
+                            binding.symbol.name = ".ctor";
+                            binding.symbol.ownerTypeName = owner.name;
+                            binding.symbol.ownerTypeId = owner.id;
+                            binding.symbol.declaringTypeId = owner.id;
+                            binding.symbol.declaringTypeName = semantic::canonicalTypeName(owner);
+                            binding.symbol.returnType = semantic::PrimitiveType::Void;
+                            binding.symbol.method = true;
+                            binding.symbol.staticMethod = false;
+                            binding.symbol.constructor = true;
+                            binding.symbol.synthetic = true;
+                            binding.symbol.accessibility = semantic::Accessibility::Public;
+                            binding.symbol.deterministic = owner.deterministic;
+                            binding.sourceName = unit->source->name();
+                            binding.symbol.sourceName = binding.sourceName;
+                            semantic::VariableSymbol self;
+                            self.name = "this";
+                            self.type = semantic::PrimitiveType::Object;
+                            self.typeName = semantic::canonicalTypeName(owner);
+                            self.index = 0;
+                            self.storageType = self.type;
+                            self.storageTypeName = self.typeName;
+                            self.parameter = true;
+                            self.declarationSpan = typeSyntax.identifierToken.span;
+                            binding.symbol.parameters.push_back(std::move(self));
+                            binding.symbol.id = semantic::stableFunctionId(binding.symbol);
+                            binding.symbol.parameters[0].id = semantic::stableTypeId(
+                                std::to_string(binding.symbol.id) + "::local:0:this");
+                            binding.symbol.declarationSpan = typeSyntax.identifierToken.span;
+                            binding.symbol.bodySpan = typeSyntax.identifierToken.span;
+                            binding.parameterNames.push_back("this");
+                            binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                            owner.constructors.push_back(binding.symbol);
+                            addBinding(module, std::move(binding), typeSyntax.identifierToken.span);
+                        }
                     }
                     if (!typeSyntax.events.empty()) {
                         if (owner.kind == semantic::TypeKind::Struct) {
@@ -3677,6 +4718,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     }
                     validateConcreteClassType(owner, module, result);
                     *ownerPointer = std::move(owner);
+                    module.visibleTypes[ownerPointer->name] = *ownerPointer;
+                    module.visibleTypes[semantic::canonicalTypeName(*ownerPointer)] = *ownerPointer;
             };
 
     struct MemberDeclarationWork {
@@ -3703,6 +4746,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     };
     std::vector<MemberDeclarationWork> memberDeclarations;
     for (auto& [moduleName, module] : modules) {
+        if (module.frontendCached) continue;
         for (const auto* unit : module.units) {
             for (const auto& declaration : unit->syntaxTree->classes) {
                 if (!declaration.typeParameters.empty()) continue;
@@ -3750,6 +4794,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     for (auto& moduleEntry : modules) {
         const auto& moduleName = moduleEntry.first;
         auto& module = moduleEntry.second;
+        if (module.frontendCached) continue;
 
         // Materialize compiler-owned reference boxes. They are real runtime
         // descriptors but synthetic source symbols, so they stay out of the
@@ -4318,6 +5363,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         std::vector<InterfaceOwnerWork> owners;
         for (auto& [moduleName, module] : modules) {
             (void)moduleName;
+            if (module.frontendCached) continue;
             for (auto& type : module.types) {
                 if (type.kind != semantic::TypeKind::Class ||
                     type.interfaceType) {
@@ -4451,6 +5497,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         }
         for (auto& [moduleName, module] : modules) {
             (void)moduleName;
+            if (module.frontendCached) continue;
             refreshVisibleTypes(modules, module);
 
             // The module fingerprint was calculated before global inherited
@@ -4486,6 +5533,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         std::unordered_map<std::string, StructOwner> structs;
         for (auto& [moduleName, module] : modules) {
             (void)moduleName;
+            if (module.frontendCached && !module.neededByDirtyModule) continue;
             for (const auto& type : module.types) {
                 if (type.kind == semantic::TypeKind::Struct) {
                     structs.emplace(
@@ -4503,7 +5551,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             colors[name] = 1;
             stack.push_back(name);
             for (const auto& field : found->second.type->fields) {
-                if (field.type != semantic::PrimitiveType::Struct ||
+                if (field.staticField ||
+                    field.constField ||
+                    field.type != semantic::PrimitiveType::Struct ||
                     field.typeName.empty()) {
                     continue;
                 }
@@ -4539,10 +5589,12 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     // Member tables are part of the visible type descriptors.
     for (auto& [name, module] : modules) {
         (void)name;
+        if (module.frontendCached) continue;
         refreshVisibleTypes(modules, module);
     }
 
     for (auto& [moduleName, module] : modules) {
+        if (module.frontendCached) continue;
         std::ostringstream dependencies;
         for (const auto& importedModule : module.imports) {
             const auto imported = modules.find(importedModule);
@@ -4557,6 +5609,49 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 << imported->second.publicFingerprint << '\n';
         }
         module.dependencyFingerprint = stableFingerprint(dependencies.str());
+    }
+
+    if (result.nativeGenericInstantiations.empty()) {
+        std::lock_guard<std::mutex> lock(sModuleFrontendCacheMutex);
+        if (sModuleFrontendCache.size() > 4096) sModuleFrontendCache.clear();
+        for (const auto& [moduleName, module] : modules) {
+            if (moduleName == "$global" || module.frontendCached || module.invalid || module.transitiveSourceFingerprint == 0) {
+                continue;
+            }
+            CachedModuleFrontend fc;
+            fc.sourceFingerprint = module.sourceFingerprint;
+            fc.transitiveSourceFingerprint = module.transitiveSourceFingerprint;
+            fc.publicFingerprint = module.publicFingerprint;
+            fc.dependencyFingerprint = module.dependencyFingerprint;
+            fc.types = module.types;
+            fc.interfaces = module.interfaces;
+            fc.delegates = module.delegates;
+            fc.declarations = module.declarations;
+            for (const auto* u : module.units) {
+                if (u && u->syntaxTree) {
+                    fc.keptSyntaxTrees.push_back(u->syntaxTree);
+                }
+            }
+            const std::string prefix = moduleName + "::";
+            for (const auto& attr : result.nativeAttributes) {
+                if (attr.target == moduleName || attr.target.rfind(prefix, 0) == 0) {
+                    fc.nativeAttributes.push_back(attr);
+                }
+            }
+            for (const auto& seq : result.nativeSequences) {
+                if (seq.typeName.rfind(prefix, 0) == 0) {
+                    fc.nativeSequences.push_back(seq);
+                }
+            }
+            for (const auto& impl : result.nativeInterfaces) {
+                if (impl.typeName.rfind(prefix, 0) == 0) {
+                    fc.nativeInterfaces.push_back(impl);
+                }
+            }
+            const std::string cacheKey =
+                moduleName + "#" + std::to_string(module.transitiveSourceFingerprint);
+            sModuleFrontendCache[cacheKey] = std::move(fc);
+        }
     }
 
     for (auto& [moduleName, module] : modules) {
@@ -4582,10 +5677,10 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 continue;
             }
         }
-        if (module.invalid) {
-            result.buildInfo.push_back(buildInfo);
-            continue;
-        }
+        // Even if a syntax error occurred (such as an incomplete trailing '.' during editing),
+        // still run the semantic binder to collect symbol occurrences for IDE/LSP services,
+        // and only skip MIR lowering if errors remain.
+        const bool hadSyntaxError = module.invalid;
 
         semantic::FunctionOverloadMap visibleFunctions;
         for (const auto& function : module.declarations) {
@@ -4628,8 +5723,31 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         auto semanticModel = binder.bindModule(bindingInput);
         result.symbols.insert(result.symbols.end(),
             semanticModel.occurrences.begin(), semanticModel.occurrences.end());
-        if (moduleDiagnostics.hasErrors()) {
+        if (hadSyntaxError || moduleDiagnostics.hasErrors()) {
             result.diagnostics.append(moduleDiagnostics);
+            for (const auto& t : bindingInput.types) {
+                if (t.moduleName == moduleName) {
+                    mir::Module partialMod;
+                    partialMod.name = moduleName;
+                    for (const auto& [visName, visType] : module.visibleTypes) {
+                        (void)visName;
+                        if (visType.moduleName == moduleName) {
+                            const bool dup = std::any_of(
+                                partialMod.types.begin(),
+                                partialMod.types.end(),
+                                [&](const semantic::TypeSymbol& ex) { return ex.id == visType.id; });
+                            if (!dup) partialMod.types.push_back(visType);
+                        }
+                    }
+                    for (std::size_t sourceIndex = 0; sourceIndex < module.units.size(); ++sourceIndex) {
+                        partialMod.sourceFiles.push_back(makeSourceFileInfo(
+                            *module.units[sourceIndex]->source,
+                            static_cast<debug::SourceFileId>(sourceIndex)));
+                    }
+                    result.modules.push_back(std::move(partialMod));
+                    break;
+                }
+            }
             result.buildInfo.push_back(buildInfo);
             continue;
         }

@@ -8,7 +8,11 @@
 
 #include <cstdint>
 #include <limits>
+#include <ostream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace realscript::bytecode {
@@ -106,20 +110,205 @@ struct FunctionReference {
     std::uint32_t interfaceSlot = std::numeric_limits<std::uint32_t>::max();
 };
 
+class SmallRegisterVector {
+public:
+    constexpr SmallRegisterVector() noexcept = default;
+    SmallRegisterVector(std::initializer_list<Register> values) {
+        for (const auto v : values) push_back(v);
+    }
+    SmallRegisterVector(const std::vector<Register>& values) {
+        for (const auto v : values) push_back(v);
+    }
+    operator std::vector<Register>() const {
+        return std::vector<Register>(begin(), end());
+    }
+
+    [[nodiscard]] constexpr std::size_t size() const noexcept {
+        return static_cast<std::size_t>(sizeAndSlice_ & 0xFFFu);
+    }
+    [[nodiscard]] constexpr bool empty() const noexcept {
+        return size() == 0;
+    }
+    void reserve(std::size_t) noexcept {}
+    void clear() noexcept {
+        sizeAndSlice_ = 0;
+        inline0_ = 0;
+    }
+
+    [[nodiscard]] const Register* data() const noexcept {
+        const std::uint32_t id = sliceId();
+        return id == 0 ? &inline0_ : sliceData(id);
+    }
+    [[nodiscard]] const Register* begin() const noexcept { return data(); }
+    [[nodiscard]] const Register* end() const noexcept { return data() + size(); }
+
+    [[nodiscard]] const Register& operator[](std::size_t index) const noexcept {
+        return data()[index];
+    }
+    [[nodiscard]] const Register& front() const noexcept { return (*this)[0]; }
+    [[nodiscard]] const Register& back() const noexcept { return (*this)[size() - 1]; }
+
+    void push_back(Register value) {
+        const auto curSize = static_cast<std::uint16_t>(size());
+        if (curSize >= 0xFFFu) {
+            throw std::overflow_error(
+                "SmallRegisterVector exceeded 12-bit operand count limit (4095)");
+        }
+        const auto curSlice = sliceId();
+        if (curSlice == 0 && curSize == 0) {
+            inline0_ = value;
+            sizeAndSlice_ = 1u;
+            return;
+        }
+        const auto newSlice = appendToSlice(curSlice, inline0_, curSize, value);
+        const auto nextSize = static_cast<std::uint32_t>((curSize + 1u) & 0xFFFu);
+        sizeAndSlice_ = (newSlice << 12u) | nextSize;
+    }
+
+    friend bool operator==(
+        const SmallRegisterVector& left,
+        const SmallRegisterVector& right) noexcept {
+        if (left.sizeAndSlice_ == right.sizeAndSlice_ &&
+            (left.sliceId() != 0 || left.inline0_ == right.inline0_)) {
+            return true;
+        }
+        const auto sz = left.size();
+        if (sz != right.size()) return false;
+        const auto* ld = left.data();
+        const auto* rd = right.data();
+        for (std::size_t i = 0; i < sz; ++i) {
+            if (ld[i] != rd[i]) return false;
+        }
+        return true;
+    }
+    friend bool operator!=(
+        const SmallRegisterVector& left,
+        const SmallRegisterVector& right) noexcept {
+        return !(left == right);
+    }
+
+private:
+    [[nodiscard]] constexpr std::uint32_t sliceId() const noexcept {
+        return sizeAndSlice_ >> 12u;
+    }
+    static const Register* sliceData(std::uint32_t id) noexcept;
+    static std::uint32_t appendToSlice(
+        std::uint32_t id,
+        Register firstInline,
+        std::uint16_t currentSize,
+        Register value);
+
+    std::uint32_t sizeAndSlice_ = 0;
+    Register inline0_ = 0;
+};
+static_assert(sizeof(SmallRegisterVector) == 8, "SmallRegisterVector must be 8 bytes");
+static_assert(std::is_trivially_copyable_v<SmallRegisterVector>);
+
+class BytecodeString {
+public:
+    constexpr BytecodeString() noexcept = default;
+    BytecodeString(const std::string& value);
+    BytecodeString(std::string&& value);
+    BytecodeString(std::string_view value);
+    BytecodeString(const char* value);
+
+    [[nodiscard]] const std::string& str() const noexcept;
+    operator const std::string&() const noexcept { return str(); }
+    operator std::string_view() const noexcept { return str(); }
+    [[nodiscard]] const char* c_str() const noexcept { return str().c_str(); }
+    [[nodiscard]] const char* data() const noexcept { return str().data(); }
+    [[nodiscard]] std::size_t size() const noexcept { return str().size(); }
+    [[nodiscard]] constexpr bool empty() const noexcept { return poolId_ == 0u; }
+    [[nodiscard]] constexpr std::uint32_t poolId() const noexcept { return poolId_; }
+    [[nodiscard]] auto begin() const noexcept { return str().begin(); }
+    [[nodiscard]] auto end() const noexcept { return str().end(); }
+
+    friend constexpr bool operator==(const BytecodeString& l, const BytecodeString& r) noexcept {
+        return l.poolId_ == r.poolId_;
+    }
+    friend constexpr bool operator!=(const BytecodeString& l, const BytecodeString& r) noexcept {
+        return l.poolId_ != r.poolId_;
+    }
+    friend bool operator==(const BytecodeString& l, const std::string& r) noexcept {
+        return l.str() == r;
+    }
+    friend bool operator==(const std::string& l, const BytecodeString& r) noexcept {
+        return l == r.str();
+    }
+    friend bool operator!=(const BytecodeString& l, const std::string& r) noexcept {
+        return l.str() != r;
+    }
+    friend bool operator!=(const std::string& l, const BytecodeString& r) noexcept {
+        return l != r.str();
+    }
+    friend bool operator==(const BytecodeString& l, const char* r) noexcept {
+        return l.str() == (r ? r : "");
+    }
+    friend bool operator==(const char* l, const BytecodeString& r) noexcept {
+        return (l ? l : "") == r.str();
+    }
+    friend bool operator!=(const BytecodeString& l, const char* r) noexcept {
+        return !(l == r);
+    }
+    friend bool operator!=(const char* l, const BytecodeString& r) noexcept {
+        return !(l == r);
+    }
+    friend std::ostream& operator<<(std::ostream& os, const BytecodeString& s) {
+        return os << s.str();
+    }
+
+private:
+    std::uint32_t poolId_ = 0;
+};
+static_assert(sizeof(BytecodeString) == 4, "BytecodeString must be 4 bytes");
+static_assert(std::is_trivially_copyable_v<BytecodeString>);
+
 struct Instruction {
+    constexpr Instruction() noexcept = default;
+
     Opcode opcode = Opcode::ConstantInt;
-    Register result = InvalidRegister;
-    std::vector<Register> operands;
-    std::uint32_t index = 0;
-    std::uint32_t typeIndex = 0;
     semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
-    semantic::SymbolId elementTypeId = 0;
-    std::int64_t integerImmediate = 0;
-    double doubleImmediate = 0.0;
     bool boolImmediate = false;
     bool checkedArithmetic = true;
-    std::string stringImmediate;
+    Register result = InvalidRegister;
+    SmallRegisterVector operands{};
+    std::uint32_t index = 0;
+    std::uint16_t typeIndex = 0;
+    std::uint16_t reserved0_ = 0;
+    union {
+        semantic::SymbolId elementTypeId = 0;
+        std::int64_t integerImmediate;
+        double doubleImmediate;
+        BytecodeString stringImmediate;
+    };
+
+    [[nodiscard]] constexpr bool usesIntegerImmediate() const noexcept {
+        return opcode == Opcode::ConstantInt || opcode == Opcode::ConstantTypeId || opcode == Opcode::LoadParameter;
+    }
+    [[nodiscard]] constexpr bool usesDoubleImmediate() const noexcept {
+        return opcode == Opcode::ConstantDouble;
+    }
+    [[nodiscard]] constexpr bool usesStringImmediate() const noexcept {
+        return opcode == Opcode::ConstantString;
+    }
+    [[nodiscard]] constexpr bool usesElementTypeId() const noexcept {
+        return !usesIntegerImmediate() && !usesDoubleImmediate() && !usesStringImmediate();
+    }
+    [[nodiscard]] constexpr semantic::SymbolId activeElementTypeId() const noexcept {
+        return usesElementTypeId() ? elementTypeId : 0u;
+    }
+    [[nodiscard]] constexpr std::int64_t activeIntegerImmediate() const noexcept {
+        return usesIntegerImmediate() ? integerImmediate : 0;
+    }
+    [[nodiscard]] constexpr double activeDoubleImmediate() const noexcept {
+        return usesDoubleImmediate() ? doubleImmediate : 0.0;
+    }
+    [[nodiscard]] constexpr BytecodeString activeStringImmediate() const noexcept {
+        return usesStringImmediate() ? stringImmediate : BytecodeString{};
+    }
 };
+static_assert(sizeof(Instruction) == 32, "Instruction must be 32 bytes");
+static_assert(std::is_trivially_copyable_v<Instruction>);
 
 struct BlockParameter {
     Register target = InvalidRegister;
@@ -138,13 +327,17 @@ enum class TerminatorKind : std::uint8_t {
 
 struct Terminator {
     TerminatorKind kind = TerminatorKind::None;
+    std::uint8_t reserved0_ = 0;
+    std::uint16_t target = 0;
     Register condition = InvalidRegister;
     Register value = InvalidRegister;
-    BlockId target = 0;
-    BlockId falseTarget = 0;
-    std::vector<Register> arguments;
-    std::vector<Register> falseArguments;
+    std::uint16_t falseTarget = 0;
+    std::uint16_t reserved1_ = 0;
+    SmallRegisterVector arguments{};
+    SmallRegisterVector falseArguments{};
 };
+static_assert(sizeof(Terminator) == 32, "Terminator must be 32 bytes");
+static_assert(std::is_trivially_copyable_v<Terminator>);
 
 struct BasicBlock {
     BlockId id = 0;

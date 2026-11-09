@@ -10,7 +10,7 @@
 - [游戏脚本 SDK](GAME_SCRIPTING_SDK.md)
 - [确定性游戏运行时](GAMEPLAY_RUNTIME.md)
 - [C# 风格特性兼容矩阵](CSHARP_COMPATIBILITY_MATRIX.md)
-- [性能基线、瓶颈与优化结果](PERFORMANCE_BASELINE_2026-08-09.md)
+- [性能基线、瓶颈与优化结果](PERFORMANCE_BASELINE.md)
 - [Phase 18–24 原生语言与运行时路线图](../roadmap/PHASE_18_24_NATIVE_LANGUAGE_AND_RUNTIME.md)
 - [Phase 11–17 游戏语言扩展 Profile](../roadmap/PHASE_11_17_LANGUAGE_EXPANSION.md)
 - [总体架构设计](../ENGINE_DESIGN.md)

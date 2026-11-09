@@ -29,6 +29,10 @@ struct FixedPoint32 {
     constexpr FixedPoint32() noexcept = default;
     constexpr explicit FixedPoint32(std::int32_t rawValue) noexcept : raw(rawValue) {}
 
+    [[nodiscard]] static constexpr FixedPoint32 fromRaw(std::int32_t rawValue) noexcept {
+        return FixedPoint32(rawValue);
+    }
+
     [[nodiscard]] static constexpr FixedPoint32 fromInt(std::int32_t val) noexcept {
         return FixedPoint32(val * SCALE);
     }
@@ -46,16 +50,44 @@ struct FixedPoint32 {
         return static_cast<double>(raw) / static_cast<double>(SCALE);
     }
 
-    constexpr FixedPoint32 operator+(FixedPoint32 rhs) const noexcept { return FixedPoint32(raw + rhs.raw); }
-    constexpr FixedPoint32 operator-(FixedPoint32 rhs) const noexcept { return FixedPoint32(raw - rhs.raw); }
+    [[nodiscard]] static constexpr std::int32_t clampRaw64(std::int64_t val) noexcept {
+        if (val > 2147483647LL) return static_cast<std::int32_t>(2147483647LL);
+        if (val < -2147483648LL) return static_cast<std::int32_t>(-2147483648LL);
+        return static_cast<std::int32_t>(val);
+    }
+
+    [[nodiscard]] constexpr FixedPoint32 saturatingAdd(FixedPoint32 rhs) const noexcept {
+        return FixedPoint32(clampRaw64(static_cast<std::int64_t>(raw) + static_cast<std::int64_t>(rhs.raw)));
+    }
+
+    [[nodiscard]] constexpr FixedPoint32 saturatingSub(FixedPoint32 rhs) const noexcept {
+        return FixedPoint32(clampRaw64(static_cast<std::int64_t>(raw) - static_cast<std::int64_t>(rhs.raw)));
+    }
+
+    [[nodiscard]] constexpr FixedPoint32 saturatingMul(FixedPoint32 rhs) const noexcept {
+        const std::int64_t prod = static_cast<std::int64_t>(raw) * static_cast<std::int64_t>(rhs.raw);
+        return FixedPoint32(clampRaw64(prod >> FracBits));
+    }
+
+    constexpr FixedPoint32 operator-() const noexcept {
+        return FixedPoint32(static_cast<std::int32_t>(0u - static_cast<std::uint32_t>(raw)));
+    }
+    constexpr FixedPoint32 operator+(FixedPoint32 rhs) const noexcept {
+        return FixedPoint32(static_cast<std::int32_t>(
+            static_cast<std::uint32_t>(raw) + static_cast<std::uint32_t>(rhs.raw)));
+    }
+    constexpr FixedPoint32 operator-(FixedPoint32 rhs) const noexcept {
+        return FixedPoint32(static_cast<std::int32_t>(
+            static_cast<std::uint32_t>(raw) - static_cast<std::uint32_t>(rhs.raw)));
+    }
     constexpr FixedPoint32 operator*(FixedPoint32 rhs) const noexcept {
-        std::int64_t prod = static_cast<std::int64_t>(raw) * static_cast<std::int64_t>(rhs.raw);
-        return FixedPoint32(static_cast<std::int32_t>(prod >> FracBits));
+        const std::int64_t prod = static_cast<std::int64_t>(raw) * static_cast<std::int64_t>(rhs.raw);
+        return FixedPoint32(static_cast<std::int32_t>(static_cast<std::uint64_t>(prod >> FracBits)));
     }
     constexpr FixedPoint32 operator/(FixedPoint32 rhs) const noexcept {
         if (rhs.raw == 0) return FixedPoint32(0);
-        std::int64_t num = (static_cast<std::int64_t>(raw) << FracBits);
-        return FixedPoint32(static_cast<std::int32_t>(num / rhs.raw));
+        const std::int64_t num = (static_cast<std::int64_t>(raw) << FracBits);
+        return FixedPoint32(static_cast<std::int32_t>(static_cast<std::uint64_t>(num / rhs.raw)));
     }
     constexpr bool operator==(FixedPoint32 rhs) const noexcept { return raw == rhs.raw; }
     constexpr bool operator!=(FixedPoint32 rhs) const noexcept { return raw != rhs.raw; }
@@ -233,28 +265,12 @@ struct FiberContext {
 struct IFiberHostCallbacks {
     virtual ~IFiberHostCallbacks() = default;
 
-    /**
-     * Invoked by `FiberOpcode::HostCommand`.
-     * @param fiber      Active fiber context (provides `boundEntity`, `ownerGroupId`, `regs`, `prng`).
-     * @param commandId  Game-defined command ID (`ins.flags`).
-     * @param arg16      16-bit parameter (`ins.regOrSlot`).
-     * @param arg32      32-bit parameter (`ins.imm32`).
-     */
     virtual void onHostCommand(
         FiberContext& fiber,
         std::uint8_t commandId,
         std::uint16_t arg16,
         std::uint32_t arg32) noexcept = 0;
 
-    /**
-     * Invoked by `FiberOpcode::HostCondJump` to evaluate game-specific blackboard/world predicates
-     * (e.g. faction check, resource threshold, unit ownership, difficulty level).
-     * @param fiber         Active fiber context.
-     * @param conditionKind Game-defined condition type (`ins.flags`).
-     * @param key16         16-bit condition key (`ins.regs.srcA`).
-     * @param threshold16   16-bit comparison operand (`ins.regs.srcB`).
-     * @return true to branch to `ins.regOrSlot`, false to fall through to `pc + 1`.
-     */
     virtual bool onEvaluateCondition(
         const FiberContext& fiber,
         std::uint8_t conditionKind,
@@ -301,13 +317,6 @@ public:
 
 /**
  * Engine-Agnostic Deterministic Fiber & Behavior Tree Scheduler.
- * Features:
- * - Direct execution of `.rs` scripts lowered via `FiberCompiler`
- * - Program table registration (`registerProgram` / `registerModule`) eliminating raw pointers in snapshots
- * - Free-list fiber slot recycling (`freeFiberIds_`) preventing unbounded memory growth
- * - O(1) 4096-slot hierarchical timing wheel for high-frequency tick sleeps
- * - Event-driven Blackboard predicate wakeup (`notifyBlackboardEvent`)
- * - 64-bit FNV-1a lockstep state digest (`computeLockstepDigest`)
  */
 class FiberScheduler {
 public:
@@ -316,21 +325,16 @@ public:
 
     explicit FiberScheduler(IFiberHostCallbacks* hostCallbacks = nullptr) noexcept;
 
-    /**
-     * Registers an immutable instruction stream in the scheduler's program table
-     * and returns its `programId` (1-based). Safe across snapshots and hot-reload.
-     */
-    std::uint32_t registerProgram(std::vector<CompactInstruction> codeStream);
+    void setHostCallbacks(IFiberHostCallbacks* hostCallbacks) noexcept {
+        host_ = hostCallbacks;
+    }
+    [[nodiscard]] IFiberHostCallbacks* hostCallbacks() const noexcept {
+        return host_;
+    }
 
-    /**
-     * Registers a compiled `.rs` fiber module in the scheduler's program table
-     * and returns its `programId` (1-based).
-     */
+    std::uint32_t registerProgram(std::vector<CompactInstruction> codeStream);
     std::uint32_t registerModule(const CompiledFiberModule& module);
 
-    /**
-     * Spawns a fiber bound to a registered `programId`.
-     */
     std::uint32_t spawnFiberByProgram(
         std::uint32_t programId,
         std::uint32_t entryPc,
@@ -339,9 +343,6 @@ public:
         std::uint32_t parentFiberId = 0,
         std::uint32_t seed = 0x53434257u);
 
-    /**
-     * Convenience overload that registers or reuses `codeStream` and spawns a fiber.
-     */
     std::uint32_t spawnFiber(
         const std::vector<CompactInstruction>& codeStream,
         std::uint32_t entryPc,
@@ -350,9 +351,6 @@ public:
         std::uint32_t parentFiberId = 0,
         std::uint32_t seed = 0x53434257u);
 
-    /**
-     * Spawns a fiber starting at a named `.rs` function in a `CompiledFiberModule`.
-     */
     std::uint32_t spawnFunction(
         const CompiledFiberModule& module,
         const std::string& functionName,
@@ -361,19 +359,15 @@ public:
         std::uint32_t parentFiberId = 0,
         std::uint32_t seed = 0x53434257u);
 
-    /**
-     * Attempts to interrupt/redirect a fiber to a new entry point.
-     * Respects `fiber.unbreakableSection` unless `force == true`.
-     */
     bool interruptFiber(std::uint32_t fiberId, std::uint32_t newEntryPc, bool force = false) noexcept;
 
     void killFiberTree(std::uint32_t rootFiberId) noexcept;
-    std::uint64_t stepTick(std::uint32_t currentTick);
+    std::size_t killEntityFibers(GenerationalEntityHandle entity) noexcept;
+    std::size_t killEntityFibersBySlot(std::uint32_t entitySlot) noexcept;
 
-    /**
-     * Wakes all fibers waiting on `(ownerGroupId, predicateChannel, targetKey)`
-     * whose `waitRequiredValue <= currentValue`.
-     */
+    std::uint64_t stepTick(std::uint32_t currentTick);
+    std::uint64_t stepTickParallel(std::uint32_t currentTick, std::size_t workerCount = 2);
+
     std::uint32_t notifyBlackboardEvent(
         std::uint8_t ownerGroupId,
         std::uint8_t predicateChannel,
@@ -386,6 +380,7 @@ public:
 
     [[nodiscard]] std::size_t activeFiberCount() const noexcept;
     [[nodiscard]] const FiberContext* getFiber(std::uint32_t fiberId) const noexcept;
+    [[nodiscard]] std::uint32_t currentTick() const noexcept { return currentTick_; }
 
 private:
     void executeFiberSlice(FiberContext& fiber, std::uint32_t currentTick, std::uint64_t& instrCounter);

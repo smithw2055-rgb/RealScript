@@ -166,11 +166,25 @@ ExecutionContext::ExecutionContext(
     const ProgramDescriptor& program,
     std::shared_ptr<runtime::ManagedHeap> heap,
     std::shared_ptr<const runtime::BindingRegistry> bindings,
-    runtime::ExecutionOptions options)
+    runtime::ExecutionOptions options,
+    const std::unordered_map<semantic::SymbolId, const TypeDescriptor*>* prebuiltTypes,
+    const std::unordered_map<semantic::SymbolId, const FunctionDescriptor*>* prebuiltFunctions)
     : program_(&program),
       heap_(heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>()),
       bindings_(std::move(bindings)),
-      options_(std::move(options)),
+      options_([&]() {
+          if (options.enforceCapabilities) {
+              options.determinism.enforceCapabilities = true;
+              if (options.determinism.grantedCapabilities.empty()) {
+                  options.determinism.grantedCapabilities = options.grantedCapabilities;
+              } else {
+                  options.determinism.grantedCapabilities.insert(
+                      options.grantedCapabilities.begin(),
+                      options.grantedCapabilities.end());
+              }
+          }
+          return std::move(options);
+      }()),
       determinism_(options_.determinism) {
     traceEventsEnabled_ =
         options_.determinism.mode != runtime::DeterminismMode::Off ||
@@ -183,21 +197,44 @@ ExecutionContext::ExecutionContext(
         options_.profile == nullptr && !diagnosticEventsEnabled_;
     fastAccounting_ = !determinismEventsEnabled_ &&
         options_.profile == nullptr && !diagnosticEventsEnabled_ &&
-        options_.limits.gcWorkBudget == 0;
-    for (std::uint32_t index = 0; index < program.typeCount; ++index) {
-        const auto& type = program.types[index];
-        types_.emplace(type.id, &type);
+        (options_.limits.gcWorkBudget == 0 || options_.trustedRelease);
+    if (prebuiltTypes) {
+        typesPtr_ = prebuiltTypes;
+    } else {
+        ownedTypes_.reserve(program.typeCount);
+        for (std::uint32_t index = 0; index < program.typeCount; ++index) {
+            const auto& type = program.types[index];
+            ownedTypes_.emplace(type.id, &type);
+        }
+        typesPtr_ = &ownedTypes_;
     }
-    for (std::uint32_t index = 0; index < program.functionCount; ++index) {
-        const auto& function = program.functions[index];
-        functions_.emplace(function.symbolId, &function);
+    stack_.reserve(64);
+    if (prebuiltFunctions) {
+        functionsPtr_ = prebuiltFunctions;
+    } else {
+        ownedFunctions_.reserve(program.functionCount);
+        for (std::uint32_t index = 0; index < program.functionCount; ++index) {
+            const auto& function = program.functions[index];
+            ownedFunctions_.emplace(function.symbolId, &function);
+        }
+        functionsPtr_ = &ownedFunctions_;
     }
+}
+
+std::vector<std::string> ExecutionContext::materializeStackTrace() const {
+    std::vector<std::string> result;
+    result.reserve(stack_.size());
+    for (auto it = stack_.rbegin(); it != stack_.rend(); ++it) {
+        result.emplace_back(*it ? *it : "<aot-function>");
+    }
+    return result;
 }
 
 const TypeDescriptor* ExecutionContext::findType(
     semantic::SymbolId typeId) const {
-    const auto found = types_.find(typeId);
-    return found == types_.end() ? nullptr : found->second;
+    if (!typesPtr_) return nullptr;
+    const auto found = typesPtr_->find(typeId);
+    return found == typesPtr_->end() ? nullptr : found->second;
 }
 
 bool ExecutionContext::isAssignable(
@@ -225,8 +262,9 @@ bool ExecutionContext::isAssignable(
 
 const FunctionDescriptor* ExecutionContext::findFunction(
     semantic::SymbolId symbolId) const {
-    const auto found = functions_.find(symbolId);
-    return found == functions_.end() ? nullptr : found->second;
+    if (!functionsPtr_) return nullptr;
+    const auto found = functionsPtr_->find(symbolId);
+    return found == functionsPtr_->end() ? nullptr : found->second;
 }
 
 void ExecutionContext::emitTrace(
@@ -265,7 +303,7 @@ void ExecutionContext::emitTrace(
     if (!diagnosticEventsEnabled_) return;
     runtime::TraceEvent event;
     event.kind = kind;
-    event.function = stack_.empty() ? std::string{} : stack_.back();
+    event.function = stack_.empty() ? std::string{} : std::string(stack_.back());
     event.operation.assign(operation.data(), operation.size());
     event.instructionIndex = executed_;
     event.callDepth = stack_.size();
@@ -277,8 +315,7 @@ bool ExecutionContext::fail(
     std::string message) {
     error_.code = code;
     error_.message = std::move(message);
-    error_.stackTrace = stack_;
-    std::reverse(error_.stackTrace.begin(), error_.stackTrace.end());
+    error_.stackTrace = materializeStackTrace();
     emitTrace(runtime::TraceEventKind::RuntimeError, 0, error_.message);
     return false;
 }
@@ -388,7 +425,7 @@ void ExecutionContext::reportUnhandledScriptException() {
     if (!pendingException_ || error_.code != runtime::ErrorCode::None) return;
     error_.code = runtime::ErrorCode::ScriptException;
     error_.message = "unhandled script exception";
-    error_.stackTrace = stack_;
+    error_.stackTrace = materializeStackTrace();
 }
 
 bool ExecutionContext::expectType(
@@ -461,9 +498,10 @@ bool ExecutionContext::expectSignatureType(
                 std::string(context) + " has the wrong native handle type");
         }
     } else if (type == semantic::PrimitiveType::Struct) {
+        const auto actualTypeId = runtime::structValueTypeId(value);
         const auto* structure = std::get_if<runtime::StructValue>(&value);
-        if (!structure || typeId == 0 || structure->typeId != typeId ||
-            !structure->storage) {
+        if (!actualTypeId || typeId == 0 || *actualTypeId != typeId ||
+            (structure && !structure->valid())) {
             return fail(
                 runtime::ErrorCode::TypeMismatch,
                 std::string(context) + " has the wrong struct type");
@@ -507,21 +545,24 @@ runtime::Value ExecutionContext::defaultValue(
     case semantic::PrimitiveType::Enum:
         return runtime::EnumValue{typeId, 0};
     case semantic::PrimitiveType::Struct: {
+        if (const auto inlined = runtime::makeDefaultInlineStructValue(typeId)) {
+            return *inlined;
+        }
         if (depth > 64) return runtime::StructValue{};
         const auto* descriptor = findType(typeId);
         if (!descriptor || descriptor->kind != semantic::TypeKind::Struct) {
             return runtime::StructValue{};
         }
-        auto storage = std::make_shared<runtime::StructStorage>();
-        storage->fields.reserve(descriptor->fieldCount);
+        std::vector<runtime::Value> fields;
+        fields.reserve(descriptor->fieldCount);
         for (std::uint32_t index = 0; index < descriptor->fieldCount; ++index) {
             const auto& field = descriptor->fields[index];
-            storage->fields.push_back(defaultValue(
+            fields.push_back(defaultValue(
                 field.type,
                 field.typeId,
                 depth + 1));
         }
-        return runtime::StructValue{typeId, std::move(storage)};
+        return runtime::makeStructValueFromFields(typeId, std::move(fields));
     }
     case semantic::PrimitiveType::Null: return std::monostate{};
     case semantic::PrimitiveType::Void:
@@ -563,6 +604,18 @@ bool ExecutionContext::invoke(
                 "argument")) {
             return false;
         }
+    }
+
+    if (trustedReleaseEnabled()) {
+        ++statistics_.functionCalls;
+        if (statistics_.maximumCallDepth == 0) {
+            statistics_.maximumCallDepth = 1;
+        }
+        return function->implementation(
+            *this,
+            arguments,
+            argumentCount,
+            result);
     }
 
     const auto previousFunctionId = currentFunctionId_;
@@ -748,6 +801,22 @@ bool ExecutionContext::call(
             runtime::ErrorCode::InvalidProgram,
             "AOT runtime dispatch target function is unavailable");
     }
+    if (signature.name &&
+        std::string_view(signature.name).rfind("$intrinsic::", 0) == 0) {
+        std::string intrinsicError;
+        if (!runtime::tryExecuteRuntimeIntrinsic(
+                signature.name,
+                runtime::ValueSpan(arguments, argumentCount),
+                heap_.get(),
+                result,
+                intrinsicError)) {
+            const auto code = intrinsicError.find("null") != std::string::npos
+                ? runtime::ErrorCode::NullReference
+                : runtime::ErrorCode::InvalidProgram;
+            return fail(code, intrinsicError);
+        }
+        return true;
+    }
     if (!bindings_) {
         return fail(
             runtime::ErrorCode::ExternalFunctionUnresolved,
@@ -775,10 +844,6 @@ bool ExecutionContext::call(
             signature.parameterTypeIds,
             signature.parameterTypeIds + signature.parameterCount);
     }
-    std::vector<runtime::Value> values;
-    if (argumentCount != 0) {
-        values.assign(arguments, arguments + argumentCount);
-    }
     runtime::RuntimeError externalError;
     ++statistics_.externalCalls;
     emitTrace(runtime::TraceEventKind::ExternalCall,
@@ -788,7 +853,7 @@ bool ExecutionContext::call(
             bindings_.get(),
             nullptr,
             reference,
-            values,
+            runtime::ValueSpan(arguments, argumentCount),
             externalResult,
             externalError)) {
         error_ = std::move(externalError);
@@ -796,8 +861,7 @@ bool ExecutionContext::call(
             error_.code = runtime::ErrorCode::ExternalFunctionUnresolved;
             error_.message = "external function '" + reference.name + "' failed";
         }
-        error_.stackTrace = stack_;
-        std::reverse(error_.stackTrace.begin(), error_.stackTrace.end());
+        error_.stackTrace = materializeStackTrace();
         return false;
     }
     if (!expectSignatureType(
@@ -1214,7 +1278,7 @@ bool ExecutionContext::constantString(
     std::string_view value,
     runtime::Value& result) {
     runtime::RuntimeError allocationError;
-    const auto reference = heap_->allocateString(std::string(value), &allocationError);
+    const auto reference = heap_->internString(value, &allocationError);
     if (!reference) {
         return fail(
             allocationError.code == runtime::ErrorCode::None
@@ -1245,7 +1309,8 @@ bool ExecutionContext::newObject(
         const auto& field = type->fields[index];
         fields.push_back(defaultValue(field.type, field.typeId));
         if (semantic::isReferenceType(field.type) ||
-            field.type == semantic::PrimitiveType::Struct) {
+            (field.type == semantic::PrimitiveType::Struct &&
+             !runtime::makeDefaultInlineStructValue(field.typeId).has_value())) {
             references.push_back(index);
         }
     }
@@ -1272,8 +1337,11 @@ bool ExecutionContext::newStruct(
     semantic::SymbolId typeId,
     runtime::Value& result) {
     result = defaultValue(semantic::PrimitiveType::Struct, typeId);
+    if (runtime::makeDefaultInlineStructValue(typeId).has_value()) {
+        return true;
+    }
     const auto* structure = std::get_if<runtime::StructValue>(&result);
-    if (!structure || !structure->storage) {
+    if (!structure || !structure->valid()) {
         return fail(
             runtime::ErrorCode::InvalidProgram,
             "AOT struct allocation references an invalid struct descriptor");
@@ -1390,23 +1458,36 @@ bool ExecutionContext::typeOperation(
 bool ExecutionContext::arrayLength(
     const runtime::Value& receiver,
     runtime::Value& result) {
+    std::int64_t len = 0;
+    if (!arrayLengthFast(receiver, len)) return false;
+    result = len;
+    return true;
+}
+
+bool ExecutionContext::arrayLengthFast(
+    const runtime::Value& receiver,
+    std::int64_t& result) {
+    if (const auto* reference = std::get_if<runtime::ObjectRef>(&receiver)) {
+        if (heap_) {
+            if (const auto length = heap_->arrayLength(*reference)) {
+                if (*length <= static_cast<std::size_t>(INT32_MAX)) {
+                    result = static_cast<std::int64_t>(*length);
+                    return true;
+                }
+            }
+        }
+        return fail(
+            runtime::ErrorCode::InvalidObjectReference,
+            "array length references an invalid managed array");
+    }
     if (std::holds_alternative<runtime::NullArray>(receiver)) {
         return fail(
             runtime::ErrorCode::NullReference,
             "array length attempted to dereference null");
     }
-    if (!expectType(receiver, semantic::PrimitiveType::Array, "array length")) {
-        return false;
-    }
-    const auto reference = std::get<runtime::ObjectRef>(receiver);
-    const auto length = heap_->arrayLength(reference);
-    if (!length || *length > static_cast<std::size_t>(INT32_MAX)) {
-        return fail(
-            runtime::ErrorCode::InvalidObjectReference,
-            "array length references an invalid managed array");
-    }
-    result = static_cast<std::int64_t>(*length);
-    return true;
+    return fail(
+        runtime::ErrorCode::TypeMismatch,
+        "array length expected 'array'");
 }
 
 bool ExecutionContext::loadElement(
@@ -1608,13 +1689,24 @@ bool ExecutionContext::loadStructField(
             "struct field load")) {
         return false;
     }
+    const auto& field = type->fields[fieldIndex];
+    if (const auto inlinedField = runtime::loadInlineStructField(receiver, fieldIndex)) {
+        if (!expectSignatureType(
+                *inlinedField,
+                field.type,
+                field.typeId,
+                "struct field load value")) {
+            return false;
+        }
+        result = *inlinedField;
+        return true;
+    }
     const auto& structure = std::get<runtime::StructValue>(receiver);
     if (!structure.storage || fieldIndex >= structure.storage->fields.size()) {
         return fail(
             runtime::ErrorCode::InvalidProgram,
             "struct field load references an invalid field slot");
     }
-    const auto& field = type->fields[fieldIndex];
     const auto& value = structure.storage->fields[fieldIndex];
     if (!expectSignatureType(
             value,
@@ -1651,16 +1743,175 @@ bool ExecutionContext::storeStructField(
             "struct field store value")) {
         return false;
     }
+    if (const auto updatedInline = runtime::storeInlineStructField(receiver, fieldIndex, value)) {
+        result = *updatedInline;
+        return true;
+    }
     const auto& structure = std::get<runtime::StructValue>(receiver);
     if (!structure.storage || fieldIndex >= structure.storage->fields.size()) {
         return fail(
             runtime::ErrorCode::InvalidProgram,
             "struct field store references an invalid field slot");
     }
+    if (&result == &receiver && structure.storage.use_count() == 1) {
+        const_cast<runtime::StructStorage&>(*structure.storage).fields[fieldIndex] = value;
+        return true;
+    }
     auto storage = std::make_shared<runtime::StructStorage>(*structure.storage);
     storage->fields[fieldIndex] = value;
     result = runtime::StructValue{typeId, std::move(storage)};
     return true;
+}
+
+bool ExecutionContext::initUnboxedStruct(
+    semantic::SymbolId typeId,
+    UnboxedCustomStruct& result) {
+    const auto* descriptor = findType(typeId);
+    if (!descriptor || descriptor->kind != semantic::TypeKind::Struct ||
+        descriptor->fieldCount > 16) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT unboxed struct allocation references an invalid struct descriptor");
+    }
+    result.typeId = typeId;
+    result.fieldCount = static_cast<std::uint8_t>(descriptor->fieldCount);
+    for (std::uint32_t index = 0; index < descriptor->fieldCount; ++index) {
+        const auto& field = descriptor->fields[index];
+        result.fields[index] = defaultValue(field.type, field.typeId, 1);
+    }
+    return true;
+}
+
+bool ExecutionContext::loadUnboxedStructField(
+    semantic::SymbolId typeId,
+    std::size_t fieldIndex,
+    const UnboxedCustomStruct& receiver,
+    runtime::Value& result) {
+    const auto* type = findType(typeId);
+    if (!type || type->kind != semantic::TypeKind::Struct ||
+        receiver.typeId != typeId ||
+        fieldIndex >= type->fieldCount ||
+        fieldIndex >= receiver.fieldCount) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "struct field load references an invalid field slot");
+    }
+    const auto& field = type->fields[fieldIndex];
+    const auto& value = receiver.fields[fieldIndex];
+    if (!expectSignatureType(
+            value,
+            field.type,
+            field.typeId,
+            "struct field load value")) {
+        return false;
+    }
+    result = value;
+    return true;
+}
+
+bool ExecutionContext::storeUnboxedStructField(
+    semantic::SymbolId typeId,
+    std::size_t fieldIndex,
+    const UnboxedCustomStruct& receiver,
+    const runtime::Value& value,
+    UnboxedCustomStruct& result) {
+    const auto* type = findType(typeId);
+    if (!type || type->kind != semantic::TypeKind::Struct ||
+        receiver.typeId != typeId ||
+        fieldIndex >= type->fieldCount ||
+        fieldIndex >= receiver.fieldCount) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "struct field store references an invalid field slot");
+    }
+    const auto& field = type->fields[fieldIndex];
+    if (!expectSignatureType(
+            value,
+            field.type,
+            field.typeId,
+            "struct field store value")) {
+        return false;
+    }
+    if (&result != &receiver) {
+        result = receiver;
+    }
+    result.fields[fieldIndex] = value;
+    return true;
+}
+
+bool ExecutionContext::ecsWritebackBoxed(
+    const CallSignature& signature,
+    std::int64_t index,
+    const runtime::Value& boxedStruct) {
+    if (!heap_ || !signature.name) return true;
+    if (!heap_->hasSparseEcsState()) return true;
+    const std::array<runtime::Value, 2> args{{
+        runtime::Value{index},
+        boxedStruct,
+    }};
+    runtime::Value ignored;
+    return call(signature, args.data(), args.size(), ignored);
+}
+
+bool ExecutionContext::resolveEcsColumnFast(
+    semantic::SymbolId denseColSymbolId,
+    const CallSignature& fallbackSignature,
+    runtime::Value& outResult) {
+    if (!hasSparseEcsState() && denseColSymbolId != 0 && heap_) {
+        if (auto existing = heap_->getStaticField(denseColSymbolId)) {
+            outResult = std::move(*existing);
+            return true;
+        }
+    }
+    return call(fallbackSignature, nullptr, 0, outResult);
+}
+
+TypedRawColumnCache ExecutionContext::acquireRawColumnCache(
+    const runtime::Value& arrayValue,
+    semantic::SymbolId expectedStructTypeId,
+    std::size_t generatedStructSize,
+    const GeneratedFieldLayout* generatedFields,
+    std::size_t generatedFieldCount) const noexcept {
+    TypedRawColumnCache cache{};
+    if (!heap_) return cache;
+    const auto* ref = std::get_if<runtime::ObjectRef>(&arrayValue);
+    if (!ref) return cache;
+    const auto* view = heap_->rawColumnView(*ref);
+    if (!view) return cache;
+    if (expectedStructTypeId != 0 && view->structTypeId != expectedStructTypeId) {
+        return cache;
+    }
+    if (view->fields.size() > cache.fields.size()) {
+        return cache;
+    }
+    if (generatedFields && generatedFieldCount != view->fields.size()) {
+        return cache;
+    }
+    cache.basePtr = static_cast<std::uint8_t*>(view->basePtr);
+    cache.strideBytes = view->strideBytes;
+    cache.count = static_cast<std::int64_t>(view->count);
+    cache.readOnly = view->readOnly;
+    cache.fieldCount = static_cast<std::uint8_t>(view->fields.size());
+    for (std::size_t i = 0; i < view->fields.size(); ++i) {
+        cache.fields[i] = TypedRawFieldCache{
+            view->fields[i].byteOffset,
+            view->fields[i].kind,
+        };
+    }
+    if (generatedFields &&
+        generatedFieldCount == view->fields.size() &&
+        generatedStructSize == view->strideBytes) {
+        bool exact = true;
+        for (std::size_t i = 0; i < generatedFieldCount; ++i) {
+            if (view->fields[i].byteOffset != generatedFields[i].byteOffset ||
+                view->fields[i].kind != generatedFields[i].expectedKind) {
+                exact = false;
+                break;
+            }
+        }
+        cache.exactNativeLayout = exact;
+    }
+    return cache;
 }
 
 bool ExecutionContext::convert(
@@ -2162,6 +2413,7 @@ Program::Program(const ProgramDescriptor& descriptor)
 
     for (std::uint32_t index = 0; index < descriptor.typeCount; ++index) {
         const auto& type = descriptor.types[index];
+        types_.emplace(type.id, &type);
         for (std::uint32_t fieldIndex = 0;
              fieldIndex < type.fieldCount;
              ++fieldIndex) {
@@ -2200,6 +2452,7 @@ Program::Program(const ProgramDescriptor& descriptor)
         // by the compiler use SymbolId; the name-only embedding convenience API
         // retains the first deterministic descriptor.
         names_.try_emplace(function.name, function.symbolId);
+        functions_.emplace(function.symbolId, &function);
         for (std::uint32_t parameter = 0;
              parameter < function.parameterCount;
              ++parameter) {
@@ -2247,7 +2500,13 @@ runtime::ExecutionResult Program::invoke(
     semantic::SymbolId symbolId,
     const std::vector<runtime::Value>& arguments,
     runtime::ExecutionOptions options) const {
-    ExecutionContext context(*descriptor_, heap_, bindings_, std::move(options));
+    ExecutionContext context(
+        *descriptor_,
+        heap_,
+        bindings_,
+        std::move(options),
+        &types_,
+        &functions_);
     runtime::Value value;
     runtime::ExecutionResult execution;
     execution.succeeded = context.invoke(

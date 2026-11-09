@@ -16,9 +16,10 @@ void printSignatureType(
     }
 }
 
+template <typename RegContainer>
 void printRegisters(
     std::ostringstream& out,
-    const std::vector<Register>& registers) {
+    const RegContainer& registers) {
     if (registers.empty()) {
         return;
     }

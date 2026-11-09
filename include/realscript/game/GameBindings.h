@@ -2,6 +2,34 @@
 
 #include "realscript/game/BindingMarshal.h"
 
+#if !defined(RS_EXPORT_CLASS)
+#define RS_EXPORT_CLASS(...)
+#endif
+#if !defined(RS_EXPORT_ECS_COMPONENT)
+#define RS_EXPORT_ECS_COMPONENT(...)
+#endif
+#if !defined(RS_EXPORT_STRUCT)
+#define RS_EXPORT_STRUCT(...)
+#endif
+#if !defined(RS_EXPORT_FIELD)
+#define RS_EXPORT_FIELD
+#endif
+#if !defined(RS_EXPORT_METHOD)
+#define RS_EXPORT_METHOD
+#endif
+#if !defined(RS_EXPORT_METHOD_EX)
+#define RS_EXPORT_METHOD_EX(...)
+#endif
+#if !defined(RS_EXPORT_PROPERTY)
+#define RS_EXPORT_PROPERTY(...)
+#endif
+#if !defined(RS_EXPORT_FUNCTION)
+#define RS_EXPORT_FUNCTION(...)
+#endif
+#if !defined(RS_EXPORT_ENUM)
+#define RS_EXPORT_ENUM
+#endif
+
 namespace realscript::game {
 
 class GameApi;
@@ -13,7 +41,8 @@ public:
     NativeTypeBuilder& method(
         std::string name,
         runtime::BindingDeterminism determinism =
-            runtime::BindingDeterminism::Deterministic);
+            runtime::BindingDeterminism::Deterministic,
+        std::string requiredCapability = {});
 
     template <auto Getter>
     NativeTypeBuilder& property(
@@ -23,6 +52,12 @@ public:
 
     template <auto Getter, auto Setter>
     NativeTypeBuilder& property(
+        std::string name,
+        runtime::BindingDeterminism determinism =
+            runtime::BindingDeterminism::Deterministic);
+
+    template <auto FieldPtr>
+    NativeTypeBuilder& field(
         std::string name,
         runtime::BindingDeterminism determinism =
             runtime::BindingDeterminism::Deterministic);
@@ -77,7 +112,8 @@ public:
         std::string name,
         Callable callable,
         runtime::BindingDeterminism determinism =
-            runtime::BindingDeterminism::Deterministic) {
+            runtime::BindingDeterminism::Deterministic,
+        std::string requiredCapability = {}) {
         using CallableType = std::decay_t<Callable>;
         using Traits = detail::FunctionTraits<CallableType>;
         auto returnType = detail::resolveScriptType<typename Traits::Return>(state_);
@@ -120,14 +156,16 @@ public:
             ? call + "; return;"
             : "return " + call + ";";
         module.functions.push_back(detail::FunctionDeclaration{
-            name, *returnType, *parameters, wrapperBody});
+            name, *returnType, *parameters, wrapperBody, determinism, requiredCapability});
         module.functions.push_back(detail::FunctionDeclaration{
             nativeName,
             std::is_void_v<typename Traits::Return>
                 ? detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int}
                 : *returnType,
             *parameters,
-            {}});
+            {},
+            determinism,
+            requiredCapability});
         return state_->bindings->bind(
             bindingName,
             [state, sharedCallable](const auto&, const auto& arguments, auto& error) {
@@ -144,10 +182,15 @@ public:
                     return invoked;
                 }
             },
-            determinism);
+            determinism,
+            std::move(requiredCapability));
     }
 
     [[nodiscard]] std::vector<compiler::SourceFile> generatedSources() const;
+    [[nodiscard]] std::vector<compiler::SourceFile> exportDeclarationStubs() const;
+    [[nodiscard]] std::string exportProjectConfigJson(
+        const std::string& projectName,
+        const std::vector<std::string>& sourcePaths = {}) const;
     [[nodiscard]] std::set<std::string> nativeModules() const;
     [[nodiscard]] const std::unordered_set<std::string>& nativeBindingNames() const noexcept;
     [[nodiscard]] bool valid() const noexcept;
@@ -155,6 +198,21 @@ public:
     [[nodiscard]] std::shared_ptr<runtime::BindingRegistry> bindings() const noexcept;
     [[nodiscard]] std::shared_ptr<runtime::ManagedHeap> heap() const noexcept;
     [[nodiscard]] std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles() const noexcept;
+
+    struct HeaderBindingGenerationResult {
+        std::string cppRegistrationSource;
+        std::string scriptDeclarationStub;
+        std::size_t classesExported = 0;
+        std::size_t structsExported = 0;
+        std::size_t methodsExported = 0;
+        std::size_t functionsExported = 0;
+        std::size_t propertiesExported = 0;
+        std::size_t enumsExported = 0;
+    };
+
+    [[nodiscard]] static HeaderBindingGenerationResult generateBindingsFromCppHeader(
+        std::string_view headerContent,
+        const std::string& defaultModuleName = "Engine.Native");
 
     template <typename T>
     [[nodiscard]] std::string canonicalTypeName() const {
@@ -174,7 +232,8 @@ template <typename T>
 template <auto Method>
 NativeTypeBuilder<T>& NativeTypeBuilder<T>::method(
     std::string name,
-    runtime::BindingDeterminism determinism) {
+    runtime::BindingDeterminism determinism,
+    std::string requiredCapability) {
     using Traits = detail::FunctionTraits<decltype(Method)>;
     static_assert(std::is_same_v<typename Traits::Class, T>,
         "bound method must belong to the native type being registered");
@@ -227,14 +286,16 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::method(
         ? call + "; return;"
         : "return " + call + ";";
     type.methods.push_back(detail::FunctionDeclaration{
-        name, *returnType, *parameters, wrapperBody});
+        name, *returnType, *parameters, wrapperBody, determinism, requiredCapability});
     module.functions.push_back(detail::FunctionDeclaration{
         nativeName,
         std::is_void_v<typename Traits::Return>
             ? detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int}
             : *returnType,
         std::move(nativeParameters),
-        {}});
+        {},
+        determinism,
+        requiredCapability});
     state_->bindings->bind(
         bindingName,
         [state](const auto&, const auto& arguments, auto& error) {
@@ -250,7 +311,8 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::method(
                 return invoked;
             }
         },
-        determinism);
+        determinism,
+        std::move(requiredCapability));
     return *this;
 }
 
@@ -304,6 +366,8 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::property(
             type.name,
             type.moduleName,
             detail::ScriptTypeCategory::NativeObject}, "self"}},
+        {},
+        determinism,
         {}});
     auto state = state_;
     state_->bindings->bind(
@@ -385,11 +449,15 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::property(
         getterNativeName,
         *getterType,
         {receiver},
+        {},
+        determinism,
         {}});
     module.functions.push_back(detail::FunctionDeclaration{
         setterNativeName,
         detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int},
         {receiver, detail::ParameterDeclaration{*setterType, "value"}},
+        {},
+        determinism,
         {}});
 
     auto state = state_;
@@ -415,6 +483,150 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::property(
             return std::optional<runtime::Value>{std::int64_t{0}};
         },
         determinism);
+    return *this;
+}
+
+namespace detail {
+
+template <typename>
+struct MemberFieldTraits;
+
+template <typename ClassType, typename FieldType>
+struct MemberFieldTraits<FieldType ClassType::*> {
+    using Class = ClassType;
+    using ValueType = std::remove_cv_t<FieldType>;
+    static constexpr bool IsReadOnly = std::is_const_v<FieldType>;
+};
+
+} // namespace detail
+
+template <typename T>
+template <auto FieldPtr>
+NativeTypeBuilder<T>& NativeTypeBuilder<T>::field(
+    std::string name,
+    runtime::BindingDeterminism determinism) {
+    using Traits = detail::MemberFieldTraits<decltype(FieldPtr)>;
+    static_assert(std::is_same_v<typename Traits::Class, T>,
+        "bound field must belong to the native type being registered");
+    using ValueType = typename Traits::ValueType;
+
+    auto fieldType = detail::resolveScriptType<ValueType>(state_);
+    auto& type = state_->nativeTypes[index_];
+    if (!fieldType) {
+        state_->errors.push_back(
+            "unsupported C++ type in native field '" +
+            type.moduleName + "::" + type.name + "." + name + "'");
+        return *this;
+    }
+
+    const auto getterPublicName = type.moduleName + "::" + type.name + ".get_" + name;
+    if (!state_->declarationNames.insert(getterPublicName).second) {
+        state_->errors.push_back("duplicate native field declaration for '" + name + "'");
+        return *this;
+    }
+    const auto getterNativeName = "__rs_native_" + type.name + "_get_" + name;
+    const auto getterBinding = type.moduleName + "::" + getterNativeName;
+    if (!state_->bindingNames.insert(getterBinding).second) {
+        state_->errors.push_back("duplicate native field binding for '" + name + "'");
+        return *this;
+    }
+
+    auto& module = state_->modules[type.moduleName];
+    detail::collectImports(module, *fieldType);
+    const detail::ParameterDeclaration receiver{
+        detail::ScriptTypeRef{
+            type.name,
+            type.moduleName,
+            detail::ScriptTypeCategory::NativeObject},
+        "self"};
+
+    auto state = state_;
+    state_->bindings->bind(
+        getterBinding,
+        [state](const auto&, const auto& arguments, auto& error) -> std::optional<runtime::Value> {
+            if (arguments.size() != 1) {
+                detail::setInvalidArguments(error, "native field getter received the wrong argument count");
+                return std::nullopt;
+            }
+            const auto recv = detail::readNativeObject<T>(state, arguments.front(), error);
+            if (!recv || !*recv) {
+                if (error.code == runtime::ErrorCode::None) {
+                    error.code = runtime::ErrorCode::NullReference;
+                    error.message = "native field getter receiver is null";
+                }
+                return std::nullopt;
+            }
+            return detail::writeValue(state, (**recv).*FieldPtr, error);
+        },
+        determinism);
+
+    if constexpr (Traits::IsReadOnly) {
+        type.properties.push_back(detail::PropertyDeclaration{
+            name,
+            *fieldType,
+            true,
+            false,
+            "return " + getterNativeName + "(this);",
+            {}});
+        module.functions.push_back(detail::FunctionDeclaration{
+            getterNativeName,
+            *fieldType,
+            {receiver},
+            {},
+            determinism,
+            {}});
+    } else {
+        const auto setterPublicName = type.moduleName + "::" + type.name + ".set_" + name;
+        const auto setterNativeName = "__rs_native_" + type.name + "_set_" + name;
+        const auto setterBinding = type.moduleName + "::" + setterNativeName;
+        if (!state_->declarationNames.insert(setterPublicName).second ||
+            !state_->bindingNames.insert(setterBinding).second) {
+            state_->errors.push_back("duplicate native field setter binding for '" + name + "'");
+            return *this;
+        }
+        type.properties.push_back(detail::PropertyDeclaration{
+            name,
+            *fieldType,
+            true,
+            true,
+            "return " + getterNativeName + "(this);",
+            setterNativeName + "(this, value); return;"});
+        module.functions.push_back(detail::FunctionDeclaration{
+            getterNativeName,
+            *fieldType,
+            {receiver},
+            {},
+            determinism,
+            {}});
+        module.functions.push_back(detail::FunctionDeclaration{
+            setterNativeName,
+            detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int},
+            {receiver, detail::ParameterDeclaration{*fieldType, "value"}},
+            {},
+            determinism,
+            {}});
+        state_->bindings->bind(
+            setterBinding,
+            [state](const auto&, const auto& arguments, auto& error) -> std::optional<runtime::Value> {
+                if (arguments.size() != 2) {
+                    detail::setInvalidArguments(error, "native field setter received the wrong argument count");
+                    return std::nullopt;
+                }
+                const auto recv = detail::readNativeObject<T>(state, arguments[0], error);
+                if (!recv || !*recv) {
+                    if (error.code == runtime::ErrorCode::None) {
+                        error.code = runtime::ErrorCode::NullReference;
+                        error.message = "native field setter receiver is null";
+                    }
+                    return std::nullopt;
+                }
+                auto converted = detail::readValue<ValueType>(state, arguments[1], error);
+                if (!converted) return std::nullopt;
+                ((**recv).*FieldPtr) = detail::passArgument<ValueType>(*converted);
+                return std::optional<runtime::Value>{std::int64_t{0}};
+            },
+            determinism);
+    }
     return *this;
 }
 

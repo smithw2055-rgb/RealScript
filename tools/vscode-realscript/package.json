@@ -1,0 +1,188 @@
+{
+  "name": "vscode-realscript",
+  "displayName": "RealScript Language Support",
+  "description": "Syntax highlighting, LSP language client (rslsp), and in-engine TCP / standalone DAP debugger (rsdebug) for the RealScript game scripting engine.",
+  "version": "0.2.0",
+  "main": "./out/extension.js",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Debuggers"
+  ],
+  "activationEvents": [
+    "onLanguage:realscript",
+    "onDebugResolve:realscript",
+    "onDebugInitialConfigurations",
+    "onCommand:realscript.restartLspServer",
+    "onCommand:realscript.attachToEngine",
+    "onCommand:realscript.captureHeapSnapshot",
+    "onCommand:realscript.diffHeapSnapshot",
+    "onCommand:realscript.findRetainingPath"
+  ],
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.3.0"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "realscript",
+        "aliases": ["RealScript", "realscript"],
+        "extensions": [".rs", ".d.rs"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "realscript",
+        "scopeName": "source.realscript",
+        "path": "./syntaxes/realscript.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "realscript.restartLspServer",
+        "title": "RealScript: Restart Language Server (rslsp)"
+      },
+      {
+        "command": "realscript.attachToEngine",
+        "title": "RealScript: Attach Debugger to Running Game Engine"
+      },
+      {
+        "command": "realscript.captureHeapSnapshot",
+        "title": "RealScript: Capture ManagedHeap Memory Snapshot & Retaining Paths"
+      },
+      {
+        "command": "realscript.diffHeapSnapshot",
+        "title": "RealScript: Diff ManagedHeap Snapshot Against Baseline (Leak Check)"
+      },
+      {
+        "command": "realscript.findRetainingPath",
+        "title": "RealScript: Find Retaining Path (Why Object Is Alive)"
+      }
+    ],
+    "menus": {
+      "debug/variables/context": [
+        {
+          "command": "realscript.findRetainingPath",
+          "when": "debugType == 'realscript'"
+        }
+      ]
+    },
+    "debuggers": [
+      {
+        "type": "realscript",
+        "label": "RealScript Debugger",
+        "languages": ["realscript"],
+        "configurationAttributes": {
+          "launch": {
+            "required": ["program", "function"],
+            "properties": {
+              "program": {
+                "type": ["string", "array"],
+                "description": "Path(s) to the RealScript (.rs) source file(s) to compile and launch."
+              },
+              "function": {
+                "type": "string",
+                "description": "Qualified entry function to invoke (e.g. 'Demo.Hello::main').",
+                "default": "Main::main"
+              },
+              "args": {
+                "type": "array",
+                "description": "Optional arguments passed to the entry function.",
+                "default": []
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Automatically pause on the first sequence point of the entry function.",
+                "default": false
+              }
+            }
+          },
+          "attach": {
+            "required": [],
+            "properties": {
+              "host": {
+                "type": "string",
+                "description": "Hostname or IP address of the running game engine's EmbeddedDapServer.",
+                "default": "127.0.0.1"
+              },
+              "port": {
+                "type": "number",
+                "description": "TCP port of the running game engine's EmbeddedDapServer (ScriptRuntime::startRemoteDebugger).",
+                "default": 4711
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Pause immediately on the next script sequence point executed by the game engine.",
+                "default": false
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "realscript",
+            "request": "attach",
+            "name": "RealScript: Attach to Running Game Engine",
+            "host": "127.0.0.1",
+            "port": 4711,
+            "stopOnEntry": false
+          },
+          {
+            "type": "realscript",
+            "request": "launch",
+            "name": "RealScript: Launch Current Script",
+            "program": ["${file}"],
+            "function": "Main::main",
+            "stopOnEntry": true
+          }
+        ]
+      }
+    ],
+    "configuration": {
+      "title": "RealScript",
+      "properties": {
+        "realscript.lsp.serverPath": {
+          "type": "string",
+          "default": "rslsp",
+          "description": "Path to the RealScript Language Server (rslsp) executable."
+        },
+        "realscript.lsp.serverArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional command-line arguments passed to rslsp."
+        },
+        "realscript.debug.adapterPath": {
+          "type": "string",
+          "default": "rsdebug",
+          "description": "Path to the RealScript Debug Adapter (rsdebug) executable for standalone 'launch' configurations."
+        },
+        "realscript.debug.defaultHost": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Default host address when attaching to a running game engine."
+        },
+        "realscript.debug.defaultPort": {
+          "type": "number",
+          "default": 4711,
+          "description": "Default TCP port when attaching to a running game engine."
+        }
+      }
+    }
+  }
+}

@@ -61,6 +61,7 @@ void usage() {
         << "  --namespace <identifier>\n"
         << "  --query-symbol <identifier>\n"
         << "  --no-line-directives\n"
+        << "  --trusted-release\n"
         << "  --help\n"
         << "  --version\n";
 }
@@ -114,6 +115,8 @@ int main(int argc, char** argv) {
             optimizationReport = true;
         } else if (argument == "--no-line-directives") {
             options.emitLineDirectives = false;
+        } else if (argument == "--trusted-release") {
+            options.trustedRelease = true;
         } else if (argument.rfind("--", 0) == 0) {
             throw std::runtime_error("unknown option: " + argument);
         } else {

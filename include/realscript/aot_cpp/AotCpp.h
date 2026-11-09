@@ -14,6 +14,7 @@ struct GenerationOptions {
     std::string cppNamespace = "realscript_generated";
     std::string querySymbol = "rs_module_query_v1";
     bool emitLineDirectives = true;
+    bool trustedRelease = false;
 };
 
 struct GeneratedProgram {

@@ -203,6 +203,11 @@ public:
         std::uint32_t encoded = 0;
         if (!u32(encoded)) return false;
         value = encoded;
+        if (value > end_ - position_) {
+            fail(error_, GameplayStateErrorCode::MalformedInput,
+                std::string{name} + " exceeds remaining payload bytes");
+            return false;
+        }
         if (value > maximum) {
             fail(error_, GameplayStateErrorCode::LimitExceeded,
                 std::string{name} + " exceeds the codec limit");
@@ -439,6 +444,7 @@ bool writeHost(
     writer.u64(state.nextPayloadId);
     writer.u64(state.nextSubscriptionId);
     writer.u64(state.nextSequenceId);
+    writer.u64(state.nextAsyncOpId);
 
     if (!writer.count(state.calls.size(), limits.maximumCalls, "call count")) {
         return false;
@@ -464,6 +470,7 @@ bool writeHost(
         writer.u64(subscription.target);
         if (!writer.string(subscription.callback)) return false;
         writer.u32(static_cast<std::uint32_t>(subscription.priority));
+        writer.boolean(subscription.once);
     }
 
     if (!writer.count(
@@ -478,6 +485,17 @@ bool writeHost(
         }
         for (const auto timerId : sequence.timers) writer.u64(timerId);
     }
+
+    if (!writer.count(
+            state.asyncOps.size(), limits.maximumSubscriptions, "async operation count")) {
+        return false;
+    }
+    for (const auto& op : state.asyncOps) {
+        writer.u64(op.id);
+        if (!writer.string(op.name)) return false;
+        writer.boolean(op.completed);
+        if (!writer.value(op.result)) return false;
+    }
     return writer.withinLimit();
 }
 
@@ -488,7 +506,8 @@ bool readHost(
     if (!readCore(reader, state.core, limits) ||
         !reader.u64(state.nextPayloadId) ||
         !reader.u64(state.nextSubscriptionId) ||
-        !reader.u64(state.nextSequenceId)) {
+        !reader.u64(state.nextSequenceId) ||
+        !reader.u64(state.nextAsyncOpId)) {
         return false;
     }
 
@@ -518,7 +537,8 @@ bool readHost(
             !reader.string(subscription.topic) ||
             !reader.u64(subscription.target) ||
             !reader.string(subscription.callback) ||
-            !reader.u32(priority)) {
+            !reader.u32(priority) ||
+            !reader.boolean(subscription.once)) {
             return false;
         }
         subscription.priority = static_cast<std::int32_t>(priority);
@@ -539,6 +559,20 @@ bool readHost(
         sequence.timers.resize(timerCount);
         for (auto& timerId : sequence.timers) {
             if (!reader.u64(timerId)) return false;
+        }
+    }
+
+    if (!reader.count(
+            countValue, limits.maximumSubscriptions, "async operation count")) {
+        return false;
+    }
+    state.asyncOps.resize(countValue);
+    for (auto& op : state.asyncOps) {
+        if (!reader.u64(op.id) ||
+            !reader.string(op.name) ||
+            !reader.boolean(op.completed) ||
+            !reader.value(op.result)) {
+            return false;
         }
     }
     return true;

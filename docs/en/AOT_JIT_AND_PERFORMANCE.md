@@ -51,6 +51,7 @@ realscript_add_aot_library(GameScriptsAot
     PROGRAM_NAME GameScripts
     OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/scripts"
     OPT_LEVEL 2
+    TRUSTED_RELEASE
     SOURCES
         game.rs
         common.rs
@@ -62,11 +63,19 @@ target_link_libraries(game PRIVATE GameScriptsAot)
 The integration:
 
 1. tracks script source dependencies;
-2. invokes `rsaot`;
+2. invokes `rsaot` (passing `--trusted-release` when `TRUSTED_RELEASE` is enabled);
 3. compiles generated C++17;
 4. links RealScript AOT support;
 5. exposes generated headers and manifest files;
 6. avoids rewriting generated files when content has not changed.
+
+## Zero-Budget Trusted Release Mode, Struct Scalarization, and Vectorized ECS Loops
+
+For trusted first-party gameplay scripts in shipping builds, RealScript supports a Zero-Budget Trusted Release AOT mode (`GenerationOptions::trustedRelease = true`, CLI `--trusted-release`, and runtime `ExecutionOptions::trustedRelease = true`):
+
+- **Zero-budget template specialization (`TrustedRelease = true`):** Typed scalar functions (`_scalar<FastAccounting, DeterminismAccounting, TrustedRelease>`) guard per-block instruction/branch accounting, GC shadow-stack root retention, and non-trapping checks behind `if constexpr (!TrustedRelease)`, allowing the C++ compiler to eliminate runtime accounting overhead at compile time while keeping the safe default specializations available in the same module.
+- **Custom `struct` stack scalarization (`AotStruct_<typeId>`):** Custom value-type `struct`s with up to 16 scalar or inline-math (`Fixed`, `Fixed16`, `Vec2`, `Vec3`, `Quat`) fields are emitted as native stack-allocated C++ structs (`AotStruct_<typeId>`) with direct `.f_<index>` field access, avoiding `runtime::Value` boxing or heap allocation inside typed functions.
+- **Zero-copy ECS raw column cache & AVX2/SIMD loop reconstruction:** When iterating over `Query<Write<T>, Read<U>>()` columns bound via `ScriptRuntime::bindEcsRawColumn` / `bindEcsRawColumnAuto<HostStruct>`, generated AOT functions cache `TypedRawColumnCache` descriptors and reconstruct multi-block MIR `foreach` loops into a contiguous C++ `for (std::int64_t ecsIdx = ...)` fast-loop with `__restrict` native pointers (`ecsPtr_<col>`) and compiler vectorization directives (`#pragma GCC ivdep`, `#pragma clang loop vectorize(enable) interleave(enable)`, and `#pragma loop(ivdep)`). When `exactNativeLayout` is not satisfied (for example, custom byte strides or 32-bit `int32_t` host fields mapped to 64-bit script `int` slots), the fast-loop automatically falls back to zero-copy strided field reads/writes (`loadFromRawColumn` / `storeToRawColumn`), and honors sparse ECS writebacks whenever sparse entity state is present.
 
 ## Native Module ABI
 
@@ -205,7 +214,7 @@ collection to 27.75 ms with 460 completed collections and 16,320 bytes live.
 
 For the complete experiment history, rejected prototypes, product macrobench
 results, and reproduction commands, see the
-[detailed performance report](../zh-CN/PERFORMANCE_BASELINE_2026-08-09.md).
+[detailed performance report](../zh-CN/PERFORMANCE_BASELINE.md).
 
 ## Differential Validation
 

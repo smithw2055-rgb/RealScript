@@ -149,7 +149,11 @@ add_executable(rsbench tools/rsbench/main.cpp)
 target_link_libraries(rsbench PRIVATE RealScript::Compiler RealScript::Runtime)
 target_compile_features(rsbench PRIVATE cxx_std_17)
 
-foreach(realscript_tool IN ITEMS rsc rsdebug rslsp rsaot rsbench)
+add_executable(rsbind tools/rsbind/main.cpp)
+target_link_libraries(rsbind PRIVATE RealScript::GameSdk)
+target_compile_features(rsbind PRIVATE cxx_std_17)
+
+foreach(realscript_tool IN ITEMS rsc rsdebug rslsp rsaot rsbench rsbind)
     realscript_enable_cxx_warnings(${realscript_tool})
 endforeach()
 
@@ -368,6 +372,18 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_fiber_scheduler_tests
         realscript.fiber-scheduler
         tests/fiber_scheduler_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_engine_integration_evolution_tests
+        realscript.engine-integration-evolution
+        tests/engine_integration_evolution_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_pool_refactor_verification_tests
+        realscript.pool-refactor-verification
+        tests/pool_refactor_verification.cpp)
+    realscript_add_cpp_test(
+        realscript_dap_socket_attach_tests
+        realscript.dap-socket-attach
+        tests/dap_socket_attach_test.cpp)
     set(REALSCRIPT_PHASE20_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/phase20")
     realscript_add_aot_library(
@@ -506,6 +522,49 @@ if(REALSCRIPT_BUILD_TESTS)
     add_test(
         NAME realscript.phase19.aot
         COMMAND realscript_phase19_aot_tests)
+
+    set(REALSCRIPT_AOT_MATH_BENCH_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/aot_math_bench")
+    realscript_add_aot_library(
+        realscript_aot_math_bench_generated
+        PROGRAM_NAME BenchProgram_math
+        CPP_NAMESPACE bench_ns_math
+        QUERY_SYMBOL rs_module_query_math
+        OUTPUT_DIRECTORY "${REALSCRIPT_AOT_MATH_BENCH_GENERATED_DIR}"
+        OPT_LEVEL 2
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/aot_trusted_math_bench.rs"
+    )
+    set(REALSCRIPT_AOT_ECS_BENCH_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/aot_ecs_bench")
+    realscript_add_aot_library(
+        realscript_aot_ecs_bench_generated
+        PROGRAM_NAME BenchProgram_ecs
+        CPP_NAMESPACE bench_ns_ecs
+        QUERY_SYMBOL rs_module_query_ecs
+        OUTPUT_DIRECTORY "${REALSCRIPT_AOT_ECS_BENCH_GENERATED_DIR}"
+        OPT_LEVEL 2
+        TRUSTED_RELEASE
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/aot_trusted_ecs_bench.rs"
+    )
+    add_executable(
+        realscript_aot_trusted_and_zero_copy_ecs_tests
+        tests/aot_trusted_and_zero_copy_ecs_test.cpp)
+    target_link_libraries(
+        realscript_aot_trusted_and_zero_copy_ecs_tests
+        PRIVATE
+            realscript_aot_math_bench_generated
+            realscript_aot_ecs_bench_generated
+            RealScript::Full)
+    target_compile_features(
+        realscript_aot_trusted_and_zero_copy_ecs_tests PRIVATE cxx_std_17)
+    target_compile_definitions(
+        realscript_aot_trusted_and_zero_copy_ecs_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME realscript.aot-trusted-and-zero-copy-ecs
+        COMMAND realscript_aot_trusted_and_zero_copy_ecs_tests)
     if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
         target_compile_definitions(
             realscript_phase19_runtime_polymorphism_tests
@@ -557,7 +616,8 @@ if(REALSCRIPT_BUILD_TESTS)
             realscript_phase21_aot_tests
             realscript_phase22_aot_tests
             realscript_phase23_aot_tests
-            realscript_phase24_aot_tests)
+            realscript_phase24_aot_tests
+            realscript_aot_trusted_and_zero_copy_ecs_tests)
         realscript_enable_cxx_warnings(${realscript_aot_test})
     endforeach()
 
@@ -594,7 +654,7 @@ if(REALSCRIPT_INSTALL_SDK)
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
     install(
-        TARGETS rsc rsdebug rslsp rsbench
+        TARGETS rsc rsdebug rslsp rsbench rsbind
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
     install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

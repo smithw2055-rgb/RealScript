@@ -143,6 +143,7 @@ private:
                     analyzeExpression(*argument.value, assigned);
                 }
                 if (!argument.forwarded &&
+                    argument.targetKind == ReferenceTargetKind::Variable &&
                     (argument.modifier == ParameterModifier::Ref ||
                      argument.modifier == ParameterModifier::Out)) {
                     assigned.insert(argument.variable.index);
@@ -216,6 +217,11 @@ private:
         case BoundNodeKind::NewObjectExpression: {
             const auto& value = static_cast<const
                 BoundNewObjectExpression&>(expression);
+            for (const auto& initializer : value.defaultFieldInitializers) {
+                for (const auto& argument : initializer.arguments) {
+                    analyzeExpression(*argument, assigned);
+                }
+            }
             for (const auto& argument : value.arguments) {
                 analyzeExpression(*argument, assigned);
             }
@@ -248,11 +254,30 @@ private:
             }
             return;
         }
-        case BoundNodeKind::MemberAccessExpression:
-            analyzeExpression(*static_cast<const BoundMemberAccessExpression&>(expression).receiver, assigned); return;
+        case BoundNodeKind::MemberAccessExpression: {
+            const auto& value = static_cast<const BoundMemberAccessExpression&>(expression);
+            if (value.receiver) analyzeExpression(*value.receiver, assigned);
+            if (value.staticInitializer) analyzeExpression(*value.staticInitializer, assigned);
+            return;
+        }
         case BoundNodeKind::MemberAssignmentExpression: {
             const auto& value = static_cast<const BoundMemberAssignmentExpression&>(expression);
-            analyzeExpression(*value.receiver, assigned); analyzeExpression(*value.expression, assigned); return;
+            if (value.receiver) analyzeExpression(*value.receiver, assigned);
+            analyzeExpression(*value.expression, assigned);
+            return;
+        }
+        case BoundNodeKind::StructFieldAccessExpression: {
+            const auto& value = static_cast<const BoundStructFieldAccessExpression&>(expression);
+            if (value.receiver) analyzeExpression(*value.receiver, assigned);
+            return;
+        }
+        case BoundNodeKind::StructFieldAssignmentExpression: {
+            const auto& value = static_cast<const BoundStructFieldAssignmentExpression&>(expression);
+            if (value.staticReceiverInitializer) {
+                analyzeExpression(*value.staticReceiverInitializer, assigned);
+            }
+            if (value.expression) analyzeExpression(*value.expression, assigned);
+            return;
         }
         case BoundNodeKind::ArrayLengthExpression:
             analyzeExpression(*static_cast<const BoundArrayLengthExpression&>(expression).receiver, assigned); return;
@@ -375,6 +400,22 @@ private:
         }
         case BoundNodeKind::ForeachStatement: {
             const auto& value = static_cast<const BoundForeachStatement&>(statement);
+            if (value.isEcsQuery) {
+                state.assigned.insert(value.indexVariable.index);
+                auto bodyAssigned = state.assigned;
+                if (value.hasEcsEntityBinding) {
+                    state.assigned.insert(value.ecsEntityCollectionVariable.index);
+                    bodyAssigned.insert(value.ecsEntityCollectionVariable.index);
+                    bodyAssigned.insert(value.ecsEntityVariable.index);
+                }
+                for (const auto& col : value.ecsColumns) {
+                    state.assigned.insert(col.collectionVariable.index);
+                    bodyAssigned.insert(col.collectionVariable.index);
+                    bodyAssigned.insert(col.iterationVariable.index);
+                }
+                (void)analyzeStatement(*value.body, {std::move(bodyAssigned), ExitKind::None});
+                return state;
+            }
             analyzeExpression(*value.collection, state.assigned);
             state.assigned.insert(value.collectionVariable.index);
             state.assigned.insert(value.indexVariable.index);

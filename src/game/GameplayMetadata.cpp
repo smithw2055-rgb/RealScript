@@ -1,6 +1,10 @@
 #include "realscript/game/GameplayMetadata.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
+#include <unordered_set>
 
 namespace realscript::game {
 namespace {
@@ -80,6 +84,119 @@ bool ScriptMetadataRegistry::addMemberAttribute(
     if (found != attributes.end() && found->name == attribute.name) return false;
     attributes.insert(found, std::move(attribute));
     return true;
+}
+
+namespace {
+
+GameplayValue parseAttributeArgumentValue(const std::string& raw) {
+    std::size_t begin = 0;
+    std::size_t end = raw.size();
+    while (begin < end && std::isspace(static_cast<unsigned char>(raw[begin]))) {
+        ++begin;
+    }
+    while (end > begin && std::isspace(static_cast<unsigned char>(raw[end - 1]))) {
+        --end;
+    }
+    const std::string trimmed = raw.substr(begin, end - begin);
+    if (trimmed == "true") return true;
+    if (trimmed == "false") return false;
+    if (trimmed.size() >= 2 && trimmed.front() == '"' && trimmed.back() == '"') {
+        std::string unescaped;
+        unescaped.reserve(trimmed.size() - 2);
+        for (std::size_t i = 1; i + 1 < trimmed.size(); ++i) {
+            if (trimmed[i] == '\\' && i + 2 < trimmed.size()) {
+                ++i;
+                switch (trimmed[i]) {
+                case 'n': unescaped.push_back('\n'); break;
+                case 'r': unescaped.push_back('\r'); break;
+                case 't': unescaped.push_back('\t'); break;
+                default: unescaped.push_back(trimmed[i]); break;
+                }
+            } else {
+                unescaped.push_back(trimmed[i]);
+            }
+        }
+        return unescaped;
+    }
+    if (!trimmed.empty()) {
+        char* parseEnd = nullptr;
+        const long long intVal = std::strtoll(trimmed.c_str(), &parseEnd, 10);
+        if (parseEnd && *parseEnd == '\0') {
+            return static_cast<std::int64_t>(intVal);
+        }
+    }
+    return trimmed;
+}
+
+bool ingestAttributeRecords(
+    ScriptMetadataRegistry& registry,
+    const std::vector<compiler::LanguageAttributeRecord>& records,
+    std::size_t& count) {
+    static const char* const kMemberKinds[] = {
+        "::field:",
+        "::property:",
+        "::method:",
+        "::ctor:",
+        "::enum:",
+    };
+    for (const auto& record : records) {
+        ScriptAttribute attribute;
+        attribute.name = record.name;
+        for (const auto& arg : record.arguments) {
+            attribute.arguments[arg.name] = parseAttributeArgumentValue(arg.value);
+        }
+
+        bool matchedMember = false;
+        for (const char* marker : kMemberKinds) {
+            const auto pos = record.target.find(marker);
+            if (pos != std::string::npos) {
+                matchedMember = true;
+                std::string owner = record.target.substr(0, pos);
+                std::string member = record.target.substr(pos + std::strlen(marker));
+                const auto arityPos = member.find('#');
+                if (arityPos != std::string::npos) {
+                    member = member.substr(0, arityPos);
+                }
+                if (registry.addMemberAttribute(std::move(owner), std::move(member), std::move(attribute))) {
+                    ++count;
+                }
+                break;
+            }
+        }
+        if (!matchedMember) {
+            if (registry.addTypeAttribute(record.target, std::move(attribute))) {
+                ++count;
+            }
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+std::size_t ScriptMetadataRegistry::populateFromLanguageMetadata(
+    const GameLanguageMetadata& metadata) {
+    std::size_t added = 0;
+    ingestAttributeRecords(*this, metadata.attributes, added);
+    return added;
+}
+
+std::size_t ScriptMetadataRegistry::populateFromProgramImage(
+    const runtime::ProgramImage& program) {
+    std::size_t added = 0;
+    for (const auto& module : program.modules()) {
+        ingestAttributeRecords(*this, module.languageMetadata.attributes, added);
+    }
+    return added;
+}
+
+std::size_t ScriptMetadataRegistry::populateFromProgram(
+    const GameProgram& program) {
+    std::size_t added = populateFromLanguageMetadata(program.languageMetadata());
+    if (program.program()) {
+        added += populateFromProgramImage(*program.program());
+    }
+    return added;
 }
 
 const std::vector<ScriptAttribute>* ScriptMetadataRegistry::typeAttributes(
@@ -221,6 +338,304 @@ ScriptContract sceneBehaviorContract() {
             {"OnFixedUpdate", 1, false},
             {"OnDestroy", 0, false},
         }};
+}
+
+namespace {
+
+const compiler::LanguageGenericInstantiation* findGenericInstantiation(
+    const runtime::ProgramImage* program,
+    const std::string& typeName) {
+    if (!program || typeName.empty()) return nullptr;
+    std::string simpleName = typeName;
+    const auto sep = simpleName.rfind("::");
+    if (sep != std::string::npos) {
+        simpleName = simpleName.substr(sep + 2);
+    }
+    for (const auto& module : program->modules()) {
+        for (const auto& inst : module.languageMetadata.genericInstantiations) {
+            if (inst.generatedName == simpleName ||
+                (module.name + "::" + inst.generatedName) == typeName) {
+                return &inst;
+            }
+        }
+    }
+    return nullptr;
+}
+
+bool isBuiltinCollectionGenericName(const std::string& name) {
+    return name == "List" || name == "Queue" || name == "Stack" ||
+        name == "HashSet" || name == "Dictionary";
+}
+
+InspectorFieldSchema buildInspectorFieldSchema(
+    const ScriptRuntime& runtime,
+    const ScriptMetadataRegistry& metadata,
+    const std::string& ownerCanonicalTypeName,
+    const semantic::FieldSymbol& field,
+    const ScriptObject* prototype,
+    const runtime::Value* parentStructValue,
+    std::size_t fieldIndexInParent,
+    std::unordered_set<std::string>& visitedStructs) {
+    const bool hasExport =
+        metadata.findMemberAttribute(ownerCanonicalTypeName, field.name, "Export") != nullptr ||
+        metadata.findMemberAttribute(ownerCanonicalTypeName, field.name, "SerializeField") != nullptr;
+    const bool isPublic =
+        field.accessibility == semantic::Accessibility::Public;
+    const bool hidden =
+        metadata.findMemberAttribute(ownerCanonicalTypeName, field.name, "HideInInspector") != nullptr;
+
+    InspectorFieldSchema fieldSchema;
+    fieldSchema.name = field.name;
+    fieldSchema.type = field.type;
+    fieldSchema.typeName = field.typeName;
+    fieldSchema.exported = hasExport || isPublic;
+    fieldSchema.hiddenInInspector = hidden;
+
+    runtime::RuntimeError error;
+    if (parentStructValue) {
+        if (const auto* structVal = std::get_if<runtime::StructValue>(parentStructValue)) {
+            if (auto subVal = runtime::structValueFieldAt(*structVal, fieldIndexInParent)) {
+                fieldSchema.defaultValue = std::move(*subVal);
+            }
+        } else if (auto inlineField = runtime::loadInlineStructField(*parentStructValue, fieldIndexInParent)) {
+            fieldSchema.defaultValue = std::move(*inlineField);
+        }
+    } else if (prototype) {
+        if (auto val = runtime.getMember(*prototype, field.name, error)) {
+            fieldSchema.defaultValue = std::move(*val);
+        }
+    }
+
+    if (const auto* rangeAttr = metadata.findMemberAttribute(
+            ownerCanonicalTypeName, field.name, "Range")) {
+        const auto readIntArg = [&](const char* named, const char* positional) -> std::optional<std::int64_t> {
+            auto it = rangeAttr->arguments.find(named);
+            if (it == rangeAttr->arguments.end()) {
+                it = rangeAttr->arguments.find(positional);
+            }
+            if (it != rangeAttr->arguments.end()) {
+                if (const auto* v = std::get_if<std::int64_t>(&it->second)) return *v;
+            }
+            return std::nullopt;
+        };
+        fieldSchema.rangeMin = readIntArg("min", "arg0");
+        fieldSchema.rangeMax = readIntArg("max", "arg1");
+    }
+
+    if (const auto* tooltipAttr = metadata.findMemberAttribute(
+            ownerCanonicalTypeName, field.name, "Tooltip")) {
+        auto it = tooltipAttr->arguments.find("text");
+        if (it == tooltipAttr->arguments.end()) {
+            it = tooltipAttr->arguments.find("arg0");
+        }
+        if (it != tooltipAttr->arguments.end()) {
+            if (const auto* v = std::get_if<std::string>(&it->second)) {
+                fieldSchema.tooltip = *v;
+            }
+        }
+    }
+
+    if (const auto* renamedAttr = metadata.findMemberAttribute(
+            ownerCanonicalTypeName, field.name, "FormerlySerializedAs")) {
+        auto it = renamedAttr->arguments.find("oldName");
+        if (it == renamedAttr->arguments.end()) {
+            it = renamedAttr->arguments.find("arg0");
+        }
+        if (it != renamedAttr->arguments.end()) {
+            if (const auto* v = std::get_if<std::string>(&it->second)) {
+                fieldSchema.formerlySerializedAs = *v;
+            }
+        }
+    }
+
+    // Reference attributes: [EntityRef], [ComponentRef], [AssetRef]
+    const auto readRefTypeArg = [](const ScriptAttribute& attr) -> std::string {
+        for (const char* key : {"type", "Type", "arg0"}) {
+            const auto it = attr.arguments.find(key);
+            if (it != attr.arguments.end()) {
+                if (const auto* v = std::get_if<std::string>(&it->second)) {
+                    return *v;
+                }
+            }
+        }
+        return {};
+    };
+    if (const auto* entityAttr = metadata.findMemberAttribute(
+            ownerCanonicalTypeName, field.name, "EntityRef")) {
+        fieldSchema.referenceKind = InspectorReferenceKind::Entity;
+        fieldSchema.referencedTypeName = readRefTypeArg(*entityAttr);
+        if (fieldSchema.referencedTypeName.empty()) {
+            fieldSchema.referencedTypeName = "Entity";
+        }
+    } else if (const auto* assetAttr = metadata.findMemberAttribute(
+                   ownerCanonicalTypeName, field.name, "AssetRef")) {
+        fieldSchema.referenceKind = InspectorReferenceKind::Asset;
+        fieldSchema.referencedTypeName = readRefTypeArg(*assetAttr);
+        if (fieldSchema.referencedTypeName.empty()) {
+            fieldSchema.referencedTypeName = field.typeName.empty() ? "Asset" : field.typeName;
+        }
+    } else if (const auto* compAttr = metadata.findMemberAttribute(
+                   ownerCanonicalTypeName, field.name, "ComponentRef")) {
+        fieldSchema.referenceKind = InspectorReferenceKind::Component;
+        fieldSchema.referencedTypeName = readRefTypeArg(*compAttr);
+        if (fieldSchema.referencedTypeName.empty()) {
+            fieldSchema.referencedTypeName = field.typeName;
+        }
+    }
+
+    // Enum dropdown options
+    if (field.type == semantic::PrimitiveType::Enum && !field.typeName.empty()) {
+        if (const auto enumType = runtime.findType(field.typeName)) {
+            for (const auto& member : enumType->descriptor.enumMembers) {
+                fieldSchema.enumOptions.push_back(InspectorEnumOption{
+                    member.name,
+                    member.value,
+                });
+            }
+        }
+    }
+
+    // Array / Collection inspection
+    if (field.type == semantic::PrimitiveType::Array) {
+        fieldSchema.isCollection = true;
+        semantic::PrimitiveType elemPrim = semantic::PrimitiveType::Error;
+        std::string elemExact;
+        if (semantic::decodeArrayTypeName(field.typeName, elemPrim, elemExact)) {
+            fieldSchema.elementTypeName = elemExact.empty()
+                ? std::string(semantic::primitiveTypeName(elemPrim))
+                : elemExact;
+        }
+    } else if (field.type == semantic::PrimitiveType::Object && !field.typeName.empty()) {
+        if (const auto* inst = findGenericInstantiation(runtime.program().get(), field.typeName)) {
+            if (isBuiltinCollectionGenericName(inst->genericName)) {
+                fieldSchema.isCollection = true;
+                if (inst->genericName == "Dictionary" && inst->arguments.size() >= 2) {
+                    fieldSchema.keyTypeName = inst->arguments[0];
+                    fieldSchema.elementTypeName = inst->arguments[1];
+                } else if (!inst->arguments.empty()) {
+                    fieldSchema.elementTypeName = inst->arguments[0];
+                }
+            }
+        }
+        if (!fieldSchema.isCollection &&
+            fieldSchema.referenceKind == InspectorReferenceKind::None) {
+            if (const auto refType = runtime.findType(field.typeName)) {
+                if (!refType->descriptor.delegateType) {
+                    fieldSchema.referenceKind = InspectorReferenceKind::Component;
+                    fieldSchema.referencedTypeName = refType->canonicalName();
+                }
+            }
+        }
+    }
+
+    // Nested struct fields
+    if (field.type == semantic::PrimitiveType::Struct && !field.typeName.empty() &&
+        visitedStructs.insert(field.typeName).second) {
+        if (const auto structType = runtime.findType(field.typeName)) {
+            const runtime::Value* parentVal =
+                runtime::structValueTypeId(fieldSchema.defaultValue).has_value()
+                ? &fieldSchema.defaultValue
+                : nullptr;
+            for (std::size_t idx = 0; idx < structType->descriptor.fields.size(); ++idx) {
+                const auto& subField = structType->descriptor.fields[idx];
+                if (subField.synthetic || subField.staticField || subField.constField) continue;
+                fieldSchema.nestedFields.push_back(buildInspectorFieldSchema(
+                    runtime,
+                    metadata,
+                    structType->canonicalName(),
+                    subField,
+                    nullptr,
+                    parentVal,
+                    idx,
+                    visitedStructs));
+            }
+        }
+        visitedStructs.erase(field.typeName);
+    }
+
+    return fieldSchema;
+}
+
+} // namespace
+
+std::optional<InspectorTypeSchema> inspectTypeSchema(
+    const ScriptRuntime& runtime,
+    const ScriptMetadataRegistry& metadata,
+    const std::string& canonicalTypeName) {
+    const auto type = runtime.findType(canonicalTypeName);
+    if (!type) return std::nullopt;
+
+    InspectorTypeSchema schema;
+    schema.canonicalTypeName = type->canonicalName();
+    schema.executeInEditMode =
+        metadata.findTypeAttribute(schema.canonicalTypeName, "Tool") != nullptr ||
+        metadata.findTypeAttribute(schema.canonicalTypeName, "ExecuteInEditMode") != nullptr;
+    schema.hasOnValidate =
+        runtime.findMethod(*type, "OnValidate", 0).has_value();
+
+    runtime::RuntimeError error;
+    auto prototype = runtime.createPrototypeObject(*type, error);
+
+    std::unordered_set<std::string> visitedStructs;
+    std::unordered_set<std::string> recordedSignals;
+
+    for (const auto& field : type->descriptor.fields) {
+        // Detect synthetic event delegate fields: $event_<SignalName>_delegate
+        if (field.synthetic) {
+            static constexpr const char* kEventPrefix = "$event_";
+            static constexpr const char* kEventSuffix = "_delegate";
+            const std::size_t prefixLen = std::strlen(kEventPrefix);
+            const std::size_t suffixLen = std::strlen(kEventSuffix);
+            if (field.name.size() > prefixLen + suffixLen &&
+                field.name.rfind(kEventPrefix, 0) == 0 &&
+                field.name.compare(
+                    field.name.size() - suffixLen, suffixLen, kEventSuffix) == 0) {
+                const std::string signalName = field.name.substr(
+                    prefixLen, field.name.size() - prefixLen - suffixLen);
+                if (recordedSignals.insert(signalName).second) {
+                    InspectorSignalSchema sig;
+                    sig.name = signalName;
+                    sig.delegateTypeName = field.typeName;
+                    if (const auto delType = runtime.findType(field.typeName)) {
+                        for (const auto& method : delType->descriptor.methods) {
+                            if (method.name == "Invoke") {
+                                const std::size_t startIdx =
+                                    (method.method && !method.staticMethod &&
+                                     !method.parameters.empty())
+                                    ? 1u
+                                    : 0u;
+                                for (std::size_t i = startIdx;
+                                     i < method.parameters.size();
+                                     ++i) {
+                                    sig.parameters.push_back(InspectorSignalParameter{
+                                        method.parameters[i].name,
+                                        method.parameters[i].type,
+                                        method.parameters[i].typeName,
+                                    });
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    schema.signals.push_back(std::move(sig));
+                }
+            }
+            continue;
+        }
+        if (field.name == "__native" || field.staticField || field.constField) continue;
+
+        schema.fields.push_back(buildInspectorFieldSchema(
+            runtime,
+            metadata,
+            schema.canonicalTypeName,
+            field,
+            prototype ? &*prototype : nullptr,
+            nullptr,
+            0,
+            visitedStructs));
+    }
+
+    return schema;
 }
 
 } // namespace realscript::game

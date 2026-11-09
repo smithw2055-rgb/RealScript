@@ -31,17 +31,17 @@ JIT, game-oriented bindings, fixed-tick coroutines, replay, and rollback.
 
 ## Language and runtime features
 
-| Area | Implemented in v0.2.0 |
+| Area | Implemented in v0.2.0+ |
 |---|---|
-| Language | Modules/imports, overloads, classes, single inheritance, interfaces, virtual dispatch, delegates, closures, events, generics, collections, enums, mutable structs, nullable values, boxing, patterns, initializers, flexible arguments, and structured exceptions. |
-| Control flow | `if`, `while`, `for`, `foreach`, `do/while`, `switch`, switch expressions, `break`, `continue`, `try/catch/finally`, and deterministic `sequence`/`yield wait_ticks`. |
-| Compiler | Lexer, parser, Binder, flow analysis, stable diagnostics, verified multi-block Typed MIR, and O0/O1/O2 optimization. |
-| Bytecode | Typed register VM, deterministic `.rsbc` 0.9 output, 0.6–0.8 legacy decoding, defensive validation, and structured script stacks. |
-| Memory | Generation-checked object references, precise roots, incremental mark/sweep GC, write barriers, bounded GC work, snapshots, retaining paths, and leak diagnostics. |
-| Native execution | Deterministic C++17 AOT, C11 module-query ABI, source maps, typed native thunks, optional toolchain JIT, and content-addressed JIT cache. |
-| Determinism | Off/Strict/Record/Replay modes, instruction/recursion/allocation/heap budgets, stable digests, external-call replay, and cross-backend differential validation. |
-| Game SDK | Typed bindings, rooted objects, scene lifecycle, events/triggers, fixed-tick gameplay host, sequence scheduling, `RSGS` state encoding, save/replay/rollback helpers, and installable CMake targets. |
-| Tooling | `rsc`, `rsaot`, `rsdebug`, `rslsp`, `rsbench`, DAP, LSP, profiling, source metadata, and body-compatible hot reload. |
+| Language | Modules/imports, overloads, operator overloads, compound assignments, classes, `static class`, static constructors (`static T()`), `readonly` fields, auto-property initializers, single inheritance (including script classes inheriting bound C++ types), interfaces, virtual dispatch, delegates, closures, events, generics, collections, enums, mutable structs, nullable values, boxing, patterns, initializers, flexible arguments, and structured exceptions. |
+| Control flow | `if`, `while`, `for`, `foreach`, `do/while`, `switch`, switch expressions, `break`, `continue`, `try/catch/finally`, deterministic `sequence` (`yield wait_ticks`, `wait_seconds`, `wait_event`, `wait_signal`, `wait_until`), and `RealScript.Fiber` cooperative fibers. |
+| Compiler | Lexer, parser, Binder, flow analysis, `[Deterministic]` static verification, stable diagnostics, verified multi-block Typed MIR, and O0/O1/O2 optimization. |
+| Bytecode | Typed register VM, 24-byte `Value` & 8-byte `Instruction` layout, quickened integer-loop superinstructions, deterministic `.rsbc` 0.9 output, 0.6–0.8 legacy decoding, defensive validation, and structured script stacks. |
+| Memory | Generation-checked object references, 12-byte inline struct slots (`InlineStructSlot`), `ValuePoolArena` mark/sweep GC for pooled strings/structs/closures, precise roots, incremental mark/sweep GC, write barriers, bounded GC work, snapshots, retaining paths, and leak diagnostics. |
+| Native execution | Deterministic C++17 AOT, Zero-Budget Trusted Release AOT (`--trusted-release`), custom `struct` stack scalarization (`AotStruct_<id>`), AVX2/SIMD vectorized ECS query loops (`__restrict` + `#pragma loop(ivdep)`), C11 module-query ABI, source maps, typed native thunks, optional toolchain JIT, content-addressed JIT cache, and tiered Interpreter/JIT/AOT dispatch. |
+| Determinism | Off/Strict/Record/Replay modes, instruction/recursion/allocation/heap budgets, Mod capability sandboxing, stable digests, external-call replay, and cross-backend differential validation. |
+| Game SDK | Typed bindings, direct math struct marshaling (`Fixed`/`Fixed16`/`Vec2`/`Vec3`/`Quat`), zero-copy C++ host ECS raw column binding (`bindEcsRawColumnAuto<T>`), `Query<Write<T>, Read<U>, With<V>, Without<W>>()` & `EntityCommandBuffer`, 2D/3D fixed-point physics (`stepPhysics2D`/`stepPhysics3D`), deterministic `RealScript.Input`, multi-component entities, generational entity handles, Editor/Play modes (`[Tool]`/`[ExecuteInEditMode]`), `OnValidate`, deep `InspectorTypeSchema` reflection, host `connectSignal`, JSON prefab/scene serialization, and `RSGS` state encoding. |
+| Tooling | `rsc`, `rsaot`, `rsdebug`, `rslsp`, `rsbench`, DAP (stdio & embedded TCP `--dap-port` attach, conditional breakpoints, watch `evaluate`), LSP (incremental `ParseSnapshot` cache, member dot-completion, `signatureHelp`, `.d.rs` host stubs), `vscode-realscript` VS Code extension, Chrome Tracing profiler export, and stateful structural hot reload (`[FormerlySerializedAs]` & cross-component ref migration). |
 
 For the exact supported/partial/unsupported language inventory, see the
 [C#-style compatibility matrix](docs/en/CSHARP_COMPATIBILITY_MATRIX.md).
@@ -178,7 +178,7 @@ Key v0.2.0 performance changes:
 - cached scene method descriptors and lower scheduler payload-copy cost.
 
 Read the [AOT/JIT performance guide](docs/en/AOT_JIT_AND_PERFORMANCE.md) and the
-[full benchmark report](docs/zh-CN/PERFORMANCE_BASELINE_2026-08-09.md) for
+[full benchmark report](docs/zh-CN/PERFORMANCE_BASELINE.md) for
 methodology, optimization history, rejected experiments, and reproduction
 commands.
 
@@ -237,7 +237,7 @@ RealScript is not CLR-compatible C#. v0.2.0 deliberately does not provide:
 - unsafe pointers, ref structs, ref properties, or complete escape analysis;
 - exception filters, `using`, native exception interop, or exceptions across a
   coroutine suspension point;
-- operator overloads, user-defined conversions, LINQ, `dynamic`, reflection
+- user-defined implicit/explicit conversions, LINQ, `dynamic`, reflection
   code generation, or the .NET base-class library;
 - direct in-process machine-code JIT, OSR, PGO, or a rollback networking
   protocol;

@@ -286,12 +286,14 @@ bool readTypeIds(
     return reader.valid();
 }
 
-void writeRegisters(Writer& writer, const std::vector<Register>& values) {
+template <typename RegContainer>
+void writeRegisters(Writer& writer, const RegContainer& values) {
     writer.u32(static_cast<std::uint32_t>(values.size()));
     for (const auto value : values) writer.u32(value);
 }
 
-bool readRegisters(Reader& reader, std::vector<Register>& values) {
+template <typename RegContainer>
+bool readRegisters(Reader& reader, RegContainer& values) {
     const auto count = reader.u32();
     if (!reader.valid() || count > reader.remaining() / 4) return false;
     values.reserve(count);
@@ -631,12 +633,19 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         for (const auto& field : type.fields) {
             strings.add(field.declaringTypeName);
             strings.add(field.sourceName);
+            if (field.hasConstantValue &&
+                std::holds_alternative<std::string>(field.constantValue)) {
+                strings.add(std::get<std::string>(field.constantValue));
+            }
         }
         for (const auto& method : type.methods) {
             addFunctionStrings(strings, method);
         }
         for (const auto& constructor : type.constructors) {
             addFunctionStrings(strings, constructor);
+        }
+        if (type.staticConstructor) {
+            addFunctionStrings(strings, *type.staticConstructor);
         }
         for (const auto& property : type.properties) {
             addPropertyStrings(strings, property);
@@ -711,7 +720,12 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
                 ? InvalidIndex
                 : strings.indexOf(field.typeName));
             typeSection.u32(static_cast<std::uint32_t>(field.index));
-            typeSection.u8(field.synthetic ? 1 : 0);
+            std::uint8_t fieldFlags = 0;
+            if (field.synthetic) fieldFlags |= 0x01u;
+            if (field.staticField) fieldFlags |= 0x02u;
+            if (field.constField) fieldFlags |= 0x04u;
+            if (field.readonlyField) fieldFlags |= 0x08u;
+            typeSection.u8(fieldFlags);
         }
         typeSection.u32(static_cast<std::uint32_t>(type.enumMembers.size()));
         for (const auto& member : type.enumMembers) {
@@ -742,6 +756,7 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         if (type.abstractType) flags |= 0x04u;
         if (type.sealedType) flags |= 0x08u;
         if (type.delegateType) flags |= 0x10u;
+        if (type.staticType) flags |= 0x20u;
         objectModelSection.u8(flags);
         objectModelSection.u64(type.baseTypeId);
         objectModelSection.u32(type.baseTypeName.empty()
@@ -755,15 +770,35 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
             objectModelSection.u32(strings.indexOf(field.declaringTypeName));
             objectModelSection.u32(strings.indexOf(field.sourceName));
             objectModelSection.u64(field.id);
+            if (!field.hasConstantValue) {
+                objectModelSection.u8(0u);
+            } else if (std::holds_alternative<std::int64_t>(field.constantValue)) {
+                objectModelSection.u8(1u);
+                objectModelSection.i64(std::get<std::int64_t>(field.constantValue));
+            } else if (std::holds_alternative<double>(field.constantValue)) {
+                objectModelSection.u8(2u);
+                objectModelSection.f64(std::get<double>(field.constantValue));
+            } else if (std::holds_alternative<bool>(field.constantValue)) {
+                objectModelSection.u8(3u);
+                objectModelSection.u8(std::get<bool>(field.constantValue) ? 1u : 0u);
+            } else if (std::holds_alternative<std::string>(field.constantValue)) {
+                objectModelSection.u8(4u);
+                objectModelSection.u32(strings.indexOf(std::get<std::string>(field.constantValue)));
+            } else {
+                objectModelSection.u8(0u);
+            }
         }
         objectModelSection.u32(static_cast<std::uint32_t>(type.methods.size()));
         for (const auto& method : type.methods) {
             writeFunctionSymbol(objectModelSection, strings, method);
         }
         objectModelSection.u32(static_cast<std::uint32_t>(
-            type.constructors.size()));
+            type.constructors.size() + (type.staticConstructor ? 1u : 0u)));
         for (const auto& constructor : type.constructors) {
             writeFunctionSymbol(objectModelSection, strings, constructor);
+        }
+        if (type.staticConstructor) {
+            writeFunctionSymbol(objectModelSection, strings, *type.staticConstructor);
         }
         objectModelSection.u32(static_cast<std::uint32_t>(
             type.properties.size()));
@@ -818,9 +853,9 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
                 codeSection.u32(instruction.index);
                 codeSection.u32(instruction.typeIndex);
                 codeSection.u8(encodeOptionalType(instruction.elementType));
-                codeSection.u64(instruction.elementTypeId);
-                codeSection.i64(instruction.integerImmediate);
-                codeSection.f64(instruction.doubleImmediate);
+                codeSection.u64(instruction.activeElementTypeId());
+                codeSection.i64(instruction.activeIntegerImmediate());
+                codeSection.f64(instruction.activeDoubleImmediate());
                 codeSection.u8(static_cast<std::uint8_t>(
                     (instruction.boolImmediate ? 1u : 0u) |
                     (instruction.checkedArithmetic ? 0u : 2u)));
@@ -1338,7 +1373,11 @@ bool decodeModule(
                     field.typeName = strings[typeNameIndex];
                 }
                 field.index = reader.u32();
-                field.synthetic = reader.u8() != 0;
+                const auto fieldFlags = reader.u8();
+                field.synthetic = (fieldFlags & 0x01u) != 0;
+                field.staticField = (fieldFlags & 0x02u) != 0;
+                field.constField = (fieldFlags & 0x04u) != 0;
+                field.readonlyField = (fieldFlags & 0x08u) != 0;
                 type.fields.push_back(std::move(field));
             }
             const auto enumCount = reader.u32();
@@ -1421,7 +1460,7 @@ bool decodeModule(
             if (!reader.valid() ||
                 accessibility > static_cast<std::uint8_t>(
                     semantic::Accessibility::Private) ||
-                (flags & 0xe0u) != 0) {
+                (flags & 0xc0u) != 0) {
                 diagnostics.report("RS5004", "invalid object-model type flags", {});
                 return false;
             }
@@ -1432,6 +1471,7 @@ bool decodeModule(
             type.abstractType = (flags & 0x04u) != 0;
             type.sealedType = (flags & 0x08u) != 0;
             type.delegateType = (flags & 0x10u) != 0;
+            type.staticType = (flags & 0x20u) != 0;
             type.baseTypeId = reader.u64();
             const auto baseTypeNameIndex = reader.u32();
             if (baseTypeNameIndex != InvalidIndex) {
@@ -1478,6 +1518,42 @@ bool decodeModule(
                     fieldAccessibility);
                 field.declaringTypeName = strings[declaringNameIndex];
                 field.sourceName = strings[sourceNameIndex];
+                const auto constKind = reader.u8();
+                if (!reader.valid() || constKind > 4u) {
+                    diagnostics.report(
+                        "RS5004", "invalid field constant value tag", {});
+                    return false;
+                }
+                if (constKind == 1u) {
+                    field.hasConstantValue = true;
+                    field.constantValue = reader.i64();
+                } else if (constKind == 2u) {
+                    field.hasConstantValue = true;
+                    field.constantValue = reader.f64();
+                } else if (constKind == 3u) {
+                    const auto b = reader.u8();
+                    if (!reader.valid() || b > 1u) {
+                        diagnostics.report(
+                            "RS5004", "invalid field boolean constant value", {});
+                        return false;
+                    }
+                    field.hasConstantValue = true;
+                    field.constantValue = (b != 0u);
+                } else if (constKind == 4u) {
+                    const auto strIdx = reader.u32();
+                    if (!validStringIndex(
+                            strIdx, strings, diagnostics,
+                            "invalid field constant string index")) {
+                        return false;
+                    }
+                    field.hasConstantValue = true;
+                    field.constantValue = strings[strIdx];
+                }
+                if (!reader.valid()) {
+                    diagnostics.report(
+                        "RS5004", "truncated field constant value", {});
+                    return false;
+                }
             }
 
             const auto methodCount = reader.u32();
@@ -1512,7 +1588,11 @@ bool decodeModule(
                         reader, strings, constructor, diagnostics)) {
                     return false;
                 }
-                type.constructors.push_back(std::move(constructor));
+                if (constructor.staticMethod) {
+                    type.staticConstructor = std::move(constructor);
+                } else {
+                    type.constructors.push_back(std::move(constructor));
+                }
             }
 
             const auto propertyCount = reader.u32();
@@ -1709,14 +1789,27 @@ bool decodeModule(
                     return false;
                 }
                 instruction.index = reader.u32();
-                instruction.typeIndex = reader.u32();
+                const auto rawTypeIdx = reader.u32();
+                if (rawTypeIdx > 0xFFFFu) {
+                    diagnostics.report("RS5004", "instruction type index exceeds 16-bit limit", {});
+                    return false;
+                }
+                instruction.typeIndex = static_cast<std::uint16_t>(rawTypeIdx);
                 if (!decodeOptionalType(reader.u8(), instruction.elementType)) {
                     diagnostics.report("RS5004", "invalid instruction element type", {});
                     return false;
                 }
-                instruction.elementTypeId = reader.u64();
-                instruction.integerImmediate = reader.i64();
-                instruction.doubleImmediate = reader.f64();
+                const auto elemTypeId = reader.u64();
+                const auto intImm = reader.i64();
+                const auto dblImm = reader.f64();
+                instruction.elementTypeId = 0;
+                if (instruction.usesDoubleImmediate()) {
+                    instruction.doubleImmediate = dblImm;
+                } else if (instruction.usesIntegerImmediate()) {
+                    instruction.integerImmediate = intImm;
+                } else if (instruction.usesElementTypeId()) {
+                    instruction.elementTypeId = elemTypeId;
+                }
                 const auto arithmeticFlags = reader.u8();
                 if (arithmeticFlags > 3u) {
                     diagnostics.report(
@@ -1747,8 +1840,14 @@ bool decodeModule(
             block.terminator.kind = static_cast<TerminatorKind>(terminator);
             block.terminator.condition = reader.u32();
             block.terminator.value = reader.u32();
-            block.terminator.target = reader.u32();
-            block.terminator.falseTarget = reader.u32();
+            const auto rawTarget = reader.u32();
+            const auto rawFalseTarget = reader.u32();
+            if (rawTarget > 0xFFFFu || rawFalseTarget > 0xFFFFu) {
+                diagnostics.report("RS5004", "terminator target block index exceeds 16-bit limit", {});
+                return false;
+            }
+            block.terminator.target = static_cast<std::uint16_t>(rawTarget);
+            block.terminator.falseTarget = static_cast<std::uint16_t>(rawFalseTarget);
             if (!readRegisters(reader, block.terminator.arguments) ||
                 !readRegisters(reader, block.terminator.falseArguments)) {
                 diagnostics.report("RS5003", "truncated bytecode terminator", {});

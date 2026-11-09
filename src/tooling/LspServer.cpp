@@ -111,13 +111,31 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
     if (method == "initialize") {
         return response(message, Json::Object{
             {"capabilities", Json::Object{
-                {"textDocumentSync", 1},
-                {"completionProvider", Json::Object{}},
+                {"textDocumentSync", 2},
+                {"completionProvider", Json::Object{
+                    {"triggerCharacters", Json::Array{"."}},
+                }},
+                {"signatureHelpProvider", Json::Object{
+                    {"triggerCharacters", Json::Array{"(", ","}},
+                }},
                 {"hoverProvider", true},
                 {"definitionProvider", true},
                 {"referencesProvider", true},
                 {"documentSymbolProvider", true},
+                {"workspaceSymbolProvider", true},
+                {"documentFormattingProvider", true},
                 {"renameProvider", true},
+                {"inlayHintProvider", true},
+                {"semanticTokensProvider", Json::Object{
+                    {"full", true},
+                    {"legend", Json::Object{
+                        {"tokenTypes", Json::Array{
+                            "namespace", "type", "function", "variable",
+                            "parameter", "property", "enumMember", "keyword",
+                            "number", "string"}},
+                        {"tokenModifiers", Json::Array{"declaration"}},
+                    }},
+                }},
             }},
             {"serverInfo", Json::Object{{"name", "RealScript LSP"},
                 {"version", realscript::kVersionString}}},
@@ -151,14 +169,36 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
             ? document->find("uri")->stringValue() : std::string{});
         const auto version = document && document->find("version")
             ? document->find("version")->integerValue() : 0;
-        std::string content;
+        std::vector<ContentChange> parsedChanges;
         if (const auto* changes = params ? params->find("contentChanges") : nullptr) {
-            if (!changes->arrayValue().empty()) {
-                const auto* text = changes->arrayValue().front().find("text");
-                if (text) content = text->stringValue();
+            for (const auto& item : changes->arrayValue()) {
+                if (!item.isObject()) continue;
+                const auto* text = item.find("text");
+                if (!text || !text->isString()) continue;
+                ContentChange cc;
+                cc.text = text->stringValue();
+                if (const auto* rangeObj = item.find("range"); rangeObj && rangeObj->isObject()) {
+                    const auto* sObj = rangeObj->find("start");
+                    const auto* eObj = rangeObj->find("end");
+                    if (sObj && sObj->isObject() && eObj && eObj->isObject()) {
+                        const auto startPos = readPosition(sObj);
+                        const auto endPos = readPosition(eObj);
+                        debug::SourceRange sr{};
+                        sr.start.line = static_cast<std::uint32_t>(startPos.line + 1);
+                        sr.start.column = static_cast<std::uint32_t>(startPos.column + 1);
+                        sr.end.line = static_cast<std::uint32_t>(endPos.line + 1);
+                        sr.end.column = static_cast<std::uint32_t>(endPos.column + 1);
+                        cc.range = sr;
+                    }
+                }
+                parsedChanges.push_back(std::move(cc));
             }
         }
-        service_.update(path, content, version);
+        if (!parsedChanges.empty()) {
+            service_.applyContentChanges(path, parsedChanges, version);
+        } else {
+            service_.update(path, std::string{}, version);
+        }
         if (notifications) {
             for (const auto& documentPath : service_.documentPaths()) {
                 publishDiagnostics(documentPath, *notifications);
@@ -199,6 +239,29 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
             });
         }
         return response(message, Json(std::move(items)));
+    }
+    if (method == "textDocument/signatureHelp") {
+        const auto help = service_.signatureHelp(path, cursor);
+        if (!help) return response(message, nullptr);
+        Json::Array sigs;
+        for (const auto& sig : help->signatures) {
+            Json::Array paramsJson;
+            for (const auto& param : sig.parameters) {
+                paramsJson.emplace_back(Json::Object{
+                    {"label", param.label},
+                });
+            }
+            sigs.emplace_back(Json::Object{
+                {"label", sig.label},
+                {"documentation", sig.documentation},
+                {"parameters", Json(std::move(paramsJson))},
+            });
+        }
+        return response(message, Json::Object{
+            {"signatures", Json(std::move(sigs))},
+            {"activeSignature", static_cast<std::int64_t>(help->activeSignature)},
+            {"activeParameter", static_cast<std::int64_t>(help->activeParameter)},
+        });
     }
     if (method == "textDocument/hover") {
         const auto value = service_.hover(path, cursor);
@@ -248,6 +311,52 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
             });
         }
         return response(message, Json::Object{{"changes", Json(std::move(changes))}});
+    }
+    if (method == "textDocument/semanticTokens/full") {
+        Json::Array data;
+        for (const auto val : service_.semanticTokensEncoded(path)) {
+            data.emplace_back(static_cast<std::int64_t>(val));
+        }
+        return response(message, Json::Object{{"data", Json(std::move(data))}});
+    }
+    if (method == "textDocument/inlayHint") {
+        Json::Array items;
+        for (const auto& hint : service_.inlayHints(path)) {
+            items.emplace_back(Json::Object{
+                {"position", position(hint.position)},
+                {"label", hint.label},
+                {"kind", static_cast<std::int64_t>(hint.kind)},
+            });
+        }
+        return response(message, Json(std::move(items)));
+    }
+    if (method == "textDocument/formatting") {
+        std::size_t tabSize = 4;
+        if (const auto* ts = nested(message, {"params", "options", "tabSize"})) {
+            tabSize = static_cast<std::size_t>(std::max<std::int64_t>(1, ts->integerValue(4)));
+        }
+        Json::Array edits;
+        for (const auto& edit : service_.formatDocument(path, tabSize)) {
+            edits.emplace_back(Json::Object{
+                {"range", range(edit.location.range)},
+                {"newText", edit.replacement},
+            });
+        }
+        return response(message, Json(std::move(edits)));
+    }
+    if (method == "workspace/symbol") {
+        const auto query = (params && params->find("query"))
+            ? params->find("query")->stringValue()
+            : std::string{};
+        Json::Array values;
+        for (const auto& symbol : service_.workspaceSymbols(query)) {
+            values.emplace_back(Json::Object{
+                {"name", symbol.name},
+                {"kind", documentSymbolKind(symbol.kind)},
+                {"location", location(symbol.location)},
+            });
+        }
+        return response(message, Json(std::move(values)));
     }
 
     if (message.find("id")) return error(message, -32601, "method not found: " + method);

@@ -119,7 +119,8 @@ std::string nativeBuiltinGenericSource(
             << "while(next<needed){next=next*2;}"
             << first << "[] grown=new " << first << "[next];int i=0;"
             << "while(i<count){grown[i]=items[i];i=i+1;}items=grown;return;}"
-            << "int Count(){return count;}int Capacity(){return items.length;}"
+            << "int Count(){return count;}int Length(){return count;}int Capacity(){return items.length;}"
+            << "bool IsEmpty(){return count==0;}"
             << "void Add(" << first << " value){EnsureCapacity(count+1);"
             << "items[count]=value;count=count+1;return;}"
             << "void Insert(int index," << first << " value){EnsureCapacity(count+1);"
@@ -131,9 +132,19 @@ std::string nativeBuiltinGenericSource(
             << "if(i<0)return false;RemoveAt(i);return true;}"
             << "int IndexOf(" << first << " value){int i=0;while(i<count){"
             << "if(items[i]==value)return i;i=i+1;}return -1;}"
+            << "int LastIndexOf(" << first << " value){int i=count-1;while(i>=0){"
+            << "if(items[i]==value)return i;i=i-1;}return -1;}"
             << "bool Contains(" << first << " value){return IndexOf(value)>=0;}"
             << first << " Get(int index){return items[index];}"
             << "void Set(int index," << first << " value){items[index]=value;return;}"
+            << first << " First(){return items[0];}"
+            << first << " Last(){return items[count-1];}"
+            << "void Reverse(){int l=0;int r=count-1;while(l<r){"
+            << first << " tmp=items[l];items[l]=items[r];items[r]=tmp;"
+            << "l=l+1;r=r-1;}return;}"
+            << "void Sort(){__rs_array_sort_range(items,count);return;}"
+            << first << "[] ToArray(){" << first << "[] arr=new " << first
+            << "[count];int i=0;while(i<count){arr[i]=items[i];i=i+1;}return arr;}"
             << "void Clear(){count=0;return;}" << enumerator
             << " GetEnumerator(){return new " << enumerator << "(this);}}"
             << "class " << enumerator << "{" << generatedName
@@ -155,12 +166,17 @@ std::string nativeBuiltinGenericSource(
             << "while(i<count){grown[i]=items[(head+i)%items.length];i=i+1;}"
             << "items=grown;head=0;tail=count;return;}"
             << "int Count(){return count;}int Capacity(){return items.length;}"
+            << "bool IsEmpty(){return count==0;}"
             << "void Enqueue(" << first << " value){EnsureCapacity(count+1);"
             << "items[tail]=value;tail=(tail+1)%items.length;count=count+1;return;}"
             << first << " Dequeue(){" << first << " value=items[head];"
             << "head=(head+1)%items.length;count=count-1;return value;}"
             << first << " Peek(){return items[head];}"
             << first << " Get(int index){return items[(head+index)%items.length];}"
+            << "bool Contains(" << first << " value){int i=0;while(i<count){"
+            << "if(items[(head+i)%items.length]==value)return true;i=i+1;}return false;}"
+            << first << "[] ToArray(){" << first << "[] arr=new " << first
+            << "[count];int i=0;while(i<count){arr[i]=items[(head+i)%items.length];i=i+1;}return arr;}"
             << "void Clear(){head=0;tail=0;count=0;return;}" << enumerator
             << " GetEnumerator(){return new " << enumerator << "(this);}}"
             << "class " << enumerator << "{" << generatedName
@@ -179,11 +195,16 @@ std::string nativeBuiltinGenericSource(
             << first << "[] grown=new " << first << "[next];int i=0;"
             << "while(i<count){grown[i]=items[i];i=i+1;}items=grown;return;}"
             << "int Count(){return count;}int Capacity(){return items.length;}"
+            << "bool IsEmpty(){return count==0;}"
             << "void Push(" << first << " value){EnsureCapacity(count+1);"
             << "items[count]=value;count=count+1;return;}"
             << first << " Pop(){count=count-1;return items[count];}"
             << first << " Peek(){return items[count-1];}"
             << first << " Get(int index){return items[count-1-index];}"
+            << "bool Contains(" << first << " value){int i=0;while(i<count){"
+            << "if(items[i]==value)return true;i=i+1;}return false;}"
+            << first << "[] ToArray(){" << first << "[] arr=new " << first
+            << "[count];int i=0;while(i<count){arr[i]=items[count-1-i];i=i+1;}return arr;}"
             << "void Clear(){count=0;return;}" << enumerator
             << " GetEnumerator(){return new " << enumerator << "(this);}}"
             << "class " << enumerator << "{" << generatedName
@@ -220,26 +241,41 @@ std::string nativeBuiltinGenericSource(
     } else if (name == "HashSet") {
         const auto enumerator = generatedName + "__Enumerator";
         source << "class " << generatedName << "{" << first
-            << "[] values;int count;" << generatedName << "(){values=new "
-            << first << "[4];count=0;}" << generatedName
-            << "(int capacity){values=new " << first << "[capacity];count=0;}"
+            << "[] values;int[] buckets;int[] nexts;int count;" << generatedName
+            << "(){values=new " << first << "[4];buckets=new int[8];nexts=new int[4];count=0;}"
+            << generatedName << "(int capacity){int cap=capacity;if(cap<4)cap=4;"
+            << "int bcap=8;while(bcap<cap*2){bcap=bcap*2;}"
+            << "values=new " << first << "[cap];buckets=new int[bcap];nexts=new int[cap];count=0;}"
+            << "void Rehash(){int bcap=buckets.length;int bi=0;while(bi<bcap){buckets[bi]=0;bi=bi+1;}"
+            << "int i=0;while(i<count){int h=__rs_stable_hash(values[i]);if(h<0)h=0-h;"
+            << "int b=h%bcap;nexts[i]=buckets[b];buckets[b]=i+1;i=i+1;}return;}"
             << "void EnsureCapacity(int needed){if(needed<=values.length)return;"
             << "int next=values.length;if(next<4)next=4;while(next<needed){next=next*2;}"
+            << "int bcap=8;while(bcap<next*2){bcap=bcap*2;}"
             << first << "[] grown=new " << first << "[next];int i=0;"
-            << "while(i<count){grown[i]=values[i];i=i+1;}values=grown;return;}"
+            << "while(i<count){grown[i]=values[i];i=i+1;}values=grown;"
+            << "buckets=new int[bcap];nexts=new int[next];Rehash();return;}"
             << "int Count(){return count;}"
-            << "bool Contains(" << first
-            << " value){int i=0;while(i<count){"
-            << "if(values[i]==value)return true;i=i+1;}return false;}"
+            << "bool IsEmpty(){return count==0;}"
+            << "int FindIndex(" << first << " value){if(count==0)return -1;"
+            << "int bcap=buckets.length;if(bcap==0)return -1;"
+            << "int h=__rs_stable_hash(value);if(h<0)h=0-h;"
+            << "int cur=buckets[h%bcap]-1;while(cur>=0){"
+            << "if(values[cur]==value)return cur;cur=nexts[cur]-1;}return -1;}"
+            << "bool Contains(" << first << " value){return FindIndex(value)>=0;}"
             << "bool Add(" << first
             << " value){if(Contains(value))return false;EnsureCapacity(count+1);"
-            << "values[count]=value;count=count+1;return true;}"
-            << "bool Remove(" << first << " value){int i=0;while(i<count){"
-            << "if(values[i]==value){int j=i;while(j<count-1){values[j]=values[j+1];"
-            << "j=j+1;}count=count-1;return true;}i=i+1;}return false;}"
+            << "int idx=count;values[idx]=value;count=count+1;"
+            << "int bcap=buckets.length;int h=__rs_stable_hash(value);if(h<0)h=0-h;"
+            << "int b=h%bcap;nexts[idx]=buckets[b];buckets[b]=idx+1;return true;}"
+            << "bool Remove(" << first << " value){int i=FindIndex(value);if(i<0)return false;"
+            << "int j=i;while(j<count-1){values[j]=values[j+1];j=j+1;}"
+            << "count=count-1;Rehash();return true;}"
             << first << " Get(int index){return values[index];}"
-            << "void Clear(){count=0;return;}" << enumerator
-            << " GetEnumerator(){return new " << enumerator << "(this);}}"
+            << first << "[] ToArray(){" << first << "[] arr=new " << first
+            << "[count];int i=0;while(i<count){arr[i]=values[i];i=i+1;}return arr;}"
+            << "void Clear(){count=0;values=new " << first << "[4];buckets=new int[8];nexts=new int[4];return;}"
+            << enumerator << " GetEnumerator(){return new " << enumerator << "(this);}}"
             << "class " << enumerator << "{" << generatedName
             << " owner;int index;" << enumerator << "(" << generatedName
             << " value){owner=value;index=-1;}bool MoveNext(){index=index+1;"
@@ -249,28 +285,50 @@ std::string nativeBuiltinGenericSource(
         if (arguments.size() != 2) return {};
         const auto enumerator = generatedName + "__Enumerator";
         source << "class " << generatedName << "{" << first
-            << "[] keys;" << second << "[] values;int count;" << generatedName
-            << "(){keys=new " << first << "[4];values=new " << second
-            << "[4];count=0;}" << generatedName
-            << "(int capacity){keys=new " << first
-            << "[capacity];values=new " << second
-            << "[capacity];count=0;}"
+            << "[] keys;" << second << "[] values;int[] buckets;int[] nexts;int count;"
+            << generatedName << "(){keys=new " << first << "[4];values=new " << second
+            << "[4];buckets=new int[8];nexts=new int[4];count=0;}" << generatedName
+            << "(int capacity){int cap=capacity;if(cap<4)cap=4;"
+            << "int bcap=8;while(bcap<cap*2){bcap=bcap*2;}"
+            << "keys=new " << first << "[cap];values=new " << second
+            << "[cap];buckets=new int[bcap];nexts=new int[cap];count=0;}"
+            << "void Rehash(){int bcap=buckets.length;int bi=0;while(bi<bcap){buckets[bi]=0;bi=bi+1;}"
+            << "int i=0;while(i<count){int h=__rs_stable_hash(keys[i]);if(h<0)h=0-h;"
+            << "int b=h%bcap;nexts[i]=buckets[b];buckets[b]=i+1;i=i+1;}return;}"
             << "void EnsureCapacity(int needed){if(needed<=keys.length)return;"
             << "int next=keys.length;if(next<4)next=4;while(next<needed){next=next*2;}"
+            << "int bcap=8;while(bcap<next*2){bcap=bcap*2;}"
             << first << "[] grownKeys=new " << first << "[next];"
             << second << "[] grownValues=new " << second << "[next];int i=0;"
             << "while(i<count){grownKeys[i]=keys[i];grownValues[i]=values[i];i=i+1;}"
-            << "keys=grownKeys;values=grownValues;return;}"
+            << "keys=grownKeys;values=grownValues;buckets=new int[bcap];nexts=new int[next];Rehash();return;}"
             << "int Count(){return count;}"
-            << "int Find(" << first
-            << " key){int i=0;while(i<count){if(keys[i]==key)return i;"
-            << "i=i+1;}return -1;}"
+            << "bool IsEmpty(){return count==0;}"
+            << "int Find(" << first << " key){if(count==0)return -1;"
+            << "int bcap=buckets.length;if(bcap==0)return -1;"
+            << "int h=__rs_stable_hash(key);if(h<0)h=0-h;"
+            << "int cur=buckets[h%bcap]-1;while(cur>=0){"
+            << "if(keys[cur]==key)return cur;cur=nexts[cur]-1;}return -1;}"
             << "bool ContainsKey(" << first
             << " key){return Find(key)>=0;}"
+            << "bool ContainsValue(" << second
+            << " value){int i=0;while(i<count){if(values[i]==value)return true;"
+            << "i=i+1;}return false;}"
+            << "bool TryGetValue(" << first << " key,out " << second
+            << " value){int i=Find(key);if(i<0){" << second
+            << "[] empty=new " << second << "[1];value=empty[0];return false;}value=values[i];return true;}"
+            << second << " GetOrDefault(" << first << " key," << second
+            << " fallback){int i=Find(key);if(i<0)return fallback;return values[i];}"
+            << first << "[] Keys(){" << first << "[] arr=new " << first
+            << "[count];int i=0;while(i<count){arr[i]=keys[i];i=i+1;}return arr;}"
+            << second << "[] Values(){" << second << "[] arr=new " << second
+            << "[count];int i=0;while(i<count){arr[i]=values[i];i=i+1;}return arr;}"
             << "void Put(" << first << " key," << second
             << " value){int i=Find(key);if(i>=0){values[i]=value;return;}"
             << "EnsureCapacity(count+1);"
-            << "keys[count]=key;values[count]=value;count=count+1;return;}"
+            << "int idx=count;keys[idx]=key;values[idx]=value;count=count+1;"
+            << "int bcap=buckets.length;int h=__rs_stable_hash(key);if(h<0)h=0-h;"
+            << "int b=h%bcap;nexts[idx]=buckets[b];buckets[b]=idx+1;return;}"
             << "void Add(" << first << " key," << second
             << " value){Put(key,value);return;}"
             << second << " Get(" << first
@@ -278,9 +336,9 @@ std::string nativeBuiltinGenericSource(
             << second << " GetAt(int index){return values[index];}"
             << "bool Remove(" << first << " key){int i=Find(key);if(i<0)return false;"
             << "while(i<count-1){keys[i]=keys[i+1];values[i]=values[i+1];i=i+1;}"
-            << "count=count-1;return true;}"
-            << "void Clear(){count=0;return;}" << enumerator
-            << " GetEnumerator(){return new " << enumerator << "(this);}}"
+            << "count=count-1;Rehash();return true;}"
+            << "void Clear(){count=0;keys=new " << first << "[4];values=new " << second << "[4];buckets=new int[8];nexts=new int[4];return;}"
+            << enumerator << " GetEnumerator(){return new " << enumerator << "(this);}}"
             << "class " << enumerator << "{" << generatedName
             << " owner;int index;" << enumerator << "(" << generatedName
             << " value){owner=value;index=-1;}bool MoveNext(){index=index+1;"
@@ -382,6 +440,14 @@ public:
         : units_(units), modules_(modules), result_(result) {}
 
     void run() {
+        bool anyGenericSyntax = false;
+        for (const auto& u : units_) {
+            if (u && u->hasGenericSyntax) {
+                anyGenericSyntax = true;
+                break;
+            }
+        }
+        if (!anyGenericSyntax) return;
         collectTemplates();
         std::vector<ParsedUnit*> queue;
         for (auto& unit : units_) queue.push_back(unit.get());
@@ -816,12 +882,14 @@ private:
             nativeGenericSanitize(targetModule) + "/" +
             generatedName + ".rs";
         auto unit = std::make_unique<ParsedUnit>();
-        unit->source = std::make_unique<text::SourceText>(
+        unit->source = std::make_shared<text::SourceText>(
             generated.str(), path);
         diagnostics::DiagnosticBag parseDiagnostics;
         syntax::Parser parser(*unit->source, parseDiagnostics);
-        unit->syntaxTree = std::make_unique<syntax::CompilationUnitSyntax>(
+        unit->syntaxTree = std::make_shared<syntax::CompilationUnitSyntax>(
             parser.parseCompilationUnit());
+        unit->hasGenericSyntax =
+            (generated.str().find('<') != std::string::npos);
         unit->moduleName = targetModule;
         unit->sourceFingerprint = stableFingerprint(
             path + "\n" + generated.str());
@@ -878,11 +946,19 @@ private:
             }
             for (const auto& value : unit->syntaxTree->classes) {
                 if (value.identifierToken.text != name) continue;
-                bool defaultConstructor = value.constructors.empty();
+                bool hasInstanceConstructor = false;
+                bool defaultConstructor = false;
                 for (const auto& constructor : value.constructors) {
+                    if (semantic::hasModifier(
+                            constructor.modifiers,
+                            syntax::SyntaxKind::StaticKeyword)) {
+                        continue;
+                    }
+                    hasInstanceConstructor = true;
                     defaultConstructor = defaultConstructor ||
                         constructor.parameters.empty();
                 }
+                if (!hasInstanceConstructor) defaultConstructor = true;
                 return {true, false, true, defaultConstructor};
             }
             for (const auto& value : unit->syntaxTree->interfaces) {
@@ -997,6 +1073,7 @@ private:
         }
         auto method = std::move(parsed.classes.front().methods.front());
         auto* ownerUnit = const_cast<ParsedUnit*>(pending.declaration->unit);
+        detachSyntaxTree(*ownerUnit);
         for (auto& declaration : ownerUnit->syntaxTree->classes) {
             if (declaration.identifierToken.text !=
                 pending.declaration->ownerName) continue;
@@ -1208,12 +1285,22 @@ private:
             for (auto& argument : value.arguments) {
                 rewriteExpression(*argument, moduleName, sourceName, queue);
             }
+            for (auto& init : value.initializers) {
+                for (auto& expr : init.expressions) {
+                    if (expr) rewriteExpression(*expr, moduleName, sourceName, queue);
+                }
+            }
             return;
         }
         case syntax::SyntaxKind::NewArrayExpression: {
             auto& value = static_cast<syntax::NewArrayExpressionSyntax&>(expression);
             rewriteType(value.elementType, moduleName, sourceName, queue);
-            rewriteExpression(*value.length, moduleName, sourceName, queue);
+            if (value.length) {
+                rewriteExpression(*value.length, moduleName, sourceName, queue);
+            }
+            for (auto& item : value.initialValues) {
+                if (item) rewriteExpression(*item, moduleName, sourceName, queue);
+            }
             return;
         }
         default:
@@ -1264,7 +1351,78 @@ private:
         }
         case syntax::SyntaxKind::ForeachStatement: {
             auto& value = static_cast<syntax::ForeachStatementSyntax&>(statement);
+            if (value.collection &&
+                value.collection->kind() == syntax::SyntaxKind::CallExpression) {
+                auto& call = static_cast<syntax::CallExpressionSyntax&>(*value.collection);
+                if (call.identifierToken.text == "Query" && call.lessToken.has_value()) {
+                    std::vector<syntax::TypeSyntax*> dataCompTypes;
+                    for (std::size_t idx = 0; idx < call.typeArguments.size(); ++idx) {
+                        auto& qArg = call.typeArguments[idx];
+                        if ((qArg.name.text == "With" || qArg.name.text == "Without") &&
+                            qArg.typeArguments.size() == 1) {
+                            rewriteType(qArg.typeArguments[0], moduleName, sourceName, queue);
+                            continue;
+                        }
+                        syntax::TypeSyntax* compType = &qArg;
+                        if ((qArg.name.text == "Write" || qArg.name.text == "Read") &&
+                            qArg.typeArguments.size() == 1) {
+                            compType = &qArg.typeArguments[0];
+                        }
+                        rewriteType(*compType, moduleName, sourceName, queue);
+                        dataCompTypes.push_back(compType);
+                    }
+                    const std::size_t totalBindings = 1 + value.additionalBindings.size();
+                    const bool hasEntityId = (totalBindings == dataCompTypes.size() + 1 && !dataCompTypes.empty());
+                    const auto getBindingType = [&](std::size_t bIdx) -> syntax::TypeSyntax* {
+                        if (bIdx == 0) return &value.type;
+                        if (bIdx - 1 < value.additionalBindings.size()) {
+                            return &value.additionalBindings[bIdx - 1].type;
+                        }
+                        return nullptr;
+                    };
+                    const auto getBindingName = [&](std::size_t bIdx) -> std::string {
+                        if (bIdx == 0) return value.identifierToken.text;
+                        if (bIdx - 1 < value.additionalBindings.size()) {
+                            return value.additionalBindings[bIdx - 1].identifierToken.text;
+                        }
+                        return {};
+                    };
+                    if (hasEntityId) {
+                        if (auto* entType = getBindingType(0)) {
+                            if (entType->name.text == "var") {
+                                clearGenericType(*entType, "int");
+                            } else {
+                                rewriteType(*entType, moduleName, sourceName, queue);
+                            }
+                            const auto entName = getBindingName(0);
+                            if (!entName.empty()) {
+                                localTypes_[entName] = typeText(*entType);
+                            }
+                        }
+                    }
+                    for (std::size_t idx = 0; idx < dataCompTypes.size(); ++idx) {
+                        const std::size_t bIdx = hasEntityId ? (idx + 1) : idx;
+                        auto* bType = getBindingType(bIdx);
+                        const auto bName = getBindingName(bIdx);
+                        if (bType) {
+                            if (bType->name.text == "var") {
+                                *bType = *dataCompTypes[idx];
+                            } else {
+                                rewriteType(*bType, moduleName, sourceName, queue);
+                            }
+                            if (!bName.empty()) {
+                                localTypes_[bName] = typeText(*bType);
+                            }
+                        }
+                    }
+                    rewriteStatement(*value.body, moduleName, sourceName, queue);
+                    return;
+                }
+            }
             rewriteType(value.type, moduleName, sourceName, queue);
+            for (auto& extra : value.additionalBindings) {
+                rewriteType(extra.type, moduleName, sourceName, queue);
+            }
             rewriteExpression(*value.collection, moduleName, sourceName, queue);
             rewriteStatement(*value.body, moduleName, sourceName, queue);
             return;
@@ -1350,7 +1508,10 @@ private:
         std::vector<ParsedUnit*>& queue) {
         if (!declaration.typeParameters.empty()) return;
         for (auto& interfaceType : declaration.interfaces) rewriteType(interfaceType, moduleName, sourceName, queue);
-        for (auto& field : declaration.fields) rewriteType(field.type, moduleName, sourceName, queue);
+        for (auto& field : declaration.fields) {
+            rewriteType(field.type, moduleName, sourceName, queue);
+            if (field.initializer) rewriteExpression(*field.initializer, moduleName, sourceName, queue);
+        }
         for (auto& event : declaration.events) rewriteType(event.delegateType, moduleName, sourceName, queue);
         for (auto& method : declaration.methods) rewriteFunction(method, moduleName, sourceName, queue);
         for (auto& sequence : declaration.sequences) {
@@ -1366,16 +1527,33 @@ private:
         }
         for (auto& constructor : declaration.constructors) {
             for (auto& parameter : constructor.parameters) rewriteParameter(parameter, moduleName, sourceName, queue);
+            for (auto& baseArg : constructor.baseArguments) {
+                if (baseArg) rewriteExpression(*baseArg, moduleName, sourceName, queue);
+            }
             rewriteStatement(constructor.body, moduleName, sourceName, queue);
         }
         for (auto& property : declaration.properties) {
             rewriteType(property.type, moduleName, sourceName, queue);
             if (property.getter && property.getter->body) rewriteStatement(*property.getter->body, moduleName, sourceName, queue);
             if (property.setter && property.setter->body) rewriteStatement(*property.setter->body, moduleName, sourceName, queue);
+            if (property.initializer) rewriteExpression(*property.initializer, moduleName, sourceName, queue);
+        }
+    }
+
+    static void detachSyntaxTree(ParsedUnit& unit) {
+        if (unit.syntaxTree.use_count() > 1 && unit.source) {
+            diagnostics::DiagnosticBag ignored;
+            syntax::Parser parser(*unit.source, ignored);
+            unit.syntaxTree = std::make_shared<syntax::CompilationUnitSyntax>(
+                parser.parseCompilationUnit());
         }
     }
 
     void rewriteUnit(ParsedUnit& unit, std::vector<ParsedUnit*>& queue) {
+        if (!unit.hasGenericSyntax && registry_.functions.empty() && registry_.members.empty()) {
+            return;
+        }
+        detachSyntaxTree(unit);
         const auto& moduleName = unit.moduleName;
         const auto sourceName = unit.source->name();
         for (auto& declaration : unit.syntaxTree->classes) rewriteTypeDeclaration(declaration, moduleName, sourceName, queue);

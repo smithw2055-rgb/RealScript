@@ -2,6 +2,8 @@
 
 #include "realscript/Version.h"
 #include "realscript/game/GameScripting.h"
+#include "realscript/game/GameplayScripting.h"
+#include "realscript/game/GameplayStateCodec.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -96,6 +98,52 @@ bool restoreScriptObject(
 
 [[nodiscard]] std::optional<ScriptObjectState> decodeScriptObjectState(
     const std::vector<std::uint8_t>& bytes,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy = {});
+
+[[nodiscard]] std::string exportScriptObjectJson(
+    const ScriptRuntime& runtime,
+    const ScriptObject& object,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy = {},
+    const SceneScriptRuntime* scene = nullptr);
+
+bool importScriptObjectJson(
+    ScriptRuntime& runtime,
+    ScriptObject& object,
+    const std::string& jsonText,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy = {},
+    SceneScriptRuntime* scene = nullptr);
+
+[[nodiscard]] std::string exportSceneJson(
+    const SceneScriptRuntime& scene,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy = {});
+
+bool importSceneJson(
+    SceneScriptRuntime& scene,
+    const std::string& jsonText,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy = {});
+
+struct RollbackFrameSnapshot {
+    GameTick tick = 0;
+    std::vector<std::uint8_t> hostStateBytes;
+    std::string sceneJson;
+    std::uint64_t frameHash = 0;
+};
+
+[[nodiscard]] std::optional<RollbackFrameSnapshot> captureRollbackFrame(
+    const SceneScriptRuntime& scene,
+    const GameplayHost& host,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy = {});
+
+bool restoreRollbackFrame(
+    SceneScriptRuntime& scene,
+    GameplayHost& host,
+    const RollbackFrameSnapshot& snapshot,
     runtime::RuntimeError& error,
     ScriptStatePolicy policy = {});
 

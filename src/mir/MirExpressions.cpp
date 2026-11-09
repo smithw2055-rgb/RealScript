@@ -308,6 +308,20 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 : 0;
             return value;
         }
+        if (literal.type == semantic::PrimitiveType::Float) {
+            const auto dblVal = emitValue(
+                Opcode::ConstantDouble,
+                semantic::PrimitiveType::Double,
+                {},
+                expression.span);
+            block(*currentBlockId_).instructions.back().doubleImmediate =
+                std::get<double>(literal.value);
+            return emitValue(
+                Opcode::ConvertNumeric,
+                semantic::PrimitiveType::Float,
+                {dblVal},
+                expression.span);
+        }
         if (literal.type == semantic::PrimitiveType::Double) {
             const auto value = emitValue(Opcode::ConstantDouble, literal.type, {}, expression.span);
             block(*currentBlockId_).instructions.back().doubleImmediate =
@@ -451,11 +465,164 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
     }
     case semantic::BoundNodeKind::NewObjectExpression: {
         const auto& allocation = static_cast<const semantic::BoundNewObjectExpression&>(expression);
+        if (allocation.objectType.staticConstructor &&
+            (!currentFunction_ || currentFunction_->symbolId != allocation.objectType.staticConstructor->id)) {
+            (void)emitCallInstruction(
+                *allocation.objectType.staticConstructor,
+                semantic::PrimitiveType::Void,
+                {},
+                {},
+                expression.span,
+                false,
+                std::numeric_limits<std::uint32_t>::max(),
+                false,
+                0,
+                std::numeric_limits<std::uint32_t>::max());
+        }
         const auto value = emitValue(Opcode::NewObject, semantic::PrimitiveType::Object, {}, expression.span);
         auto& instruction = block(*currentBlockId_).instructions.back();
         instruction.typeId = allocation.objectType.id;
         instruction.resultTypeId = allocation.objectType.id;
         instruction.symbolName = semantic::canonicalTypeName(allocation.objectType);
+        auto emitConstantFieldValue = [&](const semantic::FieldSymbol& field,
+                                          text::TextSpan span) -> ValueId {
+            const auto fieldTypeId = semantic::isExactType(field.type)
+                ? semantic::stableTypeId(field.typeName)
+                : 0;
+            if (field.hasConstantValue) {
+                if (field.type == semantic::PrimitiveType::Int ||
+                    field.type == semantic::PrimitiveType::Long ||
+                    field.type == semantic::PrimitiveType::Enum) {
+                    const auto v = emitValue(Opcode::ConstantInt, field.type, {}, span);
+                    auto& inst = block(*currentBlockId_).instructions.back();
+                    inst.integerImmediate = std::holds_alternative<std::int64_t>(field.constantValue)
+                        ? std::get<std::int64_t>(field.constantValue)
+                        : 0;
+                    inst.resultTypeId = field.type == semantic::PrimitiveType::Enum
+                        ? fieldTypeId
+                        : 0;
+                    return v;
+                }
+                if (semantic::isIntegralType(field.type)) {
+                    const auto carrier = (field.type == semantic::PrimitiveType::UInt ||
+                                          field.type == semantic::PrimitiveType::ULong)
+                        ? semantic::PrimitiveType::Long
+                        : semantic::PrimitiveType::Int;
+                    const auto v = emitValue(Opcode::ConstantInt, carrier, {}, span);
+                    block(*currentBlockId_).instructions.back().integerImmediate =
+                        std::holds_alternative<std::int64_t>(field.constantValue)
+                            ? std::get<std::int64_t>(field.constantValue)
+                            : 0;
+                    return emitValue(Opcode::ConvertNumeric, field.type, {v}, span);
+                }
+                if (field.type == semantic::PrimitiveType::Double ||
+                    field.type == semantic::PrimitiveType::Float) {
+                    const auto v = emitValue(
+                        Opcode::ConstantDouble, semantic::PrimitiveType::Double, {}, span);
+                    block(*currentBlockId_).instructions.back().doubleImmediate =
+                        std::holds_alternative<double>(field.constantValue)
+                            ? std::get<double>(field.constantValue)
+                            : (std::holds_alternative<std::int64_t>(field.constantValue)
+                                ? static_cast<double>(std::get<std::int64_t>(field.constantValue))
+                                : 0.0);
+                    if (field.type == semantic::PrimitiveType::Float) {
+                        return emitValue(Opcode::ConvertNumeric, field.type, {v}, span);
+                    }
+                    return v;
+                }
+                if (field.type == semantic::PrimitiveType::Bool) {
+                    const auto v = emitValue(Opcode::ConstantBool, field.type, {}, span);
+                    block(*currentBlockId_).instructions.back().boolImmediate =
+                        std::holds_alternative<bool>(field.constantValue)
+                            ? std::get<bool>(field.constantValue)
+                            : false;
+                    return v;
+                }
+                if (field.type == semantic::PrimitiveType::String) {
+                    if (std::holds_alternative<std::string>(field.constantValue)) {
+                        const auto v = emitValue(Opcode::ConstantString, field.type, {}, span);
+                        block(*currentBlockId_).instructions.back().stringImmediate =
+                            std::get<std::string>(field.constantValue);
+                        return v;
+                    }
+                    return emitTypedNull(field.type, field.typeName, span);
+                }
+                if (std::holds_alternative<std::monostate>(field.constantValue) &&
+                    (field.type == semantic::PrimitiveType::Object ||
+                     field.type == semantic::PrimitiveType::Array)) {
+                    return emitTypedNull(field.type, field.typeName, span);
+                }
+            }
+            if (field.type == semantic::PrimitiveType::Int ||
+                field.type == semantic::PrimitiveType::Long ||
+                field.type == semantic::PrimitiveType::Enum) {
+                const auto v = emitValue(Opcode::ConstantInt, field.type, {}, span);
+                auto& inst = block(*currentBlockId_).instructions.back();
+                inst.integerImmediate = 0;
+                inst.resultTypeId = field.type == semantic::PrimitiveType::Enum ? fieldTypeId : 0;
+                return v;
+            }
+            if (semantic::isIntegralType(field.type)) {
+                const auto v = emitValue(Opcode::ConstantInt, semantic::PrimitiveType::Int, {}, span);
+                block(*currentBlockId_).instructions.back().integerImmediate = 0;
+                return emitValue(Opcode::ConvertNumeric, field.type, {v}, span);
+            }
+            if (field.type == semantic::PrimitiveType::Double ||
+                field.type == semantic::PrimitiveType::Float) {
+                const auto v = emitValue(
+                    Opcode::ConstantDouble, semantic::PrimitiveType::Double, {}, span);
+                block(*currentBlockId_).instructions.back().doubleImmediate = 0.0;
+                if (field.type == semantic::PrimitiveType::Float) {
+                    return emitValue(Opcode::ConvertNumeric, field.type, {v}, span);
+                }
+                return v;
+            }
+            if (field.type == semantic::PrimitiveType::Bool) {
+                const auto v = emitValue(Opcode::ConstantBool, field.type, {}, span);
+                block(*currentBlockId_).instructions.back().boolImmediate = false;
+                return v;
+            }
+            if (field.type == semantic::PrimitiveType::Struct) {
+                const auto v = emitValue(
+                    Opcode::NewStruct, semantic::PrimitiveType::Struct, {}, span);
+                auto& inst = block(*currentBlockId_).instructions.back();
+                inst.typeId = fieldTypeId;
+                inst.resultTypeId = fieldTypeId;
+                inst.symbolName = field.typeName;
+                return v;
+            }
+            return emitTypedNull(field.type, field.typeName, span);
+        };
+        for (const auto& field : allocation.objectType.fields) {
+            if (field.staticField || field.constField || !field.hasConstantValue) {
+                continue;
+            }
+            const auto defaultVal = emitConstantFieldValue(field, expression.span);
+            Instruction store;
+            store.resultType = semantic::PrimitiveType::Void;
+            store.opcode = Opcode::StoreField;
+            store.operands = {value, defaultVal};
+            store.typeId = allocation.objectType.id;
+            store.fieldIndex = field.index;
+            store.symbolName = semantic::canonicalTypeName(allocation.objectType);
+            store.sourceSpan = expression.span;
+            block(*currentBlockId_).instructions.push_back(std::move(store));
+        }
+        for (const auto& initializer : allocation.defaultFieldInitializers) {
+            if (initializer.arguments.empty() || !initializer.arguments.front()) {
+                continue;
+            }
+            const auto assigned = lowerExpression(*initializer.arguments.front());
+            Instruction store;
+            store.resultType = semantic::PrimitiveType::Void;
+            store.opcode = Opcode::StoreField;
+            store.operands = {value, assigned};
+            store.typeId = allocation.objectType.id;
+            store.fieldIndex = initializer.field.index;
+            store.symbolName = semantic::canonicalTypeName(allocation.objectType);
+            store.sourceSpan = expression.span;
+            block(*currentBlockId_).instructions.push_back(std::move(store));
+        }
         if (allocation.constructor) {
             std::vector<ValueId> arguments{value};
             std::vector<ValueId> lowered(allocation.arguments.size(), -1);
@@ -512,11 +679,103 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
     }
     case semantic::BoundNodeKind::NewStructExpression: {
         const auto& allocation = static_cast<const semantic::BoundNewStructExpression&>(expression);
+        if (allocation.structType.staticConstructor &&
+            (!currentFunction_ || currentFunction_->symbolId != allocation.structType.staticConstructor->id)) {
+            (void)emitCallInstruction(
+                *allocation.structType.staticConstructor,
+                semantic::PrimitiveType::Void,
+                {},
+                {},
+                expression.span,
+                false,
+                std::numeric_limits<std::uint32_t>::max(),
+                false,
+                0,
+                std::numeric_limits<std::uint32_t>::max());
+        }
         auto value = emitValue(Opcode::NewStruct, semantic::PrimitiveType::Struct, {}, expression.span);
         auto& instruction = block(*currentBlockId_).instructions.back();
         instruction.typeId = allocation.structType.id;
         instruction.resultTypeId = allocation.structType.id;
         instruction.symbolName = semantic::canonicalTypeName(allocation.structType);
+        for (const auto& field : allocation.structType.fields) {
+            if (field.staticField || field.constField || !field.hasConstantValue) {
+                continue;
+            }
+            const auto fieldTypeId = semantic::isExactType(field.type)
+                ? semantic::stableTypeId(field.typeName)
+                : 0;
+            ValueId defaultVal = -1;
+            if (field.type == semantic::PrimitiveType::Int ||
+                field.type == semantic::PrimitiveType::Long ||
+                field.type == semantic::PrimitiveType::Enum) {
+                defaultVal = emitValue(Opcode::ConstantInt, field.type, {}, expression.span);
+                auto& inst = block(*currentBlockId_).instructions.back();
+                inst.integerImmediate = std::holds_alternative<std::int64_t>(field.constantValue)
+                    ? std::get<std::int64_t>(field.constantValue)
+                    : 0;
+                inst.resultTypeId = field.type == semantic::PrimitiveType::Enum ? fieldTypeId : 0;
+            } else if (semantic::isIntegralType(field.type)) {
+                const auto carrier = (field.type == semantic::PrimitiveType::UInt ||
+                                      field.type == semantic::PrimitiveType::ULong)
+                    ? semantic::PrimitiveType::Long
+                    : semantic::PrimitiveType::Int;
+                const auto v = emitValue(Opcode::ConstantInt, carrier, {}, expression.span);
+                block(*currentBlockId_).instructions.back().integerImmediate =
+                    std::holds_alternative<std::int64_t>(field.constantValue)
+                        ? std::get<std::int64_t>(field.constantValue)
+                        : 0;
+                defaultVal = emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span);
+            } else if (field.type == semantic::PrimitiveType::Double ||
+                       field.type == semantic::PrimitiveType::Float) {
+                const auto v = emitValue(
+                    Opcode::ConstantDouble, semantic::PrimitiveType::Double, {}, expression.span);
+                block(*currentBlockId_).instructions.back().doubleImmediate =
+                    std::holds_alternative<double>(field.constantValue)
+                        ? std::get<double>(field.constantValue)
+                        : (std::holds_alternative<std::int64_t>(field.constantValue)
+                            ? static_cast<double>(std::get<std::int64_t>(field.constantValue))
+                            : 0.0);
+                defaultVal = field.type == semantic::PrimitiveType::Float
+                    ? emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span)
+                    : v;
+            } else if (field.type == semantic::PrimitiveType::Bool) {
+                defaultVal = emitValue(Opcode::ConstantBool, field.type, {}, expression.span);
+                block(*currentBlockId_).instructions.back().boolImmediate =
+                    std::holds_alternative<bool>(field.constantValue)
+                        ? std::get<bool>(field.constantValue)
+                        : false;
+            } else if (field.type == semantic::PrimitiveType::String &&
+                       std::holds_alternative<std::string>(field.constantValue)) {
+                defaultVal = emitValue(Opcode::ConstantString, field.type, {}, expression.span);
+                block(*currentBlockId_).instructions.back().stringImmediate =
+                    std::get<std::string>(field.constantValue);
+            }
+            if (defaultVal >= 0) {
+                value = emitValue(
+                    Opcode::StoreStructField, semantic::PrimitiveType::Struct,
+                    {value, defaultVal}, expression.span);
+                auto& store = block(*currentBlockId_).instructions.back();
+                store.typeId = allocation.structType.id;
+                store.resultTypeId = allocation.structType.id;
+                store.fieldIndex = field.index;
+                store.symbolName = semantic::canonicalTypeName(allocation.structType);
+            }
+        }
+        for (const auto& initializer : allocation.defaultFieldInitializers) {
+            if (initializer.arguments.empty() || !initializer.arguments.front()) {
+                continue;
+            }
+            const auto assigned = lowerExpression(*initializer.arguments.front());
+            value = emitValue(
+                Opcode::StoreStructField, semantic::PrimitiveType::Struct,
+                {value, assigned}, expression.span);
+            auto& store = block(*currentBlockId_).instructions.back();
+            store.typeId = allocation.structType.id;
+            store.resultTypeId = allocation.structType.id;
+            store.fieldIndex = initializer.field.index;
+            store.symbolName = semantic::canonicalTypeName(allocation.structType);
+        }
         if (allocation.constructor) {
             std::vector<ValueId> arguments{value};
             std::vector<ValueId> lowered(allocation.arguments.size(), -1);
@@ -563,6 +822,158 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
     }
     case semantic::BoundNodeKind::MemberAccessExpression: {
         const auto& member = static_cast<const semantic::BoundMemberAccessExpression&>(expression);
+        if (member.field.staticField) {
+            if (member.ownerType.staticConstructor &&
+                (!currentFunction_ || currentFunction_->symbolId != member.ownerType.staticConstructor->id)) {
+                (void)emitCallInstruction(
+                    *member.ownerType.staticConstructor,
+                    semantic::PrimitiveType::Void,
+                    {},
+                    {},
+                    expression.span,
+                    false,
+                    std::numeric_limits<std::uint32_t>::max(),
+                    false,
+                    0,
+                    std::numeric_limits<std::uint32_t>::max());
+            }
+            const auto fieldTypeId = semantic::isExactType(member.field.type)
+                ? semantic::stableTypeId(member.field.typeName)
+                : 0;
+            if (member.staticInitializer) {
+                const auto hasName = "$intrinsic::static_has::" +
+                    std::to_string(member.field.id);
+                Instruction hasCall;
+                hasCall.result = nextValueId_++;
+                hasCall.resultType = semantic::PrimitiveType::Bool;
+                hasCall.opcode = Opcode::Call;
+                hasCall.symbolId = semantic::stableTypeId(hasName);
+                hasCall.symbolName = hasName;
+                hasCall.sourceSpan = expression.span;
+                const auto hasVal = hasCall.result;
+                block(*currentBlockId_).instructions.push_back(std::move(hasCall));
+
+                const auto initBlock = createBlock();
+                const auto doneBlock = createBlock();
+                emitBranch(hasVal, doneBlock, initBlock, {}, {}, expression.span);
+                setCurrentBlock(initBlock);
+                const auto initVal = lowerExpression(*member.staticInitializer);
+                const auto setName = "$intrinsic::static_set::" +
+                    std::to_string(member.field.id);
+                Instruction setCall;
+                setCall.resultType = semantic::PrimitiveType::Void;
+                setCall.opcode = Opcode::Call;
+                setCall.operands = {initVal};
+                setCall.parameterTypes = {member.field.type};
+                setCall.parameterTypeIds = {fieldTypeId};
+                setCall.symbolId = semantic::stableTypeId(setName);
+                setCall.symbolName = setName;
+                setCall.sourceSpan = expression.span;
+                block(*currentBlockId_).instructions.push_back(std::move(setCall));
+                emitJump(doneBlock, {}, expression.span);
+                setCurrentBlock(doneBlock);
+            }
+            ValueId defaultVal = -1;
+            const auto& field = member.field;
+            if (field.hasConstantValue) {
+                if (field.type == semantic::PrimitiveType::Int ||
+                    field.type == semantic::PrimitiveType::Long ||
+                    field.type == semantic::PrimitiveType::Enum) {
+                    defaultVal = emitValue(Opcode::ConstantInt, field.type, {}, expression.span);
+                    auto& inst = block(*currentBlockId_).instructions.back();
+                    inst.integerImmediate = std::holds_alternative<std::int64_t>(field.constantValue)
+                        ? std::get<std::int64_t>(field.constantValue)
+                        : 0;
+                    inst.resultTypeId = field.type == semantic::PrimitiveType::Enum ? fieldTypeId : 0;
+                } else if (semantic::isIntegralType(field.type)) {
+                    const auto carrier = (field.type == semantic::PrimitiveType::UInt ||
+                                          field.type == semantic::PrimitiveType::ULong)
+                        ? semantic::PrimitiveType::Long
+                        : semantic::PrimitiveType::Int;
+                    const auto v = emitValue(Opcode::ConstantInt, carrier, {}, expression.span);
+                    block(*currentBlockId_).instructions.back().integerImmediate =
+                        std::holds_alternative<std::int64_t>(field.constantValue)
+                            ? std::get<std::int64_t>(field.constantValue)
+                            : 0;
+                    defaultVal = emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span);
+                } else if (field.type == semantic::PrimitiveType::Double ||
+                           field.type == semantic::PrimitiveType::Float) {
+                    const auto v = emitValue(
+                        Opcode::ConstantDouble, semantic::PrimitiveType::Double, {}, expression.span);
+                    block(*currentBlockId_).instructions.back().doubleImmediate =
+                        std::holds_alternative<double>(field.constantValue)
+                            ? std::get<double>(field.constantValue)
+                            : (std::holds_alternative<std::int64_t>(field.constantValue)
+                                ? static_cast<double>(std::get<std::int64_t>(field.constantValue))
+                                : 0.0);
+                    defaultVal = field.type == semantic::PrimitiveType::Float
+                        ? emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span)
+                        : v;
+                } else if (field.type == semantic::PrimitiveType::Bool) {
+                    defaultVal = emitValue(Opcode::ConstantBool, field.type, {}, expression.span);
+                    block(*currentBlockId_).instructions.back().boolImmediate =
+                        std::holds_alternative<bool>(field.constantValue)
+                            ? std::get<bool>(field.constantValue)
+                            : false;
+                } else if (field.type == semantic::PrimitiveType::String &&
+                           std::holds_alternative<std::string>(field.constantValue)) {
+                    defaultVal = emitValue(Opcode::ConstantString, field.type, {}, expression.span);
+                    block(*currentBlockId_).instructions.back().stringImmediate =
+                        std::get<std::string>(field.constantValue);
+                }
+            }
+            if (defaultVal < 0) {
+                if (field.type == semantic::PrimitiveType::Int ||
+                    field.type == semantic::PrimitiveType::Long ||
+                    field.type == semantic::PrimitiveType::Enum) {
+                    defaultVal = emitValue(Opcode::ConstantInt, field.type, {}, expression.span);
+                    auto& inst = block(*currentBlockId_).instructions.back();
+                    inst.integerImmediate = 0;
+                    inst.resultTypeId = field.type == semantic::PrimitiveType::Enum ? fieldTypeId : 0;
+                } else if (semantic::isIntegralType(field.type)) {
+                    const auto v = emitValue(
+                        Opcode::ConstantInt, semantic::PrimitiveType::Int, {}, expression.span);
+                    block(*currentBlockId_).instructions.back().integerImmediate = 0;
+                    defaultVal = emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span);
+                } else if (field.type == semantic::PrimitiveType::Double ||
+                           field.type == semantic::PrimitiveType::Float) {
+                    const auto v = emitValue(
+                        Opcode::ConstantDouble, semantic::PrimitiveType::Double, {}, expression.span);
+                    block(*currentBlockId_).instructions.back().doubleImmediate = 0.0;
+                    defaultVal = field.type == semantic::PrimitiveType::Float
+                        ? emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span)
+                        : v;
+                } else if (field.type == semantic::PrimitiveType::Bool) {
+                    defaultVal = emitValue(Opcode::ConstantBool, field.type, {}, expression.span);
+                    block(*currentBlockId_).instructions.back().boolImmediate = false;
+                } else if (field.type == semantic::PrimitiveType::Struct) {
+                    defaultVal = emitValue(
+                        Opcode::NewStruct, semantic::PrimitiveType::Struct, {}, expression.span);
+                    auto& inst = block(*currentBlockId_).instructions.back();
+                    inst.typeId = fieldTypeId;
+                    inst.resultTypeId = fieldTypeId;
+                    inst.symbolName = field.typeName;
+                } else {
+                    defaultVal = emitTypedNull(field.type, field.typeName, expression.span);
+                }
+            }
+            const auto getName = "$intrinsic::static_get::" +
+                std::to_string(member.field.id);
+            Instruction getCall;
+            getCall.result = nextValueId_++;
+            getCall.resultType = member.field.type;
+            getCall.resultTypeId = fieldTypeId;
+            getCall.opcode = Opcode::Call;
+            getCall.operands = {defaultVal};
+            getCall.parameterTypes = {member.field.type};
+            getCall.parameterTypeIds = {fieldTypeId};
+            getCall.symbolId = semantic::stableTypeId(getName);
+            getCall.symbolName = getName;
+            getCall.sourceSpan = expression.span;
+            const auto resultVal = getCall.result;
+            block(*currentBlockId_).instructions.push_back(std::move(getCall));
+            return resultVal;
+        }
         const auto receiver = lowerExpression(*member.receiver);
         if (member.nullConditional) {
             const auto nullReceiver = emitTypedNull(
@@ -630,6 +1041,39 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
     }
     case semantic::BoundNodeKind::MemberAssignmentExpression: {
         const auto& assignment = static_cast<const semantic::BoundMemberAssignmentExpression&>(expression);
+        if (assignment.field.staticField) {
+            if (assignment.ownerType.staticConstructor &&
+                (!currentFunction_ || currentFunction_->symbolId != assignment.ownerType.staticConstructor->id)) {
+                (void)emitCallInstruction(
+                    *assignment.ownerType.staticConstructor,
+                    semantic::PrimitiveType::Void,
+                    {},
+                    {},
+                    expression.span,
+                    false,
+                    std::numeric_limits<std::uint32_t>::max(),
+                    false,
+                    0,
+                    std::numeric_limits<std::uint32_t>::max());
+            }
+            const auto value = lowerExpression(*assignment.expression);
+            const auto fieldTypeId = semantic::isExactType(assignment.field.type)
+                ? semantic::stableTypeId(assignment.field.typeName)
+                : 0;
+            const auto setName = "$intrinsic::static_set::" +
+                std::to_string(assignment.field.id);
+            Instruction setCall;
+            setCall.resultType = semantic::PrimitiveType::Void;
+            setCall.opcode = Opcode::Call;
+            setCall.operands = {value};
+            setCall.parameterTypes = {assignment.field.type};
+            setCall.parameterTypeIds = {fieldTypeId};
+            setCall.symbolId = semantic::stableTypeId(setName);
+            setCall.symbolName = setName;
+            setCall.sourceSpan = expression.span;
+            block(*currentBlockId_).instructions.push_back(std::move(setCall));
+            return value;
+        }
         const auto receiver = lowerExpression(*assignment.receiver);
         const auto checked = emitValue(Opcode::CheckNotNull, semantic::PrimitiveType::Object, {receiver}, assignment.receiver->span);
         auto& check = block(*currentBlockId_).instructions.back();
@@ -665,7 +1109,80 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         const auto& assignment = static_cast<const semantic::BoundStructFieldAssignmentExpression&>(expression);
         ValueId wrapper = -1;
         ValueId current = -1;
-        if (assignment.wrappedVariable) {
+        if (assignment.staticFieldReceiver) {
+            if (assignment.staticReceiverOwnerType.staticConstructor &&
+                (!currentFunction_ || currentFunction_->symbolId != assignment.staticReceiverOwnerType.staticConstructor->id)) {
+                (void)emitCallInstruction(
+                    *assignment.staticReceiverOwnerType.staticConstructor,
+                    semantic::PrimitiveType::Void,
+                    {},
+                    {},
+                    expression.span,
+                    false,
+                    std::numeric_limits<std::uint32_t>::max(),
+                    false,
+                    0,
+                    std::numeric_limits<std::uint32_t>::max());
+            }
+            const auto fieldTypeId = assignment.ownerType.id;
+            if (assignment.staticReceiverInitializer) {
+                const auto hasName = "$intrinsic::static_has::" +
+                    std::to_string(assignment.staticReceiverField.id);
+                Instruction hasCall;
+                hasCall.result = nextValueId_++;
+                hasCall.resultType = semantic::PrimitiveType::Bool;
+                hasCall.opcode = Opcode::Call;
+                hasCall.symbolId = semantic::stableTypeId(hasName);
+                hasCall.symbolName = hasName;
+                hasCall.sourceSpan = expression.span;
+                const auto hasVal = hasCall.result;
+                block(*currentBlockId_).instructions.push_back(std::move(hasCall));
+
+                const auto initBlock = createBlock();
+                const auto readyBlock = createBlock();
+                emitBranch(hasVal, readyBlock, initBlock, {}, {}, expression.span);
+
+                setCurrentBlock(initBlock);
+                const auto initVal = lowerExpression(*assignment.staticReceiverInitializer);
+                const auto setName = "$intrinsic::static_set::" +
+                    std::to_string(assignment.staticReceiverField.id);
+                Instruction setCall;
+                setCall.resultType = semantic::PrimitiveType::Void;
+                setCall.opcode = Opcode::Call;
+                setCall.operands = {initVal};
+                setCall.parameterTypes = {semantic::PrimitiveType::Struct};
+                setCall.parameterTypeIds = {fieldTypeId};
+                setCall.symbolId = semantic::stableTypeId(setName);
+                setCall.symbolName = setName;
+                setCall.sourceSpan = expression.span;
+                block(*currentBlockId_).instructions.push_back(std::move(setCall));
+                emitJump(readyBlock, {}, expression.span);
+
+                setCurrentBlock(readyBlock);
+            }
+            const auto defaultVal = emitValue(
+                Opcode::NewStruct, semantic::PrimitiveType::Struct, {}, expression.span);
+            auto& defInst = block(*currentBlockId_).instructions.back();
+            defInst.typeId = fieldTypeId;
+            defInst.resultTypeId = fieldTypeId;
+            defInst.symbolName = semantic::canonicalTypeName(assignment.ownerType);
+
+            const auto getName = "$intrinsic::static_get::" +
+                std::to_string(assignment.staticReceiverField.id);
+            Instruction getCall;
+            getCall.result = nextValueId_++;
+            getCall.resultType = semantic::PrimitiveType::Struct;
+            getCall.resultTypeId = fieldTypeId;
+            getCall.opcode = Opcode::Call;
+            getCall.operands = {defaultVal};
+            getCall.parameterTypes = {semantic::PrimitiveType::Struct};
+            getCall.parameterTypeIds = {fieldTypeId};
+            getCall.symbolId = semantic::stableTypeId(getName);
+            getCall.symbolName = getName;
+            getCall.sourceSpan = expression.span;
+            current = getCall.result;
+            block(*currentBlockId_).instructions.push_back(std::move(getCall));
+        } else if (assignment.wrappedVariable) {
             wrapper = emitValue(
                 Opcode::LoadLocal, semantic::PrimitiveType::Object,
                 {}, expression.span);
@@ -697,7 +1214,20 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         store.resultTypeId = assignment.ownerType.id;
         store.fieldIndex = assignment.field.index;
         store.symbolName = semantic::canonicalTypeName(assignment.ownerType);
-        if (assignment.wrappedVariable) {
+        if (assignment.staticFieldReceiver) {
+            const auto setName = "$intrinsic::static_set::" +
+                std::to_string(assignment.staticReceiverField.id);
+            Instruction setCall;
+            setCall.resultType = semantic::PrimitiveType::Void;
+            setCall.opcode = Opcode::Call;
+            setCall.operands = {updated};
+            setCall.parameterTypes = {semantic::PrimitiveType::Struct};
+            setCall.parameterTypeIds = {assignment.ownerType.id};
+            setCall.symbolId = semantic::stableTypeId(setName);
+            setCall.symbolName = setName;
+            setCall.sourceSpan = expression.span;
+            block(*currentBlockId_).instructions.push_back(std::move(setCall));
+        } else if (assignment.wrappedVariable) {
             Instruction writeback;
             writeback.resultType = semantic::PrimitiveType::Void;
             writeback.opcode = Opcode::StoreField;
@@ -737,6 +1267,20 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         }
         const auto assigned = lowerExpression(*assignment.assignedValue);
         arguments.push_back(assigned);
+        if (assignment.staticConstructor &&
+            (!currentFunction_ || currentFunction_->symbolId != assignment.staticConstructor->id)) {
+            (void)emitCallInstruction(
+                *assignment.staticConstructor,
+                semantic::PrimitiveType::Void,
+                {},
+                {},
+                expression.span,
+                false,
+                std::numeric_limits<std::uint32_t>::max(),
+                false,
+                0,
+                std::numeric_limits<std::uint32_t>::max());
+        }
         (void)emitCallInstruction(
             assignment.setter,
             semantic::PrimitiveType::Void,
@@ -856,6 +1400,27 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 }
                 break;
             case semantic::ReferenceTargetKind::ObjectField: {
+                if (argument.targetField.staticField) {
+                    if (argument.targetOwnerType.staticConstructor &&
+                        (!currentFunction_ || currentFunction_->symbolId != argument.targetOwnerType.staticConstructor->id)) {
+                        (void)emitCallInstruction(
+                            *argument.targetOwnerType.staticConstructor,
+                            semantic::PrimitiveType::Void,
+                            {},
+                            {},
+                            expression.span,
+                            false,
+                            std::numeric_limits<std::uint32_t>::max(),
+                            false,
+                            0,
+                            std::numeric_limits<std::uint32_t>::max());
+                    }
+                    if (argument.modifier == semantic::ParameterModifier::Ref &&
+                        argument.value) {
+                        initial = lowerExpression(*argument.value);
+                    }
+                    break;
+                }
                 targetReceiver = lowerExpression(*argument.targetReceiver);
                 targetReceiver = emitValue(
                     Opcode::CheckNotNull,
@@ -969,6 +1534,20 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             }
         }
 
+        if (call.staticConstructor &&
+            (!currentFunction_ || currentFunction_->symbolId != call.staticConstructor->id)) {
+            (void)emitCallInstruction(
+                *call.staticConstructor,
+                semantic::PrimitiveType::Void,
+                {},
+                {},
+                expression.span,
+                false,
+                std::numeric_limits<std::uint32_t>::max(),
+                false,
+                0,
+                std::numeric_limits<std::uint32_t>::max());
+        }
         const auto callResult = emitCallInstruction(
             call.function,
             call.type,
@@ -1003,6 +1582,27 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                     writeback.variable.index, value, expression.span);
                 break;
             case semantic::ReferenceTargetKind::ObjectField: {
+                if (writeback.targetField.staticField) {
+                    const auto fieldTypeId = semantic::isExactType(
+                            writeback.targetField.type)
+                        ? semantic::stableTypeId(
+                            writeback.targetField.typeName)
+                        : 0;
+                    const auto setName = "$intrinsic::static_set::" +
+                        std::to_string(writeback.targetField.id);
+                    Instruction setCall;
+                    setCall.resultType = semantic::PrimitiveType::Void;
+                    setCall.opcode = Opcode::Call;
+                    setCall.operands = {value};
+                    setCall.parameterTypes = {writeback.targetField.type};
+                    setCall.parameterTypeIds = {fieldTypeId};
+                    setCall.symbolId = semantic::stableTypeId(setName);
+                    setCall.symbolName = setName;
+                    setCall.sourceSpan = expression.span;
+                    block(*currentBlockId_).instructions.push_back(
+                        std::move(setCall));
+                    break;
+                }
                 Instruction store;
                 store.resultType = semantic::PrimitiveType::Void;
                 store.opcode = Opcode::StoreField;
@@ -1141,6 +1741,20 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                     call.function.ownerTypeName;
             }
             arguments[index] = value;
+        }
+        if (call.staticConstructor &&
+            (!currentFunction_ || currentFunction_->symbolId != call.staticConstructor->id)) {
+            (void)emitCallInstruction(
+                *call.staticConstructor,
+                semantic::PrimitiveType::Void,
+                {},
+                {},
+                expression.span,
+                false,
+                std::numeric_limits<std::uint32_t>::max(),
+                false,
+                0,
+                std::numeric_limits<std::uint32_t>::max());
         }
         return emitCallInstruction(
             call.function,

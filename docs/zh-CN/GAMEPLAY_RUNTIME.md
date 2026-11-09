@@ -19,13 +19,13 @@
 
 新增：
 
-- `GameplayHost`：实体、计时器、事件、随机流和脚本调用的统一宿主；
+- `GameplayHost`：实体、计时器、事件（含 `subscribeOnce` 一次性事件订阅与 `cancelEntityCalls` 实体级定时器清理）、随机流和脚本调用的统一宿主；
 - `SceneGameplayDriver`：驱动 `SceneScriptRuntime` 的固定帧入口；
 - 命名事件订阅与发布；
-- 固定 Tick 的脚本序列，可作为当前阶段的确定性协程模型；
+- 确定性脚本协程 `sequence`：支持 `yield wait_ticks(n)`、`yield wait_seconds(s)`、`yield wait_event(topic)` 与 `yield wait_until(cond)`，并在组件禁用或卸载时自动取消挂起协程；
 - `ScriptContract`，用于按回调名称和参数数量验证行为、技能、任务和 AI 脚本；
-- `ScriptMetadataRegistry`，用于序列化、Inspector、复制和编辑器元数据；
-- `installGameplayBindings`，向脚本生成 `CurrentTick`、实体、随机数、计时器和事件 API。
+- `ScriptMetadataRegistry` 与 `InspectorTypeSchema`：自动从编译器源码 Attribute 导入，支持嵌套 Struct、Enum、容器、引用分类（`[EntityRef]`/`[ComponentRef]`/`[AssetRef]`）与 `event` 信号反射；
+- `installGameplayBindings`，向脚本生成 `CurrentTick`、`TickRate`、实体、随机数、计时器（`Schedule`、`CancelTimer`、`CancelEntityTimers`）和事件（`SubscribeOnce`、`Publish`）API。
 
 每个 Tick 的固定顺序为：
 
@@ -50,16 +50,11 @@
 
 Gameplay 状态应与已有 `ScriptObjectState` 一起组合为引擎级 Rollback Frame。
 
-## 当前边界
+## 语言与编辑器集成闭环
 
-本阶段没有假装完成全部 C# 语法。以下仍属于后续编译器阶段：
+结合 Phase 18–24 原生语言能力与引擎集成演进，Gameplay Runtime 已与语言及编辑器层完全打通：
 
-- 源码级 `interface`、继承和虚分派；
-- 泛型；
-- lambda、delegate 和语言级 `event`；
-- `for`、`foreach`、`switch`；
-- `[Attribute]` 语法；
-- `yield`/协程状态机与 `async`；
-- `ref`、`out`、装箱和可变 struct receiver。
-
-当前的 Contract、Metadata、Named Event 和 Sequence 是这些语法后续可以直接 Lower 到的稳定运行时能力。
+- 源码级 `interface`、继承、虚分派、泛型与可变 `struct`；
+- 一等委托、闭包、语言级 `event` 以及宿主跨组件 `connectSignal` 信号连接；
+- 源码 `[Attribute]` 自动提取至 `ScriptMetadataRegistry` 与 `InspectorTypeSchema`；
+- `sequence` 协程状态机原生支持 `yield wait_ticks`、`yield wait_seconds`、`yield wait_event`、`yield wait_until` 与生命周期自动清理。

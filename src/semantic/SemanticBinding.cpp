@@ -139,11 +139,15 @@ void collectLambdaCaptureNames(
         visit(static_cast<const syntax::NewObjectExpressionSyntax&>(
             expression).arguments);
         return;
-    case syntax::SyntaxKind::NewArrayExpression:
-        collectLambdaCaptureNames(*static_cast<const
-            syntax::NewArrayExpressionSyntax&>(expression).length,
-            insideLambda, parameterScopes, names);
+    case syntax::SyntaxKind::NewArrayExpression: {
+        const auto& arr = static_cast<const
+            syntax::NewArrayExpressionSyntax&>(expression);
+        if (arr.length) {
+            collectLambdaCaptureNames(*arr.length, insideLambda, parameterScopes, names);
+        }
+        visit(arr.initialValues);
         return;
+    }
     default:
         return;
     }
@@ -277,24 +281,41 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
         input.types.push_back(type);
     }
 
+    const std::size_t enumStartIndex = syntaxTree.classes.size() + syntaxTree.structs.size();
+    for (std::size_t idx = 0; idx < syntaxTree.enums.size(); ++idx) {
+        auto& enumType = input.types[enumStartIndex + idx];
+        (void)populateEnumMembers(enumType, syntaxTree.enums[idx], diagnostics_);
+        input.visibleTypes[enumType.name] = enumType;
+        input.visibleTypes[canonicalTypeName(enumType)] = enumType;
+    }
     std::size_t typeIndex = 0;
     for (const auto& classSyntax : syntaxTree.classes) {
-        (void)populateTypeFields(input.types[typeIndex], classSyntax, input.visibleTypes, diagnostics_);
+        (void)populateTypeFields(input.types[typeIndex], classSyntax, input.visibleTypes, diagnostics_, true);
         input.visibleTypes[input.types[typeIndex].name] = input.types[typeIndex];
         input.visibleTypes[canonicalTypeName(input.types[typeIndex])] = input.types[typeIndex];
         ++typeIndex;
     }
     for (const auto& structSyntax : syntaxTree.structs) {
-        (void)populateTypeFields(input.types[typeIndex], structSyntax, input.visibleTypes, diagnostics_);
+        (void)populateTypeFields(input.types[typeIndex], structSyntax, input.visibleTypes, diagnostics_, true);
         input.visibleTypes[input.types[typeIndex].name] = input.types[typeIndex];
         input.visibleTypes[canonicalTypeName(input.types[typeIndex])] = input.types[typeIndex];
         ++typeIndex;
     }
-    for (const auto& enumSyntax : syntaxTree.enums) {
-        (void)populateEnumMembers(input.types[typeIndex], enumSyntax, diagnostics_);
-        input.visibleTypes[input.types[typeIndex].name] = input.types[typeIndex];
-        input.visibleTypes[canonicalTypeName(input.types[typeIndex])] = input.types[typeIndex];
-        ++typeIndex;
+    bool constProgressed = true;
+    while (constProgressed) {
+        constProgressed = false;
+        for (std::size_t idx = 0; idx < enumStartIndex; ++idx) {
+            if (resolveConstantFieldsPass(input.types[idx], input.visibleTypes)) {
+                input.visibleTypes[input.types[idx].name] = input.types[idx];
+                input.visibleTypes[canonicalTypeName(input.types[idx])] = input.types[idx];
+                constProgressed = true;
+            }
+        }
+    }
+    for (std::size_t idx = 0; idx < enumStartIndex; ++idx) {
+        (void)validateConstantFields(input.types[idx], input.visibleTypes, diagnostics_);
+        input.visibleTypes[input.types[idx].name] = input.types[idx];
+        input.visibleTypes[canonicalTypeName(input.types[idx])] = input.types[idx];
     }
 
     std::unordered_set<std::string> functionKeys;
@@ -327,6 +348,13 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
             for (const auto& methodSyntax : typeSyntax.methods) {
                 FunctionBindingInput binding;
                 binding.symbol = declareFunctionSymbol(input.moduleName, methodSyntax, input.visibleTypes, diagnostics_, &owner);
+                if (owner.staticType && !binding.symbol.staticMethod) {
+                    diagnostics_.report(
+                        "RS2489",
+                        "cannot declare instance method '" + methodSyntax.identifierToken.text +
+                            "' in static class '" + owner.name + "'",
+                        methodSyntax.identifierToken.span);
+                }
                 binding.body = &methodSyntax.body;
                 if (!binding.symbol.staticMethod) {
                     binding.parameterNames.push_back("this");
@@ -340,24 +368,75 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
                 addBinding(std::move(binding));
             }
             for (const auto& ctorSyntax : typeSyntax.constructors) {
+                const bool isStaticCtor = hasModifier(
+                    ctorSyntax.modifiers, syntax::SyntaxKind::StaticKeyword);
+                if (owner.staticType && !isStaticCtor) {
+                    diagnostics_.report(
+                        "RS2489",
+                        "static class '" + owner.name + "' cannot declare instance constructors",
+                        ctorSyntax.identifierToken.span);
+                }
                 FunctionBindingInput binding;
                 binding.symbol = declareConstructorSymbol(input.moduleName, ctorSyntax, owner, input.visibleTypes, diagnostics_);
                 binding.body = &ctorSyntax.body;
                 binding.constructorSyntax = &ctorSyntax;
-                binding.parameterNames.push_back("this");
-                binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
-                for (const auto& parameter : ctorSyntax.parameters) {
-                    binding.parameterNames.push_back(parameter.identifierToken.text);
-                    binding.parameterSpans.push_back(parameter.identifierToken.span);
+                if (!binding.symbol.staticMethod) {
+                    binding.parameterNames.push_back("this");
+                    binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                    for (const auto& parameter : ctorSyntax.parameters) {
+                        binding.parameterNames.push_back(parameter.identifierToken.text);
+                        binding.parameterSpans.push_back(parameter.identifierToken.span);
+                    }
+                    owner.constructors.push_back(binding.symbol);
+                } else {
+                    if (owner.staticConstructor.has_value()) {
+                        diagnostics_.report(
+                            "RS2497",
+                            "type '" + owner.name + "' cannot declare more than one static constructor",
+                            ctorSyntax.identifierToken.span);
+                    }
+                    owner.staticConstructor = binding.symbol;
                 }
-                owner.constructors.push_back(binding.symbol);
                 addBinding(std::move(binding));
             }
             for (const auto& propertySyntax : typeSyntax.properties) {
                 auto property = declarePropertySymbol(input.moduleName, propertySyntax, owner, input.visibleTypes, diagnostics_);
-                const bool autoProperty =
-                    (propertySyntax.getter && propertySyntax.getter->semicolonToken) ||
-                    (propertySyntax.setter && propertySyntax.setter->semicolonToken);
+                if (owner.staticType && !property.staticProperty) {
+                    diagnostics_.report(
+                        "RS2489",
+                        "cannot declare instance property '" + property.name +
+                            "' in static class '" + owner.name + "'",
+                        propertySyntax.identifierToken.span);
+                }
+                const bool getterAuto = propertySyntax.getter &&
+                    propertySyntax.getter->semicolonToken.has_value();
+                const bool setterAuto = propertySyntax.setter &&
+                    propertySyntax.setter->semicolonToken.has_value();
+                const bool getterExplicit = propertySyntax.getter &&
+                    propertySyntax.getter->body != nullptr;
+                const bool setterExplicit = propertySyntax.setter &&
+                    propertySyntax.setter->body != nullptr;
+                const bool autoProperty = getterAuto || setterAuto;
+                if (autoProperty && (getterExplicit || setterExplicit)) {
+                    diagnostics_.report(
+                        "RS2463",
+                        "property accessors cannot mix auto and explicit bodies",
+                        propertySyntax.identifierToken.span);
+                }
+                if (autoProperty && !property.getter) {
+                    diagnostics_.report(
+                        "RS2463",
+                        "auto-implemented properties must declare a get accessor",
+                        propertySyntax.identifierToken.span);
+                }
+                if (!autoProperty && propertySyntax.initializer) {
+                    diagnostics_.report(
+                        "RS2465",
+                        "only auto-implemented properties can have initializers",
+                        propertySyntax.equalsToken
+                            ? propertySyntax.equalsToken->span
+                            : propertySyntax.identifierToken.span);
+                }
                 if (autoProperty) {
                     property.backingFieldIndex = owner.fields.size();
                     FieldSymbol backing;
@@ -365,11 +444,24 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
                     backing.type = property.type;
                     backing.typeName = property.typeName;
                     backing.index = owner.fields.size();
+                    backing.declaringTypeId = owner.id;
+                    backing.declaringTypeName = canonicalTypeName(owner);
                     backing.synthetic = true;
+                    backing.staticField = property.staticProperty;
+                    backing.readonlyField = !property.setter.has_value();
+                    backing.initializerSyntax = propertySyntax.initializer.get();
                     backing.declarationSpan = propertySyntax.identifierToken.span;
                     backing.id = stableTypeId(canonicalTypeName(owner) +
                         "::field:" + backing.name);
                     owner.fields.push_back(std::move(backing));
+                    if (propertySyntax.initializer) {
+                        input.visibleTypes[owner.name] = owner;
+                        input.visibleTypes[canonicalTypeName(owner)] = owner;
+                        (void)resolveConstantFieldsPass(owner, input.visibleTypes);
+                        input.visibleTypes[owner.name] = owner;
+                        input.visibleTypes[canonicalTypeName(owner)] = owner;
+                        (void)validateConstantFields(owner, input.visibleTypes, diagnostics_);
+                    }
                 }
                 if (property.getter) {
                     FunctionBindingInput binding;
@@ -399,6 +491,85 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
                 }
                 owner.properties.push_back(std::move(property));
             }
+            if (!owner.staticConstructor.has_value()) {
+                bool hasDynamicStaticFieldInit = false;
+                for (const auto& field : owner.fields) {
+                    if (field.declaringTypeId == owner.id &&
+                        field.staticField && !field.constField &&
+                        !field.hasConstantValue && field.initializerSyntax) {
+                        hasDynamicStaticFieldInit = true;
+                        break;
+                    }
+                }
+                if (hasDynamicStaticFieldInit) {
+                    FunctionBindingInput binding;
+                    binding.symbol.moduleName = input.moduleName;
+                    binding.symbol.name = ".cctor";
+                    binding.symbol.ownerTypeName = owner.name;
+                    binding.symbol.ownerTypeId = owner.id;
+                    binding.symbol.declaringTypeId = owner.id;
+                    binding.symbol.declaringTypeName = canonicalTypeName(owner);
+                    binding.symbol.returnType = PrimitiveType::Void;
+                    binding.symbol.method = true;
+                    binding.symbol.staticMethod = true;
+                    binding.symbol.constructor = true;
+                    binding.symbol.synthetic = true;
+                    binding.symbol.deterministic = owner.deterministic;
+                    binding.symbol.id = stableFunctionId(binding.symbol);
+                    binding.symbol.declarationSpan = typeSyntax.identifierToken.span;
+                    binding.symbol.bodySpan = typeSyntax.identifierToken.span;
+                    owner.staticConstructor = binding.symbol;
+                    addBinding(std::move(binding));
+                }
+            }
+            if (owner.kind == TypeKind::Class &&
+                !owner.staticType && !owner.interfaceType &&
+                owner.constructors.empty()) {
+                bool hasOwnDynamicInstanceFieldInit = false;
+                for (const auto& field : owner.fields) {
+                    if (field.declaringTypeId == owner.id &&
+                        !field.staticField && !field.constField &&
+                        !field.hasConstantValue && field.initializerSyntax) {
+                        hasOwnDynamicInstanceFieldInit = true;
+                        break;
+                    }
+                }
+                if (hasOwnDynamicInstanceFieldInit) {
+                    FunctionBindingInput binding;
+                    binding.symbol.moduleName = input.moduleName;
+                    binding.symbol.name = ".ctor";
+                    binding.symbol.ownerTypeName = owner.name;
+                    binding.symbol.ownerTypeId = owner.id;
+                    binding.symbol.declaringTypeId = owner.id;
+                    binding.symbol.declaringTypeName = canonicalTypeName(owner);
+                    binding.symbol.returnType = PrimitiveType::Void;
+                    binding.symbol.method = true;
+                    binding.symbol.staticMethod = false;
+                    binding.symbol.constructor = true;
+                    binding.symbol.synthetic = true;
+                    binding.symbol.accessibility = Accessibility::Public;
+                    binding.symbol.deterministic = owner.deterministic;
+                    VariableSymbol self;
+                    self.name = "this";
+                    self.type = PrimitiveType::Object;
+                    self.typeName = canonicalTypeName(owner);
+                    self.index = 0;
+                    self.storageType = self.type;
+                    self.storageTypeName = self.typeName;
+                    self.parameter = true;
+                    self.declarationSpan = typeSyntax.identifierToken.span;
+                    binding.symbol.parameters.push_back(std::move(self));
+                    binding.symbol.id = stableFunctionId(binding.symbol);
+                    binding.symbol.parameters[0].id = stableTypeId(
+                        std::to_string(binding.symbol.id) + "::local:0:this");
+                    binding.symbol.declarationSpan = typeSyntax.identifierToken.span;
+                    binding.symbol.bodySpan = typeSyntax.identifierToken.span;
+                    binding.parameterNames.push_back("this");
+                    binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                    owner.constructors.push_back(binding.symbol);
+                    addBinding(std::move(binding));
+                }
+            }
             for (auto& type : input.types) {
                 if (type.id == owner.id) type = owner;
             }
@@ -424,6 +595,15 @@ SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
     result.types = input.types;
 
     if (!input.functionBindings.empty()) {
+        currentModuleName_ = input.moduleName;
+        for (const auto& binding : input.functionBindings) {
+            for (const auto& param : binding.symbol.parameters) {
+                if (param.modifier == ParameterModifier::Ref ||
+                    param.modifier == ParameterModifier::Out) {
+                    (void)ensureCaptureStorage(param);
+                }
+            }
+        }
         for (const auto& binding : input.functionBindings) {
             result.functions.push_back(bindFunction(binding));
         }
@@ -505,6 +685,8 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
         const auto found = visibleTypes_.find(input.symbol.ownerTypeName);
         if (found != visibleTypes_.end()) currentOwnerType_ = found->second;
     }
+    currentDeterministicContext_ = input.symbol.deterministic ||
+        (currentOwnerType_ && currentOwnerType_->deterministic);
 
     std::vector<std::unique_ptr<BoundStatement>>
         capturedParameterInitializers;
@@ -516,6 +698,10 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
         if (parameter.id == 0) {
             parameter.id = stableTypeId(std::to_string(currentFunctionId_) +
                 "::local:" + std::to_string(parameter.index) + ":" + parameter.name);
+        }
+        if (parameter.modifier == ParameterModifier::Ref ||
+            parameter.modifier == ParameterModifier::Out) {
+            (void)ensureCaptureStorage(parameter);
         }
         const bool captured = parameter.name != "this" &&
             parameter.modifier == ParameterModifier::None &&
@@ -563,15 +749,44 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
 
     if (input.syntheticAutoGetter || input.syntheticAutoSetter) {
         result.body = std::make_unique<BoundBlockStatement>();
-        if (!currentOwnerType_ || input.symbol.staticMethod) {
-            diagnostics_.report("RS2462", "auto properties require an instance owner", {});
+        if (!currentOwnerType_) {
+            diagnostics_.report("RS2462", "auto properties require an owner type", {});
+        } else if (input.symbol.staticMethod) {
+            if (input.syntheticAutoGetter) {
+                auto memberAccess = std::make_unique<BoundMemberAccessExpression>();
+                memberAccess->type = input.syntheticField.type;
+                memberAccess->typeName = input.syntheticField.typeName;
+                memberAccess->ownerType = *currentOwnerType_;
+                memberAccess->field = input.syntheticField;
+                if (!currentOwnerType_->staticConstructor.has_value() &&
+                    !input.syntheticField.hasConstantValue &&
+                    input.syntheticField.initializerSyntax) {
+                    memberAccess->staticInitializer = bindStaticFieldInitializer(
+                        *currentOwnerType_, input.syntheticField);
+                }
+                auto statement = std::make_unique<BoundReturnStatement>();
+                statement->expression = std::move(memberAccess);
+                result.body->statements.push_back(std::move(statement));
+            } else {
+                const auto* valueVariable = lookupVariable("value");
+                auto assignment = std::make_unique<BoundMemberAssignmentExpression>();
+                assignment->type = input.syntheticField.type;
+                assignment->typeName = input.syntheticField.typeName;
+                assignment->ownerType = *currentOwnerType_;
+                assignment->field = input.syntheticField;
+                auto value = std::make_unique<BoundVariableExpression>();
+                value->type = valueVariable->type;
+                value->typeName = valueVariable->typeName;
+                value->variable = *valueVariable;
+                assignment->expression = std::move(value);
+                auto statement = std::make_unique<BoundExpressionStatement>();
+                statement->expression = std::move(assignment);
+                result.body->statements.push_back(std::move(statement));
+            }
         } else {
             const auto* thisVariable = lookupVariable("this");
             if (input.syntheticAutoGetter) {
-                auto receiver = std::make_unique<BoundVariableExpression>();
-                receiver->type = thisVariable->type;
-                receiver->typeName = thisVariable->typeName;
-                receiver->variable = *thisVariable;
+                auto receiver = makeVariableAccess(*thisVariable, input.symbol.declarationSpan);
                 std::unique_ptr<BoundExpression> access;
                 if (currentOwnerType_->kind == TypeKind::Struct) {
                     auto structureAccess = std::make_unique<BoundStructFieldAccessExpression>();
@@ -601,10 +816,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                         "struct properties cannot declare setters in the Phase 3E value model",
                         {});
                 } else {
-                    auto receiver = std::make_unique<BoundVariableExpression>();
-                    receiver->type = thisVariable->type;
-                    receiver->typeName = thisVariable->typeName;
-                    receiver->variable = *thisVariable;
+                    auto receiver = makeVariableAccess(*thisVariable, input.symbol.declarationSpan);
                     auto assignment = std::make_unique<BoundMemberAssignmentExpression>();
                     assignment->type = input.syntheticField.type;
                     assignment->typeName = input.syntheticField.typeName;
@@ -645,15 +857,87 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
         result.body = bindSequenceCancellation(input);
     } else if (input.sequence) {
         result.body = bindSequenceSegment(input);
-    } else if (input.body) {
-        auto initializer = bindBaseConstructorInitializer(input);
-        result.body = bindBlockStatement(*input.body, false);
+    } else {
+        auto initializer = (input.body || (input.symbol.constructor && !input.symbol.staticMethod))
+            ? bindBaseConstructorInitializer(input)
+            : nullptr;
+        std::vector<std::unique_ptr<BoundStatement>> ctorFieldInitializers;
+        if (input.symbol.constructor && currentOwnerType_) {
+            if (input.symbol.staticMethod) {
+                for (const auto& field : currentOwnerType_->fields) {
+                    if (field.declaringTypeId != currentOwnerType_->id ||
+                        !field.staticField || field.constField || !field.initializerSyntax) {
+                        continue;
+                    }
+                    auto value = bindStaticFieldInitializer(*currentOwnerType_, field);
+                    if (!value) continue;
+                    auto assignment = std::make_unique<BoundMemberAssignmentExpression>();
+                    assignment->span = field.declarationSpan;
+                    assignment->type = field.type;
+                    assignment->typeName = field.typeName;
+                    assignment->ownerType = *currentOwnerType_;
+                    assignment->field = field;
+                    assignment->expression = std::move(value);
+                    auto stmt = std::make_unique<BoundExpressionStatement>();
+                    stmt->span = field.declarationSpan;
+                    stmt->expression = std::move(assignment);
+                    ctorFieldInitializers.push_back(std::move(stmt));
+                }
+            } else if (const auto* thisVar = lookupVariable("this")) {
+                for (const auto& field : currentOwnerType_->fields) {
+                    if ((initializer && field.declaringTypeId != currentOwnerType_->id) ||
+                        field.staticField || field.constField ||
+                        field.hasConstantValue || !field.initializerSyntax) {
+                        continue;
+                    }
+                    auto value = bindStaticFieldInitializer(*currentOwnerType_, field);
+                    if (!value) continue;
+                    if (currentOwnerType_->kind == TypeKind::Struct) {
+                        auto assignment = std::make_unique<BoundStructFieldAssignmentExpression>();
+                        assignment->span = field.declarationSpan;
+                        assignment->type = field.type;
+                        assignment->typeName = field.typeName;
+                        assignment->variable = *thisVar;
+                        assignment->ownerType = *currentOwnerType_;
+                        assignment->field = field;
+                        assignment->expression = std::move(value);
+                        auto stmt = std::make_unique<BoundExpressionStatement>();
+                        stmt->span = field.declarationSpan;
+                        stmt->expression = std::move(assignment);
+                        ctorFieldInitializers.push_back(std::move(stmt));
+                    } else {
+                        auto assignment = std::make_unique<BoundMemberAssignmentExpression>();
+                        assignment->span = field.declarationSpan;
+                        assignment->type = field.type;
+                        assignment->typeName = field.typeName;
+                        assignment->receiver = makeVariableAccess(*thisVar, field.declarationSpan);
+                        assignment->ownerType = *currentOwnerType_;
+                        assignment->field = field;
+                        assignment->expression = std::move(value);
+                        auto stmt = std::make_unique<BoundExpressionStatement>();
+                        stmt->span = field.declarationSpan;
+                        stmt->expression = std::move(assignment);
+                        ctorFieldInitializers.push_back(std::move(stmt));
+                    }
+                }
+            }
+        }
+        if (input.body) {
+            result.body = bindBlockStatement(*input.body, false);
+        } else {
+            result.body = std::make_unique<BoundBlockStatement>();
+            result.body->span = input.symbol.bodySpan;
+        }
+        if (!ctorFieldInitializers.empty()) {
+            result.body->statements.insert(
+                result.body->statements.begin(),
+                std::make_move_iterator(ctorFieldInitializers.begin()),
+                std::make_move_iterator(ctorFieldInitializers.end()));
+        }
         if (initializer) {
             result.body->statements.insert(
                 result.body->statements.begin(), std::move(initializer));
         }
-    } else {
-        result.body = std::make_unique<BoundBlockStatement>();
     }
     if (input.sequence && input.sequenceSegment == 0 &&
         input.sequenceParameterFields.size() > 1 && currentOwnerType_) {
@@ -734,7 +1018,29 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     currentStorageReturnTypeName_.clear();
     allVariables_.clear();
     sequenceLocalFields_.clear();
+    currentDeterministicContext_ = false;
     return result;
+}
+
+VariableSymbol Binder::allocateTempVariable(
+    const std::string& prefix,
+    PrimitiveType type,
+    const std::string& typeName,
+    text::TextSpan span) {
+    VariableSymbol temp;
+    temp.name = "$" + prefix + "_" + std::to_string(nextVariableIndex_);
+    temp.type = type;
+    temp.typeName = typeName;
+    temp.storageType = type;
+    temp.storageTypeName = typeName;
+    temp.index = nextVariableIndex_++;
+    temp.declarationSpan = span;
+    temp.scopeSpan = span;
+    temp.id = stableTypeId(
+        std::to_string(currentFunctionId_) + "::local:" +
+        std::to_string(temp.index) + ":" + temp.name);
+    allVariables_.push_back(temp);
+    return temp;
 }
 
 std::unique_ptr<BoundExpression> Binder::makeVariableAccess(
@@ -810,6 +1116,85 @@ const FunctionSymbol* Binder::findScheduleFunction() const noexcept {
         return &candidate;
     }
     return nullptr;
+}
+
+std::unique_ptr<BoundExpression> Binder::bindSequenceYieldDelay(
+    const syntax::YieldWaitStatementSyntax& yieldSyntax) {
+    auto delayExpr = bindExpression(*yieldSyntax.delay);
+    if (yieldSyntax.waitTicksToken.text != "wait_seconds") {
+        return convertExpression(
+            std::move(delayExpr),
+            PrimitiveType::Int,
+            yieldSyntax.delay->span(),
+            "sequence wait_ticks delay");
+    }
+
+    const FunctionSymbol* tpsFunc = nullptr;
+    const auto foundTps = visibleFunctions_.find("TicksPerSecond");
+    if (foundTps != visibleFunctions_.end()) {
+        for (const auto& candidate : foundTps->second) {
+            if (!candidate.method && candidate.parameters.empty() &&
+                candidate.returnType == PrimitiveType::Int) {
+                tpsFunc = &candidate;
+                break;
+            }
+        }
+    }
+
+    std::unique_ptr<BoundExpression> tickRateExpr;
+    if (tpsFunc) {
+        auto call = std::make_unique<BoundCallExpression>();
+        call->type = PrimitiveType::Int;
+        call->span = yieldSyntax.waitTicksToken.span;
+        call->function = *tpsFunc;
+        tickRateExpr = std::move(call);
+    } else {
+        auto lit = std::make_unique<BoundLiteralExpression>();
+        lit->type = PrimitiveType::Int;
+        lit->value = std::int64_t{60};
+        lit->span = yieldSyntax.waitTicksToken.span;
+        tickRateExpr = std::move(lit);
+    }
+
+    if (delayExpr->type == PrimitiveType::Double ||
+        delayExpr->type == PrimitiveType::Float) {
+        auto leftDouble = convertExpression(
+            std::move(delayExpr),
+            PrimitiveType::Double,
+            yieldSyntax.delay->span(),
+            "sequence wait_seconds delay");
+        auto rightDouble = convertExpression(
+            std::move(tickRateExpr),
+            PrimitiveType::Double,
+            yieldSyntax.waitTicksToken.span,
+            "sequence wait_seconds tick rate");
+        auto mul = std::make_unique<BoundBinaryExpression>();
+        mul->type = PrimitiveType::Double;
+        mul->operatorKind = BoundBinaryOperatorKind::Multiplication;
+        mul->span = yieldSyntax.delay->span();
+        mul->left = std::move(leftDouble);
+        mul->right = std::move(rightDouble);
+
+        auto castToInt = std::make_unique<BoundConversionExpression>();
+        castToInt->type = PrimitiveType::Int;
+        castToInt->conversion = ConversionKind::Numeric;
+        castToInt->span = yieldSyntax.delay->span();
+        castToInt->expression = std::move(mul);
+        return castToInt;
+    }
+
+    auto leftInt = convertExpression(
+        std::move(delayExpr),
+        PrimitiveType::Int,
+        yieldSyntax.delay->span(),
+        "sequence wait_seconds delay");
+    auto mul = std::make_unique<BoundBinaryExpression>();
+    mul->type = PrimitiveType::Int;
+    mul->operatorKind = BoundBinaryOperatorKind::Multiplication;
+    mul->span = yieldSyntax.delay->span();
+    mul->left = std::move(leftInt);
+    mul->right = std::move(tickRateExpr);
+    return mul;
 }
 
 void Binder::appendSequenceRestartCancellation(
@@ -1030,11 +1415,7 @@ Binder::bindSingleYieldLoopSequence(const FunctionBindingInput& input) {
         callback->span = yieldSyntax.waitTicksToken.span;
         callback->value = input.sequenceNextCallback->name;
         call->arguments.push_back(std::move(callback));
-        call->arguments.push_back(convertExpression(
-            bindExpression(*yieldSyntax.delay),
-            PrimitiveType::Int,
-            yieldSyntax.delay->span(),
-            "sequence wait_ticks delay"));
+        call->arguments.push_back(bindSequenceYieldDelay(yieldSyntax));
         auto statement = std::make_unique<BoundExpressionStatement>();
         statement->span = yieldSyntax.span();
         const auto* receiver = lookupVariable("this");
@@ -1207,9 +1588,7 @@ Binder::bindSingleYieldBranchSequence(const FunctionBindingInput& input) {
         callback->span = yieldSyntax.waitTicksToken.span;
         callback->value = input.sequenceNextCallback->name;
         call->arguments.push_back(std::move(callback));
-        call->arguments.push_back(convertExpression(
-            bindExpression(*yieldSyntax.delay), PrimitiveType::Int,
-            yieldSyntax.delay->span(), "sequence wait_ticks delay"));
+        call->arguments.push_back(bindSequenceYieldDelay(yieldSyntax));
         auto timerAssignment =
             std::make_unique<BoundMemberAssignmentExpression>();
         timerAssignment->type = input.sequenceTimerField.type;
@@ -1664,6 +2043,45 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
             const auto& yield = static_cast<const
                 syntax::YieldWaitStatementSyntax&>(syntaxTree);
             const auto id = yieldIds.at(&yield);
+
+            if (yield.waitTicksToken.text == "wait_until") {
+                auto resumed = std::make_unique<BoundIfStatement>();
+                resumed->span = yield.span();
+                resumed->condition = convertExpression(
+                    bindExpression(*yield.delay),
+                    PrimitiveType::Bool,
+                    yield.delay->span(),
+                    "sequence wait_until condition");
+                resumed->thenStatement = makeStateAssignment(0, yield.span());
+                resumed->elseStatement = makeCompositionPoll(yield.span());
+
+                auto initialCheck = std::make_unique<BoundIfStatement>();
+                initialCheck->span = yield.span();
+                initialCheck->condition = convertExpression(
+                    bindExpression(*yield.delay),
+                    PrimitiveType::Bool,
+                    yield.delay->span(),
+                    "sequence wait_until condition");
+                initialCheck->thenStatement = makeStateAssignment(0, yield.span());
+                auto suspendBlock = std::make_unique<BoundBlockStatement>();
+                suspendBlock->span = yield.span();
+                suspendBlock->statements.push_back(
+                    makeStateAssignment(id, yield.span()));
+                auto poll = makeCompositionPoll(yield.span());
+                suspendBlock->statements.insert(
+                    suspendBlock->statements.end(),
+                    std::make_move_iterator(poll->statements.begin()),
+                    std::make_move_iterator(poll->statements.end()));
+                initialCheck->elseStatement = std::move(suspendBlock);
+
+                auto dispatch = std::make_unique<BoundIfStatement>();
+                dispatch->span = yield.span();
+                dispatch->condition = makeStateEquals(id, yield.span());
+                dispatch->thenStatement = std::move(resumed);
+                dispatch->elseStatement = std::move(initialCheck);
+                return dispatch;
+            }
+
             auto resumed = std::make_unique<BoundBlockStatement>();
             resumed->span = yield.span();
             resumed->statements.push_back(makeStateAssignment(0, yield.span()));
@@ -1671,43 +2089,200 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
             auto suspended = std::make_unique<BoundBlockStatement>();
             suspended->span = yield.span();
             suspended->statements.push_back(makeStateAssignment(id, yield.span()));
-            const auto* schedule = findScheduleFunction();
-            if (!schedule) {
-                diagnostics_.report(
-                    "RS2493",
-                    "sequence requires imported RealScript.Game.Schedule",
-                    yield.span());
+
+            if (yield.waitTicksToken.text == "wait_async") {
+                const FunctionSymbol* waitAsync = nullptr;
+                const auto foundAsync = visibleFunctions_.find("WaitAsyncOperation");
+                if (foundAsync != visibleFunctions_.end()) {
+                    for (const auto& candidate : foundAsync->second) {
+                        if (!candidate.method &&
+                            candidate.parameters.size() == 3 &&
+                            candidate.parameters[0].type == PrimitiveType::Long &&
+                            candidate.parameters[1].type == PrimitiveType::String &&
+                            candidate.parameters[2].type == PrimitiveType::Long) {
+                            waitAsync = &candidate;
+                            if (candidate.moduleName == "RealScript.Scene") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!waitAsync) {
+                    diagnostics_.report(
+                        "RS2493",
+                        "sequence wait_async requires imported RealScript.Game.WaitAsyncOperation",
+                        yield.span());
+                } else {
+                    auto call = std::make_unique<BoundCallExpression>();
+                    call->type = waitAsync->returnType;
+                    call->typeName = waitAsync->returnTypeName;
+                    call->span = yield.span();
+                    call->function = *waitAsync;
+                    call->arguments.push_back(makeSequenceFieldAccess(
+                        input.sequenceTargetField, yield.span()));
+                    auto callback = std::make_unique<BoundLiteralExpression>();
+                    callback->type = PrimitiveType::String;
+                    callback->value = input.sequenceNextCallback->name;
+                    callback->span = yield.waitTicksToken.span;
+                    call->arguments.push_back(std::move(callback));
+                    call->arguments.push_back(convertExpression(
+                        bindExpression(*yield.delay),
+                        PrimitiveType::Long,
+                        yield.delay->span(),
+                        "sequence wait_async operation id"));
+                    auto timer = std::make_unique<BoundMemberAssignmentExpression>();
+                    timer->type = input.sequenceTimerField.type;
+                    timer->span = yield.span();
+                    const auto* receiver = lookupVariable("this");
+                    timer->receiver = receiver
+                        ? makeVariableAccess(*receiver, yield.span())
+                        : makeError(yield.span());
+                    timer->ownerType = *currentOwnerType_;
+                    timer->field = input.sequenceTimerField;
+                    timer->expression = std::move(call);
+                    auto subStatement =
+                        std::make_unique<BoundExpressionStatement>();
+                    subStatement->span = yield.span();
+                    subStatement->expression = std::move(timer);
+                    suspended->statements.push_back(std::move(subStatement));
+                }
+            } else if (yield.waitTicksToken.text == "wait_event" ||
+                       yield.waitTicksToken.text == "wait_signal") {
+                const FunctionSymbol* subscribeOnce = nullptr;
+                const auto foundSub = visibleFunctions_.find("SubscribeOnce");
+                if (foundSub != visibleFunctions_.end()) {
+                    for (const auto& candidate : foundSub->second) {
+                        if (!candidate.method &&
+                            candidate.parameters.size() == 3 &&
+                            candidate.parameters[0].type == PrimitiveType::Long &&
+                            candidate.parameters[1].type == PrimitiveType::String &&
+                            candidate.parameters[2].type == PrimitiveType::String) {
+                            subscribeOnce = &candidate;
+                            break;
+                        }
+                    }
+                }
+                if (!subscribeOnce) {
+                    diagnostics_.report(
+                        "RS2493",
+                        "sequence wait_event requires imported RealScript.Game.SubscribeOnce",
+                        yield.span());
+                } else {
+                    auto call = std::make_unique<BoundCallExpression>();
+                    call->type = subscribeOnce->returnType;
+                    call->typeName = subscribeOnce->returnTypeName;
+                    call->span = yield.span();
+                    call->function = *subscribeOnce;
+                    call->arguments.push_back(makeSequenceFieldAccess(
+                        input.sequenceTargetField, yield.span()));
+                    auto callback = std::make_unique<BoundLiteralExpression>();
+                    callback->type = PrimitiveType::String;
+                    callback->value = input.sequenceNextCallback->name;
+                    callback->span = yield.waitTicksToken.span;
+                    call->arguments.push_back(std::move(callback));
+                    if (yield.secondArgument) {
+                        auto entityExpr = convertExpression(
+                            bindExpression(*yield.delay),
+                            PrimitiveType::Long,
+                            yield.delay->span(),
+                            "sequence wait_signal entityId");
+                        auto prefixLit = std::make_unique<BoundLiteralExpression>();
+                        prefixLit->span = yield.delay->span();
+                        prefixLit->type = PrimitiveType::String;
+                        prefixLit->value = std::string("$signal::");
+                        auto sepLit = std::make_unique<BoundLiteralExpression>();
+                        sepLit->span = yield.delay->span();
+                        sepLit->type = PrimitiveType::String;
+                        sepLit->value = std::string("::");
+                        auto sigExpr = convertExpression(
+                            bindExpression(*yield.secondArgument),
+                            PrimitiveType::String,
+                            yield.secondArgument->span(),
+                            "sequence wait_signal name");
+                        syntax::SyntaxToken plusToken{
+                            syntax::SyntaxKind::PlusToken, yield.span(), "+", {}};
+                        auto withEntity = bindBinaryOperation(
+                            std::move(prefixLit),
+                            yield.delay->span(),
+                            plusToken,
+                            std::move(entityExpr),
+                            yield.delay->span(),
+                            yield.delay->span());
+                        auto withSep = bindBinaryOperation(
+                            std::move(withEntity),
+                            yield.delay->span(),
+                            plusToken,
+                            std::move(sepLit),
+                            yield.delay->span(),
+                            yield.span());
+                        auto fullTopic = bindBinaryOperation(
+                            std::move(withSep),
+                            yield.delay->span(),
+                            plusToken,
+                            std::move(sigExpr),
+                            yield.secondArgument->span(),
+                            yield.span());
+                        call->arguments.push_back(std::move(fullTopic));
+                    } else {
+                        call->arguments.push_back(convertExpression(
+                            bindExpression(*yield.delay),
+                            PrimitiveType::String,
+                            yield.delay->span(),
+                            "sequence wait_event topic"));
+                    }
+                    auto timer = std::make_unique<BoundMemberAssignmentExpression>();
+                    timer->type = input.sequenceTimerField.type;
+                    timer->span = yield.span();
+                    const auto* receiver = lookupVariable("this");
+                    timer->receiver = receiver
+                        ? makeVariableAccess(*receiver, yield.span())
+                        : makeError(yield.span());
+                    timer->ownerType = *currentOwnerType_;
+                    timer->field = input.sequenceTimerField;
+                    timer->expression = std::move(call);
+                    auto subStatement =
+                        std::make_unique<BoundExpressionStatement>();
+                    subStatement->span = yield.span();
+                    subStatement->expression = std::move(timer);
+                    suspended->statements.push_back(std::move(subStatement));
+                }
             } else {
-                auto call = std::make_unique<BoundCallExpression>();
-                call->type = schedule->returnType;
-                call->typeName = schedule->returnTypeName;
-                call->span = yield.span();
-                call->function = *schedule;
-                call->arguments.push_back(makeSequenceFieldAccess(
-                    input.sequenceTargetField, yield.span()));
-                auto callback = std::make_unique<BoundLiteralExpression>();
-                callback->type = PrimitiveType::String;
-                callback->value = input.sequenceNextCallback->name;
-                callback->span = yield.waitTicksToken.span;
-                call->arguments.push_back(std::move(callback));
-                call->arguments.push_back(convertExpression(
-                    bindExpression(*yield.delay), PrimitiveType::Int,
-                    yield.delay->span(), "sequence wait_ticks delay"));
-                auto timer = std::make_unique<BoundMemberAssignmentExpression>();
-                timer->type = input.sequenceTimerField.type;
-                timer->span = yield.span();
-                const auto* receiver = lookupVariable("this");
-                timer->receiver = receiver
-                    ? makeVariableAccess(*receiver, yield.span())
-                    : makeError(yield.span());
-                timer->ownerType = *currentOwnerType_;
-                timer->field = input.sequenceTimerField;
-                timer->expression = std::move(call);
-                auto scheduleStatement =
-                    std::make_unique<BoundExpressionStatement>();
-                scheduleStatement->span = yield.span();
-                scheduleStatement->expression = std::move(timer);
-                suspended->statements.push_back(std::move(scheduleStatement));
+                const auto* schedule = findScheduleFunction();
+                if (!schedule) {
+                    diagnostics_.report(
+                        "RS2493",
+                        "sequence requires imported RealScript.Game.Schedule",
+                        yield.span());
+                } else {
+                    auto call = std::make_unique<BoundCallExpression>();
+                    call->type = schedule->returnType;
+                    call->typeName = schedule->returnTypeName;
+                    call->span = yield.span();
+                    call->function = *schedule;
+                    call->arguments.push_back(makeSequenceFieldAccess(
+                        input.sequenceTargetField, yield.span()));
+                    auto callback = std::make_unique<BoundLiteralExpression>();
+                    callback->type = PrimitiveType::String;
+                    callback->value = input.sequenceNextCallback->name;
+                    callback->span = yield.waitTicksToken.span;
+                    call->arguments.push_back(std::move(callback));
+                    call->arguments.push_back(bindSequenceYieldDelay(yield));
+                    auto timer = std::make_unique<BoundMemberAssignmentExpression>();
+                    timer->type = input.sequenceTimerField.type;
+                    timer->span = yield.span();
+                    const auto* receiver = lookupVariable("this");
+                    timer->receiver = receiver
+                        ? makeVariableAccess(*receiver, yield.span())
+                        : makeError(yield.span());
+                    timer->ownerType = *currentOwnerType_;
+                    timer->field = input.sequenceTimerField;
+                    timer->expression = std::move(call);
+                    auto scheduleStatement =
+                        std::make_unique<BoundExpressionStatement>();
+                    scheduleStatement->span = yield.span();
+                    scheduleStatement->expression = std::move(timer);
+                    suspended->statements.push_back(std::move(scheduleStatement));
+                }
             }
             auto stop = std::make_unique<BoundReturnStatement>();
             stop->span = yield.span();
@@ -2458,11 +3033,7 @@ std::unique_ptr<BoundBlockStatement> Binder::bindSequenceSegment(
             callback->value = input.sequenceNextCallback->name;
             call->arguments.push_back(std::move(callback));
 
-            call->arguments.push_back(convertExpression(
-                bindExpression(*yieldSyntax.delay),
-                PrimitiveType::Int,
-                yieldSyntax.delay->span(),
-                "sequence wait_ticks delay"));
+            call->arguments.push_back(bindSequenceYieldDelay(yieldSyntax));
 
             auto statement = std::make_unique<BoundExpressionStatement>();
             statement->span = yieldSyntax.span();
@@ -2751,6 +3322,234 @@ std::unique_ptr<BoundStatement> Binder::bindForeachStatement(
     const syntax::ForeachStatementSyntax& syntaxTree) {
     auto result = std::make_unique<BoundForeachStatement>();
     result->span = syntaxTree.span();
+
+    if (syntaxTree.collection &&
+        syntaxTree.collection->kind() == syntax::SyntaxKind::CallExpression) {
+        const auto& call = static_cast<const syntax::CallExpressionSyntax&>(*syntaxTree.collection);
+        if (call.identifierToken.text == "Query" && call.lessToken.has_value()) {
+            result->isEcsQuery = true;
+            struct RawBinding {
+                std::optional<syntax::SyntaxToken> modifierToken;
+                syntax::TypeSyntax type;
+                syntax::SyntaxToken identifierToken;
+            };
+            std::vector<RawBinding> bindings;
+            bindings.push_back(RawBinding{
+                syntaxTree.modifierToken, syntaxTree.type, syntaxTree.identifierToken});
+            for (const auto& extra : syntaxTree.additionalBindings) {
+                bindings.push_back(RawBinding{
+                    extra.modifierToken, extra.type, extra.identifierToken});
+            }
+            std::vector<syntax::TypeSyntax> dataArgs;
+            for (const auto& qArg : call.typeArguments) {
+                if (qArg.name.text == "With" && qArg.typeArguments.size() == 1) {
+                    std::string filterTypeName;
+                    (void)bindType(qArg.typeArguments[0], false, &filterTypeName);
+                    if (!filterTypeName.empty()) {
+                        result->ecsWithTypes.push_back(std::move(filterTypeName));
+                    }
+                    continue;
+                }
+                if (qArg.name.text == "Without" && qArg.typeArguments.size() == 1) {
+                    std::string filterTypeName;
+                    (void)bindType(qArg.typeArguments[0], false, &filterTypeName);
+                    if (!filterTypeName.empty()) {
+                        result->ecsWithoutTypes.push_back(std::move(filterTypeName));
+                    }
+                    continue;
+                }
+                dataArgs.push_back(qArg);
+            }
+
+            const bool hasEntityBinding =
+                (!dataArgs.empty() && bindings.size() == dataArgs.size() + 1);
+            if (dataArgs.empty() ||
+                (!hasEntityBinding && bindings.size() != dataArgs.size())) {
+                diagnostics_.report(
+                    "RS2214",
+                    "ECS Query<...>() type argument count must match foreach binding variables",
+                    syntaxTree.collection->span());
+            }
+
+            pushScope(syntaxTree.span());
+            result->indexVariable.name = "$foreach_index_" + std::to_string(nextVariableIndex_);
+            result->indexVariable.type = PrimitiveType::Int;
+            result->indexVariable.index = nextVariableIndex_++;
+            result->indexVariable.declarationSpan = syntaxTree.inKeyword.span;
+            result->indexVariable.id = stableTypeId(std::to_string(currentFunctionId_) +
+                "::local:" + std::to_string(result->indexVariable.index) + ":" +
+                result->indexVariable.name);
+            (void)declareVariable(result->indexVariable, syntaxTree.inKeyword.span);
+
+            if (hasEntityBinding) {
+                result->hasEcsEntityBinding = true;
+                const auto& entBind = bindings[0];
+                if (entBind.modifierToken.has_value() &&
+                    entBind.modifierToken->kind == syntax::SyntaxKind::RefKeyword) {
+                    diagnostics_.report(
+                        "RS2215",
+                        "cannot bind 'ref' variable to read-only ECS entity id",
+                        entBind.modifierToken->span);
+                }
+                if (entBind.type.name.text != "var") {
+                    std::string declaredEntTypeName;
+                    const PrimitiveType declaredEntPrim =
+                        bindType(entBind.type, false, &declaredEntTypeName);
+                    if (declaredEntPrim != PrimitiveType::Int) {
+                        diagnostics_.report(
+                            "RS2216",
+                            "ECS query leading entity variable must have type 'int'",
+                            entBind.type.span());
+                    }
+                }
+                result->ecsEntityCollectionVariable.name =
+                    "$ecs_ent_col_" + std::to_string(nextVariableIndex_);
+                result->ecsEntityCollectionVariable.type = PrimitiveType::Array;
+                result->ecsEntityCollectionVariable.typeName =
+                    arrayTypeName(PrimitiveType::Int, {});
+                result->ecsEntityCollectionVariable.index = nextVariableIndex_++;
+                result->ecsEntityCollectionVariable.declarationSpan =
+                    syntaxTree.foreachKeyword.span;
+                result->ecsEntityCollectionVariable.id = stableTypeId(
+                    std::to_string(currentFunctionId_) + "::local:" +
+                    std::to_string(result->ecsEntityCollectionVariable.index) + ":" +
+                    result->ecsEntityCollectionVariable.name);
+                (void)declareVariable(
+                    result->ecsEntityCollectionVariable, syntaxTree.foreachKeyword.span);
+
+                result->ecsEntityVariable.name = entBind.identifierToken.text;
+                result->ecsEntityVariable.type = PrimitiveType::Int;
+                result->ecsEntityVariable.isConst = true;
+                result->ecsEntityVariable.modifier = ParameterModifier::In;
+                result->ecsEntityVariable.index = nextVariableIndex_++;
+                result->ecsEntityVariable.declarationSpan = entBind.identifierToken.span;
+                result->ecsEntityVariable.id = stableTypeId(
+                    std::to_string(currentFunctionId_) + "::local:" +
+                    std::to_string(result->ecsEntityVariable.index) + ":" +
+                    result->ecsEntityVariable.name);
+                (void)declareVariable(result->ecsEntityVariable, entBind.identifierToken.span);
+            }
+
+            const std::size_t availBindings = hasEntityBinding
+                ? (bindings.size() - 1)
+                : bindings.size();
+            const std::size_t colCount = std::min(dataArgs.size(), availBindings);
+            for (std::size_t idx = 0; idx < colCount; ++idx) {
+                const auto& qArg = dataArgs[idx];
+                const auto& b = bindings[hasEntityBinding ? (idx + 1) : idx];
+                bool isWrite = false;
+                bool isReadOnly = false;
+                syntax::TypeSyntax compTypeSyntax = qArg;
+                if (qArg.name.text == "Write" && qArg.typeArguments.size() == 1) {
+                    isWrite = true;
+                    isReadOnly = false;
+                    compTypeSyntax = qArg.typeArguments[0];
+                } else if (qArg.name.text == "Read" && qArg.typeArguments.size() == 1) {
+                    isWrite = false;
+                    isReadOnly = true;
+                    compTypeSyntax = qArg.typeArguments[0];
+                } else {
+                    isWrite = b.modifierToken.has_value() &&
+                        b.modifierToken->kind == syntax::SyntaxKind::RefKeyword;
+                    isReadOnly = b.modifierToken.has_value() &&
+                        b.modifierToken->kind == syntax::SyntaxKind::InKeyword;
+                }
+
+                if (b.modifierToken.has_value() &&
+                    b.modifierToken->kind == syntax::SyntaxKind::RefKeyword &&
+                    isReadOnly) {
+                    diagnostics_.report(
+                        "RS2215",
+                        "cannot bind 'ref' variable to read-only ECS query component 'Read<" +
+                            compTypeSyntax.name.text + ">'",
+                        b.modifierToken->span);
+                }
+                if (b.modifierToken.has_value() &&
+                    b.modifierToken->kind == syntax::SyntaxKind::InKeyword) {
+                    isWrite = false;
+                    isReadOnly = true;
+                }
+
+                std::string compTypeName;
+                const PrimitiveType compPrim = bindType(compTypeSyntax, false, &compTypeName);
+                if (b.type.name.text != "var") {
+                    std::string declaredTypeName;
+                    const PrimitiveType declaredPrim = bindType(b.type, false, &declaredTypeName);
+                    if (declaredPrim != compPrim || declaredTypeName != compTypeName) {
+                        diagnostics_.report(
+                            "RS2216",
+                            "ECS query iteration variable type does not match query component type",
+                            b.type.span());
+                    }
+                }
+
+                BoundEcsQueryColumn col;
+                col.isWrite = isWrite;
+                col.isReadOnly = isReadOnly;
+                col.elementType = compPrim;
+                col.elementTypeName = compTypeName;
+
+                col.collectionVariable.name = "$ecs_col_" + std::to_string(idx) + "_" +
+                    std::to_string(nextVariableIndex_);
+                col.collectionVariable.type = PrimitiveType::Array;
+                col.collectionVariable.typeName = arrayTypeName(compPrim, compTypeName);
+                col.collectionVariable.index = nextVariableIndex_++;
+                col.collectionVariable.declarationSpan = syntaxTree.foreachKeyword.span;
+                col.collectionVariable.id = stableTypeId(std::to_string(currentFunctionId_) +
+                    "::local:" + std::to_string(col.collectionVariable.index) + ":" +
+                    col.collectionVariable.name);
+                (void)declareVariable(col.collectionVariable, syntaxTree.foreachKeyword.span);
+
+                col.iterationVariable.name = b.identifierToken.text;
+                col.iterationVariable.type = compPrim;
+                col.iterationVariable.typeName = compTypeName;
+                col.iterationVariable.isConst = isReadOnly;
+                col.iterationVariable.modifier = isReadOnly
+                    ? ParameterModifier::In
+                    : (isWrite ? ParameterModifier::Ref : ParameterModifier::None);
+                col.iterationVariable.index = nextVariableIndex_++;
+                col.iterationVariable.declarationSpan = b.identifierToken.span;
+                col.iterationVariable.id = stableTypeId(std::to_string(currentFunctionId_) +
+                    "::local:" + std::to_string(col.iterationVariable.index) + ":" +
+                    col.iterationVariable.name);
+                (void)declareVariable(col.iterationVariable, b.identifierToken.span);
+
+                result->ecsColumns.push_back(std::move(col));
+            }
+            if (!result->ecsColumns.empty()) {
+                result->collectionVariable = result->ecsColumns.front().collectionVariable;
+                result->iterationVariable = result->ecsColumns.front().iterationVariable;
+            }
+            {
+                std::string spec;
+                for (std::size_t i = 0; i < result->ecsColumns.size(); ++i) {
+                    if (i != 0) spec += ",";
+                    spec += result->ecsColumns[i].elementTypeName.empty()
+                        ? std::string(primitiveTypeName(result->ecsColumns[i].elementType))
+                        : result->ecsColumns[i].elementTypeName;
+                }
+                spec += ";";
+                for (std::size_t i = 0; i < result->ecsWithTypes.size(); ++i) {
+                    if (i != 0) spec += ",";
+                    spec += result->ecsWithTypes[i];
+                }
+                spec += ";";
+                for (std::size_t i = 0; i < result->ecsWithoutTypes.size(); ++i) {
+                    if (i != 0) spec += ",";
+                    spec += result->ecsWithoutTypes[i];
+                }
+                result->ecsQuerySpec = std::move(spec);
+            }
+            ++loopDepth_;
+            ++breakableDepth_;
+            result->body = bindEmbeddedStatement(*syntaxTree.body);
+            --breakableDepth_;
+            --loopDepth_;
+            popScope();
+            return result;
+        }
+    }
+
     result->collection = bindExpression(*syntaxTree.collection);
 
     PrimitiveType elementType = PrimitiveType::Error;
@@ -3151,6 +3950,49 @@ std::unique_ptr<BoundStatement> Binder::bindTryStatement(
         finallyLoopDepth_ = loopDepth_;
         result->finallyBody = bindBlockStatement(
             *syntaxTree.finallyBody, true);
+        if (syntaxTree.finallyKeyword->text == "$using_finally" &&
+            result->finallyBody &&
+            result->finallyBody->kind() == BoundNodeKind::BlockStatement &&
+            static_cast<BoundBlockStatement&>(*result->finallyBody).statements.size() == 1 &&
+            syntaxTree.finallyBody->statements.size() == 1 &&
+            syntaxTree.finallyBody->statements[0]->kind() ==
+                syntax::SyntaxKind::ExpressionStatement) {
+            const auto& exprStmt = static_cast<const syntax::ExpressionStatementSyntax&>(
+                *syntaxTree.finallyBody->statements[0]);
+            if (exprStmt.expression &&
+                exprStmt.expression->kind() == syntax::SyntaxKind::MemberCallExpression) {
+                const auto& mcall = static_cast<const syntax::MemberCallExpressionSyntax&>(
+                    *exprStmt.expression);
+                if (mcall.receiver &&
+                    mcall.receiver->kind() == syntax::SyntaxKind::NameExpression) {
+                    const auto& nameExpr = static_cast<const syntax::NameExpressionSyntax&>(
+                        *mcall.receiver);
+                    if (const auto* varSym = lookupVariable(nameExpr.identifierToken.text);
+                        varSym && varSym->type == PrimitiveType::Object) {
+                        auto nullLit = std::make_unique<BoundLiteralExpression>();
+                        nullLit->type = PrimitiveType::Null;
+                        nullLit->span = nameExpr.identifierToken.span;
+                        auto cond = std::make_unique<BoundBinaryExpression>();
+                        cond->type = PrimitiveType::Bool;
+                        cond->operatorKind = BoundBinaryOperatorKind::NotEquals;
+                        cond->span = nameExpr.identifierToken.span;
+                        cond->left = makeVariableAccess(*varSym, nameExpr.identifierToken.span);
+                        cond->right = convertExpression(
+                            std::move(nullLit),
+                            PrimitiveType::Object,
+                            nameExpr.identifierToken.span,
+                            "using null check",
+                            varSym->typeName);
+                        auto ifStmt = std::make_unique<BoundIfStatement>();
+                        ifStmt->span = nameExpr.identifierToken.span;
+                        ifStmt->condition = std::move(cond);
+                        auto& finallyStmts = static_cast<BoundBlockStatement&>(*result->finallyBody).statements;
+                        ifStmt->thenStatement = std::move(finallyStmts[0]);
+                        finallyStmts[0] = std::move(ifStmt);
+                    }
+                }
+            }
+        }
         bindingFinally_ = previousFinally;
         finallyBreakableDepth_ = previousFinallyBreakableDepth;
         finallyLoopDepth_ = previousFinallyLoopDepth;
@@ -3184,7 +4026,7 @@ Binder::bindEventSubscriptionStatement(
             lookupVariable(syntaxTree.eventNameToken.text) != nullptr ||
             sequenceLocalFields_.find(syntaxTree.eventNameToken.text) !=
                 sequenceLocalFields_.end();
-        if (!isCompoundAssignment && currentOwnerType_ && !currentStaticMethod_) {
+        if (!isCompoundAssignment && currentOwnerType_) {
             if (!hasEvent(*currentOwnerType_, syntaxTree.eventNameToken.text) &&
                 hasFieldOrProperty(*currentOwnerType_, syntaxTree.eventNameToken.text)) {
                 isCompoundAssignment = true;
@@ -3253,11 +4095,20 @@ Binder::bindEventSubscriptionStatement(
                 if (lookupVariable(name.identifierToken.text) ||
                     sequenceLocalFields_.find(name.identifierToken.text) !=
                         sequenceLocalFields_.end() ||
-                    (currentOwnerType_ && !currentStaticMethod_ &&
+                    (currentOwnerType_ &&
                      hasFieldOrProperty(
                          *currentOwnerType_, name.identifierToken.text))) {
+                    const auto savedOcc = occurrences_.size();
                     probeReceiver = bindExpression(*syntaxTree.receiver);
+                    occurrences_.resize(savedOcc);
                 }
+            } else if (syntaxTree.receiver->kind() ==
+                           syntax::SyntaxKind::MemberAccessExpression ||
+                       syntaxTree.receiver->kind() ==
+                           syntax::SyntaxKind::ElementAccessExpression) {
+                const auto savedOcc = occurrences_.size();
+                probeReceiver = bindExpression(*syntaxTree.receiver);
+                occurrences_.resize(savedOcc);
             }
             if (probeReceiver &&
                 (probeReceiver->type == PrimitiveType::Object ||
@@ -3610,10 +4461,35 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
     }
     result->variable.index = nextVariableIndex_++;
     result->variable.parameter = false;
+    result->variable.isConst = syntaxTree.constKeyword.has_value();
     result->variable.declarationSpan = syntaxTree.identifierToken.span;
     result->variable.id = stableTypeId(std::to_string(currentFunctionId_) +
         "::local:" + std::to_string(result->variable.index) + ":" +
         result->variable.name);
+
+    if (result->variable.isConst && !syntaxTree.initializer) {
+        diagnostics_.report(
+            "RS2407",
+            "const local variable '" + result->variable.name + "' requires an initializer",
+            syntaxTree.identifierToken.span);
+    } else if (result->variable.isConst && syntaxTree.initializer) {
+        syntax::TokenValue constVal;
+        PrimitiveType constType = PrimitiveType::Error;
+        if (evaluateConstantSyntaxExpression(
+                *syntaxTree.initializer,
+                currentOwnerType_ ? &*currentOwnerType_ : nullptr,
+                visibleTypes_,
+                constVal,
+                constType,
+                &scopes_)) {
+            if (isFloatingPointType(result->variable.type) &&
+                std::holds_alternative<std::int64_t>(constVal)) {
+                constVal = static_cast<double>(std::get<std::int64_t>(constVal));
+            }
+            result->variable.hasConstantValue = true;
+            result->variable.constantValue = std::move(constVal);
+        }
+    }
 
     if (capturedVariableNames_.find(result->variable.name) !=
         capturedVariableNames_.end()) {
@@ -3741,6 +4617,17 @@ PrimitiveType Binder::bindType(
     if (baseType == PrimitiveType::Error) {
         const auto found = visibleTypes_.find(syntaxTree.name.text);
         if (found != visibleTypes_.end()) {
+            if (found->second.id != 0 && !syntaxTree.name.span.empty()) {
+                SymbolOccurrence occ;
+                occ.id = found->second.id;
+                occ.kind = SymbolKind::Type;
+                occ.name = found->second.name;
+                occ.detail = canonicalTypeName(found->second);
+                occ.sourceName = currentSourceName_;
+                occ.span = syntaxTree.name.span;
+                occ.definition = false;
+                occurrences_.push_back(std::move(occ));
+            }
             baseType = found->second.kind == TypeKind::Class
                 ? PrimitiveType::Object
                 : found->second.kind == TypeKind::Struct
