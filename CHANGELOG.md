@@ -13,7 +13,7 @@ v0.98.0 represents the major Game Engine Integration Evolution release, bringing
 
 - Added **Unified Flat-Frame Slot Layout**: consolidated local variables, evaluation stack, and frame overhead into contiguous memory, significantly reducing call-frame allocation and cache thrashing.
 - Implemented **Computed-Goto Interpreter Dispatch**: high-performance threaded code dispatch in the bytecode VM loop with fallback to direct-switch.
-- Widened `BytecodeString` to 32-bit with lock-free paged string and register slice pools for low contention in multi-threaded execution.
+- Widened `BytecodeString` to 32-bit with lock-free paged string and register slice pools for low contention in multi-threaded execution, and added `SmallRegisterVector::assign` batch slice interning (`internedSliceCount`, `internedStringCount`) to eliminate intermediate `2..N-1` register slice allocations during lowering and decoding.
 - Added **Incremental GC Stepping & Shadow-Stack-Safe Value Pool Reclamation**: integrated bounded GC step ticking in the flat-VM loop, safeguarding pooled values and preventing long pause times during continuous allocation.
 - Introduced **Small Buffer Optimization (SBO) for HeapObject**: optimized short strings and small inline objects to eliminate heap allocations for transient operations.
 - Added **Native Fast-Path & Identity Cache**: fast O(1) bi-directional C++ host object mapping and bypassing reflection thunks for hot-path method calls.
@@ -31,7 +31,7 @@ v0.98.0 represents the major Game Engine Integration Evolution release, bringing
 ### Game SDK & ECS Integration
 
 - Added **Zero-Copy Host C++ Contiguous Struct ECS Raw Column Binding** (`ObjectKind::RawColumnArray`, `NativeFieldLayout`, `NativeFieldKind`, `ScriptRuntime::bindEcsRawColumn`, and `bindEcsRawColumnAuto<HostStruct>`) with in-place `HeapSlot` reuse on per-frame rebind across both the Bytecode Interpreter and C++17 AOT.
-- Added **`rsbind` Auto-Binding Generator CLI Tool**: parses C++ headers to automatically generate type-safe bindings, method thunks, and ECS raw column helpers.
+- Added **`rsbind` Auto-Binding Generator CLI Tool**: parses C++ headers (including `RS_EXPORT_CONSTRUCTOR`, `static` methods, and `std::vector<T>` / template parameter lists) to automatically generate type-safe bindings (`NativeTypeBuilder::constructor<Args...>`, `staticMethod<M>`, `std::vector<T>` <-> `T[]` marshaling), method thunks, and ECS raw column helpers.
 - Extended `Query<...>()` ECS chunk queries with multi-entity Sparse-Set intersection joins (`setEcsEntityComponent`, `getEcsEntityComponent`, `hasEcsEntityComponent`, `removeEcsEntityComponent`, `destroyEcsEntity`), `With<T>` / `Without<U>` filter clauses, optional leading `int entityId` iteration bindings, and `EntityCommandBuffer` (ECB) deferred structural mutation queues.
 - Extended `RealScript.Physics` and `SceneScriptRuntime` with 3D fixed-point colliders (`Box3D`, `Sphere3D`, `Capsule3D`), `stepPhysics3D`, spatial queries (`raycast3D`, `raycastAll3D`, `overlapSphere3D`), 3D collision/trigger callbacks (`OnCollisionEnter3D`/`Stay3D`/`Exit3D`, `OnTriggerEnter3D`/`Stay3D`/`Exit3D`), generational entity handles, and deferred entity destruction.
 - Upgraded 12-byte `InlineStructSlot` bit-packing to support `Vec3`, `Quat`, and `Enum` fields inline inside `runtime::StructValue` without increasing `sizeof(InlineStructSlot)` (12B) or `sizeof(Value)` (24B), with in-place slot updates in `Opcode::StoreStructField`.

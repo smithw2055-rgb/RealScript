@@ -114,14 +114,41 @@ class SmallRegisterVector {
 public:
     constexpr SmallRegisterVector() noexcept = default;
     SmallRegisterVector(std::initializer_list<Register> values) {
-        for (const auto v : values) push_back(v);
+        assign(values.begin(), values.size());
     }
     SmallRegisterVector(const std::vector<Register>& values) {
-        for (const auto v : values) push_back(v);
+        assign(values.data(), values.size());
+    }
+    SmallRegisterVector(const Register* values, std::size_t count) {
+        assign(values, count);
     }
     operator std::vector<Register>() const {
         return std::vector<Register>(begin(), end());
     }
+
+    void assign(const Register* values, std::size_t count) {
+        if (count == 0u || !values) {
+            clear();
+            return;
+        }
+        if (count > 0xFFFu) {
+            throw std::overflow_error(
+                "SmallRegisterVector exceeded 12-bit operand count limit (4095)");
+        }
+        if (count == 1u) {
+            inline0_ = values[0];
+            sizeAndSlice_ = 1u;
+            return;
+        }
+        const auto newSlice = internSlice(values, static_cast<std::uint16_t>(count));
+        inline0_ = 0;
+        sizeAndSlice_ = (newSlice << 12u) | static_cast<std::uint32_t>(count);
+    }
+
+    [[nodiscard]] static std::size_t internedSliceCount() noexcept;
+    // Test/teardown helper only: invalidates all existing slice IDs in the global pool.
+    // Must not be called while any bytecode::Module, ProgramImage, or SmallRegisterVector is live.
+    static void clearSlicePool() noexcept;
 
     [[nodiscard]] constexpr std::size_t size() const noexcept {
         return static_cast<std::size_t>(sizeAndSlice_ & 0xFFFu);
@@ -193,6 +220,9 @@ private:
         return sizeAndSlice_ >> 12u;
     }
     static const Register* sliceData(std::uint32_t id) noexcept;
+    static std::uint32_t internSlice(
+        const Register* values,
+        std::uint16_t count);
     static std::uint32_t appendToSlice(
         std::uint32_t id,
         Register firstInline,
@@ -219,6 +249,10 @@ public:
     [[nodiscard]] const char* c_str() const noexcept { return str().c_str(); }
     [[nodiscard]] const char* data() const noexcept { return str().data(); }
     [[nodiscard]] std::size_t size() const noexcept { return str().size(); }
+    [[nodiscard]] static std::size_t internedStringCount() noexcept;
+    // Test/teardown helper only: invalidates all existing string pointers/IDs in the global pool.
+    // Must not be called while any bytecode::Module, ProgramImage, or BytecodeString is live.
+    static void clearStringPool() noexcept;
     [[nodiscard]] constexpr bool empty() const noexcept { return poolId_ == 0u; }
     [[nodiscard]] constexpr std::uint32_t poolId() const noexcept { return poolId_; }
     [[nodiscard]] auto begin() const noexcept { return str().begin(); }

@@ -303,6 +303,31 @@ bool readRegisters(Reader& reader, RegContainer& values) {
     return reader.valid();
 }
 
+bool readRegisters(Reader& reader, SmallRegisterVector& values) {
+    const auto count = reader.u32();
+    if (!reader.valid() || count > reader.remaining() / 4 || count > 0xFFFu) return false;
+    if (count == 0u) {
+        values.clear();
+        return reader.valid();
+    }
+    if (count <= 16u) {
+        Register stackRegs[16];
+        for (std::uint32_t index = 0; index < count; ++index) {
+            stackRegs[index] = reader.u32();
+        }
+        if (!reader.valid()) return false;
+        values.assign(stackRegs, count);
+        return true;
+    }
+    std::vector<Register> heapRegs(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        heapRegs[index] = reader.u32();
+    }
+    if (!reader.valid()) return false;
+    values.assign(heapRegs.data(), heapRegs.size());
+    return true;
+}
+
 void writeRange(Writer& writer, const debug::SourceRange& range) {
     writer.u32(range.fileId);
     writer.u64(static_cast<std::uint64_t>(range.span.start));

@@ -213,8 +213,18 @@ Module Lowerer::lower(const mir::Module& source) const {
                 instruction.result = definesValue(sourceInstruction)
                     ? static_cast<Register>(sourceInstruction.result)
                     : InvalidRegister;
-                for (const auto operand : sourceInstruction.operands) {
-                    instruction.operands.push_back(static_cast<Register>(operand));
+                if (sourceInstruction.operands.size() <= 16u) {
+                    Register stackOps[16];
+                    for (std::size_t oi = 0; oi < sourceInstruction.operands.size(); ++oi) {
+                        stackOps[oi] = static_cast<Register>(sourceInstruction.operands[oi]);
+                    }
+                    instruction.operands.assign(stackOps, sourceInstruction.operands.size());
+                } else {
+                    std::vector<Register> heapOps(sourceInstruction.operands.size());
+                    for (std::size_t oi = 0; oi < sourceInstruction.operands.size(); ++oi) {
+                        heapOps[oi] = static_cast<Register>(sourceInstruction.operands[oi]);
+                    }
+                    instruction.operands.assign(heapOps.data(), heapOps.size());
                 }
                 instruction.index = static_cast<std::uint32_t>(
                     sourceInstruction.opcode == mir::Opcode::Parameter
@@ -326,14 +336,25 @@ Module Lowerer::lower(const mir::Module& source) const {
             }
             block.terminator.target = static_cast<std::uint16_t>(sourceBlock.terminator.target);
             block.terminator.falseTarget = static_cast<std::uint16_t>(sourceBlock.terminator.falseTarget);
-            for (const auto argument : sourceBlock.terminator.arguments) {
-                block.terminator.arguments.push_back(
-                    static_cast<Register>(argument));
-            }
-            for (const auto argument : sourceBlock.terminator.falseArguments) {
-                block.terminator.falseArguments.push_back(
-                    static_cast<Register>(argument));
-            }
+            const auto assignTermRegs = [](SmallRegisterVector& dst, const std::vector<mir::ValueId>& srcRegs) {
+                if (srcRegs.empty()) {
+                    dst.clear();
+                } else if (srcRegs.size() <= 16u) {
+                    Register stackRegs[16];
+                    for (std::size_t i = 0; i < srcRegs.size(); ++i) {
+                        stackRegs[i] = static_cast<Register>(srcRegs[i]);
+                    }
+                    dst.assign(stackRegs, srcRegs.size());
+                } else {
+                    std::vector<Register> heapRegs(srcRegs.size());
+                    for (std::size_t i = 0; i < srcRegs.size(); ++i) {
+                        heapRegs[i] = static_cast<Register>(srcRegs[i]);
+                    }
+                    dst.assign(heapRegs.data(), heapRegs.size());
+                }
+            };
+            assignTermRegs(block.terminator.arguments, sourceBlock.terminator.arguments);
+            assignTermRegs(block.terminator.falseArguments, sourceBlock.terminator.falseArguments);
             function.blocks.push_back(std::move(block));
         }
         for (const auto& sourceHandler : sourceFunction.exceptionHandlers) {

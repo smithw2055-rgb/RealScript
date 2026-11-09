@@ -36,6 +36,7 @@ enum class ScriptTypeCategory {
     String,
     Struct,
     NativeObject,
+    Array,
 };
 
 struct ScriptTypeRef {
@@ -57,6 +58,7 @@ struct FunctionDeclaration {
     runtime::BindingDeterminism determinism =
         runtime::BindingDeterminism::Deterministic;
     std::string requiredCapability;
+    bool isStatic = false;
 };
 
 struct PropertyDeclaration {
@@ -108,6 +110,14 @@ struct IsSharedPtr<std::shared_ptr<T>> : std::true_type {
 };
 
 template <typename T>
+struct IsStdVector : std::false_type {};
+
+template <typename T, typename Alloc>
+struct IsStdVector<std::vector<T, Alloc>> : std::true_type {
+    using Element = T;
+};
+
+template <typename T>
 using RemoveCvRef = std::remove_cv_t<std::remove_reference_t<T>>;
 
 template <typename T>
@@ -118,6 +128,7 @@ struct FunctionTraits<R(Args...)> {
     using Return = R;
     using Arguments = std::tuple<Args...>;
     static constexpr std::size_t Arity = sizeof...(Args);
+    static constexpr bool IsMemberFunction = false;
 };
 
 template <typename R, typename... Args>
@@ -127,12 +138,14 @@ template <typename C, typename R, typename... Args>
 struct FunctionTraits<R (C::*)(Args...)> : FunctionTraits<R(Args...)> {
     using Class = C;
     static constexpr bool IsConst = false;
+    static constexpr bool IsMemberFunction = true;
 };
 
 template <typename C, typename R, typename... Args>
 struct FunctionTraits<R (C::*)(Args...) const> : FunctionTraits<R(Args...)> {
     using Class = C;
     static constexpr bool IsConst = true;
+    static constexpr bool IsMemberFunction = true;
 };
 
 template <typename F>
@@ -199,6 +212,17 @@ std::optional<ScriptTypeRef> resolveScriptType(
         if (found == state->nativeTypeByCppType.end()) return std::nullopt;
         const auto& type = state->nativeTypes[found->second];
         return ScriptTypeRef{type.name, type.moduleName, ScriptTypeCategory::NativeObject};
+    } else if constexpr (IsStdVector<ValueType>::value) {
+        using Element = typename IsStdVector<ValueType>::Element;
+        auto elemRef = resolveScriptType<Element>(state);
+        if (!elemRef || elemRef->category == ScriptTypeCategory::Void ||
+            elemRef->category == ScriptTypeCategory::Array) {
+            return std::nullopt;
+        }
+        return ScriptTypeRef{
+            elemRef->sourceName + "[]",
+            elemRef->moduleName,
+            ScriptTypeCategory::Array};
     } else {
         return std::nullopt;
     }

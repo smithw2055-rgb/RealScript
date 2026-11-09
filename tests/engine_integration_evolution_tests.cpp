@@ -7461,6 +7461,155 @@ public class CrashDemo {
     }
 }
 
+struct NativeP0Squad {
+    int id = 0;
+    std::string tag;
+    std::vector<int> scores;
+
+    NativeP0Squad() = default;
+    NativeP0Squad(int idVal, std::string tagVal)
+        : id(idVal), tag(std::move(tagVal)), scores{10, 20} {}
+    NativeP0Squad(int idVal, std::vector<int> scoresVal)
+        : id(idVal), tag("Elite"), scores(std::move(scoresVal)) {}
+
+    static int ComputeBonus(const std::vector<int>& vals, int multiplier) {
+        int sum = 0;
+        for (int v : vals) sum += v;
+        return sum * multiplier;
+    }
+
+    static int CountNonEmptyTags(const std::vector<std::string>& tags) {
+        int count = 0;
+        for (const auto& t : tags) {
+            if (!t.empty()) ++count;
+        }
+        return count;
+    }
+
+    std::vector<int> GetScaledScores(int factor) const {
+        std::vector<int> out;
+        out.reserve(scores.size());
+        for (int v : scores) out.push_back(v * factor);
+        return out;
+    }
+
+    int GetId() const { return id; }
+};
+
+void testV2RoadmapP0SlicePoolAndRsbindEvolution() {
+    using namespace realscript;
+    // 1. P0-1: Verify SmallRegisterVector batch construction & lowering do not leak intermediate 1..N-1 slices
+    const std::size_t baselineSlices = bytecode::SmallRegisterVector::internedSliceCount();
+    {
+        bytecode::SmallRegisterVector emptyVec;
+        bytecode::SmallRegisterVector singleVec{77777u};
+        require(
+            bytecode::SmallRegisterVector::internedSliceCount() == baselineSlices,
+            "0- and 1-element SmallRegisterVector must not allocate slices in RegisterSlicePool");
+
+        bytecode::SmallRegisterVector fiveVec{90001u, 90002u, 90003u, 90004u, 90005u};
+        const std::size_t afterFirstFive = bytecode::SmallRegisterVector::internedSliceCount();
+        require(
+            afterFirstFive == baselineSlices + 1u,
+            "5-element SmallRegisterVector initializer_list must allocate exactly 1 slice (no 2..4 intermediate slice leaks)");
+
+        std::vector<bytecode::Register> duplicateStdVec{90001u, 90002u, 90003u, 90004u, 90005u};
+        bytecode::SmallRegisterVector fiveVecDup(duplicateStdVec);
+        require(
+            bytecode::SmallRegisterVector::internedSliceCount() == afterFirstFive,
+            "duplicate 5-element SmallRegisterVector must deduplicate without allocating a new slice");
+        require(fiveVec == fiveVecDup && fiveVec[4] == 90005u, "deduplicated slice contents must match");
+    }
+
+    // 2. P0-2: Verify rsbind C++ header generator handles templates, RS_EXPORT_CONSTRUCTOR, static methods, and std::vector<T>
+    const char* cppHeader = R"CPP(
+        namespace game::units {
+        RS_EXPORT_CLASS("Game.Units")
+        class NativeP0Squad {
+        public:
+            RS_EXPORT_CONSTRUCTOR
+            NativeP0Squad(int id, const std::string& tag = "Alpha");
+
+            RS_EXPORT_CONSTRUCTOR("CreateElite")
+            NativeP0Squad(int id, const std::vector<int>& scores);
+
+            RS_EXPORT_METHOD
+            static int ComputeBonus(const std::vector<int>& vals, int multiplier = (1 + 1));
+
+            RS_EXPORT_METHOD
+            std::vector<int> GetScaledScores(int factor) const;
+
+            RS_EXPORT_PROPERTY("Scores", GetScores, SetScores, std::vector<int>)
+        };
+        }
+    )CPP";
+
+    const auto gen = game::GameApi::generateBindingsFromCppHeader(cppHeader, "Game.Units");
+    require(gen.classesExported == 1, "rsbind P0 must export NativeP0Squad class");
+    require(gen.constructorsExported == 2, "rsbind P0 must export both constructors");
+    require(
+        gen.cppRegistrationSource.find("builder_NativeP0Squad.constructor<int, const std::string&>(\"Create\")") != std::string::npos,
+        "rsbind P0 must emit C++ constructor<int, const std::string&>(\"Create\")");
+    require(
+        gen.cppRegistrationSource.find("builder_NativeP0Squad.constructor<int, const std::vector<int>&>(\"CreateElite\")") != std::string::npos,
+        "rsbind P0 must emit C++ constructor<int, const std::vector<int>&>(\"CreateElite\")");
+    require(
+        gen.scriptDeclarationStub.find("public static NativeP0Squad Create(int id, string tag)") != std::string::npos,
+        "rsbind P0 stub must emit public static Create factory");
+    require(
+        gen.scriptDeclarationStub.find("public static NativeP0Squad CreateElite(int id, int[] scores)") != std::string::npos,
+        "rsbind P0 stub must map std::vector<int> to int[] in CreateElite");
+    require(
+        gen.scriptDeclarationStub.find("public static int ComputeBonus(int[] vals, int multiplier)") != std::string::npos,
+        "rsbind P0 stub must emit public static ComputeBonus with int[] parameter");
+    require(
+        gen.scriptDeclarationStub.find("int[] GetScaledScores(int factor)") != std::string::npos,
+        "rsbind P0 stub must map std::vector<int> return type to int[]");
+
+    // 3. P0-2 End-to-End Runtime Execution: NativeTypeBuilder::constructor, staticMethod, and std::vector<int> <-> int[] marshaling
+    game::GameApi api;
+    api.type<NativeP0Squad>("Game.Units", "NativeP0Squad")
+        .constructor<int, const std::string&>("Create")
+        .constructor<int, const std::vector<int>&>("CreateElite")
+        .staticMethod<&NativeP0Squad::ComputeBonus>("ComputeBonus")
+        .staticMethod<&NativeP0Squad::CountNonEmptyTags>("CountNonEmptyTags")
+        .method<&NativeP0Squad::GetScaledScores>("GetScaledScores")
+        .property<&NativeP0Squad::GetId>("Id");
+    require(api.valid(), "GameApi with P0 constructor, staticMethod, and std::vector<int> must be valid");
+
+    game::GameScriptCompiler compiler(api);
+    const auto compiled = compiler.compile({
+        {"p0_squad_test.rs", R"RS(
+            module App.P0Test;
+            import Game.Units;
+
+            int runP0SquadTest() {
+                int[] baseScores = new int[3] { 5, 10, 15 };
+                int bonus = NativeP0Squad.ComputeBonus(baseScores, 2);
+                NativeP0Squad elite = NativeP0Squad.CreateElite(7, baseScores);
+                int[] scaled = elite.GetScaledScores(3);
+                NativeP0Squad basic = NativeP0Squad.Create(3, "Bravo");
+                string[] tags = new string[3];
+                tags[0] = "Alpha";
+                tags[2] = "Gamma";
+                int nonEmptyTags = NativeP0Squad.CountNonEmptyTags(tags);
+                return bonus + elite.Id + scaled[0] + scaled[1] + scaled[2] + basic.Id + nonEmptyTags;
+            }
+        )RS"}
+    });
+    require(!compiled.diagnostics.hasErrors(), "P0 script using native constructors, static methods, and int[] marshaling must compile");
+
+    runtime::Interpreter interpreter(compiled.program.program(), api.heap());
+    interpreter.setBindingRegistry(api.bindings());
+    const auto execRes = interpreter.invoke("App.P0Test::runP0SquadTest");
+    require(execRes.succeeded, "App.P0Test::runP0SquadTest must succeed: " + execRes.error.message);
+    // bonus = (5+10+15)*2 = 60; elite.Id = 7; scaled = {15, 30, 45} -> sum = 90; basic.Id = 3; nonEmptyTags = 2 -> total = 162
+    require(
+        std::holds_alternative<std::int64_t>(execRes.value) &&
+        std::get<std::int64_t>(execRes.value) == 162,
+        "App.P0Test::runP0SquadTest must return 162");
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -7519,8 +7668,10 @@ int main() {
         testRemediationPhaseBP1Items();
         std::cout << "[28/29] testRemediationPhaseCP2Items..." << std::endl;
         testRemediationPhaseCP2Items();
-        std::cout << "[29/29] testAuditFixesMultiInterfaceConversionsAndAotSourceMap..." << std::endl;
+        std::cout << "[29/30] testAuditFixesMultiInterfaceConversionsAndAotSourceMap..." << std::endl;
         testAuditFixesMultiInterfaceConversionsAndAotSourceMap();
+        std::cout << "[30/30] testV2RoadmapP0SlicePoolAndRsbindEvolution..." << std::endl;
+        testV2RoadmapP0SlicePoolAndRsbindEvolution();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

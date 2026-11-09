@@ -29,6 +29,9 @@
 #if !defined(RS_EXPORT_ENUM)
 #define RS_EXPORT_ENUM
 #endif
+#if !defined(RS_EXPORT_CONSTRUCTOR)
+#define RS_EXPORT_CONSTRUCTOR(...)
+#endif
 
 namespace realscript::game {
 
@@ -40,6 +43,22 @@ public:
     template <auto Method>
     NativeTypeBuilder& method(
         std::string name,
+        runtime::BindingDeterminism determinism =
+            runtime::BindingDeterminism::Deterministic,
+        std::string requiredCapability = {});
+
+    template <auto Method>
+    NativeTypeBuilder& staticMethod(
+        std::string name,
+        runtime::BindingDeterminism determinism =
+            runtime::BindingDeterminism::Deterministic,
+        std::string requiredCapability = {}) {
+        return method<Method>(std::move(name), determinism, std::move(requiredCapability));
+    }
+
+    template <typename... Args>
+    NativeTypeBuilder& constructor(
+        std::string factoryName = "Create",
         runtime::BindingDeterminism determinism =
             runtime::BindingDeterminism::Deterministic,
         std::string requiredCapability = {});
@@ -205,6 +224,7 @@ public:
         std::size_t classesExported = 0;
         std::size_t structsExported = 0;
         std::size_t methodsExported = 0;
+        std::size_t constructorsExported = 0;
         std::size_t functionsExported = 0;
         std::size_t propertiesExported = 0;
         std::size_t enumsExported = 0;
@@ -235,8 +255,10 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::method(
     runtime::BindingDeterminism determinism,
     std::string requiredCapability) {
     using Traits = detail::FunctionTraits<decltype(Method)>;
-    static_assert(std::is_same_v<typename Traits::Class, T>,
-        "bound method must belong to the native type being registered");
+    if constexpr (Traits::IsMemberFunction) {
+        static_assert(std::is_same_v<typename Traits::Class, T>,
+            "bound method must belong to the native type being registered");
+    }
 
     auto returnType = detail::resolveScriptType<typename Traits::Return>(state_);
     auto parameters = detail::makeParameters<typename Traits::Arguments>(
@@ -268,49 +290,177 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::method(
         return *this;
     }
 
-    std::vector<detail::ParameterDeclaration> nativeParameters;
-    nativeParameters.push_back({
-        detail::ScriptTypeRef{
-            type.name,
-            type.moduleName,
-            detail::ScriptTypeCategory::NativeObject},
-        "self"});
-    nativeParameters.insert(
-        nativeParameters.end(), parameters->begin(), parameters->end());
-    std::string call = nativeName + "(this";
+    if constexpr (Traits::IsMemberFunction) {
+        std::vector<detail::ParameterDeclaration> nativeParameters;
+        nativeParameters.push_back({
+            detail::ScriptTypeRef{
+                type.name,
+                type.moduleName,
+                detail::ScriptTypeCategory::NativeObject},
+            "self"});
+        nativeParameters.insert(
+            nativeParameters.end(), parameters->begin(), parameters->end());
+        std::string call = nativeName + "(this";
+        for (const auto& parameter : *parameters) {
+            call += ", " + parameter.name;
+        }
+        call += ")";
+        const auto wrapperBody = std::is_void_v<typename Traits::Return>
+            ? call + "; return;"
+            : "return " + call + ";";
+        type.methods.push_back(detail::FunctionDeclaration{
+            name, *returnType, *parameters, wrapperBody, determinism, requiredCapability, false});
+        module.functions.push_back(detail::FunctionDeclaration{
+            nativeName,
+            std::is_void_v<typename Traits::Return>
+                ? detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int}
+                : *returnType,
+            std::move(nativeParameters),
+            {},
+            determinism,
+            requiredCapability,
+            false});
+        state_->bindings->bind(
+            bindingName,
+            [state](const auto&, const auto& arguments, auto& error) {
+                const auto invoked = detail::invokeMethod<Method, Traits>(
+                    state,
+                    arguments,
+                    error,
+                    std::make_index_sequence<Traits::Arity>{});
+                if (!invoked) return std::optional<runtime::Value>{};
+                if constexpr (std::is_void_v<typename Traits::Return>) {
+                    return std::optional<runtime::Value>{std::int64_t{0}};
+                } else {
+                    return invoked;
+                }
+            },
+            determinism,
+            std::move(requiredCapability));
+    } else {
+        std::string call = nativeName + "(";
+        for (std::size_t index = 0; index < parameters->size(); ++index) {
+            if (index != 0) call += ", ";
+            call += (*parameters)[index].name;
+        }
+        call += ")";
+        const auto wrapperBody = std::is_void_v<typename Traits::Return>
+            ? call + "; return;"
+            : "return " + call + ";";
+        type.methods.push_back(detail::FunctionDeclaration{
+            name, *returnType, *parameters, wrapperBody, determinism, requiredCapability, true});
+        module.functions.push_back(detail::FunctionDeclaration{
+            nativeName,
+            std::is_void_v<typename Traits::Return>
+                ? detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int}
+                : *returnType,
+            *parameters,
+            {},
+            determinism,
+            requiredCapability,
+            false});
+        state_->bindings->bind(
+            bindingName,
+            [state](const auto&, const auto& arguments, auto& error) {
+                auto fn = Method;
+                const auto invoked = detail::invokeFree<decltype(fn), Traits>(
+                    state,
+                    fn,
+                    arguments,
+                    error,
+                    std::make_index_sequence<Traits::Arity>{});
+                if (!invoked) return std::optional<runtime::Value>{};
+                if constexpr (std::is_void_v<typename Traits::Return>) {
+                    return std::optional<runtime::Value>{std::int64_t{0}};
+                } else {
+                    return invoked;
+                }
+            },
+            determinism,
+            std::move(requiredCapability));
+    }
+    return *this;
+}
+
+namespace detail {
+
+template <typename T, typename... Args>
+struct ConstructorBindingCallable {
+    std::shared_ptr<GameApiState> state;
+
+    static std::shared_ptr<T> create(Args... args) {
+        return std::make_shared<T>(std::forward<Args>(args)...);
+    }
+
+    std::optional<runtime::Value> operator()(
+        const bytecode::FunctionReference&,
+        runtime::ValueSpan arguments,
+        runtime::RuntimeError& error) const {
+        using FactoryFn = std::shared_ptr<T>(*)(Args...);
+        using Traits = FunctionTraits<FactoryFn>;
+        FactoryFn fn = &ConstructorBindingCallable::create;
+        return invokeFree<FactoryFn, Traits>(
+            state,
+            fn,
+            arguments,
+            error,
+            std::make_index_sequence<Traits::Arity>{});
+    }
+};
+
+} // namespace detail
+
+template <typename T>
+template <typename... Args>
+NativeTypeBuilder<T>& NativeTypeBuilder<T>::constructor(
+    std::string factoryName,
+    runtime::BindingDeterminism determinism,
+    std::string requiredCapability) {
+    using FactoryFn = std::shared_ptr<T>(*)(Args...);
+    using Traits = detail::FunctionTraits<FactoryFn>;
+
+    auto returnType = detail::resolveScriptType<std::shared_ptr<T>>(state_);
+    auto parameters = detail::makeParameters<typename Traits::Arguments>(
+        state_, std::make_index_sequence<Traits::Arity>{});
+    auto& type = state_->nativeTypes[index_];
+    if (!returnType || !parameters) {
+        state_->errors.push_back(
+            "unsupported C++ type in native constructor '" +
+            type.moduleName + "::" + type.name + "." + factoryName + "'");
+        return *this;
+    }
+
+    const auto publicName = type.moduleName + "::" + type.name + "." + factoryName;
+    if (!state_->declarationNames.insert(publicName).second) {
+        state_->errors.push_back("duplicate native constructor declaration '" + publicName + "'");
+        return *this;
+    }
+
+    auto& module = state_->modules[type.moduleName];
+    detail::collectImports(module, *returnType);
     for (const auto& parameter : *parameters) {
-        call += ", " + parameter.name;
+        detail::collectImports(module, parameter.type);
+    }
+    const auto nativeName = "__rs_native_" + type.name + "_ctor_" + factoryName;
+    const auto bindingName = type.moduleName + "::" + nativeName;
+    if (!state_->bindingNames.insert(bindingName).second) {
+        state_->errors.push_back("duplicate native constructor binding '" + bindingName + "'");
+        return *this;
+    }
+
+    std::string call = nativeName + "(";
+    for (std::size_t index = 0; index < parameters->size(); ++index) {
+        if (index != 0) call += ", ";
+        call += (*parameters)[index].name;
     }
     call += ")";
-    const auto wrapperBody = std::is_void_v<typename Traits::Return>
-        ? call + "; return;"
-        : "return " + call + ";";
     type.methods.push_back(detail::FunctionDeclaration{
-        name, *returnType, *parameters, wrapperBody, determinism, requiredCapability});
+        factoryName, *returnType, *parameters, "return " + call + ";", determinism, requiredCapability, true});
     module.functions.push_back(detail::FunctionDeclaration{
-        nativeName,
-        std::is_void_v<typename Traits::Return>
-            ? detail::ScriptTypeRef{"int", {}, detail::ScriptTypeCategory::Int}
-            : *returnType,
-        std::move(nativeParameters),
-        {},
-        determinism,
-        requiredCapability});
+        nativeName, *returnType, *parameters, {}, determinism, requiredCapability, false});
     state_->bindings->bind(
         bindingName,
-        [state](const auto&, const auto& arguments, auto& error) {
-            const auto invoked = detail::invokeMethod<Method, Traits>(
-                state,
-                arguments,
-                error,
-                std::make_index_sequence<Traits::Arity>{});
-            if (!invoked) return std::optional<runtime::Value>{};
-            if constexpr (std::is_void_v<typename Traits::Return>) {
-                return std::optional<runtime::Value>{std::int64_t{0}};
-            } else {
-                return invoked;
-            }
-        },
+        detail::ConstructorBindingCallable<T, Args...>{state_},
         determinism,
         std::move(requiredCapability));
     return *this;

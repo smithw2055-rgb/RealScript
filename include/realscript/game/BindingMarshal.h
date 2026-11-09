@@ -215,6 +215,9 @@ std::optional<RemoveCvRef<T>> readValue(
         if (const auto* result = std::get_if<std::string>(&value)) {
             return ValueType(*result);
         }
+        if (std::holds_alternative<runtime::NullString>(value)) {
+            return ValueType{};
+        }
         if (const auto* reference = std::get_if<runtime::ObjectRef>(&value)) {
             const auto text = state->heap->stringView(*reference);
             if (text) return ValueType(*text);
@@ -280,11 +283,42 @@ std::optional<RemoveCvRef<T>> readValue(
         const auto object = readNativeObject<Element>(state, value, error);
         if (!object) return std::nullopt;
         return object->get();
+    } else if constexpr (IsStdVector<ValueType>::value) {
+        using Element = typename IsStdVector<ValueType>::Element;
+        if (std::holds_alternative<runtime::NullArray>(value) ||
+            std::holds_alternative<runtime::NullObject>(value)) {
+            return ValueType{};
+        }
+        const auto* reference = std::get_if<runtime::ObjectRef>(&value);
+        if (!reference || !state->heap) {
+            setTypeMismatch(error, "expected array argument");
+            return std::nullopt;
+        }
+        const auto len = state->heap->arrayLength(*reference);
+        if (!len) {
+            setTypeMismatch(error, "expected array argument");
+            return std::nullopt;
+        }
+        ValueType out;
+        out.reserve(*len);
+        for (std::size_t i = 0; i < *len; ++i) {
+            const auto elemVal = state->heap->arrayGet(*reference, i);
+            if (!elemVal) {
+                setTypeMismatch(error, "failed to read array element");
+                return std::nullopt;
+            }
+            auto convertedElem = readValue<Element>(state, *elemVal, error);
+            if (!convertedElem) return std::nullopt;
+            out.push_back(std::move(*convertedElem));
+        }
+        return out;
     } else {
         static_assert(!sizeof(T), "unsupported C++ argument type for RealScript game binding");
         return std::nullopt;
     }
-    if constexpr (!IsSharedPtr<ValueType>::value && !std::is_pointer_v<ValueType>) {
+    if constexpr (!IsSharedPtr<ValueType>::value &&
+                  !std::is_pointer_v<ValueType> &&
+                  !IsStdVector<ValueType>::value) {
         return std::nullopt;
     }
 }
@@ -350,6 +384,62 @@ std::optional<runtime::Value> writeValue(
             state,
             std::shared_ptr<Element>(value, [](Element*) {}),
             error);
+    } else if constexpr (IsStdVector<ValueType>::value) {
+        using Element = typename IsStdVector<ValueType>::Element;
+        auto elemRef = resolveScriptType<Element>(state);
+        if (!elemRef || !state->heap) {
+            setTypeMismatch(error, "unsupported C++ vector element type");
+            return std::nullopt;
+        }
+        semantic::PrimitiveType elemPrim = semantic::PrimitiveType::Error;
+        semantic::SymbolId elemTypeId = 0;
+        semantic::SymbolId arrTypeId = 0;
+        runtime::Value defaultElemVal{};
+        if (elemRef->category == ScriptTypeCategory::NativeObject) {
+            elemPrim = semantic::PrimitiveType::Object;
+            const std::string canonicalElem = elemRef->moduleName.empty()
+                ? elemRef->sourceName
+                : (elemRef->moduleName + "::" + elemRef->sourceName);
+            elemTypeId = semantic::stableTypeId(canonicalElem);
+            arrTypeId = semantic::stableTypeId(
+                semantic::arrayTypeName(semantic::PrimitiveType::Object, canonicalElem));
+            defaultElemVal = runtime::NullObject{};
+        } else if (elemRef->category == ScriptTypeCategory::Struct) {
+            elemPrim = semantic::PrimitiveType::Struct;
+            const std::string canonicalElem = elemRef->moduleName.empty()
+                ? elemRef->sourceName
+                : (elemRef->moduleName + "::" + elemRef->sourceName);
+            elemTypeId = semantic::stableTypeId(canonicalElem);
+            arrTypeId = semantic::stableTypeId(
+                semantic::arrayTypeName(semantic::PrimitiveType::Struct, canonicalElem));
+            auto defOpt = writeValue(state, RemoveCvRef<Element>{}, error);
+            if (!defOpt) return std::nullopt;
+            defaultElemVal = std::move(*defOpt);
+        } else if (elemRef->category == ScriptTypeCategory::String) {
+            elemPrim = semantic::PrimitiveType::String;
+            elemTypeId = 0;
+            arrTypeId = semantic::stableTypeId(
+                semantic::arrayTypeName(semantic::PrimitiveType::String, {}));
+            defaultElemVal = runtime::NullString{};
+        } else {
+            elemPrim = semantic::resolvePrimitiveType(elemRef->sourceName);
+            elemTypeId = 0;
+            arrTypeId = semantic::stableTypeId(
+                semantic::arrayTypeName(elemPrim, {}));
+            auto defOpt = writeValue(state, RemoveCvRef<Element>{}, error);
+            if (!defOpt) return std::nullopt;
+            defaultElemVal = std::move(*defOpt);
+        }
+        const auto arrRef = state->heap->allocateTypedArray(
+            arrTypeId, elemPrim, elemTypeId, value.size(), defaultElemVal, &error);
+        if (!arrRef) return std::nullopt;
+        for (std::size_t i = 0; i < value.size(); ++i) {
+            auto elemVal = writeValue(state, value[i], error);
+            if (!elemVal || !state->heap->arraySet(*arrRef, i, std::move(*elemVal), &error)) {
+                return std::nullopt;
+            }
+        }
+        return runtime::Value{*arrRef};
     } else {
         static_assert(!sizeof(T), "unsupported C++ return type for RealScript game binding");
     }

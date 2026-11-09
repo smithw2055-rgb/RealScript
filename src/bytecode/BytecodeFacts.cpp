@@ -161,9 +161,9 @@ struct RegisterSlicePool {
 
     RegisterSlicePool() = default;
 
-    std::uint32_t intern(std::vector<Register>&& vec) {
-        if (vec.empty()) return 0u;
-        const RegisterSliceView probe{vec.data(), vec.size()};
+    std::uint32_t intern(const Register* rawData, std::size_t count) {
+        if (!rawData || count == 0u) return 0u;
+        const RegisterSliceView probe{rawData, count};
         std::lock_guard<std::mutex> lock(writeMutex);
         const auto found = indexBySlice.find(probe);
         if (found != indexBySlice.end()) return found->second;
@@ -183,13 +183,28 @@ struct RegisterSlicePool {
             pages[pageIdx].store(page, std::memory_order_release);
         }
 
-        page->storage[offset] = std::move(vec);
+        page->storage[offset].assign(rawData, rawData + count);
         const Register* pinnedPtr = page->storage[offset].data();
         const std::size_t pinnedSize = page->storage[offset].size();
         indexBySlice.emplace(RegisterSliceView{pinnedPtr, pinnedSize}, id);
         page->published[offset].store(pinnedPtr, std::memory_order_release);
         ++nextId;
         return id;
+    }
+
+    [[nodiscard]] std::size_t count() const noexcept {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(writeMutex));
+        return nextId > 0u ? static_cast<std::size_t>(nextId - 1u) : 0u;
+    }
+
+    void clear() noexcept {
+        std::lock_guard<std::mutex> lock(writeMutex);
+        indexBySlice.clear();
+        for (std::uint32_t i = 0; i < kMaxPages; ++i) {
+            pages[i].store(nullptr, std::memory_order_release);
+        }
+        ownedPages.clear();
+        nextId = 1u;
     }
 
     [[nodiscard]] const Register* data(std::uint32_t id) const noexcept {
@@ -298,6 +313,27 @@ struct BytecodeStringPool {
             page->published[localSlot & kPageMask].load(std::memory_order_acquire);
         return strPtr ? *strPtr : emptyString_;
     }
+
+    [[nodiscard]] std::size_t count() const noexcept {
+        std::size_t total = 0;
+        for (std::uint32_t s = 0; s < kShardCount; ++s) {
+            std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(shards_[s].writeMutex));
+            total += shards_[s].nextSlot;
+        }
+        return total;
+    }
+
+    void clear() noexcept {
+        for (std::uint32_t s = 0; s < kShardCount; ++s) {
+            std::lock_guard<std::mutex> lock(shards_[s].writeMutex);
+            shards_[s].indexByView.clear();
+            for (std::uint32_t p = 0; p < kMaxPagesPerShard; ++p) {
+                shards_[s].pages[p].store(nullptr, std::memory_order_release);
+            }
+            shards_[s].ownedPages.clear();
+            shards_[s].nextSlot = 0u;
+        }
+    }
 };
 
 BytecodeStringPool& bytecodeStringPool() {
@@ -311,13 +347,31 @@ const Register* SmallRegisterVector::sliceData(std::uint32_t id) noexcept {
     return registerSlicePool().data(id);
 }
 
+std::uint32_t SmallRegisterVector::internSlice(
+    const Register* values,
+    std::uint16_t count) {
+    return registerSlicePool().intern(values, count);
+}
+
 std::uint32_t SmallRegisterVector::appendToSlice(
     std::uint32_t id,
     Register firstInline,
     std::uint16_t currentSize,
     Register value) {
+    const std::size_t nextSize = static_cast<std::size_t>(currentSize) + 1u;
+    if (nextSize <= 64u) {
+        Register stackBuf[64];
+        if (id == 0u) {
+            if (currentSize == 1u) stackBuf[0] = firstInline;
+        } else {
+            const auto* src = sliceData(id);
+            std::memcpy(stackBuf, src, currentSize * sizeof(Register));
+        }
+        stackBuf[currentSize] = value;
+        return registerSlicePool().intern(stackBuf, nextSize);
+    }
     std::vector<Register> next;
-    next.reserve(static_cast<std::size_t>(currentSize) + 1u);
+    next.reserve(nextSize);
     if (id == 0u) {
         if (currentSize == 1u) next.push_back(firstInline);
     } else {
@@ -325,7 +379,15 @@ std::uint32_t SmallRegisterVector::appendToSlice(
         next.insert(next.end(), src, src + currentSize);
     }
     next.push_back(value);
-    return registerSlicePool().intern(std::move(next));
+    return registerSlicePool().intern(next.data(), next.size());
+}
+
+std::size_t SmallRegisterVector::internedSliceCount() noexcept {
+    return registerSlicePool().count();
+}
+
+void SmallRegisterVector::clearSlicePool() noexcept {
+    registerSlicePool().clear();
 }
 
 BytecodeString::BytecodeString(const std::string& value)
@@ -342,6 +404,14 @@ BytecodeString::BytecodeString(const char* value)
 
 const std::string& BytecodeString::str() const noexcept {
     return bytecodeStringPool().get(poolId_);
+}
+
+std::size_t BytecodeString::internedStringCount() noexcept {
+    return bytecodeStringPool().count();
+}
+
+void BytecodeString::clearStringPool() noexcept {
+    bytecodeStringPool().clear();
 }
 
 } // namespace realscript::bytecode
