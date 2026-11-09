@@ -67,6 +67,9 @@ enum class QuickOpcode : std::uint8_t {
     ConvertIntToLongFast,
     ConvertIntToDoubleFast,
     ConvertLongToDoubleFast,
+    NegateIntUnchecked,
+    NegateDouble,
+    LogicalNot,
 };
 
 enum class SuperOpcode : std::uint8_t {
@@ -148,6 +151,9 @@ enum class FlatOpcode : std::uint8_t {
     SuperBinaryLocalDoubleConstStoreElided,
     SuperBinaryLocalDoubleLocalStore,
     SuperBinaryLocalDoubleLocalStoreElided,
+    NegateIntUnchecked,
+    NegateDouble,
+    LogicalNot,
     GenericBytecode,
     // 6. Flattened block terminators
     TermJumpNoArgs,

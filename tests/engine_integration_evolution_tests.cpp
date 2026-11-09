@@ -7951,6 +7951,176 @@ int EvalImpulse(int mass, double velocity);
     }
 }
 
+
+void testV5EvolutionCrossModuleStructInliningFiberHotReloadAndBranchFusion() {
+    using namespace realscript;
+
+    // 1. Cross-module struct/enum TypeSymbol auto-import + 2-pass transitive -O2 inlining + dead unchecked arithmetic elimination
+    {
+        compiler::Compilation comp({
+            {"vec_math.rs", R"RS(
+                module VecMath;
+
+                public struct Vec2D {
+                    public double x;
+                    public double y;
+                }
+
+                public Vec2D MakeVec2D(double x, double y) {
+                    Vec2D v = new Vec2D();
+                    v.x = x;
+                    v.y = y;
+                    return v;
+                }
+
+                public Vec2D ScaleVec2D(double x, double y, double s) {
+                    return MakeVec2D(x * s, y * s);
+                }
+
+                public struct Box2D {
+                    public Vec2D min;
+                    public Vec2D max;
+                }
+
+                public Box2D MakeEmptyBox() {
+                    Box2D b = new Box2D();
+                    return b;
+                }
+            )RS"},
+            {"app_sim.rs", R"RS(
+                module AppSim;
+                import VecMath;
+
+                public double ComputeEnergy(int steps) {
+                    Box2D emptyBox = MakeEmptyBox();
+                    double sum = emptyBox.min.x;
+                    for (int i = steps; i > 0; i = i - 1) {
+                        Vec2D p = ScaleVec2D(2.0, 3.0, 1.5);
+                        int deadUnchecked = unchecked(i * 123 + 456);
+                        double neg = -p.x;
+                        if (!(neg > 0.0)) {
+                            sum = sum + p.x + p.y;
+                        }
+                    }
+                    return sum;
+                }
+            )RS"}
+        });
+        auto build = comp.build();
+        require(!build.diagnostics.hasErrors(), "V5 cross-module struct inlining modules must build cleanly");
+
+        diagnostics::DiagnosticBag optDiags;
+        optimization::Options optOpts;
+        optOpts.level = optimization::Level::Aggressive;
+        optOpts.enableInlining = true;
+        auto optRes = optimization::Optimizer{}.optimize(build.modules, optDiags, optOpts);
+        require(!optDiags.hasErrors(), "V5 cross-module struct MIR -O2 optimization must pass MirVerifier without errors");
+        // Pass 1 inlines MakeVec2D into ScaleVec2D (and into ComputeEnergy if called), Pass 2 inlines ScaleVec2D into ComputeEnergy!
+        require(optRes.statistics.functionsInlined >= 2,
+            "Expected 2-pass transitive cross-module inliner to inline both MakeVec2D and ScaleVec2D");
+        require(optRes.statistics.structFieldsForwarded >= 2,
+            "Expected struct field forwarding to scalarize inlined Vec2D fields");
+
+        bytecode::Lowerer lowerer;
+        std::vector<bytecode::Module> bcMods;
+        for (const auto& m : optRes.modules) bcMods.push_back(lowerer.lower(m));
+        runtime::Interpreter interp(std::move(bcMods));
+        const auto execRes = interp.invoke("AppSim::ComputeEnergy", {std::int64_t{5}});
+        require(execRes.succeeded, "AppSim::ComputeEnergy must execute cleanly: " + execRes.error.message);
+        // p.x = 3.0, p.y = 4.5 -> 7.5 per step * 5 steps = 37.5
+        const double val = std::get<double>(execRes.value);
+        require(val > 37.499 && val < 37.501, "expected AppSim::ComputeEnergy(5) == 37.5");
+    }
+
+    // 2. Safe body-only hot-reload with newly added helper function (allowAddedFunctions = true)
+    {
+        compiler::Compilation c1({
+            {"live_reload.rs", R"RS(
+                module Game.LiveReload;
+                public int CalcScore(int baseVal) {
+                    return baseVal + 10;
+                }
+            )RS"}
+        });
+        auto b1 = c1.build();
+        bytecode::Lowerer lowerer;
+        std::vector<bytecode::Module> m1{lowerer.lower(b1.modules.front())};
+        runtime::RuntimeError linkErr;
+        auto prog1 = runtime::ProgramImage::link(m1, linkErr);
+        require(prog1.has_value(), "prog1 must link");
+        runtime::EngineRuntime eng(std::make_shared<runtime::ProgramImage>(*prog1));
+
+        compiler::Compilation c2({
+            {"live_reload.rs", R"RS(
+                module Game.LiveReload;
+                int ComputeBonusHelper(int v) {
+                    return v * 3;
+                }
+                public int CalcScore(int baseVal) {
+                    return ComputeBonusHelper(baseVal) + 10;
+                }
+            )RS"}
+        });
+        auto b2 = c2.build();
+        std::vector<bytecode::Module> m2{lowerer.lower(b2.modules.front())};
+        const auto strictNoAddPlan = hot_reload::prepare(*prog1, m2, hot_reload::ReloadOptions{false, false, false});
+        require(!strictNoAddPlan.compatible && !strictNoAddPlan.issues.empty(),
+            "Hot-reload with allowAddedFunctions=false must reject newly added function");
+        const auto plan = hot_reload::apply(eng, m2);
+        require(plan.compatible && plan.addedFunctions.size() == 1 && plan.changedFunctions.size() == 1,
+            "Hot-reload adding a new helper function must succeed with default ReloadOptions");
+        const auto afterRes = eng.invoke("Game.LiveReload::CalcScore", {std::int64_t{7}});
+        require(afterRes.succeeded && std::get<std::int64_t>(afterRes.value) == 31,
+            "Reloaded CalcScore(7) must call newly added ComputeBonusHelper(7) and return 31");
+    }
+
+    // 3. FiberScheduler live module hot-reload (reloadModule) preserving active sleeping fiber state & registers
+    {
+        struct TestFiberHost : runtime::IFiberHostCallbacks {
+            std::int32_t lastCommandArg = 0;
+            void onHostCommand(
+                runtime::FiberContext& fiber,
+                std::uint8_t commandId,
+                std::uint16_t arg16,
+                std::uint32_t arg32) noexcept override {
+                (void)fiber;
+                (void)commandId;
+                (void)arg16;
+                lastCommandArg = static_cast<std::int32_t>(arg32);
+            }
+        } host;
+
+        runtime::CompiledFiberModule modV1;
+        modV1.moduleName = "AI.Patrol";
+        modV1.entryPoints["PatrolLoop"] = 0;
+        modV1.instructions = {
+            runtime::CompactInstruction(runtime::FiberOpcode::LoadInt, 0, 0, 10),         // pc 0: r0 = 10
+            runtime::CompactInstruction(runtime::FiberOpcode::YieldTicks, 0, 0, 5),       // pc 1: sleep 5 ticks -> wakes at pc 2
+            runtime::CompactInstruction(runtime::FiberOpcode::HostCommand, 1, 0, 100),    // pc 2: emit 100
+            runtime::CompactInstruction(runtime::FiberOpcode::Return, 0, 0, 0)            // pc 3: return
+        };
+
+        runtime::FiberScheduler sched(&host);
+        const std::uint32_t progId = sched.registerModule(modV1);
+        const std::uint32_t fid = sched.spawnFiberByProgram(
+            progId, 0, runtime::GenerationalEntityHandle{1, 1});
+        sched.stepTick(1); // executes pc 0..1, fiber sleeps until tick 6 at pc == 2
+        const auto* fBefore = sched.getFiber(fid);
+        require(fBefore && fBefore->status == runtime::FiberStatus::SleepingTicks &&
+                fBefore->pc == 2 && fBefore->regs[0] == 10,
+            "Fiber must be sleeping at pc 2 with r0 == 10 before reloadModule");
+
+        // Hot-reload PatrolLoop with updated HostCommand payload (250 instead of 100)
+        runtime::CompiledFiberModule modV2 = modV1;
+        modV2.instructions[2] = runtime::CompactInstruction(runtime::FiberOpcode::HostCommand, 1, 0, 250);
+        require(sched.reloadModule(progId, modV1, modV2), "FiberScheduler::reloadModule must succeed");
+
+        sched.stepTick(6); // wakes fiber at pc == 2 and runs updated instruction!
+        require(host.lastCommandArg == 250,
+            "Reloaded fiber must execute updated HostCommand payload (250) while preserving state");
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -8015,8 +8185,10 @@ int main() {
         testV2RoadmapP0SlicePoolAndRsbindEvolution();
         std::cout << "[31/32] testV3NextStageFlatDoubleFieldsInlinerOverloadsAndHotReloadBreakpoints..." << std::endl;
         testV3NextStageFlatDoubleFieldsInlinerOverloadsAndHotReloadBreakpoints();
-        std::cout << "[32/32] testV4EvolutionCustomStructMarshalingDoubleSuperinstructionsAndCrossModuleInlining..." << std::endl;
+        std::cout << "[32/33] testV4EvolutionCustomStructMarshalingDoubleSuperinstructionsAndCrossModuleInlining..." << std::endl;
         testV4EvolutionCustomStructMarshalingDoubleSuperinstructionsAndCrossModuleInlining();
+        std::cout << "[33/33] testV5EvolutionCrossModuleStructInliningFiberHotReloadAndBranchFusion..." << std::endl;
+        testV5EvolutionCrossModuleStructInliningFiberHotReloadAndBranchFusion();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

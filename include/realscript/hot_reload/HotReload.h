@@ -26,6 +26,7 @@ struct ReloadIssue {
 struct ReloadOptions {
     bool allowStructuralChanges = false;
     bool allowModuleSetChanges = false;
+    bool allowAddedFunctions = true;
 };
 
 struct ReloadPlan {

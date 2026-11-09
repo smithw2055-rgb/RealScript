@@ -320,7 +320,9 @@ ReloadPlan prepare(
 
     const auto oldFunctions = functions(oldModules);
     const auto newFunctions = functions(newModules);
-    if (oldFunctions.size() != newFunctions.size() && !options.allowStructuralChanges) {
+    if (oldFunctions.size() != newFunctions.size() &&
+        !options.allowStructuralChanges &&
+        !options.allowAddedFunctions) {
         plan.issues.push_back({
             ReloadIssueKind::FunctionSetChanged,
             {},
@@ -360,10 +362,16 @@ ReloadPlan prepare(
         }
     }
     for (const auto& [id, newFunction] : newFunctions) {
-        (void)newFunction;
         if (oldFunctions.find(id) == oldFunctions.end()) {
             plan.addedFunctions.push_back(id);
             plan.structuralMigrationRequired = true;
+            if (!options.allowStructuralChanges && !options.allowAddedFunctions) {
+                plan.issues.push_back({
+                    ReloadIssueKind::FunctionSetChanged,
+                    newFunction.function->name,
+                    "function was added during hot reload",
+                });
+            }
         }
     }
 

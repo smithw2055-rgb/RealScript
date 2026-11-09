@@ -334,6 +334,11 @@ public:
 
     std::uint32_t registerProgram(std::vector<CompactInstruction> codeStream);
     std::uint32_t registerModule(const CompiledFiberModule& module);
+    bool reloadProgram(std::uint32_t programId, std::vector<CompactInstruction> newCodeStream);
+    bool reloadModule(
+        std::uint32_t programId,
+        const CompiledFiberModule& oldModule,
+        const CompiledFiberModule& newModule);
 
     std::uint32_t spawnFiberByProgram(
         std::uint32_t programId,
