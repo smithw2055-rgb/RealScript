@@ -17,7 +17,7 @@ deliberately smaller deterministic profile.
 | Interfaces | Supported | Interface values, inheritance contracts, deterministic runtime interface dispatch. No default interface bodies. |
 | Accessibility | Supported | `public`, `internal`, `protected`, and `private` on supported declarations. |
 | Delegates and closures | Supported | First-class exact delegate values, method groups, heap closures, shared mutable captures, multicast, events. |
-| Generics | Supported | Compile-time specialization, inference, generic members, class/struct/`new()` constraints, generic interfaces/delegates. No open runtime generics or variance. |
+| Generics | Supported | Compile-time specialization, inference, generic members, `class`/`struct`/`new()` and multi-interface `where` constraints, generic interfaces/delegates. No open runtime generics or variance. |
 | Collections and `foreach` | Supported | Growable deterministic `List`, `Dictionary`, `HashSet`, `Queue`, `Stack`; native enumerator protocol. Not the .NET collection library or LINQ. |
 | Structs | Supported | Copy semantics, mutable receivers, implicit/ref `this`, nested managed references, structural equality. |
 | Exact primitive identities | Supported | Exact signed/unsigned integer widths, binary32 `float`, binary64 `double`, and `char`; checked/unchecked conversions. |
@@ -25,7 +25,7 @@ deliberately smaller deterministic profile.
 | Boxing/unboxing | Supported | Exact script value-type identity with managed-heap/GC support. |
 | Reference locations | Partial | Ref parameters, locals, returns, fields, indexers, and ref `this`. No unsafe pointers, ref properties, ref structs, or full escape analysis. |
 | Attributes | Partial | Native syntax and versioned metadata for compiler/Game SDK/artifacts, auto-ingested into `ScriptMetadataRegistry` and `InspectorTypeSchema`. No executable attribute classes or full `AttributeUsage`. |
-| User operators/conversions | Partial | User-defined `operator` overloads (`+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, unary `-`, `!`, `~`) and compound assignments (`+=`, `-=`, `*=`, `/=`, `%=`) are supported. User-defined implicit/explicit conversions are not supported. |
+| User operators/conversions | Supported | User-defined `operator` overloads (`+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, unary `-`, `!`, `~`), compound assignments (`+=`, `-=`, `*=`, `/=`, `%=`), and user-defined `implicit`/`explicit` conversion operators (`public static implicit/explicit operator Target(Source)`). |
 | `const`, `readonly`, static members, property initializers | Supported | Compile-time `const`, constructor-assigned `readonly` fields, `static class`, deterministic `static` constructors (`static T()`), `static` fields/initializers, and instance/`static` auto-property initializers (`{ get; set; } = expr;`) are supported across interpreter, bytecode, and C++17 AOT. |
 
 ## Expressions and control flow

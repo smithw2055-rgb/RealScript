@@ -24,7 +24,7 @@ v0.98.0 represents the major Game Engine Integration Evolution release, bringing
 
 - Added **Zero-Budget Trusted Release AOT Mode** (`GenerationOptions::trustedRelease`, `ExecutionOptions::trustedRelease`, `rsaot --trusted-release`, and CMake `realscript_add_aot_library(... TRUSTED_RELEASE)`), compiling out instruction/branch/GC accounting guards via `if constexpr (!TrustedRelease)`.
 - Added **Custom Struct Stack Scalarization** (`AotStruct_<typeId>`), decomposing value-type structs up to 16 scalar/inline-math fields into stack-allocated C++ structs.
-- Added **`#line` Source Mapping Directives**: C++17 AOT codegen emits accurate line markers back to original `.rs` script source, enabling native C++ debugger step-in/out directly to script lines.
+- Added **`#line` Source Mapping Directives & Symbolized Stack Traces**: C++17 AOT codegen emits `#line` markers and static `programSourceMap` tables (`AotLineMapping`), and both AOT and the Bytecode Interpreter populate `RuntimeError::sourceLocations` and `RuntimeError::symbolizedStackTrace` (`function (path:line:col)`).
 - Implemented **AVX2 / SIMD Vectorized ECS Loop Reconstruction**: auto-detects and transforms ECS query loops into vectorized C++ inner loops (`__restrict` native column pointers and `#pragma loop(ivdep)` / `#pragma clang loop vectorize(enable)`).
 - Added natural-loop **LICM (Loop-Invariant Code Motion) Load Hoisting** in the MIR/bytecode optimizer.
 
@@ -39,8 +39,7 @@ v0.98.0 represents the major Game Engine Integration Evolution release, bringing
 
 ### Language & Type System
 
-- Added **Auto-Property Initializers** (`public int Hp { get; set; } = 100;` and static auto-property initializers on classes and structs).
-- Added **Static Constructors** (`static ClassName()`), guaranteed to run before first type access.
+- Added **User-Defined `implicit` and `explicit` Conversion Operators** (`public static implicit/explicit operator Target(Source)`), **Multi-Interface Generic Constraints** (`where T : Base, IFoo, IBar, new()`), **Auto-Property Initializers** (`public int Hp { get; set; } = 100;`), and **Static Constructors** (`static ClassName()`).
 - Enforced `static class` and constructor-assigned `readonly` fields across compiler, VM, and AOT.
 - Extended standard library with math, bitwise, and string intrinsics.
 

@@ -6471,7 +6471,7 @@ class Worker
         std::thread worker([&]() {
             finalRes = rt.invokeStatic(
                 *runLoopMethod,
-                {std::int64_t{400}});
+                {std::int64_t{20000}});
             workerDone.store(true, std::memory_order_release);
         });
 
@@ -7187,6 +7187,280 @@ class LevelLoader {
     }
 }
 
+
+void testAuditFixesMultiInterfaceConversionsAndAotSourceMap() {
+    using namespace realscript;
+
+    // 1. Multi-interface & base-class generic constraints + multiple where clauses
+    {
+        compiler::Compilation comp({
+            {"multi_constraints.rs", R"RS(
+module Evolution.MultiConstraints;
+
+public interface IDamageable {
+    int GetHp();
+}
+
+public interface IHealable {
+    int GetMaxHp();
+}
+
+public interface IComparable<T> {
+    int CompareTo(T other);
+}
+
+public class BaseUnit {
+    public int teamId = 1;
+}
+
+public class Paladin : BaseUnit, IDamageable, IHealable, IComparable<Paladin> {
+    public int hp = 80;
+    public int maxHp = 100;
+
+    public Paladin() {}
+
+    public int GetHp() { return hp; }
+    public int GetMaxHp() { return maxHp; }
+    public int CompareTo(Paladin other) { return hp - other.hp; }
+}
+
+public class OnlyDamageable : BaseUnit, IDamageable {
+    public int GetHp() { return 50; }
+}
+
+public class CombatEvaluator<T>
+    where T : BaseUnit, IDamageable, IHealable
+    where T : IComparable<T>, new()
+{
+    public int Evaluate(T unit) {
+        T clone = new T();
+        return unit.teamId * 1000 + unit.GetHp() + unit.GetMaxHp() + unit.CompareTo(clone);
+    }
+}
+
+public int ProcessUnit<T>(T unit)
+    where T : class, IDamageable, IHealable, new()
+{
+    CombatEvaluator<T> eval = new CombatEvaluator<T>();
+    return eval.Evaluate(unit);
+}
+
+public int main() {
+    Paladin p = new Paladin();
+    p.hp = 95;
+    return ProcessUnit<Paladin>(p);
+}
+)RS"},
+        });
+        const auto build = comp.build();
+        require(
+            !build.diagnostics.hasErrors(),
+            "multi-interface generic constraints failed to compile:\n" +
+                diagnosticsText(build.diagnostics));
+
+        bytecode::Lowerer lowerer;
+        std::vector<bytecode::Module> bcMods;
+        for (const auto& m : build.modules) bcMods.push_back(lowerer.lower(m));
+        runtime::Interpreter interp(std::move(bcMods));
+        const auto res = interp.invoke("Evolution.MultiConstraints::main");
+        // teamId(1)*1000 + GetHp(95) + GetMaxHp(100) + CompareTo(95 - 80 = 15) = 1210
+        require(
+            res.succeeded && std::get<std::int64_t>(res.value) == 1210,
+            "multi-interface generic constraint execution expected 1210");
+
+        // Negative test: HalfUnit does not implement IHealable -> must report RS8530
+        compiler::Compilation badComp({
+            {"bad_multi_constraints.rs", R"RS(
+module Evolution.BadMultiConstraints;
+
+public interface IDamageable { int GetHp(); }
+public interface IHealable { int GetMaxHp(); }
+
+public class HalfUnit : IDamageable {
+    public int GetHp() { return 10; }
+}
+
+public int RequireBoth<T>(T u) where T : IDamageable, IHealable {
+    return u.GetHp();
+}
+
+public int main() {
+    HalfUnit h = new HalfUnit();
+    return RequireBoth<HalfUnit>(h);
+}
+)RS"},
+        });
+        const auto badBuild = badComp.build();
+        bool foundRS8530 = false;
+        for (const auto& d : badBuild.diagnostics.items()) {
+            if (d.code == "RS8530" && d.message.find("IHealable") != std::string::npos) {
+                foundRS8530 = true;
+            }
+        }
+        require(
+            badBuild.diagnostics.hasErrors() && foundRS8530,
+            "expected RS8530 when type argument fails second interface in multi-interface constraint");
+    }
+
+    // 2. User-defined implicit and explicit conversion operators (struct & class, Bytecode & AOT)
+    {
+        const char* convSrc = R"RS(
+module Evolution.Conversions;
+
+public struct Meter {
+    public int value;
+
+    public Meter(int v) {
+        value = v;
+    }
+
+    public static implicit operator Meter(int v) {
+        return new Meter(v);
+    }
+
+    public static explicit operator int(Meter m) {
+        return m.value;
+    }
+
+    public static explicit operator long(Meter m) {
+        return (long)m.value * 1000L;
+    }
+}
+
+public struct Centimeter {
+    public int cm;
+
+    public Centimeter(int v) {
+        cm = v;
+    }
+
+    public static implicit operator Centimeter(Meter m) {
+        return new Centimeter(m.value * 100);
+    }
+
+    public static explicit operator Meter(Centimeter c) {
+        return new Meter(c.cm / 100);
+    }
+}
+
+public int MeasureCentimeters(Centimeter c) {
+    return c.cm;
+}
+
+public Centimeter ReturnImplicit(Meter m) {
+    return m;
+}
+
+public int main() {
+    Meter m1 = 7;
+    Centimeter c1 = m1;
+    int fromCall = MeasureCentimeters(m1);
+    Centimeter c2 = ReturnImplicit(3);
+    Meter mBack = (Meter)c2;
+    int rawMeters = (int)mBack;
+    long rawMillimeters = (long)mBack;
+    return c1.cm + fromCall + c2.cm + rawMeters + (int)(rawMillimeters / 1000L);
+}
+)RS";
+        compiler::Compilation comp({{"conversions.rs", convSrc}});
+        const auto build = comp.build();
+        require(
+            !build.diagnostics.hasErrors(),
+            "user-defined conversion operators failed to compile:\n" +
+                diagnosticsText(build.diagnostics));
+
+        bytecode::Lowerer lowerer;
+        std::vector<bytecode::Module> bcMods;
+        for (const auto& m : build.modules) bcMods.push_back(lowerer.lower(m));
+        runtime::Interpreter interp(std::move(bcMods));
+        const auto res = interp.invoke("Evolution.Conversions::main");
+        // c1.cm(700) + fromCall(700) + c2.cm(300) + rawMeters(3) + rawMillimeters/1000(3) = 1706
+        require(
+            res.succeeded && std::get<std::int64_t>(res.value) == 1706,
+            "user-defined conversion execution expected 1706, got error/val: " + res.error.message);
+
+        // Negative test: explicit conversion operator must NOT be used implicitly
+        compiler::Compilation badImplicit({
+            {"bad_implicit.rs", R"RS(
+module Evolution.BadImplicit;
+public struct Meter {
+    public int value;
+    public Meter(int v) { value = v; }
+    public static explicit operator int(Meter m) { return m.value; }
+}
+public int main() {
+    Meter m = new Meter(5);
+    int x = m;
+    return x;
+}
+)RS"},
+        });
+        const auto badBuild = badImplicit.build();
+        require(
+            badBuild.diagnostics.hasErrors(),
+            "explicit operator int(Meter) must not be allowed in implicit assignment");
+    }
+
+    // 3. C++17 AOT Source-Level Symbol Mapping & Stack Trace Line Number Reconstruction
+    {
+        const char* aotTraceSrc = R"RS(
+module Evolution.AotTrace;
+
+public class CrashDemo {
+    public static int LeafDivide(int a, int b) {
+        int scaled = a * 10;
+        return scaled / b;
+    }
+
+    public static int MiddleStep(int x) {
+        int next = x + 5;
+        return LeafDivide(next, 0);
+    }
+
+    public static int EntryPoint() {
+        return MiddleStep(3);
+    }
+}
+)RS";
+        compiler::Compilation comp({{"scripts/aot_trace_demo.rs", aotTraceSrc}});
+        const auto build = comp.build();
+        require(!build.diagnostics.hasErrors(), "aot_trace_demo.rs failed to compile");
+
+        bytecode::Lowerer lowerer;
+        std::vector<bytecode::Module> bcMods;
+        for (const auto& m : build.modules) bcMods.push_back(lowerer.lower(m));
+        runtime::Interpreter interp(std::move(bcMods));
+        const auto interpRes = interp.invoke("Evolution.AotTrace::CrashDemo.EntryPoint");
+        require(
+            !interpRes.succeeded &&
+                interpRes.error.code == runtime::ErrorCode::DivisionByZero &&
+                interpRes.error.sourceLocations.size() == 3 &&
+                interpRes.error.symbolizedStackTrace.size() == 3,
+            "Interpreter RuntimeError must populate sourceLocations and symbolizedStackTrace");
+        require(
+            interpRes.error.sourceLocations[0].sourcePath == "scripts/aot_trace_demo.rs" &&
+                interpRes.error.sourceLocations[0].sourceLine == 7 &&
+                interpRes.error.sourceLocations[1].sourceLine == 12 &&
+                interpRes.error.sourceLocations[2].sourceLine == 16 &&
+                interpRes.error.symbolizedStackTrace[0].find("scripts/aot_trace_demo.rs:7:") != std::string::npos,
+            "Interpreter symbolizedStackTrace top frame must include exact statement line scripts/aot_trace_demo.rs:7");
+
+        diagnostics::DiagnosticBag aotDiags;
+        aot::CppGenerator generator;
+        aot::GenerationOptions genOpts;
+        genOpts.programName = "AotTraceProg";
+        genOpts.cppNamespace = "aot_trace_ns";
+        genOpts.emitLineDirectives = true;
+        const auto generated = generator.generate(build.modules, aotDiags, genOpts);
+        require(
+            !aotDiags.hasErrors() &&
+                generated.source.find("typedActiveGenLine = ") != std::string::npos &&
+                generated.source.find("context.setActiveGeneratedLine(") != std::string::npos &&
+                generated.source.find("programSourceMap[]") != std::string::npos,
+            "Generated C++17 AOT source must include typedActiveGenLine and programSourceMap");
+    }
+}
+
 int main() {
     try {
         std::cout << "[1/12] testScriptInheritingNativeAndMathMarshaling..." << std::endl;
@@ -7243,8 +7517,10 @@ int main() {
         testRemediationPhaseAP0Items();
         std::cout << "[27/28] testRemediationPhaseBP1Items..." << std::endl;
         testRemediationPhaseBP1Items();
-        std::cout << "[28/28] testRemediationPhaseCP2Items..." << std::endl;
+        std::cout << "[28/29] testRemediationPhaseCP2Items..." << std::endl;
         testRemediationPhaseCP2Items();
+        std::cout << "[29/29] testAuditFixesMultiInterfaceConversionsAndAotSourceMap..." << std::endl;
+        testAuditFixesMultiInterfaceConversionsAndAotSourceMap();
         std::cout << "All engine integration evolution tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

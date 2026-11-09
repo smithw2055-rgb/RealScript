@@ -919,7 +919,34 @@ private:
         bool valueType = false;
         bool referenceType = false;
         bool defaultConstructor = false;
+        std::set<std::string> supertypes;
     };
+
+    void collectSupertypes(
+        const std::string& typeName,
+        std::set<std::string>& outSupertypes,
+        std::set<std::string>& visited) const {
+        if (typeName.empty() || !visited.insert(typeName).second) return;
+        outSupertypes.insert(typeName);
+        for (const auto& unit : units_) {
+            for (const auto& value : unit->syntaxTree->classes) {
+                if (value.identifierToken.text != typeName) continue;
+                for (const auto& iface : value.interfaces) {
+                    const auto parentName = nativeGenericTypeText(iface);
+                    outSupertypes.insert(parentName);
+                    collectSupertypes(parentName, outSupertypes, visited);
+                }
+            }
+            for (const auto& value : unit->syntaxTree->structs) {
+                if (value.identifierToken.text != typeName) continue;
+                for (const auto& iface : value.interfaces) {
+                    const auto parentName = nativeGenericTypeText(iface);
+                    outSupertypes.insert(parentName);
+                    collectSupertypes(parentName, outSupertypes, visited);
+                }
+            }
+        }
+    }
 
     ConcreteTypeFacts concreteTypeFacts(const std::string& name) const {
         static const std::set<std::string> primitiveValues = {
@@ -927,21 +954,25 @@ private:
             "long", "ulong", "float", "double", "char", "fixed32",
             "fixed64"};
         if (primitiveValues.find(name) != primitiveValues.end()) {
-            return {true, true, false, true};
+            return {true, true, false, true, {name}};
         }
         if (name == "string" || name == "object" ||
             (name.size() > 2 && name.substr(name.size() - 2) == "[]")) {
-            return {true, false, true, false};
+            return {true, false, true, false, {name, "object"}};
         }
+        std::set<std::string> supertypes;
+        std::set<std::string> visited;
+        collectSupertypes(name, supertypes, visited);
+        supertypes.insert("object");
         for (const auto& unit : units_) {
             for (const auto& value : unit->syntaxTree->structs) {
                 if (value.identifierToken.text == name) {
-                    return {true, true, false, true};
+                    return {true, true, false, true, std::move(supertypes)};
                 }
             }
             for (const auto& value : unit->syntaxTree->enums) {
                 if (value.identifierToken.text == name) {
-                    return {true, true, false, true};
+                    return {true, true, false, true, std::move(supertypes)};
                 }
             }
             for (const auto& value : unit->syntaxTree->classes) {
@@ -959,20 +990,69 @@ private:
                         constructor.parameters.empty();
                 }
                 if (!hasInstanceConstructor) defaultConstructor = true;
-                return {true, false, true, defaultConstructor};
+                return {true, false, true, defaultConstructor, std::move(supertypes)};
             }
             for (const auto& value : unit->syntaxTree->interfaces) {
                 if (value.identifierToken.text == name) {
-                    return {true, false, true, false};
+                    return {true, false, true, false, std::move(supertypes)};
                 }
             }
             for (const auto& value : unit->syntaxTree->delegates) {
                 if (value.identifierToken.text == name) {
-                    return {true, false, true, false};
+                    return {true, false, true, false, std::move(supertypes)};
                 }
             }
         }
         return {};
+    }
+
+    std::string resolveConstraintTypeName(
+        const std::string& rawConstraint,
+        const NativeGenericTemplate& declaration,
+        const std::vector<std::string>& arguments,
+        const std::string& consumerModule,
+        text::TextSpan span,
+        const std::string& sourceName,
+        std::string* outSubstitutedText = nullptr) {
+        std::map<std::string, std::string> substitutions;
+        for (std::size_t i = 0; i < declaration.parameters.size() && i < arguments.size(); ++i) {
+            substitutions.emplace(declaration.parameters[i], arguments[i]);
+        }
+        (void)span;
+        text::SourceText source("class __RsConstraintHolder { " + rawConstraint + " f; }", sourceName);
+        diagnostics::DiagnosticBag ignored;
+        syntax::Parser parser(source, ignored);
+        auto unit = parser.parseCompilationUnit();
+        if (unit.classes.empty() || unit.classes.front().fields.empty()) {
+            if (outSubstitutedText) *outSubstitutedText = rawConstraint;
+            return rawConstraint;
+        }
+        auto parsedType = unit.classes.front().fields.front().type;
+        std::function<void(syntax::TypeSyntax&)> substituteType = [&](syntax::TypeSyntax& t) {
+            const auto sub = substitutions.find(t.name.text);
+            if (sub != substitutions.end() && !t.isGeneric()) {
+                t.name.text = sub->second;
+            }
+            for (auto& arg : t.typeArguments) {
+                substituteType(arg);
+            }
+        };
+        substituteType(parsedType);
+        if (outSubstitutedText) {
+            *outSubstitutedText = nativeGenericTypeText(parsedType);
+        }
+        if (parsedType.isGeneric()) {
+            const auto savedLocalTypes = localTypes_;
+            std::vector<ParsedUnit*> dummyQueue;
+            rewriteType(parsedType, consumerModule, sourceName, dummyQueue);
+            for (std::size_t qIdx = 0; qIdx < dummyQueue.size(); ++qIdx) {
+                auto* u = dummyQueue[qIdx];
+                if (!u || !processed_.insert(u).second) continue;
+                rewriteUnit(*u, dummyQueue);
+            }
+            localTypes_ = savedLocalTypes;
+        }
+        return nativeGenericTypeText(parsedType);
     }
 
     bool validateConstraints(
@@ -989,10 +1069,22 @@ private:
             const auto facts = concreteTypeFacts(arguments[index]);
             for (const auto& constraint : found->second) {
                 bool satisfied = true;
-                if (constraint == "class") satisfied = facts.referenceType;
-                else if (constraint == "struct") satisfied = facts.valueType;
-                else if (constraint == "new()") satisfied = facts.defaultConstructor;
-                else continue;
+                if (constraint == "class") {
+                    satisfied = facts.referenceType;
+                } else if (constraint == "struct") {
+                    satisfied = facts.valueType;
+                } else if (constraint == "new()") {
+                    satisfied = facts.defaultConstructor;
+                } else {
+                    std::string substitutedType;
+                    const auto expectedType = resolveConstraintTypeName(
+                        constraint, declaration, arguments, consumerModule, span, sourceName, &substitutedType);
+                    satisfied = facts.known &&
+                        (facts.supertypes.find(expectedType) != facts.supertypes.end() ||
+                         (!substitutedType.empty() &&
+                          facts.supertypes.find(substitutedType) != facts.supertypes.end()) ||
+                         facts.supertypes.find(constraint) != facts.supertypes.end());
+                }
                 if (satisfied) continue;
                 result_.diagnostics.report(
                     "RS8530",

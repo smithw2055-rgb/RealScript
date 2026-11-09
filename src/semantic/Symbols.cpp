@@ -1200,10 +1200,16 @@ std::string canonicalFunctionKey(const FunctionSymbol& function) {
                 function.parameters[i].typeName);
     }
     out << ')';
+    if (function.name == "op_Implicit" || function.name == "op_Explicit") {
+        out << "->" << displayType(function.returnType, function.returnTypeName);
+    }
     return out.str();
 }
 
 std::string canonicalFunctionSignature(const FunctionSymbol& function) {
+    if (function.name == "op_Implicit" || function.name == "op_Explicit") {
+        return canonicalFunctionKey(function);
+    }
     return canonicalFunctionKey(function) + "->" + displayType(function.returnType, function.returnTypeName);
 }
 

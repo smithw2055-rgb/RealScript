@@ -657,10 +657,38 @@ enum class ErrorCode {
     CapabilityDenied,
 };
 
+struct StackTraceLocation {
+    semantic::SymbolId symbolId = 0;
+    std::string function;
+    std::string sourcePath;
+    std::uint32_t sourceLine = 0;
+    std::uint32_t sourceColumn = 0;
+    std::uint32_t generatedLine = 0;
+
+    [[nodiscard]] bool hasSourceLocation() const noexcept {
+        return !sourcePath.empty() && sourceLine != 0;
+    }
+
+    [[nodiscard]] std::string format() const {
+        if (!hasSourceLocation()) {
+            return function.empty() ? std::string("<unknown>") : function;
+        }
+        std::string out = function.empty() ? std::string("<unknown>") : function;
+        out += " (" + sourcePath + ":" + std::to_string(sourceLine);
+        if (sourceColumn != 0) {
+            out += ":" + std::to_string(sourceColumn);
+        }
+        out += ")";
+        return out;
+    }
+};
+
 struct RuntimeError {
     ErrorCode code = ErrorCode::None;
     std::string message;
     std::vector<std::string> stackTrace;
+    std::vector<StackTraceLocation> sourceLocations;
+    std::vector<std::string> symbolizedStackTrace;
 };
 
 struct HeapConfig {

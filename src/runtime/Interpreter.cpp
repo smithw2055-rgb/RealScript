@@ -198,6 +198,96 @@ std::vector<std::string> materializeStack(
     return result;
 }
 
+void populateInterpreterSourceLocations(State& state) {
+    state.error.sourceLocations.clear();
+    state.error.symbolizedStackTrace.clear();
+    state.error.sourceLocations.reserve(state.error.stackTrace.size());
+    state.error.symbolizedStackTrace.reserve(state.error.stackTrace.size());
+    for (std::size_t idx = 0; idx < state.error.stackTrace.size(); ++idx) {
+        const auto& frameName = state.error.stackTrace[idx];
+        StackTraceLocation loc;
+        loc.function = frameName;
+        if (state.program) {
+            if (const auto symbolId = state.program->findFunction(frameName)) {
+                loc.symbolId = *symbolId;
+                if (const auto* fnLoc = state.program->resolveFunction(*symbolId)) {
+                    const auto& dbg = fnLoc->function->debugInfo;
+                    const debug::SequencePoint* activeSp = nullptr;
+                    if (idx < state.debugFrames.size()) {
+                        const auto& dbgFrame =
+                            state.debugFrames[state.debugFrames.size() - 1 - idx];
+                        if (dbgFrame.function == fnLoc->function && dbgFrame.point) {
+                            activeSp = dbgFrame.point;
+                        }
+                    }
+                    if (!activeSp && !dbg.sequencePoints.empty()) {
+                        activeSp = &dbg.sequencePoints.front();
+                    }
+                    if (activeSp && fnLoc->module) {
+                        for (const auto& src : fnLoc->module->sourceFiles) {
+                            if (src.id == activeSp->range.fileId) {
+                                loc.sourcePath = src.path;
+                                break;
+                            }
+                        }
+                        loc.sourceLine =
+                            static_cast<std::uint32_t>(activeSp->range.start.line + 1);
+                        loc.sourceColumn =
+                            static_cast<std::uint32_t>(activeSp->range.start.column + 1);
+                    }
+                }
+            }
+        }
+        state.error.symbolizedStackTrace.push_back(loc.format());
+        state.error.sourceLocations.push_back(std::move(loc));
+    }
+}
+
+void refineInterpreterFrameSourceLocation(
+    State& state,
+    const ProgramImage::FunctionLocation& location,
+    bytecode::BlockId blockId,
+    std::uint32_t instructionIndex,
+    std::uint32_t span,
+    bool isTerminator = false) {
+    if (state.stack.empty() ||
+        state.error.sourceLocations.size() < state.stack.size() ||
+        state.error.symbolizedStackTrace.size() != state.error.sourceLocations.size()) {
+        return;
+    }
+    const std::size_t traceIdx = state.error.sourceLocations.size() - state.stack.size();
+    auto& loc = state.error.sourceLocations[traceIdx];
+    if (!location.function || !location.module) return;
+    const auto& dbg = location.function->debugInfo;
+    if (dbg.sequencePoints.empty()) return;
+
+    const std::uint32_t maxInstIdx =
+        instructionIndex + (span > 1 ? span - 1 : 0);
+    const debug::SequencePoint* bestSp = nullptr;
+    for (const auto& sp : dbg.sequencePoints) {
+        if (sp.blockId != blockId) continue;
+        if (isTerminator && sp.terminator) {
+            bestSp = &sp;
+            break;
+        }
+        if (!sp.terminator && sp.instructionIndex <= maxInstIdx) {
+            bestSp = &sp;
+        }
+    }
+    if (!bestSp) {
+        bestSp = &dbg.sequencePoints.front();
+    }
+    for (const auto& src : location.module->sourceFiles) {
+        if (src.id == bestSp->range.fileId) {
+            loc.sourcePath = src.path;
+            break;
+        }
+    }
+    loc.sourceLine = static_cast<std::uint32_t>(bestSp->range.start.line + 1);
+    loc.sourceColumn = static_cast<std::uint32_t>(bestSp->range.start.column + 1);
+    state.error.symbolizedStackTrace[traceIdx] = loc.format();
+}
+
 class ShadowFrameScope {
 public:
     ShadowFrameScope(
@@ -329,6 +419,7 @@ bool fail(State& state, ErrorCode code, std::string message) {
     state.error.message = std::move(message);
     state.error.stackTrace = materializeStack(state.stack);
     std::reverse(state.error.stackTrace.begin(), state.error.stackTrace.end());
+    populateInterpreterSourceLocations(state);
     emitTrace(state, TraceEventKind::RuntimeError, 0, state.error.message);
     notifyDebuggerException(
         state,
@@ -1031,6 +1122,7 @@ bool executeCall(
         }
         state.error.stackTrace = materializeStack(state.stack);
         std::reverse(state.error.stackTrace.begin(), state.error.stackTrace.end());
+        populateInterpreterSourceLocations(state);
         notifyDebuggerException(
             state,
             state.error.code,
@@ -2766,6 +2858,7 @@ bool executeFunction(
             }
             state.error.stackTrace = materializeStack(state.stack);
             std::reverse(state.error.stackTrace.begin(), state.error.stackTrace.end());
+            populateInterpreterSourceLocations(state);
             state.stack.pop_back();
             return false;
         }
@@ -3827,6 +3920,19 @@ L_FlatError:
                 RS_FLAT_DISPATCH_AT_IP();
             }
         }
+        if (!state.pendingException &&
+            ip >= streamBase &&
+            ip < streamBase + execution->flatStream.size() &&
+            ip->blockIndex < execution->blocks.size()) {
+            const bool isTerm = ip->flatOpcode >= detail::FlatOpcode::TermJumpNoArgs;
+            refineInterpreterFrameSourceLocation(
+                state,
+                location,
+                execution->blocks[ip->blockIndex].bytecode->id,
+                ip->instructionIndexInBlock,
+                ip->span,
+                isTerm);
+        }
         state.valueTop = frameOffset;
         state.stack.pop_back();
         return false;
@@ -3963,6 +4069,14 @@ L_FlatError:
                         exceptionTransferred = true;
                         break;
                     }
+                } else {
+                    refineInterpreterFrameSourceLocation(
+                        state,
+                        location,
+                        bytecodeBlock.id,
+                        static_cast<std::uint32_t>(instructionIndex),
+                        static_cast<std::uint32_t>(executionSpan),
+                        false);
                 }
                 state.stack.pop_back();
                 return false;
@@ -4320,6 +4434,7 @@ ExecutionResult Interpreter::invoke(
         state.error.code = ErrorCode::ScriptException;
         state.error.message = "unhandled script exception";
         state.error.stackTrace = materializeStack(state.stack);
+        populateInterpreterSourceLocations(state);
     }
     if (state.determinismEventsEnabled) {
         state.determinism.mergeEventDigest(

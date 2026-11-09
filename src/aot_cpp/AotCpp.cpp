@@ -2038,9 +2038,12 @@ void emitTypedPrimitiveFunction(
     source.line("    ExecutionContext::TypedDeterminismAccountingScope<DeterminismAccounting && !TrustedRelease> determinismAccounting(context);");
     source.line("    std::conditional_t<!FastAccounting && !DeterminismAccounting && !TrustedRelease, std::vector<runtime::PersistentRoot>, aot::EmptyGcGuards> typedLocalGcGuards;");
     source.line("    (void)typedLocalGcGuards;");
+    source.line("    std::uint32_t typedActiveGenLine = 0;");
+    source.line("    (void)typedActiveGenLine;");
     source.line("    const auto typedFail = [&](runtime::ErrorCode code, const char* message) {");
     source.line("        if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush();");
-    source.line("        return context.fail(code, message);");
+    source.line("        context.setActiveGeneratedLine(typedActiveGenLine);");
+    source.line("        return context.fail(code, message, typedActiveGenLine);");
     source.line("    };");
     source.line("    (void)typedFail;");
     std::vector<std::size_t> localStoreCounts(function.localTypes.size(), 0);
@@ -2163,6 +2166,7 @@ void emitTypedPrimitiveFunction(
                 false,
                 instruction.sourceSpan,
                 &explicitPoint);
+            const std::uint32_t currentInstGenLine = source.nextLine() + (options.emitLineDirectives && resolvedPoint ? 1u : 0u);
             if (emitLineDirective(
                     source,
                     module,
@@ -2170,8 +2174,11 @@ void emitTypedPrimitiveFunction(
                     options.emitLineDirectives,
                     &sourceMap,
                     function.symbolId,
-                    explicitPoint)) {
+                    true)) {
                 activeSourceLine = true;
+            }
+            if (resolvedPoint) {
+                source.line("            typedActiveGenLine = " + std::to_string(currentInstGenLine) + "u;");
             }
             const auto result = instruction.result >= 0
                 ? typedValueExpression(instruction.result)
@@ -2667,7 +2674,7 @@ void emitTypedPrimitiveFunction(
                     source.line("            (void)prevFn_" + suffix + ";");
                     source.line("            if (!context.enterTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>(0x" +
                         hexId(calleeView->function->symbolId) + "ULL, \"" +
-                        escapeCppString(calleeView->qualifiedName) + "\", prevFn_" + suffix + ")) {");
+                        escapeCppString(calleeView->qualifiedName) + "\", prevFn_" + suffix + ", typedActiveGenLine)) {");
                     source.line("                if constexpr (!TrustedRelease) {");
                     source.line("                    rawAccounting.resumeAfterCall();");
                     source.line("                    determinismAccounting.resumeAfterCall();");
@@ -2801,6 +2808,7 @@ void emitTypedPrimitiveFunction(
                             source.line("            }};");
                             argPtr = "bridgeArgs_" + suffix + ".data()";
                         }
+                        source.line("            context.setActiveGeneratedLine(typedActiveGenLine);");
                         source.line("            runtime::Value bridgeRes_" + suffix + ";");
                         source.line("            const bool bridgeOk_" + suffix +
                             " = context.call(call_" + std::to_string(callId) +
@@ -3725,6 +3733,7 @@ GeneratedProgram CppGenerator::generate(
                     false,
                     instruction.sourceSpan,
                     &explicitPoint);
+                const std::uint32_t currentInstGenLine = source.nextLine() + (options.emitLineDirectives && resolvedPoint ? 1u : 0u);
                 if (emitLineDirective(
                         source,
                         module,
@@ -3732,8 +3741,11 @@ GeneratedProgram CppGenerator::generate(
                         options.emitLineDirectives,
                         &sourceMap,
                         function.symbolId,
-                        explicitPoint)) {
+                        true)) {
                     activeSourceLine = true;
+                }
+                if (resolvedPoint) {
+                    source.line("            context.setActiveGeneratedLine(" + std::to_string(currentInstGenLine) + "u);");
                 }
                 const auto result = instruction.result >= 0
                     ? valueExpression(instruction.result)
@@ -4004,6 +4016,7 @@ GeneratedProgram CppGenerator::generate(
                 true,
                 block.terminator.sourceSpan,
                 &explicitTermPoint);
+            const std::uint32_t currentTermGenLine = source.nextLine() + (options.emitLineDirectives && resolvedTermPoint ? 1u : 0u);
             emitLineDirective(
                 source,
                 module,
@@ -4011,7 +4024,10 @@ GeneratedProgram CppGenerator::generate(
                 options.emitLineDirectives,
                 &sourceMap,
                 function.symbolId,
-                explicitTermPoint);
+                true);
+            if (resolvedTermPoint) {
+                source.line("            context.setActiveGeneratedLine(" + std::to_string(currentTermGenLine) + "u);");
+            }
             switch (block.terminator.kind) {
             case mir::TerminatorKind::ReturnVoid:
                 source.line("            result = std::monostate{};");

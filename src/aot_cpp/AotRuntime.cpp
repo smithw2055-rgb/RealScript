@@ -209,6 +209,7 @@ ExecutionContext::ExecutionContext(
         typesPtr_ = &ownedTypes_;
     }
     stack_.reserve(64);
+    stackSites_.reserve(64);
     if (prebuiltFunctions) {
         functionsPtr_ = prebuiltFunctions;
     } else {
@@ -221,6 +222,65 @@ ExecutionContext::ExecutionContext(
     }
 }
 
+namespace {
+
+std::optional<runtime::StackTraceLocation> lookupDescriptorSourceLocation(
+    const ProgramDescriptor& descriptor,
+    semantic::SymbolId symbolId,
+    const char* functionName,
+    std::uint32_t generatedLine) {
+    if (symbolId == 0 && (!functionName || functionName[0] == '\0')) {
+        return std::nullopt;
+    }
+    std::string resolvedName = functionName ? functionName : "";
+    if (symbolId == 0 && descriptor.functions) {
+        for (std::uint32_t i = 0; i < descriptor.functionCount; ++i) {
+            if (descriptor.functions[i].name &&
+                resolvedName == descriptor.functions[i].name) {
+                symbolId = descriptor.functions[i].symbolId;
+                break;
+            }
+        }
+    } else if (resolvedName.empty() && descriptor.functions) {
+        for (std::uint32_t i = 0; i < descriptor.functionCount; ++i) {
+            if (descriptor.functions[i].symbolId == symbolId &&
+                descriptor.functions[i].name) {
+                resolvedName = descriptor.functions[i].name;
+                break;
+            }
+        }
+    }
+    if (symbolId == 0) return std::nullopt;
+
+    const SourceMapEntry* best = nullptr;
+    if (descriptor.sourceMap && descriptor.sourceMapCount > 0) {
+        for (std::uint32_t i = 0; i < descriptor.sourceMapCount; ++i) {
+            const auto& entry = descriptor.sourceMap[i];
+            if (entry.symbolId != symbolId) continue;
+            if (!best) {
+                best = &entry;
+            } else if (generatedLine != 0 && entry.generatedLine <= generatedLine &&
+                       entry.generatedLine >= best->generatedLine) {
+                best = &entry;
+            }
+        }
+    }
+
+    runtime::StackTraceLocation loc;
+    loc.symbolId = symbolId;
+    loc.function = std::move(resolvedName);
+    if (best) {
+        loc.sourcePath = best->sourcePath ? best->sourcePath : "";
+        loc.sourceLine = best->sourceLine;
+        loc.sourceColumn = best->sourceColumn;
+        loc.generatedLine = generatedLine != 0 ? generatedLine : best->generatedLine;
+        return loc;
+    }
+    return loc;
+}
+
+} // namespace
+
 std::vector<std::string> ExecutionContext::materializeStackTrace() const {
     std::vector<std::string> result;
     result.reserve(stack_.size());
@@ -228,6 +288,53 @@ std::vector<std::string> ExecutionContext::materializeStackTrace() const {
         result.emplace_back(*it ? *it : "<aot-function>");
     }
     return result;
+}
+
+std::vector<runtime::StackTraceLocation>
+ExecutionContext::materializeSourceLocations() const {
+    std::vector<runtime::StackTraceLocation> result;
+    result.reserve(stack_.size());
+    for (std::size_t idx = stack_.size(); idx > 0; --idx) {
+        const std::size_t i = idx - 1;
+        const char* fnName = stack_[i] ? stack_[i] : "<aot-function>";
+        const semantic::SymbolId symId =
+            i < stackSites_.size() ? stackSites_[i].symbolId : 0;
+        const std::uint32_t genLine =
+            i < stackSites_.size() ? stackSites_[i].generatedLine : 0;
+        if (program_) {
+            if (auto resolved = lookupDescriptorSourceLocation(
+                    *program_, symId, fnName, genLine)) {
+                result.push_back(std::move(*resolved));
+                continue;
+            }
+        }
+        runtime::StackTraceLocation fallback;
+        fallback.symbolId = symId;
+        fallback.function = fnName;
+        fallback.generatedLine = genLine;
+        result.push_back(std::move(fallback));
+    }
+    return result;
+}
+
+std::vector<std::string>
+ExecutionContext::materializeSymbolizedStackTrace() const {
+    const auto locations = materializeSourceLocations();
+    std::vector<std::string> result;
+    result.reserve(locations.size());
+    for (const auto& loc : locations) {
+        result.push_back(loc.format());
+    }
+    return result;
+}
+
+void ExecutionContext::populateErrorStackTrace(std::uint32_t activeGeneratedLine) {
+    if (activeGeneratedLine != 0 && !stackSites_.empty()) {
+        stackSites_.back().generatedLine = activeGeneratedLine;
+    }
+    error_.stackTrace = materializeStackTrace();
+    error_.sourceLocations = materializeSourceLocations();
+    error_.symbolizedStackTrace = materializeSymbolizedStackTrace();
 }
 
 const TypeDescriptor* ExecutionContext::findType(
@@ -312,10 +419,11 @@ void ExecutionContext::emitTrace(
 
 bool ExecutionContext::fail(
     runtime::ErrorCode code,
-    std::string message) {
+    std::string message,
+    std::uint32_t generatedLine) {
     error_.code = code;
     error_.message = std::move(message);
-    error_.stackTrace = materializeStackTrace();
+    populateErrorStackTrace(generatedLine);
     emitTrace(runtime::TraceEventKind::RuntimeError, 0, error_.message);
     return false;
 }
@@ -396,6 +504,9 @@ bool ExecutionContext::throwScript(const runtime::Value& value) {
             "throw requires a non-null script object");
     }
     pendingException_ = value;
+    error_.stackTrace = materializeStackTrace();
+    error_.sourceLocations = materializeSourceLocations();
+    error_.symbolizedStackTrace = materializeSymbolizedStackTrace();
     return false;
 }
 
@@ -418,6 +529,11 @@ bool ExecutionContext::takePendingException(runtime::Value& value) {
     if (!pendingException_) return false;
     value = *pendingException_;
     pendingException_.reset();
+    if (error_.code == runtime::ErrorCode::None) {
+        error_.stackTrace.clear();
+        error_.sourceLocations.clear();
+        error_.symbolizedStackTrace.clear();
+    }
     return true;
 }
 
@@ -425,7 +541,9 @@ void ExecutionContext::reportUnhandledScriptException() {
     if (!pendingException_ || error_.code != runtime::ErrorCode::None) return;
     error_.code = runtime::ErrorCode::ScriptException;
     error_.message = "unhandled script exception";
-    error_.stackTrace = materializeStackTrace();
+    if (error_.stackTrace.empty()) {
+        populateErrorStackTrace();
+    }
 }
 
 bool ExecutionContext::expectType(
@@ -607,20 +725,29 @@ bool ExecutionContext::invoke(
     }
 
     if (trustedReleaseEnabled()) {
+        const auto previousFunctionId = currentFunctionId_;
+        currentFunctionId_ = function->symbolId;
+        stack_.push_back(function->name ? function->name : "<aot-function>");
+        stackSites_.push_back({function->symbolId, 0});
         ++statistics_.functionCalls;
         if (statistics_.maximumCallDepth == 0) {
             statistics_.maximumCallDepth = 1;
         }
-        return function->implementation(
+        const bool ok = function->implementation(
             *this,
             arguments,
             argumentCount,
             result);
+        if (!stack_.empty()) stack_.pop_back();
+        if (!stackSites_.empty()) stackSites_.pop_back();
+        currentFunctionId_ = previousFunctionId;
+        return ok;
     }
 
     const auto previousFunctionId = currentFunctionId_;
     currentFunctionId_ = function->symbolId;
     stack_.push_back(function->name ? function->name : "<aot-function>");
+    stackSites_.push_back({function->symbolId, 0});
     ++statistics_.functionCalls;
     statistics_.maximumCallDepth = std::max(
         statistics_.maximumCallDepth,
@@ -645,7 +772,8 @@ bool ExecutionContext::invoke(
             "AOT execution threw an unknown exception");
     }
     if (!succeeded) {
-        stack_.pop_back();
+        if (!stack_.empty()) stack_.pop_back();
+        if (!stackSites_.empty()) stackSites_.pop_back();
         currentFunctionId_ = previousFunctionId;
         return false;
     }
@@ -654,7 +782,8 @@ bool ExecutionContext::invoke(
             function->returnType,
             function->returnTypeId,
             "return value")) {
-        stack_.pop_back();
+        if (!stack_.empty()) stack_.pop_back();
+        if (!stackSites_.empty()) stackSites_.pop_back();
         currentFunctionId_ = previousFunctionId;
         return false;
     }
@@ -666,7 +795,8 @@ bool ExecutionContext::invoke(
             emitTrace(runtime::TraceEventKind::FunctionExit);
         }
     }
-    stack_.pop_back();
+    if (!stack_.empty()) stack_.pop_back();
+    if (!stackSites_.empty()) stackSites_.pop_back();
     currentFunctionId_ = previousFunctionId;
     return true;
 }
@@ -861,7 +991,7 @@ bool ExecutionContext::call(
             error_.code = runtime::ErrorCode::ExternalFunctionUnresolved;
             error_.message = "external function '" + reference.name + "' failed";
         }
-        error_.stackTrace = materializeStackTrace();
+        populateErrorStackTrace();
         return false;
     }
     if (!expectSignatureType(
@@ -2540,6 +2670,48 @@ runtime::ExecutionResult Program::invoke(
         return missing;
     }
     return invoke(found->second, arguments, std::move(options));
+}
+
+std::optional<runtime::StackTraceLocation> Program::resolveSourceLocation(
+    semantic::SymbolId symbolId,
+    std::uint32_t generatedLine) const {
+    if (!descriptor_) return std::nullopt;
+    auto loc = lookupDescriptorSourceLocation(*descriptor_, symbolId, nullptr, generatedLine);
+    if (loc && loc->hasSourceLocation()) return loc;
+    return std::nullopt;
+}
+
+std::optional<runtime::StackTraceLocation> Program::resolveSourceLocation(
+    const std::string& qualifiedName,
+    std::uint32_t generatedLine) const {
+    const auto found = names_.find(qualifiedName);
+    if (found == names_.end()) return std::nullopt;
+    return resolveSourceLocation(found->second, generatedLine);
+}
+
+std::vector<std::string> Program::symbolizeStackTrace(
+    const runtime::RuntimeError& error) const {
+    if (!error.symbolizedStackTrace.empty()) {
+        return error.symbolizedStackTrace;
+    }
+    if (!error.sourceLocations.empty()) {
+        std::vector<std::string> out;
+        out.reserve(error.sourceLocations.size());
+        for (const auto& loc : error.sourceLocations) {
+            out.push_back(loc.format());
+        }
+        return out;
+    }
+    std::vector<std::string> out;
+    out.reserve(error.stackTrace.size());
+    for (const auto& frameName : error.stackTrace) {
+        if (const auto loc = resolveSourceLocation(frameName, 0)) {
+            out.push_back(loc->format());
+        } else {
+            out.push_back(frameName);
+        }
+    }
+    return out;
 }
 
 } // namespace realscript::aot

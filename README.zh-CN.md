@@ -227,7 +227,7 @@ RealScript 不是 CLR 兼容 C#。v0.98.0 明确不提供：
 - 通用 `Task`、线程或不受限的 `async/await`；
 - Unsafe Pointer、Ref Struct、Ref Property 或完整 Escape Analysis；
 - Exception Filter、`using`、Native Exception Interop，或异常跨越协程暂停点；
-- 用户自定义隐式/显式转换、LINQ、`dynamic`、反射代码生成或 .NET BCL；
+- LINQ、`dynamic`、反射代码生成或 .NET BCL；
 - 直接进程内机器码 JIT、OSR、PGO 或 Rollback Networking Protocol；
 - Source、`.rsbc`、AOT ABI、SDK Metadata 和 Gameplay State 的长期冻结兼容性。
 

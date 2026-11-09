@@ -264,7 +264,8 @@ static_assert(sizeof(BytecodeString) == 4, "BytecodeString must be 4 bytes");
 static_assert(std::is_trivially_copyable_v<BytecodeString>);
 
 struct Instruction {
-    constexpr Instruction() noexcept = default;
+    constexpr Instruction() noexcept
+        : elementTypeId(0) {}
 
     Opcode opcode = Opcode::ConstantInt;
     semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
@@ -276,7 +277,7 @@ struct Instruction {
     std::uint16_t typeIndex = 0;
     std::uint16_t reserved0_ = 0;
     union {
-        semantic::SymbolId elementTypeId = 0;
+        semantic::SymbolId elementTypeId;
         std::int64_t integerImmediate;
         double doubleImmediate;
         BytecodeString stringImmediate;

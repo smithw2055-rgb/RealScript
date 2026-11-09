@@ -651,6 +651,37 @@ ClassDeclarationSyntax Parser::parseClassDeclaration(
             result.constructors.push_back(parseConstructorDeclaration(
                 std::move(memberAttributes), std::move(memberModifiers)));
         } else {
+            if (current().kind == SyntaxKind::IdentifierToken &&
+                (current().text == "implicit" || current().text == "explicit") &&
+                peek(1).kind == SyntaxKind::OperatorKeyword) {
+                const auto convKeyword = nextToken();
+                const auto operatorKeyword = nextToken();
+                auto targetType = parseType();
+                SyntaxToken identifier;
+                identifier.kind = SyntaxKind::IdentifierToken;
+                identifier.span = operatorKeyword.span;
+                identifier.text = convKeyword.text == "implicit"
+                    ? "op_Implicit"
+                    : "op_Explicit";
+                auto method = parseFunctionDeclaration(
+                    std::move(memberModifiers), std::move(targetType),
+                    std::move(identifier), std::move(memberAttributes));
+                if (!isStatic) {
+                    diagnostics_.report(
+                        "RS1112",
+                        "user-defined conversion operator declaration must be static",
+                        operatorKeyword.span);
+                }
+                if (method.parameters.size() != 1) {
+                    diagnostics_.report(
+                        "RS1113",
+                        "user-defined conversion operator must take exactly 1 parameter",
+                        operatorKeyword.span);
+                    method.identifierToken.text = "op_Invalid";
+                }
+                result.methods.push_back(std::move(method));
+                continue;
+            }
             std::optional<SyntaxToken> refReturnKeyword;
             if (current().kind == SyntaxKind::RefKeyword) {
                 refReturnKeyword = nextToken();
@@ -874,6 +905,37 @@ StructDeclarationSyntax Parser::parseStructDeclaration(
             result.constructors.push_back(parseConstructorDeclaration(
                 std::move(memberAttributes), std::move(memberModifiers)));
         } else {
+            if (current().kind == SyntaxKind::IdentifierToken &&
+                (current().text == "implicit" || current().text == "explicit") &&
+                peek(1).kind == SyntaxKind::OperatorKeyword) {
+                const auto convKeyword = nextToken();
+                const auto operatorKeyword = nextToken();
+                auto targetType = parseType();
+                SyntaxToken identifier;
+                identifier.kind = SyntaxKind::IdentifierToken;
+                identifier.span = operatorKeyword.span;
+                identifier.text = convKeyword.text == "implicit"
+                    ? "op_Implicit"
+                    : "op_Explicit";
+                auto method = parseFunctionDeclaration(
+                    std::move(memberModifiers), std::move(targetType),
+                    std::move(identifier), std::move(memberAttributes));
+                if (!isStatic) {
+                    diagnostics_.report(
+                        "RS1112",
+                        "user-defined conversion operator declaration must be static",
+                        operatorKeyword.span);
+                }
+                if (method.parameters.size() != 1) {
+                    diagnostics_.report(
+                        "RS1113",
+                        "user-defined conversion operator must take exactly 1 parameter",
+                        operatorKeyword.span);
+                    method.identifierToken.text = "op_Invalid";
+                }
+                result.methods.push_back(std::move(method));
+                continue;
+            }
             std::optional<SyntaxToken> refReturnKeyword;
             if (current().kind == SyntaxKind::RefKeyword) {
                 refReturnKeyword = nextToken();
@@ -2080,8 +2142,32 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
         return result;
     }
     case SyntaxKind::OpenParenToken: {
-        if (isPrimitiveTypeKeyword(peek(1).kind) &&
-            peek(2).kind == SyntaxKind::CloseParenToken) {
+        const auto startsOperandAfterCast = [](SyntaxKind k) noexcept {
+            switch (k) {
+            case SyntaxKind::IdentifierToken:
+            case SyntaxKind::IntegerLiteralToken:
+            case SyntaxKind::FloatLiteralToken:
+            case SyntaxKind::StringLiteralToken:
+            case SyntaxKind::InterpolatedStringToken:
+            case SyntaxKind::TrueKeyword:
+            case SyntaxKind::FalseKeyword:
+            case SyntaxKind::NullKeyword:
+            case SyntaxKind::ThisKeyword:
+            case SyntaxKind::BaseKeyword:
+            case SyntaxKind::NewKeyword:
+            case SyntaxKind::TypeofKeyword:
+            case SyntaxKind::OpenParenToken:
+            case SyntaxKind::BangToken:
+                return true;
+            default:
+                return false;
+            }
+        };
+        if ((isPrimitiveTypeKeyword(peek(1).kind) &&
+             peek(2).kind == SyntaxKind::CloseParenToken) ||
+            (peek(1).kind == SyntaxKind::IdentifierToken &&
+             peek(2).kind == SyntaxKind::CloseParenToken &&
+             startsOperandAfterCast(peek(3).kind))) {
             auto result = std::make_unique<CastExpressionSyntax>();
             result->openParenToken = nextToken();
             result->type = parseType();

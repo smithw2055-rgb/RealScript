@@ -14,7 +14,7 @@ RealScript 采用 C# 风格语法，但不是 CLR、ECMA C# 或 .NET 标准库�
 | Interface | 支持 | Interface 类型值、实现契约和确定性运行时分派；无默认 Interface 实现。 |
 | 访问控制 | 支持 | 已支持声明上的 `public`、`internal`、`protected`、`private`。 |
 | Delegate 与 Closure | 支持 | 一等委托、方法组、堆闭包、共享可变捕获、多播和通用 Event 存储。 |
-| 泛型 | 支持 | 编译期特化、推断、泛型成员、`class`/`struct`/`new()` 约束、泛型 Interface/Delegate；无开放运行时泛型和协变/逆变。 |
+| 泛型 | 支持 | 编译期特化、推断、泛型成员、`class`/`struct`/`new()` 与多接口复合 `where` 约束、泛型 Interface/Delegate；无开放运行时泛型和协变/逆变。 |
 | 集合与 `foreach` | 支持 | 可增长且确定性的 `List`、`Dictionary`、`HashSet`、`Queue`、`Stack` 和 Enumerator 协议；不是 .NET 集合库或 LINQ。 |
 | Struct | 支持 | 值复制、可变 receiver、隐式/ref `this`、嵌套托管引用和结构相等。 |
 | 精确基础值类型 | 支持 | 精确有符号/无符号整数宽度、binary32 `float`、binary64 `double`、`char`，以及 checked/unchecked 转换。 |
@@ -22,7 +22,7 @@ RealScript 采用 C# 风格语法，但不是 CLR、ECMA C# 或 .NET 标准库�
 | Boxing/Unboxing | 支持 | 保留脚本值类型精确身份，并纳入托管堆与 GC。 |
 | 引用位置 | 部分支持 | ref 参数、局部、返回、字段、Indexer 与 ref `this`；无 unsafe 指针、ref property、ref struct 和完整逃逸分析。 |
 | Attribute | 部分支持 | 原生语法及编译器/Game SDK/产物元数据，自动导入 `ScriptMetadataRegistry` 与 `InspectorTypeSchema`；无可执行 Attribute Class 和完整 `AttributeUsage`。 |
-| 用户运算符/转换 | 部分支持 | 支持自定义 `operator` 重载（`+`、`-`、`*`、`/`、`%`、`==`、`!=`、`<`、`<=`、`>`、`>=`、一元 `-`、`!`、`~`）与复合赋值（`+=`、`-=`、`*=`、`/=`、`%=`）；不支持自定义隐式/显式类型转换。 |
+| 用户运算符/转换 | 支持 | 支持自定义 `operator` 重载（`+`、`-`、`*`、`/`、`%`、`==`、`!=`、`<`、`<=`、`>`、`>=`、一元 `-`、`!`、`~`）、复合赋值（`+=`、`-=`、`*=`、`/=`、`%=`）与自定义隐式/显式类型转换运算符（`public static implicit/explicit operator Target(Source)`）。 |
 | `const`、`readonly`、静态成员与属性初始化器 | 支持 | 支持编译期 `const`、构造函数内赋值的 `readonly` 字段、`static class`、确定性静态构造函数（`static T()`）、`static` 字段及初始化器，以及跨解释器、字节码与 C++17 AOT 的实例/静态自动属性初始化器（`{ get; set; } = expr;`）。 |
 
 ## 表达式与控制流

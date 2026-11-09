@@ -285,6 +285,85 @@ std::vector<const syntax::ExpressionSyntax*> syntaxPointers(
     return result;
 }
 
+const FunctionSymbol* findUserDefinedConversion(
+    PrimitiveType sourceType,
+    const std::string& sourceTypeName,
+    PrimitiveType targetType,
+    const std::string& targetTypeName,
+    bool allowExplicit,
+    const TypeSymbolMap& visibleTypes,
+    bool& ambiguous) {
+    ambiguous = false;
+    std::vector<const FunctionSymbol*> candidates;
+    std::unordered_set<SymbolId> seenIds;
+    const auto collectFromOwner = [&](const std::string& ownerTypeName) {
+        if (ownerTypeName.empty()) return;
+        const auto ownerIt = visibleTypes.find(ownerTypeName);
+        if (ownerIt == visibleTypes.end()) return;
+        for (const auto& method : ownerIt->second.methods) {
+            if (!method.staticMethod || method.parameters.size() != 1) continue;
+            if (method.name != "op_Implicit" &&
+                (!allowExplicit || method.name != "op_Explicit")) {
+                continue;
+            }
+            if (method.returnType != targetType) continue;
+            if (isExactType(targetType) &&
+                !targetTypeName.empty() &&
+                !method.returnTypeName.empty() &&
+                method.returnTypeName != targetTypeName) {
+                continue;
+            }
+            if (seenIds.insert(method.id).second) {
+                candidates.push_back(&method);
+            }
+        }
+    };
+    if ((sourceType == PrimitiveType::Struct ||
+         sourceType == PrimitiveType::Object) &&
+        !sourceTypeName.empty()) {
+        collectFromOwner(sourceTypeName);
+    }
+    if ((targetType == PrimitiveType::Struct ||
+         targetType == PrimitiveType::Object) &&
+        !targetTypeName.empty()) {
+        collectFromOwner(targetTypeName);
+    }
+    if (candidates.empty()) return nullptr;
+
+    const FunctionSymbol* best = nullptr;
+    int bestScore = std::numeric_limits<int>::max();
+    for (const auto* candidate : candidates) {
+        const auto& param = candidate->parameters[0];
+        if (param.modifier != ParameterModifier::None &&
+            param.modifier != ParameterModifier::In) {
+            continue;
+        }
+        int rank = -1;
+        if (sourceType == param.type &&
+            (!isExactType(param.type) ||
+             param.typeName.empty() ||
+             sourceTypeName.empty() ||
+             sourceTypeName == param.typeName ||
+             (param.type == PrimitiveType::Object &&
+              isAssignable(visibleTypes, sourceTypeName, param.typeName)))) {
+            rank = (sourceTypeName == param.typeName) ? 0 : 1;
+        } else if (!isExactType(sourceType) && !isExactType(param.type)) {
+            rank = conversionRank(sourceType, param.type);
+            if (rank >= 0) rank += 2;
+        }
+        if (rank < 0) continue;
+        if (candidate->name == "op_Explicit") rank += 1;
+        if (rank < bestScore) {
+            best = candidate;
+            bestScore = rank;
+            ambiguous = false;
+        } else if (rank == bestScore && best && best->id != candidate->id) {
+            ambiguous = true;
+        }
+    }
+    return best;
+}
+
 bool exactParameterMatch(
     const BoundExpression& expression,
     const VariableSymbol& parameter,
@@ -319,13 +398,26 @@ const FunctionSymbol* selectBest(
                 break;
             }
             if (parameter.modifier == ParameterModifier::None) {
-                const auto rank = conversionRank(
+                auto rank = conversionRank(
                     arguments[i]->type, parameter.type);
                 if (rank < 0 ||
                     (arguments[i]->type == parameter.type &&
                      !exactParameterMatch(*arguments[i], parameter, visibleTypes))) {
-                    applicable = false;
-                    break;
+                    bool convAmbig = false;
+                    const auto* userConv = findUserDefinedConversion(
+                        arguments[i]->type,
+                        arguments[i]->typeName,
+                        parameter.type,
+                        parameter.typeName,
+                        false,
+                        visibleTypes,
+                        convAmbig);
+                    if (userConv && !convAmbig) {
+                        rank = 5;
+                    } else {
+                        applicable = false;
+                        break;
+                    }
                 }
                 score += rank;
             } else if (!exactParameterMatch(
@@ -474,14 +566,27 @@ FlexibleCallPlan selectFlexibleCall(
                 break;
             }
             if (parameter.modifier == ParameterModifier::None) {
-                const auto rank = conversionRank(
+                auto rank = conversionRank(
                     arguments[source]->type, parameter.type);
                 if (rank < 0 ||
                     (arguments[source]->type == parameter.type &&
                      !exactParameterMatch(
                          *arguments[source], parameter, visibleTypes))) {
-                    applicable = false;
-                    break;
+                    bool convAmbig = false;
+                    const auto* userConv = findUserDefinedConversion(
+                        arguments[source]->type,
+                        arguments[source]->typeName,
+                        parameter.type,
+                        parameter.typeName,
+                        false,
+                        visibleTypes,
+                        convAmbig);
+                    if (userConv && !convAmbig) {
+                        rank = 5;
+                    } else {
+                        applicable = false;
+                        break;
+                    }
                 }
                 score += rank;
             } else if (!exactParameterMatch(
@@ -3598,6 +3703,45 @@ std::unique_ptr<BoundExpression> Binder::bindCastExpression(
     if (isNumericType(expression->type) && isNumericType(target)) {
         conversion = ConversionKind::Numeric;
     }
+    if (conversion == ConversionKind::None ||
+        (isExactType(target) && expression->type == target &&
+         !sameExactType(*expression, target, targetTypeName, visibleTypes_))) {
+        bool convAmbiguous = false;
+        const auto* userConv = findUserDefinedConversion(
+            expression->type,
+            expression->typeName,
+            target,
+            targetTypeName,
+            true,
+            visibleTypes_,
+            convAmbiguous);
+        if (convAmbiguous) {
+            diagnostics_.report(
+                "RS2473",
+                "user-defined conversion is ambiguous",
+                syntaxTree.span());
+            return makeError(syntaxTree.span());
+        }
+        if (userConv &&
+            isMemberAccessible(
+                userConv->accessibility,
+                userConv->declaringTypeId,
+                userConv->moduleName)) {
+            auto call = std::make_unique<BoundCallExpression>();
+            call->span = syntaxTree.span();
+            call->type = storageReturnTypeOf(*userConv);
+            call->typeName = storageReturnTypeNameOf(*userConv);
+            call->function = *userConv;
+            call->arguments.push_back(convertExpression(
+                std::move(expression),
+                userConv->parameters[0].type,
+                syntaxTree.expression->span(),
+                "conversion operator operand",
+                userConv->parameters[0].typeName));
+            call->argumentEvaluationOrder = {0};
+            return call;
+        }
+    }
     if (conversion == ConversionKind::None) {
         diagnostics_.report(
             "RS2106",
@@ -5665,6 +5809,36 @@ std::unique_ptr<BoundExpression> Binder::convertExpression(
     if (isExactType(target) && expression->type == target &&
         !sameExactType(
             *expression, target, targetTypeName, visibleTypes_)) {
+        bool convAmbiguous = false;
+        const auto* userConv = findUserDefinedConversion(
+            expression->type,
+            expression->typeName,
+            target,
+            targetTypeName,
+            false,
+            visibleTypes_,
+            convAmbiguous);
+        if (convAmbiguous) {
+            diagnostics_.report(
+                "RS2473",
+                "user-defined implicit conversion is ambiguous for " + context,
+                span);
+            return makeError(span);
+        }
+        if (userConv &&
+            isMemberAccessible(
+                userConv->accessibility,
+                userConv->declaringTypeId,
+                userConv->moduleName)) {
+            auto call = std::make_unique<BoundCallExpression>();
+            call->span = span;
+            call->type = storageReturnTypeOf(*userConv);
+            call->typeName = storageReturnTypeNameOf(*userConv);
+            call->function = *userConv;
+            call->arguments.push_back(std::move(expression));
+            call->argumentEvaluationOrder = {0};
+            return call;
+        }
         diagnostics_.report(
             "RS2410",
             "cannot convert exact type '" + expression->typeName +
@@ -5678,6 +5852,45 @@ std::unique_ptr<BoundExpression> Binder::convertExpression(
         conversion = ConversionKind::Numeric;
     }
     if (conversion == ConversionKind::None) {
+        bool convAmbiguous = false;
+        const auto* userConv = findUserDefinedConversion(
+            expression->type,
+            expression->typeName,
+            target,
+            targetTypeName,
+            false,
+            visibleTypes_,
+            convAmbiguous);
+        if (convAmbiguous) {
+            diagnostics_.report(
+                "RS2473",
+                "user-defined implicit conversion is ambiguous for " + context,
+                span);
+            return makeError(span);
+        }
+        if (userConv &&
+            isMemberAccessible(
+                userConv->accessibility,
+                userConv->declaringTypeId,
+                userConv->moduleName)) {
+            auto call = std::make_unique<BoundCallExpression>();
+            call->span = span;
+            call->type = storageReturnTypeOf(*userConv);
+            call->typeName = storageReturnTypeNameOf(*userConv);
+            call->function = *userConv;
+            if (expression->type == userConv->parameters[0].type) {
+                call->arguments.push_back(std::move(expression));
+            } else {
+                call->arguments.push_back(convertExpression(
+                    std::move(expression),
+                    userConv->parameters[0].type,
+                    span,
+                    "implicit conversion operand",
+                    userConv->parameters[0].typeName));
+            }
+            call->argumentEvaluationOrder = {0};
+            return call;
+        }
         diagnostics_.report(
             "RS2106",
             "cannot convert '" + std::string(primitiveTypeName(expression->type)) +

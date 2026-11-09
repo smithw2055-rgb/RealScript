@@ -252,6 +252,21 @@ void testBudgetsTracingAndGcRoots() {
                 realscript::runtime::ErrorCode::DivisionByZero &&
             atDivision.instructionsExecuted == 5,
         "typed AOT batched accounting changed runtime-error precedence");
+    require(!atDivision.error.sourceLocations.empty() &&
+            !atDivision.error.symbolizedStackTrace.empty() &&
+            atDivision.error.sourceLocations[0].hasSourceLocation() &&
+            atDivision.error.sourceLocations[0].sourceLine > 0 &&
+            atDivision.error.symbolizedStackTrace[0].find("phase5_app.rs:") != std::string::npos,
+        "typed AOT runtime error did not reconstruct source file and line number in symbolizedStackTrace");
+    const auto resolvedLoc = aot.resolveSourceLocation("Phase5.App::failDivision");
+    require(resolvedLoc.has_value() &&
+            resolvedLoc->hasSourceLocation() &&
+            resolvedLoc->sourcePath.find("phase5_app.rs") != std::string::npos,
+        "Program::resolveSourceLocation failed to resolve Phase5.App::failDivision");
+    const auto symbolizedViaApi = aot.symbolizeStackTrace(atDivision.error);
+    require(!symbolizedViaApi.empty() &&
+            symbolizedViaApi[0].find("phase5_app.rs:") != std::string::npos,
+        "Program::symbolizeStackTrace failed to symbolize AOT stack trace");
 
     realscript::runtime::ExecutionOptions recursive;
     recursive.limits.recursionLimit = 3;

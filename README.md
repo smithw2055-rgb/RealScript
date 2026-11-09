@@ -241,8 +241,7 @@ RealScript is not CLR-compatible C#. v0.98.0 deliberately does not provide:
 - unsafe pointers, ref structs, ref properties, or complete escape analysis;
 - exception filters, `using`, native exception interop, or exceptions across a
   coroutine suspension point;
-- user-defined implicit/explicit conversions, LINQ, `dynamic`, reflection
-  code generation, or the .NET base-class library;
+- LINQ, `dynamic`, reflection code generation, or the .NET base-class library;
 - direct in-process machine-code JIT, OSR, PGO, or a rollback networking
   protocol;
 - frozen long-term compatibility for source, `.rsbc`, AOT ABI, SDK metadata,

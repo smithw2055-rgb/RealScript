@@ -513,25 +513,38 @@ public:
     [[nodiscard]] bool typedDeterminismAccountingEnabled() const noexcept {
         return determinismOnly_ && options_.limits.gcWorkBudget == 0;
     }
+    void setActiveGeneratedLine(std::uint32_t generatedLine) noexcept {
+        if (!stackSites_.empty()) {
+            stackSites_.back().generatedLine = generatedLine;
+        }
+    }
+
     template <bool FastAccounting, bool DeterminismAccounting, bool TrustedRelease = false>
     [[nodiscard]] bool enterTypedDirectCall(
         semantic::SymbolId calleeSymbolId,
         const char* calleeName,
-        semantic::SymbolId& outPreviousFunctionId) {
+        semantic::SymbolId& outPreviousFunctionId,
+        std::uint32_t callerGeneratedLine = 0) {
         if constexpr (TrustedRelease) {
             (void)calleeSymbolId;
             (void)calleeName;
             (void)outPreviousFunctionId;
+            (void)callerGeneratedLine;
             return true;
         } else {
+            if (callerGeneratedLine != 0 && !stackSites_.empty()) {
+                stackSites_.back().generatedLine = callerGeneratedLine;
+            }
             if (stack_.size() >= options_.limits.recursionLimit) {
                 return fail(
                     runtime::ErrorCode::RecursionLimitExceeded,
-                    "recursion limit exceeded");
+                    "recursion limit exceeded",
+                    callerGeneratedLine);
             }
             outPreviousFunctionId = currentFunctionId_;
             currentFunctionId_ = calleeSymbolId;
             stack_.push_back(calleeName ? calleeName : "<aot-function>");
+            stackSites_.push_back({calleeSymbolId, 0});
             ++statistics_.functionCalls;
             if (stack_.size() > statistics_.maximumCallDepth) {
                 statistics_.maximumCallDepth = stack_.size();
@@ -589,7 +602,8 @@ public:
                     }
                 }
             }
-            stack_.pop_back();
+            if (!stack_.empty()) stack_.pop_back();
+            if (!stackSites_.empty()) stackSites_.pop_back();
             currentFunctionId_ = previousFunctionId;
         }
     }
@@ -617,7 +631,10 @@ public:
         semantic::SymbolId typeId) const;
     [[nodiscard]] bool takePendingException(runtime::Value& value);
     void reportUnhandledScriptException();
-    [[nodiscard]] bool fail(runtime::ErrorCode code, std::string message);
+    [[nodiscard]] bool fail(
+        runtime::ErrorCode code,
+        std::string message,
+        std::uint32_t generatedLine = 0);
     [[nodiscard]] bool expectType(
         const runtime::Value& value,
         semantic::PrimitiveType type,
@@ -797,8 +814,16 @@ private:
     runtime::RuntimeStatistics statistics_;
     runtime::DeterminismSession determinism_;
     std::uint64_t executed_ = 0;
+    struct FrameSite {
+        semantic::SymbolId symbolId = 0;
+        std::uint32_t generatedLine = 0;
+    };
     [[nodiscard]] std::vector<std::string> materializeStackTrace() const;
+    [[nodiscard]] std::vector<runtime::StackTraceLocation> materializeSourceLocations() const;
+    [[nodiscard]] std::vector<std::string> materializeSymbolizedStackTrace() const;
+    void populateErrorStackTrace(std::uint32_t activeGeneratedLine = 0);
     std::vector<const char*> stack_;
+    std::vector<FrameSite> stackSites_;
     semantic::SymbolId currentFunctionId_ = 0;
     runtime::ShadowStack shadowStack_;
     std::unordered_map<semantic::SymbolId, const TypeDescriptor*> ownedTypes_;
@@ -819,6 +844,14 @@ public:
     [[nodiscard]] bool hasFunction(semantic::SymbolId symbolId) const noexcept {
         return functions_.find(symbolId) != functions_.end();
     }
+    [[nodiscard]] std::optional<runtime::StackTraceLocation> resolveSourceLocation(
+        semantic::SymbolId symbolId,
+        std::uint32_t generatedLine = 0) const;
+    [[nodiscard]] std::optional<runtime::StackTraceLocation> resolveSourceLocation(
+        const std::string& qualifiedName,
+        std::uint32_t generatedLine = 0) const;
+    [[nodiscard]] std::vector<std::string> symbolizeStackTrace(
+        const runtime::RuntimeError& error) const;
 
     [[nodiscard]] runtime::ExecutionResult invoke(
         semantic::SymbolId symbolId,
