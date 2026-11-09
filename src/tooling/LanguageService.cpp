@@ -504,6 +504,13 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
         if (!replaced) {
             result_.modules.push_back(*newMirMod);
         }
+    } else {
+        result_.modules.erase(
+            std::remove_if(
+                result_.modules.begin(),
+                result_.modules.end(),
+                [&](const mir::Module& m) { return m.name == dirtyMod; }),
+            result_.modules.end());
     }
 
     // 3. Update result_.buildInfo
@@ -885,9 +892,15 @@ std::vector<LanguageDiagnostic> LanguageService::diagnostics(const std::string& 
     if (!contains(path)) return {};
     (void)build();
     std::vector<LanguageDiagnostic> output;
+    const auto allPaths = documentPaths();
+    const bool isPrimaryDoc = !allPaths.empty() && allPaths.front() == path;
     for (const auto& item : result_.diagnostics.items()) {
-        if (!item.sourceName.empty() && item.sourceName != path) continue;
-        output.push_back({item.code, item.message, item.severity, {path, rangeFor(path, item.span)}});
+        if (!item.sourceName.empty()) {
+            if (item.sourceName != path) continue;
+            output.push_back({item.code, item.message, item.severity, {path, rangeFor(path, item.span)}});
+        } else if (isPrimaryDoc) {
+            output.push_back({item.code, item.message, item.severity, {path, {}}});
+        }
     }
     return output;
 }

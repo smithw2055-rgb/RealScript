@@ -309,6 +309,27 @@ void SceneFiberHostAdapter::registerAsyncConditionKey(
     asyncConditions_[key16] = requestId;
 }
 
+namespace {
+
+SceneEntityId resolveBoundFiberEntity(
+    const SceneScriptRuntime& scene,
+    runtime::GenerationalEntityHandle handle) noexcept {
+    if (handle.slot == 0 ||
+        handle.slot == runtime::GenerationalEntityHandle::InvalidSlot) {
+        return SceneScriptRuntime::BroadcastTarget;
+    }
+    const std::uint32_t slotGen = scene.getEntitySlotGeneration(handle.slot);
+    if (slotGen != 0) {
+        if (slotGen != handle.generation) {
+            return SceneScriptRuntime::BroadcastTarget;
+        }
+        return (static_cast<SceneEntityId>(slotGen) << 32u) | handle.slot;
+    }
+    return static_cast<SceneEntityId>(handle.slot);
+}
+
+} // namespace
+
 void SceneFiberHostAdapter::onHostCommand(
     runtime::FiberContext& fiber,
     std::uint8_t commandId,
@@ -316,7 +337,7 @@ void SceneFiberHostAdapter::onHostCommand(
     std::uint32_t arg32) noexcept {
     const auto it = commands_.find(commandId);
     if (it == commands_.end()) return;
-    const auto entityId = static_cast<SceneEntityId>(fiber.boundEntity.slot);
+    const auto entityId = resolveBoundFiberEntity(scene_, fiber.boundEntity);
     if (entityId == SceneScriptRuntime::BroadcastTarget) return;
 
     const std::vector<runtime::Value> args2{
@@ -374,7 +395,7 @@ bool SceneFiberHostAdapter::onEvaluateCondition(
     }
     const auto it = conditions_.find(key16);
     if (it == conditions_.end()) return false;
-    const auto entityId = static_cast<SceneEntityId>(fiber.boundEntity.slot);
+    const auto entityId = resolveBoundFiberEntity(scene_, fiber.boundEntity);
     if (entityId == SceneScriptRuntime::BroadcastTarget) return false;
 
     const ScriptObject* comp = it->second.componentType.empty()

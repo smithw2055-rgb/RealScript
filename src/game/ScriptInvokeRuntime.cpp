@@ -168,6 +168,14 @@ bool ScriptRuntime::setMember(
                 error.message = "cannot set static field '" + name + "' without a managed heap";
                 return false;
             }
+            if (object.type().descriptor.staticConstructor) {
+                auto cctorExec = invokeSymbol(
+                    object.type().descriptor.staticConstructor->id, {}, options);
+                if (!cctorExec.succeeded) {
+                    error = std::move(cctorExec.error);
+                    return false;
+                }
+            }
             heap_->setStaticField(field.id, std::move(value));
             return true;
         }
@@ -225,6 +233,14 @@ std::optional<runtime::Value> ScriptRuntime::getMember(
                     error.code = runtime::ErrorCode::InvalidObjectReference;
                     error.message = "cannot read static field '" + name + "' without a managed heap";
                     return std::nullopt;
+                }
+                if (object.type().descriptor.staticConstructor) {
+                    auto cctorExec = invokeSymbol(
+                        object.type().descriptor.staticConstructor->id, {}, options);
+                    if (!cctorExec.succeeded) {
+                        error = std::move(cctorExec.error);
+                        return std::nullopt;
+                    }
                 }
                 if (auto existing = heap_->getStaticField(field.id)) {
                     return existing;

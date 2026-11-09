@@ -700,6 +700,93 @@ bool SceneScriptRuntime::isComponentEnabled(
     return false;
 }
 
+bool SceneScriptRuntime::isComponentStarted(
+    SceneEntityId entity,
+    const std::string& scriptType) const noexcept {
+    const auto found = instances_.find(entity);
+    if (found == instances_.end()) return false;
+    for (const auto& instance : found->second) {
+        if (matchesComponentType(instance.object.type(), scriptType)) {
+            return instance.started;
+        }
+    }
+    return false;
+}
+
+bool SceneScriptRuntime::restoreComponentWithoutLifecycle(
+    SceneEntityId entity,
+    const std::string& scriptType,
+    bool enabled,
+    bool started) {
+    SceneScriptOptions opts;
+    opts.enabled = enabled;
+    std::size_t compIndex = 0;
+    if (!attachComponentWithoutLifecycle(entity, scriptType, std::move(opts), compIndex)) {
+        return false;
+    }
+    instances_[entity][compIndex].started = started;
+    return true;
+}
+
+void SceneScriptRuntime::restoreEntityActiveWithoutLifecycle(
+    SceneEntityId entity,
+    bool active) {
+    if (entity == BroadcastTarget || isStaleGenerationalEntity(entity)) return;
+    entityActiveSelf_[entity] = active;
+    tickOrderDirty_ = true;
+}
+
+void SceneScriptRuntime::clearForSnapshotImport() {
+    if (fiberScheduler_) {
+        for (const auto entity : entities()) {
+            const std::uint32_t gen = entityIdGeneration(entity);
+            const std::uint32_t slot = entityIdSlot(entity);
+            if (gen != 0) {
+                (void)fiberScheduler_->killEntityFibers(
+                    runtime::GenerationalEntityHandle{slot, gen});
+            } else {
+                (void)fiberScheduler_->killEntityFibersBySlot(slot);
+            }
+        }
+    }
+    for (auto& [entity, comps] : instances_) {
+        (void)entity;
+        for (auto& comp : comps) {
+            cancelActiveInstanceSequences(runtime_, comp.object, executionOptions_);
+        }
+    }
+    instances_.clear();
+    parentByEntity_.clear();
+    childrenByEntity_.clear();
+    entityActiveSelf_.clear();
+    localTransforms_.clear();
+    worldTransformCache_.clear();
+    tickOrderDirty_ = true;
+    cachedTickOrder_.clear();
+    signalConnections_.clear();
+    currentInputActions_.clear();
+    previousInputActions_.clear();
+    inputAxes2D_.clear();
+    colliders2D_.clear();
+    activeOverlaps2D_.clear();
+    activeOverlapWasTrigger2D_.clear();
+    activeContacts2D_.clear();
+    lastBroadphasePairs2D_ = 0;
+    colliders3D_.clear();
+    activeOverlaps3D_.clear();
+    activeOverlapWasTrigger3D_.clear();
+    activeContacts3D_.clear();
+    lastBroadphasePairs3D_ = 0;
+    pendingDestroyEntities_.clear();
+    entityNames_.clear();
+    groupEntities_.clear();
+    asyncRequests_.clear();
+    pendingAsyncCompletions_.clear();
+    nextAsyncRequestId_ = 1;
+    eventQueue_.clear();
+    resetGenerationalSlots();
+}
+
 void SceneScriptRuntime::start() {
     rebuildTickOrderIfNeeded();
     const auto snapshot = cachedTickOrder_;
@@ -1200,6 +1287,7 @@ bool SceneScriptRuntime::rebuildSignalDelegateChain(
 
     runtime::RuntimeError error;
     std::optional<runtime::ObjectRef> chainHead;
+    runtime::PersistentRoot chainHeadRoot;
 
     for (const auto& conn : signalConnections_) {
         if (conn.sourceEntity != sourceEntity || conn.signalName != signalName) {
@@ -1233,9 +1321,11 @@ bool SceneScriptRuntime::rebuildSignalDelegateChain(
         const auto leafRef = runtime_.heap()->allocateObject(
             delegateType->descriptor.id, std::move(leafFields), {0u, 7u}, &error);
         if (!leafRef) return false;
+        auto leafRoot = runtime_.heap()->retain(*leafRef);
 
         if (!chainHead) {
             chainHead = *leafRef;
+            chainHeadRoot = std::move(leafRoot);
         } else {
             std::vector<runtime::Value> combinedFields{
                 *chainHead,
@@ -1251,6 +1341,7 @@ bool SceneScriptRuntime::rebuildSignalDelegateChain(
                 delegateType->descriptor.id, std::move(combinedFields), {0u, 7u}, &error);
             if (!combinedRef) return false;
             chainHead = *combinedRef;
+            chainHeadRoot = runtime_.heap()->retain(*combinedRef);
         }
     }
 
@@ -1444,6 +1535,8 @@ bool SceneScriptRuntime::setParent(SceneEntityId child, SceneEntityId parent) {
         entityActiveSelf_[parent] = true;
     }
 
+    const bool wasActiveInHierarchy = isActiveInHierarchy(child);
+
     const auto oldParentIt = parentByEntity_.find(child);
     if (oldParentIt != parentByEntity_.end()) {
         const auto oldParent = oldParentIt->second;
@@ -1464,6 +1557,49 @@ bool SceneScriptRuntime::setParent(SceneEntityId child, SceneEntityId parent) {
         }
     }
     invalidateTransformSubtree(child);
+
+    const bool nowActiveInHierarchy = isActiveInHierarchy(child);
+    if (wasActiveInHierarchy != nowActiveInHierarchy) {
+        tickOrderDirty_ = true;
+        const auto notifyNodeComponents = [&](SceneEntityId nodeId, bool becomingActive) {
+            if (!becomingActive && fiberScheduler_) {
+                const std::uint32_t nodeGen = entityIdGeneration(nodeId);
+                const std::uint32_t nodeSlot = entityIdSlot(nodeId);
+                if (nodeGen != 0) {
+                    (void)fiberScheduler_->killEntityFibers(
+                        runtime::GenerationalEntityHandle{nodeSlot, nodeGen});
+                } else {
+                    (void)fiberScheduler_->killEntityFibersBySlot(nodeSlot);
+                }
+            }
+            const auto instIt = instances_.find(nodeId);
+            if (instIt == instances_.end()) return;
+            for (auto& comp : instIt->second) {
+                if (!comp.enabled) continue;
+                if (!becomingActive) {
+                    cancelActiveInstanceSequences(runtime_, comp.object, executionOptions_);
+                }
+                const auto& cb = becomingActive ? comp.onEnable : comp.onDisable;
+                (void)invokeLifecycle(
+                    nodeId,
+                    comp,
+                    cb,
+                    {},
+                    becomingActive ? "OnEnable" : "OnDisable");
+            }
+        };
+        const auto notifySubtree = [&](const auto& self, SceneEntityId nodeId) -> void {
+            if (!isEntityActiveSelf(nodeId)) return;
+            notifyNodeComponents(nodeId, nowActiveInHierarchy);
+            const auto chIt = childrenByEntity_.find(nodeId);
+            if (chIt == childrenByEntity_.end()) return;
+            const auto childrenCopy = chIt->second;
+            for (const auto subChild : childrenCopy) {
+                self(self, subChild);
+            }
+        };
+        notifySubtree(notifySubtree, child);
+    }
     return true;
 }
 
