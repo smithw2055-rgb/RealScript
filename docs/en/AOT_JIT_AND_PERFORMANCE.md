@@ -96,7 +96,7 @@ The public ABI header can be included from a C11 host.
 
 ## Same-SDK Boundary
 
-The v0.2.0 AOT ABI assumes compatible RealScript SDK headers, runtime
+The v0.98.0 AOT ABI assumes compatible RealScript SDK headers, runtime
 implementation, compiler settings, and C++ ABI.
 
 It is not a promise that a precompiled module can be moved between arbitrary standard libraries, compiler versions, or platforms.
@@ -185,12 +185,18 @@ Benchmark output includes:
 
 A zero-warmup run is valid.
 
-## v0.2.0 Release Baseline
+## v0.98.0 Release Baseline
 
 The following local Release measurements were collected on Windows 11 with an
-AMD Ryzen 7 6800H and Visual Studio 2026. They are regression baselines, not
+AMD Ryzen 7 6800H and Visual Studio. They are regression baselines, not
 cross-language rankings. Timings are medians; RAW native-backend measurements
 use `gcWorkBudget=0` so collector work is measured separately.
+
+In v0.98.0, the native execution model is further enhanced with:
+- **Zero-Budget Trusted Release AOT** (`--trusted-release`): eliminates instruction/branch/GC accounting guards via compile-time template branching (`if constexpr (!TrustedRelease)`).
+- **Custom Struct Stack Scalarization**: custom value structs up to 16 scalar/inline-math fields are scalarized to stack-allocated C++ structures (`AotStruct_<id>`).
+- **AVX2 / SIMD Vectorized ECS Query Loops**: vectorized inner loops with `__restrict` pointers and `#pragma loop(ivdep)`.
+- **`#line` Source Mapping**: maps C++17 AOT generated statements directly back to `.rs` script source lines for native C++ debuggers.
 
 | Workload | Median |
 |---|---:|

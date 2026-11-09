@@ -2,8 +2,8 @@
 
 [Repository README](../../README.md) | [简体中文文档](../zh-CN/README.md)
 
-This library describes the RealScript v0.2.0 implementation through Phase 24.
-It is organized by subsystem and user workflow.
+This library describes the RealScript v0.98.0 implementation through Phase 24
+and the Engine Integration Evolution. It is organized by subsystem and user workflow.
 
 ## New Users
 
@@ -47,8 +47,8 @@ The original detailed documents remain useful for implementation history and sub
 
 ## Versioning
 
-The current documentation describes the v0.2.0 implementation through Phase
-24. The source language, MIR, bytecode, runtime ABI, metadata, and debug-info
+The current documentation describes the v0.98.0 implementation through Phase
+24 and the Engine Integration Evolution. The source language, MIR, bytecode, runtime ABI, metadata, and debug-info
 formats use separate version dimensions. A numbered GitHub release does not
 freeze those compatibility contracts; pin an exact release and rebuild AOT
 artifacts with the matching SDK.

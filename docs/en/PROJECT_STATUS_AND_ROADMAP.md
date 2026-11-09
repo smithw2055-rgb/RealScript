@@ -8,10 +8,10 @@ The Phase 1–24 compiler, runtime, Game SDK, deterministic gameplay, and native
 
 RealScript should currently be described as:
 
-> A complete v0.2.0 Phase 24 implementation of a native, strongly typed,
-> deterministic C#-style game language and engine-integration baseline—not a
-> frozen production 1.0 language, CLR-compatible platform, or .NET standard
-> library.
+> A complete v0.98.0 Phase 24 and Game Engine Integration Evolution implementation
+> of a native, strongly typed, deterministic C#-style game language and
+> engine-integration baseline (offering Godot/Unity parity)—not a frozen production 1.0
+> language, CLR-compatible platform, or .NET standard library.
 
 The implementation is suitable for:
 
@@ -49,6 +49,18 @@ The implementation is suitable for:
 - fixed ticks, PCG random streams, deterministic timers/events, snapshots, and stable hashes;
 - gameplay contracts, host metadata, fixed-step scene driving, and generated gameplay bindings;
 - versioned `RSGS` state encoding for save, replay, and rollback composition.
+
+### Game Engine Integration Evolution (Godot/Unity Parity)
+
+- unified flat-frame slot layout and computed-goto bytecode VM interpreter dispatch;
+- incremental GC stepping and shadow-stack-safe pooled value reclamation;
+- zero-budget trusted release AOT mode (`--trusted-release`) and `#line` source mapping directives;
+- zero-copy C++ contiguous struct ECS raw column binding (`bindEcsRawColumnAuto`) and AVX2 vectorized ECS query loops;
+- `rsbind` CLI tool for automatic C++ header binding and ECS column generation;
+- embedded TCP socket DAP server, exception breakpoints, and DAP heap retaining-path profiler;
+- incremental LSP subgraph rebuild cache and async request bridge;
+- official `vscode-realscript` VS Code extension;
+- 3D fixed-point physics and math extensions.
 
 ### Phase 11 — structured gameplay control flow
 
@@ -153,13 +165,13 @@ The following remain draft:
 - GC and embedding ownership contracts;
 - cross-toolchain AOT module distribution.
 
-Projects integrating v0.2.0 should pin the exact release or commit, rebuild AOT
+Projects integrating v0.98.0 should pin the exact release or commit, rebuild AOT
 artifacts with the matching SDK, and use the
 [current C#-style compatibility matrix](CSHARP_COMPATIBILITY_MATRIX.md).
 
 ## Recommended Next Stage
 
-Phases 1–24 are closed. The next work should be driven by integration, hardening,
+Phases 1–24 and the Game Engine Integration Evolution are complete. The next work should be driven by integration, hardening,
 profiling, and explicit RFCs rather than assuming unimplemented CLR semantics:
 
 1. embed `GameApi`, `GameScriptCompiler`, `SceneScriptRuntime`, and `GameplayHost`;
@@ -186,7 +198,7 @@ Future work may consider:
 
 ## Release Naming
 
-v0.2.0 is a numbered development release, not a declaration that compatibility
+v0.98.0 is a numbered development release, not a declaration that compatibility
 contracts are frozen. Release notes must identify the exact commit and state
 the source-language, bytecode, SDK, gameplay-state, and ABI boundaries. A future
 1.0 release requires explicit compatibility and migration policies.

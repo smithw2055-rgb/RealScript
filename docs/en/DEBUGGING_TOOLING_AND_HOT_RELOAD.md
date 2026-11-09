@@ -24,6 +24,8 @@ The bytecode verifier validates source ranges, line tables, sequence targets, lo
 `DebugController` binds to a linked program image and manages:
 
 - source breakpoint binding (including conditional breakpoints via `BreakpointSpec` and `setConditionalBreakpoints`);
+- exception breakpoints (breaking on caught/uncaught exceptions via `setExceptionBreakpoints`);
+- reentrant DAP safepoints during nested runtime execution;
 - same-line sequence-point re-entry suppression;
 - stop on entry;
 - pause and continue;
@@ -32,6 +34,7 @@ The bytecode verifier validates source ranges, line tables, sequence targets, lo
 - step out;
 - termination;
 - thread-safe stack and variable snapshots;
+- heap retaining-path profiler (interactive path-to-root query to diagnose memory leaks);
 - side-effect-free expression evaluation (`evaluate`) on any paused frame.
 
 Source breakpoints bind to the nearest executable sequence point when an exact source line does not contain executable code.
@@ -118,13 +121,27 @@ The initial synchronization model uses full-document updates.
 
 `LanguageService` reuses the normal compiler and `BuildSnapshot` model. It does not maintain an independent parser or type checker.
 
-Each source file maintains a cached `ParseSnapshot` (lexed tokens, parsed syntax tree, and public declaration fingerprint). Body-only edits reuse parsed syntax trees of untouched files and skip rebinding dependent modules whose imported public signatures have not changed.
+Each source file maintains a cached `ParseSnapshot` (lexed tokens, parsed syntax tree, and public declaration fingerprint). In addition, `LanguageService` maintains an incremental subgraph metadata rebuild cache and an asynchronous request bridge for low-latency IDE response. Body-only edits reuse parsed syntax trees of untouched files and skip rebinding dependent modules whose imported public signatures have not changed.
 
-The repository includes an official Visual Studio Code extension under `vscode-realscript/` providing:
+The repository includes an official Visual Studio Code extension under `tools/vscode-realscript/` providing:
 
 - automatic `rslsp` Language Client startup for `.rs` and `.d.rs` files;
 - a `realscript` Debug Adapter supporting both `"request": "launch"` (`rsdebug --dap`) and `"request": "attach"` (connecting to `rsdebug --dap-port <port>` or an in-engine `EmbeddedDapServer` over TCP);
 - TextMate syntax highlighting and language configuration for RealScript keywords, attributes, `sequence` coroutines, and ECS `Query<...>()` expressions.
+
+## Auto-Binding Generator (`rsbind`)
+
+`rsbind` parses C++ header files and emits type-safe binding code and ECS raw column helpers:
+
+```bash
+rsbind --output src/game/GameBindings.gen.cpp include/game/*.h
+```
+
+`rsbind` generates:
+- host type registrations and member thunks;
+- field and template type bindings;
+- zero-copy ECS raw column helpers (`bindEcsRawColumnAuto`);
+- `.d.rs` ambient type definition stubs for LSP editor autocompletion.
 
 ## Protocol Safety
 
@@ -172,7 +189,7 @@ The compatibility analyzer returns structured rejection reasons.
 For structural changes during editor/gameplay iteration, `ScriptRuntime::replaceProgram` and `SceneScriptRuntime::hotReload` provide stateful instance migration:
 
 - allocates new component instances against the updated `ProgramImage`;
-- migrates matching fields and fields renamed with `[FormerlySerializedAs("oldName")]`;
+- migrates matching fields, static fields, and fields renamed with `[FormerlySerializedAs("oldName")]`;
 - preserves synthetic coroutine (`$sequence_*`) and event (`$event_*`) state fields;
 - recursively patches cross-component `ObjectRef` fields, arrays, and delegate targets to point to the newly migrated instances.
 

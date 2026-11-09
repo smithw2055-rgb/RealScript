@@ -54,11 +54,11 @@ deliberately smaller deterministic profile.
 
 | Area | Status | RealScript contract |
 |---|---|---|
-| Interpreter | Supported | Verified typed-register bytecode with budgets, GC, deterministic tracing, and structured errors. |
-| C++17 AOT | Supported | Generated native code executes the same MIR semantics, including delegates, value types, patterns, and exceptions, plus Zero-Budget Trusted Release (`--trusted-release`), struct stack scalarization, and vectorized ECS fast-loops. |
+| Interpreter | Supported | Verified typed-register bytecode with unified flat-frame layout, computed-goto dispatch, incremental GC stepping, budgets, deterministic tracing, and structured errors. |
+| C++17 AOT | Supported | Generated native code executes the same MIR semantics, including delegates, value types, patterns, and exceptions, plus Zero-Budget Trusted Release (`--trusted-release`), `#line` source mapping directives, struct stack scalarization, and vectorized ECS fast-loops. |
 | Toolchain JIT | Platform-dependent | External C++ toolchain JIT where configured; it is not an in-process CLR-style machine-code JIT. |
 | `.rsbc` artifacts | Draft, versioned | Current output is 0.9; decoder supports 0.6–0.9. Format is not frozen. |
-| LSP/DAP/hot reload | Supported profile | Original-source symbols/sequence points, incremental `ParseSnapshot` caching, member `.` completion, `signatureHelp`, `.d.rs` host stubs, stdio & embedded TCP (`--dap-port` / `EmbeddedDapServer`) DAP debugging, conditional breakpoints, side-effect-free watch `evaluate`, `vscode-realscript` extension, and stateful scene hot reload (`[FormerlySerializedAs]` & cross-component ref migration). |
+| LSP/DAP/hot reload | Supported profile | Original-source symbols/sequence points, incremental `ParseSnapshot` and subgraph metadata caching, member `.` completion, `signatureHelp`, `.d.rs` host stubs, stdio & embedded TCP (`--dap-port` / `EmbeddedDapServer`) DAP debugging, conditional & exception breakpoints, reentrant safepoints, heap retaining-path profiler, side-effect-free watch `evaluate`, `vscode-realscript` extension, `rsbind` auto-binding CLI, and stateful scene hot reload (`[FormerlySerializedAs]`, static field rename migration, & cross-component ref migration). |
 | Reflection and dynamic | Not supported | Stable compile-time/runtime TypeIds exist, but no CLR reflection, `dynamic`, runtime code emission, or runtime generic construction. |
 | Standard library | Purpose-built | Deterministic game/runtime primitives and collections, not the .NET BCL. |
 

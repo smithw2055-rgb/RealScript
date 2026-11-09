@@ -59,8 +59,8 @@ Each module records:
 
 If an implementation changes without changing public signatures, dependent module MIR may be reused from the previous `BuildSnapshot`. If a public signature changes, direct dependents are rebound.
 
-The v0.2.0 baseline reuses semantic and MIR results. Persistent parser caches
-are future work.
+The v0.98.0 baseline reuses semantic and MIR results with per-file `ParseSnapshot`
+caching in the language server. Persistent parser disk caches are future work.
 
 ## Typed MIR
 
@@ -141,6 +141,12 @@ The optimizer verifies MIR before and after transformation. It preserves:
 ## Typed Register Bytecode
 
 The bytecode backend maps MIR values to typed registers and locals to explicit local slots. Block parameters become typed edge arguments.
+
+In v0.98.0, the runtime bytecode engine features:
+- **Unified Flat-Frame Layout**: contiguous memory allocation for locals, arguments, and evaluation registers;
+- **Computed-Goto Threaded Dispatch**: direct label addressing for instruction decoding in performance-critical loops;
+- **Widened 32-bit `BytecodeString`**: backed by lock-free paged string pools and register slice pools;
+- **Compacted Representations**: 24-byte `Value` and 8-byte `Instruction` layouts with quickened integer superinstructions (`AddIntLocalConst`, `SubIntLocalConst`, `LessIntLocalConstBranch`).
 
 Bytecode functions retain:
 

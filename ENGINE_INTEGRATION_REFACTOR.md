@@ -1,10 +1,10 @@
-# RealScript 引擎深度集成重构建议方案
+# RealScript 引擎深度集成重构方案与落地进展
+
+> **注：** 随着 v0.98.0（Game Engine Integration Evolution）的完成，本文档中提出的属性注解（`[Export]`、`[Tool]`、`[SerializeField]`）、运行时反射（`InspectorTypeSchema`）、场景生命周期（`SceneLifecycleRuntime`）、自动化绑定工具（`rsbind`）、内嵌 DAP 附加调试以及 VS Code 插件等核心建议均已在主线落地。
 
 ## 1. 概述
 
-目前 RealScript (v0.2.0) 在语言层面的特性已经比较完善，具备了诸如 AOT、JIT、确定性和严格类型系统等优秀特性。然而，要达到类似 Unity (C# / MonoBehaviour) 或 Godot (GDScript / C#) 那种与编辑器和引擎高度紧密融合的开发体验，不仅需要一门好的语言，还需要构建一套完整的集成生态。
-
-基于 RealScript 当前“功能较为单一、聚焦于语言层面”的痛点，以下从**语言设计与特性**、**运行时与编译器架构**、以及**工具链与工作流**三个主要维度，提出将其深度集成到现代游戏引擎的重构和改进建议。
+RealScript 早期聚焦于语言层面，具备了诸如 AOT、JIT、确定性和严格类型系统等优秀特性。为了达到类似 Unity (C# / MonoBehaviour) 或 Godot (GDScript / C#) 那种与编辑器和引擎高度紧密融合的开发体验，不仅需要一门好的语言，还需要构建一套完整的集成生态。在 v0.98.0 中，语言设计、运行时架构与工具链三个维度均完成了现代引擎对齐。
 
 ---
 

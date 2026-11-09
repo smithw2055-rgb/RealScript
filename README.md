@@ -11,10 +11,11 @@ modern C++17 game engines. It combines C#-inspired source syntax with verified
 bytecode, deterministic execution, C++17 AOT, an optional external-toolchain
 JIT, game-oriented bindings, fixed-tick coroutines, replay, and rollback.
 
-> **v0.2.0 status:** The Phase 1–24 implementation is complete and usable as a
-> same-SDK engine integration baseline. The source language, `.rsbc` format,
-> native ABI, metadata, and gameplay-state contracts remain versioned but are
-> not frozen for long-term compatibility. RealScript is not CLR-compatible C#.
+> **v0.98.0 status:** The Phase 1–24 implementation and the Game Engine
+> Integration Evolution are complete, providing a full-featured engine integration
+> baseline (parity with modern engine workflows like Godot/Unity). The source
+> language, `.rsbc` format, native ABI, metadata, and gameplay-state contracts
+> remain versioned but are not frozen for long-term compatibility. RealScript is not CLR-compatible C#.
 
 ## Why RealScript
 
@@ -23,25 +24,25 @@ JIT, game-oriented bindings, fixed-tick coroutines, replay, and rollback.
 - **Built for simulation:** fixed ticks, seeded PCG streams, deterministic
   timers/events, serializable coroutines, snapshots, replay, and rollback.
 - **Native engine integration:** typed C++ bindings, managed script objects,
-  native handles, CMake package targets, and generated C++17 modules.
-- **Useful development tools:** compiler/runner, AOT generator, DAP debugger,
-  LSP server, hot reload, profiler, and benchmark runner.
+  native handles, zero-copy ECS columns, auto-binding generator (`rsbind`), CMake package targets, and generated C++17 modules.
+- **Useful development tools:** compiler/runner, AOT generator, auto-binding generator, DAP debugger,
+  LSP server, VS Code extension, hot reload, profiler, and benchmark runner.
 - **No third-party core dependency:** the compiler and runtime require C++17
   and CMake; the optional JIT invokes an installed C++ compiler.
 
 ## Language and runtime features
 
-| Area | Implemented in v0.2.0+ |
+| Area | Implemented in v0.98.0 |
 |---|---|
-| Language | Modules/imports, overloads, operator overloads, compound assignments, classes, `static class`, static constructors (`static T()`), `readonly` fields, auto-property initializers, single inheritance (including script classes inheriting bound C++ types), interfaces, virtual dispatch, delegates, closures, events, generics, collections, enums, mutable structs, nullable values, boxing, patterns, initializers, flexible arguments, and structured exceptions. |
+| Language | Modules/imports, overloads, operator overloads, compound assignments, classes, `static class`, static constructors (`static T()`), `readonly` fields, auto-property initializers (`public int Hp { get; set; } = 100;`), single inheritance (including script classes inheriting bound C++ types), interfaces, virtual dispatch, delegates, closures, events, generics, collections, enums, mutable structs, nullable values, boxing, patterns, initializers, flexible arguments, and structured exceptions. |
 | Control flow | `if`, `while`, `for`, `foreach`, `do/while`, `switch`, switch expressions, `break`, `continue`, `try/catch/finally`, deterministic `sequence` (`yield wait_ticks`, `wait_seconds`, `wait_event`, `wait_signal`, `wait_until`), and `RealScript.Fiber` cooperative fibers. |
-| Compiler | Lexer, parser, Binder, flow analysis, `[Deterministic]` static verification, stable diagnostics, verified multi-block Typed MIR, and O0/O1/O2 optimization. |
-| Bytecode | Typed register VM, 24-byte `Value` & 8-byte `Instruction` layout, quickened integer-loop superinstructions, deterministic `.rsbc` 0.9 output, 0.6–0.8 legacy decoding, defensive validation, and structured script stacks. |
-| Memory | Generation-checked object references, 12-byte inline struct slots (`InlineStructSlot`), `ValuePoolArena` mark/sweep GC for pooled strings/structs/closures, precise roots, incremental mark/sweep GC, write barriers, bounded GC work, snapshots, retaining paths, and leak diagnostics. |
-| Native execution | Deterministic C++17 AOT, Zero-Budget Trusted Release AOT (`--trusted-release`), custom `struct` stack scalarization (`AotStruct_<id>`), AVX2/SIMD vectorized ECS query loops (`__restrict` + `#pragma loop(ivdep)`), C11 module-query ABI, source maps, typed native thunks, optional toolchain JIT, content-addressed JIT cache, and tiered Interpreter/JIT/AOT dispatch. |
+| Compiler | Lexer, parser, Binder, flow analysis, `[Deterministic]` static verification, stable diagnostics, verified multi-block Typed MIR, natural-loop LICM load hoisting, and O0/O1/O2 optimization. |
+| Bytecode | Typed register VM, unified flat-frame slot layout, computed-goto threaded dispatch, 24-byte `Value` & 8-byte `Instruction` layout, widened 32-bit `BytecodeString` with lock-free pools, quickened integer-loop superinstructions, deterministic `.rsbc` 0.9 output, 0.6–0.8 legacy decoding, defensive validation, and structured script stacks. |
+| Memory | Generation-checked object references, 12-byte inline struct slots (`InlineStructSlot`), HeapObject Small Buffer Optimization (SBO), `ValuePoolArena` mark/sweep GC for pooled strings/structs/closures, precise roots, incremental mark/sweep GC stepping with shadow-stack safety, write barriers, bounded GC work, snapshots, retaining paths, and leak diagnostics. |
+| Native execution | Deterministic C++17 AOT, Zero-Budget Trusted Release AOT (`--trusted-release`), `#line` source mapping directives back to `.rs` script lines, custom `struct` stack scalarization (`AotStruct_<id>`), AVX2/SIMD vectorized ECS query loops (`__restrict` + `#pragma loop(ivdep)`), C11 module-query ABI, source maps, typed native thunks, native fast-paths & identity cache, optional toolchain JIT, content-addressed JIT cache, and tiered Interpreter/JIT/AOT dispatch. |
 | Determinism | Off/Strict/Record/Replay modes, instruction/recursion/allocation/heap budgets, Mod capability sandboxing, stable digests, external-call replay, and cross-backend differential validation. |
-| Game SDK | Typed bindings, direct math struct marshaling (`Fixed`/`Fixed16`/`Vec2`/`Vec3`/`Quat`), zero-copy C++ host ECS raw column binding (`bindEcsRawColumnAuto<T>`), `Query<Write<T>, Read<U>, With<V>, Without<W>>()` & `EntityCommandBuffer`, 2D/3D fixed-point physics (`stepPhysics2D`/`stepPhysics3D`), deterministic `RealScript.Input`, multi-component entities, generational entity handles, Editor/Play modes (`[Tool]`/`[ExecuteInEditMode]`), `OnValidate`, deep `InspectorTypeSchema` reflection, host `connectSignal`, JSON prefab/scene serialization, and `RSGS` state encoding. |
-| Tooling | `rsc`, `rsaot`, `rsdebug`, `rslsp`, `rsbench`, DAP (stdio & embedded TCP `--dap-port` attach, conditional breakpoints, watch `evaluate`), LSP (incremental `ParseSnapshot` cache, member dot-completion, `signatureHelp`, `.d.rs` host stubs), `vscode-realscript` VS Code extension, Chrome Tracing profiler export, and stateful structural hot reload (`[FormerlySerializedAs]` & cross-component ref migration). |
+| Game SDK | Typed bindings, automated C++ binding generation (`rsbind`), direct math struct marshaling (`Fixed`/`Fixed16`/`Vec2`/`Vec3`/`Quat`), zero-copy C++ host ECS raw column binding (`bindEcsRawColumnAuto<T>`), `Query<Write<T>, Read<U>, With<V>, Without<W>>()` & `EntityCommandBuffer`, 2D/3D fixed-point physics (`stepPhysics2D`/`stepPhysics3D`), spatial queries (raycast/overlap), deterministic `RealScript.Input`, multi-component entities, generational entity handles, Editor/Play modes (`[Tool]`/`[ExecuteInEditMode]`), `OnValidate`, deep `InspectorTypeSchema` reflection, host `connectSignal`, JSON prefab/scene serialization, and `RSGS` state encoding. |
+| Tooling | `rsc`, `rsaot`, `rsbind`, `rsdebug`, `rslsp`, `rsbench`, DAP (stdio & embedded TCP `--dap-port` attach, conditional & exception breakpoints, reentrant safepoints, heap retaining-path profiler, watch `evaluate`), LSP (incremental `ParseSnapshot` & subgraph metadata cache, async request bridge, member dot-completion, `signatureHelp`, `.d.rs` host stubs), `vscode-realscript` VS Code extension, Chrome Tracing profiler export, and stateful structural hot reload (`[FormerlySerializedAs]`, static field rename migration, & cross-component ref migration). |
 
 For the exact supported/partial/unsupported language inventory, see the
 [C#-style compatibility matrix](docs/en/CSHARP_COMPATIBILITY_MATRIX.md).
@@ -168,14 +169,16 @@ is measured separately.
 | 10,000 coroutine resume | 86.06 ms; 8.61 µs/callback |
 | 10,000 coroutine deterministic replay | 89.45 ms |
 
-Key v0.2.0 performance changes:
+Key v0.98.0 performance changes:
 
+- unified flat-frame slot layout and computed-goto threaded interpreter dispatch;
+- zero-budget trusted release AOT mode (`--trusted-release`) and custom struct stack scalarization;
+- zero-copy host C++ contiguous struct ECS raw column binding (`bindEcsRawColumnAuto`) with AVX2 SIMD loop reconstruction;
+- widened 32-bit `BytecodeString` with lock-free paged pools and 24B/8B compacted value/instruction representations;
+- incremental GC stepping with shadow-stack-safe value pool reclamation;
 - typed AOT/JIT scalar lowering and range-proven checked arithmetic;
-- direct typed CFG labels and failure-aware accounting;
-- local RAW/Strict accounting with exact budget and digest preservation;
-- interpreter integer specialization and cheaper call-stack materialization;
-- bounded incremental sweep progress during continuous allocation;
-- cached scene method descriptors and lower scheduler payload-copy cost.
+- interpreter integer specialization and quickened loop superinstructions;
+- cached scene method descriptors, native fast-paths, and identity cache.
 
 Read the [AOT/JIT performance guide](docs/en/AOT_JIT_AND_PERFORMANCE.md) and the
 [full benchmark report](docs/zh-CN/PERFORMANCE_BASELINE.md) for
@@ -204,9 +207,10 @@ snapshot, restore, replay, rollback, and C++17 AOT generation.
 | Tool | Purpose |
 |---|---|
 | `rsc` | Compile, validate, inspect MIR/bytecode, run scripts, emit packages, profiles, and digests. |
-| `rsaot` | Generate deterministic C++17 AOT sources and manifests. |
-| `rsdebug` | Run the source-level Debug Adapter Protocol server. |
-| `rslsp` | Run the Language Server Protocol server. |
+| `rsaot` | Generate deterministic C++17 AOT sources, line-mappings, and manifests. |
+| `rsbind` | Parse C++ headers to automatically generate type-safe bindings, method thunks, and ECS raw column helpers. |
+| `rsdebug` | Run the Debug Adapter Protocol server (stdio & TCP `--dap-port` attach). |
+| `rslsp` | Run the Language Server Protocol server (incremental caching & fast query). |
 | `rsbench` | Run reproducible timing, GC, digest, and profile benchmarks. |
 
 ## Documentation
@@ -229,7 +233,7 @@ snapshot, restore, replay, rollback, and C++17 AOT generation.
 
 ## Deliberate limits
 
-RealScript is not CLR-compatible C#. v0.2.0 deliberately does not provide:
+RealScript is not CLR-compatible C#. v0.98.0 deliberately does not provide:
 
 - multiple class inheritance, default interface implementations, open runtime
   generics, or generic variance;

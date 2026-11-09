@@ -5,59 +5,61 @@ remain versioned but unfrozen until a future 1.0 release.
 
 ## [Unreleased]
 
-### Engine integration and editor dataflow
+## [0.98.0] - 2026-11-09
 
-- Added Zero-Budget Trusted Release AOT mode (`GenerationOptions::trustedRelease`,
-  `ExecutionOptions::trustedRelease`, `rsaot --trusted-release`, and CMake
-  `realscript_add_aot_library(... TRUSTED_RELEASE)`), compiling out
-  instruction/branch/GC accounting guards via `if constexpr (!TrustedRelease)`
-  and scalarizing custom value-type `struct`s up to 16 scalar/inline-math fields
-  into stack-allocated `AotStruct_<typeId>` C++ structs.
-- Added Zero-Copy Host C++ Contiguous Struct ECS Raw Column Binding
-  (`ObjectKind::RawColumnArray`, `NativeFieldLayout`, `NativeFieldKind`,
-  `ScriptRuntime::bindEcsRawColumn`, and `bindEcsRawColumnAuto<HostStruct>`) with
-  in-place `HeapSlot` reuse on per-frame rebind across both the Bytecode
-  Interpreter and C++17 AOT, plus AVX2/SIMD vectorized ECS query loop
-  reconstruction (`analyzeVectorizedEcsLoops` / `emitVectorizedEcsLoop` emitting
-  `__restrict` native column pointers and `#pragma GCC ivdep` /
-  `#pragma clang loop vectorize(enable)` / `#pragma loop(ivdep)`).
-- Added auto-property initializers (`public int Hp { get; set; } = 100;` and
-  `static` auto-property initializers on classes and structs), static
-  constructors (`static ClassName()`), `static class` enforcement, and
-  constructor-assigned `readonly` field enforcement across the compiler,
-  bytecode VM, and C++17 AOT.
-- Compacted `runtime::Value` to 24 bytes (`PooledStringValue`,
-  `PooledStructValue`, `PooledClosureValue`) and `bytecode::Instruction` to
-  8 bytes, added quickened integer-loop bytecode superinstructions
-  (`AddIntLocalConst`, `SubIntLocalConst`, `LessIntLocalConstBranch`), and
-  integrated `ValuePoolArena::collectGarbage` into `ManagedHeap::collect` to
-  reclaim unreferenced pooled strings, >4-field structs, and closures.
-- Added an embeddable TCP socket DAP server (`EmbeddedDapServer` in
-  `realscript/debug/DapServer.h` and `rsdebug --dap-port <port>` attach mode),
-  per-file `ParseSnapshot` incremental caching in `LanguageService`, and the
-  official `vscode-realscript` VS Code extension supporting `rslsp`, `launch`
-  (`--dap`) and `attach` (`--dap-port`) debugging, and TextMate highlighting.
-- Extended `RealScript.Physics` and `SceneScriptRuntime` with 3D fixed-point
-  colliders (`Box3D`, `Sphere3D`, `Capsule3D`), `stepPhysics3D`, spatial queries
-  (`raycast3D`, `raycastAll3D`, `overlapSphere3D`), 3D collision/trigger
-  callbacks (`OnCollisionEnter3D`/`Stay3D`/`Exit3D`,
-  `OnTriggerEnter3D`/`Stay3D`/`Exit3D`), generational entity handles
-  (`spawnGenerationalEntity`, `isStaleGenerationalEntity`), deferred entity
-  destruction (`queueDestroyEntity`, `flushDestroyedEntities`), entity names and
-  groups (`setEntityName`, `findEntityByName`, `addEntityToGroup`,
-  `getEntitiesInGroup`), and `[ExportGroup]` / `[ExportSubgroup]` /
-  `[ExportCategory]` inspector schema grouping.
-- Upgraded 12-byte `InlineStructSlot` bit-packing to support `Vec3`, `Quat`, and
-  `Enum` fields inline inside `runtime::StructValue` without increasing
-  `sizeof(InlineStructSlot)` (12B) or `sizeof(Value)` (24B), and added in-place
-  slot updates in `Opcode::StoreStructField`.
-- Extended `Query<...>()` ECS chunk queries with multi-entity Sparse-Set
-  intersection joins (`setEcsEntityComponent`, `getEcsEntityComponent`,
-  `hasEcsEntityComponent`, `removeEcsEntityComponent`, `destroyEcsEntity`),
-  `With<T>` / `Without<U>` filter clauses, optional leading `int entityId`
-  iteration bindings, and `EntityCommandBuffer` (ECB) deferred structural
-  mutation queues (`queueEcsSetComponent`, `queueEcsRemoveComponent`,
-  `queueEcsDestroyEntity`, `flushEcsCommandBuffer`).
+v0.98.0 represents the major Game Engine Integration Evolution release, bringing deep parity with modern engine scripting workflows (Godot/Unity), flat-frame high-throughput VM execution, automated C++ binding generation (`rsbind`), zero-budget trusted AOT, native fast-paths, advanced DAP/LSP tooling, and zero-copy ECS architecture.
+
+### Virtual Machine & Runtime Architecture
+
+- Added **Unified Flat-Frame Slot Layout**: consolidated local variables, evaluation stack, and frame overhead into contiguous memory, significantly reducing call-frame allocation and cache thrashing.
+- Implemented **Computed-Goto Interpreter Dispatch**: high-performance threaded code dispatch in the bytecode VM loop with fallback to direct-switch.
+- Widened `BytecodeString` to 32-bit with lock-free paged string and register slice pools for low contention in multi-threaded execution.
+- Added **Incremental GC Stepping & Shadow-Stack-Safe Value Pool Reclamation**: integrated bounded GC step ticking in the flat-VM loop, safeguarding pooled values and preventing long pause times during continuous allocation.
+- Introduced **Small Buffer Optimization (SBO) for HeapObject**: optimized short strings and small inline objects to eliminate heap allocations for transient operations.
+- Added **Native Fast-Path & Identity Cache**: fast O(1) bi-directional C++ host object mapping and bypassing reflection thunks for hot-path method calls.
+- Flattened `SceneScriptRuntime` dispatch for direct invocation without intermediary bridge wrappers.
+- Compacted `runtime::Value` to 24 bytes (`PooledStringValue`, `PooledStructValue`, `PooledClosureValue`) and `bytecode::Instruction` to 8 bytes, added quickened integer-loop bytecode superinstructions (`AddIntLocalConst`, `SubIntLocalConst`, `LessIntLocalConstBranch`), and integrated `ValuePoolArena::collectGarbage` into `ManagedHeap::collect`.
+
+### C++17 AOT & Native Performance
+
+- Added **Zero-Budget Trusted Release AOT Mode** (`GenerationOptions::trustedRelease`, `ExecutionOptions::trustedRelease`, `rsaot --trusted-release`, and CMake `realscript_add_aot_library(... TRUSTED_RELEASE)`), compiling out instruction/branch/GC accounting guards via `if constexpr (!TrustedRelease)`.
+- Added **Custom Struct Stack Scalarization** (`AotStruct_<typeId>`), decomposing value-type structs up to 16 scalar/inline-math fields into stack-allocated C++ structs.
+- Added **`#line` Source Mapping Directives**: C++17 AOT codegen emits accurate line markers back to original `.rs` script source, enabling native C++ debugger step-in/out directly to script lines.
+- Implemented **AVX2 / SIMD Vectorized ECS Loop Reconstruction**: auto-detects and transforms ECS query loops into vectorized C++ inner loops (`__restrict` native column pointers and `#pragma loop(ivdep)` / `#pragma clang loop vectorize(enable)`).
+- Added natural-loop **LICM (Loop-Invariant Code Motion) Load Hoisting** in the MIR/bytecode optimizer.
+
+### Game SDK & ECS Integration
+
+- Added **Zero-Copy Host C++ Contiguous Struct ECS Raw Column Binding** (`ObjectKind::RawColumnArray`, `NativeFieldLayout`, `NativeFieldKind`, `ScriptRuntime::bindEcsRawColumn`, and `bindEcsRawColumnAuto<HostStruct>`) with in-place `HeapSlot` reuse on per-frame rebind across both the Bytecode Interpreter and C++17 AOT.
+- Added **`rsbind` Auto-Binding Generator CLI Tool**: parses C++ headers to automatically generate type-safe bindings, method thunks, and ECS raw column helpers.
+- Extended `Query<...>()` ECS chunk queries with multi-entity Sparse-Set intersection joins (`setEcsEntityComponent`, `getEcsEntityComponent`, `hasEcsEntityComponent`, `removeEcsEntityComponent`, `destroyEcsEntity`), `With<T>` / `Without<U>` filter clauses, optional leading `int entityId` iteration bindings, and `EntityCommandBuffer` (ECB) deferred structural mutation queues.
+- Extended `RealScript.Physics` and `SceneScriptRuntime` with 3D fixed-point colliders (`Box3D`, `Sphere3D`, `Capsule3D`), `stepPhysics3D`, spatial queries (`raycast3D`, `raycastAll3D`, `overlapSphere3D`), 3D collision/trigger callbacks (`OnCollisionEnter3D`/`Stay3D`/`Exit3D`, `OnTriggerEnter3D`/`Stay3D`/`Exit3D`), generational entity handles, and deferred entity destruction.
+- Upgraded 12-byte `InlineStructSlot` bit-packing to support `Vec3`, `Quat`, and `Enum` fields inline inside `runtime::StructValue` without increasing `sizeof(InlineStructSlot)` (12B) or `sizeof(Value)` (24B), with in-place slot updates in `Opcode::StoreStructField`.
+- Added `[ExportGroup]` / `[ExportSubgroup]` / `[ExportCategory]` inspector schema grouping, and `[FormerlySerializedAs]` static field rename migration.
+
+### Language & Type System
+
+- Added **Auto-Property Initializers** (`public int Hp { get; set; } = 100;` and static auto-property initializers on classes and structs).
+- Added **Static Constructors** (`static ClassName()`), guaranteed to run before first type access.
+- Enforced `static class` and constructor-assigned `readonly` fields across compiler, VM, and AOT.
+- Extended standard library with math, bitwise, and string intrinsics.
+
+### Debugging, Tooling & LSP Ecosystem
+
+- Added **Embedded TCP Socket DAP Server** (`EmbeddedDapServer` in `realscript/debug/DapServer.h` and `rsdebug --dap-port <port>` attach mode) for in-engine live debugging.
+- Added **DAP Exception Breakpoints**: break on caught/uncaught script exceptions with reentrant DAP safepoints.
+- Added **DAP Heap Retaining-Path Profiler**: interactive path-to-root inspection for locating script memory leaks.
+- Enhanced **LSP Language Server (`rslsp`)**: incremental `ParseSnapshot` cache, incremental subgraph metadata rebuild cache, fast symbol-id navigation, member dot-completion, signature help, and async request bridging.
+- Published official **VS Code Extension (`vscode-realscript`)**: complete syntax highlighting, LSP client integration, and DAP launch/attach debugger configurations.
+- Extended `DebugController`, `DebugSession`, and `DapServer` with conditional breakpoints (`BreakpointSpec`, `setConditionalBreakpoints`), same-line sequence-point re-entry suppression, and side-effect-free watch/hover expression evaluation.
+- Extended `GameApi::exportDeclarationStub()` (`.d.rs`), `LanguageService` (`realscript.project.json`, ambient sources, member `.` dot-completion, and `signatureHelp`), and `LspServer` (`textDocument/signatureHelp`).
+- Added `exportChromeTraceJson` to export `ExecutionProfile` and `GcStatistics` in Chrome Tracing / Perfetto (`traceEvents`) JSON format.
+
+### Compatibility
+
+- Project version is now **0.98.0**.
+- Current bytecode output is `.rsbc` 0.9; the decoder accepts 0.6–0.9.
+- SDK compatibility, Game SDK package, and script-object-state versions remain independently versioned at 1.
 - Optimized `ManagedHeap` by sharing `referenceFields` layout vectors across
   instances of the same `typeId` (`sharedTypeLayoutCount`) and adding global
   string interning (`internString`, `internedStringCount`) used by
@@ -263,5 +265,6 @@ baseline.
   DAP/LSP tooling, C++17 AOT, deterministic execution, profiling, benchmarking,
   and optional external-toolchain JIT.
 
+[0.98.0]: https://github.com/smithw2055-rgb/RealScript/compare/v0.2.0...v0.98.0
 [0.2.0]: https://github.com/smithw2055-rgb/RealScript/compare/v0.1.0-alpha...v0.2.0
 [0.1.0-alpha]: https://github.com/smithw2055-rgb/RealScript/releases/tag/v0.1.0-alpha

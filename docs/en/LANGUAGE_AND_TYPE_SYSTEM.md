@@ -2,9 +2,9 @@
 
 [Documentation Home](README.md) | [Architecture](ARCHITECTURE.md)
 
-RealScript v0.2.0 provides a compact C#-inspired language designed for
+RealScript v0.98.0 provides a compact C#-inspired language designed for
 embedding in C++17 game engines. This page describes the native Phase 24
-implementation. The language is intentionally smaller than C# and prioritizes
+and Engine Integration Evolution implementation. The language is intentionally smaller than C# and prioritizes
 explicit, verifiable, deterministic semantics. For an exact
 supported/partial/unsupported inventory, see the
 [C#-style compatibility matrix](CSHARP_COMPATIBILITY_MATRIX.md).

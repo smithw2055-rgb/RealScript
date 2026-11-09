@@ -1,7 +1,7 @@
 # SDK Productization
 
 RealScript RS0 defines the first versioned embedding surface for engine
-integration. v0.2.0 ships that surface as a release, while the language and
+integration. v0.98.0 ships that surface as a release, while the language and
 binary compatibility contracts remain unfrozen.
 
 ## CMake consumer targets
@@ -30,8 +30,9 @@ Available targets are:
 - `RealScript::Full`
 - `RealScript::Frontend` for compatibility
 - `RealScript::rsaot` as the installed AOT generator executable
+- `RealScript::rsbind` as the installed auto-binding generator executable
 
-The v0.2.0 implementation still uses one internal static archive. The component
+The v0.98.0 implementation still uses one internal static archive. The component
 targets are the supported consumer boundary; the implementation can be split
 later without changing downstream CMake files.
 

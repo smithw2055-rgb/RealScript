@@ -158,9 +158,10 @@ Changing one dimension does not automatically require changing every other dimen
 
 ## Current Architectural Boundaries
 
-The v0.2.0 Phase 24 implementation includes inheritance, runtime
-interfaces/virtual dispatch, compile-time generics, deterministic coroutine
-state machines, and script exceptions, but their source/artifact/ABI contracts
+The v0.98.0 implementation includes Phase 24 and the Game Engine Integration
+Evolution (unified flat-frame slot layout, computed-goto dispatch, `rsbind`
+auto-binding, trusted release AOT, zero-copy ECS raw columns, DAP attach/exception
+breakpoints, and VS Code tooling), but their source/artifact/ABI contracts
 are not frozen. Cross-toolchain AOT distribution and an in-process direct
 machine-code JIT remain future design areas. See the
 [compatibility matrix](CSHARP_COMPATIBILITY_MATRIX.md) for language boundaries.

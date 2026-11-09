@@ -31,7 +31,7 @@ The original detailed architecture, specification, and phase documents remain av
 
 ## Documentation Status
 
-The English library is the default overview for the v0.2.0 implementation.
+The English library is the default overview for the v0.98.0 implementation.
 The Chinese specification set remains the most detailed historical record for
 some subsystems. Draft v0.1 labels identify specification revisions, not the
 product release. Until those specifications are frozen, implementation tests

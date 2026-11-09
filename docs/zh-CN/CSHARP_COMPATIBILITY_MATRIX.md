@@ -51,11 +51,11 @@ RealScript 采用 C# 风格语法，但不是 CLR、ECMA C# 或 .NET 标准库�
 
 | 能力 | 状态 | RealScript 语义边界 |
 |---|---|---|
-| Interpreter | 支持 | 验证过的类型化寄存器 Bytecode、预算、GC、确定性 Trace 与结构化错误。 |
-| C++17 AOT | 支持 | 生成代码与解释器共享 MIR 语义，包括委托、值类型、Pattern 和异常，并支持零预算 Trusted Release（`--trusted-release`）、结构体栈标量化与 AVX2 向量化 ECS 快循环。 |
+| Interpreter | 支持 | 验证过的类型化寄存器 Bytecode、统一扁平栈帧布局（Unified Flat Frame）、Computed-goto 解释器派发、增量 GC 步进、预算、确定性 Trace 与结构化错误。 |
+| C++17 AOT | 支持 | 生成代码与解释器共享 MIR 语义，包括委托、值类型、Pattern 和异常，并支持零预算 Trusted Release（`--trusted-release`）、`#line` 源码行号映射指令、结构体栈标量化与 AVX2 向量化 ECS 快循环。 |
 | Toolchain JIT | 平台相关 | 配置后使用外部 C++ 工具链；不是 CLR 风格进程内机器码 JIT。 |
 | `.rsbc` | Draft、带版本 | 当前输出 0.9，Decoder 支持 0.6–0.9；格式尚未冻结。 |
-| LSP/DAP/Hot Reload | 支持受限模型 | 原始源码符号与 Sequence Point、`ParseSnapshot` 增量缓存、成员 `.` 补全、`signatureHelp`、`.d.rs` 宿主声明导出、标准流及内嵌 TCP（`--dap-port` / `EmbeddedDapServer`）DAP 调试、条件断点、无副作用 Watch 求值、`vscode-realscript` 插件，以及带状态结构化热重载（`[FormerlySerializedAs]` 与跨组件引用迁移）。 |
+| LSP/DAP/Hot Reload | 支持受限模型 | 原始源码符号与 Sequence Point、`ParseSnapshot` 与语法子图增量重构缓存、成员 `.` 补全、`signatureHelp`、`.d.rs` 宿主声明导出、标准流及内嵌 TCP（`--dap-port` / `EmbeddedDapServer`）DAP 调试、条件与异常断点、重入安全点、堆保留路径分析器、无副作用 Watch 求值、`vscode-realscript` 插件、`rsbind` 自动绑定工具，以及带状态结构化热重载（`[FormerlySerializedAs]`、静态字段重命名迁移与跨组件引用迁移）。 |
 | Reflection 与 `dynamic` | 不支持 | 有稳定 TypeId，但无 CLR Reflection、`dynamic`、运行时代码生成和运行时泛型构造。 |
 | 标准库 | 专用模型 | 提供确定性游戏/运行时基础能力，不是 .NET BCL。 |
 

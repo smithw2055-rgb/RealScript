@@ -10,9 +10,7 @@ RealScript 是一门面向现代 C++17 游戏引擎的嵌入式强类型脚本�
 它采用接近 C# 的源码语法，同时提供经过验证的字节码、确定性执行、C++17 AOT、
 可选外部工具链 JIT、游戏绑定、固定 Tick 协程、回放和 Rollback。
 
-> **v0.2.0 状态：** Phase 1–24 实现已经完成，可作为同版本 SDK 的游戏引擎集成
-> 基线。源码语言、`.rsbc`、Native ABI、元数据和 Gameplay 状态格式均已版本化，
-> 但尚未冻结长期兼容性。RealScript 不是 CLR 兼容的 C# 实现。
+> **v0.98.0 状态：** Phase 1–24 实现与游戏引擎深度集成演进（Game Engine Integration Evolution）已全部完成，提供了与现代引擎（如 Godot / Unity）深度对齐的完整脚本生态基线。源码语言、`.rsbc`、Native ABI、元数据和 Gameplay 状态格式均已版本化，但尚未冻结长期兼容性。RealScript 不是 CLR 兼容的 C# 实现。
 
 ## 为什么使用 RealScript
 
@@ -20,26 +18,25 @@ RealScript 是一门面向现代 C++17 游戏引擎的嵌入式强类型脚本�
   预算、Profile 与确定性事件行为。
 - **面向游戏模拟：** 固定 Tick、PCG 随机流、确定性 Timer/Event、可序列化协程、
   Snapshot、Replay 与 Rollback。
-- **原生引擎集成：** 类型化 C++ 绑定、托管脚本对象、Native Handle、CMake 包和
-  生成式 C++17 模块。
-- **完整开发工具：** 编译/运行器、AOT 生成器、DAP 调试器、LSP、热重载、Profiler
+- **原生引擎集成：** 类型化 C++ 绑定、托管脚本对象、Native Handle、零拷贝 ECS 列绑定、C++ 绑定代码自动生成器（`rsbind`）、CMake 包和生成式 C++17 模块。
+- **完整开发工具：** 编译/运行器、AOT 生成器、自动绑定生成器、DAP 调试器、LSP、VS Code 扩展、热重载、Profiler
   和基准工具。
 - **核心无第三方依赖：** 编译器和运行时只要求 C++17 与 CMake；可选 JIT 调用已安装
   的外部 C++ 编译器。
 
 ## 语言与运行时特性
 
-| 领域 | v0.2.0+ 已实现能力 |
+| 领域 | v0.98.0 已实现能力 |
 |---|---|
-| 语言 | Module/import、重载、运算符重载、复合赋值、Class、`static class`、静态构造函数（`static T()`）、`readonly` 字段、自动属性初始化器、单继承（含脚本类直接继承 C++ 绑定类型）、Interface、Virtual Dispatch、Delegate、Closure、Event、Generic、Collection、Enum、可变 Struct、Nullable、Boxing、Pattern、Initializer、灵活参数与结构化异常。 |
+| 语言 | Module/import、重载、运算符重载、复合赋值、Class、`static class`、静态构造函数（`static T()`）、`readonly` 字段、自动属性初始化器（`public int Hp { get; set; } = 100;`）、单继承（含脚本类直接继承 C++ 绑定类型）、Interface、Virtual Dispatch、Delegate、Closure、Event、Generic、Collection、Enum、可变 Struct、Nullable、Boxing、Pattern、Initializer、灵活参数与结构化异常。 |
 | 控制流 | `if`、`while`、`for`、`foreach`、`do/while`、`switch`、Switch Expression、`break`、`continue`、`try/catch/finally`、确定性 `sequence`（`yield wait_ticks`、`wait_seconds`、`wait_event`、`wait_signal`、`wait_until`）与 `RealScript.Fiber` 协作式纤程。 |
-| 编译器 | Lexer、Parser、Binder、Flow Analysis、`[Deterministic]` 静态校验、稳定诊断、经过验证的多基本块 Typed MIR，以及 O0/O1/O2 优化。 |
-| 字节码 | 类型化寄存器 VM、24B 紧凑 `Value` 与 8B `Instruction`、整数循环指令快化（Quickening）、确定性 `.rsbc` 0.9 输出、0.6–0.8 兼容读取、防御性验证和结构化脚本调用栈。 |
-| 内存 | 代际 ObjectRef、12B 内联结构体槽（`InlineStructSlot`）、`ValuePoolArena` 池化对象 GC 回收、精确根、增量 Mark/Sweep、写屏障、有界 GC Work、Snapshot、Retaining Path 和泄漏诊断。 |
-| 原生执行 | 确定性 C++17 AOT、零预算 Trusted Release AOT（`--trusted-release`）、自定义 `struct` 栈标量化（`AotStruct_<id>`）、AVX2/SIMD 向量化 ECS 循环重构（`__restrict` + `#pragma loop(ivdep)`）、C11 Module Query ABI、Source Map、类型化 Native Thunk、可选工具链 JIT、内容寻址缓存与 Interpreter/JIT/AOT 分层执行。 |
+| 编译器 | Lexer、Parser、Binder、Flow Analysis、`[Deterministic]` 静态校验、稳定诊断、经过验证的多基本块 Typed MIR、自然循环 LICM 变量加载外提，以及 O0/O1/O2 优化。 |
+| 字节码 | 类型化寄存器 VM、统一扁平栈帧布局（Unified Flat Frame）、Computed-goto 线程化派发、24B 紧凑 `Value` 与 8B `Instruction`、32 位拓宽 `BytecodeString` 及无锁池、整数循环指令快化（Quickening）、确定性 `.rsbc` 0.9 输出、0.6–0.8 兼容读取、防御性验证和结构化脚本调用栈。 |
+| 内存 | 代际 ObjectRef、12B 内联结构体槽（`InlineStructSlot`）、HeapObject 小缓冲区优化（SBO）、`ValuePoolArena` 池化对象 GC 回收、精确根、带阴影栈保护的增量 Mark/Sweep GC 步进、写屏障、有界 GC Work、Snapshot、Retaining Path 和泄漏诊断。 |
+| 原生执行 | 确定性 C++17 AOT、零预算 Trusted Release AOT（`--trusted-release`）、`#line` 源码行号映射指令、自定义 `struct` 栈标量化（`AotStruct_<id>`）、AVX2/SIMD 向量化 ECS 循环重构（`__restrict` + `#pragma loop(ivdep)`）、C11 Module Query ABI、Source Map、类型化 Native Thunk、原生快速路径与对象标识缓存（Identity Cache）、可选工具链 JIT、内容寻址缓存与 Interpreter/JIT/AOT 分层执行。 |
 | 确定性 | Off/Strict/Record/Replay、指令/递归/分配/堆预算、Mod 能力沙箱（Capability Sandboxing）、稳定 Digest、外部调用回放与跨后端差分验证。 |
-| Game SDK | 类型化 Binding、数学原语直接封送与快路径（`Fixed`/`Fixed16`/`Vec2`/`Vec3`/`Quat`）、C++ 宿主连续内存零拷贝 ECS 列绑定（`bindEcsRawColumnAuto<T>`）、`Query<Write<T>, Read<U>, With<V>, Without<W>>()` 与 `EntityCommandBuffer`、2D/3D 定点物理（`stepPhysics2D`/`stepPhysics3D`）、确定性 `RealScript.Input`、单实体多组件、代际实体句柄、Editor/Play 模式（`[Tool]`/`[ExecuteInEditMode]`）、`OnValidate`、深度 `InspectorTypeSchema` 反射、宿主 `connectSignal`、JSON 场景/预制体序列化与 `RSGS` 状态编码。 |
-| 工具链 | `rsc`、`rsaot`、`rsdebug`、`rslsp`、`rsbench`、DAP（标准流与内嵌 TCP `--dap-port` 附加调试、条件断点、无副作用 Watch 求值）、LSP（`ParseSnapshot` 增量缓存、成员 `.` 补全、`signatureHelp`、`.d.rs` 宿主声明导出）、`vscode-realscript` VS Code 插件、Chrome Tracing 性能导出，以及带状态结构化热重载（`[FormerlySerializedAs]` 与跨组件引用迁移）。 |
+| Game SDK | 类型化 Binding、C++ 头文件自动生成绑定（`rsbind`）、数学原语直接封送与快路径（`Fixed`/`Fixed16`/`Vec2`/`Vec3`/`Quat`）、C++ 宿主连续内存零拷贝 ECS 列绑定（`bindEcsRawColumnAuto<T>`）、`Query<Write<T>, Read<U>, With<V>, Without<W>>()` 与 `EntityCommandBuffer`、2D/3D 定点物理（`stepPhysics2D`/`stepPhysics3D`）、空间查询（Raycast/Overlap）、确定性 `RealScript.Input`、单实体多组件、代际实体句柄、Editor/Play 模式（`[Tool]`/`[ExecuteInEditMode]`）、`OnValidate`、深度 `InspectorTypeSchema` 反射、宿主 `connectSignal`、JSON 场景/预制体序列化与 `RSGS` 状态编码。 |
+| 工具链 | `rsc`、`rsaot`、`rsbind`、`rsdebug`、`rslsp`、`rsbench`、DAP（标准流与内嵌 TCP `--dap-port` 附加调试、条件与异常断点、重入安全点、堆保留路径分析器、无副作用 Watch 求值）、LSP（`ParseSnapshot` 增量缓存、子图元数据增量重构缓存、异步请求桥接、成员 `.` 补全、`signatureHelp`、`.d.rs` 宿主声明导出）、`vscode-realscript` 官方 VS Code 插件、Chrome Tracing 性能导出，以及带状态结构化热重载（`[FormerlySerializedAs]`、静态字段重命名迁移与跨组件引用迁移）。 |
 
 完整的支持/部分支持/不支持清单见
 [C# 风格兼容矩阵](docs/zh-CN/CSHARP_COMPATIBILITY_MATRIX.md)。
@@ -164,14 +161,16 @@ realscript::game::SceneScriptRuntime scene(scripts);
 | 10,000 个协程 Resume | 86.06 ms；8.61 µs/Callback |
 | 10,000 个协程确定性 Replay | 89.45 ms |
 
-v0.2.0 的关键性能改动包括：
+v0.98.0 的关键性能改动包括：
 
+- 统一扁平栈帧布局（Unified Flat Frame）与 Computed-goto 解释器线程化派发；
+- 零预算 Trusted Release AOT 模式（`--trusted-release`）与自定义结构体栈标量化；
+- C++ 宿主连续结构体零拷贝 ECS 原始列绑定（`bindEcsRawColumnAuto`）与 AVX2 SIMD 循环重构；
+- 32 位拓宽 `BytecodeString` 及无锁分页池、24B/8B 紧凑值与指令表示；
+- 带阴影栈安全保护的增量 GC 步进与池化值回收；
 - Typed AOT/JIT Scalar Lowering 与 Range-Proven Checked Arithmetic；
-- 直接 Typed CFG Label 与 Failure-Aware Accounting；
-- 保持精确预算和 Digest 的局部 RAW/Strict Accounting；
-- Interpreter 整数专用路径和低成本调用栈物化；
-- 持续分配时仍能有界完成的 Incremental Sweep；
-- Scene Method Descriptor Cache 和更少的 Scheduler Payload Copy。
+- 解释器整数特化与快化循环超级指令（Quickening）；
+- 缓存场景方法描述符、原生快速路径（Native Fast-Path）与对象标识缓存（Identity Cache）。
 
 详细方法、优化历史、被撤销的实验和复现命令见
 [完整性能报告](docs/zh-CN/PERFORMANCE_BASELINE.md)与
@@ -198,9 +197,10 @@ Suspend、Snapshot、Restore、Replay、Rollback 与 C++17 AOT。
 | 工具 | 用途 |
 |---|---|
 | `rsc` | 编译、验证、检查 MIR/Bytecode、运行脚本并输出 Package、Profile 和 Digest。 |
-| `rsaot` | 生成确定性 C++17 AOT 源码与 Manifest。 |
-| `rsdebug` | 启动源码级 Debug Adapter Protocol Server。 |
-| `rslsp` | 启动 Language Server Protocol Server。 |
+| `rsaot` | 生成确定性 C++17 AOT 源码、行号映射与 Manifest。 |
+| `rsbind` | 解析 C++ 头文件，自动生成类型安全绑定、方法 Thunk 与 ECS 连续列辅助代码。 |
+| `rsdebug` | 启动源码级 Debug Adapter Protocol Server（支持 stdio 及 `--dap-port` TCP 附加调试）。 |
+| `rslsp` | 启动 Language Server Protocol Server（支持增量缓存与快速子图查询）。 |
 | `rsbench` | 运行可复现 Timing、GC、Digest 与 Profile 基准。 |
 
 ## 文档
@@ -221,7 +221,7 @@ Suspend、Snapshot、Restore、Replay、Rollback 与 C++17 AOT。
 
 ## 明确边界
 
-RealScript 不是 CLR 兼容 C#。v0.2.0 明确不提供：
+RealScript 不是 CLR 兼容 C#。v0.98.0 明确不提供：
 
 - 多类继承、默认 Interface 实现、开放运行时泛型或 Generic Variance；
 - 通用 `Task`、线程或不受限的 `async/await`；

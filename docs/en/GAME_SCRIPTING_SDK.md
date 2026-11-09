@@ -173,6 +173,10 @@ scene.connectSignal(
 
 `BindingMarshal.h` and `ScriptRuntime` directly marshal `RealScript.Math` types (`Fixed`, `Fixed16`, `Vec2`, `Vec3`, `Quat`) between C++ (`FixedValue`, `Fixed16Value`, `Vec2Value`, `Vec3Value`, `QuatValue`) and scripts. `ScriptRuntime::getMemberVec2` and `setMemberVec2` read and mutate unshared `Vec2` struct fields in place without intermediate heap allocations.
 
+In addition, the runtime incorporates an **Identity Cache** and **Native Fast-Path**:
+- **Identity Cache**: maintains bi-directional O(1) mappings between host C++ pointer addresses and script object handles, eliminating redundant wrapper allocations;
+- **Native Fast-Path**: high-frequency callbacks and bound host calls bypass generic reflection thunks and invoke direct function pointers.
+
 For high-throughput ECS systems (`foreach (ref var t, in var v in Query<Write<Transform>, Read<Velocity>, With<ActiveTag>, Without<FrozenTag>>())`), C++ hosts can bind contiguous native component arrays directly to script ECS columns via `ScriptRuntime::bindEcsRawColumn` or `bindEcsRawColumnAuto<HostStruct>`:
 
 ```cpp
@@ -228,3 +232,11 @@ The engine owns condition evaluation; scripts own the reaction. This keeps spati
 Every invocation returns `ExecutionResult`; scene failures are accumulated as `SceneScriptError` values with entity, callback, runtime error, and script stack. Stale native handles, stale managed references, wrong exact types, execution budgets, and Strict/Record/Replay binding policies remain enforced.
 
 The scene layer is engine-neutral and does not prescribe an ECS, serializer, asset format, editor, or event bus. Script classes can directly inherit bound `NativeType` wrappers, implement interfaces, expose `InspectorTypeSchema` metadata and `event` signals, and participate in stateful hot reload.
+
+## Automated C++ Binding with `rsbind`
+
+To eliminate repetitive boilerplate bindings, the SDK includes `rsbind`:
+- Extracts struct/class signatures, methods, properties, and template classes from C++ header files;
+- Emits registration code matching `GameApi` types and methods;
+- Generates zero-copy ECS column helpers (`bindEcsRawColumnAuto`);
+- Emits corresponding ambient `.d.rs` declaration files for LSP IDE completion.

@@ -2,7 +2,7 @@
   "name": "vscode-realscript",
   "displayName": "RealScript Language Support",
   "description": "Syntax highlighting, LSP language client (rslsp), and in-engine TCP / standalone DAP debugger (rsdebug) for the RealScript game scripting engine.",
-  "version": "0.2.0",
+  "version": "0.98.0",
   "main": "./out/extension.js",
   "engines": {
     "vscode": "^1.75.0"
