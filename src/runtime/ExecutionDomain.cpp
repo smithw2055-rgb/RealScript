@@ -1,4 +1,5 @@
 #include "realscript/runtime/ExecutionDomain.h"
+#include "realscript/aot_cpp/AotRuntime.h"
 
 #include <limits>
 #include <string>
@@ -437,6 +438,52 @@ std::size_t ExecutionDomainContext::flushSimCommands(
         if (!exec.succeeded) {
             if (error && error->code == ErrorCode::None) {
                 *error = exec.error;
+            }
+            continue;
+        }
+        ++executedCount;
+    }
+    return executedCount;
+}
+
+std::size_t ExecutionDomainContext::flushSimCommands(
+    aot::ExecutionContext& simAotContext,
+    RuntimeError* error) {
+    auto commands = consumeSimCommands();
+    std::size_t executedCount = 0;
+    for (auto& cmd : commands) {
+        std::vector<Value> args;
+        args.reserve(cmd.payload.size() + (cmd.targetObject.valid() ? 1u : 0u));
+        if (cmd.targetObject.valid()) {
+            args.push_back(Value{cmd.targetObject});
+        }
+        for (auto& val : cmd.payload) {
+            if (simHeap_) {
+                if (const auto* strRef = std::get_if<ObjectRef>(&val)) {
+                    if (strRef->kind == ObjectKind::String &&
+                        strRef->heapId != static_cast<std::uint32_t>(simHeap_->heapId())) {
+                        if (const auto sv = stringViewAcrossDomains(*strRef)) {
+                            RuntimeError strErr;
+                            if (const auto interned = simHeap_->internString(*sv, &strErr)) {
+                                args.push_back(Value{*interned});
+                                continue;
+                            }
+                        }
+                    }
+                } else if (const auto* sv = std::get_if<StringValue>(&val)) {
+                    RuntimeError strErr;
+                    if (const auto interned = simHeap_->internString(sv->str(), &strErr)) {
+                        args.push_back(Value{*interned});
+                        continue;
+                    }
+                }
+            }
+            args.push_back(std::move(val));
+        }
+        Value outResult{};
+        if (!simAotContext.invoke(cmd.commandTypeId, args.data(), args.size(), outResult)) {
+            if (error && error->code == ErrorCode::None) {
+                *error = simAotContext.error();
             }
             continue;
         }

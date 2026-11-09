@@ -7,6 +7,7 @@
 #include "realscript/semantic/Semantic.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <ostream>
 #include <stdexcept>
@@ -132,8 +133,12 @@ public:
             return;
         }
         if (count > 0xFFFu) {
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
             throw std::overflow_error(
                 "SmallRegisterVector exceeded 12-bit operand count limit (4095)");
+#else
+            std::abort();
+#endif
         }
         if (count == 1u) {
             inline0_ = values[0];
@@ -179,8 +184,12 @@ public:
     void push_back(Register value) {
         const auto curSize = static_cast<std::uint16_t>(size());
         if (curSize >= 0xFFFu) {
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
             throw std::overflow_error(
                 "SmallRegisterVector exceeded 12-bit operand count limit (4095)");
+#else
+            std::abort();
+#endif
         }
         const auto curSlice = sliceId();
         if (curSlice == 0 && curSize == 0) {

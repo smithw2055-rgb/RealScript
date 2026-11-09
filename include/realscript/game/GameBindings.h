@@ -163,7 +163,7 @@ public:
     NativeStructBuilder<S> structType(std::string moduleName, std::string name) {
         static_assert(std::is_class_v<S> && std::is_default_constructible_v<S>,
             "registered native struct must be a default-constructible C++ struct/class");
-        const auto key = std::type_index(typeid(S));
+        const auto key = detail::cppTypeKey<S>();
         const auto existing = state_->nativeStructByCppType.find(key);
         if (existing != state_->nativeStructByCppType.end()) {
             const auto& registered = state_->nativeStructs[existing->second];
@@ -191,7 +191,7 @@ public:
 
     template <typename T>
     NativeTypeBuilder<T> type(std::string moduleName, std::string name) {
-        const auto key = std::type_index(typeid(T));
+        const auto key = detail::cppTypeKey<T>();
         const auto existing = state_->nativeTypeByCppType.find(key);
         if (existing != state_->nativeTypeByCppType.end()) {
             const auto& registered = state_->nativeTypes[existing->second];
@@ -330,7 +330,7 @@ public:
 
     template <typename T>
     [[nodiscard]] std::string canonicalTypeName() const {
-        const auto found = state_->nativeTypeByCppType.find(std::type_index(typeid(T)));
+        const auto found = state_->nativeTypeByCppType.find(detail::cppTypeKey<T>());
         if (found == state_->nativeTypeByCppType.end()) return {};
         const auto& type = state_->nativeTypes[found->second];
         return type.moduleName + "::" + type.name;

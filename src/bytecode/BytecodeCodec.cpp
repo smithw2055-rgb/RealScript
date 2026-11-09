@@ -1,6 +1,7 @@
 #include "realscript/bytecode/Bytecode.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
@@ -64,7 +65,11 @@ public:
     }
     void patchU32(std::size_t offset, std::uint32_t value) {
         if (offset + 4 > data_.size()) {
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
             throw std::logic_error("bytecode writer patch is outside buffer");
+#else
+            std::abort();
+#endif
         }
         for (int shift = 0; shift < 32; shift += 8) {
             data_[offset++] = static_cast<std::uint8_t>(value >> shift);
@@ -171,7 +176,11 @@ std::uint8_t encodeType(semantic::PrimitiveType type) {
     case semantic::PrimitiveType::Char: return 19;
     case semantic::PrimitiveType::Error: break;
     }
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
     throw std::logic_error("invalid type in bytecode encoder");
+#else
+    std::abort();
+#endif
 }
 
 bool decodeType(std::uint8_t tag, semantic::PrimitiveType& type) {
@@ -225,7 +234,11 @@ public:
     [[nodiscard]] std::uint32_t indexOf(const std::string& value) const {
         const auto found = indices_.find(value);
         if (found == indices_.end()) {
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
             throw std::logic_error("missing string in bytecode pool");
+#else
+            std::abort();
+#endif
         }
         return found->second;
     }

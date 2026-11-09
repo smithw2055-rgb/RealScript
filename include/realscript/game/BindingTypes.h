@@ -27,6 +27,28 @@ namespace realscript::game {
 
 namespace detail {
 
+#if defined(__cpp_rtti) || defined(_CPPRTTI)
+using CppTypeKey = std::type_index;
+template <typename T>
+[[nodiscard]] inline CppTypeKey cppTypeKey() noexcept {
+    return std::type_index(typeid(T));
+}
+#else
+using CppTypeKey = const void*;
+template <typename T>
+struct CppTypeTag {
+    static inline constexpr char id = 0;
+};
+template <>
+struct CppTypeTag<void> {
+    static inline constexpr char id = 0;
+};
+template <typename T>
+[[nodiscard]] inline CppTypeKey cppTypeKey() noexcept {
+    return &CppTypeTag<std::remove_cv_t<std::remove_reference_t<T>>>::id;
+}
+#endif
+
 enum class ScriptTypeCategory {
     Void,
     Bool,
@@ -71,7 +93,7 @@ struct PropertyDeclaration {
 };
 
 struct NativeTypeDeclaration {
-    std::type_index cppType = typeid(void);
+    CppTypeKey cppType = cppTypeKey<void>();
     std::string moduleName;
     std::string name;
     semantic::SymbolId typeId = 0;
@@ -94,7 +116,7 @@ struct NativeStructFieldDeclaration {
 };
 
 struct NativeStructDeclaration {
-    std::type_index cppType = typeid(void);
+    CppTypeKey cppType = cppTypeKey<void>();
     std::string moduleName;
     std::string name;
     semantic::SymbolId typeId = 0;
@@ -117,9 +139,9 @@ struct GameApiState {
     std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles =
         std::make_shared<runtime::NativeHandleRegistry>();
     std::vector<NativeTypeDeclaration> nativeTypes;
-    std::unordered_map<std::type_index, std::size_t> nativeTypeByCppType;
+    std::unordered_map<CppTypeKey, std::size_t> nativeTypeByCppType;
     std::vector<NativeStructDeclaration> nativeStructs;
-    std::unordered_map<std::type_index, std::size_t> nativeStructByCppType;
+    std::unordered_map<CppTypeKey, std::size_t> nativeStructByCppType;
     std::map<std::string, ModuleDeclaration> modules;
     std::unordered_set<std::string> bindingNames;
     std::unordered_set<std::string> declarationNames;
@@ -227,13 +249,13 @@ std::optional<ScriptTypeRef> resolveScriptType(
         return ScriptTypeRef{"Quat", "RealScript.Math", ScriptTypeCategory::Struct};
     } else if constexpr (IsSharedPtr<ValueType>::value) {
         using Element = typename IsSharedPtr<ValueType>::Element;
-        const auto found = state->nativeTypeByCppType.find(std::type_index(typeid(Element)));
+        const auto found = state->nativeTypeByCppType.find(cppTypeKey<Element>());
         if (found == state->nativeTypeByCppType.end()) return std::nullopt;
         const auto& type = state->nativeTypes[found->second];
         return ScriptTypeRef{type.name, type.moduleName, ScriptTypeCategory::NativeObject};
     } else if constexpr (std::is_pointer_v<ValueType>) {
         using Element = std::remove_pointer_t<ValueType>;
-        const auto found = state->nativeTypeByCppType.find(std::type_index(typeid(Element)));
+        const auto found = state->nativeTypeByCppType.find(cppTypeKey<Element>());
         if (found == state->nativeTypeByCppType.end()) return std::nullopt;
         const auto& type = state->nativeTypes[found->second];
         return ScriptTypeRef{type.name, type.moduleName, ScriptTypeCategory::NativeObject};
@@ -249,7 +271,7 @@ std::optional<ScriptTypeRef> resolveScriptType(
             elemRef->moduleName,
             ScriptTypeCategory::Array};
     } else if constexpr (std::is_class_v<ValueType> && std::is_default_constructible_v<ValueType>) {
-        const auto found = state->nativeStructByCppType.find(std::type_index(typeid(ValueType)));
+        const auto found = state->nativeStructByCppType.find(cppTypeKey<ValueType>());
         if (found == state->nativeStructByCppType.end()) return std::nullopt;
         const auto& st = state->nativeStructs[found->second];
         return ScriptTypeRef{st.name, st.moduleName, ScriptTypeCategory::Struct};
@@ -274,7 +296,7 @@ inline void setTypeMismatch(
 
 inline const NativeTypeDeclaration* findNativeType(
     const std::shared_ptr<GameApiState>& state,
-    std::type_index type) {
+    CppTypeKey type) {
     const auto found = state->nativeTypeByCppType.find(type);
     return found == state->nativeTypeByCppType.end()
         ? nullptr

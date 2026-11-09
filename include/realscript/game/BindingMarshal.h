@@ -9,7 +9,7 @@ std::optional<std::shared_ptr<T>> readNativeObject(
     const std::shared_ptr<GameApiState>& state,
     const runtime::Value& value,
     runtime::RuntimeError& error) {
-    const auto* type = findNativeType(state, std::type_index(typeid(T)));
+    const auto* type = findNativeType(state, cppTypeKey<T>());
     if (!type) {
         setTypeMismatch(error, "native C++ type is not registered with the game script API");
         return std::nullopt;
@@ -94,7 +94,7 @@ std::optional<runtime::Value> writeNativeObject(
     const std::shared_ptr<GameApiState>& state,
     std::shared_ptr<T> value,
     runtime::RuntimeError& error) {
-    const auto* type = findNativeType(state, std::type_index(typeid(T)));
+    const auto* type = findNativeType(state, cppTypeKey<T>());
     if (!type) {
         setTypeMismatch(error, "native C++ type is not registered with the game script API");
         return std::nullopt;
@@ -331,7 +331,7 @@ std::optional<RemoveCvRef<T>> readValue(
         }
         return out;
     } else if constexpr (std::is_class_v<ValueType> && std::is_default_constructible_v<ValueType>) {
-        const auto found = state->nativeStructByCppType.find(std::type_index(typeid(ValueType)));
+        const auto found = state->nativeStructByCppType.find(cppTypeKey<ValueType>());
         if (found == state->nativeStructByCppType.end()) {
             setTypeMismatch(error, "native C++ struct type is not registered with the game script API");
             return std::nullopt;
@@ -474,7 +474,7 @@ std::optional<runtime::Value> writeValue(
         }
         return runtime::Value{*arrRef};
     } else if constexpr (std::is_class_v<ValueType> && std::is_default_constructible_v<ValueType>) {
-        const auto found = state->nativeStructByCppType.find(std::type_index(typeid(ValueType)));
+        const auto found = state->nativeStructByCppType.find(cppTypeKey<ValueType>());
         if (found == state->nativeStructByCppType.end()) {
             setTypeMismatch(error, "native C++ struct type is not registered with the game script API");
             return std::nullopt;

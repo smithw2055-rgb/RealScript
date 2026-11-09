@@ -1,6 +1,7 @@
 #include "realscript/bytecode/Bytecode.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -168,8 +169,12 @@ struct RegisterSlicePool {
         const auto found = indexBySlice.find(probe);
         if (found != indexBySlice.end()) return found->second;
         if (nextId >= kMaxSlices) {
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
             throw std::overflow_error(
                 "bytecode register slice pool exceeded 20-bit capacity");
+#else
+            std::abort();
+#endif
         }
         const std::uint32_t id = nextId;
         const std::uint32_t pageIdx = id >> kPageShift;
@@ -272,8 +277,12 @@ struct BytecodeStringPool {
         const auto found = shard.indexByView.find(text);
         if (found != shard.indexByView.end()) return found->second;
         if (shard.nextSlot >= kMaxSlotsPerShard) {
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
             throw std::overflow_error(
                 "bytecode string pool exceeded 64M capacity");
+#else
+            std::abort();
+#endif
         }
 
         const std::uint32_t localSlot = shard.nextSlot;

@@ -13,6 +13,10 @@
 #include <unordered_set>
 #include <vector>
 
+namespace realscript::aot {
+class ExecutionContext;
+}
+
 namespace realscript::runtime {
 
 enum class DomainKind : std::uint8_t {
@@ -171,6 +175,9 @@ public:
     }
     std::size_t flushSimCommands(
         const Interpreter& simInterpreter,
+        RuntimeError* error = nullptr);
+    std::size_t flushSimCommands(
+        aot::ExecutionContext& simAotContext,
         RuntimeError* error = nullptr);
 
     // Heap-allocated reentrant UI async tasks with control-unload cancellation safety

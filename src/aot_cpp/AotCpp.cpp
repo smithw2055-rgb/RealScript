@@ -3315,8 +3315,8 @@ GeneratedProgram CppGenerator::generate(
                         } else {
                             foundIt->observable = foundIt->observable || extra.observable;
                             foundIt->simState = foundIt->simState || extra.simState;
-                            if (foundIt->observableBitIndex == 0xFFu &&
-                                extra.observableBitIndex != 0xFFu) {
+                            if (foundIt->observableBitIndex >= 64u &&
+                                extra.observableBitIndex < 64u) {
                                 foundIt->observableBitIndex = extra.observableBitIndex;
                             }
                         }
@@ -3324,16 +3324,16 @@ GeneratedProgram CppGenerator::generate(
                     if (dst.observable) {
                         std::uint8_t nextBit = 0;
                         for (const auto& f : dst.fields) {
-                            if (f.observable && f.observableBitIndex != 0xFFu &&
+                            if (f.observable && f.observableBitIndex < 64u &&
                                 f.observableBitIndex >= nextBit) {
                                 nextBit = static_cast<std::uint8_t>(f.observableBitIndex + 1u);
                             }
                         }
                         for (auto& f : dst.fields) {
-                            if (!f.staticField && !f.constField && !f.observable) {
+                            if (!f.staticField && !f.constField) {
                                 f.observable = true;
-                                if (f.observableBitIndex == 0xFFu && nextBit < 64u) {
-                                    f.observableBitIndex = nextBit++;
+                                if (f.observableBitIndex >= 64u) {
+                                    f.observableBitIndex = (nextBit < 63u) ? nextBit++ : 63u;
                                 }
                             }
                         }
