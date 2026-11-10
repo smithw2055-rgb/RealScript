@@ -2719,6 +2719,10 @@ void markStackRootValueInPools(const Value& value) noexcept;
 std::size_t finishValuePoolGcSweep() noexcept;
 std::size_t reclaimUnreferencedPoolValues(
     const ShadowStack* activeShadowStack = nullptr) noexcept;
+void registerExternalValuePoolRootMarker(
+    const void* ownerKey,
+    std::function<void()> markerCallback);
+void unregisterExternalValuePoolRootMarker(const void* ownerKey) noexcept;
 [[nodiscard]] RuntimeValuePoolStatistics getRuntimeValuePoolStatistics() noexcept;
 
 [[nodiscard]] bool tryExecuteRuntimeIntrinsic(

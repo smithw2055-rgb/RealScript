@@ -6165,6 +6165,17 @@ struct HeapStructStoragePool {
                     (static_cast<std::uint64_t>(static_cast<std::uint32_t>(qt.y)) << 16u) ^
                     (static_cast<std::uint64_t>(static_cast<std::uint32_t>(qt.z)) << 32u) ^
                     (static_cast<std::uint64_t>(static_cast<std::uint32_t>(qt.w)) << 48u);
+            } else if (Float4Value f4{}; v.tryGetFloat4(f4)) {
+                const auto fbits = [](float x) noexcept -> std::uint32_t {
+                    const float norm = (x == 0.0f) ? 0.0f : x;
+                    std::uint32_t b = 0;
+                    std::memcpy(&b, &norm, sizeof(b));
+                    return b;
+                };
+                vw ^= static_cast<std::uint64_t>(fbits(f4.x)) ^
+                    (static_cast<std::uint64_t>(fbits(f4.y)) << 16u) ^
+                    (static_cast<std::uint64_t>(fbits(f4.z)) << 32u) ^
+                    (static_cast<std::uint64_t>(fbits(f4.w)) * 0x9e3779b97f4a7c15ULL);
             } else if (const auto* sv = std::get_if<StringValue>(&v)) {
                 vw ^= sv->id;
             } else if (const auto* st = std::get_if<StructValue>(&v)) {

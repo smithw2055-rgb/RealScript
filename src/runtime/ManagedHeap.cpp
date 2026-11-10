@@ -170,7 +170,9 @@ void transferActiveShadowStack(ShadowStack* from, ShadowStack* to) noexcept {
 }
 
 ShadowStack::ShadowStack() noexcept
-    : instanceId_(nextShadowStackId()) {}
+    : instanceId_(nextShadowStackId()) {
+    (void)currentThreadShadowStackShard();
+}
 
 ShadowStack::~ShadowStack() noexcept {
     if (registryShard_ != nullptr) {
@@ -4096,6 +4098,24 @@ std::size_t reclaimUnreferencedPoolValues(
         }
     }
     return finishValuePoolGcSweep();
+}
+
+void registerExternalValuePoolRootMarker(
+    const void* ownerKey,
+    std::function<void()> markerCallback) {
+    if (!ownerKey) return;
+    std::lock_guard<std::mutex> lock(liveHeapsPoolMutex());
+    if (markerCallback) {
+        liveHeapPoolMarkers()[ownerKey] = std::move(markerCallback);
+    } else {
+        liveHeapPoolMarkers().erase(ownerKey);
+    }
+}
+
+void unregisterExternalValuePoolRootMarker(const void* ownerKey) noexcept {
+    if (!ownerKey) return;
+    std::lock_guard<std::mutex> lock(liveHeapsPoolMutex());
+    liveHeapPoolMarkers().erase(ownerKey);
 }
 
 } // namespace realscript::runtime
