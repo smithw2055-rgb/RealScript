@@ -6848,9 +6848,14 @@ bool executeFunction(
                 if (needsPoolPin) {
                     pinValueInPools(storeVal);
                 }
-                if (mayHaveRefs && (ce.view.needsRememberedBarrier || gcActive || state.heap->phase() != GcPhase::Idle)) {
-                    state.heap->recordArrayWriteBarrier(ce.ref, storeVal);
-                    ce.view.needsRememberedBarrier = false;
+                if (mayHaveRefs) {
+                    if (ce.view.dirtyCards != nullptr) {
+                        ce.view.dirtyCards[uIdx >> ManagedHeap::kCardElementShift] = 1u;
+                    }
+                    if (RS_FLAT_UNLIKELY(ce.view.needsRememberedBarrier || gcActive || state.heap->phase() != GcPhase::Idle)) {
+                        state.heap->recordArrayWriteBarrier(ce.ref, uIdx, storeVal);
+                        ce.view.needsRememberedBarrier = false;
+                    }
                 }
                 localExecuted += spanCost;
                 ce.view.data[uIdx] = storeVal;
@@ -6928,9 +6933,14 @@ bool executeFunction(
                 if (needsPoolPin) {
                     pinValueInPools(storeVal);
                 }
-                if (needsBarrier && (ce.view.needsRememberedBarrier || gcActive || state.heap->phase() != GcPhase::Idle)) {
-                    state.heap->recordArrayWriteBarrier(ce.ref, storeVal);
-                    ce.view.needsRememberedBarrier = false;
+                if (needsBarrier) {
+                    if (ce.view.dirtyCards != nullptr) {
+                        ce.view.dirtyCards[uIdx >> ManagedHeap::kCardElementShift] = 1u;
+                    }
+                    if (RS_FLAT_UNLIKELY(ce.view.needsRememberedBarrier || gcActive || state.heap->phase() != GcPhase::Idle)) {
+                        state.heap->recordArrayWriteBarrier(ce.ref, uIdx, storeVal);
+                        ce.view.needsRememberedBarrier = false;
+                    }
                 }
                 localExecuted += spanCost;
                 ce.view.data[uIdx] = storeVal;
