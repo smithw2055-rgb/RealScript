@@ -777,7 +777,10 @@ struct NativeRawColumnView {
 
 class ShadowStack {
 public:
-    ShadowStack() = default;
+    static constexpr std::size_t InlineFrameCapacity = 4;
+    static constexpr std::uint32_t InvalidRegistrySlot = 0xffffffffu;
+
+    ShadowStack() noexcept;
     ~ShadowStack() noexcept;
     ShadowStack(const ShadowStack& other);
     ShadowStack& operator=(const ShadowStack& other);
@@ -791,16 +794,57 @@ public:
         const std::size_t* activeRegisterLimit = nullptr);
     void popFrame() noexcept;
     void visitRoots(const std::function<void(const Value&)>& visitor) const;
-    [[nodiscard]] std::size_t frameCount() const noexcept;
 
-private:
+    template <typename Visitor>
+    void visitRoots(Visitor&& visitor) const {
+        const auto visitValues = [&](const std::vector<Value>* values, const std::size_t* limit) {
+            if (!values) return;
+            const std::size_t count = limit
+                ? std::min(*limit, values->size())
+                : values->size();
+            const Value* data = values->data();
+            for (std::size_t index = 0; index < count; ++index) {
+                const Value& v = data[index];
+                if (!std::holds_alternative<std::monostate>(v)) {
+                    visitor(v);
+                }
+            }
+        };
+        const std::size_t inlineCount = std::min(frameCount_, InlineFrameCapacity);
+        for (std::size_t i = 0; i < inlineCount; ++i) {
+            const auto& frame = inlineFrames_[i];
+            visitValues(frame.arguments, nullptr);
+            visitValues(frame.locals, nullptr);
+            visitValues(frame.registers, frame.activeRegisterLimit);
+        }
+        for (const auto& frame : overflowFrames_) {
+            visitValues(frame.arguments, nullptr);
+            visitValues(frame.locals, nullptr);
+            visitValues(frame.registers, frame.activeRegisterLimit);
+        }
+    }
+
+    [[nodiscard]] std::size_t frameCount() const noexcept { return frameCount_; }
+    [[nodiscard]] std::uint64_t instanceId() const noexcept { return instanceId_; }
+
     struct FrameRoots {
         const std::vector<Value>* arguments = nullptr;
         const std::vector<Value>* locals = nullptr;
         const std::vector<Value>* registers = nullptr;
         const std::size_t* activeRegisterLimit = nullptr;
     };
-    std::vector<FrameRoots> frames_;
+
+private:
+    friend void registerActiveShadowStack(ShadowStack* stack) noexcept;
+    friend void unregisterActiveShadowStack(ShadowStack* stack) noexcept;
+    friend void transferActiveShadowStack(ShadowStack* from, ShadowStack* to) noexcept;
+
+    std::array<FrameRoots, InlineFrameCapacity> inlineFrames_{};
+    std::vector<FrameRoots> overflowFrames_;
+    std::size_t frameCount_ = 0;
+    std::uint64_t instanceId_ = 0;
+    void* registryShard_ = nullptr;
+    std::uint32_t registrySlot_ = InvalidRegistrySlot;
 };
 
 class ManagedHeap {
@@ -865,11 +909,21 @@ public:
     [[nodiscard]] std::optional<semantic::SymbolId> objectTypeId(
         ObjectRef reference) const;
     [[nodiscard]] std::optional<Value> fieldGet(ObjectRef reference, std::size_t index) const;
+    [[nodiscard]] const Value* fieldGetFast(
+        ObjectRef reference,
+        std::size_t index,
+        semantic::SymbolId* outTypeId = nullptr) const noexcept;
     bool fieldSet(
         ObjectRef reference,
         std::size_t index,
         Value value,
         RuntimeError* error = nullptr);
+    bool fieldSetFast(
+        ObjectRef reference,
+        std::size_t index,
+        const Value& value,
+        semantic::SymbolId expectedTypeId,
+        semantic::PrimitiveType expectedFieldType) noexcept;
 
     [[nodiscard]] RootToken addPersistentRoot(ObjectRef reference);
     [[nodiscard]] RootToken addPersistentRoot(Value value);
@@ -1315,8 +1369,14 @@ public:
     [[nodiscard]] std::size_t replayEntriesConsumed() const noexcept;
 
 private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    DeterminismMode mode_ = DeterminismMode::Off;
+    bool canonicalizeFloatingPoint_ = true;
+    bool enforceCapabilities_ = false;
+    std::shared_ptr<ReplayLog> replayLog_{};
+    std::unique_ptr<std::unordered_set<std::string>> grantedCapabilities_{};
+    std::vector<ExternalCallRecord> replayEntries_{};
+    std::size_t replayCursor_ = 0;
+    std::uint64_t digest_ = 14695981039346656037ULL;
 };
 
 class ProgramImage;

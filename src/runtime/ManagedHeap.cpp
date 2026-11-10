@@ -67,71 +67,156 @@ std::mutex& poolGcMutex() noexcept {
     return m;
 }
 
-std::mutex& activeShadowStacksMutex() noexcept {
-    static std::mutex m;
-    return m;
+std::uint64_t nextShadowStackId() noexcept {
+    static std::atomic<std::uint64_t> next{1};
+    return nextIdentity(next);
 }
 
-std::unordered_set<const ShadowStack*>& activeShadowStacks() noexcept {
-    static std::unordered_set<const ShadowStack*> stacks;
-    return stacks;
+struct ThreadShadowStackShard {
+    std::mutex mutex;
+    std::vector<ShadowStack*> stacks;
+    bool threadExited = false;
+
+    ThreadShadowStackShard() {
+        stacks.reserve(16);
+    }
+};
+
+std::mutex& shadowStackShardsMutex() noexcept {
+    static auto* m = new std::mutex();
+    return *m;
 }
 
-void registerActiveShadowStack(const ShadowStack* stack) noexcept {
-    std::lock_guard<std::mutex> lock(activeShadowStacksMutex());
-    activeShadowStacks().insert(stack);
+std::vector<std::shared_ptr<ThreadShadowStackShard>>& shadowStackShards() noexcept {
+    static auto* shards = new std::vector<std::shared_ptr<ThreadShadowStackShard>>();
+    return *shards;
 }
 
-void unregisterActiveShadowStack(const ShadowStack* stack) noexcept {
-    std::lock_guard<std::mutex> lock(activeShadowStacksMutex());
-    activeShadowStacks().erase(stack);
+ThreadShadowStackShard* currentThreadShadowStackShard() noexcept {
+    struct TlsShardHolder {
+        std::shared_ptr<ThreadShadowStackShard> shard;
+        TlsShardHolder()
+            : shard(std::make_shared<ThreadShadowStackShard>()) {
+            std::lock_guard<std::mutex> lock(shadowStackShardsMutex());
+            shadowStackShards().push_back(shard);
+        }
+        ~TlsShardHolder() noexcept {
+            if (shard) {
+                std::lock_guard<std::mutex> lock(shard->mutex);
+                shard->threadExited = true;
+            }
+        }
+    };
+    thread_local TlsShardHolder tlsHolder;
+    return tlsHolder.shard.get();
 }
 
 } // namespace
 
+void registerActiveShadowStack(ShadowStack* stack) noexcept {
+    if (!stack || stack->registryShard_ != nullptr) return;
+    auto* shard = currentThreadShadowStackShard();
+    std::lock_guard<std::mutex> lock(shard->mutex);
+    stack->registryShard_ = shard;
+    stack->registrySlot_ = static_cast<std::uint32_t>(shard->stacks.size());
+    shard->stacks.push_back(stack);
+}
+
+void unregisterActiveShadowStack(ShadowStack* stack) noexcept {
+    if (!stack || !stack->registryShard_) return;
+    auto* shard = static_cast<ThreadShadowStackShard*>(stack->registryShard_);
+    std::lock_guard<std::mutex> lock(shard->mutex);
+    const std::uint32_t slot = stack->registrySlot_;
+    if (slot < shard->stacks.size() && shard->stacks[slot] == stack) {
+        ShadowStack* last = shard->stacks.back();
+        shard->stacks[slot] = last;
+        last->registrySlot_ = slot;
+        shard->stacks.pop_back();
+    }
+    stack->registryShard_ = nullptr;
+    stack->registrySlot_ = ShadowStack::InvalidRegistrySlot;
+}
+
+void transferActiveShadowStack(ShadowStack* from, ShadowStack* to) noexcept {
+    if (!from || !to || from == to) return;
+    if (from->registryShard_ != nullptr) {
+        auto* shard = static_cast<ThreadShadowStackShard*>(from->registryShard_);
+        std::lock_guard<std::mutex> lock(shard->mutex);
+        to->inlineFrames_ = from->inlineFrames_;
+        to->overflowFrames_ = std::move(from->overflowFrames_);
+        to->frameCount_ = from->frameCount_;
+        from->inlineFrames_ = {};
+        from->frameCount_ = 0;
+
+        const std::uint32_t slot = from->registrySlot_;
+        if (slot < shard->stacks.size() && shard->stacks[slot] == from) {
+            shard->stacks[slot] = to;
+            to->registryShard_ = shard;
+            to->registrySlot_ = slot;
+        }
+        from->registryShard_ = nullptr;
+        from->registrySlot_ = ShadowStack::InvalidRegistrySlot;
+        return;
+    }
+    to->inlineFrames_ = from->inlineFrames_;
+    to->overflowFrames_ = std::move(from->overflowFrames_);
+    to->frameCount_ = from->frameCount_;
+    from->inlineFrames_ = {};
+    from->frameCount_ = 0;
+    if (to->frameCount_ > 0) {
+        registerActiveShadowStack(to);
+    }
+}
+
+ShadowStack::ShadowStack() noexcept
+    : instanceId_(nextShadowStackId()) {}
+
 ShadowStack::~ShadowStack() noexcept {
-    if (!frames_.empty()) {
+    if (registryShard_ != nullptr) {
         unregisterActiveShadowStack(this);
     }
 }
 
 ShadowStack::ShadowStack(const ShadowStack& other)
-    : frames_(other.frames_) {
-    if (!frames_.empty()) {
+    : inlineFrames_(other.inlineFrames_),
+      overflowFrames_(other.overflowFrames_),
+      frameCount_(other.frameCount_),
+      instanceId_(nextShadowStackId()) {
+    if (frameCount_ > 0) {
         registerActiveShadowStack(this);
     }
 }
 
 ShadowStack& ShadowStack::operator=(const ShadowStack& other) {
     if (this == &other) return *this;
-    const bool wasEmpty = frames_.empty();
-    frames_ = other.frames_;
-    if (wasEmpty && !frames_.empty()) {
+    const bool wasEmpty = (frameCount_ == 0);
+    auto overflowCopy = other.overflowFrames_;
+    inlineFrames_ = other.inlineFrames_;
+    overflowFrames_ = std::move(overflowCopy);
+    frameCount_ = other.frameCount_;
+    instanceId_ = nextShadowStackId();
+    if (wasEmpty && frameCount_ > 0) {
         registerActiveShadowStack(this);
-    } else if (!wasEmpty && frames_.empty()) {
+    } else if (!wasEmpty && frameCount_ == 0) {
         unregisterActiveShadowStack(this);
     }
     return *this;
 }
 
 ShadowStack::ShadowStack(ShadowStack&& other) noexcept
-    : frames_(std::move(other.frames_)) {
-    if (!frames_.empty()) {
-        unregisterActiveShadowStack(&other);
-        registerActiveShadowStack(this);
-    }
+    : instanceId_(nextShadowStackId()) {
+    transferActiveShadowStack(&other, this);
+    other.instanceId_ = nextShadowStackId();
 }
 
 ShadowStack& ShadowStack::operator=(ShadowStack&& other) noexcept {
     if (this == &other) return *this;
-    if (!frames_.empty()) {
+    if (registryShard_ != nullptr) {
         unregisterActiveShadowStack(this);
     }
-    frames_ = std::move(other.frames_);
-    if (!frames_.empty()) {
-        unregisterActiveShadowStack(&other);
-        registerActiveShadowStack(this);
-    }
+    instanceId_ = nextShadowStackId();
+    transferActiveShadowStack(&other, this);
+    other.instanceId_ = nextShadowStackId();
     return *this;
 }
 
@@ -140,40 +225,36 @@ void ShadowStack::pushFrame(
     const std::vector<Value>* locals,
     const std::vector<Value>* registers,
     const std::size_t* activeRegisterLimit) {
-    const bool wasEmpty = frames_.empty();
-    frames_.push_back({arguments, locals, registers, activeRegisterLimit});
-    if (wasEmpty) {
+    const std::size_t idx = frameCount_;
+    if (idx < InlineFrameCapacity) {
+        inlineFrames_[idx] = {arguments, locals, registers, activeRegisterLimit};
+    } else {
+        overflowFrames_.push_back({arguments, locals, registers, activeRegisterLimit});
+    }
+    frameCount_ = idx + 1;
+    if (idx == 0) {
         registerActiveShadowStack(this);
     }
 }
 
 void ShadowStack::popFrame() noexcept {
-    if (!frames_.empty()) {
-        frames_.pop_back();
-        if (frames_.empty()) {
+    if (frameCount_ > 0) {
+        const std::size_t newCount = frameCount_ - 1;
+        if (newCount >= InlineFrameCapacity) {
+            overflowFrames_.pop_back();
+        } else {
+            inlineFrames_[newCount] = {};
+        }
+        frameCount_ = newCount;
+        if (newCount == 0) {
             unregisterActiveShadowStack(this);
         }
     }
 }
 
 void ShadowStack::visitRoots(const std::function<void(const Value&)>& visitor) const {
-    const auto visitValues = [&](const std::vector<Value>* values, const std::size_t* limit) {
-        if (!values) return;
-        const std::size_t count = limit
-            ? std::min(*limit, values->size())
-            : values->size();
-        for (std::size_t index = 0; index < count; ++index) {
-            visitor((*values)[index]);
-        }
-    };
-    for (const auto& frame : frames_) {
-        visitValues(frame.arguments, nullptr);
-        visitValues(frame.locals, nullptr);
-        visitValues(frame.registers, frame.activeRegisterLimit);
-    }
+    visitRoots<const std::function<void(const Value&)>&>(visitor);
 }
-
-std::size_t ShadowStack::frameCount() const noexcept { return frames_.size(); }
 
 struct ManagedHeap::Impl {
     struct Header {
@@ -281,6 +362,15 @@ struct ManagedHeap::Impl {
         return false;
     }
 
+    [[nodiscard]] static constexpr bool elementTypeMayContainReferences(
+        semantic::PrimitiveType elementType) noexcept {
+        return elementType == semantic::PrimitiveType::Object ||
+            elementType == semantic::PrimitiveType::Array ||
+            elementType == semantic::PrimitiveType::String ||
+            elementType == semantic::PrimitiveType::Struct ||
+            elementType == semantic::PrimitiveType::Error;
+    }
+
     explicit Impl(HeapConfig value)
         : config(value), heapId(nextHeapId()),
           nextCollectionThreshold(value.initialCollectionThresholdBytes) {
@@ -335,11 +425,19 @@ struct ManagedHeap::Impl {
     bool requested = false;
     bool resumeSweep = false;
     bool hasSparseEcsStaticFields = false;
-    bool rootsRescannedForSweep = false;
+    std::uint64_t lastScannedShadowStackId = 0;
     std::size_t sweepIndex = 0;
     std::size_t sweepLimit = 0;
     std::size_t nextCollectionThreshold = 0;
     GcStatistics statistics;
+
+    void reopenMarkFromSweep() noexcept {
+        if (phase == GcPhase::Sweep) {
+            phase = GcPhase::Mark;
+            resumeSweep = true;
+            lastScannedShadowStackId = 0;
+        }
+    }
 
     [[nodiscard]] HeapObject* get(ObjectRef reference) noexcept {
         if (!reference.valid() || reference.heapId != heapId ||
@@ -418,10 +516,7 @@ struct ManagedHeap::Impl {
         if (statistics.liveBytes >= nextCollectionThreshold) requested = true;
         if (phase != GcPhase::Idle) {
             markStack.push_back(reference);
-            if (phase == GcPhase::Sweep) {
-                phase = GcPhase::Mark;
-                resumeSweep = true;
-            }
+            reopenMarkFromSweep();
         }
         return reference;
     }
@@ -520,7 +615,7 @@ struct ManagedHeap::Impl {
             return;
         }
         if (const auto* structure = std::get_if<StructValue>(&value);
-            structure && structure->storage &&
+            structure && !structure->isInline && structure->storage &&
             visitedStructs.insert(structure->storage.get()).second) {
             for (const auto& field : structure->storage->fields) {
                 markValue(field, visitedStructs);
@@ -529,8 +624,18 @@ struct ManagedHeap::Impl {
     }
 
     void markValue(const Value& value) {
-        std::unordered_set<const StructStorage*> visitedStructs;
-        markValue(value, visitedStructs);
+        if (const auto* reference = std::get_if<ObjectRef>(&value)) {
+            mark(*reference);
+            return;
+        }
+        if (const auto* structure = std::get_if<StructValue>(&value);
+            structure && !structure->isInline && structure->storage) {
+            std::unordered_set<const StructStorage*> visitedStructs;
+            visitedStructs.insert(structure->storage.get());
+            for (const auto& field : structure->storage->fields) {
+                markValue(field, visitedStructs);
+            }
+        }
     }
 
     [[nodiscard]] bool validRootValue(
@@ -541,7 +646,7 @@ struct ManagedHeap::Impl {
         }
         if (const auto* structure = std::get_if<StructValue>(&value)) {
             if (!structure->valid()) return false;
-            if (!structure->storage) return true;
+            if (structure->isInline || !structure->storage) return true;
             if (!visitedStructs.insert(structure->storage.get()).second) return true;
             for (const auto& field : structure->storage->fields) {
                 if (!validRootValue(field, visitedStructs)) return false;
@@ -551,11 +656,23 @@ struct ManagedHeap::Impl {
     }
 
     [[nodiscard]] bool validRootValue(const Value& value) const {
-        std::unordered_set<const StructStorage*> visitedStructs;
-        return validRootValue(value, visitedStructs);
+        if (const auto* reference = std::get_if<ObjectRef>(&value)) {
+            return get(*reference) != nullptr;
+        }
+        if (const auto* structure = std::get_if<StructValue>(&value)) {
+            if (!structure->valid()) return false;
+            if (structure->isInline || !structure->storage) return true;
+            std::unordered_set<const StructStorage*> visitedStructs;
+            visitedStructs.insert(structure->storage.get());
+            for (const auto& field : structure->storage->fields) {
+                if (!validRootValue(field, visitedStructs)) return false;
+            }
+        }
+        return true;
     }
 
     void markRoots(const ShadowStack& shadowStack) {
+        lastScannedShadowStackId = shadowStack.instanceId();
         shadowStack.visitRoots([&](const Value& value) { markValue(value); });
         for (const auto& entry : persistentRoots) markValue(entry.second);
         for (const auto& entry : staticFields) markValue(entry.second);
@@ -574,7 +691,7 @@ struct ManagedHeap::Impl {
         sweepIndex = 0;
         sweepLimit = slots.size();
         resumeSweep = false;
-        rootsRescannedForSweep = false;
+        lastScannedShadowStackId = 0;
         phase = GcPhase::Mark;
         ++statistics.collectionsStarted;
         markRoots(shadowStack);
@@ -585,6 +702,7 @@ struct ManagedHeap::Impl {
         if (!object || object->header.kind == ObjectKind::String) return;
         const auto count = object->valueCount();
         if (object->header.kind == ObjectKind::Array) {
+            if (!elementTypeMayContainReferences(object->header.elementType)) return;
             for (std::size_t i = 0; i < count; ++i) markValue(object->valueAt(i));
             return;
         }
@@ -606,9 +724,8 @@ struct ManagedHeap::Impl {
         const auto* object = get(owner);
         if (!object || !object->header.marked) return;
         markValue(value);
-        if (phase == GcPhase::Sweep && !markStack.empty()) {
-            phase = GcPhase::Mark;
-            resumeSweep = true;
+        if (!markStack.empty()) {
+            reopenMarkFromSweep();
         }
     }
 
@@ -616,6 +733,7 @@ struct ManagedHeap::Impl {
         phase = GcPhase::Idle;
         requested = false;
         resumeSweep = false;
+        lastScannedShadowStackId = 0;
         sweepIndex = 0;
         sweepLimit = 0;
         for (const auto slotIdx : nurserySlots) {
@@ -667,10 +785,7 @@ std::optional<ObjectRef> ManagedHeap::internString(
         if (impl_->get(found->second) != nullptr) {
             if (impl_->phase != GcPhase::Idle) {
                 impl_->mark(found->second);
-                if (impl_->phase == GcPhase::Sweep) {
-                    impl_->phase = GcPhase::Mark;
-                    impl_->resumeSweep = true;
-                }
+                impl_->reopenMarkFromSweep();
             }
             return found->second;
         }
@@ -1287,6 +1402,19 @@ std::optional<Value> ManagedHeap::fieldGet(ObjectRef reference, std::size_t inde
     return object->valueAt(index);
 }
 
+const Value* ManagedHeap::fieldGetFast(
+    ObjectRef reference,
+    std::size_t index,
+    semantic::SymbolId* outTypeId) const noexcept {
+    const auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Record ||
+        object->header.typeId == 0 || index >= object->valueCount()) {
+        return nullptr;
+    }
+    if (outTypeId) *outTypeId = object->header.typeId;
+    return &object->valueAt(index);
+}
+
 bool ManagedHeap::fieldSet(
     ObjectRef reference,
     std::size_t index,
@@ -1303,7 +1431,8 @@ bool ManagedHeap::fieldSet(
             "managed field index is out of range");
         return false;
     }
-    if (object->referenceFields &&
+    if (Impl::valueMayContainReferences(value) &&
+        object->referenceFields &&
         std::binary_search(
             object->referenceFields->begin(),
             object->referenceFields->end(),
@@ -1315,12 +1444,48 @@ bool ManagedHeap::fieldSet(
     return true;
 }
 
+bool ManagedHeap::fieldSetFast(
+    ObjectRef reference,
+    std::size_t index,
+    const Value& value,
+    semantic::SymbolId expectedTypeId,
+    semantic::PrimitiveType expectedFieldType) noexcept {
+    auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Record ||
+        object->header.typeId != expectedTypeId ||
+        index >= object->valueCount() ||
+        valueType(value) != expectedFieldType) {
+        return false;
+    }
+    if (const auto* childRef = std::get_if<ObjectRef>(&value);
+        childRef && !impl_->get(*childRef)) {
+        return false;
+    }
+    if (Impl::valueMayContainReferences(value) &&
+        object->referenceFields &&
+        std::binary_search(
+            object->referenceFields->begin(),
+            object->referenceFields->end(),
+            index)) {
+        impl_->writeBarrier(reference, value);
+    }
+    pinValueInPools(value);
+    object->valueAt(index) = value;
+    return true;
+}
+
 ManagedHeap::RootToken ManagedHeap::addPersistentRoot(ObjectRef reference) {
     return addPersistentRoot(Value{reference});
 }
 
 ManagedHeap::RootToken ManagedHeap::addPersistentRoot(Value value) {
     if (!impl_->validRootValue(value)) return 0;
+    if (impl_->phase != GcPhase::Idle) {
+        impl_->markValue(value);
+        if (!impl_->markStack.empty()) {
+            impl_->reopenMarkFromSweep();
+        }
+    }
     auto token = impl_->nextRootToken++;
     if (token == 0) token = impl_->nextRootToken++;
     pinValueInPools(value);
@@ -1338,6 +1503,12 @@ bool ManagedHeap::updatePersistentRoot(RootToken token, Value value) {
     if (token == 0 || !impl_->validRootValue(value)) return false;
     const auto found = impl_->persistentRoots.find(token);
     if (found == impl_->persistentRoots.end()) return false;
+    if (impl_->phase != GcPhase::Idle) {
+        impl_->markValue(value);
+        if (!impl_->markStack.empty()) {
+            impl_->reopenMarkFromSweep();
+        }
+    }
     pinValueInPools(value);
     found->second = std::move(value);
     return true;
@@ -1369,9 +1540,8 @@ std::optional<Value> ManagedHeap::getStaticField(semantic::SymbolId id) const {
 void ManagedHeap::setStaticField(semantic::SymbolId id, Value value) {
     if (impl_->phase != GcPhase::Idle) {
         impl_->markValue(value);
-        if (impl_->phase == GcPhase::Sweep && !impl_->markStack.empty()) {
-            impl_->phase = GcPhase::Mark;
-            impl_->resumeSweep = true;
+        if (!impl_->markStack.empty()) {
+            impl_->reopenMarkFromSweep();
         }
     }
     pinValueInPools(value);
@@ -1399,9 +1569,8 @@ bool ManagedHeap::setNativeEcsComponent(
     Value component) {
     if (impl_->phase != GcPhase::Idle) {
         impl_->markValue(component);
-        if (impl_->phase == GcPhase::Sweep && !impl_->markStack.empty()) {
-            impl_->phase = GcPhase::Mark;
-            impl_->resumeSweep = true;
+        if (!impl_->markStack.empty()) {
+            impl_->reopenMarkFromSweep();
         }
     }
     pinValueInPools(component);
@@ -1512,9 +1681,8 @@ bool ManagedHeap::setNativeEcsComponentByDenseIndex(
     }
     if (impl_->phase != GcPhase::Idle) {
         impl_->markValue(component);
-        if (impl_->phase == GcPhase::Sweep && !impl_->markStack.empty()) {
-            impl_->phase = GcPhase::Mark;
-            impl_->resumeSweep = true;
+        if (!impl_->markStack.empty()) {
+            impl_->reopenMarkFromSweep();
         }
     }
     if (Impl::valueMayContainReferences(component)) {
@@ -1660,24 +1828,20 @@ std::size_t ManagedHeap::step(
     if (impl_->phase == GcPhase::Idle) {
         if (!impl_->requested) return 0;
         impl_->startCollection(shadowStack);
-    } else if (impl_->phase == GcPhase::Mark) {
+    } else if (impl_->phase == GcPhase::Mark &&
+               impl_->lastScannedShadowStackId != shadowStack.instanceId()) {
         impl_->markRoots(shadowStack);
     }
 
     std::size_t performed = 0;
     while (performed < workBudget) {
         if (impl_->phase == GcPhase::Sweep && !impl_->markStack.empty()) {
-            impl_->phase = GcPhase::Mark;
-            impl_->resumeSweep = true;
-            impl_->rootsRescannedForSweep = false;
+            impl_->reopenMarkFromSweep();
         }
         if (impl_->phase == GcPhase::Mark) {
             if (impl_->markStack.empty()) {
-                if (!impl_->rootsRescannedForSweep) {
-                    impl_->markRoots(shadowStack);
-                    impl_->rootsRescannedForSweep = true;
-                    if (!impl_->markStack.empty()) continue;
-                }
+                impl_->markRoots(shadowStack);
+                if (!impl_->markStack.empty()) continue;
                 impl_->phase = GcPhase::Sweep;
                 if (!impl_->resumeSweep) impl_->sweepIndex = 0;
                 impl_->resumeSweep = false;
@@ -1781,7 +1945,7 @@ std::size_t ManagedHeap::collectYoung(
             return;
         }
         if (const auto* structure = std::get_if<StructValue>(&val);
-            structure && structure->storage &&
+            structure && !structure->isInline && structure->storage &&
             visitedStructs.insert(structure->storage.get()).second) {
             for (const auto& field : structure->storage->fields) {
                 self(self, field);
@@ -1802,6 +1966,7 @@ std::size_t ManagedHeap::collectYoung(
         if (!oldObj || oldObj->header.kind == ObjectKind::String) continue;
         const auto count = oldObj->valueCount();
         if (oldObj->header.kind == ObjectKind::Array) {
+            if (!Impl::elementTypeMayContainReferences(oldObj->header.elementType)) continue;
             for (std::size_t i = 0; i < count; ++i) markYoungValue(markYoungValue, oldObj->valueAt(i));
         } else if (oldObj->referenceFields) {
             for (const auto idx : *oldObj->referenceFields) {
@@ -1817,6 +1982,7 @@ std::size_t ManagedHeap::collectYoung(
         if (!obj || obj->header.kind == ObjectKind::String) continue;
         const auto count = obj->valueCount();
         if (obj->header.kind == ObjectKind::Array) {
+            if (!Impl::elementTypeMayContainReferences(obj->header.elementType)) continue;
             for (std::size_t i = 0; i < count; ++i) markYoungValue(markYoungValue, obj->valueAt(i));
         } else if (obj->referenceFields) {
             for (const auto idx : *obj->referenceFields) {
@@ -2695,12 +2861,31 @@ std::size_t reclaimUnreferencedPoolValues(
         });
     }
     {
-        std::lock_guard<std::mutex> stackLock(activeShadowStacksMutex());
-        for (const ShadowStack* stack : activeShadowStacks()) {
-            if (stack && stack != activeShadowStack) {
-                stack->visitRoots([](const Value& value) {
-                    markStackRootValueInPools(value);
-                });
+        std::vector<std::shared_ptr<ThreadShadowStackShard>> shardsSnapshot;
+        {
+            std::lock_guard<std::mutex> listLock(shadowStackShardsMutex());
+            auto& shards = shadowStackShards();
+            shards.erase(
+                std::remove_if(
+                    shards.begin(),
+                    shards.end(),
+                    [](const std::shared_ptr<ThreadShadowStackShard>& shard) {
+                        if (!shard) return true;
+                        std::lock_guard<std::mutex> shardLock(shard->mutex);
+                        return shard->threadExited && shard->stacks.empty();
+                    }),
+                shards.end());
+            shardsSnapshot = shards;
+        }
+        for (const auto& shard : shardsSnapshot) {
+            if (!shard) continue;
+            std::lock_guard<std::mutex> shardLock(shard->mutex);
+            for (const ShadowStack* stack : shard->stacks) {
+                if (stack && stack != activeShadowStack) {
+                    stack->visitRoots([](const Value& value) {
+                        markStackRootValueInPools(value);
+                    });
+                }
             }
         }
     }

@@ -440,6 +440,13 @@ std::uint16_t toCompactReg(std::uint32_t value) noexcept {
         : InvalidCompactReg;
 }
 
+std::uint64_t nextExecutionMirrorId() noexcept {
+    static std::atomic<std::uint64_t> next{1};
+    auto id = next.fetch_add(1, std::memory_order_relaxed);
+    if (id == 0) id = next.fetch_add(1, std::memory_order_relaxed);
+    return id;
+}
+
 } // namespace
 
 std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
@@ -447,6 +454,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
     const std::unordered_map<
         semantic::SymbolId, ProgramImage::FunctionLocation>& functions) {
     auto mirror = std::make_shared<ExecutionMirror>();
+    mirror->instanceId = nextExecutionMirrorId();
     std::size_t functionCount = 0;
     for (const auto& module : modules) functionCount += module.functions.size();
     mirror->functions.reserve(functionCount);
@@ -539,6 +547,65 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         return QuickOpcode::ConvertLongToDoubleFast;
                     }
                     return QuickOpcode::Generic;
+                case bytecode::Opcode::ConvertNumeric:
+                    if (validRes &&
+                        instruction.operands.size() == 1 &&
+                        instruction.operands[0] < function.registerTypes.size() &&
+                        instruction.operands[0] < InvalidCompactReg) {
+                        const auto srcType = function.registerTypes[instruction.operands[0]];
+                        const auto dstType = function.registerTypes[instruction.result];
+                        if (srcType == semantic::PrimitiveType::Int &&
+                            dstType == semantic::PrimitiveType::Float) {
+                            return QuickOpcode::ConvertIntToFloatFast;
+                        }
+                        if (srcType == semantic::PrimitiveType::Double &&
+                            dstType == semantic::PrimitiveType::Float) {
+                            return QuickOpcode::ConvertDoubleToFloatFast;
+                        }
+                        if (srcType == semantic::PrimitiveType::Float &&
+                            dstType == semantic::PrimitiveType::Int) {
+                            return QuickOpcode::ConvertFloatToIntFast;
+                        }
+                        if (srcType == semantic::PrimitiveType::Float &&
+                            dstType == semantic::PrimitiveType::Double) {
+                            return QuickOpcode::ConvertFloatToDoubleFast;
+                        }
+                        if (srcType == semantic::PrimitiveType::Int &&
+                            dstType == semantic::PrimitiveType::Long) {
+                            return QuickOpcode::ConvertIntToLongFast;
+                        }
+                        if (srcType == semantic::PrimitiveType::Long &&
+                            dstType == semantic::PrimitiveType::Int) {
+                            return QuickOpcode::ConvertLongToIntFast;
+                        }
+                        if (srcType == semantic::PrimitiveType::Int &&
+                            dstType == semantic::PrimitiveType::Double) {
+                            return QuickOpcode::ConvertIntToDoubleFast;
+                        }
+                        if (srcType == semantic::PrimitiveType::Long &&
+                            dstType == semantic::PrimitiveType::Double) {
+                            return QuickOpcode::ConvertLongToDoubleFast;
+                        }
+                    }
+                    return QuickOpcode::Generic;
+                case bytecode::Opcode::NewStruct:
+                    if (validRes &&
+                        function.registerTypes[instruction.result] ==
+                            semantic::PrimitiveType::Struct &&
+                        instruction.result < function.registerTypeIds.size() &&
+                        instruction.typeIndex < module.types.size() &&
+                        module.types[instruction.typeIndex].kind == semantic::TypeKind::Struct) {
+                        const auto tid = module.types[instruction.typeIndex].id;
+                        if (function.registerTypeIds[instruction.result] == tid &&
+                            (tid == fixedTypeId() ||
+                             tid == fixed16TypeId() ||
+                             tid == vec2TypeId() ||
+                             tid == vec3TypeId() ||
+                             tid == quatTypeId())) {
+                            return QuickOpcode::NewStructFast;
+                        }
+                    }
+                    return QuickOpcode::Generic;
                 case bytecode::Opcode::NegateInt:
                     if (validRes &&
                         !instruction.checkedArithmetic &&
@@ -556,12 +623,19 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     if (validRes &&
                         instruction.operands.size() == 1 &&
                         instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            semantic::PrimitiveType::Double &&
-                        function.registerTypes[instruction.result] ==
-                            semantic::PrimitiveType::Double) {
-                        return QuickOpcode::NegateDouble;
+                        instruction.operands[0] < InvalidCompactReg) {
+                        if (function.registerTypes[instruction.operands[0]] ==
+                                semantic::PrimitiveType::Double &&
+                            function.registerTypes[instruction.result] ==
+                                semantic::PrimitiveType::Double) {
+                            return QuickOpcode::NegateDouble;
+                        }
+                        if (function.registerTypes[instruction.operands[0]] ==
+                                semantic::PrimitiveType::Float &&
+                            function.registerTypes[instruction.result] ==
+                                semantic::PrimitiveType::Float) {
+                            return QuickOpcode::NegateFloat;
+                        }
                     }
                     return QuickOpcode::Generic;
                 case bytecode::Opcode::LogicalNot:
@@ -688,7 +762,16 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         instruction.index < InvalidCompactReg) {
                         const auto& fld = module.types[instruction.typeIndex].fields[instruction.index];
                         if (!semantic::isExactType(fld.type) &&
-                            fld.type != semantic::PrimitiveType::Handle) {
+                            fld.type != semantic::PrimitiveType::Handle &&
+                            function.registerTypes[instruction.result] == fld.type) {
+                            return QuickOpcode::LoadStructFieldFast;
+                        }
+                        if (fld.type == semantic::PrimitiveType::Struct &&
+                            function.registerTypes[instruction.result] ==
+                                semantic::PrimitiveType::Struct &&
+                            instruction.result < function.registerTypeIds.size() &&
+                            function.registerTypeIds[instruction.result] ==
+                                exactTypeId(fld.type, fld.typeName)) {
                             return QuickOpcode::LoadStructFieldFast;
                         }
                     }
@@ -710,6 +793,14 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         if (!semantic::isExactType(fld.type) &&
                             fld.type != semantic::PrimitiveType::Handle &&
                             function.registerTypes[instruction.operands[1]] == fld.type) {
+                            return QuickOpcode::StoreStructFieldFast;
+                        }
+                        if (fld.type == semantic::PrimitiveType::Struct &&
+                            function.registerTypes[instruction.operands[1]] ==
+                                semantic::PrimitiveType::Struct &&
+                            instruction.operands[1] < function.registerTypeIds.size() &&
+                            function.registerTypeIds[instruction.operands[1]] ==
+                                exactTypeId(fld.type, fld.typeName)) {
                             return QuickOpcode::StoreStructFieldFast;
                         }
                     }
@@ -737,6 +828,37 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     case bytecode::Opcode::GreaterDouble: return QuickOpcode::GreaterDouble;
                     case bytecode::Opcode::GreaterOrEqualDouble: return QuickOpcode::GreaterOrEqualDouble;
                     default: break;
+                    }
+                }
+                if (validRes &&
+                    instruction.operands.size() == 2 &&
+                    instruction.operands[0] < function.registerTypes.size() &&
+                    instruction.operands[0] < InvalidCompactReg &&
+                    instruction.operands[1] < function.registerTypes.size() &&
+                    instruction.operands[1] < InvalidCompactReg &&
+                    function.registerTypes[instruction.operands[0]] ==
+                        semantic::PrimitiveType::Float &&
+                    function.registerTypes[instruction.operands[1]] ==
+                        semantic::PrimitiveType::Float) {
+                    const auto resType = function.registerTypes[instruction.result];
+                    if (resType == semantic::PrimitiveType::Float) {
+                        switch (instruction.opcode) {
+                        case bytecode::Opcode::AddDouble: return QuickOpcode::AddFloat;
+                        case bytecode::Opcode::SubtractDouble: return QuickOpcode::SubtractFloat;
+                        case bytecode::Opcode::MultiplyDouble: return QuickOpcode::MultiplyFloat;
+                        case bytecode::Opcode::DivideDouble: return QuickOpcode::DivideFloat;
+                        default: break;
+                        }
+                    } else if (resType == semantic::PrimitiveType::Bool) {
+                        switch (instruction.opcode) {
+                        case bytecode::Opcode::LessDouble: return QuickOpcode::LessFloat;
+                        case bytecode::Opcode::LessOrEqualDouble: return QuickOpcode::LessOrEqualFloat;
+                        case bytecode::Opcode::GreaterDouble: return QuickOpcode::GreaterFloat;
+                        case bytecode::Opcode::GreaterOrEqualDouble: return QuickOpcode::GreaterOrEqualFloat;
+                        case bytecode::Opcode::Equal: return QuickOpcode::EqualFloat;
+                        case bytecode::Opcode::NotEqual: return QuickOpcode::NotEqualFloat;
+                        default: break;
+                        }
                     }
                 }
                 if (!validRes ||
@@ -794,11 +916,19 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     if (bb.terminator.kind == bytecode::TerminatorKind::ReturnValue &&
                         bb.terminator.value < function.registerTypes.size() &&
                         function.registerTypes[bb.terminator.value] == function.returnType &&
-                        !semantic::isExactType(function.returnType) &&
-                        function.returnType != semantic::PrimitiveType::Object &&
-                        function.returnType != semantic::PrimitiveType::Array &&
-                        function.returnType != semantic::PrimitiveType::String &&
-                        function.returnType != semantic::PrimitiveType::Handle) {
+                        ((!semantic::isExactType(function.returnType) &&
+                          function.returnType != semantic::PrimitiveType::Object &&
+                          function.returnType != semantic::PrimitiveType::Array &&
+                          function.returnType != semantic::PrimitiveType::String &&
+                          function.returnType != semantic::PrimitiveType::Handle) ||
+                         (function.returnType == semantic::PrimitiveType::Struct &&
+                          bb.terminator.value < function.registerTypeIds.size() &&
+                          function.registerTypeIds[bb.terminator.value] == function.returnTypeId &&
+                          (function.returnTypeId == fixedTypeId() ||
+                           function.returnTypeId == fixed16TypeId() ||
+                           function.returnTypeId == vec2TypeId() ||
+                           function.returnTypeId == vec3TypeId() ||
+                           function.returnTypeId == quatTypeId())))) {
                         blockMirror.returnPrevalidatedScalar = true;
                     }
                 }
@@ -1165,6 +1295,65 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         }
     }
 
+    const auto isBuiltinMathModule = [](const bytecode::Module& mod) noexcept {
+        return mod.name == "RealScript.Math" &&
+            mod.sourceFiles.size() == 1 &&
+            mod.sourceFiles[0].path == "$builtin/RealScript.Math.rs";
+    };
+
+    const auto computeStraightLineCallMetrics = [](
+        const auto& self,
+        const ExecutionFunction* fn,
+        std::uint32_t& outInstCost,
+        std::uint16_t& outCallCount,
+        std::uint16_t& outMaxDepth,
+        int depth) noexcept -> bool {
+        if (!fn || !fn->bytecode || fn->blocks.size() != 1 ||
+            !fn->bytecode->exceptionHandlers.empty() || depth > 6) {
+            return false;
+        }
+        const auto& blk = fn->blocks[0];
+        if (blk.terminatorKind != bytecode::TerminatorKind::ReturnValue &&
+            blk.terminatorKind != bytecode::TerminatorKind::ReturnVoid) {
+            return false;
+        }
+        std::uint32_t instCost =
+            static_cast<std::uint32_t>(blk.bytecode->instructions.size() + 1u);
+        std::uint32_t callCount = 1u;
+        std::uint16_t maxSubDepth = 0u;
+        for (const auto& inst : blk.instructions) {
+            if (!inst.bytecode) return false;
+            const auto op = inst.bytecode->opcode;
+            if (op == bytecode::Opcode::NewDelegate ||
+                op == bytecode::Opcode::NewObject ||
+                op == bytecode::Opcode::NewArray ||
+                op == bytecode::Opcode::ConstantString) {
+                return false;
+            }
+            if (op == bytecode::Opcode::Call) {
+                if (inst.opcode != QuickOpcode::CallDirect || !inst.directExecution) {
+                    return false;
+                }
+                std::uint32_t subInst = 0;
+                std::uint16_t subCalls = 0;
+                std::uint16_t subDepth = 0;
+                if (!self(self, inst.directExecution, subInst, subCalls, subDepth, depth + 1)) {
+                    return false;
+                }
+                instCost += subInst;
+                callCount += subCalls;
+                if (subDepth > maxSubDepth) maxSubDepth = subDepth;
+            }
+        }
+        if (instCost >= InvalidCompactReg || callCount > 250u || (1u + maxSubDepth) > 250u) {
+            return false;
+        }
+        outInstCost = instCost;
+        outCallCount = static_cast<std::uint16_t>(callCount);
+        outMaxDepth = static_cast<std::uint16_t>(1u + maxSubDepth);
+        return true;
+    };
+
     // Pass 3: Build unified flat frame slot layout & direct-threaded FlatInstruction stream
     for (const auto& module : modules) {
         for (const auto& function : module.functions) {
@@ -1478,6 +1667,155 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         }
                     }
 
+                    // Pass 3 fusion for float constant literal:
+                    // ConstantDouble + ConvertDoubleToFloatFast (+ optional StoreLocal(float))
+                    if (i + 1 < nInst &&
+                        inst.opcode == QuickOpcode::ConstantDouble &&
+                        inst.result < regCount &&
+                        globalRegReads[inst.result] == 1 &&
+                        blk.instructions[i + 1].opcode == QuickOpcode::ConvertDoubleToFloatFast &&
+                        blk.instructions[i + 1].op0 == inst.result &&
+                        blk.instructions[i + 1].result < regCount) {
+                        const double dImm = inst.bytecode->activeDoubleImmediate();
+                        if (dImm >= -static_cast<double>(std::numeric_limits<float>::max()) &&
+                            dImm <= static_cast<double>(std::numeric_limits<float>::max())) {
+                            const auto& conv = blk.instructions[i + 1];
+                            const float fImm = static_cast<float>(dImm);
+                            std::memcpy(&flat.integerImmediate, &fImm, sizeof(float));
+                            if (i + 2 < nInst &&
+                                blk.instructions[i + 2].opcode == QuickOpcode::StoreLocal &&
+                                blk.instructions[i + 2].op0 == conv.result &&
+                                globalRegReads[conv.result] == 1) {
+                                flat.flatOpcode = FlatOpcode::SuperConstFloatStoreLocal;
+                                flat.span = 3;
+                                flat.dstSlot = regSlot(conv.result);
+                                flat.storeSlot = localSlot(blk.instructions[i + 2].auxReg1);
+                                execFunc.flatStream.push_back(flat);
+                                i += 3;
+                                continue;
+                            }
+                            flat.flatOpcode = FlatOpcode::SuperConstFloat;
+                            flat.span = 2;
+                            flat.dstSlot = regSlot(conv.result);
+                            execFunc.flatStream.push_back(flat);
+                            i += 2;
+                            continue;
+                        }
+                    }
+
+                    // Pass 3 fusion for 4-instruction float local arithmetic:
+                    // LoadLocal(float) + LoadLocal(float) + (AddFloat..DivideFloat) + StoreLocal(float)
+                    if (i + 3 < nInst &&
+                        inst.opcode == QuickOpcode::LoadLocal &&
+                        inst.result < regCount &&
+                        function.registerTypes[inst.result] == semantic::PrimitiveType::Float) {
+                        const auto& second = blk.instructions[i + 1];
+                        const auto& binary = blk.instructions[i + 2];
+                        const auto& store = blk.instructions[i + 3];
+                        const bool isSecondLocal = (second.opcode == QuickOpcode::LoadLocal &&
+                            second.result < regCount &&
+                            function.registerTypes[second.result] == semantic::PrimitiveType::Float);
+                        const bool isFloatArith =
+                            binary.opcode >= QuickOpcode::AddFloat &&
+                            binary.opcode <= QuickOpcode::DivideFloat;
+                        if (isSecondLocal &&
+                            isFloatArith &&
+                            store.opcode == QuickOpcode::StoreLocal &&
+                            inst.result != second.result &&
+                            binary.op0 == inst.result &&
+                            binary.op1 == second.result &&
+                            store.op0 == binary.result &&
+                            binary.result < regCount) {
+                            const bool tempsDead =
+                                globalRegReads[inst.result] == 1 &&
+                                globalRegReads[second.result] == 1 &&
+                                globalRegReads[binary.result] == 1;
+                            flat.span = 4;
+                            flat.binaryOpcode1 = binary.opcode;
+                            flat.src0Slot = localSlot(inst.auxReg1);
+                            flat.src1Slot = localSlot(second.auxReg1);
+                            flat.dstSlot = regSlot(inst.result);
+                            flat.aux0Slot = regSlot(second.result);
+                            flat.aux1Slot = regSlot(binary.result);
+                            flat.storeSlot = localSlot(store.auxReg1);
+                            flat.flatOpcode = tempsDead
+                                ? FlatOpcode::SuperBinaryLocalFloatLocalStoreElided
+                                : FlatOpcode::SuperBinaryLocalFloatLocalStore;
+                            execFunc.flatStream.push_back(flat);
+                            i += 4;
+                            continue;
+                        }
+                    }
+
+                    // Pass 3 fusion for 2/3-instruction float local-reg arithmetic:
+                    // LoadLocal(float) + (AddFloat..DivideFloat)(r_loaded, r_reg) [+ StoreLocal(float)]
+                    if (i + 1 < nInst &&
+                        inst.opcode == QuickOpcode::LoadLocal &&
+                        inst.result < regCount &&
+                        function.registerTypes[inst.result] == semantic::PrimitiveType::Float) {
+                        const auto& binary = blk.instructions[i + 1];
+                        const bool isFloatArith =
+                            binary.opcode >= QuickOpcode::AddFloat &&
+                            binary.opcode <= QuickOpcode::DivideFloat;
+                        if (isFloatArith &&
+                            binary.op0 == inst.result &&
+                            binary.op1 != inst.result &&
+                            binary.result < regCount) {
+                            const bool storesResult =
+                                i + 2 < nInst &&
+                                blk.instructions[i + 2].opcode == QuickOpcode::StoreLocal &&
+                                blk.instructions[i + 2].op0 == binary.result;
+                            flat.binaryOpcode1 = binary.opcode;
+                            flat.src0Slot = localSlot(inst.auxReg1);
+                            flat.src1Slot = regSlot(binary.op1);
+                            flat.dstSlot = regSlot(inst.result);
+                            flat.aux1Slot = regSlot(binary.result);
+                            if (storesResult) {
+                                const bool tempsDead =
+                                    globalRegReads[inst.result] == 1 &&
+                                    globalRegReads[binary.result] == 1;
+                                flat.span = 3;
+                                flat.storeSlot = localSlot(blk.instructions[i + 2].auxReg1);
+                                flat.flatOpcode = tempsDead
+                                    ? FlatOpcode::SuperBinaryLocalFloatRegStoreElided
+                                    : FlatOpcode::SuperBinaryLocalFloatRegStore;
+                                execFunc.flatStream.push_back(flat);
+                                i += 3;
+                                continue;
+                            } else {
+                                const bool tempDead = (globalRegReads[inst.result] == 1);
+                                flat.span = 2;
+                                flat.flatOpcode = tempDead
+                                    ? FlatOpcode::SuperBinaryLocalFloatRegElided
+                                    : FlatOpcode::SuperBinaryLocalFloatReg;
+                                execFunc.flatStream.push_back(flat);
+                                i += 2;
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Pass 3 fusion for 2-instruction float reg-reg arithmetic + store:
+                    // (AddFloat..DivideFloat)(r_a, r_b) + StoreLocal(float) with dead temp
+                    if (i + 1 < nInst &&
+                        inst.opcode >= QuickOpcode::AddFloat &&
+                        inst.opcode <= QuickOpcode::DivideFloat &&
+                        inst.result < regCount &&
+                        globalRegReads[inst.result] == 1 &&
+                        blk.instructions[i + 1].opcode == QuickOpcode::StoreLocal &&
+                        blk.instructions[i + 1].op0 == inst.result) {
+                        flat.flatOpcode = FlatOpcode::SuperBinaryRegFloatStoreElided;
+                        flat.span = 2;
+                        flat.binaryOpcode1 = inst.opcode;
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.storeSlot = localSlot(blk.instructions[i + 1].auxReg1);
+                        execFunc.flatStream.push_back(flat);
+                        i += 2;
+                        continue;
+                    }
+
                     // Single instruction mapping
                     flat.span = 1;
                     switch (inst.opcode) {
@@ -1593,17 +1931,332 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         flat.dstSlot = inst.result == InvalidCompactReg
                             ? InvalidCompactReg
                             : regSlot(inst.result);
-                        if (inst.op0 == InvalidCompactReg) {
-                            flat.flatOpcode = FlatOpcode::CallDirect0;
-                        } else if (inst.op1 == InvalidCompactReg) {
-                            flat.flatOpcode = FlatOpcode::CallDirect1;
-                            flat.src0Slot = regSlot(inst.op0);
-                        } else if (inst.op2 == InvalidCompactReg) {
-                            flat.flatOpcode = FlatOpcode::CallDirect2;
-                            flat.src0Slot = regSlot(inst.op0);
-                            flat.src1Slot = regSlot(inst.op1);
-                        } else {
-                            flat.flatOpcode = FlatOpcode::CallDirectN;
+                        bool loweredMathIntrinsic = false;
+                        if (flat.dstSlot != InvalidCompactReg &&
+                            inst.directTarget &&
+                            inst.directExecution &&
+                            inst.directTarget->module &&
+                            isBuiltinMathModule(*inst.directTarget->module) &&
+                            inst.directTarget->function) {
+                            std::uint32_t calleeInstCost = 0;
+                            std::uint16_t calleeCallCount = 0;
+                            std::uint16_t calleeMaxDepth = 0;
+                            if (computeStraightLineCallMetrics(
+                                    computeStraightLineCallMetrics,
+                                    inst.directExecution,
+                                    calleeInstCost,
+                                    calleeCallCount,
+                                    calleeMaxDepth,
+                                    0) &&
+                                (1u + calleeInstCost) < InvalidCompactReg) {
+                                const auto& targetFn = *inst.directTarget->function;
+                                const auto& fnName = targetFn.name;
+                                const auto& pTypes = targetFn.parameterTypes;
+                                const auto& pTypeIds = targetFn.parameterTypeIds;
+                                const auto retType = targetFn.returnType;
+                                const auto retTypeId = targetFn.returnTypeId;
+                                const auto fTid = fixedTypeId();
+                                const auto v3Tid = vec3TypeId();
+                                const auto v2Tid = vec2TypeId();
+
+                                flat.aux0Slot = static_cast<std::uint16_t>(1u + calleeInstCost);
+                                flat.aux1Slot = static_cast<std::uint16_t>(
+                                    (calleeCallCount & 0xFFu) | ((calleeMaxDepth & 0xFFu) << 8u));
+
+                                if (pTypes.empty() &&
+                                    retType == semantic::PrimitiveType::Struct &&
+                                    retTypeId == fTid) {
+                                    if (fnName == "Fixed.Zero") {
+                                        flat.flatOpcode = FlatOpcode::MathFixedConst;
+                                        flat.integerImmediate = 0;
+                                        loweredMathIntrinsic = true;
+                                    } else if (fnName == "Fixed.One") {
+                                        flat.flatOpcode = FlatOpcode::MathFixedConst;
+                                        flat.integerImmediate = 256;
+                                        loweredMathIntrinsic = true;
+                                    } else if (fnName == "Fixed.Half") {
+                                        flat.flatOpcode = FlatOpcode::MathFixedConst;
+                                        flat.integerImmediate = 128;
+                                        loweredMathIntrinsic = true;
+                                    } else if (fnName == "Fixed.Pi" || fnName == "Math.Pi") {
+                                        flat.flatOpcode = FlatOpcode::MathFixedConst;
+                                        flat.integerImmediate = 804;
+                                        loweredMathIntrinsic = true;
+                                    } else if (fnName == "Fixed.HalfPi" || fnName == "Math.HalfPi") {
+                                        flat.flatOpcode = FlatOpcode::MathFixedConst;
+                                        flat.integerImmediate = 402;
+                                        loweredMathIntrinsic = true;
+                                    } else if (fnName == "Fixed.TwoPi" || fnName == "Math.TwoPi") {
+                                        flat.flatOpcode = FlatOpcode::MathFixedConst;
+                                        flat.integerImmediate = 1608;
+                                        loweredMathIntrinsic = true;
+                                    }
+                                } else if (pTypes.size() == 1 &&
+                                           retType == semantic::PrimitiveType::Struct &&
+                                           retTypeId == fTid) {
+                                    if (pTypes[0] == semantic::PrimitiveType::Int) {
+                                        if (fnName == "Fixed.Raw") {
+                                            flat.flatOpcode = FlatOpcode::MathFixedFromRaw;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            loweredMathIntrinsic = true;
+                                        } else if (fnName == "Fixed.Of") {
+                                            flat.flatOpcode = FlatOpcode::MathFixedFromInt;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            loweredMathIntrinsic = true;
+                                        }
+                                    } else if (pTypes[0] == semantic::PrimitiveType::Struct &&
+                                               pTypeIds.size() == 1 &&
+                                               pTypeIds[0] == fTid &&
+                                               fnName == "Fixed.op_UnaryNegation") {
+                                        flat.flatOpcode = FlatOpcode::MathFixedNeg;
+                                        flat.src0Slot = regSlot(inst.op0);
+                                        loweredMathIntrinsic = true;
+                                    }
+                                } else if (pTypes.size() == 2 &&
+                                           retType == semantic::PrimitiveType::Struct &&
+                                           retTypeId == fTid) {
+                                    if (pTypes[0] == semantic::PrimitiveType::Int &&
+                                        pTypes[1] == semantic::PrimitiveType::Int &&
+                                        fnName == "Fixed.Ratio") {
+                                        flat.flatOpcode = FlatOpcode::MathFixedRatio;
+                                        flat.src0Slot = regSlot(inst.op0);
+                                        flat.src1Slot = regSlot(inst.op1);
+                                        loweredMathIntrinsic = true;
+                                    } else if (pTypes[0] == semantic::PrimitiveType::Struct &&
+                                               pTypes[1] == semantic::PrimitiveType::Struct &&
+                                               pTypeIds.size() == 2 &&
+                                               pTypeIds[0] == fTid &&
+                                               pTypeIds[1] == fTid) {
+                                        if (fnName == "Fixed.op_Addition") {
+                                            flat.flatOpcode = FlatOpcode::MathFixedAdd;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            flat.src1Slot = regSlot(inst.op1);
+                                            loweredMathIntrinsic = true;
+                                        } else if (fnName == "Fixed.op_Subtraction") {
+                                            flat.flatOpcode = FlatOpcode::MathFixedSub;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            flat.src1Slot = regSlot(inst.op1);
+                                            loweredMathIntrinsic = true;
+                                        } else if (fnName == "Fixed.op_Multiply") {
+                                            flat.flatOpcode = FlatOpcode::MathFixedMul;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            flat.src1Slot = regSlot(inst.op1);
+                                            loweredMathIntrinsic = true;
+                                        } else if (fnName == "Fixed.op_Division") {
+                                            flat.flatOpcode = FlatOpcode::MathFixedDiv;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            flat.src1Slot = regSlot(inst.op1);
+                                            loweredMathIntrinsic = true;
+                                        }
+                                    } else if (fnName == "Fixed.op_Multiply" && pTypeIds.size() == 2) {
+                                        if (pTypes[0] == semantic::PrimitiveType::Struct &&
+                                            pTypeIds[0] == fTid &&
+                                            pTypes[1] == semantic::PrimitiveType::Int) {
+                                            flat.flatOpcode = FlatOpcode::MathFixedMulInt;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            flat.src1Slot = regSlot(inst.op1);
+                                            loweredMathIntrinsic = true;
+                                        } else if (pTypes[0] == semantic::PrimitiveType::Int &&
+                                                   pTypes[1] == semantic::PrimitiveType::Struct &&
+                                                   pTypeIds[1] == fTid) {
+                                            flat.flatOpcode = FlatOpcode::MathFixedMulInt;
+                                            flat.src0Slot = regSlot(inst.op1);
+                                            flat.src1Slot = regSlot(inst.op0);
+                                            loweredMathIntrinsic = true;
+                                        }
+                                    } else if (fnName == "Fixed.op_Division" &&
+                                               pTypeIds.size() == 2 &&
+                                               pTypes[0] == semantic::PrimitiveType::Struct &&
+                                               pTypeIds[0] == fTid &&
+                                               pTypes[1] == semantic::PrimitiveType::Int) {
+                                        flat.flatOpcode = FlatOpcode::MathFixedDivInt;
+                                        flat.src0Slot = regSlot(inst.op0);
+                                        flat.src1Slot = regSlot(inst.op1);
+                                        loweredMathIntrinsic = true;
+                                    } else if (fnName == "Vec3.Dot" &&
+                                               pTypeIds.size() == 2 &&
+                                               pTypes[0] == semantic::PrimitiveType::Struct &&
+                                               pTypes[1] == semantic::PrimitiveType::Struct &&
+                                               pTypeIds[0] == v3Tid &&
+                                               pTypeIds[1] == v3Tid) {
+                                        flat.flatOpcode = FlatOpcode::MathVec3Dot;
+                                        flat.src0Slot = regSlot(inst.op0);
+                                        flat.src1Slot = regSlot(inst.op1);
+                                        loweredMathIntrinsic = true;
+                                    } else if (fnName == "Vec2.Dot" &&
+                                               pTypeIds.size() == 2 &&
+                                               pTypes[0] == semantic::PrimitiveType::Struct &&
+                                               pTypes[1] == semantic::PrimitiveType::Struct &&
+                                               pTypeIds[0] == v2Tid &&
+                                               pTypeIds[1] == v2Tid) {
+                                        flat.flatOpcode = FlatOpcode::MathVec2Dot;
+                                        flat.src0Slot = regSlot(inst.op0);
+                                        flat.src1Slot = regSlot(inst.op1);
+                                        loweredMathIntrinsic = true;
+                                    }
+                                } else if (retType == semantic::PrimitiveType::Struct &&
+                                           retTypeId == v3Tid) {
+                                    if (pTypes.empty()) {
+                                        if (fnName == "Vec3.Zero") {
+                                            flat.flatOpcode = FlatOpcode::MathVec3Const;
+                                            flat.integerImmediate = 0;
+                                            loweredMathIntrinsic = true;
+                                        } else if (fnName == "Vec3.One") {
+                                            flat.flatOpcode = FlatOpcode::MathVec3Const;
+                                            flat.integerImmediate = 256;
+                                            loweredMathIntrinsic = true;
+                                        }
+                                    } else if (pTypes.size() == 3 &&
+                                               pTypes[0] == semantic::PrimitiveType::Int &&
+                                               pTypes[1] == semantic::PrimitiveType::Int &&
+                                               pTypes[2] == semantic::PrimitiveType::Int) {
+                                        if (fnName == "Vec3.Raw") {
+                                            flat.flatOpcode = FlatOpcode::MathVec3Raw;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            flat.src1Slot = regSlot(inst.op1);
+                                            flat.src2Slot = regSlot(inst.op2);
+                                            loweredMathIntrinsic = true;
+                                        } else if (fnName == "Vec3.Of") {
+                                            flat.flatOpcode = FlatOpcode::MathVec3Of;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            flat.src1Slot = regSlot(inst.op1);
+                                            flat.src2Slot = regSlot(inst.op2);
+                                            loweredMathIntrinsic = true;
+                                        }
+                                    } else if (pTypes.size() == 1 &&
+                                               pTypes[0] == semantic::PrimitiveType::Struct &&
+                                               pTypeIds.size() == 1 &&
+                                               pTypeIds[0] == v3Tid &&
+                                               fnName == "Vec3.op_UnaryNegation") {
+                                        flat.flatOpcode = FlatOpcode::MathVec3Neg;
+                                        flat.src0Slot = regSlot(inst.op0);
+                                        loweredMathIntrinsic = true;
+                                    } else if (pTypes.size() == 2 && pTypeIds.size() == 2) {
+                                        if (pTypes[0] == semantic::PrimitiveType::Struct &&
+                                            pTypes[1] == semantic::PrimitiveType::Struct &&
+                                            pTypeIds[0] == v3Tid &&
+                                            pTypeIds[1] == v3Tid) {
+                                            if (fnName == "Vec3.op_Addition") {
+                                                flat.flatOpcode = FlatOpcode::MathVec3Add;
+                                                flat.src0Slot = regSlot(inst.op0);
+                                                flat.src1Slot = regSlot(inst.op1);
+                                                loweredMathIntrinsic = true;
+                                            } else if (fnName == "Vec3.op_Subtraction") {
+                                                flat.flatOpcode = FlatOpcode::MathVec3Sub;
+                                                flat.src0Slot = regSlot(inst.op0);
+                                                flat.src1Slot = regSlot(inst.op1);
+                                                loweredMathIntrinsic = true;
+                                            } else if (fnName == "Vec3.Cross") {
+                                                flat.flatOpcode = FlatOpcode::MathVec3Cross;
+                                                flat.src0Slot = regSlot(inst.op0);
+                                                flat.src1Slot = regSlot(inst.op1);
+                                                loweredMathIntrinsic = true;
+                                            }
+                                        } else if (fnName == "Vec3.op_Multiply") {
+                                            if (pTypes[0] == semantic::PrimitiveType::Struct &&
+                                                pTypeIds[0] == v3Tid &&
+                                                pTypes[1] == semantic::PrimitiveType::Struct &&
+                                                pTypeIds[1] == fTid) {
+                                                flat.flatOpcode = FlatOpcode::MathVec3MulFixed;
+                                                flat.src0Slot = regSlot(inst.op0);
+                                                flat.src1Slot = regSlot(inst.op1);
+                                                loweredMathIntrinsic = true;
+                                            } else if (pTypes[0] == semantic::PrimitiveType::Struct &&
+                                                       pTypeIds[0] == fTid &&
+                                                       pTypes[1] == semantic::PrimitiveType::Struct &&
+                                                       pTypeIds[1] == v3Tid) {
+                                                flat.flatOpcode = FlatOpcode::MathVec3MulFixed;
+                                                flat.src0Slot = regSlot(inst.op1);
+                                                flat.src1Slot = regSlot(inst.op0);
+                                                loweredMathIntrinsic = true;
+                                            } else if (pTypes[0] == semantic::PrimitiveType::Struct &&
+                                                       pTypeIds[0] == v3Tid &&
+                                                       pTypes[1] == semantic::PrimitiveType::Int) {
+                                                flat.flatOpcode = FlatOpcode::MathVec3MulInt;
+                                                flat.src0Slot = regSlot(inst.op0);
+                                                flat.src1Slot = regSlot(inst.op1);
+                                                loweredMathIntrinsic = true;
+                                            } else if (pTypes[0] == semantic::PrimitiveType::Int &&
+                                                       pTypes[1] == semantic::PrimitiveType::Struct &&
+                                                       pTypeIds[1] == v3Tid) {
+                                                flat.flatOpcode = FlatOpcode::MathVec3MulInt;
+                                                flat.src0Slot = regSlot(inst.op1);
+                                                flat.src1Slot = regSlot(inst.op0);
+                                                loweredMathIntrinsic = true;
+                                            }
+                                        } else if (fnName == "Vec3.op_Division") {
+                                            if (pTypes[0] == semantic::PrimitiveType::Struct &&
+                                                pTypeIds[0] == v3Tid &&
+                                                pTypes[1] == semantic::PrimitiveType::Struct &&
+                                                pTypeIds[1] == fTid) {
+                                                flat.flatOpcode = FlatOpcode::MathVec3DivFixed;
+                                                flat.src0Slot = regSlot(inst.op0);
+                                                flat.src1Slot = regSlot(inst.op1);
+                                                loweredMathIntrinsic = true;
+                                            } else if (pTypes[0] == semantic::PrimitiveType::Struct &&
+                                                       pTypeIds[0] == v3Tid &&
+                                                       pTypes[1] == semantic::PrimitiveType::Int) {
+                                                flat.flatOpcode = FlatOpcode::MathVec3DivInt;
+                                                flat.src0Slot = regSlot(inst.op0);
+                                                flat.src1Slot = regSlot(inst.op1);
+                                                loweredMathIntrinsic = true;
+                                            }
+                                        }
+                                    }
+                                } else if (retType == semantic::PrimitiveType::Struct &&
+                                           retTypeId == v2Tid &&
+                                           pTypes.size() == 2 &&
+                                           pTypeIds.size() == 2) {
+                                    if (pTypes[0] == semantic::PrimitiveType::Struct &&
+                                        pTypes[1] == semantic::PrimitiveType::Struct &&
+                                        pTypeIds[0] == v2Tid &&
+                                        pTypeIds[1] == v2Tid) {
+                                        if (fnName == "Vec2.op_Addition") {
+                                            flat.flatOpcode = FlatOpcode::MathVec2Add;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            flat.src1Slot = regSlot(inst.op1);
+                                            loweredMathIntrinsic = true;
+                                        } else if (fnName == "Vec2.op_Subtraction") {
+                                            flat.flatOpcode = FlatOpcode::MathVec2Sub;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            flat.src1Slot = regSlot(inst.op1);
+                                            loweredMathIntrinsic = true;
+                                        }
+                                    } else if (fnName == "Vec2.op_Multiply") {
+                                        if (pTypes[0] == semantic::PrimitiveType::Struct &&
+                                            pTypeIds[0] == v2Tid &&
+                                            pTypes[1] == semantic::PrimitiveType::Struct &&
+                                            pTypeIds[1] == fTid) {
+                                            flat.flatOpcode = FlatOpcode::MathVec2MulFixed;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            flat.src1Slot = regSlot(inst.op1);
+                                            loweredMathIntrinsic = true;
+                                        } else if (pTypes[0] == semantic::PrimitiveType::Struct &&
+                                                   pTypeIds[0] == fTid &&
+                                                   pTypes[1] == semantic::PrimitiveType::Struct &&
+                                                   pTypeIds[1] == v2Tid) {
+                                            flat.flatOpcode = FlatOpcode::MathVec2MulFixed;
+                                            flat.src0Slot = regSlot(inst.op1);
+                                            flat.src1Slot = regSlot(inst.op0);
+                                            loweredMathIntrinsic = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (!loweredMathIntrinsic) {
+                            if (inst.op0 == InvalidCompactReg) {
+                                flat.flatOpcode = FlatOpcode::CallDirect0;
+                            } else if (inst.op1 == InvalidCompactReg) {
+                                flat.flatOpcode = FlatOpcode::CallDirect1;
+                                flat.src0Slot = regSlot(inst.op0);
+                            } else if (inst.op2 == InvalidCompactReg) {
+                                flat.flatOpcode = FlatOpcode::CallDirect2;
+                                flat.src0Slot = regSlot(inst.op0);
+                                flat.src1Slot = regSlot(inst.op1);
+                            } else {
+                                flat.flatOpcode = FlatOpcode::CallDirectN;
+                            }
                         }
                         break;
                     }
@@ -1683,19 +2336,51 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         flat.aux0Slot = inst.auxReg1;
                         flat.aux1Slot = inst.bytecode->typeIndex;
                         break;
-                    case QuickOpcode::LoadStructFieldFast:
-                        flat.flatOpcode = FlatOpcode::LoadStructFieldFast;
+                    case QuickOpcode::LoadStructFieldFast: {
                         flat.dstSlot = regSlot(inst.result);
                         flat.src0Slot = regSlot(inst.op0);
                         flat.aux0Slot = inst.auxReg1;
+                        const auto& structType = module.types[inst.bytecode->typeIndex];
+                        const auto& fld = structType.fields[inst.auxReg1];
+                        const auto fldTid = exactTypeId(fld.type, fld.typeName);
+                        flat.integerImmediate = static_cast<std::int64_t>(fldTid);
+                        if (structType.id == fixedTypeId() &&
+                            inst.auxReg1 == 0 &&
+                            fld.type == semantic::PrimitiveType::Int) {
+                            flat.flatOpcode = FlatOpcode::LoadFixedRawFast;
+                        } else if (structType.id == vec3TypeId() &&
+                                   inst.auxReg1 < 3 &&
+                                   fld.type == semantic::PrimitiveType::Struct &&
+                                   fldTid == fixedTypeId()) {
+                            flat.flatOpcode = FlatOpcode::LoadVec3FieldFast;
+                        } else {
+                            flat.flatOpcode = FlatOpcode::LoadStructFieldFast;
+                        }
                         break;
-                    case QuickOpcode::StoreStructFieldFast:
-                        flat.flatOpcode = FlatOpcode::StoreStructFieldFast;
+                    }
+                    case QuickOpcode::StoreStructFieldFast: {
                         flat.dstSlot = regSlot(inst.result);
                         flat.src0Slot = regSlot(inst.op0);
                         flat.src1Slot = regSlot(inst.op1);
                         flat.aux0Slot = inst.auxReg1;
+                        const auto& structType = module.types[inst.bytecode->typeIndex];
+                        const auto& fld = structType.fields[inst.auxReg1];
+                        const auto fldTid = exactTypeId(fld.type, fld.typeName);
+                        flat.integerImmediate = static_cast<std::int64_t>(fldTid);
+                        if (structType.id == fixedTypeId() &&
+                            inst.auxReg1 == 0 &&
+                            fld.type == semantic::PrimitiveType::Int) {
+                            flat.flatOpcode = FlatOpcode::StoreFixedRawFast;
+                        } else if (structType.id == vec3TypeId() &&
+                                   inst.auxReg1 < 3 &&
+                                   fld.type == semantic::PrimitiveType::Struct &&
+                                   fldTid == fixedTypeId()) {
+                            flat.flatOpcode = FlatOpcode::StoreVec3FieldFast;
+                        } else {
+                            flat.flatOpcode = FlatOpcode::StoreStructFieldFast;
+                        }
                         break;
+                    }
                     case QuickOpcode::ConstantBool:
                         flat.flatOpcode = FlatOpcode::ConstantBool;
                         flat.dstSlot = regSlot(inst.result);
@@ -1740,9 +2425,122 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         flat.dstSlot = regSlot(inst.result);
                         flat.src0Slot = regSlot(inst.op0);
                         break;
+                    case QuickOpcode::AddFloat:
+                        flat.flatOpcode = FlatOpcode::AddFloat;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::SubtractFloat:
+                        flat.flatOpcode = FlatOpcode::SubFloat;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::MultiplyFloat:
+                        flat.flatOpcode = FlatOpcode::MulFloat;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::DivideFloat:
+                        flat.flatOpcode = FlatOpcode::DivFloat;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::LessFloat:
+                        flat.flatOpcode = FlatOpcode::LessFloat;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::LessOrEqualFloat:
+                        flat.flatOpcode = FlatOpcode::LessOrEqualFloat;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::GreaterFloat:
+                        flat.flatOpcode = FlatOpcode::GreaterFloat;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::GreaterOrEqualFloat:
+                        flat.flatOpcode = FlatOpcode::GreaterOrEqualFloat;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::EqualFloat:
+                        flat.flatOpcode = FlatOpcode::EqualFloat;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::NotEqualFloat:
+                        flat.flatOpcode = FlatOpcode::NotEqualFloat;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        flat.src1Slot = regSlot(inst.op1);
+                        break;
+                    case QuickOpcode::NegateFloat:
+                        flat.flatOpcode = FlatOpcode::NegateFloat;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        break;
+                    case QuickOpcode::ConvertIntToFloatFast:
+                        flat.flatOpcode = FlatOpcode::ConvertIntToFloatFast;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        break;
+                    case QuickOpcode::ConvertDoubleToFloatFast:
+                        flat.flatOpcode = FlatOpcode::ConvertDoubleToFloatFast;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        break;
+                    case QuickOpcode::ConvertFloatToIntFast:
+                        flat.flatOpcode = FlatOpcode::ConvertFloatToIntFast;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        break;
+                    case QuickOpcode::ConvertFloatToDoubleFast:
+                        flat.flatOpcode = FlatOpcode::ConvertFloatToDoubleFast;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        break;
+                    case QuickOpcode::ConvertLongToIntFast:
+                        flat.flatOpcode = FlatOpcode::ConvertLongToIntFast;
+                        flat.dstSlot = regSlot(inst.result);
+                        flat.src0Slot = regSlot(inst.op0);
+                        break;
+                    case QuickOpcode::NewStructFast: {
+                        flat.flatOpcode = FlatOpcode::NewStructFast;
+                        flat.dstSlot = regSlot(inst.result);
+                        const auto structTid = module.types[inst.bytecode->typeIndex].id;
+                        if (structTid == fixedTypeId()) flat.aux0Slot = 1;
+                        else if (structTid == fixed16TypeId()) flat.aux0Slot = 2;
+                        else if (structTid == vec2TypeId()) flat.aux0Slot = 3;
+                        else if (structTid == vec3TypeId()) flat.aux0Slot = 4;
+                        else if (structTid == quatTypeId()) flat.aux0Slot = 5;
+                        else flat.aux0Slot = 0;
+                        break;
+                    }
                     case QuickOpcode::Generic:
                     default:
-                        flat.flatOpcode = FlatOpcode::GenericBytecode;
+                        if (inst.bytecode &&
+                            inst.bytecode->opcode == bytecode::Opcode::NewArray &&
+                            inst.bytecode->operands.size() == 1 &&
+                            inst.bytecode->operands[0] < regCount &&
+                            inst.bytecode->result < regCount &&
+                            inst.bytecode->result < function.registerTypeIds.size()) {
+                            flat.flatOpcode = FlatOpcode::NewArrayFast;
+                            flat.dstSlot = regSlot(static_cast<std::uint16_t>(inst.bytecode->result));
+                            flat.src0Slot = regSlot(static_cast<std::uint16_t>(inst.bytecode->operands[0]));
+                        } else {
+                            flat.flatOpcode = FlatOpcode::GenericBytecode;
+                        }
                         break;
                     }
                     execFunc.flatStream.push_back(flat);

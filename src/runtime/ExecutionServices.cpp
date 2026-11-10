@@ -285,48 +285,46 @@ void ProfileCollector::reset() {
     totalEvents_ = 0;
 }
 
-struct DeterminismSession::Impl {
-    explicit Impl(DeterminismOptions value)
-        : options(std::move(value)) {
-        if (options.mode == DeterminismMode::Replay && options.replayLog) {
-            replayEntries = options.replayLog->entries();
-        }
-    }
-
-    DeterminismOptions options;
-    std::vector<ExternalCallRecord> replayEntries;
-    std::size_t replayCursor = 0;
-    std::uint64_t digest = FnvOffset;
-};
-
 DeterminismSession::DeterminismSession(DeterminismOptions options)
-    : impl_(std::make_unique<Impl>(std::move(options))) {}
+    : mode_(options.mode),
+      canonicalizeFloatingPoint_(options.canonicalizeFloatingPoint),
+      enforceCapabilities_(options.enforceCapabilities),
+      replayLog_(std::move(options.replayLog)),
+      grantedCapabilities_(
+          options.grantedCapabilities.empty()
+              ? nullptr
+              : std::make_unique<std::unordered_set<std::string>>(
+                    std::move(options.grantedCapabilities))),
+      replayCursor_(0),
+      digest_(FnvOffset) {
+    if (mode_ == DeterminismMode::Replay && replayLog_) {
+        replayEntries_ = replayLog_->entries();
+    }
+}
 
 DeterminismSession::~DeterminismSession() = default;
 DeterminismSession::DeterminismSession(DeterminismSession&&) noexcept = default;
 DeterminismSession& DeterminismSession::operator=(DeterminismSession&&) noexcept = default;
 
 void DeterminismSession::observe(const TraceEvent& event) {
-    if (!impl_) return;
-    hashScalar(impl_->digest, static_cast<std::uint8_t>(event.kind));
-    hashString(impl_->digest, event.function);
+    hashScalar(digest_, static_cast<std::uint8_t>(event.kind));
+    hashString(digest_, event.function);
     // Function-exit value strings are diagnostic and may contain process-local
     // heap or native-handle identities. The returned Value is hashed separately
     // by finalize(), so exclude that presentation-only payload from the digest.
     if (event.kind != TraceEventKind::FunctionExit) {
-        hashString(impl_->digest, event.operation);
+        hashString(digest_, event.operation);
     }
-    hashScalar(impl_->digest, event.instructionIndex);
+    hashScalar(digest_, event.instructionIndex);
     const auto depth = static_cast<std::uint64_t>(event.callDepth);
-    hashScalar(impl_->digest, depth);
+    hashScalar(digest_, depth);
 }
 
 void DeterminismSession::mergeEventDigest(
     std::uint64_t eventDigest,
     std::uint64_t eventCount) noexcept {
-    if (!impl_) return;
-    hashScalar(impl_->digest, eventCount);
-    hashScalar(impl_->digest, eventDigest);
+    hashScalar(digest_, eventCount);
+    hashScalar(digest_, eventDigest);
 }
 
 bool DeterminismSession::invokeExternal(
@@ -336,8 +334,7 @@ bool DeterminismSession::invokeExternal(
     ValueSpan arguments,
     std::optional<Value>& result,
     RuntimeError& error) {
-    if (!impl_) return false;
-    const auto mode = impl_->options.mode;
+    const auto mode = mode_;
     auto policy = BindingDeterminism::NonDeterministic;
     std::string requiredCapability;
     const ExternalFunction* function = fallback;
@@ -350,13 +347,14 @@ bool DeterminismSession::invokeExternal(
             resolvedFromRegistry = true;
         }
     }
-    if (impl_->options.enforceCapabilities) {
+    if (enforceCapabilities_) {
         if (!resolvedFromRegistry && function && *function) {
             requiredCapability = "Host.UnregisteredExternal";
         }
         if (!requiredCapability.empty() &&
-            impl_->options.grantedCapabilities.find(requiredCapability) ==
-                impl_->options.grantedCapabilities.end()) {
+            (!grantedCapabilities_ ||
+             grantedCapabilities_->find(requiredCapability) ==
+                 grantedCapabilities_->end())) {
             error.code = ErrorCode::CapabilityDenied;
             error.message = "external function '" + reference.name +
                 "' requires capability '" + requiredCapability + "'";
@@ -366,10 +364,10 @@ bool DeterminismSession::invokeExternal(
     std::uint64_t argumentHash = 0;
     if (mode != DeterminismMode::Off) {
         argumentHash = argumentsHash(
-            arguments, impl_->options.canonicalizeFloatingPoint);
-        hashScalar(impl_->digest, reference.symbolId);
-        hashString(impl_->digest, reference.name);
-        hashScalar(impl_->digest, argumentHash);
+            arguments, canonicalizeFloatingPoint_);
+        hashScalar(digest_, reference.symbolId);
+        hashString(digest_, reference.name);
+        hashScalar(digest_, argumentHash);
     }
 
     if (mode == DeterminismMode::Strict &&
@@ -382,14 +380,14 @@ bool DeterminismSession::invokeExternal(
 
     if (mode == DeterminismMode::Replay &&
         policy != BindingDeterminism::Deterministic) {
-        if (!impl_->options.replayLog ||
-            impl_->replayCursor >= impl_->replayEntries.size()) {
+        if (!replayLog_ ||
+            replayCursor_ >= replayEntries_.size()) {
             error.code = ErrorCode::ReplayMismatch;
             error.message = "replay log ended before external function '" +
                 reference.name + "'";
             return false;
         }
-        const auto& record = impl_->replayEntries[impl_->replayCursor++];
+        const auto& record = replayEntries_[replayCursor_++];
         if (record.symbolId != reference.symbolId ||
             record.name != reference.name ||
             record.argumentHash != argumentHash) {
@@ -400,20 +398,20 @@ bool DeterminismSession::invokeExternal(
         }
         if (record.succeeded) {
             result = record.result;
-            hashValue(impl_->digest, *result,
-                impl_->options.canonicalizeFloatingPoint);
+            hashValue(digest_, *result,
+                canonicalizeFloatingPoint_);
             return true;
         }
         error.code = record.errorCode;
         error.message = record.errorMessage;
-        hashScalar(impl_->digest, static_cast<std::uint16_t>(error.code));
-        hashString(impl_->digest, error.message);
+        hashScalar(digest_, static_cast<std::uint16_t>(error.code));
+        hashString(digest_, error.message);
         return false;
     }
 
     if (mode == DeterminismMode::Record &&
         policy != BindingDeterminism::Deterministic) {
-        if (!impl_->options.replayLog) {
+        if (!replayLog_) {
             error.code = ErrorCode::DeterminismViolation;
             error.message = "record mode requires a replay log";
             return false;
@@ -452,20 +450,20 @@ bool DeterminismSession::invokeExternal(
         if (succeeded) record.result = *invocationResult;
         record.errorCode = invocationError.code;
         record.errorMessage = invocationError.message;
-        impl_->options.replayLog->append(std::move(record));
+        replayLog_->append(std::move(record));
     }
     if (!succeeded) {
         error = std::move(invocationError);
         if (mode != DeterminismMode::Off) {
-            hashScalar(impl_->digest, static_cast<std::uint16_t>(error.code));
-            hashString(impl_->digest, error.message);
+            hashScalar(digest_, static_cast<std::uint16_t>(error.code));
+            hashString(digest_, error.message);
         }
         return false;
     }
     result = std::move(invocationResult);
     if (mode != DeterminismMode::Off) {
-        hashValue(impl_->digest, *result,
-            impl_->options.canonicalizeFloatingPoint);
+        hashValue(digest_, *result,
+            canonicalizeFloatingPoint_);
     }
     return true;
 }
@@ -475,48 +473,47 @@ bool DeterminismSession::finish(
     const Value& value,
     RuntimeError& error,
     const RuntimeStatistics& statistics) {
-    if (!impl_) return succeeded;
-    if (succeeded && impl_->options.mode == DeterminismMode::Replay &&
-        impl_->replayCursor != impl_->replayEntries.size()) {
+    if (succeeded && mode_ == DeterminismMode::Replay &&
+        replayCursor_ != replayEntries_.size()) {
         succeeded = false;
         error.code = ErrorCode::ReplayMismatch;
         error.message = "replay log contains " +
-            std::to_string(impl_->replayEntries.size() - impl_->replayCursor) +
+            std::to_string(replayEntries_.size() - replayCursor_) +
             " unconsumed external call entr" +
-            (impl_->replayEntries.size() - impl_->replayCursor == 1
+            (replayEntries_.size() - replayCursor_ == 1
                 ? "y" : "ies");
     }
-    hashScalar(impl_->digest, succeeded);
+    hashScalar(digest_, succeeded);
     if (succeeded) {
-        hashValue(impl_->digest, value,
-            impl_->options.canonicalizeFloatingPoint);
+        hashValue(digest_, value,
+            canonicalizeFloatingPoint_);
     } else {
-        hashScalar(impl_->digest, static_cast<std::uint16_t>(error.code));
-        hashString(impl_->digest, error.message);
-        for (const auto& frame : error.stackTrace) hashString(impl_->digest, frame);
+        hashScalar(digest_, static_cast<std::uint16_t>(error.code));
+        hashString(digest_, error.message);
+        for (const auto& frame : error.stackTrace) hashString(digest_, frame);
     }
-    hashScalar(impl_->digest, statistics.instructionsExecuted);
-    hashScalar(impl_->digest, statistics.functionCalls);
-    hashScalar(impl_->digest, statistics.externalCalls);
-    hashScalar(impl_->digest, statistics.branchesTaken);
+    hashScalar(digest_, statistics.instructionsExecuted);
+    hashScalar(digest_, statistics.functionCalls);
+    hashScalar(digest_, statistics.externalCalls);
+    hashScalar(digest_, statistics.branchesTaken);
     const auto depth = static_cast<std::uint64_t>(statistics.maximumCallDepth);
-    hashScalar(impl_->digest, depth);
-    hashScalar(impl_->digest, statistics.gcWorkPerformed);
-    if (impl_->options.mode == DeterminismMode::Replay &&
-        impl_->replayCursor != impl_->replayEntries.size()) {
-        hashScalar(impl_->digest,
-            static_cast<std::uint64_t>(impl_->replayEntries.size() -
-                impl_->replayCursor));
+    hashScalar(digest_, depth);
+    hashScalar(digest_, statistics.gcWorkPerformed);
+    if (mode_ == DeterminismMode::Replay &&
+        replayCursor_ != replayEntries_.size()) {
+        hashScalar(digest_,
+            static_cast<std::uint64_t>(replayEntries_.size() -
+                replayCursor_));
     }
     return succeeded;
 }
 
 std::uint64_t DeterminismSession::digest() const noexcept {
-    return impl_ ? impl_->digest : 0;
+    return digest_;
 }
 
 std::size_t DeterminismSession::replayEntriesConsumed() const noexcept {
-    return impl_ ? impl_->replayCursor : 0;
+    return replayCursor_;
 }
 
 std::uint64_t stableValueHash(const Value& value) noexcept {
