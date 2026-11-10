@@ -126,6 +126,10 @@ struct InspectorSignalSchema {
     std::vector<InspectorSignalParameter> parameters;
 };
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct InspectorFieldSchema {
     std::string name;
     semantic::PrimitiveType type = semantic::PrimitiveType::Error;
@@ -145,6 +149,9 @@ struct InspectorFieldSchema {
     std::vector<InspectorEnumOption> enumOptions;
     std::vector<InspectorFieldSchema> nestedFields;
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 struct InspectorTypeSchema {
     std::string canonicalTypeName;

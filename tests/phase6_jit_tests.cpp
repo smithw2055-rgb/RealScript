@@ -118,6 +118,90 @@ void testToolchainJit() {
     require(second.cacheHit, "second JIT compilation did not reuse the cache");
     require(second.module->contentHash() == first.module->contentHash(),
         "cached JIT module content hash changed");
+
+    // Verify 16-byte Value cross-DLL pool bridge (NativeHandle typeId, QuatArena, StringValue) across JIT shared module boundary
+    {
+        const char* bridgeSrc = R"(
+module Phase6.JitValueBridge;
+import RealScript.Math;
+
+handle echoHandle(handle h)
+{
+    return h;
+}
+
+Quat echoQuat(Quat q)
+{
+    return q;
+}
+
+Quat makeJitArenaQuat(int wRaw)
+{
+    return Quat.Raw(404, -505, 606, wRaw);
+}
+
+string echoString(string s)
+{
+    return s;
+}
+
+string makeBridgeLabel(string prefix)
+{
+    return prefix + "_from_jit_dll";
+}
+)";
+        realscript::compiler::Compilation comp;
+        comp.addSource({"jit_bridge.rs", bridgeSrc});
+        auto built = comp.build();
+        require(!built.diagnostics.hasErrors(), "JIT value bridge fixture failed to compile");
+
+        auto bridgeCfg = options();
+        bridgeCfg.generation.programName = "Phase6JitValueBridge";
+        auto bridgeJit = jit.compile(built.modules, bridgeCfg);
+        require(bridgeJit.succeeded(), bridgeJit.error.empty() ? "bridge JIT failed" : bridgeJit.error);
+
+        auto sharedHeap = std::make_shared<realscript::runtime::ManagedHeap>();
+        bridgeJit.module->setHeap(sharedHeap);
+
+        const auto handleTid = realscript::semantic::stableTypeId("Phase6.JitValueBridge::BridgeEntity");
+        const realscript::runtime::NativeHandle hostHandle(17u, 5u, handleTid, 3u);
+        const auto hRes = bridgeJit.module->invoke("Phase6.JitValueBridge::echoHandle", {hostHandle});
+        require(
+            hRes.succeeded && std::get<realscript::runtime::NativeHandle>(hRes.value) == hostHandle,
+            "NativeHandle typeId corrupted across JIT DLL boundary");
+
+        const realscript::runtime::QuatValue bigQuat{101, -202, 303, 1500000000};
+        const auto qRes = bridgeJit.module->invoke("Phase6.JitValueBridge::echoQuat", {bigQuat});
+        require(
+            qRes.succeeded && std::get<realscript::runtime::QuatValue>(qRes.value) == bigQuat,
+            "QuatArena (Host -> JIT -> Host) corrupted across JIT DLL boundary");
+
+        const realscript::runtime::QuatValue jitQuatExpected{404, -505, 606, 1750000000};
+        const auto qJitRes = bridgeJit.module->invoke(
+            "Phase6.JitValueBridge::makeJitArenaQuat",
+            {std::int64_t{1750000000}});
+        require(
+            qJitRes.succeeded &&
+                std::get<realscript::runtime::QuatValue>(qJitRes.value) == jitQuatExpected,
+            "QuatArena (JIT -> Host) corrupted across JIT DLL boundary");
+
+        const std::string hostLongStr = "host_seed_long_non_sso_bridge_string";
+        const auto echoStrRes = bridgeJit.module->invoke(
+            "Phase6.JitValueBridge::echoString",
+            {hostLongStr});
+        require(
+            echoStrRes.succeeded && std::get<std::string>(echoStrRes.value) == hostLongStr,
+            "StringValue echo corrupted across JIT DLL boundary");
+
+        const auto sRes = bridgeJit.module->invoke(
+            "Phase6.JitValueBridge::makeBridgeLabel",
+            {hostLongStr});
+        const auto* strRef = std::get_if<realscript::runtime::ObjectRef>(&sRes.value);
+        require(
+            sRes.succeeded && strRef != nullptr &&
+                sharedHeap->stringView(*strRef) == (hostLongStr + "_from_jit_dll"),
+            "StringValue concat across JIT DLL boundary corrupted");
+    }
 }
 
 } // namespace

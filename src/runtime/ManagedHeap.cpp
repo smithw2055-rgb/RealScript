@@ -292,8 +292,8 @@ struct ManagedHeap::Impl {
         }
         void clearValues() noexcept {
             if (usesInlineValues) {
-                for (std::uint8_t i = 0; i < inlineValueCount; ++i) {
-                    inlineValues[i] = Value{};
+                if (inlineValueCount != 0) {
+                    std::memset(inlineValues.data(), 0, static_cast<std::size_t>(inlineValueCount) * sizeof(Value));
                 }
                 inlineValueCount = 0;
                 usesInlineValues = false;
@@ -355,9 +355,12 @@ struct ManagedHeap::Impl {
     };
 
     [[nodiscard]] static bool valueMayContainReferences(const Value& value) noexcept {
-        if (std::holds_alternative<ObjectRef>(value)) return true;
-        if (const auto* s = std::get_if<StructValue>(&value)) {
-            return !s->isInline && s->storage != nullptr;
+        if (!value.isTraceable()) return false;
+        const auto t = value.rawTag();
+        if (t == ValueTag::ObjectRef) return true;
+        if (t == ValueTag::Struct) {
+            const auto& s = value.asStructUnchecked();
+            return !s.isInline && s.storage != nullptr;
         }
         return false;
     }
@@ -610,30 +613,38 @@ struct ManagedHeap::Impl {
     void markValue(
         const Value& value,
         std::unordered_set<const StructStorage*>& visitedStructs) {
-        if (const auto* reference = std::get_if<ObjectRef>(&value)) {
-            mark(*reference);
+        if (!value.isTraceable()) return;
+        const auto t = value.rawTag();
+        if (t == ValueTag::ObjectRef) {
+            mark(value.asObjectRefUnchecked());
             return;
         }
-        if (const auto* structure = std::get_if<StructValue>(&value);
-            structure && !structure->isInline && structure->storage &&
-            visitedStructs.insert(structure->storage.get()).second) {
-            for (const auto& field : structure->storage->fields) {
-                markValue(field, visitedStructs);
+        if (t == ValueTag::Struct) {
+            const auto& structure = value.asStructUnchecked();
+            if (!structure.isInline && structure.storage &&
+                visitedStructs.insert(structure.storage.get()).second) {
+                for (const auto& field : structure.storage->fields) {
+                    markValue(field, visitedStructs);
+                }
             }
         }
     }
 
     void markValue(const Value& value) {
-        if (const auto* reference = std::get_if<ObjectRef>(&value)) {
-            mark(*reference);
+        if (!value.isTraceable()) return;
+        const auto t = value.rawTag();
+        if (t == ValueTag::ObjectRef) {
+            mark(value.asObjectRefUnchecked());
             return;
         }
-        if (const auto* structure = std::get_if<StructValue>(&value);
-            structure && !structure->isInline && structure->storage) {
-            std::unordered_set<const StructStorage*> visitedStructs;
-            visitedStructs.insert(structure->storage.get());
-            for (const auto& field : structure->storage->fields) {
-                markValue(field, visitedStructs);
+        if (t == ValueTag::Struct) {
+            const auto& structure = value.asStructUnchecked();
+            if (!structure.isInline && structure.storage) {
+                std::unordered_set<const StructStorage*> visitedStructs;
+                visitedStructs.insert(structure.storage.get());
+                for (const auto& field : structure.storage->fields) {
+                    markValue(field, visitedStructs);
+                }
             }
         }
     }
@@ -1154,8 +1165,9 @@ bool writeNativeFieldToBytes(
         return false;
     }
     case NativeFieldKind::Quat: {
-        if (const auto* v = std::get_if<QuatValue>(&val)) {
-            std::memcpy(ptr, v, sizeof(*v));
+        QuatValue qv{};
+        if (val.tryGetQuat(qv)) {
+            std::memcpy(ptr, &qv, sizeof(qv));
             return true;
         }
         return false;
@@ -1352,16 +1364,18 @@ bool ManagedHeap::arraySet(
             return false;
         }
     } else if (expected == semantic::PrimitiveType::Enum) {
-        const auto* enumeration = std::get_if<EnumValue>(&value);
-        if (!enumeration || enumeration->typeId != object->header.elementTypeId) {
+        EnumValue enumeration{};
+        if (!value.tryGetEnum(enumeration) ||
+            enumeration.typeId != object->header.elementTypeId) {
             setHeapError(error, ErrorCode::TypeMismatch,
                 "managed array enum element type mismatch");
             return false;
         }
     } else if (expected == semantic::PrimitiveType::Handle) {
-        const auto* handle = std::get_if<NativeHandle>(&value);
-        if (!handle || (object->header.elementTypeId != 0 &&
-                        handle->typeId != object->header.elementTypeId)) {
+        NativeHandle handle{};
+        if (!value.tryGetNativeHandle(handle) ||
+            (object->header.elementTypeId != 0 &&
+             handle.typeId != object->header.elementTypeId)) {
             setHeapError(error, ErrorCode::TypeMismatch,
                 "managed array native handle type mismatch");
             return false;
@@ -1936,19 +1950,24 @@ std::size_t ManagedHeap::collectYoung(
     std::vector<ObjectRef> youngQueue;
     std::unordered_set<const StructStorage*> visitedStructs;
     const auto markYoungValue = [&](const auto& self, const Value& val) -> void {
-        if (const auto* ref = std::get_if<ObjectRef>(&val)) {
-            auto* obj = impl_->get(*ref);
+        if (!val.isTraceable()) return;
+        const auto t = val.rawTag();
+        if (t == ValueTag::ObjectRef) {
+            const auto& ref = val.asObjectRefUnchecked();
+            auto* obj = impl_->get(ref);
             if (obj && obj->header.inNursery && !obj->header.marked) {
                 obj->header.marked = true;
-                youngQueue.push_back(*ref);
+                youngQueue.push_back(ref);
             }
             return;
         }
-        if (const auto* structure = std::get_if<StructValue>(&val);
-            structure && !structure->isInline && structure->storage &&
-            visitedStructs.insert(structure->storage.get()).second) {
-            for (const auto& field : structure->storage->fields) {
-                self(self, field);
+        if (t == ValueTag::Struct) {
+            const auto& structure = val.asStructUnchecked();
+            if (!structure.isInline && structure.storage &&
+                visitedStructs.insert(structure.storage.get()).second) {
+                for (const auto& field : structure.storage->fields) {
+                    self(self, field);
+                }
             }
         }
     };

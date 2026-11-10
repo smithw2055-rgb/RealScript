@@ -1324,8 +1324,8 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         for (const auto& inst : blk.instructions) {
             if (!inst.bytecode) return false;
             const auto op = inst.bytecode->opcode;
-            if (op == bytecode::Opcode::NewDelegate ||
-                op == bytecode::Opcode::NewObject ||
+            if (op == bytecode::Opcode::NewObject ||
+                op == bytecode::Opcode::NewDelegate ||
                 op == bytecode::Opcode::NewArray ||
                 op == bytecode::Opcode::ConstantString) {
                 return false;
@@ -1353,6 +1353,191 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         outMaxDepth = static_cast<std::uint16_t>(1u + maxSubDepth);
         return true;
     };
+
+    // Precompute block-derived instruction/call metrics for multi-block builtin RealScript.Math functions
+    // (Fixed.Sin, Fixed.Cos, Math.Sqrt64, Fixed.Sqrt, Quat.Length, Quat.Normalized, Quat.FromEuler, Quat.Lerp)
+    const auto findMathExecFn = [&](std::string_view name, std::size_t paramCount) noexcept -> const ExecutionFunction* {
+        for (const auto& mod : modules) {
+            if (!isBuiltinMathModule(mod)) continue;
+            for (const auto& fn : mod.functions) {
+                if (fn.name == name && fn.parameterTypes.size() == paramCount) {
+                    const auto it = mirror->functions.find(&fn);
+                    if (it != mirror->functions.end()) return &it->second;
+                }
+            }
+        }
+        return nullptr;
+    };
+    const auto bLen = [](const ExecutionFunction* fn, std::size_t idx) noexcept -> std::uint32_t {
+        if (!fn || idx >= fn->blocks.size() || !fn->blocks[idx].bytecode) return 0u;
+        return static_cast<std::uint32_t>(fn->blocks[idx].bytecode->instructions.size() + 1u);
+    };
+
+    std::uint32_t sinCalleeBaseCost = 0;
+    std::uint16_t sinCalleeCalls = 0;
+    std::uint32_t sinWrapExtraCost = 0;
+    std::uint32_t cosCalleeBaseCost = 0;
+    std::uint16_t cosCalleeCalls = 0;
+    std::uint32_t sqrt64NegCalleeCost = 0;
+    std::uint32_t sqrt64PosBaseCalleeCost = 0;
+    std::uint32_t sqrt64LoopIterCost = 0;
+    std::uint32_t fixedSqrtNegCalleeCost = 0;
+    std::uint32_t fixedSqrtPosBaseCalleeCost = 0;
+    std::uint32_t quatLenPosBaseCalleeCost = 0;
+    std::uint16_t quatLenPosCalls = 0;
+    std::uint32_t quatNormPosBaseCalleeCost = 0;
+    std::uint16_t quatNormPosCalls = 0;
+    std::uint32_t quatFromEulerBaseCalleeCost = 0;
+    std::uint16_t quatFromEulerBaseCalls = 0;
+    std::uint32_t quatLerpPosBaseCalleeCost = 0;
+    std::uint16_t quatLerpPosBaseCalls = 0;
+    std::uint32_t quatLerpDotNegExtraCost = 0;
+    std::uint16_t quatLerpDotNegExtraCalls = 0;
+
+    const auto accumBlockMetrics = [&](const ExecutionFunction* fn,
+                                       std::size_t bIdx,
+                                       std::uint32_t& ioInst,
+                                       std::uint16_t& ioCalls) noexcept -> bool {
+        if (!fn || bIdx >= fn->blocks.size() || !fn->blocks[bIdx].bytecode) return false;
+        ioInst += static_cast<std::uint32_t>(fn->blocks[bIdx].bytecode->instructions.size() + 1u);
+        for (const auto& inst : fn->blocks[bIdx].instructions) {
+            if (!inst.bytecode || inst.bytecode->opcode != bytecode::Opcode::Call) continue;
+            if (inst.opcode != QuickOpcode::CallDirect || !inst.directExecution ||
+                !inst.directTarget || !inst.directTarget->function) {
+                return false;
+            }
+            const auto& cName = inst.directTarget->function->name;
+            if (cName == "Fixed.Sin" && sinCalleeBaseCost > 0) {
+                ioInst += sinCalleeBaseCost;
+                ioCalls = static_cast<std::uint16_t>(ioCalls + sinCalleeCalls);
+            } else if (cName == "Fixed.Cos" && cosCalleeBaseCost > 0) {
+                ioInst += cosCalleeBaseCost;
+                ioCalls = static_cast<std::uint16_t>(ioCalls + cosCalleeCalls);
+            } else if (cName == "Math.Sqrt64" && sqrt64PosBaseCalleeCost > 0) {
+                ioInst += sqrt64PosBaseCalleeCost;
+                ioCalls = static_cast<std::uint16_t>(ioCalls + 1u);
+            } else if (cName == "Quat.Length" && quatLenPosBaseCalleeCost > 0) {
+                ioInst += quatLenPosBaseCalleeCost;
+                ioCalls = static_cast<std::uint16_t>(ioCalls + quatLenPosCalls);
+            } else if (cName == "Quat.Normalized" && quatNormPosBaseCalleeCost > 0) {
+                ioInst += quatNormPosBaseCalleeCost;
+                ioCalls = static_cast<std::uint16_t>(ioCalls + quatNormPosCalls);
+            } else {
+                std::uint32_t subInst = 0;
+                std::uint16_t subCalls = 0;
+                std::uint16_t subDepth = 0;
+                if (!computeStraightLineCallMetrics(
+                        computeStraightLineCallMetrics,
+                        inst.directExecution,
+                        subInst,
+                        subCalls,
+                        subDepth,
+                        0)) {
+                    return false;
+                }
+                ioInst += subInst;
+                ioCalls = static_cast<std::uint16_t>(ioCalls + subCalls);
+            }
+        }
+        return true;
+    };
+
+    if (const auto* sinFn = findMathExecFn("Fixed.Sin", 1);
+        sinFn && sinFn->blocks.size() == 11 &&
+        bLen(sinFn, 1) == bLen(sinFn, 3) &&
+        bLen(sinFn, 5) == bLen(sinFn, 6) + 1u &&
+        bLen(sinFn, 8) == bLen(sinFn, 9) + 1u) {
+        std::uint32_t cost = 0;
+        std::uint16_t calls = 1;
+        if (accumBlockMetrics(sinFn, 0, cost, calls) &&
+            accumBlockMetrics(sinFn, 2, cost, calls) &&
+            accumBlockMetrics(sinFn, 4, cost, calls) &&
+            accumBlockMetrics(sinFn, 6, cost, calls) &&
+            accumBlockMetrics(sinFn, 7, cost, calls) &&
+            accumBlockMetrics(sinFn, 9, cost, calls) &&
+            accumBlockMetrics(sinFn, 10, cost, calls)) {
+            sinCalleeBaseCost = cost;
+            sinCalleeCalls = calls;
+            sinWrapExtraCost = bLen(sinFn, 1);
+        }
+    }
+    if (const auto* cosFn = findMathExecFn("Fixed.Cos", 1);
+        cosFn && cosFn->blocks.size() == 1 && sinCalleeBaseCost > 0) {
+        std::uint32_t cost = 0;
+        std::uint16_t calls = 1;
+        if (accumBlockMetrics(cosFn, 0, cost, calls)) {
+            cosCalleeBaseCost = cost;
+            cosCalleeCalls = calls;
+        }
+    }
+    if (const auto* sq64Fn = findMathExecFn("Math.Sqrt64", 1);
+        sq64Fn && sq64Fn->blocks.size() == 12 &&
+        bLen(sq64Fn, 3) == bLen(sq64Fn, 4) &&
+        bLen(sq64Fn, 9) == bLen(sq64Fn, 10) + 2u) {
+        sqrt64NegCalleeCost = bLen(sq64Fn, 0) + bLen(sq64Fn, 1);
+        sqrt64PosBaseCalleeCost =
+            bLen(sq64Fn, 0) + bLen(sq64Fn, 2) + bLen(sq64Fn, 3) +
+            bLen(sq64Fn, 5) + bLen(sq64Fn, 6) + bLen(sq64Fn, 8);
+        sqrt64LoopIterCost =
+            bLen(sq64Fn, 6) + bLen(sq64Fn, 7) + bLen(sq64Fn, 10) + bLen(sq64Fn, 11);
+    }
+    if (const auto* fSqFn = findMathExecFn("Fixed.Sqrt", 1);
+        fSqFn && fSqFn->blocks.size() == 3 && sqrt64PosBaseCalleeCost > 0) {
+        std::uint32_t negCost = 0;
+        std::uint16_t negCalls = 1;
+        std::uint32_t posCost = 0;
+        std::uint16_t posCalls = 1;
+        if (accumBlockMetrics(fSqFn, 0, negCost, negCalls) &&
+            accumBlockMetrics(fSqFn, 1, negCost, negCalls) &&
+            accumBlockMetrics(fSqFn, 0, posCost, posCalls) &&
+            accumBlockMetrics(fSqFn, 2, posCost, posCalls)) {
+            fixedSqrtNegCalleeCost = negCost;
+            fixedSqrtPosBaseCalleeCost = posCost;
+        }
+    }
+    if (const auto* qLenFn = findMathExecFn("Quat.Length", 1);
+        qLenFn && qLenFn->blocks.size() == 1 && sqrt64PosBaseCalleeCost > 0) {
+        std::uint32_t cost = 0;
+        std::uint16_t calls = 1;
+        if (accumBlockMetrics(qLenFn, 0, cost, calls)) {
+            quatLenPosBaseCalleeCost = cost;
+            quatLenPosCalls = calls;
+        }
+    }
+    if (const auto* qNormFn = findMathExecFn("Quat.Normalized", 1);
+        qNormFn && qNormFn->blocks.size() == 3 && quatLenPosBaseCalleeCost > 0) {
+        std::uint32_t cost = 0;
+        std::uint16_t calls = 1;
+        if (accumBlockMetrics(qNormFn, 0, cost, calls) &&
+            accumBlockMetrics(qNormFn, 2, cost, calls)) {
+            quatNormPosBaseCalleeCost = cost;
+            quatNormPosCalls = calls;
+        }
+    }
+    if (const auto* qEulerFn = findMathExecFn("Quat.FromEuler", 3);
+        qEulerFn && qEulerFn->blocks.size() == 1 && sinCalleeBaseCost > 0 && cosCalleeBaseCost > 0) {
+        std::uint32_t cost = 0;
+        std::uint16_t calls = 1;
+        if (accumBlockMetrics(qEulerFn, 0, cost, calls)) {
+            quatFromEulerBaseCalleeCost = cost;
+            quatFromEulerBaseCalls = calls;
+        }
+    }
+    if (const auto* qLerpFn = findMathExecFn("Quat.Lerp", 3);
+        qLerpFn && qLerpFn->blocks.size() == 3 && quatNormPosBaseCalleeCost > 0) {
+        std::uint32_t cost = 0;
+        std::uint16_t calls = 1;
+        std::uint32_t negExtra = 0;
+        std::uint16_t negCalls = 0;
+        if (accumBlockMetrics(qLerpFn, 0, cost, calls) &&
+            accumBlockMetrics(qLerpFn, 2, cost, calls) &&
+            accumBlockMetrics(qLerpFn, 1, negExtra, negCalls)) {
+            quatLerpPosBaseCalleeCost = cost;
+            quatLerpPosBaseCalls = calls;
+            quatLerpDotNegExtraCost = negExtra;
+            quatLerpDotNegExtraCalls = negCalls;
+        }
+    }
 
     // Pass 3: Build unified flat frame slot layout & direct-threaded FlatInstruction stream
     for (const auto& module : modules) {
@@ -1427,8 +1612,9 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
 
             for (std::size_t bIdx = 0; bIdx < execFunc.blocks.size(); ++bIdx) {
                 const auto& blk = execFunc.blocks[bIdx];
+                const std::size_t blockStreamStart = execFunc.flatStream.size();
                 execFunc.blockStreamOffsets[bIdx] =
-                    static_cast<std::uint32_t>(execFunc.flatStream.size());
+                    static_cast<std::uint32_t>(blockStreamStart);
 
                 const std::size_t nInst = blk.instructions.size();
                 for (std::size_t i = 0; i < nInst;) {
@@ -2242,6 +2428,191 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                         }
                                     }
                                 }
+                                const auto qTid = quatTypeId();
+                                if (!loweredMathIntrinsic) {
+                                    if (pTypes.empty() &&
+                                        retType == semantic::PrimitiveType::Struct &&
+                                        retTypeId == qTid &&
+                                        (fnName == "Quat.Identity" || fnName == "QuatIdentity")) {
+                                        flat.flatOpcode = FlatOpcode::MathQuatIdentity;
+                                        loweredMathIntrinsic = true;
+                                    } else if (pTypes.size() == 2 && pTypeIds.size() == 2 &&
+                                               pTypes[0] == semantic::PrimitiveType::Struct &&
+                                               pTypes[1] == semantic::PrimitiveType::Struct &&
+                                               pTypeIds[0] == qTid && pTypeIds[1] == qTid) {
+                                        if (retType == semantic::PrimitiveType::Struct &&
+                                            retTypeId == fTid &&
+                                            fnName == "Quat.Dot") {
+                                            flat.flatOpcode = FlatOpcode::MathQuatDot;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            flat.src1Slot = regSlot(inst.op1);
+                                            loweredMathIntrinsic = true;
+                                        } else if (retType == semantic::PrimitiveType::Struct &&
+                                                   retTypeId == qTid &&
+                                                   fnName == "Quat.op_Multiply") {
+                                            flat.flatOpcode = FlatOpcode::MathQuatMul;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            flat.src1Slot = regSlot(inst.op1);
+                                            loweredMathIntrinsic = true;
+                                        }
+                                    } else if (pTypes.size() == 2 && pTypeIds.size() == 2 &&
+                                               retType == semantic::PrimitiveType::Struct &&
+                                               retTypeId == v3Tid &&
+                                               pTypes[1] == semantic::PrimitiveType::Struct &&
+                                               pTypeIds[1] == v3Tid) {
+                                        if (pTypes[0] == semantic::PrimitiveType::Struct &&
+                                            pTypeIds[0] == qTid &&
+                                            (fnName == "Quat.Rotate" || fnName == "Quat.op_Multiply" || fnName == "QuatRotateVec3")) {
+                                            flat.flatOpcode = FlatOpcode::MathQuatRotateVec3;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            flat.src1Slot = regSlot(inst.op1);
+                                            loweredMathIntrinsic = true;
+                                        } else if (pTypes[0] == semantic::PrimitiveType::Object &&
+                                                   fnName == "Quat.Rotate") {
+                                            flat.flatOpcode = FlatOpcode::MathQuatRotate;
+                                            flat.src0Slot = regSlot(inst.op0);
+                                            flat.src1Slot = regSlot(inst.op1);
+                                            loweredMathIntrinsic = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if (!loweredMathIntrinsic) {
+                                const auto& targetFn = *inst.directTarget->function;
+                                const auto& fnName = targetFn.name;
+                                const auto& pTypes = targetFn.parameterTypes;
+                                const auto& pTypeIds = targetFn.parameterTypeIds;
+                                const auto retType = targetFn.returnType;
+                                const auto retTypeId = targetFn.returnTypeId;
+                                const auto fTid = fixedTypeId();
+                                const auto qTid = quatTypeId();
+                                const bool isWrapper1Block = (inst.directExecution->blocks.size() == 1);
+                                const std::uint32_t wrapperCost = isWrapper1Block
+                                    ? bLen(inst.directExecution, 0)
+                                    : 0u;
+
+                                if (pTypes.size() == 1 && pTypeIds.size() == 1 &&
+                                    pTypes[0] == semantic::PrimitiveType::Struct &&
+                                    pTypeIds[0] == fTid &&
+                                    retType == semantic::PrimitiveType::Struct &&
+                                    retTypeId == fTid) {
+                                    if ((fnName == "Fixed.Sin" || (isWrapper1Block && (fnName == "Math.Sin" || fnName == "Sin"))) &&
+                                        sinCalleeBaseCost > 0) {
+                                        const bool isWrap = (fnName != "Fixed.Sin");
+                                        flat.flatOpcode = FlatOpcode::MathFixedSin;
+                                        flat.src0Slot = regSlot(inst.op0);
+                                        flat.aux0Slot = static_cast<std::uint16_t>(
+                                            1u + sinCalleeBaseCost + (isWrap ? wrapperCost : 0u));
+                                        const std::uint16_t calls = static_cast<std::uint16_t>(sinCalleeCalls + (isWrap ? 1u : 0u));
+                                        const std::uint16_t depth = static_cast<std::uint16_t>(2u + (isWrap ? 1u : 0u));
+                                        flat.aux1Slot = static_cast<std::uint16_t>((calls & 0xFFu) | ((depth & 0xFFu) << 8u));
+                                        flat.integerImmediate = static_cast<std::int64_t>(sinWrapExtraCost);
+                                        loweredMathIntrinsic = true;
+                                    } else if ((fnName == "Fixed.Cos" || (isWrapper1Block && (fnName == "Math.Cos" || fnName == "Cos"))) &&
+                                               cosCalleeBaseCost > 0) {
+                                        const bool isWrap = (fnName != "Fixed.Cos");
+                                        flat.flatOpcode = FlatOpcode::MathFixedCos;
+                                        flat.src0Slot = regSlot(inst.op0);
+                                        flat.aux0Slot = static_cast<std::uint16_t>(
+                                            1u + cosCalleeBaseCost + (isWrap ? wrapperCost : 0u));
+                                        const std::uint16_t calls = static_cast<std::uint16_t>(cosCalleeCalls + (isWrap ? 1u : 0u));
+                                        const std::uint16_t depth = static_cast<std::uint16_t>(3u + (isWrap ? 1u : 0u));
+                                        flat.aux1Slot = static_cast<std::uint16_t>((calls & 0xFFu) | ((depth & 0xFFu) << 8u));
+                                        flat.integerImmediate = static_cast<std::int64_t>(sinWrapExtraCost);
+                                        loweredMathIntrinsic = true;
+                                    } else if (fnName == "Fixed.Sqrt" && fixedSqrtPosBaseCalleeCost > 0) {
+                                        flat.flatOpcode = FlatOpcode::MathFixedSqrt;
+                                        flat.src0Slot = regSlot(inst.op0);
+                                        flat.aux0Slot = static_cast<std::uint16_t>(1u + fixedSqrtPosBaseCalleeCost);
+                                        flat.aux1Slot = static_cast<std::uint16_t>(3u | (2u << 8u));
+                                        const std::uint32_t negTotal = 1u + fixedSqrtNegCalleeCost;
+                                        flat.integerImmediate = static_cast<std::int64_t>(
+                                            (sqrt64LoopIterCost & 0xFFu) | ((negTotal & 0xFFFFu) << 8u));
+                                        loweredMathIntrinsic = true;
+                                    }
+                                } else if (pTypes.size() == 1 && pTypeIds.size() == 1 &&
+                                           pTypes[0] == semantic::PrimitiveType::Struct &&
+                                           pTypeIds[0] == qTid &&
+                                           retType == semantic::PrimitiveType::Struct &&
+                                           retTypeId == qTid &&
+                                           (fnName == "Quat.Normalized" || (isWrapper1Block && fnName == "QuatNormalize")) &&
+                                           quatNormPosBaseCalleeCost > 0) {
+                                    const bool isWrap = (fnName != "Quat.Normalized");
+                                    const std::uint32_t totalNormCost =
+                                        1u + (isWrap ? wrapperCost : 0u) + quatNormPosBaseCalleeCost;
+                                    if (totalNormCost < InvalidCompactReg) {
+                                        flat.flatOpcode = FlatOpcode::MathQuatNormalize;
+                                        flat.src0Slot = regSlot(inst.op0);
+                                        flat.aux0Slot = static_cast<std::uint16_t>(totalNormCost);
+                                        const std::uint16_t calls =
+                                            static_cast<std::uint16_t>((isWrap ? 1u : 0u) + quatNormPosCalls);
+                                        const std::uint16_t depth = static_cast<std::uint16_t>(3u + (isWrap ? 1u : 0u));
+                                        flat.aux1Slot = static_cast<std::uint16_t>((calls & 0xFFu) | ((depth & 0xFFu) << 8u));
+                                        flat.integerImmediate = static_cast<std::int64_t>(sqrt64LoopIterCost);
+                                        loweredMathIntrinsic = true;
+                                    }
+                                } else if (pTypes.size() == 1 &&
+                                           pTypes[0] == semantic::PrimitiveType::Long &&
+                                           retType == semantic::PrimitiveType::Long &&
+                                           fnName == "Math.Sqrt64" &&
+                                           sqrt64PosBaseCalleeCost > 0) {
+                                    flat.flatOpcode = FlatOpcode::MathSqrt64;
+                                    flat.src0Slot = regSlot(inst.op0);
+                                    flat.aux0Slot = static_cast<std::uint16_t>(1u + sqrt64PosBaseCalleeCost);
+                                    flat.aux1Slot = static_cast<std::uint16_t>(1u | (1u << 8u));
+                                    const std::uint32_t negTotal = 1u + sqrt64NegCalleeCost;
+                                    flat.integerImmediate = static_cast<std::int64_t>(
+                                        (sqrt64LoopIterCost & 0xFFu) | ((negTotal & 0xFFFFu) << 8u));
+                                    loweredMathIntrinsic = true;
+                                } else if (pTypes.size() == 3 && pTypeIds.size() == 3 &&
+                                           retType == semantic::PrimitiveType::Struct &&
+                                           retTypeId == qTid &&
+                                           inst.bytecode &&
+                                           inst.bytecode->operands.size() == 3 &&
+                                           inst.bytecode->operands[2] < regCount) {
+                                    const std::uint16_t arg2Slot = regSlot(
+                                        static_cast<std::uint16_t>(inst.bytecode->operands[2]));
+                                    if (pTypes[0] == semantic::PrimitiveType::Struct && pTypeIds[0] == fTid &&
+                                        pTypes[1] == semantic::PrimitiveType::Struct && pTypeIds[1] == fTid &&
+                                        pTypes[2] == semantic::PrimitiveType::Struct && pTypeIds[2] == fTid &&
+                                        (fnName == "Quat.FromEuler" || (isWrapper1Block && fnName == "QuatFromEuler")) &&
+                                        quatFromEulerBaseCalleeCost > 0) {
+                                        const bool isWrap = (fnName != "Quat.FromEuler");
+                                        flat.flatOpcode = FlatOpcode::MathQuatFromEuler;
+                                        flat.src0Slot = regSlot(inst.op0);
+                                        flat.src1Slot = regSlot(inst.op1);
+                                        flat.src2Slot = arg2Slot;
+                                        flat.aux0Slot = static_cast<std::uint16_t>(
+                                            1u + quatFromEulerBaseCalleeCost + (isWrap ? wrapperCost : 0u));
+                                        const std::uint16_t calls = static_cast<std::uint16_t>(
+                                            quatFromEulerBaseCalls + (isWrap ? 1u : 0u));
+                                        const std::uint16_t depth = static_cast<std::uint16_t>(4u + (isWrap ? 1u : 0u));
+                                        flat.aux1Slot = static_cast<std::uint16_t>((calls & 0xFFu) | ((depth & 0xFFu) << 8u));
+                                        flat.integerImmediate = static_cast<std::int64_t>(sinWrapExtraCost);
+                                        loweredMathIntrinsic = true;
+                                    } else if (pTypes[0] == semantic::PrimitiveType::Struct && pTypeIds[0] == qTid &&
+                                               pTypes[1] == semantic::PrimitiveType::Struct && pTypeIds[1] == qTid &&
+                                               pTypes[2] == semantic::PrimitiveType::Struct && pTypeIds[2] == fTid &&
+                                               (fnName == "Quat.Lerp" || (isWrapper1Block && fnName == "QuatLerp")) &&
+                                               quatLerpPosBaseCalleeCost > 0) {
+                                        const bool isWrap = (fnName != "Quat.Lerp");
+                                        flat.flatOpcode = FlatOpcode::MathQuatLerp;
+                                        flat.src0Slot = regSlot(inst.op0);
+                                        flat.src1Slot = regSlot(inst.op1);
+                                        flat.src2Slot = arg2Slot;
+                                        flat.aux0Slot = static_cast<std::uint16_t>(
+                                            1u + quatLerpPosBaseCalleeCost + (isWrap ? wrapperCost : 0u));
+                                        const std::uint16_t calls = static_cast<std::uint16_t>(
+                                            quatLerpPosBaseCalls + (isWrap ? 1u : 0u));
+                                        const std::uint16_t depth = static_cast<std::uint16_t>(4u + (isWrap ? 1u : 0u));
+                                        flat.aux1Slot = static_cast<std::uint16_t>((calls & 0xFFu) | ((depth & 0xFFu) << 8u));
+                                        flat.integerImmediate = static_cast<std::int64_t>(
+                                            (sqrt64LoopIterCost & 0xFFu) |
+                                            ((quatLerpDotNegExtraCost & 0xFFFFu) << 8u) |
+                                            ((static_cast<std::uint64_t>(quatLerpDotNegExtraCalls) & 0xFFu) << 24u));
+                                        loweredMathIntrinsic = true;
+                                    }
+                                }
                             }
                         }
                         if (!loweredMathIntrinsic) {
@@ -2353,6 +2724,11 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                    fld.type == semantic::PrimitiveType::Struct &&
                                    fldTid == fixedTypeId()) {
                             flat.flatOpcode = FlatOpcode::LoadVec3FieldFast;
+                        } else if (structType.id == quatTypeId() &&
+                                   inst.auxReg1 < 4 &&
+                                   fld.type == semantic::PrimitiveType::Struct &&
+                                   fldTid == fixedTypeId()) {
+                            flat.flatOpcode = FlatOpcode::LoadQuatFieldFast;
                         } else {
                             flat.flatOpcode = FlatOpcode::LoadStructFieldFast;
                         }
@@ -2376,6 +2752,11 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                    fld.type == semantic::PrimitiveType::Struct &&
                                    fldTid == fixedTypeId()) {
                             flat.flatOpcode = FlatOpcode::StoreVec3FieldFast;
+                        } else if (structType.id == quatTypeId() &&
+                                   inst.auxReg1 < 4 &&
+                                   fld.type == semantic::PrimitiveType::Struct &&
+                                   fldTid == fixedTypeId()) {
+                            flat.flatOpcode = FlatOpcode::StoreQuatFieldFast;
                         } else {
                             flat.flatOpcode = FlatOpcode::StoreStructFieldFast;
                         }
@@ -2545,6 +2926,391 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     }
                     execFunc.flatStream.push_back(flat);
                     ++i;
+                }
+
+                // Pass 3b: Dead-temporary MoveSlot folding & compound Vec3/Quat/Fixed superinstruction fusion
+                if (execFunc.flatStream.size() > blockStreamStart + 1) {
+                    const auto isDeadSingleUseRegSlot = [&](std::uint16_t slot) noexcept -> bool {
+                        if (slot < execFunc.registerOffset || slot >= execFunc.scratchOffset) {
+                            return false;
+                        }
+                        const std::size_t rIdx = static_cast<std::size_t>(slot - execFunc.registerOffset);
+                        return rIdx < regCount && globalRegReads[rIdx] == 1;
+                    };
+                    const auto isLoadLocalOrParamMove = [](const FlatInstruction& fi) noexcept -> bool {
+                        return fi.flatOpcode == FlatOpcode::MoveSlot &&
+                            fi.span == 1 &&
+                            fi.bytecode != nullptr &&
+                            (fi.bytecode->opcode == bytecode::Opcode::LoadLocal ||
+                             fi.bytecode->opcode == bytecode::Opcode::LoadParameter);
+                    };
+                    const auto isStoreLocalMove = [](const FlatInstruction& fi) noexcept -> bool {
+                        return fi.flatOpcode == FlatOpcode::MoveSlot &&
+                            fi.span == 1 &&
+                            fi.bytecode != nullptr &&
+                            fi.bytecode->opcode == bytecode::Opcode::StoreLocal;
+                    };
+                    const auto mathOrFieldArity = [](FlatOpcode op, bool& usesSpanOnlyCost) noexcept -> int {
+                        usesSpanOnlyCost = false;
+                        switch (op) {
+                        case FlatOpcode::LoadFixedRawFast:
+                        case FlatOpcode::LoadVec3FieldFast:
+                        case FlatOpcode::LoadQuatFieldFast:
+                        case FlatOpcode::SuperLoadVec3RawFast:
+                        case FlatOpcode::SuperLoadQuatRawFast:
+                            usesSpanOnlyCost = true;
+                            return 1;
+                        case FlatOpcode::MathFixedConst:
+                        case FlatOpcode::MathVec3Const:
+                        case FlatOpcode::MathQuatIdentity:
+                            return 0;
+                        case FlatOpcode::MathFixedFromRaw:
+                        case FlatOpcode::MathFixedFromInt:
+                        case FlatOpcode::MathFixedNeg:
+                        case FlatOpcode::MathFixedSin:
+                        case FlatOpcode::MathFixedCos:
+                        case FlatOpcode::MathFixedSqrt:
+                        case FlatOpcode::MathSqrt64:
+                        case FlatOpcode::MathVec3Neg:
+                        case FlatOpcode::MathQuatNormalize:
+                        case FlatOpcode::SuperQuatNormalizedBoxed:
+                            return 1;
+                        case FlatOpcode::MathFixedRatio:
+                        case FlatOpcode::MathFixedAdd:
+                        case FlatOpcode::MathFixedSub:
+                        case FlatOpcode::MathFixedMul:
+                        case FlatOpcode::MathFixedMulInt:
+                        case FlatOpcode::MathFixedDiv:
+                        case FlatOpcode::MathFixedDivInt:
+                        case FlatOpcode::MathVec3Add:
+                        case FlatOpcode::MathVec3Sub:
+                        case FlatOpcode::MathVec3MulFixed:
+                        case FlatOpcode::MathVec3MulInt:
+                        case FlatOpcode::MathVec3DivFixed:
+                        case FlatOpcode::MathVec3DivInt:
+                        case FlatOpcode::MathVec3Dot:
+                        case FlatOpcode::MathVec3Cross:
+                        case FlatOpcode::MathVec2Add:
+                        case FlatOpcode::MathVec2Sub:
+                        case FlatOpcode::MathVec2MulFixed:
+                        case FlatOpcode::MathVec2Dot:
+                        case FlatOpcode::MathQuatDot:
+                        case FlatOpcode::MathQuatMul:
+                        case FlatOpcode::MathQuatRotate:
+                        case FlatOpcode::MathQuatRotateVec3:
+                        case FlatOpcode::SuperQuatRotateBoxed:
+                        case FlatOpcode::SuperQuatMulNormalized:
+                            return 2;
+                        case FlatOpcode::MathVec3Raw:
+                        case FlatOpcode::MathVec3Of:
+                        case FlatOpcode::MathQuatFromEuler:
+                        case FlatOpcode::MathQuatLerp:
+                        case FlatOpcode::SuperFixedMulAdd:
+                        case FlatOpcode::SuperVec3MulAdd:
+                        case FlatOpcode::SuperVec3AddQuatRotate:
+                        case FlatOpcode::SuperQuatMulChain:
+                        case FlatOpcode::SuperQuatMulRotateVec3:
+                            return 3;
+                        default:
+                            return -1;
+                        }
+                    };
+                    const auto canAddMoveCost = [](const FlatInstruction& fi, bool usesSpanOnlyCost) noexcept -> bool {
+                        if (fi.span >= 250u) return false;
+                        if (usesSpanOnlyCost) return true;
+                        if (static_cast<std::uint32_t>(fi.aux0Slot) + 1u >= InvalidCompactReg) return false;
+                        if (fi.flatOpcode == FlatOpcode::MathFixedSqrt ||
+                            fi.flatOpcode == FlatOpcode::MathSqrt64) {
+                            const auto packed = static_cast<std::uint64_t>(fi.integerImmediate);
+                            const auto negCost = (packed >> 8u) & 0xFFFFu;
+                            if (negCost + 1u >= 0xFFFFu) return false;
+                        }
+                        return true;
+                    };
+                    const auto addMoveCost = [](FlatInstruction& fi, bool usesSpanOnlyCost) noexcept {
+                        fi.span = static_cast<std::uint8_t>(fi.span + 1u);
+                        if (!usesSpanOnlyCost) {
+                            fi.aux0Slot = static_cast<std::uint16_t>(fi.aux0Slot + 1u);
+                            if (fi.flatOpcode == FlatOpcode::MathFixedSqrt ||
+                                fi.flatOpcode == FlatOpcode::MathSqrt64) {
+                                const auto packed = static_cast<std::uint64_t>(fi.integerImmediate);
+                                const auto iterCost = packed & 0xFFu;
+                                const auto negCost = ((packed >> 8u) & 0xFFFFu) + 1u;
+                                fi.integerImmediate = static_cast<std::int64_t>(
+                                    iterCost | ((negCost & 0xFFFFu) << 8u));
+                            }
+                        }
+                    };
+
+                    const auto runMoveSlotFolding = [&]() {
+                        std::vector<FlatInstruction> out;
+                        const std::size_t curEnd = execFunc.flatStream.size();
+                        out.reserve(curEnd - blockStreamStart);
+                        for (std::size_t idx = blockStreamStart; idx < curEnd; ++idx) {
+                            FlatInstruction cur = execFunc.flatStream[idx];
+                            bool spanOnly = false;
+                            const int arity = mathOrFieldArity(cur.flatOpcode, spanOnly);
+                            if (arity >= 0) {
+                                // Absorb contiguous preceding dead-register LoadLocal/LoadParameter MoveSlots
+                                while (!out.empty() &&
+                                       isLoadLocalOrParamMove(out.back()) &&
+                                       isDeadSingleUseRegSlot(out.back().dstSlot) &&
+                                       canAddMoveCost(cur, spanOnly) &&
+                                       out.back().instructionIndexInBlock + out.back().span ==
+                                           cur.instructionIndexInBlock) {
+                                    const std::uint16_t deadReg = out.back().dstSlot;
+                                    const std::uint16_t replSlot = out.back().src0Slot;
+                                    bool matched = false;
+                                    if (arity >= 1 && cur.src0Slot == deadReg) {
+                                        cur.src0Slot = replSlot;
+                                        matched = true;
+                                    } else if (arity >= 2 && cur.src1Slot == deadReg) {
+                                        cur.src1Slot = replSlot;
+                                        matched = true;
+                                    } else if (arity >= 3 && cur.src2Slot == deadReg) {
+                                        cur.src2Slot = replSlot;
+                                        matched = true;
+                                    }
+                                    if (!matched) break;
+                                    cur.instructionIndexInBlock = out.back().instructionIndexInBlock;
+                                    addMoveCost(cur, spanOnly);
+                                    out.pop_back();
+                                }
+                                // Absorb immediately trailing StoreLocal MoveSlot if cur.dstSlot is dead single-use
+                                if (idx + 1 < curEnd &&
+                                    isStoreLocalMove(execFunc.flatStream[idx + 1]) &&
+                                    execFunc.flatStream[idx + 1].src0Slot == cur.dstSlot &&
+                                    isDeadSingleUseRegSlot(cur.dstSlot) &&
+                                    canAddMoveCost(cur, spanOnly) &&
+                                    cur.instructionIndexInBlock + cur.span ==
+                                        execFunc.flatStream[idx + 1].instructionIndexInBlock) {
+                                    cur.dstSlot = execFunc.flatStream[idx + 1].dstSlot;
+                                    addMoveCost(cur, spanOnly);
+                                    ++idx;
+                                }
+                            }
+                            out.push_back(cur);
+                        }
+                        execFunc.flatStream.erase(
+                            execFunc.flatStream.begin() + static_cast<std::ptrdiff_t>(blockStreamStart),
+                            execFunc.flatStream.end());
+                        execFunc.flatStream.insert(execFunc.flatStream.end(), out.begin(), out.end());
+                    };
+
+                    const auto runCompoundMathFusion = [&]() {
+                        std::vector<FlatInstruction> out;
+                        const std::size_t curEnd = execFunc.flatStream.size();
+                        out.reserve(curEnd - blockStreamStart);
+                        const auto combineCallMeta = [](std::uint16_t a1, std::uint16_t b1, std::uint16_t& outMeta) noexcept -> bool {
+                            const std::uint32_t calls = (a1 & 0xFFu) + (b1 & 0xFFu);
+                            const std::uint32_t depth = std::max<std::uint32_t>((a1 >> 8u) & 0xFFu, (b1 >> 8u) & 0xFFu);
+                            if (calls > 250u || depth > 250u) return false;
+                            outMeta = static_cast<std::uint16_t>((calls & 0xFFu) | ((depth & 0xFFu) << 8u));
+                            return true;
+                        };
+                        for (std::size_t idx = blockStreamStart; idx < curEnd;) {
+                            // 1. 3-FlatInstruction deferred LHS load patterns:
+                            //    m0(LoadLocal/Param -> rA [dead]) + f0(prod -> rMid [dead]) + f1(add(rA, rMid) -> dst)
+                            if (idx + 2 < curEnd) {
+                                const auto& m0 = execFunc.flatStream[idx];
+                                const auto& f0 = execFunc.flatStream[idx + 1];
+                                const auto& f1 = execFunc.flatStream[idx + 2];
+                                if (isLoadLocalOrParamMove(m0) &&
+                                    isDeadSingleUseRegSlot(m0.dstSlot) &&
+                                    isDeadSingleUseRegSlot(f0.dstSlot) &&
+                                    (f0.storeSlot == InvalidCompactReg || f0.storeSlot != m0.src0Slot) &&
+                                    m0.instructionIndexInBlock + m0.span == f0.instructionIndexInBlock &&
+                                    f0.instructionIndexInBlock + f0.span == f1.instructionIndexInBlock &&
+                                    static_cast<std::uint32_t>(m0.span) + f0.span + f1.span <= 250u &&
+                                    static_cast<std::uint32_t>(m0.span) + f0.aux0Slot + f1.aux0Slot < InvalidCompactReg) {
+                                    std::uint16_t mergedMeta = 0;
+                                    const bool lhsAndRhsMatch =
+                                        (f1.src0Slot == m0.dstSlot && f1.src1Slot == f0.dstSlot) ||
+                                        (f1.src1Slot == m0.dstSlot && f1.src0Slot == f0.dstSlot);
+                                    if (lhsAndRhsMatch && combineCallMeta(f0.aux1Slot, f1.aux1Slot, mergedMeta)) {
+                                        FlatInstruction fused = f1;
+                                        fused.instructionIndexInBlock = m0.instructionIndexInBlock;
+                                        fused.span = static_cast<std::uint8_t>(m0.span + f0.span + f1.span);
+                                        fused.aux0Slot = static_cast<std::uint16_t>(m0.span + f0.aux0Slot + f1.aux0Slot);
+                                        fused.aux1Slot = mergedMeta;
+                                        if (f0.flatOpcode == FlatOpcode::MathVec3MulFixed &&
+                                            f1.flatOpcode == FlatOpcode::MathVec3Add) {
+                                            fused.flatOpcode = FlatOpcode::SuperVec3MulAdd;
+                                            fused.src0Slot = m0.src0Slot;
+                                            fused.src1Slot = f0.src0Slot;
+                                            fused.src2Slot = f0.src1Slot;
+                                            fused.dstSlot = f1.dstSlot;
+                                            out.push_back(fused);
+                                            idx += 3;
+                                            continue;
+                                        }
+                                        if (f0.flatOpcode == FlatOpcode::MathFixedMul &&
+                                            f1.flatOpcode == FlatOpcode::MathFixedAdd) {
+                                            fused.flatOpcode = FlatOpcode::SuperFixedMulAdd;
+                                            fused.src0Slot = m0.src0Slot;
+                                            fused.src1Slot = f0.src0Slot;
+                                            fused.src2Slot = f0.src1Slot;
+                                            fused.dstSlot = f1.dstSlot;
+                                            out.push_back(fused);
+                                            idx += 3;
+                                            continue;
+                                        }
+                                        if ((f0.flatOpcode == FlatOpcode::MathQuatRotateVec3 ||
+                                             f0.flatOpcode == FlatOpcode::SuperQuatRotateBoxed) &&
+                                            f1.flatOpcode == FlatOpcode::MathVec3Add) {
+                                            fused.flatOpcode = FlatOpcode::SuperVec3AddQuatRotate;
+                                            fused.src0Slot = m0.src0Slot;
+                                            fused.src1Slot = f0.src0Slot;
+                                            fused.src2Slot = f0.src1Slot;
+                                            fused.storeSlot = (f0.flatOpcode == FlatOpcode::SuperQuatRotateBoxed)
+                                                ? f0.storeSlot
+                                                : InvalidCompactReg;
+                                            fused.dstSlot = f1.dstSlot;
+                                            out.push_back(fused);
+                                            idx += 3;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 2. 2-FlatInstruction contiguous dead-intermediate patterns: f0(-> rMid [dead]) + f1(uses rMid)
+                            if (idx + 1 < curEnd) {
+                                const auto& f0 = execFunc.flatStream[idx];
+                                const auto& f1 = execFunc.flatStream[idx + 1];
+                                if (isDeadSingleUseRegSlot(f0.dstSlot) &&
+                                    f0.instructionIndexInBlock + f0.span == f1.instructionIndexInBlock &&
+                                    static_cast<std::uint32_t>(f0.span) + f1.span <= 250u) {
+                                    // 2a. Field + Fixed.raw chain: v.x.raw / q.w.raw
+                                    if ((f0.flatOpcode == FlatOpcode::LoadVec3FieldFast ||
+                                         f0.flatOpcode == FlatOpcode::LoadQuatFieldFast) &&
+                                        f1.flatOpcode == FlatOpcode::LoadFixedRawFast &&
+                                        f1.src0Slot == f0.dstSlot) {
+                                        FlatInstruction fused = f0;
+                                        fused.flatOpcode = (f0.flatOpcode == FlatOpcode::LoadVec3FieldFast)
+                                            ? FlatOpcode::SuperLoadVec3RawFast
+                                            : FlatOpcode::SuperLoadQuatRawFast;
+                                        fused.span = static_cast<std::uint8_t>(f0.span + f1.span);
+                                        fused.dstSlot = f1.dstSlot;
+                                        out.push_back(fused);
+                                        idx += 2;
+                                        continue;
+                                    }
+
+                                    // 2b. Math compound chains
+                                    std::uint16_t mergedMeta = 0;
+                                    if (static_cast<std::uint32_t>(f0.aux0Slot) + f1.aux0Slot < InvalidCompactReg &&
+                                        combineCallMeta(f0.aux1Slot, f1.aux1Slot, mergedMeta)) {
+                                        FlatInstruction fused = f1;
+                                        fused.instructionIndexInBlock = f0.instructionIndexInBlock;
+                                        fused.span = static_cast<std::uint8_t>(f0.span + f1.span);
+                                        fused.aux0Slot = static_cast<std::uint16_t>(f0.aux0Slot + f1.aux0Slot);
+                                        fused.aux1Slot = mergedMeta;
+
+                                        if (f0.flatOpcode == FlatOpcode::MathVec3MulFixed &&
+                                            f1.flatOpcode == FlatOpcode::MathVec3Add &&
+                                            (f1.src0Slot == f0.dstSlot || f1.src1Slot == f0.dstSlot)) {
+                                            fused.flatOpcode = FlatOpcode::SuperVec3MulAdd;
+                                            fused.src0Slot = (f1.src0Slot == f0.dstSlot) ? f1.src1Slot : f1.src0Slot;
+                                            fused.src1Slot = f0.src0Slot;
+                                            fused.src2Slot = f0.src1Slot;
+                                            fused.dstSlot = f1.dstSlot;
+                                            out.push_back(fused);
+                                            idx += 2;
+                                            continue;
+                                        }
+                                        if (f0.flatOpcode == FlatOpcode::MathFixedMul &&
+                                            f1.flatOpcode == FlatOpcode::MathFixedAdd &&
+                                            (f1.src0Slot == f0.dstSlot || f1.src1Slot == f0.dstSlot)) {
+                                            fused.flatOpcode = FlatOpcode::SuperFixedMulAdd;
+                                            fused.src0Slot = (f1.src0Slot == f0.dstSlot) ? f1.src1Slot : f1.src0Slot;
+                                            fused.src1Slot = f0.src0Slot;
+                                            fused.src2Slot = f0.src1Slot;
+                                            fused.dstSlot = f1.dstSlot;
+                                            out.push_back(fused);
+                                            idx += 2;
+                                            continue;
+                                        }
+                                        if ((f0.flatOpcode == FlatOpcode::MathQuatRotateVec3 ||
+                                             f0.flatOpcode == FlatOpcode::SuperQuatRotateBoxed) &&
+                                            f1.flatOpcode == FlatOpcode::MathVec3Add &&
+                                            (f1.src0Slot == f0.dstSlot || f1.src1Slot == f0.dstSlot)) {
+                                            const std::uint16_t aSlot =
+                                                (f1.src0Slot == f0.dstSlot) ? f1.src1Slot : f1.src0Slot;
+                                            const std::uint16_t rotStore =
+                                                (f0.flatOpcode == FlatOpcode::SuperQuatRotateBoxed)
+                                                    ? f0.storeSlot
+                                                    : InvalidCompactReg;
+                                            if (rotStore == InvalidCompactReg || rotStore != aSlot) {
+                                                fused.flatOpcode = FlatOpcode::SuperVec3AddQuatRotate;
+                                                fused.src0Slot = aSlot;
+                                                fused.src1Slot = f0.src0Slot;
+                                                fused.src2Slot = f0.src1Slot;
+                                                fused.storeSlot = rotStore;
+                                                fused.dstSlot = f1.dstSlot;
+                                                out.push_back(fused);
+                                                idx += 2;
+                                                continue;
+                                            }
+                                        }
+                                        if (f0.flatOpcode == FlatOpcode::MathQuatMul &&
+                                            (f1.flatOpcode == FlatOpcode::SuperQuatNormalizedBoxed ||
+                                             f1.flatOpcode == FlatOpcode::MathQuatNormalize) &&
+                                            f1.src0Slot == f0.dstSlot) {
+                                            fused.flatOpcode = FlatOpcode::SuperQuatMulNormalized;
+                                            fused.src0Slot = f0.src0Slot;
+                                            fused.src1Slot = f0.src1Slot;
+                                            fused.storeSlot = (f1.flatOpcode == FlatOpcode::SuperQuatNormalizedBoxed)
+                                                ? f1.storeSlot
+                                                : InvalidCompactReg;
+                                            fused.integerImmediate = f1.integerImmediate;
+                                            fused.dstSlot = f1.dstSlot;
+                                            out.push_back(fused);
+                                            idx += 2;
+                                            continue;
+                                        }
+                                        if (f0.flatOpcode == FlatOpcode::MathQuatMul &&
+                                            f1.flatOpcode == FlatOpcode::MathQuatMul &&
+                                            f1.src0Slot == f0.dstSlot) {
+                                            fused.flatOpcode = FlatOpcode::SuperQuatMulChain;
+                                            fused.src0Slot = f0.src0Slot;
+                                            fused.src1Slot = f0.src1Slot;
+                                            fused.src2Slot = f1.src1Slot;
+                                            fused.dstSlot = f1.dstSlot;
+                                            out.push_back(fused);
+                                            idx += 2;
+                                            continue;
+                                        }
+                                        if (f0.flatOpcode == FlatOpcode::MathQuatMul &&
+                                            ((f1.flatOpcode == FlatOpcode::MathQuatRotateVec3) ||
+                                             (f1.flatOpcode == FlatOpcode::SuperQuatRotateBoxed &&
+                                              f1.storeSlot == InvalidCompactReg)) &&
+                                            f1.src0Slot == f0.dstSlot) {
+                                            fused.flatOpcode = FlatOpcode::SuperQuatMulRotateVec3;
+                                            fused.src0Slot = f0.src0Slot;
+                                            fused.src1Slot = f0.src1Slot;
+                                            fused.src2Slot = f1.src1Slot;
+                                            fused.dstSlot = f1.dstSlot;
+                                            out.push_back(fused);
+                                            idx += 2;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+
+                            out.push_back(execFunc.flatStream[idx]);
+                            ++idx;
+                        }
+                        execFunc.flatStream.erase(
+                            execFunc.flatStream.begin() + static_cast<std::ptrdiff_t>(blockStreamStart),
+                            execFunc.flatStream.end());
+                        execFunc.flatStream.insert(execFunc.flatStream.end(), out.begin(), out.end());
+                    };
+
+                    runMoveSlotFolding();
+                    runCompoundMathFusion();
+                    runMoveSlotFolding();
                 }
 
                 // Append block terminator as a FlatInstruction
@@ -2825,11 +3591,11 @@ std::optional<InlineStructSlot> encodeInlineStructSlot(
         slot.setBits(static_cast<std::uint64_t>(v->raw));
         return slot;
     }
-    if (const auto* v = std::get_if<EnumValue>(&value)) {
-        if (v->value >= -8388608 && v->value <= 8388607) {
+    if (EnumValue ev{}; value.tryGetEnum(ev)) {
+        if (ev.value >= -8388608 && ev.value <= 8388607) {
             slot.kind = InlineStructSlot::Kind::Enum;
-            slot.setBits(v->typeId);
-            slot.setAuxInt24(static_cast<std::int32_t>(v->value));
+            slot.setBits(ev.typeId);
+            slot.setAuxInt24(static_cast<std::int32_t>(ev.value));
             return slot;
         }
         return std::nullopt;
@@ -2850,17 +3616,17 @@ std::optional<InlineStructSlot> encodeInlineStructSlot(
         }
         return std::nullopt;
     }
-    if (const auto* v = std::get_if<QuatValue>(&value)) {
+    if (QuatValue qv{}; value.tryGetQuat(qv)) {
         const auto inInt16 = [](std::int32_t c) noexcept {
             return c >= std::numeric_limits<std::int16_t>::min() &&
                    c <= std::numeric_limits<std::int16_t>::max();
         };
-        if (inInt16(v->x) && inInt16(v->y) && inInt16(v->z) && inInt16(v->w)) {
+        if (inInt16(qv.x) && inInt16(qv.y) && inInt16(qv.z) && inInt16(qv.w)) {
             slot.kind = InlineStructSlot::Kind::Quat;
-            slot.lo = static_cast<std::uint32_t>(static_cast<std::uint16_t>(static_cast<std::int16_t>(v->x))) |
-                (static_cast<std::uint32_t>(static_cast<std::uint16_t>(static_cast<std::int16_t>(v->y))) << 16u);
-            slot.hi = static_cast<std::uint32_t>(static_cast<std::uint16_t>(static_cast<std::int16_t>(v->z))) |
-                (static_cast<std::uint32_t>(static_cast<std::uint16_t>(static_cast<std::int16_t>(v->w))) << 16u);
+            slot.lo = static_cast<std::uint32_t>(static_cast<std::uint16_t>(static_cast<std::int16_t>(qv.x))) |
+                (static_cast<std::uint32_t>(static_cast<std::uint16_t>(static_cast<std::int16_t>(qv.y))) << 16u);
+            slot.hi = static_cast<std::uint32_t>(static_cast<std::uint16_t>(static_cast<std::int16_t>(qv.z))) |
+                (static_cast<std::uint32_t>(static_cast<std::uint16_t>(static_cast<std::int16_t>(qv.w))) << 16u);
             return slot;
         }
         return std::nullopt;
@@ -2989,6 +3755,7 @@ constexpr std::uint8_t kSlotFlagStackRoot = 0x10u;
 
 std::atomic<bool> g_poolGcMarkInProgress{false};
 std::atomic<bool> g_anyPoolHasPinnedSlots{false};
+std::atomic<const detail::SharedValuePoolBridge*> g_externalPoolBridge{nullptr};
 
 inline void noteShardPinned(std::atomic<bool>& shardFlag) noexcept {
     if (!shardFlag.load(std::memory_order_relaxed)) {
@@ -3022,7 +3789,7 @@ inline void noteShardMarked(std::atomic<bool>& shardFlag) noexcept {
     std::uint32_t& outShardIdx,
     std::uint32_t& outLocalSlot) noexcept {
     const std::uint32_t rawLocal = id & kPoolLocalMask;
-    if (id == 0u || rawLocal == 0u) return false;
+    if (id == 0u || (id & 0x80000000u) != 0u || rawLocal == 0u) return false;
     outShardIdx = (id >> kPoolLocalBits) & kPoolShardMask;
     outLocalSlot = rawLocal - 1u;
     return true;
@@ -3160,7 +3927,6 @@ struct RuntimeStringPool {
         if (text.empty()) {
             StringValue sv;
             sv.id = 0u;
-            sv.length = 0u;
             sv.ptr = &emptyString_;
             return sv;
         }
@@ -3194,7 +3960,6 @@ struct RuntimeStringPool {
             }
             StringValue sv;
             sv.id = tls.id;
-            sv.length = tls.length;
             sv.ptr = tls.ptr;
             return sv;
         }
@@ -3222,7 +3987,6 @@ struct RuntimeStringPool {
 
             StringValue sv;
             sv.id = id;
-            sv.length = tls.length;
             sv.ptr = &stored;
             return sv;
         }
@@ -3231,7 +3995,6 @@ struct RuntimeStringPool {
         if (localSlot == kInvalidLocalSlot) {
             StringValue sv;
             sv.id = 0u;
-            sv.length = 0u;
             sv.ptr = &emptyString_;
             return sv;
         }
@@ -3258,7 +4021,6 @@ struct RuntimeStringPool {
 
         StringValue sv;
         sv.id = id;
-        sv.length = tls.length;
         sv.ptr = &stored;
         return sv;
     }
@@ -3270,7 +4032,6 @@ struct RuntimeStringPool {
         if (!decodeShardedPoolId(id, shardIdx, localSlot)) {
             StringValue sv;
             sv.id = 0u;
-            sv.length = 0u;
             sv.ptr = &emptyString_;
             return sv;
         }
@@ -3284,14 +4045,12 @@ struct RuntimeStringPool {
                 const std::string& stored = page->strings[offset][bank];
                 StringValue sv;
                 sv.id = id;
-                sv.length = static_cast<std::uint32_t>(stored.size());
                 sv.ptr = &stored;
                 return sv;
             }
         }
         StringValue sv;
         sv.id = 0u;
-        sv.length = 0u;
         sv.ptr = &emptyString_;
         return sv;
     }
@@ -3345,6 +4104,9 @@ RuntimeStringPool& runtimeStringPool() {
 }
 
 StringValue runtimeStringPoolById(std::uint32_t id) noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->stringByIdFn) return bridge->stringByIdFn(id);
+    }
     return runtimeStringPool().getById(id);
 }
 
@@ -3649,7 +4411,81 @@ InlineStructPool& inlineStructPool() {
 }
 
 std::uint32_t allocateInlineArenaEntry(const InlineStructArenaEntry& entry) noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->internInlineArenaFn) return bridge->internInlineArenaFn(entry);
+    }
     return inlineStructPool().intern(entry);
+}
+
+struct NativeHandleTypeTable {
+    static constexpr std::uint32_t kFastCapacity = 4096u;
+    std::atomic<semantic::SymbolId> fastSlots[kFastCapacity]{};
+    std::atomic<std::uint32_t> fastCount{0u};
+    std::mutex overflowMutex;
+    std::vector<semantic::SymbolId> overflowTypes;
+    std::unordered_map<semantic::SymbolId, std::uint32_t> overflowMap;
+
+    std::uint32_t intern(semantic::SymbolId typeId) noexcept {
+        if (typeId == 0u) return 0u;
+        struct TlsEntry {
+            semantic::SymbolId typeId = 0u;
+            std::uint32_t idx = 0u;
+        };
+        thread_local std::array<TlsEntry, 16> tlsCache{};
+        auto& tls = tlsCache[(typeId ^ (typeId >> 17u)) & 15u];
+        if (tls.typeId == typeId && tls.idx != 0u) {
+            return tls.idx;
+        }
+        const std::uint32_t cur = std::min<std::uint32_t>(
+            fastCount.load(std::memory_order_acquire), kFastCapacity);
+        for (std::uint32_t i = 0u; i < cur; ++i) {
+            if (fastSlots[i].load(std::memory_order_acquire) == typeId) {
+                tls = {typeId, i + 1u};
+                return i + 1u;
+            }
+        }
+        std::lock_guard<std::mutex> lock(overflowMutex);
+        const std::uint32_t curLocked = std::min<std::uint32_t>(
+            fastCount.load(std::memory_order_relaxed), kFastCapacity);
+        for (std::uint32_t i = 0u; i < curLocked; ++i) {
+            if (fastSlots[i].load(std::memory_order_relaxed) == typeId) {
+                tls = {typeId, i + 1u};
+                return i + 1u;
+            }
+        }
+        if (curLocked < kFastCapacity) {
+            fastSlots[curLocked].store(typeId, std::memory_order_release);
+            fastCount.store(curLocked + 1u, std::memory_order_release);
+            tls = {typeId, curLocked + 1u};
+            return curLocked + 1u;
+        }
+        const auto found = overflowMap.find(typeId);
+        if (found != overflowMap.end()) {
+            tls = {typeId, found->second};
+            return found->second;
+        }
+        const std::uint32_t idx = kFastCapacity + 1u +
+            static_cast<std::uint32_t>(overflowTypes.size());
+        overflowTypes.push_back(typeId);
+        overflowMap.emplace(typeId, idx);
+        tls = {typeId, idx};
+        return idx;
+    }
+
+    semantic::SymbolId lookup(std::uint32_t idx) noexcept {
+        if (idx == 0u) return 0u;
+        if (idx <= kFastCapacity) {
+            return fastSlots[idx - 1u].load(std::memory_order_acquire);
+        }
+        std::lock_guard<std::mutex> lock(overflowMutex);
+        const std::size_t off = static_cast<std::size_t>(idx - kFastCapacity - 1u);
+        return off < overflowTypes.size() ? overflowTypes[off] : 0u;
+    }
+};
+
+NativeHandleTypeTable& nativeHandleTypeTable() noexcept {
+    static NativeHandleTypeTable table;
+    return table;
 }
 
 // ----------------------------------------------------------------------------
@@ -3723,8 +4559,8 @@ struct HeapStructStoragePool {
                 vw ^= dbits;
             } else if (const auto* chv = std::get_if<CharValue>(&v)) {
                 vw ^= chv->value;
-            } else if (const auto* env = std::get_if<EnumValue>(&v)) {
-                vw ^= env->typeId ^ (static_cast<std::uint64_t>(env->value) * 0x9e3779b97f4a7c15ULL);
+            } else if (EnumValue env{}; v.tryGetEnum(env)) {
+                vw ^= env.typeId ^ (static_cast<std::uint64_t>(env.value) * 0x9e3779b97f4a7c15ULL);
             } else if (const auto* fx = std::get_if<FixedValue>(&v)) {
                 vw ^= static_cast<std::uint32_t>(fx->raw);
             } else if (const auto* fx16 = std::get_if<Fixed16Value>(&v)) {
@@ -3736,19 +4572,19 @@ struct HeapStructStoragePool {
                 vw ^= static_cast<std::uint32_t>(v3->x) ^
                     (static_cast<std::uint64_t>(static_cast<std::uint32_t>(v3->y)) << 21u) ^
                     (static_cast<std::uint64_t>(static_cast<std::uint32_t>(v3->z)) << 42u);
-            } else if (const auto* qt = std::get_if<QuatValue>(&v)) {
-                vw ^= static_cast<std::uint32_t>(qt->x) ^
-                    (static_cast<std::uint64_t>(static_cast<std::uint32_t>(qt->y)) << 16u) ^
-                    (static_cast<std::uint64_t>(static_cast<std::uint32_t>(qt->z)) << 32u) ^
-                    (static_cast<std::uint64_t>(static_cast<std::uint32_t>(qt->w)) << 48u);
+            } else if (QuatValue qt{}; v.tryGetQuat(qt)) {
+                vw ^= static_cast<std::uint32_t>(qt.x) ^
+                    (static_cast<std::uint64_t>(static_cast<std::uint32_t>(qt.y)) << 16u) ^
+                    (static_cast<std::uint64_t>(static_cast<std::uint32_t>(qt.z)) << 32u) ^
+                    (static_cast<std::uint64_t>(static_cast<std::uint32_t>(qt.w)) << 48u);
             } else if (const auto* sv = std::get_if<StringValue>(&v)) {
                 vw ^= sv->id;
             } else if (const auto* st = std::get_if<StructValue>(&v)) {
                 vw ^= st->typeId ^ (static_cast<std::uint64_t>(st->storage.raw_) << 16u);
             } else if (const auto* obj = std::get_if<ObjectRef>(&v)) {
                 vw ^= (static_cast<std::uint64_t>(obj->slot) << 32u) ^ obj->generation;
-            } else if (const auto* nh = std::get_if<NativeHandle>(&v)) {
-                vw ^= nh->typeId ^ (static_cast<std::uint64_t>(nh->slot) << 16u) ^ nh->generation;
+            } else if (NativeHandle nh{}; v.tryGetNativeHandle(nh)) {
+                vw ^= nh.typeId ^ (static_cast<std::uint64_t>(nh.slot) << 16u) ^ nh.generation;
             }
             h ^= vw + 0x9e3779b97f4a7c15ULL + (h << 6u) + (h >> 2u);
         }
@@ -3970,18 +4806,45 @@ HeapStructStoragePool& heapStructPool() {
     return pool;
 }
 
-StructStorageHandle::StructStorageHandle(std::shared_ptr<const StructStorage> store)
-    : raw_(heapStructPool().registerStorage(std::move(store))) {}
+StructStorageHandle::StructStorageHandle(std::shared_ptr<const StructStorage> store) {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->registerHeapStructFn) {
+            raw_ = bridge->registerHeapStructFn(&store);
+            return;
+        }
+    }
+    raw_ = heapStructPool().registerStorage(std::move(store));
+}
 
-StructStorageHandle::StructStorageHandle(std::shared_ptr<StructStorage> store)
-    : raw_(heapStructPool().registerStorage(std::move(store))) {}
+StructStorageHandle::StructStorageHandle(std::shared_ptr<StructStorage> store) {
+    std::shared_ptr<const StructStorage> cstore = std::move(store);
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->registerHeapStructFn) {
+            raw_ = bridge->registerHeapStructFn(&cstore);
+            return;
+        }
+    }
+    raw_ = heapStructPool().registerStorage(std::move(cstore));
+}
 
 const StructStorage* StructStorageHandle::get() const noexcept {
     if (!isStoragePtr()) return nullptr;
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->lookupHeapStructFn) {
+            return static_cast<const StructStorage*>(bridge->lookupHeapStructFn(raw_));
+        }
+    }
     return heapStructPool().get(raw_);
 }
 
 const InlineStructArenaEntry& StructValue::inlineEntry() const noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->lookupInlineArenaFn) {
+            if (const auto* ptr = bridge->lookupInlineArenaFn(storage.inlineArenaIndex())) {
+                return *ptr;
+            }
+        }
+    }
     return inlineStructPool().get(storage.inlineArenaIndex());
 }
 
@@ -4030,14 +4893,32 @@ bool operator==(const StructValue& left, const StructValue& right) {
 }
 
 StringValue::StringValue(const std::string& value) {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->internStringFn) {
+            *this = bridge->internStringFn(value);
+            return;
+        }
+    }
     *this = runtimeStringPool().intern(value);
 }
 
 StringValue::StringValue(std::string&& value) {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->internStringFn) {
+            *this = bridge->internStringFn(value);
+            return;
+        }
+    }
     *this = runtimeStringPool().intern(value);
 }
 
 StringValue::StringValue(std::string_view value) {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->internStringFn) {
+            *this = bridge->internStringFn(value);
+            return;
+        }
+    }
     *this = runtimeStringPool().intern(value);
 }
 
@@ -4187,11 +5068,11 @@ std::optional<Value> loadInlineStructField(
         if (fieldIndex == 2) return Value{FixedValue{v3->z}};
         return std::nullopt;
     }
-    if (const auto* q = std::get_if<QuatValue>(&value)) {
-        if (fieldIndex == 0) return Value{FixedValue{q->x}};
-        if (fieldIndex == 1) return Value{FixedValue{q->y}};
-        if (fieldIndex == 2) return Value{FixedValue{q->z}};
-        if (fieldIndex == 3) return Value{FixedValue{q->w}};
+    if (QuatValue q{}; value.tryGetQuat(q)) {
+        if (fieldIndex == 0) return Value{FixedValue{q.x}};
+        if (fieldIndex == 1) return Value{FixedValue{q.y}};
+        if (fieldIndex == 2) return Value{FixedValue{q.z}};
+        if (fieldIndex == 3) return Value{FixedValue{q.w}};
         return std::nullopt;
     }
     if (const auto* s = std::get_if<StructValue>(&value); s && s->isInline) {
@@ -4281,10 +5162,9 @@ std::optional<Value> storeInlineStructField(
         }
         return std::nullopt;
     }
-    if (const auto* q = std::get_if<QuatValue>(&structure)) {
+    if (QuatValue out{}; structure.tryGetQuat(out)) {
         const auto raw = extractRawFixedField(fieldValue);
         if (!raw) return std::nullopt;
-        QuatValue out = *q;
         if (fieldIndex == 0) {
             out.x = *raw;
             return Value{out};
@@ -4727,9 +5607,9 @@ bool intrinsicValueLess(const Value& a, const Value& b, const ManagedHeap* heap)
         if (const auto* usa = std::get_if<UShortValue>(&a)) return usa->value < std::get<UShortValue>(b).value;
         if (const auto* cha = std::get_if<CharValue>(&a)) return cha->value < std::get<CharValue>(b).value;
         if (const auto* ba = std::get_if<bool>(&a)) return (!*ba && std::get<bool>(b));
-        if (const auto* ena = std::get_if<EnumValue>(&a)) {
-            const auto& enb = std::get<EnumValue>(b);
-            return ena->typeId != enb.typeId ? (ena->typeId < enb.typeId) : (ena->value < enb.value);
+        if (EnumValue ena{}; a.tryGetEnum(ena)) {
+            const auto enb = std::get<EnumValue>(b);
+            return ena.typeId != enb.typeId ? (ena.typeId < enb.typeId) : (ena.value < enb.value);
         }
         if (const auto* fxa = std::get_if<FixedValue>(&a)) return fxa->raw < std::get<FixedValue>(b).raw;
         if (const auto* f16a = std::get_if<Fixed16Value>(&a)) return f16a->raw < std::get<Fixed16Value>(b).raw;
@@ -5186,12 +6066,12 @@ bool tryExecuteRuntimeIntrinsic(
             else if (const auto* sh = std::get_if<ShortValue>(&v)) mixU64(static_cast<std::uint16_t>(sh->value));
             else if (const auto* us = std::get_if<UShortValue>(&v)) mixU64(us->value);
             else if (const auto* ch = std::get_if<CharValue>(&v)) mixU64(ch->value);
-            else if (const auto* en = std::get_if<EnumValue>(&v)) { mixU64(en->typeId); mixU64(static_cast<std::uint64_t>(en->value)); }
+            else if (EnumValue en{}; v.tryGetEnum(en)) { mixU64(en.typeId); mixU64(static_cast<std::uint64_t>(en.value)); }
             else if (const auto* fx = std::get_if<FixedValue>(&v)) mixU64(static_cast<std::uint32_t>(fx->raw));
             else if (const auto* f16 = std::get_if<Fixed16Value>(&v)) mixU64(static_cast<std::uint64_t>(f16->raw));
             else if (const auto* v2 = std::get_if<Vec2Value>(&v)) { mixU64(static_cast<std::uint32_t>(v2->x)); mixU64(static_cast<std::uint32_t>(v2->y)); }
             else if (const auto* v3 = std::get_if<Vec3Value>(&v)) { mixU64(static_cast<std::uint32_t>(v3->x)); mixU64(static_cast<std::uint32_t>(v3->y)); mixU64(static_cast<std::uint32_t>(v3->z)); }
-            else if (const auto* q = std::get_if<QuatValue>(&v)) { mixU64(static_cast<std::uint32_t>(q->x)); mixU64(static_cast<std::uint32_t>(q->y)); mixU64(static_cast<std::uint32_t>(q->z)); mixU64(static_cast<std::uint32_t>(q->w)); }
+            else if (QuatValue q{}; v.tryGetQuat(q)) { mixU64(static_cast<std::uint32_t>(q.x)); mixU64(static_cast<std::uint32_t>(q.y)); mixU64(static_cast<std::uint32_t>(q.z)); mixU64(static_cast<std::uint32_t>(q.w)); }
             else if (const auto* d = std::get_if<double>(&v)) {
                 std::uint64_t bits = 0;
                 const double norm = (*d == 0.0) ? 0.0 : *d;
@@ -5592,18 +6472,190 @@ bool hasAnyPinnedPoolValues() noexcept {
     return g_anyPoolHasPinnedSlots.load(std::memory_order_acquire);
 }
 
-void pinValueInPools(const Value& value) noexcept {
-    if (const auto* sv = std::get_if<StringValue>(&value)) {
-        if (sv->id != 0u) runtimeStringPool().pinById(sv->id);
+namespace detail {
+
+namespace {
+struct ArenaScalarOverflowTable {
+    std::mutex mutex;
+    std::vector<InlineStructArenaEntry> entries;
+    std::unordered_map<
+        InlineStructArenaEntry,
+        std::uint32_t,
+        InlineStructEntryHash,
+        InlineStructEntryEq> map;
+
+    std::uint32_t intern(const InlineStructArenaEntry& entry) noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto found = map.find(entry);
+        if (found != map.end()) return found->second;
+        const std::uint32_t id = 0x80000000u | static_cast<std::uint32_t>(entries.size() + 1u);
+        entries.push_back(entry);
+        map.emplace(entry, id);
+        return id;
+    }
+
+    const InlineStructArenaEntry& get(std::uint32_t id) noexcept {
+        const std::size_t off = static_cast<std::size_t>((id & 0x7FFFFFFFu) - 1u);
+        std::lock_guard<std::mutex> lock(mutex);
+        return off < entries.size() ? entries[off] : g_zeroInlineEntry;
+    }
+};
+
+ArenaScalarOverflowTable& arenaScalarOverflowTable() noexcept {
+    static ArenaScalarOverflowTable table;
+    return table;
+}
+
+StringValue hostInternStringBridge(std::string_view text) {
+    return runtimeStringPool().intern(text);
+}
+StringValue hostStringByIdBridge(std::uint32_t id) noexcept {
+    return runtimeStringPool().getById(id);
+}
+std::uint32_t hostInternInlineArenaBridge(const InlineStructArenaEntry& entry) noexcept {
+    return inlineStructPool().intern(entry);
+}
+const InlineStructArenaEntry* hostLookupInlineArenaBridge(std::uint32_t idx) noexcept {
+    return &inlineStructPool().get(idx);
+}
+std::uint32_t hostRegisterHeapStructBridge(const void* storeSharedPtrAddr) {
+    const auto* sp = static_cast<const std::shared_ptr<const StructStorage>*>(storeSharedPtrAddr);
+    return sp ? heapStructPool().registerStorage(*sp) : 0u;
+}
+const void* hostLookupHeapStructBridge(std::uint32_t id) noexcept {
+    return heapStructPool().get(id);
+}
+} // namespace
+
+std::uint32_t internArenaQuat(QuatValue value) noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->internArenaQuatFn) return bridge->internArenaQuatFn(value);
+    }
+    InlineStructArenaEntry entry{};
+    entry.nestedFieldMask = 0x8001u;
+    entry.slots[0].kind = InlineStructSlot::Kind::Quat;
+    entry.slots[0].lo = static_cast<std::uint32_t>(value.x);
+    entry.slots[0].hi = static_cast<std::uint32_t>(value.y);
+    entry.slots[1].kind = InlineStructSlot::Kind::Quat;
+    entry.slots[1].lo = static_cast<std::uint32_t>(value.z);
+    entry.slots[1].hi = static_cast<std::uint32_t>(value.w);
+    const std::uint32_t id = inlineStructPool().intern(entry);
+    return id != 0u ? id : arenaScalarOverflowTable().intern(entry);
+}
+
+QuatValue lookupArenaQuat(std::uint32_t arenaIdx) noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->lookupArenaQuatFn) return bridge->lookupArenaQuatFn(arenaIdx);
+    }
+    const auto& entry = (arenaIdx & 0x80000000u) != 0u
+        ? arenaScalarOverflowTable().get(arenaIdx)
+        : inlineStructPool().get(arenaIdx);
+    return QuatValue{
+        static_cast<std::int32_t>(entry.slots[0].lo),
+        static_cast<std::int32_t>(entry.slots[0].hi),
+        static_cast<std::int32_t>(entry.slots[1].lo),
+        static_cast<std::int32_t>(entry.slots[1].hi),
+    };
+}
+
+std::uint32_t internArenaEnum(EnumValue value) noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->internArenaEnumFn) return bridge->internArenaEnumFn(value);
+    }
+    InlineStructArenaEntry entry{};
+    entry.nestedTypeId = value.typeId;
+    entry.nestedFieldMask = 0x8002u;
+    entry.slots[0].kind = InlineStructSlot::Kind::Enum;
+    entry.slots[0].setBits(static_cast<std::uint64_t>(value.value));
+    const std::uint32_t id = inlineStructPool().intern(entry);
+    return id != 0u ? id : arenaScalarOverflowTable().intern(entry);
+}
+
+EnumValue lookupArenaEnum(std::uint32_t arenaIdx) noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->lookupArenaEnumFn) return bridge->lookupArenaEnumFn(arenaIdx);
+    }
+    const auto& entry = (arenaIdx & 0x80000000u) != 0u
+        ? arenaScalarOverflowTable().get(arenaIdx)
+        : inlineStructPool().get(arenaIdx);
+    return EnumValue{
+        entry.nestedTypeId,
+        static_cast<std::int64_t>(entry.slots[0].bits()),
+    };
+}
+
+std::uint32_t internNativeHandleTypeId(semantic::SymbolId typeId) noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->internNativeHandleTypeIdFn) return bridge->internNativeHandleTypeIdFn(typeId);
+    }
+    return nativeHandleTypeTable().intern(typeId);
+}
+
+semantic::SymbolId lookupNativeHandleTypeId(std::uint32_t typeIdx) noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->lookupNativeHandleTypeIdFn) return bridge->lookupNativeHandleTypeIdFn(typeIdx);
+    }
+    return nativeHandleTypeTable().lookup(typeIdx);
+}
+
+const SharedValuePoolBridge* hostValuePoolBridge() noexcept {
+    if (const auto* existing = g_externalPoolBridge.load(std::memory_order_acquire)) {
+        return existing;
+    }
+    static const SharedValuePoolBridge kHostBridge{
+        1u,
+        &internArenaQuat,
+        &lookupArenaQuat,
+        &internArenaEnum,
+        &lookupArenaEnum,
+        &internNativeHandleTypeId,
+        &lookupNativeHandleTypeId,
+        &hostInternStringBridge,
+        &hostStringByIdBridge,
+        &hostInternInlineArenaBridge,
+        &hostLookupInlineArenaBridge,
+        &hostRegisterHeapStructBridge,
+        &hostLookupHeapStructBridge,
+    };
+    return &kHostBridge;
+}
+
+void bindHostValuePoolBridge(const void* bridgePtr) noexcept {
+    const auto* incoming = static_cast<const SharedValuePoolBridge*>(bridgePtr);
+    if (!incoming || incoming->version != 1u || incoming == hostValuePoolBridge()) {
         return;
     }
-    if (const auto* st = std::get_if<StructValue>(&value)) {
-        if (st->isInline) {
-            const std::uint32_t idx = st->storage.inlineArenaIndex();
+    g_externalPoolBridge.store(incoming, std::memory_order_release);
+}
+
+} // namespace detail
+
+void pinValueInPools(const Value& value) noexcept {
+    if (!value.isTraceable()) return;
+    switch (value.rawTag()) {
+    case ValueTag::String: {
+        const auto& sv = value.asStringUnchecked();
+        if (sv.id != 0u) runtimeStringPool().pinById(sv.id);
+        return;
+    }
+    case ValueTag::Struct: {
+        const auto& st = value.asStructUnchecked();
+        if (st.isInline) {
+            const std::uint32_t idx = st.storage.inlineArenaIndex();
             if (idx != 0u) inlineStructPool().pinById(idx);
-        } else if (st->storage.isStoragePtr()) {
-            heapStructPool().pinById(st->storage.raw_);
+        } else if (st.storage.isStoragePtr()) {
+            heapStructPool().pinById(st.storage.raw_);
         }
+        return;
+    }
+    case ValueTag::EnumArena:
+    case ValueTag::QuatArena: {
+        const std::uint32_t idx = value.arenaPoolIndex();
+        if (idx != 0u) inlineStructPool().pinById(idx);
+        return;
+    }
+    default:
+        return;
     }
 }
 
@@ -5654,32 +6706,60 @@ void beginValuePoolGcMark() noexcept {
 }
 
 void markValueInPools(const Value& value) noexcept {
-    if (const auto* sv = std::get_if<StringValue>(&value)) {
-        if (sv->id != 0u) runtimeStringPool().markById(sv->id);
+    if (!value.isTraceable()) return;
+    switch (value.rawTag()) {
+    case ValueTag::String: {
+        const auto& sv = value.asStringUnchecked();
+        if (sv.id != 0u) runtimeStringPool().markById(sv.id);
         return;
     }
-    if (const auto* st = std::get_if<StructValue>(&value)) {
-        if (st->isInline) {
-            const std::uint32_t idx = st->storage.inlineArenaIndex();
+    case ValueTag::Struct: {
+        const auto& st = value.asStructUnchecked();
+        if (st.isInline) {
+            const std::uint32_t idx = st.storage.inlineArenaIndex();
             if (idx != 0u) inlineStructPool().markById(idx);
-        } else if (st->storage.isStoragePtr()) {
-            heapStructPool().markById(st->storage.raw_);
+        } else if (st.storage.isStoragePtr()) {
+            heapStructPool().markById(st.storage.raw_);
         }
+        return;
+    }
+    case ValueTag::EnumArena:
+    case ValueTag::QuatArena: {
+        const std::uint32_t idx = value.arenaPoolIndex();
+        if (idx != 0u) inlineStructPool().markById(idx);
+        return;
+    }
+    default:
+        return;
     }
 }
 
 void markStackRootValueInPools(const Value& value) noexcept {
-    if (const auto* sv = std::get_if<StringValue>(&value)) {
-        if (sv->id != 0u) runtimeStringPool().markStackRootById(sv->id);
+    if (!value.isTraceable()) return;
+    switch (value.rawTag()) {
+    case ValueTag::String: {
+        const auto& sv = value.asStringUnchecked();
+        if (sv.id != 0u) runtimeStringPool().markStackRootById(sv.id);
         return;
     }
-    if (const auto* st = std::get_if<StructValue>(&value)) {
-        if (st->isInline) {
-            const std::uint32_t idx = st->storage.inlineArenaIndex();
+    case ValueTag::Struct: {
+        const auto& st = value.asStructUnchecked();
+        if (st.isInline) {
+            const std::uint32_t idx = st.storage.inlineArenaIndex();
             if (idx != 0u) inlineStructPool().markStackRootById(idx);
-        } else if (st->storage.isStoragePtr()) {
-            heapStructPool().markStackRootById(st->storage.raw_);
+        } else if (st.storage.isStoragePtr()) {
+            heapStructPool().markStackRootById(st.storage.raw_);
         }
+        return;
+    }
+    case ValueTag::EnumArena:
+    case ValueTag::QuatArena: {
+        const std::uint32_t idx = value.arenaPoolIndex();
+        if (idx != 0u) inlineStructPool().markStackRootById(idx);
+        return;
+    }
+    default:
+        return;
     }
 }
 

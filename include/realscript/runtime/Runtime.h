@@ -6,6 +6,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <type_traits>
 #include <functional>
 #include <initializer_list>
 #include <memory>
@@ -35,6 +37,40 @@ struct NullArray {
     friend constexpr bool operator==(NullArray, NullArray) noexcept { return true; }
 };
 
+enum class ValueTag : std::uint8_t {
+    Monostate = 0,
+    NullString = 1,
+    NullObject = 2,
+    NullArray = 3,
+    Bool = 4,
+    Byte = 5,
+    SByte = 6,
+    Short = 7,
+    UShort = 8,
+    Int64 = 9,
+    UInt = 10,
+    Long = 11,
+    ULong = 12,
+    Float = 13,
+    Double = 14,
+    Char = 15,
+    EnumInline = 16,
+    Fixed = 17,
+    Fixed16 = 18,
+    Vec2 = 19,
+    Vec3 = 20,
+    QuatInline = 21,
+    NativeHandle = 22,
+    // Traceable / Pool-backed tags (>= FirstTraceable)
+    EnumArena = 23,
+    QuatArena = 24,
+    Struct = 25,
+    String = 26,
+    ObjectRef = 27,
+
+    FirstTraceable = EnumArena,
+};
+
 enum class ObjectKind : std::uint8_t {
     String,
     Array,
@@ -48,6 +84,9 @@ struct ObjectRef {
     std::uint32_t generation = 0;
     std::uint32_t heapId = 0;
     ObjectKind kind = ObjectKind::Record;
+    std::uint8_t pad0_ = 0;
+    std::uint8_t pad1_ = 0;
+    std::uint8_t vtag_ = static_cast<std::uint8_t>(ValueTag::ObjectRef);
 
     constexpr ObjectRef() noexcept = default;
     constexpr ObjectRef(
@@ -58,7 +97,10 @@ struct ObjectRef {
         : slot(s),
           generation(gen),
           heapId(static_cast<std::uint32_t>(hId)),
-          kind(k) {}
+          kind(k),
+          pad0_(0),
+          pad1_(0),
+          vtag_(static_cast<std::uint8_t>(ValueTag::ObjectRef)) {}
 
     [[nodiscard]] constexpr bool valid() const noexcept {
         return slot != InvalidSlot && generation != 0 && heapId != 0;
@@ -385,16 +427,30 @@ struct StructValue {
 
     semantic::SymbolId typeId = 0;
     StructStorageHandle storage{};
-    std::uint8_t inlineCount = 0;
-    std::uint8_t inlineSlotCount = 0;
+    std::uint8_t inlineCount : 4;
+    std::uint8_t inlineSlotCount : 4;
     bool isInline = false;
     std::uint8_t packedOffsetsAndLengths = 0; // 2 bits offset per field
+    std::uint8_t vtag_ = static_cast<std::uint8_t>(ValueTag::Struct);
 
-    constexpr StructValue() noexcept = default;
+    constexpr StructValue() noexcept
+        : typeId(0),
+          storage{},
+          inlineCount(0),
+          inlineSlotCount(0),
+          isInline(false),
+          packedOffsetsAndLengths(0),
+          vtag_(static_cast<std::uint8_t>(ValueTag::Struct)) {}
     StructValue(
         semantic::SymbolId id,
         StructStorageHandle store) noexcept
-        : typeId(id), storage(store), inlineCount(0), isInline(false) {}
+        : typeId(id),
+          storage(store),
+          inlineCount(0),
+          inlineSlotCount(0),
+          isInline(false),
+          packedOffsetsAndLengths(0),
+          vtag_(static_cast<std::uint8_t>(ValueTag::Struct)) {}
 
     [[nodiscard]] bool valid() const noexcept {
         return typeId != 0 && (isInline || storage != nullptr);
@@ -420,11 +476,15 @@ struct StructValue {
     }
 };
 static_assert(sizeof(StructValue) == 16, "StructValue must be 16 bytes");
+static_assert(offsetof(StructValue, vtag_) == 15, "StructValue::vtag_ must reside at byte 15");
 
 struct StringValue {
-    std::uint32_t id = 0;
-    std::uint32_t length = 0;
     const std::string* ptr = nullptr;
+    std::uint32_t id = 0;
+    std::uint8_t pad0_ = 0;
+    std::uint8_t pad1_ = 0;
+    std::uint8_t pad2_ = 0;
+    std::uint8_t vtag_ = static_cast<std::uint8_t>(ValueTag::String);
 
     constexpr StringValue() noexcept = default;
     StringValue(const std::string& value);
@@ -480,82 +540,844 @@ struct StringValue {
     }
 };
 static_assert(sizeof(StringValue) == 16, "StringValue must be 16 bytes");
+static_assert(offsetof(StringValue, vtag_) == 15, "StringValue::vtag_ must reside at byte 15");
+static_assert(offsetof(ObjectRef, vtag_) == 15, "ObjectRef::vtag_ must reside at byte 15");
 
-using Value = std::variant<
-    std::monostate,
-    NullString,
-    NullObject,
-    NullArray,
-    bool,
-    ByteValue,
-    SByteValue,
-    ShortValue,
-    UShortValue,
-    std::int64_t,
-    UIntValue,
-    LongValue,
-    ULongValue,
-    FloatValue,
-    double,
-    CharValue,
-    EnumValue,
-    FixedValue,
-    Fixed16Value,
-    Vec2Value,
-    Vec3Value,
-    QuatValue,
-    StructValue,
-    StringValue,
-    ObjectRef,
-    NativeHandle>;
-static_assert(sizeof(Value) == 24, "runtime::Value must be 24 bytes");
+namespace detail {
+[[nodiscard]] std::uint32_t internArenaQuat(QuatValue value) noexcept;
+[[nodiscard]] QuatValue lookupArenaQuat(std::uint32_t arenaIdx) noexcept;
+[[nodiscard]] std::uint32_t internArenaEnum(EnumValue value) noexcept;
+[[nodiscard]] EnumValue lookupArenaEnum(std::uint32_t arenaIdx) noexcept;
+[[nodiscard]] std::uint32_t internNativeHandleTypeId(semantic::SymbolId typeId) noexcept;
+[[nodiscard]] semantic::SymbolId lookupNativeHandleTypeId(std::uint32_t typeIdx) noexcept;
+
+struct SharedValuePoolBridge {
+    std::uint32_t version = 1u;
+    std::uint32_t (*internArenaQuatFn)(QuatValue) noexcept = nullptr;
+    QuatValue (*lookupArenaQuatFn)(std::uint32_t) noexcept = nullptr;
+    std::uint32_t (*internArenaEnumFn)(EnumValue) noexcept = nullptr;
+    EnumValue (*lookupArenaEnumFn)(std::uint32_t) noexcept = nullptr;
+    std::uint32_t (*internNativeHandleTypeIdFn)(semantic::SymbolId) noexcept = nullptr;
+    semantic::SymbolId (*lookupNativeHandleTypeIdFn)(std::uint32_t) noexcept = nullptr;
+    StringValue (*internStringFn)(std::string_view) = nullptr;
+    StringValue (*stringByIdFn)(std::uint32_t) noexcept = nullptr;
+    std::uint32_t (*internInlineArenaFn)(const InlineStructArenaEntry&) noexcept = nullptr;
+    const InlineStructArenaEntry* (*lookupInlineArenaFn)(std::uint32_t) noexcept = nullptr;
+    std::uint32_t (*registerHeapStructFn)(const void*) = nullptr;
+    const void* (*lookupHeapStructFn)(std::uint32_t) noexcept = nullptr;
+};
+
+[[nodiscard]] const SharedValuePoolBridge* hostValuePoolBridge() noexcept;
+void bindHostValuePoolBridge(const void* bridgePtr) noexcept;
+
+template <typename T>
+struct ValueTaggedCell {
+    static_assert(sizeof(T) <= 12, "ValueTaggedCell requires sizeof(T) <= 12");
+    T payload{};
+    std::uint8_t pad[15 - sizeof(T)]{};
+    std::uint8_t vtag = 0;
+};
+} // namespace detail
+
+struct alignas(16) Value {
+    struct EnumInlineCell {
+        semantic::SymbolId typeId = 0;
+        std::int32_t value32 = 0;
+        std::uint8_t pad[3]{};
+        std::uint8_t vtag = 0;
+    };
+    struct QuatInlineCell {
+        std::int32_t x = 0;
+        std::int32_t y = 0;
+        std::int32_t z = 0;
+        std::uint8_t w0 = 0;
+        std::uint8_t w1 = 0;
+        std::uint8_t w2 = 0;
+        std::uint8_t vtag = 0;
+    };
+    struct NativeHandleCell {
+        std::uint32_t slot = NativeHandle::InvalidSlot;
+        std::uint16_t generation = 0;
+        std::uint16_t registryId = 0;
+        std::uint32_t typeIdx = 0;
+        std::uint8_t pad[3]{};
+        std::uint8_t vtag = 0;
+    };
+    struct ArenaRefCell {
+        std::uint32_t arenaIdx = 0;
+        std::uint8_t pad[11]{};
+        std::uint8_t vtag = 0;
+    };
+
+    union Storage {
+        detail::ValueTaggedCell<std::monostate> monostateCell{};
+        detail::ValueTaggedCell<NullString> nullStringCell;
+        detail::ValueTaggedCell<NullObject> nullObjectCell;
+        detail::ValueTaggedCell<NullArray> nullArrayCell;
+        detail::ValueTaggedCell<bool> boolCell;
+        detail::ValueTaggedCell<ByteValue> byteCell;
+        detail::ValueTaggedCell<SByteValue> sbyteCell;
+        detail::ValueTaggedCell<ShortValue> shortCell;
+        detail::ValueTaggedCell<UShortValue> ushortCell;
+        detail::ValueTaggedCell<std::int64_t> int64Cell;
+        detail::ValueTaggedCell<UIntValue> uintCell;
+        detail::ValueTaggedCell<LongValue> longCell;
+        detail::ValueTaggedCell<ULongValue> ulongCell;
+        detail::ValueTaggedCell<FloatValue> floatCell;
+        detail::ValueTaggedCell<double> doubleCell;
+        detail::ValueTaggedCell<CharValue> charCell;
+        EnumInlineCell enumInlineCell;
+        detail::ValueTaggedCell<FixedValue> fixedCell;
+        detail::ValueTaggedCell<Fixed16Value> fixed16Cell;
+        detail::ValueTaggedCell<Vec2Value> vec2Cell;
+        detail::ValueTaggedCell<Vec3Value> vec3Cell;
+        QuatInlineCell quatInlineCell;
+        NativeHandleCell nativeHandleCell;
+        ArenaRefCell arenaRefCell;
+        StructValue structVal;
+        StringValue stringVal;
+        ObjectRef objectRef;
+    } u_{};
+
+    constexpr Value() noexcept = default;
+    constexpr Value(const Value&) noexcept = default;
+    constexpr Value(Value&&) noexcept = default;
+    constexpr Value& operator=(const Value&) noexcept = default;
+    constexpr Value& operator=(Value&&) noexcept = default;
+
+    constexpr Value(std::monostate) noexcept : u_{} {}
+
+    constexpr Value(NullString) noexcept {
+        u_.nullStringCell = {NullString{}, {}, static_cast<std::uint8_t>(ValueTag::NullString)};
+    }
+    constexpr Value(NullObject) noexcept {
+        u_.nullObjectCell = {NullObject{}, {}, static_cast<std::uint8_t>(ValueTag::NullObject)};
+    }
+    constexpr Value(NullArray) noexcept {
+        u_.nullArrayCell = {NullArray{}, {}, static_cast<std::uint8_t>(ValueTag::NullArray)};
+    }
+
+    template <
+        typename B,
+        std::enable_if_t<std::is_same_v<std::remove_cv_t<std::remove_reference_t<B>>, bool>, int> = 0>
+    constexpr Value(B v) noexcept {
+        u_.boolCell = {v, {}, static_cast<std::uint8_t>(ValueTag::Bool)};
+    }
+
+    constexpr Value(ByteValue v) noexcept {
+        u_.byteCell = {v, {}, static_cast<std::uint8_t>(ValueTag::Byte)};
+    }
+    constexpr Value(SByteValue v) noexcept {
+        u_.sbyteCell = {v, {}, static_cast<std::uint8_t>(ValueTag::SByte)};
+    }
+    constexpr Value(ShortValue v) noexcept {
+        u_.shortCell = {v, {}, static_cast<std::uint8_t>(ValueTag::Short)};
+    }
+    constexpr Value(UShortValue v) noexcept {
+        u_.ushortCell = {v, {}, static_cast<std::uint8_t>(ValueTag::UShort)};
+    }
+
+    template <
+        typename I,
+        std::enable_if_t<
+            std::is_integral_v<std::remove_cv_t<std::remove_reference_t<I>>> &&
+            std::is_signed_v<std::remove_cv_t<std::remove_reference_t<I>>> &&
+            !std::is_same_v<std::remove_cv_t<std::remove_reference_t<I>>, bool> &&
+            !std::is_same_v<std::remove_cv_t<std::remove_reference_t<I>>, char> &&
+            !std::is_same_v<std::remove_cv_t<std::remove_reference_t<I>>, char16_t> &&
+            !std::is_same_v<std::remove_cv_t<std::remove_reference_t<I>>, char32_t> &&
+            !std::is_same_v<std::remove_cv_t<std::remove_reference_t<I>>, wchar_t>,
+            int> = 0>
+    constexpr Value(I v) noexcept {
+        u_.int64Cell = {static_cast<std::int64_t>(v), {}, static_cast<std::uint8_t>(ValueTag::Int64)};
+    }
+
+    constexpr Value(UIntValue v) noexcept {
+        u_.uintCell = {v, {}, static_cast<std::uint8_t>(ValueTag::UInt)};
+    }
+    constexpr Value(LongValue v) noexcept {
+        u_.longCell = {v, {}, static_cast<std::uint8_t>(ValueTag::Long)};
+    }
+    constexpr Value(ULongValue v) noexcept {
+        u_.ulongCell = {v, {}, static_cast<std::uint8_t>(ValueTag::ULong)};
+    }
+    constexpr Value(FloatValue v) noexcept {
+        u_.floatCell = {v, {}, static_cast<std::uint8_t>(ValueTag::Float)};
+    }
+
+    template <
+        typename F,
+        std::enable_if_t<std::is_floating_point_v<std::remove_cv_t<std::remove_reference_t<F>>>, int> = 0>
+    constexpr Value(F v) noexcept {
+        u_.doubleCell = {static_cast<double>(v), {}, static_cast<std::uint8_t>(ValueTag::Double)};
+    }
+
+    constexpr Value(CharValue v) noexcept {
+        u_.charCell = {v, {}, static_cast<std::uint8_t>(ValueTag::Char)};
+    }
+
+    Value(EnumValue v) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+        if (__builtin_expect(v.value >= -2147483647LL - 1LL && v.value <= 2147483647LL, 1))
+#else
+        if (v.value >= -2147483647LL - 1LL && v.value <= 2147483647LL)
+#endif
+        {
+            u_.enumInlineCell = {
+                v.typeId,
+                static_cast<std::int32_t>(v.value),
+                {},
+                static_cast<std::uint8_t>(ValueTag::EnumInline)};
+        } else {
+            u_.arenaRefCell = {
+                detail::internArenaEnum(v),
+                {},
+                static_cast<std::uint8_t>(ValueTag::EnumArena)};
+        }
+    }
+
+    constexpr Value(FixedValue v) noexcept {
+        u_.fixedCell = {v, {}, static_cast<std::uint8_t>(ValueTag::Fixed)};
+    }
+    constexpr Value(Fixed16Value v) noexcept {
+        u_.fixed16Cell = {v, {}, static_cast<std::uint8_t>(ValueTag::Fixed16)};
+    }
+    constexpr Value(Vec2Value v) noexcept {
+        u_.vec2Cell = {v, {}, static_cast<std::uint8_t>(ValueTag::Vec2)};
+    }
+    constexpr Value(Vec3Value v) noexcept {
+        u_.vec3Cell = {v, {}, static_cast<std::uint8_t>(ValueTag::Vec3)};
+    }
+
+    Value(QuatValue v) noexcept {
+        storeQuat(v);
+    }
+
+    Value(StructValue v) noexcept {
+        v.vtag_ = static_cast<std::uint8_t>(ValueTag::Struct);
+        u_.structVal = v;
+    }
+
+    Value(StringValue v) noexcept {
+        v.vtag_ = static_cast<std::uint8_t>(ValueTag::String);
+        u_.stringVal = v;
+    }
+
+    Value(const std::string& v) : Value(StringValue(v)) {}
+    Value(std::string&& v) : Value(StringValue(std::move(v))) {}
+    Value(std::string_view v) : Value(StringValue(v)) {}
+
+    template <
+        typename S,
+        std::enable_if_t<
+            std::is_same_v<std::decay_t<S>, const char*> ||
+            std::is_same_v<std::decay_t<S>, char*>,
+            int> = 0>
+    Value(S v) : Value(StringValue(std::string_view(v ? v : ""))) {}
+
+    Value(ObjectRef v) noexcept {
+        v.vtag_ = static_cast<std::uint8_t>(ValueTag::ObjectRef);
+        u_.objectRef = v;
+    }
+
+    Value(NativeHandle v) noexcept {
+        const std::uint32_t tIdx = (v.typeId == 0)
+            ? 0u
+            : detail::internNativeHandleTypeId(v.typeId);
+        u_.nativeHandleCell = {
+            v.slot,
+            static_cast<std::uint16_t>(v.generation),
+            static_cast<std::uint16_t>(v.registryId),
+            tIdx,
+            {},
+            static_cast<std::uint8_t>(ValueTag::NativeHandle)};
+    }
+
+    // Direct active-member writers (zero temporary, zero STLF stall, strict-aliasing safe)
+    void storeInt64(std::int64_t v) noexcept {
+        u_.int64Cell = {v, {}, static_cast<std::uint8_t>(ValueTag::Int64)};
+    }
+    void storeBool(bool v) noexcept {
+        u_.boolCell = {v, {}, static_cast<std::uint8_t>(ValueTag::Bool)};
+    }
+    void storeLong(std::int64_t v) noexcept {
+        u_.longCell = {LongValue{v}, {}, static_cast<std::uint8_t>(ValueTag::Long)};
+    }
+    void storeFloat(float v) noexcept {
+        u_.floatCell = {FloatValue{v}, {}, static_cast<std::uint8_t>(ValueTag::Float)};
+    }
+    void storeDouble(double v) noexcept {
+        u_.doubleCell = {v, {}, static_cast<std::uint8_t>(ValueTag::Double)};
+    }
+    void storeFixed(std::int32_t raw) noexcept {
+        u_.fixedCell = {FixedValue{raw}, {}, static_cast<std::uint8_t>(ValueTag::Fixed)};
+    }
+    void storeVec2(std::int32_t x, std::int32_t y) noexcept {
+        u_.vec2Cell = {Vec2Value{x, y}, {}, static_cast<std::uint8_t>(ValueTag::Vec2)};
+    }
+    void storeVec3(std::int32_t x, std::int32_t y, std::int32_t z) noexcept {
+        u_.vec3Cell = {Vec3Value{x, y, z}, {}, static_cast<std::uint8_t>(ValueTag::Vec3)};
+    }
+    void storeQuat(const QuatValue& v) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+        if (__builtin_expect(v.w >= -8388608 && v.w <= 8388607, 1))
+#else
+        if (v.w >= -8388608 && v.w <= 8388607)
+#endif
+        {
+            const auto uw = static_cast<std::uint32_t>(v.w);
+            u_.quatInlineCell = {
+                v.x,
+                v.y,
+                v.z,
+                static_cast<std::uint8_t>(uw & 0xFFu),
+                static_cast<std::uint8_t>((uw >> 8u) & 0xFFu),
+                static_cast<std::uint8_t>((uw >> 16u) & 0xFFu),
+                static_cast<std::uint8_t>(ValueTag::QuatInline)};
+        } else {
+            u_.arenaRefCell = {
+                detail::internArenaQuat(v),
+                {},
+                static_cast<std::uint8_t>(ValueTag::QuatArena)};
+        }
+    }
+
+    [[nodiscard]] ValueTag rawTag() const noexcept {
+        unsigned char t = 0;
+        std::memcpy(&t, reinterpret_cast<const unsigned char*>(&u_) + 15, 1);
+        return static_cast<ValueTag>(t);
+    }
+
+    [[nodiscard]] bool isTraceable() const noexcept {
+        return static_cast<std::uint8_t>(rawTag()) >=
+            static_cast<std::uint8_t>(ValueTag::FirstTraceable);
+    }
+
+    [[nodiscard]] std::uint32_t arenaPoolIndex() const noexcept {
+        std::uint32_t idx = 0;
+        std::memcpy(&idx, &u_, sizeof(idx));
+        return idx;
+    }
+
+    [[nodiscard]] std::size_t index() const noexcept {
+        static constexpr std::uint8_t kCanonicalIndex[28] = {
+            0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13,
+            14, 15, 16, 17, 18, 19, 20, 21, 25, 16, 21, 22, 23, 24,
+        };
+        const auto t = static_cast<std::uint8_t>(rawTag());
+        return t < 28u ? static_cast<std::size_t>(kCanonicalIndex[t]) : 0u;
+    }
+
+    [[nodiscard]] bool tryGetInt64(std::int64_t& out) const noexcept {
+        if (rawTag() != ValueTag::Int64) return false;
+        out = u_.int64Cell.payload;
+        return true;
+    }
+    [[nodiscard]] bool tryGetDouble(double& out) const noexcept {
+        if (rawTag() != ValueTag::Double) return false;
+        out = u_.doubleCell.payload;
+        return true;
+    }
+    [[nodiscard]] bool tryGetFloat(float& out) const noexcept {
+        if (rawTag() != ValueTag::Float) return false;
+        out = u_.floatCell.payload.value;
+        return true;
+    }
+    [[nodiscard]] bool tryGetBool(bool& out) const noexcept {
+        if (rawTag() != ValueTag::Bool) return false;
+        out = u_.boolCell.payload;
+        return true;
+    }
+    [[nodiscard]] bool tryGetLong(std::int64_t& out) const noexcept {
+        if (rawTag() != ValueTag::Long) return false;
+        out = u_.longCell.payload.value;
+        return true;
+    }
+    [[nodiscard]] bool tryGetFixed(std::int32_t& outRaw) const noexcept {
+        if (rawTag() != ValueTag::Fixed) return false;
+        outRaw = u_.fixedCell.payload.raw;
+        return true;
+    }
+    [[nodiscard]] bool tryGetVec2(Vec2Value& out) const noexcept {
+        if (rawTag() != ValueTag::Vec2) return false;
+        out = u_.vec2Cell.payload;
+        return true;
+    }
+    [[nodiscard]] bool tryGetVec3(Vec3Value& out) const noexcept {
+        if (rawTag() != ValueTag::Vec3) return false;
+        out = u_.vec3Cell.payload;
+        return true;
+    }
+    [[nodiscard]] bool tryGetQuat(QuatValue& out) const noexcept {
+        const auto t = rawTag();
+#if defined(__GNUC__) || defined(__clang__)
+        if (__builtin_expect(t == ValueTag::QuatInline, 1))
+#else
+        if (t == ValueTag::QuatInline)
+#endif
+        {
+            out.x = u_.quatInlineCell.x;
+            out.y = u_.quatInlineCell.y;
+            out.z = u_.quatInlineCell.z;
+            const std::uint32_t u24 =
+                static_cast<std::uint32_t>(u_.quatInlineCell.w0) |
+                (static_cast<std::uint32_t>(u_.quatInlineCell.w1) << 8u) |
+                (static_cast<std::uint32_t>(u_.quatInlineCell.w2) << 16u);
+            out.w = static_cast<std::int32_t>((u24 ^ 0x00800000u) - 0x00800000u);
+            return true;
+        }
+        if (t == ValueTag::QuatArena) {
+            out = detail::lookupArenaQuat(u_.arenaRefCell.arenaIdx);
+            return true;
+        }
+        return false;
+    }
+    [[nodiscard]] bool tryGetEnum(EnumValue& out) const noexcept {
+        const auto t = rawTag();
+#if defined(__GNUC__) || defined(__clang__)
+        if (__builtin_expect(t == ValueTag::EnumInline, 1))
+#else
+        if (t == ValueTag::EnumInline)
+#endif
+        {
+            out.typeId = u_.enumInlineCell.typeId;
+            out.value = static_cast<std::int64_t>(u_.enumInlineCell.value32);
+            return true;
+        }
+        if (t == ValueTag::EnumArena) {
+            out = detail::lookupArenaEnum(u_.arenaRefCell.arenaIdx);
+            return true;
+        }
+        return false;
+    }
+    [[nodiscard]] bool tryGetNativeHandle(NativeHandle& out) const noexcept {
+        if (rawTag() != ValueTag::NativeHandle) return false;
+        out.slot = u_.nativeHandleCell.slot;
+        out.generation = u_.nativeHandleCell.generation;
+        out.registryId = u_.nativeHandleCell.registryId;
+        const auto tIdx = u_.nativeHandleCell.typeIdx;
+        out.typeId = (tIdx == 0u) ? 0u : detail::lookupNativeHandleTypeId(tIdx);
+        return true;
+    }
+
+    [[nodiscard]] std::int64_t asInt64Unchecked() const noexcept {
+        return u_.int64Cell.payload;
+    }
+    [[nodiscard]] bool asBoolUnchecked() const noexcept {
+        return u_.boolCell.payload;
+    }
+    [[nodiscard]] const StringValue& asStringUnchecked() const noexcept {
+        return u_.stringVal;
+    }
+    [[nodiscard]] const StructValue& asStructUnchecked() const noexcept {
+        return u_.structVal;
+    }
+    [[nodiscard]] const ObjectRef& asObjectRefUnchecked() const noexcept {
+        return u_.objectRef;
+    }
+
+    friend bool operator==(const Value& left, const Value& right) {
+        const auto lt = left.rawTag();
+        const auto rt = right.rawTag();
+        if (lt != rt) return false;
+        switch (lt) {
+        case ValueTag::Monostate:
+        case ValueTag::NullString:
+        case ValueTag::NullObject:
+        case ValueTag::NullArray:
+            return true;
+        case ValueTag::Bool:
+            return left.u_.boolCell.payload == right.u_.boolCell.payload;
+        case ValueTag::Byte:
+            return left.u_.byteCell.payload == right.u_.byteCell.payload;
+        case ValueTag::SByte:
+            return left.u_.sbyteCell.payload == right.u_.sbyteCell.payload;
+        case ValueTag::Short:
+            return left.u_.shortCell.payload == right.u_.shortCell.payload;
+        case ValueTag::UShort:
+            return left.u_.ushortCell.payload == right.u_.ushortCell.payload;
+        case ValueTag::Int64:
+            return left.u_.int64Cell.payload == right.u_.int64Cell.payload;
+        case ValueTag::UInt:
+            return left.u_.uintCell.payload == right.u_.uintCell.payload;
+        case ValueTag::Long:
+            return left.u_.longCell.payload == right.u_.longCell.payload;
+        case ValueTag::ULong:
+            return left.u_.ulongCell.payload == right.u_.ulongCell.payload;
+        case ValueTag::Float:
+            return left.u_.floatCell.payload == right.u_.floatCell.payload;
+        case ValueTag::Double:
+            return left.u_.doubleCell.payload == right.u_.doubleCell.payload;
+        case ValueTag::Char:
+            return left.u_.charCell.payload == right.u_.charCell.payload;
+        case ValueTag::EnumInline:
+            return left.u_.enumInlineCell.typeId == right.u_.enumInlineCell.typeId &&
+                left.u_.enumInlineCell.value32 == right.u_.enumInlineCell.value32;
+        case ValueTag::Fixed:
+            return left.u_.fixedCell.payload == right.u_.fixedCell.payload;
+        case ValueTag::Fixed16:
+            return left.u_.fixed16Cell.payload == right.u_.fixed16Cell.payload;
+        case ValueTag::Vec2:
+            return left.u_.vec2Cell.payload == right.u_.vec2Cell.payload;
+        case ValueTag::Vec3:
+            return left.u_.vec3Cell.payload == right.u_.vec3Cell.payload;
+        case ValueTag::QuatInline:
+            return left.u_.quatInlineCell.x == right.u_.quatInlineCell.x &&
+                left.u_.quatInlineCell.y == right.u_.quatInlineCell.y &&
+                left.u_.quatInlineCell.z == right.u_.quatInlineCell.z &&
+                left.u_.quatInlineCell.w0 == right.u_.quatInlineCell.w0 &&
+                left.u_.quatInlineCell.w1 == right.u_.quatInlineCell.w1 &&
+                left.u_.quatInlineCell.w2 == right.u_.quatInlineCell.w2;
+        case ValueTag::NativeHandle: {
+            if (left.u_.nativeHandleCell.slot != right.u_.nativeHandleCell.slot ||
+                left.u_.nativeHandleCell.generation != right.u_.nativeHandleCell.generation ||
+                left.u_.nativeHandleCell.registryId != right.u_.nativeHandleCell.registryId) {
+                return false;
+            }
+            if (left.u_.nativeHandleCell.typeIdx == right.u_.nativeHandleCell.typeIdx) {
+                return true;
+            }
+            NativeHandle lh{}, rh{};
+            (void)left.tryGetNativeHandle(lh);
+            (void)right.tryGetNativeHandle(rh);
+            return lh == rh;
+        }
+        case ValueTag::EnumArena: {
+            if (left.u_.arenaRefCell.arenaIdx == right.u_.arenaRefCell.arenaIdx &&
+                left.u_.arenaRefCell.arenaIdx != 0u) {
+                return true;
+            }
+            EnumValue le{}, re{};
+            (void)left.tryGetEnum(le);
+            (void)right.tryGetEnum(re);
+            return le == re;
+        }
+        case ValueTag::QuatArena: {
+            if (left.u_.arenaRefCell.arenaIdx == right.u_.arenaRefCell.arenaIdx &&
+                left.u_.arenaRefCell.arenaIdx != 0u) {
+                return true;
+            }
+            QuatValue lq{}, rq{};
+            (void)left.tryGetQuat(lq);
+            (void)right.tryGetQuat(rq);
+            return lq == rq;
+        }
+        case ValueTag::Struct:
+            return left.u_.structVal == right.u_.structVal;
+        case ValueTag::String:
+            return left.u_.stringVal == right.u_.stringVal;
+        case ValueTag::ObjectRef:
+            return left.u_.objectRef == right.u_.objectRef;
+        }
+        return false;
+    }
+
+    friend bool operator!=(const Value& left, const Value& right) {
+        return !(left == right);
+    }
+};
+static_assert(sizeof(Value) == 16, "runtime::Value must be 16 bytes");
+static_assert(alignof(Value) == 16, "runtime::Value must be 16-byte aligned");
 static_assert(std::is_trivially_copyable_v<Value>, "runtime::Value must be trivially copyable");
 static_assert(std::is_trivially_destructible_v<Value>, "runtime::Value must be trivially destructible");
+
+namespace detail {
+template <typename T>
+struct ValueInPlaceTraits {
+    static constexpr bool isInPlace = false;
+};
+#define RS_DEFINE_VALUE_INPLACE_TRAIT(Type, TagEnum, MemberExpr)                  \
+    template <>                                                                   \
+    struct ValueInPlaceTraits<Type> {                                             \
+        static constexpr bool isInPlace = true;                                   \
+        static constexpr ValueTag tag = ValueTag::TagEnum;                        \
+        static Type* ptr(Value* v) noexcept { return &(v->u_.MemberExpr); }       \
+        static const Type* ptr(const Value* v) noexcept {                         \
+            return &(v->u_.MemberExpr);                                           \
+        }                                                                         \
+    }
+
+RS_DEFINE_VALUE_INPLACE_TRAIT(std::monostate, Monostate, monostateCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(NullString, NullString, nullStringCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(NullObject, NullObject, nullObjectCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(NullArray, NullArray, nullArrayCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(bool, Bool, boolCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(ByteValue, Byte, byteCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(SByteValue, SByte, sbyteCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(ShortValue, Short, shortCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(UShortValue, UShort, ushortCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(std::int64_t, Int64, int64Cell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(UIntValue, UInt, uintCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(LongValue, Long, longCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(ULongValue, ULong, ulongCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(FloatValue, Float, floatCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(double, Double, doubleCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(CharValue, Char, charCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(FixedValue, Fixed, fixedCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(Fixed16Value, Fixed16, fixed16Cell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(Vec2Value, Vec2, vec2Cell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(Vec3Value, Vec3, vec3Cell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(StructValue, Struct, structVal);
+RS_DEFINE_VALUE_INPLACE_TRAIT(StringValue, String, stringVal);
+RS_DEFINE_VALUE_INPLACE_TRAIT(ObjectRef, ObjectRef, objectRef);
+
+#undef RS_DEFINE_VALUE_INPLACE_TRAIT
+
+// Transient 64-slot thread-local decode ring for legacy `std::get_if<EnumValue|QuatValue|NativeHandle>`.
+// Returned pointers are valid only for immediate read-only inspection within the current expression/statement;
+// prefer value-returning `Value::tryGetEnum` / `Value::tryGetQuat` / `Value::tryGetNativeHandle` in new code.
+template <typename T>
+inline const T* tlsDecodedValueSlot(const T& decoded) noexcept {
+    struct Ring {
+        std::array<T, 64> items{};
+        std::uint8_t next = 0;
+    };
+    thread_local Ring ring{};
+    const std::uint8_t idx = ring.next++ & 63u;
+    ring.items[idx] = decoded;
+    return &ring.items[idx];
+}
+} // namespace detail
 
 } // namespace realscript::runtime
 
 namespace std {
-template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
-inline constexpr bool holds_alternative(
-    const realscript::runtime::Value& value) noexcept {
-    return std::holds_alternative<realscript::runtime::StringValue>(value);
+
+template <
+    typename T,
+    std::enable_if_t<realscript::runtime::detail::ValueInPlaceTraits<T>::isInPlace, int> = 0>
+inline bool holds_alternative(const realscript::runtime::Value& value) noexcept {
+    return value.rawTag() == realscript::runtime::detail::ValueInPlaceTraits<T>::tag;
 }
+
+template <
+    typename T,
+    std::enable_if_t<std::is_same_v<T, realscript::runtime::EnumValue>, int> = 0>
+inline bool holds_alternative(const realscript::runtime::Value& value) noexcept {
+    const auto t = value.rawTag();
+    return t == realscript::runtime::ValueTag::EnumInline ||
+        t == realscript::runtime::ValueTag::EnumArena;
+}
+
+template <
+    typename T,
+    std::enable_if_t<std::is_same_v<T, realscript::runtime::QuatValue>, int> = 0>
+inline bool holds_alternative(const realscript::runtime::Value& value) noexcept {
+    const auto t = value.rawTag();
+    return t == realscript::runtime::ValueTag::QuatInline ||
+        t == realscript::runtime::ValueTag::QuatArena;
+}
+
+template <
+    typename T,
+    std::enable_if_t<std::is_same_v<T, realscript::runtime::NativeHandle>, int> = 0>
+inline bool holds_alternative(const realscript::runtime::Value& value) noexcept {
+    return value.rawTag() == realscript::runtime::ValueTag::NativeHandle;
+}
+
+template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
+inline bool holds_alternative(const realscript::runtime::Value& value) noexcept {
+    return value.rawTag() == realscript::runtime::ValueTag::String;
+}
+
+template <
+    typename T,
+    std::enable_if_t<realscript::runtime::detail::ValueInPlaceTraits<T>::isInPlace, int> = 0>
+inline const T* get_if(const realscript::runtime::Value* value) noexcept {
+    if (!value || value->rawTag() != realscript::runtime::detail::ValueInPlaceTraits<T>::tag) {
+        return nullptr;
+    }
+    return realscript::runtime::detail::ValueInPlaceTraits<T>::ptr(value);
+}
+
+template <
+    typename T,
+    std::enable_if_t<realscript::runtime::detail::ValueInPlaceTraits<T>::isInPlace, int> = 0>
+inline T* get_if(realscript::runtime::Value* value) noexcept {
+    if (!value || value->rawTag() != realscript::runtime::detail::ValueInPlaceTraits<T>::tag) {
+        return nullptr;
+    }
+    return realscript::runtime::detail::ValueInPlaceTraits<T>::ptr(value);
+}
+
+template <
+    typename T,
+    std::enable_if_t<std::is_same_v<T, realscript::runtime::EnumValue>, int> = 0>
+inline const realscript::runtime::EnumValue* get_if(
+    const realscript::runtime::Value* value) noexcept {
+    if (!value) return nullptr;
+    realscript::runtime::EnumValue decoded{};
+    if (!value->tryGetEnum(decoded)) return nullptr;
+    return realscript::runtime::detail::tlsDecodedValueSlot(decoded);
+}
+
+template <
+    typename T,
+    std::enable_if_t<std::is_same_v<T, realscript::runtime::EnumValue>, int> = 0>
+inline const realscript::runtime::EnumValue* get_if(
+    realscript::runtime::Value* value) noexcept {
+    return std::get_if<realscript::runtime::EnumValue>(
+        static_cast<const realscript::runtime::Value*>(value));
+}
+
+template <
+    typename T,
+    std::enable_if_t<std::is_same_v<T, realscript::runtime::QuatValue>, int> = 0>
+inline const realscript::runtime::QuatValue* get_if(
+    const realscript::runtime::Value* value) noexcept {
+    if (!value) return nullptr;
+    realscript::runtime::QuatValue decoded{};
+    if (!value->tryGetQuat(decoded)) return nullptr;
+    return realscript::runtime::detail::tlsDecodedValueSlot(decoded);
+}
+
+template <
+    typename T,
+    std::enable_if_t<std::is_same_v<T, realscript::runtime::QuatValue>, int> = 0>
+inline const realscript::runtime::QuatValue* get_if(
+    realscript::runtime::Value* value) noexcept {
+    return std::get_if<realscript::runtime::QuatValue>(
+        static_cast<const realscript::runtime::Value*>(value));
+}
+
+template <
+    typename T,
+    std::enable_if_t<std::is_same_v<T, realscript::runtime::NativeHandle>, int> = 0>
+inline const realscript::runtime::NativeHandle* get_if(
+    const realscript::runtime::Value* value) noexcept {
+    if (!value) return nullptr;
+    realscript::runtime::NativeHandle decoded{};
+    if (!value->tryGetNativeHandle(decoded)) return nullptr;
+    return realscript::runtime::detail::tlsDecodedValueSlot(decoded);
+}
+
+template <
+    typename T,
+    std::enable_if_t<std::is_same_v<T, realscript::runtime::NativeHandle>, int> = 0>
+inline const realscript::runtime::NativeHandle* get_if(
+    realscript::runtime::Value* value) noexcept {
+    return std::get_if<realscript::runtime::NativeHandle>(
+        static_cast<const realscript::runtime::Value*>(value));
+}
+
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
 inline const std::string* get_if(
     const realscript::runtime::Value* value) noexcept {
-    if (!value) return nullptr;
-    if (const auto* sv = std::get_if<realscript::runtime::StringValue>(value)) {
-        return &sv->str();
+    if (!value || value->rawTag() != realscript::runtime::ValueTag::String) {
+        return nullptr;
     }
-    return nullptr;
+    return &value->asStringUnchecked().str();
 }
+
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
 inline const std::string* get_if(
     realscript::runtime::Value* value) noexcept {
     return std::get_if<std::string>(
         static_cast<const realscript::runtime::Value*>(value));
 }
+
+template <
+    typename T,
+    std::enable_if_t<realscript::runtime::detail::ValueInPlaceTraits<T>::isInPlace, int> = 0>
+inline const T& get(const realscript::runtime::Value& value) {
+    if (const auto* p = std::get_if<T>(&value)) return *p;
+    throw std::bad_variant_access{};
+}
+
+template <
+    typename T,
+    std::enable_if_t<realscript::runtime::detail::ValueInPlaceTraits<T>::isInPlace, int> = 0>
+inline T& get(realscript::runtime::Value& value) {
+    if (auto* p = std::get_if<T>(&value)) return *p;
+    throw std::bad_variant_access{};
+}
+
+template <
+    typename T,
+    std::enable_if_t<realscript::runtime::detail::ValueInPlaceTraits<T>::isInPlace, int> = 0>
+inline const T&& get(const realscript::runtime::Value&& value) {
+    if (const auto* p = std::get_if<T>(&value)) return std::move(*p);
+    throw std::bad_variant_access{};
+}
+
+template <
+    typename T,
+    std::enable_if_t<realscript::runtime::detail::ValueInPlaceTraits<T>::isInPlace, int> = 0>
+inline T&& get(realscript::runtime::Value&& value) {
+    if (auto* p = std::get_if<T>(&value)) return std::move(*p);
+    throw std::bad_variant_access{};
+}
+
+template <
+    typename T,
+    std::enable_if_t<
+        std::is_same_v<T, realscript::runtime::EnumValue> ||
+        std::is_same_v<T, realscript::runtime::QuatValue> ||
+        std::is_same_v<T, realscript::runtime::NativeHandle>,
+        int> = 0>
+inline T get(const realscript::runtime::Value& value) {
+    T out{};
+    if constexpr (std::is_same_v<T, realscript::runtime::EnumValue>) {
+        if (value.tryGetEnum(out)) return out;
+    } else if constexpr (std::is_same_v<T, realscript::runtime::QuatValue>) {
+        if (value.tryGetQuat(out)) return out;
+    } else {
+        if (value.tryGetNativeHandle(out)) return out;
+    }
+    throw std::bad_variant_access{};
+}
+
+template <
+    typename T,
+    std::enable_if_t<
+        std::is_same_v<T, realscript::runtime::EnumValue> ||
+        std::is_same_v<T, realscript::runtime::QuatValue> ||
+        std::is_same_v<T, realscript::runtime::NativeHandle>,
+        int> = 0>
+inline T get(realscript::runtime::Value& value) {
+    return std::get<T>(static_cast<const realscript::runtime::Value&>(value));
+}
+
+template <
+    typename T,
+    std::enable_if_t<
+        std::is_same_v<T, realscript::runtime::EnumValue> ||
+        std::is_same_v<T, realscript::runtime::QuatValue> ||
+        std::is_same_v<T, realscript::runtime::NativeHandle>,
+        int> = 0>
+inline T get(const realscript::runtime::Value&& value) {
+    return std::get<T>(static_cast<const realscript::runtime::Value&>(value));
+}
+
+template <
+    typename T,
+    std::enable_if_t<
+        std::is_same_v<T, realscript::runtime::EnumValue> ||
+        std::is_same_v<T, realscript::runtime::QuatValue> ||
+        std::is_same_v<T, realscript::runtime::NativeHandle>,
+        int> = 0>
+inline T get(realscript::runtime::Value&& value) {
+    return std::get<T>(static_cast<const realscript::runtime::Value&>(value));
+}
+
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
-inline const std::string& get(
-    const realscript::runtime::Value& value) {
+inline const std::string& get(const realscript::runtime::Value& value) {
     return std::get<realscript::runtime::StringValue>(value).str();
 }
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
-inline const std::string& get(
-    realscript::runtime::Value& value) {
+inline const std::string& get(realscript::runtime::Value& value) {
     return std::get<realscript::runtime::StringValue>(
         static_cast<const realscript::runtime::Value&>(value)).str();
 }
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
-inline const std::string& get(
-    const realscript::runtime::Value&& value) {
+inline const std::string& get(const realscript::runtime::Value&& value) {
     return std::get<realscript::runtime::StringValue>(value).str();
 }
 template <typename T, std::enable_if_t<std::is_same_v<T, std::string>, int> = 0>
-inline std::string get(
-    realscript::runtime::Value&& value) {
+inline std::string get(realscript::runtime::Value&& value) {
     return std::get<realscript::runtime::StringValue>(value).str();
 }
+
 } // namespace std
 
 namespace realscript::runtime {
@@ -1149,6 +1971,10 @@ enum class BindingDeterminism : std::uint8_t {
     NonDeterministic,
 };
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct ExternalCallRecord {
     semantic::SymbolId symbolId = 0;
     std::string name;
@@ -1158,6 +1984,9 @@ struct ExternalCallRecord {
     ErrorCode errorCode = ErrorCode::None;
     std::string errorMessage;
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 class ReplayLog {
 public:
@@ -1286,6 +2115,10 @@ struct ExecutionOptions {
     bool trustedRelease = false;
 };
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct ExecutionResult {
     bool succeeded = false;
     Value value;
@@ -1295,6 +2128,9 @@ struct ExecutionResult {
     std::uint64_t determinismDigest = 0;
     std::size_t replayEntriesConsumed = 0;
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 using ExternalFunction = std::function<std::optional<Value>(
     const bytecode::FunctionReference&,

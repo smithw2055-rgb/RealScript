@@ -274,12 +274,12 @@ std::optional<RemoveCvRef<T>> readValue(
         setTypeMismatch(error, "expected Vec3 argument");
         return std::nullopt;
     } else if constexpr (std::is_same_v<ValueType, Quat>) {
-        if (const auto* quat = std::get_if<runtime::QuatValue>(&value)) {
+        if (runtime::QuatValue quat{}; value.tryGetQuat(quat)) {
             return Quat{
-                Fixed::fromRaw(quat->x),
-                Fixed::fromRaw(quat->y),
-                Fixed::fromRaw(quat->z),
-                Fixed::fromRaw(quat->w)};
+                Fixed::fromRaw(quat.x),
+                Fixed::fromRaw(quat.y),
+                Fixed::fromRaw(quat.z),
+                Fixed::fromRaw(quat.w)};
         }
         const auto* structure = std::get_if<runtime::StructValue>(&value);
         if (structure &&

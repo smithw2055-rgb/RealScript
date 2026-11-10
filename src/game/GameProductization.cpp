@@ -227,10 +227,10 @@ bool writeValue(
     } else if (const auto* item = std::get_if<double>(&value)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Double));
         writer.writeU64(canonicalDoubleBits(*item));
-    } else if (const auto* item = std::get_if<runtime::EnumValue>(&value)) {
+    } else if (runtime::EnumValue item{}; value.tryGetEnum(item)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Enum));
-        writer.writeU64(item->typeId);
-        writer.writeU64(static_cast<std::uint64_t>(item->value));
+        writer.writeU64(item.typeId);
+        writer.writeU64(static_cast<std::uint64_t>(item.value));
     } else if (const auto* item = std::get_if<runtime::CharValue>(&value)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Char));
         writer.writeU32(item->value);
@@ -249,12 +249,12 @@ bool writeValue(
         writer.writeU32(static_cast<std::uint32_t>(item->x));
         writer.writeU32(static_cast<std::uint32_t>(item->y));
         writer.writeU32(static_cast<std::uint32_t>(item->z));
-    } else if (const auto* item = std::get_if<runtime::QuatValue>(&value)) {
+    } else if (runtime::QuatValue item{}; value.tryGetQuat(item)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Quat));
-        writer.writeU32(static_cast<std::uint32_t>(item->x));
-        writer.writeU32(static_cast<std::uint32_t>(item->y));
-        writer.writeU32(static_cast<std::uint32_t>(item->z));
-        writer.writeU32(static_cast<std::uint32_t>(item->w));
+        writer.writeU32(static_cast<std::uint32_t>(item.x));
+        writer.writeU32(static_cast<std::uint32_t>(item.y));
+        writer.writeU32(static_cast<std::uint32_t>(item.z));
+        writer.writeU32(static_cast<std::uint32_t>(item.w));
     } else if (const auto* item = std::get_if<runtime::StructValue>(&value)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Struct));
         writer.writeU64(item->typeId);
@@ -852,8 +852,8 @@ bool valueToJsonImpl(
         out = tooling::Json(*doubleItem);
     } else if (const auto* charItem = std::get_if<runtime::CharValue>(&value)) {
         out = tooling::Json(static_cast<std::int64_t>(charItem->value));
-    } else if (const auto* enumItem = std::get_if<runtime::EnumValue>(&value)) {
-        out = tooling::Json(enumItem->value);
+    } else if (runtime::EnumValue enumItem{}; value.tryGetEnum(enumItem)) {
+        out = tooling::Json(enumItem.value);
     } else if (const auto* strItem = std::get_if<std::string>(&value)) {
         out = tooling::Json(*strItem);
     } else if (const auto structTypeId = runtime::structValueTypeId(value)) {

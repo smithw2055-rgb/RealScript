@@ -381,7 +381,7 @@ CompileResult ToolchainJit::compile(
         sizeof(RsRuntimeApiV1),
         aot::RuntimeAbiMajor,
         aot::RuntimeAbiMinor,
-        nullptr,
+        const_cast<void*>(static_cast<const void*>(runtime::detail::hostValuePoolBridge())),
     };
     RsModuleExportsV1 exports{};
     exports.size = sizeof(exports);

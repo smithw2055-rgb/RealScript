@@ -31,8 +31,8 @@
 
 namespace realscript::aot {
 
-constexpr std::uint32_t RuntimeAbiMajor = 1;
-constexpr std::uint32_t RuntimeAbiMinor = 2;
+constexpr std::uint32_t RuntimeAbiMajor = 2;
+constexpr std::uint32_t RuntimeAbiMinor = 0;
 
 struct GeneratedFieldLayout {
     std::size_t byteOffset = 0;
@@ -939,10 +939,7 @@ struct NativeValue<std::string> {
 template <>
 struct NativeValue<runtime::EnumValue> {
     static bool read(const runtime::Value& value, runtime::EnumValue& output) {
-        const auto* typed = std::get_if<runtime::EnumValue>(&value);
-        if (!typed) return false;
-        output = *typed;
-        return true;
+        return value.tryGetEnum(output);
     }
     static runtime::Value write(runtime::EnumValue value) { return value; }
 };
@@ -961,10 +958,7 @@ struct NativeValue<runtime::ObjectRef> {
 template <>
 struct NativeValue<runtime::NativeHandle> {
     static bool read(const runtime::Value& value, runtime::NativeHandle& output) {
-        const auto* typed = std::get_if<runtime::NativeHandle>(&value);
-        if (!typed) return false;
-        output = *typed;
-        return true;
+        return value.tryGetNativeHandle(output);
     }
     static runtime::Value write(runtime::NativeHandle value) { return value; }
 };
@@ -1387,11 +1381,7 @@ template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
     const runtime::Value& value,
     runtime::QuatValue& out) noexcept {
     (void)type;
-    if (const auto* p = std::get_if<runtime::QuatValue>(&value)) {
-        out = *p;
-        return true;
-    }
-    return false;
+    return value.tryGetQuat(out);
 }
 
 [[nodiscard]] inline bool typedUnboxScalar(
@@ -1399,11 +1389,7 @@ template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
     const runtime::Value& value,
     runtime::EnumValue& out) noexcept {
     (void)type;
-    if (const auto* p = std::get_if<runtime::EnumValue>(&value)) {
-        out = *p;
-        return true;
-    }
-    return false;
+    return value.tryGetEnum(out);
 }
 
 [[nodiscard]] inline bool typedUnboxScalar(

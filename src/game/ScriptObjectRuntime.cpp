@@ -392,9 +392,9 @@ bool ScriptRuntime::isNativeAlive(const ScriptObject& object) const noexcept {
     }
     const auto field = heap_->fieldGet(object.reference(), 0);
     if (!field) return false;
-    const auto* handle = std::get_if<runtime::NativeHandle>(&*field);
-    if (!handle || !handle->valid()) return false;
-    return nativeHandles_->isAlive(*handle);
+    runtime::NativeHandle handle{};
+    if (!field->tryGetNativeHandle(handle) || !handle.valid()) return false;
+    return nativeHandles_->isAlive(handle);
 }
 
 bool ScriptRuntime::releaseNative(ScriptObject& object) const noexcept {
@@ -406,9 +406,9 @@ bool ScriptRuntime::releaseNative(ScriptObject& object) const noexcept {
     }
     const auto field = heap_->fieldGet(object.reference(), 0);
     if (!field) return false;
-    const auto* handle = std::get_if<runtime::NativeHandle>(&*field);
-    if (!handle || !handle->valid()) return false;
-    return nativeHandles_->release(*handle);
+    runtime::NativeHandle handle{};
+    if (!field->tryGetNativeHandle(handle) || !handle.valid()) return false;
+    return nativeHandles_->release(handle);
 }
 
 bool ScriptRuntime::isTypeAssignable(

@@ -633,11 +633,18 @@ struct SceneScriptError {
     runtime::RuntimeError error;
 };
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct SceneScriptOptions {
     bool enabled = true;
     std::map<std::string, runtime::Value> initialMembers;
     runtime::Value owner;
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 struct PrefabComponentTemplate {
     std::string scriptType;
@@ -1065,6 +1072,10 @@ private:
         std::string callbackMethod;
         std::string componentType;
     };
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
     struct AsyncRequestEntry {
         AsyncRequestId id = 0;
         std::string debugTag;
@@ -1076,6 +1087,9 @@ private:
         AsyncRequestId id = 0;
         runtime::Value result{};
     };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
     struct MethodCacheEntry {
         semantic::SymbolId typeId = 0;

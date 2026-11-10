@@ -158,12 +158,13 @@ bool ScriptRuntime::valueMatches(
         return true;
     }
     case semantic::PrimitiveType::Enum: {
-        const auto* enumeration = std::get_if<runtime::EnumValue>(&value);
-        return enumeration && enumeration->typeId == typeId;
+        runtime::EnumValue enumeration{};
+        return value.tryGetEnum(enumeration) && enumeration.typeId == typeId;
     }
     case semantic::PrimitiveType::Handle: {
-        const auto* handle = std::get_if<runtime::NativeHandle>(&value);
-        return handle && (typeId == 0 || handle->typeId == 0 || handle->typeId == typeId);
+        runtime::NativeHandle handle{};
+        return value.tryGetNativeHandle(handle) &&
+            (typeId == 0 || handle.typeId == 0 || handle.typeId == typeId);
     }
     default:
         return true;
@@ -248,12 +249,12 @@ std::optional<Vec3> ScriptRuntime::readVec3(
 
 std::optional<Quat> ScriptRuntime::readQuat(
     const runtime::Value& value) noexcept {
-    if (const auto* quat = std::get_if<runtime::QuatValue>(&value)) {
+    if (runtime::QuatValue quat{}; value.tryGetQuat(quat)) {
         return Quat{
-            Fixed::fromRaw(quat->x),
-            Fixed::fromRaw(quat->y),
-            Fixed::fromRaw(quat->z),
-            Fixed::fromRaw(quat->w)};
+            Fixed::fromRaw(quat.x),
+            Fixed::fromRaw(quat.y),
+            Fixed::fromRaw(quat.z),
+            Fixed::fromRaw(quat.w)};
     }
     const auto* structure = std::get_if<runtime::StructValue>(&value);
     if (!structure ||

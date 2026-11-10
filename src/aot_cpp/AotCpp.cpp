@@ -4204,6 +4204,9 @@ GeneratedProgram CppGenerator::generate(
     source.line("        runtime_api->abi_minor < realscript::aot::RuntimeAbiMinor) {");
     source.line("        return RS_STATUS_V1_ABI_MISMATCH;");
     source.line("    }");
+    source.line("    if (runtime_api->user_data) {");
+    source.line("        realscript::runtime::detail::bindHostValuePoolBridge(runtime_api->user_data);");
+    source.line("    }");
     source.line("    out_exports->required_abi_major = realscript::aot::RuntimeAbiMajor;");
     source.line("    out_exports->required_abi_minor = realscript::aot::RuntimeAbiMinor;");
     source.line("    out_exports->module_name = " + options.cppNamespace +

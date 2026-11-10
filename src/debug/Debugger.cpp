@@ -112,7 +112,7 @@ bool tryAsInt64(const runtime::Value& value, std::int64_t& out) noexcept {
     if (const auto* v = std::get_if<runtime::UShortValue>(&value)) { out = v->value; return true; }
     if (const auto* v = std::get_if<runtime::UIntValue>(&value)) { out = static_cast<std::int64_t>(v->value); return true; }
     if (const auto* v = std::get_if<runtime::ULongValue>(&value)) { out = static_cast<std::int64_t>(v->value); return true; }
-    if (const auto* v = std::get_if<runtime::EnumValue>(&value)) { out = v->value; return true; }
+    if (runtime::EnumValue v{}; value.tryGetEnum(v)) { out = v.value; return true; }
     return false;
 }
 
@@ -156,8 +156,8 @@ bool isNullValue(const runtime::Value& value) noexcept {
     if (const auto* ref = std::get_if<runtime::ObjectRef>(&value)) {
         return !ref->valid();
     }
-    if (const auto* handle = std::get_if<runtime::NativeHandle>(&value)) {
-        return !handle->valid();
+    if (runtime::NativeHandle handle{}; value.tryGetNativeHandle(handle)) {
+        return !handle.valid();
     }
     return false;
 }

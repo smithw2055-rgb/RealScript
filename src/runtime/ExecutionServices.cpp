@@ -116,9 +116,9 @@ void hashValue(
         hashScalar(hash, bits);
     } else if (const auto* v = std::get_if<CharValue>(&value)) {
         hashScalar(hash, v->value);
-    } else if (const auto* v = std::get_if<EnumValue>(&value)) {
-        hashScalar(hash, v->typeId);
-        hashScalar(hash, v->value);
+    } else if (EnumValue v{}; value.tryGetEnum(v)) {
+        hashScalar(hash, v.typeId);
+        hashScalar(hash, v.value);
     } else if (const auto* v = std::get_if<FixedValue>(&value)) {
         hashScalar(hash, v->raw);
     } else if (const auto* v = std::get_if<Fixed16Value>(&value)) {
@@ -130,11 +130,11 @@ void hashValue(
         hashScalar(hash, v->x);
         hashScalar(hash, v->y);
         hashScalar(hash, v->z);
-    } else if (const auto* v = std::get_if<QuatValue>(&value)) {
-        hashScalar(hash, v->x);
-        hashScalar(hash, v->y);
-        hashScalar(hash, v->z);
-        hashScalar(hash, v->w);
+    } else if (QuatValue v{}; value.tryGetQuat(v)) {
+        hashScalar(hash, v.x);
+        hashScalar(hash, v.y);
+        hashScalar(hash, v.z);
+        hashScalar(hash, v.w);
     } else if (const auto* v = std::get_if<StructValue>(&value)) {
         hashScalar(hash, v->typeId);
         const auto count = static_cast<std::uint64_t>(v->fieldCount());
@@ -150,10 +150,10 @@ void hashValue(
         hashScalar(hash, v->slot);
         hashScalar(hash, v->generation);
         hashScalar(hash, v->kind);
-    } else if (const auto* v = std::get_if<NativeHandle>(&value)) {
-        hashScalar(hash, v->slot);
-        hashScalar(hash, v->generation);
-        hashScalar(hash, v->typeId);
+    } else if (NativeHandle v{}; value.tryGetNativeHandle(v)) {
+        hashScalar(hash, v.slot);
+        hashScalar(hash, v.generation);
+        hashScalar(hash, v.typeId);
     }
 }
 
