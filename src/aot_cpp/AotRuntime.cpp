@@ -683,9 +683,10 @@ bool ExecutionContext::expectSignatureType(
                 std::string(context) + " has the wrong runtime array type");
         }
     } else if (type == semantic::PrimitiveType::Handle && typeId != 0) {
-        const auto* handle = std::get_if<runtime::NativeHandle>(&value);
-        if (!handle || (handle->valid() && handle->typeId != typeId) ||
-            (!handle->valid() && handle->typeId != 0 && handle->typeId != typeId)) {
+        runtime::NativeHandle handle{};
+        if (!value.tryGetNativeHandle(handle) ||
+            (handle.valid() && handle.typeId != typeId) ||
+            (!handle.valid() && handle.typeId != 0 && handle.typeId != typeId)) {
             return fail(
                 runtime::ErrorCode::TypeMismatch,
                 std::string(context) + " has the wrong native handle type");
@@ -700,8 +701,8 @@ bool ExecutionContext::expectSignatureType(
                 std::string(context) + " has the wrong struct type");
         }
     } else if (type == semantic::PrimitiveType::Enum) {
-        const auto* enumeration = std::get_if<runtime::EnumValue>(&value);
-        if (!enumeration || typeId == 0 || enumeration->typeId != typeId) {
+        runtime::EnumValue enumeration{};
+        if (!value.tryGetEnum(enumeration) || typeId == 0 || enumeration.typeId != typeId) {
             return fail(
                 runtime::ErrorCode::TypeMismatch,
                 std::string(context) + " has the wrong enum type");

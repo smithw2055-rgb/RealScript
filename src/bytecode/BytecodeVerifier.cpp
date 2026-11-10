@@ -1188,9 +1188,7 @@ bool verifyModule(
                 case Opcode::NewArray: {
                     const auto validElement =
                         instruction.elementType == semantic::PrimitiveType::Bool ||
-                        instruction.elementType == semantic::PrimitiveType::Int ||
-                        instruction.elementType == semantic::PrimitiveType::Long ||
-                        instruction.elementType == semantic::PrimitiveType::Double ||
+                        semantic::isNumericType(instruction.elementType) ||
                         instruction.elementType == semantic::PrimitiveType::String ||
                         instruction.elementType == semantic::PrimitiveType::Object ||
                         instruction.elementType == semantic::PrimitiveType::Struct ||
@@ -1233,9 +1231,7 @@ bool verifyModule(
                 case Opcode::StoreElement: {
                     const auto validElement =
                         instruction.elementType == semantic::PrimitiveType::Bool ||
-                        instruction.elementType == semantic::PrimitiveType::Int ||
-                        instruction.elementType == semantic::PrimitiveType::Long ||
-                        instruction.elementType == semantic::PrimitiveType::Double ||
+                        semantic::isNumericType(instruction.elementType) ||
                         instruction.elementType == semantic::PrimitiveType::String ||
                         instruction.elementType == semantic::PrimitiveType::Object ||
                         instruction.elementType == semantic::PrimitiveType::Struct ||

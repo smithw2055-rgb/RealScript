@@ -1264,7 +1264,9 @@ FunctionSymbol declareFunctionSymbol(
         result.declaringTypeName = canonicalTypeName(*owner);
         result.ownerTypeName = owner->name;
         result.ownerTypeId = owner->id;
-        appendImplicitThis(result, *owner, true);
+        const bool mutableStructReceiver =
+            owner->sourceName != "$builtin/RealScript.Math.rs";
+        appendImplicitThis(result, *owner, mutableStructReceiver);
     }
     const auto returnType = resolveType(syntaxTree.returnType, visibleTypes, true);
     result.returnType = returnType.type;

@@ -407,6 +407,10 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_dap_socket_attach_tests
         realscript.dap-socket-attach
         tests/dap_socket_attach_test.cpp)
+    realscript_add_cpp_test(
+        realscript_game_math_flat_opcode_tests
+        realscript.game-math-flat-opcode
+        tests/game_math_flat_opcode_benchmark.cpp)
     set(REALSCRIPT_PHASE20_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/phase20")
     realscript_add_aot_library(

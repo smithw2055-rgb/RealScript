@@ -1712,12 +1712,19 @@ SceneEntityId SceneScriptRuntime::instantiatePrefab(
     const std::map<std::string, runtime::Value>& rootMemberOverrides) {
     if (nextEntityId == 0) nextEntityId = 1;
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
     struct PendingActivation {
         int order = 0;
         SceneEntityId entity = 0;
         std::size_t compIndex = 0;
         runtime::Value owner;
     };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
     std::vector<PendingActivation> activations;
 
     // Phase 1: Allocate all entities, transforms, hierarchy links, and component instances

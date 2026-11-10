@@ -70,6 +70,23 @@ enum class QuickOpcode : std::uint8_t {
     NegateIntUnchecked,
     NegateDouble,
     LogicalNot,
+    AddFloat,
+    SubtractFloat,
+    MultiplyFloat,
+    DivideFloat,
+    LessFloat,
+    LessOrEqualFloat,
+    GreaterFloat,
+    GreaterOrEqualFloat,
+    EqualFloat,
+    NotEqualFloat,
+    NegateFloat,
+    ConvertIntToFloatFast,
+    ConvertDoubleToFloatFast,
+    ConvertFloatToIntFast,
+    ConvertFloatToDoubleFast,
+    ConvertLongToIntFast,
+    NewStructFast,
 };
 
 enum class SuperOpcode : std::uint8_t {
@@ -154,8 +171,113 @@ enum class FlatOpcode : std::uint8_t {
     NegateIntUnchecked,
     NegateDouble,
     LogicalNot,
+    NewArrayFast,
+    // 6. Float scalar operations, conversions & superinstructions
+    AddFloat,
+    SubFloat,
+    MulFloat,
+    DivFloat,
+    LessFloat,
+    LessOrEqualFloat,
+    GreaterFloat,
+    GreaterOrEqualFloat,
+    EqualFloat,
+    NotEqualFloat,
+    NegateFloat,
+    ConvertIntToFloatFast,
+    ConvertDoubleToFloatFast,
+    ConvertFloatToIntFast,
+    ConvertFloatToDoubleFast,
+    ConvertLongToIntFast,
+    SuperConstFloat,
+    SuperConstFloatStoreLocal,
+    SuperBinaryLocalFloatLocalStore,
+    SuperBinaryLocalFloatLocalStoreElided,
+    SuperBinaryLocalFloatReg,
+    SuperBinaryLocalFloatRegElided,
+    SuperBinaryLocalFloatRegStore,
+    SuperBinaryLocalFloatRegStoreElided,
+    SuperBinaryRegFloatStoreElided,
+    // 7. Inline struct & Fixed / Vec3 / Vec2 / Quat / Trig / Sqrt fast paths
+    NewStructFast,
+    LoadFixedRawFast,
+    StoreFixedRawFast,
+    LoadVec3FieldFast,
+    StoreVec3FieldFast,
+    LoadQuatFieldFast,
+    StoreQuatFieldFast,
+    MathFixedConst,
+    MathFixedFromRaw,
+    MathFixedFromInt,
+    MathFixedRatio,
+    MathFixedNeg,
+    MathFixedAdd,
+    MathFixedSub,
+    MathFixedMul,
+    MathFixedMulInt,
+    MathFixedDiv,
+    MathFixedDivInt,
+    MathFixedSin,
+    MathFixedCos,
+    MathFixedSqrt,
+    MathSqrt64,
+    MathVec3Const,
+    MathVec3Raw,
+    MathVec3Of,
+    MathVec3Neg,
+    MathVec3Add,
+    MathVec3Sub,
+    MathVec3MulFixed,
+    MathVec3MulInt,
+    MathVec3DivFixed,
+    MathVec3DivInt,
+    MathVec3Dot,
+    MathVec3Cross,
+    MathVec2Add,
+    MathVec2Sub,
+    MathVec2MulFixed,
+    MathVec2Dot,
+    MathQuatIdentity,
+    MathQuatDot,
+    MathQuatMul,
+    MathQuatRotate,
+    MathQuatRotateVec3,
+    SuperQuatRotateBoxed,
+    MathQuatNormalize,
+    SuperQuatNormalizedBoxed,
+    MathQuatFromEuler,
+    MathQuatLerp,
+    // 7b. Dead-temporary-eliding compound math & field superinstructions
+    SuperLoadVec3RawFast,
+    SuperLoadQuatRawFast,
+    SuperFixedMulAdd,
+    SuperVec3MulAdd,
+    SuperVec3AddQuatRotate,
+    SuperQuatMulNormalized,
+    SuperQuatMulChain,
+    SuperQuatMulRotateVec3,
+    // 7c. Cache-friendly prologue/back-edge fusion & small-frame function unfolding opcodes
+    SuperMoveParamStoreLocalElided,
+    SuperBinaryLocalIntConstStoreJump,
+    SuperBinaryLocalIntLocalStoreJump,
+    SuperBinaryLocalIntRegStoreJump,
+    SuperCheckNotNullCallPolledFast,
+    InlineCallEnter,
+    InlineReturnVoid,
+    InlineReturnVoidJump,
+    InlineReturnScalar,
+    InlineReturnScalarJump,
+    // 7d. Strongly-typed Array & Object fast paths
+    LoadElementTypedFast,
+    StoreElementPrimFast,
+    StoreElementStructFast,
+    StoreElementObjFast,
+    SuperLessLocalArrayLengthBranch,
+    NewObjectFast,
+    LoadFieldExactFast,
+    StoreFieldExactFast,
     GenericBytecode,
-    // 6. Flattened block terminators
+    // 8. Flattened block terminators
     TermJumpNoArgs,
     TermBranchBoolNoArgs,
     TermBranchGeneric,
@@ -191,35 +313,128 @@ struct alignas(8) ExecutionInstruction {
     std::uint16_t storeSlot = InvalidCompactReg;
 };
 
-struct alignas(8) FlatInstruction {
+// Cold side-metadata split out of FlatInstruction so hot dispatch streams pack
+// cleanly at 32 bytes/instruction (exactly 2 instructions per 64-byte L1 cache line).
+struct FlatColdMeta {
     const bytecode::Instruction* bytecode = nullptr;
     const ProgramImage::FunctionLocation* directTarget = nullptr;
     const ExecutionFunction* directExecution = nullptr;
-    std::int64_t integerImmediate = 0;
-
-    std::uint32_t trueTargetOffset = InvalidStreamOffset;
-    std::uint32_t falseTargetOffset = InvalidStreamOffset;
+    const ProgramImage::FunctionLocation* inlinedCallee = nullptr;
     std::uint32_t blockIndex = 0;
     std::uint32_t instructionIndexInBlock = 0;
+    std::uint32_t callerBlockIndex = 0;
+    std::uint32_t callerInstIndex = 0;
+    std::uint16_t inlineFrameBias = 0;
+};
 
-    FlatOpcode flatOpcode = FlatOpcode::GenericBytecode;
-    QuickOpcode binaryOpcode1 = QuickOpcode::Generic;
-    QuickOpcode binaryOpcode2 = QuickOpcode::Generic;
-    std::uint8_t span = 1;
-    bool checkedArithmetic1 = true;
-    bool checkedArithmetic2 = true;
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4201)
+#endif
+struct alignas(32) FlatInstruction {
+    static constexpr std::uint8_t FlagChecked1 = 0x01u;
+    static constexpr std::uint8_t FlagChecked2 = 0x02u;
+    static constexpr std::uint8_t FlagFastParamPrologue = 0x04u;
+    static constexpr std::uint8_t FlagArrayNoNullCheck = 0x08u;
+    static constexpr std::uint8_t FlagArrayNoBoundsCheck = 0x10u;
+    static constexpr std::uint8_t FlagPreJump1 = 0x20u;
+
+    std::int64_t integerImmediate = 0; // bytes 0..7
+    union {                            // bytes 8..15
+        struct {
+            std::uint16_t src2Slot;
+            std::uint16_t aux0Slot;
+            std::uint16_t aux1Slot;
+            std::uint16_t storeSlot;
+        };
+        struct {
+            std::uint32_t trueTargetOffset;
+            std::uint32_t falseTargetOffset;
+        };
+    };
 
     // All slot fields below are pre-biased relative to `Value* frameBase`:
     //   parameters: [0 .. paramCount - 1]
     //   locals:     [localOffset .. registerOffset - 1]
     //   registers:  [registerOffset .. scratchOffset - 1]
-    std::uint16_t dstSlot = InvalidCompactReg;
-    std::uint16_t src0Slot = InvalidCompactReg;
-    std::uint16_t src1Slot = InvalidCompactReg;
-    std::uint16_t src2Slot = InvalidCompactReg;
-    std::uint16_t aux0Slot = InvalidCompactReg;
-    std::uint16_t aux1Slot = InvalidCompactReg;
-    std::uint16_t storeSlot = InvalidCompactReg;
+    std::uint16_t dstSlot = InvalidCompactReg;           // bytes 16..17
+    std::uint16_t src0Slot = InvalidCompactReg;          // bytes 18..19
+    std::uint16_t src1Slot = InvalidCompactReg;          // bytes 20..21
+    FlatOpcode flatOpcode = FlatOpcode::GenericBytecode; // byte 22
+    std::uint8_t span = 1;                               // byte 23
+    QuickOpcode binaryOpcode1 = QuickOpcode::Generic;    // byte 24
+    QuickOpcode binaryOpcode2 = QuickOpcode::Generic;    // byte 25
+    std::uint8_t arithFlags = FlagChecked1 | FlagChecked2; // byte 26
+    std::uint8_t inlineArgCount = 0;                     // byte 27
+    std::uint32_t auxImm32 = 0;                          // bytes 28..31
+
+    constexpr FlatInstruction() noexcept
+        : integerImmediate(0),
+          src2Slot(InvalidCompactReg),
+          aux0Slot(InvalidCompactReg),
+          aux1Slot(InvalidCompactReg),
+          storeSlot(InvalidCompactReg),
+          dstSlot(InvalidCompactReg),
+          src0Slot(InvalidCompactReg),
+          src1Slot(InvalidCompactReg),
+          flatOpcode(FlatOpcode::GenericBytecode),
+          span(1),
+          binaryOpcode1(QuickOpcode::Generic),
+          binaryOpcode2(QuickOpcode::Generic),
+          arithFlags(FlagChecked1 | FlagChecked2),
+          inlineArgCount(0),
+          auxImm32(0) {}
+
+    [[nodiscard]] constexpr bool checked1() const noexcept {
+        return (arithFlags & FlagChecked1) != 0u;
+    }
+    [[nodiscard]] constexpr bool checked2() const noexcept {
+        return (arithFlags & FlagChecked2) != 0u;
+    }
+    constexpr void setChecked1(bool v) noexcept {
+        arithFlags = v
+            ? static_cast<std::uint8_t>(arithFlags | FlagChecked1)
+            : static_cast<std::uint8_t>(arithFlags & ~FlagChecked1);
+    }
+    constexpr void setChecked2(bool v) noexcept {
+        arithFlags = v
+            ? static_cast<std::uint8_t>(arithFlags | FlagChecked2)
+            : static_cast<std::uint8_t>(arithFlags & ~FlagChecked2);
+    }
+};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+static_assert(sizeof(FlatInstruction) == 32, "FlatInstruction must be 32 bytes (2 per 64B cache line)");
+static_assert(alignof(FlatInstruction) == 32, "FlatInstruction must be 32-byte aligned");
+
+enum class FastFieldKind : std::uint8_t {
+    None = 0,
+    ExactValueTag = 1,
+    Quat = 2,
+    String = 3,
+    Object = 4,
+    Array = 5,
+    UserStruct = 6,
+    Enum = 7,
+};
+
+struct FieldAccessMeta {
+    semantic::SymbolId ownerTypeId = 0;
+    semantic::SymbolId fieldTypeId = 0;
+};
+
+struct ObjectAllocationTemplate {
+    semantic::SymbolId typeId = 0;
+    std::vector<Value> defaultFields;
+    std::shared_ptr<const std::vector<std::size_t>> referenceFields;
+};
+
+enum class TrivialMethodKind : std::uint8_t {
+    None = 0,
+    ReturnVoid,
+    ReturnConst,
+    ReturnParam,
 };
 
 struct ExecutionBlock {
@@ -236,6 +451,7 @@ struct ExecutionBlock {
 };
 
 struct ExecutionFunction {
+    Value trivialConstValue{};
     const bytecode::Function* bytecode = nullptr;
     const bytecode::FunctionReference* directNativeReference = nullptr;
     std::uint16_t nativeForwarderInstructionCost = 0;
@@ -247,17 +463,26 @@ struct ExecutionFunction {
     std::uint16_t scratchOffset = 0;
     std::uint32_t totalFrameSlots = 0;
     std::uint32_t entryStreamOffset = InvalidStreamOffset;
+    std::uint16_t trivialInstCost = 0;
+    std::uint16_t trivialParamIndex = 0;
+    TrivialMethodKind trivialKind = TrivialMethodKind::None;
     bool hasDebugSequencePoints = false;
     bool hasExceptionHandlers = false;
     bool canUseFlatFastPath = false;
+    bool isSmallLeafInlineCandidate = false;
+    bool hasFastParamToLocalPrologue = false;
     std::vector<ExecutionBlock> blocks;
     std::vector<FlatInstruction> flatStream;
+    std::vector<FlatColdMeta> flatCold;
     std::vector<std::uint32_t> blockStreamOffsets;
     std::unordered_map<bytecode::BlockId, std::size_t> blockIndices;
 };
 
 struct ExecutionMirror {
+    std::uint64_t instanceId = 0;
     std::unordered_map<const bytecode::Function*, ExecutionFunction> functions;
+    std::vector<FieldAccessMeta> fieldMetas;
+    std::vector<ObjectAllocationTemplate> objectTemplates;
 };
 
 [[nodiscard]] std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
