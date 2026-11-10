@@ -427,6 +427,15 @@ bool notifyDebuggerException(
     std::string description,
     bool isUncaught,
     bool isRuntimeError) {
+#if defined(REALSCRIPT_SLIM_RUNTIME_BUILD)
+    (void)state;
+    (void)code;
+    (void)exceptionId;
+    (void)description;
+    (void)isUncaught;
+    (void)isRuntimeError;
+    return true;
+#else
     if (!state.debugger || state.exceptionNotifiedDebugger ||
         code == ErrorCode::ExecutionTerminated || state.debugFrames.empty()) {
         return true;
@@ -447,6 +456,7 @@ bool notifyDebuggerException(
         std::move(description),
         isUncaught,
         isRuntimeError);
+#endif
 }
 
 bool fail(State& state, ErrorCode code, std::string message) {
@@ -892,6 +902,14 @@ bool debugSequencePoint(
     bytecode::BlockId blockId,
     std::uint32_t instructionIndex,
     bool terminator) {
+#if defined(REALSCRIPT_SLIM_RUNTIME_BUILD)
+    (void)state;
+    (void)function;
+    (void)blockId;
+    (void)instructionIndex;
+    (void)terminator;
+    return true;
+#else
     if (!state.debugger) return true;
     const auto* point = findSequencePoint(
         function, blockId, instructionIndex, terminator);
@@ -904,6 +922,7 @@ bool debugSequencePoint(
             "execution terminated by debugger");
     }
     return true;
+#endif
 }
 
 bool executeFunction(
@@ -4982,6 +5001,7 @@ ExecutionResult Interpreter::invoke(
     if (state.heap && state.program) {
         state.heap->registerProgramObservableTypes(*state.program);
     }
+#if !defined(REALSCRIPT_SLIM_RUNTIME_BUILD)
     state.debugger = options.debugger.get();
     struct DebugExecutionScope {
         debug::DebugController* debugger = nullptr;
@@ -4997,6 +5017,7 @@ ExecutionResult Interpreter::invoke(
     if (state.debugger) {
         state.debugger->bindProgram(*program_);
     }
+#endif
     Value value;
     ExecutionResult execution;
     ShadowFrameScope roots(
