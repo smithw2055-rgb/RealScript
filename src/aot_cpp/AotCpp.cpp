@@ -947,6 +947,35 @@ bool supportsTypedPrimitiveAot(
             case mir::Opcode::CheckNotNull:
             case mir::Opcode::ArrayLength:
                 break;
+            case mir::Opcode::NewObject: {
+                const auto objTid = instruction.resultTypeId != 0
+                    ? instruction.resultTypeId
+                    : instruction.typeId;
+                if (instruction.resultType != semantic::PrimitiveType::Object ||
+                    objTid == 0 ||
+                    !isTypedAotSlot({semantic::PrimitiveType::Object, objTid}, &customStructs)) {
+                    return false;
+                }
+                break;
+            }
+            case mir::Opcode::IsType:
+            case mir::Opcode::AsType: {
+                if (instruction.operands.size() != 1 ||
+                    instruction.elementType != semantic::PrimitiveType::Object ||
+                    instruction.elementTypeId == 0 ||
+                    operandSlot(instruction, 0).primitive != semantic::PrimitiveType::Object) {
+                    return false;
+                }
+                if (instruction.opcode == mir::Opcode::IsType &&
+                    instruction.resultType != semantic::PrimitiveType::Bool) {
+                    return false;
+                }
+                if (instruction.opcode == mir::Opcode::AsType &&
+                    instruction.resultType != semantic::PrimitiveType::Object) {
+                    return false;
+                }
+                break;
+            }
             case mir::Opcode::LoadField:
                 if (!isTypedAotSlot({instruction.resultType, instruction.resultTypeId}, &customStructs)) {
                     return false;
@@ -1013,7 +1042,7 @@ bool supportsTypedPrimitiveAot(
                 break;
             }
             case mir::Opcode::Call: {
-                if (instruction.virtualDispatch || instruction.interfaceDispatch) {
+                if (instruction.virtualDispatch && instruction.interfaceDispatch) {
                     return false;
                 }
                 const std::string_view symName(instruction.symbolName);
@@ -1021,8 +1050,27 @@ bool supportsTypedPrimitiveAot(
                     symName.rfind("$intrinsic::static_get::ecs_col::", 0) == 0 ||
                     symName.rfind("$intrinsic::static_get::ecs_ent::", 0) == 0 ||
                     symName.rfind("$intrinsic::ecs_writeback::", 0) == 0;
-                if (usesReferenceSlots && !isEcsIntrinsic) {
-                    return false;
+                bool hasPolyOrLoopInFn = function.blocks.size() > 1;
+                if (!hasPolyOrLoopInFn && usesReferenceSlots && !isEcsIntrinsic) {
+                    for (const auto& scanBlk : function.blocks) {
+                        for (const auto& scanInst : scanBlk.instructions) {
+                            if (scanInst.opcode == mir::Opcode::IsType ||
+                                scanInst.opcode == mir::Opcode::AsType ||
+                                scanInst.opcode == mir::Opcode::NewDelegate ||
+                                scanInst.opcode == mir::Opcode::InvokeDelegate ||
+                                scanInst.opcode == mir::Opcode::CombineDelegate ||
+                                scanInst.opcode == mir::Opcode::RemoveDelegate ||
+                                (scanInst.opcode == mir::Opcode::Call &&
+                                 (scanInst.virtualDispatch || scanInst.interfaceDispatch))) {
+                                hasPolyOrLoopInFn = true;
+                                break;
+                            }
+                        }
+                        if (hasPolyOrLoopInFn) break;
+                    }
+                    if (!hasPolyOrLoopInFn) {
+                        return false;
+                    }
                 }
                 if (!symName.empty() &&
                     symName.rfind("$intrinsic::", 0) == 0 &&
@@ -1044,8 +1092,71 @@ bool supportsTypedPrimitiveAot(
                         instruction.parameterTypes[index],
                         paramTypeId,
                     };
-                    if (!isTypedAotSlot(expectedSlot, &customStructs) ||
-                        operandSlot(instruction, index) != expectedSlot) {
+                    if (!isTypedAotSlot(expectedSlot, &customStructs)) {
+                        return false;
+                    }
+                    const auto actualOpSlot = operandSlot(instruction, index);
+                    if (expectedSlot.primitive == semantic::PrimitiveType::Object) {
+                        if (actualOpSlot.primitive != semantic::PrimitiveType::Object &&
+                            actualOpSlot.primitive != semantic::PrimitiveType::Null) {
+                            return false;
+                        }
+                    } else if (actualOpSlot != expectedSlot) {
+                        return false;
+                    }
+                }
+                break;
+            }
+            case mir::Opcode::NewDelegate: {
+                if (instruction.resultType != semantic::PrimitiveType::Object ||
+                    instruction.typeId == 0 ||
+                    instruction.operands.size() > 1 ||
+                    (instruction.virtualDispatch && instruction.interfaceDispatch)) {
+                    return false;
+                }
+                if (instruction.operands.size() == 1) {
+                    const auto recvSlot = operandSlot(instruction, 0);
+                    if (recvSlot.primitive != semantic::PrimitiveType::Object &&
+                        recvSlot.primitive != semantic::PrimitiveType::Null) {
+                        return false;
+                    }
+                } else if (instruction.virtualDispatch || instruction.interfaceDispatch) {
+                    return false;
+                }
+                break;
+            }
+            case mir::Opcode::CombineDelegate:
+            case mir::Opcode::RemoveDelegate: {
+                if (instruction.resultType != semantic::PrimitiveType::Object ||
+                    instruction.typeId == 0 ||
+                    instruction.operands.size() != 2) {
+                    return false;
+                }
+                const auto lSlot = operandSlot(instruction, 0);
+                const auto rSlot = operandSlot(instruction, 1);
+                if ((lSlot.primitive != semantic::PrimitiveType::Object &&
+                     lSlot.primitive != semantic::PrimitiveType::Null) ||
+                    (rSlot.primitive != semantic::PrimitiveType::Object &&
+                     rSlot.primitive != semantic::PrimitiveType::Null)) {
+                    return false;
+                }
+                break;
+            }
+            case mir::Opcode::InvokeDelegate: {
+                if (instruction.typeId == 0 || instruction.operands.empty()) {
+                    return false;
+                }
+                const auto delSlot = operandSlot(instruction, 0);
+                if (delSlot.primitive != semantic::PrimitiveType::Object &&
+                    delSlot.primitive != semantic::PrimitiveType::Null) {
+                    return false;
+                }
+                if (instruction.resultType != semantic::PrimitiveType::Void &&
+                    !isTypedAotSlot({instruction.resultType, instruction.resultTypeId}, &customStructs)) {
+                    return false;
+                }
+                for (std::size_t idx = 1; idx < instruction.operands.size(); ++idx) {
+                    if (!isTypedAotSlot(operandSlot(instruction, idx), &customStructs)) {
                         return false;
                     }
                 }
@@ -1184,7 +1295,8 @@ void emitTypedTransfer(
     mir::BlockId target,
     const std::vector<mir::ValueId>& arguments,
     const std::string& prefix,
-    const std::string& indent) {
+    const std::string& indent,
+    const std::vector<std::size_t>* regGuardSlot = nullptr) {
     const auto* block = findBlock(function, target);
     if (!block) return;
     output.line(indent + "if constexpr (FastAccounting && !TrustedRelease) {");
@@ -1206,9 +1318,21 @@ void emitTypedTransfer(
     for (std::size_t index = 0;
          index < arguments.size() && index < block->parameters.size();
          ++index) {
+        const auto paramVal = block->parameters[index].value;
         output.line(indent +
-            typedValueExpression(block->parameters[index].value) + " = " +
+            typedValueExpression(paramVal) + " = " +
             prefix + "_" + std::to_string(index) + ";");
+        if (regGuardSlot != nullptr && paramVal >= 0) {
+            const auto rIdx = static_cast<std::size_t>(paramVal);
+            if (rIdx < regGuardSlot->size() &&
+                (*regGuardSlot)[rIdx] != std::numeric_limits<std::size_t>::max()) {
+                output.line(indent + "if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
+                output.line(indent + "    aot::retainTypedGcSlot(context.rawHeap(), typedLocalGcGuards[" +
+                    std::to_string((*regGuardSlot)[rIdx]) + "], " +
+                    typedValueExpression(paramVal) + ");");
+                output.line(indent + "}");
+            }
+        }
     }
     output.line(indent + "goto typedBlock_" + std::to_string(target) + ";");
 }
@@ -1280,12 +1404,20 @@ bool typedInstructionCanFail(
     case mir::Opcode::CheckNotNull:
     case mir::Opcode::LoadField:
     case mir::Opcode::StoreField:
+    case mir::Opcode::NewObject:
+    case mir::Opcode::NewArray:
+    case mir::Opcode::IsType:
+    case mir::Opcode::AsType:
     case mir::Opcode::ArrayLength:
     case mir::Opcode::LoadElement:
     case mir::Opcode::StoreElement:
     case mir::Opcode::NewStruct:
     case mir::Opcode::LoadStructField:
     case mir::Opcode::StoreStructField:
+    case mir::Opcode::NewDelegate:
+    case mir::Opcode::CombineDelegate:
+    case mir::Opcode::RemoveDelegate:
+    case mir::Opcode::InvokeDelegate:
         return true;
     case mir::Opcode::AddInt:
     case mir::Opcode::SubtractInt:
@@ -2007,12 +2139,32 @@ void emitVectorizedEcsLoop(
     source.line("            }");
 }
 
+bool aotTypeAssignable(
+    semantic::SymbolId actual,
+    semantic::SymbolId expected,
+    const std::map<semantic::SymbolId, TypeView>& allTypes) noexcept {
+    if (actual == expected) return true;
+    if (actual == 0 || expected == 0) return false;
+    auto current = actual;
+    for (std::size_t depth = 0; current != 0 && depth < 256; ++depth) {
+        const auto it = allTypes.find(current);
+        if (it == allTypes.end() || !it->second.type) return false;
+        for (const auto& imap : it->second.type->interfaceDispatchMaps) {
+            if (imap.interfaceTypeId == expected) return true;
+        }
+        if (it->second.type->baseTypeId == expected) return true;
+        current = it->second.type->baseTypeId;
+    }
+    return false;
+}
+
 void emitTypedPrimitiveFunction(
     Emitter& source,
     const FunctionView& view,
     const GenerationOptions& options,
     std::vector<SourceMapRecord>& sourceMap,
     const std::unordered_map<semantic::SymbolId, const FunctionView*>& typedFunctions,
+    const std::map<semantic::SymbolId, TypeView>& allTypes,
     const std::unordered_map<const mir::Instruction*, std::size_t>& callIds) {
     const auto& module = *view.module;
     const auto& function = *view.function;
@@ -2036,8 +2188,56 @@ void emitTypedPrimitiveFunction(
     }
     source.line("    ExecutionContext::TypedRawAccountingScope<FastAccounting && !TrustedRelease> rawAccounting(context);");
     source.line("    ExecutionContext::TypedDeterminismAccountingScope<DeterminismAccounting && !TrustedRelease> determinismAccounting(context);");
-    source.line("    std::conditional_t<!FastAccounting && !DeterminismAccounting && !TrustedRelease, std::vector<runtime::PersistentRoot>, aot::EmptyGcGuards> typedLocalGcGuards;");
+    std::vector<std::size_t> paramGuardSlot(
+        function.parameterTypes.size(),
+        std::numeric_limits<std::size_t>::max());
+    std::vector<std::size_t> localGuardSlot(
+        function.localTypes.size(),
+        std::numeric_limits<std::size_t>::max());
+    std::vector<std::size_t> regGuardSlot(
+        types.size(),
+        std::numeric_limits<std::size_t>::max());
+    std::size_t totalGcGuardSlots = 0;
+    bool hasRefParams = false;
+    for (std::size_t pIdx = 0; pIdx < function.parameterTypes.size(); ++pIdx) {
+        if (function.parameterTypes[pIdx] == semantic::PrimitiveType::Object ||
+            function.parameterTypes[pIdx] == semantic::PrimitiveType::Array) {
+            paramGuardSlot[pIdx] = totalGcGuardSlots++;
+            hasRefParams = true;
+        }
+    }
+    for (std::size_t lIdx = 0; lIdx < function.localTypes.size(); ++lIdx) {
+        if (function.localTypes[lIdx] == semantic::PrimitiveType::Object ||
+            function.localTypes[lIdx] == semantic::PrimitiveType::Array) {
+            localGuardSlot[lIdx] = totalGcGuardSlots++;
+        }
+    }
+    for (std::size_t rIdx = 0; rIdx < types.size(); ++rIdx) {
+        if (types[rIdx].primitive == semantic::PrimitiveType::Object ||
+            types[rIdx].primitive == semantic::PrimitiveType::Array) {
+            regGuardSlot[rIdx] = totalGcGuardSlots++;
+        }
+    }
+    if (totalGcGuardSlots > 0) {
+        source.line("    std::conditional_t<!FastAccounting && !DeterminismAccounting && !TrustedRelease, std::array<runtime::PersistentRoot, " +
+            std::to_string(totalGcGuardSlots) + ">, aot::EmptyGcGuards> typedLocalGcGuards{};");
+    } else {
+        source.line("    aot::EmptyGcGuards typedLocalGcGuards{};");
+    }
     source.line("    (void)typedLocalGcGuards;");
+    if (hasRefParams) {
+        source.line("    if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
+        source.line("        if (auto* rawH = context.rawHeap()) {");
+        for (std::size_t pIdx = 0; pIdx < function.parameterTypes.size(); ++pIdx) {
+            if (paramGuardSlot[pIdx] != std::numeric_limits<std::size_t>::max()) {
+                source.line("            aot::retainTypedGcSlot(rawH, typedLocalGcGuards[" +
+                    std::to_string(paramGuardSlot[pIdx]) + "], typedArg_" +
+                    std::to_string(pIdx) + ");");
+            }
+        }
+        source.line("        }");
+        source.line("    }");
+    }
     source.line("    std::uint32_t typedActiveGenLine = 0;");
     source.line("    (void)typedActiveGenLine;");
     source.line("    const auto typedFail = [&](runtime::ErrorCode code, const char* message) {");
@@ -2191,6 +2391,31 @@ void emitTypedPrimitiveFunction(
                     instruction.operands[index] < 0) return {};
                 return types[static_cast<std::size_t>(instruction.operands[index])];
             };
+            const auto callOperandExpr = [&](std::size_t index) -> std::string {
+                const auto opSlot = operandSlot(index);
+                if (index < instruction.parameterTypes.size() &&
+                    opSlot.primitive == semantic::PrimitiveType::Null) {
+                    if (instruction.parameterTypes[index] == semantic::PrimitiveType::Object) {
+                        return "runtime::Value{runtime::NullObject{}}";
+                    }
+                    if (instruction.parameterTypes[index] == semantic::PrimitiveType::Array) {
+                        return "runtime::Value{runtime::NullArray{}}";
+                    }
+                }
+                return operand(index);
+            };
+            const auto emitRetainRegResult = [&](const std::string& indent = "            ") {
+                if (instruction.result < 0) return;
+                const auto rIdx = static_cast<std::size_t>(instruction.result);
+                if (rIdx >= regGuardSlot.size() ||
+                    regGuardSlot[rIdx] == std::numeric_limits<std::size_t>::max()) {
+                    return;
+                }
+                source.line(indent + "if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
+                source.line(indent + "    aot::retainTypedGcSlot(context.rawHeap(), typedLocalGcGuards[" +
+                    std::to_string(regGuardSlot[rIdx]) + "], " + result + ");");
+                source.line(indent + "}");
+            };
             switch (instruction.opcode) {
             case mir::Opcode::Parameter: {
                 const auto index = static_cast<std::size_t>(
@@ -2210,7 +2435,13 @@ void emitTypedPrimitiveFunction(
                 }
                 break;
             case mir::Opcode::ConstantNull:
-                source.line("            " + result + " = runtime::Value{std::monostate{}};");
+                if (instruction.resultType == semantic::PrimitiveType::Object) {
+                    source.line("            " + result + " = runtime::Value{runtime::NullObject{}};");
+                } else if (instruction.resultType == semantic::PrimitiveType::Array) {
+                    source.line("            " + result + " = runtime::Value{runtime::NullArray{}};");
+                } else {
+                    source.line("            " + result + " = runtime::Value{std::monostate{}};");
+                }
                 break;
             case mir::Opcode::ConvertNullToObject:
                 source.line("            " + result + " = runtime::Value{runtime::NullObject{}};");
@@ -2218,29 +2449,76 @@ void emitTypedPrimitiveFunction(
             case mir::Opcode::ConvertNullToArray:
                 source.line("            " + result + " = runtime::Value{runtime::NullArray{}};");
                 break;
+            case mir::Opcode::NewObject: {
+                const auto objTid = instruction.resultTypeId != 0
+                    ? instruction.resultTypeId
+                    : instruction.typeId;
+                source.line("            if (!context.newObject(0x" +
+                    hexId(objTid) + "ULL, " + result +
+                    ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                emitRetainRegResult();
+                break;
+            }
+            case mir::Opcode::IsType:
+                source.line("            if (!context.isTypeObjectFast(" + operand(0) +
+                    ", 0x" + hexId(instruction.elementTypeId) + "ULL, " + result +
+                    ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                break;
+            case mir::Opcode::AsType:
+                source.line("            if (!context.asTypeObjectFast(" + operand(0) +
+                    ", 0x" + hexId(instruction.elementTypeId) + "ULL, " + result +
+                    ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                emitRetainRegResult();
+                break;
             case mir::Opcode::CheckNotNull:
-                source.line("            if (!context.checkNotNull(0x" +
+                source.line("            if (!context.checkNotNullFast(0x" +
                     hexId(instruction.typeId) + "ULL, " + operand(0) + ", " +
-                    result + ")) { if constexpr (DeterminismAccounting) determinismAccounting.flush(); return false; }");
+                    result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                emitRetainRegResult();
                 break;
             case mir::Opcode::LoadField: {
-                const auto tmpField = "typedField_" + std::to_string(instructionIndex);
-                source.line("            runtime::Value " + tmpField + ";");
-                source.line("            if (!context.loadField(0x" +
-                    hexId(instruction.typeId) + "ULL, " +
-                    std::to_string(instruction.fieldIndex) + "u, " + operand(0) +
-                    ", " + tmpField + ") || !aot::typedUnboxScalar(" +
-                    primitiveExpression(instruction.resultType) + ", " + tmpField +
-                    ", " + result + ")) { if constexpr (DeterminismAccounting) determinismAccounting.flush(); return false; }");
+                if (instruction.resultType == semantic::PrimitiveType::Int) {
+                    source.line("            if (!context.loadFieldInt64Fast(0x" +
+                        hexId(instruction.typeId) + "ULL, " +
+                        std::to_string(instruction.fieldIndex) + "u, " + operand(0) +
+                        ", " + result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                } else if (instruction.resultType == semantic::PrimitiveType::Object) {
+                    source.line("            if (!context.loadFieldObjectFast(0x" +
+                        hexId(instruction.typeId) + "ULL, " +
+                        std::to_string(instruction.fieldIndex) + "u, 0x" +
+                        hexId(instruction.resultTypeId) + "ULL, " + operand(0) +
+                        ", " + result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                    emitRetainRegResult();
+                } else {
+                    const auto tmpField = "typedField_" + std::to_string(instructionIndex);
+                    source.line("            runtime::Value " + tmpField + ";");
+                    source.line("            if (!context.loadField(0x" +
+                        hexId(instruction.typeId) + "ULL, " +
+                        std::to_string(instruction.fieldIndex) + "u, " + operand(0) +
+                        ", " + tmpField + ") || !aot::typedUnboxScalar(" +
+                        primitiveExpression(instruction.resultType) + ", " + tmpField +
+                        ", " + result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                    if (instruction.resultType == semantic::PrimitiveType::Object ||
+                        instruction.resultType == semantic::PrimitiveType::Array) {
+                        emitRetainRegResult();
+                    }
+                }
                 break;
             }
             case mir::Opcode::StoreField: {
                 const auto valSlot = operandSlot(1);
-                source.line("            if (!context.storeField(0x" +
-                    hexId(instruction.typeId) + "ULL, " +
-                    std::to_string(instruction.fieldIndex) + "u, " + operand(0) +
-                    ", aot::typedBoxScalar(" + primitiveExpression(valSlot.primitive) +
-                    ", " + operand(1) + "))) { if constexpr (DeterminismAccounting) determinismAccounting.flush(); return false; }");
+                if (valSlot.primitive == semantic::PrimitiveType::Int) {
+                    source.line("            if (!context.storeFieldInt64Fast(0x" +
+                        hexId(instruction.typeId) + "ULL, " +
+                        std::to_string(instruction.fieldIndex) + "u, " + operand(0) +
+                        ", " + operand(1) + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                } else {
+                    source.line("            if (!context.storeField(0x" +
+                        hexId(instruction.typeId) + "ULL, " +
+                        std::to_string(instruction.fieldIndex) + "u, " + operand(0) +
+                        ", aot::typedBoxScalar(" + primitiveExpression(valSlot.primitive) +
+                        ", " + operand(1) + "))) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                }
                 break;
             }
             case mir::Opcode::NewArray: {
@@ -2250,11 +2528,7 @@ void emitTypedPrimitiveFunction(
                     hexId(instruction.elementTypeId) + "ULL, runtime::Value{" +
                     operand(0) + "}, " + result +
                     ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
-                source.line("            if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
-                source.line("                if (context.heap() != nullptr && std::holds_alternative<runtime::ObjectRef>(" + result + ")) {");
-                source.line("                    typedLocalGcGuards.push_back(context.heap()->retain(" + result + "));");
-                source.line("                }");
-                source.line("            }");
+                emitRetainRegResult();
                 break;
             }
             case mir::Opcode::ArrayLength: {
@@ -2303,6 +2577,13 @@ void emitTypedPrimitiveFunction(
                             ") || !aot::typedUnboxScalar(semantic::PrimitiveType::Struct, " + tmpElem +
                             ", " + result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
                     }
+                } else if (instruction.elementType == semantic::PrimitiveType::Object &&
+                           instruction.resultType == semantic::PrimitiveType::Object) {
+                    source.line("            if (!context.loadElementObjectFast(0x" +
+                        hexId(instruction.elementTypeId) + "ULL, " + operand(0) +
+                        ", " + operand(1) + ", " + result +
+                        ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                    emitRetainRegResult();
                 } else {
                     const auto tmpElem = "typedElem_" + std::to_string(instructionIndex);
                     source.line("            runtime::Value " + tmpElem + ";");
@@ -2313,6 +2594,10 @@ void emitTypedPrimitiveFunction(
                         ") || !aot::typedUnboxScalar(" +
                         primitiveExpression(instruction.resultType) + ", " + tmpElem +
                         ", " + result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                    if (instruction.resultType == semantic::PrimitiveType::Array ||
+                        instruction.resultType == semantic::PrimitiveType::Object) {
+                        emitRetainRegResult();
+                    }
                 }
                 break;
             }
@@ -2373,10 +2658,28 @@ void emitTypedPrimitiveFunction(
                 source.line("            " + result + " = " +
                     typedLocalExpression(instruction.localIndex) + ";");
                 break;
-            case mir::Opcode::StoreLocal:
+            case mir::Opcode::StoreLocal: {
+                const auto srcSlot = operandSlot(0);
+                std::string rhsExpr = operand(0);
+                if (instruction.localIndex < function.localTypes.size() &&
+                    srcSlot.primitive == semantic::PrimitiveType::Null) {
+                    if (function.localTypes[instruction.localIndex] == semantic::PrimitiveType::Object) {
+                        rhsExpr = "runtime::Value{runtime::NullObject{}}";
+                    } else if (function.localTypes[instruction.localIndex] == semantic::PrimitiveType::Array) {
+                        rhsExpr = "runtime::Value{runtime::NullArray{}}";
+                    }
+                }
                 source.line("            " +
                     typedLocalExpression(instruction.localIndex) + " = " +
-                    operand(0) + ";");
+                    rhsExpr + ";");
+                if (instruction.localIndex < localGuardSlot.size() &&
+                    localGuardSlot[instruction.localIndex] != std::numeric_limits<std::size_t>::max()) {
+                    source.line("            if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
+                    source.line("                aot::retainTypedGcSlot(context.rawHeap(), typedLocalGcGuards[" +
+                        std::to_string(localGuardSlot[instruction.localIndex]) + "], " +
+                        typedLocalExpression(instruction.localIndex) + ");");
+                    source.line("            }");
+                }
                 if (instruction.localIndex < function.localTypes.size() &&
                     function.localTypes[instruction.localIndex] == semantic::PrimitiveType::Array) {
                     const auto elemTypeIt = arrayLocalStructElemType.find(instruction.localIndex);
@@ -2397,6 +2700,7 @@ void emitTypedPrimitiveFunction(
                     }
                 }
                 break;
+            }
             case mir::Opcode::ConvertIntToLong:
                 source.line("            " + result +
                     " = static_cast<std::int64_t>(" + operand(0) + ");");
@@ -2667,8 +2971,196 @@ void emitTypedPrimitiveFunction(
                 source.line("                rawAccounting.suspendBeforeCall();");
                 source.line("                determinismAccounting.suspendBeforeCall();");
                 source.line("            }");
-                const auto targetIt = typedFunctions.find(instruction.symbolId);
-                if (targetIt != typedFunctions.end()) {
+                const bool isPolyCall = instruction.virtualDispatch || instruction.interfaceDispatch;
+                const auto targetIt = !isPolyCall
+                    ? typedFunctions.find(instruction.symbolId)
+                    : typedFunctions.end();
+                if (isPolyCall && !instruction.operands.empty()) {
+                    const auto callId = callIds.at(&instruction);
+                    std::vector<std::pair<semantic::SymbolId, const FunctionView*>> polyTargets;
+                    const semantic::SymbolId baseRecvTid =
+                        !instruction.parameterTypeIds.empty() ? instruction.parameterTypeIds[0] : 0;
+                    for (const auto& [candTid, tView] : allTypes) {
+                        if (!tView.type ||
+                            tView.type->kind != semantic::TypeKind::Class ||
+                            tView.type->abstractType ||
+                            tView.type->interfaceType) {
+                            continue;
+                        }
+                        semantic::SymbolId resolvedSym = 0;
+                        if (instruction.virtualDispatch) {
+                            if (baseRecvTid != 0 && !aotTypeAssignable(candTid, baseRecvTid, allTypes)) {
+                                continue;
+                            }
+                            if (instruction.virtualSlot < tView.type->virtualDispatchTable.size()) {
+                                resolvedSym = tView.type->virtualDispatchTable[instruction.virtualSlot];
+                            }
+                        } else if (instruction.interfaceDispatch) {
+                            for (const auto& imap : tView.type->interfaceDispatchMaps) {
+                                if (imap.interfaceTypeId == instruction.interfaceTypeId) {
+                                    if (instruction.interfaceSlot < imap.slots.size()) {
+                                        resolvedSym = imap.slots[instruction.interfaceSlot];
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        if (resolvedSym == 0) continue;
+                        const auto tfIt = typedFunctions.find(resolvedSym);
+                        if (tfIt == typedFunctions.end()) continue;
+                        const auto* candFn = tfIt->second->function;
+                        if (candFn->parameterTypes.size() != instruction.operands.size() ||
+                            candFn->returnType != instruction.resultType) {
+                            continue;
+                        }
+                        bool sigCompatible = true;
+                        for (std::size_t aIdx = 0; aIdx < instruction.operands.size(); ++aIdx) {
+                            const auto cTid = aIdx < candFn->parameterTypeIds.size()
+                                ? candFn->parameterTypeIds[aIdx]
+                                : 0;
+                            const auto opSlot = operandSlot(aIdx);
+                            if (aIdx >= instruction.parameterTypes.size() ||
+                                candFn->parameterTypes[aIdx] != instruction.parameterTypes[aIdx]) {
+                                sigCompatible = false;
+                                break;
+                            }
+                            if (candFn->parameterTypes[aIdx] == semantic::PrimitiveType::Object) {
+                                if (opSlot.primitive != semantic::PrimitiveType::Null &&
+                                    (opSlot.primitive != semantic::PrimitiveType::Object ||
+                                     (aIdx > 0 && cTid != 0 &&
+                                      !aotTypeAssignable(opSlot.typeId, cTid, allTypes)))) {
+                                    sigCompatible = false;
+                                    break;
+                                }
+                            } else if (typedCppType({candFn->parameterTypes[aIdx], cTid}) !=
+                                       typedCppType(opSlot)) {
+                                sigCompatible = false;
+                                break;
+                            }
+                        }
+                        if (instruction.resultType != semantic::PrimitiveType::Void &&
+                            typedCppType({candFn->returnType, candFn->returnTypeId}) !=
+                                typedCppType({instruction.resultType, instruction.resultTypeId})) {
+                            sigCompatible = false;
+                        }
+                        if (sigCompatible) {
+                            polyTargets.emplace_back(candTid, tfIt->second);
+                        }
+                    }
+
+                    source.line("            if (RS_AOT_UNLIKELY(std::holds_alternative<runtime::NullObject>(" + callOperandExpr(0) + "))) {");
+                    source.line("                if constexpr (!TrustedRelease) {");
+                    source.line("                    rawAccounting.resumeAfterCall();");
+                    source.line("                    determinismAccounting.resumeAfterCall();");
+                    source.line("                }");
+                    source.line("                return typedFail(runtime::ErrorCode::NullReference, \"" +
+                        std::string(instruction.virtualDispatch
+                            ? "AOT virtual call attempted to dereference null"
+                            : "AOT interface call attempted to dereference null") + "\");");
+                    source.line("            }");
+                    source.line("            const semantic::SymbolId polyActualTid_" + suffix +
+                        " = context.objectTypeIdFast(" + callOperandExpr(0) + ");");
+                    source.line("            bool polyDispatched_" + suffix + " = false;");
+                    source.line("            bool polyCallOk_" + suffix + " = false;");
+                    if (instruction.resultType != semantic::PrimitiveType::Void) {
+                        const TypedSlotType retSlot{instruction.resultType, instruction.resultTypeId};
+                        source.line("            " + typedCppType(retSlot) + " polyCallRes_" + suffix + "{};");
+                    }
+                    if (!polyTargets.empty()) {
+                        source.line("            switch (polyActualTid_" + suffix + ") {");
+                        for (const auto& [candTid, calleeView] : polyTargets) {
+                            source.line("            case 0x" + hexId(candTid) + "ULL: {");
+                            source.line("                polyDispatched_" + suffix + " = true;");
+                            source.line("                semantic::SymbolId prevFn_" + suffix + " = 0;");
+                            source.line("                (void)prevFn_" + suffix + ";");
+                            source.line("                if (!context.enterTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>(0x" +
+                                hexId(calleeView->function->symbolId) + "ULL, \"" +
+                                escapeCppString(calleeView->qualifiedName) + "\", prevFn_" + suffix + ", typedActiveGenLine)) {");
+                            source.line("                    if constexpr (!TrustedRelease) {");
+                            source.line("                        rawAccounting.resumeAfterCall();");
+                            source.line("                        determinismAccounting.resumeAfterCall();");
+                            source.line("                    }");
+                            source.line("                    return false;");
+                            source.line("                }");
+                            std::string callArgs = "context";
+                            for (std::size_t argIndex = 0; argIndex < instruction.operands.size(); ++argIndex) {
+                                callArgs += ", " + callOperandExpr(argIndex);
+                            }
+                            if (instruction.resultType != semantic::PrimitiveType::Void) {
+                                callArgs += ", polyCallRes_" + suffix;
+                            }
+                            source.line("                polyCallOk_" + suffix + " = " + calleeView->cppName +
+                                "_scalar<FastAccounting, DeterminismAccounting, TrustedRelease>(" + callArgs + ");");
+                            if (instruction.resultType != semantic::PrimitiveType::Void) {
+                                source.line("                context.exitTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>(prevFn_" +
+                                    suffix + ", polyCallOk_" + suffix +
+                                    ", [&]() { return aot::typedBoxScalar(" +
+                                    primitiveExpression(instruction.resultType) +
+                                    ", polyCallRes_" + suffix + "); });");
+                            } else {
+                                source.line("                context.exitTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>(prevFn_" +
+                                    suffix + ", polyCallOk_" + suffix +
+                                    ", []() { return runtime::Value{std::monostate{}}; });");
+                            }
+                            source.line("                break;");
+                            source.line("            }");
+                        }
+                        source.line("            default: break;");
+                        source.line("            }");
+                    }
+                    source.line("            if (RS_AOT_UNLIKELY(!polyDispatched_" + suffix + ")) {");
+                    std::string argPtr = "nullptr";
+                    if (!instruction.operands.empty()) {
+                        source.line("                std::array<runtime::Value, " +
+                            std::to_string(instruction.operands.size()) +
+                            "> bridgeArgs_" + suffix + "{{");
+                        for (std::size_t argIndex = 0; argIndex < instruction.operands.size(); ++argIndex) {
+                            const auto argSlot = operandSlot(argIndex);
+                            const auto boxPrim = (argIndex < instruction.parameterTypes.size() &&
+                                                  argSlot.primitive == semantic::PrimitiveType::Null)
+                                ? instruction.parameterTypes[argIndex]
+                                : argSlot.primitive;
+                            source.line("                    aot::typedBoxScalar(" +
+                                primitiveExpression(boxPrim) + ", " +
+                                callOperandExpr(argIndex) + "),");
+                        }
+                        source.line("                }};");
+                        argPtr = "bridgeArgs_" + suffix + ".data()";
+                    }
+                    source.line("                context.setActiveGeneratedLine(typedActiveGenLine);");
+                    source.line("                runtime::Value bridgeRes_" + suffix + ";");
+                    source.line("                polyCallOk_" + suffix +
+                        " = context.call(call_" + std::to_string(callId) +
+                        "_signature, " + argPtr + ", " +
+                        std::to_string(instruction.operands.size()) +
+                        "u, bridgeRes_" + suffix + ");");
+                    if (instruction.resultType != semantic::PrimitiveType::Void) {
+                        source.line("                if (polyCallOk_" + suffix +
+                            " && !aot::typedUnboxScalar(" +
+                            primitiveExpression(instruction.resultType) +
+                            ", bridgeRes_" + suffix + ", polyCallRes_" + suffix + ")) {");
+                        source.line("                    if constexpr (!TrustedRelease) {");
+                        source.line("                        rawAccounting.resumeAfterCall();");
+                        source.line("                        determinismAccounting.resumeAfterCall();");
+                        source.line("                    }");
+                        source.line("                    return typedFail(runtime::ErrorCode::TypeMismatch, \"AOT call return type mismatch\");");
+                        source.line("                }");
+                    }
+                    source.line("            }");
+                    source.line("            if constexpr (!TrustedRelease) {");
+                    source.line("                rawAccounting.resumeAfterCall();");
+                    source.line("                determinismAccounting.resumeAfterCall();");
+                    source.line("            }");
+                    source.line("            if (!polyCallOk_" + suffix + ") return false;");
+                    if (instruction.result >= 0 &&
+                        instruction.resultType != semantic::PrimitiveType::Void) {
+                        source.line("            " + result + " = polyCallRes_" + suffix + ";");
+                        if (instruction.resultType == semantic::PrimitiveType::Array ||
+                            instruction.resultType == semantic::PrimitiveType::Object) {
+                            emitRetainRegResult();
+                        }
+                    }
+                } else if (targetIt != typedFunctions.end()) {
                     const auto* calleeView = targetIt->second;
                     source.line("            semantic::SymbolId prevFn_" + suffix + " = 0;");
                     source.line("            (void)prevFn_" + suffix + ";");
@@ -2683,7 +3175,7 @@ void emitTypedPrimitiveFunction(
                     source.line("            }");
                     std::string callArgs = "context";
                     for (std::size_t argIndex = 0; argIndex < instruction.operands.size(); ++argIndex) {
-                        callArgs += ", " + operand(argIndex);
+                        callArgs += ", " + callOperandExpr(argIndex);
                     }
                     if (instruction.resultType != semantic::PrimitiveType::Void) {
                         const TypedSlotType retSlot{
@@ -2717,6 +3209,10 @@ void emitTypedPrimitiveFunction(
                     if (instruction.result >= 0 &&
                         instruction.resultType != semantic::PrimitiveType::Void) {
                         source.line("            " + result + " = directCallRes_" + suffix + ";");
+                        if (instruction.resultType == semantic::PrimitiveType::Array ||
+                            instruction.resultType == semantic::PrimitiveType::Object) {
+                            emitRetainRegResult();
+                        }
                     }
                 } else {
                     const auto callId = callIds.at(&instruction);
@@ -2787,11 +3283,7 @@ void emitTypedPrimitiveFunction(
                         source.line("            }");
                         source.line("            if (!colOk_" + suffix + ") return false;");
                         if (!options.trustedRelease) {
-                            source.line("            if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
-                            source.line("                if (context.heap() != nullptr && std::holds_alternative<runtime::ObjectRef>(" + result + ")) {");
-                            source.line("                    typedLocalGcGuards.push_back(context.heap()->retain(" + result + "));");
-                            source.line("                }");
-                            source.line("            }");
+                            emitRetainRegResult();
                         }
                     } else {
                         std::string argPtr = "nullptr";
@@ -2801,9 +3293,13 @@ void emitTypedPrimitiveFunction(
                                 "> bridgeArgs_" + suffix + "{{");
                             for (std::size_t argIndex = 0; argIndex < instruction.operands.size(); ++argIndex) {
                                 const auto argSlot = operandSlot(argIndex);
+                                const auto boxPrim = (argIndex < instruction.parameterTypes.size() &&
+                                                      argSlot.primitive == semantic::PrimitiveType::Null)
+                                    ? instruction.parameterTypes[argIndex]
+                                    : argSlot.primitive;
                                 source.line("                aot::typedBoxScalar(" +
-                                    primitiveExpression(argSlot.primitive) + ", " +
-                                    operand(argIndex) + "),");
+                                    primitiveExpression(boxPrim) + ", " +
+                                    callOperandExpr(argIndex) + "),");
                             }
                             source.line("            }};");
                             argPtr = "bridgeArgs_" + suffix + ".data()";
@@ -2829,13 +3325,311 @@ void emitTypedPrimitiveFunction(
                                 "\"AOT call return type mismatch\");");
                             if (instruction.resultType == semantic::PrimitiveType::Array ||
                                 instruction.resultType == semantic::PrimitiveType::Object) {
-                                source.line("            if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
-                                source.line("                if (context.heap() != nullptr && std::holds_alternative<runtime::ObjectRef>(" + result + ")) {");
-                                source.line("                    typedLocalGcGuards.push_back(context.heap()->retain(" + result + "));");
-                                source.line("                }");
-                                source.line("            }");
+                                emitRetainRegResult();
                             }
                         }
+                    }
+                }
+                break;
+            }
+            case mir::Opcode::NewDelegate: {
+                const auto callId = callIds.at(&instruction);
+                if (instruction.operands.empty()) {
+                    source.line("            if (!context.newDelegate(0x" +
+                        hexId(instruction.typeId) + "ULL, call_" +
+                        std::to_string(callId) + "_signature, nullptr, 0u, " +
+                        result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                } else if (operandSlot(0).primitive == semantic::PrimitiveType::Null) {
+                    const auto nullTmp = "delNullTarget_" + std::to_string(instructionIndex);
+                    source.line("            const runtime::Value " + nullTmp + "{runtime::NullObject{}};");
+                    source.line("            if (!context.newDelegate(0x" +
+                        hexId(instruction.typeId) + "ULL, call_" +
+                        std::to_string(callId) + "_signature, &" + nullTmp +
+                        ", 1u, " + result +
+                        ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                } else {
+                    source.line("            if (!context.newDelegate(0x" +
+                        hexId(instruction.typeId) + "ULL, call_" +
+                        std::to_string(callId) + "_signature, &" + operand(0) +
+                        ", 1u, " + result +
+                        ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                }
+                emitRetainRegResult();
+                break;
+            }
+            case mir::Opcode::CombineDelegate:
+            case mir::Opcode::RemoveDelegate: {
+                const auto leftExpr = (operandSlot(0).primitive == semantic::PrimitiveType::Null)
+                    ? std::string("runtime::Value{runtime::NullObject{}}")
+                    : operand(0);
+                const auto rightExpr = (operandSlot(1).primitive == semantic::PrimitiveType::Null)
+                    ? std::string("runtime::Value{runtime::NullObject{}}")
+                    : operand(1);
+                source.line("            if (!context.combineDelegates(0x" +
+                    hexId(instruction.typeId) + "ULL, " + leftExpr + ", " +
+                    rightExpr + ", " +
+                    (instruction.opcode == mir::Opcode::RemoveDelegate ? "true" : "false") +
+                    ", " + result +
+                    ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                emitRetainRegResult();
+                break;
+            }
+            case mir::Opcode::InvokeDelegate: {
+                const auto callIdx = typedCallSiteCounter++;
+                const auto suffix = std::to_string(callIdx);
+                const std::size_t userArgCount = instruction.operands.size() - 1u;
+
+                const semantic::FunctionSymbol* invokeSym = nullptr;
+                if (const auto dtIt = allTypes.find(instruction.typeId);
+                    dtIt != allTypes.end() && dtIt->second.type && dtIt->second.type->delegateType) {
+                    for (const auto& m : dtIt->second.type->methods) {
+                        if (m.name == "Invoke") {
+                            invokeSym = &m;
+                            break;
+                        }
+                    }
+                }
+
+                const auto delegateArgSlot = [&](std::size_t k) -> TypedSlotType {
+                    const auto opSlot = operandSlot(k + 1u);
+                    if (opSlot.primitive != semantic::PrimitiveType::Null) {
+                        return opSlot;
+                    }
+                    if (invokeSym && (k + 1u) < invokeSym->parameters.size()) {
+                        const auto& param = invokeSym->parameters[k + 1u];
+                        const auto pt = semantic::storageTypeOf(param);
+                        const auto ptId = exactTypeId(pt, semantic::storageTypeNameOf(param));
+                        return TypedSlotType{pt, ptId};
+                    }
+                    return opSlot;
+                };
+
+                const auto matchesCandidateParam = [&](semantic::PrimitiveType cPt,
+                                                       semantic::SymbolId cTid,
+                                                       std::size_t k) -> bool {
+                    const auto opSlot = operandSlot(k + 1u);
+                    const auto expSlot = delegateArgSlot(k);
+                    if (cPt != expSlot.primitive) return false;
+                    if (cPt == semantic::PrimitiveType::Object) {
+                        if (opSlot.primitive == semantic::PrimitiveType::Null) {
+                            return cTid == 0 || expSlot.typeId == 0 ||
+                                   aotTypeAssignable(expSlot.typeId, cTid, allTypes);
+                        }
+                        return cTid == 0 || aotTypeAssignable(opSlot.typeId, cTid, allTypes);
+                    }
+                    if (cPt == semantic::PrimitiveType::Array) {
+                        if (opSlot.primitive == semantic::PrimitiveType::Null) {
+                            return cTid == 0 || expSlot.typeId == cTid;
+                        }
+                        return cTid == 0 || opSlot.typeId == cTid;
+                    }
+                    return opSlot.primitive == cPt && opSlot.typeId == cTid;
+                };
+
+                struct DelegateScalarCandidate {
+                    semantic::SymbolId symbolId = 0;
+                    const FunctionView* view = nullptr;
+                    bool expectsReceiver = false;
+                    semantic::SymbolId recvTypeId = 0;
+                };
+                std::vector<DelegateScalarCandidate> delCandidates;
+                for (const auto& [candSym, candView] : typedFunctions) {
+                    const auto* candFn = candView->function;
+                    if (candFn->returnType != instruction.resultType) continue;
+                    if (instruction.resultType != semantic::PrimitiveType::Void) {
+                        if (instruction.resultType == semantic::PrimitiveType::Object) {
+                            if (instruction.resultTypeId != 0 &&
+                                !aotTypeAssignable(candFn->returnTypeId, instruction.resultTypeId, allTypes)) {
+                                continue;
+                            }
+                        } else if (candFn->returnTypeId != instruction.resultTypeId) {
+                            continue;
+                        }
+                        if (typedCppType({candFn->returnType, candFn->returnTypeId}) !=
+                            typedCppType({instruction.resultType, instruction.resultTypeId})) {
+                            continue;
+                        }
+                    }
+                    if (candFn->parameterTypes.size() == userArgCount) {
+                        bool match = true;
+                        for (std::size_t k = 0; k < userArgCount; ++k) {
+                            const auto cTid = k < candFn->parameterTypeIds.size() ? candFn->parameterTypeIds[k] : 0;
+                            if (!matchesCandidateParam(candFn->parameterTypes[k], cTid, k)) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) {
+                            delCandidates.push_back({candSym, candView, false, 0});
+                        }
+                    } else if (candFn->parameterTypes.size() == userArgCount + 1u &&
+                               candFn->parameterTypes[0] == semantic::PrimitiveType::Object) {
+                        bool match = true;
+                        for (std::size_t k = 0; k < userArgCount; ++k) {
+                            const auto cTid = (k + 1u) < candFn->parameterTypeIds.size()
+                                ? candFn->parameterTypeIds[k + 1u]
+                                : 0;
+                            if (!matchesCandidateParam(candFn->parameterTypes[k + 1u], cTid, k)) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) {
+                            const auto recvTid = !candFn->parameterTypeIds.empty()
+                                ? candFn->parameterTypeIds[0]
+                                : 0;
+                            delCandidates.push_back({candSym, candView, true, recvTid});
+                        }
+                    }
+                }
+                std::sort(
+                    delCandidates.begin(),
+                    delCandidates.end(),
+                    [](const DelegateScalarCandidate& a, const DelegateScalarCandidate& b) {
+                        return a.symbolId < b.symbolId;
+                    });
+
+                source.line("            if constexpr (!TrustedRelease) {");
+                source.line("                rawAccounting.suspendBeforeCall();");
+                source.line("                determinismAccounting.suspendBeforeCall();");
+                source.line("                context.setActiveGeneratedLine(typedActiveGenLine);");
+                source.line("            }");
+                if (instruction.resultType != semantic::PrimitiveType::Void) {
+                    const TypedSlotType retSlot{instruction.resultType, instruction.resultTypeId};
+                    source.line("            " + typedCppType(retSlot) + " delCallRes_" + suffix + "{};");
+                }
+                source.line("            auto invokeDelLeaf_" + suffix + " = [&](const aot::ResolvedAotDelegateLeaf& leaf) -> bool {");
+                if (!delCandidates.empty()) {
+                    source.line("                switch (leaf.targetSymbolId) {");
+                    for (const auto& cand : delCandidates) {
+                        source.line("                case 0x" + hexId(cand.symbolId) + "ULL: {");
+                        std::string recvGuard = cand.expectsReceiver ? "leaf.hasReceiver" : "!leaf.hasReceiver";
+                        if (cand.expectsReceiver && cand.recvTypeId != 0) {
+                            const auto rHex = "0x" + hexId(cand.recvTypeId) + "ULL";
+                            recvGuard += " && (leaf.receiver.rawTag() == runtime::ValueTag::NullObject || "
+                                "(leaf.receiver.rawTag() == runtime::ValueTag::ObjectRef && context.rawHeap() != nullptr && "
+                                "(context.rawHeap()->objectTypeIdFast(leaf.receiver.asObjectRefUnchecked()) == " + rHex +
+                                " || context.isAssignable(context.rawHeap()->objectTypeIdFast(leaf.receiver.asObjectRefUnchecked()), " + rHex + "))))";
+                        }
+                        source.line("                    if (RS_AOT_LIKELY(" + recvGuard + ")) {");
+                        source.line("                        semantic::SymbolId prevFn_" + suffix + " = 0;");
+                        source.line("                        (void)prevFn_" + suffix + ";");
+                        source.line("                        if (!context.enterTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>(0x" +
+                            hexId(cand.symbolId) + "ULL, \"" +
+                            escapeCppString(cand.view->qualifiedName) + "\", prevFn_" + suffix + ", typedActiveGenLine)) {");
+                        source.line("                            return false;");
+                        source.line("                        }");
+                        std::string callArgs = "context";
+                        if (cand.expectsReceiver) {
+                            callArgs += ", leaf.receiver";
+                        }
+                        const std::size_t bias = cand.expectsReceiver ? 1u : 0u;
+                        for (std::size_t k = 0; k < userArgCount; ++k) {
+                            const auto opSlot = operandSlot(k + 1u);
+                            const auto cPt = cand.view->function->parameterTypes[k + bias];
+                            if (opSlot.primitive == semantic::PrimitiveType::Null &&
+                                cPt == semantic::PrimitiveType::Object) {
+                                callArgs += ", runtime::Value{runtime::NullObject{}}";
+                            } else if (opSlot.primitive == semantic::PrimitiveType::Null &&
+                                       cPt == semantic::PrimitiveType::Array) {
+                                callArgs += ", runtime::Value{runtime::NullArray{}}";
+                            } else {
+                                callArgs += ", " + operand(k + 1u);
+                            }
+                        }
+                        if (instruction.resultType != semantic::PrimitiveType::Void) {
+                            callArgs += ", delCallRes_" + suffix;
+                        }
+                        source.line("                        const bool leafOk = " + cand.view->cppName +
+                            "_scalar<FastAccounting, DeterminismAccounting, TrustedRelease>(" + callArgs + ");");
+                        if (instruction.resultType != semantic::PrimitiveType::Void) {
+                            source.line("                        context.exitTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>(prevFn_" +
+                                suffix + ", leafOk, [&]() { return aot::typedBoxScalar(" +
+                                primitiveExpression(instruction.resultType) + ", delCallRes_" + suffix + "); });");
+                        } else {
+                            source.line("                        context.exitTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>(prevFn_" +
+                                suffix + ", leafOk, []() { return runtime::Value{std::monostate{}}; });");
+                        }
+                        source.line("                        return leafOk;");
+                        source.line("                    }");
+                        source.line("                    break;");
+                        source.line("                }");
+                    }
+                    source.line("                default: break;");
+                    source.line("                }");
+                }
+                source.line("                if (RS_AOT_UNLIKELY(!context.hasFunction(leaf.targetSymbolId))) {");
+                source.line("                    return context.fail(runtime::ErrorCode::InvalidProgram, \"AOT delegate target function is unavailable\", typedActiveGenLine);");
+                source.line("                }");
+                source.line("                std::array<runtime::Value, " + std::to_string(userArgCount + 1u) + "> boxedDelArgs{};");
+                source.line("                std::size_t boxedCount = 0;");
+                source.line("                if (leaf.hasReceiver) boxedDelArgs[boxedCount++] = leaf.receiver;");
+                for (std::size_t k = 0; k < userArgCount; ++k) {
+                    const auto argSlot = operandSlot(k + 1u);
+                    const auto boxPrim = delegateArgSlot(k).primitive;
+                    if (argSlot.primitive == semantic::PrimitiveType::Struct &&
+                        classifyInlineMath(argSlot.primitive, argSlot.typeId) == InlineMathKind::None) {
+                        source.line("                boxedDelArgs[boxedCount++] = " + operand(k + 1u) + ".boxToValue();");
+                    } else {
+                        source.line("                boxedDelArgs[boxedCount++] = aot::typedBoxScalar(" +
+                            primitiveExpression(boxPrim) + ", " + operand(k + 1u) + ");");
+                    }
+                }
+                source.line("                context.setActiveGeneratedLine(typedActiveGenLine);");
+                source.line("                runtime::Value boxedDelRes;");
+                source.line("                if (!context.invoke(leaf.targetSymbolId, boxedCount == 0 ? nullptr : boxedDelArgs.data(), boxedCount, boxedDelRes)) {");
+                source.line("                    return false;");
+                source.line("                }");
+                if (instruction.resultType != semantic::PrimitiveType::Void) {
+                    source.line("                if (!aot::typedUnboxScalar(" +
+                        primitiveExpression(instruction.resultType) + ", boxedDelRes, delCallRes_" + suffix + ")) {");
+                    source.line("                    return context.fail(runtime::ErrorCode::TypeMismatch, \"AOT delegate return type mismatch\", typedActiveGenLine);");
+                    source.line("                }");
+                }
+                source.line("                return true;");
+                source.line("            };");
+
+                const auto invokeDelOpId = std::to_string(
+                    runtime::determinismOperationId("invoke.delegate")) + "ULL";
+                source.line("            aot::ResolvedAotDelegateLeaf singleLeaf_" + suffix + "{};");
+                source.line("            const int delKind_" + suffix + " = context.inspectSingleOrMulticastDelegate(0x" +
+                    hexId(instruction.typeId) + "ULL, " + operand(0) + ", singleLeaf_" + suffix + ");");
+                source.line("            bool delCallOk_" + suffix + " = false;");
+                source.line("            if (RS_AOT_LIKELY(delKind_" + suffix + " == 1)) {");
+                source.line("                delCallOk_" + suffix + " = invokeDelLeaf_" + suffix + "(singleLeaf_" + suffix + ");");
+                source.line("            } else if (delKind_" + suffix + " == 2) {");
+                source.line("                std::vector<aot::ResolvedAotDelegateLeaf> mcFallback_" + suffix + ";");
+                source.line("                std::size_t mcCount_" + suffix + " = 0;");
+                source.line("                const auto* mcLeaves_" + suffix + " = context.acquireMulticastLeavesFast(0x" +
+                    hexId(instruction.typeId) + "ULL, " + operand(0) + ", mcCount_" + suffix + ", mcFallback_" + suffix + ");");
+                source.line("                if (RS_AOT_LIKELY(mcLeaves_" + suffix + " != nullptr)) {");
+                source.line("                    struct McPinGuard { ExecutionContext& ctx; const aot::ResolvedAotDelegateLeaf* ptr; ~McPinGuard() { ctx.releaseMulticastLeavesFast(ptr); } } mcPin_" + suffix + "{context, mcLeaves_" + suffix + "};");
+                source.line("                    delCallOk_" + suffix + " = true;");
+                source.line("                    for (std::size_t mcIdx_" + suffix + " = 0; mcIdx_" + suffix + " < mcCount_" + suffix + "; ++mcIdx_" + suffix + ") {");
+                source.line("                        if constexpr (FastAccounting && !TrustedRelease) {");
+                source.line("                            if (!context.consumeRawTyped(1ULL)) { delCallOk_" + suffix + " = false; break; }");
+                source.line("                        } else if constexpr (DeterminismAccounting && !TrustedRelease) {");
+                source.line("                            determinismAccounting.resumeAfterCall();");
+                source.line("                            if (!determinismAccounting.consume(" + invokeDelOpId + ")) { delCallOk_" + suffix + " = false; break; }");
+                source.line("                            determinismAccounting.suspendBeforeCall();");
+                source.line("                        } else if constexpr (!TrustedRelease) {");
+                source.line("                            if (!context.consume(" + invokeDelOpId + ", \"invoke.delegate\")) { delCallOk_" + suffix + " = false; break; }");
+                source.line("                        }");
+                source.line("                        if (!invokeDelLeaf_" + suffix + "(mcLeaves_" + suffix + "[mcIdx_" + suffix + "])) { delCallOk_" + suffix + " = false; break; }");
+                source.line("                    }");
+                source.line("                }");
+                source.line("            }");
+                source.line("            if constexpr (!TrustedRelease) {");
+                source.line("                rawAccounting.resumeAfterCall();");
+                source.line("                determinismAccounting.resumeAfterCall();");
+                source.line("            }");
+                source.line("            if (!delCallOk_" + suffix + ") return false;");
+                if (instruction.result >= 0 &&
+                    instruction.resultType != semantic::PrimitiveType::Void) {
+                    source.line("            " + result + " = delCallRes_" + suffix + ";");
+                    if (instruction.resultType == semantic::PrimitiveType::Array ||
+                        instruction.resultType == semantic::PrimitiveType::Object) {
+                        emitRetainRegResult();
                     }
                 }
                 break;
@@ -2873,7 +3667,19 @@ void emitTypedPrimitiveFunction(
             emitLineDirective(
                 source, module, resolvedTermPoint, options.emitLineDirectives,
                 &sourceMap, function.symbolId, explicitTermPoint);
-            source.line("            typedOutResult = " + value + ";");
+            const auto retValIdx = static_cast<std::size_t>(block.terminator.value);
+            const auto retValPrim = (block.terminator.value >= 0 && retValIdx < types.size())
+                ? types[retValIdx].primitive
+                : function.returnType;
+            if (retValPrim == semantic::PrimitiveType::Null &&
+                function.returnType == semantic::PrimitiveType::Object) {
+                source.line("            typedOutResult = runtime::Value{runtime::NullObject{}};");
+            } else if (retValPrim == semantic::PrimitiveType::Null &&
+                       function.returnType == semantic::PrimitiveType::Array) {
+                source.line("            typedOutResult = runtime::Value{runtime::NullArray{}};");
+            } else {
+                source.line("            typedOutResult = " + value + ";");
+            }
             source.line("            return true;");
             break;
         }
@@ -2900,9 +3706,21 @@ void emitTypedPrimitiveFunction(
                 for (std::size_t idx = 0;
                      idx < block.terminator.arguments.size() && idx < targetBlock->parameters.size();
                      ++idx) {
+                    const auto paramVal = targetBlock->parameters[idx].value;
                     source.line("            " +
-                        typedValueExpression(targetBlock->parameters[idx].value) +
+                        typedValueExpression(paramVal) +
                         " = typedEdge_" + std::to_string(idx) + ";");
+                    if (paramVal >= 0) {
+                        const auto rIdx = static_cast<std::size_t>(paramVal);
+                        if (rIdx < regGuardSlot.size() &&
+                            regGuardSlot[rIdx] != std::numeric_limits<std::size_t>::max()) {
+                            source.line("            if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
+                            source.line("                aot::retainTypedGcSlot(context.rawHeap(), typedLocalGcGuards[" +
+                                std::to_string(regGuardSlot[rIdx]) + "], " +
+                                typedValueExpression(paramVal) + ");");
+                            source.line("            }");
+                        }
+                    }
                 }
                 source.line("            goto typedBlock_" + std::to_string(block.terminator.target) + ";");
             }
@@ -2916,11 +3734,13 @@ void emitTypedPrimitiveFunction(
             emitGeneratedLineReset(source, options.emitLineDirectives);
             emitTypedTransfer(
                 source, function, block.terminator.target,
-                block.terminator.arguments, "typedTrueEdge", "                ");
+                block.terminator.arguments, "typedTrueEdge", "                ",
+                &regGuardSlot);
             source.line("            } else {");
             emitTypedTransfer(
                 source, function, block.terminator.falseTarget,
-                block.terminator.falseArguments, "typedFalseEdge", "                ");
+                block.terminator.falseArguments, "typedFalseEdge", "                ",
+                &regGuardSlot);
             source.line("            }");
             break;
         case mir::TerminatorKind::Throw:
@@ -3654,7 +4474,7 @@ GeneratedProgram CppGenerator::generate(
         const auto& function = *view.function;
         if (typedFunctions.find(function.symbolId) != typedFunctions.end()) {
             emitTypedPrimitiveFunction(
-                source, view, options, sourceMap, typedFunctions, callIds);
+                source, view, options, sourceMap, typedFunctions, types, callIds);
         } else {
         source.line("static bool " + view.cppName + "(");
         source.line("    ExecutionContext& context,");

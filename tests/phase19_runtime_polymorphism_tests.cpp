@@ -1,5 +1,6 @@
 #include "realscript/syntax/Syntax.h"
 #include "realscript/compiler/Compilation.h"
+#include "realscript/optimization/Optimizer.h"
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/aot_cpp/AotCpp.h"
 #include "realscript/jit/Jit.h"
@@ -1121,6 +1122,177 @@ int main() { Base value = new Base(); return 0; }
         "abstract class allocation did not report RS2524");
 }
 
+void testDevirtAndPolymorphicFastPathRegressions() {
+    // 1. Cross-module multi-level hierarchy devirtualization + intra-block StoreLocal overwrite safety
+    realscript::compiler::Compilation compilation({
+        {"m_root.rs", R"(
+module Reg.RootMod;
+public interface ICompute { public int Calc(int x); }
+public class Root : ICompute
+{
+    public int factor;
+    public Root() { this.factor = 3; }
+    public virtual int Calc(int x) { return this.factor * 4; }
+}
+)"},
+        {"m_mid.rs", R"(
+module Reg.MidMod;
+import Reg.RootMod;
+public class Middle : Root
+{
+    public Middle() : base() { this.factor = 5; }
+}
+)"},
+        {"m_leaf.rs", R"(
+module Reg.LeafMod;
+import Reg.MidMod;
+public class Leaf : Middle
+{
+    public Leaf() : base() { this.factor = 7; }
+    public override int Calc(int x) { return this.factor * 6; }
+}
+)"},
+        {"m_caller.rs", R"(
+module Reg.CallerMod;
+import Reg.RootMod;
+import Reg.LeafMod;
+public int runCrossModuleHierarchy()
+{
+    ICompute c = new Leaf();
+    return c.Calc(1);
+}
+public int runOverwriteLocal(int mode)
+{
+    ICompute dynamicObj = new Root();
+    ICompute local = new Leaf();
+    int first = local.Calc(1);
+    if (mode >= 0) { }
+    local = dynamicObj;
+    return first + local.Calc(1);
+}
+)"},
+    });
+    auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "cross-module devirt regression failed to compile:\n" +
+            diagnosticsText(build.diagnostics));
+
+    realscript::optimization::Optimizer optimizer;
+    realscript::optimization::Options optOpts;
+    optOpts.level = realscript::optimization::Level::Aggressive;
+    realscript::diagnostics::DiagnosticBag optDiags;
+    auto optResult = optimizer.optimize(std::move(build.modules), optDiags, optOpts);
+    require(!optDiags.hasErrors(),
+        "optimizer failed after cross-module devirt:\n" +
+            diagnosticsText(optDiags));
+    require(optResult.statistics.callsDevirtualized >= 2,
+        "expected cross-module devirtualization to occur");
+
+    realscript::bytecode::Lowerer lowerer;
+    std::vector<realscript::bytecode::Module> bcModules;
+    for (const auto& m : optResult.modules) {
+        auto bc = lowerer.lower(m);
+        realscript::diagnostics::DiagnosticBag verified;
+        require(realscript::bytecode::verifyModule(bc, verified) && !verified.hasErrors(),
+            "bytecode verifier failed after cross-module devirt:\n" +
+                diagnosticsText(verified));
+        bcModules.push_back(std::move(bc));
+    }
+
+    realscript::runtime::Interpreter interp(std::move(bcModules));
+    realscript::runtime::ExecutionOptions fastOpts;
+    fastOpts.determinism.mode = realscript::runtime::DeterminismMode::Off;
+    realscript::runtime::ExecutionOptions slowOpts;
+    slowOpts.determinism.mode = realscript::runtime::DeterminismMode::Strict;
+    slowOpts.trace = [](const realscript::runtime::TraceEvent&) {};
+
+    const auto rFast = interp.invoke("Reg.CallerMod::runCrossModuleHierarchy", {}, fastOpts);
+    const auto rSlow = interp.invoke("Reg.CallerMod::runCrossModuleHierarchy", {}, slowOpts);
+    require(rFast.succeeded && rSlow.succeeded &&
+            std::get<std::int64_t>(rFast.value) == 42 &&
+            rFast.value == rSlow.value &&
+            rFast.instructionsExecuted == rSlow.instructionsExecuted,
+        "cross-module hierarchy devirt parity failed");
+
+    const auto ovwFast = interp.invoke("Reg.CallerMod::runOverwriteLocal", {std::int64_t{1}}, fastOpts);
+    const auto ovwSlow = interp.invoke("Reg.CallerMod::runOverwriteLocal", {std::int64_t{1}}, slowOpts);
+    require(ovwFast.succeeded && ovwSlow.succeeded &&
+            std::get<std::int64_t>(ovwFast.value) == (42 + 12) &&
+            ovwFast.instructionsExecuted == ovwSlow.instructionsExecuted,
+        "runOverwriteLocal parity failed");
+
+    // 2. Verify intra-block local overwrite does not falsely devirtualize `local = dynamicObj` to `Leaf`
+    // and verify CallPolledFast + StoreLocal instruction budget parity when callee traps/exceeds budget
+    realscript::compiler::Compilation dynComp({
+        {"dyn.rs", R"(
+module Reg.Dyn;
+public interface IWorker
+{
+    public int Step(int v);
+}
+public class FastWorker : IWorker
+{
+    public int a;
+    public int b;
+    public FastWorker() { this.a = 10; this.b = 3; }
+    public int Step(int v) { return this.a - this.b; }
+}
+public class MulWorker : IWorker
+{
+    public int a;
+    public MulWorker() { this.a = 9; }
+    public int Step(int v) { return this.a * 4; }
+}
+public int runPolymorphic(int mode)
+{
+    IWorker w = new FastWorker();
+    int r1 = w.Step(1);
+    if (mode > 0)
+    {
+        IWorker m = new MulWorker();
+        w = m;
+    }
+    int r2 = w.Step(2);
+    return r1 + r2;
+}
+)"},
+    });
+    auto dynBuild = dynComp.build();
+    require(!dynBuild.diagnostics.hasErrors(),
+        "dyn polymorphic test failed to compile:\n" +
+            diagnosticsText(dynBuild.diagnostics));
+    realscript::diagnostics::DiagnosticBag dynOptDiags;
+    auto dynOpt = optimizer.optimize(std::move(dynBuild.modules), dynOptDiags, optOpts);
+    require(!dynOptDiags.hasErrors(),
+        "dyn polymorphic optimizer failed:\n" +
+            diagnosticsText(dynOptDiags));
+    std::vector<realscript::bytecode::Module> dynBc;
+    for (const auto& m : dynOpt.modules) {
+        dynBc.push_back(lowerer.lower(m));
+    }
+    realscript::runtime::Interpreter dynInterp(std::move(dynBc));
+    const auto pFast = dynInterp.invoke("Reg.Dyn::runPolymorphic", {std::int64_t{1}}, fastOpts);
+    const auto pSlow = dynInterp.invoke("Reg.Dyn::runPolymorphic", {std::int64_t{1}}, slowOpts);
+    require(pFast.succeeded && pSlow.succeeded &&
+            std::get<std::int64_t>(pFast.value) == (7 + 36) &&
+            pFast.instructionsExecuted == pSlow.instructionsExecuted,
+        "polymorphic TrivialMethodKind + StoreLocal parity failed");
+
+    for (std::uint64_t budget = 1; budget < pFast.instructionsExecuted; ++budget) {
+        auto bFast = fastOpts;
+        bFast.limits.instructionBudget = budget;
+        auto bSlow = slowOpts;
+        bSlow.limits.instructionBudget = budget;
+        const auto bf = dynInterp.invoke("Reg.Dyn::runPolymorphic", {std::int64_t{1}}, bFast);
+        const auto bs = dynInterp.invoke("Reg.Dyn::runPolymorphic", {std::int64_t{1}}, bSlow);
+        require(!bf.succeeded && !bs.succeeded &&
+                bf.error.code == realscript::runtime::ErrorCode::InstructionBudgetExceeded &&
+                bf.instructionsExecuted == bs.instructionsExecuted,
+            "CallPolledFast + StoreLocal budget boundary parity failed at budget=" +
+                std::to_string(budget));
+    }
+}
+
 }
 int main() {
     try {
@@ -1140,6 +1312,7 @@ int main() {
         testGlobalInheritanceDeclarationOrder();
         testCanonicalVirtualSlotOrder();
         testVirtualDiagnostics();
+        testDevirtAndPolymorphicFastPathRegressions();
         std::cout << "Phase 19 runtime polymorphism tests passed\n";
         return 0;
     } catch (const std::exception& exception) {

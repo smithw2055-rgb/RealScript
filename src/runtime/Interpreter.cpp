@@ -24,6 +24,40 @@ struct InlineCallCacheEntry {
     const detail::ExecutionFunction* execution = nullptr;
 };
 
+struct PolymorphicPicWay {
+    semantic::SymbolId receiverTypeId = 0;
+    const ProgramImage::FunctionLocation* target = nullptr;
+    const detail::ExecutionFunction* execution = nullptr;
+};
+
+struct PolymorphicPicSite {
+    std::array<PolymorphicPicWay, 4> ways{};
+    std::uint8_t nextReplace = 0;
+};
+
+struct ResolvedDelegateLeaf {
+    ObjectRef leafRef{};
+    ObjectRef receiverRef{};
+    Value receiverVal{NullObject{}};
+    const ProgramImage::FunctionLocation* target = nullptr;
+    const detail::ExecutionFunction* execution = nullptr;
+    bool hasBoundReceiver = false;
+    bool valid = false;
+};
+
+struct DelegateCallSiteCache {
+    std::array<ResolvedDelegateLeaf, 16> singleWays{};
+
+    semantic::SymbolId lastSymId = 0;
+    const ProgramImage::FunctionLocation* lastSymTarget = nullptr;
+    const detail::ExecutionFunction* lastSymExec = nullptr;
+
+    ObjectRef multicastRef{};
+    std::vector<ResolvedDelegateLeaf> multicastLeaves;
+    bool multicastValid = false;
+    std::uint32_t multicastPinCount = 0;
+};
+
 DeterminismOperationId instructionOperationId(
     bytecode::Opcode opcode) noexcept {
     constexpr auto Count =
@@ -83,6 +117,9 @@ struct State {
     std::vector<Value> values;
     std::size_t valueTop = 0;
     std::array<InlineCallCacheEntry, 64>* inlineCallCache = nullptr;
+    std::vector<PolymorphicPicSite>* polyCallCache = nullptr;
+    std::vector<DelegateCallSiteCache>* delegateCallCache = nullptr;
+    const detail::ExecutionMirror* mirror = nullptr;
     std::optional<Value> pendingException;
     bool exceptionNotifiedDebugger = false;
 };
@@ -324,14 +361,17 @@ struct ValueWindow {
 
 struct ArgumentSource {
     const std::vector<Value>* values = nullptr;
+    const Value* directValues = nullptr;
     std::size_t offset = 0;
-    std::array<bytecode::Register, 2> inlineRegs{0, 0};
+    std::array<bytecode::Register, 3> inlineRegs{0, 0, 0};
     const bytecode::Register* indices = nullptr;
     std::size_t count = 0;
 
     ArgumentSource() = default;
     ArgumentSource(const std::vector<Value>& contiguous)
         : values(&contiguous), count(contiguous.size()) {}
+    ArgumentSource(const Value* ptr, std::size_t cnt) noexcept
+        : directValues(ptr), count(cnt) {}
     ArgumentSource(
         const ValueWindow& registers,
         const bytecode::SmallRegisterVector& operands) noexcept
@@ -344,7 +384,7 @@ struct ArgumentSource {
         bytecode::Register reg0) noexcept
         : values(registers.values),
           offset(registers.offset),
-          inlineRegs{reg0, 0},
+          inlineRegs{reg0, 0, 0},
           indices(inlineRegs.data()),
           count(1) {}
     ArgumentSource(
@@ -353,9 +393,19 @@ struct ArgumentSource {
         bytecode::Register reg1) noexcept
         : values(registers.values),
           offset(registers.offset),
-          inlineRegs{reg0, reg1},
+          inlineRegs{reg0, reg1, 0},
           indices(inlineRegs.data()),
           count(2) {}
+    ArgumentSource(
+        const ValueWindow& registers,
+        bytecode::Register reg0,
+        bytecode::Register reg1,
+        bytecode::Register reg2) noexcept
+        : values(registers.values),
+          offset(registers.offset),
+          inlineRegs{reg0, reg1, reg2},
+          indices(inlineRegs.data()),
+          count(3) {}
     ArgumentSource(
         const ValueWindow& registers) noexcept
         : values(registers.values),
@@ -366,6 +416,7 @@ struct ArgumentSource {
     [[nodiscard]] std::size_t size() const noexcept { return count; }
     [[nodiscard]] bool empty() const noexcept { return count == 0; }
     [[nodiscard]] const Value& operator[](std::size_t index) const noexcept {
+        if (directValues) return directValues[index];
         return (*values)[offset + (indices ? indices[index] : index)];
     }
     [[nodiscard]] const Value& front() const noexcept { return (*this)[0]; }
@@ -754,7 +805,19 @@ bool runtimeAssignable(
     semantic::SymbolId actual,
     semantic::SymbolId expected) noexcept {
     if (actual == expected) return true;
+    if (actual == 0) return false;
+    if (state.mirror) {
+        const auto it = state.mirror->typeDispatch.find(actual);
+        if (it != state.mirror->typeDispatch.end()) {
+            if (expected == 0) return true;
+            for (const auto cand : it->second.assignableTargetIds) {
+                if (cand == expected) return true;
+            }
+            return false;
+        }
+    }
     if (!state.program) return false;
+    if (expected == 0) return state.program->resolveType(actual) != nullptr;
     auto current = actual;
     for (std::size_t depth = 0; current != 0 && depth < 256; ++depth) {
         const auto* found = state.program->resolveType(current);
@@ -767,6 +830,48 @@ bool runtimeAssignable(
         current = found->baseTypeId;
     }
     return false;
+}
+
+const detail::PrelinkedDispatchTarget* resolvePrelinkedPolymorphicTarget(
+    const detail::ExecutionMirror& mirror,
+    semantic::SymbolId actualTypeId,
+    const detail::PolymorphicCallSiteDesc& site) noexcept {
+    if (!site.valid || actualTypeId == 0) return nullptr;
+    const auto tIt = mirror.typeDispatch.find(actualTypeId);
+    if (tIt == mirror.typeDispatch.end()) return nullptr;
+    const auto& meta = tIt->second;
+    if (!site.isInterface) {
+        if (site.slot >= meta.virtualTargets.size()) return nullptr;
+        const auto& target = meta.virtualTargets[site.slot];
+        return (target.target && target.execution) ? &target : nullptr;
+    }
+    const auto& imaps = meta.interfaceMaps;
+    if (imaps.size() <= 4) {
+        for (const auto& m : imaps) {
+            if (m.interfaceTypeId == site.interfaceTypeId) {
+                if (site.slot >= m.slots.size()) return nullptr;
+                const auto& target = m.slots[site.slot];
+                return (target.target && target.execution) ? &target : nullptr;
+            }
+        }
+        return nullptr;
+    }
+    std::size_t lo = 0;
+    std::size_t hi = imaps.size();
+    while (lo < hi) {
+        const std::size_t mid = lo + ((hi - lo) >> 1u);
+        if (imaps[mid].interfaceTypeId < site.interfaceTypeId) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo < imaps.size() && imaps[lo].interfaceTypeId == site.interfaceTypeId) {
+        if (site.slot >= imaps[lo].slots.size()) return nullptr;
+        const auto& target = imaps[lo].slots[site.slot];
+        return (target.target && target.execution) ? &target : nullptr;
+    }
+    return nullptr;
 }
 
 const semantic::InterfaceDispatchMap* runtimeInterfaceMap(
@@ -1179,6 +1284,17 @@ bool executeCall(
         if (const auto cached = tryCachedType(*actualTypeId)) {
             return *cached;
         }
+        if (state.mirror) {
+            detail::PolymorphicCallSiteDesc desc{};
+            desc.valid = true;
+            desc.isInterface = false;
+            desc.slot = reference.virtualSlot;
+            if (const auto* pre = resolvePrelinkedPolymorphicTarget(*state.mirror, *actualTypeId, desc)) {
+                (*state.inlineCallCache)[cacheIndex()] = {
+                    &instruction, *receiver, *actualTypeId, pre->target, pre->execution};
+                return executeFunction(state, *pre->target, arguments, result, pre->execution, true);
+            }
+        }
         const auto* actualType = state.program->resolveType(*actualTypeId);
         if (!actualType ||
             reference.virtualSlot >=
@@ -1224,6 +1340,18 @@ bool executeCall(
         }
         if (const auto cached = tryCachedType(*actualTypeId)) {
             return *cached;
+        }
+        if (state.mirror) {
+            detail::PolymorphicCallSiteDesc desc{};
+            desc.valid = true;
+            desc.isInterface = true;
+            desc.interfaceTypeId = reference.interfaceTypeId;
+            desc.slot = reference.interfaceSlot;
+            if (const auto* pre = resolvePrelinkedPolymorphicTarget(*state.mirror, *actualTypeId, desc)) {
+                (*state.inlineCallCache)[cacheIndex()] = {
+                    &instruction, *receiver, *actualTypeId, pre->target, pre->execution};
+                return executeFunction(state, *pre->target, arguments, result, pre->execution, true);
+            }
         }
         const auto* implementation = runtimeInterfaceMap(
             state, *actualTypeId, reference.interfaceTypeId);
@@ -1364,9 +1492,32 @@ bool executeCall(
     return true;
 }
 
+const std::shared_ptr<const std::vector<std::size_t>>& delegateReferenceFields() {
+    static const auto refs = std::make_shared<const std::vector<std::size_t>>(
+        std::initializer_list<std::size_t>{0u, 7u});
+    return refs;
+}
+
 std::int64_t delegateWord(std::uint64_t value, bool high) noexcept {
     return static_cast<std::int64_t>(
         static_cast<std::uint32_t>(high ? value >> 32u : value));
+}
+
+bool readDelegateIdFromFields(
+    const Value* fields,
+    std::size_t lowIndex,
+    semantic::SymbolId& outId) noexcept {
+    std::int64_t lo = 0, hi = 0;
+    if (!fields[lowIndex].tryGetInt64(lo) ||
+        !fields[lowIndex + 1u].tryGetInt64(hi) ||
+        lo < 0 || hi < 0 ||
+        lo > std::numeric_limits<std::uint32_t>::max() ||
+        hi > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    outId = static_cast<std::uint64_t>(static_cast<std::uint32_t>(lo)) |
+        (static_cast<std::uint64_t>(static_cast<std::uint32_t>(hi)) << 32u);
+    return true;
 }
 
 bool readDelegateId(
@@ -1375,6 +1526,14 @@ bool readDelegateId(
     std::size_t lowIndex,
     semantic::SymbolId& value,
     const char* context) {
+    ObjectFastView view{};
+    if (state.heap && state.heap->tryBindObjectFastView(reference, view) &&
+        lowIndex + 1u < view.fieldCount) {
+        if (!readDelegateIdFromFields(view.fields, lowIndex, value)) {
+            return fail(state, ErrorCode::InvalidProgram, context);
+        }
+        return true;
+    }
     const auto low = state.heap->fieldGet(reference, lowIndex);
     const auto high = state.heap->fieldGet(reference, lowIndex + 1u);
     const auto* lowValue = low ? std::get_if<std::int64_t>(&*low) : nullptr;
@@ -1395,41 +1554,60 @@ bool flattenDelegate(
     State& state,
     semantic::SymbolId delegateTypeId,
     const Value& value,
-    std::vector<Value>& leaves,
-    std::size_t depth = 0) {
+    std::vector<Value>& leaves) {
     if (std::holds_alternative<NullObject>(value)) return true;
-    if (depth > 1024) {
+    if (!state.heap) {
         return fail(state, ErrorCode::InvalidProgram,
-            "delegate invocation list is too deep");
+            "delegate invocation has no heap");
     }
-    const auto* reference = std::get_if<ObjectRef>(&value);
-    const auto actualType = reference && state.heap
-        ? state.heap->objectTypeId(*reference)
-        : std::optional<semantic::SymbolId>{};
-    if (!reference || !actualType || *actualType != delegateTypeId ||
-        state.heap->fieldCount(*reference) != 8u) {
-        return fail(state, ErrorCode::TypeMismatch,
-            "delegate invocation list contains an incompatible value");
+    std::array<Value, 64> inlineStack{};
+    std::size_t inlineTop = 0;
+    std::vector<Value> heapStack;
+    inlineStack[inlineTop++] = value;
+    std::size_t visitedNodes = 0;
+    while (inlineTop > 0 || !heapStack.empty()) {
+        Value cur;
+        if (!heapStack.empty()) {
+            cur = heapStack.back();
+            heapStack.pop_back();
+        } else {
+            cur = inlineStack[--inlineTop];
+        }
+        if (std::holds_alternative<NullObject>(cur)) continue;
+        if (++visitedNodes > 65536u) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "delegate invocation list is too deep");
+        }
+        const auto* reference = std::get_if<ObjectRef>(&cur);
+        ObjectFastView view{};
+        if (!reference ||
+            !state.heap->tryBindObjectFastView(*reference, view) ||
+            view.typeId != delegateTypeId ||
+            view.fieldCount != 8u) {
+            return fail(state, ErrorCode::TypeMismatch,
+                "delegate invocation list contains an incompatible value");
+        }
+        std::int64_t flags = -1;
+        if (!view.fields[3].tryGetInt64(flags) || flags < 0 || flags > 4) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "delegate invocation-list metadata is corrupt");
+        }
+        if (flags != 4) {
+            leaves.push_back(cur);
+            continue;
+        }
+        const Value left = view.fields[0];
+        const Value right = view.fields[7];
+        // Push right first so left is popped first (left-to-right order)
+        if (!heapStack.empty() || inlineTop + 2u > inlineStack.size()) {
+            heapStack.push_back(right);
+            heapStack.push_back(left);
+        } else {
+            inlineStack[inlineTop++] = right;
+            inlineStack[inlineTop++] = left;
+        }
     }
-    const auto flagsValue = state.heap->fieldGet(*reference, 3u);
-    const auto* flags = flagsValue
-        ? std::get_if<std::int64_t>(&*flagsValue)
-        : nullptr;
-    if (!flags || *flags < 0 || *flags > 4) {
-        return fail(state, ErrorCode::InvalidProgram,
-            "delegate invocation-list metadata is corrupt");
-    }
-    if (*flags != 4) {
-        leaves.push_back(value);
-        return true;
-    }
-    const auto left = state.heap->fieldGet(*reference, 0u);
-    const auto right = state.heap->fieldGet(*reference, 7u);
-    return left && right &&
-        flattenDelegate(
-            state, delegateTypeId, *left, leaves, depth + 1) &&
-        flattenDelegate(
-            state, delegateTypeId, *right, leaves, depth + 1);
+    return true;
 }
 
 bool sameDelegateLeaf(
@@ -1438,7 +1616,17 @@ bool sameDelegateLeaf(
     const Value& right) {
     const auto* leftRef = std::get_if<ObjectRef>(&left);
     const auto* rightRef = std::get_if<ObjectRef>(&right);
-    if (!leftRef || !rightRef) return false;
+    if (!leftRef || !rightRef || !state.heap) return false;
+    if (*leftRef == *rightRef && state.heap->isAlive(*leftRef)) return true;
+    ObjectFastView lv{}, rv{};
+    if (state.heap->tryBindObjectFastView(*leftRef, lv) &&
+        state.heap->tryBindObjectFastView(*rightRef, rv) &&
+        lv.fieldCount >= 7u && rv.fieldCount >= 7u) {
+        for (std::size_t index = 0; index < 7u; ++index) {
+            if (!(lv.fields[index] == rv.fields[index])) return false;
+        }
+        return true;
+    }
     for (std::size_t index = 0; index < 7u; ++index) {
         const auto a = state.heap->fieldGet(*leftRef, index);
         const auto b = state.heap->fieldGet(*rightRef, index);
@@ -1447,40 +1635,389 @@ bool sameDelegateLeaf(
     return true;
 }
 
+bool allocateCombineDelegateNode(
+    State& state,
+    semantic::SymbolId delegateTypeId,
+    const Value& left,
+    const Value& right,
+    Value& outNode,
+    bool* outSlotsMoved = nullptr) {
+    const std::array<Value, 8> fields{{
+        left,
+        std::int64_t{0},
+        std::int64_t{0},
+        std::int64_t{4},
+        std::int64_t{0},
+        std::int64_t{0},
+        std::int64_t{0},
+        right,
+    }};
+    RuntimeError error;
+    bool localMoved = false;
+    const auto allocated = state.heap->allocateObjectFromTemplate(
+        delegateTypeId,
+        fields.data(),
+        fields.size(),
+        delegateReferenceFields(),
+        &error,
+        &localMoved);
+    if (localMoved && outSlotsMoved) *outSlotsMoved = true;
+    if (!allocated) {
+        return fail(state,
+            error.code == ErrorCode::None
+                ? ErrorCode::OutOfMemory
+                : error.code,
+            error.message.empty()
+                ? "delegate-list allocation failed"
+                : error.message);
+    }
+    outNode = *allocated;
+    return true;
+}
+
 bool buildDelegateList(
     State& state,
     semantic::SymbolId delegateTypeId,
     const std::vector<Value>& leaves,
-    Value& result) {
+    Value& result,
+    bool* outSlotsMoved = nullptr) {
     if (leaves.empty()) {
         result = NullObject{};
         return true;
     }
     result = leaves.front();
     for (std::size_t index = 1; index < leaves.size(); ++index) {
-        std::vector<Value> fields{
-            result,
-            std::int64_t{0},
-            std::int64_t{0},
-            std::int64_t{4},
-            std::int64_t{0},
-            std::int64_t{0},
-            std::int64_t{0},
-            leaves[index],
-        };
-        RuntimeError error;
-        const auto allocated = state.heap->allocateObject(
-            delegateTypeId, std::move(fields), {0u, 7u}, &error);
-        if (!allocated) {
-            return fail(state,
-                error.code == ErrorCode::None
-                    ? ErrorCode::OutOfMemory
-                    : error.code,
-                error.message.empty()
-                    ? "delegate-list allocation failed"
-                    : error.message);
+        Value nextNode;
+        if (!allocateCombineDelegateNode(
+                state, delegateTypeId, result, leaves[index], nextNode, outSlotsMoved)) {
+            return false;
         }
-        result = *allocated;
+        result = nextNode;
+    }
+    return true;
+}
+
+bool combineOrRemoveDelegateFastImpl(
+    State& state,
+    semantic::SymbolId delegateTypeId,
+    const Value& left,
+    const Value& right,
+    bool isRemove,
+    Value& result,
+    bool* outSlotsMoved = nullptr) {
+    if (!state.heap) {
+        return fail(state, ErrorCode::InvalidProgram, "delegate combination has no heap");
+    }
+    const bool leftNull = (left.rawTag() == ValueTag::NullObject);
+    const bool rightNull = (right.rawTag() == ValueTag::NullObject);
+    ObjectFastView leftView{}, rightView{};
+    std::int64_t leftFlags = -1, rightFlags = -1;
+
+    if (!leftNull) {
+        if (left.rawTag() != ValueTag::ObjectRef ||
+            !state.heap->tryBindObjectFastView(left.u_.objectRef, leftView) ||
+            leftView.typeId != delegateTypeId ||
+            leftView.fieldCount != 8u) {
+            return fail(state, ErrorCode::TypeMismatch,
+                "delegate combination left operand has incompatible type");
+        }
+        if (!leftView.fields[3].tryGetInt64(leftFlags) || leftFlags < 0 || leftFlags > 4) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "delegate invocation-list metadata is corrupt");
+        }
+    }
+    if (!rightNull) {
+        if (right.rawTag() != ValueTag::ObjectRef ||
+            !state.heap->tryBindObjectFastView(right.u_.objectRef, rightView) ||
+            rightView.typeId != delegateTypeId ||
+            rightView.fieldCount != 8u) {
+            return fail(state, ErrorCode::TypeMismatch,
+                "delegate combination right operand has incompatible type");
+        }
+        if (!rightView.fields[3].tryGetInt64(rightFlags) || rightFlags < 0 || rightFlags > 4) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "delegate invocation-list metadata is corrupt");
+        }
+    }
+
+    if (!isRemove) {
+        if (leftNull && rightNull) {
+            result = NullObject{};
+            return true;
+        }
+        if (leftNull) {
+            if (rightFlags != 4) {
+                result = right;
+                return true;
+            }
+            std::vector<Value> rLeaves;
+            if (!flattenDelegate(state, delegateTypeId, right, rLeaves)) return false;
+            result = right;
+            return true;
+        }
+        if (rightNull) {
+            if (leftFlags != 4) {
+                result = left;
+                return true;
+            }
+            std::vector<Value> lLeaves;
+            if (!flattenDelegate(state, delegateTypeId, left, lLeaves)) return false;
+            result = left;
+            return true;
+        }
+        if (leftFlags == 4) {
+            const auto checkChild = [&](const Value& child) -> bool {
+                if (child.rawTag() == ValueTag::NullObject) return true;
+                ObjectFastView cv{};
+                std::int64_t cf = -1;
+                if (child.rawTag() != ValueTag::ObjectRef ||
+                    !state.heap->tryBindObjectFastView(child.u_.objectRef, cv) ||
+                    cv.typeId != delegateTypeId ||
+                    cv.fieldCount != 8u) {
+                    return fail(state, ErrorCode::TypeMismatch,
+                        "delegate invocation list contains an incompatible value");
+                }
+                if (!cv.fields[3].tryGetInt64(cf) || cf < 0 || cf > 4) {
+                    return fail(state, ErrorCode::InvalidProgram,
+                        "delegate invocation-list metadata is corrupt");
+                }
+                return true;
+            };
+            if (!checkChild(leftView.fields[0]) || !checkChild(leftView.fields[7])) {
+                return false;
+            }
+        }
+        // O(1) single-node append when appending a single leaf delegate (the 99.9% `+=` path!)
+        if (rightFlags != 4) {
+            return allocateCombineDelegateNode(
+                state, delegateTypeId, left, right, result, outSlotsMoved);
+        }
+        // Appending a multicast right subtree onto left in O(|right|) allocations
+        std::vector<Value> rightLeaves;
+        if (!flattenDelegate(state, delegateTypeId, right, rightLeaves)) return false;
+        Value cur = left;
+        for (const auto& rLeaf : rightLeaves) {
+            Value nextNode;
+            if (!allocateCombineDelegateNode(
+                    state, delegateTypeId, cur, rLeaf, nextNode, outSlotsMoved)) {
+                return false;
+            }
+            cur = nextNode;
+        }
+        result = cur;
+        return true;
+    }
+
+    // RemoveDelegate (`-=`)
+    if (leftNull) {
+        result = Value{NullObject{}};
+        return true;
+    }
+    if (rightNull) {
+        if (leftFlags == 4) {
+            std::vector<Value> lLeaves;
+            if (!flattenDelegate(state, delegateTypeId, left, lLeaves)) return false;
+        }
+        result = left;
+        return true;
+    }
+    if (leftFlags != 4 && rightFlags != 4) {
+        if (sameDelegateLeaf(state, left, right)) {
+            result = NullObject{};
+        } else {
+            result = left;
+        }
+        return true;
+    }
+    std::vector<Value> leftLeaves;
+    std::vector<Value> rightLeaves;
+    if (!flattenDelegate(state, delegateTypeId, left, leftLeaves) ||
+        !flattenDelegate(state, delegateTypeId, right, rightLeaves)) {
+        return false;
+    }
+    if (!rightLeaves.empty() && rightLeaves.size() <= leftLeaves.size()) {
+        std::optional<std::size_t> removeAt;
+        for (std::size_t start = 0;
+             start + rightLeaves.size() <= leftLeaves.size();
+             ++start) {
+            bool matches = true;
+            for (std::size_t index = 0; index < rightLeaves.size(); ++index) {
+                if (!sameDelegateLeaf(state, leftLeaves[start + index], rightLeaves[index])) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) removeAt = start;
+        }
+        if (!removeAt) {
+            result = left;
+            return true;
+        }
+        leftLeaves.erase(
+            leftLeaves.begin() + static_cast<std::ptrdiff_t>(*removeAt),
+            leftLeaves.begin() + static_cast<std::ptrdiff_t>(*removeAt + rightLeaves.size()));
+    } else {
+        result = left;
+        return true;
+    }
+    return buildDelegateList(state, delegateTypeId, leftLeaves, result, outSlotsMoved);
+}
+
+bool resolveDelegateLeafFast(
+    State& state,
+    const detail::ExecutionMirror& mirror,
+    ObjectRef leafRef,
+    const ObjectFastView& view,
+    std::size_t expectedUserArgs,
+    DelegateCallSiteCache& siteCache,
+    ResolvedDelegateLeaf& outLeaf) noexcept {
+    if (view.fieldCount != 8u || !state.program || !state.heap) return false;
+    std::int64_t flags = -1;
+    std::int64_t slot = -1;
+    if (!view.fields[3].tryGetInt64(flags) ||
+        !view.fields[4].tryGetInt64(slot) ||
+        flags < 0 || flags > 2 ||
+        slot < 0 || slot > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    semantic::SymbolId targetSymId = 0;
+    if (!readDelegateIdFromFields(view.fields, 1u, targetSymId)) {
+        return false;
+    }
+    const Value& targetVal = view.fields[0];
+    const bool hasRecv = (targetVal.rawTag() != ValueTag::NullObject);
+    ObjectRef recvRef{};
+    if (hasRecv) {
+        if (targetVal.rawTag() == ValueTag::ObjectRef) {
+            recvRef = targetVal.u_.objectRef;
+            if (!state.heap->isAlive(recvRef)) return false;
+        }
+    }
+
+    const ProgramImage::FunctionLocation* targetLoc = nullptr;
+    const detail::ExecutionFunction* calleeExec = nullptr;
+
+    if (flags != 0) {
+        if (!hasRecv || targetVal.rawTag() != ValueTag::ObjectRef) return false;
+        const semantic::SymbolId recvTid = state.heap->objectTypeIdFast(recvRef);
+        if (recvTid == 0) return false;
+        detail::PolymorphicCallSiteDesc polyDesc{};
+        polyDesc.slot = static_cast<std::uint32_t>(slot);
+        polyDesc.isInterface = (flags == 2);
+        if (polyDesc.isInterface) {
+            if (!readDelegateIdFromFields(view.fields, 5u, polyDesc.interfaceTypeId)) {
+                return false;
+            }
+        }
+        polyDesc.valid = true;
+        if (const auto* pre = resolvePrelinkedPolymorphicTarget(mirror, recvTid, polyDesc)) {
+            targetLoc = pre->target;
+            calleeExec = pre->execution;
+            targetSymId = pre->symbolId;
+        } else {
+            return false;
+        }
+    } else {
+        if (siteCache.lastSymId == targetSymId &&
+            siteCache.lastSymTarget != nullptr &&
+            siteCache.lastSymExec != nullptr) {
+            targetLoc = siteCache.lastSymTarget;
+            calleeExec = siteCache.lastSymExec;
+        } else {
+            targetLoc = state.program->resolveFunction(targetSymId);
+            if (!targetLoc || !targetLoc->function) return false;
+            calleeExec = detail::findExecutionFunction(mirror, *targetLoc->function);
+            if (!calleeExec) return false;
+            siteCache.lastSymId = targetSymId;
+            siteCache.lastSymTarget = targetLoc;
+            siteCache.lastSymExec = calleeExec;
+        }
+    }
+
+    if (!targetLoc || !targetLoc->function || !calleeExec) return false;
+    const std::size_t expectedTotalParams = expectedUserArgs + (hasRecv ? 1u : 0u);
+    if (targetLoc->function->parameterTypes.size() != expectedTotalParams) {
+        return false;
+    }
+
+    outLeaf.leafRef = leafRef;
+    outLeaf.receiverRef = recvRef;
+    outLeaf.receiverVal = targetVal;
+    outLeaf.target = targetLoc;
+    outLeaf.execution = calleeExec;
+    outLeaf.hasBoundReceiver = hasRecv;
+    outLeaf.valid = true;
+    return true;
+}
+
+bool flattenAndResolveMulticastFast(
+    State& state,
+    const detail::ExecutionMirror& mirror,
+    semantic::SymbolId delegateTypeId,
+    ObjectRef rootRef,
+    std::size_t expectedUserArgs,
+    DelegateCallSiteCache& siteCache,
+    std::vector<ResolvedDelegateLeaf>& outLeaves) {
+    outLeaves.clear();
+    if (!state.heap) return false;
+
+    std::array<ObjectRef, 64> inlineStack{};
+    std::size_t inlineTop = 0;
+    std::vector<ObjectRef> heapStack;
+    inlineStack[inlineTop++] = rootRef;
+    std::size_t visitedNodes = 0;
+
+    while (inlineTop > 0 || !heapStack.empty()) {
+        ObjectRef curRef{};
+        if (!heapStack.empty()) {
+            curRef = heapStack.back();
+            heapStack.pop_back();
+        } else {
+            curRef = inlineStack[--inlineTop];
+        }
+        if (++visitedNodes > 65536u) return false;
+
+        ObjectFastView view{};
+        if (!state.heap->tryBindObjectFastView(curRef, view) ||
+            view.typeId != delegateTypeId ||
+            view.fieldCount != 8u) {
+            return false;
+        }
+        std::int64_t flags = -1;
+        if (!view.fields[3].tryGetInt64(flags) || flags < 0 || flags > 4) {
+            return false;
+        }
+        if (flags != 4) {
+            ResolvedDelegateLeaf leaf{};
+            if (!resolveDelegateLeafFast(
+                    state, mirror, curRef, view, expectedUserArgs, siteCache, leaf)) {
+                return false;
+            }
+            outLeaves.push_back(std::move(leaf));
+            continue;
+        }
+        const Value& leftVal = view.fields[0];
+        const Value& rightVal = view.fields[7];
+        const bool rightObj = (rightVal.rawTag() == ValueTag::ObjectRef);
+        const bool leftObj = (leftVal.rawTag() == ValueTag::ObjectRef);
+        if ((rightVal.rawTag() != ValueTag::NullObject && !rightObj) ||
+            (leftVal.rawTag() != ValueTag::NullObject && !leftObj)) {
+            return false;
+        }
+        if (rightObj) {
+            if (!heapStack.empty() || inlineTop + 2u > inlineStack.size()) {
+                heapStack.push_back(rightVal.u_.objectRef);
+            } else {
+                inlineStack[inlineTop++] = rightVal.u_.objectRef;
+            }
+        }
+        if (leftObj) {
+            if (!heapStack.empty() || inlineTop + 1u > inlineStack.size()) {
+                heapStack.push_back(leftVal.u_.objectRef);
+            } else {
+                inlineStack[inlineTop++] = leftVal.u_.objectRef;
+            }
+        }
     }
     return true;
 }
@@ -2454,7 +2991,7 @@ bool executeInstruction(
         std::uint64_t flags = 0;
         if (reference.virtualDispatch) flags |= 1u;
         if (reference.interfaceDispatch) flags |= 2u;
-        std::vector<Value> fields{
+        const std::array<Value, 8> fields{{
             std::move(target),
             delegateWord(reference.symbolId, false),
             delegateWord(reference.symbolId, true),
@@ -2467,10 +3004,10 @@ bool executeInstruction(
             delegateWord(reference.interfaceTypeId, false),
             delegateWord(reference.interfaceTypeId, true),
             NullObject{},
-        };
+        }};
         RuntimeError error;
-        const auto allocated = state.heap->allocateObject(
-            type->id, std::move(fields), {0u, 7u}, &error);
+        const auto allocated = state.heap->allocateObjectFromTemplate(
+            type->id, fields.data(), fields.size(), delegateReferenceFields(), &error);
         if (!allocated) {
             return fail(state,
                 error.code == ErrorCode::None
@@ -2497,50 +3034,14 @@ bool executeInstruction(
                 type->id, "delegate combination right operand")) {
             return false;
         }
-        std::vector<Value> leftLeaves;
-        std::vector<Value> rightLeaves;
-        if (!flattenDelegate(
-                state, type->id, *left, leftLeaves) ||
-            !flattenDelegate(
-                state, type->id, *right, rightLeaves)) {
-            return false;
-        }
-        if (instruction.opcode ==
-                bytecode::Opcode::CombineDelegate) {
-            leftLeaves.insert(
-                leftLeaves.end(),
-                rightLeaves.begin(), rightLeaves.end());
-        } else if (!rightLeaves.empty() &&
-                   rightLeaves.size() <= leftLeaves.size()) {
-            std::optional<std::size_t> removeAt;
-            for (std::size_t start = 0;
-                 start + rightLeaves.size() <= leftLeaves.size();
-                 ++start) {
-                bool matches = true;
-                for (std::size_t index = 0;
-                     index < rightLeaves.size(); ++index) {
-                    if (!sameDelegateLeaf(
-                            state,
-                            leftLeaves[start + index],
-                            rightLeaves[index])) {
-                        matches = false;
-                        break;
-                    }
-                }
-                if (matches) removeAt = start;
-            }
-            if (removeAt) {
-                leftLeaves.erase(
-                    leftLeaves.begin() +
-                        static_cast<std::ptrdiff_t>(*removeAt),
-                    leftLeaves.begin() +
-                        static_cast<std::ptrdiff_t>(
-                            *removeAt + rightLeaves.size()));
-            }
-        }
         Value combined;
-        if (!buildDelegateList(
-                state, type->id, leftLeaves, combined)) {
+        if (!combineOrRemoveDelegateFastImpl(
+                state,
+                type->id,
+                *left,
+                *right,
+                instruction.opcode == bytecode::Opcode::RemoveDelegate,
+                combined)) {
             return false;
         }
         return storeResult(std::move(combined));
@@ -3193,15 +3694,35 @@ bool executeFunction(
 
         Value* __restrict frameBase = state.values.data() + frameOffset;
         const std::size_t argCount = arguments.size();
-        for (std::size_t i = 0; i < argCount; ++i) {
-            frameBase[i] = arguments[i];
-        }
-        const std::size_t dirtyEnd = std::min(frameEnd, previousSize);
-        if (frameOffset + argCount < dirtyEnd) {
-            std::memset(
-                frameBase + argCount,
-                0,
-                (dirtyEnd - (frameOffset + argCount)) * sizeof(Value));
+        std::uint32_t initialEntryOffset = execution->entryStreamOffset;
+        std::uint64_t prologueSpanBonus = 0;
+        if (execution->hasFastParamToLocalPrologue &&
+            state.limits.gcWorkBudget == 0 &&
+            execution->entryStreamOffset == 0 &&
+            argCount > 0 &&
+            RS_FLAT_LIKELY(state.executed + 2u * argCount <= state.limits.instructionBudget)) {
+            const std::size_t locOff = execution->localOffset;
+            const std::size_t nLocals = function.localTypes.size();
+            Value* __restrict localBase = frameBase + locOff;
+            for (std::size_t i = 0; i < argCount; ++i) {
+                localBase[i] = arguments[i];
+            }
+            if (nLocals > argCount) {
+                std::memset(localBase + argCount, 0, (nLocals - argCount) * sizeof(Value));
+            }
+            prologueSpanBonus = 2u * argCount;
+            initialEntryOffset = static_cast<std::uint32_t>(argCount);
+        } else {
+            for (std::size_t i = 0; i < argCount; ++i) {
+                frameBase[i] = arguments[i];
+            }
+            const std::size_t dirtyEnd = std::min(frameEnd, previousSize);
+            if (frameOffset + argCount < dirtyEnd) {
+                std::memset(
+                    frameBase + argCount,
+                    0,
+                    (dirtyEnd - (frameOffset + argCount)) * sizeof(Value));
+            }
         }
         state.valueTop = frameEnd;
 
@@ -3237,7 +3758,7 @@ bool executeFunction(
             return detail::InvalidStreamOffset;
         };
 
-        std::uint64_t localExecuted = state.executed;
+        std::uint64_t localExecuted = state.executed + prologueSpanBonus;
         std::uint64_t gcAccounted = localExecuted;
         const bool gcBudgetEnabled = (state.limits.gcWorkBudget != 0 && state.heap != nullptr);
         bool gcActive = gcBudgetEnabled &&
@@ -3313,7 +3834,7 @@ bool executeFunction(
         const std::uint64_t budgetLimit = state.limits.instructionBudget;
         const detail::FlatInstruction* const streamBase = execution->flatStream.data();
         const detail::FlatColdMeta* const flatColdBase = execution->flatCold.data();
-        const detail::FlatInstruction* ip = streamBase + execution->entryStreamOffset;
+        const detail::FlatInstruction* ip = streamBase + initialEntryOffset;
 
 #if defined(__GNUC__) || defined(__clang__)
         #pragma GCC diagnostic push
@@ -3483,6 +4004,12 @@ bool executeFunction(
             &&L_NewObjectFast,
             &&L_LoadFieldExactFast,
             &&L_StoreFieldExactFast,
+            &&L_IsTypeObjFast,
+            &&L_AsTypeObjFast,
+            &&L_NewDelegateFast,
+            &&L_CombineDelegateFast,
+            &&L_RemoveDelegateFast,
+            &&L_InvokeDelegateFast,
             &&L_GenericBytecode,
             &&L_TermJumpNoArgs,
             &&L_TermBranchBoolNoArgs,
@@ -4198,76 +4725,234 @@ bool executeFunction(
             }
 
             RS_FLAT_CASE(CallPolledFast) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                const auto& cold = flatColdBase[ip - streamBase];
-                const auto& instruction = *cold.bytecode;
-                const auto* receiver = std::get_if<ObjectRef>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_LIKELY(receiver != nullptr && state.heap && state.heap->isAlive(*receiver))) {
-                    const auto callSite = reinterpret_cast<std::uintptr_t>(&instruction);
-                    const auto idx = static_cast<std::size_t>((callSite >> 4U) & 63U);
-                    const auto& cached = (*state.inlineCallCache)[idx];
-                    if (RS_FLAT_LIKELY(
-                            cached.callSite == &instruction &&
-                            cached.target && cached.execution &&
-                            (cached.receiver == *receiver ||
-                             (cached.receiverTypeId != 0 &&
-                              state.heap->objectTypeIdFast(*receiver) == cached.receiverTypeId)))) {
-                        const auto tKind = cached.execution->trivialKind;
-                        if (tKind != detail::TrivialMethodKind::None &&
-                            RS_FLAT_LIKELY(state.stack.size() < state.limits.recursionLimit)) {
-                            const std::uint64_t tCost = cached.execution->trivialInstCost;
-                            if (RS_FLAT_LIKELY(tCost <= budgetLimit - localExecuted)) {
-                                localExecuted += tCost;
-                                ++state.statistics.functionCalls;
-                                if (state.stack.size() + 1 > state.statistics.maximumCallDepth) {
-                                    state.statistics.maximumCallDepth = state.stack.size() + 1;
+            L_CallPolledFastBody:
+                const std::uint64_t baseCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || baseCost > budgetLimit - localExecuted)) {
+                    if (baseCost > 1u) goto L_FlatSuperFallback;
+                    goto L_FlatBudgetExceeded;
+                }
+                const Value& recvVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_LIKELY(recvVal.rawTag() == ValueTag::ObjectRef)) {
+                    const ObjectRef ref = recvVal.u_.objectRef;
+                    auto& oce = objectCache[ref.slot & 3u];
+                    if (RS_FLAT_LIKELY((oce.valid && oce.ref == ref) || bindObjectCacheEntry(ref, oce))) {
+                        const semantic::SymbolId actualTid = oce.view.typeId;
+                        const std::uint32_t siteId = ip->auxImm32;
+                        const PolymorphicPicWay* hit = nullptr;
+                        if (RS_FLAT_LIKELY(state.polyCallCache != nullptr &&
+                                           siteId < state.polyCallCache->size())) {
+                            auto& pic = (*state.polyCallCache)[siteId];
+                            if (pic.ways[0].receiverTypeId == actualTid) hit = &pic.ways[0];
+                            else if (pic.ways[1].receiverTypeId == actualTid) hit = &pic.ways[1];
+                            else if (pic.ways[2].receiverTypeId == actualTid) hit = &pic.ways[2];
+                            else if (pic.ways[3].receiverTypeId == actualTid) hit = &pic.ways[3];
+                            else if (state.mirror && siteId < state.mirror->polyCallSites.size()) {
+                                if (const auto* pre = resolvePrelinkedPolymorphicTarget(
+                                        *state.mirror, actualTid, state.mirror->polyCallSites[siteId])) {
+                                    auto& slotWay = pic.ways[pic.nextReplace & 3u];
+                                    pic.nextReplace = static_cast<std::uint8_t>((pic.nextReplace + 1u) & 3u);
+                                    slotWay = {actualTid, pre->target, pre->execution};
+                                    hit = &slotWay;
                                 }
-                                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
-                                if (ip->dstSlot != detail::InvalidCompactReg) {
-                                    if (tKind == detail::TrivialMethodKind::ReturnConst) {
-                                        frameBase[ip->dstSlot] = cached.execution->trivialConstValue;
-                                    } else if (tKind == detail::TrivialMethodKind::ReturnParam) {
-                                        const std::uint16_t pIdx = cached.execution->trivialParamIndex;
-                                        if (pIdx == 0) {
-                                            frameBase[ip->dstSlot] = frameBase[ip->src0Slot];
-                                        } else {
-                                            frameBase[ip->dstSlot] =
-                                                frameBase[execution->registerOffset + instruction.operands[pIdx]];
-                                        }
-                                    }
-                                }
-                                RS_FLAT_DISPATCH_NEXT();
                             }
                         }
-                        if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
-                        state.executed = localExecuted;
-                        Value callResult;
-                        const ValueWindow regWin{&state.values, frameOffset + execution->registerOffset, function.registerTypes.size()};
-                        const bool ok = (ip->src1Slot == detail::InvalidCompactReg)
-                            ? executeFunction(
-                                state, *cached.target,
-                                ArgumentSource(
-                                    ValueWindow{&state.values, frameOffset + ip->src0Slot, 1},
-                                    static_cast<bytecode::Register>(0)),
-                                callResult, cached.execution, true)
-                            : executeFunction(
-                                state, *cached.target,
-                                ArgumentSource(regWin, instruction.operands),
-                                callResult, cached.execution, true);
-                        frameBase = state.values.data() + frameOffset;
-                        syncAfterFlatSubcall();
-                        if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
-                        if (ip->dstSlot != detail::InvalidCompactReg) {
-                            frameBase[ip->dstSlot] = std::move(callResult);
+                        if (RS_FLAT_LIKELY(hit != nullptr)) {
+                            const auto* calleeExec = hit->execution;
+                            const auto tKind = calleeExec->trivialKind;
+                            if (tKind != detail::TrivialMethodKind::None &&
+                                RS_FLAT_LIKELY(state.stack.size() < state.limits.recursionLimit)) {
+                                const std::uint64_t totalCost = baseCost + calleeExec->trivialInstCost;
+                                if (RS_FLAT_LIKELY(totalCost <= budgetLimit - localExecuted)) {
+                                    bool trivialHandled = false;
+                                    Value trivialOut{};
+                                    switch (tKind) {
+                                    case detail::TrivialMethodKind::ReturnVoid:
+                                        trivialHandled = true;
+                                        break;
+                                    case detail::TrivialMethodKind::ReturnConst:
+                                        trivialOut = calleeExec->trivialConstValue;
+                                        trivialHandled = true;
+                                        break;
+                                    case detail::TrivialMethodKind::ReturnParam: {
+                                        const std::uint16_t pIdx = calleeExec->trivialParamIndex;
+                                        if (pIdx == 0) {
+                                            trivialOut = recvVal;
+                                            trivialHandled = true;
+                                        } else if (pIdx == 1 && ip->inlineArgCount >= 2u) {
+                                            trivialOut = frameBase[ip->src1Slot];
+                                            trivialHandled = true;
+                                        } else if (pIdx == 2 && ip->inlineArgCount >= 3u) {
+                                            trivialOut = frameBase[ip->src2Slot];
+                                            trivialHandled = true;
+                                        }
+                                        break;
+                                    }
+                                    case detail::TrivialMethodKind::ReturnThisFieldExact: {
+                                        const std::uint16_t f0 = calleeExec->trivialFieldIndex0;
+                                        if (RS_FLAT_LIKELY(f0 < oce.view.fieldCount)) {
+                                            const Value& fv = oce.view.fields[f0];
+                                            if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(fv.rawTag()) ==
+                                                               calleeExec->trivialFieldTag0)) {
+                                                trivialOut = fv;
+                                                trivialHandled = true;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    case detail::TrivialMethodKind::StoreThisFieldExact: {
+                                        const std::uint16_t pIdx = calleeExec->trivialParamIndex;
+                                        const std::uint16_t f0 = calleeExec->trivialFieldIndex0;
+                                        if (pIdx == 1 && ip->inlineArgCount >= 2u &&
+                                            RS_FLAT_LIKELY(f0 < oce.view.fieldCount)) {
+                                            const Value& rhs = frameBase[ip->src1Slot];
+                                            if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(rhs.rawTag()) ==
+                                                               calleeExec->trivialFieldTag0)) {
+                                                oce.view.fields[f0] = rhs;
+                                                trivialHandled = true;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    case detail::TrivialMethodKind::ReturnThisFieldAddField:
+                                    case detail::TrivialMethodKind::ReturnThisFieldSubField: {
+                                        const std::uint16_t f0 = calleeExec->trivialFieldIndex0;
+                                        const std::uint16_t f1 = calleeExec->trivialFieldIndex1;
+                                        std::int64_t a = 0, b = 0;
+                                        if (RS_FLAT_LIKELY(f0 < oce.view.fieldCount &&
+                                                           f1 < oce.view.fieldCount &&
+                                                           oce.view.fields[f0].tryGetInt64(a) &&
+                                                           oce.view.fields[f1].tryGetInt64(b))) {
+                                            const std::int64_t r =
+                                                (tKind == detail::TrivialMethodKind::ReturnThisFieldAddField)
+                                                    ? (a + b)
+                                                    : (a - b);
+                                            if (!calleeExec->trivialCheckedArith) {
+                                                trivialOut.storeInt64(wrapInt32(r));
+                                                trivialHandled = true;
+                                            } else if (RS_FLAT_LIKELY(isValidInt32Payload(r))) {
+                                                trivialOut.storeInt64(r);
+                                                trivialHandled = true;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    case detail::TrivialMethodKind::ReturnThisFieldAddConst:
+                                    case detail::TrivialMethodKind::ReturnThisFieldSubConst:
+                                    case detail::TrivialMethodKind::ReturnThisFieldMulConst: {
+                                        const std::uint16_t f0 = calleeExec->trivialFieldIndex0;
+                                        std::int64_t a = 0;
+                                        if (RS_FLAT_LIKELY(f0 < oce.view.fieldCount &&
+                                                           oce.view.fields[f0].tryGetInt64(a))) {
+                                            const std::int64_t c =
+                                                calleeExec->trivialConstValue.asInt64Unchecked();
+                                            std::int64_t r = 0;
+                                            bool ovf = false;
+                                            if (tKind == detail::TrivialMethodKind::ReturnThisFieldAddConst) {
+                                                r = a + c;
+                                            } else if (tKind == detail::TrivialMethodKind::ReturnThisFieldSubConst) {
+                                                r = a - c;
+                                            } else {
+#if defined(__GNUC__) || defined(__clang__)
+                                                ovf = __builtin_mul_overflow(a, c, &r);
+#else
+                                                if (RS_FLAT_LIKELY(isValidInt32Payload(a) && isValidInt32Payload(c))) {
+                                                    r = a * c;
+                                                } else {
+                                                    ovf = true;
+                                                }
+#endif
+                                            }
+                                            if (!ovf) {
+                                                if (!calleeExec->trivialCheckedArith) {
+                                                    trivialOut.storeInt64(wrapInt32(r));
+                                                    trivialHandled = true;
+                                                } else if (RS_FLAT_LIKELY(isValidInt32Payload(r))) {
+                                                    trivialOut.storeInt64(r);
+                                                    trivialHandled = true;
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    case detail::TrivialMethodKind::None:
+                                        break;
+                                    }
+                                    if (RS_FLAT_LIKELY(trivialHandled)) {
+                                        localExecuted += totalCost;
+                                        ++state.statistics.functionCalls;
+                                        if (state.stack.size() + 1 > state.statistics.maximumCallDepth) {
+                                            state.statistics.maximumCallDepth = state.stack.size() + 1;
+                                        }
+                                        if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                                        if (ip->dstSlot != detail::InvalidCompactReg) {
+                                            frameBase[ip->dstSlot] = trivialOut;
+                                        }
+                                        RS_FLAT_DISPATCH_NEXT();
+                                    }
+                                }
+                            }
+                            localExecuted += baseCost;
+                            if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                            state.executed = localExecuted;
+                            Value callResult;
+                            const ValueWindow baseWin{&state.values, frameOffset, execution->totalFrameSlots};
+                            bool ok = false;
+                            if (ip->inlineArgCount == 1u) {
+                                ok = executeFunction(
+                                    state, *hit->target,
+                                    ArgumentSource(baseWin, static_cast<bytecode::Register>(ip->src0Slot)),
+                                    callResult, calleeExec, true);
+                            } else if (ip->inlineArgCount == 2u) {
+                                ok = executeFunction(
+                                    state, *hit->target,
+                                    ArgumentSource(
+                                        baseWin,
+                                        static_cast<bytecode::Register>(ip->src0Slot),
+                                        static_cast<bytecode::Register>(ip->src1Slot)),
+                                    callResult, calleeExec, true);
+                            } else if (ip->inlineArgCount == 3u) {
+                                ok = executeFunction(
+                                    state, *hit->target,
+                                    ArgumentSource(
+                                        baseWin,
+                                        static_cast<bytecode::Register>(ip->src0Slot),
+                                        static_cast<bytecode::Register>(ip->src1Slot),
+                                        static_cast<bytecode::Register>(ip->src2Slot)),
+                                    callResult, calleeExec, true);
+                            } else {
+                                const auto& cold = flatColdBase[ip - streamBase];
+                                const ValueWindow regWin{
+                                    &state.values,
+                                    frameOffset + execution->registerOffset,
+                                    function.registerTypes.size()};
+                                ok = executeFunction(
+                                    state, *hit->target,
+                                    ArgumentSource(regWin, cold.bytecode->operands),
+                                    callResult, calleeExec, true);
+                            }
+                            frameBase = state.values.data() + frameOffset;
+                            if (RS_FLAT_LIKELY(calleeExec->isSmallLeafInlineCandidate && !gcBudgetEnabled)) {
+                                localExecuted = state.executed;
+                                gcAccounted = localExecuted;
+                            } else {
+                                syncAfterFlatSubcall();
+                            }
+                            if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
+                            if (ip->dstSlot != detail::InvalidCompactReg) {
+                                frameBase[ip->dstSlot] = std::move(callResult);
+                            }
+                            RS_FLAT_DISPATCH_NEXT();
                         }
-                        RS_FLAT_DISPATCH_NEXT();
                     }
                 }
+                if (baseCost > 1u) goto L_FlatSuperFallback;
+                ++localExecuted;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
+                const auto& cold = flatColdBase[ip - streamBase];
                 Value callResult;
                 const ValueWindow regWin{&state.values, frameOffset + execution->registerOffset, function.registerTypes.size()};
-                const bool ok = executeCall(state, *location.module, instruction, regWin, callResult);
+                const bool ok = executeCall(state, *location.module, *cold.bytecode, regWin, callResult);
                 frameBase = state.values.data() + frameOffset;
                 syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
@@ -6545,64 +7230,8 @@ bool executeFunction(
             }
 
             RS_FLAT_CASE(SuperCheckNotNullCallPolledFast) {
-                const std::uint64_t baseCost = ip->span;
-                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || baseCost > budgetLimit - localExecuted)) {
-                    goto L_FlatSuperFallback;
-                }
-                const auto* receiver = std::get_if<ObjectRef>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_UNLIKELY(receiver == nullptr || !state.heap || !state.heap->isAlive(*receiver))) {
-                    goto L_FlatSuperFallback;
-                }
-                const auto& cold = flatColdBase[ip - streamBase];
-                const auto& instruction = *cold.bytecode;
-                const auto callSite = reinterpret_cast<std::uintptr_t>(&instruction);
-                const auto idx = static_cast<std::size_t>((callSite >> 4U) & 63U);
-                const auto& cached = (*state.inlineCallCache)[idx];
-                if (RS_FLAT_LIKELY(
-                        cached.callSite == &instruction &&
-                        cached.target && cached.execution &&
-                        (cached.receiver == *receiver ||
-                         (cached.receiverTypeId != 0 &&
-                          state.heap->objectTypeIdFast(*receiver) == cached.receiverTypeId)))) {
-                    const auto tKind = cached.execution->trivialKind;
-                    if (tKind != detail::TrivialMethodKind::None &&
-                        RS_FLAT_LIKELY(state.stack.size() < state.limits.recursionLimit)) {
-                        const std::uint64_t totalCost = baseCost + cached.execution->trivialInstCost;
-                        if (RS_FLAT_LIKELY(totalCost <= budgetLimit - localExecuted)) {
-                            localExecuted += totalCost;
-                            ++state.statistics.functionCalls;
-                            if (state.stack.size() + 1 > state.statistics.maximumCallDepth) {
-                                state.statistics.maximumCallDepth = state.stack.size() + 1;
-                            }
-                            if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
-                            if (ip->dstSlot != detail::InvalidCompactReg) {
-                                if (tKind == detail::TrivialMethodKind::ReturnConst) {
-                                    frameBase[ip->dstSlot] = cached.execution->trivialConstValue;
-                                } else if (tKind == detail::TrivialMethodKind::ReturnParam) {
-                                    frameBase[ip->dstSlot] = frameBase[ip->src0Slot];
-                                }
-                            }
-                            RS_FLAT_DISPATCH_NEXT();
-                        }
-                    }
-                    localExecuted += baseCost;
-                    if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
-                    state.executed = localExecuted;
-                    Value callResult;
-                    const ValueWindow singleWin{&state.values, frameOffset + ip->src0Slot, 1};
-                    const bool ok = executeFunction(
-                        state, *cached.target,
-                        ArgumentSource(singleWin, static_cast<bytecode::Register>(0)),
-                        callResult, cached.execution, true);
-                    frameBase = state.values.data() + frameOffset;
-                    syncAfterFlatSubcall();
-                    if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
-                    if (ip->dstSlot != detail::InvalidCompactReg) {
-                        frameBase[ip->dstSlot] = std::move(callResult);
-                    }
-                    RS_FLAT_DISPATCH_NEXT();
-                }
-                goto L_FlatSuperFallback;
+                // Directly share CallPolledFast's 4-Way PIC + multi-arg + TrivialMethodKind fast path!
+                goto L_CallPolledFastBody;
             }
 
             RS_FLAT_CASE(InlineCallEnter) {
@@ -7105,6 +7734,688 @@ bool executeFunction(
                     }
                 }
                 goto L_FlatMathFallback;
+            }
+
+            RS_FLAT_CASE(IsTypeObjFast) {
+                const std::uint64_t spanCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    goto L_FlatBudgetExceeded;
+                }
+                const Value& srcVal = frameBase[ip->src0Slot];
+                const ValueTag vtag = srcVal.rawTag();
+                if (vtag == ValueTag::NullObject || vtag == ValueTag::Monostate) {
+                    localExecuted += spanCost;
+                    frameBase[ip->dstSlot].storeBool(false);
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                if (RS_FLAT_LIKELY(vtag == ValueTag::ObjectRef)) {
+                    const ObjectRef ref = srcVal.u_.objectRef;
+                    auto& oce = objectCache[ref.slot & 3u];
+                    if (RS_FLAT_LIKELY((oce.valid && oce.ref == ref) || bindObjectCacheEntry(ref, oce))) {
+                        const auto targetTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                        bool matches = (oce.view.typeId == targetTid) ||
+                                       (oce.verifiedBaseTid == targetTid) ||
+                                       (cachedAssignableSubTid == oce.view.typeId &&
+                                        cachedAssignableBaseTid == targetTid);
+                        if (!matches) {
+                            matches = runtimeAssignable(state, oce.view.typeId, targetTid);
+                            if (matches) {
+                                oce.verifiedBaseTid = targetTid;
+                                cachedAssignableSubTid = oce.view.typeId;
+                                cachedAssignableBaseTid = targetTid;
+                            }
+                        }
+                        localExecuted += spanCost;
+                        frameBase[ip->dstSlot].storeBool(matches);
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                }
+                goto L_FlatMathFallback;
+            }
+
+            RS_FLAT_CASE(AsTypeObjFast) {
+                const std::uint64_t spanCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    goto L_FlatBudgetExceeded;
+                }
+                const Value& srcVal = frameBase[ip->src0Slot];
+                const ValueTag vtag = srcVal.rawTag();
+                if (vtag == ValueTag::NullObject || vtag == ValueTag::Monostate) {
+                    localExecuted += spanCost;
+                    frameBase[ip->dstSlot] = NullObject{};
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                if (RS_FLAT_LIKELY(vtag == ValueTag::ObjectRef)) {
+                    const ObjectRef ref = srcVal.u_.objectRef;
+                    auto& oce = objectCache[ref.slot & 3u];
+                    if (RS_FLAT_LIKELY((oce.valid && oce.ref == ref) || bindObjectCacheEntry(ref, oce))) {
+                        const auto targetTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                        bool matches = (oce.view.typeId == targetTid) ||
+                                       (oce.verifiedBaseTid == targetTid) ||
+                                       (cachedAssignableSubTid == oce.view.typeId &&
+                                        cachedAssignableBaseTid == targetTid);
+                        if (!matches) {
+                            matches = runtimeAssignable(state, oce.view.typeId, targetTid);
+                            if (matches) {
+                                oce.verifiedBaseTid = targetTid;
+                                cachedAssignableSubTid = oce.view.typeId;
+                                cachedAssignableBaseTid = targetTid;
+                            }
+                        }
+                        localExecuted += spanCost;
+                        if (matches) {
+                            frameBase[ip->dstSlot] = srcVal;
+                        } else {
+                            frameBase[ip->dstSlot] = NullObject{};
+                        }
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                }
+                goto L_FlatMathFallback;
+            }
+
+            RS_FLAT_CASE(NewDelegateFast) {
+                if (RS_FLAT_UNLIKELY(state.heap == nullptr || state.mirror == nullptr ||
+                                     ip->auxImm32 >= state.mirror->newDelegateSites.size())) {
+                    goto L_FlatMathFallback;
+                }
+                const std::uint64_t spanCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    goto L_FlatBudgetExceeded;
+                }
+                const auto& site = state.mirror->newDelegateSites[ip->auxImm32];
+                if (RS_FLAT_UNLIKELY(!site.valid)) goto L_FlatMathFallback;
+
+                std::array<Value, 8> fields = site.templateFields;
+                if (site.hasReceiverOperand) {
+                    const Value& recvVal = frameBase[ip->src0Slot];
+                    if (site.expectedReceiverType == semantic::PrimitiveType::Object) {
+                        const ValueTag vt = recvVal.rawTag();
+                        if (vt == ValueTag::NullObject) {
+                            // Valid null receiver target
+                        } else if (RS_FLAT_LIKELY(vt == ValueTag::ObjectRef)) {
+                            const ObjectRef rRef = recvVal.u_.objectRef;
+                            auto& rOce = objectCache[rRef.slot & 3u];
+                            if (RS_FLAT_UNLIKELY(!(rOce.valid && rOce.ref == rRef) &&
+                                                 !bindObjectCacheEntry(rRef, rOce))) {
+                                goto L_FlatMathFallback;
+                            }
+                            const semantic::SymbolId expTid = site.expectedReceiverTypeId;
+                            if (expTid != 0 &&
+                                rOce.view.typeId != expTid &&
+                                rOce.verifiedBaseTid != expTid &&
+                                !(cachedAssignableSubTid == rOce.view.typeId &&
+                                  cachedAssignableBaseTid == expTid)) {
+                                if (RS_FLAT_UNLIKELY(!runtimeAssignable(state, rOce.view.typeId, expTid))) {
+                                    goto L_FlatMathFallback;
+                                }
+                                rOce.verifiedBaseTid = expTid;
+                                cachedAssignableSubTid = rOce.view.typeId;
+                                cachedAssignableBaseTid = expTid;
+                            }
+                        } else {
+                            goto L_FlatMathFallback;
+                        }
+                    } else {
+                        goto L_FlatMathFallback;
+                    }
+                    fields[0] = recvVal;
+                }
+
+                localExecuted += spanCost;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                else gcAccounted = localExecuted;
+
+                bool slotsMoved = false;
+                RuntimeError allocErr;
+                const auto ref = state.heap->allocateObjectFromTemplate(
+                    site.delegateTypeId,
+                    fields.data(),
+                    fields.size(),
+                    delegateReferenceFields(),
+                    &allocErr,
+                    &slotsMoved);
+                if (RS_FLAT_LIKELY(ref.has_value())) {
+                    if (RS_FLAT_UNLIKELY(slotsMoved)) {
+                        invalidateAllFlatCaches();
+                    }
+                    if (gcBudgetEnabled) {
+                        gcActive = (state.heap->phase() != GcPhase::Idle ||
+                                    state.heap->collectionRequested());
+                    }
+                    frameBase[ip->dstSlot] = *ref;
+                    auto& oce = objectCache[ref->slot & 3u];
+                    if (state.heap->tryBindObjectFastView(*ref, oce.view)) {
+                        oce.ref = *ref;
+                        oce.verifiedBaseTid = 0;
+                        oce.valid = true;
+                    }
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                state.executed = localExecuted;
+                fail(state,
+                    allocErr.code == ErrorCode::None ? ErrorCode::OutOfMemory : allocErr.code,
+                    allocErr.message.empty() ? "delegate allocation failed" : allocErr.message);
+                goto L_FlatError;
+            }
+
+            RS_FLAT_CASE(CombineDelegateFast) {
+                if (RS_FLAT_UNLIKELY(state.heap == nullptr)) goto L_FlatMathFallback;
+                const std::uint64_t spanCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    goto L_FlatBudgetExceeded;
+                }
+                const Value& leftVal = frameBase[ip->src0Slot];
+                const Value& rightVal = frameBase[ip->src1Slot];
+                const auto delTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                const ValueTag lTag = leftVal.rawTag();
+                const ValueTag rTag = rightVal.rawTag();
+                if (RS_FLAT_UNLIKELY((lTag != ValueTag::NullObject && lTag != ValueTag::ObjectRef) ||
+                                     (rTag != ValueTag::NullObject && rTag != ValueTag::ObjectRef))) {
+                    goto L_FlatMathFallback;
+                }
+                localExecuted += spanCost;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                else gcAccounted = localExecuted;
+                state.executed = localExecuted;
+
+                bool slotsMoved = false;
+                Value combinedOut;
+                if (RS_FLAT_UNLIKELY(!combineOrRemoveDelegateFastImpl(
+                        state, delTid, leftVal, rightVal, false, combinedOut, &slotsMoved))) {
+                    goto L_FlatError;
+                }
+                if (RS_FLAT_UNLIKELY(slotsMoved)) {
+                    invalidateAllFlatCaches();
+                }
+                if (gcBudgetEnabled) {
+                    gcActive = (state.heap->phase() != GcPhase::Idle ||
+                                state.heap->collectionRequested());
+                }
+                frameBase[ip->dstSlot] = combinedOut;
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(RemoveDelegateFast) {
+                if (RS_FLAT_UNLIKELY(state.heap == nullptr)) goto L_FlatMathFallback;
+                const std::uint64_t spanCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    goto L_FlatBudgetExceeded;
+                }
+                const Value& leftVal = frameBase[ip->src0Slot];
+                const Value& rightVal = frameBase[ip->src1Slot];
+                const auto delTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                const ValueTag lTag = leftVal.rawTag();
+                const ValueTag rTag = rightVal.rawTag();
+                if (RS_FLAT_UNLIKELY((lTag != ValueTag::NullObject && lTag != ValueTag::ObjectRef) ||
+                                     (rTag != ValueTag::NullObject && rTag != ValueTag::ObjectRef))) {
+                    goto L_FlatMathFallback;
+                }
+                localExecuted += spanCost;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                else gcAccounted = localExecuted;
+                state.executed = localExecuted;
+
+                bool slotsMoved = false;
+                Value removedOut;
+                if (RS_FLAT_UNLIKELY(!combineOrRemoveDelegateFastImpl(
+                        state, delTid, leftVal, rightVal, true, removedOut, &slotsMoved))) {
+                    goto L_FlatError;
+                }
+                if (RS_FLAT_UNLIKELY(slotsMoved)) {
+                    invalidateAllFlatCaches();
+                }
+                if (gcBudgetEnabled) {
+                    gcActive = (state.heap->phase() != GcPhase::Idle ||
+                                state.heap->collectionRequested());
+                }
+                frameBase[ip->dstSlot] = removedOut;
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(InvokeDelegateFast) {
+                const std::uint64_t baseCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || baseCost > budgetLimit - localExecuted)) {
+                    if (baseCost > 1u) goto L_FlatSuperFallback;
+                    goto L_FlatBudgetExceeded;
+                }
+                if (RS_FLAT_UNLIKELY(state.heap == nullptr || state.mirror == nullptr ||
+                                     state.delegateCallCache == nullptr ||
+                                     ip->auxImm32 >= state.mirror->invokeDelegateSites.size() ||
+                                     ip->auxImm32 >= state.delegateCallCache->size())) {
+                    goto L_FlatMathFallback;
+                }
+                const auto& siteDesc = state.mirror->invokeDelegateSites[ip->auxImm32];
+                const Value& delVal = frameBase[ip->src0Slot];
+                const ValueTag delTag = delVal.rawTag();
+                if (RS_FLAT_UNLIKELY(delTag == ValueTag::NullObject || delTag == ValueTag::Monostate)) {
+                    localExecuted += baseCost;
+                    state.executed = localExecuted;
+                    fail(state, ErrorCode::NullReference,
+                        "delegate invocation attempted to dereference null");
+                    goto L_FlatError;
+                }
+                if (RS_FLAT_UNLIKELY(delTag != ValueTag::ObjectRef)) goto L_FlatMathFallback;
+
+                const ObjectRef delRef = delVal.u_.objectRef;
+                auto& delOce = objectCache[delRef.slot & 3u];
+                if (RS_FLAT_UNLIKELY(!(delOce.valid && delOce.ref == delRef) &&
+                                     !bindObjectCacheEntry(delRef, delOce))) {
+                    goto L_FlatMathFallback;
+                }
+                if (RS_FLAT_UNLIKELY(delOce.view.typeId != siteDesc.delegateTypeId ||
+                                     delOce.view.fieldCount != 8u)) {
+                    goto L_FlatMathFallback;
+                }
+
+                // Extract and type-validate user arguments into a C++ stack buffer (zero heap malloc!)
+                const std::size_t uCount = siteDesc.userParamTypes.size();
+                std::array<Value, 8> userArgsStack{};
+                std::vector<Value> userArgsHeap;
+                Value* userArgsPtr = userArgsStack.data();
+                if (RS_FLAT_UNLIKELY(uCount > userArgsStack.size())) {
+                    userArgsHeap.resize(uCount);
+                    userArgsPtr = userArgsHeap.data();
+                }
+                if (ip->inlineArgCount >= 1u) {
+                    if (uCount >= 1u) userArgsPtr[0] = frameBase[ip->src1Slot];
+                    if (uCount >= 2u) userArgsPtr[1] = frameBase[ip->src2Slot];
+                } else {
+                    const auto& cold = flatColdBase[ip - streamBase];
+                    const std::size_t regBase = execution->registerOffset;
+                    for (std::size_t k = 0; k < uCount; ++k) {
+                        userArgsPtr[k] = frameBase[regBase + cold.bytecode->operands[k + 1u]];
+                    }
+                }
+                bool userArgsValid = true;
+                for (std::size_t k = 0; k < uCount; ++k) {
+                    const std::uint8_t expTag = siteDesc.userParamExactTags[k];
+                    if (expTag != 0u) {
+                        if (RS_FLAT_UNLIKELY(static_cast<std::uint8_t>(userArgsPtr[k].rawTag()) != expTag)) {
+                            userArgsValid = false;
+                            break;
+                        }
+                    } else {
+                        const auto pt = siteDesc.userParamTypes[k];
+                        const auto ptId = siteDesc.userParamTypeIds[k];
+                        const ValueTag vt = userArgsPtr[k].rawTag();
+                        if (pt == semantic::PrimitiveType::Object) {
+                            if (vt == ValueTag::NullObject) {
+                                // ok
+                            } else if (vt == ValueTag::ObjectRef) {
+                                const auto actTid = state.heap->objectTypeIdFast(userArgsPtr[k].u_.objectRef);
+                                if (actTid == 0) {
+                                    userArgsValid = false;
+                                    break;
+                                }
+                                if (ptId != 0 && actTid != ptId &&
+                                    !(cachedAssignableSubTid == actTid && cachedAssignableBaseTid == ptId)) {
+                                    if (!runtimeAssignable(state, actTid, ptId)) {
+                                        userArgsValid = false;
+                                        break;
+                                    }
+                                    cachedAssignableSubTid = actTid;
+                                    cachedAssignableBaseTid = ptId;
+                                }
+                            } else {
+                                userArgsValid = false;
+                                break;
+                            }
+                        } else {
+                            // Complex Struct / Enum / String / Array: verify cleanly via expectSignatureType-free check
+                            userArgsValid = false;
+                            break;
+                        }
+                    }
+                }
+                if (RS_FLAT_UNLIKELY(!userArgsValid)) goto L_FlatMathFallback;
+
+                std::int64_t rootFlags = -1;
+                if (RS_FLAT_UNLIKELY(!delOce.view.fields[3].tryGetInt64(rootFlags) ||
+                                     rootFlags < 0 || rootFlags > 4)) {
+                    goto L_FlatMathFallback;
+                }
+
+                auto& siteCache = (*state.delegateCallCache)[ip->auxImm32];
+
+                const auto tryEvalTrivialLeaf = [&](const ResolvedDelegateLeaf& leaf,
+                                                    std::uint64_t preCallCost,
+                                                    Value& outTrivialVal) -> bool {
+                    const auto* calleeExec = leaf.execution;
+                    const auto tKind = calleeExec->trivialKind;
+                    if (tKind == detail::TrivialMethodKind::None ||
+                        RS_FLAT_UNLIKELY(state.stack.size() >= state.limits.recursionLimit)) {
+                        return false;
+                    }
+                    const std::uint64_t totalCost = preCallCost + calleeExec->trivialInstCost;
+                    if (RS_FLAT_UNLIKELY(totalCost > budgetLimit - localExecuted)) {
+                        return false;
+                    }
+                    const std::size_t bias = leaf.hasBoundReceiver ? 1u : 0u;
+                    bool handled = false;
+                    switch (tKind) {
+                    case detail::TrivialMethodKind::ReturnVoid:
+                        handled = true;
+                        break;
+                    case detail::TrivialMethodKind::ReturnConst:
+                        outTrivialVal = calleeExec->trivialConstValue;
+                        handled = true;
+                        break;
+                    case detail::TrivialMethodKind::ReturnParam: {
+                        const std::uint16_t pIdx = calleeExec->trivialParamIndex;
+                        if (leaf.hasBoundReceiver && pIdx == 0) {
+                            outTrivialVal = leaf.receiverVal;
+                            handled = true;
+                        } else if (pIdx >= bias && (pIdx - bias) < uCount) {
+                            outTrivialVal = userArgsPtr[pIdx - bias];
+                            handled = true;
+                        }
+                        break;
+                    }
+                    case detail::TrivialMethodKind::ReturnThisFieldExact:
+                    case detail::TrivialMethodKind::StoreThisFieldExact:
+                    case detail::TrivialMethodKind::ReturnThisFieldAddField:
+                    case detail::TrivialMethodKind::ReturnThisFieldSubField:
+                    case detail::TrivialMethodKind::ReturnThisFieldAddConst:
+                    case detail::TrivialMethodKind::ReturnThisFieldSubConst:
+                    case detail::TrivialMethodKind::ReturnThisFieldMulConst: {
+                        if (!leaf.hasBoundReceiver || leaf.receiverVal.rawTag() != ValueTag::ObjectRef) {
+                            break;
+                        }
+                        auto& rOce = objectCache[leaf.receiverRef.slot & 3u];
+                        if (RS_FLAT_UNLIKELY(!(rOce.valid && rOce.ref == leaf.receiverRef) &&
+                                             !bindObjectCacheEntry(leaf.receiverRef, rOce))) {
+                            break;
+                        }
+                        const std::uint16_t f0 = calleeExec->trivialFieldIndex0;
+                        if (tKind == detail::TrivialMethodKind::ReturnThisFieldExact) {
+                            if (RS_FLAT_LIKELY(f0 < rOce.view.fieldCount &&
+                                               static_cast<std::uint8_t>(rOce.view.fields[f0].rawTag()) ==
+                                                   calleeExec->trivialFieldTag0)) {
+                                outTrivialVal = rOce.view.fields[f0];
+                                handled = true;
+                            }
+                        } else if (tKind == detail::TrivialMethodKind::StoreThisFieldExact) {
+                            const std::uint16_t pIdx = calleeExec->trivialParamIndex;
+                            if (pIdx >= bias && (pIdx - bias) < uCount &&
+                                RS_FLAT_LIKELY(f0 < rOce.view.fieldCount)) {
+                                const Value& rhs = userArgsPtr[pIdx - bias];
+                                if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(rhs.rawTag()) ==
+                                                   calleeExec->trivialFieldTag0)) {
+                                    rOce.view.fields[f0] = rhs;
+                                    handled = true;
+                                }
+                            }
+                        } else if (tKind == detail::TrivialMethodKind::ReturnThisFieldAddField ||
+                                   tKind == detail::TrivialMethodKind::ReturnThisFieldSubField) {
+                            const std::uint16_t f1 = calleeExec->trivialFieldIndex1;
+                            std::int64_t a = 0, b = 0;
+                            if (RS_FLAT_LIKELY(f0 < rOce.view.fieldCount &&
+                                               f1 < rOce.view.fieldCount &&
+                                               rOce.view.fields[f0].tryGetInt64(a) &&
+                                               rOce.view.fields[f1].tryGetInt64(b))) {
+                                const std::int64_t r =
+                                    (tKind == detail::TrivialMethodKind::ReturnThisFieldAddField)
+                                        ? (a + b)
+                                        : (a - b);
+                                if (!calleeExec->trivialCheckedArith) {
+                                    outTrivialVal.storeInt64(wrapInt32(r));
+                                    handled = true;
+                                } else if (RS_FLAT_LIKELY(isValidInt32Payload(r))) {
+                                    outTrivialVal.storeInt64(r);
+                                    handled = true;
+                                }
+                            }
+                        } else {
+                            std::int64_t a = 0;
+                            if (RS_FLAT_LIKELY(f0 < rOce.view.fieldCount &&
+                                               rOce.view.fields[f0].tryGetInt64(a))) {
+                                const std::int64_t c = calleeExec->trivialConstValue.asInt64Unchecked();
+                                std::int64_t r = 0;
+                                bool ovf = false;
+                                if (tKind == detail::TrivialMethodKind::ReturnThisFieldAddConst) r = a + c;
+                                else if (tKind == detail::TrivialMethodKind::ReturnThisFieldSubConst) r = a - c;
+                                else {
+#if defined(__GNUC__) || defined(__clang__)
+                                    ovf = __builtin_mul_overflow(a, c, &r);
+#else
+                                    if (RS_FLAT_LIKELY(isValidInt32Payload(a) && isValidInt32Payload(c))) {
+                                        r = a * c;
+                                    } else {
+                                        ovf = true;
+                                    }
+#endif
+                                }
+                                if (!ovf) {
+                                    if (!calleeExec->trivialCheckedArith) {
+                                        outTrivialVal.storeInt64(wrapInt32(r));
+                                        handled = true;
+                                    } else if (RS_FLAT_LIKELY(isValidInt32Payload(r))) {
+                                        outTrivialVal.storeInt64(r);
+                                        handled = true;
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    case detail::TrivialMethodKind::None:
+                        break;
+                    }
+                    if (RS_FLAT_LIKELY(handled)) {
+                        localExecuted += totalCost;
+                        ++state.statistics.functionCalls;
+                        if (state.stack.size() + 1 > state.statistics.maximumCallDepth) {
+                            state.statistics.maximumCallDepth = state.stack.size() + 1;
+                        }
+                        if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                        return true;
+                    }
+                    return false;
+                };
+
+                if (RS_FLAT_LIKELY(rootFlags != 4)) {
+                    // Single-cast 16-entry direct-mapped IC keyed by immutable delegate ObjectRef
+                    auto& slotWay = siteCache.singleWays[delRef.slot & 15u];
+                    const ResolvedDelegateLeaf* hit = nullptr;
+                    if (RS_FLAT_LIKELY(
+                            slotWay.valid &&
+                            slotWay.leafRef == delRef &&
+                            (!slotWay.hasBoundReceiver ||
+                             slotWay.receiverVal.rawTag() != ValueTag::ObjectRef ||
+                             state.heap->isAlive(slotWay.receiverRef)))) {
+                        hit = &slotWay;
+                    } else {
+                        ResolvedDelegateLeaf resolved{};
+                        if (!resolveDelegateLeafFast(
+                                state, *state.mirror, delRef, delOce.view, uCount, siteCache, resolved)) {
+                            goto L_FlatMathFallback;
+                        }
+                        slotWay = std::move(resolved);
+                        hit = &slotWay;
+                    }
+
+                    Value callResult{};
+                    if (tryEvalTrivialLeaf(*hit, baseCost, callResult)) {
+                        if (ip->dstSlot != detail::InvalidCompactReg) {
+                            frameBase[ip->dstSlot] = callResult;
+                        }
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+
+                    localExecuted += baseCost;
+                    if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                    state.executed = localExecuted;
+
+                    const ResolvedDelegateLeaf hitLeaf = *hit;
+                    bool ok = false;
+                    if (!hitLeaf.hasBoundReceiver) {
+                        ok = executeFunction(
+                            state,
+                            *hitLeaf.target,
+                            ArgumentSource(userArgsPtr, uCount),
+                            callResult,
+                            hitLeaf.execution,
+                            true);
+                    } else if (RS_FLAT_LIKELY(uCount + 1u <= 8u)) {
+                        std::array<Value, 8> boundArgs{};
+                        boundArgs[0] = hitLeaf.receiverVal;
+                        for (std::size_t k = 0; k < uCount; ++k) boundArgs[k + 1u] = userArgsPtr[k];
+                        ok = executeFunction(
+                            state,
+                            *hitLeaf.target,
+                            ArgumentSource(boundArgs.data(), uCount + 1u),
+                            callResult,
+                            hitLeaf.execution,
+                            true);
+                    } else {
+                        std::vector<Value> boundVec;
+                        boundVec.reserve(uCount + 1u);
+                        boundVec.push_back(hitLeaf.receiverVal);
+                        for (std::size_t k = 0; k < uCount; ++k) boundVec.push_back(userArgsPtr[k]);
+                        ok = executeFunction(
+                            state,
+                            *hitLeaf.target,
+                            ArgumentSource(boundVec),
+                            callResult,
+                            hitLeaf.execution,
+                            true);
+                    }
+
+                    frameBase = state.values.data() + frameOffset;
+                    if (RS_FLAT_LIKELY(hitLeaf.execution->isSmallLeafInlineCandidate && !gcBudgetEnabled)) {
+                        localExecuted = state.executed;
+                        gcAccounted = localExecuted;
+                    } else {
+                        syncAfterFlatSubcall();
+                    }
+                    if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
+                    if (ip->dstSlot != detail::InvalidCompactReg) {
+                        frameBase[ip->dstSlot] = std::move(callResult);
+                    }
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+
+                // Multicast fast path (flags == 4): pre-flattened & pre-resolved leaf vector cache!
+                bool mcCacheHit = (siteCache.multicastValid && siteCache.multicastRef == delRef);
+                if (mcCacheHit) {
+                    for (const auto& leaf : siteCache.multicastLeaves) {
+                        if (!state.heap->isAlive(leaf.leafRef) ||
+                            (leaf.hasBoundReceiver &&
+                             leaf.receiverVal.rawTag() == ValueTag::ObjectRef &&
+                             !state.heap->isAlive(leaf.receiverRef))) {
+                            mcCacheHit = false;
+                            break;
+                        }
+                    }
+                }
+                std::vector<ResolvedDelegateLeaf> fallbackMulticastLeaves;
+                std::vector<ResolvedDelegateLeaf>* activeLeaves = &siteCache.multicastLeaves;
+                bool pinnedSiteCache = false;
+                if (RS_FLAT_LIKELY(mcCacheHit)) {
+                    ++siteCache.multicastPinCount;
+                    pinnedSiteCache = true;
+                } else if (siteCache.multicastPinCount == 0u) {
+                    siteCache.multicastValid = false;
+                    if (!flattenAndResolveMulticastFast(
+                            state, *state.mirror, siteDesc.delegateTypeId, delRef, uCount, siteCache, siteCache.multicastLeaves)) {
+                        goto L_FlatMathFallback;
+                    }
+                    siteCache.multicastRef = delRef;
+                    siteCache.multicastValid = true;
+                    ++siteCache.multicastPinCount;
+                    pinnedSiteCache = true;
+                } else {
+                    activeLeaves = &fallbackMulticastLeaves;
+                    if (!flattenAndResolveMulticastFast(
+                            state, *state.mirror, siteDesc.delegateTypeId, delRef, uCount, siteCache, fallbackMulticastLeaves)) {
+                        goto L_FlatMathFallback;
+                    }
+                }
+                struct MulticastPinGuard {
+                    DelegateCallSiteCache& cache;
+                    bool pinned = false;
+                    ~MulticastPinGuard() {
+                        if (pinned && cache.multicastPinCount > 0u) {
+                            --cache.multicastPinCount;
+                        }
+                    }
+                } pinGuard{siteCache, pinnedSiteCache};
+
+                localExecuted += baseCost;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                state.executed = localExecuted;
+
+                Value lastResult{};
+                std::array<Value, 8> mcBoundArgs{};
+                const std::size_t leafCount = activeLeaves->size();
+                for (std::size_t li = 0; li < leafCount; ++li) {
+                    const ResolvedDelegateLeaf leaf = (*activeLeaves)[li];
+                    if (tryEvalTrivialLeaf(leaf, 1u, lastResult)) {
+                        state.executed = localExecuted;
+                        continue;
+                    }
+                    if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) {
+                        state.executed = localExecuted - 1u;
+                        fail(state, ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
+                        goto L_FlatError;
+                    }
+                    if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                    state.executed = localExecuted;
+
+                    bool ok = false;
+                    if (!leaf.hasBoundReceiver) {
+                        ok = executeFunction(
+                            state,
+                            *leaf.target,
+                            ArgumentSource(userArgsPtr, uCount),
+                            lastResult,
+                            leaf.execution,
+                            true);
+                    } else if (RS_FLAT_LIKELY(uCount + 1u <= mcBoundArgs.size())) {
+                        mcBoundArgs[0] = leaf.receiverVal;
+                        for (std::size_t k = 0; k < uCount; ++k) mcBoundArgs[k + 1u] = userArgsPtr[k];
+                        ok = executeFunction(
+                            state,
+                            *leaf.target,
+                            ArgumentSource(mcBoundArgs.data(), uCount + 1u),
+                            lastResult,
+                            leaf.execution,
+                            true);
+                    } else {
+                        std::vector<Value> boundVec;
+                        boundVec.reserve(uCount + 1u);
+                        boundVec.push_back(leaf.receiverVal);
+                        for (std::size_t k = 0; k < uCount; ++k) boundVec.push_back(userArgsPtr[k]);
+                        ok = executeFunction(
+                            state,
+                            *leaf.target,
+                            ArgumentSource(boundVec),
+                            lastResult,
+                            leaf.execution,
+                            true);
+                    }
+                    if (RS_FLAT_LIKELY(leaf.execution->isSmallLeafInlineCandidate && !gcBudgetEnabled)) {
+                        localExecuted = state.executed;
+                        gcAccounted = localExecuted;
+                    } else {
+                        syncAfterFlatSubcall();
+                    }
+                    if (RS_FLAT_UNLIKELY(!ok)) {
+                        frameBase = state.values.data() + frameOffset;
+                        goto L_FlatError;
+                    }
+                }
+                frameBase = state.values.data() + frameOffset;
+                if (ip->dstSlot != detail::InvalidCompactReg) {
+                    frameBase[ip->dstSlot] = std::move(lastResult);
+                }
+                RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(GenericBytecode) {
@@ -8005,6 +9316,8 @@ ExecutionResult Interpreter::invoke(
             std::vector<Value> values;
             std::vector<const std::string*> stack;
             std::array<InlineCallCacheEntry, 64> inlineCallCache{};
+            std::vector<PolymorphicPicSite> polyCallCache;
+            std::vector<DelegateCallSiteCache> delegateCallCache;
             std::uint64_t lastMirrorId = 0;
         };
         enum : std::size_t { MaxDepth = 8 };
@@ -8013,6 +9326,9 @@ ExecutionResult Interpreter::invoke(
     };
     thread_local ThreadInvokeScratch tlsScratch;
     std::array<InlineCallCacheEntry, 64> fallbackInlineCache;
+    std::vector<PolymorphicPicSite> fallbackPolyCache;
+    std::vector<DelegateCallSiteCache> fallbackDelCache;
+    const auto& activeMirror = detail::executionMirror(*program_);
     struct ScratchGuard {
         ThreadInvokeScratch& scratch;
         State& state;
@@ -8020,24 +9336,40 @@ ExecutionResult Interpreter::invoke(
         ScratchGuard(
             ThreadInvokeScratch& s,
             State& st,
-            std::uint64_t mirrorId,
-            std::array<InlineCallCacheEntry, 64>& fallback) noexcept
+            const detail::ExecutionMirror& mirror,
+            std::array<InlineCallCacheEntry, 64>& fallback,
+            std::vector<PolymorphicPicSite>& fallbackPoly,
+            std::vector<DelegateCallSiteCache>& fallbackDel)
             : scratch(s), state(st) {
+            state.mirror = &mirror;
+            const std::uint64_t mirrorId = mirror.instanceId;
+            const std::size_t polyCount = mirror.polyCallSites.size();
+            const std::size_t delCount = mirror.invokeDelegateSites.size();
             if (scratch.depth < ThreadInvokeScratch::MaxDepth) {
                 auto& buf = scratch.pool[scratch.depth++];
                 if (buf.values.size() < 256) buf.values.resize(256);
                 if (buf.stack.capacity() < 32) buf.stack.reserve(32);
-                if (buf.lastMirrorId != mirrorId) {
+                if (buf.lastMirrorId != mirrorId ||
+                    buf.polyCallCache.size() != polyCount ||
+                    buf.delegateCallCache.size() != delCount) {
                     buf.inlineCallCache.fill(InlineCallCacheEntry{});
+                    buf.polyCallCache.assign(polyCount, PolymorphicPicSite{});
+                    buf.delegateCallCache.assign(delCount, DelegateCallSiteCache{});
                     buf.lastMirrorId = mirrorId;
                 }
                 state.values = std::move(buf.values);
                 state.stack = std::move(buf.stack);
                 state.inlineCallCache = &buf.inlineCallCache;
+                state.polyCallCache = &buf.polyCallCache;
+                state.delegateCallCache = &buf.delegateCallCache;
                 active = true;
             } else {
                 fallback.fill(InlineCallCacheEntry{});
+                fallbackPoly.assign(polyCount, PolymorphicPicSite{});
+                fallbackDel.assign(delCount, DelegateCallSiteCache{});
                 state.inlineCallCache = &fallback;
+                state.polyCallCache = &fallbackPoly;
+                state.delegateCallCache = &fallbackDel;
             }
         }
         ~ScratchGuard() noexcept {
@@ -8055,8 +9387,10 @@ ExecutionResult Interpreter::invoke(
     ScratchGuard scratchGuard(
         tlsScratch,
         state,
-        detail::executionMirror(*program_).instanceId,
-        fallbackInlineCache);
+        activeMirror,
+        fallbackInlineCache,
+        fallbackPolyCache,
+        fallbackDelCache);
     state.limits = options.limits;
     state.program = program_.get();
     state.externalResolver = &externalResolver_;

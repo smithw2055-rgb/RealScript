@@ -2930,7 +2930,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         }
                         break;
                     }
-                    case QuickOpcode::CallPolled:
+                    case QuickOpcode::CallPolled: {
                         flat.flatOpcode = FlatOpcode::CallPolledFast;
                         flat.dstSlot = inst.result == InvalidCompactReg
                             ? InvalidCompactReg
@@ -2939,7 +2939,33 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         flat.src1Slot = inst.op1 == InvalidCompactReg
                             ? InvalidCompactReg
                             : regSlot(inst.op1);
+                        flat.src2Slot = inst.op2 == InvalidCompactReg
+                            ? InvalidCompactReg
+                            : regSlot(inst.op2);
+                        const std::size_t opCount = inst.bytecode ? inst.bytecode->operands.size() : 0;
+                        flat.inlineArgCount = (opCount >= 1 && opCount <= 3)
+                            ? static_cast<std::uint8_t>(opCount)
+                            : 0u;
+                        const std::uint32_t siteId =
+                            static_cast<std::uint32_t>(mirror->polyCallSites.size());
+                        PolymorphicCallSiteDesc siteDesc{};
+                        if (inst.bytecode && inst.bytecode->index < module.functionReferences.size()) {
+                            const auto& ref = module.functionReferences[inst.bytecode->index];
+                            if (ref.virtualDispatch && !ref.interfaceDispatch) {
+                                siteDesc.isInterface = false;
+                                siteDesc.slot = ref.virtualSlot;
+                                siteDesc.valid = true;
+                            } else if (ref.interfaceDispatch && !ref.virtualDispatch) {
+                                siteDesc.isInterface = true;
+                                siteDesc.interfaceTypeId = ref.interfaceTypeId;
+                                siteDesc.slot = ref.interfaceSlot;
+                                siteDesc.valid = true;
+                            }
+                        }
+                        mirror->polyCallSites.push_back(siteDesc);
+                        flat.auxImm32 = siteId;
                         break;
+                    }
                     case QuickOpcode::ConstantDouble: {
                         flat.flatOpcode = FlatOpcode::ConstantDouble;
                         flat.dstSlot = regSlot(inst.result);
@@ -3283,6 +3309,182 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                 }
                                 break;
                             }
+                            if ((bcInst.opcode == bytecode::Opcode::IsType ||
+                                 bcInst.opcode == bytecode::Opcode::AsType) &&
+                                bcInst.operands.size() == 1 &&
+                                bcInst.operands[0] < regCount &&
+                                bcInst.result < regCount &&
+                                bcInst.elementType == semantic::PrimitiveType::Object &&
+                                bcInst.elementTypeId != 0 &&
+                                function.registerTypes[bcInst.operands[0]] ==
+                                    semantic::PrimitiveType::Object) {
+                                flat.flatOpcode = (bcInst.opcode == bytecode::Opcode::IsType)
+                                    ? FlatOpcode::IsTypeObjFast
+                                    : FlatOpcode::AsTypeObjFast;
+                                flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                flat.src0Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[0]));
+                                flat.integerImmediate = static_cast<std::int64_t>(bcInst.elementTypeId);
+                                break;
+                            }
+                            if (bcInst.opcode == bytecode::Opcode::NewDelegate &&
+                                bcInst.result < regCount &&
+                                bcInst.typeIndex < module.types.size() &&
+                                bcInst.index < module.functionReferences.size() &&
+                                bcInst.operands.size() <= 1) {
+                                const auto& delType = module.types[bcInst.typeIndex];
+                                const auto& fnRef = module.functionReferences[bcInst.index];
+                                const bool recvOk = bcInst.operands.empty()
+                                    ? !(fnRef.virtualDispatch || fnRef.interfaceDispatch)
+                                    : (bcInst.operands[0] < regCount && !fnRef.parameterTypes.empty());
+                                std::uint64_t delFlags = 0;
+                                if (fnRef.virtualDispatch) delFlags |= 1u;
+                                if (fnRef.interfaceDispatch) delFlags |= 2u;
+                                if (delType.delegateType && delType.id != 0 && recvOk && delFlags <= 2u) {
+                                    const auto delWord = [](std::uint64_t v, bool high) noexcept -> std::int64_t {
+                                        return static_cast<std::int64_t>(
+                                            static_cast<std::uint32_t>(high ? (v >> 32u) : v));
+                                    };
+                                    NewDelegateSiteDesc site{};
+                                    site.delegateTypeId = delType.id;
+                                    site.hasReceiverOperand = !bcInst.operands.empty();
+                                    if (site.hasReceiverOperand) {
+                                        site.expectedReceiverType = fnRef.parameterTypes.front();
+                                        site.expectedReceiverTypeId = fnRef.parameterTypeIds.empty()
+                                            ? 0
+                                            : fnRef.parameterTypeIds.front();
+                                    }
+                                    site.templateFields[0] = NullObject{};
+                                    site.templateFields[1] = delWord(fnRef.symbolId, false);
+                                    site.templateFields[2] = delWord(fnRef.symbolId, true);
+                                    site.templateFields[3] = static_cast<std::int64_t>(delFlags);
+                                    site.templateFields[4] = static_cast<std::int64_t>(
+                                        fnRef.virtualDispatch
+                                            ? fnRef.virtualSlot
+                                            : (fnRef.interfaceDispatch ? fnRef.interfaceSlot : 0u));
+                                    site.templateFields[5] = delWord(fnRef.interfaceTypeId, false);
+                                    site.templateFields[6] = delWord(fnRef.interfaceTypeId, true);
+                                    site.templateFields[7] = NullObject{};
+                                    site.valid = true;
+                                    const auto siteId =
+                                        static_cast<std::uint32_t>(mirror->newDelegateSites.size());
+                                    mirror->newDelegateSites.push_back(site);
+                                    flat.flatOpcode = FlatOpcode::NewDelegateFast;
+                                    flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                    flat.src0Slot = site.hasReceiverOperand
+                                        ? regSlot(static_cast<std::uint16_t>(bcInst.operands[0]))
+                                        : InvalidCompactReg;
+                                    flat.inlineArgCount = static_cast<std::uint8_t>(bcInst.operands.size());
+                                    flat.auxImm32 = siteId;
+                                    break;
+                                }
+                            }
+                            if ((bcInst.opcode == bytecode::Opcode::CombineDelegate ||
+                                 bcInst.opcode == bytecode::Opcode::RemoveDelegate) &&
+                                bcInst.operands.size() == 2 &&
+                                bcInst.operands[0] < regCount &&
+                                bcInst.operands[1] < regCount &&
+                                bcInst.result < regCount &&
+                                bcInst.typeIndex < module.types.size()) {
+                                const auto& delType = module.types[bcInst.typeIndex];
+                                if (delType.delegateType && delType.id != 0) {
+                                    flat.flatOpcode =
+                                        (bcInst.opcode == bytecode::Opcode::CombineDelegate)
+                                            ? FlatOpcode::CombineDelegateFast
+                                            : FlatOpcode::RemoveDelegateFast;
+                                    flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                    flat.src0Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[0]));
+                                    flat.src1Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[1]));
+                                    flat.integerImmediate = static_cast<std::int64_t>(delType.id);
+                                    break;
+                                }
+                            }
+                            if (bcInst.opcode == bytecode::Opcode::InvokeDelegate &&
+                                !bcInst.operands.empty() &&
+                                bcInst.operands[0] < regCount &&
+                                (bcInst.result == bytecode::InvalidRegister || bcInst.result < regCount) &&
+                                bcInst.typeIndex < module.types.size()) {
+                                const auto& delType = module.types[bcInst.typeIndex];
+                                const semantic::FunctionSymbol* invokeSym = nullptr;
+                                if (delType.delegateType && delType.id != 0) {
+                                    for (const auto& m : delType.methods) {
+                                        if (m.name == "Invoke") {
+                                            invokeSym = &m;
+                                            break;
+                                        }
+                                    }
+                                }
+                                bool allOpsInRange = true;
+                                for (const auto opReg : bcInst.operands) {
+                                    if (opReg >= regCount) {
+                                        allOpsInRange = false;
+                                        break;
+                                    }
+                                }
+                                if (invokeSym &&
+                                    !invokeSym->parameters.empty() &&
+                                    bcInst.operands.size() == invokeSym->parameters.size() &&
+                                    allOpsInRange) {
+                                    const auto exactScalarOrInlineTag =
+                                        [&](semantic::PrimitiveType pt, semantic::SymbolId tid) noexcept -> std::uint8_t {
+                                        switch (pt) {
+                                        case semantic::PrimitiveType::Bool: return static_cast<std::uint8_t>(ValueTag::Bool);
+                                        case semantic::PrimitiveType::Byte: return static_cast<std::uint8_t>(ValueTag::Byte);
+                                        case semantic::PrimitiveType::SByte: return static_cast<std::uint8_t>(ValueTag::SByte);
+                                        case semantic::PrimitiveType::Short: return static_cast<std::uint8_t>(ValueTag::Short);
+                                        case semantic::PrimitiveType::UShort: return static_cast<std::uint8_t>(ValueTag::UShort);
+                                        case semantic::PrimitiveType::Int: return static_cast<std::uint8_t>(ValueTag::Int64);
+                                        case semantic::PrimitiveType::UInt: return static_cast<std::uint8_t>(ValueTag::UInt);
+                                        case semantic::PrimitiveType::Long: return static_cast<std::uint8_t>(ValueTag::Long);
+                                        case semantic::PrimitiveType::ULong: return static_cast<std::uint8_t>(ValueTag::ULong);
+                                        case semantic::PrimitiveType::Float: return static_cast<std::uint8_t>(ValueTag::Float);
+                                        case semantic::PrimitiveType::Double: return static_cast<std::uint8_t>(ValueTag::Double);
+                                        case semantic::PrimitiveType::Char: return static_cast<std::uint8_t>(ValueTag::Char);
+                                        case semantic::PrimitiveType::Struct:
+                                            if (tid == fixedTypeId()) return static_cast<std::uint8_t>(ValueTag::Fixed);
+                                            if (tid == fixed16TypeId()) return static_cast<std::uint8_t>(ValueTag::Fixed16);
+                                            if (tid == vec2TypeId()) return static_cast<std::uint8_t>(ValueTag::Vec2);
+                                            if (tid == vec3TypeId()) return static_cast<std::uint8_t>(ValueTag::Vec3);
+                                            return 0u;
+                                        default:
+                                            return 0u;
+                                        }
+                                    };
+                                    InvokeDelegateSiteDesc site{};
+                                    site.delegateTypeId = delType.id;
+                                    const std::size_t uCount = invokeSym->parameters.size() - 1u;
+                                    site.userParamTypes.reserve(uCount);
+                                    site.userParamTypeIds.reserve(uCount);
+                                    site.userParamExactTags.reserve(uCount);
+                                    for (std::size_t pIdx = 1; pIdx < invokeSym->parameters.size(); ++pIdx) {
+                                        const auto& param = invokeSym->parameters[pIdx];
+                                        const auto pt = semantic::storageTypeOf(param);
+                                        const auto ptId = exactTypeId(pt, semantic::storageTypeNameOf(param));
+                                        site.userParamTypes.push_back(pt);
+                                        site.userParamTypeIds.push_back(ptId);
+                                        site.userParamExactTags.push_back(exactScalarOrInlineTag(pt, ptId));
+                                    }
+                                    site.valid = true;
+                                    const auto siteId =
+                                        static_cast<std::uint32_t>(mirror->invokeDelegateSites.size());
+                                    mirror->invokeDelegateSites.push_back(std::move(site));
+                                    flat.flatOpcode = FlatOpcode::InvokeDelegateFast;
+                                    flat.dstSlot = (bcInst.result == bytecode::InvalidRegister)
+                                        ? InvalidCompactReg
+                                        : regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                    flat.src0Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[0]));
+                                    flat.src1Slot = bcInst.operands.size() >= 2
+                                        ? regSlot(static_cast<std::uint16_t>(bcInst.operands[1]))
+                                        : InvalidCompactReg;
+                                    flat.src2Slot = bcInst.operands.size() >= 3
+                                        ? regSlot(static_cast<std::uint16_t>(bcInst.operands[2]))
+                                        : InvalidCompactReg;
+                                    flat.inlineArgCount = bcInst.operands.size() <= 3
+                                        ? static_cast<std::uint8_t>(bcInst.operands.size())
+                                        : 0u;
+                                    flat.auxImm32 = siteId;
+                                    break;
+                                }
+                            }
                             if (bcInst.opcode == bytecode::Opcode::LoadElement &&
                                 bcInst.operands.size() == 2 &&
                                 bcInst.operands[0] < regCount &&
@@ -3415,6 +3617,8 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                             usesSpanOnlyCost = true;
                             return 0;
                         case FlatOpcode::CheckNotNullFast:
+                        case FlatOpcode::IsTypeObjFast:
+                        case FlatOpcode::AsTypeObjFast:
                         case FlatOpcode::LoadFieldFast:
                         case FlatOpcode::LoadFieldExactFast:
                         case FlatOpcode::NewArrayFast:
@@ -3456,6 +3660,8 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         case FlatOpcode::LoadElementTypedFast:
                         case FlatOpcode::StoreFieldFast:
                         case FlatOpcode::StoreFieldExactFast:
+                        case FlatOpcode::CombineDelegateFast:
+                        case FlatOpcode::RemoveDelegateFast:
                             usesSpanOnlyCost = true;
                             return 2;
                         case FlatOpcode::StoreElementIntFast:
@@ -3559,13 +3765,14 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         out.reserve(curEnd - blockStreamStart);
                         for (std::size_t idx = blockStreamStart; idx < curEnd; ++idx) {
                             FlatBuildItem cur = buildStream[idx];
-                            // Fuse CheckNotNullFast(s0 -> deadReg, span>=1) + CallPolledFast(s0 == deadReg, zero extra args)
+                            // Fuse CheckNotNullFast(s0 -> deadReg, span>=1) + CallPolledFast(s0 == deadReg, 0..2 extra args)
                             if (!out.empty() &&
                                 out.back().hot.flatOpcode == FlatOpcode::CheckNotNullFast &&
                                 cur.hot.flatOpcode == FlatOpcode::CallPolledFast &&
                                 cur.hot.span == 1 &&
                                 static_cast<std::uint32_t>(out.back().hot.span) + 1u <= 250u &&
-                                cur.hot.src1Slot == InvalidCompactReg &&
+                                cur.hot.inlineArgCount >= 1u &&
+                                cur.hot.inlineArgCount <= 3u &&
                                 cur.hot.src0Slot == out.back().hot.dstSlot &&
                                 isDeadSingleUseRegSlot(out.back().hot.dstSlot) &&
                                 out.back().cold.instructionIndexInBlock + out.back().hot.span ==
@@ -3575,12 +3782,49 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                 fusedPolled.hot.span = static_cast<std::uint8_t>(out.back().hot.span + 1u);
                                 fusedPolled.hot.src0Slot = out.back().hot.src0Slot;
                                 fusedPolled.cold.instructionIndexInBlock = out.back().cold.instructionIndexInBlock;
+                                cur = fusedPolled;
                                 out.pop_back();
-                                out.push_back(fusedPolled);
+                                while (!out.empty() &&
+                                       isLoadLocalOrParamMove(out.back()) &&
+                                       isDeadSingleUseRegSlot(out.back().hot.dstSlot) &&
+                                       cur.hot.span < 250u &&
+                                       out.back().cold.instructionIndexInBlock + out.back().hot.span ==
+                                           cur.cold.instructionIndexInBlock) {
+                                    const std::uint16_t deadReg = out.back().hot.dstSlot;
+                                    const std::uint16_t replSlot = out.back().hot.src0Slot;
+                                    bool matched = false;
+                                    if (cur.hot.src0Slot == deadReg) {
+                                        cur.hot.src0Slot = replSlot;
+                                        matched = true;
+                                    } else if (cur.hot.inlineArgCount >= 2u && cur.hot.src1Slot == deadReg) {
+                                        cur.hot.src1Slot = replSlot;
+                                        matched = true;
+                                    } else if (cur.hot.inlineArgCount >= 3u && cur.hot.src2Slot == deadReg) {
+                                        cur.hot.src2Slot = replSlot;
+                                        matched = true;
+                                    }
+                                    if (!matched) break;
+                                    cur.cold.instructionIndexInBlock = out.back().cold.instructionIndexInBlock;
+                                    cur.hot.span = static_cast<std::uint8_t>(cur.hot.span + out.back().hot.span);
+                                    out.pop_back();
+                                }
+                                out.push_back(cur);
                                 continue;
                             }
                             bool spanOnly = false;
-                            const int arity = foldableArity(cur.hot.flatOpcode, spanOnly);
+                            int arity = foldableArity(cur.hot.flatOpcode, spanOnly);
+                            if (cur.hot.flatOpcode == FlatOpcode::NewDelegateFast &&
+                                cur.hot.inlineArgCount <= 1u) {
+                                spanOnly = true;
+                                arity = static_cast<int>(cur.hot.inlineArgCount);
+                            } else if ((cur.hot.flatOpcode == FlatOpcode::CallPolledFast ||
+                                        cur.hot.flatOpcode == FlatOpcode::SuperCheckNotNullCallPolledFast ||
+                                        cur.hot.flatOpcode == FlatOpcode::InvokeDelegateFast) &&
+                                       cur.hot.inlineArgCount >= 1u &&
+                                       cur.hot.inlineArgCount <= 3u) {
+                                spanOnly = true;
+                                arity = static_cast<int>(cur.hot.inlineArgCount);
+                            }
                             if (arity >= 0) {
                                 while (!out.empty()) {
                                     // Fold preceding CheckNotNullFast(s0 -> deadReg) directly into LoadFieldFast / StoreFieldFast!
@@ -3628,6 +3872,12 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                     break;
                                 }
                                 if (cur.hot.dstSlot != InvalidCompactReg &&
+                                    cur.hot.flatOpcode != FlatOpcode::CallPolledFast &&
+                                    cur.hot.flatOpcode != FlatOpcode::SuperCheckNotNullCallPolledFast &&
+                                    cur.hot.flatOpcode != FlatOpcode::NewDelegateFast &&
+                                    cur.hot.flatOpcode != FlatOpcode::CombineDelegateFast &&
+                                    cur.hot.flatOpcode != FlatOpcode::RemoveDelegateFast &&
+                                    cur.hot.flatOpcode != FlatOpcode::InvokeDelegateFast &&
                                     idx + 1 < curEnd &&
                                     isStoreLocalMove(buildStream[idx + 1]) &&
                                     buildStream[idx + 1].hot.src0Slot == cur.hot.dstSlot &&
@@ -3686,7 +3936,8 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                     cur.hot.flatOpcode == FlatOpcode::StoreElementIntFast ||
                                     cur.hot.flatOpcode == FlatOpcode::StoreElementPrimFast ||
                                     cur.hot.flatOpcode == FlatOpcode::StoreElementStructFast ||
-                                    cur.hot.flatOpcode == FlatOpcode::StoreElementObjFast;
+                                    cur.hot.flatOpcode == FlatOpcode::StoreElementObjFast ||
+                                    cur.hot.flatOpcode == FlatOpcode::InvokeDelegateFast;
                                 if (validatesSrc0 && cur.hot.src0Slot < provenNonNull.size()) {
                                     provenNonNull[cur.hot.src0Slot] = 1;
                                 }
@@ -3705,7 +3956,8 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                 }
                                 if (cur.hot.flatOpcode == FlatOpcode::CheckNotNullFast ||
                                     cur.hot.flatOpcode == FlatOpcode::NewArrayFast ||
-                                    cur.hot.flatOpcode == FlatOpcode::NewObjectFast) {
+                                    cur.hot.flatOpcode == FlatOpcode::NewObjectFast ||
+                                    cur.hot.flatOpcode == FlatOpcode::NewDelegateFast) {
                                     if (cur.hot.dstSlot < provenNonNull.size()) {
                                         provenNonNull[cur.hot.dstSlot] = 1;
                                     }
@@ -4420,6 +4672,269 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     }
                 }
             }
+            // Extended trivial field getter / setter / binary-field micro-methods for virtual & interface dispatch
+            if (execFunc.trivialKind == TrivialMethodKind::None &&
+                execFunc.canUseFlatFastPath &&
+                execFunc.blocks.size() == 1 &&
+                !execFunc.hasExceptionHandlers &&
+                execFunc.directNativeReference == nullptr &&
+                execFunc.entryStreamOffset == 0 &&
+                paramCount >= 1 &&
+                function.parameterTypes[0] == semantic::PrimitiveType::Object &&
+                execFunc.flatStream.size() <= 10) {
+                std::uint32_t totalSpan = 0;
+                std::vector<std::int16_t> slotParamOrigin(execFunc.totalFrameSlots, -1);
+                for (std::size_t p = 0; p < paramCount; ++p) {
+                    slotParamOrigin[p] = static_cast<std::int16_t>(p);
+                }
+                struct LoadedFieldInfo {
+                    bool valid = false;
+                    std::uint16_t fieldIdx = 0;
+                    std::uint8_t exactTag = 0;
+                    semantic::SymbolId ownerTid = 0;
+                };
+                std::vector<LoadedFieldInfo> slotFieldOrigin(execFunc.totalFrameSlots);
+                std::vector<bool> slotIsConstInt(execFunc.totalFrameSlots, false);
+                std::vector<std::int64_t> slotConstInt(execFunc.totalFrameSlots, 0);
+
+                bool okFieldMicro = true;
+                bool sawStoreField = false;
+                std::uint16_t storedFieldIdx = 0;
+                std::uint8_t storedFieldTag = 0;
+                semantic::SymbolId storedOwnerTid = 0;
+                std::int16_t storedSrcParam = -1;
+
+                TrivialMethodKind computedExprKind = TrivialMethodKind::None;
+                std::uint16_t exprSlot = InvalidCompactReg;
+                std::uint16_t exprF0 = 0, exprF1 = 0;
+                semantic::SymbolId exprOwnerTid = 0;
+                std::int64_t exprConst = 0;
+                bool exprChecked = true;
+
+                for (std::size_t idx = 0; idx + 1 < execFunc.flatStream.size(); ++idx) {
+                    const auto& fi = execFunc.flatStream[idx];
+                    totalSpan += fi.span;
+                    if (fi.flatOpcode == FlatOpcode::SuperMoveParamStoreLocalElided ||
+                        fi.flatOpcode == FlatOpcode::SuperMoveParamStoreLocal) {
+                        if (fi.src0Slot < slotParamOrigin.size()) {
+                            const auto orig = slotParamOrigin[fi.src0Slot];
+                            if (fi.storeSlot < slotParamOrigin.size()) {
+                                if (computedExprKind != TrivialMethodKind::None && fi.storeSlot == exprSlot) {
+                                    okFieldMicro = false;
+                                    break;
+                                }
+                                slotParamOrigin[fi.storeSlot] = orig;
+                                slotFieldOrigin[fi.storeSlot] = {};
+                                slotIsConstInt[fi.storeSlot] = false;
+                                slotConstInt[fi.storeSlot] = 0;
+                            }
+                            if (fi.flatOpcode == FlatOpcode::SuperMoveParamStoreLocal &&
+                                fi.dstSlot < slotParamOrigin.size()) {
+                                if (computedExprKind != TrivialMethodKind::None && fi.dstSlot == exprSlot) {
+                                    okFieldMicro = false;
+                                    break;
+                                }
+                                slotParamOrigin[fi.dstSlot] = orig;
+                                slotFieldOrigin[fi.dstSlot] = {};
+                                slotIsConstInt[fi.dstSlot] = false;
+                                slotConstInt[fi.dstSlot] = 0;
+                            }
+                        } else {
+                            okFieldMicro = false;
+                            break;
+                        }
+                    } else if (fi.flatOpcode == FlatOpcode::MoveSlot) {
+                        if (fi.src0Slot < execFunc.totalFrameSlots && fi.dstSlot < execFunc.totalFrameSlots) {
+                            slotParamOrigin[fi.dstSlot] = slotParamOrigin[fi.src0Slot];
+                            slotFieldOrigin[fi.dstSlot] = slotFieldOrigin[fi.src0Slot];
+                            slotIsConstInt[fi.dstSlot] = slotIsConstInt[fi.src0Slot];
+                            slotConstInt[fi.dstSlot] = slotConstInt[fi.src0Slot];
+                            if (computedExprKind != TrivialMethodKind::None) {
+                                if (fi.src0Slot == exprSlot) {
+                                    exprSlot = fi.dstSlot;
+                                } else if (fi.dstSlot == exprSlot) {
+                                    okFieldMicro = false;
+                                    break;
+                                }
+                            }
+                        } else {
+                            okFieldMicro = false;
+                            break;
+                        }
+                    } else if (fi.flatOpcode == FlatOpcode::CheckNotNullFast) {
+                        if (fi.src0Slot < execFunc.totalFrameSlots &&
+                            fi.dstSlot < execFunc.totalFrameSlots &&
+                            slotParamOrigin[fi.src0Slot] == 0) {
+                            if (computedExprKind != TrivialMethodKind::None && fi.dstSlot == exprSlot) {
+                                okFieldMicro = false;
+                                break;
+                            }
+                            slotParamOrigin[fi.dstSlot] = 0;
+                            slotFieldOrigin[fi.dstSlot] = {};
+                            slotIsConstInt[fi.dstSlot] = false;
+                            slotConstInt[fi.dstSlot] = 0;
+                        } else {
+                            okFieldMicro = false;
+                            break;
+                        }
+                    } else if (fi.flatOpcode == FlatOpcode::LoadFieldExactFast) {
+                        if (fi.src0Slot < execFunc.totalFrameSlots &&
+                            fi.dstSlot < execFunc.totalFrameSlots &&
+                            slotParamOrigin[fi.src0Slot] == 0) {
+                            if (computedExprKind != TrivialMethodKind::None && fi.dstSlot == exprSlot) {
+                                okFieldMicro = false;
+                                break;
+                            }
+                            slotParamOrigin[fi.dstSlot] = -1;
+                            slotIsConstInt[fi.dstSlot] = false;
+                            slotConstInt[fi.dstSlot] = 0;
+                            slotFieldOrigin[fi.dstSlot] = {
+                                true,
+                                fi.aux0Slot,
+                                static_cast<std::uint8_t>(fi.binaryOpcode1),
+                                static_cast<semantic::SymbolId>(fi.integerImmediate),
+                            };
+                        } else {
+                            okFieldMicro = false;
+                            break;
+                        }
+                    } else if (fi.flatOpcode == FlatOpcode::StoreFieldExactFast && !sawStoreField &&
+                               computedExprKind == TrivialMethodKind::None) {
+                        const auto tag = static_cast<ValueTag>(static_cast<std::uint8_t>(fi.binaryOpcode1));
+                        const bool nonRefScalarTag =
+                            tag >= ValueTag::Bool && tag <= ValueTag::QuatInline;
+                        if (nonRefScalarTag &&
+                            fi.src0Slot < execFunc.totalFrameSlots &&
+                            fi.src1Slot < execFunc.totalFrameSlots &&
+                            slotParamOrigin[fi.src0Slot] == 0 &&
+                            slotParamOrigin[fi.src1Slot] >= 1) {
+                            sawStoreField = true;
+                            storedFieldIdx = fi.aux0Slot;
+                            storedFieldTag = static_cast<std::uint8_t>(fi.binaryOpcode1);
+                            storedOwnerTid = static_cast<semantic::SymbolId>(fi.integerImmediate);
+                            storedSrcParam = slotParamOrigin[fi.src1Slot];
+                        } else {
+                            okFieldMicro = false;
+                            break;
+                        }
+                    } else if (fi.flatOpcode == FlatOpcode::ConstantInt) {
+                        if (fi.dstSlot < execFunc.totalFrameSlots) {
+                            if (computedExprKind != TrivialMethodKind::None && fi.dstSlot == exprSlot) {
+                                okFieldMicro = false;
+                                break;
+                            }
+                            slotParamOrigin[fi.dstSlot] = -1;
+                            slotFieldOrigin[fi.dstSlot] = {};
+                            slotIsConstInt[fi.dstSlot] = true;
+                            slotConstInt[fi.dstSlot] = fi.integerImmediate;
+                        } else {
+                            okFieldMicro = false;
+                            break;
+                        }
+                    } else if ((fi.flatOpcode == FlatOpcode::AddIntChecked ||
+                                fi.flatOpcode == FlatOpcode::AddIntUnchecked ||
+                                fi.flatOpcode == FlatOpcode::SubIntChecked ||
+                                fi.flatOpcode == FlatOpcode::SubIntUnchecked ||
+                                fi.flatOpcode == FlatOpcode::MulIntChecked ||
+                                fi.flatOpcode == FlatOpcode::MulIntUnchecked) &&
+                               !sawStoreField &&
+                               computedExprKind == TrivialMethodKind::None &&
+                               fi.src0Slot < execFunc.totalFrameSlots &&
+                               fi.src1Slot < execFunc.totalFrameSlots &&
+                               fi.dstSlot < execFunc.totalFrameSlots) {
+                        const auto& lf = slotFieldOrigin[fi.src0Slot];
+                        const auto& rf = slotFieldOrigin[fi.src1Slot];
+                        const bool checkedOp =
+                            fi.flatOpcode == FlatOpcode::AddIntChecked ||
+                            fi.flatOpcode == FlatOpcode::SubIntChecked ||
+                            fi.flatOpcode == FlatOpcode::MulIntChecked;
+                        const bool isAdd =
+                            fi.flatOpcode == FlatOpcode::AddIntChecked ||
+                            fi.flatOpcode == FlatOpcode::AddIntUnchecked;
+                        const bool isSub =
+                            fi.flatOpcode == FlatOpcode::SubIntChecked ||
+                            fi.flatOpcode == FlatOpcode::SubIntUnchecked;
+                        const bool isMul =
+                            fi.flatOpcode == FlatOpcode::MulIntChecked ||
+                            fi.flatOpcode == FlatOpcode::MulIntUnchecked;
+                        const auto intTag = static_cast<std::uint8_t>(ValueTag::Int64);
+                        if (lf.valid && rf.valid &&
+                            lf.exactTag == intTag && rf.exactTag == intTag &&
+                            lf.ownerTid == rf.ownerTid && (isAdd || isSub)) {
+                            computedExprKind = isAdd
+                                ? TrivialMethodKind::ReturnThisFieldAddField
+                                : TrivialMethodKind::ReturnThisFieldSubField;
+                            exprSlot = fi.dstSlot;
+                            exprF0 = lf.fieldIdx;
+                            exprF1 = rf.fieldIdx;
+                            exprOwnerTid = lf.ownerTid;
+                            exprChecked = checkedOp;
+                        } else if (lf.valid && lf.exactTag == intTag && slotIsConstInt[fi.src1Slot]) {
+                            computedExprKind = isAdd
+                                ? TrivialMethodKind::ReturnThisFieldAddConst
+                                : (isSub
+                                    ? TrivialMethodKind::ReturnThisFieldSubConst
+                                    : TrivialMethodKind::ReturnThisFieldMulConst);
+                            exprSlot = fi.dstSlot;
+                            exprF0 = lf.fieldIdx;
+                            exprOwnerTid = lf.ownerTid;
+                            exprConst = slotConstInt[fi.src1Slot];
+                            exprChecked = checkedOp;
+                        } else if ((isAdd || isMul) && rf.valid && rf.exactTag == intTag &&
+                                   slotIsConstInt[fi.src0Slot]) {
+                            computedExprKind = isAdd
+                                ? TrivialMethodKind::ReturnThisFieldAddConst
+                                : TrivialMethodKind::ReturnThisFieldMulConst;
+                            exprSlot = fi.dstSlot;
+                            exprF0 = rf.fieldIdx;
+                            exprOwnerTid = rf.ownerTid;
+                            exprConst = slotConstInt[fi.src0Slot];
+                            exprChecked = checkedOp;
+                        } else {
+                            okFieldMicro = false;
+                            break;
+                        }
+                    } else {
+                        okFieldMicro = false;
+                        break;
+                    }
+                }
+                if (okFieldMicro && !execFunc.flatStream.empty()) {
+                    const auto& retInst = execFunc.flatStream.back();
+                    totalSpan += retInst.span;
+                    if (totalSpan > 0 && totalSpan <= 64u) {
+                        if (sawStoreField && retInst.flatOpcode == FlatOpcode::TermReturnVoid) {
+                            execFunc.trivialKind = TrivialMethodKind::StoreThisFieldExact;
+                            execFunc.trivialInstCost = static_cast<std::uint16_t>(totalSpan);
+                            execFunc.trivialFieldIndex0 = storedFieldIdx;
+                            execFunc.trivialFieldTag0 = storedFieldTag;
+                            execFunc.trivialOwnerTypeId = storedOwnerTid;
+                            execFunc.trivialParamIndex = static_cast<std::uint16_t>(storedSrcParam);
+                        } else if (!sawStoreField &&
+                                   retInst.flatOpcode == FlatOpcode::TermReturnScalarFast &&
+                                   retInst.src0Slot < execFunc.totalFrameSlots) {
+                            if (computedExprKind != TrivialMethodKind::None &&
+                                retInst.src0Slot == exprSlot) {
+                                execFunc.trivialKind = computedExprKind;
+                                execFunc.trivialInstCost = static_cast<std::uint16_t>(totalSpan);
+                                execFunc.trivialFieldIndex0 = exprF0;
+                                execFunc.trivialFieldIndex1 = exprF1;
+                                execFunc.trivialOwnerTypeId = exprOwnerTid;
+                                execFunc.trivialConstValue = exprConst;
+                                execFunc.trivialCheckedArith = exprChecked;
+                            } else if (computedExprKind == TrivialMethodKind::None &&
+                                       slotFieldOrigin[retInst.src0Slot].valid) {
+                                const auto& fld = slotFieldOrigin[retInst.src0Slot];
+                                execFunc.trivialKind = TrivialMethodKind::ReturnThisFieldExact;
+                                execFunc.trivialInstCost = static_cast<std::uint16_t>(totalSpan);
+                                execFunc.trivialFieldIndex0 = fld.fieldIdx;
+                                execFunc.trivialFieldTag0 = fld.exactTag;
+                                execFunc.trivialOwnerTypeId = fld.ownerTid;
+                            }
+                        }
+                    }
+                }
+            }
 
             // Classify small-frame multi-block leaf inline candidates for Pass 4 unfolding
             if (execFunc.canUseFlatFastPath &&
@@ -4567,6 +5082,8 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     case FlatOpcode::SuperQuatMulChain:
                     case FlatOpcode::SuperQuatMulRotateVec3:
                     case FlatOpcode::CheckNotNullFast:
+                    case FlatOpcode::IsTypeObjFast:
+                    case FlatOpcode::AsTypeObjFast:
                     case FlatOpcode::LoadFieldFast:
                     case FlatOpcode::LoadFieldExactFast:
                     case FlatOpcode::StoreFieldFast:
@@ -4640,6 +5157,94 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         }
     }
 
+    // Pass 3b: Pre-link per-type virtual & interface dispatch tables + flattened O(1) assignable IDs
+    {
+        std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> allTypesById;
+        for (const auto& module : modules) {
+            for (const auto& type : module.types) {
+                if (type.id != 0) allTypesById.emplace(type.id, &type);
+            }
+        }
+        const auto resolvePrelinkedTarget = [&](semantic::SymbolId symId) noexcept -> PrelinkedDispatchTarget {
+            PrelinkedDispatchTarget out{};
+            out.symbolId = symId;
+            if (symId == 0) return out;
+            const auto fIt = functions.find(symId);
+            if (fIt != functions.end() && fIt->second.function) {
+                out.target = &fIt->second;
+                out.execution = findExecutionFunction(*mirror, *fIt->second.function);
+            }
+            return out;
+        };
+
+        mirror->typeDispatch.reserve(allTypesById.size());
+        for (const auto& [tid, typePtr] : allTypesById) {
+            const auto& type = *typePtr;
+            TypeDispatchMetadata meta;
+            meta.typeId = tid;
+
+            // Flatten self + all base classes + all interfaces (deduplicated) for O(1) L1 scan
+            auto cur = tid;
+            for (std::size_t depth = 0; cur != 0 && depth < 256; ++depth) {
+                if (std::find(meta.assignableTargetIds.begin(), meta.assignableTargetIds.end(), cur) ==
+                    meta.assignableTargetIds.end()) {
+                    meta.assignableTargetIds.push_back(cur);
+                }
+                const auto cIt = allTypesById.find(cur);
+                if (cIt == allTypesById.end()) break;
+                for (const auto& imap : cIt->second->interfaceDispatchMaps) {
+                    if (imap.interfaceTypeId != 0 &&
+                        std::find(meta.assignableTargetIds.begin(),
+                                  meta.assignableTargetIds.end(),
+                                  imap.interfaceTypeId) == meta.assignableTargetIds.end()) {
+                        meta.assignableTargetIds.push_back(imap.interfaceTypeId);
+                    }
+                }
+                cur = cIt->second->baseTypeId;
+            }
+
+            if (type.kind == semantic::TypeKind::Class) {
+                meta.virtualTargets.reserve(type.virtualDispatchTable.size());
+                for (const auto vSym : type.virtualDispatchTable) {
+                    meta.virtualTargets.push_back(resolvePrelinkedTarget(vSym));
+                }
+
+                // Collect own + inherited interface maps (first match in inheritance order wins)
+                cur = tid;
+                for (std::size_t depth = 0; cur != 0 && depth < 256; ++depth) {
+                    const auto cIt = allTypesById.find(cur);
+                    if (cIt == allTypesById.end()) break;
+                    for (const auto& imap : cIt->second->interfaceDispatchMaps) {
+                        if (imap.interfaceTypeId == 0) continue;
+                        const bool exists = std::any_of(
+                            meta.interfaceMaps.begin(),
+                            meta.interfaceMaps.end(),
+                            [&](const PrelinkedInterfaceMap& m) {
+                                return m.interfaceTypeId == imap.interfaceTypeId;
+                            });
+                        if (!exists) {
+                            PrelinkedInterfaceMap pmap;
+                            pmap.interfaceTypeId = imap.interfaceTypeId;
+                            pmap.slots.reserve(imap.slots.size());
+                            for (const auto sSym : imap.slots) {
+                                pmap.slots.push_back(resolvePrelinkedTarget(sSym));
+                            }
+                            meta.interfaceMaps.push_back(std::move(pmap));
+                        }
+                    }
+                    cur = cIt->second->baseTypeId;
+                }
+                std::sort(
+                    meta.interfaceMaps.begin(),
+                    meta.interfaceMaps.end(),
+                    [](const PrelinkedInterfaceMap& a, const PrelinkedInterfaceMap& b) {
+                        return a.interfaceTypeId < b.interfaceTypeId;
+                    });
+            }
+            mirror->typeDispatch.emplace(tid, std::move(meta));
+        }
+    }
+
     // Pass 4: Unfold small-frame leaf script functions at CallDirect sites & thread empty Jump->Jump chains
     for (const auto& module : modules) {
         for (const auto& function : module.functions) {
@@ -4666,6 +5271,12 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     op == FlatOpcode::NewArrayFast ||
                     op == FlatOpcode::NewObjectFast ||
                     op == FlatOpcode::CheckNotNullFast ||
+                    op == FlatOpcode::IsTypeObjFast ||
+                    op == FlatOpcode::AsTypeObjFast ||
+                    op == FlatOpcode::NewDelegateFast ||
+                    op == FlatOpcode::CombineDelegateFast ||
+                    op == FlatOpcode::RemoveDelegateFast ||
+                    op == FlatOpcode::InvokeDelegateFast ||
                     op == FlatOpcode::LoadFieldFast ||
                     op == FlatOpcode::LoadFieldExactFast ||
                     op == FlatOpcode::StoreFieldFast ||

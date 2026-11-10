@@ -348,23 +348,55 @@ bool ExecutionContext::isAssignable(
     semantic::SymbolId actual,
     semantic::SymbolId expected) const noexcept {
     if (actual == expected) return true;
-    std::unordered_set<semantic::SymbolId> visited;
+    if (actual == 0) return false;
+    if (expected == 0) return findType(actual) != nullptr;
+    const std::size_t cIdx =
+        static_cast<std::size_t>(((actual >> 4u) ^ (expected * 0x9e3779b97f4a7c15ULL)) & 31ULL);
+    const auto& cached = assignableCache_[cIdx];
+    if (cached.actual == actual && cached.expected == expected && cached.result != 0) {
+        return cached.result == 2u;
+    }
     auto current = actual;
-    while (current != 0 && visited.insert(current).second) {
+    bool matched = false;
+    for (std::size_t depth = 0; current != 0 && depth < 256; ++depth) {
         const auto* type = findType(current);
-        if (!type) return false;
-        for (std::uint32_t index = 0;
-             index < type->interfaceDispatchMapCount;
-             ++index) {
-            if (type->interfaceDispatchMaps &&
-                type->interfaceDispatchMaps[index].interfaceTypeId == expected) {
-                return true;
+        if (!type) break;
+        if (type->interfaceDispatchMaps && type->interfaceDispatchMapCount > 0) {
+            if (type->interfaceDispatchMapCount <= 4) {
+                for (std::uint32_t index = 0;
+                     index < type->interfaceDispatchMapCount;
+                     ++index) {
+                    if (type->interfaceDispatchMaps[index].interfaceTypeId == expected) {
+                        matched = true;
+                        break;
+                    }
+                }
+            } else {
+                std::uint32_t lo = 0;
+                std::uint32_t hi = type->interfaceDispatchMapCount;
+                while (lo < hi) {
+                    const std::uint32_t mid = lo + ((hi - lo) >> 1u);
+                    if (type->interfaceDispatchMaps[mid].interfaceTypeId < expected) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                if (lo < type->interfaceDispatchMapCount &&
+                    type->interfaceDispatchMaps[lo].interfaceTypeId == expected) {
+                    matched = true;
+                }
             }
+            if (matched) break;
         }
-        if (type->baseTypeId == expected) return true;
+        if (type->baseTypeId == expected) {
+            matched = true;
+            break;
+        }
         current = type->baseTypeId;
     }
-    return false;
+    assignableCache_[cIdx] = {actual, expected, static_cast<std::uint8_t>(matched ? 2u : 1u)};
+    return matched;
 }
 
 const FunctionDescriptor* ExecutionContext::findFunction(
@@ -1006,63 +1038,111 @@ bool ExecutionContext::call(
     return true;
 }
 
+namespace {
+
+const std::shared_ptr<const std::vector<std::size_t>>& aotDelegateReferenceFields() {
+    static const auto refs = std::make_shared<const std::vector<std::size_t>>(
+        std::initializer_list<std::size_t>{0u, 7u});
+    return refs;
+}
+
+bool readAotDelegateIdFromFields(
+    const runtime::Value* fields,
+    std::size_t lowIndex,
+    semantic::SymbolId& outId) noexcept {
+    std::int64_t lo = 0, hi = 0;
+    if (!fields[lowIndex].tryGetInt64(lo) ||
+        !fields[lowIndex + 1u].tryGetInt64(hi) ||
+        lo < 0 || hi < 0 ||
+        lo > std::numeric_limits<std::uint32_t>::max() ||
+        hi > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    outId = static_cast<std::uint64_t>(static_cast<std::uint32_t>(lo)) |
+        (static_cast<std::uint64_t>(static_cast<std::uint32_t>(hi)) << 32u);
+    return true;
+}
+
+} // namespace
+
+bool ExecutionContext::hasFunction(semantic::SymbolId symbolId) const noexcept {
+    return findFunction(symbolId) != nullptr;
+}
+
 bool ExecutionContext::newDelegate(
     semantic::SymbolId delegateTypeId,
     const CallSignature& signature,
     const runtime::Value* target,
     std::size_t targetCount,
     runtime::Value& result) {
-    const auto* delegateType = findType(delegateTypeId);
-    if (!delegateType || !delegateType->delegateType ||
-        targetCount > 1 || (targetCount != 0 && !target)) {
-        return fail(
-            runtime::ErrorCode::InvalidProgram,
-            "AOT delegate creation has invalid metadata");
+    if (RS_AOT_UNLIKELY(!heap_)) {
+        return fail(runtime::ErrorCode::InvalidProgram, "AOT delegate creation has no heap");
+    }
+    if (RS_AOT_UNLIKELY(lastVerifiedDelegateTypeId_ != delegateTypeId)) {
+        const auto* delegateType = findType(delegateTypeId);
+        if (!delegateType || !delegateType->delegateType) {
+            return fail(runtime::ErrorCode::InvalidProgram, "AOT delegate creation has invalid metadata");
+        }
+        lastVerifiedDelegateTypeId_ = delegateTypeId;
     }
     runtime::Value targetValue = runtime::NullObject{};
     if (targetCount == 1) {
-        if (signature.parameterCount == 0 ||
-            !expectSignatureType(
-                target[0], signature.parameterTypes[0],
-                typeIdAt(
-                    signature.parameterTypeIds,
-                    signature.parameterCount, 0),
-                "delegate target")) {
+        if (RS_AOT_UNLIKELY(!target || signature.parameterCount == 0)) {
+            return fail(runtime::ErrorCode::InvalidProgram,
+                "AOT delegate creation has invalid metadata");
+        }
+        const auto expType = signature.parameterTypes[0];
+        const auto expTid = signature.parameterTypeIds ? signature.parameterTypeIds[0] : 0;
+        if (RS_AOT_LIKELY(expType == semantic::PrimitiveType::Object)) {
+            const auto vt = target[0].rawTag();
+            if (vt == runtime::ValueTag::NullObject) {
+                // Valid null object target
+            } else if (RS_AOT_LIKELY(vt == runtime::ValueTag::ObjectRef)) {
+                const auto actualTid = heap_->objectTypeIdFast(target[0].asObjectRefUnchecked());
+                if (RS_AOT_UNLIKELY(actualTid == 0 || (expTid != 0 && actualTid != expTid && !isAssignable(actualTid, expTid)))) {
+                    if (!expectSignatureType(target[0], expType, expTid, "delegate target")) return false;
+                }
+            } else {
+                return expectSignatureType(target[0], expType, expTid, "delegate target");
+            }
+        } else if (!expectSignatureType(target[0], expType, expTid, "delegate target")) {
             return false;
         }
         targetValue = target[0];
-    } else if (signature.virtualDispatch ||
-               signature.interfaceDispatch) {
-        return fail(
-            runtime::ErrorCode::InvalidProgram,
-            "AOT delegate dispatch target has no receiver");
+    } else if (RS_AOT_UNLIKELY(targetCount > 1 || signature.virtualDispatch || signature.interfaceDispatch)) {
+        if (targetCount > 1) {
+            return fail(runtime::ErrorCode::InvalidProgram, "AOT delegate creation has invalid metadata");
+        }
+        return fail(runtime::ErrorCode::InvalidProgram, "AOT delegate dispatch target has no receiver");
     }
-    const auto word = [](std::uint64_t value, bool high) {
+
+    const auto word = [](std::uint64_t value, bool high) noexcept {
         return static_cast<std::int64_t>(
-            static_cast<std::uint32_t>(high ? value >> 32u : value));
+            static_cast<std::uint32_t>(high ? (value >> 32u) : value));
     };
     std::uint64_t flags = 0;
     if (signature.virtualDispatch) flags |= 1u;
     if (signature.interfaceDispatch) flags |= 2u;
-    std::vector<runtime::Value> fields{
+    const std::array<runtime::Value, 8> fields{{
         std::move(targetValue),
         word(signature.symbolId, false),
         word(signature.symbolId, true),
         static_cast<std::int64_t>(flags),
         static_cast<std::int64_t>(signature.virtualDispatch
             ? signature.virtualSlot
-            : signature.interfaceDispatch
-                ? signature.interfaceSlot
-                : 0u),
+            : (signature.interfaceDispatch ? signature.interfaceSlot : 0u)),
         word(signature.interfaceTypeId, false),
         word(signature.interfaceTypeId, true),
         runtime::NullObject{},
-    };
+    }};
     runtime::RuntimeError allocationError;
-    const auto reference = heap_->allocateObject(
-        delegateTypeId, std::move(fields), {0u, 7u},
+    const auto reference = heap_->allocateObjectFromTemplate(
+        delegateTypeId,
+        fields.data(),
+        fields.size(),
+        aotDelegateReferenceFields(),
         &allocationError);
-    if (!reference) {
+    if (RS_AOT_UNLIKELY(!reference.has_value())) {
         return fail(
             allocationError.code == runtime::ErrorCode::None
                 ? runtime::ErrorCode::OutOfMemory
@@ -1081,120 +1161,63 @@ bool ExecutionContext::combineDelegates(
     const runtime::Value& right,
     bool remove,
     runtime::Value& result) {
-    const auto* delegateType = findType(delegateTypeId);
-    if (!delegateType || !delegateType->delegateType ||
-        !expectSignatureType(
-            left, semantic::PrimitiveType::Object,
-            delegateTypeId, "delegate combination left operand") ||
-        !expectSignatureType(
-            right, semantic::PrimitiveType::Object,
-            delegateTypeId, "delegate combination right operand")) {
-        return false;
+    if (RS_AOT_UNLIKELY(!heap_)) {
+        return fail(runtime::ErrorCode::InvalidProgram, "AOT delegate combination has no heap");
     }
-    const auto flatten = [&](const auto& self,
-                             const runtime::Value& value,
-                             std::vector<runtime::Value>& leaves,
-                             std::size_t depth) -> bool {
-        if (std::holds_alternative<runtime::NullObject>(value)) {
-            return true;
+    if (RS_AOT_UNLIKELY(lastVerifiedDelegateTypeId_ != delegateTypeId)) {
+        const auto* delegateType = findType(delegateTypeId);
+        if (!delegateType || !delegateType->delegateType) {
+            return fail(runtime::ErrorCode::InvalidProgram, "AOT delegate combination has invalid metadata");
         }
-        if (depth > 1024) {
-            return fail(
-                runtime::ErrorCode::InvalidProgram,
-                "AOT delegate invocation list is too deep");
+        lastVerifiedDelegateTypeId_ = delegateTypeId;
+    }
+    const bool leftNull = (left.rawTag() == runtime::ValueTag::NullObject);
+    const bool rightNull = (right.rawTag() == runtime::ValueTag::NullObject);
+    runtime::ObjectFastView leftView{}, rightView{};
+    std::int64_t leftFlags = -1, rightFlags = -1;
+
+    if (!leftNull) {
+        if (RS_AOT_UNLIKELY(left.rawTag() != runtime::ValueTag::ObjectRef ||
+                            !heap_->tryBindObjectFastView(left.asObjectRefUnchecked(), leftView) ||
+                            leftView.typeId != delegateTypeId ||
+                            leftView.fieldCount != 8u)) {
+            return expectSignatureType(left, semantic::PrimitiveType::Object, delegateTypeId,
+                "delegate combination left operand");
         }
-        const auto* reference =
-            std::get_if<runtime::ObjectRef>(&value);
-        const auto type = reference
-            ? heap_->objectTypeId(*reference)
-            : std::optional<semantic::SymbolId>{};
-        const auto flagsValue = reference
-            ? heap_->fieldGet(*reference, 3u)
-            : std::optional<runtime::Value>{};
-        const auto* flags = flagsValue
-            ? std::get_if<std::int64_t>(&*flagsValue)
-            : nullptr;
-        if (!reference || !type || *type != delegateTypeId ||
-            heap_->fieldCount(*reference) != 8u || !flags ||
-            *flags < 0 || *flags > 4) {
-            return fail(
-                runtime::ErrorCode::InvalidProgram,
+        if (RS_AOT_UNLIKELY(!leftView.fields[3].tryGetInt64(leftFlags) || leftFlags < 0 || leftFlags > 4)) {
+            return fail(runtime::ErrorCode::InvalidProgram,
                 "AOT delegate invocation-list metadata is corrupt");
         }
-        if (*flags != 4) {
-            leaves.push_back(value);
-            return true;
-        }
-        const auto first = heap_->fieldGet(*reference, 0u);
-        const auto second = heap_->fieldGet(*reference, 7u);
-        return first && second &&
-            self(self, *first, leaves, depth + 1) &&
-            self(self, *second, leaves, depth + 1);
-    };
-    std::vector<runtime::Value> leftLeaves;
-    std::vector<runtime::Value> rightLeaves;
-    if (!flatten(flatten, left, leftLeaves, 0) ||
-        !flatten(flatten, right, rightLeaves, 0)) {
-        return false;
     }
-    const auto sameLeaf = [&](const runtime::Value& a,
-                              const runtime::Value& b) {
-        const auto* aRef = std::get_if<runtime::ObjectRef>(&a);
-        const auto* bRef = std::get_if<runtime::ObjectRef>(&b);
-        if (!aRef || !bRef) return false;
-        for (std::size_t index = 0; index < 7u; ++index) {
-            const auto av = heap_->fieldGet(*aRef, index);
-            const auto bv = heap_->fieldGet(*bRef, index);
-            if (!av || !bv || !(*av == *bv)) return false;
+    if (!rightNull) {
+        if (RS_AOT_UNLIKELY(right.rawTag() != runtime::ValueTag::ObjectRef ||
+                            !heap_->tryBindObjectFastView(right.asObjectRefUnchecked(), rightView) ||
+                            rightView.typeId != delegateTypeId ||
+                            rightView.fieldCount != 8u)) {
+            return expectSignatureType(right, semantic::PrimitiveType::Object, delegateTypeId,
+                "delegate combination right operand");
         }
-        return true;
-    };
-    if (!remove) {
-        leftLeaves.insert(
-            leftLeaves.end(), rightLeaves.begin(), rightLeaves.end());
-    } else if (!rightLeaves.empty() &&
-               rightLeaves.size() <= leftLeaves.size()) {
-        std::optional<std::size_t> removeAt;
-        for (std::size_t start = 0;
-             start + rightLeaves.size() <= leftLeaves.size(); ++start) {
-            bool matches = true;
-            for (std::size_t index = 0;
-                 index < rightLeaves.size(); ++index) {
-                if (!sameLeaf(
-                        leftLeaves[start + index], rightLeaves[index])) {
-                    matches = false;
-                    break;
-                }
-            }
-            if (matches) removeAt = start;
-        }
-        if (removeAt) {
-            leftLeaves.erase(
-                leftLeaves.begin() +
-                    static_cast<std::ptrdiff_t>(*removeAt),
-                leftLeaves.begin() +
-                    static_cast<std::ptrdiff_t>(
-                        *removeAt + rightLeaves.size()));
+        if (RS_AOT_UNLIKELY(!rightView.fields[3].tryGetInt64(rightFlags) || rightFlags < 0 || rightFlags > 4)) {
+            return fail(runtime::ErrorCode::InvalidProgram,
+                "AOT delegate invocation-list metadata is corrupt");
         }
     }
-    if (leftLeaves.empty()) {
-        result = runtime::NullObject{};
-        return true;
-    }
-    result = leftLeaves.front();
-    for (std::size_t index = 1; index < leftLeaves.size(); ++index) {
-        std::vector<runtime::Value> fields{
-            result,
+
+    const auto allocCombineNode = [&](const runtime::Value& l,
+                                      const runtime::Value& r,
+                                      runtime::Value& outNode) -> bool {
+        const std::array<runtime::Value, 8> fields{{
+            l,
             std::int64_t{0}, std::int64_t{0},
             std::int64_t{4}, std::int64_t{0},
             std::int64_t{0}, std::int64_t{0},
-            leftLeaves[index],
-        };
+            r,
+        }};
         runtime::RuntimeError allocationError;
-        const auto allocated = heap_->allocateObject(
-            delegateTypeId, std::move(fields), {0u, 7u},
-            &allocationError);
-        if (!allocated) {
+        const auto allocated = heap_->allocateObjectFromTemplate(
+            delegateTypeId, fields.data(), fields.size(),
+            aotDelegateReferenceFields(), &allocationError);
+        if (RS_AOT_UNLIKELY(!allocated.has_value())) {
             return fail(
                 allocationError.code == runtime::ErrorCode::None
                     ? runtime::ErrorCode::OutOfMemory
@@ -1203,9 +1226,451 @@ bool ExecutionContext::combineDelegates(
                     ? "AOT delegate-list allocation failed"
                     : allocationError.message);
         }
-        result = *allocated;
+        outNode = *allocated;
+        return true;
+    };
+
+    const auto flattenFast = [&](const runtime::Value& rootVal,
+                                 std::vector<runtime::Value>& leaves) -> bool {
+        if (rootVal.rawTag() == runtime::ValueTag::NullObject) return true;
+        std::array<runtime::Value, 64> inlineStack{};
+        std::size_t inlineTop = 0;
+        std::vector<runtime::Value> heapStack;
+        inlineStack[inlineTop++] = rootVal;
+        std::size_t visited = 0;
+        while (inlineTop > 0 || !heapStack.empty()) {
+            runtime::Value cur;
+            if (!heapStack.empty()) {
+                cur = heapStack.back();
+                heapStack.pop_back();
+            } else {
+                cur = inlineStack[--inlineTop];
+            }
+            if (cur.rawTag() == runtime::ValueTag::NullObject) continue;
+            if (++visited > 65536u) {
+                return fail(runtime::ErrorCode::InvalidProgram,
+                    "AOT delegate invocation list is too deep");
+            }
+            runtime::ObjectFastView v{};
+            if (cur.rawTag() != runtime::ValueTag::ObjectRef ||
+                !heap_->tryBindObjectFastView(cur.asObjectRefUnchecked(), v) ||
+                v.typeId != delegateTypeId ||
+                v.fieldCount != 8u) {
+                return fail(runtime::ErrorCode::InvalidProgram,
+                    "AOT delegate invocation-list metadata is corrupt");
+            }
+            std::int64_t fl = -1;
+            if (!v.fields[3].tryGetInt64(fl) || fl < 0 || fl > 4) {
+                return fail(runtime::ErrorCode::InvalidProgram,
+                    "AOT delegate invocation-list metadata is corrupt");
+            }
+            if (fl != 4) {
+                leaves.push_back(cur);
+                continue;
+            }
+            const runtime::Value f0 = v.fields[0];
+            const runtime::Value f7 = v.fields[7];
+            if (!heapStack.empty() || inlineTop + 2u > inlineStack.size()) {
+                heapStack.push_back(f7);
+                heapStack.push_back(f0);
+            } else {
+                inlineStack[inlineTop++] = f7;
+                inlineStack[inlineTop++] = f0;
+            }
+        }
+        return true;
+    };
+
+    if (!remove) {
+        if (leftNull && rightNull) {
+            result = runtime::NullObject{};
+            return true;
+        }
+        if (leftNull) {
+            if (rightFlags != 4) {
+                result = right;
+                return true;
+            }
+            std::vector<runtime::Value> rLeaves;
+            if (!flattenFast(right, rLeaves)) return false;
+            result = right;
+            return true;
+        }
+        if (rightNull) {
+            if (leftFlags != 4) {
+                result = left;
+                return true;
+            }
+            std::vector<runtime::Value> lLeaves;
+            if (!flattenFast(left, lLeaves)) return false;
+            result = left;
+            return true;
+        }
+        if (leftFlags == 4) {
+            const auto checkChild = [&](const runtime::Value& child) -> bool {
+                if (child.rawTag() == runtime::ValueTag::NullObject) return true;
+                runtime::ObjectFastView cv{};
+                std::int64_t cf = -1;
+                if (child.rawTag() != runtime::ValueTag::ObjectRef ||
+                    !heap_->tryBindObjectFastView(child.asObjectRefUnchecked(), cv) ||
+                    cv.typeId != delegateTypeId ||
+                    cv.fieldCount != 8u ||
+                    !cv.fields[3].tryGetInt64(cf) || cf < 0 || cf > 4) {
+                    return fail(runtime::ErrorCode::InvalidProgram,
+                        "AOT delegate invocation-list metadata is corrupt");
+                }
+                return true;
+            };
+            if (!checkChild(leftView.fields[0]) || !checkChild(leftView.fields[7])) {
+                return false;
+            }
+        }
+        // O(1) fast append for `+= singleLeaf`
+        if (rightFlags != 4) {
+            return allocCombineNode(left, right, result);
+        }
+        std::vector<runtime::Value> rightLeaves;
+        if (!flattenFast(right, rightLeaves)) return false;
+        runtime::Value cur = left;
+        for (const auto& rLeaf : rightLeaves) {
+            runtime::Value nextNode;
+            if (!allocCombineNode(cur, rLeaf, nextNode)) return false;
+            cur = nextNode;
+        }
+        result = cur;
+        return true;
+    }
+
+    // RemoveDelegate (`-=`)
+    if (leftNull) {
+        result = runtime::Value{runtime::NullObject{}};
+        return true;
+    }
+    if (rightNull) {
+        if (leftFlags == 4) {
+            std::vector<runtime::Value> lLeaves;
+            if (!flattenFast(left, lLeaves)) return false;
+        }
+        result = left;
+        return true;
+    }
+    const auto sameLeaf = [&](const runtime::Value& a, const runtime::Value& b) noexcept -> bool {
+        if (a.rawTag() != runtime::ValueTag::ObjectRef || b.rawTag() != runtime::ValueTag::ObjectRef) {
+            return false;
+        }
+        const auto aRef = a.asObjectRefUnchecked();
+        const auto bRef = b.asObjectRefUnchecked();
+        if (aRef == bRef && heap_->isAlive(aRef)) return true;
+        runtime::ObjectFastView av{}, bv{};
+        if (!heap_->tryBindObjectFastView(aRef, av) ||
+            !heap_->tryBindObjectFastView(bRef, bv) ||
+            av.fieldCount < 7u || bv.fieldCount < 7u) {
+            return false;
+        }
+        for (std::size_t index = 0; index < 7u; ++index) {
+            if (!(av.fields[index] == bv.fields[index])) return false;
+        }
+        return true;
+    };
+    if (leftFlags != 4 && rightFlags != 4) {
+        result = sameLeaf(left, right) ? runtime::Value{runtime::NullObject{}} : left;
+        return true;
+    }
+    std::vector<runtime::Value> leftLeaves;
+    std::vector<runtime::Value> rightLeaves;
+    if (!flattenFast(left, leftLeaves) || !flattenFast(right, rightLeaves)) {
+        return false;
+    }
+    if (!rightLeaves.empty() && rightLeaves.size() <= leftLeaves.size()) {
+        std::optional<std::size_t> removeAt;
+        for (std::size_t start = 0;
+             start + rightLeaves.size() <= leftLeaves.size(); ++start) {
+            bool matches = true;
+            for (std::size_t index = 0; index < rightLeaves.size(); ++index) {
+                if (!sameLeaf(leftLeaves[start + index], rightLeaves[index])) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) removeAt = start;
+        }
+        if (!removeAt) {
+            result = left;
+            return true;
+        }
+        leftLeaves.erase(
+            leftLeaves.begin() + static_cast<std::ptrdiff_t>(*removeAt),
+            leftLeaves.begin() + static_cast<std::ptrdiff_t>(*removeAt + rightLeaves.size()));
+    } else {
+        result = left;
+        return true;
+    }
+    if (leftLeaves.empty()) {
+        result = runtime::NullObject{};
+        return true;
+    }
+    result = leftLeaves.front();
+    for (std::size_t index = 1; index < leftLeaves.size(); ++index) {
+        runtime::Value nextNode;
+        if (!allocCombineNode(result, leftLeaves[index], nextNode)) return false;
+        result = nextNode;
     }
     return true;
+}
+
+int ExecutionContext::inspectDelegateSlow(
+    semantic::SymbolId delegateTypeId,
+    const runtime::Value& delValue,
+    ResolvedAotDelegateLeaf& outSingle) {
+    const auto* delegateType = findType(delegateTypeId);
+    if (RS_AOT_UNLIKELY(!delegateType || !delegateType->delegateType || !heap_)) {
+        (void)fail(runtime::ErrorCode::InvalidProgram,
+            "AOT delegate invocation has invalid metadata");
+        return 0;
+    }
+    if (delValue.rawTag() == runtime::ValueTag::NullObject ||
+        delValue.rawTag() == runtime::ValueTag::Monostate) {
+        (void)fail(runtime::ErrorCode::NullReference,
+            "AOT delegate invocation attempted to dereference null");
+        return 0;
+    }
+    runtime::ObjectFastView view{};
+    if (delValue.rawTag() != runtime::ValueTag::ObjectRef ||
+        !heap_->tryBindObjectFastView(delValue.asObjectRefUnchecked(), view) ||
+        view.typeId != delegateTypeId ||
+        view.fieldCount != 8u) {
+        (void)fail(runtime::ErrorCode::TypeMismatch,
+            "AOT delegate invocation received an incompatible value");
+        return 0;
+    }
+    std::int64_t flags = -1;
+    if (!view.fields[3].tryGetInt64(flags)) {
+        (void)fail(runtime::ErrorCode::InvalidProgram,
+            "AOT delegate dispatch metadata is corrupt");
+        return 0;
+    }
+    const auto delRef = delValue.asObjectRefUnchecked();
+    if (flags == 4) {
+        auto& ce = delLeafCache_[delRef.slot & 15u];
+        ce.delRef = delRef;
+        ce.delegateTypeId = delegateTypeId;
+        ce.isMulticast = true;
+        ce.valid = true;
+        return 2;
+    }
+
+    std::int64_t slotVal = -1;
+    semantic::SymbolId targetSymbolId = 0;
+    if (flags < 0 || flags > 3 ||
+        !view.fields[4].tryGetInt64(slotVal) ||
+        slotVal < 0 || slotVal > std::numeric_limits<std::uint32_t>::max() ||
+        !readAotDelegateIdFromFields(view.fields, 1u, targetSymbolId)) {
+        (void)fail(runtime::ErrorCode::InvalidProgram,
+            "AOT delegate dispatch metadata is corrupt");
+        return 0;
+    }
+    const bool virtualDispatch = (flags & 1) != 0;
+    const bool interfaceDispatch = (flags & 2) != 0;
+    if (virtualDispatch && interfaceDispatch) {
+        (void)fail(runtime::ErrorCode::InvalidProgram,
+            "AOT delegate dispatch modes conflict");
+        return 0;
+    }
+    const runtime::Value& target = view.fields[0];
+    const bool hasRecv = (target.rawTag() != runtime::ValueTag::NullObject);
+    if (virtualDispatch || interfaceDispatch) {
+        const auto recvTid = (hasRecv && target.rawTag() == runtime::ValueTag::ObjectRef)
+            ? heap_->objectTypeIdFast(target.asObjectRefUnchecked())
+            : 0;
+        const auto* runtimeType = recvTid != 0 ? findType(recvTid) : nullptr;
+        if (!runtimeType) {
+            (void)fail(runtime::ErrorCode::InvalidObjectReference,
+                "AOT delegate receiver has no runtime type");
+            return 0;
+        }
+        const auto dispatchSlot = static_cast<std::uint32_t>(slotVal);
+        if (virtualDispatch) {
+            if (!runtimeType->virtualDispatchTable ||
+                dispatchSlot >= runtimeType->virtualSlotCount) {
+                (void)fail(runtime::ErrorCode::InvalidProgram,
+                    "AOT delegate virtual slot is invalid");
+                return 0;
+            }
+            targetSymbolId = runtimeType->virtualDispatchTable[dispatchSlot];
+        } else {
+            semantic::SymbolId interfaceTypeId = 0;
+            if (!readAotDelegateIdFromFields(view.fields, 5u, interfaceTypeId)) {
+                (void)fail(runtime::ErrorCode::InvalidProgram,
+                    "AOT delegate interface identity is corrupt");
+                return 0;
+            }
+            const InterfaceDispatchDescriptor* map = nullptr;
+            const auto* curType = runtimeType;
+            for (std::size_t depth = 0; curType != nullptr && depth < 256 && map == nullptr; ++depth) {
+                if (curType->interfaceDispatchMaps) {
+                    for (std::uint32_t idx = 0; idx < curType->interfaceDispatchMapCount; ++idx) {
+                        if (curType->interfaceDispatchMaps[idx].interfaceTypeId == interfaceTypeId) {
+                            map = &curType->interfaceDispatchMaps[idx];
+                            break;
+                        }
+                    }
+                }
+                curType = curType->baseTypeId != 0 ? findType(curType->baseTypeId) : nullptr;
+            }
+            if (!map || !map->slots || dispatchSlot >= map->slotCount) {
+                (void)fail(runtime::ErrorCode::InvalidProgram,
+                    "AOT delegate interface slot is invalid");
+                return 0;
+            }
+            targetSymbolId = map->slots[dispatchSlot];
+        }
+    }
+    outSingle.targetSymbolId = targetSymbolId;
+    outSingle.receiver = target;
+    outSingle.hasReceiver = hasRecv;
+
+    auto& ce = delLeafCache_[delRef.slot & 15u];
+    ce.delRef = delRef;
+    ce.hasObjectReceiver = (hasRecv && target.rawTag() == runtime::ValueTag::ObjectRef);
+    ce.recvRef = ce.hasObjectReceiver ? target.asObjectRefUnchecked() : runtime::ObjectRef{};
+    ce.delegateTypeId = delegateTypeId;
+    ce.resolved = outSingle;
+    ce.isMulticast = false;
+    ce.valid = true;
+    return 1;
+}
+
+const ResolvedAotDelegateLeaf* ExecutionContext::acquireMulticastLeavesFast(
+    semantic::SymbolId delegateTypeId,
+    const runtime::Value& rootValue,
+    std::size_t& outCount,
+    std::vector<ResolvedAotDelegateLeaf>& fallbackBuf) {
+    outCount = 0;
+    if (RS_AOT_UNLIKELY(!heap_ || rootValue.rawTag() != runtime::ValueTag::ObjectRef)) {
+        (void)fail(runtime::ErrorCode::InvalidProgram, "AOT delegate invocation list is corrupt");
+        return nullptr;
+    }
+    const auto rootRef = rootValue.asObjectRefUnchecked();
+    if (RS_AOT_LIKELY(cachedMulticastTypeId_ == delegateTypeId &&
+                      cachedMulticastRef_ == rootRef &&
+                      !cachedMulticastLeaves_.empty() &&
+                      heap_->objectTypeIdFast(rootRef) == delegateTypeId)) {
+        bool allAlive = true;
+        for (const auto& item : cachedMulticastMeta_) {
+            if (!heap_->isAlive(item.leafRef) ||
+                (item.hasObjRecv && !heap_->isAlive(item.recvRef))) {
+                allAlive = false;
+                break;
+            }
+        }
+        if (RS_AOT_LIKELY(allAlive)) {
+            ++cachedMulticastPinCount_;
+            outCount = cachedMulticastLeaves_.size();
+            return cachedMulticastLeaves_.data();
+        }
+    }
+
+    const bool canPopulateCache = (cachedMulticastPinCount_ == 0);
+    if (canPopulateCache) {
+        cachedMulticastMeta_.clear();
+        cachedMulticastLeaves_.clear();
+        cachedMulticastTypeId_ = 0;
+    } else {
+        fallbackBuf.clear();
+    }
+
+    std::array<runtime::Value, 64> inlineStack{};
+    std::size_t inlineTop = 0;
+    std::vector<runtime::Value> nodeStack;
+    inlineStack[inlineTop++] = rootValue;
+    std::size_t visited = 0;
+
+    while (inlineTop > 0 || !nodeStack.empty()) {
+        runtime::Value cur;
+        if (!nodeStack.empty()) {
+            cur = nodeStack.back();
+            nodeStack.pop_back();
+        } else {
+            cur = inlineStack[--inlineTop];
+        }
+        if (cur.rawTag() == runtime::ValueTag::NullObject) continue;
+        if (++visited > 65536u) {
+            (void)fail(runtime::ErrorCode::InvalidProgram,
+                "AOT delegate invocation list is corrupt");
+            return nullptr;
+        }
+        runtime::ObjectFastView v{};
+        std::int64_t fl = -1;
+        if (cur.rawTag() != runtime::ValueTag::ObjectRef ||
+            !heap_->tryBindObjectFastView(cur.asObjectRefUnchecked(), v) ||
+            v.typeId != delegateTypeId ||
+            v.fieldCount != 8u ||
+            !v.fields[3].tryGetInt64(fl) || fl < 0 || fl > 4) {
+            (void)fail(runtime::ErrorCode::InvalidProgram,
+                "AOT delegate invocation list is corrupt");
+            return nullptr;
+        }
+        if (fl != 4) {
+            ResolvedAotDelegateLeaf resolved{};
+            if (RS_AOT_LIKELY(fl == 0)) {
+                std::int64_t lo = -1, hi = -1, slotVal = -1;
+                if (RS_AOT_UNLIKELY(
+                        !v.fields[1].tryGetInt64(lo) ||
+                        !v.fields[2].tryGetInt64(hi) ||
+                        !v.fields[4].tryGetInt64(slotVal) ||
+                        lo < 0 || hi < 0 || slotVal < 0 ||
+                        lo > std::numeric_limits<std::uint32_t>::max() ||
+                        hi > std::numeric_limits<std::uint32_t>::max() ||
+                        slotVal > std::numeric_limits<std::uint32_t>::max())) {
+                    (void)fail(runtime::ErrorCode::InvalidProgram,
+                        "AOT delegate dispatch metadata is corrupt");
+                    return nullptr;
+                }
+                resolved.targetSymbolId =
+                    static_cast<std::uint64_t>(static_cast<std::uint32_t>(lo)) |
+                    (static_cast<std::uint64_t>(static_cast<std::uint32_t>(hi)) << 32u);
+                resolved.receiver = v.fields[0];
+                resolved.hasReceiver = (resolved.receiver.rawTag() != runtime::ValueTag::NullObject);
+            } else {
+                if (inspectDelegateSlow(delegateTypeId, cur, resolved) != 1) {
+                    return nullptr;
+                }
+            }
+            if (canPopulateCache) {
+                const bool hasObjR =
+                    resolved.hasReceiver && resolved.receiver.rawTag() == runtime::ValueTag::ObjectRef;
+                cachedMulticastMeta_.push_back({
+                    resolved,
+                    cur.asObjectRefUnchecked(),
+                    hasObjR ? resolved.receiver.asObjectRefUnchecked() : runtime::ObjectRef{},
+                    hasObjR,
+                });
+                cachedMulticastLeaves_.push_back(std::move(resolved));
+            } else {
+                fallbackBuf.push_back(std::move(resolved));
+            }
+            continue;
+        }
+        const runtime::Value f0 = v.fields[0];
+        const runtime::Value f7 = v.fields[7];
+        if (!nodeStack.empty() || inlineTop + 2u > inlineStack.size()) {
+            nodeStack.push_back(f7);
+            nodeStack.push_back(f0);
+        } else {
+            inlineStack[inlineTop++] = f7;
+            inlineStack[inlineTop++] = f0;
+        }
+    }
+
+    if (canPopulateCache) {
+        cachedMulticastTypeId_ = delegateTypeId;
+        cachedMulticastRef_ = rootRef;
+        ++cachedMulticastPinCount_;
+        outCount = cachedMulticastLeaves_.size();
+        return cachedMulticastLeaves_.data();
+    }
+    outCount = fallbackBuf.size();
+    return fallbackBuf.data();
 }
 
 bool ExecutionContext::invokeDelegate(

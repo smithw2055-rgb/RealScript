@@ -1304,6 +1304,506 @@ bool inlineSmallFunctions(
     return anyInlined;
 }
 
+
+bool devirtualizeTypeAssignable(
+    semantic::SymbolId actual,
+    semantic::SymbolId expected,
+    const std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*>& types) noexcept {
+    if (actual == expected) return true;
+    if (actual == 0 || expected == 0) return false;
+    auto current = actual;
+    for (std::size_t depth = 0; current != 0 && depth < 256; ++depth) {
+        const auto found = types.find(current);
+        if (found == types.end()) return false;
+        for (const auto& iface : found->second->interfaceDispatchMaps) {
+            if (iface.interfaceTypeId == expected) return true;
+        }
+        if (found->second->baseTypeId == expected) return true;
+        current = found->second->baseTypeId;
+    }
+    return false;
+}
+
+const semantic::FunctionSymbol* findClassMethodBySymbolId(
+    semantic::SymbolId classTypeId,
+    semantic::SymbolId methodSymbolId,
+    const std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*>& types) noexcept {
+    auto current = classTypeId;
+    for (std::size_t depth = 0; current != 0 && depth < 256; ++depth) {
+        const auto found = types.find(current);
+        if (found == types.end()) return nullptr;
+        for (const auto& method : found->second->methods) {
+            if (method.id == methodSymbolId) return &method;
+        }
+        current = found->second->baseTypeId;
+    }
+    return nullptr;
+}
+
+bool devirtualizeCalls(
+    mir::Module& module,
+    const Options& options,
+    Statistics& statistics,
+    const std::vector<mir::Module>* allModules = nullptr) {
+    if (!options.enableDevirtualization) return false;
+
+    const auto initialModuleTypes = module.types;
+    std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> allTypes;
+    std::unordered_map<semantic::SymbolId, const mir::Function*> allFunctions;
+    std::unordered_set<semantic::SymbolId> existingModuleTypes;
+    for (const auto& t : initialModuleTypes) {
+        if (t.id != 0) {
+            allTypes.emplace(t.id, &t);
+            existingModuleTypes.insert(t.id);
+        }
+    }
+    for (const auto& fn : module.functions) {
+        if (fn.symbolId != 0) allFunctions.emplace(fn.symbolId, &fn);
+    }
+    if (allModules) {
+        for (const auto& m : *allModules) {
+            if (&m == &module) continue;
+            for (const auto& t : m.types) {
+                if (t.id != 0) allTypes.emplace(t.id, &t);
+            }
+            for (const auto& fn : m.functions) {
+                if (fn.symbolId != 0) allFunctions.emplace(fn.symbolId, &fn);
+            }
+        }
+    }
+
+    const auto ensureTypeImported = [&](semantic::SymbolId rootTid) {
+        if (rootTid == 0 || existingModuleTypes.count(rootTid)) return;
+        std::vector<semantic::SymbolId> worklist{rootTid};
+        while (!worklist.empty()) {
+            const semantic::SymbolId tid = worklist.back();
+            worklist.pop_back();
+            if (tid == 0 || existingModuleTypes.count(tid)) continue;
+            const auto it = allTypes.find(tid);
+            if (it == allTypes.end() || !it->second) continue;
+            const semantic::TypeSymbol& t = *it->second;
+            module.types.push_back(t);
+            existingModuleTypes.insert(tid);
+            if (t.baseTypeId != 0 && !existingModuleTypes.count(t.baseTypeId)) {
+                worklist.push_back(t.baseTypeId);
+            }
+            for (const auto& imap : t.interfaceDispatchMaps) {
+                if (imap.interfaceTypeId != 0 &&
+                    !existingModuleTypes.count(imap.interfaceTypeId)) {
+                    worklist.push_back(imap.interfaceTypeId);
+                }
+            }
+        }
+    };
+
+    bool anyDevirt = false;
+    for (auto& caller : module.functions) {
+        if (caller.blocks.empty()) continue;
+        mir::ValueId nextId = findMaxValueId(caller) + 1;
+
+        struct ValStaticType {
+            semantic::PrimitiveType type = semantic::PrimitiveType::Error;
+            semantic::SymbolId typeId = 0;
+        };
+        std::unordered_map<mir::ValueId, ValStaticType> staticTypes;
+        bool entryHasPredecessors = false;
+        bool entryProtectedByHandler = false;
+        const mir::BlockId entryBlockId = caller.blocks.front().id;
+        for (const auto& handler : caller.exceptionHandlers) {
+            for (const auto pb : handler.protectedBlocks) {
+                if (pb == entryBlockId) {
+                    entryProtectedByHandler = true;
+                    break;
+                }
+            }
+            if (entryProtectedByHandler) break;
+        }
+
+        for (const auto& blk : caller.blocks) {
+            for (const auto& p : blk.parameters) {
+                if (p.value >= 0) {
+                    staticTypes[p.value] = {p.type, p.typeId};
+                }
+            }
+            for (const auto& inst : blk.instructions) {
+                if (inst.result >= 0) {
+                    const auto tid = inst.resultTypeId != 0
+                        ? inst.resultTypeId
+                        : (semantic::isExactType(inst.resultType) ? inst.typeId : 0);
+                    staticTypes[inst.result] = {inst.resultType, tid};
+                }
+            }
+            if (blk.terminator.kind == mir::TerminatorKind::Jump) {
+                if (blk.terminator.target == entryBlockId) entryHasPredecessors = true;
+            } else if (blk.terminator.kind == mir::TerminatorKind::Branch) {
+                if (blk.terminator.target == entryBlockId ||
+                    blk.terminator.falseTarget == entryBlockId) {
+                    entryHasPredecessors = true;
+                }
+            }
+        }
+        const bool entryCanDominateAllBlocks =
+            !entryHasPredecessors && !entryProtectedByHandler;
+
+        struct ExactInfo {
+            semantic::SymbolId exactTypeId = 0;
+            mir::ValueId domExactValue = -1;
+            mir::BlockId defBlockId = 0;
+            bool definedInEntry = false;
+            bool knownNonNull = false;
+        };
+        std::unordered_map<mir::ValueId, ExactInfo> exactMap;
+
+        const auto isSealedConcreteClass = [&](semantic::SymbolId tid) noexcept -> bool {
+            if (tid == 0) return false;
+            const auto it = allTypes.find(tid);
+            return it != allTypes.end() &&
+                it->second->kind == semantic::TypeKind::Class &&
+                !it->second->abstractType &&
+                !it->second->interfaceType &&
+                it->second->sealedType;
+        };
+
+        // Pass 1: seed SSA values from NewObject & sealed class types in entry & all blocks
+        for (std::size_t bIdx = 0; bIdx < caller.blocks.size(); ++bIdx) {
+            const auto& blk = caller.blocks[bIdx];
+            const bool inEntry = (bIdx == 0 && entryCanDominateAllBlocks);
+            for (const auto& p : blk.parameters) {
+                if (p.value >= 0 && p.type == semantic::PrimitiveType::Object &&
+                    isSealedConcreteClass(p.typeId)) {
+                    exactMap[p.value] = {p.typeId, p.value, blk.id, inEntry, false};
+                }
+            }
+            for (const auto& inst : blk.instructions) {
+                if (inst.result < 0) continue;
+                const auto stIt = staticTypes.find(inst.result);
+                const auto stTid = stIt != staticTypes.end() ? stIt->second.typeId : 0;
+                if (inst.opcode == mir::Opcode::NewObject && stTid != 0) {
+                    const auto tIt = allTypes.find(stTid);
+                    if (tIt != allTypes.end() &&
+                        tIt->second->kind == semantic::TypeKind::Class &&
+                        !tIt->second->abstractType &&
+                        !tIt->second->interfaceType) {
+                        exactMap[inst.result] = {stTid, inst.result, blk.id, inEntry, true};
+                    }
+                } else if (inst.opcode == mir::Opcode::CheckNotNull && !inst.operands.empty()) {
+                    const auto opIt = exactMap.find(inst.operands[0]);
+                    if (opIt != exactMap.end()) {
+                        ExactInfo info = opIt->second;
+                        info.knownNonNull = true;
+                        exactMap[inst.result] = info;
+                    } else if (isSealedConcreteClass(stTid)) {
+                        exactMap[inst.result] = {stTid, inst.result, blk.id, inEntry, true};
+                    } else {
+                        exactMap[inst.result] = {0, -1, blk.id, inEntry, true};
+                    }
+                } else if (inst.resultType == semantic::PrimitiveType::Object &&
+                           isSealedConcreteClass(stTid)) {
+                    exactMap[inst.result] = {stTid, inst.result, blk.id, inEntry, false};
+                }
+            }
+        }
+
+        // Analyze StoreLocal across function for single-assignment entry locals & uniform exact-type locals
+        const std::size_t localCount = caller.localTypes.size();
+        std::vector<std::size_t> localStores(localCount, 0);
+        std::vector<semantic::SymbolId> localUniformExact(localCount, 0);
+        std::vector<bool> localUniformValid(localCount, true);
+        std::vector<std::size_t> entryStoreInstIdx(localCount, std::numeric_limits<std::size_t>::max());
+        std::vector<mir::ValueId> entryStoreRhs(localCount, -1);
+
+        for (const auto& handler : caller.exceptionHandlers) {
+            if (handler.exceptionLocal < localCount) {
+                localStores[handler.exceptionLocal] += 2;
+                localUniformValid[handler.exceptionLocal] = false;
+            }
+        }
+
+        for (std::size_t iter = 0; iter < 2; ++iter) {
+            std::fill(localStores.begin(), localStores.end(), 0);
+            std::fill(localUniformExact.begin(), localUniformExact.end(), 0);
+            std::fill(localUniformValid.begin(), localUniformValid.end(), true);
+            std::fill(entryStoreInstIdx.begin(), entryStoreInstIdx.end(), std::numeric_limits<std::size_t>::max());
+            std::fill(entryStoreRhs.begin(), entryStoreRhs.end(), -1);
+            for (const auto& handler : caller.exceptionHandlers) {
+                if (handler.exceptionLocal < localCount) {
+                    localStores[handler.exceptionLocal] += 2;
+                    localUniformValid[handler.exceptionLocal] = false;
+                }
+            }
+
+            for (std::size_t bIdx = 0; bIdx < caller.blocks.size(); ++bIdx) {
+                const auto& blk = caller.blocks[bIdx];
+                for (std::size_t iIdx = 0; iIdx < blk.instructions.size(); ++iIdx) {
+                    const auto& inst = blk.instructions[iIdx];
+                    if (inst.opcode == mir::Opcode::StoreLocal &&
+                        inst.localIndex < localCount &&
+                        !inst.operands.empty()) {
+                        const auto slot = inst.localIndex;
+                        ++localStores[slot];
+                        if (bIdx == 0 && !entryHasPredecessors && localStores[slot] == 1) {
+                            entryStoreInstIdx[slot] = iIdx;
+                            entryStoreRhs[slot] = inst.operands[0];
+                        }
+                        const auto exIt = exactMap.find(inst.operands[0]);
+                        const semantic::SymbolId rhsExact =
+                            (exIt != exactMap.end()) ? exIt->second.exactTypeId : 0;
+                        if (rhsExact == 0) {
+                            localUniformValid[slot] = false;
+                        } else if (localUniformExact[slot] == 0) {
+                            localUniformExact[slot] = rhsExact;
+                        } else if (localUniformExact[slot] != rhsExact) {
+                            localUniformValid[slot] = false;
+                        }
+                    }
+                }
+            }
+
+            for (std::size_t bIdx = 0; bIdx < caller.blocks.size(); ++bIdx) {
+                const auto& blk = caller.blocks[bIdx];
+                const bool inEntry = (bIdx == 0 && entryCanDominateAllBlocks);
+                std::unordered_map<std::size_t, mir::ValueId> blockLocalValue;
+                for (std::size_t iIdx = 0; iIdx < blk.instructions.size(); ++iIdx) {
+                    const auto& inst = blk.instructions[iIdx];
+                    if (inst.opcode == mir::Opcode::StoreLocal &&
+                        inst.localIndex < localCount &&
+                        !inst.operands.empty()) {
+                        blockLocalValue[inst.localIndex] = inst.operands[0];
+                        continue;
+                    }
+                    if (inst.opcode == mir::Opcode::LoadLocal &&
+                        inst.result >= 0 &&
+                        inst.localIndex < localCount) {
+                        const auto slot = inst.localIndex;
+                        const auto blkLocalIt = blockLocalValue.find(slot);
+                        if (blkLocalIt != blockLocalValue.end()) {
+                            const auto rhsEx = exactMap.find(blkLocalIt->second);
+                            if (rhsEx != exactMap.end()) {
+                                exactMap[inst.result] = rhsEx->second;
+                            } else {
+                                exactMap.erase(inst.result);
+                            }
+                            continue;
+                        }
+                        if (localStores[slot] == 1 &&
+                            entryStoreRhs[slot] >= 0 &&
+                            ((bIdx > 0 && entryCanDominateAllBlocks) ||
+                             (bIdx == 0 && !entryHasPredecessors && iIdx > entryStoreInstIdx[slot]))) {
+                            const auto rhsEx = exactMap.find(entryStoreRhs[slot]);
+                            if (rhsEx != exactMap.end()) {
+                                ExactInfo prop = rhsEx->second;
+                                if (!prop.definedInEntry) {
+                                    prop.domExactValue = -1;
+                                }
+                                exactMap[inst.result] = prop;
+                                continue;
+                            }
+                        }
+                        if (localUniformValid[slot] && localUniformExact[slot] != 0) {
+                            exactMap[inst.result] = {
+                                localUniformExact[slot], -1, blk.id, inEntry, false};
+                        }
+                    } else if (inst.opcode == mir::Opcode::CheckNotNull &&
+                               inst.result >= 0 &&
+                               !inst.operands.empty()) {
+                        const auto opIt = exactMap.find(inst.operands[0]);
+                        if (opIt != exactMap.end()) {
+                            ExactInfo info = opIt->second;
+                            info.knownNonNull = true;
+                            exactMap[inst.result] = info;
+                        }
+                    }
+                }
+            }
+        }
+
+        bool callerChanged = false;
+        for (std::size_t bIdx = 0; bIdx < caller.blocks.size(); ++bIdx) {
+            auto& blk = caller.blocks[bIdx];
+            std::vector<mir::Instruction> rewritten;
+            rewritten.reserve(blk.instructions.size() + 4);
+            for (auto& inst : blk.instructions) {
+                if (inst.opcode == mir::Opcode::Call &&
+                    (inst.virtualDispatch || inst.interfaceDispatch) &&
+                    !(inst.virtualDispatch && inst.interfaceDispatch) &&
+                    !inst.operands.empty() &&
+                    inst.operands.size() == inst.parameterTypes.size() &&
+                    inst.parameterTypeIds.size() == inst.parameterTypes.size()) {
+                    const mir::ValueId recvOp = inst.operands[0];
+                    const auto recvStIt = staticTypes.find(recvOp);
+                    const semantic::SymbolId recvStaticTid =
+                        recvStIt != staticTypes.end() ? recvStIt->second.typeId : 0;
+                    const auto exIt = exactMap.find(recvOp);
+                    const ExactInfo exInfo = exIt != exactMap.end() ? exIt->second : ExactInfo{};
+
+                    semantic::SymbolId resolvedSym = 0;
+                    if (exInfo.exactTypeId != 0) {
+                        const auto cIt = allTypes.find(exInfo.exactTypeId);
+                        if (cIt != allTypes.end() &&
+                            cIt->second->kind == semantic::TypeKind::Class &&
+                            !cIt->second->abstractType &&
+                            !cIt->second->interfaceType) {
+                            if (inst.virtualDispatch) {
+                                if (inst.virtualSlot < cIt->second->virtualDispatchTable.size()) {
+                                    resolvedSym = cIt->second->virtualDispatchTable[inst.virtualSlot];
+                                }
+                            } else if (inst.interfaceDispatch) {
+                                for (const auto& imap : cIt->second->interfaceDispatchMaps) {
+                                    if (imap.interfaceTypeId == inst.interfaceTypeId) {
+                                        if (inst.interfaceSlot < imap.slots.size()) {
+                                            resolvedSym = imap.slots[inst.interfaceSlot];
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } else if (inst.virtualDispatch && recvStaticTid != 0) {
+                        const auto sIt = allTypes.find(recvStaticTid);
+                        if (sIt != allTypes.end() &&
+                            sIt->second->kind == semantic::TypeKind::Class &&
+                            inst.virtualSlot < sIt->second->virtualDispatchTable.size()) {
+                            const semantic::SymbolId candSym =
+                                sIt->second->virtualDispatchTable[inst.virtualSlot];
+                            if (candSym != 0) {
+                                bool canDevirt = sIt->second->sealedType;
+                                if (!canDevirt) {
+                                    const auto* mSym = findClassMethodBySymbolId(
+                                        recvStaticTid, candSym, allTypes);
+                                    if (mSym && mSym->sealedMethod && !mSym->abstractMethod) {
+                                        canDevirt = true;
+                                    }
+                                }
+                                if (canDevirt) {
+                                    resolvedSym = candSym;
+                                }
+                            }
+                        }
+                    }
+
+                    if (resolvedSym != 0) {
+                        const auto fnIt = allFunctions.find(resolvedSym);
+                        if (fnIt != allFunctions.end()) {
+                            const mir::Function& targetFn = *fnIt->second;
+                            if (targetFn.parameterTypes.size() == inst.operands.size() &&
+                                targetFn.parameterTypeIds.size() == targetFn.parameterTypes.size() &&
+                                !targetFn.parameterTypeIds.empty() &&
+                                targetFn.parameterTypes[0] == semantic::PrimitiveType::Object &&
+                                targetFn.returnType == inst.resultType &&
+                                targetFn.returnTypeId == inst.resultTypeId) {
+                                const semantic::SymbolId expectedThisTid = targetFn.parameterTypeIds[0];
+                                const auto expTypeIt = allTypes.find(expectedThisTid);
+                                bool extraArgsCompatible = true;
+                                for (std::size_t a = 1; a < inst.operands.size(); ++a) {
+                                    const auto opSt = staticTypes.find(inst.operands[a]);
+                                    if (opSt == staticTypes.end() ||
+                                        opSt->second.type != targetFn.parameterTypes[a]) {
+                                        extraArgsCompatible = false;
+                                        break;
+                                    }
+                                    if (targetFn.parameterTypes[a] == semantic::PrimitiveType::Object) {
+                                        if (targetFn.parameterTypeIds[a] != 0 &&
+                                            !devirtualizeTypeAssignable(
+                                                opSt->second.typeId,
+                                                targetFn.parameterTypeIds[a],
+                                                allTypes)) {
+                                            extraArgsCompatible = false;
+                                            break;
+                                        }
+                                    } else if (opSt->second.typeId != targetFn.parameterTypeIds[a]) {
+                                        extraArgsCompatible = false;
+                                        break;
+                                    }
+                                }
+                                if (extraArgsCompatible &&
+                                    expTypeIt != allTypes.end() &&
+                                    expTypeIt->second->kind == semantic::TypeKind::Class) {
+                                    mir::ValueId chosenRecv = -1;
+                                    bool chosenNonNull = exInfo.knownNonNull;
+                                    if (devirtualizeTypeAssignable(recvStaticTid, expectedThisTid, allTypes)) {
+                                        chosenRecv = recvOp;
+                                    } else if (exInfo.domExactValue >= 0 &&
+                                               (exInfo.definedInEntry || exInfo.defBlockId == blk.id)) {
+                                        const auto domSt = staticTypes.find(exInfo.domExactValue);
+                                        if (domSt != staticTypes.end() &&
+                                            devirtualizeTypeAssignable(
+                                                domSt->second.typeId, expectedThisTid, allTypes)) {
+                                            chosenRecv = exInfo.domExactValue;
+                                            const auto domEx = exactMap.find(exInfo.domExactValue);
+                                            if (domEx != exactMap.end() && domEx->second.knownNonNull) {
+                                                chosenNonNull = true;
+                                            }
+                                        }
+                                    } else if (targetFn.blocks.size() == 1 &&
+                                               targetFn.exceptionHandlers.empty() &&
+                                               targetFn.blocks.front().instructions.size() <=
+                                                   options.maxInlineInstructions + 4) {
+                                        ensureTypeImported(expectedThisTid);
+                                        mir::Instruction castInst;
+                                        castInst.opcode = mir::Opcode::AsType;
+                                        castInst.result = nextId++;
+                                        castInst.resultType = semantic::PrimitiveType::Object;
+                                        castInst.resultTypeId = expectedThisTid;
+                                        castInst.elementType = semantic::PrimitiveType::Object;
+                                        castInst.elementTypeId = expectedThisTid;
+                                        castInst.operands = {recvOp};
+                                        castInst.sourceSpan = inst.sourceSpan;
+                                        chosenRecv = castInst.result;
+                                        staticTypes[chosenRecv] = {
+                                            semantic::PrimitiveType::Object, expectedThisTid};
+                                        rewritten.push_back(std::move(castInst));
+                                    }
+
+                                    if (chosenRecv >= 0) {
+                                        ensureTypeImported(expectedThisTid);
+                                        const auto chosenSt = staticTypes.find(chosenRecv);
+                                        if (chosenSt != staticTypes.end() && chosenSt->second.typeId != 0) {
+                                            ensureTypeImported(chosenSt->second.typeId);
+                                        }
+                                        if (!chosenNonNull) {
+                                            mir::Instruction chk;
+                                            chk.opcode = mir::Opcode::CheckNotNull;
+                                            chk.result = nextId++;
+                                            chk.resultType = semantic::PrimitiveType::Object;
+                                            chk.resultTypeId = expectedThisTid;
+                                            chk.typeId = expectedThisTid;
+                                            chk.operands = {chosenRecv};
+                                            chk.sourceSpan = inst.sourceSpan;
+                                            chosenRecv = chk.result;
+                                            staticTypes[chosenRecv] = {
+                                                semantic::PrimitiveType::Object, expectedThisTid};
+                                            rewritten.push_back(std::move(chk));
+                                        }
+                                        inst.operands[0] = chosenRecv;
+                                        inst.symbolId = targetFn.symbolId;
+                                        inst.symbolName = targetFn.moduleName + "::" + targetFn.name;
+                                        inst.parameterTypes = targetFn.parameterTypes;
+                                        inst.parameterTypeIds = targetFn.parameterTypeIds;
+                                        inst.virtualDispatch = false;
+                                        inst.virtualSlot = std::numeric_limits<std::uint32_t>::max();
+                                        inst.interfaceDispatch = false;
+                                        inst.interfaceTypeId = 0;
+                                        inst.interfaceSlot = std::numeric_limits<std::uint32_t>::max();
+                                        ++statistics.callsDevirtualized;
+                                        callerChanged = true;
+                                        anyDevirt = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                rewritten.push_back(std::move(inst));
+            }
+            blk.instructions = std::move(rewritten);
+        }
+        if (callerChanged) {
+            compactValueIds(caller);
+        }
+    }
+    return anyDevirt;
+}
+
 bool optimizeFunction(
     mir::Function& function,
     const Options& options,
@@ -1339,7 +1839,8 @@ bool Statistics::changed() const noexcept {
     return constantsFolded != 0 || branchesFolded != 0 ||
         instructionsRemoved != 0 || blocksRemoved != 0 ||
         localLoadsFolded != 0 || functionsInlined != 0 ||
-        loopInvariantsHoisted != 0 || structFieldsForwarded != 0;
+        loopInvariantsHoisted != 0 || structFieldsForwarded != 0 ||
+        callsDevirtualized != 0;
 }
 
 Result Optimizer::optimize(
@@ -1348,21 +1849,29 @@ Result Optimizer::optimize(
     Options options) const {
     Result result;
     Options innerOptions = options;
-    if (options.level == Level::Aggressive && options.enableInlining && modules.size() > 1) {
-        for (std::size_t inlinePass = 0; inlinePass < 2; ++inlinePass) {
+    if (options.level == Level::Aggressive &&
+        (options.enableInlining || options.enableDevirtualization) &&
+        modules.size() > 1) {
+        for (std::size_t inlinePass = 0; inlinePass < 3; ++inlinePass) {
             const auto snapshot = modules;
-            bool anyPassInlined = false;
+            bool anyPassChanged = false;
             for (auto& module : modules) {
                 diagnostics::DiagnosticBag checkDiag;
                 if (mir::verifyModule(module, checkDiag)) {
-                    if (inlineSmallFunctions(module, options, result.statistics, &snapshot)) {
-                        anyPassInlined = true;
+                    if (options.enableDevirtualization &&
+                        devirtualizeCalls(module, options, result.statistics, &snapshot)) {
+                        anyPassChanged = true;
+                    }
+                    if (options.enableInlining &&
+                        inlineSmallFunctions(module, options, result.statistics, &snapshot)) {
+                        anyPassChanged = true;
                     }
                 }
             }
-            if (!anyPassInlined) break;
+            if (!anyPassChanged) break;
         }
         innerOptions.enableInlining = false;
+        innerOptions.enableDevirtualization = false;
     }
     result.modules.reserve(modules.size());
     for (auto& module : modules) {
@@ -1389,9 +1898,17 @@ mir::Module Optimizer::optimizeModule(
             diagnostics.append(inputDiagnostics);
             return module;
         }
-        if (options.level == Level::Aggressive && options.enableInlining) {
-            for (std::size_t inlinePass = 0; inlinePass < 2; ++inlinePass) {
-                if (!inlineSmallFunctions(module, options, target)) break;
+        if (options.level == Level::Aggressive &&
+            (options.enableInlining || options.enableDevirtualization)) {
+            for (std::size_t inlinePass = 0; inlinePass < 3; ++inlinePass) {
+                bool passChanged = false;
+                if (options.enableDevirtualization) {
+                    passChanged |= devirtualizeCalls(module, options, target);
+                }
+                if (options.enableInlining) {
+                    passChanged |= inlineSmallFunctions(module, options, target);
+                }
+                if (!passChanged) break;
             }
         }
         for (auto& function : module.functions) {

@@ -2,6 +2,7 @@
 
 #include "realscript/runtime/Runtime.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -276,6 +277,12 @@ enum class FlatOpcode : std::uint8_t {
     NewObjectFast,
     LoadFieldExactFast,
     StoreFieldExactFast,
+    IsTypeObjFast,
+    AsTypeObjFast,
+    NewDelegateFast,
+    CombineDelegateFast,
+    RemoveDelegateFast,
+    InvokeDelegateFast,
     GenericBytecode,
     // 8. Flattened block terminators
     TermJumpNoArgs,
@@ -435,6 +442,55 @@ enum class TrivialMethodKind : std::uint8_t {
     ReturnVoid,
     ReturnConst,
     ReturnParam,
+    ReturnThisFieldExact,
+    StoreThisFieldExact,
+    ReturnThisFieldAddField,
+    ReturnThisFieldSubField,
+    ReturnThisFieldAddConst,
+    ReturnThisFieldSubConst,
+    ReturnThisFieldMulConst,
+};
+
+struct PrelinkedDispatchTarget {
+    semantic::SymbolId symbolId = 0;
+    const ProgramImage::FunctionLocation* target = nullptr;
+    const ExecutionFunction* execution = nullptr;
+};
+
+struct PrelinkedInterfaceMap {
+    semantic::SymbolId interfaceTypeId = 0;
+    std::vector<PrelinkedDispatchTarget> slots;
+};
+
+struct TypeDispatchMetadata {
+    semantic::SymbolId typeId = 0;
+    std::vector<semantic::SymbolId> assignableTargetIds;
+    std::vector<PrelinkedDispatchTarget> virtualTargets;
+    std::vector<PrelinkedInterfaceMap> interfaceMaps;
+};
+
+struct PolymorphicCallSiteDesc {
+    semantic::SymbolId interfaceTypeId = 0;
+    std::uint32_t slot = 0;
+    bool isInterface = false;
+    bool valid = false;
+};
+
+struct NewDelegateSiteDesc {
+    semantic::SymbolId delegateTypeId = 0;
+    semantic::PrimitiveType expectedReceiverType = semantic::PrimitiveType::Error;
+    semantic::SymbolId expectedReceiverTypeId = 0;
+    bool hasReceiverOperand = false;
+    bool valid = false;
+    std::array<Value, 8> templateFields{};
+};
+
+struct InvokeDelegateSiteDesc {
+    semantic::SymbolId delegateTypeId = 0;
+    std::vector<semantic::PrimitiveType> userParamTypes;
+    std::vector<semantic::SymbolId> userParamTypeIds;
+    std::vector<std::uint8_t> userParamExactTags;
+    bool valid = false;
 };
 
 struct ExecutionBlock {
@@ -465,6 +521,12 @@ struct ExecutionFunction {
     std::uint32_t entryStreamOffset = InvalidStreamOffset;
     std::uint16_t trivialInstCost = 0;
     std::uint16_t trivialParamIndex = 0;
+    std::uint16_t trivialFieldIndex0 = 0;
+    std::uint16_t trivialFieldIndex1 = 0;
+    semantic::SymbolId trivialOwnerTypeId = 0;
+    std::uint8_t trivialFieldTag0 = 0;
+    std::uint8_t trivialFieldTag1 = 0;
+    bool trivialCheckedArith = true;
     TrivialMethodKind trivialKind = TrivialMethodKind::None;
     bool hasDebugSequencePoints = false;
     bool hasExceptionHandlers = false;
@@ -483,6 +545,10 @@ struct ExecutionMirror {
     std::unordered_map<const bytecode::Function*, ExecutionFunction> functions;
     std::vector<FieldAccessMeta> fieldMetas;
     std::vector<ObjectAllocationTemplate> objectTemplates;
+    std::unordered_map<semantic::SymbolId, TypeDispatchMetadata> typeDispatch;
+    std::vector<PolymorphicCallSiteDesc> polyCallSites;
+    std::vector<NewDelegateSiteDesc> newDelegateSites;
+    std::vector<InvokeDelegateSiteDesc> invokeDelegateSites;
 };
 
 [[nodiscard]] std::shared_ptr<const ExecutionMirror> buildExecutionMirror(

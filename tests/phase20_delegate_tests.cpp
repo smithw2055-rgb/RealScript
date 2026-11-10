@@ -644,6 +644,87 @@ Holder main() { return new Holder(); }
         "delegate invocation/capture state was not restored");
 }
 
+void testReentrantMulticastAndBudgetParity() {
+    realscript::compiler::Compilation compilation({{
+        "phase20-reentrant-multicast.rs",
+        R"(
+module Phase20.ReentrantMulticast;
+
+delegate void Step(Runner r);
+
+class Runner
+{
+    public int log;
+    public Step innerChain;
+
+    public void OuterFirst(Runner r)
+    {
+        log = log * 10 + 1;
+        // Re-entrantly invoke the SAME Fire(Step) call site with a different multicast delegate!
+        Fire(innerChain, r);
+    }
+
+    public void OuterSecond(Runner r)
+    {
+        log = log * 10 + 4;
+    }
+
+    public void InnerA(Runner r)
+    {
+        log = log * 10 + 2;
+    }
+
+    public void InnerB(Runner r)
+    {
+        log = log * 10 + 3;
+    }
+}
+
+void Fire(Step s, Runner r)
+{
+    s(r);
+}
+
+int main()
+{
+    Runner r = new Runner();
+    Step ia = r.InnerA;
+    Step ib = r.InnerB;
+    r.innerChain = ia + ib;
+
+    Step o1 = r.OuterFirst;
+    Step o2 = r.OuterSecond;
+    Step outerChain = o1 + o2;
+
+    Fire(outerChain, r);
+    return r.log;
+}
+)"}});
+    const auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "reentrant multicast compilation failed:\n" +
+            diagnosticsText(build.diagnostics));
+    realscript::bytecode::Lowerer lowerer;
+    auto module = lowerer.lower(build.modules.front());
+    realscript::runtime::Interpreter interpreter({std::move(module)});
+
+    realscript::runtime::ExecutionOptions fastOpts{};
+    fastOpts.determinism.mode = realscript::runtime::DeterminismMode::Off;
+    const auto fastRes = interpreter.invoke("Phase20.ReentrantMulticast::main", {}, fastOpts);
+
+    realscript::runtime::ExecutionOptions strictOpts{};
+    strictOpts.determinism.mode = realscript::runtime::DeterminismMode::Strict;
+    const auto strictRes = interpreter.invoke("Phase20.ReentrantMulticast::main", {}, strictOpts);
+
+    require(fastRes.succeeded && strictRes.succeeded,
+        "reentrant multicast execution failed: " + fastRes.error.message);
+    require(std::get<std::int64_t>(fastRes.value) == 1234 &&
+            std::get<std::int64_t>(strictRes.value) == 1234,
+        "reentrant multicast leaf execution order corrupted");
+    require(fastRes.instructionsExecuted == strictRes.instructionsExecuted,
+        "reentrant multicast fast/strict instruction count mismatch");
+}
+
 } // namespace
 
 int main() {
@@ -660,6 +741,7 @@ int main() {
         testSubscriberSideEventAccess();
         testDelegateReferenceParameters();
         testDelegateHeapSnapshotRestore();
+        testReentrantMulticastAndBudgetParity();
         std::cout << "Phase 20 delegate tests passed\n";
         return 0;
     } catch (const std::exception& error) {

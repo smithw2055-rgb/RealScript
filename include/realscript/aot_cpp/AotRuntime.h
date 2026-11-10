@@ -208,6 +208,19 @@ struct ProgramDescriptor {
     std::uint32_t sourceMapCount = 0;
 };
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
+struct ResolvedAotDelegateLeaf {
+    runtime::Value receiver{runtime::NullObject{}};
+    semantic::SymbolId targetSymbolId = 0;
+    bool hasReceiver = false;
+};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
 struct CallSignature {
     semantic::SymbolId symbolId = 0;
     const char* name = nullptr;
@@ -499,6 +512,46 @@ public:
         const runtime::Value& right,
         bool remove,
         runtime::Value& result);
+    [[nodiscard]] int inspectDelegateSlow(
+        semantic::SymbolId delegateTypeId,
+        const runtime::Value& delValue,
+        ResolvedAotDelegateLeaf& outSingle);
+    [[nodiscard]] inline int inspectSingleOrMulticastDelegate(
+        semantic::SymbolId delegateTypeId,
+        const runtime::Value& delValue,
+        ResolvedAotDelegateLeaf& outSingle) {
+        if (RS_AOT_LIKELY(delValue.rawTag() == runtime::ValueTag::ObjectRef && heap_ != nullptr)) {
+            const auto ref = delValue.asObjectRefUnchecked();
+            const auto& ce = delLeafCache_[ref.slot & 15u];
+            if (RS_AOT_LIKELY(
+                    ce.valid &&
+                    !ce.isMulticast &&
+                    ce.delRef == ref &&
+                    ce.delegateTypeId == delegateTypeId &&
+                    heap_->objectTypeIdFast(ref) == delegateTypeId &&
+                    (!ce.hasObjectReceiver || heap_->objectTypeIdFast(ce.recvRef) != 0))) {
+                outSingle = ce.resolved;
+                return 1;
+            }
+            if (ce.valid && ce.isMulticast && ce.delRef == ref &&
+                ce.delegateTypeId == delegateTypeId &&
+                heap_->objectTypeIdFast(ref) == delegateTypeId) {
+                return 2;
+            }
+        }
+        return inspectDelegateSlow(delegateTypeId, delValue, outSingle);
+    }
+    [[nodiscard]] const ResolvedAotDelegateLeaf* acquireMulticastLeavesFast(
+        semantic::SymbolId delegateTypeId,
+        const runtime::Value& rootValue,
+        std::size_t& outCount,
+        std::vector<ResolvedAotDelegateLeaf>& fallbackBuf);
+    void releaseMulticastLeavesFast(const ResolvedAotDelegateLeaf* ptr) noexcept {
+        if (ptr == cachedMulticastLeaves_.data() && cachedMulticastPinCount_ > 0) {
+            --cachedMulticastPinCount_;
+        }
+    }
+    [[nodiscard]] bool hasFunction(semantic::SymbolId symbolId) const noexcept;
 
     [[nodiscard]] bool consume(std::string_view operation);
     [[nodiscard]] bool consume(
@@ -771,6 +824,174 @@ public:
         const runtime::Value& right,
         runtime::Value& result);
 
+    [[nodiscard]] runtime::ManagedHeap* rawHeap() const noexcept {
+        return heap_.get();
+    }
+    [[nodiscard]] semantic::SymbolId objectTypeIdFast(
+        const runtime::Value& receiver) const noexcept {
+        if (receiver.rawTag() == runtime::ValueTag::ObjectRef && heap_) {
+            return heap_->objectTypeIdFast(receiver.asObjectRefUnchecked());
+        }
+        return 0;
+    }
+    [[nodiscard]] bool checkNotNullFast(
+        semantic::SymbolId typeId,
+        const runtime::Value& receiver,
+        runtime::Value& result) {
+        if (receiver.rawTag() == runtime::ValueTag::ObjectRef && heap_) {
+            const auto actualTid = heap_->objectTypeIdFast(receiver.asObjectRefUnchecked());
+            if (actualTid != 0 && (actualTid == typeId || isAssignable(actualTid, typeId))) {
+                result = receiver;
+                return true;
+            }
+        }
+        return checkNotNull(typeId, receiver, result);
+    }
+    [[nodiscard]] bool loadFieldObjectFast(
+        semantic::SymbolId ownerTypeId,
+        std::size_t fieldIndex,
+        semantic::SymbolId expectedFieldTypeId,
+        const runtime::Value& receiver,
+        runtime::Value& result) {
+        if (RS_AOT_LIKELY(receiver.rawTag() == runtime::ValueTag::ObjectRef && heap_ != nullptr)) {
+            runtime::ObjectFastView view{};
+            if (RS_AOT_LIKELY(heap_->tryBindObjectFastView(receiver.asObjectRefUnchecked(), view) &&
+                              fieldIndex < view.fieldCount &&
+                              (view.typeId == ownerTypeId || isAssignable(view.typeId, ownerTypeId)))) {
+                const runtime::Value& fv = view.fields[fieldIndex];
+                const auto ftag = fv.rawTag();
+                if (ftag == runtime::ValueTag::NullObject) {
+                    result = fv;
+                    return true;
+                }
+                if (RS_AOT_LIKELY(ftag == runtime::ValueTag::ObjectRef)) {
+                    const auto fTid = heap_->objectTypeIdFast(fv.asObjectRefUnchecked());
+                    if (RS_AOT_LIKELY(fTid != 0 &&
+                                      (expectedFieldTypeId == 0 ||
+                                       fTid == expectedFieldTypeId ||
+                                       isAssignable(fTid, expectedFieldTypeId)))) {
+                        result = fv;
+                        return true;
+                    }
+                }
+            }
+        }
+        return loadField(ownerTypeId, fieldIndex, receiver, result);
+    }
+    [[nodiscard]] bool loadFieldInt64Fast(
+        semantic::SymbolId typeId,
+        std::size_t fieldIndex,
+        const runtime::Value& receiver,
+        std::int64_t& result) {
+        if (receiver.rawTag() == runtime::ValueTag::ObjectRef && heap_) {
+            runtime::ObjectFastView view{};
+            if (heap_->tryBindObjectFastView(receiver.asObjectRefUnchecked(), view) &&
+                fieldIndex < view.fieldCount &&
+                (view.typeId == typeId || isAssignable(view.typeId, typeId)) &&
+                view.fields[fieldIndex].tryGetInt64(result)) {
+                return true;
+            }
+        }
+        runtime::Value boxed;
+        if (!loadField(typeId, fieldIndex, receiver, boxed)) return false;
+        return boxed.tryGetInt64(result);
+    }
+    [[nodiscard]] bool storeFieldInt64Fast(
+        semantic::SymbolId typeId,
+        std::size_t fieldIndex,
+        const runtime::Value& receiver,
+        std::int64_t value) {
+        if (receiver.rawTag() == runtime::ValueTag::ObjectRef && heap_) {
+            runtime::ObjectFastView view{};
+            if (heap_->tryBindObjectFastView(receiver.asObjectRefUnchecked(), view) &&
+                fieldIndex < view.fieldCount &&
+                (view.typeId == typeId || isAssignable(view.typeId, typeId)) &&
+                view.fields[fieldIndex].rawTag() == runtime::ValueTag::Int64) {
+                view.fields[fieldIndex].storeInt64(value);
+                return true;
+            }
+        }
+        return storeField(typeId, fieldIndex, receiver, runtime::Value{value});
+    }
+    [[nodiscard]] bool loadElementObjectFast(
+        semantic::SymbolId elementTypeId,
+        const runtime::Value& receiver,
+        std::int64_t index,
+        runtime::Value& result) {
+        if (receiver.rawTag() == runtime::ValueTag::ObjectRef && heap_) {
+            runtime::ArrayFastView view{};
+            if (heap_->tryBindArrayFastView(receiver.asObjectRefUnchecked(), view) &&
+                view.elementType == semantic::PrimitiveType::Object &&
+                view.elementTypeId == elementTypeId &&
+                static_cast<std::uint64_t>(index) < view.length) {
+                result = view.data[static_cast<std::size_t>(index)];
+                return true;
+            }
+        }
+        return loadElement(
+            semantic::PrimitiveType::Object,
+            elementTypeId,
+            receiver,
+            runtime::Value{index},
+            result);
+    }
+    [[nodiscard]] bool isTypeObjectFast(
+        const runtime::Value& value,
+        semantic::SymbolId targetTypeId,
+        bool& result) {
+        const auto tag = value.rawTag();
+        if (tag == runtime::ValueTag::NullObject || tag == runtime::ValueTag::Monostate) {
+            result = false;
+            return true;
+        }
+        if (tag == runtime::ValueTag::ObjectRef && heap_) {
+            const auto actualTid = heap_->objectTypeIdFast(value.asObjectRefUnchecked());
+            if (actualTid != 0) {
+                result = (actualTid == targetTypeId) || isAssignable(actualTid, targetTypeId);
+                return true;
+            }
+        }
+        runtime::Value boxed;
+        if (!typeOperation(
+                semantic::PrimitiveType::Object,
+                semantic::PrimitiveType::Object,
+                targetTypeId,
+                value,
+                false,
+                boxed)) {
+            return false;
+        }
+        result = std::holds_alternative<bool>(boxed) && std::get<bool>(boxed);
+        return true;
+    }
+    [[nodiscard]] bool asTypeObjectFast(
+        const runtime::Value& value,
+        semantic::SymbolId targetTypeId,
+        runtime::Value& result) {
+        const auto tag = value.rawTag();
+        if (tag == runtime::ValueTag::NullObject || tag == runtime::ValueTag::Monostate) {
+            result = runtime::NullObject{};
+            return true;
+        }
+        if (tag == runtime::ValueTag::ObjectRef && heap_) {
+            const auto actualTid = heap_->objectTypeIdFast(value.asObjectRefUnchecked());
+            if (actualTid != 0) {
+                if (actualTid == targetTypeId || isAssignable(actualTid, targetTypeId)) {
+                    result = value;
+                } else {
+                    result = runtime::NullObject{};
+                }
+                return true;
+            }
+        }
+        return typeOperation(
+            semantic::PrimitiveType::Object,
+            semantic::PrimitiveType::Object,
+            targetTypeId,
+            value,
+            true,
+            result);
+    }
     [[nodiscard]] const ProgramDescriptor& program() const noexcept;
     [[nodiscard]] std::shared_ptr<runtime::ManagedHeap> heap() const noexcept;
     [[nodiscard]] runtime::ShadowStack& shadowStack() noexcept;
@@ -782,15 +1003,15 @@ public:
         const runtime::Value& value);
     [[nodiscard]] std::uint64_t determinismDigest() const noexcept;
     [[nodiscard]] std::size_t replayEntriesConsumed() const noexcept;
+    [[nodiscard]] bool isAssignable(
+        semantic::SymbolId actual,
+        semantic::SymbolId expected) const noexcept;
 
 private:
     friend class FrameScope;
     [[nodiscard]] const TypeDescriptor* findType(semantic::SymbolId typeId) const;
     [[nodiscard]] const FunctionDescriptor* findFunction(
         semantic::SymbolId symbolId) const;
-    [[nodiscard]] bool isAssignable(
-        semantic::SymbolId actual,
-        semantic::SymbolId expected) const noexcept;
     void emitTrace(
         runtime::TraceEventKind kind,
         runtime::DeterminismOperationId operationId = 0,
@@ -826,10 +1047,45 @@ private:
     std::vector<FrameSite> stackSites_;
     semantic::SymbolId currentFunctionId_ = 0;
     runtime::ShadowStack shadowStack_;
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
+    struct AotDelegateCacheEntry {
+        ResolvedAotDelegateLeaf resolved{};
+        runtime::ObjectRef delRef{};
+        runtime::ObjectRef recvRef{};
+        semantic::SymbolId delegateTypeId = 0;
+        bool hasObjectReceiver = false;
+        bool isMulticast = false;
+        bool valid = false;
+    };
+    std::array<AotDelegateCacheEntry, 16> delLeafCache_{};
+    struct CachedMulticastItem {
+        ResolvedAotDelegateLeaf leaf{};
+        runtime::ObjectRef leafRef{};
+        runtime::ObjectRef recvRef{};
+        bool hasObjRecv = false;
+    };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    semantic::SymbolId lastVerifiedDelegateTypeId_ = 0;
+    semantic::SymbolId cachedMulticastTypeId_ = 0;
+    runtime::ObjectRef cachedMulticastRef_{};
+    std::vector<CachedMulticastItem> cachedMulticastMeta_;
+    std::vector<ResolvedAotDelegateLeaf> cachedMulticastLeaves_;
+    std::uint32_t cachedMulticastPinCount_ = 0;
     std::unordered_map<semantic::SymbolId, const TypeDescriptor*> ownedTypes_;
     std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> ownedFunctions_;
     const std::unordered_map<semantic::SymbolId, const TypeDescriptor*>* typesPtr_ = nullptr;
     const std::unordered_map<semantic::SymbolId, const FunctionDescriptor*>* functionsPtr_ = nullptr;
+    struct AssignableCacheEntry {
+        semantic::SymbolId actual = 0;
+        semantic::SymbolId expected = 0;
+        std::uint8_t result = 0; // 0 = empty, 1 = false, 2 = true
+    };
+    mutable std::array<AssignableCacheEntry, 32> assignableCache_{};
     std::optional<runtime::Value> pendingException_;
 };
 
@@ -1190,11 +1446,31 @@ template <bool Checked>
 [[nodiscard]] inline runtime::Value typedBoxScalar(
     semantic::PrimitiveType type,
     const runtime::Value& value) {
-    (void)type;
+    if (std::holds_alternative<std::monostate>(value)) {
+        if (type == semantic::PrimitiveType::Object) {
+            return runtime::Value{runtime::NullObject{}};
+        }
+        if (type == semantic::PrimitiveType::Array) {
+            return runtime::Value{runtime::NullArray{}};
+        }
+    }
     return value;
 }
 
 struct EmptyGcGuards {};
+
+inline void retainTypedGcSlot(
+    runtime::ManagedHeap* rawH,
+    runtime::PersistentRoot& slot,
+    const runtime::Value& value) {
+    if (rawH != nullptr && std::holds_alternative<runtime::ObjectRef>(value)) {
+        if (!slot.valid() || !slot.update(value)) {
+            slot = rawH->retain(value);
+        }
+    } else if (slot.valid()) {
+        slot.reset();
+    }
+}
 
 struct UnboxedCustomStruct {
     semantic::SymbolId typeId = 0;

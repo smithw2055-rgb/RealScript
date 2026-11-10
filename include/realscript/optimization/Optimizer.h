@@ -23,6 +23,7 @@ struct Options {
     bool enableInlining = true;
     bool enableLicm = true;
     bool enableStructFieldForwarding = true;
+    bool enableDevirtualization = true;
     std::size_t maxInlineInstructions = 12;
 };
 
@@ -37,6 +38,7 @@ struct Statistics {
     std::uint64_t functionsInlined = 0;
     std::uint64_t loopInvariantsHoisted = 0;
     std::uint64_t structFieldsForwarded = 0;
+    std::uint64_t callsDevirtualized = 0;
 
     [[nodiscard]] bool changed() const noexcept;
 };
