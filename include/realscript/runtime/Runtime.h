@@ -1884,6 +1884,7 @@ private:
 
 struct ArrayFastView {
     Value* data = nullptr;
+    std::uint8_t* dirtyCards = nullptr;
     std::uint32_t length = 0;
     semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
     bool needsRememberedBarrier = false;
@@ -1900,6 +1901,9 @@ struct ObjectFastView {
 class ManagedHeap {
 public:
     using RootToken = std::uint64_t;
+    static constexpr std::size_t kCardElementShift = 6;
+    static constexpr std::size_t kCardElements = std::size_t{1} << kCardElementShift;
+    static constexpr std::size_t kCardTableMinLength = kCardElements + 1;
 
     explicit ManagedHeap(HeapConfig config = {});
     ~ManagedHeap();
@@ -1963,6 +1967,7 @@ public:
     [[nodiscard]] std::optional<Value> arrayGet(ObjectRef reference, std::size_t index) const;
     [[nodiscard]] const Value* arrayGetFast(ObjectRef reference, std::size_t index) const noexcept;
     [[nodiscard]] bool tryBindArrayFastView(ObjectRef reference, ArrayFastView& outView) const noexcept;
+    void recordArrayWriteBarrier(ObjectRef arrayRef, std::size_t index, const Value& value) noexcept;
     void recordArrayWriteBarrier(ObjectRef arrayRef, const Value& value) noexcept;
     [[nodiscard]] bool tryBindObjectFastView(ObjectRef reference, ObjectFastView& outView) const noexcept;
     void recordObjectWriteBarrier(ObjectRef objectRef, const Value& value) noexcept;

@@ -387,13 +387,86 @@ void writeProtocolMessage(std::ostream& output, const Json& message) {
     output.flush();
 }
 
+namespace {
+
+int hexDigitValue(char ch) noexcept {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
+    if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
+    return -1;
+}
+
+std::string percentDecode(const std::string& input) {
+    std::string out;
+    out.reserve(input.size());
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        if (input[i] == '%' && i + 2 < input.size()) {
+            const int hi = hexDigitValue(input[i + 1]);
+            const int lo = hexDigitValue(input[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(input[i]);
+    }
+    return out;
+}
+
+std::string percentEncodePath(const std::string& input) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(input.size());
+    for (unsigned char ch : input) {
+        if (ch == ' ' || ch == '%' || ch == '#' || ch == '?') {
+            out.push_back('%');
+            out.push_back(kHex[(ch >> 4) & 0x0Fu]);
+            out.push_back(kHex[ch & 0x0Fu]);
+        } else {
+            out.push_back(static_cast<char>(ch));
+        }
+    }
+    return out;
+}
+
+} // namespace
+
 std::string uriToPath(const std::string& uri) {
     const std::string prefix = "file://";
-    return uri.rfind(prefix, 0) == 0 ? uri.substr(prefix.size()) : uri;
+    if (uri.rfind(prefix, 0) != 0) return uri;
+    std::string raw = percentDecode(uri.substr(prefix.size()));
+    // Handle Windows file:///C:/... or file:///c:/... URIs
+    if (raw.size() >= 3 && raw[0] == '/' &&
+        ((raw[1] >= 'a' && raw[1] <= 'z') || (raw[1] >= 'A' && raw[1] <= 'Z')) &&
+        raw[2] == ':') {
+        raw.erase(0, 1);
+        if (raw[0] >= 'a' && raw[0] <= 'z') {
+            raw[0] = static_cast<char>(raw[0] - 'a' + 'A');
+        }
+    }
+    for (char& ch : raw) {
+        if (ch == '\\') ch = '/';
+    }
+    return raw;
 }
 
 std::string pathToUri(const std::string& path) {
-    return path.rfind("file://", 0) == 0 ? path : "file://" + path;
+    if (path.rfind("file://", 0) == 0) return path;
+    std::string normalized = path;
+    for (char& ch : normalized) {
+        if (ch == '\\') ch = '/';
+    }
+    if (normalized.size() >= 2 &&
+        ((normalized[0] >= 'a' && normalized[0] <= 'z') ||
+         (normalized[0] >= 'A' && normalized[0] <= 'Z')) &&
+        normalized[1] == ':') {
+        if (normalized[0] >= 'a' && normalized[0] <= 'z') {
+            normalized[0] = static_cast<char>(normalized[0] - 'a' + 'A');
+        }
+        return "file:///" + percentEncodePath(normalized);
+    }
+    return "file://" + percentEncodePath(normalized);
 }
 
 } // namespace realscript::tooling

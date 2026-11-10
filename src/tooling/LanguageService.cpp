@@ -6,7 +6,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
+#include <fstream>
 #include <set>
+#include <sstream>
 #include <unordered_set>
 
 namespace realscript::tooling {
@@ -156,17 +159,110 @@ LanguageService::DocHeaderInfo LanguageService::parseDocHeader(const Document& d
     return info;
 }
 
-void LanguageService::open(std::string path, std::string content, std::int64_t version) {
-    const bool existed = (documents_.find(path) != documents_.end());
+namespace {
+
+bool hasRealScriptExtension(const std::filesystem::path& p) {
+    const std::string filename = p.filename().string();
+    if (filename.size() >= 5 && filename.compare(filename.size() - 5, 5, ".d.rs") == 0) {
+        return true;
+    }
+    if (filename.size() >= 3 && filename.compare(filename.size() - 3, 3, ".rs") == 0) {
+        return true;
+    }
+    return false;
+}
+
+bool isDeclarationStubPath(const std::string& path) noexcept {
+    return path.size() >= 5 && path.compare(path.size() - 5, 5, ".d.rs") == 0;
+}
+
+bool shouldSkipDirectoryName(const std::string& dirName) noexcept {
+    if (dirName.empty() || dirName[0] == '.') return true;
+    if (dirName == "build" || dirName == "out" || dirName == "dist" ||
+        dirName == "target" || dirName == "node_modules" ||
+        dirName == "CMakeFiles" || dirName == "jit-cache" ||
+        dirName == "jit-benchmark-cache") {
+        return true;
+    }
+    if (dirName.rfind("build-", 0) == 0 || dirName.rfind("build_", 0) == 0 ||
+        dirName.rfind("cmake-build-", 0) == 0) {
+        return true;
+    }
+    return false;
+}
+
+bool readFileContents(const std::filesystem::path& filePath, std::string& outText) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(filePath, ec) || ec) return false;
+    std::ifstream in(filePath, std::ios::binary);
+    if (!in) return false;
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    outText = ss.str();
+    return true;
+}
+
+bool isPathWithinRoot(const std::string& filePath, const std::string& rootPath) noexcept {
+    if (rootPath.empty() || filePath.size() < rootPath.size()) return false;
+    if (filePath.compare(0, rootPath.size(), rootPath) != 0) return false;
+    if (filePath.size() == rootPath.size()) return true;
+    return rootPath.back() == '/' || filePath[rootPath.size()] == '/';
+}
+
+} // namespace
+
+std::string LanguageService::normalizeDocPath(const std::string& rawPath) {
+    if (rawPath.empty()) return {};
+    std::string p = uriToPath(rawPath);
+    for (char& ch : p) {
+        if (ch == '\\') ch = '/';
+    }
+    if (p.size() >= 2 &&
+        ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) &&
+        p[1] == ':') {
+        if (p[0] >= 'a' && p[0] <= 'z') {
+            p[0] = static_cast<char>(p[0] - 'a' + 'A');
+        }
+    }
+    // Preserve simple virtual filenames without path traversal segments as-is
+    if (p.find('/') == std::string::npos) {
+        return p;
+    }
+    std::string normalized = std::filesystem::path(p).lexically_normal().generic_string();
+    while (normalized.size() > 1 && normalized.back() == '/') {
+        if (normalized.size() == 3 && normalized[1] == ':') break;
+        normalized.pop_back();
+    }
+    return normalized;
+}
+
+bool LanguageService::reloadDiskFileIntoWorkspace(const std::string& normalizedPath) {
+    if (normalizedPath.empty()) return false;
+    const std::filesystem::path fsPath(normalizedPath);
+    if (!hasRealScriptExtension(fsPath)) return false;
+    std::string diskContent;
+    if (!readFileContents(fsPath, diskContent)) {
+        return false;
+    }
+    auto& wsDoc = workspaceDocuments_[normalizedPath];
+    initDocument(normalizedPath, std::move(diskContent), 1, wsDoc);
+    return true;
+}
+
+void LanguageService::open(std::string rawPath, std::string content, std::int64_t version) {
+    const std::string path = normalizeDocPath(rawPath);
+    const bool existedInOpen = (documents_.find(path) != documents_.end());
+    const bool existedInWorkspace = (workspaceDocuments_.find(path) != workspaceDocuments_.end());
     auto& doc = documents_[path];
     initDocument(path, std::move(content), version, doc);
-    if (!existed) {
+    if (!existedInOpen && !existedInWorkspace) {
         structuralDirty_ = true;
     } else {
         dirtyPaths_.insert(path);
     }
     dirty_ = true;
     hasCachedDefinitions_ = false;
+    hasCachedDiagnostics_ = false;
 }
 
 void LanguageService::update(std::string path, std::string content, std::int64_t version) {
@@ -174,15 +270,22 @@ void LanguageService::update(std::string path, std::string content, std::int64_t
 }
 
 bool LanguageService::applyContentChanges(
-    const std::string& path,
+    const std::string& rawPath,
     const std::vector<ContentChange>& changes,
     std::int64_t version) {
+    const std::string path = normalizeDocPath(rawPath);
     auto it = documents_.find(path);
     if (it == documents_.end()) {
         if (changes.empty()) return false;
-        initDocument(path, std::string{}, version, documents_[path]);
+        std::string seedContent;
+        if (const auto wsIt = workspaceDocuments_.find(path); wsIt != workspaceDocuments_.end()) {
+            seedContent = wsIt->second.content;
+            dirtyPaths_.insert(path);
+        } else {
+            structuralDirty_ = true;
+        }
+        initDocument(path, std::move(seedContent), version, documents_[path]);
         it = documents_.find(path);
-        structuralDirty_ = true;
     } else {
         dirtyPaths_.insert(path);
     }
@@ -219,38 +322,63 @@ bool LanguageService::applyContentChanges(
     initDocument(path, std::move(content), version, it->second);
     dirty_ = true;
     hasCachedDefinitions_ = false;
+    hasCachedDiagnostics_ = false;
     return true;
 }
 
-std::string LanguageService::documentContent(const std::string& path) const {
-    const auto* doc = document(path);
+std::string LanguageService::documentContent(const std::string& rawPath) const {
+    const auto* doc = document(rawPath);
     return doc ? doc->content : std::string{};
 }
 
-void LanguageService::close(const std::string& path) {
+void LanguageService::close(const std::string& rawPath) {
+    const std::string path = normalizeDocPath(rawPath);
     documents_.erase(path);
+    // If the closed file exists on disk (either in an indexed workspace or standalone file),
+    // reload its saved on-disk version into workspaceDocuments_ so modules importing it never break,
+    // and any unsaved buffer edits are cleanly reverted to disk state.
+    if (!reloadDiskFileIntoWorkspace(path)) {
+        bool underIndexedRoot = false;
+        for (const auto& root : workspaceRoots_) {
+            if (isPathWithinRoot(path, root)) {
+                underIndexedRoot = true;
+                break;
+            }
+        }
+        if (underIndexedRoot) {
+            std::error_code ec;
+            if (!std::filesystem::exists(std::filesystem::path(path), ec) || ec) {
+                workspaceDocuments_.erase(path);
+            }
+        }
+    }
     structuralDirty_ = true;
     dirty_ = true;
     hasCachedDefinitions_ = false;
+    hasCachedDiagnostics_ = false;
 }
 
 void LanguageService::setAmbientSources(std::vector<compiler::SourceFile> sources) {
     ambientDocuments_.clear();
     for (auto& src : sources) {
-        auto& doc = ambientDocuments_[src.path];
-        initDocument(src.path, std::move(src.content), 1, doc);
+        const std::string normPath = normalizeDocPath(src.path);
+        auto& doc = ambientDocuments_[normPath];
+        initDocument(normPath, std::move(src.content), 1, doc);
     }
     structuralDirty_ = true;
     dirty_ = true;
     hasCachedDefinitions_ = false;
+    hasCachedDiagnostics_ = false;
 }
 
 void LanguageService::addAmbientSource(compiler::SourceFile source) {
-    auto& doc = ambientDocuments_[source.path];
-    initDocument(source.path, std::move(source.content), 1, doc);
+    const std::string normPath = normalizeDocPath(source.path);
+    auto& doc = ambientDocuments_[normPath];
+    initDocument(normPath, std::move(source.content), 1, doc);
     structuralDirty_ = true;
     dirty_ = true;
     hasCachedDefinitions_ = false;
+    hasCachedDiagnostics_ = false;
 }
 
 void LanguageService::clearAmbientSources() {
@@ -258,12 +386,20 @@ void LanguageService::clearAmbientSources() {
     structuralDirty_ = true;
     dirty_ = true;
     hasCachedDefinitions_ = false;
+    hasCachedDiagnostics_ = false;
 }
 
-bool LanguageService::loadProjectConfigJson(const std::string& jsonText) {
+bool LanguageService::loadProjectConfigJson(
+    const std::string& jsonText,
+    const std::string& baseDir,
+    bool merge) {
     std::string error;
     const auto parsed = Json::parse(jsonText, error);
     if (!parsed || !parsed->isObject()) return false;
+
+    const std::filesystem::path baseFsPath =
+        baseDir.empty() ? std::filesystem::path{} : std::filesystem::path(normalizeDocPath(baseDir));
+
     const auto* ambientArr = parsed->find("ambientStubs");
     if (!ambientArr) {
         ambientArr = parsed->find("ambientSources");
@@ -271,30 +407,252 @@ bool LanguageService::loadProjectConfigJson(const std::string& jsonText) {
     if (!ambientArr) {
         ambientArr = parsed->find("generatedModules");
     }
-    if (!ambientArr || !ambientArr->isArray()) return false;
-    ambientDocuments_.clear();
-    for (const auto& entry : ambientArr->arrayValue()) {
-        if (!entry.isObject()) continue;
-        const auto* pathVal = entry.find("path");
-        const auto* contentVal = entry.find("content");
-        if (!pathVal || !pathVal->isString() || !contentVal || !contentVal->isString()) {
+
+    bool loadedAnySection = false;
+    if (ambientArr && ambientArr->isArray()) {
+        if (!merge) {
+            ambientDocuments_.clear();
+        }
+        for (const auto& entry : ambientArr->arrayValue()) {
+            if (entry.isString() && !baseFsPath.empty()) {
+                const std::filesystem::path relPath(entry.stringValue());
+                const std::filesystem::path fullPath = relPath.is_absolute() ? relPath : (baseFsPath / relPath);
+                std::string diskStub;
+                if (readFileContents(fullPath, diskStub)) {
+                    const std::string key = normalizeDocPath(fullPath.generic_string());
+                    initDocument(key, std::move(diskStub), 1, ambientDocuments_[key]);
+                }
+                continue;
+            }
+            if (!entry.isObject()) continue;
+            const auto* pathVal = entry.find("path");
+            const auto* contentVal = entry.find("content");
+            if (!pathVal || !pathVal->isString()) continue;
+
+            std::string resolvedKey = pathVal->stringValue();
+            if (!baseFsPath.empty()) {
+                const std::filesystem::path entryFsPath(resolvedKey);
+                const std::filesystem::path fullPath =
+                    entryFsPath.is_absolute() ? entryFsPath : (baseFsPath / entryFsPath);
+                resolvedKey = normalizeDocPath(fullPath.generic_string());
+                if (contentVal && contentVal->isString()) {
+                    initDocument(resolvedKey, contentVal->stringValue(), 1, ambientDocuments_[resolvedKey]);
+                } else {
+                    std::string diskStub;
+                    if (readFileContents(fullPath, diskStub)) {
+                        initDocument(resolvedKey, std::move(diskStub), 1, ambientDocuments_[resolvedKey]);
+                    }
+                }
+            } else if (contentVal && contentVal->isString()) {
+                resolvedKey = normalizeDocPath(resolvedKey);
+                initDocument(resolvedKey, contentVal->stringValue(), 1, ambientDocuments_[resolvedKey]);
+            }
+        }
+        loadedAnySection = true;
+    }
+
+    if (const auto* sourceDirsArr = parsed->find("sourceDirs");
+        sourceDirsArr && sourceDirsArr->isArray() && !baseFsPath.empty()) {
+        for (const auto& dirItem : sourceDirsArr->arrayValue()) {
+            if (!dirItem.isString()) continue;
+            const std::filesystem::path subDir(dirItem.stringValue());
+            const std::filesystem::path fullDir = subDir.is_absolute() ? subDir : (baseFsPath / subDir);
+            std::error_code ec;
+            if (std::filesystem::is_directory(fullDir, ec) && !ec) {
+                (void)addWorkspaceRoot(fullDir.generic_string());
+            }
+        }
+        loadedAnySection = true;
+    }
+
+    if (!loadedAnySection) return false;
+    structuralDirty_ = true;
+    dirty_ = true;
+    hasCachedDefinitions_ = false;
+    hasCachedDiagnostics_ = false;
+    return true;
+}
+
+bool LanguageService::loadProjectConfigFile(const std::string& configPath, bool merge) {
+    const std::string normConfig = normalizeDocPath(configPath);
+    if (normConfig.empty()) return false;
+    const std::filesystem::path fsConfig(normConfig);
+    std::string jsonText;
+    if (!readFileContents(fsConfig, jsonText)) return false;
+    const std::string parentDir = fsConfig.has_parent_path()
+        ? fsConfig.parent_path().generic_string()
+        : std::string{};
+    return loadProjectConfigJson(jsonText, parentDir, merge);
+}
+
+std::size_t LanguageService::addWorkspaceRoot(const std::string& rawRootPath) {
+    const std::string rootPath = normalizeDocPath(rawRootPath);
+    if (rootPath.empty()) return 0;
+    const std::filesystem::path fsRoot(rootPath);
+    std::error_code ec;
+    if (!std::filesystem::exists(fsRoot, ec) || ec || !std::filesystem::is_directory(fsRoot, ec)) {
+        return 0;
+    }
+
+    workspaceRoots_.insert(rootPath);
+    std::size_t indexedCount = 0;
+
+    // 1. Auto-discover root realscript.project.json if present
+    const std::filesystem::path rootConfig = fsRoot / "realscript.project.json";
+    bool mergedAmbient = !ambientDocuments_.empty();
+    if (std::filesystem::is_regular_file(rootConfig, ec) && !ec) {
+        if (loadProjectConfigFile(rootConfig.generic_string(), mergedAmbient)) {
+            mergedAmbient = true;
+        }
+    }
+
+    // 2. Recursively scan workspace directory for .rs / .d.rs files and nested realscript.project.json
+    std::filesystem::recursive_directory_iterator it(
+        fsRoot,
+        std::filesystem::directory_options::skip_permission_denied,
+        ec);
+    const std::filesystem::recursive_directory_iterator end;
+    while (!ec && it != end) {
+        const auto& entry = *it;
+        std::error_code entryEc;
+        if (entry.is_directory(entryEc) && !entryEc) {
+            const std::string dirName = entry.path().filename().string();
+            if (shouldSkipDirectoryName(dirName)) {
+                it.disable_recursion_pending();
+            }
+            it.increment(ec);
             continue;
         }
-        const auto& p = pathVal->stringValue();
-        auto& doc = ambientDocuments_[p];
-        initDocument(p, contentVal->stringValue(), 1, doc);
+        if (entry.is_regular_file(entryEc) && !entryEc) {
+            const auto& p = entry.path();
+            const std::string filename = p.filename().string();
+            if (filename == "realscript.project.json" && p != rootConfig) {
+                (void)loadProjectConfigFile(p.generic_string(), true);
+            } else if (hasRealScriptExtension(p)) {
+                const std::string normFile = normalizeDocPath(p.generic_string());
+                if (reloadDiskFileIntoWorkspace(normFile)) {
+                    ++indexedCount;
+                }
+            }
+        }
+        it.increment(ec);
+    }
+
+    structuralDirty_ = true;
+    dirty_ = true;
+    hasCachedDefinitions_ = false;
+    hasCachedDiagnostics_ = false;
+    return indexedCount;
+}
+
+void LanguageService::removeWorkspaceRoot(const std::string& rawRootPath) {
+    const std::string rootPath = normalizeDocPath(rawRootPath);
+    if (workspaceRoots_.erase(rootPath) == 0) return;
+
+    for (auto it = workspaceDocuments_.begin(); it != workspaceDocuments_.end();) {
+        if (!isPathWithinRoot(it->first, rootPath)) {
+            ++it;
+            continue;
+        }
+        bool coveredByRemainingRoot = false;
+        for (const auto& otherRoot : workspaceRoots_) {
+            if (isPathWithinRoot(it->first, otherRoot)) {
+                coveredByRemainingRoot = true;
+                break;
+            }
+        }
+        if (!coveredByRemainingRoot) {
+            it = workspaceDocuments_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = ambientDocuments_.begin(); it != ambientDocuments_.end();) {
+        if (!isPathWithinRoot(it->first, rootPath)) {
+            ++it;
+            continue;
+        }
+        bool coveredByRemainingRoot = false;
+        for (const auto& otherRoot : workspaceRoots_) {
+            if (isPathWithinRoot(it->first, otherRoot)) {
+                coveredByRemainingRoot = true;
+                break;
+            }
+        }
+        if (!coveredByRemainingRoot) {
+            it = ambientDocuments_.erase(it);
+        } else {
+            ++it;
+        }
     }
     structuralDirty_ = true;
     dirty_ = true;
     hasCachedDefinitions_ = false;
+    hasCachedDiagnostics_ = false;
+}
+
+bool LanguageService::syncDiskFile(const std::string& rawPath) {
+    const std::string path = normalizeDocPath(rawPath);
+    if (path.empty()) return false;
+    const std::filesystem::path fsPath(path);
+    if (fsPath.filename() == "realscript.project.json") {
+        return loadProjectConfigFile(path, !workspaceRoots_.empty() || !ambientDocuments_.empty());
+    }
+    const bool wasInWorkspace = (workspaceDocuments_.find(path) != workspaceDocuments_.end());
+    if (!reloadDiskFileIntoWorkspace(path)) {
+        return false;
+    }
+    // If not shadowed by an open editor buffer, invalidate build graph
+    if (documents_.find(path) == documents_.end()) {
+        if (wasInWorkspace) {
+            dirtyPaths_.insert(path);
+        } else {
+            structuralDirty_ = true;
+        }
+        dirty_ = true;
+        hasCachedDefinitions_ = false;
+        hasCachedDiagnostics_ = false;
+    }
     return true;
 }
 
-bool LanguageService::contains(const std::string& path) const noexcept {
+bool LanguageService::removeDiskFile(const std::string& rawPath) {
+    const std::string path = normalizeDocPath(rawPath);
+    const bool erased = (workspaceDocuments_.erase(path) > 0);
+    if (erased && documents_.find(path) == documents_.end()) {
+        structuralDirty_ = true;
+        dirty_ = true;
+        hasCachedDefinitions_ = false;
+        hasCachedDiagnostics_ = false;
+    }
+    return erased;
+}
+
+bool LanguageService::contains(const std::string& rawPath) const noexcept {
+    const std::string path = normalizeDocPath(rawPath);
+    return documents_.find(path) != documents_.end() ||
+        workspaceDocuments_.find(path) != workspaceDocuments_.end();
+}
+
+bool LanguageService::isOpenDocument(const std::string& rawPath) const noexcept {
+    const std::string path = normalizeDocPath(rawPath);
     return documents_.find(path) != documents_.end();
 }
 
 std::vector<std::string> LanguageService::documentPaths() const {
+    std::set<std::string> uniquePaths;
+    for (const auto& [path, value] : workspaceDocuments_) {
+        (void)value;
+        uniquePaths.insert(path);
+    }
+    for (const auto& [path, value] : documents_) {
+        (void)value;
+        uniquePaths.insert(path);
+    }
+    return std::vector<std::string>(uniquePaths.begin(), uniquePaths.end());
+}
+
+std::vector<std::string> LanguageService::openDocumentPaths() const {
     std::vector<std::string> paths;
     paths.reserve(documents_.size());
     for (const auto& [path, value] : documents_) {
@@ -303,6 +661,10 @@ std::vector<std::string> LanguageService::documentPaths() const {
     }
     std::sort(paths.begin(), paths.end());
     return paths;
+}
+
+std::vector<std::string> LanguageService::workspaceRoots() const {
+    return std::vector<std::string>(workspaceRoots_.begin(), workspaceRoots_.end());
 }
 
 const compiler::BuildResult& LanguageService::build() {
@@ -329,9 +691,11 @@ void LanguageService::recordFullBuildGraph() {
         if (!bi.reused) ++lastRebuiltModuleCount_;
     }
 
-    for (const auto& [path, doc] : ambientDocuments_) {
+    std::unordered_set<std::string> activeStubModules;
+    for (const auto& [path, doc] : workspaceDocuments_) {
         if (documents_.find(path) != documents_.end()) continue;
         auto hdr = parseDocHeader(doc);
+        if (isDeclarationStubPath(path)) activeStubModules.insert(hdr.moduleName);
         moduleToPaths_[hdr.moduleName].insert(path);
         for (const auto& imp : hdr.imports) {
             moduleImports_[hdr.moduleName].insert(imp);
@@ -341,6 +705,23 @@ void LanguageService::recordFullBuildGraph() {
     }
     for (const auto& [path, doc] : documents_) {
         auto hdr = parseDocHeader(doc);
+        if (isDeclarationStubPath(path)) activeStubModules.insert(hdr.moduleName);
+        moduleToPaths_[hdr.moduleName].insert(path);
+        for (const auto& imp : hdr.imports) {
+            moduleImports_[hdr.moduleName].insert(imp);
+            reverseImports_[imp].insert(hdr.moduleName);
+        }
+        docHeaders_[path] = std::move(hdr);
+    }
+    for (const auto& [path, doc] : ambientDocuments_) {
+        if (documents_.find(path) != documents_.end() ||
+            workspaceDocuments_.find(path) != workspaceDocuments_.end()) {
+            continue;
+        }
+        auto hdr = parseDocHeader(doc);
+        if (isDeclarationStubPath(path) && activeStubModules.find(hdr.moduleName) != activeStubModules.end()) {
+            continue;
+        }
         moduleToPaths_[hdr.moduleName].insert(path);
         for (const auto& imp : hdr.imports) {
             moduleImports_[hdr.moduleName].insert(imp);
@@ -391,10 +772,10 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
 
     std::set<std::string> dirtyModules;
     for (const auto& path : dirtyPaths_) {
-        const auto docIt = documents_.find(path);
+        const auto* docPtr = document(path);
         const auto oldHdrIt = docHeaders_.find(path);
-        if (docIt == documents_.end() || oldHdrIt == docHeaders_.end()) return false;
-        const auto newHdr = parseDocHeader(docIt->second);
+        if (!docPtr || oldHdrIt == docHeaders_.end()) return false;
+        const auto newHdr = parseDocHeader(*docPtr);
         if (!newHdr.eligibleForSubgraph ||
             newHdr.moduleName != oldHdrIt->second.moduleName ||
             newHdr.imports != oldHdrIt->second.imports) {
@@ -653,6 +1034,7 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
 
     dirtyPaths_.clear();
     hasCachedDefinitions_ = false;
+    hasCachedDiagnostics_ = false;
     dirty_ = false;
     return true;
 }
@@ -662,28 +1044,38 @@ void LanguageService::rebuild() {
         return;
     }
     compiler::Compilation compilation;
+    const auto allProjectPaths = documentPaths();
+    std::unordered_set<std::string> activeStubModules;
+    for (const auto& path : allProjectPaths) {
+        if (isDeclarationStubPath(path)) {
+            if (const auto* d = document(path)) {
+                activeStubModules.insert(parseDocHeader(*d).moduleName);
+            }
+        }
+    }
+
     std::vector<std::string> ambientPaths;
     ambientPaths.reserve(ambientDocuments_.size());
-    for (const auto& [path, documentValue] : ambientDocuments_) {
-        (void)documentValue;
-        if (documents_.find(path) == documents_.end()) {
-            ambientPaths.push_back(path);
+    for (const auto& [path, docVal] : ambientDocuments_) {
+        if (documents_.find(path) != documents_.end() ||
+            workspaceDocuments_.find(path) != workspaceDocuments_.end()) {
+            continue;
         }
+        if (isDeclarationStubPath(path) &&
+            activeStubModules.find(parseDocHeader(docVal).moduleName) != activeStubModules.end()) {
+            continue;
+        }
+        ambientPaths.push_back(path);
     }
     std::sort(ambientPaths.begin(), ambientPaths.end());
     for (const auto& path : ambientPaths) {
         compilation.addSource({path, ambientDocuments_.at(path).content});
     }
 
-    std::vector<std::string> paths;
-    paths.reserve(documents_.size());
-    for (const auto& [path, documentValue] : documents_) {
-        (void)documentValue;
-        paths.push_back(path);
-    }
-    std::sort(paths.begin(), paths.end());
-    for (const auto& path : paths) {
-        compilation.addSource({path, documents_.at(path).content});
+    for (const auto& path : allProjectPaths) {
+        if (const auto* d = document(path)) {
+            compilation.addSource({path, d->content});
+        }
     }
     result_ = compilation.build(hasSnapshot_ ? &snapshot_ : nullptr);
     if (!result_.snapshot.modules.empty()) {
@@ -694,12 +1086,18 @@ void LanguageService::rebuild() {
     }
     recordFullBuildGraph();
     hasCachedDefinitions_ = false;
+    hasCachedDiagnostics_ = false;
     dirty_ = false;
 }
 
-const LanguageService::Document* LanguageService::document(const std::string& path) const noexcept {
-    const auto found = documents_.find(path);
-    if (found != documents_.end()) return &found->second;
+const LanguageService::Document* LanguageService::document(const std::string& rawPath) const noexcept {
+    const std::string path = normalizeDocPath(rawPath);
+    if (const auto found = documents_.find(path); found != documents_.end()) {
+        return &found->second;
+    }
+    if (const auto wsFound = workspaceDocuments_.find(path); wsFound != workspaceDocuments_.end()) {
+        return &wsFound->second;
+    }
     const auto ambientFound = ambientDocuments_.find(path);
     return ambientFound == ambientDocuments_.end() ? nullptr : &ambientFound->second;
 }
@@ -745,8 +1143,7 @@ const std::vector<DocumentSymbol>& LanguageService::allDefinitionsRef() const {
                       std::string name, std::string detail,
                       const std::string& path, text::TextSpan span) {
         if (id == 0 || path.empty() ||
-            (documents_.find(path) == documents_.end() &&
-             ambientDocuments_.find(path) == ambientDocuments_.end()) ||
+            document(path) == nullptr ||
             !identifier(name) || generatedNames.find(name) != generatedNames.end() ||
             !seen.insert(id).second) {
             return;
@@ -821,8 +1218,9 @@ std::vector<DocumentSymbol> LanguageService::allDefinitions() const {
 }
 
 std::optional<DocumentSymbol> LanguageService::resolve(
-    const std::string& path,
+    const std::string& rawPath,
     text::LinePosition position) const {
+    const std::string path = normalizeDocPath(rawPath);
     const auto token = tokenAt(path, position);
     if (!token || token->kind != syntax::SyntaxKind::IdentifierToken) return std::nullopt;
     const auto& definitions = allDefinitionsRef();
@@ -888,26 +1286,105 @@ std::optional<DocumentSymbol> LanguageService::resolve(
     return nearest ? std::optional<DocumentSymbol>(*nearest) : std::optional<DocumentSymbol>(matches.front());
 }
 
-std::vector<LanguageDiagnostic> LanguageService::diagnostics(const std::string& path) {
+std::vector<LanguageDiagnostic> LanguageService::diagnostics(const std::string& rawPath) {
+    const std::string path = normalizeDocPath(rawPath);
     if (!contains(path)) return {};
     (void)build();
-    std::vector<LanguageDiagnostic> output;
-    const auto allPaths = documentPaths();
-    const bool isPrimaryDoc = !allPaths.empty() && allPaths.front() == path;
-    for (const auto& item : result_.diagnostics.items()) {
-        if (!item.sourceName.empty()) {
-            if (item.sourceName != path) continue;
-            output.push_back({item.code, item.message, item.severity, {path, rangeFor(path, item.span)}});
-        } else if (isPrimaryDoc) {
-            output.push_back({item.code, item.message, item.severity, {path, {}}});
+    if (!hasCachedDiagnostics_) {
+        cachedDiagnosticsByPath_.clear();
+        const auto& items = result_.diagnostics.items();
+        if (!items.empty()) {
+            std::vector<std::string> projPaths;
+            std::vector<std::string> openPaths;
+            std::string primaryDoc;
+            std::unordered_set<std::string> succeededModules;
+            bool sourcelessContextInitialized = false;
+
+            const auto ensureSourcelessContext = [&]() {
+                if (sourcelessContextInitialized) return;
+                sourcelessContextInitialized = true;
+                projPaths = documentPaths();
+                openPaths = openDocumentPaths();
+                const auto& fallbackPool = openPaths.empty() ? projPaths : openPaths;
+                primaryDoc = fallbackPool.empty() ? std::string{} : fallbackPool.front();
+                for (const auto& m : result_.modules) {
+                    succeededModules.insert(m.name);
+                }
+            };
+
+            const auto inferOwnerForSourceless = [&](const diagnostics::Diagnostic& item, bool& outHasValidSpan) -> std::string {
+                ensureSourcelessContext();
+                outHasValidSpan = false;
+                std::string quotedToken;
+                const std::size_t q1 = item.message.find('\'');
+                if (q1 != std::string::npos) {
+                    const std::size_t q2 = item.message.find('\'', q1 + 1);
+                    if (q2 != std::string::npos && q2 > q1 + 1) {
+                        quotedToken = item.message.substr(q1 + 1, q2 - q1 - 1);
+                    }
+                }
+
+                std::vector<std::string> spanTokenMatches;
+                std::vector<std::string> failedModCandidates;
+                for (const auto& candPath : projPaths) {
+                    const auto* docPtr = document(candPath);
+                    if (!docPtr) continue;
+                    const auto hdrIt = docHeaders_.find(candPath);
+                    const bool modFailed = (hdrIt == docHeaders_.end()) ||
+                        (succeededModules.find(hdrIt->second.moduleName) == succeededModules.end());
+                    if (!modFailed) continue;
+                    if (item.span.end() <= docPtr->content.size()) {
+                        failedModCandidates.push_back(candPath);
+                        if (!quotedToken.empty() && item.span.length > 0) {
+                            const std::string_view slice(
+                                docPtr->content.data() + item.span.start,
+                                item.span.length);
+                            if (slice.find(quotedToken) != std::string_view::npos) {
+                                spanTokenMatches.push_back(candPath);
+                            }
+                        }
+                    }
+                }
+                if (spanTokenMatches.size() == 1) {
+                    outHasValidSpan = true;
+                    return spanTokenMatches.front();
+                }
+                if (failedModCandidates.size() == 1) {
+                    outHasValidSpan = (item.span.length > 0);
+                    return failedModCandidates.front();
+                }
+                return primaryDoc;
+            };
+
+            for (const auto& item : items) {
+                if (!item.sourceName.empty()) {
+                    const std::string itemPath = normalizeDocPath(item.sourceName);
+                    cachedDiagnosticsByPath_[itemPath].push_back(
+                        {item.code, item.message, item.severity, {itemPath, rangeFor(itemPath, item.span)}});
+                } else {
+                    bool validSpan = false;
+                    const std::string ownerPath = inferOwnerForSourceless(item, validSpan);
+                    if (!ownerPath.empty()) {
+                        cachedDiagnosticsByPath_[ownerPath].push_back({
+                            item.code,
+                            item.message,
+                            item.severity,
+                            {ownerPath, validSpan ? rangeFor(ownerPath, item.span) : debug::SourceRange{}},
+                        });
+                    }
+                }
+            }
         }
+        hasCachedDiagnostics_ = true;
     }
-    return output;
+    const auto it = cachedDiagnosticsByPath_.find(path);
+    return it != cachedDiagnosticsByPath_.end() ? it->second : std::vector<LanguageDiagnostic>{};
 }
 
 std::vector<CompletionItem> LanguageService::completion(
-    const std::string& path,
+    const std::string& rawPath,
     text::LinePosition position) {
+    const std::string path = normalizeDocPath(rawPath);
     (void)build();
     const auto token = tokenAt(path, position);
     const auto cursorOffset = token ? token->span.start : std::size_t{0};
@@ -1472,8 +1949,9 @@ std::vector<CompletionItem> LanguageService::completion(
 }
 
 std::optional<SignatureHelp> LanguageService::signatureHelp(
-    const std::string& path,
+    const std::string& rawPath,
     text::LinePosition position) {
+    const std::string path = normalizeDocPath(rawPath);
     (void)build();
     const auto* doc = document(path);
     if (!doc) return std::nullopt;
@@ -1593,8 +2071,9 @@ std::optional<SignatureHelp> LanguageService::signatureHelp(
 }
 
 std::optional<HoverInfo> LanguageService::hover(
-    const std::string& path,
+    const std::string& rawPath,
     text::LinePosition position) {
+    const std::string path = normalizeDocPath(rawPath);
     (void)build();
     const auto symbol = resolve(path, position);
     if (!symbol) return std::nullopt;
@@ -1604,17 +2083,19 @@ std::optional<HoverInfo> LanguageService::hover(
 }
 
 std::optional<Location> LanguageService::definition(
-    const std::string& path,
+    const std::string& rawPath,
     text::LinePosition position) {
+    const std::string path = normalizeDocPath(rawPath);
     (void)build();
     const auto symbol = resolve(path, position);
     return symbol ? std::optional<Location>(symbol->location) : std::nullopt;
 }
 
 std::vector<Location> LanguageService::references(
-    const std::string& path,
+    const std::string& rawPath,
     text::LinePosition position,
     bool includeDefinition) {
+    const std::string path = normalizeDocPath(rawPath);
     (void)build();
     const auto token = tokenAt(path, position);
     const auto symbol = resolve(path, position);
@@ -1626,8 +2107,7 @@ std::vector<Location> LanguageService::references(
         std::set<std::tuple<std::string, std::size_t, std::size_t>> seenSpans;
         for (const auto& occ : result_.symbols) {
             if (occ.id != symbol->id) continue;
-            if (documents_.find(occ.sourceName) == documents_.end() &&
-                ambientDocuments_.find(occ.sourceName) == ambientDocuments_.end()) {
+            if (document(occ.sourceName) == nullptr) {
                 continue;
             }
             hasAnySymbolOccurrence = true;
@@ -1640,9 +2120,7 @@ std::vector<Location> LanguageService::references(
                 output.push_back({occ.sourceName, rangeFor(occ.sourceName, occ.span)});
             }
         }
-        if (includeDefinition &&
-            (documents_.find(symbol->location.path) != documents_.end() ||
-             ambientDocuments_.find(symbol->location.path) != ambientDocuments_.end())) {
+        if (includeDefinition && document(symbol->location.path) != nullptr) {
             const auto defSpan = symbol->location.range.span;
             if (seenSpans.emplace(symbol->location.path, defSpan.start, defSpan.length).second) {
                 output.push_back(symbol->location);
@@ -1657,8 +2135,10 @@ std::vector<Location> LanguageService::references(
         }
     }
 
-    for (const auto& [documentPath, value] : documents_) {
-        text::SourceText source(value.content, documentPath);
+    for (const auto& documentPath : documentPaths()) {
+        const auto* docPtr = document(documentPath);
+        if (!docPtr) continue;
+        text::SourceText source(docPtr->content, documentPath);
         diagnostics::DiagnosticBag diagnostics;
         syntax::Lexer lexer(source, diagnostics);
         for (const auto& candidate : lexer.lexAll()) {
@@ -1688,7 +2168,8 @@ std::vector<TextEdit> LanguageService::rename(
     return edits;
 }
 
-std::vector<DocumentSymbol> LanguageService::documentSymbols(const std::string& path) {
+std::vector<DocumentSymbol> LanguageService::documentSymbols(const std::string& rawPath) {
+    const std::string path = normalizeDocPath(rawPath);
     (void)build();
     std::vector<DocumentSymbol> output;
     for (const auto& symbol : allDefinitionsRef()) {
@@ -1701,7 +2182,8 @@ std::vector<DocumentSymbol> LanguageService::documentSymbols(const std::string& 
     return output;
 }
 
-std::vector<SemanticToken> LanguageService::semanticTokens(const std::string& path) {
+std::vector<SemanticToken> LanguageService::semanticTokens(const std::string& rawPath) {
+    const std::string path = normalizeDocPath(rawPath);
     (void)build();
     const auto* doc = document(path);
     if (!doc) return {};
@@ -1783,7 +2265,8 @@ std::vector<std::uint32_t> LanguageService::semanticTokensEncoded(const std::str
     return data;
 }
 
-std::vector<InlayHint> LanguageService::inlayHints(const std::string& path) {
+std::vector<InlayHint> LanguageService::inlayHints(const std::string& rawPath) {
+    const std::string path = normalizeDocPath(rawPath);
     (void)build();
     const auto* doc = document(path);
     if (!doc) return {};
@@ -1963,7 +2446,8 @@ std::vector<InlayHint> LanguageService::inlayHints(const std::string& path) {
     return hints;
 }
 
-std::vector<TextEdit> LanguageService::formatDocument(const std::string& path, std::size_t tabSize) {
+std::vector<TextEdit> LanguageService::formatDocument(const std::string& rawPath, std::size_t tabSize) {
+    const std::string path = normalizeDocPath(rawPath);
     const auto* doc = document(path);
     if (!doc) return {};
     std::string formatted;

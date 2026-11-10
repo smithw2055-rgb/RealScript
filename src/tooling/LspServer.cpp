@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 namespace realscript::tooling {
 namespace {
@@ -68,6 +70,32 @@ Json location(const Location& value) {
     return Json::Object{{"uri", pathToUri(value.path)}, {"range", range(value.range)}};
 }
 
+std::vector<std::string> extractWorkspaceRoots(const Json* params) {
+    std::vector<std::string> roots;
+    if (!params || !params->isObject()) return roots;
+
+    if (const auto* wsFolders = params->find("workspaceFolders");
+        wsFolders && wsFolders->isArray()) {
+        for (const auto& folder : wsFolders->arrayValue()) {
+            if (!folder.isObject()) continue;
+            if (const auto* uriVal = folder.find("uri"); uriVal && uriVal->isString()) {
+                const std::string p = uriToPath(uriVal->stringValue());
+                if (!p.empty()) roots.push_back(p);
+            }
+        }
+    }
+    if (roots.empty()) {
+        if (const auto* rootUri = params->find("rootUri");
+            rootUri && rootUri->isString() && !rootUri->stringValue().empty()) {
+            roots.push_back(uriToPath(rootUri->stringValue()));
+        } else if (const auto* rootPath = params->find("rootPath");
+                   rootPath && rootPath->isString() && !rootPath->stringValue().empty()) {
+            roots.push_back(rootPath->stringValue());
+        }
+    }
+    return roots;
+}
+
 } // namespace
 
 Json LspServer::response(const Json& request, Json result) const {
@@ -87,7 +115,8 @@ Json LspServer::error(const Json& request, int code, std::string message) const 
 
 void LspServer::publishDiagnostics(const std::string& path, std::ostream& output) {
     Json::Array values;
-    for (const auto& diagnostic : service_.diagnostics(path)) {
+    const auto diags = service_.diagnostics(path);
+    for (const auto& diagnostic : diags) {
         values.emplace_back(Json::Object{
             {"range", range(diagnostic.location.range)},
             {"severity", diagnostic.severity == diagnostics::DiagnosticSeverity::Error ? 1 : 2},
@@ -96,11 +125,52 @@ void LspServer::publishDiagnostics(const std::string& path, std::ostream& output
             {"message", diagnostic.message},
         });
     }
+    if (!diags.empty()) {
+        publishedNonEmptyDiagnostics_.insert(path);
+    } else {
+        publishedNonEmptyDiagnostics_.erase(path);
+    }
     writeProtocolMessage(output, Json::Object{
         {"jsonrpc", "2.0"},
         {"method", "textDocument/publishDiagnostics"},
         {"params", Json::Object{{"uri", pathToUri(path)}, {"diagnostics", Json(std::move(values))}}},
     });
+}
+
+void LspServer::publishWorkspaceDiagnostics(std::ostream& output) {
+    (void)service_.build();
+    const auto openPaths = service_.openDocumentPaths();
+    const std::unordered_set<std::string> openSet(openPaths.begin(), openPaths.end());
+    const auto allPaths = service_.documentPaths();
+    const std::unordered_set<std::string> allSet(allPaths.begin(), allPaths.end());
+
+    // Clear stale diagnostics on any removed files
+    std::vector<std::string> vanished;
+    for (const auto& prevPath : publishedNonEmptyDiagnostics_) {
+        if (allSet.find(prevPath) == allSet.end()) {
+            vanished.push_back(prevPath);
+        }
+    }
+    for (const auto& vanishedPath : vanished) {
+        publishedNonEmptyDiagnostics_.erase(vanishedPath);
+        writeProtocolMessage(output, Json::Object{
+            {"jsonrpc", "2.0"},
+            {"method", "textDocument/publishDiagnostics"},
+            {"params", Json::Object{{"uri", pathToUri(vanishedPath)}, {"diagnostics", Json::Array{}}}},
+        });
+    }
+
+    for (const auto& docPath : allPaths) {
+        if (openSet.find(docPath) != openSet.end()) {
+            publishDiagnostics(docPath, output);
+            continue;
+        }
+        const auto diags = service_.diagnostics(docPath);
+        if (!diags.empty() ||
+            publishedNonEmptyDiagnostics_.find(docPath) != publishedNonEmptyDiagnostics_.end()) {
+            publishDiagnostics(docPath, output);
+        }
+    }
 }
 
 Json LspServer::handle(const Json& message, std::ostream* notifications) {
@@ -109,9 +179,21 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
     const auto* params = message.find("params");
 
     if (method == "initialize") {
+        for (const auto& root : extractWorkspaceRoots(params)) {
+            (void)service_.addWorkspaceRoot(root);
+        }
+        if (notifications && !service_.workspaceRoots().empty()) {
+            publishWorkspaceDiagnostics(*notifications);
+        }
         return response(message, Json::Object{
             {"capabilities", Json::Object{
                 {"textDocumentSync", 2},
+                {"workspace", Json::Object{
+                    {"workspaceFolders", Json::Object{
+                        {"supported", true},
+                        {"changeNotifications", true},
+                    }},
+                }},
                 {"completionProvider", Json::Object{
                     {"triggerCharacters", Json::Array{"."}},
                 }},
@@ -141,11 +223,61 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
                 {"version", realscript::kVersionString}}},
         });
     }
+    if (method == "initialized" || method == "$/cancelRequest" || method == "$/setTrace") {
+        return Json();
+    }
     if (method == "shutdown") {
         shutdown_ = true;
         return response(message, nullptr);
     }
     if (method == "exit") return Json();
+
+    if (method == "workspace/didChangeWorkspaceFolders") {
+        if (const auto* event = params ? params->find("event") : nullptr;
+            event && event->isObject()) {
+            if (const auto* removed = event->find("removed"); removed && removed->isArray()) {
+                for (const auto& item : removed->arrayValue()) {
+                    if (const auto* uriVal = item.find("uri"); uriVal && uriVal->isString()) {
+                        service_.removeWorkspaceRoot(uriToPath(uriVal->stringValue()));
+                    }
+                }
+            }
+            if (const auto* added = event->find("added"); added && added->isArray()) {
+                for (const auto& item : added->arrayValue()) {
+                    if (const auto* uriVal = item.find("uri"); uriVal && uriVal->isString()) {
+                        (void)service_.addWorkspaceRoot(uriToPath(uriVal->stringValue()));
+                    }
+                }
+            }
+            if (notifications) {
+                publishWorkspaceDiagnostics(*notifications);
+            }
+        }
+        return Json();
+    }
+
+    if (method == "workspace/didChangeWatchedFiles") {
+        if (const auto* changes = params ? params->find("changes") : nullptr;
+            changes && changes->isArray()) {
+            for (const auto& change : changes->arrayValue()) {
+                if (!change.isObject()) continue;
+                const auto* uriVal = change.find("uri");
+                const auto* typeVal = change.find("type");
+                if (!uriVal || !uriVal->isString()) continue;
+                const std::string filePath = uriToPath(uriVal->stringValue());
+                const std::int64_t changeType = typeVal ? typeVal->integerValue(2) : 2;
+                if (changeType == 3) {
+                    (void)service_.removeDiskFile(filePath);
+                } else {
+                    (void)service_.syncDiskFile(filePath);
+                }
+            }
+            if (notifications) {
+                publishWorkspaceDiagnostics(*notifications);
+            }
+        }
+        return Json();
+    }
 
     if (method == "textDocument/didOpen") {
         const auto* document = params ? params->find("textDocument") : nullptr;
@@ -157,9 +289,7 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
             ? document->find("version")->integerValue(1) : 1;
         service_.open(path, content, version);
         if (notifications) {
-            for (const auto& documentPath : service_.documentPaths()) {
-                publishDiagnostics(documentPath, *notifications);
-            }
+            publishWorkspaceDiagnostics(*notifications);
         }
         return Json();
     }
@@ -200,9 +330,7 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
             service_.update(path, std::string{}, version);
         }
         if (notifications) {
-            for (const auto& documentPath : service_.documentPaths()) {
-                publishDiagnostics(documentPath, *notifications);
-            }
+            publishWorkspaceDiagnostics(*notifications);
         }
         return Json();
     }
@@ -212,14 +340,19 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
             ? document->find("uri")->stringValue() : std::string{});
         service_.close(path);
         if (notifications) {
-            writeProtocolMessage(*notifications, Json::Object{
-                {"jsonrpc", "2.0"},
-                {"method", "textDocument/publishDiagnostics"},
-                {"params", Json::Object{{"uri", pathToUri(path)}, {"diagnostics", Json::Array{}}}},
-            });
-            for (const auto& documentPath : service_.documentPaths()) {
-                publishDiagnostics(documentPath, *notifications);
+            if (service_.contains(path)) {
+                // Ensure publishWorkspaceDiagnostics refreshes the closed file's on-disk diagnostic state
+                // (clears any transient unsaved-buffer errors while keeping real disk errors accurate)
+                publishedNonEmptyDiagnostics_.insert(path);
+            } else {
+                publishedNonEmptyDiagnostics_.erase(path);
+                writeProtocolMessage(*notifications, Json::Object{
+                    {"jsonrpc", "2.0"},
+                    {"method", "textDocument/publishDiagnostics"},
+                    {"params", Json::Object{{"uri", pathToUri(path)}, {"diagnostics", Json::Array{}}}},
+                });
             }
+            publishWorkspaceDiagnostics(*notifications);
         }
         return Json();
     }

@@ -287,8 +287,406 @@ void ShadowStack::visitRoots(const std::function<void(const Value&)>& visitor) c
     visitRoots<const std::function<void(const Value&)>&>(visitor);
 }
 
+enum class SlotStorage : std::uint8_t {
+    Empty      = 0,
+    SsoString  = 1,
+    HeapString = 2,
+    SlabValues = 3,
+    HeapValues = 4,
+    RawColumn  = 5,
+};
+
+namespace GcFlag {
+    constexpr std::uint8_t Marked          = 1u << 0;
+    constexpr std::uint8_t InNursery       = 1u << 1;
+    constexpr std::uint8_t InRememberedSet = 1u << 2;
+    constexpr std::uint8_t HasCardTable    = 1u << 3;
+    constexpr std::uint8_t CustomSize      = 1u << 4;
+    constexpr std::uint8_t IsInterned      = 1u << 5;
+    constexpr std::uint8_t InDirtyQueue    = 1u << 6;
+    constexpr std::uint8_t HasUiObserver   = 1u << 7;
+} // namespace GcFlag
+
+struct UiObservableSlotMeta {
+    std::uint64_t dirtyFieldMask = 0;
+    std::uint16_t uiObserverCount = 0;
+};
+
+struct TypeLayoutEntry {
+    semantic::SymbolId typeId = 0;
+    semantic::SymbolId elementTypeId = 0;
+    semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
+    bool mayContainReferences = false;
+    std::vector<std::size_t> referenceFields;
+};
+
+struct ArrayLayoutKey {
+    semantic::SymbolId arrayTypeId = 0;
+    semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
+    semantic::SymbolId elementTypeId = 0;
+
+    friend constexpr bool operator==(const ArrayLayoutKey& a, const ArrayLayoutKey& b) noexcept {
+        return a.arrayTypeId == b.arrayTypeId &&
+            a.elementType == b.elementType &&
+            a.elementTypeId == b.elementTypeId;
+    }
+};
+
+struct ArrayLayoutKeyHash {
+    std::size_t operator()(const ArrayLayoutKey& k) const noexcept {
+        std::size_t h = static_cast<std::size_t>(k.arrayTypeId);
+        h ^= static_cast<std::size_t>(k.elementType) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= static_cast<std::size_t>(k.elementTypeId) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct alignas(32) CompactSlot {
+    static constexpr std::uint32_t kInvalidHandle = 0xFFFFFFFFu;
+    static constexpr std::size_t kMaxSsoBytes = 23;
+    static constexpr std::size_t kInlineValueCapacity = 4;
+
+    std::uint32_t generation = 1;
+    std::uint8_t kindAndStorage = 0;
+    std::uint8_t gcFlags = 0;
+    std::uint16_t auxMeta = 0;
+
+    union Payload {
+        std::array<char, 24> ssoChars;
+        struct Structured {
+            std::uint32_t layoutId;
+            std::uint32_t length;
+            Value* data;
+            std::uint32_t handle;
+            std::uint32_t cardHandle;
+        } s;
+
+        constexpr Payload() noexcept
+            : s{0, 0, nullptr, kInvalidHandle, kInvalidHandle} {}
+    } payload;
+
+    [[nodiscard]] constexpr SlotStorage storage() const noexcept {
+        return static_cast<SlotStorage>(kindAndStorage & 0x0Fu);
+    }
+    [[nodiscard]] constexpr ObjectKind kind() const noexcept {
+        return static_cast<ObjectKind>((kindAndStorage >> 4) & 0x0Fu);
+    }
+    [[nodiscard]] constexpr bool occupied() const noexcept {
+        return storage() != SlotStorage::Empty;
+    }
+    constexpr void setKindAndStorage(ObjectKind k, SlotStorage st) noexcept {
+        kindAndStorage = static_cast<std::uint8_t>(
+            (static_cast<std::uint8_t>(k) << 4) | (static_cast<std::uint8_t>(st) & 0x0Fu));
+    }
+    [[nodiscard]] constexpr bool hasFlag(std::uint8_t f) const noexcept {
+        return (gcFlags & f) != 0;
+    }
+};
+static_assert(sizeof(CompactSlot) == 32, "CompactSlot must be exactly 32 bytes (2 per cache line)");
+static_assert(alignof(CompactSlot) == 32, "CompactSlot must be 32-byte aligned");
+
+[[nodiscard]] Value* emptyValueSlicePtr() noexcept {
+    static Value s_empty{};
+    return &s_empty;
+}
+
+class PagedValueSlabPool {
+public:
+    static constexpr std::size_t kBlocksPerPage = 1024;
+    static constexpr std::uint16_t kZeroClass = 0xFFFFu;
+
+    [[nodiscard]] static constexpr std::uint16_t sizeToClass(std::size_t count) noexcept {
+        return count <= 1 ? 0 : (count <= 2 ? 1 : 2);
+    }
+    [[nodiscard]] static constexpr std::size_t classStride(std::uint16_t cls) noexcept {
+        return std::size_t{1} << cls;
+    }
+
+    Value* allocate(std::size_t count, std::uint16_t& outClass, std::uint32_t& outHandle) {
+        if (count == 0) {
+            outClass = kZeroClass;
+            outHandle = CompactSlot::kInvalidHandle;
+            return emptyValueSlicePtr();
+        }
+        const std::uint16_t cls = sizeToClass(count);
+        outClass = cls;
+        auto& pool = classes_[cls];
+        if (!pool.freeList.empty()) {
+            outHandle = pool.freeList.back();
+            pool.freeList.pop_back();
+            return resolve(cls, outHandle);
+        }
+        const std::size_t stride = classStride(cls);
+        if (pool.cursor >= kBlocksPerPage) {
+            pool.pages.push_back(std::make_unique<Value[]>(kBlocksPerPage * stride));
+            pool.cursor = 0;
+        }
+        const auto pageIdx = static_cast<std::uint32_t>(pool.pages.size() - 1);
+        const auto blockIdx = static_cast<std::uint32_t>(pool.cursor++);
+        outHandle = (pageIdx << 10) | blockIdx;
+        return &pool.pages[pageIdx][blockIdx * stride];
+    }
+
+    void deallocate(std::uint16_t cls, std::uint32_t handle, std::uint32_t usedCount) noexcept {
+        (void)usedCount;
+        if (cls == kZeroClass || handle == CompactSlot::kInvalidHandle) return;
+        classes_[cls].freeList.push_back(handle);
+    }
+
+    [[nodiscard]] Value* resolve(std::uint16_t cls, std::uint32_t handle) const noexcept {
+        const std::size_t stride = classStride(cls);
+        return &classes_[cls].pages[handle >> 10][(handle & 0x3FFu) * stride];
+    }
+
+    void clear() noexcept {
+        for (auto& c : classes_) {
+            c.pages.clear();
+            c.freeList.clear();
+            c.cursor = kBlocksPerPage;
+        }
+    }
+
+private:
+    struct ClassArena {
+        std::vector<std::unique_ptr<Value[]>> pages;
+        std::vector<std::uint32_t> freeList;
+        std::size_t cursor = kBlocksPerPage;
+    };
+    std::array<ClassArena, 3> classes_;
+};
+
+class LargeValueBufferPool {
+public:
+    std::uint32_t acquireFill(std::size_t length, const Value& initVal, Value*& outData) {
+        const std::uint32_t id = acquireId(length);
+        buffers_[id].assign(length, initVal);
+        outData = buffers_[id].data();
+        return id;
+    }
+
+    std::uint32_t acquireCopy(const Value* src, std::size_t length, Value*& outData) {
+        const std::uint32_t id = acquireId(length);
+        buffers_[id].assign(src, src + length);
+        outData = buffers_[id].data();
+        return id;
+    }
+
+    std::uint32_t acquireMove(std::vector<Value>&& vals, Value*& outData) {
+        const std::uint32_t id = acquireId(vals.size());
+        if (buffers_[id].capacity() >= vals.size()) {
+            buffers_[id].assign(
+                std::make_move_iterator(vals.begin()),
+                std::make_move_iterator(vals.end()));
+        } else {
+            buffers_[id] = std::move(vals);
+        }
+        outData = buffers_[id].data();
+        return id;
+    }
+
+    void release(std::uint32_t id) noexcept {
+        if (id >= buffers_.size()) return;
+        auto& buf = buffers_[id];
+        const std::size_t cap = buf.capacity();
+        buf.clear();
+        if (cap > 4096) {
+            std::vector<Value>().swap(buf);
+            smallFreeIds_.push_back(id);
+        } else if (cap <= 64) {
+            smallFreeIds_.push_back(id);
+        } else {
+            largeFreeIds_.push_back(id);
+        }
+    }
+
+    void clear() noexcept {
+        buffers_.clear();
+        smallFreeIds_.clear();
+        largeFreeIds_.clear();
+    }
+
+private:
+    std::uint32_t acquireId(std::size_t needed) {
+        auto& primary = (needed <= 64) ? smallFreeIds_ : largeFreeIds_;
+        if (!primary.empty()) {
+            const std::uint32_t id = primary.back();
+            primary.pop_back();
+            if (needed <= 64 && buffers_[id].capacity() > 256) {
+                std::vector<Value>().swap(buffers_[id]);
+            }
+            return id;
+        }
+        auto& secondary = (needed <= 64) ? largeFreeIds_ : smallFreeIds_;
+        if (!secondary.empty()) {
+            const std::uint32_t id = secondary.back();
+            secondary.pop_back();
+            if (needed <= 64 && buffers_[id].capacity() > 256) {
+                std::vector<Value>().swap(buffers_[id]);
+            }
+            return id;
+        }
+        const auto id = static_cast<std::uint32_t>(buffers_.size());
+        buffers_.emplace_back();
+        return id;
+    }
+
+    std::vector<std::vector<Value>> buffers_;
+    std::vector<std::uint32_t> smallFreeIds_;
+    std::vector<std::uint32_t> largeFreeIds_;
+};
+
+class HeapStringPool {
+public:
+    std::uint32_t acquire(std::string&& str) {
+        if (!freeIds_.empty()) {
+            const std::uint32_t id = freeIds_.back();
+            freeIds_.pop_back();
+            strings_[id] = std::move(str);
+            return id;
+        }
+        const auto id = static_cast<std::uint32_t>(strings_.size());
+        strings_.push_back(std::move(str));
+        return id;
+    }
+
+    void release(std::uint32_t id) noexcept {
+        if (id >= strings_.size()) return;
+        auto& s = strings_[id];
+        s.clear();
+        if (s.capacity() > 4096) {
+            std::string().swap(s);
+        }
+        freeIds_.push_back(id);
+    }
+
+    [[nodiscard]] const std::string& get(std::uint32_t id) const noexcept {
+        return strings_[id];
+    }
+
+    void clear() noexcept {
+        strings_.clear();
+        freeIds_.clear();
+    }
+
+private:
+    std::vector<std::string> strings_;
+    std::vector<std::uint32_t> freeIds_;
+};
+
+class RawColumnPool {
+public:
+    std::uint32_t acquire(NativeRawColumnView&& view) {
+        if (!freeIds_.empty()) {
+            const std::uint32_t id = freeIds_.back();
+            freeIds_.pop_back();
+            views_[id] = std::move(view);
+            return id;
+        }
+        const auto id = static_cast<std::uint32_t>(views_.size());
+        views_.push_back(std::move(view));
+        return id;
+    }
+
+    void release(std::uint32_t id) noexcept {
+        if (id >= views_.size()) return;
+        views_[id] = NativeRawColumnView{};
+        freeIds_.push_back(id);
+    }
+
+    [[nodiscard]] NativeRawColumnView& get(std::uint32_t id) noexcept { return views_[id]; }
+    [[nodiscard]] const NativeRawColumnView& get(std::uint32_t id) const noexcept { return views_[id]; }
+
+    void clear() noexcept {
+        views_.clear();
+        freeIds_.clear();
+    }
+
+private:
+    std::vector<NativeRawColumnView> views_;
+    std::vector<std::uint32_t> freeIds_;
+};
+
+class CardTableArena {
+public:
+    struct CardSlice {
+        std::uint64_t* words = nullptr;
+        std::uint32_t wordCount = 0;
+
+        [[nodiscard]] std::uint8_t* bytePtr() const noexcept {
+            return reinterpret_cast<std::uint8_t*>(words);
+        }
+        void clearAll() noexcept {
+            if (words && wordCount > 0) {
+                std::memset(words, 0, static_cast<std::size_t>(wordCount) * sizeof(std::uint64_t));
+            }
+        }
+        void markAllDirty() noexcept {
+            if (words && wordCount > 0) {
+                std::memset(words, 1, static_cast<std::size_t>(wordCount) * sizeof(std::uint64_t));
+            }
+        }
+    };
+
+    std::uint32_t allocate(std::size_t elementCount) {
+        const std::size_t cardCount =
+            (elementCount + ManagedHeap::kCardElements - 1) >> ManagedHeap::kCardElementShift;
+        const auto wordCount = static_cast<std::uint32_t>((cardCount + 7) >> 3);
+        auto& bucket = freeByWordCount_[wordCount];
+        if (!bucket.empty()) {
+            const std::uint32_t handle = bucket.back();
+            bucket.pop_back();
+            slices_[handle].clearAll();
+            return handle;
+        }
+        std::uint64_t* mem = allocateAlignedWords(wordCount);
+        std::memset(mem, 0, static_cast<std::size_t>(wordCount) * sizeof(std::uint64_t));
+        const auto handle = static_cast<std::uint32_t>(slices_.size());
+        slices_.push_back(CardSlice{mem, wordCount});
+        return handle;
+    }
+
+    void deallocate(std::uint32_t handle) {
+        if (handle >= slices_.size()) return;
+        freeByWordCount_[slices_[handle].wordCount].push_back(handle);
+    }
+
+    [[nodiscard]] CardSlice& get(std::uint32_t handle) noexcept { return slices_[handle]; }
+    [[nodiscard]] const CardSlice& get(std::uint32_t handle) const noexcept { return slices_[handle]; }
+
+    void clear() noexcept {
+        pages_.clear();
+        oversizedPages_.clear();
+        cursor_ = kWordsPerPage;
+        slices_.clear();
+        freeByWordCount_.clear();
+    }
+
+private:
+    static constexpr std::size_t kWordsPerPage = 8192; // 64 KB per page
+
+    std::uint64_t* allocateAlignedWords(std::uint32_t wordCount) {
+        if (wordCount > kWordsPerPage) {
+            oversizedPages_.push_back(std::make_unique<std::uint64_t[]>(wordCount));
+            return oversizedPages_.back().get();
+        }
+        if (cursor_ + wordCount > kWordsPerPage) {
+            pages_.push_back(std::make_unique<std::uint64_t[]>(kWordsPerPage));
+            cursor_ = 0;
+        }
+        std::uint64_t* ptr = &pages_.back()[cursor_];
+        cursor_ += wordCount;
+        return ptr;
+    }
+
+    std::vector<std::unique_ptr<std::uint64_t[]>> pages_;
+    std::vector<std::unique_ptr<std::uint64_t[]>> oversizedPages_;
+    std::size_t cursor_ = kWordsPerPage;
+    std::vector<CardSlice> slices_;
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> freeByWordCount_;
+};
+
 struct ManagedHeap::Impl {
-    struct Header {
+    struct LegacyHeader {
         ObjectKind kind = ObjectKind::Record;
         semantic::SymbolId typeId = 0;
         semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
@@ -302,88 +700,14 @@ struct ManagedHeap::Impl {
         std::size_t sizeBytes = 0;
     };
 
-    struct HeapObject {
-        static constexpr std::size_t InlineFieldCapacity = 4;
-        Header header;
-        std::array<Value, InlineFieldCapacity> inlineValues{};
-        std::uint8_t inlineValueCount = 0;
-        bool usesInlineValues = false;
-        std::vector<Value> values;
-        std::string stringPayload;
-        std::shared_ptr<const std::vector<std::size_t>> referenceFields;
-        std::optional<NativeRawColumnView> rawColumnView;
-
-        [[nodiscard]] std::size_t valueCount() const noexcept {
-            return usesInlineValues
-                ? static_cast<std::size_t>(inlineValueCount)
-                : values.size();
-        }
-        [[nodiscard]] const Value* dataPtr() const noexcept {
-            return usesInlineValues ? inlineValues.data() : values.data();
-        }
-        [[nodiscard]] Value* dataPtr() noexcept {
-            return usesInlineValues ? inlineValues.data() : values.data();
-        }
-        [[nodiscard]] const Value& valueAt(std::size_t index) const noexcept {
-            return usesInlineValues ? inlineValues[index] : values[index];
-        }
-        [[nodiscard]] Value& valueAt(std::size_t index) noexcept {
-            return usesInlineValues ? inlineValues[index] : values[index];
-        }
-        void clearValues() noexcept {
-            inlineValueCount = 0;
-            usesInlineValues = false;
-            if (!values.empty()) {
-                values.clear();
-            }
-        }
-
-        void reset() noexcept {
-            header = Header{};
-            clearValues(); // Retain capacity in slot pool to avoid malloc/free churn!
-            if (!stringPayload.empty()) stringPayload.clear();
-            if (referenceFields) referenceFields.reset();
-            if (rawColumnView.has_value()) rawColumnView.reset();
-        }
-    };
-
     struct LegacyHeapObjectLayout {
-        Header header;
+        LegacyHeader header;
         std::vector<Value> values;
         std::string stringPayload;
         std::shared_ptr<const std::vector<std::size_t>> referenceFields;
         std::optional<NativeRawColumnView> rawColumnView;
     };
     static constexpr std::size_t BaseObjectSizeBytes = sizeof(LegacyHeapObjectLayout);
-
-    struct InlineSlotObjectPtr {
-        HeapObject storage{};
-        bool occupied = false;
-
-        [[nodiscard]] constexpr explicit operator bool() const noexcept { return occupied; }
-        [[nodiscard]] constexpr HeapObject* get() noexcept { return occupied ? &storage : nullptr; }
-        [[nodiscard]] constexpr const HeapObject* get() const noexcept { return occupied ? &storage : nullptr; }
-        [[nodiscard]] constexpr HeapObject* operator->() noexcept { return &storage; }
-        [[nodiscard]] constexpr const HeapObject* operator->() const noexcept { return &storage; }
-        [[nodiscard]] constexpr HeapObject& operator*() noexcept { return storage; }
-        [[nodiscard]] constexpr const HeapObject& operator*() const noexcept { return storage; }
-
-        void emplace(HeapObject&& obj) noexcept {
-            storage = std::move(obj);
-            occupied = true;
-        }
-        void reset() noexcept {
-            if (occupied) {
-                storage.reset();
-                occupied = false;
-            }
-        }
-    };
-
-    struct Slot {
-        InlineSlotObjectPtr object;
-        std::uint32_t generation = 1;
-    };
 
     struct NativeEcsColumnTable {
         std::vector<std::int64_t> entityIds;
@@ -414,6 +738,7 @@ struct ManagedHeap::Impl {
     explicit Impl(HeapConfig value)
         : config(value), heapId(nextHeapId()),
           nextCollectionThreshold(value.initialCollectionThresholdBytes) {
+        typeLayouts.push_back(TypeLayoutEntry{}); // layoutId 0: default empty
         {
             std::lock_guard<std::mutex> lock(liveHeapsPoolMutex());
             liveHeapPoolMarkers()[this] = [this]() { this->markAllReachablePoolValues(); };
@@ -432,6 +757,78 @@ struct ManagedHeap::Impl {
         liveHeapPoolMarkers().erase(this);
     }
 
+    [[nodiscard]] static std::size_t slotValueCount(const CompactSlot& slot) noexcept {
+        const auto st = slot.storage();
+        if (st == SlotStorage::SlabValues || st == SlotStorage::HeapValues) {
+            return slot.payload.s.length;
+        }
+        return 0;
+    }
+
+    [[nodiscard]] std::string_view slotStringView(const CompactSlot& slot) const noexcept {
+        if (slot.storage() == SlotStorage::SsoString) {
+            return std::string_view(slot.payload.ssoChars.data(), slot.auxMeta);
+        }
+        if (slot.storage() == SlotStorage::HeapString) {
+            return std::string_view(stringPool.get(slot.payload.s.handle));
+        }
+        return {};
+    }
+
+    [[nodiscard]] std::size_t slotSizeBytes(std::uint32_t slotIndex, const CompactSlot& slot) const noexcept {
+        if (slot.hasFlag(GcFlag::CustomSize)) {
+            const auto it = customSlotSizes.find(slotIndex);
+            if (it != customSlotSizes.end()) return it->second;
+        }
+        switch (slot.storage()) {
+        case SlotStorage::SsoString:
+            return BaseObjectSizeBytes + slot.auxMeta;
+        case SlotStorage::HeapString:
+            return BaseObjectSizeBytes + slot.payload.s.length;
+        case SlotStorage::SlabValues:
+        case SlotStorage::HeapValues:
+            return BaseObjectSizeBytes + static_cast<std::size_t>(slot.payload.s.length) * sizeof(Value);
+        case SlotStorage::RawColumn:
+        case SlotStorage::Empty:
+            return BaseObjectSizeBytes;
+        }
+        return BaseObjectSizeBytes;
+    }
+
+    void releaseSlotPayload(std::uint32_t slotIndex, CompactSlot& slot) noexcept {
+        if (slot.hasFlag(GcFlag::HasCardTable) &&
+            slot.payload.s.cardHandle != CompactSlot::kInvalidHandle) {
+            cardArena.deallocate(slot.payload.s.cardHandle);
+        }
+        if (slot.hasFlag(GcFlag::CustomSize)) {
+            customSlotSizes.erase(slotIndex);
+        }
+        if (slot.hasFlag(GcFlag::InDirtyQueue | GcFlag::HasUiObserver)) {
+            uiObservableMeta.erase(slotIndex);
+        }
+        switch (slot.storage()) {
+        case SlotStorage::Empty:
+        case SlotStorage::SsoString:
+            break;
+        case SlotStorage::HeapString:
+            stringPool.release(slot.payload.s.handle);
+            break;
+        case SlotStorage::SlabValues:
+            slabPool.deallocate(slot.auxMeta, slot.payload.s.handle, slot.payload.s.length);
+            break;
+        case SlotStorage::HeapValues:
+            largeBuffers.release(slot.payload.s.handle);
+            break;
+        case SlotStorage::RawColumn:
+            rawColumns.release(slot.payload.s.handle);
+            break;
+        }
+        slot.kindAndStorage = 0;
+        slot.gcFlags = 0;
+        slot.auxMeta = 0;
+        slot.payload = CompactSlot::Payload{};
+    }
+
     void markAllReachablePoolValues() const {
         for (const auto& entry : persistentRoots) markValueInPools(entry.second);
         for (const auto& entry : staticFields) markValueInPools(entry.second);
@@ -440,29 +837,159 @@ struct ManagedHeap::Impl {
             for (const auto& v : table.values) markValueInPools(v);
         }
         for (const auto& slot : slots) {
-            if (!slot.object) continue;
-            const auto count = slot.object->valueCount();
+            if (!slot.occupied()) continue;
+            const auto count = slotValueCount(slot);
+            if (count == 0) continue;
+            const Value* data = slot.payload.s.data;
             for (std::size_t i = 0; i < count; ++i) {
-                markValueInPools(slot.object->valueAt(i));
+                markValueInPools(data[i]);
             }
         }
     }
 
+    std::uint32_t internArrayLayout(
+        semantic::SymbolId arrayTypeId,
+        semantic::PrimitiveType elementType,
+        semantic::SymbolId elementTypeId) {
+        const ArrayLayoutKey key{arrayTypeId, elementType, elementTypeId};
+        if (hasLastArrayLayout && key == lastArrayLayoutKey) {
+            return lastArrayLayoutId;
+        }
+        const auto it = arrayLayoutByKey.find(key);
+        if (it != arrayLayoutByKey.end()) {
+            hasLastArrayLayout = true;
+            lastArrayLayoutKey = key;
+            lastArrayLayoutId = it->second;
+            return it->second;
+        }
+        TypeLayoutEntry entry;
+        entry.typeId = arrayTypeId;
+        entry.elementType = elementType;
+        entry.elementTypeId = elementTypeId;
+        entry.mayContainReferences = elementTypeMayContainReferences(elementType);
+        const auto id = static_cast<std::uint32_t>(typeLayouts.size());
+        typeLayouts.push_back(std::move(entry));
+        arrayLayoutByKey.emplace(key, id);
+        hasLastArrayLayout = true;
+        lastArrayLayoutKey = key;
+        lastArrayLayoutId = id;
+        return id;
+    }
+
+    std::uint32_t internTypedRecordLayout(
+        semantic::SymbolId typeId,
+        const std::vector<std::size_t>& refFields) {
+        const auto it = sharedRecordLayoutByTypeId.find(typeId);
+        if (it != sharedRecordLayoutByTypeId.end() &&
+            typeLayouts[it->second].referenceFields == refFields) {
+            lastRegisteredLayoutTypeId = typeId;
+            lastRegisteredLayoutId = it->second;
+            return it->second;
+        }
+        TypeLayoutEntry entry;
+        entry.typeId = typeId;
+        entry.mayContainReferences = !refFields.empty();
+        entry.referenceFields = refFields;
+        const auto id = static_cast<std::uint32_t>(typeLayouts.size());
+        typeLayouts.push_back(std::move(entry));
+        sharedRecordLayoutByTypeId[typeId] = id;
+        lastRegisteredLayoutTypeId = typeId;
+        lastRegisteredLayoutId = id;
+        return id;
+    }
+
+    std::uint32_t internTemplateRecordLayout(
+        semantic::SymbolId typeId,
+        const std::shared_ptr<const std::vector<std::size_t>>& referenceFields) {
+        if (typeId == lastRegisteredLayoutTypeId && lastRegisteredLayoutId != 0) {
+            return lastRegisteredLayoutId;
+        }
+        const auto it = sharedRecordLayoutByTypeId.find(typeId);
+        if (it != sharedRecordLayoutByTypeId.end()) {
+            lastRegisteredLayoutTypeId = typeId;
+            lastRegisteredLayoutId = it->second;
+            return it->second;
+        }
+        TypeLayoutEntry entry;
+        entry.typeId = typeId;
+        if (referenceFields && !referenceFields->empty()) {
+            entry.referenceFields = *referenceFields;
+            entry.mayContainReferences = true;
+        }
+        const auto id = static_cast<std::uint32_t>(typeLayouts.size());
+        typeLayouts.push_back(std::move(entry));
+        sharedRecordLayoutByTypeId[typeId] = id;
+        lastRegisteredLayoutTypeId = typeId;
+        lastRegisteredLayoutId = id;
+        return id;
+    }
+
+    std::uint32_t internUntypedAllRefRecordLayout(std::size_t fieldCount) {
+        const auto it = untypedDenseRecordLayouts.find(fieldCount);
+        if (it != untypedDenseRecordLayouts.end()) {
+            return it->second;
+        }
+        TypeLayoutEntry entry;
+        entry.typeId = 0;
+        entry.mayContainReferences = fieldCount > 0;
+        entry.referenceFields.resize(fieldCount);
+        for (std::size_t i = 0; i < fieldCount; ++i) entry.referenceFields[i] = i;
+        const auto id = static_cast<std::uint32_t>(typeLayouts.size());
+        typeLayouts.push_back(std::move(entry));
+        untypedDenseRecordLayouts.emplace(fieldCount, id);
+        return id;
+    }
+
+    std::uint32_t internSnapshotUntypedRecordLayout(const std::vector<std::size_t>& refFields) {
+        for (const auto existingId : untypedCustomRecordLayouts) {
+            if (typeLayouts[existingId].referenceFields == refFields) {
+                return existingId;
+            }
+        }
+        TypeLayoutEntry entry;
+        entry.typeId = 0;
+        entry.mayContainReferences = !refFields.empty();
+        entry.referenceFields = refFields;
+        const auto id = static_cast<std::uint32_t>(typeLayouts.size());
+        typeLayouts.push_back(std::move(entry));
+        untypedCustomRecordLayouts.push_back(id);
+        return id;
+    }
+
     HeapConfig config;
     std::uint64_t heapId = 0;
-    std::vector<Slot> slots;
+    std::vector<CompactSlot> slots;
     std::vector<std::uint32_t> freeSlots;
     std::vector<ObjectRef> markStack;
     std::vector<ObjectRef> youngWorkQueue;
     std::vector<std::uint32_t> nurserySlots;
     std::vector<ObjectRef> rememberedSet;
+
+    PagedValueSlabPool slabPool;
+    LargeValueBufferPool largeBuffers;
+    HeapStringPool stringPool;
+    RawColumnPool rawColumns;
+    CardTableArena cardArena;
+
+    std::vector<TypeLayoutEntry> typeLayouts;
+    std::unordered_map<semantic::SymbolId, std::uint32_t> sharedRecordLayoutByTypeId;
+    std::unordered_map<ArrayLayoutKey, std::uint32_t, ArrayLayoutKeyHash> arrayLayoutByKey;
+    std::unordered_map<std::size_t, std::uint32_t> untypedDenseRecordLayouts;
+    std::vector<std::uint32_t> untypedCustomRecordLayouts;
+    std::unordered_map<std::uint32_t, std::size_t> customSlotSizes;
+
     semantic::SymbolId lastRegisteredLayoutTypeId = 0;
+    std::uint32_t lastRegisteredLayoutId = 0;
+    bool hasLastArrayLayout = false;
+    ArrayLayoutKey lastArrayLayoutKey{};
+    std::uint32_t lastArrayLayoutId = 0;
+
     std::unordered_map<RootToken, Value> persistentRoots;
     std::unordered_map<semantic::SymbolId, Value> staticFields;
     std::unordered_map<std::string, NativeEcsColumnTable> nativeEcsTables;
     std::unordered_map<std::string, ObjectRef> internedStrings;
-    std::unordered_map<semantic::SymbolId, std::shared_ptr<const std::vector<std::size_t>>> sharedTypeReferenceFields;
     std::unordered_map<semantic::SymbolId, std::vector<std::uint8_t>> typeObservableBits;
+    std::unordered_map<std::uint32_t, UiObservableSlotMeta> uiObservableMeta;
     std::vector<ObjectRef> dirtyObjects;
     RootToken nextRootToken = 1;
     GcPhase phase = GcPhase::Idle;
@@ -483,22 +1010,30 @@ struct ManagedHeap::Impl {
         }
     }
 
-    [[nodiscard]] HeapObject* get(ObjectRef reference) noexcept {
-        if (!reference.valid() || reference.heapId != heapId ||
-            reference.slot >= slots.size()) return nullptr;
+    [[nodiscard]] CompactSlot* getSlot(ObjectRef reference) noexcept {
+        if (!reference.valid() || reference.heapId != static_cast<std::uint32_t>(heapId) ||
+            reference.slot >= slots.size()) {
+            return nullptr;
+        }
         auto& slot = slots[reference.slot];
-        if (!slot.object || slot.generation != reference.generation ||
-            slot.object->header.kind != reference.kind) return nullptr;
-        return slot.object.get();
+        if (!slot.occupied() || slot.generation != reference.generation ||
+            slot.kind() != reference.kind) {
+            return nullptr;
+        }
+        return &slot;
     }
 
-    [[nodiscard]] const HeapObject* get(ObjectRef reference) const noexcept {
-        if (!reference.valid() || reference.heapId != heapId ||
-            reference.slot >= slots.size()) return nullptr;
+    [[nodiscard]] const CompactSlot* getSlot(ObjectRef reference) const noexcept {
+        if (!reference.valid() || reference.heapId != static_cast<std::uint32_t>(heapId) ||
+            reference.slot >= slots.size()) {
+            return nullptr;
+        }
         const auto& slot = slots[reference.slot];
-        if (!slot.object || slot.generation != reference.generation ||
-            slot.object->header.kind != reference.kind) return nullptr;
-        return slot.object.get();
+        if (!slot.occupied() || slot.generation != reference.generation ||
+            slot.kind() != reference.kind) {
+            return nullptr;
+        }
+        return &slot;
     }
 
     [[nodiscard]] std::optional<std::uint32_t> acquireSlot(
@@ -539,26 +1074,11 @@ struct ManagedHeap::Impl {
     [[nodiscard]] ObjectRef finalizeSlotAllocation(
         std::uint32_t slotIndex,
         ObjectKind kind,
-        semantic::SymbolId typeId,
-        semantic::PrimitiveType elementType,
-        semantic::SymbolId elementTypeId,
-        std::shared_ptr<const std::vector<std::size_t>> referenceFields,
+        SlotStorage storageKind,
         std::size_t sizeBytes) {
         auto& slot = slots[slotIndex];
-        auto& object = slot.object.storage;
-        object.header.kind = kind;
-        object.header.typeId = typeId;
-        object.header.elementType = elementType;
-        object.header.elementTypeId = elementTypeId;
-        object.header.marked = phase != GcPhase::Idle;
-        object.header.inNursery = true;
-        object.header.inRememberedSet = false;
-        object.header.inDirtyQueue = false;
-        object.header.uiObserverCount = 0;
-        object.header.dirtyFieldMask = 0;
-        object.header.sizeBytes = sizeBytes;
-        object.referenceFields = std::move(referenceFields);
-        slot.object.occupied = true;
+        slot.setKindAndStorage(kind, storageKind);
+        slot.gcFlags = GcFlag::InNursery | (phase != GcPhase::Idle ? GcFlag::Marked : 0u);
         nurserySlots.push_back(slotIndex);
         const ObjectRef reference{slotIndex, slot.generation, kind, heapId};
 
@@ -566,9 +1086,7 @@ struct ManagedHeap::Impl {
         statistics.bytesAllocated += sizeBytes;
         ++statistics.liveObjects;
         statistics.liveBytes += sizeBytes;
-        statistics.peakLiveBytes = std::max(
-            statistics.peakLiveBytes,
-            statistics.liveBytes);
+        statistics.peakLiveBytes = std::max(statistics.peakLiveBytes, statistics.liveBytes);
         if (statistics.liveBytes >= nextCollectionThreshold) requested = true;
         if (phase != GcPhase::Idle) {
             markStack.push_back(reference);
@@ -583,12 +1101,20 @@ struct ManagedHeap::Impl {
         RuntimeError* error) {
         const auto slotIndex = acquireSlot(sizeBytes, error);
         if (!slotIndex) return std::nullopt;
-        auto& object = slots[*slotIndex].object.storage;
-        object.clearValues();
-        object.stringPayload = std::move(value);
-        return finalizeSlotAllocation(
-            *slotIndex, ObjectKind::String, 0,
-            semantic::PrimitiveType::Error, 0, nullptr, sizeBytes);
+        auto& slot = slots[*slotIndex];
+        if (value.size() <= CompactSlot::kMaxSsoBytes) {
+            slot.auxMeta = static_cast<std::uint16_t>(value.size());
+            if (!value.empty()) {
+                std::memcpy(slot.payload.ssoChars.data(), value.data(), value.size());
+            }
+            slot.payload.ssoChars[value.size()] = '\0';
+            return finalizeSlotAllocation(*slotIndex, ObjectKind::String, SlotStorage::SsoString, sizeBytes);
+        }
+        const auto len = static_cast<std::uint32_t>(value.size());
+        const std::uint32_t handle = stringPool.acquire(std::move(value));
+        slot.auxMeta = 0;
+        slot.payload.s = {0u, len, nullptr, handle, CompactSlot::kInvalidHandle};
+        return finalizeSlotAllocation(*slotIndex, ObjectKind::String, SlotStorage::HeapString, sizeBytes);
     }
 
     [[nodiscard]] std::optional<ObjectRef> allocateArraySlot(
@@ -600,81 +1126,126 @@ struct ManagedHeap::Impl {
         std::size_t sizeBytes,
         RuntimeError* error,
         bool* outReallocated = nullptr) {
+        const std::uint32_t layoutId = internArrayLayout(arrayTypeId, elementType, elementTypeId);
         const auto slotIndex = acquireSlot(sizeBytes, error, outReallocated);
         if (!slotIndex) return std::nullopt;
-        auto& object = slots[*slotIndex].object.storage;
-        if (!object.stringPayload.empty()) object.stringPayload.clear();
-        if (object.rawColumnView.has_value()) object.rawColumnView.reset();
         if (initialValue.isTraceable()) {
             pinValueInPools(initialValue);
         }
-        if (length <= HeapObject::InlineFieldCapacity) {
-            if (!object.values.empty()) object.values.clear();
-            object.usesInlineValues = true;
-            object.inlineValueCount = static_cast<std::uint8_t>(length);
+        auto& slot = slots[*slotIndex];
+        if (length <= CompactSlot::kInlineValueCapacity) {
+            std::uint16_t cls = 0;
+            std::uint32_t handle = CompactSlot::kInvalidHandle;
+            Value* ptr = slabPool.allocate(length, cls, handle);
             for (std::size_t i = 0; i < length; ++i) {
-                object.inlineValues[i] = initialValue;
+                ptr[i] = initialValue;
             }
-        } else {
-            object.inlineValueCount = 0;
-            object.usesInlineValues = false;
-            // Reuse existing vector capacity in-place without malloc/free!
-            object.values.assign(length, initialValue);
+            slot.auxMeta = cls;
+            slot.payload.s = {
+                layoutId,
+                static_cast<std::uint32_t>(length),
+                ptr,
+                handle,
+                CompactSlot::kInvalidHandle,
+            };
+            return finalizeSlotAllocation(*slotIndex, ObjectKind::Array, SlotStorage::SlabValues, sizeBytes);
         }
-        return finalizeSlotAllocation(
-            *slotIndex, ObjectKind::Array, arrayTypeId,
-            elementType, elementTypeId, nullptr, sizeBytes);
+        Value* ptr = nullptr;
+        const std::uint32_t handle = largeBuffers.acquireFill(length, initialValue, ptr);
+        slot.auxMeta = 0;
+        slot.payload.s = {
+            layoutId,
+            static_cast<std::uint32_t>(length),
+            ptr,
+            handle,
+            CompactSlot::kInvalidHandle,
+        };
+        return finalizeSlotAllocation(*slotIndex, ObjectKind::Array, SlotStorage::HeapValues, sizeBytes);
     }
 
-    [[nodiscard]] std::optional<ObjectRef> allocateValuesSlot(
-        ObjectKind kind,
-        semantic::SymbolId typeId,
-        semantic::PrimitiveType elementType,
-        semantic::SymbolId elementTypeId,
+    [[nodiscard]] std::optional<ObjectRef> allocateRecordValuesSlot(
+        std::uint32_t layoutId,
         std::vector<Value>&& vals,
-        std::shared_ptr<const std::vector<std::size_t>> referenceFields,
         std::size_t sizeBytes,
         RuntimeError* error) {
         const auto slotIndex = acquireSlot(sizeBytes, error);
         if (!slotIndex) return std::nullopt;
-        auto& object = slots[*slotIndex].object.storage;
-        object.stringPayload.clear();
-        for (const auto& v : vals) pinValueInPools(v);
-        if (kind == ObjectKind::Record &&
-            vals.size() <= HeapObject::InlineFieldCapacity) {
-            object.values.clear();
-            object.usesInlineValues = true;
-            object.inlineValueCount = static_cast<std::uint8_t>(vals.size());
-            for (std::size_t i = 0; i < vals.size(); ++i) {
-                object.inlineValues[i] = std::move(vals[i]);
+        for (const auto& v : vals) {
+            if (v.isTraceable()) pinValueInPools(v);
+        }
+        auto& slot = slots[*slotIndex];
+        const std::size_t count = vals.size();
+        if (count <= CompactSlot::kInlineValueCapacity) {
+            std::uint16_t cls = 0;
+            std::uint32_t handle = CompactSlot::kInvalidHandle;
+            Value* ptr = slabPool.allocate(count, cls, handle);
+            for (std::size_t i = 0; i < count; ++i) {
+                ptr[i] = std::move(vals[i]);
             }
-            for (std::size_t i = vals.size(); i < HeapObject::InlineFieldCapacity; ++i) {
-                object.inlineValues[i] = Value{};
-            }
-        } else {
-            if (object.usesInlineValues) {
-                for (std::uint8_t i = 0; i < object.inlineValueCount; ++i) {
-                    object.inlineValues[i] = Value{};
-                }
-                object.inlineValueCount = 0;
-                object.usesInlineValues = false;
-            }
-            if (object.values.capacity() >= vals.size()) {
-                object.values.assign(vals.begin(), vals.end());
-            } else {
-                object.values = std::move(vals);
+            slot.auxMeta = cls;
+            slot.payload.s = {
+                layoutId,
+                static_cast<std::uint32_t>(count),
+                ptr,
+                handle,
+                CompactSlot::kInvalidHandle,
+            };
+            return finalizeSlotAllocation(*slotIndex, ObjectKind::Record, SlotStorage::SlabValues, sizeBytes);
+        }
+        Value* ptr = nullptr;
+        const std::uint32_t handle = largeBuffers.acquireMove(std::move(vals), ptr);
+        slot.auxMeta = 0;
+        slot.payload.s = {
+            layoutId,
+            static_cast<std::uint32_t>(count),
+            ptr,
+            handle,
+            CompactSlot::kInvalidHandle,
+        };
+        return finalizeSlotAllocation(*slotIndex, ObjectKind::Record, SlotStorage::HeapValues, sizeBytes);
+    }
+
+    void promoteSlotToOldGen(CompactSlot& slot) {
+        slot.gcFlags &= static_cast<std::uint8_t>(~(GcFlag::InNursery | GcFlag::Marked));
+        ++statistics.objectsPromoted;
+        if (slot.kind() == ObjectKind::Array &&
+            slot.storage() == SlotStorage::HeapValues &&
+            slot.payload.s.length >= ManagedHeap::kCardTableMinLength &&
+            !slot.hasFlag(GcFlag::HasCardTable)) {
+            const auto& layout = typeLayouts[slot.payload.s.layoutId];
+            if (layout.mayContainReferences) {
+                slot.payload.s.cardHandle = cardArena.allocate(slot.payload.s.length);
+                slot.gcFlags |= GcFlag::HasCardTable;
             }
         }
-        return finalizeSlotAllocation(
-            *slotIndex, kind, typeId, elementType, elementTypeId,
-            (referenceFields && !referenceFields->empty()) ? std::move(referenceFields) : nullptr,
-            sizeBytes);
+    }
+
+    void sweepReclaimSlot(std::uint32_t slotIdx, CompactSlot& slot, bool isYoung) {
+        if (slot.kind() == ObjectKind::String && slot.hasFlag(GcFlag::IsInterned)) {
+            const std::string key(slotStringView(slot));
+            const auto it = internedStrings.find(key);
+            if (it != internedStrings.end() &&
+                it->second.slot == slotIdx &&
+                it->second.generation == slot.generation) {
+                internedStrings.erase(it);
+            }
+        }
+        const auto bytes = slotSizeBytes(slotIdx, slot);
+        releaseSlotPayload(slotIdx, slot);
+        ++slot.generation;
+        if (slot.generation == 0) slot.generation = 1;
+        freeSlots.push_back(slotIdx);
+        --statistics.liveObjects;
+        statistics.liveBytes -= bytes;
+        ++statistics.objectsReclaimed;
+        if (isYoung) ++statistics.youngObjectsReclaimed;
+        statistics.bytesReclaimed += bytes;
     }
 
     void mark(ObjectRef reference) {
-        auto* object = get(reference);
-        if (!object || object->header.marked) return;
-        object->header.marked = true;
+        auto* slot = getSlot(reference);
+        if (!slot || slot->hasFlag(GcFlag::Marked)) return;
+        slot->gcFlags |= GcFlag::Marked;
         markStack.push_back(reference);
     }
 
@@ -721,7 +1292,7 @@ struct ManagedHeap::Impl {
         const Value& value,
         std::unordered_set<const StructStorage*>& visitedStructs) const {
         if (const auto* reference = std::get_if<ObjectRef>(&value)) {
-            return get(*reference) != nullptr;
+            return getSlot(*reference) != nullptr;
         }
         if (const auto* structure = std::get_if<StructValue>(&value)) {
             if (!structure->valid()) return false;
@@ -736,7 +1307,7 @@ struct ManagedHeap::Impl {
 
     [[nodiscard]] bool validRootValue(const Value& value) const {
         if (const auto* reference = std::get_if<ObjectRef>(&value)) {
-            return get(*reference) != nullptr;
+            return getSlot(*reference) != nullptr;
         }
         if (const auto* structure = std::get_if<StructValue>(&value)) {
             if (!structure->valid()) return false;
@@ -764,7 +1335,9 @@ struct ManagedHeap::Impl {
 
     void startCollection(const ShadowStack& shadowStack) {
         for (auto& slot : slots) {
-            if (slot.object) slot.object->header.marked = false;
+            if (slot.occupied()) {
+                slot.gcFlags &= static_cast<std::uint8_t>(~GcFlag::Marked);
+            }
         }
         markStack.clear();
         sweepIndex = 0;
@@ -777,31 +1350,72 @@ struct ManagedHeap::Impl {
     }
 
     void scan(ObjectRef reference) {
-        const auto* object = get(reference);
-        if (!object || object->header.kind == ObjectKind::String) return;
-        const auto count = object->valueCount();
-        if (object->header.kind == ObjectKind::Array) {
-            if (!elementTypeMayContainReferences(object->header.elementType)) return;
-            for (std::size_t i = 0; i < count; ++i) markValue(object->valueAt(i));
+        const auto* slot = getSlot(reference);
+        if (!slot || slot->kind() == ObjectKind::String) return;
+        const auto count = slotValueCount(*slot);
+        if (count == 0) return;
+        const Value* data = slot->payload.s.data;
+        const auto& layout = typeLayouts[slot->payload.s.layoutId];
+        if (slot->kind() == ObjectKind::Array) {
+            if (!layout.mayContainReferences) return;
+            for (std::size_t i = 0; i < count; ++i) markValue(data[i]);
             return;
         }
-        if (object->referenceFields) {
-            for (const auto index : *object->referenceFields) {
-                if (index < count) markValue(object->valueAt(index));
-            }
+        for (const auto index : layout.referenceFields) {
+            if (index < count) markValue(data[index]);
         }
     }
 
-    void writeBarrier(ObjectRef owner, const Value& value) {
+    void writeBarrierObject(ObjectRef owner, const Value& value) noexcept {
         if (!valueMayContainReferences(value)) return;
-        if (auto* ownerObj = get(owner);
-            ownerObj && !ownerObj->header.inNursery && !ownerObj->header.inRememberedSet) {
-            ownerObj->header.inRememberedSet = true;
+        auto* slot = getSlot(owner);
+        if (!slot) return;
+        if (!slot->hasFlag(GcFlag::InNursery) && !slot->hasFlag(GcFlag::InRememberedSet)) {
+            slot->gcFlags |= GcFlag::InRememberedSet;
             rememberedSet.push_back(owner);
         }
-        if (phase == GcPhase::Idle) return;
-        const auto* object = get(owner);
-        if (!object || !object->header.marked) return;
+        if (phase == GcPhase::Idle || !slot->hasFlag(GcFlag::Marked)) return;
+        markValue(value);
+        if (!markStack.empty()) {
+            reopenMarkFromSweep();
+        }
+    }
+
+    void writeBarrierArrayElement(ObjectRef owner, std::size_t elementIndex, const Value& value) noexcept {
+        if (!valueMayContainReferences(value)) return;
+        auto* slot = getSlot(owner);
+        if (!slot) return;
+        if (!slot->hasFlag(GcFlag::InNursery)) {
+            if (slot->hasFlag(GcFlag::HasCardTable)) {
+                auto* cardBytes = cardArena.get(slot->payload.s.cardHandle).bytePtr();
+                cardBytes[elementIndex >> ManagedHeap::kCardElementShift] = 1u;
+            }
+            if (!slot->hasFlag(GcFlag::InRememberedSet)) {
+                slot->gcFlags |= GcFlag::InRememberedSet;
+                rememberedSet.push_back(owner);
+            }
+        }
+        if (phase == GcPhase::Idle || !slot->hasFlag(GcFlag::Marked)) return;
+        markValue(value);
+        if (!markStack.empty()) {
+            reopenMarkFromSweep();
+        }
+    }
+
+    void writeBarrierArrayConservative(ObjectRef owner, const Value& value) noexcept {
+        if (!valueMayContainReferences(value)) return;
+        auto* slot = getSlot(owner);
+        if (!slot) return;
+        if (!slot->hasFlag(GcFlag::InNursery)) {
+            if (slot->hasFlag(GcFlag::HasCardTable)) {
+                cardArena.get(slot->payload.s.cardHandle).markAllDirty();
+            }
+            if (!slot->hasFlag(GcFlag::InRememberedSet)) {
+                slot->gcFlags |= GcFlag::InRememberedSet;
+                rememberedSet.push_back(owner);
+            }
+        }
+        if (phase == GcPhase::Idle || !slot->hasFlag(GcFlag::Marked)) return;
         markValue(value);
         if (!markStack.empty()) {
             reopenMarkFromSweep();
@@ -816,16 +1430,18 @@ struct ManagedHeap::Impl {
         sweepIndex = 0;
         sweepLimit = 0;
         for (const auto slotIdx : nurserySlots) {
-            if (slotIdx < slots.size() && slots[slotIdx].object &&
-                slots[slotIdx].object->header.inNursery) {
-                slots[slotIdx].object->header.inNursery = false;
-                ++statistics.objectsPromoted;
+            if (slotIdx < slots.size() && slots[slotIdx].occupied() &&
+                slots[slotIdx].hasFlag(GcFlag::InNursery)) {
+                promoteSlotToOldGen(slots[slotIdx]);
             }
         }
         nurserySlots.clear();
         for (const auto& ref : rememberedSet) {
-            if (auto* obj = get(ref)) {
-                obj->header.inRememberedSet = false;
+            if (auto* slot = getSlot(ref)) {
+                slot->gcFlags &= static_cast<std::uint8_t>(~GcFlag::InRememberedSet);
+                if (slot->hasFlag(GcFlag::HasCardTable)) {
+                    cardArena.get(slot->payload.s.cardHandle).clearAll();
+                }
             }
         }
         rememberedSet.clear();
@@ -861,7 +1477,7 @@ std::optional<ObjectRef> ManagedHeap::internString(
     const std::string key(value);
     const auto found = impl_->internedStrings.find(key);
     if (found != impl_->internedStrings.end()) {
-        if (impl_->get(found->second) != nullptr) {
+        if (impl_->getSlot(found->second) != nullptr) {
             if (impl_->phase != GcPhase::Idle) {
                 impl_->mark(found->second);
                 impl_->reopenMarkFromSweep();
@@ -872,6 +1488,7 @@ std::optional<ObjectRef> ManagedHeap::internString(
     }
     auto allocated = allocateString(key, error);
     if (allocated) {
+        impl_->slots[allocated->slot].gcFlags |= GcFlag::IsInterned;
         impl_->internedStrings[key] = *allocated;
     }
     return allocated;
@@ -881,13 +1498,13 @@ std::size_t ManagedHeap::internedStringCount() const noexcept {
     std::size_t aliveCount = 0;
     for (const auto& [k, ref] : impl_->internedStrings) {
         (void)k;
-        if (impl_->get(ref) != nullptr) ++aliveCount;
+        if (impl_->getSlot(ref) != nullptr) ++aliveCount;
     }
     return aliveCount;
 }
 
 std::size_t ManagedHeap::sharedTypeLayoutCount() const noexcept {
-    return impl_->sharedTypeReferenceFields.size();
+    return impl_->sharedRecordLayoutByTypeId.size();
 }
 
 std::optional<ObjectRef> ManagedHeap::allocateArray(
@@ -969,17 +1586,10 @@ std::optional<ObjectRef> ManagedHeap::allocateRecord(
         return std::nullopt;
     }
     std::vector<Value> fields(fieldCount);
-    std::vector<std::size_t> referenceFields(fieldCount);
-    for (std::size_t index = 0; index < fieldCount; ++index) {
-        referenceFields[index] = index;
-    }
-    return impl_->allocateValuesSlot(
-        ObjectKind::Record,
-        0,
-        semantic::PrimitiveType::Error,
-        0,
+    const std::uint32_t layoutId = impl_->internUntypedAllRefRecordLayout(fieldCount);
+    return impl_->allocateRecordValuesSlot(
+        layoutId,
         std::move(fields),
-        std::make_shared<const std::vector<std::size_t>>(std::move(referenceFields)),
         Impl::BaseObjectSizeBytes + storage,
         error);
 }
@@ -1010,23 +1620,10 @@ std::optional<ObjectRef> ManagedHeap::allocateObject(
     referenceFields.erase(
         std::unique(referenceFields.begin(), referenceFields.end()),
         referenceFields.end());
-    std::shared_ptr<const std::vector<std::size_t>> sharedRefs;
-    const auto foundLayout = impl_->sharedTypeReferenceFields.find(typeId);
-    if (foundLayout != impl_->sharedTypeReferenceFields.end() &&
-        foundLayout->second && *foundLayout->second == referenceFields) {
-        sharedRefs = foundLayout->second;
-    } else {
-        sharedRefs = std::make_shared<const std::vector<std::size_t>>(std::move(referenceFields));
-        impl_->sharedTypeReferenceFields[typeId] = sharedRefs;
-    }
-    impl_->lastRegisteredLayoutTypeId = typeId;
-    return impl_->allocateValuesSlot(
-        ObjectKind::Record,
-        typeId,
-        semantic::PrimitiveType::Error,
-        0,
+    const std::uint32_t layoutId = impl_->internTypedRecordLayout(typeId, referenceFields);
+    return impl_->allocateRecordValuesSlot(
+        layoutId,
         std::move(fields),
-        std::move(sharedRefs),
         Impl::BaseObjectSizeBytes + storage,
         error);
 }
@@ -1048,53 +1645,54 @@ std::optional<ObjectRef> ManagedHeap::allocateObjectFromTemplate(
         setHeapError(error, ErrorCode::OutOfMemory, "managed object is too large");
         return std::nullopt;
     }
-    if (typeId != impl_->lastRegisteredLayoutTypeId) {
-        auto& entry = impl_->sharedTypeReferenceFields[typeId];
-        if (!entry) {
-            static const auto emptyRefs = std::make_shared<const std::vector<std::size_t>>();
-            entry = referenceFields ? referenceFields : emptyRefs;
-        }
-        impl_->lastRegisteredLayoutTypeId = typeId;
-    }
+    const std::uint32_t layoutId = impl_->internTemplateRecordLayout(typeId, referenceFields);
     const std::size_t sizeBytes = Impl::BaseObjectSizeBytes + storage;
     const auto slotIndex = impl_->acquireSlot(sizeBytes, error, outSlotsReallocated);
     if (!slotIndex) return std::nullopt;
-    auto& object = impl_->slots[*slotIndex].object.storage;
-    if (!object.stringPayload.empty()) object.stringPayload.clear();
-    if (fieldCount <= Impl::HeapObject::InlineFieldCapacity) {
-        if (!object.values.empty()) object.values.clear();
-        object.usesInlineValues = true;
-        object.inlineValueCount = static_cast<std::uint8_t>(fieldCount);
+    for (std::size_t i = 0; i < fieldCount; ++i) {
+        if (defaultFields[i].isTraceable()) pinValueInPools(defaultFields[i]);
+    }
+    auto& slot = impl_->slots[*slotIndex];
+    if (fieldCount <= CompactSlot::kInlineValueCapacity) {
+        std::uint16_t cls = 0;
+        std::uint32_t handle = CompactSlot::kInvalidHandle;
+        Value* ptr = impl_->slabPool.allocate(fieldCount, cls, handle);
         if (fieldCount != 0) {
-            std::memcpy(object.inlineValues.data(), defaultFields, fieldCount * sizeof(Value));
+            std::memcpy(ptr, defaultFields, fieldCount * sizeof(Value));
         }
-    } else {
-        object.inlineValueCount = 0;
-        object.usesInlineValues = false;
-        object.values.assign(defaultFields, defaultFields + fieldCount);
+        slot.auxMeta = cls;
+        slot.payload.s = {
+            layoutId,
+            static_cast<std::uint32_t>(fieldCount),
+            ptr,
+            handle,
+            CompactSlot::kInvalidHandle,
+        };
+        return impl_->finalizeSlotAllocation(
+            *slotIndex, ObjectKind::Record, SlotStorage::SlabValues, sizeBytes);
     }
-    std::shared_ptr<const std::vector<std::size_t>> activeRefs;
-    if (referenceFields && !referenceFields->empty()) {
-        activeRefs = referenceFields;
-    }
+    Value* ptr = nullptr;
+    const std::uint32_t handle = impl_->largeBuffers.acquireCopy(defaultFields, fieldCount, ptr);
+    slot.auxMeta = 0;
+    slot.payload.s = {
+        layoutId,
+        static_cast<std::uint32_t>(fieldCount),
+        ptr,
+        handle,
+        CompactSlot::kInvalidHandle,
+    };
     return impl_->finalizeSlotAllocation(
-        *slotIndex,
-        ObjectKind::Record,
-        typeId,
-        semantic::PrimitiveType::Error,
-        0,
-        std::move(activeRefs),
-        sizeBytes);
+        *slotIndex, ObjectKind::Record, SlotStorage::HeapValues, sizeBytes);
 }
 
 bool ManagedHeap::isAlive(ObjectRef reference) const noexcept {
-    return impl_->get(reference) != nullptr;
+    return impl_->getSlot(reference) != nullptr;
 }
 
 std::optional<std::string_view> ManagedHeap::stringView(ObjectRef reference) const {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::String) return std::nullopt;
-    return std::string_view(object->stringPayload);
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::String) return std::nullopt;
+    return impl_->slotStringView(*slot);
 }
 
 namespace {
@@ -1317,40 +1915,37 @@ bool writeNativeFieldToBytes(
 } // namespace
 
 std::optional<std::size_t> ManagedHeap::arrayLength(ObjectRef reference) const {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array) return std::nullopt;
-    if (object->rawColumnView.has_value()) {
-        return object->rawColumnView->count;
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) return std::nullopt;
+    if (slot->storage() == SlotStorage::RawColumn) {
+        return impl_->rawColumns.get(slot->payload.s.handle).count;
     }
-    return object->valueCount();
+    return static_cast<std::size_t>(slot->payload.s.length);
 }
 
-std::optional<semantic::SymbolId> ManagedHeap::arrayTypeId(
-    ObjectRef reference) const {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array) return std::nullopt;
-    return object->header.typeId;
+std::optional<semantic::SymbolId> ManagedHeap::arrayTypeId(ObjectRef reference) const {
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) return std::nullopt;
+    return impl_->typeLayouts[slot->payload.s.layoutId].typeId;
 }
 
-std::optional<semantic::PrimitiveType> ManagedHeap::arrayElementType(
-    ObjectRef reference) const {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array) return std::nullopt;
-    return object->header.elementType;
+std::optional<semantic::PrimitiveType> ManagedHeap::arrayElementType(ObjectRef reference) const {
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) return std::nullopt;
+    return impl_->typeLayouts[slot->payload.s.layoutId].elementType;
 }
 
-std::optional<semantic::SymbolId> ManagedHeap::arrayElementTypeId(
-    ObjectRef reference) const {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array) return std::nullopt;
-    return object->header.elementTypeId;
+std::optional<semantic::SymbolId> ManagedHeap::arrayElementTypeId(ObjectRef reference) const {
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) return std::nullopt;
+    return impl_->typeLayouts[slot->payload.s.layoutId].elementTypeId;
 }
 
 std::optional<Value> ManagedHeap::arrayGet(ObjectRef reference, std::size_t index) const {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array) return std::nullopt;
-    if (object->rawColumnView.has_value()) {
-        const auto& view = *object->rawColumnView;
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) return std::nullopt;
+    if (slot->storage() == SlotStorage::RawColumn) {
+        const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
         if (index >= view.count || (!view.basePtr && view.count > 0)) return std::nullopt;
         const auto* elemBase = static_cast<const std::uint8_t*>(view.basePtr) + index * view.strideBytes;
         const auto fieldCount = view.fields.size();
@@ -1367,61 +1962,75 @@ std::optional<Value> ManagedHeap::arrayGet(ObjectRef reference, std::size_t inde
         }
         return Value{makeStructValueFromFields(view.structTypeId, std::move(heapFields))};
     }
-    const auto count = object->valueCount();
-    if (index >= count) return std::nullopt;
-    return object->dataPtr()[index];
+    if (index >= slot->payload.s.length) return std::nullopt;
+    return slot->payload.s.data[index];
 }
 
 const Value* ManagedHeap::arrayGetFast(ObjectRef reference, std::size_t index) const noexcept {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array ||
-        object->rawColumnView.has_value() || index >= object->valueCount()) {
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array ||
+        slot->storage() == SlotStorage::RawColumn || index >= slot->payload.s.length) {
         return nullptr;
     }
-    return &object->dataPtr()[index];
+    return &slot->payload.s.data[index];
 }
 
 bool ManagedHeap::tryBindArrayFastView(ObjectRef reference, ArrayFastView& outView) const noexcept {
-    auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array ||
-        object->rawColumnView.has_value()) {
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array ||
+        slot->storage() == SlotStorage::RawColumn) {
         return false;
     }
-    const auto count = object->valueCount();
-    if (count > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+    const std::uint32_t count = slot->payload.s.length;
+    if (count > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         return false;
     }
-    outView.data = object->dataPtr();
-    outView.length = static_cast<std::uint32_t>(count);
-    outView.elementType = object->header.elementType;
-    outView.needsRememberedBarrier = (!object->header.inNursery && !object->header.inRememberedSet);
-    outView.elementTypeId = object->header.elementTypeId;
+    const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+    const bool inNursery = slot->hasFlag(GcFlag::InNursery);
+    outView.data = slot->payload.s.data;
+    outView.dirtyCards = (!inNursery && slot->hasFlag(GcFlag::HasCardTable))
+        ? impl_->cardArena.get(slot->payload.s.cardHandle).bytePtr()
+        : nullptr;
+    outView.length = count;
+    outView.elementType = layout.elementType;
+    outView.needsRememberedBarrier = (!inNursery && !slot->hasFlag(GcFlag::InRememberedSet));
+    outView.elementTypeId = layout.elementTypeId;
     return true;
 }
 
+void ManagedHeap::recordArrayWriteBarrier(
+    ObjectRef arrayRef,
+    std::size_t index,
+    const Value& value) noexcept {
+    impl_->writeBarrierArrayElement(arrayRef, index, value);
+}
+
 void ManagedHeap::recordArrayWriteBarrier(ObjectRef arrayRef, const Value& value) noexcept {
-    impl_->writeBarrier(arrayRef, value);
+    impl_->writeBarrierArrayConservative(arrayRef, value);
 }
 
 bool ManagedHeap::tryBindObjectFastView(ObjectRef reference, ObjectFastView& outView) const noexcept {
-    auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Record ||
-        object->header.typeId == 0 || object->header.uiObserverCount > 0) {
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Record ||
+        slot->hasFlag(GcFlag::HasUiObserver)) {
         return false;
     }
+    const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+    if (layout.typeId == 0) return false;
     if (!impl_->typeObservableBits.empty() &&
-        impl_->typeObservableBits.find(object->header.typeId) != impl_->typeObservableBits.end()) {
+        impl_->typeObservableBits.find(layout.typeId) != impl_->typeObservableBits.end()) {
         return false;
     }
-    outView.fields = object->dataPtr();
-    outView.fieldCount = static_cast<std::uint32_t>(object->valueCount());
-    outView.typeId = object->header.typeId;
-    outView.needsRememberedBarrier = (!object->header.inNursery && !object->header.inRememberedSet);
+    outView.fields = slot->payload.s.data;
+    outView.fieldCount = slot->payload.s.length;
+    outView.typeId = layout.typeId;
+    outView.needsRememberedBarrier =
+        (!slot->hasFlag(GcFlag::InNursery) && !slot->hasFlag(GcFlag::InRememberedSet));
     return true;
 }
 
 void ManagedHeap::recordObjectWriteBarrier(ObjectRef objectRef, const Value& value) noexcept {
-    impl_->writeBarrier(objectRef, value);
+    impl_->writeBarrierObject(objectRef, value);
 }
 
 const void* ManagedHeap::slotStorageToken() const noexcept {
@@ -1429,11 +2038,11 @@ const void* ManagedHeap::slotStorageToken() const noexcept {
 }
 
 semantic::SymbolId ManagedHeap::objectTypeIdFast(ObjectRef reference) const noexcept {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Record) {
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Record) {
         return 0;
     }
-    return object->header.typeId;
+    return impl_->typeLayouts[slot->payload.s.layoutId].typeId;
 }
 
 bool ManagedHeap::arraySetPrevalidated(
@@ -1441,12 +2050,12 @@ bool ManagedHeap::arraySetPrevalidated(
     std::size_t index,
     const Value& value,
     bool mayBeReference) noexcept {
-    auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array) {
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) {
         return false;
     }
-    if (object->rawColumnView.has_value()) {
-        const auto& view = *object->rawColumnView;
+    if (slot->storage() == SlotStorage::RawColumn) {
+        const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
         if (view.readOnly || index >= view.count || !view.basePtr) return false;
         const auto* s = std::get_if<StructValue>(&value);
         if (!s || !s->valid() || s->typeId != view.structTypeId ||
@@ -1462,16 +2071,16 @@ bool ManagedHeap::arraySetPrevalidated(
         }
         return true;
     }
-    if (index >= object->valueCount()) {
+    if (index >= slot->payload.s.length) {
         return false;
     }
     if (mayBeReference) {
-        impl_->writeBarrier(reference, value);
+        impl_->writeBarrierArrayElement(reference, index, value);
     }
     if (value.isTraceable()) {
         pinValueInPools(value);
     }
-    object->dataPtr()[index] = value;
+    slot->payload.s.data[index] = value;
     return true;
 }
 
@@ -1481,14 +2090,14 @@ bool ManagedHeap::arraySet(
     Value value,
     RuntimeError* error,
     ArrayStoreTypePolicy typePolicy) {
-    auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array) {
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference,
             "managed array reference is invalid");
         return false;
     }
-    if (object->rawColumnView.has_value()) {
-        const auto& view = *object->rawColumnView;
+    if (slot->storage() == SlotStorage::RawColumn) {
+        const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
         if (index >= view.count) {
             setHeapError(error, ErrorCode::IndexOutOfRange,
                 "managed array index is out of range");
@@ -1517,14 +2126,16 @@ bool ManagedHeap::arraySet(
         }
         return true;
     }
-    const auto valueLen = object->valueCount();
-    Value* values = object->dataPtr();
+    const auto valueLen = static_cast<std::size_t>(slot->payload.s.length);
+    Value* values = slot->payload.s.data;
     if (index >= valueLen) {
         setHeapError(error, ErrorCode::IndexOutOfRange,
             "managed array index is out of range");
         return false;
     }
-    const auto expected = object->header.elementType;
+    const auto layoutId = slot->payload.s.layoutId;
+    const auto expected = impl_->typeLayouts[layoutId].elementType;
+    const auto expectedTypeId = impl_->typeLayouts[layoutId].elementTypeId;
     if (expected != semantic::PrimitiveType::Error && valueType(value) != expected) {
         setHeapError(error, ErrorCode::TypeMismatch,
             "managed array element type mismatch");
@@ -1536,7 +2147,7 @@ bool ManagedHeap::arraySet(
         const auto actual = child ? objectTypeId(*child) : std::nullopt;
         if (!actual ||
             (typePolicy == ArrayStoreTypePolicy::Exact &&
-             *actual != object->header.elementTypeId)) {
+             *actual != expectedTypeId)) {
             setHeapError(error, ErrorCode::TypeMismatch,
                 "managed array object element type mismatch");
             return false;
@@ -1545,7 +2156,7 @@ bool ManagedHeap::arraySet(
                !std::holds_alternative<NullArray>(value)) {
         const auto* child = std::get_if<ObjectRef>(&value);
         const auto actual = child ? arrayTypeId(*child) : std::nullopt;
-        if (!actual || *actual != object->header.elementTypeId) {
+        if (!actual || *actual != expectedTypeId) {
             setHeapError(error, ErrorCode::TypeMismatch,
                 "managed array nested array type mismatch");
             return false;
@@ -1553,7 +2164,7 @@ bool ManagedHeap::arraySet(
     } else if (expected == semantic::PrimitiveType::Struct) {
         const auto actualTypeId = structValueTypeId(value);
         const auto* structure = std::get_if<StructValue>(&value);
-        if (!actualTypeId || *actualTypeId != object->header.elementTypeId ||
+        if (!actualTypeId || *actualTypeId != expectedTypeId ||
             (structure && !structure->valid())) {
             setHeapError(error, ErrorCode::TypeMismatch,
                 "managed array struct element type mismatch");
@@ -1562,7 +2173,7 @@ bool ManagedHeap::arraySet(
     } else if (expected == semantic::PrimitiveType::Enum) {
         EnumValue enumeration{};
         if (!value.tryGetEnum(enumeration) ||
-            enumeration.typeId != object->header.elementTypeId) {
+            enumeration.typeId != expectedTypeId) {
             setHeapError(error, ErrorCode::TypeMismatch,
                 "managed array enum element type mismatch");
             return false;
@@ -1570,8 +2181,8 @@ bool ManagedHeap::arraySet(
     } else if (expected == semantic::PrimitiveType::Handle) {
         NativeHandle handle{};
         if (!value.tryGetNativeHandle(handle) ||
-            (object->header.elementTypeId != 0 &&
-             handle.typeId != object->header.elementTypeId)) {
+            (expectedTypeId != 0 &&
+             handle.typeId != expectedTypeId)) {
             setHeapError(error, ErrorCode::TypeMismatch,
                 "managed array native handle type mismatch");
             return false;
@@ -1580,52 +2191,53 @@ bool ManagedHeap::arraySet(
     if (value.isTraceable()) {
         pinValueInPools(value);
     }
-    impl_->writeBarrier(reference, value);
+    impl_->writeBarrierArrayElement(reference, index, value);
     values[index] = std::move(value);
     return true;
 }
 
-std::optional<semantic::SymbolId> ManagedHeap::objectTypeId(
-    ObjectRef reference) const {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Record ||
-        object->header.typeId == 0) {
-        return std::nullopt;
-    }
-    return object->header.typeId;
+std::optional<semantic::SymbolId> ManagedHeap::objectTypeId(ObjectRef reference) const {
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Record) return std::nullopt;
+    const auto tid = impl_->typeLayouts[slot->payload.s.layoutId].typeId;
+    if (tid == 0) return std::nullopt;
+    return tid;
 }
 
 std::optional<std::size_t> ManagedHeap::fieldCount(ObjectRef reference) const {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Record) return std::nullopt;
-    return object->valueCount();
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Record) return std::nullopt;
+    return static_cast<std::size_t>(slot->payload.s.length);
 }
 
 bool ManagedHeap::isInlineRecordObject(ObjectRef reference) const noexcept {
-    const auto* object = impl_->get(reference);
-    return object && object->header.kind == ObjectKind::Record &&
-        object->usesInlineValues;
+    const auto* slot = impl_->getSlot(reference);
+    return slot && slot->kind() == ObjectKind::Record &&
+        slot->storage() == SlotStorage::SlabValues;
 }
 
 std::optional<Value> ManagedHeap::fieldGet(ObjectRef reference, std::size_t index) const {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Record) return std::nullopt;
-    if (index >= object->valueCount()) return std::nullopt;
-    return object->valueAt(index);
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Record) return std::nullopt;
+    if (index >= slot->payload.s.length) return std::nullopt;
+    return slot->payload.s.data[index];
 }
 
 const Value* ManagedHeap::fieldGetFast(
     ObjectRef reference,
     std::size_t index,
     semantic::SymbolId* outTypeId) const noexcept {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Record ||
-        (outTypeId && object->header.typeId == 0) ||
-        index >= object->valueCount()) {
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Record ||
+        index >= slot->payload.s.length) {
         return nullptr;
     }
-    if (outTypeId) *outTypeId = object->header.typeId;
-    return &object->valueAt(index);
+    const auto tid = impl_->typeLayouts[slot->payload.s.layoutId].typeId;
+    if (outTypeId) {
+        if (tid == 0) return nullptr;
+        *outTypeId = tid;
+    }
+    return &slot->payload.s.data[index];
 }
 
 bool ManagedHeap::fieldSetFast(
@@ -1640,28 +2252,27 @@ bool ManagedHeap::fieldSet(
     std::size_t index,
     Value value,
     RuntimeError* error) {
-    auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Record) {
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Record) {
         setHeapError(error, ErrorCode::InvalidObjectReference,
             "managed record reference is invalid");
         return false;
     }
-    if (index >= object->valueCount()) {
+    if (index >= slot->payload.s.length) {
         setHeapError(error, ErrorCode::InvalidArguments,
             "managed field index is out of range");
         return false;
     }
-    auto& slotVal = object->valueAt(index);
+    auto& slotVal = slot->payload.s.data[index];
     if (slotVal == value) {
         return true;
     }
+    const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+    const auto& refFields = layout.referenceFields;
     if (Impl::valueMayContainReferences(value) &&
-        object->referenceFields &&
-        std::binary_search(
-            object->referenceFields->begin(),
-            object->referenceFields->end(),
-            index)) {
-        impl_->writeBarrier(reference, value);
+        !refFields.empty() &&
+        std::binary_search(refFields.begin(), refFields.end(), index)) {
+        impl_->writeBarrierObject(reference, value);
     }
     if (value.isTraceable()) {
         pinValueInPools(value);
@@ -1669,22 +2280,23 @@ bool ManagedHeap::fieldSet(
     slotVal = std::move(value);
 
     std::uint8_t observableBit = 0xFFu;
-    if (object->header.typeId != 0) {
-        const auto foundBits = impl_->typeObservableBits.find(object->header.typeId);
+    const bool hasObserver = slot->hasFlag(GcFlag::HasUiObserver);
+    if (layout.typeId != 0) {
+        const auto foundBits = impl_->typeObservableBits.find(layout.typeId);
         if (foundBits != impl_->typeObservableBits.end() &&
             index < foundBits->second.size()) {
             observableBit = foundBits->second[index];
-        } else if (object->header.uiObserverCount > 0) {
+        } else if (hasObserver) {
             observableBit = static_cast<std::uint8_t>(index < 63u ? index : 63u);
         }
-    } else if (object->header.uiObserverCount > 0) {
+    } else if (hasObserver) {
         observableBit = static_cast<std::uint8_t>(index < 63u ? index : 63u);
     }
     if (observableBit != 0xFFu) {
         const std::uint8_t safeBit = observableBit < 63u ? observableBit : 63u;
-        object->header.dirtyFieldMask |= (1ULL << safeBit);
-        if (!object->header.inDirtyQueue) {
-            object->header.inDirtyQueue = true;
+        impl_->uiObservableMeta[reference.slot].dirtyFieldMask |= (1ULL << safeBit);
+        if (!slot->hasFlag(GcFlag::InDirtyQueue)) {
+            slot->gcFlags |= GcFlag::InDirtyQueue;
             impl_->dirtyObjects.push_back(reference);
         }
     }
@@ -1697,34 +2309,32 @@ bool ManagedHeap::fieldSetFast(
     const Value& value,
     semantic::SymbolId expectedTypeId,
     semantic::PrimitiveType expectedFieldType) noexcept {
-    auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Record ||
-        object->header.typeId != expectedTypeId ||
-        object->header.uiObserverCount > 0 ||
-        index >= object->valueCount() ||
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Record ||
+        slot->hasFlag(GcFlag::HasUiObserver) ||
+        index >= slot->payload.s.length ||
         valueType(value) != expectedFieldType) {
         return false;
     }
+    const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+    if (layout.typeId != expectedTypeId) return false;
     if (!impl_->typeObservableBits.empty() &&
         impl_->typeObservableBits.find(expectedTypeId) != impl_->typeObservableBits.end()) {
         return false;
     }
     if (const auto* childRef = std::get_if<ObjectRef>(&value);
-        childRef && !impl_->get(*childRef)) {
+        childRef && !impl_->getSlot(*childRef)) {
         return false;
     }
     if (Impl::valueMayContainReferences(value) &&
-        object->referenceFields &&
-        std::binary_search(
-            object->referenceFields->begin(),
-            object->referenceFields->end(),
-            index)) {
-        impl_->writeBarrier(reference, value);
+        !layout.referenceFields.empty() &&
+        std::binary_search(layout.referenceFields.begin(), layout.referenceFields.end(), index)) {
+        impl_->writeBarrierObject(reference, value);
     }
     if (value.isTraceable()) {
         pinValueInPools(value);
     }
-    object->valueAt(index) = value;
+    slot->payload.s.data[index] = value;
     return true;
 }
 
@@ -1762,46 +2372,67 @@ void ManagedHeap::registerProgramObservableTypes(const ProgramImage& program) {
 }
 
 std::uint64_t ManagedHeap::dirtyFieldMask(ObjectRef reference) const noexcept {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Record) return 0;
-    return object->header.dirtyFieldMask;
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Record) return 0;
+    const auto it = impl_->uiObservableMeta.find(reference.slot);
+    return it != impl_->uiObservableMeta.end() ? it->second.dirtyFieldMask : 0;
 }
 
 void ManagedHeap::clearDirtyFieldMask(ObjectRef reference) noexcept {
-    if (auto* object = impl_->get(reference)) {
-        object->header.dirtyFieldMask = 0;
-        object->header.inDirtyQueue = false;
-    }
-}
-
-void ManagedHeap::addUiObserver(ObjectRef reference) noexcept {
-    if (auto* object = impl_->get(reference)) {
-        if (object->header.uiObserverCount < 0xFFFFu) {
-            ++object->header.uiObserverCount;
+    if (auto* slot = impl_->getSlot(reference)) {
+        slot->gcFlags &= static_cast<std::uint8_t>(~GcFlag::InDirtyQueue);
+        const auto it = impl_->uiObservableMeta.find(reference.slot);
+        if (it != impl_->uiObservableMeta.end()) {
+            it->second.dirtyFieldMask = 0;
+            if (it->second.uiObserverCount == 0) {
+                impl_->uiObservableMeta.erase(it);
+            }
         }
     }
 }
 
+void ManagedHeap::addUiObserver(ObjectRef reference) noexcept {
+    if (auto* slot = impl_->getSlot(reference)) {
+        auto& meta = impl_->uiObservableMeta[reference.slot];
+        if (meta.uiObserverCount < 0xFFFFu) {
+            ++meta.uiObserverCount;
+        }
+        slot->gcFlags |= GcFlag::HasUiObserver;
+    }
+}
+
 void ManagedHeap::removeUiObserver(ObjectRef reference) noexcept {
-    if (auto* object = impl_->get(reference)) {
-        if (object->header.uiObserverCount > 0) {
-            --object->header.uiObserverCount;
+    if (auto* slot = impl_->getSlot(reference)) {
+        const auto it = impl_->uiObservableMeta.find(reference.slot);
+        if (it != impl_->uiObservableMeta.end()) {
+            if (it->second.uiObserverCount > 0) {
+                --it->second.uiObserverCount;
+            }
+            if (it->second.uiObserverCount == 0) {
+                slot->gcFlags &= static_cast<std::uint8_t>(~GcFlag::HasUiObserver);
+                if (it->second.dirtyFieldMask == 0 && !slot->hasFlag(GcFlag::InDirtyQueue)) {
+                    impl_->uiObservableMeta.erase(it);
+                }
+            }
         }
     }
 }
 
 std::uint16_t ManagedHeap::uiObserverCount(ObjectRef reference) const noexcept {
-    const auto* object = impl_->get(reference);
-    return object ? object->header.uiObserverCount : 0;
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot) return 0;
+    const auto it = impl_->uiObservableMeta.find(reference.slot);
+    return it != impl_->uiObservableMeta.end() ? it->second.uiObserverCount : 0;
 }
 
 std::vector<ObjectRef> ManagedHeap::consumeDirtyObjects() {
     std::vector<ObjectRef> result;
     result.reserve(impl_->dirtyObjects.size());
     for (const auto& ref : impl_->dirtyObjects) {
-        if (auto* obj = impl_->get(ref)) {
-            obj->header.inDirtyQueue = false;
-            if (obj->header.dirtyFieldMask != 0) {
+        if (auto* slot = impl_->getSlot(ref)) {
+            slot->gcFlags &= static_cast<std::uint8_t>(~GcFlag::InDirtyQueue);
+            const auto it = impl_->uiObservableMeta.find(ref.slot);
+            if (it != impl_->uiObservableMeta.end() && it->second.dirtyFieldMask != 0) {
                 result.push_back(ref);
             }
         }
@@ -1834,13 +2465,11 @@ std::optional<ObjectRef> ManagedHeap::allocateWeakDelegate(
         Value{NullObject{}},
     };
     const auto storage = estimateValueStorage(fields.size());
-    return impl_->allocateValuesSlot(
-        ObjectKind::Record,
-        delegateTypeId,
-        semantic::PrimitiveType::Error,
-        0,
+    const std::uint32_t layoutId = impl_->internTypedRecordLayout(
+        delegateTypeId, std::vector<std::size_t>{7u});
+    return impl_->allocateRecordValuesSlot(
+        layoutId,
         std::move(fields),
-        std::make_shared<const std::vector<std::size_t>>(std::vector<std::size_t>{7u}),
         Impl::BaseObjectSizeBytes + storage,
         error);
 }
@@ -2108,39 +2737,41 @@ std::optional<ObjectRef> ManagedHeap::allocateRawColumnArray(
             "raw ECS column view metadata is invalid");
         return std::nullopt;
     }
+    const std::uint32_t layoutId = impl_->internArrayLayout(
+        arrayTypeId, semantic::PrimitiveType::Struct, elementTypeId);
     const auto slotIndex = impl_->acquireSlot(Impl::BaseObjectSizeBytes, error);
     if (!slotIndex) return std::nullopt;
-    auto& object = impl_->slots[*slotIndex].object.storage;
-    object.clearValues();
-    object.stringPayload.clear();
-    object.rawColumnView = std::move(view);
+    auto& slot = impl_->slots[*slotIndex];
+    const std::uint32_t rawHandle = impl_->rawColumns.acquire(std::move(view));
+    slot.auxMeta = 0;
+    slot.payload.s = {layoutId, 0u, nullptr, rawHandle, CompactSlot::kInvalidHandle};
     return impl_->finalizeSlotAllocation(
         *slotIndex,
         ObjectKind::Array,
-        arrayTypeId,
-        semantic::PrimitiveType::Struct,
-        elementTypeId,
-        nullptr,
+        SlotStorage::RawColumn,
         Impl::BaseObjectSizeBytes);
 }
 
 bool ManagedHeap::updateRawColumnArray(
     ObjectRef reference,
     NativeRawColumnView view) noexcept {
-    auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array ||
-        !object->rawColumnView.has_value() ||
-        !validateRawColumnView(view, object->header.elementTypeId)) {
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array ||
+        slot->storage() != SlotStorage::RawColumn) {
         return false;
     }
-    object->rawColumnView = std::move(view);
+    const auto elementTypeId = impl_->typeLayouts[slot->payload.s.layoutId].elementTypeId;
+    if (!validateRawColumnView(view, elementTypeId)) {
+        return false;
+    }
+    impl_->rawColumns.get(slot->payload.s.handle) = std::move(view);
     return true;
 }
 
 bool ManagedHeap::isRawColumnArray(ObjectRef reference) const noexcept {
-    const auto* object = impl_->get(reference);
-    return object && object->header.kind == ObjectKind::Array &&
-        object->rawColumnView.has_value();
+    const auto* slot = impl_->getSlot(reference);
+    return slot && slot->kind() == ObjectKind::Array &&
+        slot->storage() == SlotStorage::RawColumn;
 }
 
 bool ManagedHeap::hasSparseEcsState() const noexcept {
@@ -2152,12 +2783,12 @@ void ManagedHeap::notifySparseEcsState() noexcept {
 }
 
 const NativeRawColumnView* ManagedHeap::rawColumnView(ObjectRef reference) const noexcept {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array ||
-        !object->rawColumnView.has_value()) {
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array ||
+        slot->storage() != SlotStorage::RawColumn) {
         return nullptr;
     }
-    return &*object->rawColumnView;
+    return &impl_->rawColumns.get(slot->payload.s.handle);
 }
 
 bool ManagedHeap::readRawColumnFields(
@@ -2166,12 +2797,12 @@ bool ManagedHeap::readRawColumnFields(
     Value* outFields,
     std::size_t maxFields,
     std::uint8_t& outFieldCount) const noexcept {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array ||
-        !object->rawColumnView.has_value()) {
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array ||
+        slot->storage() != SlotStorage::RawColumn) {
         return false;
     }
-    const auto& view = *object->rawColumnView;
+    const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
     if (index >= view.count || !view.basePtr || view.fields.size() > maxFields) {
         return false;
     }
@@ -2190,12 +2821,12 @@ bool ManagedHeap::writeRawColumnFields(
     const Value* fields,
     std::size_t fieldCount,
     RuntimeError* error) noexcept {
-    auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array ||
-        !object->rawColumnView.has_value()) {
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array ||
+        slot->storage() != SlotStorage::RawColumn) {
         return false;
     }
-    const auto& view = *object->rawColumnView;
+    const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
     if (index >= view.count) {
         setHeapError(error, ErrorCode::IndexOutOfRange,
             "array element index is out of range");
@@ -2265,27 +2896,10 @@ std::size_t ManagedHeap::step(
                 impl_->finishCollection(shadowStack);
                 break;
             }
-            auto& slot = impl_->slots[impl_->sweepIndex++];
-            if (slot.object && !slot.object->header.marked) {
-                if (slot.object->header.kind == ObjectKind::String) {
-                    const auto& s = slot.object->stringPayload;
-                    const auto it = impl_->internedStrings.find(s);
-                    if (it != impl_->internedStrings.end() &&
-                        it->second.slot == static_cast<std::uint32_t>(impl_->sweepIndex - 1) &&
-                        it->second.generation == slot.generation) {
-                        impl_->internedStrings.erase(it);
-                    }
-                }
-                const auto bytes = slot.object->header.sizeBytes;
-                slot.object.reset();
-                ++slot.generation;
-                if (slot.generation == 0) slot.generation = 1;
-                impl_->freeSlots.push_back(
-                    static_cast<std::uint32_t>(impl_->sweepIndex - 1));
-                --impl_->statistics.liveObjects;
-                impl_->statistics.liveBytes -= bytes;
-                ++impl_->statistics.objectsReclaimed;
-                impl_->statistics.bytesReclaimed += bytes;
+            const auto slotIdx = static_cast<std::uint32_t>(impl_->sweepIndex++);
+            auto& slot = impl_->slots[slotIdx];
+            if (slot.occupied() && !slot.hasFlag(GcFlag::Marked)) {
+                impl_->sweepReclaimSlot(slotIdx, slot, false);
             }
             ++impl_->statistics.sweepWork;
             ++performed;
@@ -2327,9 +2941,6 @@ void ManagedHeap::collectFull(const ShadowStack& shadowStack) {
         }
     };
 
-    // Objects allocated during an incremental cycle are kept alive until that
-    // cycle finishes. Drain it first, then start a fresh cycle so collectFull()
-    // observes the complete heap as it exists at the call boundary.
     if (impl_->phase != GcPhase::Idle) drainCollection();
     requestCollection();
     drainCollection();
@@ -2356,8 +2967,8 @@ std::size_t ManagedHeap::collectYoung(
     if (impl_->nurserySlots.empty()) return 0;
 
     for (const auto slotIdx : impl_->nurserySlots) {
-        if (slotIdx < impl_->slots.size() && impl_->slots[slotIdx].object) {
-            impl_->slots[slotIdx].object->header.marked = false;
+        if (slotIdx < impl_->slots.size() && impl_->slots[slotIdx].occupied()) {
+            impl_->slots[slotIdx].gcFlags &= static_cast<std::uint8_t>(~GcFlag::Marked);
         }
     }
 
@@ -2369,9 +2980,9 @@ std::size_t ManagedHeap::collectYoung(
         const auto t = val.rawTag();
         if (t == ValueTag::ObjectRef) {
             const auto& ref = val.asObjectRefUnchecked();
-            auto* obj = impl_->get(ref);
-            if (obj && obj->header.inNursery && !obj->header.marked) {
-                obj->header.marked = true;
+            auto* slot = impl_->getSlot(ref);
+            if (slot && slot->hasFlag(GcFlag::InNursery) && !slot->hasFlag(GcFlag::Marked)) {
+                slot->gcFlags |= GcFlag::Marked;
                 youngQueue.push_back(ref);
             }
             return;
@@ -2397,16 +3008,42 @@ std::size_t ManagedHeap::collectYoung(
         if (!table.mayContainReferences) continue;
         for (const auto& v : table.values) markYoungValue(markYoungValue, v);
     }
+
+    // Card-Table-accelerated Remembered Set scan:
     for (const auto& oldRef : impl_->rememberedSet) {
-        const auto* oldObj = impl_->get(oldRef);
-        if (!oldObj || oldObj->header.kind == ObjectKind::String) continue;
-        const auto count = oldObj->valueCount();
-        if (oldObj->header.kind == ObjectKind::Array) {
-            if (!Impl::elementTypeMayContainReferences(oldObj->header.elementType)) continue;
-            for (std::size_t i = 0; i < count; ++i) markYoungValue(markYoungValue, oldObj->valueAt(i));
-        } else if (oldObj->referenceFields) {
-            for (const auto idx : *oldObj->referenceFields) {
-                if (idx < count) markYoungValue(markYoungValue, oldObj->valueAt(idx));
+        auto* oldSlot = impl_->getSlot(oldRef);
+        if (!oldSlot || oldSlot->kind() == ObjectKind::String) continue;
+        const auto count = Impl::slotValueCount(*oldSlot);
+        if (count == 0) continue;
+        const Value* data = oldSlot->payload.s.data;
+        const auto& layout = impl_->typeLayouts[oldSlot->payload.s.layoutId];
+
+        if (oldSlot->kind() == ObjectKind::Array) {
+            if (!layout.mayContainReferences) continue;
+            if (oldSlot->hasFlag(GcFlag::HasCardTable)) {
+                auto& slice = impl_->cardArena.get(oldSlot->payload.s.cardHandle);
+                for (std::uint32_t w = 0; w < slice.wordCount; ++w) {
+                    if (slice.words[w] == 0) continue; // Skip 8 clean cards = 512 Values!
+                    auto* cardBytes = reinterpret_cast<std::uint8_t*>(&slice.words[w]);
+                    for (std::uint32_t b = 0; b < 8; ++b) {
+                        if (cardBytes[b] == 0) continue;
+                        cardBytes[b] = 0;
+                        const std::size_t cardIdx = (static_cast<std::size_t>(w) << 3) + b;
+                        const std::size_t begin = cardIdx << ManagedHeap::kCardElementShift;
+                        const std::size_t end = std::min(count, begin + ManagedHeap::kCardElements);
+                        for (std::size_t i = begin; i < end; ++i) {
+                            markYoungValue(markYoungValue, data[i]);
+                        }
+                    }
+                }
+                continue;
+            }
+            for (std::size_t i = 0; i < count; ++i) {
+                markYoungValue(markYoungValue, data[i]);
+            }
+        } else {
+            for (const auto idx : layout.referenceFields) {
+                if (idx < count) markYoungValue(markYoungValue, data[idx]);
             }
         }
     }
@@ -2414,15 +3051,20 @@ std::size_t ManagedHeap::collectYoung(
     while (!youngQueue.empty()) {
         const auto ref = youngQueue.back();
         youngQueue.pop_back();
-        const auto* obj = impl_->get(ref);
-        if (!obj || obj->header.kind == ObjectKind::String) continue;
-        const auto count = obj->valueCount();
-        if (obj->header.kind == ObjectKind::Array) {
-            if (!Impl::elementTypeMayContainReferences(obj->header.elementType)) continue;
-            for (std::size_t i = 0; i < count; ++i) markYoungValue(markYoungValue, obj->valueAt(i));
-        } else if (obj->referenceFields) {
-            for (const auto idx : *obj->referenceFields) {
-                if (idx < count) markYoungValue(markYoungValue, obj->valueAt(idx));
+        const auto* slot = impl_->getSlot(ref);
+        if (!slot || slot->kind() == ObjectKind::String) continue;
+        const auto count = Impl::slotValueCount(*slot);
+        if (count != 0) {
+            const Value* data = slot->payload.s.data;
+            const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+            if (slot->kind() == ObjectKind::Array) {
+                if (layout.mayContainReferences) {
+                    for (std::size_t i = 0; i < count; ++i) markYoungValue(markYoungValue, data[i]);
+                }
+            } else {
+                for (const auto idx : layout.referenceFields) {
+                    if (idx < count) markYoungValue(markYoungValue, data[idx]);
+                }
             }
         }
         ++impl_->statistics.markWork;
@@ -2432,40 +3074,20 @@ std::size_t ManagedHeap::collectYoung(
     for (const auto slotIdx : impl_->nurserySlots) {
         if (slotIdx >= impl_->slots.size()) continue;
         auto& slot = impl_->slots[slotIdx];
-        if (!slot.object || !slot.object->header.inNursery) continue;
+        if (!slot.occupied() || !slot.hasFlag(GcFlag::InNursery)) continue;
         ++processed;
-        if (!slot.object->header.marked) {
-            if (slot.object->header.kind == ObjectKind::String) {
-                const auto& s = slot.object->stringPayload;
-                const auto it = impl_->internedStrings.find(s);
-                if (it != impl_->internedStrings.end() &&
-                    it->second.slot == slotIdx &&
-                    it->second.generation == slot.generation) {
-                    impl_->internedStrings.erase(it);
-                }
-            }
-            const auto bytes = slot.object->header.sizeBytes;
-            slot.object.reset();
-            ++slot.generation;
-            if (slot.generation == 0) slot.generation = 1;
-            impl_->freeSlots.push_back(slotIdx);
-            --impl_->statistics.liveObjects;
-            impl_->statistics.liveBytes -= bytes;
-            ++impl_->statistics.objectsReclaimed;
-            ++impl_->statistics.youngObjectsReclaimed;
-            impl_->statistics.bytesReclaimed += bytes;
+        if (!slot.hasFlag(GcFlag::Marked)) {
+            impl_->sweepReclaimSlot(slotIdx, slot, true);
         } else {
-            slot.object->header.inNursery = false;
-            slot.object->header.marked = false;
-            ++impl_->statistics.objectsPromoted;
+            impl_->promoteSlotToOldGen(slot);
         }
         ++impl_->statistics.sweepWork;
     }
 
     impl_->nurserySlots.clear();
     for (const auto& ref : impl_->rememberedSet) {
-        if (auto* obj = impl_->get(ref)) {
-            obj->header.inRememberedSet = false;
+        if (auto* slot = impl_->getSlot(ref)) {
+            slot->gcFlags &= static_cast<std::uint8_t>(~GcFlag::InRememberedSet);
         }
     }
     impl_->rememberedSet.clear();
@@ -2480,13 +3102,13 @@ bool ManagedHeap::readPackedIntArray(
     ObjectRef reference,
     std::vector<std::int64_t>& out,
     RuntimeError* error) const {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array) {
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
         return false;
     }
-    const auto len = object->valueCount();
-    const Value* values = object->dataPtr();
+    const auto len = Impl::slotValueCount(*slot);
+    const Value* values = slot->payload.s.data;
     out.resize(len);
     for (std::size_t i = 0; i < len; ++i) {
         if (const auto* iv = std::get_if<std::int64_t>(&values[i])) {
@@ -2510,24 +3132,25 @@ bool ManagedHeap::writePackedIntArray(
         setHeapError(error, ErrorCode::InvalidArguments, "bulk write source buffer is null");
         return false;
     }
-    auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array) {
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
         return false;
     }
-    if (object->header.elementType != semantic::PrimitiveType::Int &&
-        object->header.elementType != semantic::PrimitiveType::Long &&
-        object->header.elementType != semantic::PrimitiveType::Error) {
+    const auto elemType = impl_->typeLayouts[slot->payload.s.layoutId].elementType;
+    if (elemType != semantic::PrimitiveType::Int &&
+        elemType != semantic::PrimitiveType::Long &&
+        elemType != semantic::PrimitiveType::Error) {
         setHeapError(error, ErrorCode::TypeMismatch, "array element is not an integer");
         return false;
     }
-    const auto len = object->valueCount();
-    Value* values = object->dataPtr();
+    const auto len = Impl::slotValueCount(*slot);
     if (count > len) {
         setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
         return false;
     }
-    const bool asLong = object->header.elementType == semantic::PrimitiveType::Long;
+    Value* values = slot->payload.s.data;
+    const bool asLong = elemType == semantic::PrimitiveType::Long;
     for (std::size_t i = 0; i < count; ++i) {
         values[i] = asLong ? Value{LongValue{data[i]}} : Value{data[i]};
     }
@@ -2538,13 +3161,13 @@ bool ManagedHeap::readPackedDoubleArray(
     ObjectRef reference,
     std::vector<double>& out,
     RuntimeError* error) const {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array) {
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
         return false;
     }
-    const auto len = object->valueCount();
-    const Value* values = object->dataPtr();
+    const auto len = Impl::slotValueCount(*slot);
+    const Value* values = slot->payload.s.data;
     out.resize(len);
     for (std::size_t i = 0; i < len; ++i) {
         if (const auto* dv = std::get_if<double>(&values[i])) {
@@ -2568,24 +3191,25 @@ bool ManagedHeap::writePackedDoubleArray(
         setHeapError(error, ErrorCode::InvalidArguments, "bulk write source buffer is null");
         return false;
     }
-    auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array) {
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
         return false;
     }
-    if (object->header.elementType != semantic::PrimitiveType::Double &&
-        object->header.elementType != semantic::PrimitiveType::Float &&
-        object->header.elementType != semantic::PrimitiveType::Error) {
+    const auto elemType = impl_->typeLayouts[slot->payload.s.layoutId].elementType;
+    if (elemType != semantic::PrimitiveType::Double &&
+        elemType != semantic::PrimitiveType::Float &&
+        elemType != semantic::PrimitiveType::Error) {
         setHeapError(error, ErrorCode::TypeMismatch, "array element is not a floating-point number");
         return false;
     }
-    const auto len = object->valueCount();
-    Value* values = object->dataPtr();
+    const auto len = Impl::slotValueCount(*slot);
     if (count > len) {
         setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
         return false;
     }
-    const bool asFloat = object->header.elementType == semantic::PrimitiveType::Float;
+    Value* values = slot->payload.s.data;
+    const bool asFloat = elemType == semantic::PrimitiveType::Float;
     for (std::size_t i = 0; i < count; ++i) {
         values[i] = asFloat ? Value{FloatValue{static_cast<float>(data[i])}} : Value{data[i]};
     }
@@ -2596,13 +3220,13 @@ bool ManagedHeap::readPackedVec2Array(
     ObjectRef reference,
     std::vector<Vec2Value>& out,
     RuntimeError* error) const {
-    const auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array) {
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
         return false;
     }
-    const auto len = object->valueCount();
-    const Value* values = object->dataPtr();
+    const auto len = Impl::slotValueCount(*slot);
+    const Value* values = slot->payload.s.data;
     out.resize(len);
     for (std::size_t i = 0; i < len; ++i) {
         if (const auto* v2 = std::get_if<Vec2Value>(&values[i])) {
@@ -2630,23 +3254,24 @@ bool ManagedHeap::writePackedVec2Array(
         setHeapError(error, ErrorCode::InvalidArguments, "bulk write source buffer is null");
         return false;
     }
-    auto* object = impl_->get(reference);
-    if (!object || object->header.kind != ObjectKind::Array) {
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
         return false;
     }
-    if (object->header.elementType != semantic::PrimitiveType::Error &&
-        !(object->header.elementType == semantic::PrimitiveType::Struct &&
-          object->header.elementTypeId == vec2TypeId())) {
+    const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+    if (layout.elementType != semantic::PrimitiveType::Error &&
+        !(layout.elementType == semantic::PrimitiveType::Struct &&
+          layout.elementTypeId == vec2TypeId())) {
         setHeapError(error, ErrorCode::TypeMismatch, "array element is not a Vec2");
         return false;
     }
-    const auto len = object->valueCount();
-    Value* values = object->dataPtr();
+    const auto len = Impl::slotValueCount(*slot);
     if (count > len) {
         setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
         return false;
     }
+    Value* values = slot->payload.s.data;
     for (std::size_t i = 0; i < count; ++i) {
         values[i] = Value{data[i]};
     }
@@ -2672,32 +3297,32 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
     result.objects.reserve(impl_->statistics.liveObjects);
     for (std::size_t slotIndex = 0; slotIndex < impl_->slots.size(); ++slotIndex) {
         const auto& slot = impl_->slots[slotIndex];
-        if (!slot.object) continue;
-        const auto& object = *slot.object;
+        if (!slot.occupied()) continue;
         HeapObjectInfo info;
         info.reference = {
             static_cast<std::uint32_t>(slotIndex),
             slot.generation,
-            object.header.kind,
+            slot.kind(),
             impl_->heapId,
         };
-        info.kind = object.header.kind;
-        info.typeId = object.header.typeId;
-        info.elementType = object.header.elementType;
-        info.elementTypeId = object.header.elementTypeId;
-        info.sizeBytes = object.header.sizeBytes;
-        if (object.header.kind == ObjectKind::String) {
-            info.stringValue = object.stringPayload;
+        info.kind = slot.kind();
+        info.sizeBytes = impl_->slotSizeBytes(static_cast<std::uint32_t>(slotIndex), slot);
+        if (slot.kind() == ObjectKind::String) {
+            info.stringValue = std::string(impl_->slotStringView(slot));
         } else {
-            const auto count = object.valueCount();
+            const auto& layout = impl_->typeLayouts[slot.payload.s.layoutId];
+            info.typeId = layout.typeId;
+            info.elementType = layout.elementType;
+            info.elementTypeId = layout.elementTypeId;
+            const auto count = Impl::slotValueCount(slot);
             info.valueCount = count;
             info.values.resize(count);
             for (std::size_t i = 0; i < count; ++i) {
-                info.values[i] = object.valueAt(i);
+                info.values[i] = slot.payload.s.data[i];
             }
             const auto& values = info.values;
-            if (object.referenceFields) {
-                info.referenceFields = *object.referenceFields;
+            if (!layout.referenceFields.empty()) {
+                info.referenceFields = layout.referenceFields;
             }
             const auto addEdge = [&](std::size_t index) {
                 if (index >= values.size()) return;
@@ -2706,7 +3331,7 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
                                                const Value& value,
                                                const std::string& label) -> void {
                     if (const auto* target = std::get_if<ObjectRef>(&value);
-                        target && impl_->get(*target)) {
+                        target && impl_->getSlot(*target)) {
                         info.edges.push_back({*target, label});
                         return;
                     }
@@ -2721,15 +3346,15 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
                     }
                 };
                 addValueEdges(addValueEdges, values[index],
-                    (object.header.kind == ObjectKind::Array ? "element[" : "field[") +
+                    (slot.kind() == ObjectKind::Array ? "element[" : "field[") +
                         std::to_string(index) + "]");
             };
-            if (object.header.kind == ObjectKind::Array) {
+            if (slot.kind() == ObjectKind::Array) {
                 for (std::size_t index = 0; index < values.size(); ++index) {
                     addEdge(index);
                 }
-            } else if (object.referenceFields) {
-                for (const auto index : *object.referenceFields) addEdge(index);
+            } else {
+                for (const auto index : layout.referenceFields) addEdge(index);
             }
         }
         result.objects.push_back(std::move(info));
@@ -2740,7 +3365,7 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
         std::unordered_set<const StructStorage*> visitedStructs;
         const auto addRoots = [&](const auto& self, const Value& current) -> void {
             if (const auto* reference = std::get_if<ObjectRef>(&current);
-                reference && impl_->get(*reference)) {
+                reference && impl_->getSlot(*reference)) {
                 result.roots.push_back({token, *reference, kind});
                 return;
             }
@@ -2805,9 +3430,10 @@ bool ManagedHeap::restore(
 
     std::size_t slotCount = 0;
     std::size_t liveBytes = 0;
+    std::unordered_map<std::uint32_t, const HeapObjectInfo*> infos;
     for (const auto& info : snapshot.objects) {
         if (!info.reference.valid() ||
-            info.reference.heapId != impl_->heapId ||
+            info.reference.heapId != static_cast<std::uint32_t>(impl_->heapId) ||
             info.reference.kind != info.kind ||
             info.reference.slot == ObjectRef::InvalidSlot ||
             info.sizeBytes > impl_->config.maximumHeapBytes ||
@@ -2816,37 +3442,17 @@ bool ManagedHeap::restore(
                 "heap snapshot contains invalid object metadata");
             return false;
         }
-        liveBytes += info.sizeBytes;
-        slotCount = std::max(
-            slotCount,
-            static_cast<std::size_t>(info.reference.slot) + 1u);
-    }
-
-    std::vector<Impl::Slot> slots(slotCount);
-    std::unordered_map<std::uint32_t, const HeapObjectInfo*> infos;
-    for (const auto& info : snapshot.objects) {
         if (!infos.emplace(info.reference.slot, &info).second) {
             setHeapError(error, ErrorCode::InvalidProgram,
                 "heap snapshot contains duplicate object slots");
             return false;
         }
-        auto& slot = slots[info.reference.slot];
-        slot.generation = info.reference.generation;
-        Impl::HeapObject object;
-        object.header.kind = info.kind;
-        object.header.typeId = info.typeId;
-        object.header.elementType = info.elementType;
-        object.header.elementTypeId = info.elementTypeId;
-        object.header.sizeBytes = info.sizeBytes;
-        object.header.inNursery = false;
-        object.header.inRememberedSet = false;
         if (info.kind == ObjectKind::String) {
             if (!info.values.empty() || info.valueCount != 0) {
                 setHeapError(error, ErrorCode::InvalidProgram,
                     "heap snapshot string payload is invalid");
                 return false;
             }
-            object.stringPayload = info.stringValue;
         } else {
             if (info.values.size() != info.valueCount) {
                 setHeapError(error, ErrorCode::InvalidProgram,
@@ -2860,35 +3466,19 @@ bool ManagedHeap::restore(
                     return false;
                 }
             }
-            if (info.values.size() <= Impl::HeapObject::InlineFieldCapacity) {
-                object.usesInlineValues = true;
-                object.inlineValueCount = static_cast<std::uint8_t>(info.values.size());
-                for (std::size_t fi = 0; fi < info.values.size(); ++fi) {
-                    object.inlineValues[fi] = info.values[fi];
-                }
-            } else {
-                object.values = info.values;
-            }
-            if (info.typeId != 0) {
-                auto& shared = impl_->sharedTypeReferenceFields[info.typeId];
-                if (!shared || *shared != info.referenceFields) {
-                    shared = std::make_shared<const std::vector<std::size_t>>(info.referenceFields);
-                }
-                object.referenceFields = shared;
-            } else {
-                object.referenceFields = std::make_shared<const std::vector<std::size_t>>(info.referenceFields);
-            }
         }
-        slot.object.emplace(std::move(object));
+        liveBytes += info.sizeBytes;
+        slotCount = std::max(
+            slotCount,
+            static_cast<std::size_t>(info.reference.slot) + 1u);
     }
 
     const auto validValue = [&](const auto& self,
                                 const Value& value,
-                                std::unordered_set<const StructStorage*>&
-                                    visited) -> bool {
+                                std::unordered_set<const StructStorage*>& visited) -> bool {
         if (const auto* reference = std::get_if<ObjectRef>(&value)) {
             const auto found = infos.find(reference->slot);
-            return reference->heapId == impl_->heapId &&
+            return reference->heapId == static_cast<std::uint32_t>(impl_->heapId) &&
                 found != infos.end() &&
                 found->second->reference == *reference;
         }
@@ -2927,14 +3517,113 @@ bool ManagedHeap::restore(
         nextRootToken = std::max(nextRootToken, root.token + 1u);
     }
 
+    // All validation passed; rebuild pools and slots cleanly
+    impl_->slabPool.clear();
+    impl_->largeBuffers.clear();
+    impl_->stringPool.clear();
+    impl_->rawColumns.clear();
+    impl_->cardArena.clear();
+    impl_->customSlotSizes.clear();
+    impl_->uiObservableMeta.clear();
+    impl_->typeLayouts.assign(1, TypeLayoutEntry{});
+    impl_->sharedRecordLayoutByTypeId.clear();
+    impl_->arrayLayoutByKey.clear();
+    impl_->untypedDenseRecordLayouts.clear();
+    impl_->untypedCustomRecordLayouts.clear();
+    impl_->lastRegisteredLayoutTypeId = 0;
+    impl_->lastRegisteredLayoutId = 0;
+    impl_->hasLastArrayLayout = false;
+    impl_->lastArrayLayoutKey = {};
+    impl_->lastArrayLayoutId = 0;
+    impl_->slots.assign(slotCount, CompactSlot{});
+
+    for (const auto& info : snapshot.objects) {
+        const std::uint32_t slotIdx = info.reference.slot;
+        auto& slot = impl_->slots[slotIdx];
+        slot.generation = info.reference.generation;
+        slot.gcFlags = 0; // Restored objects reside in Old Gen (inNursery = false)
+
+        if (info.kind == ObjectKind::String) {
+            if (info.stringValue.size() <= CompactSlot::kMaxSsoBytes) {
+                slot.setKindAndStorage(ObjectKind::String, SlotStorage::SsoString);
+                slot.auxMeta = static_cast<std::uint16_t>(info.stringValue.size());
+                if (!info.stringValue.empty()) {
+                    std::memcpy(slot.payload.ssoChars.data(), info.stringValue.data(), info.stringValue.size());
+                }
+                slot.payload.ssoChars[info.stringValue.size()] = '\0';
+            } else {
+                slot.setKindAndStorage(ObjectKind::String, SlotStorage::HeapString);
+                slot.auxMeta = 0;
+                std::string copy = info.stringValue;
+                const auto len = static_cast<std::uint32_t>(copy.size());
+                const std::uint32_t strHandle = impl_->stringPool.acquire(std::move(copy));
+                slot.payload.s = {0u, len, nullptr, strHandle, CompactSlot::kInvalidHandle};
+            }
+        } else {
+            std::uint32_t layoutId = 0;
+            if (info.kind == ObjectKind::Array) {
+                layoutId = impl_->internArrayLayout(info.typeId, info.elementType, info.elementTypeId);
+            } else if (info.typeId != 0) {
+                layoutId = impl_->internTypedRecordLayout(info.typeId, info.referenceFields);
+            } else {
+                layoutId = impl_->internSnapshotUntypedRecordLayout(info.referenceFields);
+            }
+
+            const std::size_t count = info.values.size();
+            if (count <= CompactSlot::kInlineValueCapacity) {
+                std::uint16_t cls = 0;
+                std::uint32_t handle = CompactSlot::kInvalidHandle;
+                Value* ptr = impl_->slabPool.allocate(count, cls, handle);
+                for (std::size_t fi = 0; fi < count; ++fi) {
+                    ptr[fi] = info.values[fi];
+                }
+                slot.setKindAndStorage(info.kind, SlotStorage::SlabValues);
+                slot.auxMeta = cls;
+                slot.payload.s = {
+                    layoutId,
+                    static_cast<std::uint32_t>(count),
+                    ptr,
+                    handle,
+                    CompactSlot::kInvalidHandle,
+                };
+            } else {
+                Value* ptr = nullptr;
+                const std::uint32_t handle = impl_->largeBuffers.acquireCopy(info.values.data(), count, ptr);
+                std::uint32_t cardHandle = CompactSlot::kInvalidHandle;
+                if (info.kind == ObjectKind::Array &&
+                    count >= ManagedHeap::kCardTableMinLength &&
+                    impl_->typeLayouts[layoutId].mayContainReferences) {
+                    cardHandle = impl_->cardArena.allocate(count);
+                    slot.gcFlags |= GcFlag::HasCardTable;
+                }
+                slot.setKindAndStorage(info.kind, SlotStorage::HeapValues);
+                slot.auxMeta = 0;
+                slot.payload.s = {
+                    layoutId,
+                    static_cast<std::uint32_t>(count),
+                    ptr,
+                    handle,
+                    cardHandle,
+                };
+            }
+        }
+
+        const std::size_t defaultSize = impl_->slotSizeBytes(slotIdx, slot);
+        if (info.sizeBytes != defaultSize) {
+            slot.gcFlags |= GcFlag::CustomSize;
+            impl_->customSlotSizes[slotIdx] = info.sizeBytes;
+        }
+    }
+
     std::vector<std::uint32_t> freeSlots;
-    for (std::size_t index = 0; index < slots.size(); ++index) {
-        if (!slots[index].object) {
+    for (std::size_t index = 0; index < impl_->slots.size(); ++index) {
+        const auto& slot = impl_->slots[index];
+        if (!slot.occupied()) {
             freeSlots.push_back(static_cast<std::uint32_t>(index));
         } else {
-            const auto count = slots[index].object->valueCount();
+            const auto count = Impl::slotValueCount(slot);
             for (std::size_t fi = 0; fi < count; ++fi) {
-                pinValueInPools(slots[index].object->valueAt(fi));
+                pinValueInPools(slot.payload.s.data[fi]);
             }
         }
     }
@@ -2942,7 +3631,6 @@ bool ManagedHeap::restore(
         (void)token;
         pinValueInPools(val);
     }
-    impl_->slots = std::move(slots);
     impl_->freeSlots = std::move(freeSlots);
     impl_->persistentRoots = std::move(roots);
     impl_->nextRootToken = nextRootToken;

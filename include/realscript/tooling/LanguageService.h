@@ -99,10 +99,22 @@ public:
     void setAmbientSources(std::vector<compiler::SourceFile> sources);
     void addAmbientSource(compiler::SourceFile source);
     void clearAmbientSources();
-    bool loadProjectConfigJson(const std::string& jsonText);
+    bool loadProjectConfigJson(
+        const std::string& jsonText,
+        const std::string& baseDir = {},
+        bool merge = false);
+    bool loadProjectConfigFile(const std::string& configPath, bool merge = false);
+
+    std::size_t addWorkspaceRoot(const std::string& rootPath);
+    void removeWorkspaceRoot(const std::string& rootPath);
+    bool syncDiskFile(const std::string& path);
+    bool removeDiskFile(const std::string& path);
 
     [[nodiscard]] bool contains(const std::string& path) const noexcept;
+    [[nodiscard]] bool isOpenDocument(const std::string& path) const noexcept;
     [[nodiscard]] std::vector<std::string> documentPaths() const;
+    [[nodiscard]] std::vector<std::string> openDocumentPaths() const;
+    [[nodiscard]] std::vector<std::string> workspaceRoots() const;
     [[nodiscard]] std::vector<LanguageDiagnostic> diagnostics(const std::string& path);
     [[nodiscard]] std::vector<CompletionItem> completion(
         const std::string& path,
@@ -169,8 +181,13 @@ private:
         const std::string& path,
         text::TextSpan span) const;
 
+    [[nodiscard]] static std::string normalizeDocPath(const std::string& rawPath);
+    [[nodiscard]] bool reloadDiskFileIntoWorkspace(const std::string& normalizedPath);
+
     std::unordered_map<std::string, Document> documents_;
+    std::unordered_map<std::string, Document> workspaceDocuments_;
     std::unordered_map<std::string, Document> ambientDocuments_;
+    std::set<std::string> workspaceRoots_;
     compiler::BuildResult result_;
     compiler::BuildSnapshot snapshot_;
     struct DocHeaderInfo {
@@ -195,7 +212,9 @@ private:
     mutable std::vector<DocumentSymbol> cachedDefinitions_;
     mutable std::unordered_map<semantic::SymbolId, std::size_t> cachedDefById_;
     mutable std::unordered_map<std::string, std::vector<std::size_t>> cachedOccByPath_;
+    mutable std::unordered_map<std::string, std::vector<LanguageDiagnostic>> cachedDiagnosticsByPath_;
     mutable bool hasCachedDefinitions_ = false;
+    mutable bool hasCachedDiagnostics_ = false;
     bool hasSnapshot_ = false;
     bool dirty_ = true;
 };
