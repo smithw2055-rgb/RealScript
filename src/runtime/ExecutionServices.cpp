@@ -508,6 +508,137 @@ bool DeterminismSession::finish(
     return succeeded;
 }
 
+DeterminismMode DeterminismSession::mode() const noexcept {
+    return mode_;
+}
+
+bool DeterminismSession::recordAsyncDrainBatch(
+    std::uint64_t tickSequence,
+    std::size_t count,
+    RuntimeError& error) {
+    static constexpr semantic::SymbolId kAsyncDrainBatchSymbolId = 0xA5D0A100u;
+    if (mode_ != DeterminismMode::Record) {
+        return true;
+    }
+    if (!replayLog_) {
+        error.code = ErrorCode::DeterminismViolation;
+        error.message = "record mode requires a replay log for async completion queue";
+        return false;
+    }
+    ExternalCallRecord record;
+    record.symbolId = kAsyncDrainBatchSymbolId;
+    record.name = "$async.drain";
+    record.argumentHash = tickSequence;
+    record.succeeded = true;
+    record.result = Value(static_cast<std::int64_t>(count));
+    replayLog_->append(std::move(record));
+
+    hashScalar(digest_, kAsyncDrainBatchSymbolId);
+    hashScalar(digest_, tickSequence);
+    hashScalar(digest_, static_cast<std::uint64_t>(count));
+    return true;
+}
+
+bool DeterminismSession::replayAsyncDrainBatch(
+    std::uint64_t tickSequence,
+    std::size_t& outCount,
+    RuntimeError& error) {
+    static constexpr semantic::SymbolId kAsyncDrainBatchSymbolId = 0xA5D0A100u;
+    outCount = 0;
+    if (mode_ != DeterminismMode::Replay) {
+        return true;
+    }
+    if (!replayLog_ || replayCursor_ >= replayEntries_.size()) {
+        error.code = ErrorCode::ReplayMismatch;
+        error.message = "replay log ended before async drain tick " +
+            std::to_string(tickSequence);
+        return false;
+    }
+    const auto& record = replayEntries_[replayCursor_++];
+    if (record.symbolId != kAsyncDrainBatchSymbolId ||
+        record.name != "$async.drain" ||
+        record.argumentHash != tickSequence ||
+        !record.succeeded) {
+        error.code = ErrorCode::ReplayMismatch;
+        error.message = "replay entry does not match async drain tick " +
+            std::to_string(tickSequence);
+        return false;
+    }
+    const auto* countInt = std::get_if<std::int64_t>(&record.result);
+    if (!countInt || *countInt < 0) {
+        error.code = ErrorCode::ReplayMismatch;
+        error.message = "replay async drain batch count is invalid";
+        return false;
+    }
+    outCount = static_cast<std::size_t>(*countInt);
+
+    hashScalar(digest_, kAsyncDrainBatchSymbolId);
+    hashScalar(digest_, tickSequence);
+    hashScalar(digest_, static_cast<std::uint64_t>(outCount));
+    return true;
+}
+
+bool DeterminismSession::recordAsyncCompletion(
+    ExternalCallRecord record,
+    RuntimeError& error) {
+    if (mode_ != DeterminismMode::Record) {
+        return true;
+    }
+    if (!replayLog_) {
+        error.code = ErrorCode::DeterminismViolation;
+        error.message = "record mode requires a replay log for async completion";
+        return false;
+    }
+    if (record.succeeded && !isReplayStableValue(record.result)) {
+        error.code = ErrorCode::DeterminismViolation;
+        error.message = "async operation '" + record.name +
+            "' produced a non-replayable handle value";
+        return false;
+    }
+
+    hashScalar(digest_, record.symbolId);
+    hashString(digest_, record.name);
+    hashScalar(digest_, record.argumentHash);
+    hashScalar(digest_, record.succeeded);
+    if (record.succeeded) {
+        hashValue(digest_, record.result, canonicalizeFloatingPoint_);
+    } else {
+        hashScalar(digest_, static_cast<std::uint16_t>(record.errorCode));
+        hashString(digest_, record.errorMessage);
+    }
+
+    replayLog_->append(std::move(record));
+    return true;
+}
+
+bool DeterminismSession::consumeAsyncCompletion(
+    ExternalCallRecord& outRecord,
+    RuntimeError& error) {
+    if (mode_ != DeterminismMode::Replay) {
+        error.code = ErrorCode::InvalidProgram;
+        error.message = "consumeAsyncCompletion called outside replay mode";
+        return false;
+    }
+    if (!replayLog_ || replayCursor_ >= replayEntries_.size()) {
+        error.code = ErrorCode::ReplayMismatch;
+        error.message = "replay log ended before expected async completion entry";
+        return false;
+    }
+    outRecord = replayEntries_[replayCursor_++];
+
+    hashScalar(digest_, outRecord.symbolId);
+    hashString(digest_, outRecord.name);
+    hashScalar(digest_, outRecord.argumentHash);
+    hashScalar(digest_, outRecord.succeeded);
+    if (outRecord.succeeded) {
+        hashValue(digest_, outRecord.result, canonicalizeFloatingPoint_);
+    } else {
+        hashScalar(digest_, static_cast<std::uint16_t>(outRecord.errorCode));
+        hashString(digest_, outRecord.errorMessage);
+    }
+    return true;
+}
+
 std::uint64_t DeterminismSession::digest() const noexcept {
     return digest_;
 }

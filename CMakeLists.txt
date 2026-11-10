@@ -53,6 +53,7 @@ add_library(realscript_frontend STATIC
     src/runtime/ExecutionServices.cpp
     src/runtime/ManagedHeap.cpp
     src/runtime/FiberScheduler.cpp
+    src/runtime/AsyncRuntime.cpp
     src/game/GameApi.cpp
     src/game/ScriptObjectRuntime.cpp
     src/game/ScriptInvokeRuntime.cpp
@@ -388,6 +389,10 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_game_math_flat_opcode_tests
         realscript.game-math-flat-opcode
         tests/game_math_flat_opcode_benchmark.cpp)
+    realscript_add_cpp_test(
+        realscript_phase25_async_primitives_tests
+        realscript.phase25.async-primitives
+        tests/phase25_async_primitives_tests.cpp)
     set(REALSCRIPT_PHASE20_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/phase20")
     realscript_add_aot_library(

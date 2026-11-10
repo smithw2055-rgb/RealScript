@@ -2271,6 +2271,21 @@ public:
         const Value& value,
         RuntimeError& error,
         const RuntimeStatistics& statistics);
+    [[nodiscard]] DeterminismMode mode() const noexcept;
+    [[nodiscard]] bool recordAsyncDrainBatch(
+        std::uint64_t tickSequence,
+        std::size_t count,
+        RuntimeError& error);
+    [[nodiscard]] bool replayAsyncDrainBatch(
+        std::uint64_t tickSequence,
+        std::size_t& outCount,
+        RuntimeError& error);
+    [[nodiscard]] bool recordAsyncCompletion(
+        ExternalCallRecord record,
+        RuntimeError& error);
+    [[nodiscard]] bool consumeAsyncCompletion(
+        ExternalCallRecord& outRecord,
+        RuntimeError& error);
     [[nodiscard]] std::uint64_t digest() const noexcept;
     [[nodiscard]] std::size_t replayEntriesConsumed() const noexcept;
 
@@ -2372,6 +2387,8 @@ private:
     std::shared_ptr<ManagedHeap> heap_;
 };
 
+class AsyncRuntimeContext;
+
 class EngineRuntime {
 public:
     explicit EngineRuntime(std::shared_ptr<const ProgramImage> program);
@@ -2381,6 +2398,8 @@ public:
     [[nodiscard]] std::shared_ptr<ManagedHeap> heap() const noexcept;
     void setNativeHandles(std::shared_ptr<NativeHandleRegistry> handles);
     [[nodiscard]] std::shared_ptr<NativeHandleRegistry> nativeHandles() const noexcept;
+    void setAsyncRuntime(std::shared_ptr<AsyncRuntimeContext> asyncRuntime);
+    [[nodiscard]] std::shared_ptr<AsyncRuntimeContext> asyncRuntime() const noexcept;
     [[nodiscard]] ExecutionResult invoke(
         const std::string& qualifiedName,
         const std::vector<Value>& arguments = {},
@@ -2400,6 +2419,7 @@ private:
     std::shared_ptr<const BindingRegistry> bindings_;
     std::shared_ptr<ManagedHeap> heap_;
     std::shared_ptr<NativeHandleRegistry> nativeHandles_;
+    std::shared_ptr<AsyncRuntimeContext> asyncRuntime_;
 };
 
 [[nodiscard]] semantic::SymbolId fixedTypeId() noexcept;

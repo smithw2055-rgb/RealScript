@@ -3,6 +3,7 @@
 #include <mutex>
 #include <cstring>
 #include "realscript/runtime/Runtime.h"
+#include "realscript/runtime/AsyncRuntime.h"
 
 #include "ExecutionMirror.h"
 #include "realscript/diagnostics/Diagnostic.h"
@@ -7494,14 +7495,19 @@ const semantic::TypeSymbol* ProgramImage::resolveType(
 EngineRuntime::EngineRuntime(std::shared_ptr<const ProgramImage> program)
     : program_(std::move(program)),
       heap_(std::make_shared<ManagedHeap>()),
-      nativeHandles_(std::make_shared<NativeHandleRegistry>()) {}
+      nativeHandles_(std::make_shared<NativeHandleRegistry>()),
+      asyncRuntime_(std::make_shared<AsyncRuntimeContext>(heap_.get())) {}
 
 void EngineRuntime::setBindings(std::shared_ptr<const BindingRegistry> bindings) {
     bindings_ = std::move(bindings);
 }
 
 void EngineRuntime::setHeap(std::shared_ptr<ManagedHeap> heap) {
+    auto oldHeap = std::move(heap_);
     heap_ = heap ? std::move(heap) : std::make_shared<ManagedHeap>();
+    if (asyncRuntime_) {
+        asyncRuntime_->setHeap(heap_.get());
+    }
 }
 
 std::shared_ptr<ManagedHeap> EngineRuntime::heap() const noexcept { return heap_; }
@@ -7515,6 +7521,18 @@ void EngineRuntime::setNativeHandles(
 
 std::shared_ptr<NativeHandleRegistry> EngineRuntime::nativeHandles() const noexcept {
     return nativeHandles_;
+}
+
+void EngineRuntime::setAsyncRuntime(
+    std::shared_ptr<AsyncRuntimeContext> asyncRuntime) {
+    asyncRuntime_ = asyncRuntime
+        ? std::move(asyncRuntime)
+        : std::make_shared<AsyncRuntimeContext>(heap_.get());
+    asyncRuntime_->setHeap(heap_.get());
+}
+
+std::shared_ptr<AsyncRuntimeContext> EngineRuntime::asyncRuntime() const noexcept {
+    return asyncRuntime_;
 }
 
 ExecutionResult EngineRuntime::invoke(
