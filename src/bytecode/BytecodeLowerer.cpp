@@ -10,11 +10,14 @@ namespace {
 bool definesValue(const mir::Instruction& instruction) noexcept {
     if (instruction.opcode == mir::Opcode::StoreLocal ||
         instruction.opcode == mir::Opcode::StoreField ||
-        instruction.opcode == mir::Opcode::StoreElement) {
+        instruction.opcode == mir::Opcode::StoreElement ||
+        instruction.opcode == mir::Opcode::AsyncEnter ||
+        instruction.opcode == mir::Opcode::AwaitSuspend) {
         return false;
     }
     return (instruction.opcode != mir::Opcode::Call &&
-            instruction.opcode != mir::Opcode::InvokeDelegate) ||
+            instruction.opcode != mir::Opcode::InvokeDelegate &&
+            instruction.opcode != mir::Opcode::AwaitResume) ||
         instruction.resultType != semantic::PrimitiveType::Void;
 }
 
@@ -86,6 +89,10 @@ Opcode lowerOpcode(mir::Opcode opcode) {
     case mir::Opcode::IsType: return Opcode::IsType;
     case mir::Opcode::AsType: return Opcode::AsType;
     case mir::Opcode::ConstantTypeId: return Opcode::ConstantTypeId;
+    case mir::Opcode::AsyncEnter: return Opcode::AsyncEnter;
+    case mir::Opcode::AwaitSuspend: return Opcode::AwaitSuspend;
+    case mir::Opcode::AwaitResume: return Opcode::AwaitResume;
+    case mir::Opcode::AsyncResolve: return Opcode::AsyncResolve;
     }
     throw std::logic_error("unsupported MIR opcode in bytecode lowerer");
 }
@@ -248,7 +255,11 @@ Module Lowerer::lower(const mir::Module& source) const {
                     sourceInstruction.opcode == mir::Opcode::StoreField ||
                     sourceInstruction.opcode == mir::Opcode::NewStruct ||
                     sourceInstruction.opcode == mir::Opcode::LoadStructField ||
-                    sourceInstruction.opcode == mir::Opcode::StoreStructField) {
+                    sourceInstruction.opcode == mir::Opcode::StoreStructField ||
+                    sourceInstruction.opcode == mir::Opcode::AsyncEnter ||
+                    sourceInstruction.opcode == mir::Opcode::AwaitSuspend ||
+                    sourceInstruction.opcode == mir::Opcode::AwaitResume ||
+                    sourceInstruction.opcode == mir::Opcode::AsyncResolve) {
                     const auto foundType = typeIndices.find(sourceInstruction.typeId);
                     if (foundType == typeIndices.end()) {
                         throw std::logic_error(

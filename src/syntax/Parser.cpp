@@ -2410,6 +2410,15 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
         if (peek(1).kind == SyntaxKind::OpenParenToken ||
             isGenericCallStart()) {
             return parseCallExpression();
+        } else if (isGenericTypeMemberAccessStart()) {
+            auto result = std::make_unique<NameExpressionSyntax>();
+            result->identifierToken = nextToken();
+            parseTypeArgumentList(
+                result->lessToken,
+                result->typeArguments,
+                result->typeArgumentCommaTokens,
+                result->greaterToken);
+            return result;
         } else {
             auto result = std::make_unique<NameExpressionSyntax>();
             result->identifierToken = nextToken();
@@ -2421,6 +2430,36 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
         return result;
     }
     }
+}
+
+bool Parser::isGenericTypeMemberAccessStart() const noexcept {
+    if (current().kind != SyntaxKind::IdentifierToken ||
+        peek(1).kind != SyntaxKind::LessToken) {
+        return false;
+    }
+    int depth = 0;
+    std::size_t offset = 1;
+    while (position_ + offset < tokens_.size()) {
+        const auto kind = peek(offset).kind;
+        if (kind == SyntaxKind::LessToken) {
+            ++depth;
+        } else if (kind == SyntaxKind::GreaterToken) {
+            --depth;
+            if (depth == 0) {
+                return peek(offset + 1).kind == SyntaxKind::DotToken;
+            }
+        } else if (isIdentifierLike(kind) ||
+                   kind == SyntaxKind::DotToken ||
+                   kind == SyntaxKind::CommaToken ||
+                   kind == SyntaxKind::QuestionToken ||
+                   kind == SyntaxKind::OpenBracketToken ||
+                   kind == SyntaxKind::CloseBracketToken) {
+        } else {
+            return false;
+        }
+        ++offset;
+    }
+    return false;
 }
 
 bool Parser::isGenericCallStart() const noexcept {
@@ -2441,6 +2480,7 @@ bool Parser::isGenericCallStart() const noexcept {
                     SyntaxKind::OpenParenToken;
             }
         } else if (isIdentifierLike(kind) ||
+                   kind == SyntaxKind::DotToken ||
                    kind == SyntaxKind::CommaToken ||
                    kind == SyntaxKind::QuestionToken ||
                    kind == SyntaxKind::OpenBracketToken ||

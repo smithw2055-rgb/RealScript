@@ -31,11 +31,14 @@ struct Constant {
 bool isValueInstruction(const mir::Instruction& instruction) noexcept {
     if (instruction.opcode == mir::Opcode::StoreLocal ||
         instruction.opcode == mir::Opcode::StoreField ||
-        instruction.opcode == mir::Opcode::StoreElement) {
+        instruction.opcode == mir::Opcode::StoreElement ||
+        instruction.opcode == mir::Opcode::AsyncEnter ||
+        instruction.opcode == mir::Opcode::AwaitSuspend) {
         return false;
     }
     return (instruction.opcode != mir::Opcode::Call &&
-            instruction.opcode != mir::Opcode::InvokeDelegate) ||
+            instruction.opcode != mir::Opcode::InvokeDelegate &&
+            instruction.opcode != mir::Opcode::AwaitResume) ||
         instruction.resultType != semantic::PrimitiveType::Void;
 }
 
@@ -494,6 +497,9 @@ bool foldConstants(
                 continue;
             }
             if (instruction.opcode == mir::Opcode::Call ||
+                instruction.opcode == mir::Opcode::InvokeDelegate ||
+                instruction.opcode == mir::Opcode::AwaitSuspend ||
+                instruction.opcode == mir::Opcode::AwaitResume ||
                 instruction.opcode == mir::Opcode::StoreField ||
                 instruction.opcode == mir::Opcode::StoreElement) {
                 localConstants.clear();
@@ -957,7 +963,8 @@ bool hoistLoopInvariants(mir::Function& function, Statistics& statistics) {
                 if (isValueInstruction(inst)) {
                     loopDefinedValues.insert(inst.result);
                 }
-                if (inst.opcode == mir::Opcode::StoreLocal) {
+                if (inst.opcode == mir::Opcode::StoreLocal ||
+                    inst.opcode == mir::Opcode::AwaitSuspend) {
                     loopModifiedLocals.insert(inst.localIndex);
                 }
             }

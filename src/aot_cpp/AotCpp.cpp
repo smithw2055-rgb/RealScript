@@ -848,6 +848,11 @@ bool supportsTypedPrimitiveAot(
     if (!function.exceptionHandlers.empty()) {
         return false;
     }
+    if (!function.blocks.empty() &&
+        !function.blocks.front().instructions.empty() &&
+        function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter) {
+        return false;
+    }
     if (function.returnType != semantic::PrimitiveType::Void &&
         !isTypedAotSlot({function.returnType, function.returnTypeId}, &customStructs)) {
         return false;
@@ -4499,8 +4504,17 @@ GeneratedProgram CppGenerator::generate(
         }
         source.line("    std::vector<runtime::Value> registers(" +
             std::to_string(registerCount(function)) + ");");
+        const bool isAsyncFunction = !function.blocks.empty() &&
+            !function.blocks.front().instructions.empty() &&
+            function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
         source.line("    FrameScope frame(context, argumentValues, locals, registers);");
         source.line("    std::uint32_t currentBlock = 0;");
+        if (isAsyncFunction) {
+            source.line("    runtime::CoroutineFrameHandle activeCoroutine{};");
+            source.line("    (void)context.tryEnterResumingCoroutine(0x" +
+                hexId(function.symbolId) +
+                "ULL, argumentValues, locals, registers, currentBlock, activeCoroutine);");
+        }
         source.line("    for (;;) {");
         source.line("        switch (currentBlock) {");
 
@@ -4732,6 +4746,10 @@ GeneratedProgram CppGenerator::generate(
                         "u, " + resultName + ")) {");
                     source.line("                if (context.hasPendingException()) {");
                     emitExceptionRoute("                    ");
+                    if (isAsyncFunction) {
+                        source.line("                    return context.finishUncaughtAsyncException(activeCoroutine, 0x" +
+                            hexId(function.returnTypeId) + "ULL, result);");
+                    }
                     source.line("                }");
                     source.line("                return false;");
                     source.line("            }");
@@ -4770,6 +4788,10 @@ GeneratedProgram CppGenerator::generate(
                         "u, " + resultName + ")) {");
                     source.line("                if (context.hasPendingException()) {");
                     emitExceptionRoute("                    ");
+                    if (isAsyncFunction) {
+                        source.line("                    return context.finishUncaughtAsyncException(activeCoroutine, 0x" +
+                            hexId(function.returnTypeId) + "ULL, result);");
+                    }
                     source.line("                }");
                     source.line("                return false;");
                     source.line("            }");
@@ -4789,6 +4811,51 @@ GeneratedProgram CppGenerator::generate(
                             : "false") +
                         ", " + result + ")) return false;");
                     break;
+                case mir::Opcode::AsyncEnter:
+                    break;
+                case mir::Opcode::AwaitSuspend: {
+                    source.line("            {");
+                    source.line("                bool suspendedNow = false;");
+                    source.line("                if (!context.awaitSuspend(0x" +
+                        hexId(function.symbolId) + "ULL, 0x" +
+                        hexId(function.returnTypeId) + "ULL, " +
+                        operand(0) + ", locals[" +
+                        std::to_string(instruction.localIndex) + "], " +
+                        std::to_string(instruction.integerImmediate) +
+                        "u, argumentValues, locals, registers, activeCoroutine, suspendedNow, result)) return false;");
+                    source.line("                if (suspendedNow) return true;");
+                    source.line("            }");
+                    break;
+                }
+                case mir::Opcode::AwaitResume: {
+                    const std::string outPtr = instruction.result >= 0
+                        ? ("&" + result)
+                        : std::string("nullptr");
+                    source.line("            if (!context.awaitResume(locals[" +
+                        std::to_string(instruction.localIndex) + "], " +
+                        primitiveExpression(instruction.elementType) + ", 0x" +
+                        hexId(instruction.elementTypeId) + "ULL, " +
+                        outPtr + ")) {");
+                    source.line("                if (context.hasPendingException()) {");
+                    emitExceptionRoute("                    ");
+                    if (isAsyncFunction) {
+                        source.line("                    return context.finishUncaughtAsyncException(activeCoroutine, 0x" +
+                            hexId(function.returnTypeId) + "ULL, result);");
+                    }
+                    source.line("                }");
+                    source.line("                return false;");
+                    source.line("            }");
+                    break;
+                }
+                case mir::Opcode::AsyncResolve: {
+                    const std::string payloadPtr = instruction.operands.empty()
+                        ? std::string("nullptr")
+                        : ("&" + operand(0));
+                    source.line("            if (!context.asyncResolve(activeCoroutine, 0x" +
+                        hexId(instruction.typeId) + "ULL, " +
+                        payloadPtr + ", " + result + ")) return false;");
+                    break;
+                }
                 default:
                     if (isConversion(instruction.opcode)) {
                         source.line("            if (!context.convert(" +
@@ -4898,6 +4965,10 @@ GeneratedProgram CppGenerator::generate(
                     valueExpression(block.terminator.value) + ")) {");
                 source.line("                if (context.hasPendingException()) {");
                 emitExceptionRoute("                    ");
+                if (isAsyncFunction) {
+                    source.line("                    return context.finishUncaughtAsyncException(activeCoroutine, 0x" +
+                        hexId(function.returnTypeId) + "ULL, result);");
+                }
                 source.line("                }");
                 source.line("                return false;");
                 source.line("            }");

@@ -67,6 +67,8 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(DefaultKeyword);
         RS_KIND(SequenceKeyword);
         RS_KIND(YieldKeyword);
+        RS_KIND(AsyncKeyword);
+        RS_KIND(AwaitKeyword);
         RS_KIND(ClassKeyword);
         RS_KIND(StructKeyword);
         RS_KIND(EnumKeyword);
@@ -208,6 +210,8 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"default", SyntaxKind::DefaultKeyword},
         {"sequence", SyntaxKind::SequenceKeyword},
         {"yield", SyntaxKind::YieldKeyword},
+        {"async", SyntaxKind::AsyncKeyword},
+        {"await", SyntaxKind::AwaitKeyword},
         {"class", SyntaxKind::ClassKeyword},
         {"struct", SyntaxKind::StructKeyword},
         {"enum", SyntaxKind::EnumKeyword},
@@ -266,6 +270,7 @@ int unaryPrecedence(SyntaxKind kind) noexcept {
     case SyntaxKind::PlusToken:
     case SyntaxKind::MinusToken:
     case SyntaxKind::BangToken:
+    case SyntaxKind::AwaitKeyword:
         return 7;
     default:
         return 0;
@@ -311,6 +316,7 @@ bool isDeclarationModifier(SyntaxKind kind) noexcept {
     case SyntaxKind::VirtualKeyword:
     case SyntaxKind::OverrideKeyword:
     case SyntaxKind::SealedKeyword:
+    case SyntaxKind::AsyncKeyword:
         return true;
     default:
         return false;

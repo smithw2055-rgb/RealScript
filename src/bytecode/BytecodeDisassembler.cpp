@@ -315,8 +315,18 @@ std::string disassembleModule(const Module& module) {
                 case Opcode::InvokeDelegate:
                 case Opcode::CombineDelegate:
                 case Opcode::RemoveDelegate:
+                case Opcode::AsyncEnter:
+                case Opcode::AsyncResolve:
                     out << " type" << instruction.typeIndex;
                     printRegisters(out, instruction.operands);
+                    break;
+                case Opcode::AwaitSuspend:
+                    out << " local" << instruction.index
+                        << " resume=bb" << instruction.integerImmediate;
+                    printRegisters(out, instruction.operands);
+                    break;
+                case Opcode::AwaitResume:
+                    out << " local" << instruction.index;
                     break;
                 default:
                     for (std::size_t index = 0;

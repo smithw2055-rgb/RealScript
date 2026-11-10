@@ -94,6 +94,10 @@ enum class Opcode : std::uint8_t {
     IsType,
     AsType,
     ConstantTypeId,
+    AsyncEnter,
+    AwaitSuspend,
+    AwaitResume,
+    AsyncResolve,
 };
 
 struct FunctionReference {
@@ -319,7 +323,7 @@ struct Instruction {
     };
 
     [[nodiscard]] constexpr bool usesIntegerImmediate() const noexcept {
-        return opcode == Opcode::ConstantInt || opcode == Opcode::ConstantTypeId || opcode == Opcode::LoadParameter;
+        return opcode == Opcode::ConstantInt || opcode == Opcode::ConstantTypeId || opcode == Opcode::LoadParameter || opcode == Opcode::AwaitSuspend;
     }
     [[nodiscard]] constexpr bool usesDoubleImmediate() const noexcept {
         return opcode == Opcode::ConstantDouble;

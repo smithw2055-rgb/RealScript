@@ -1,5 +1,6 @@
 #include <cstring>
 #include "realscript/runtime/Runtime.h"
+#include "realscript/runtime/AsyncRuntime.h"
 
 #include "ExecutionMirror.h"
 #include "realscript/debug/Debugger.h"
@@ -61,7 +62,7 @@ struct DelegateCallSiteCache {
 DeterminismOperationId instructionOperationId(
     bytecode::Opcode opcode) noexcept {
     constexpr auto Count =
-        static_cast<std::size_t>(bytecode::Opcode::ConstantTypeId) + 1U;
+        static_cast<std::size_t>(bytecode::Opcode::AsyncResolve) + 1U;
     static const auto ids = [] {
         std::array<DeterminismOperationId, Count> result{};
         for (std::size_t index = 0; index < result.size(); ++index) {
@@ -122,7 +123,38 @@ struct State {
     const detail::ExecutionMirror* mirror = nullptr;
     std::optional<Value> pendingException;
     bool exceptionNotifiedDebugger = false;
+    AsyncRuntimeContext* asyncRuntime = nullptr;
+    void* resumeEnvRaw = nullptr;
+    const std::shared_ptr<const void>* resumeEnvOwner = nullptr;
+    CoroutineFrameHandle resumingCoroutine{};
+    CoroutineFrame* resumingFramePtr = nullptr;
+    CoroutineFrameHandle* currentBlockVmCoroutinePtr = nullptr;
+    bool coroutineSuspendedNow = false;
+    Value suspendedReturnValue{};
 };
+
+struct InterpreterResumeEnv {
+    std::shared_ptr<const ProgramImage> program;
+    std::shared_ptr<ManagedHeap> heap;
+    std::shared_ptr<const BindingRegistry> bindings;
+    ExternalFunction externalResolver;
+    ExecutionOptions options;
+};
+
+struct ThreadInvokeScratch {
+    struct Buffers {
+        std::vector<Value> values;
+        std::vector<const std::string*> stack;
+        std::array<InlineCallCacheEntry, 64> inlineCallCache{};
+        std::vector<PolymorphicPicSite> polyCallCache;
+        std::vector<DelegateCallSiteCache> delegateCallCache;
+        std::uint64_t lastMirrorId = 0;
+    };
+    enum : std::size_t { MaxDepth = 8 };
+    std::array<Buffers, MaxDepth> pool{};
+    std::size_t depth = 0;
+};
+thread_local ThreadInvokeScratch tlsInvokeScratch;
 
 [[nodiscard]] constexpr bool isValidInt32Payload(std::int64_t v) noexcept {
     return v >= static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::min()) &&
@@ -1436,6 +1468,23 @@ bool executeCall(
             argSpan = ValueSpan(heapArguments);
         }
     }
+    if (reference.name.rfind("$intrinsic::Async.__", 0) == 0) {
+        std::string intrinsicError;
+        if (!tryExecuteAsyncIntrinsic(
+                reference.name.substr(12u),
+                argSpan,
+                state.asyncRuntime,
+                state.heap,
+                result,
+                intrinsicError) ||
+            !intrinsicError.empty()) {
+            const auto code = intrinsicError.find("null") != std::string::npos
+                ? ErrorCode::NullReference
+                : ErrorCode::InvalidProgram;
+            return fail(state, code, intrinsicError);
+        }
+        return true;
+    }
     if (reference.name.rfind("$intrinsic::", 0) == 0) {
         std::string intrinsicError;
         if (!tryExecuteRuntimeIntrinsic(
@@ -2440,6 +2489,203 @@ bool executeSuperInstruction(
     }
 }
 
+
+std::string extractScriptExceptionMessage(const State& state, const Value& excVal) {
+    if (!state.heap || !std::holds_alternative<ObjectRef>(excVal)) {
+        return "unhandled script exception in async function";
+    }
+    const ObjectRef ref = std::get<ObjectRef>(excVal);
+    const auto tid = state.heap->objectTypeId(ref);
+    const auto* typeDesc = (tid && state.program) ? state.program->resolveType(*tid) : nullptr;
+    if (typeDesc) {
+        for (std::size_t f = 0; f < typeDesc->fields.size(); ++f) {
+            if (typeDesc->fields[f].type == semantic::PrimitiveType::String) {
+                if (const auto fv = state.heap->fieldGet(ref, f)) {
+                    if (!std::holds_alternative<NullString>(*fv) &&
+                        !std::holds_alternative<std::monostate>(*fv)) {
+                        const auto s = valueToString(*fv, state.heap);
+                        if (!s.empty()) return s;
+                    }
+                }
+            }
+        }
+        if (!typeDesc->name.empty()) return typeDesc->name;
+    }
+    return "unhandled script exception in async function";
+}
+
+void resumeInterpreterCoroutineCallback(
+    void* runnerContext,
+    CoroutineFrameHandle frameHandle,
+    CoroutineFrame& frame,
+    AsyncRuntimeContext& asyncContext);
+
+bool suspendInterpreterCoroutine(
+    State& state,
+    const bytecode::Function& function,
+    CoroutineFrameHandle& ioActiveCoroutine,
+    const Value* argsPtr,
+    std::size_t argCount,
+    const Value* localsPtr,
+    std::size_t localCount,
+    const Value* regsPtr,
+    std::size_t regCount,
+    std::uint32_t resumeBlockId,
+    AwaitableHandle awaitedHandle,
+    Value& outAwaitableStruct) {
+    if (!state.asyncRuntime) {
+        return fail(state, ErrorCode::InvalidProgram, "async suspension requires an AsyncRuntimeContext");
+    }
+    AwaitableHandle completionHandle{};
+    if (!ioActiveCoroutine.valid()) {
+        completionHandle = state.asyncRuntime->awaitables().allocatePending(ResumeQueue::Update);
+        ioActiveCoroutine = state.asyncRuntime->coroutines().allocateFrame(
+            function.symbolId,
+            function.returnTypeId,
+            completionHandle,
+            ResumeQueue::Update);
+    } else {
+        const auto* existing = state.asyncRuntime->coroutines().resolve(ioActiveCoroutine);
+        if (!existing) {
+            return fail(state, ErrorCode::InvalidProgram, "active coroutine frame handle is stale");
+        }
+        completionHandle = existing->completionHandle;
+    }
+
+    std::shared_ptr<const void> ownerCopy{};
+    if (state.resumeEnvOwner && *state.resumeEnvOwner) {
+        const auto* cur = state.asyncRuntime->coroutines().resolve(ioActiveCoroutine);
+        if (!cur || !cur->runnerOwner) {
+            ownerCopy = *state.resumeEnvOwner;
+        }
+    }
+
+    if (!state.asyncRuntime->coroutines().suspendFrame(
+            ioActiveCoroutine,
+            argsPtr,
+            argCount,
+            localsPtr,
+            localCount,
+            regsPtr,
+            regCount,
+            resumeBlockId,
+            awaitedHandle,
+            &resumeInterpreterCoroutineCallback,
+            state.resumeEnvRaw,
+            std::move(ownerCopy))) {
+        return fail(state, ErrorCode::InvalidProgram, "failed to suspend coroutine onto awaited handle");
+    }
+    outAwaitableStruct = makeAwaitableStructValue(function.returnTypeId, completionHandle);
+    return true;
+}
+
+bool resumeInterpreterAwaitable(
+    State& state,
+    const Value& awaitableVal,
+    bool hasResult,
+    semantic::PrimitiveType expectedType,
+    semantic::SymbolId expectedTypeId,
+    Value& outResumedVal) {
+    AwaitableHandle awaitedHandle{};
+    if (!state.asyncRuntime || !tryExtractAwaitableHandle(awaitableVal, awaitedHandle)) {
+        return fail(state, ErrorCode::InvalidProgram, "await.resume local does not hold a valid Awaitable");
+    }
+    Value payload{};
+    RuntimeError faultErr{};
+    Value excObj{};
+    const AwaitStatus st = state.asyncRuntime->awaitables().getResult(
+        awaitedHandle, payload, faultErr, &excObj);
+    if (st == AwaitStatus::Succeeded) {
+        if (hasResult) {
+            if (!expectSignatureType(state, payload, expectedType, expectedTypeId, "await result")) {
+                return false;
+            }
+            outResumedVal = std::move(payload);
+        }
+        return true;
+    }
+    if (st == AwaitStatus::Canceled || st == AwaitStatus::Faulted) {
+        const auto matRef = materializeAsyncResumeException(
+            state.heap, st, faultErr, excObj);
+        if (!matRef) {
+            return fail(state, ErrorCode::OutOfMemory, "failed to allocate async resume exception");
+        }
+        state.pendingException = Value(*matRef);
+        return false;
+    }
+    return fail(state, ErrorCode::InvalidProgram, "await.resume encountered non-terminal Awaitable");
+}
+
+bool resolveInterpreterCoroutine(
+    State& state,
+    CoroutineFrameHandle activeCoroutine,
+    semantic::SymbolId returnStructTypeId,
+    const Value* optionalPayload,
+    Value& outWrappedStruct) {
+    if (!state.asyncRuntime) {
+        return fail(state, ErrorCode::InvalidProgram, "async.resolve requires an AsyncRuntimeContext");
+    }
+    if (activeCoroutine.valid()) {
+        auto* frame = state.asyncRuntime->coroutines().resolve(activeCoroutine);
+        if (!frame) {
+            return fail(state, ErrorCode::InvalidProgram, "async.resolve coroutine frame is invalid");
+        }
+        frame->completed = true;
+        const Value val = optionalPayload ? *optionalPayload : Value{};
+        (void)state.asyncRuntime->awaitables().trySetResult(frame->completionHandle, val);
+        outWrappedStruct = makeAwaitableStructValue(returnStructTypeId, frame->completionHandle);
+        return true;
+    }
+    AwaitableHandle h{};
+    if (!optionalPayload) {
+        h = AwaitableHandle::completedVoid();
+    } else {
+        h = state.asyncRuntime->awaitables().fromResult(*optionalPayload);
+    }
+    outWrappedStruct = makeAwaitableStructValue(returnStructTypeId, h);
+    return true;
+}
+
+bool finishUncaughtInterpreterAsyncException(
+    State& state,
+    const bytecode::Function& function,
+    CoroutineFrameHandle activeCoroutine,
+    Value& outResult) {
+    if (!state.asyncRuntime || !state.pendingException.has_value()) {
+        return false;
+    }
+    const Value excVal = *state.pendingException;
+    state.pendingException.reset();
+    state.error = RuntimeError{};
+
+    const bool isCanceled = isAsyncCanceledExceptionObject(state.heap, excVal);
+    if (activeCoroutine.valid()) {
+        auto* frame = state.asyncRuntime->coroutines().resolve(activeCoroutine);
+        if (!frame) return false;
+        frame->completed = true;
+        if (isCanceled) {
+            (void)state.asyncRuntime->awaitables().trySetCanceled(frame->completionHandle);
+        } else {
+            std::string msg = extractScriptExceptionMessage(state, excVal);
+            (void)state.asyncRuntime->awaitables().trySetFaulted(
+                frame->completionHandle,
+                ErrorCode::ScriptException,
+                std::move(msg),
+                excVal);
+        }
+        outResult = makeAwaitableStructValue(function.returnTypeId, frame->completionHandle);
+        return true;
+    }
+    AwaitableHandle h = isCanceled
+        ? state.asyncRuntime->awaitables().fromCanceled()
+        : state.asyncRuntime->awaitables().fromFaulted(
+              ErrorCode::ScriptException,
+              extractScriptExceptionMessage(state, excVal),
+              excVal);
+    outResult = makeAwaitableStructValue(function.returnTypeId, h);
+    return true;
+}
+
 bool executeInstruction(
     State& state,
     const bytecode::Module& module,
@@ -3226,6 +3472,85 @@ bool executeInstruction(
         if (instruction.result == bytecode::InvalidRegister) return true;
         return storeResult(std::move(callResult));
     }
+    case bytecode::Opcode::AsyncEnter:
+        return true;
+    case bytecode::Opcode::AwaitSuspend: {
+        const auto* val = operand(0);
+        if (!val || instruction.index >= locals.size() || !state.asyncRuntime) {
+            return fail(state, ErrorCode::InvalidProgram, "invalid await.suspend operand or local");
+        }
+        locals[instruction.index] = *val;
+        AwaitableHandle awaitedHandle{};
+        if (!tryExtractAwaitableHandle(*val, awaitedHandle) ||
+            !state.asyncRuntime->awaitables().isValid(awaitedHandle)) {
+            return fail(state, ErrorCode::InvalidProgram, "awaited value does not hold a valid Awaitable handle");
+        }
+        if (state.asyncRuntime->awaitables().isCompleted(awaitedHandle)) {
+            return true;
+        }
+        if (!state.currentBlockVmCoroutinePtr) {
+            return fail(state, ErrorCode::InvalidProgram, "missing coroutine context in block VM");
+        }
+        Value pendingRet{};
+        const Value* argsRaw = arguments.size() == 0 ? nullptr : &arguments.values->at(arguments.offset);
+        const Value* locsRaw = locals.size() == 0 ? nullptr : &locals.values->at(locals.offset);
+        const Value* regsRaw = registers.size() == 0 ? nullptr : &registers.values->at(registers.offset);
+        if (!suspendInterpreterCoroutine(
+                state,
+                function,
+                *state.currentBlockVmCoroutinePtr,
+                argsRaw,
+                arguments.size(),
+                locsRaw,
+                locals.size(),
+                regsRaw,
+                registers.size(),
+                static_cast<std::uint32_t>(instruction.activeIntegerImmediate()),
+                awaitedHandle,
+                pendingRet)) {
+            return false;
+        }
+        state.suspendedReturnValue = std::move(pendingRet);
+        state.coroutineSuspendedNow = true;
+        return true;
+    }
+    case bytecode::Opcode::AwaitResume: {
+        if (instruction.index >= locals.size()) {
+            return fail(state, ErrorCode::InvalidProgram, "invalid await.resume local");
+        }
+        const Value awaitableVal = locals[instruction.index];
+        locals[instruction.index] = Value{};
+        Value resumedVal{};
+        const bool hasRes = (instruction.result != bytecode::InvalidRegister);
+        if (!resumeInterpreterAwaitable(
+                state,
+                awaitableVal,
+                hasRes,
+                instruction.elementType,
+                instruction.activeElementTypeId(),
+                resumedVal)) {
+            return false;
+        }
+        if (!hasRes) return true;
+        return storeResult(std::move(resumedVal));
+    }
+    case bytecode::Opcode::AsyncResolve: {
+        const auto* retTypeDesc = typeDescriptor(module, instruction.typeIndex);
+        if (!retTypeDesc || !state.currentBlockVmCoroutinePtr) {
+            return fail(state, ErrorCode::InvalidProgram, "invalid async.resolve metadata");
+        }
+        const Value* payloadPtr = instruction.operands.empty() ? nullptr : operand(0);
+        Value wrapped{};
+        if (!resolveInterpreterCoroutine(
+                state,
+                *state.currentBlockVmCoroutinePtr,
+                retTypeDesc->id,
+                payloadPtr,
+                wrapped)) {
+            return false;
+        }
+        return storeResult(std::move(wrapped));
+    }
     case bytecode::Opcode::NegateInt: {
         const auto* value = operand(0);
         if (!value || !expectType(state, *value, semantic::PrimitiveType::Int, "negation")) return false;
@@ -3547,6 +3872,17 @@ bool executeFunction(
     if (state.stack.size() >= state.limits.recursionLimit) {
         return fail(state, ErrorCode::RecursionLimitExceeded, "recursion limit exceeded");
     }
+    CoroutineFrameHandle activeCoroutine{};
+    CoroutineFrame* activeCoroutineFrame = nullptr;
+    if (state.resumingFramePtr != nullptr &&
+        state.resumingCoroutine.valid() &&
+        function.symbolId == state.resumingFramePtr->functionSymbolId) {
+        activeCoroutine = state.resumingCoroutine;
+        activeCoroutineFrame = state.resumingFramePtr;
+        state.resumingCoroutine = CoroutineFrameHandle::invalid();
+        state.resumingFramePtr = nullptr;
+        argumentsPrevalidated = true;
+    }
     if (!argumentsPrevalidated &&
         arguments.size() != function.parameterTypes.size()) {
         return fail(state, ErrorCode::InvalidArguments, "argument count does not match function signature");
@@ -3693,10 +4029,35 @@ bool executeFunction(
         }
 
         Value* __restrict frameBase = state.values.data() + frameOffset;
-        const std::size_t argCount = arguments.size();
+        const std::size_t argCount = activeCoroutineFrame
+            ? activeCoroutineFrame->savedArguments.size()
+            : arguments.size();
         std::uint32_t initialEntryOffset = execution->entryStreamOffset;
         std::uint64_t prologueSpanBonus = 0;
-        if (execution->hasFastParamToLocalPrologue &&
+        if (activeCoroutineFrame != nullptr) {
+            const std::size_t nArgs = std::min(argCount, function.parameterTypes.size());
+            for (std::size_t i = 0; i < nArgs; ++i) {
+                frameBase[execution->paramOffset + i] = activeCoroutineFrame->savedArguments[i];
+            }
+            const std::size_t nLocs = std::min(
+                activeCoroutineFrame->savedLocals.size(), function.localTypes.size());
+            for (std::size_t i = 0; i < nLocs; ++i) {
+                frameBase[execution->localOffset + i] = activeCoroutineFrame->savedLocals[i];
+            }
+            const std::size_t nRegs = std::min(
+                activeCoroutineFrame->savedRegisters.size(), function.registerTypes.size());
+            for (std::size_t i = 0; i < nRegs; ++i) {
+                frameBase[execution->registerOffset + i] = activeCoroutineFrame->savedRegisters[i];
+            }
+            const auto foundResumeBlk = execution->blockIndices.find(
+                activeCoroutineFrame->resumeBlockId);
+            if (foundResumeBlk == execution->blockIndices.end()) {
+                state.valueTop = frameOffset;
+                state.stack.pop_back();
+                return fail(state, ErrorCode::InvalidProgram, "invalid coroutine resume block id");
+            }
+            initialEntryOffset = execution->blockStreamOffsets[foundResumeBlk->second];
+        } else if (execution->hasFastParamToLocalPrologue &&
             state.limits.gcWorkBudget == 0 &&
             execution->entryStreamOffset == 0 &&
             argCount > 0 &&
@@ -4010,6 +4371,10 @@ bool executeFunction(
             &&L_CombineDelegateFast,
             &&L_RemoveDelegateFast,
             &&L_InvokeDelegateFast,
+            &&L_AsyncEnter,
+            &&L_AwaitSuspend,
+            &&L_AwaitResume,
+            &&L_AsyncResolve,
             &&L_GenericBytecode,
             &&L_TermJumpNoArgs,
             &&L_TermBranchBoolNoArgs,
@@ -8418,6 +8783,96 @@ bool executeFunction(
                 RS_FLAT_DISPATCH_NEXT();
             }
 
+            RS_FLAT_CASE(AsyncEnter) {
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(AwaitSuspend) {
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                const Value awaitableVal = frameBase[ip->src0Slot];
+                frameBase[ip->storeSlot] = awaitableVal;
+                AwaitableHandle awaitedHandle{};
+                if (RS_FLAT_UNLIKELY(!state.asyncRuntime ||
+                                     !tryExtractAwaitableHandle(awaitableVal, awaitedHandle) ||
+                                     !state.asyncRuntime->awaitables().isValid(awaitedHandle))) {
+                    state.executed = localExecuted;
+                    fail(state, ErrorCode::InvalidProgram, "awaited value does not hold a valid Awaitable handle");
+                    goto L_FlatError;
+                }
+                if (state.asyncRuntime->awaitables().isCompleted(awaitedHandle)) {
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                state.executed = localExecuted;
+                if (RS_FLAT_UNLIKELY(!suspendInterpreterCoroutine(
+                        state,
+                        function,
+                        activeCoroutine,
+                        frameBase + execution->paramOffset,
+                        argCount,
+                        frameBase + execution->localOffset,
+                        function.localTypes.size(),
+                        frameBase + execution->registerOffset,
+                        function.registerTypes.size(),
+                        static_cast<std::uint32_t>(ip->integerImmediate),
+                        awaitedHandle,
+                        result))) {
+                    goto L_FlatError;
+                }
+                state.valueTop = frameOffset;
+                state.stack.pop_back();
+                return true;
+            }
+
+            RS_FLAT_CASE(AwaitResume) {
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                state.executed = localExecuted;
+                const Value awaitableVal = frameBase[ip->src0Slot];
+                frameBase[ip->src0Slot] = Value{};
+                Value resumedVal{};
+                const bool hasRes = (ip->dstSlot != detail::InvalidCompactReg);
+                if (RS_FLAT_UNLIKELY(!resumeInterpreterAwaitable(
+                        state,
+                        awaitableVal,
+                        hasRes,
+                        static_cast<semantic::PrimitiveType>(static_cast<std::uint8_t>(ip->binaryOpcode1)),
+                        static_cast<semantic::SymbolId>(ip->integerImmediate),
+                        resumedVal))) {
+                    frameBase = state.values.data() + frameOffset;
+                    syncAfterFlatSubcall();
+                    goto L_FlatError;
+                }
+                frameBase = state.values.data() + frameOffset;
+                syncAfterFlatSubcall();
+                if (hasRes) {
+                    frameBase[ip->dstSlot] = std::move(resumedVal);
+                }
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(AsyncResolve) {
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                state.executed = localExecuted;
+                const Value* payloadPtr =
+                    (ip->inlineArgCount != 0u && ip->src0Slot != detail::InvalidCompactReg)
+                        ? &frameBase[ip->src0Slot]
+                        : nullptr;
+                Value wrapped{};
+                if (RS_FLAT_UNLIKELY(!resolveInterpreterCoroutine(
+                        state,
+                        activeCoroutine,
+                        static_cast<semantic::SymbolId>(ip->integerImmediate),
+                        payloadPtr,
+                        wrapped))) {
+                    goto L_FlatError;
+                }
+                frameBase[ip->dstSlot] = std::move(wrapped);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
             RS_FLAT_CASE(GenericBytecode) {
             L_FlatMathFallback:
                 if (RS_FLAT_UNLIKELY(ip->span > 1)) goto L_FlatSuperFallback;
@@ -8830,6 +9285,13 @@ L_FlatError:
                     }
                     state.stack.pop_back();
                 }
+                if (execution->isAsyncFunction && state.pendingException.has_value()) {
+                    const bool resolved = finishUncaughtInterpreterAsyncException(
+                        state, function, activeCoroutine, result);
+                    state.valueTop = frameOffset;
+                    state.stack.pop_back();
+                    return resolved;
+                }
                 state.valueTop = frameOffset;
                 state.stack.pop_back();
                 return false;
@@ -8862,6 +9324,13 @@ L_FlatError:
                 }
             }
         }
+        if (execution->isAsyncFunction && state.pendingException.has_value()) {
+            const bool resolved = finishUncaughtInterpreterAsyncException(
+                state, function, activeCoroutine, result);
+            state.valueTop = frameOffset;
+            state.stack.pop_back();
+            return resolved;
+        }
         state.valueTop = frameOffset;
         state.stack.pop_back();
         return false;
@@ -8892,17 +9361,36 @@ L_FlatError:
     state.statistics.maximumCallDepth = std::max(state.statistics.maximumCallDepth, state.stack.size());
     emitTrace(state, TraceEventKind::FunctionEnter);
     ArenaFrameScope frame(state);
+    const std::size_t blockArgCount = activeCoroutineFrame
+        ? activeCoroutineFrame->savedArguments.size()
+        : arguments.size();
     const auto argumentOffset = frame.base();
-    const auto localOffset = argumentOffset + arguments.size();
+    const auto localOffset = argumentOffset + blockArgCount;
     const auto registerOffset = localOffset + function.localTypes.size();
     const auto scratchOffset = registerOffset + function.registerTypes.size();
     frame.allocate(
-        arguments.size() + function.localTypes.size() +
+        blockArgCount + function.localTypes.size() +
         function.registerTypes.size() + execution->edgeScratchCount);
-    for (std::size_t index = 0; index < arguments.size(); ++index) {
-        state.values[argumentOffset + index] = arguments[index];
+    if (activeCoroutineFrame != nullptr) {
+        for (std::size_t index = 0; index < blockArgCount; ++index) {
+            state.values[argumentOffset + index] = activeCoroutineFrame->savedArguments[index];
+        }
+        const std::size_t nLocs = std::min(
+            activeCoroutineFrame->savedLocals.size(), function.localTypes.size());
+        for (std::size_t index = 0; index < nLocs; ++index) {
+            state.values[localOffset + index] = activeCoroutineFrame->savedLocals[index];
+        }
+        const std::size_t nRegs = std::min(
+            activeCoroutineFrame->savedRegisters.size(), function.registerTypes.size());
+        for (std::size_t index = 0; index < nRegs; ++index) {
+            state.values[registerOffset + index] = activeCoroutineFrame->savedRegisters[index];
+        }
+    } else {
+        for (std::size_t index = 0; index < blockArgCount; ++index) {
+            state.values[argumentOffset + index] = arguments[index];
+        }
     }
-    ValueWindow argumentWindow{&state.values, argumentOffset, arguments.size()};
+    ValueWindow argumentWindow{&state.values, argumentOffset, blockArgCount};
     ValueWindow locals{&state.values, localOffset, function.localTypes.size()};
     ValueWindow registers{
         &state.values, registerOffset, function.registerTypes.size()};
@@ -8918,7 +9406,20 @@ L_FlatError:
             registers.debugView(),
         }
         : debug::DebugFrameView{});
-    const detail::ExecutionBlock* block = &execution->blocks[execution->entry];
+    CoroutineFrameHandle* const prevBlockCoroPtr = state.currentBlockVmCoroutinePtr;
+    state.currentBlockVmCoroutinePtr = &activeCoroutine;
+    struct RestoreBlockCoroPtr {
+        State& st;
+        CoroutineFrameHandle* prev;
+        ~RestoreBlockCoroPtr() { st.currentBlockVmCoroutinePtr = prev; }
+    } restoreBlockCoroPtr{state, prevBlockCoroPtr};
+    const detail::ExecutionBlock* block = activeCoroutineFrame
+        ? detail::findExecutionBlock(*execution, activeCoroutineFrame->resumeBlockId)
+        : &execution->blocks[execution->entry];
+    if (!block) {
+        state.stack.pop_back();
+        return fail(state, ErrorCode::InvalidProgram, "invalid coroutine resume block in block VM");
+    }
 
     const auto routePendingException = [&](bytecode::BlockId protectedBlock) {
         if (!state.pendingException ||
@@ -9008,8 +9509,23 @@ L_FlatError:
                         static_cast<std::uint32_t>(executionSpan),
                         false);
                 }
+                if (execution->isAsyncFunction && state.pendingException.has_value()) {
+                    const bool resolved = finishUncaughtInterpreterAsyncException(
+                        state, function, activeCoroutine, result);
+                    state.stack.pop_back();
+                    return resolved;
+                }
                 state.stack.pop_back();
                 return false;
+            }
+            if (state.coroutineSuspendedNow) {
+                state.coroutineSuspendedNow = false;
+                result = std::move(state.suspendedReturnValue);
+                if (state.traceEventsEnabled) {
+                    emitTrace(state, TraceEventKind::FunctionExit);
+                }
+                state.stack.pop_back();
+                return true;
             }
             instructionIndex += executionSpan - 1;
         }
@@ -9136,6 +9652,12 @@ L_FlatError:
                 block = handler;
                 continue;
             }
+            if (execution->isAsyncFunction && state.pendingException.has_value()) {
+                const bool resolved = finishUncaughtInterpreterAsyncException(
+                    state, function, activeCoroutine, result);
+                state.stack.pop_back();
+                return resolved;
+            }
             state.stack.pop_back();
             return false;
         }
@@ -9244,10 +9766,172 @@ L_FlatError:
     }
 }
 
+
+void resumeInterpreterCoroutineCallback(
+    void* runnerContext,
+    CoroutineFrameHandle frameHandle,
+    CoroutineFrame& frame,
+    AsyncRuntimeContext& asyncContext) {
+    const auto faultUnresolvedFrame = [&](const RuntimeError& err) {
+        if (auto* f = asyncContext.coroutines().resolve(frameHandle)) {
+            if (!f->completed && !f->suspended) {
+                f->completed = true;
+                const ErrorCode code = (err.code != ErrorCode::None)
+                    ? err.code
+                    : ErrorCode::InvalidProgram;
+                const std::string msg = !err.message.empty()
+                    ? err.message
+                    : std::string("resumed coroutine failed with runtime error");
+                (void)asyncContext.awaitables().trySetFaulted(
+                    f->completionHandle, code, msg);
+            }
+        }
+    };
+
+    if (void* activeRaw = asyncContext.activeInterpreterState()) {
+        auto* activeState = static_cast<State*>(activeRaw);
+        if (activeState->program != nullptr) {
+            const auto* loc = activeState->program->resolveFunction(frame.functionSymbolId);
+            if (loc) {
+                const CoroutineFrameHandle savedCoro = activeState->resumingCoroutine;
+                CoroutineFrame* const savedFramePtr = activeState->resumingFramePtr;
+                const bool savedSuspendedNow = activeState->coroutineSuspendedNow;
+                Value savedSuspendedRet = std::move(activeState->suspendedReturnValue);
+                RuntimeError savedError = std::move(activeState->error);
+                std::optional<Value> savedPendingExc = std::move(activeState->pendingException);
+
+                activeState->resumingCoroutine = frameHandle;
+                activeState->resumingFramePtr = &frame;
+                activeState->coroutineSuspendedNow = false;
+                activeState->suspendedReturnValue = Value{};
+                activeState->error = RuntimeError{};
+                activeState->pendingException.reset();
+
+                Value ignoredResult{};
+                const ArgumentSource emptyArgs{};
+                const bool ok = executeFunction(*activeState, *loc, emptyArgs, ignoredResult);
+                if (!ok) {
+                    faultUnresolvedFrame(activeState->error);
+                }
+
+                activeState->resumingCoroutine = savedCoro;
+                activeState->resumingFramePtr = savedFramePtr;
+                activeState->coroutineSuspendedNow = savedSuspendedNow;
+                activeState->suspendedReturnValue = std::move(savedSuspendedRet);
+                activeState->error = std::move(savedError);
+                activeState->pendingException = std::move(savedPendingExc);
+                return;
+            }
+        }
+    }
+
+    auto* env = static_cast<InterpreterResumeEnv*>(runnerContext);
+    if (!env || !env->program) return;
+    const auto* found = env->program->resolveFunction(frame.functionSymbolId);
+    if (!found) return;
+
+    std::array<InlineCallCacheEntry, 64> fallbackInlineCache;
+    std::vector<PolymorphicPicSite> fallbackPolyCache;
+    std::vector<DelegateCallSiteCache> fallbackDelCache;
+    const auto& activeMirror = detail::executionMirror(*env->program);
+
+    State state;
+    state.mirror = &activeMirror;
+    const std::uint64_t mirrorId = activeMirror.instanceId;
+    const std::size_t polyCount = activeMirror.polyCallSites.size();
+    const std::size_t delCount = activeMirror.invokeDelegateSites.size();
+    const bool useTls = (tlsInvokeScratch.depth < ThreadInvokeScratch::MaxDepth);
+    if (useTls) {
+        auto& buf = tlsInvokeScratch.pool[tlsInvokeScratch.depth++];
+        if (buf.values.size() < 256) buf.values.resize(256);
+        if (buf.stack.capacity() < 32) buf.stack.reserve(32);
+        if (buf.lastMirrorId != mirrorId ||
+            buf.polyCallCache.size() != polyCount ||
+            buf.delegateCallCache.size() != delCount) {
+            buf.inlineCallCache.fill(InlineCallCacheEntry{});
+            buf.polyCallCache.assign(polyCount, PolymorphicPicSite{});
+            buf.delegateCallCache.assign(delCount, DelegateCallSiteCache{});
+            buf.lastMirrorId = mirrorId;
+        }
+        state.values = std::move(buf.values);
+        state.stack = std::move(buf.stack);
+        state.inlineCallCache = &buf.inlineCallCache;
+        state.polyCallCache = &buf.polyCallCache;
+        state.delegateCallCache = &buf.delegateCallCache;
+    } else {
+        fallbackInlineCache.fill(InlineCallCacheEntry{});
+        fallbackPolyCache.assign(polyCount, PolymorphicPicSite{});
+        fallbackDelCache.assign(delCount, DelegateCallSiteCache{});
+        state.inlineCallCache = &fallbackInlineCache;
+        state.polyCallCache = &fallbackPolyCache;
+        state.delegateCallCache = &fallbackDelCache;
+    }
+
+    struct TlsReleaseGuard {
+        State& st;
+        bool active;
+        ~TlsReleaseGuard() noexcept {
+            if (active) {
+                if (st.values.size() > 4096) st.values.resize(256);
+                st.stack.clear();
+                auto& b = tlsInvokeScratch.pool[--tlsInvokeScratch.depth];
+                b.values = std::move(st.values);
+                b.stack = std::move(st.stack);
+            }
+        }
+    } tlsGuard{state, useTls};
+
+    ExecutionOptions resumeOpts = env->options;
+    state.limits = resumeOpts.limits;
+    state.program = env->program.get();
+    state.externalResolver = &env->externalResolver;
+    state.bindings = env->bindings.get();
+    state.trace = &env->options.trace;
+    state.profile = resumeOpts.profile.get();
+    state.determinismEventsEnabled =
+        resumeOpts.determinism.mode != DeterminismMode::Off;
+    state.diagnosticEventsEnabled =
+        state.trace && static_cast<bool>(*state.trace);
+    state.determinismOnly = state.determinismEventsEnabled &&
+        state.profile == nullptr && !state.diagnosticEventsEnabled;
+    state.traceEventsEnabled =
+        state.determinismEventsEnabled || state.profile != nullptr ||
+        state.diagnosticEventsEnabled;
+    state.fastAccounting = !state.traceEventsEnabled &&
+        resumeOpts.debugger == nullptr;
+    state.determinism = DeterminismSession(std::move(resumeOpts.determinism));
+    state.heap = env->heap.get();
+    state.debugger = resumeOpts.debugger.get();
+    state.asyncRuntime = &asyncContext;
+    const std::shared_ptr<const void> keepAlive = frame.runnerOwner;
+    state.resumeEnvRaw = env;
+    state.resumeEnvOwner = &keepAlive;
+    state.resumingCoroutine = frameHandle;
+    state.resumingFramePtr = &frame;
+
+    void* const prevBridge = asyncContext.activeInterpreterState();
+    asyncContext.setActiveInterpreterState(&state);
+    struct RestoreBridge {
+        AsyncRuntimeContext& ctx;
+        void* prev;
+        ~RestoreBridge() noexcept { ctx.setActiveInterpreterState(prev); }
+    } restoreBridge{asyncContext, prevBridge};
+
+    ShadowFrameScope roots(
+        state.shadowStack, nullptr, nullptr, &state.values, &state.valueTop);
+    Value ignoredResult{};
+    const ArgumentSource emptyArgs{};
+    const bool ok = executeFunction(state, *found, emptyArgs, ignoredResult);
+    if (!ok) {
+        faultUnresolvedFrame(state.error);
+    }
+}
+
 } // namespace
 
 Interpreter::Interpreter(std::vector<bytecode::Module> modules)
-    : heap_(std::make_shared<ManagedHeap>()) {
+    : heap_(std::make_shared<ManagedHeap>()),
+      asyncRuntime_(std::make_shared<AsyncRuntimeContext>(heap_.get())) {
     auto linked = ProgramImage::link(std::move(modules), programError_);
     if (linked) {
         program_ = std::make_shared<ProgramImage>(std::move(*linked));
@@ -9261,7 +9945,8 @@ Interpreter::Interpreter(
     std::shared_ptr<const ProgramImage> program,
     std::shared_ptr<ManagedHeap> heap)
     : program_(std::move(program)),
-      heap_(heap ? std::move(heap) : std::make_shared<ManagedHeap>()) {
+      heap_(heap ? std::move(heap) : std::make_shared<ManagedHeap>()),
+      asyncRuntime_(std::make_shared<AsyncRuntimeContext>(heap_.get())) {
     if (!program_) {
         programError_.code = ErrorCode::InvalidProgram;
         programError_.message = "interpreter has no linked program image";
@@ -9270,16 +9955,33 @@ Interpreter::Interpreter(
 
 void Interpreter::setExternalResolver(ExternalFunction resolver) {
     externalResolver_ = std::move(resolver);
+    resumeEnv_.reset();
 }
 
 void Interpreter::setHeap(std::shared_ptr<ManagedHeap> heap) {
     heap_ = heap ? std::move(heap) : std::make_shared<ManagedHeap>();
+    if (asyncRuntime_) asyncRuntime_->setHeap(heap_.get());
+    resumeEnv_.reset();
 }
 
 std::shared_ptr<ManagedHeap> Interpreter::heap() const noexcept { return heap_; }
 
+void Interpreter::setAsyncRuntime(std::shared_ptr<AsyncRuntimeContext> asyncRuntime) {
+    asyncRuntime_ = asyncRuntime
+        ? std::move(asyncRuntime)
+        : std::make_shared<AsyncRuntimeContext>(heap_.get());
+    if (heap_ && asyncRuntime_->awaitables().heap() == nullptr) {
+        asyncRuntime_->setHeap(heap_.get());
+    }
+}
+
+std::shared_ptr<AsyncRuntimeContext> Interpreter::asyncRuntime() const noexcept {
+    return asyncRuntime_;
+}
+
 void Interpreter::setBindingRegistry(std::shared_ptr<const BindingRegistry> bindings) {
     bindings_ = std::move(bindings);
+    resumeEnv_.reset();
 }
 
 ExecutionResult Interpreter::invoke(
@@ -9311,20 +10013,7 @@ ExecutionResult Interpreter::invoke(
         missing.error.message = "entry function was not found";
         return missing;
     }
-    struct ThreadInvokeScratch {
-        struct Buffers {
-            std::vector<Value> values;
-            std::vector<const std::string*> stack;
-            std::array<InlineCallCacheEntry, 64> inlineCallCache{};
-            std::vector<PolymorphicPicSite> polyCallCache;
-            std::vector<DelegateCallSiteCache> delegateCallCache;
-            std::uint64_t lastMirrorId = 0;
-        };
-        enum : std::size_t { MaxDepth = 8 };
-        std::array<Buffers, MaxDepth> pool{};
-        std::size_t depth = 0;
-    };
-    thread_local ThreadInvokeScratch tlsScratch;
+    auto& tlsScratch = tlsInvokeScratch;
     std::array<InlineCallCacheEntry, 64> fallbackInlineCache;
     std::vector<PolymorphicPicSite> fallbackPolyCache;
     std::vector<DelegateCallSiteCache> fallbackDelCache;
@@ -9418,9 +10107,40 @@ ExecutionResult Interpreter::invoke(
                 options.grantedCapabilities.end());
         }
     }
+    if (!resumeEnv_) {
+        auto env = std::make_shared<InterpreterResumeEnv>();
+        env->program = program_;
+        env->heap = heap_;
+        env->bindings = bindings_;
+        env->externalResolver = externalResolver_;
+        env->options = options;
+        resumeEnv_ = env;
+    } else {
+        static_cast<InterpreterResumeEnv*>(resumeEnv_.get())->options = options;
+    }
     state.determinism = DeterminismSession(std::move(options.determinism));
     state.heap = heap_.get();
     state.debugger = options.debugger.get();
+    state.asyncRuntime = asyncRuntime_.get();
+    if (state.asyncRuntime && state.heap && state.asyncRuntime->awaitables().heap() == nullptr) {
+        state.asyncRuntime->setHeap(state.heap);
+    }
+    const std::shared_ptr<const void> resumeOwnerRef = resumeEnv_;
+    state.resumeEnvRaw = resumeEnv_.get();
+    state.resumeEnvOwner = &resumeOwnerRef;
+    void* const prevAsyncBridge = state.asyncRuntime
+        ? state.asyncRuntime->activeInterpreterState()
+        : nullptr;
+    if (state.asyncRuntime) {
+        state.asyncRuntime->setActiveInterpreterState(&state);
+    }
+    struct ActiveStateBridgeScope {
+        AsyncRuntimeContext* ctx;
+        void* prev;
+        ~ActiveStateBridgeScope() noexcept {
+            if (ctx) ctx->setActiveInterpreterState(prev);
+        }
+    } activeStateBridgeScope{state.asyncRuntime, prevAsyncBridge};
     struct DebugExecutionScope {
         debug::DebugController* debugger = nullptr;
         explicit DebugExecutionScope(debug::DebugController* d) : debugger(d) {

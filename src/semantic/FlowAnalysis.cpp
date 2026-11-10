@@ -153,6 +153,8 @@ private:
         }
         case BoundNodeKind::UnaryExpression:
             analyzeExpression(*static_cast<const BoundUnaryExpression&>(expression).operand, assigned); return;
+        case BoundNodeKind::AwaitExpression:
+            analyzeExpression(*static_cast<const BoundAwaitExpression&>(expression).operand, assigned); return;
         case BoundNodeKind::BinaryExpression: {
             const auto& value = static_cast<const BoundBinaryExpression&>(expression);
             analyzeExpression(*value.left, assigned);

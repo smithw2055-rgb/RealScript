@@ -70,6 +70,10 @@ const char* opcodeName(Opcode opcode) noexcept {
     case Opcode::InvokeDelegate: return "invoke.delegate";
     case Opcode::CombineDelegate: return "combine.delegate";
     case Opcode::RemoveDelegate: return "remove.delegate";
+    case Opcode::AsyncEnter: return "async.enter";
+    case Opcode::AwaitSuspend: return "await.suspend";
+    case Opcode::AwaitResume: return "await.resume";
+    case Opcode::AsyncResolve: return "async.resolve";
     }
     return "unknown";
 }

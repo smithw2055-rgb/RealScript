@@ -2,6 +2,7 @@
 
 #include "realscript/aot_cpp/RuntimeAbi.h"
 #include "realscript/runtime/Runtime.h"
+#include "realscript/runtime/AsyncRuntime.h"
 #include "realscript/semantic/Semantic.h"
 
 #include <array>
@@ -994,6 +995,45 @@ public:
     }
     [[nodiscard]] const ProgramDescriptor& program() const noexcept;
     [[nodiscard]] std::shared_ptr<runtime::ManagedHeap> heap() const noexcept;
+    void setAsyncRuntime(
+        std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime,
+        std::shared_ptr<void> resumeEnv = nullptr);
+    [[nodiscard]] runtime::AsyncRuntimeContext* rawAsyncRuntime() const noexcept {
+        return asyncRuntime_.get();
+    }
+    [[nodiscard]] bool tryEnterResumingCoroutine(
+        semantic::SymbolId functionSymbolId,
+        std::vector<runtime::Value>& argumentValues,
+        std::vector<runtime::Value>& locals,
+        std::vector<runtime::Value>& registers,
+        std::uint32_t& outResumeBlockId,
+        runtime::CoroutineFrameHandle& outActiveCoroutine);
+    [[nodiscard]] bool awaitSuspend(
+        semantic::SymbolId functionSymbolId,
+        semantic::SymbolId returnStructTypeId,
+        const runtime::Value& awaitableValue,
+        runtime::Value& awaitLocalSlot,
+        std::uint32_t resumeBlockId,
+        const std::vector<runtime::Value>& argumentValues,
+        const std::vector<runtime::Value>& locals,
+        const std::vector<runtime::Value>& registers,
+        runtime::CoroutineFrameHandle& ioActiveCoroutine,
+        bool& outSuspendedNow,
+        runtime::Value& outResult);
+    [[nodiscard]] bool awaitResume(
+        runtime::Value& awaitLocalSlot,
+        semantic::PrimitiveType expectedType,
+        semantic::SymbolId expectedTypeId,
+        runtime::Value* optionalOutResult);
+    [[nodiscard]] bool asyncResolve(
+        runtime::CoroutineFrameHandle activeCoroutine,
+        semantic::SymbolId returnStructTypeId,
+        const runtime::Value* optionalPayload,
+        runtime::Value& outWrappedResult);
+    [[nodiscard]] bool finishUncaughtAsyncException(
+        runtime::CoroutineFrameHandle activeCoroutine,
+        semantic::SymbolId returnStructTypeId,
+        runtime::Value& outResult);
     [[nodiscard]] runtime::ShadowStack& shadowStack() noexcept;
     [[nodiscard]] const runtime::RuntimeError& error() const noexcept;
     [[nodiscard]] const runtime::RuntimeStatistics& statistics() const noexcept;
@@ -1087,6 +1127,10 @@ private:
     };
     mutable std::array<AssignableCacheEntry, 32> assignableCache_{};
     std::optional<runtime::Value> pendingException_;
+    std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime_;
+    std::shared_ptr<void> resumeEnv_;
+    runtime::CoroutineFrameHandle resumingCoroutine_{};
+    runtime::CoroutineFrame* resumingFramePtr_ = nullptr;
 };
 
 class Program {
@@ -1096,6 +1140,8 @@ public:
     void setBindings(std::shared_ptr<const runtime::BindingRegistry> bindings);
     void setHeap(std::shared_ptr<runtime::ManagedHeap> heap);
     [[nodiscard]] std::shared_ptr<runtime::ManagedHeap> heap() const noexcept;
+    void setAsyncRuntime(std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime);
+    [[nodiscard]] std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime() const noexcept;
     [[nodiscard]] const ProgramDescriptor& descriptor() const noexcept;
     [[nodiscard]] bool hasFunction(semantic::SymbolId symbolId) const noexcept {
         return functions_.find(symbolId) != functions_.end();
@@ -1122,6 +1168,8 @@ private:
     const ProgramDescriptor* descriptor_ = nullptr;
     std::shared_ptr<const runtime::BindingRegistry> bindings_;
     std::shared_ptr<runtime::ManagedHeap> heap_;
+    std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime_;
+    mutable std::shared_ptr<void> resumeEnv_;
     std::unordered_map<std::string, semantic::SymbolId> names_;
     std::unordered_map<semantic::SymbolId, const TypeDescriptor*> types_;
     std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> functions_;

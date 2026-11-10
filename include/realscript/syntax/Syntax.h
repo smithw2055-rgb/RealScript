@@ -76,6 +76,8 @@ enum class SyntaxKind {
     DefaultKeyword,
     SequenceKeyword,
     YieldKeyword,
+    AsyncKeyword,
+    AwaitKeyword,
     ClassKeyword,
     StructKeyword,
     EnumKeyword,
@@ -310,9 +312,20 @@ struct LiteralExpressionSyntax final : ExpressionSyntax {
 
 struct NameExpressionSyntax final : ExpressionSyntax {
     SyntaxToken identifierToken;
+    std::optional<SyntaxToken> lessToken;
+    std::vector<TypeSyntax> typeArguments;
+    std::vector<SyntaxToken> typeArgumentCommaTokens;
+    std::optional<SyntaxToken> greaterToken;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::NameExpression; }
-    [[nodiscard]] text::TextSpan span() const noexcept override { return identifierToken.span; }
+    [[nodiscard]] text::TextSpan span() const noexcept override {
+        if (greaterToken) {
+            return {
+                identifierToken.span.start,
+                greaterToken->span.end() - identifierToken.span.start};
+        }
+        return identifierToken.span;
+    }
 };
 
 struct LambdaExpressionSyntax final : ExpressionSyntax {
@@ -1227,6 +1240,7 @@ private:
     void parseGenericConstraintClauses(
         std::vector<GenericConstraintClauseSyntax>& clauses);
     [[nodiscard]] bool isGenericCallStart() const noexcept;
+    bool isGenericTypeMemberAccessStart() const noexcept;
     [[nodiscard]] ParameterSyntax parseParameter();
     [[nodiscard]] BlockStatementSyntax parseBlockStatement();
     [[nodiscard]] std::unique_ptr<StatementSyntax> parseStatement();

@@ -179,6 +179,7 @@ struct FunctionSymbol {
     bool propertyGetter = false;
     bool propertySetter = false;
     bool synthetic = false;
+    bool asyncFunction = false;
     bool deterministic = false;
     bool nonDeterministic = false;
     std::string sourceName;
@@ -459,6 +460,7 @@ enum class BoundNodeKind {
     LiteralExpression,
     VariableExpression,
     UnaryExpression,
+    AwaitExpression,
     BinaryExpression,
     TypeBinaryExpression,
     TypeOfExpression,
@@ -548,6 +550,15 @@ struct BoundUnaryExpression final : BoundExpression {
     std::unique_ptr<BoundExpression> operand;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::UnaryExpression;
+    }
+};
+
+struct BoundAwaitExpression final : BoundExpression {
+    std::unique_ptr<BoundExpression> operand;
+    SymbolId operandTypeId = 0;
+    SymbolId resultTypeId = 0;
+    [[nodiscard]] BoundNodeKind kind() const noexcept override {
+        return BoundNodeKind::AwaitExpression;
     }
 };
 
@@ -1292,6 +1303,7 @@ private:
     std::size_t nextVariableIndex_ = 0;
     std::optional<VariableSymbol> currentExceptionVariable_;
     bool bindingFinally_ = false;
+    bool currentFunctionIsAsync_ = false;
     std::size_t finallyBreakableDepth_ = 0;
     std::size_t finallyLoopDepth_ = 0;
     FunctionOverloadMap visibleFunctions_;

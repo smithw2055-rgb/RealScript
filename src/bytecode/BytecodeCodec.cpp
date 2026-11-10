@@ -1803,7 +1803,7 @@ bool decodeModule(
                  ++instructionIndex) {
                 Instruction instruction;
                 const auto opcode = reader.u8();
-                if (opcode > static_cast<std::uint8_t>(Opcode::ConstantTypeId)) {
+                if (opcode > static_cast<std::uint8_t>(Opcode::AsyncResolve)) {
                     diagnostics.report("RS5005", "invalid bytecode opcode", {});
                     return false;
                 }

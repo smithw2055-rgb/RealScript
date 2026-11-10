@@ -30,6 +30,12 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             (function.ownerTypeName.empty()
                 ? function.name
                 : function.ownerTypeName + "." + function.name);
+        if (function.moduleName == "RealScript.Async" &&
+            function.ownerTypeName == "Async" &&
+            function.name.rfind("__", 0) == 0) {
+            instruction.symbolName = "$intrinsic::Async." + function.name;
+            instruction.symbolId = semantic::stableTypeId(instruction.symbolName);
+        }
         instruction.resultTypeId = semantic::isExactType(resultType)
             ? semantic::stableTypeId(resultTypeName)
             : 0;
@@ -108,6 +114,48 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
     };
 
     switch (expression.kind()) {
+    case semantic::BoundNodeKind::AwaitExpression: {
+        const auto& awaitExpr = static_cast<const
+            semantic::BoundAwaitExpression&>(expression);
+        const auto operandVal = lowerExpression(*awaitExpr.operand);
+        const auto awaitLocalIndex = currentFunction_->localTypes.size();
+        currentFunction_->localTypes.push_back(semantic::PrimitiveType::Struct);
+        currentFunction_->localTypeIds.push_back(awaitExpr.operandTypeId);
+
+        const auto resumeBlock = createBlock();
+
+        Instruction suspendInst;
+        suspendInst.result = -1;
+        suspendInst.resultType = semantic::PrimitiveType::Void;
+        suspendInst.opcode = Opcode::AwaitSuspend;
+        suspendInst.operands = {operandVal};
+        suspendInst.localIndex = awaitLocalIndex;
+        suspendInst.typeId = awaitExpr.operandTypeId;
+        suspendInst.symbolName = awaitExpr.operand->typeName;
+        suspendInst.integerImmediate = static_cast<std::int64_t>(resumeBlock);
+        suspendInst.sourceSpan = expression.span;
+        block(*currentBlockId_).instructions.push_back(std::move(suspendInst));
+
+        emitJump(resumeBlock, {}, expression.span);
+        setCurrentBlock(resumeBlock);
+
+        const bool isVoidResult = (awaitExpr.type == semantic::PrimitiveType::Void);
+        Instruction resumeInst;
+        resumeInst.result = isVoidResult ? -1 : nextValueId_++;
+        resumeInst.resultType = awaitExpr.type;
+        resumeInst.resultTypeId = semantic::isExactType(awaitExpr.type)
+            ? semantic::stableTypeId(awaitExpr.typeName)
+            : 0;
+        resumeInst.opcode = Opcode::AwaitResume;
+        resumeInst.localIndex = awaitLocalIndex;
+        resumeInst.typeId = awaitExpr.operandTypeId;
+        resumeInst.elementType = awaitExpr.type;
+        resumeInst.elementTypeId = resumeInst.resultTypeId;
+        resumeInst.symbolName = awaitExpr.operand->typeName;
+        resumeInst.sourceSpan = expression.span;
+        block(*currentBlockId_).instructions.push_back(std::move(resumeInst));
+        return isVoidResult ? -1 : block(*currentBlockId_).instructions.back().result;
+    }
     case semantic::BoundNodeKind::DelegateCreationExpression: {
         const auto& creation = static_cast<const
             semantic::BoundDelegateCreationExpression&>(expression);
@@ -2269,6 +2317,26 @@ void Lowerer::emitReturn(
     text::TextSpan sourceSpan) {
     if (!hasCurrentBlock() || currentBlockTerminated()) {
         throw std::logic_error("cannot emit a return into a closed MIR block");
+    }
+    if (currentAsyncFunction_) {
+        Instruction resolveInst;
+        resolveInst.result = nextValueId_++;
+        resolveInst.resultType = semantic::PrimitiveType::Struct;
+        resolveInst.resultTypeId = currentFunction_->returnTypeId;
+        resolveInst.opcode = Opcode::AsyncResolve;
+        if (value.has_value()) {
+            resolveInst.operands = {*value};
+        }
+        resolveInst.typeId = currentFunction_->returnTypeId;
+        resolveInst.symbolName = currentAsyncReturnTypeName_;
+        resolveInst.sourceSpan = sourceSpan;
+        const ValueId wrappedVal = resolveInst.result;
+        block(*currentBlockId_).instructions.push_back(std::move(resolveInst));
+        auto& terminator = block(*currentBlockId_).terminator;
+        terminator.kind = TerminatorKind::ReturnValue;
+        terminator.value = wrappedVal;
+        terminator.sourceSpan = sourceSpan;
+        return;
     }
     auto& terminator = block(*currentBlockId_).terminator;
     terminator.kind = value

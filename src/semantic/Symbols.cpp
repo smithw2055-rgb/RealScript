@@ -1236,6 +1236,8 @@ FunctionSymbol declareFunctionSymbol(
         syntaxTree.modifiers, syntax::SyntaxKind::AbstractKeyword);
     result.sealedMethod = hasModifier(
         syntaxTree.modifiers, syntax::SyntaxKind::SealedKeyword);
+    result.asyncFunction = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::AsyncKeyword);
     result.nonDeterministic = hasAttributeName(
         syntaxTree.attributes, "NonDeterministic");
     result.deterministic = !result.nonDeterministic &&
@@ -1247,7 +1249,9 @@ FunctionSymbol declareFunctionSymbol(
         result.ownerTypeName = owner->name;
         result.ownerTypeId = owner->id;
         const bool mutableStructReceiver =
-            owner->sourceName != "$builtin/RealScript.Math.rs";
+            owner->sourceName != "$builtin/RealScript.Math.rs" &&
+            owner->sourceName != "$builtin/RealScript.Async.rs" &&
+            owner->name.rfind("Awaitable__", 0) != 0;
         appendImplicitThis(result, *owner, mutableStructReceiver);
     }
     const auto returnType = resolveType(syntaxTree.returnType, visibleTypes, true);
@@ -1263,6 +1267,52 @@ FunctionSymbol declareFunctionSymbol(
         diagnostics.report("RS2200", "unknown return type '" + syntaxTree.returnType.name.text + "'", syntaxTree.returnType.span());
     }
     appendSyntaxParameters(result, syntaxTree.parameters, visibleTypes, diagnostics);
+    if (result.asyncFunction) {
+        if (result.abstractMethod) {
+            diagnostics.report(
+                "RS2603",
+                "abstract method '" + result.name + "' cannot be marked 'async'",
+                syntaxTree.identifierToken.span);
+        }
+        if (syntaxTree.refReturnKeyword) {
+            diagnostics.report(
+                "RS2601",
+                "async function '" + result.name + "' cannot return by reference",
+                syntaxTree.refReturnKeyword->span);
+        }
+        for (const auto& param : result.parameters) {
+            if (!param.name.empty() && param.name != "this" &&
+                (param.modifier == ParameterModifier::Ref ||
+                 param.modifier == ParameterModifier::Out)) {
+                diagnostics.report(
+                    "RS2602",
+                    "async function '" + result.name + "' cannot declare ref or out parameter '" +
+                        param.name + "'",
+                    param.declarationSpan);
+            }
+        }
+        bool validAsyncRet = false;
+        if (result.returnType == PrimitiveType::Struct) {
+            if (result.returnTypeName == "RealScript.Async::Awaitable" ||
+                result.returnTypeName == "Awaitable") {
+                validAsyncRet = true;
+            } else {
+                const auto foundRet = visibleTypes.find(result.returnTypeName);
+                if (foundRet != visibleTypes.end() &&
+                    (foundRet->second.name.rfind("Awaitable__", 0) == 0 ||
+                     foundRet->second.name == "Awaitable")) {
+                    validAsyncRet = true;
+                }
+            }
+        }
+        if (result.returnType != PrimitiveType::Error && !validAsyncRet) {
+            diagnostics.report(
+                "RS2600",
+                "return type of async function '" + result.name +
+                    "' must be 'Awaitable' or 'Awaitable<T>'",
+                syntaxTree.returnType.span());
+        }
+    }
     result.id = stableFunctionId(result);
     result.declarationSpan = syntaxTree.identifierToken.span;
     result.bodySpan = syntaxTree.semicolonToken
@@ -1338,6 +1388,12 @@ FunctionSymbol declareConstructorSymbol(
         : std::string{};
     result.method = true;
     result.constructor = true;
+    if (hasModifier(syntaxTree.modifiers, syntax::SyntaxKind::AsyncKeyword)) {
+        diagnostics.report(
+            "RS2603",
+            "constructor cannot be marked 'async'",
+            syntaxTree.identifierToken.span);
+    }
     result.nonDeterministic = hasAttributeName(
         syntaxTree.attributes, "NonDeterministic");
     result.deterministic = !result.nonDeterministic &&

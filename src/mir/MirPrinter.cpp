@@ -166,6 +166,20 @@ std::string printModule(const Module& module) {
                     out << " %" << instruction.operands[0] << ", %"
                         << instruction.operands[1] << ", %"
                         << instruction.operands[2];
+                } else if (instruction.opcode == Opcode::AsyncEnter) {
+                    out << " @" << instruction.symbolName << "[0x"
+                        << std::hex << instruction.typeId << std::dec << "]";
+                } else if (instruction.opcode == Opcode::AwaitSuspend) {
+                    out << " local" << instruction.localIndex
+                        << " resume=bb" << instruction.integerImmediate
+                        << ", %" << instruction.operands.front();
+                } else if (instruction.opcode == Opcode::AwaitResume) {
+                    out << " local" << instruction.localIndex;
+                } else if (instruction.opcode == Opcode::AsyncResolve) {
+                    out << " @" << instruction.symbolName;
+                    if (!instruction.operands.empty()) {
+                        out << ", %" << instruction.operands.front();
+                    }
                 } else if (instruction.opcode == Opcode::NewObject ||
                            instruction.opcode == Opcode::NewStruct) {
                     out << " @" << instruction.symbolName << "[0x"

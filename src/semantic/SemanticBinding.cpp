@@ -672,11 +672,34 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     breakableDepth_ = 0;
     checkedArithmetic_ = true;
     result.symbol.sourceName = currentSourceName_;
+    currentFunctionIsAsync_ = input.symbol.asyncFunction;
     currentReturnType_ = input.symbol.returnType;
     currentReturnTypeName_ = input.symbol.returnTypeName;
     currentReturnModifier_ = input.symbol.returnModifier;
     currentStorageReturnType_ = storageReturnTypeOf(input.symbol);
     currentStorageReturnTypeName_ = storageReturnTypeNameOf(input.symbol);
+    if (currentFunctionIsAsync_ && input.symbol.returnType == PrimitiveType::Struct) {
+        if (input.symbol.returnTypeName == "RealScript.Async::Awaitable" ||
+            input.symbol.returnTypeName == "Awaitable") {
+            currentReturnType_ = PrimitiveType::Void;
+            currentReturnTypeName_.clear();
+            currentStorageReturnType_ = PrimitiveType::Void;
+            currentStorageReturnTypeName_.clear();
+        } else {
+            const auto foundAsyncType = visibleTypes_.find(input.symbol.returnTypeName);
+            if (foundAsyncType != visibleTypes_.end()) {
+                for (const auto& m : foundAsyncType->second.methods) {
+                    if (m.staticMethod && m.name == "FromResult" && m.parameters.size() == 1) {
+                        currentReturnType_ = m.parameters[0].type;
+                        currentReturnTypeName_ = m.parameters[0].typeName;
+                        currentStorageReturnType_ = storageTypeOf(m.parameters[0]);
+                        currentStorageReturnTypeName_ = storageTypeNameOf(m.parameters[0]);
+                        break;
+                    }
+                }
+            }
+        }
+    }
     nextVariableIndex_ = input.symbol.parameters.size();
     currentStaticMethod_ = input.symbol.staticMethod;
     currentConstructor_ = input.symbol.constructor;
@@ -997,8 +1020,8 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     result.variableCount = nextVariableIndex_;
     result.variables = allVariables_;
 
-    if (result.symbol.returnType != PrimitiveType::Void &&
-        result.symbol.returnType != PrimitiveType::Error &&
+    if (currentReturnType_ != PrimitiveType::Void &&
+        currentReturnType_ != PrimitiveType::Error &&
         detail::canReachFunctionEnd(result, diagnostics_)) {
         diagnostics_.report(
             "RS2001",
@@ -1010,6 +1033,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     currentOwnerType_.reset();
     currentStaticMethod_ = false;
     currentConstructor_ = false;
+    currentFunctionIsAsync_ = false;
     currentModuleName_.clear();
     currentSourceName_.clear();
     currentFunctionId_ = 0;

@@ -42,6 +42,9 @@ inline constexpr std::size_t kResumeQueueCount = 4;
 [[nodiscard]] const char* awaitStatusName(AwaitStatus status) noexcept;
 [[nodiscard]] const char* resumeQueueName(ResumeQueue queue) noexcept;
 [[nodiscard]] semantic::SymbolId whenAnyResultTypeId() noexcept;
+[[nodiscard]] semantic::SymbolId awaitableVoidTypeId() noexcept;
+[[nodiscard]] semantic::SymbolId asyncExceptionTypeId() noexcept;
+[[nodiscard]] semantic::SymbolId asyncCanceledExceptionTypeId() noexcept;
 
 /**
  * 8-Byte Generational Handle to a pooled `AwaitableCore` slot.
@@ -327,6 +330,7 @@ struct WhenAnyOptions {
     ResumeQueue resumeQueue = ResumeQueue::Update;
     CancellationToken token = CancellationToken::none();
     CancellationSourceHandle cancelLosersSource{};
+    bool returnWinnerIndex = false;
 };
 
 #if defined(_MSC_VER)
@@ -524,6 +528,7 @@ private:
         bool resolved = false;
         CombinatorKind kind = CombinatorKind::WhenAll;
         bool materializeHeapArray = true;
+        bool returnWinnerIndex = false;
         AwaitableHandle parentHandle{};
         CancellationSourceHandle cancelLosersSource{};
         CancellationRegistration parentCancelReg{};
@@ -703,6 +708,183 @@ private:
     std::uint64_t drainTickSequence_ = 0;
 };
 
+class AsyncRuntimeContext;
+struct CoroutineFrame;
+
+struct CoroutineFrameHandle {
+    std::uint32_t slot = 0;
+    std::uint32_t version = 0;
+
+    static constexpr CoroutineFrameHandle invalid() noexcept { return {}; }
+
+    [[nodiscard]] constexpr bool valid() const noexcept { return version != 0; }
+
+    [[nodiscard]] constexpr std::uint64_t pack64() const noexcept {
+        return (static_cast<std::uint64_t>(version) << 32u) |
+            static_cast<std::uint64_t>(slot);
+    }
+
+    [[nodiscard]] static constexpr CoroutineFrameHandle unpack64(
+        std::uint64_t packed) noexcept {
+        CoroutineFrameHandle h{};
+        h.slot = static_cast<std::uint32_t>(packed & 0xFFFFFFFFULL);
+        h.version = static_cast<std::uint32_t>(packed >> 32u);
+        return h;
+    }
+
+    friend constexpr bool operator==(
+        CoroutineFrameHandle a,
+        CoroutineFrameHandle b) noexcept {
+        return a.slot == b.slot && a.version == b.version;
+    }
+    friend constexpr bool operator!=(
+        CoroutineFrameHandle a,
+        CoroutineFrameHandle b) noexcept {
+        return !(a == b);
+    }
+};
+static_assert(sizeof(CoroutineFrameHandle) == 8, "CoroutineFrameHandle must be 8 bytes");
+
+using CoroutineResumeCallback = void (*)(
+    void* runnerContext,
+    CoroutineFrameHandle frameHandle,
+    CoroutineFrame& frame,
+    AsyncRuntimeContext& asyncContext);
+
+struct CoroutineFrame {
+    semantic::SymbolId functionSymbolId = 0;
+    semantic::SymbolId returnStructTypeId = 0;
+    AwaitableHandle completionHandle{};
+    AwaitableHandle awaitedHandle{};
+    std::uint32_t resumeBlockId = 0;
+    ResumeQueue resumeQueue = ResumeQueue::Update;
+    bool suspended = false;
+    bool completed = false;
+    CoroutineResumeCallback resumeCallback = nullptr;
+    void* runnerContext = nullptr;
+    std::shared_ptr<const void> runnerOwner{};
+    std::vector<Value> savedArguments;
+    std::vector<Value> savedLocals;
+    std::vector<Value> savedRegisters;
+};
+
+struct CoroutinePoolStatistics {
+    std::size_t capacity = 0;
+    std::size_t activeCount = 0;
+    std::size_t freeListCount = 0;
+    std::size_t activeGcRoots = 0;
+    std::uint64_t totalAllocated = 0;
+    std::uint64_t totalRecycled = 0;
+    std::uint64_t totalSuspensions = 0;
+    std::uint64_t totalResumptions = 0;
+};
+
+class CoroutineFramePool {
+public:
+    explicit CoroutineFramePool(
+        ManagedHeap* heap = nullptr,
+        AsyncRuntimeContext* ownerContext = nullptr,
+        std::size_t initialReserve = 32);
+    ~CoroutineFramePool() noexcept { clear(); }
+    CoroutineFramePool(const CoroutineFramePool&) = delete;
+    CoroutineFramePool& operator=(const CoroutineFramePool&) = delete;
+
+    void setHeap(ManagedHeap* heap) noexcept;
+    [[nodiscard]] ManagedHeap* heap() const noexcept { return heap_; }
+
+    void setOwnerContext(AsyncRuntimeContext* ownerContext) noexcept {
+        ownerContext_ = ownerContext;
+    }
+
+    [[nodiscard]] CoroutineFrameHandle allocateFrame(
+        semantic::SymbolId functionSymbolId,
+        semantic::SymbolId returnStructTypeId,
+        AwaitableHandle completionHandle,
+        ResumeQueue resumeQueue = ResumeQueue::Update);
+
+    [[nodiscard]] CoroutineFrame* resolve(CoroutineFrameHandle handle) noexcept;
+    [[nodiscard]] const CoroutineFrame* resolve(CoroutineFrameHandle handle) const noexcept;
+
+    bool suspendFrame(
+        CoroutineFrameHandle handle,
+        const Value* args,
+        std::size_t argCount,
+        const Value* locals,
+        std::size_t localCount,
+        const Value* regs,
+        std::size_t regCount,
+        std::uint32_t resumeBlockId,
+        AwaitableHandle awaitedHandle,
+        CoroutineResumeCallback resumeCallback,
+        void* runnerContext,
+        std::shared_ptr<const void> runnerOwner = {});
+
+    void recycleFrame(CoroutineFrameHandle handle) noexcept;
+    void clear() noexcept;
+    [[nodiscard]] CoroutinePoolStatistics statistics() const noexcept;
+
+private:
+    struct FrameSlot {
+        CoroutineFrame frame{};
+        std::vector<ManagedHeap::RootToken> pinnedRootTokens;
+        std::uint32_t version = 1;
+        bool allocated = false;
+    };
+
+    void releasePinnedRoots(FrameSlot& slot) noexcept;
+    void snapshotAndPinValues(
+        FrameSlot& slot,
+        const Value* args,
+        std::size_t argCount,
+        const Value* locals,
+        std::size_t localCount,
+        const Value* regs,
+        std::size_t regCount);
+
+    static void onAwaitedCompletedCallback(
+        void* context,
+        AwaitableHandle completedHandle,
+        AwaitStatus terminalStatus,
+        std::uint64_t packedFrameHandle);
+
+    ManagedHeap* heap_ = nullptr;
+    AsyncRuntimeContext* ownerContext_ = nullptr;
+    std::deque<FrameSlot> slots_;
+    std::vector<std::uint32_t> freeSlots_;
+    std::size_t activeGcRoots_ = 0;
+    std::uint64_t totalAllocated_ = 0;
+    std::uint64_t totalRecycled_ = 0;
+    std::uint64_t totalSuspensions_ = 0;
+    std::uint64_t totalResumptions_ = 0;
+};
+
+[[nodiscard]] Value makeAwaitableStructValue(
+    semantic::SymbolId structTypeId,
+    AwaitableHandle handle);
+
+[[nodiscard]] bool tryExtractAwaitableHandle(
+    const Value& value,
+    AwaitableHandle& outHandle) noexcept;
+
+[[nodiscard]] std::optional<ObjectRef> materializeAsyncResumeException(
+    ManagedHeap* heap,
+    AwaitStatus terminalStatus,
+    const RuntimeError& faultError,
+    const Value& storedExceptionObject,
+    semantic::SymbolId fallbackExceptionTypeId = 0);
+
+[[nodiscard]] bool isAsyncCanceledExceptionObject(
+    const ManagedHeap* heap,
+    const Value& excValue) noexcept;
+
+bool tryExecuteAsyncIntrinsic(
+    std::string_view intrinsicName,
+    ValueSpan arguments,
+    AsyncRuntimeContext* asyncContext,
+    ManagedHeap* heap,
+    Value& result,
+    std::string& outError);
+
 class AsyncRuntimeContext {
 public:
     explicit AsyncRuntimeContext(ManagedHeap* heap = nullptr);
@@ -717,6 +899,11 @@ public:
     [[nodiscard]] AwaitableCorePool& awaitables() noexcept { return awaitables_; }
     [[nodiscard]] const AwaitableCorePool& awaitables() const noexcept { return awaitables_; }
 
+    [[nodiscard]] CoroutineFramePool& coroutines() noexcept { return coroutines_; }
+    [[nodiscard]] const CoroutineFramePool& coroutines() const noexcept { return coroutines_; }
+
+    [[nodiscard]] AwaitableHandle enqueueYield(CancellationToken token = CancellationToken::none());
+
     [[nodiscard]] AsyncCompletionQueue& completionQueue() noexcept { return completionQueue_; }
     [[nodiscard]] const AsyncCompletionQueue& completionQueue() const noexcept {
         return completionQueue_;
@@ -730,10 +917,20 @@ public:
     std::size_t stepResumeQueue(ResumeQueue queue, std::size_t maxContinuations = 0);
     void reset() noexcept;
 
+    [[nodiscard]] void* activeInterpreterState() const noexcept { return activeInterpreterState_; }
+    void setActiveInterpreterState(void* state) noexcept { activeInterpreterState_ = state; }
+
+    [[nodiscard]] void* activeAotContext() const noexcept { return activeAotContext_; }
+    void setActiveAotContext(void* ctx) noexcept { activeAotContext_ = ctx; }
+
 private:
     CancellationTokenPool cancellations_;
     AwaitableCorePool awaitables_;
+    CoroutineFramePool coroutines_;
     AsyncCompletionQueue completionQueue_;
+    void* activeInterpreterState_ = nullptr;
+    void* activeAotContext_ = nullptr;
+    std::vector<AwaitableHandle> pendingYields_;
 };
 
 } // namespace realscript::runtime

@@ -408,7 +408,7 @@ namespace {
 DeterminismOperationId cachedInstructionOperationId(
     bytecode::Opcode opcode) noexcept {
     constexpr auto Count =
-        static_cast<std::size_t>(bytecode::Opcode::ConstantTypeId) + 1U;
+        static_cast<std::size_t>(bytecode::Opcode::AsyncResolve) + 1U;
     static const auto ids = [] {
         std::array<DeterminismOperationId, Count> result{};
         for (std::size_t index = 0; index < result.size(); ++index) {
@@ -1209,7 +1209,8 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         break;
                     }
                 }
-                if (validForwarder && candidateRef) {
+                if (validForwarder && candidateRef &&
+                    candidateRef->name.rfind("$intrinsic::", 0) != 0) {
                     const bool returnMatches =
                         (function.returnType == semantic::PrimitiveType::Void &&
                          bb.terminator.kind == bytecode::TerminatorKind::ReturnVoid) ||
@@ -1757,6 +1758,9 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             if (found == mirror->functions.end()) continue;
             auto& execFunc = found->second;
             execFunc.hasExceptionHandlers = !function.exceptionHandlers.empty();
+            execFunc.isAsyncFunction = !function.blocks.empty() &&
+                !function.blocks.front().instructions.empty() &&
+                function.blocks.front().instructions.front().opcode == bytecode::Opcode::AsyncEnter;
 
             const std::size_t paramCount = function.parameterTypes.size();
             const std::size_t localCount = function.localTypes.size();
@@ -3485,6 +3489,46 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                     flat.auxImm32 = siteId;
                                     break;
                                 }
+                            }
+                            if (bcInst.opcode == bytecode::Opcode::AsyncEnter) {
+                                flat.flatOpcode = FlatOpcode::AsyncEnter;
+                                break;
+                            }
+                            if (bcInst.opcode == bytecode::Opcode::AwaitSuspend &&
+                                bcInst.operands.size() == 1 &&
+                                bcInst.operands[0] < regCount &&
+                                bcInst.index < localCount) {
+                                flat.flatOpcode = FlatOpcode::AwaitSuspend;
+                                flat.src0Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[0]));
+                                flat.storeSlot = localSlot(static_cast<std::uint16_t>(bcInst.index));
+                                flat.integerImmediate = bcInst.activeIntegerImmediate();
+                                break;
+                            }
+                            if (bcInst.opcode == bytecode::Opcode::AwaitResume &&
+                                bcInst.index < localCount &&
+                                (bcInst.result == bytecode::InvalidRegister || bcInst.result < regCount)) {
+                                flat.flatOpcode = FlatOpcode::AwaitResume;
+                                flat.src0Slot = localSlot(static_cast<std::uint16_t>(bcInst.index));
+                                flat.dstSlot = (bcInst.result == bytecode::InvalidRegister)
+                                    ? InvalidCompactReg
+                                    : regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                flat.binaryOpcode1 = static_cast<QuickOpcode>(static_cast<std::uint8_t>(bcInst.elementType));
+                                flat.integerImmediate = static_cast<std::int64_t>(bcInst.activeElementTypeId());
+                                break;
+                            }
+                            if (bcInst.opcode == bytecode::Opcode::AsyncResolve &&
+                                bcInst.result < regCount &&
+                                bcInst.operands.size() <= 1 &&
+                                (bcInst.operands.empty() || bcInst.operands[0] < regCount) &&
+                                bcInst.typeIndex < module.types.size()) {
+                                flat.flatOpcode = FlatOpcode::AsyncResolve;
+                                flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                flat.src0Slot = bcInst.operands.empty()
+                                    ? InvalidCompactReg
+                                    : regSlot(static_cast<std::uint16_t>(bcInst.operands[0]));
+                                flat.inlineArgCount = static_cast<std::uint8_t>(bcInst.operands.size());
+                                flat.integerImmediate = static_cast<std::int64_t>(module.types[bcInst.typeIndex].id);
+                                break;
                             }
                             if (bcInst.opcode == bytecode::Opcode::LoadElement &&
                                 bcInst.operands.size() == 2 &&
@@ -7556,6 +7600,7 @@ ExecutionResult EngineRuntime::invoke(
     }
     Interpreter interpreter(std::move(program), heap_);
     interpreter.setBindingRegistry(bindings_);
+    interpreter.setAsyncRuntime(asyncRuntime_);
     return interpreter.invoke(*entry, arguments, std::move(options));
 }
 
@@ -7572,6 +7617,7 @@ ExecutionResult EngineRuntime::invoke(
     }
     Interpreter interpreter(std::move(program), heap_);
     interpreter.setBindingRegistry(bindings_);
+    interpreter.setAsyncRuntime(asyncRuntime_);
     return interpreter.invoke(symbolId, arguments, std::move(options));
 }
 

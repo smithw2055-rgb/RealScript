@@ -283,6 +283,10 @@ enum class FlatOpcode : std::uint8_t {
     CombineDelegateFast,
     RemoveDelegateFast,
     InvokeDelegateFast,
+    AsyncEnter,
+    AwaitSuspend,
+    AwaitResume,
+    AsyncResolve,
     GenericBytecode,
     // 8. Flattened block terminators
     TermJumpNoArgs,
@@ -337,6 +341,9 @@ struct FlatColdMeta {
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable : 4201)
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 #endif
 struct alignas(32) FlatInstruction {
     static constexpr std::uint8_t FlagChecked1 = 0x01u;
@@ -411,6 +418,8 @@ struct alignas(32) FlatInstruction {
 };
 #if defined(_MSC_VER)
 #pragma warning(pop)
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
 #endif
 static_assert(sizeof(FlatInstruction) == 32, "FlatInstruction must be 32 bytes (2 per 64B cache line)");
 static_assert(alignof(FlatInstruction) == 32, "FlatInstruction must be 32-byte aligned");
@@ -533,6 +542,7 @@ struct ExecutionFunction {
     bool canUseFlatFastPath = false;
     bool isSmallLeafInlineCandidate = false;
     bool hasFastParamToLocalPrologue = false;
+    bool isAsyncFunction = false;
     std::vector<ExecutionBlock> blocks;
     std::vector<FlatInstruction> flatStream;
     std::vector<FlatColdMeta> flatCold;

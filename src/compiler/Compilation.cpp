@@ -2463,6 +2463,217 @@ public struct Ray {
     return kSource;
 }
 
+const std::string& builtinAsyncModuleSource() {
+    static const std::string kSource = R"RS(
+module RealScript.Async;
+
+public class AsyncException {
+    public string message;
+    public AsyncException() {
+        message = "";
+    }
+    public AsyncException(string msg) {
+        message = msg;
+    }
+}
+
+public class AsyncCanceledException : AsyncException {
+    public AsyncCanceledException(string msg) {
+        message = msg;
+    }
+}
+
+public struct CancellationToken {
+    public long __handle;
+
+    public CancellationToken(long h) {
+        __handle = h;
+    }
+
+    public static CancellationToken None() {
+        return new CancellationToken(0L);
+    }
+
+    public static CancellationToken PreCanceled() {
+        return new CancellationToken(Async.__TokenPreCanceled());
+    }
+
+    public bool IsCancellationRequested() {
+        return Async.__TokenIsCanceled(__handle);
+    }
+}
+
+public struct CancellationTokenSource {
+    public long __handle;
+
+    public CancellationTokenSource(long h) {
+        __handle = h;
+    }
+
+    public static CancellationTokenSource Create() {
+        return new CancellationTokenSource(Async.__CtsCreate());
+    }
+
+    public static CancellationTokenSource CreateLinked(CancellationToken parent) {
+        return new CancellationTokenSource(Async.__CtsCreateLinked(parent.__handle));
+    }
+
+    public CancellationToken Token() {
+        return new CancellationToken(Async.__CtsToken(__handle));
+    }
+
+    public int Cancel() {
+        return Async.__CtsCancel(__handle);
+    }
+
+    public bool IsCancellationRequested() {
+        return Async.__TokenIsCanceled(Async.__CtsToken(__handle));
+    }
+
+    public bool Release() {
+        return Async.__CtsRelease(__handle);
+    }
+}
+
+public struct Awaitable {
+    public long __handle;
+
+    public Awaitable(long h) {
+        __handle = h;
+    }
+
+    public static Awaitable Completed() {
+        return new Awaitable(Async.__CompletedVoid());
+    }
+
+    public static Awaitable FromCanceled() {
+        return new Awaitable(Async.__FromCanceled());
+    }
+
+    public static Awaitable FromFaulted(string msg) {
+        return new Awaitable(Async.__FromFaulted(msg));
+    }
+
+    public static Awaitable Yield() {
+        return new Awaitable(Async.__Yield(0L));
+    }
+
+    public static Awaitable YieldWithToken(CancellationToken token) {
+        return new Awaitable(Async.__Yield(token.__handle));
+    }
+
+    public bool IsCompleted() {
+        return Async.__IsCompleted(__handle);
+    }
+
+    public bool Release() {
+        return Async.__Release(__handle);
+    }
+}
+
+public class Async {
+    public static long __CompletedVoid() { return 0L; }
+    public static long __FromCanceled() { return 0L; }
+    public static long __FromFaulted(string msg) { return 0L; }
+    public static long __Yield(long tokenHandle) { return 0L; }
+    public static long __NewPending(long tokenHandle) { return 0L; }
+    public static bool __CompleteVoid(long rawHandle) { return false; }
+    public static bool __CompleteInt(long rawHandle, int value) { return false; }
+    public static bool __CompleteFault(long rawHandle, string msg) { return false; }
+    public static bool __CompleteCancel(long rawHandle) { return false; }
+    public static bool __IsCompleted(long rawHandle) { return false; }
+    public static bool __Release(long rawHandle) { return false; }
+    public static long __WhenAll(Awaitable[] tasks, long tokenHandle) { return 0L; }
+    public static long __WhenAnyIndex(Awaitable[] tasks, long tokenHandle, long cancelLosersCtsHandle) { return 0L; }
+    public static long __CtsCreate() { return 0L; }
+    public static long __CtsCreateLinked(long parentTokenHandle) { return 0L; }
+    public static long __CtsToken(long ctsHandle) { return 0L; }
+    public static int __CtsCancel(long ctsHandle) { return 0; }
+    public static bool __CtsRelease(long ctsHandle) { return false; }
+    public static long __TokenPreCanceled() { return 0L; }
+    public static bool __TokenIsCanceled(long tokenHandle) { return false; }
+    public static int __StepUpdate(int maxCount) { return 0; }
+    public static int __ReadyUpdateCount() { return 0; }
+
+    public static Awaitable NewSignal() {
+        return new Awaitable(__NewPending(0L));
+    }
+
+    public static Awaitable NewSignalWithToken(CancellationToken token) {
+        return new Awaitable(__NewPending(token.__handle));
+    }
+
+    public static bool ResolveSignal(Awaitable signal) {
+        return __CompleteVoid(signal.__handle);
+    }
+
+    public static bool FaultSignal(Awaitable signal, string message) {
+        return __CompleteFault(signal.__handle, message);
+    }
+
+    public static bool CancelSignal(Awaitable signal) {
+        return __CompleteCancel(signal.__handle);
+    }
+
+    public static Awaitable WhenAll(Awaitable[] tasks) {
+        return new Awaitable(__WhenAll(tasks, 0L));
+    }
+
+    public static Awaitable WhenAllWithToken(Awaitable[] tasks, CancellationToken token) {
+        return new Awaitable(__WhenAll(tasks, token.__handle));
+    }
+
+    public static Awaitable<int> WhenAny(Awaitable[] tasks) {
+        return Awaitable<int>.FromHandle(__WhenAnyIndex(tasks, 0L, 0L));
+    }
+
+    public static Awaitable<int> WhenAnyRace(
+        Awaitable[] tasks,
+        CancellationToken token,
+        CancellationTokenSource cancelLosers) {
+        return Awaitable<int>.FromHandle(
+            __WhenAnyIndex(tasks, token.__handle, cancelLosers.__handle));
+    }
+
+    public static Awaitable<int> NewIntSignal() {
+        return Awaitable<int>.FromHandle(__NewPending(0L));
+    }
+
+    public static Awaitable<int> NewIntSignalWithToken(CancellationToken token) {
+        return Awaitable<int>.FromHandle(__NewPending(token.__handle));
+    }
+
+    public static bool ResolveIntSignal(Awaitable<int> signal, int value) {
+        return __CompleteInt(signal.__handle, value);
+    }
+
+    public static int StepUpdate() {
+        return __StepUpdate(0);
+    }
+
+    public static int StepUpdateBounded(int maxCount) {
+        return __StepUpdate(maxCount);
+    }
+
+    public static int ReadyUpdateCount() {
+        return __ReadyUpdateCount();
+    }
+}
+)RS";
+    return kSource;
+}
+
+bool sourceMentionsAsyncPrimitives(std::string_view text) noexcept {
+    return text.find("async") != std::string_view::npos ||
+        text.find("await") != std::string_view::npos ||
+        text.find("Awaitable") != std::string_view::npos ||
+        text.find("CancellationToken") != std::string_view::npos ||
+        text.find("AsyncException") != std::string_view::npos ||
+        text.find("AsyncCanceledException") != std::string_view::npos ||
+        text.find("Async.") != std::string_view::npos ||
+        text.find("RealScript.Async") != std::string_view::npos;
+}
+
 const std::string& builtinFiberModuleSource() {
     static const std::string kSource = R"RS(
 module RealScript.Fiber;
@@ -2586,6 +2797,34 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         addSourceUnit(SourceFile{
             "$builtin/RealScript.Fiber.rs",
             builtinFiberModuleSource()});
+    }
+
+    bool needsBuiltinAsync = false;
+    std::vector<std::string> modulesUsingAsync;
+    for (const auto& [name, module] : modules) {
+        if (name == "RealScript.Async") continue;
+        bool moduleUsesAsync =
+            module.imports.find("RealScript.Async") != module.imports.end();
+        if (!moduleUsesAsync) {
+            for (const auto* u : module.units) {
+                if (u && u->source && sourceMentionsAsyncPrimitives(u->source->content())) {
+                    moduleUsesAsync = true;
+                    break;
+                }
+            }
+        }
+        if (moduleUsesAsync) {
+            needsBuiltinAsync = true;
+            modulesUsingAsync.push_back(name);
+        }
+    }
+    if (needsBuiltinAsync && modules.find("RealScript.Async") == modules.end()) {
+        addSourceUnit(SourceFile{
+            "$builtin/RealScript.Async.rs",
+            builtinAsyncModuleSource()});
+    }
+    for (const auto& modName : modulesUsingAsync) {
+        modules[modName].imports.insert("RealScript.Async");
     }
 
     specializeNativeGenerics(units, modules, result);

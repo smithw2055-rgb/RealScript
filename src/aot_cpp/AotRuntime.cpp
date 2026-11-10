@@ -739,21 +739,27 @@ bool ExecutionContext::invoke(
             runtime::ErrorCode::RecursionLimitExceeded,
             "recursion limit exceeded");
     }
-    if (argumentCount != function->parameterCount) {
-        return fail(
-            runtime::ErrorCode::InvalidArguments,
-            "argument count does not match function signature");
-    }
-    for (std::size_t index = 0; index < argumentCount; ++index) {
-        if (!expectSignatureType(
-                arguments[index],
-                function->parameterTypes[index],
-                typeIdAt(
-                    function->parameterTypeIds,
-                    function->parameterCount,
-                    index),
-                "argument")) {
-            return false;
+    const bool isResumingThisFunction =
+        resumingFramePtr_ != nullptr &&
+        resumingCoroutine_.valid() &&
+        resumingFramePtr_->functionSymbolId == symbolId;
+    if (!isResumingThisFunction) {
+        if (argumentCount != function->parameterCount) {
+            return fail(
+                runtime::ErrorCode::InvalidArguments,
+                "argument count does not match function signature");
+        }
+        for (std::size_t index = 0; index < argumentCount; ++index) {
+            if (!expectSignatureType(
+                    arguments[index],
+                    function->parameterTypes[index],
+                    typeIdAt(
+                        function->parameterTypeIds,
+                        function->parameterCount,
+                        index),
+                    "argument")) {
+                return false;
+            }
         }
     }
 
@@ -963,6 +969,24 @@ bool ExecutionContext::call(
         return fail(
             runtime::ErrorCode::InvalidProgram,
             "AOT runtime dispatch target function is unavailable");
+    }
+    if (signature.name &&
+        std::string_view(signature.name).rfind("$intrinsic::Async.__", 0) == 0) {
+        std::string intrinsicError;
+        if (!runtime::tryExecuteAsyncIntrinsic(
+                std::string_view(signature.name).substr(12u),
+                runtime::ValueSpan(arguments, argumentCount),
+                asyncRuntime_.get(),
+                heap_.get(),
+                result,
+                intrinsicError) ||
+            !intrinsicError.empty()) {
+            const auto code = intrinsicError.find("null") != std::string::npos
+                ? runtime::ErrorCode::NullReference
+                : runtime::ErrorCode::InvalidProgram;
+            return fail(code, intrinsicError);
+        }
+        return true;
     }
     if (signature.name &&
         std::string_view(signature.name).rfind("$intrinsic::", 0) == 0) {
@@ -2942,7 +2966,8 @@ std::size_t ExecutionContext::replayEntriesConsumed() const noexcept {
 
 Program::Program(const ProgramDescriptor& descriptor)
     : descriptor_(&descriptor),
-      heap_(std::make_shared<runtime::ManagedHeap>()) {
+      heap_(std::make_shared<runtime::ManagedHeap>()),
+      asyncRuntime_(std::make_shared<runtime::AsyncRuntimeContext>(heap_.get())) {
     if (descriptor.abiMajor != RuntimeAbiMajor ||
         descriptor.abiMinor > RuntimeAbiMinor) {
         throw std::invalid_argument("AOT program requires an incompatible runtime ABI");
@@ -3075,17 +3100,402 @@ Program::Program(const ProgramDescriptor& descriptor)
     }
 }
 
+
+struct AotResumeEnv {
+    const ProgramDescriptor* descriptor = nullptr;
+    std::shared_ptr<runtime::ManagedHeap> heap;
+    std::shared_ptr<const runtime::BindingRegistry> bindings;
+    runtime::ExecutionOptions options;
+    const std::unordered_map<semantic::SymbolId, const TypeDescriptor*>* typesPtr = nullptr;
+    const std::unordered_map<semantic::SymbolId, const FunctionDescriptor*>* functionsPtr = nullptr;
+    std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime;
+};
+
+namespace {
+
+std::string extractAotExceptionMessage(
+    const std::unordered_map<semantic::SymbolId, const TypeDescriptor*>* typesMap,
+    const runtime::ManagedHeap* heap,
+    const runtime::Value& excVal) {
+    if (!heap || !std::holds_alternative<runtime::ObjectRef>(excVal)) {
+        return "unhandled script exception in async function";
+    }
+    const auto ref = std::get<runtime::ObjectRef>(excVal);
+    const auto tid = heap->objectTypeId(ref);
+    const TypeDescriptor* desc = nullptr;
+    if (tid && typesMap) {
+        const auto it = typesMap->find(*tid);
+        if (it != typesMap->end()) desc = it->second;
+    }
+    if (desc) {
+        for (std::uint32_t f = 0; f < desc->fieldCount; ++f) {
+            if (desc->fields && desc->fields[f].type == semantic::PrimitiveType::String) {
+                if (const auto fv = heap->fieldGet(ref, f)) {
+                    if (!std::holds_alternative<runtime::NullString>(*fv) &&
+                        !std::holds_alternative<std::monostate>(*fv)) {
+                        const auto s = runtime::valueToString(*fv, heap);
+                        if (!s.empty()) return s;
+                    }
+                }
+            }
+        }
+        if (desc->name) return desc->name;
+    }
+    return "unhandled script exception in async function";
+}
+
+} // namespace
+
+void ExecutionContext::setAsyncRuntime(
+    std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime,
+    std::shared_ptr<void> resumeEnv) {
+    asyncRuntime_ = std::move(asyncRuntime);
+    resumeEnv_ = std::move(resumeEnv);
+    if (asyncRuntime_ && heap_ && asyncRuntime_->awaitables().heap() == nullptr) {
+        asyncRuntime_->setHeap(heap_.get());
+    }
+}
+
+bool ExecutionContext::tryEnterResumingCoroutine(
+    semantic::SymbolId functionSymbolId,
+    std::vector<runtime::Value>& argumentValues,
+    std::vector<runtime::Value>& locals,
+    std::vector<runtime::Value>& registers,
+    std::uint32_t& outResumeBlockId,
+    runtime::CoroutineFrameHandle& outActiveCoroutine) {
+    if (resumingFramePtr_ == nullptr ||
+        !resumingCoroutine_.valid() ||
+        resumingFramePtr_->functionSymbolId != functionSymbolId) {
+        return false;
+    }
+    auto* frame = resumingFramePtr_;
+    outActiveCoroutine = resumingCoroutine_;
+    resumingCoroutine_ = runtime::CoroutineFrameHandle::invalid();
+    resumingFramePtr_ = nullptr;
+
+    argumentValues = frame->savedArguments;
+    const std::size_t nLocs = std::min(locals.size(), frame->savedLocals.size());
+    for (std::size_t i = 0; i < nLocs; ++i) {
+        locals[i] = frame->savedLocals[i];
+    }
+    const std::size_t nRegs = std::min(registers.size(), frame->savedRegisters.size());
+    for (std::size_t i = 0; i < nRegs; ++i) {
+        registers[i] = frame->savedRegisters[i];
+    }
+    outResumeBlockId = frame->resumeBlockId;
+    return true;
+}
+
+bool ExecutionContext::awaitSuspend(
+    semantic::SymbolId functionSymbolId,
+    semantic::SymbolId returnStructTypeId,
+    const runtime::Value& awaitableValue,
+    runtime::Value& awaitLocalSlot,
+    std::uint32_t resumeBlockId,
+    const std::vector<runtime::Value>& argumentValues,
+    const std::vector<runtime::Value>& locals,
+    const std::vector<runtime::Value>& registers,
+    runtime::CoroutineFrameHandle& ioActiveCoroutine,
+    bool& outSuspendedNow,
+    runtime::Value& outResult) {
+    outSuspendedNow = false;
+    awaitLocalSlot = awaitableValue;
+    runtime::AwaitableHandle awaitedHandle{};
+    if (!asyncRuntime_ ||
+        !runtime::tryExtractAwaitableHandle(awaitableValue, awaitedHandle) ||
+        !asyncRuntime_->awaitables().isValid(awaitedHandle)) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT awaited value does not hold a valid Awaitable handle");
+    }
+    if (asyncRuntime_->awaitables().isCompleted(awaitedHandle)) {
+        return true;
+    }
+
+    runtime::AwaitableHandle completionHandle{};
+    if (!ioActiveCoroutine.valid()) {
+        completionHandle = asyncRuntime_->awaitables().allocatePending(runtime::ResumeQueue::Update);
+        ioActiveCoroutine = asyncRuntime_->coroutines().allocateFrame(
+            functionSymbolId,
+            returnStructTypeId,
+            completionHandle,
+            runtime::ResumeQueue::Update);
+    } else {
+        const auto* existing = asyncRuntime_->coroutines().resolve(ioActiveCoroutine);
+        if (!existing) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT active coroutine frame handle is stale");
+        }
+        completionHandle = existing->completionHandle;
+    }
+
+    struct AotRunnerThunk {
+        static void run(
+            void* runnerContext,
+            runtime::CoroutineFrameHandle frameHandle,
+            runtime::CoroutineFrame& frame,
+            runtime::AsyncRuntimeContext& asyncContext) {
+            const auto faultUnresolvedFrame = [&](const runtime::RuntimeError& err) {
+                if (auto* f = asyncContext.coroutines().resolve(frameHandle)) {
+                    if (!f->completed && !f->suspended) {
+                        f->completed = true;
+                        const runtime::ErrorCode code =
+                            (err.code != runtime::ErrorCode::None)
+                                ? err.code
+                                : runtime::ErrorCode::InvalidProgram;
+                        const std::string msg = !err.message.empty()
+                            ? err.message
+                            : std::string("resumed AOT coroutine failed with runtime error");
+                        (void)asyncContext.awaitables().trySetFaulted(
+                            f->completionHandle, code, msg);
+                    }
+                }
+            };
+
+            if (void* activeRaw = asyncContext.activeAotContext()) {
+                auto* activeCtx = static_cast<ExecutionContext*>(activeRaw);
+                if (activeCtx->hasFunction(frame.functionSymbolId)) {
+                    const runtime::CoroutineFrameHandle savedCoro = activeCtx->resumingCoroutine_;
+                    runtime::CoroutineFrame* const savedFramePtr = activeCtx->resumingFramePtr_;
+                    runtime::RuntimeError savedError = std::move(activeCtx->error_);
+                    std::optional<runtime::Value> savedPendingExc =
+                        std::move(activeCtx->pendingException_);
+
+                    activeCtx->resumingCoroutine_ = frameHandle;
+                    activeCtx->resumingFramePtr_ = &frame;
+                    activeCtx->error_ = runtime::RuntimeError{};
+                    activeCtx->pendingException_.reset();
+
+                    runtime::Value ignored{};
+                    const bool ok = activeCtx->invoke(frame.functionSymbolId, nullptr, 0, ignored);
+                    if (!ok) {
+                        faultUnresolvedFrame(activeCtx->error_);
+                    }
+
+                    activeCtx->resumingCoroutine_ = savedCoro;
+                    activeCtx->resumingFramePtr_ = savedFramePtr;
+                    activeCtx->error_ = std::move(savedError);
+                    activeCtx->pendingException_ = std::move(savedPendingExc);
+                    return;
+                }
+            }
+            auto* env = static_cast<AotResumeEnv*>(runnerContext);
+            if (!env || !env->descriptor) return;
+            runtime::ExecutionOptions opts = env->options;
+            ExecutionContext freshCtx(
+                *env->descriptor,
+                env->heap,
+                env->bindings,
+                std::move(opts),
+                env->typesPtr,
+                env->functionsPtr);
+            std::shared_ptr<runtime::AsyncRuntimeContext> borrowedAsync(
+                std::shared_ptr<runtime::AsyncRuntimeContext>{}, &asyncContext);
+            freshCtx.setAsyncRuntime(
+                std::move(borrowedAsync),
+                 std::const_pointer_cast<void>(frame.runnerOwner));
+            freshCtx.resumingCoroutine_ = frameHandle;
+            freshCtx.resumingFramePtr_ = &frame;
+
+            void* const prevBridge = asyncContext.activeAotContext();
+            asyncContext.setActiveAotContext(&freshCtx);
+            struct RestoreBridge {
+                runtime::AsyncRuntimeContext& ctx;
+                void* prev;
+                ~RestoreBridge() noexcept { ctx.setActiveAotContext(prev); }
+            } restoreBridge{asyncContext, prevBridge};
+
+            runtime::Value ignored{};
+            const bool ok = freshCtx.invoke(frame.functionSymbolId, nullptr, 0, ignored);
+            if (!ok) {
+                faultUnresolvedFrame(freshCtx.error());
+            }
+        }
+    };
+
+    if (!resumeEnv_) {
+        auto env = std::make_shared<AotResumeEnv>();
+        env->descriptor = program_;
+        env->heap = heap_;
+        env->bindings = bindings_;
+        env->options = options_;
+        env->typesPtr = typesPtr_;
+        env->functionsPtr = functionsPtr_;
+        resumeEnv_ = std::move(env);
+    }
+
+    std::shared_ptr<const void> ownerCopy{};
+    const auto* curFrame = asyncRuntime_->coroutines().resolve(ioActiveCoroutine);
+    if (!curFrame || !curFrame->runnerOwner) {
+        ownerCopy = resumeEnv_;
+    }
+
+    if (!asyncRuntime_->coroutines().suspendFrame(
+            ioActiveCoroutine,
+            argumentValues.data(),
+            argumentValues.size(),
+            locals.data(),
+            locals.size(),
+            registers.data(),
+            registers.size(),
+            resumeBlockId,
+            awaitedHandle,
+            &AotRunnerThunk::run,
+            resumeEnv_.get(),
+            std::move(ownerCopy))) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT failed to suspend coroutine onto awaited handle");
+    }
+
+    outResult = runtime::makeAwaitableStructValue(returnStructTypeId, completionHandle);
+    outSuspendedNow = true;
+    return true;
+}
+
+bool ExecutionContext::awaitResume(
+    runtime::Value& awaitLocalSlot,
+    semantic::PrimitiveType expectedType,
+    semantic::SymbolId expectedTypeId,
+    runtime::Value* optionalOutResult) {
+    runtime::AwaitableHandle awaitedHandle{};
+    const runtime::Value awaitableVal = awaitLocalSlot;
+    awaitLocalSlot = runtime::Value{};
+    if (!asyncRuntime_ ||
+        !runtime::tryExtractAwaitableHandle(awaitableVal, awaitedHandle)) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT await.resume local does not hold a valid Awaitable");
+    }
+    runtime::Value payload{};
+    runtime::RuntimeError faultErr{};
+    runtime::Value excObj{};
+    const auto st = asyncRuntime_->awaitables().getResult(
+        awaitedHandle, payload, faultErr, &excObj);
+    if (st == runtime::AwaitStatus::Succeeded) {
+        if (optionalOutResult != nullptr) {
+            if (!expectSignatureType(payload, expectedType, expectedTypeId, "await result")) {
+                return false;
+            }
+            *optionalOutResult = std::move(payload);
+        }
+        return true;
+    }
+    if (st == runtime::AwaitStatus::Canceled || st == runtime::AwaitStatus::Faulted) {
+        const auto matRef = runtime::materializeAsyncResumeException(
+            heap_.get(), st, faultErr, excObj);
+        if (!matRef) {
+            return fail(runtime::ErrorCode::OutOfMemory, "failed to allocate AOT async exception");
+        }
+        pendingException_ = runtime::Value(*matRef);
+        return false;
+    }
+    return fail(
+        runtime::ErrorCode::InvalidProgram,
+        "AOT await.resume encountered non-terminal Awaitable");
+}
+
+bool ExecutionContext::asyncResolve(
+    runtime::CoroutineFrameHandle activeCoroutine,
+    semantic::SymbolId returnStructTypeId,
+    const runtime::Value* optionalPayload,
+    runtime::Value& outWrappedResult) {
+    if (!asyncRuntime_) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT async.resolve requires an AsyncRuntimeContext");
+    }
+    if (activeCoroutine.valid()) {
+        auto* frame = asyncRuntime_->coroutines().resolve(activeCoroutine);
+        if (!frame) {
+            return fail(
+                runtime::ErrorCode::InvalidProgram,
+                "AOT async.resolve coroutine frame is invalid");
+        }
+        frame->completed = true;
+        const runtime::Value val = optionalPayload ? *optionalPayload : runtime::Value{};
+        (void)asyncRuntime_->awaitables().trySetResult(frame->completionHandle, val);
+        outWrappedResult = runtime::makeAwaitableStructValue(
+            returnStructTypeId, frame->completionHandle);
+        return true;
+    }
+    const runtime::AwaitableHandle h = optionalPayload
+        ? asyncRuntime_->awaitables().fromResult(*optionalPayload)
+        : runtime::AwaitableHandle::completedVoid();
+    outWrappedResult = runtime::makeAwaitableStructValue(returnStructTypeId, h);
+    return true;
+}
+
+bool ExecutionContext::finishUncaughtAsyncException(
+    runtime::CoroutineFrameHandle activeCoroutine,
+    semantic::SymbolId returnStructTypeId,
+    runtime::Value& outResult) {
+    if (!asyncRuntime_ || !pendingException_.has_value()) {
+        return false;
+    }
+    const runtime::Value excVal = *pendingException_;
+    pendingException_.reset();
+    error_ = runtime::RuntimeError{};
+
+    const bool isCanceled = runtime::isAsyncCanceledExceptionObject(heap_.get(), excVal);
+    if (activeCoroutine.valid()) {
+        auto* frame = asyncRuntime_->coroutines().resolve(activeCoroutine);
+        if (!frame) return false;
+        frame->completed = true;
+        if (isCanceled) {
+            (void)asyncRuntime_->awaitables().trySetCanceled(frame->completionHandle);
+        } else {
+            std::string msg = extractAotExceptionMessage(typesPtr_, heap_.get(), excVal);
+            (void)asyncRuntime_->awaitables().trySetFaulted(
+                frame->completionHandle,
+                runtime::ErrorCode::ScriptException,
+                std::move(msg),
+                excVal);
+        }
+        outResult = runtime::makeAwaitableStructValue(
+            returnStructTypeId, frame->completionHandle);
+        return true;
+    }
+    const runtime::AwaitableHandle h = isCanceled
+        ? asyncRuntime_->awaitables().fromCanceled()
+        : asyncRuntime_->awaitables().fromFaulted(
+              runtime::ErrorCode::ScriptException,
+              extractAotExceptionMessage(typesPtr_, heap_.get(), excVal),
+              excVal);
+    outResult = runtime::makeAwaitableStructValue(returnStructTypeId, h);
+    return true;
+}
+
 void Program::setBindings(
     std::shared_ptr<const runtime::BindingRegistry> bindings) {
     bindings_ = std::move(bindings);
+    resumeEnv_.reset();
 }
 
 void Program::setHeap(std::shared_ptr<runtime::ManagedHeap> heap) {
     heap_ = heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>();
+    if (asyncRuntime_) asyncRuntime_->setHeap(heap_.get());
+    resumeEnv_.reset();
 }
 
 std::shared_ptr<runtime::ManagedHeap> Program::heap() const noexcept {
     return heap_;
+}
+
+void Program::setAsyncRuntime(
+    std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime) {
+    asyncRuntime_ = asyncRuntime
+        ? std::move(asyncRuntime)
+        : std::make_shared<runtime::AsyncRuntimeContext>(heap_.get());
+    if (heap_ && asyncRuntime_->awaitables().heap() == nullptr) {
+        asyncRuntime_->setHeap(heap_.get());
+    }
+    resumeEnv_.reset();
+}
+
+std::shared_ptr<runtime::AsyncRuntimeContext> Program::asyncRuntime() const noexcept {
+    return asyncRuntime_;
 }
 
 const ProgramDescriptor& Program::descriptor() const noexcept {
@@ -3096,6 +3506,7 @@ runtime::ExecutionResult Program::invoke(
     semantic::SymbolId symbolId,
     const std::vector<runtime::Value>& arguments,
     runtime::ExecutionOptions options) const {
+    const runtime::ExecutionOptions invokeOptionsCopy = options;
     ExecutionContext context(
         *descriptor_,
         heap_,
@@ -3103,6 +3514,33 @@ runtime::ExecutionResult Program::invoke(
         std::move(options),
         &types_,
         &functions_);
+    if (!resumeEnv_) {
+        auto env = std::make_shared<AotResumeEnv>();
+        env->descriptor = descriptor_;
+        env->heap = heap_;
+        env->bindings = bindings_;
+        env->options = invokeOptionsCopy;
+        env->typesPtr = &types_;
+        env->functionsPtr = &functions_;
+        env->asyncRuntime = asyncRuntime_;
+        resumeEnv_ = std::move(env);
+    } else {
+        static_cast<AotResumeEnv*>(resumeEnv_.get())->options = invokeOptionsCopy;
+    }
+    context.setAsyncRuntime(asyncRuntime_, resumeEnv_);
+    void* const prevBridge = asyncRuntime_
+        ? asyncRuntime_->activeAotContext()
+        : nullptr;
+    if (asyncRuntime_) {
+        asyncRuntime_->setActiveAotContext(&context);
+    }
+    struct ActiveAotBridgeScope {
+        runtime::AsyncRuntimeContext* ctx;
+        void* prev;
+        ~ActiveAotBridgeScope() noexcept {
+            if (ctx) ctx->setActiveAotContext(prev);
+        }
+    } activeAotBridgeScope{asyncRuntime_.get(), prevBridge};
     runtime::Value value;
     runtime::ExecutionResult execution;
     execution.succeeded = context.invoke(

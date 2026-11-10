@@ -2301,6 +2301,7 @@ private:
 };
 
 class ProgramImage;
+class AsyncRuntimeContext;
 
 namespace detail {
 struct ExecutionMirror;
@@ -2361,6 +2362,8 @@ public:
     void setBindingRegistry(std::shared_ptr<const BindingRegistry> bindings);
     void setHeap(std::shared_ptr<ManagedHeap> heap);
     [[nodiscard]] std::shared_ptr<ManagedHeap> heap() const noexcept;
+    void setAsyncRuntime(std::shared_ptr<AsyncRuntimeContext> asyncRuntime);
+    [[nodiscard]] std::shared_ptr<AsyncRuntimeContext> asyncRuntime() const noexcept;
 
     [[nodiscard]] ExecutionResult invoke(
         semantic::SymbolId symbolId,
@@ -2385,9 +2388,9 @@ private:
     ExternalFunction externalResolver_;
     std::shared_ptr<const BindingRegistry> bindings_;
     std::shared_ptr<ManagedHeap> heap_;
+    std::shared_ptr<AsyncRuntimeContext> asyncRuntime_;
+    mutable std::shared_ptr<void> resumeEnv_;
 };
-
-class AsyncRuntimeContext;
 
 class EngineRuntime {
 public:

@@ -393,6 +393,10 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase25_async_primitives_tests
         realscript.phase25.async-primitives
         tests/phase25_async_primitives_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_phase26_async_coroutines_tests
+        realscript.phase26.async-coroutines
+        tests/phase26_async_coroutines_tests.cpp)
     set(REALSCRIPT_PHASE20_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/phase20")
     realscript_add_aot_library(
@@ -508,6 +512,29 @@ if(REALSCRIPT_BUILD_TESTS)
     add_test(
         NAME realscript.phase24.aot
         COMMAND realscript_phase24_aot_tests)
+    set(REALSCRIPT_PHASE26_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase26")
+    realscript_add_aot_library(
+        realscript_phase26_generated
+        PROGRAM_NAME Phase26Aot
+        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE26_GENERATED_DIR}"
+        OPT_LEVEL 2
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase26_aot.rs"
+    )
+    add_executable(
+        realscript_phase26_aot_tests tests/phase26_aot_tests.cpp)
+    target_link_libraries(
+        realscript_phase26_aot_tests
+        PRIVATE realscript_phase26_generated RealScript::Full)
+    target_compile_features(
+        realscript_phase26_aot_tests PRIVATE cxx_std_17)
+    target_compile_definitions(
+        realscript_phase26_aot_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME realscript.phase26.aot
+        COMMAND realscript_phase26_aot_tests)
     set(REALSCRIPT_PHASE19_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/phase19")
     realscript_add_aot_library(
@@ -626,6 +653,7 @@ if(REALSCRIPT_BUILD_TESTS)
             realscript_phase22_aot_tests
             realscript_phase23_aot_tests
             realscript_phase24_aot_tests
+            realscript_phase26_aot_tests
             realscript_aot_trusted_and_zero_copy_ecs_tests)
         realscript_enable_cxx_warnings(${realscript_aot_test})
     endforeach()

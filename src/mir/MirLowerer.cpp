@@ -111,6 +111,8 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
     }
 
     currentFunction_ = &result; nextValueId_ = 0;
+    currentAsyncFunction_ = function.symbol.asyncFunction;
+    currentAsyncReturnTypeName_ = semantic::storageReturnTypeNameOf(function.symbol);
     breakTargets_.clear(); continueTargets_.clear();
     breakFinalizerDepths_.clear(); continueFinalizerDepths_.clear();
     finalizers_.clear();
@@ -119,6 +121,16 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
     exceptionCleanupBlocks_.clear();
     collectLocalTypes(*function.body);
     const auto entry = createBlock(); setCurrentBlock(entry);
+    if (currentAsyncFunction_) {
+        Instruction enterInst;
+        enterInst.result = -1;
+        enterInst.resultType = semantic::PrimitiveType::Void;
+        enterInst.opcode = Opcode::AsyncEnter;
+        enterInst.typeId = result.returnTypeId;
+        enterInst.symbolName = currentAsyncReturnTypeName_;
+        enterInst.sourceSpan = function.symbol.declarationSpan;
+        block(*currentBlockId_).instructions.push_back(std::move(enterInst));
+    }
     if (function.symbol.constructor && function.symbol.staticMethod) {
         const auto guardId = semantic::stableTypeId(
             function.symbol.declaringTypeName + "::cctor_guard");
@@ -170,7 +182,10 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
         emitStoreLocal(parameter.index, value, {});
     }
     lowerStatement(*function.body);
-    if (hasCurrentBlock() && !currentBlockTerminated() && function.symbol.returnType == semantic::PrimitiveType::Void)
+    const bool isVoidAsync = currentAsyncFunction_ &&
+        result.returnTypeId == semantic::stableTypeId("RealScript.Async::Awaitable");
+    if (hasCurrentBlock() && !currentBlockTerminated() &&
+        (function.symbol.returnType == semantic::PrimitiveType::Void || isVoidAsync))
         emitReturn(std::nullopt, function.body->span);
 
     for (const auto& basicBlock : result.blocks) {
@@ -194,6 +209,7 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
             if (!duplicate) result.debugInfo.sequencePoints.push_back(std::move(point));
         }
     }
+    currentAsyncFunction_ = false; currentAsyncReturnTypeName_.clear();
     currentFunction_ = nullptr; clearCurrentBlock(); return result;
 }
 

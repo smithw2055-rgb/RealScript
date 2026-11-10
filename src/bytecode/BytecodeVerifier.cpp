@@ -207,7 +207,9 @@ bool instructionDefinesValue(
     const Module& module) noexcept {
     if (instruction.opcode == Opcode::StoreLocal ||
         instruction.opcode == Opcode::StoreField ||
-        instruction.opcode == Opcode::StoreElement) {
+        instruction.opcode == Opcode::StoreElement ||
+        instruction.opcode == Opcode::AsyncEnter ||
+        instruction.opcode == Opcode::AwaitSuspend) {
         return false;
     }
     if (instruction.opcode == Opcode::Call &&
@@ -215,7 +217,8 @@ bool instructionDefinesValue(
         return module.functionReferences[instruction.index].returnType !=
             semantic::PrimitiveType::Void;
     }
-    if (instruction.opcode == Opcode::InvokeDelegate) {
+    if (instruction.opcode == Opcode::InvokeDelegate ||
+        instruction.opcode == Opcode::AwaitResume) {
         return instruction.result != InvalidRegister;
     }
     return true;
@@ -235,6 +238,8 @@ std::size_t expectedOperandCount(
     case Opcode::NewObject:
     case Opcode::NewStruct:
     case Opcode::ConstantTypeId:
+    case Opcode::AsyncEnter:
+    case Opcode::AwaitResume:
         return 0;
     case Opcode::StoreLocal:
     case Opcode::ConvertNullToString:
@@ -255,7 +260,10 @@ std::size_t expectedOperandCount(
     case Opcode::LogicalNot:
     case Opcode::IsType:
     case Opcode::AsType:
+    case Opcode::AwaitSuspend:
         return 1;
+    case Opcode::AsyncResolve:
+        return instruction.operands.size();
     case Opcode::LoadElement:
     case Opcode::StoreField:
     case Opcode::StoreStructField:
@@ -1661,6 +1669,41 @@ bool verifyModule(
                             registerType(instruction.operands[1]) ||
                         resultType != semantic::PrimitiveType::Bool) {
                         diagnostics.report("RS5145", "invalid equality comparison", {});
+                    }
+                    break;
+                case Opcode::AsyncEnter:
+                    if (instruction.typeIndex >= module.types.size() ||
+                        module.types[instruction.typeIndex].kind != semantic::TypeKind::Struct ||
+                        function.returnType != semantic::PrimitiveType::Struct ||
+                        function.returnTypeId != module.types[instruction.typeIndex].id) {
+                        diagnostics.report("RS5190", "invalid bytecode async.enter", {});
+                    }
+                    break;
+                case Opcode::AwaitSuspend:
+                    if (instruction.operands.size() != 1 ||
+                        instruction.index >= function.localTypes.size() ||
+                        function.localTypes[instruction.index] != semantic::PrimitiveType::Struct ||
+                        registerType(instruction.operands.front()) != semantic::PrimitiveType::Struct ||
+                        instruction.typeIndex >= module.types.size() ||
+                        instruction.integerImmediate < 0 ||
+                        blocks.find(static_cast<BlockId>(instruction.integerImmediate)) == blocks.end()) {
+                        diagnostics.report("RS5191", "invalid bytecode await.suspend", {});
+                    }
+                    break;
+                case Opcode::AwaitResume:
+                    if (instruction.index >= function.localTypes.size() ||
+                        function.localTypes[instruction.index] != semantic::PrimitiveType::Struct ||
+                        instruction.typeIndex >= module.types.size()) {
+                        diagnostics.report("RS5192", "invalid bytecode await.resume", {});
+                    }
+                    break;
+                case Opcode::AsyncResolve:
+                    if (instruction.operands.size() > 1 ||
+                        instruction.typeIndex >= module.types.size() ||
+                        module.types[instruction.typeIndex].kind != semantic::TypeKind::Struct ||
+                        resultType != semantic::PrimitiveType::Struct ||
+                        registerTypeId(instruction.result) != module.types[instruction.typeIndex].id) {
+                        diagnostics.report("RS5193", "invalid bytecode async.resolve", {});
                     }
                     break;
                 }

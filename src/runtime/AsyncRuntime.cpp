@@ -92,6 +92,24 @@ semantic::SymbolId whenAnyResultTypeId() noexcept {
     return id;
 }
 
+semantic::SymbolId awaitableVoidTypeId() noexcept {
+    static const semantic::SymbolId id =
+        semantic::stableTypeId("RealScript.Async::Awaitable");
+    return id;
+}
+
+semantic::SymbolId asyncExceptionTypeId() noexcept {
+    static const semantic::SymbolId id =
+        semantic::stableTypeId("RealScript.Async::AsyncException");
+    return id;
+}
+
+semantic::SymbolId asyncCanceledExceptionTypeId() noexcept {
+    static const semantic::SymbolId id =
+        semantic::stableTypeId("RealScript.Async::AsyncCanceledException");
+    return id;
+}
+
 // ============================================================================
 // CancellationTokenPool
 // ============================================================================
@@ -514,6 +532,20 @@ std::uint32_t AwaitableCorePool::allocateRawSlot(ResumeQueue defaultQueue) {
     return slotIndex;
 }
 
+namespace {
+
+inline bool valueNeedsManagedHeapRoot(const Value& v) noexcept {
+    if (std::holds_alternative<ObjectRef>(v)) {
+        return std::get<ObjectRef>(v).valid();
+    }
+    if (const auto* st = std::get_if<StructValue>(&v)) {
+        return !st->isInline && st->storage != nullptr;
+    }
+    return false;
+}
+
+} // namespace
+
 void AwaitableCorePool::releaseRootToken(ManagedHeap::RootToken& token) noexcept {
     if (token != 0) {
         if (heap_) {
@@ -528,7 +560,7 @@ void AwaitableCorePool::pinValueIfNeeded(
     const Value& value,
     ManagedHeap::RootToken& rootToken) {
     releaseRootToken(rootToken);
-    if (heap_ && value.isTraceable()) {
+    if (heap_ && valueNeedsManagedHeapRoot(value)) {
         rootToken = heap_->addPersistentRoot(value);
         if (rootToken != 0) {
             ++activeGcRoots_;
@@ -966,6 +998,7 @@ std::uint32_t AwaitableCorePool::allocateCombinatorSlot() {
     comb.allocated = true;
     comb.resolved = false;
     comb.materializeHeapArray = true;
+    comb.returnWinnerIndex = false;
     comb.parentHandle = AwaitableHandle::invalid();
     comb.cancelLosersSource = CancellationSourceHandle{};
     comb.parentCancelReg = CancellationRegistration{};
@@ -1166,29 +1199,33 @@ void AwaitableCorePool::handleWhenAnyChild(
         }
 
         const AwaitableHandle parent = comb.parentHandle;
-        if (isValid(parent) && !parent.isCompletedVoidSentinel()) {
-            auto& parentSlot = slotAt(parent.slot);
-            if (!parentSlot.cold) {
-                parentSlot.cold = std::make_unique<ColdSlotState>();
+        if (comb.returnWinnerIndex) {
+            trySetResult(parent, Value(static_cast<std::int64_t>(childIndex)));
+        } else {
+            if (isValid(parent) && !parent.isCompletedVoidSentinel()) {
+                auto& parentSlot = slotAt(parent.slot);
+                if (!parentSlot.cold) {
+                    parentSlot.cold = std::make_unique<ColdSlotState>();
+                }
+                parentSlot.dirtyCold = true;
+                parentSlot.cold->hasWhenAnyMetadata = true;
+                parentSlot.cold->whenAnyWinnerIndex = childIndex;
+                parentSlot.cold->whenAnyWinnerStatus = childStatus;
+                parentSlot.cold->whenAnyWinnerErrorCode = childError.code;
+                parentSlot.cold->whenAnyWinnerErrorMessage = childError.message;
             }
-            parentSlot.dirtyCold = true;
-            parentSlot.cold->hasWhenAnyMetadata = true;
-            parentSlot.cold->whenAnyWinnerIndex = childIndex;
-            parentSlot.cold->whenAnyWinnerStatus = childStatus;
-            parentSlot.cold->whenAnyWinnerErrorCode = childError.code;
-            parentSlot.cold->whenAnyWinnerErrorMessage = childError.message;
-        }
 
-        Value payloadForTuple =
-            (childStatus == AwaitStatus::Faulted &&
-             std::holds_alternative<std::monostate>(childValue) &&
-             !std::holds_alternative<std::monostate>(childException))
-                ? std::move(childException)
-                : std::move(childValue);
-        if (isValid(parent) && !parent.isCompletedVoidSentinel()) {
-            slotAt(parent.slot).cold->whenAnyWinnerValue = payloadForTuple;
+            Value payloadForTuple =
+                (childStatus == AwaitStatus::Faulted &&
+                 std::holds_alternative<std::monostate>(childValue) &&
+                 !std::holds_alternative<std::monostate>(childException))
+                    ? std::move(childException)
+                    : std::move(childValue);
+            if (isValid(parent) && !parent.isCompletedVoidSentinel()) {
+                slotAt(parent.slot).cold->whenAnyWinnerValue = payloadForTuple;
+            }
+            trySetResult(parent, std::move(payloadForTuple));
         }
-        trySetResult(parent, std::move(payloadForTuple));
     }
 
     if (comb.unconsumedCallbacks == 0) {
@@ -1369,6 +1406,7 @@ AwaitableHandle AwaitableCorePool::whenAny(
 
     const std::uint32_t combIdx = allocateCombinatorSlot();
     combinators_[combIdx].kind = CombinatorKind::WhenAny;
+    combinators_[combIdx].returnWinnerIndex = options.returnWinnerIndex;
     combinators_[combIdx].parentHandle = parent;
     combinators_[combIdx].cancelLosersSource = options.cancelLosersSource;
     combinators_[combIdx].totalChildren = count;
@@ -2018,16 +2056,664 @@ AsyncDrainResult AsyncCompletionQueue::drainToMainThread(
 }
 
 // ============================================================================
+// CoroutineFramePool & RealScript.Async Runtime Bridge
+// ============================================================================
+
+CoroutineFramePool::CoroutineFramePool(
+    ManagedHeap* heap,
+    AsyncRuntimeContext* ownerContext,
+    std::size_t initialReserve)
+    : heap_(heap), ownerContext_(ownerContext) {
+    freeSlots_.reserve(initialReserve);
+}
+
+void CoroutineFramePool::setHeap(ManagedHeap* heap) noexcept {
+    if (heap_ == heap) return;
+    if (heap_) {
+        for (auto& slot : slots_) {
+            releasePinnedRoots(slot);
+        }
+    }
+    activeGcRoots_ = 0;
+    heap_ = heap;
+    if (heap_) {
+        for (auto& slot : slots_) {
+            if (!slot.allocated || !slot.frame.suspended) continue;
+            auto pinRange = [&](const std::vector<Value>& vec) {
+                for (const auto& v : vec) {
+                    if (valueNeedsManagedHeapRoot(v)) {
+                        const auto tok = heap_->addPersistentRoot(v);
+                        if (tok != 0) {
+                            ++activeGcRoots_;
+                            slot.pinnedRootTokens.push_back(tok);
+                        }
+                    }
+                }
+            };
+            pinRange(slot.frame.savedArguments);
+            pinRange(slot.frame.savedLocals);
+            pinRange(slot.frame.savedRegisters);
+        }
+    }
+}
+
+CoroutineFrameHandle CoroutineFramePool::allocateFrame(
+    semantic::SymbolId functionSymbolId,
+    semantic::SymbolId returnStructTypeId,
+    AwaitableHandle completionHandle,
+    ResumeQueue resumeQueue) {
+    std::uint32_t idx = 0;
+    if (!freeSlots_.empty()) {
+        idx = freeSlots_.back();
+        freeSlots_.pop_back();
+    } else {
+        idx = static_cast<std::uint32_t>(slots_.size());
+        slots_.emplace_back();
+    }
+    auto& slot = slots_[idx];
+    slot.allocated = true;
+    slot.frame.functionSymbolId = functionSymbolId;
+    slot.frame.returnStructTypeId = returnStructTypeId;
+    slot.frame.completionHandle = completionHandle;
+    slot.frame.awaitedHandle = AwaitableHandle::invalid();
+    slot.frame.resumeBlockId = 0;
+    slot.frame.resumeQueue = resumeQueue;
+    slot.frame.suspended = false;
+    slot.frame.completed = false;
+    slot.frame.resumeCallback = nullptr;
+    slot.frame.runnerContext = nullptr;
+    slot.frame.runnerOwner.reset();
+    slot.frame.savedArguments.clear();
+    slot.frame.savedLocals.clear();
+    slot.frame.savedRegisters.clear();
+    ++totalAllocated_;
+    return CoroutineFrameHandle{idx, slot.version};
+}
+
+CoroutineFrame* CoroutineFramePool::resolve(CoroutineFrameHandle handle) noexcept {
+    if (!handle.valid() || handle.slot >= slots_.size()) return nullptr;
+    auto& slot = slots_[handle.slot];
+    if (!slot.allocated || slot.version != handle.version) return nullptr;
+    return &slot.frame;
+}
+
+const CoroutineFrame* CoroutineFramePool::resolve(CoroutineFrameHandle handle) const noexcept {
+    if (!handle.valid() || handle.slot >= slots_.size()) return nullptr;
+    const auto& slot = slots_[handle.slot];
+    if (!slot.allocated || slot.version != handle.version) return nullptr;
+    return &slot.frame;
+}
+
+void CoroutineFramePool::releasePinnedRoots(FrameSlot& slot) noexcept {
+    for (auto& tok : slot.pinnedRootTokens) {
+        if (tok != 0) {
+            if (heap_) {
+                (void)heap_->removePersistentRoot(tok);
+            }
+            tok = 0;
+            if (activeGcRoots_ > 0) --activeGcRoots_;
+        }
+    }
+    slot.pinnedRootTokens.clear();
+}
+
+void CoroutineFramePool::snapshotAndPinValues(
+    FrameSlot& slot,
+    const Value* args,
+    std::size_t argCount,
+    const Value* locals,
+    std::size_t localCount,
+    const Value* regs,
+    std::size_t regCount) {
+    releasePinnedRoots(slot);
+
+    slot.frame.savedArguments.assign(args, args + argCount);
+    slot.frame.savedLocals.assign(locals, locals + localCount);
+    slot.frame.savedRegisters.assign(regs, regs + regCount);
+
+    if (!heap_) return;
+    auto pinRange = [&](const std::vector<Value>& vec) {
+        for (const auto& v : vec) {
+            if (valueNeedsManagedHeapRoot(v)) {
+                const auto tok = heap_->addPersistentRoot(v);
+                if (tok != 0) {
+                    ++activeGcRoots_;
+                    slot.pinnedRootTokens.push_back(tok);
+                }
+            }
+        }
+    };
+    pinRange(slot.frame.savedArguments);
+    pinRange(slot.frame.savedLocals);
+    pinRange(slot.frame.savedRegisters);
+}
+
+bool CoroutineFramePool::suspendFrame(
+    CoroutineFrameHandle handle,
+    const Value* args,
+    std::size_t argCount,
+    const Value* locals,
+    std::size_t localCount,
+    const Value* regs,
+    std::size_t regCount,
+    std::uint32_t resumeBlockId,
+    AwaitableHandle awaitedHandle,
+    CoroutineResumeCallback resumeCallback,
+    void* runnerContext,
+    std::shared_ptr<const void> runnerOwner) {
+    if (!ownerContext_ || !resumeCallback) return false;
+    if (!handle.valid() || handle.slot >= slots_.size()) return false;
+    auto& slot = slots_[handle.slot];
+    if (!slot.allocated || slot.version != handle.version) return false;
+
+    snapshotAndPinValues(slot, args, argCount, locals, localCount, regs, regCount);
+    slot.frame.resumeBlockId = resumeBlockId;
+    slot.frame.awaitedHandle = awaitedHandle;
+    slot.frame.suspended = true;
+    slot.frame.completed = false;
+    slot.frame.resumeCallback = resumeCallback;
+    slot.frame.runnerContext = runnerContext;
+    if (runnerOwner) {
+        slot.frame.runnerOwner = std::move(runnerOwner);
+    }
+
+    AsyncContinuation cont;
+    cont.callback = &CoroutineFramePool::onAwaitedCompletedCallback;
+    cont.context = this;
+    cont.userTag = handle.pack64();
+    cont.resumeQueue = slot.frame.resumeQueue;
+    cont.runInlineOnComplete = false;
+    if (!ownerContext_->awaitables().onCompleted(awaitedHandle, cont)) {
+        slot.frame.suspended = false;
+        releasePinnedRoots(slot);
+        return false;
+    }
+
+    ++totalSuspensions_;
+    return true;
+}
+
+void CoroutineFramePool::onAwaitedCompletedCallback(
+    void* context,
+    AwaitableHandle /*completedHandle*/,
+    AwaitStatus /*terminalStatus*/,
+    std::uint64_t packedFrameHandle) {
+    auto* self = static_cast<CoroutineFramePool*>(context);
+    if (!self || !self->ownerContext_) return;
+    const auto handle = CoroutineFrameHandle::unpack64(packedFrameHandle);
+    if (!handle.valid() || handle.slot >= self->slots_.size()) return;
+    auto& slot = self->slots_[handle.slot];
+    if (!slot.allocated || slot.version != handle.version) return;
+
+    slot.frame.suspended = false;
+    ++self->totalResumptions_;
+    const CoroutineResumeCallback cb = slot.frame.resumeCallback;
+    void* const runnerCtx = slot.frame.runnerContext;
+    if (cb) {
+        cb(runnerCtx, handle, slot.frame, *self->ownerContext_);
+    }
+
+    // Re-check slot validity after callback in case the coroutine re-suspended or completed.
+    if (handle.slot < self->slots_.size()) {
+        auto& postSlot = self->slots_[handle.slot];
+        if (postSlot.allocated && postSlot.version == handle.version) {
+            if (!postSlot.frame.completed && !postSlot.frame.suspended) {
+                if (postSlot.frame.completionHandle.valid() &&
+                    self->ownerContext_->awaitables().status(postSlot.frame.completionHandle) ==
+                        AwaitStatus::Pending) {
+                    (void)self->ownerContext_->awaitables().trySetFaulted(
+                        postSlot.frame.completionHandle,
+                        ErrorCode::InvalidProgram,
+                        "resumed coroutine terminated without resolving completion handle");
+                }
+            }
+            if (postSlot.frame.completed || !postSlot.frame.suspended) {
+                self->recycleFrame(handle);
+            }
+        }
+    }
+}
+
+void CoroutineFramePool::recycleFrame(CoroutineFrameHandle handle) noexcept {
+    if (!handle.valid() || handle.slot >= slots_.size()) return;
+    auto& slot = slots_[handle.slot];
+    if (!slot.allocated || slot.version != handle.version) return;
+
+    releasePinnedRoots(slot);
+    slot.frame.savedArguments.clear();
+    slot.frame.savedLocals.clear();
+    slot.frame.savedRegisters.clear();
+    slot.frame.runnerOwner.reset();
+    slot.frame.resumeCallback = nullptr;
+    slot.frame.runnerContext = nullptr;
+    slot.frame.suspended = false;
+    slot.frame.completed = false;
+    slot.allocated = false;
+    slot.version = nextNonZeroVersion(slot.version);
+    freeSlots_.push_back(handle.slot);
+    ++totalRecycled_;
+}
+
+void CoroutineFramePool::clear() noexcept {
+    for (auto& slot : slots_) {
+        if (slot.allocated) {
+            releasePinnedRoots(slot);
+            slot.frame.runnerOwner.reset();
+            slot.allocated = false;
+            slot.version = nextNonZeroVersion(slot.version);
+        }
+    }
+    slots_.clear();
+    freeSlots_.clear();
+    activeGcRoots_ = 0;
+    totalAllocated_ = 0;
+    totalRecycled_ = 0;
+    totalSuspensions_ = 0;
+    totalResumptions_ = 0;
+}
+
+CoroutinePoolStatistics CoroutineFramePool::statistics() const noexcept {
+    CoroutinePoolStatistics stats;
+    stats.capacity = slots_.size();
+    stats.freeListCount = freeSlots_.size();
+    stats.activeCount = slots_.size() >= freeSlots_.size()
+        ? (slots_.size() - freeSlots_.size())
+        : 0;
+    stats.activeGcRoots = activeGcRoots_;
+    stats.totalAllocated = totalAllocated_;
+    stats.totalRecycled = totalRecycled_;
+    stats.totalSuspensions = totalSuspensions_;
+    stats.totalResumptions = totalResumptions_;
+    return stats;
+}
+
+namespace {
+
+bool tryExtractPackedInt64(const Value& v, std::uint64_t& outPacked) noexcept {
+    if (const auto* lv = std::get_if<LongValue>(&v)) {
+        outPacked = static_cast<std::uint64_t>(lv->value);
+        return true;
+    }
+    if (const auto* ulv = std::get_if<ULongValue>(&v)) {
+        outPacked = ulv->value;
+        return true;
+    }
+    if (const auto* iv = std::get_if<std::int64_t>(&v)) {
+        outPacked = static_cast<std::uint64_t>(*iv);
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
+Value makeAwaitableStructValue(
+    semantic::SymbolId structTypeId,
+    AwaitableHandle handle) {
+    const semantic::SymbolId tid = structTypeId != 0
+        ? structTypeId
+        : awaitableVoidTypeId();
+    const std::array<Value, 1> fields = {
+        Value(LongValue{static_cast<std::int64_t>(handle.pack64())}),
+    };
+    return Value(makeStructValueFromFields(tid, fields));
+}
+
+bool tryExtractAwaitableHandle(
+    const Value& value,
+    AwaitableHandle& outHandle) noexcept {
+    const auto* st = std::get_if<StructValue>(&value);
+    if (!st || st->fieldCount() < 1) return false;
+    const auto field0 = structValueFieldAt(*st, 0);
+    if (!field0) return false;
+    std::uint64_t packed = 0;
+    if (!tryExtractPackedInt64(*field0, packed)) return false;
+    outHandle = AwaitableHandle::unpack64(packed);
+    return true;
+}
+
+std::optional<ObjectRef> materializeAsyncResumeException(
+    ManagedHeap* heap,
+    AwaitStatus terminalStatus,
+    const RuntimeError& faultError,
+    const Value& storedExceptionObject,
+    semantic::SymbolId fallbackExceptionTypeId) {
+    if (const auto* existingObj = std::get_if<ObjectRef>(&storedExceptionObject)) {
+        if (existingObj->valid() && (!heap || heap->isAlive(*existingObj))) {
+            return *existingObj;
+        }
+    }
+    if (!heap) return std::nullopt;
+
+    const std::string msg = !faultError.message.empty()
+        ? faultError.message
+        : (terminalStatus == AwaitStatus::Canceled
+               ? std::string("async operation was canceled")
+               : std::string("async operation faulted"));
+
+    RuntimeError allocErr;
+    const auto strRef = heap->allocateString(msg, &allocErr);
+    if (!strRef) return std::nullopt;
+    PersistentRoot strPin = heap->retain(Value(*strRef));
+
+    const semantic::SymbolId typeId = (terminalStatus == AwaitStatus::Canceled)
+        ? asyncCanceledExceptionTypeId()
+        : (fallbackExceptionTypeId != 0
+               ? fallbackExceptionTypeId
+               : asyncExceptionTypeId());
+
+    return heap->allocateObject(
+        typeId,
+        std::vector<Value>{Value(*strRef)},
+        std::vector<std::size_t>{0u},
+        &allocErr);
+}
+
+bool isAsyncCanceledExceptionObject(
+    const ManagedHeap* heap,
+    const Value& excValue) noexcept {
+    if (!heap) return false;
+    const auto* objRef = std::get_if<ObjectRef>(&excValue);
+    if (!objRef || !objRef->valid()) return false;
+    const auto tid = heap->objectTypeId(*objRef);
+    return tid.has_value() && *tid == asyncCanceledExceptionTypeId();
+}
+
+bool tryExecuteAsyncIntrinsic(
+    std::string_view intrinsicName,
+    ValueSpan arguments,
+    AsyncRuntimeContext* asyncContext,
+    ManagedHeap* heap,
+    Value& result,
+    std::string& outError) {
+    constexpr std::string_view kPrefix = "Async.__";
+    if (intrinsicName.rfind(kPrefix, 0) != 0) return false;
+    if (!asyncContext) {
+        outError = "Async intrinsic requires an active AsyncRuntimeContext";
+        return false;
+    }
+    const std::string_view op = intrinsicName.substr(kPrefix.size());
+    auto& pool = asyncContext->awaitables();
+    auto& ctsPool = asyncContext->cancellations();
+
+    if (op == "CompletedVoid") {
+        result = Value(LongValue{
+            static_cast<std::int64_t>(AwaitableHandle::completedVoid().pack64())});
+        return true;
+    }
+    if (op == "FromCanceled") {
+        const AwaitableHandle h = pool.fromCanceled();
+        result = Value(LongValue{static_cast<std::int64_t>(h.pack64())});
+        return true;
+    }
+    if (op == "FromFaulted") {
+        std::string msg = "async operation faulted";
+        if (!arguments.empty() && !std::holds_alternative<NullString>(arguments[0])) {
+            msg = valueToString(arguments[0], heap);
+        }
+        const AwaitableHandle h = pool.fromFaulted(ErrorCode::ScriptException, std::move(msg));
+        result = Value(LongValue{static_cast<std::int64_t>(h.pack64())});
+        return true;
+    }
+    if (op == "Yield") {
+        std::uint64_t packedTok = 0;
+        if (!arguments.empty()) {
+            (void)tryExtractPackedInt64(arguments[0], packedTok);
+        }
+        const AwaitableHandle h = asyncContext->enqueueYield(
+            CancellationToken::unpack64(packedTok));
+        result = Value(LongValue{static_cast<std::int64_t>(h.pack64())});
+        return true;
+    }
+    if (op == "NewPending") {
+        std::uint64_t packedTok = 0;
+        if (!arguments.empty()) {
+            (void)tryExtractPackedInt64(arguments[0], packedTok);
+        }
+        const AwaitableHandle h = pool.allocatePending(
+            ResumeQueue::Update, CancellationToken::unpack64(packedTok));
+        result = Value(LongValue{static_cast<std::int64_t>(h.pack64())});
+        return true;
+    }
+    if (op == "CompleteVoid") {
+        std::uint64_t packed = 0;
+        if (arguments.empty() || !tryExtractPackedInt64(arguments[0], packed)) {
+            result = Value(false);
+            return true;
+        }
+        result = Value(pool.trySetResult(AwaitableHandle::unpack64(packed), Value{}));
+        return true;
+    }
+    if (op == "CompleteInt") {
+        std::uint64_t packed = 0;
+        if (arguments.size() < 2 || !tryExtractPackedInt64(arguments[0], packed)) {
+            result = Value(false);
+            return true;
+        }
+        result = Value(pool.trySetResult(AwaitableHandle::unpack64(packed), arguments[1]));
+        return true;
+    }
+    if (op == "CompleteFault") {
+        std::uint64_t packed = 0;
+        if (arguments.size() < 2 || !tryExtractPackedInt64(arguments[0], packed)) {
+            result = Value(false);
+            return true;
+        }
+        std::string msg = std::holds_alternative<NullString>(arguments[1])
+            ? std::string("async signal faulted")
+            : valueToString(arguments[1], heap);
+        result = Value(pool.trySetFaulted(
+            AwaitableHandle::unpack64(packed), ErrorCode::ScriptException, std::move(msg)));
+        return true;
+    }
+    if (op == "CompleteCancel") {
+        std::uint64_t packed = 0;
+        if (arguments.empty() || !tryExtractPackedInt64(arguments[0], packed)) {
+            result = Value(false);
+            return true;
+        }
+        result = Value(pool.trySetCanceled(AwaitableHandle::unpack64(packed)));
+        return true;
+    }
+    if (op == "IsCompleted") {
+        std::uint64_t packed = 0;
+        if (arguments.empty() || !tryExtractPackedInt64(arguments[0], packed)) {
+            result = Value(false);
+            return true;
+        }
+        result = Value(pool.isCompleted(AwaitableHandle::unpack64(packed)));
+        return true;
+    }
+    if (op == "Release") {
+        std::uint64_t packed = 0;
+        if (arguments.empty() || !tryExtractPackedInt64(arguments[0], packed)) {
+            result = Value(false);
+            return true;
+        }
+        result = Value(pool.discard(AwaitableHandle::unpack64(packed)));
+        return true;
+    }
+    if (op == "WhenAll") {
+        if (arguments.empty() || std::holds_alternative<NullArray>(arguments[0])) {
+            outError = "WhenAll tasks array cannot be null";
+            return false;
+        }
+        const auto* arrRef = std::get_if<ObjectRef>(&arguments[0]);
+        if (!arrRef || !heap) {
+            outError = "WhenAll requires a valid tasks array";
+            return false;
+        }
+        const auto lenOpt = heap->arrayLength(*arrRef);
+        if (!lenOpt) {
+            outError = "WhenAll array reference is invalid";
+            return false;
+        }
+        std::vector<AwaitableHandle> children;
+        children.reserve(*lenOpt);
+        for (std::size_t i = 0; i < *lenOpt; ++i) {
+            const auto elem = heap->arrayGet(*arrRef, i);
+            AwaitableHandle ch{};
+            if (!elem || !tryExtractAwaitableHandle(*elem, ch)) {
+                outError = "WhenAll element does not hold a valid Awaitable handle";
+                return false;
+            }
+            children.push_back(ch);
+        }
+        std::uint64_t packedTok = 0;
+        if (arguments.size() >= 2) {
+            (void)tryExtractPackedInt64(arguments[1], packedTok);
+        }
+        WhenAllOptions opts{};
+        opts.resumeQueue = ResumeQueue::Update;
+        opts.token = CancellationToken::unpack64(packedTok);
+        opts.materializeHeapArray = false;
+        const AwaitableHandle h = pool.whenAll(children.data(), children.size(), opts);
+        result = Value(LongValue{static_cast<std::int64_t>(h.pack64())});
+        return true;
+    }
+    if (op == "WhenAnyIndex") {
+        if (arguments.empty() || std::holds_alternative<NullArray>(arguments[0])) {
+            outError = "WhenAny tasks array cannot be null";
+            return false;
+        }
+        const auto* arrRef = std::get_if<ObjectRef>(&arguments[0]);
+        if (!arrRef || !heap) {
+            outError = "WhenAny requires a valid tasks array";
+            return false;
+        }
+        const auto lenOpt = heap->arrayLength(*arrRef);
+        if (!lenOpt) {
+            outError = "WhenAny array reference is invalid";
+            return false;
+        }
+        std::vector<AwaitableHandle> children;
+        children.reserve(*lenOpt);
+        for (std::size_t i = 0; i < *lenOpt; ++i) {
+            const auto elem = heap->arrayGet(*arrRef, i);
+            AwaitableHandle ch{};
+            if (!elem || !tryExtractAwaitableHandle(*elem, ch)) {
+                outError = "WhenAny element does not hold a valid Awaitable handle";
+                return false;
+            }
+            children.push_back(ch);
+        }
+        std::uint64_t packedTok = 0;
+        std::uint64_t packedLosersCts = 0;
+        if (arguments.size() >= 2) {
+            (void)tryExtractPackedInt64(arguments[1], packedTok);
+        }
+        if (arguments.size() >= 3) {
+            (void)tryExtractPackedInt64(arguments[2], packedLosersCts);
+        }
+        WhenAnyOptions opts{};
+        opts.resumeQueue = ResumeQueue::Update;
+        opts.token = CancellationToken::unpack64(packedTok);
+        opts.cancelLosersSource = CancellationSourceHandle::unpack64(packedLosersCts);
+        opts.returnWinnerIndex = true;
+        const AwaitableHandle h = pool.whenAny(children.data(), children.size(), opts);
+        result = Value(LongValue{static_cast<std::int64_t>(h.pack64())});
+        return true;
+    }
+    if (op == "CtsCreate") {
+        const auto h = ctsPool.createSource();
+        result = Value(LongValue{static_cast<std::int64_t>(h.pack64())});
+        return true;
+    }
+    if (op == "CtsCreateLinked") {
+        std::uint64_t packedParent = 0;
+        if (!arguments.empty()) {
+            (void)tryExtractPackedInt64(arguments[0], packedParent);
+        }
+        const auto parentTok = CancellationToken::unpack64(packedParent);
+        const auto h = ctsPool.createLinkedSource(&parentTok, 1u);
+        result = Value(LongValue{static_cast<std::int64_t>(h.pack64())});
+        return true;
+    }
+    if (op == "CtsToken") {
+        std::uint64_t packedCts = 0;
+        if (arguments.empty() || !tryExtractPackedInt64(arguments[0], packedCts)) {
+            result = Value(LongValue{0});
+            return true;
+        }
+        const auto tok = ctsPool.token(CancellationSourceHandle::unpack64(packedCts));
+        result = Value(LongValue{static_cast<std::int64_t>(tok.pack64())});
+        return true;
+    }
+    if (op == "CtsCancel") {
+        std::uint64_t packedCts = 0;
+        if (arguments.empty() || !tryExtractPackedInt64(arguments[0], packedCts)) {
+            result = Value(std::int64_t{0});
+            return true;
+        }
+        const std::size_t n = ctsPool.cancel(CancellationSourceHandle::unpack64(packedCts));
+        result = Value(static_cast<std::int64_t>(n));
+        return true;
+    }
+    if (op == "CtsRelease") {
+        std::uint64_t packedCts = 0;
+        if (arguments.empty() || !tryExtractPackedInt64(arguments[0], packedCts)) {
+            result = Value(false);
+            return true;
+        }
+        result = Value(ctsPool.releaseSource(CancellationSourceHandle::unpack64(packedCts)));
+        return true;
+    }
+    if (op == "TokenPreCanceled") {
+        result = Value(LongValue{
+            static_cast<std::int64_t>(CancellationToken::preCanceled().pack64())});
+        return true;
+    }
+    if (op == "TokenIsCanceled") {
+        std::uint64_t packedTok = 0;
+        if (arguments.empty() || !tryExtractPackedInt64(arguments[0], packedTok)) {
+            result = Value(false);
+            return true;
+        }
+        result = Value(ctsPool.isCancellationRequested(
+            CancellationToken::unpack64(packedTok)));
+        return true;
+    }
+    if (op == "StepUpdate") {
+        std::size_t maxCount = 0;
+        if (!arguments.empty()) {
+            if (const auto* n = std::get_if<std::int64_t>(&arguments[0]); n && *n > 0) {
+                maxCount = static_cast<std::size_t>(*n);
+            }
+        }
+        const std::size_t ran = asyncContext->stepResumeQueue(ResumeQueue::Update, maxCount);
+        result = Value(static_cast<std::int64_t>(ran));
+        return true;
+    }
+    if (op == "ReadyUpdateCount") {
+        const std::size_t cnt = pool.readyContinuationCount(ResumeQueue::Update);
+        result = Value(static_cast<std::int64_t>(cnt));
+        return true;
+    }
+    outError = "unknown Async intrinsic '" + std::string(intrinsicName) + "'";
+    return false;
+}
+
+// ============================================================================
 // AsyncRuntimeContext
 // ============================================================================
 
 AsyncRuntimeContext::AsyncRuntimeContext(ManagedHeap* heap)
     : cancellations_(),
       awaitables_(heap, &cancellations_),
+      coroutines_(heap, this),
       completionQueue_() {}
 
 void AsyncRuntimeContext::setHeap(ManagedHeap* heap) noexcept {
     awaitables_.setHeap(heap);
+    coroutines_.setHeap(heap);
+}
+
+AwaitableHandle AsyncRuntimeContext::enqueueYield(CancellationToken token) {
+    const AwaitableHandle h = awaitables_.allocatePending(ResumeQueue::Update, token);
+    if (awaitables_.status(h) == AwaitStatus::Pending) {
+        pendingYields_.push_back(h);
+    }
+    return h;
 }
 
 bool AsyncRuntimeContext::stepPreTickIo(
@@ -2048,14 +2734,38 @@ bool AsyncRuntimeContext::stepPreTickIo(
 std::size_t AsyncRuntimeContext::stepResumeQueue(
     ResumeQueue queue,
     std::size_t maxContinuations) {
-    return awaitables_.drainReadyContinuations(queue, maxContinuations);
+    if (queue == ResumeQueue::Update && !pendingYields_.empty()) {
+        std::vector<AwaitableHandle> batch;
+        batch.swap(pendingYields_);
+        for (const auto yh : batch) {
+            if (awaitables_.isValid(yh) && awaitables_.status(yh) == AwaitStatus::Pending) {
+                (void)awaitables_.trySetResult(yh, Value{});
+            }
+        }
+    }
+    std::size_t totalExecuted = 0;
+    for (std::size_t pass = 0; pass < 65536u; ++pass) {
+        if (maxContinuations != 0 && totalExecuted >= maxContinuations) {
+            break;
+        }
+        const std::size_t passLimit = (maxContinuations != 0)
+            ? (maxContinuations - totalExecuted)
+            : 0;
+        const std::size_t ran = awaitables_.drainReadyContinuations(queue, passLimit);
+        if (ran == 0) break;
+        totalExecuted += ran;
+    }
+    return totalExecuted;
 }
 
 void AsyncRuntimeContext::reset() noexcept {
+    pendingYields_.clear();
     completionQueue_.reset();
+    coroutines_.clear();
     awaitables_.clear();
     cancellations_.clear();
     awaitables_.setCancellationPool(&cancellations_);
+    coroutines_.setOwnerContext(this);
 }
 
 } // namespace realscript::runtime

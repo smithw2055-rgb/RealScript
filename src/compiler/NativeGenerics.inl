@@ -90,7 +90,7 @@ std::map<std::string, std::vector<std::string>> nativeGenericConstraints(
 std::size_t nativeBuiltinGenericArity(const std::string& name) {
     if (name == "List" || name == "Queue" || name == "Stack" ||
         name == "Optional" || name == "Nullable" || name == "Box" ||
-        name == "HashSet") {
+        name == "HashSet" || name == "Awaitable") {
         return 1;
     }
     if (name == "Dictionary") return 2;
@@ -107,6 +107,20 @@ std::string nativeBuiltinGenericSource(
         ? arguments[1]
         : std::string{};
     std::ostringstream source;
+    if (name == "Awaitable") {
+        source << "public struct " << generatedName << "{"
+            << "public long __handle;"
+            << "public " << generatedName << "(long h){__handle=h;}"
+            << "public Awaitable AsUntyped(){return new Awaitable(__handle);}"
+            << "public bool IsCompleted(){return Async.__IsCompleted(__handle);}"
+            << "public bool Release(){return Async.__Release(__handle);}"
+            << "public static " << generatedName << " FromHandle(long h){return new " << generatedName << "(h);}"
+            << "public static async " << generatedName << " FromResult(" << first << " value){return value;}"
+            << "public static " << generatedName << " FromCanceled(){return new " << generatedName << "(Async.__FromCanceled());}"
+            << "public static " << generatedName << " FromFaulted(string msg){return new " << generatedName << "(Async.__FromFaulted(msg));}"
+            << "}";
+        return source.str();
+    }
     if (name == "List") {
         const auto enumerator = generatedName + "__Enumerator";
         source << "class " << generatedName << "{" << first
@@ -846,9 +860,83 @@ private:
             return name;
         }
 
+        auto stripArrayAndNullable = [](std::string arg) noexcept {
+            while (arg.size() >= 2 && arg.substr(arg.size() - 2) == "[]") {
+                arg.resize(arg.size() - 2);
+            }
+            if (!arg.empty() && arg.back() == '?') {
+                arg.pop_back();
+            }
+            return arg;
+        };
+        auto isCanonicalBuiltinTypeArg = [&](const std::string& rawArg) noexcept {
+            const std::string arg = stripArrayAndNullable(rawArg);
+            return arg == "bool" || arg == "byte" || arg == "sbyte" ||
+                arg == "short" || arg == "ushort" || arg == "int" ||
+                arg == "uint" || arg == "long" || arg == "ulong" ||
+                arg == "float" || arg == "double" || arg == "char" ||
+                arg == "string" || arg == "fixed" || arg == "fixed16" ||
+                arg == "vec2" || arg == "vec3" || arg == "quat" ||
+                arg == "Awaitable" || arg == "CancellationToken";
+        };
+        auto moduleDeclaresTypeName = [&](const std::string& modName,
+                                          const std::string& typeName) noexcept {
+            const auto modIt = modules_.find(modName);
+            if (modIt == modules_.end()) return false;
+            for (const auto* u : modIt->second.units) {
+                if (!u || !u->syntaxTree) continue;
+                for (const auto& c : u->syntaxTree->classes) {
+                    if (c.identifierToken.text == typeName) return true;
+                }
+                for (const auto& s : u->syntaxTree->structs) {
+                    if (s.identifierToken.text == typeName) return true;
+                }
+                for (const auto& i : u->syntaxTree->interfaces) {
+                    if (i.identifierToken.text == typeName) return true;
+                }
+                for (const auto& e : u->syntaxTree->enums) {
+                    if (e.identifierToken.text == typeName) return true;
+                }
+                for (const auto& d : u->syntaxTree->delegates) {
+                    if (d.identifierToken.text == typeName) return true;
+                }
+            }
+            return false;
+        };
+        auto resolveAwaitableOwnerModule = [&](const std::string& rawArg) -> std::string {
+            if (isCanonicalBuiltinTypeArg(rawArg) &&
+                modules_.find("RealScript.Async") != modules_.end()) {
+                return "RealScript.Async";
+            }
+            const std::string baseType = stripArrayAndNullable(rawArg);
+            if (moduleDeclaresTypeName(consumerModule, baseType)) {
+                return consumerModule;
+            }
+            const auto consIt = modules_.find(consumerModule);
+            if (consIt != modules_.end()) {
+                std::string matchedMod;
+                for (const auto& imp : consIt->second.imports) {
+                    if (moduleDeclaresTypeName(imp, baseType)) {
+                        if (!matchedMod.empty()) {
+                            return consumerModule;
+                        }
+                        matchedMod = imp;
+                    }
+                }
+                if (!matchedMod.empty()) {
+                    if (modules_.find("RealScript.Async") != modules_.end()) {
+                        modules_[matchedMod].imports.insert("RealScript.Async");
+                    }
+                    return matchedMod;
+                }
+            }
+            return consumerModule;
+        };
         const auto targetModule = declaration
             ? declaration->moduleName
-            : consumerModule;
+            : ((name == "Awaitable" && arguments.size() == 1)
+                   ? resolveAwaitableOwnerModule(arguments[0])
+                   : consumerModule);
         const auto generatedName = nativeGenericGeneratedName(name, arguments);
         const auto key = targetModule + "::" +
             (function ? "function:" : "type:") + generatedName;
@@ -1254,6 +1342,31 @@ private:
                 *static_cast<syntax::ParenthesizedExpressionSyntax&>(expression).expression,
                 moduleName, sourceName, queue);
             return;
+        case syntax::SyntaxKind::NameExpression: {
+            auto& nameExpr = static_cast<syntax::NameExpressionSyntax&>(expression);
+            if (nameExpr.lessToken) {
+                for (auto& argument : nameExpr.typeArguments) {
+                    rewriteType(argument, moduleName, sourceName, queue);
+                }
+                std::vector<std::string> arguments;
+                for (const auto& argument : nameExpr.typeArguments) {
+                    arguments.push_back(typeText(argument));
+                }
+                nameExpr.identifierToken.text = request(
+                    moduleName,
+                    nameExpr.identifierToken.text,
+                    std::move(arguments),
+                    false,
+                    nameExpr.span(),
+                    sourceName,
+                    queue);
+                nameExpr.lessToken.reset();
+                nameExpr.typeArguments.clear();
+                nameExpr.typeArgumentCommaTokens.clear();
+                nameExpr.greaterToken.reset();
+            }
+            return;
+        }
         case syntax::SyntaxKind::CallExpression: {
             auto& call = static_cast<syntax::CallExpressionSyntax&>(expression);
             for (auto& argument : call.arguments) {

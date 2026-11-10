@@ -87,6 +87,8 @@ std::size_t expectedOperandCount(const Instruction& instruction) noexcept {
     case Opcode::NewObject:
     case Opcode::NewStruct:
     case Opcode::ConstantTypeId:
+    case Opcode::AsyncEnter:
+    case Opcode::AwaitResume:
         return 0;
     case Opcode::NewArray:
         return 1;
@@ -108,7 +110,10 @@ std::size_t expectedOperandCount(const Instruction& instruction) noexcept {
     case Opcode::LogicalNot:
     case Opcode::IsType:
     case Opcode::AsType:
+    case Opcode::AwaitSuspend:
         return 1;
+    case Opcode::AsyncResolve:
+        return instruction.operands.size();
     case Opcode::StoreField:
     case Opcode::StoreStructField:
     case Opcode::LoadElement:
@@ -146,11 +151,14 @@ semantic::SymbolId typeIdAt(
 bool definesValue(const Instruction& instruction) noexcept {
     if (instruction.opcode == Opcode::StoreLocal ||
         instruction.opcode == Opcode::StoreField ||
-        instruction.opcode == Opcode::StoreElement) {
+        instruction.opcode == Opcode::StoreElement ||
+        instruction.opcode == Opcode::AsyncEnter ||
+        instruction.opcode == Opcode::AwaitSuspend) {
         return false;
     }
     return (instruction.opcode != Opcode::Call &&
-            instruction.opcode != Opcode::InvokeDelegate) ||
+            instruction.opcode != Opcode::InvokeDelegate &&
+            instruction.opcode != Opcode::AwaitResume) ||
         instruction.resultType != semantic::PrimitiveType::Void;
 }
 
@@ -1202,6 +1210,39 @@ bool verifyModule(
                         !carrierMatches ||
                         valueType(instruction.operands[1]) != operandType) {
                         diagnostics.report("RS3020", "invalid numeric comparison types", instruction.sourceSpan);
+                    }
+                } else if (instruction.opcode == Opcode::AsyncEnter) {
+                    if (types.find(instruction.typeId) == types.end() ||
+                        function.returnType != semantic::PrimitiveType::Struct ||
+                        function.returnTypeId != instruction.typeId) {
+                        diagnostics.report(
+                            "RS3075", "invalid MIR async.enter contract", instruction.sourceSpan);
+                    }
+                } else if (instruction.opcode == Opcode::AwaitSuspend &&
+                           operandCountIsValid) {
+                    if (instruction.localIndex >= function.localTypes.size() ||
+                        function.localTypes[instruction.localIndex] != semantic::PrimitiveType::Struct ||
+                        valueType(instruction.operands.front()) != semantic::PrimitiveType::Struct ||
+                        types.find(instruction.typeId) == types.end() ||
+                        instruction.integerImmediate < 0 ||
+                        blocks.find(static_cast<BlockId>(instruction.integerImmediate)) == blocks.end()) {
+                        diagnostics.report(
+                            "RS3076", "invalid MIR await.suspend contract", instruction.sourceSpan);
+                    }
+                } else if (instruction.opcode == Opcode::AwaitResume) {
+                    if (instruction.localIndex >= function.localTypes.size() ||
+                        function.localTypes[instruction.localIndex] != semantic::PrimitiveType::Struct ||
+                        types.find(instruction.typeId) == types.end()) {
+                        diagnostics.report(
+                            "RS3077", "invalid MIR await.resume contract", instruction.sourceSpan);
+                    }
+                } else if (instruction.opcode == Opcode::AsyncResolve) {
+                    if (instruction.operands.size() > 1 ||
+                        instruction.resultType != semantic::PrimitiveType::Struct ||
+                        instruction.resultTypeId != instruction.typeId ||
+                        types.find(instruction.typeId) == types.end()) {
+                        diagnostics.report(
+                            "RS3078", "invalid MIR async.resolve contract", instruction.sourceSpan);
                     }
                 } else if ((instruction.opcode == Opcode::Equal ||
                             instruction.opcode == Opcode::NotEqual) &&

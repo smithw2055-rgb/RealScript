@@ -1666,6 +1666,63 @@ std::unique_ptr<BoundExpression> Binder::bindNameExpression(
 
 std::unique_ptr<BoundExpression> Binder::bindUnaryExpression(
     const syntax::UnaryExpressionSyntax& syntaxTree) {
+    if (syntaxTree.operatorToken.kind == syntax::SyntaxKind::AwaitKeyword) {
+        if (!currentFunctionIsAsync_) {
+            diagnostics_.report(
+                "RS2604",
+                "the 'await' operator can only be used within an 'async' function",
+                syntaxTree.operatorToken.span);
+        }
+        auto operand = bindExpression(*syntaxTree.operand);
+        if (operand->type == PrimitiveType::Error) {
+            return makeError(syntaxTree.span());
+        }
+        if (operand->type == PrimitiveType::Struct && !operand->typeName.empty()) {
+            const auto foundType = visibleTypes_.find(operand->typeName);
+            if (operand->typeName == "RealScript.Async::Awaitable" ||
+                operand->typeName == "Awaitable" ||
+                (foundType != visibleTypes_.end() &&
+                 foundType->second.name == "Awaitable")) {
+                auto res = std::make_unique<BoundAwaitExpression>();
+                res->span = syntaxTree.span();
+                res->type = PrimitiveType::Void;
+                res->operandTypeId = foundType != visibleTypes_.end()
+                    ? foundType->second.id
+                    : stableTypeId("RealScript.Async::Awaitable");
+                res->resultTypeId = 0;
+                res->operand = std::move(operand);
+                return res;
+            }
+            if (foundType != visibleTypes_.end() &&
+                foundType->second.name.rfind("Awaitable__", 0) == 0) {
+                for (const auto& m : foundType->second.methods) {
+                    if (m.staticMethod && m.name == "FromResult" &&
+                        m.parameters.size() == 1) {
+                        auto res = std::make_unique<BoundAwaitExpression>();
+                        res->span = syntaxTree.span();
+                        res->type = m.parameters[0].type;
+                        res->typeName = m.parameters[0].typeName;
+                        res->operandTypeId = foundType->second.id;
+                        res->resultTypeId =
+                            (isExactType(res->type) || res->type == PrimitiveType::Handle) &&
+                            !res->typeName.empty()
+                                ? stableTypeId(res->typeName)
+                                : 0;
+                        res->operand = std::move(operand);
+                        return res;
+                    }
+                }
+            }
+        }
+        diagnostics_.report(
+            "RS2605",
+            "type '" + (operand->typeName.empty()
+                ? std::string(primitiveTypeName(operand->type))
+                : operand->typeName) + "' is not awaitable",
+            syntaxTree.operand->span());
+        return makeError(syntaxTree.span());
+    }
+
     auto operand = bindExpression(*syntaxTree.operand);
     if (operand->type == PrimitiveType::Error) return makeError(syntaxTree.span());
 

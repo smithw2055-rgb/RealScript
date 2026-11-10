@@ -85,6 +85,10 @@ enum class Opcode {
     IsType,
     AsType,
     ConstantTypeId,
+    AsyncEnter,
+    AwaitSuspend,
+    AwaitResume,
+    AsyncResolve,
 };
 
 struct Instruction {
@@ -230,6 +234,8 @@ private:
     void emitThrow(ValueId value, text::TextSpan sourceSpan);
 
     Function* currentFunction_ = nullptr;
+    bool currentAsyncFunction_ = false;
+    std::string currentAsyncReturnTypeName_;
     std::optional<BlockId> currentBlockId_;
     ValueId nextValueId_ = 0;
     std::vector<BlockId> breakTargets_;
