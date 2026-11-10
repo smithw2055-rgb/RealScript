@@ -246,6 +246,213 @@ public int edgeSinSqrt64AndSelfNorm() {
     v = q.Rotate(v);
     return sMin.raw + sNegWrap.raw + sPosWrap.raw + (int)(sqSmall + (sqLarge % (long)10000)) + q.w.raw + v.x.raw;
 }
+
+// 7. Small-Frame Multi-Block Script Helper Unfolding benchmark (10,000 iterations, 30,000 helper calls)
+int mitigateDamage(int rawDmg, int armor, int tick) {
+    if (armor <= 0) {
+        return rawDmg;
+    }
+    int reduced = rawDmg - (armor / 2);
+    if ((tick % 4) == 0) {
+        reduced = reduced - 3;
+    }
+    if (reduced < 1) {
+        return 1;
+    }
+    return reduced;
+}
+
+int advanceCooldown(int cd, int haste) {
+    if (cd > haste) {
+        return cd - haste;
+    }
+    if (cd == 0) {
+        return 6;
+    }
+    return 0;
+}
+
+Fixed blendEnergy(Fixed cur, Fixed gain, int tick) {
+    if ((tick % 3) == 0) {
+        return cur + gain * Fixed.Half();
+    }
+    return cur + gain;
+}
+
+public int benchSmallFrameInline(int steps) {
+    int hp = 500000;
+    int cd = 5;
+    Fixed energy = Fixed.Of(10);
+    Fixed gain = Fixed.Raw(64);
+    for (int i = 0; i < steps; i = i + 1) {
+        int dmg = mitigateDamage(14 + (i % 7), 6 + (i % 5), i);
+        cd = advanceCooldown(cd, 1 + (i % 2));
+        if (cd == 0) {
+            energy = blendEnergy(energy, gain, i);
+        } else {
+            energy = blendEnergy(energy, Fixed.Raw(16), i);
+        }
+        hp = hp - dmg;
+    }
+    return hp + cd + energy.ToInt();
+}
+
+// 8. Typed Array & Loop BCE Benchmarks (256 elements x 40 passes = 10,240 element updates)
+public class SimAgent {
+    public int hp;
+    public int shield;
+    public SimAgent(int h, int s) {
+        hp = h;
+        shield = s;
+    }
+    public int Bonus() {
+        return 2;
+    }
+}
+
+public int benchIntArrayLoop(int passes) {
+    int[] data = new int[256];
+    for (int i = 0; i < data.Length; i = i + 1) {
+        data[i] = i * 3 + 1;
+    }
+    int sum = 0;
+    for (int p = 0; p < passes; p = p + 1) {
+        for (int i = 0; i < data.Length; i = i + 1) {
+            int v = data[i] + p;
+            data[i] = v;
+            sum = sum + v;
+        }
+    }
+    return sum;
+}
+
+public int benchFloatArrayLoop(int passes) {
+    float[] pos = new float[256];
+    float[] vel = new float[256];
+    for (int i = 0; i < pos.Length; i = i + 1) {
+        pos[i] = (float)i * 0.5f;
+        vel[i] = 1.25f;
+    }
+    float dt = 0.016f;
+    float acc = 0.0f;
+    for (int p = 0; p < passes; p = p + 1) {
+        for (int i = 0; i < pos.Length; i = i + 1) {
+            float np = pos[i] + vel[i] * dt;
+            pos[i] = np;
+            acc = acc + np;
+        }
+    }
+    return (int)acc;
+}
+
+public int benchVec3ArrayLoop(int passes) {
+    Vec3[] pos = new Vec3[256];
+    Vec3[] vel = new Vec3[256];
+    for (int i = 0; i < pos.Length; i = i + 1) {
+        pos[i] = Vec3.Of(i, 1, -1);
+        vel[i] = Vec3.Raw(64, 32, -16);
+    }
+    Fixed dt = Fixed.Raw(16);
+    Vec3 sum = Vec3.Zero();
+    for (int p = 0; p < passes; p = p + 1) {
+        for (int i = 0; i < pos.Length; i = i + 1) {
+            Vec3 np = pos[i] + vel[i] * dt;
+            pos[i] = np;
+            sum = sum + np;
+        }
+    }
+    return sum.x.raw + sum.y.raw + sum.z.raw;
+}
+
+public int benchObjectArrayLoop(int passes) {
+    SimAgent[] agents = new SimAgent[256];
+    for (int i = 0; i < agents.Length; i = i + 1) {
+        agents[i] = new SimAgent(100 + i, 25);
+    }
+    int checksum = 0;
+    for (int p = 0; p < passes; p = p + 1) {
+        for (int i = 0; i < agents.Length; i = i + 1) {
+            SimAgent a = agents[i];
+            int nextHp = a.hp + a.Bonus() - 1;
+            a.hp = nextHp;
+            checksum = checksum + nextHp + a.shield;
+        }
+    }
+    return checksum;
+}
+
+// 9. Monomorphic Object Field Cache & Nursery Fast Allocation Benchmarks (10,000 steps)
+public class CombatUnit {
+    public int hp;
+    public int shield;
+    public int armor;
+    public float morale;
+    public CombatUnit(int h, int s, int a) {
+        this.hp = h;
+        this.shield = s;
+        this.armor = a;
+        this.morale = 1.0f;
+    }
+}
+
+public class RigidBodyObj {
+    public Vec3 pos;
+    public Vec3 vel;
+    public Quat rot;
+    public Fixed dtScale;
+    public RigidBodyObj() {
+        this.pos = Vec3.Of(1, 2, 3);
+        this.vel = Vec3.Raw(64, -32, 16);
+        this.rot = Quat.Identity();
+        this.dtScale = Fixed.Raw(255);
+    }
+}
+
+public class HitEvent {
+    public int sourceId;
+    public int damage;
+    public int critBonus;
+    public HitEvent(int src, int dmg, int crit) {
+        this.sourceId = src;
+        this.damage = dmg;
+        this.critBonus = crit;
+    }
+}
+
+public int benchObjectFieldScalar(int steps) {
+    CombatUnit u = new CombatUnit(1000, 250, 5);
+    for (int i = 0; i < steps; i = i + 1) {
+        int rawDmg = (i % 8) + 3;
+        int eff = rawDmg - u.armor;
+        if (eff < 1) {
+            eff = 1;
+        }
+        u.hp = u.hp + u.shield - eff;
+        u.shield = (u.shield + 3) % 256;
+        u.morale = u.morale + 0.125f;
+    }
+    return u.hp + u.shield + (int)u.morale;
+}
+
+public int benchObjectFieldTransform(int steps) {
+    RigidBodyObj body = new RigidBodyObj();
+    Fixed dt = Fixed.Raw(16);
+    for (int i = 0; i < steps; i = i + 1) {
+        body.pos = body.pos + body.vel * dt;
+        body.vel = body.vel * body.dtScale + Vec3.Raw(1, 1, 1);
+    }
+    Vec3 p = body.pos;
+    return p.x.raw + p.y.raw + p.z.raw;
+}
+
+public int benchObjectAllocTick(int steps) {
+    int checksum = 0;
+    for (int i = 0; i < steps; i = i + 1) {
+        HitEvent ev = new HitEvent(i, (i % 16) + 4, 2);
+        checksum = checksum + ev.damage * ev.critBonus + (ev.sourceId % 32);
+    }
+    return checksum;
+}
 )RS";
 
 std::shared_ptr<realscript::runtime::ProgramImage> compileSources(
@@ -308,11 +515,16 @@ BenchMetrics runBenchCase(
         realscript::runtime::ExecutionOptions slowOpts = fastOpts;
         slowOpts.determinism.mode = realscript::runtime::DeterminismMode::Strict;
         slowOpts.trace = [](const realscript::runtime::TraceEvent&) {};
-        const auto heapBeforeFast = runtime.heap()->statistics();
-        const auto fastCheck = runtime.invoke(entry, {std::int64_t{200}}, fastOpts);
-        const auto heapAfterFast = runtime.heap()->statistics();
-        const auto slowCheck = runtime.invoke(entry, {std::int64_t{200}}, slowOpts);
-        const auto heapAfterSlow = runtime.heap()->statistics();
+        const std::int64_t paritySteps = std::min<std::int64_t>(steps, 200);
+        const std::shared_ptr<const realscript::runtime::ProgramImage> progAlias(&runtime.program(), [](const realscript::runtime::ProgramImage*) {});
+        realscript::runtime::EngineRuntime fastParityRt(progAlias);
+        realscript::runtime::EngineRuntime slowParityRt(progAlias);
+        const auto heapBeforeFast = fastParityRt.heap()->statistics();
+        const auto fastCheck = fastParityRt.invoke(entry, {paritySteps}, fastOpts);
+        const auto heapAfterFast = fastParityRt.heap()->statistics();
+        const auto heapBeforeSlow = slowParityRt.heap()->statistics();
+        const auto slowCheck = slowParityRt.invoke(entry, {paritySteps}, slowOpts);
+        const auto heapAfterSlow = slowParityRt.heap()->statistics();
         requireCond(fastCheck.succeeded && slowCheck.succeeded, entry + " parity run failed");
         requireCond(fastCheck.value == slowCheck.value, entry + " value mismatch");
         requireCond(
@@ -331,7 +543,7 @@ BenchMetrics runBenchCase(
             fastCheck.statistics.gcWorkPerformed == slowCheck.statistics.gcWorkPerformed,
             entry + " gcWorkPerformed mismatch");
         const auto fastObjs = heapAfterFast.objectsAllocated - heapBeforeFast.objectsAllocated;
-        const auto slowObjs = heapAfterSlow.objectsAllocated - heapAfterFast.objectsAllocated;
+        const auto slowObjs = heapAfterSlow.objectsAllocated - heapBeforeSlow.objectsAllocated;
         requireCond(fastObjs == slowObjs, entry + " heap objectsAllocated parity mismatch");
     }
 
@@ -759,6 +971,893 @@ void testReviewRegressions() {
                 fastRes.value == slowRes.value,
             "user-defined RealScript.Math module was miscompiled into builtin Q24.8 intrinsics");
     }
+
+    // Regression 8: Small-frame multi-block function unfolding — normal parity, exhaustive budget sweep,
+    // recursion-limit trap, dual-frame error stack trace + line numbers, and caller try/catch routing
+    {
+        const char* inlineSrc = R"RS(
+module Test.SmallInline;
+
+public class BoomError { public int code; }
+
+int stepMitigate(int hp, int shield, int tick) {
+    if (shield > 10) {
+        int absorbed = shield / 2;
+        if ((tick % 3) == 0) {
+            return hp - 1 + (absorbed % 5);
+        }
+        return hp - 2;
+    }
+    return hp - 4;
+}
+
+void stepNoop(int tag) {
+    if (tag < 0) {
+        return;
+    }
+    int tmp = tag + 1;
+}
+
+int trapCalleeDiv(int num, int den) {
+    if (num < 0) {
+        return 0;
+    }
+    return num / den;
+}
+
+public int runSinglePass(int seed) {
+    int h = 100;
+    stepNoop(seed);
+    h = stepMitigate(h, 16, seed);
+    stepNoop(-1);
+    h = stepMitigate(h, 4, seed + 1);
+    return h;
+}
+
+public int callerTrap(int den) {
+    int a = stepMitigate(50, 12, 3);
+    int b = trapCalleeDiv(a, den);
+    return b + 1;
+}
+
+public int callerCatchAroundInline(int mode) {
+    int acc = 0;
+    try {
+        acc = stepMitigate(40, 14, mode);
+        if (mode == 7) {
+            throw new BoomError { code = 900 };
+        }
+        acc = stepMitigate(acc, 3, mode + 1);
+    } catch (BoomError e) {
+        acc = acc + e.code;
+    }
+    return acc;
+}
+)RS";
+        for (const auto optLvl : {
+                 optimization::Level::None,
+                 optimization::Level::Basic,
+                 optimization::Level::Aggressive}) {
+            auto prog = compileSources({{"small_inline.rs", inlineSrc}}, optLvl);
+            runtime::Interpreter interp(prog);
+
+            runtime::ExecutionOptions fastOpts;
+            fastOpts.determinism.mode = runtime::DeterminismMode::Off;
+            runtime::ExecutionOptions traceSlowOpts;
+            traceSlowOpts.determinism.mode = runtime::DeterminismMode::Strict;
+            traceSlowOpts.trace = [](const runtime::TraceEvent&) {};
+
+            const auto okFast = interp.invoke("Test.SmallInline::runSinglePass", {std::int64_t{6}}, fastOpts);
+            const auto okSlow = interp.invoke("Test.SmallInline::runSinglePass", {std::int64_t{6}}, traceSlowOpts);
+            requireCond(
+                okFast.succeeded && okSlow.succeeded &&
+                    okFast.value == okSlow.value &&
+                    okFast.instructionsExecuted == okSlow.instructionsExecuted &&
+                    okFast.statistics.functionCalls == okSlow.statistics.functionCalls &&
+                    okFast.statistics.branchesTaken == okSlow.statistics.branchesTaken &&
+                    okFast.statistics.maximumCallDepth == okSlow.statistics.maximumCallDepth,
+                "Small-frame unfolded runSinglePass parity failed");
+
+            // Exhaustive 1-by-1 instruction budget sweep across caller + unfolded multi-block callees
+            for (std::uint64_t b = 1; b < okFast.instructionsExecuted; ++b) {
+                runtime::ExecutionOptions bFast = fastOpts;
+                bFast.limits.instructionBudget = b;
+                runtime::ExecutionOptions bSlow = traceSlowOpts;
+                bSlow.limits.instructionBudget = b;
+                const auto rF = interp.invoke("Test.SmallInline::runSinglePass", {std::int64_t{6}}, bFast);
+                const auto rS = interp.invoke("Test.SmallInline::runSinglePass", {std::int64_t{6}}, bSlow);
+                requireCond(
+                    !rF.succeeded && !rS.succeeded &&
+                        rF.error.code == runtime::ErrorCode::InstructionBudgetExceeded &&
+                        rS.error.code == runtime::ErrorCode::InstructionBudgetExceeded &&
+                        rF.instructionsExecuted == rS.instructionsExecuted &&
+                        rF.statistics.functionCalls == rS.statistics.functionCalls &&
+                        rF.statistics.branchesTaken == rS.statistics.branchesTaken &&
+                        rF.statistics.maximumCallDepth == rS.statistics.maximumCallDepth &&
+                        rF.error.stackTrace == rS.error.stackTrace,
+                    "Small-frame unfolded instruction budget sweep parity failed at b=" + std::to_string(b));
+            }
+
+            // Recursion limit = 1 must reject entering unfolded callee with exact parity
+            {
+                runtime::ExecutionOptions recFast = fastOpts;
+                recFast.limits.recursionLimit = 1;
+                runtime::ExecutionOptions recSlow = traceSlowOpts;
+                recSlow.limits.recursionLimit = 1;
+                const auto recF = interp.invoke("Test.SmallInline::runSinglePass", {std::int64_t{6}}, recFast);
+                const auto recS = interp.invoke("Test.SmallInline::runSinglePass", {std::int64_t{6}}, recSlow);
+                requireCond(
+                    !recF.succeeded && !recS.succeeded &&
+                        recF.error.code == runtime::ErrorCode::RecursionLimitExceeded &&
+                        recS.error.code == runtime::ErrorCode::RecursionLimitExceeded &&
+                        recF.instructionsExecuted == recS.instructionsExecuted &&
+                        recF.error.stackTrace == recS.error.stackTrace,
+                    "Small-frame unfolded recursionLimit=1 parity failed");
+            }
+
+            // DivisionByZero inside unfolded callee must report identical 2-frame stackTrace & line numbers
+            {
+                const auto trapF = interp.invoke("Test.SmallInline::callerTrap", {std::int64_t{0}}, fastOpts);
+                const auto trapS = interp.invoke("Test.SmallInline::callerTrap", {std::int64_t{0}}, traceSlowOpts);
+                requireCond(
+                    !trapF.succeeded && !trapS.succeeded &&
+                        trapF.error.code == runtime::ErrorCode::DivisionByZero &&
+                        trapF.instructionsExecuted == trapS.instructionsExecuted &&
+                        trapF.error.stackTrace.size() == 2 &&
+                        trapF.error.stackTrace == trapS.error.stackTrace &&
+                        trapF.error.symbolizedStackTrace == trapS.error.symbolizedStackTrace,
+                    "Small-frame unfolded DivisionByZero stack trace / line-number parity failed");
+            }
+
+            // Caller try/catch exception handler offsets must remain valid after Pass 4 unfolding
+            for (const std::int64_t mode : {std::int64_t{2}, std::int64_t{7}}) {
+                const auto cF = interp.invoke("Test.SmallInline::callerCatchAroundInline", {mode}, fastOpts);
+                const auto cS = interp.invoke("Test.SmallInline::callerCatchAroundInline", {mode}, traceSlowOpts);
+                requireCond(
+                    cF.succeeded && cS.succeeded &&
+                        cF.value == cS.value &&
+                        cF.instructionsExecuted == cS.instructionsExecuted &&
+                        cF.statistics.functionCalls == cS.statistics.functionCalls,
+                    "Small-frame callerCatchAroundInline parity failed");
+            }
+        }
+    }
+
+    // Regression 9: Monomorphic & polymorphic SuperCheckNotNullCallPolledFast + TrivialMethodKind parity
+    {
+        const char* polySrc = R"RS(
+module Test.PolledInline;
+
+interface ISensor {
+    public int kind();
+    public void ping();
+}
+
+public class ConstSensor : ISensor {
+    public int kind() { return 11; }
+    public void ping() { return; }
+}
+
+public class AltConstSensor : ISensor {
+    public int kind() { return 29; }
+    public void ping() { return; }
+}
+
+public class StatefulSensor : ISensor {
+    int baseVal;
+    public StatefulSensor(int b) { baseVal = b; }
+    public int kind() {
+        if (baseVal > 10) {
+            return baseVal + 3;
+        }
+        return baseVal + 1;
+    }
+    public void ping() {
+        baseVal = baseVal + 1;
+    }
+}
+
+public int runHomogeneous(int n) {
+    ISensor[] arr = new ISensor[4];
+    arr[0] = new ConstSensor();
+    arr[1] = new ConstSensor();
+    arr[2] = new ConstSensor();
+    arr[3] = new ConstSensor();
+    int sum = 0;
+    for (int i = 0; i < n; i = i + 1) {
+        ISensor s = arr[i % 4];
+        s.ping();
+        sum = sum + s.kind();
+    }
+    return sum;
+}
+
+public int runPolymorphic(int n) {
+    ISensor[] arr = new ISensor[3];
+    arr[0] = new ConstSensor();
+    arr[1] = new AltConstSensor();
+    arr[2] = new StatefulSensor(15);
+    int sum = 0;
+    for (int i = 0; i < n; i = i + 1) {
+        ISensor s = arr[i % 3];
+        s.ping();
+        sum = sum + s.kind();
+    }
+    return sum;
+}
+
+public int runNullTrap() {
+    ISensor[] arr = new ISensor[2];
+    arr[0] = new ConstSensor();
+    int sum = 0;
+    for (int i = 0; i < 2; i = i + 1) {
+        ISensor s = arr[i];
+        sum = sum + s.kind();
+    }
+    return sum;
+}
+)RS";
+        for (const auto optLvl : {optimization::Level::None, optimization::Level::Aggressive}) {
+            auto prog = compileSources({{"polled_inline.rs", polySrc}}, optLvl);
+            runtime::Interpreter interp(prog);
+            runtime::ExecutionOptions fastOpts;
+            fastOpts.determinism.mode = runtime::DeterminismMode::Off;
+            runtime::ExecutionOptions traceSlowOpts;
+            traceSlowOpts.determinism.mode = runtime::DeterminismMode::Strict;
+            traceSlowOpts.trace = [](const runtime::TraceEvent&) {};
+
+            const auto monoF = interp.invoke("Test.PolledInline::runHomogeneous", {std::int64_t{24}}, fastOpts);
+            const auto monoS = interp.invoke("Test.PolledInline::runHomogeneous", {std::int64_t{24}}, traceSlowOpts);
+            requireCond(
+                monoF.succeeded && monoS.succeeded &&
+                    monoF.value == monoS.value &&
+                    monoF.instructionsExecuted == monoS.instructionsExecuted &&
+                    monoF.statistics.functionCalls == monoS.statistics.functionCalls &&
+                    monoF.statistics.maximumCallDepth == monoS.statistics.maximumCallDepth,
+                "SuperCheckNotNullCallPolledFast homogeneous parity failed");
+
+            const auto polyF = interp.invoke("Test.PolledInline::runPolymorphic", {std::int64_t{18}}, fastOpts);
+            const auto polyS = interp.invoke("Test.PolledInline::runPolymorphic", {std::int64_t{18}}, traceSlowOpts);
+            requireCond(
+                polyF.succeeded && polyS.succeeded &&
+                    polyF.value == polyS.value &&
+                    polyF.instructionsExecuted == polyS.instructionsExecuted &&
+                    polyF.statistics.functionCalls == polyS.statistics.functionCalls &&
+                    polyF.statistics.maximumCallDepth == polyS.statistics.maximumCallDepth,
+                "SuperCheckNotNullCallPolledFast polymorphic fallback parity failed");
+
+            const auto nullF = interp.invoke("Test.PolledInline::runNullTrap", {}, fastOpts);
+            const auto nullS = interp.invoke("Test.PolledInline::runNullTrap", {}, traceSlowOpts);
+            requireCond(
+                !nullF.succeeded && !nullS.succeeded &&
+                    nullF.error.code == runtime::ErrorCode::NullReference &&
+                    nullS.error.code == runtime::ErrorCode::NullReference &&
+                    nullF.instructionsExecuted == nullS.instructionsExecuted &&
+                    nullF.error.symbolizedStackTrace == nullS.error.symbolizedStackTrace,
+                "SuperCheckNotNullCallPolledFast null trap parity failed");
+
+            runtime::ExecutionOptions recFast = fastOpts;
+            recFast.limits.recursionLimit = 1;
+            runtime::ExecutionOptions recSlow = traceSlowOpts;
+            recSlow.limits.recursionLimit = 1;
+            const auto recF = interp.invoke("Test.PolledInline::runHomogeneous", {std::int64_t{4}}, recFast);
+            const auto recS = interp.invoke("Test.PolledInline::runHomogeneous", {std::int64_t{4}}, recSlow);
+            requireCond(
+                !recF.succeeded && !recS.succeeded &&
+                    recF.error.code == runtime::ErrorCode::RecursionLimitExceeded &&
+                    recF.instructionsExecuted == recS.instructionsExecuted,
+                "TrivialMethodKind recursionLimit=1 parity failed");
+        }
+    }
+
+    // Regression 10: Strongly-typed arrays (int[], float[], double[], bool[], Struct[], Object[], String[]),
+    // Loop Null & Bounds Check Elimination (Pass 3c), Generational Write Barrier survival,
+    // Covariant Object[] store check, Negative/OOB/Null traps, and 1-by-1 Instruction Budget Sweep
+    {
+        const char* arrSrc = R"RS(
+module Test.TypedArraysBce;
+import RealScript.Math;
+
+public struct CustomPair {
+    public int id;
+    public string tag;
+}
+
+public class Animal {
+    public int energy;
+    public Animal(int e) { energy = e; }
+}
+
+public class Wolf : Animal {
+    public Wolf(int e) : base(e) {}
+}
+
+public class Sheep : Animal {
+    public Sheep(int e) : base(e) {}
+}
+
+public int runAllArrayTypes(int n) {
+    int[] ia = new int[n];
+    float[] fa = new float[n];
+    double[] da = new double[n];
+    bool[] ba = new bool[n];
+    Vec3[] va = new Vec3[n];
+    CustomPair[] pa = new CustomPair[n];
+    Animal[] oa = new Animal[n];
+    string[] sa = new string[n];
+
+    for (int i = 0; i < ia.Length; i = i + 1) {
+        ia[i] = i + 10;
+        fa[i] = (float)i * 1.5f;
+        da[i] = (double)i * 2.25;
+        ba[i] = (i % 2) == 0;
+        va[i] = Vec3.Of(i, i + 1, i + 2);
+        CustomPair cp = new CustomPair();
+        cp.id = i * 5;
+        cp.tag = "slot";
+        pa[i] = cp;
+        if ((i % 2) == 0) {
+            oa[i] = new Wolf(i + 100);
+        } else {
+            oa[i] = new Sheep(i + 200);
+        }
+        sa[i] = "item";
+    }
+
+    int acc = 0;
+    float facc = 0.0f;
+    double dacc = 0.0;
+    for (int i = 0; i < n; i = i + 1) {
+        ia[i] = ia[i] + 3;
+        facc = facc + fa[i];
+        dacc = dacc + da[i];
+        if (ba[i]) {
+            acc = acc + ia[i];
+        }
+        Vec3 v = va[i];
+        acc = acc + v.x.ToInt() + pa[i].id + oa[i].energy;
+    }
+    oa[0] = null;
+    sa[0] = null;
+    return acc + (int)facc + (int)dacc;
+}
+
+public int trapNullHeader(int[] arr) {
+    int s = 0;
+    for (int i = 0; i < arr.Length; i = i + 1) {
+        s = s + arr[i];
+    }
+    return s;
+}
+
+public int trapOobSecondArray(float[] a, float[] b) {
+    float s = 0.0f;
+    for (int i = 0; i < a.Length; i = i + 1) {
+        s = s + a[i] + b[i];
+    }
+    return (int)s;
+}
+
+public int trapNegativeIndex(Vec3[] arr, int badIdx) {
+    Vec3 v = arr[badIdx];
+    return v.x.raw;
+}
+
+public void populateYoungIntoOldArray(Animal[] oldArr, int baseEnergy) {
+    for (int i = 0; i < oldArr.Length; i = i + 1) {
+        oldArr[i] = new Wolf(baseEnergy + i);
+    }
+}
+
+public Animal[] makeAnimalArray(int n) {
+    return new Animal[n];
+}
+
+public int sumAnimalArray(Animal[] arr) {
+    int s = 0;
+    for (int i = 0; i < arr.Length; i = i + 1) {
+        Animal a = arr[i];
+        s = s + a.energy;
+    }
+    return s;
+}
+)RS";
+        for (const auto optLvl : {
+                 optimization::Level::None,
+                 optimization::Level::Basic,
+                 optimization::Level::Aggressive}) {
+            auto prog = compileSources({{"typed_arrays_bce.rs", arrSrc}}, optLvl);
+            runtime::Interpreter interp(prog);
+
+            runtime::ExecutionOptions fastOpts;
+            fastOpts.determinism.mode = runtime::DeterminismMode::Off;
+            runtime::ExecutionOptions traceSlowOpts;
+            traceSlowOpts.determinism.mode = runtime::DeterminismMode::Strict;
+            traceSlowOpts.trace = [](const runtime::TraceEvent&) {};
+
+            const auto okFast = interp.invoke("Test.TypedArraysBce::runAllArrayTypes", {std::int64_t{6}}, fastOpts);
+            const auto okSlow = interp.invoke("Test.TypedArraysBce::runAllArrayTypes", {std::int64_t{6}}, traceSlowOpts);
+            requireCond(
+                okFast.succeeded && okSlow.succeeded &&
+                    okFast.value == okSlow.value &&
+                    okFast.instructionsExecuted == okSlow.instructionsExecuted &&
+                    okFast.statistics.functionCalls == okSlow.statistics.functionCalls &&
+                    okFast.statistics.branchesTaken == okSlow.statistics.branchesTaken &&
+                    okFast.statistics.maximumCallDepth == okSlow.statistics.maximumCallDepth,
+                "TypedArraysBce::runAllArrayTypes parity failed");
+
+            // Exhaustive 1-by-1 instruction budget sweep across array allocation, SuperLessLocalArrayLengthBranch,
+            // LoadElementTypedFast, StoreElement{Prim,Struct,Obj}Fast, and FlagPreJump1 for-loop latch!
+            const auto smallFast = interp.invoke("Test.TypedArraysBce::runAllArrayTypes", {std::int64_t{2}}, fastOpts);
+            const auto smallSlow = interp.invoke("Test.TypedArraysBce::runAllArrayTypes", {std::int64_t{2}}, traceSlowOpts);
+            requireCond(smallFast.succeeded && smallSlow.succeeded && smallFast.instructionsExecuted == smallSlow.instructionsExecuted,
+                        "small runAllArrayTypes baseline failed");
+            for (std::uint64_t b = 1; b < smallFast.instructionsExecuted; ++b) {
+                runtime::ExecutionOptions bFast = fastOpts;
+                bFast.limits.instructionBudget = b;
+                runtime::ExecutionOptions bSlow = traceSlowOpts;
+                bSlow.limits.instructionBudget = b;
+                const auto rF = interp.invoke("Test.TypedArraysBce::runAllArrayTypes", {std::int64_t{2}}, bFast);
+                const auto rS = interp.invoke("Test.TypedArraysBce::runAllArrayTypes", {std::int64_t{2}}, bSlow);
+                requireCond(
+                    !rF.succeeded && !rS.succeeded &&
+                        rF.error.code == runtime::ErrorCode::InstructionBudgetExceeded &&
+                        rS.error.code == runtime::ErrorCode::InstructionBudgetExceeded &&
+                        rF.instructionsExecuted == rS.instructionsExecuted &&
+                        rF.statistics.branchesTaken == rS.statistics.branchesTaken &&
+                        rF.error.stackTrace == rS.error.stackTrace &&
+                        rF.error.symbolizedStackTrace == rS.error.symbolizedStackTrace,
+                    "TypedArraysBce 1-by-1 budget sweep failed at b=" + std::to_string(b));
+            }
+
+            // NullReference in SuperLessLocalArrayLengthBranch header
+            {
+                const auto nF = interp.invoke("Test.TypedArraysBce::trapNullHeader", {runtime::NullArray{}}, fastOpts);
+                const auto nS = interp.invoke("Test.TypedArraysBce::trapNullHeader", {runtime::NullArray{}}, traceSlowOpts);
+                requireCond(
+                    !nF.succeeded && !nS.succeeded &&
+                        nF.error.code == runtime::ErrorCode::NullReference &&
+                        nS.error.code == runtime::ErrorCode::NullReference &&
+                        nF.instructionsExecuted == nS.instructionsExecuted &&
+                        nF.error.symbolizedStackTrace == nS.error.symbolizedStackTrace,
+                    "trapNullHeader parity failed");
+            }
+
+            // IndexOutOfRange on shorter secondary float[] array inside BCE loop + negative index on Vec3[]
+            {
+                auto heap = interp.heap();
+                const auto floatArrTid = semantic::stableTypeId("float[]");
+                const auto aRef = heap->allocateTypedArray(floatArrTid, semantic::PrimitiveType::Float, 0, 5, runtime::FloatValue{1.0f});
+                const auto bRef = heap->allocateTypedArray(floatArrTid, semantic::PrimitiveType::Float, 0, 3, runtime::FloatValue{2.0f});
+                requireCond(aRef && bRef, "float[] host alloc failed");
+                auto pinA = heap->retain(*aRef);
+                auto pinB = heap->retain(*bRef);
+
+                const auto oobF = interp.invoke("Test.TypedArraysBce::trapOobSecondArray", {*aRef, *bRef}, fastOpts);
+                const auto oobS = interp.invoke("Test.TypedArraysBce::trapOobSecondArray", {*aRef, *bRef}, traceSlowOpts);
+                requireCond(
+                    !oobF.succeeded && !oobS.succeeded &&
+                        oobF.error.code == runtime::ErrorCode::IndexOutOfRange &&
+                        oobS.error.code == runtime::ErrorCode::IndexOutOfRange &&
+                        oobF.instructionsExecuted == oobS.instructionsExecuted &&
+                        oobF.error.symbolizedStackTrace == oobS.error.symbolizedStackTrace,
+                    "trapOobSecondArray parity failed");
+
+                const auto vec3Tid = semantic::stableTypeId("RealScript.Math::Vec3");
+                const auto vec3ArrTid = semantic::stableTypeId("RealScript.Math::Vec3[]");
+                const auto vArr = heap->allocateTypedArray(vec3ArrTid, semantic::PrimitiveType::Struct, vec3Tid, 4, runtime::Vec3Value{1, 2, 3});
+                requireCond(vArr.has_value(), "Vec3[] host alloc failed");
+                auto pinV = heap->retain(*vArr);
+
+                const auto negF = interp.invoke("Test.TypedArraysBce::trapNegativeIndex", {*vArr, std::int64_t{-1}}, fastOpts);
+                const auto negS = interp.invoke("Test.TypedArraysBce::trapNegativeIndex", {*vArr, std::int64_t{-1}}, traceSlowOpts);
+                requireCond(
+                    !negF.succeeded && !negS.succeeded &&
+                        negF.error.code == runtime::ErrorCode::IndexOutOfRange &&
+                        negF.instructionsExecuted == negS.instructionsExecuted &&
+                        negF.error.symbolizedStackTrace == negS.error.symbolizedStackTrace,
+                    "trapNegativeIndex parity failed");
+            }
+
+            // Generational GC write-barrier verification on StoreElementObjFast:
+            // Promote `oldArr` to old generation via collectYoung, then store fresh nursery `Wolf` objects via StoreElementObjFast,
+            // then run collectYoung again -- remembered set MUST keep all nursery `Wolf` elements alive!
+            {
+                auto heap = interp.heap();
+                const auto made = interp.invoke("Test.TypedArraysBce::makeAnimalArray", {std::int64_t{8}}, fastOpts);
+                requireCond(made.succeeded && std::holds_alternative<runtime::ObjectRef>(made.value), "makeAnimalArray failed");
+                const auto oldArrRef = std::get<runtime::ObjectRef>(made.value);
+                auto pinOld = heap->retain(oldArrRef);
+
+                runtime::ShadowStack emptyRoots;
+                (void)heap->collectYoung(emptyRoots); // Promotes `oldArrRef` out of nursery into old-gen!
+
+                const auto popRes = interp.invoke("Test.TypedArraysBce::populateYoungIntoOldArray", {oldArrRef, std::int64_t{50}}, fastOpts);
+                requireCond(popRes.succeeded, "populateYoungIntoOldArray failed");
+
+                // Young GC must trace `oldArrRef` via remembered set recorded by StoreElementObjFast!
+                (void)heap->collectYoung(emptyRoots);
+
+                const auto sumRes = interp.invoke("Test.TypedArraysBce::sumAnimalArray", {oldArrRef}, fastOpts);
+                requireCond(
+                    sumRes.succeeded && std::get<std::int64_t>(sumRes.value) == (50 * 8 + 28),
+                    "Generational remembered-set write barrier missed nursery elements stored via StoreElementObjFast!");
+            }
+        }
+    }
+
+    // Regression 11: ObjectFastView L0 Cache, Universal FastFieldKind (Prim/Fixed/Vec3/Quat/String/Object/Array/Struct/Enum),
+    // Polymorphic Subclass Field Access, Unfolded Constructor GC Root Clearing, StoreFieldFast Generational Write Barrier,
+    // Small Inline Array (length <= 4) Snapshot & Packed Bulk Access, Null/OOM Traps & 1-by-1 Budget Sweep
+    {
+        const char* objSrc = R"RS(
+module Test.ObjectIcAndNursery;
+import RealScript.Math;
+
+public enum AgentState {
+    Idle = 0,
+    Moving = 1,
+    Attacking = 2
+}
+
+public struct StatPair {
+    public int minVal;
+    public int maxVal;
+}
+
+public class SmallNode {
+    public int val;
+    public SmallNode next;
+    public SmallNode(int v) {
+        this.val = v;
+        this.next = null;
+    }
+}
+
+public class EmptyMarker {
+    public int id;
+}
+
+public class BaseActor {
+    public int hp;
+    public Vec3 pos;
+    public BaseActor(int h, Vec3 p) {
+        this.hp = h;
+        this.pos = p;
+    }
+}
+
+public class HeroActor : BaseActor {
+    public int mana;
+    public HeroActor(int h, Vec3 p, int m) : base(h, p) {
+        this.mana = m;
+    }
+}
+
+// > 4 fields so `usesInlineValues == false` (exercises out-of-line values.data() in ObjectFastView!)
+public class RichEntity {
+    public int id;
+    public float speed;
+    public double preciseTime;
+    public bool active;
+    public Vec3 position;
+    public Quat rotation;
+    public string label;
+    public AgentState state;
+    public StatPair stats;
+    public SmallNode head;
+    public int[] smallScores;
+}
+
+public class OldHolder {
+    public SmallNode child;
+    public int[] inlineArr;
+    public string tag;
+    public StatPair stats;
+}
+
+public int stepActorHelper(BaseActor a, int bonus) {
+    a.hp = a.hp + bonus;
+    a.pos = a.pos + Vec3.Of(1, 0, -1);
+    return a.hp + a.pos.x.ToInt();
+}
+
+public int trapSelfOverwriteNull() {
+    SmallNode n = new SmallNode(10);
+    int v0 = n.val;
+    n = n.next;
+    return v0 + n.val;
+}
+
+public int exerciseAllFastFieldKinds(int n) {
+    RichEntity e = new RichEntity();
+    e.id = 10;
+    e.speed = 2.5f;
+    e.preciseTime = 1.25;
+    e.active = true;
+    e.position = Vec3.Of(2, 3, 4);
+    e.rotation = Quat.Identity();
+    e.label = "hero";
+    e.state = AgentState.Moving;
+    StatPair sp = new StatPair();
+    sp.minVal = 5;
+    sp.maxVal = 15;
+    e.stats = sp;
+    e.head = new SmallNode(42);
+    e.smallScores = new int[4];
+    e.smallScores[0] = 7;
+    e.smallScores[3] = 9;
+
+    BaseActor poly = new HeroActor(50, Vec3.Of(3, 1, 2), 30);
+    int total = 0;
+    for (int i = 0; i < n; i = i + 1) {
+        e.id = e.id + 1;
+        e.speed = e.speed + 0.5f;
+        e.preciseTime = e.preciseTime + 0.25;
+        if (e.active) {
+            e.position = e.position + Vec3.Raw(256, 128, 64);
+        }
+        if (e.state == AgentState.Moving) {
+            total = total + e.stats.minVal + e.stats.maxVal;
+        }
+        SmallNode nd = e.head;
+        nd.val = nd.val + e.smallScores[0] + e.smallScores[3];
+        total = total + stepActorHelper(poly, 2) + nd.val + e.id;
+    }
+    e.head = null;
+    e.smallScores = null;
+    e.label = null;
+    return total + (int)e.speed + (int)e.preciseTime + e.position.x.ToInt();
+}
+
+public int allocAndDropEphemeral(int count) {
+    int sum = 0;
+    for (int i = 0; i < count; i = i + 1) {
+        SmallNode tmp = new SmallNode(i + 1);
+        int[] tiny = new int[3];
+        tiny[0] = tmp.val;
+        tiny[2] = 5;
+        sum = sum + tiny[0] + tiny[2];
+        tmp = null;
+        tiny = null;
+    }
+    return sum;
+}
+
+public int foldStoreLocalNewObject() {
+    EmptyMarker m = new EmptyMarker();
+    m.id = 77;
+    return m.id;
+}
+
+public OldHolder makeOldHolder() {
+    return new OldHolder();
+}
+
+public void attachYoungToOldHolder(OldHolder h, int baseVal) {
+    StatPair sp = new StatPair();
+    sp.minVal = 1;
+    sp.maxVal = 2;
+    h.stats = sp;
+    h.tag = "kept";
+    SmallNode yn = new SmallNode(baseVal);
+    int[] ya = new int[4];
+    ya[0] = baseVal + 10;
+    ya[3] = baseVal + 20;
+    h.child = yn;
+    h.inlineArr = ya;
+}
+
+public int readOldHolder(OldHolder h) {
+    return h.child.val + h.inlineArr[0] + h.inlineArr[3];
+}
+
+public int[] makeSmallIntArray4() {
+    int[] a = new int[4];
+    a[0] = 11;
+    a[1] = 22;
+    a[2] = 33;
+    a[3] = 44;
+    return a;
+}
+
+public int trapNullInlinedHelper() {
+    BaseActor nullActor = null;
+    return stepActorHelper(nullActor, 5);
+}
+)RS";
+
+        for (const auto optLvl : {
+                 optimization::Level::None,
+                 optimization::Level::Basic,
+                 optimization::Level::Aggressive}) {
+            auto prog = compileSources({{"object_ic_nursery.rs", objSrc}}, optLvl);
+            runtime::Interpreter interp(prog);
+
+            runtime::ExecutionOptions fastOpts;
+            fastOpts.determinism.mode = runtime::DeterminismMode::Off;
+            runtime::ExecutionOptions traceSlowOpts;
+            traceSlowOpts.determinism.mode = runtime::DeterminismMode::Strict;
+            traceSlowOpts.trace = [](const runtime::TraceEvent&) {};
+
+            const auto okFast = interp.invoke("Test.ObjectIcAndNursery::exerciseAllFastFieldKinds", {std::int64_t{5}}, fastOpts);
+            const auto okSlow = interp.invoke("Test.ObjectIcAndNursery::exerciseAllFastFieldKinds", {std::int64_t{5}}, traceSlowOpts);
+            requireCond(
+                okFast.succeeded && okSlow.succeeded &&
+                    okFast.value == okSlow.value &&
+                    okFast.instructionsExecuted == okSlow.instructionsExecuted &&
+                    okFast.statistics.functionCalls == okSlow.statistics.functionCalls &&
+                    okFast.statistics.branchesTaken == okSlow.statistics.branchesTaken &&
+                    okFast.statistics.maximumCallDepth == okSlow.statistics.maximumCallDepth &&
+                    interp.heap()->sharedTypeLayoutCount() >= 3,
+                "ObjectIcAndNursery::exerciseAllFastFieldKinds parity failed");
+
+            // Folded NewObjectFast -> StoreLocal parity + sharedTypeLayoutCount parity on value-only class
+            {
+                auto layoutHeapF = std::make_shared<runtime::ManagedHeap>();
+                auto layoutHeapS = std::make_shared<runtime::ManagedHeap>();
+                runtime::Interpreter layoutInterpF(prog, layoutHeapF);
+                runtime::Interpreter layoutInterpS(prog, layoutHeapS);
+                const auto foldF = layoutInterpF.invoke("Test.ObjectIcAndNursery::foldStoreLocalNewObject", {}, fastOpts);
+                const auto foldS = layoutInterpS.invoke("Test.ObjectIcAndNursery::foldStoreLocalNewObject", {}, traceSlowOpts);
+                requireCond(
+                    foldF.succeeded && foldS.succeeded &&
+                        foldF.value == foldS.value &&
+                        foldF.instructionsExecuted == foldS.instructionsExecuted &&
+                        layoutHeapF->sharedTypeLayoutCount() == layoutHeapS->sharedTypeLayoutCount() &&
+                        layoutHeapF->sharedTypeLayoutCount() == 1,
+                    "foldStoreLocalNewObject or sharedTypeLayoutCount parity failed");
+            }
+
+            // Self-overwrite `n = n.next` (dstSlot == src0Slot) must invalidate provenNonNull[n]
+            {
+                const auto soF = interp.invoke("Test.ObjectIcAndNursery::trapSelfOverwriteNull", {}, fastOpts);
+                const auto soS = interp.invoke("Test.ObjectIcAndNursery::trapSelfOverwriteNull", {}, traceSlowOpts);
+                requireCond(
+                    !soF.succeeded && !soS.succeeded &&
+                        soF.error.code == runtime::ErrorCode::NullReference &&
+                        soS.error.code == runtime::ErrorCode::NullReference &&
+                        soF.instructionsExecuted == soS.instructionsExecuted &&
+                        soF.error.symbolizedStackTrace == soS.error.symbolizedStackTrace,
+                    "trapSelfOverwriteNull provenNonNull invalidation parity failed");
+            }
+
+            // Exhaustive 1-by-1 instruction budget sweep across NewObjectFast, unfolded ctor/helper, and all FastFieldKinds!
+            const auto bBaseF = interp.invoke("Test.ObjectIcAndNursery::exerciseAllFastFieldKinds", {std::int64_t{2}}, fastOpts);
+            const auto bBaseS = interp.invoke("Test.ObjectIcAndNursery::exerciseAllFastFieldKinds", {std::int64_t{2}}, traceSlowOpts);
+            requireCond(bBaseF.succeeded && bBaseS.succeeded && bBaseF.instructionsExecuted == bBaseS.instructionsExecuted,
+                        "small exerciseAllFastFieldKinds baseline failed");
+            for (std::uint64_t b = 1; b < bBaseF.instructionsExecuted; ++b) {
+                runtime::ExecutionOptions bFast = fastOpts;
+                bFast.limits.instructionBudget = b;
+                runtime::ExecutionOptions bSlow = traceSlowOpts;
+                bSlow.limits.instructionBudget = b;
+                const auto rF = interp.invoke("Test.ObjectIcAndNursery::exerciseAllFastFieldKinds", {std::int64_t{2}}, bFast);
+                const auto rS = interp.invoke("Test.ObjectIcAndNursery::exerciseAllFastFieldKinds", {std::int64_t{2}}, bSlow);
+                requireCond(
+                    !rF.succeeded && !rS.succeeded &&
+                        rF.error.code == runtime::ErrorCode::InstructionBudgetExceeded &&
+                        rS.error.code == runtime::ErrorCode::InstructionBudgetExceeded &&
+                        rF.instructionsExecuted == rS.instructionsExecuted &&
+                        rF.statistics.branchesTaken == rS.statistics.branchesTaken &&
+                        rF.error.stackTrace == rS.error.stackTrace &&
+                        rF.error.symbolizedStackTrace == rS.error.symbolizedStackTrace,
+                    "ObjectIcAndNursery 1-by-1 budget sweep failed at b=" + std::to_string(b));
+            }
+
+            // NullReference inside Pass 4 unfolded helper `stepActorHelper` must preserve exact stackTrace & instructionsExecuted!
+            {
+                const auto nF = interp.invoke("Test.ObjectIcAndNursery::trapNullInlinedHelper", {}, fastOpts);
+                const auto nS = interp.invoke("Test.ObjectIcAndNursery::trapNullInlinedHelper", {}, traceSlowOpts);
+                requireCond(
+                    !nF.succeeded && !nS.succeeded &&
+                        nF.error.code == runtime::ErrorCode::NullReference &&
+                        nS.error.code == runtime::ErrorCode::NullReference &&
+                        nF.instructionsExecuted == nS.instructionsExecuted &&
+                        nF.error.stackTrace == nS.error.stackTrace &&
+                        nF.error.symbolizedStackTrace == nS.error.symbolizedStackTrace,
+                    "trapNullInlinedHelper stackTrace/location parity failed");
+            }
+
+            // Unfolded constructor GC root clearing + tight incremental GC survival & full reclamation check
+            {
+                runtime::HeapConfig tightCfg;
+                tightCfg.initialCollectionThresholdBytes = 1024;
+                tightCfg.maximumHeapBytes = 8192;
+                auto tightHeap = std::make_shared<runtime::ManagedHeap>(tightCfg);
+                runtime::Interpreter tightInterp(prog, tightHeap);
+                runtime::ExecutionOptions gcFastOpts = fastOpts;
+                gcFastOpts.limits.gcWorkBudget = 16;
+                const auto ephRes = tightInterp.invoke("Test.ObjectIcAndNursery::allocAndDropEphemeral", {std::int64_t{200}}, gcFastOpts);
+                requireCond(ephRes.succeeded && std::get<std::int64_t>(ephRes.value) == (200 * 201 / 2 + 200 * 5),
+                            "allocAndDropEphemeral under tight 8KB heap failed");
+                runtime::ShadowStack emptyStack;
+                tightHeap->collectFull(emptyStack);
+                requireCond(tightHeap->liveObjects() == 0 && tightHeap->liveBytes() == 0,
+                            "Unfolded constructor or inline small array leaked live objects after collectFull!");
+            }
+
+            // Tight-heap OOM parity on NewObjectFast (both unfolded and folded StoreLocal)
+            {
+                runtime::HeapConfig tinyCfg;
+                tinyCfg.initialCollectionThresholdBytes = 64;
+                tinyCfg.maximumHeapBytes = 64; // Too small for even 1 object!
+                auto tinyHeapF = std::make_shared<runtime::ManagedHeap>(tinyCfg);
+                auto tinyHeapS = std::make_shared<runtime::ManagedHeap>(tinyCfg);
+                runtime::Interpreter tinyF(prog, tinyHeapF);
+                runtime::Interpreter tinyS(prog, tinyHeapS);
+                const auto oomF = tinyF.invoke("Test.ObjectIcAndNursery::foldStoreLocalNewObject", {}, fastOpts);
+                const auto oomS = tinyS.invoke("Test.ObjectIcAndNursery::foldStoreLocalNewObject", {}, traceSlowOpts);
+                requireCond(
+                    !oomF.succeeded && !oomS.succeeded &&
+                        oomF.error.code == runtime::ErrorCode::OutOfMemory &&
+                        oomS.error.code == runtime::ErrorCode::OutOfMemory &&
+                        oomF.instructionsExecuted == oomS.instructionsExecuted &&
+                        oomF.error.stackTrace == oomS.error.stackTrace,
+                    "NewObjectFast tight-heap OOM parity failed");
+            }
+
+            // Generational GC write-barrier verification on StoreFieldFast (Object + small inline Array fields)
+            // + Snapshot/Restore & Packed Int Array verification on length <= 4 inline array!
+            {
+                auto heap = interp.heap();
+                const auto madeH = interp.invoke("Test.ObjectIcAndNursery::makeOldHolder", {}, fastOpts);
+                requireCond(madeH.succeeded && std::holds_alternative<runtime::ObjectRef>(madeH.value), "makeOldHolder failed");
+                const auto holderRef = std::get<runtime::ObjectRef>(madeH.value);
+                auto pinHolder = heap->retain(holderRef);
+
+                runtime::ShadowStack emptyRoots;
+                (void)heap->collectYoung(emptyRoots); // Promote `holderRef` to old-gen
+
+                const auto attRes = interp.invoke("Test.ObjectIcAndNursery::attachYoungToOldHolder", {holderRef, std::int64_t{100}}, fastOpts);
+                requireCond(attRes.succeeded, "attachYoungToOldHolder failed");
+
+                // Young GC must keep nursery `SmallNode` & nursery `int[4]` alive via StoreFieldFast remembered-set barrier!
+                (void)heap->collectYoung(emptyRoots);
+
+                const auto rdRes = interp.invoke("Test.ObjectIcAndNursery::readOldHolder", {holderRef}, fastOpts);
+                requireCond(
+                    rdRes.succeeded && std::get<std::int64_t>(rdRes.value) == (100 + 110 + 120),
+                    "Generational remembered-set write barrier missed nursery object/array stored via StoreFieldFast!");
+
+                // Also verify StoreElementStructFast with inline user struct (`StatPair[]`)
+                const auto statTid = semantic::stableTypeId("Test.ObjectIcAndNursery::StatPair");
+                const auto statArrTid = semantic::stableTypeId("Test.ObjectIcAndNursery::StatPair[]");
+                const auto sArr = heap->allocateTypedArray(
+                    statArrTid,
+                    semantic::PrimitiveType::Struct,
+                    statTid,
+                    2,
+                    runtime::makeStructValueFromFields(
+                        statTid,
+                        std::vector<runtime::Value>{std::int64_t{0}, std::int64_t{0}}));
+                requireCond(sArr.has_value(), "StatPair[] alloc failed");
+                auto pinSArr = heap->retain(*sArr);
+                (void)heap->collectYoung(emptyRoots);
+
+                // Verify small inline array (length == 4) packed read/write & HeapSnapshot round-trip
+                const auto arr4Res = interp.invoke("Test.ObjectIcAndNursery::makeSmallIntArray4", {}, fastOpts);
+                requireCond(arr4Res.succeeded && std::holds_alternative<runtime::ObjectRef>(arr4Res.value), "makeSmallIntArray4 failed");
+                const auto arr4Ref = std::get<runtime::ObjectRef>(arr4Res.value);
+                auto pinArr4 = heap->retain(arr4Ref);
+
+                std::vector<std::int64_t> packedOut;
+                requireCond(heap->readPackedIntArray(arr4Ref, packedOut) &&
+                            packedOut == std::vector<std::int64_t>{11, 22, 33, 44},
+                            "readPackedIntArray on inline small array failed");
+                const std::array<std::int64_t, 4> newVals{101, 202, 303, 404};
+                requireCond(heap->writePackedIntArray(arr4Ref, newVals.data(), newVals.size()),
+                            "writePackedIntArray on inline small array failed");
+
+                const auto snap = heap->snapshot(&emptyRoots);
+                requireCond(heap->restore(snap), "HeapSnapshot restore with inline small array failed");
+                std::vector<std::int64_t> afterRestore;
+                requireCond(heap->readPackedIntArray(arr4Ref, afterRestore) &&
+                            afterRestore == std::vector<std::int64_t>{101, 202, 303, 404},
+                            "Inline small array values corrupted across snapshot/restore");
+            }
+        }
+    }
 }
 
 } // namespace
@@ -972,18 +2071,39 @@ int main() {
                 (void)runBenchCase(runtime, "Bench.GameMath::benchTrigSqrtMath", 200, 1, 2);
                 (void)runBenchCase(runtime, "Bench.GameMath::benchQuatMath", 200, 1, 2);
                 (void)runBenchCase(runtime, "Bench.GameMath::benchTransformRigMath", 200, 1, 2);
+                (void)runBenchCase(runtime, "Bench.GameMath::benchSmallFrameInline", 200, 1, 2);
+                (void)runBenchCase(runtime, "Bench.GameMath::benchIntArrayLoop", 4, 1, 2);
+                (void)runBenchCase(runtime, "Bench.GameMath::benchFloatArrayLoop", 4, 1, 2);
+                (void)runBenchCase(runtime, "Bench.GameMath::benchVec3ArrayLoop", 4, 1, 2);
+                (void)runBenchCase(runtime, "Bench.GameMath::benchObjectArrayLoop", 4, 1, 2);
+                (void)runBenchCase(runtime, "Bench.GameMath::benchObjectFieldScalar", 200, 1, 2);
+                (void)runBenchCase(runtime, "Bench.GameMath::benchObjectFieldTransform", 200, 1, 2);
+                (void)runBenchCase(runtime, "Bench.GameMath::benchObjectAllocTick", 200, 1, 2);
             } else {
                 constexpr std::int64_t kSteps = 10000;
+                constexpr std::int64_t kArrayPasses = 40; // 256 * 40 = 10,240 element steps
                 const auto floatMetrics = runBenchCase(runtime, "Bench.GameMath::benchFloatMath", kSteps, 5, 15);
                 const auto fixedMetrics = runBenchCase(runtime, "Bench.GameMath::benchFixedMath", kSteps, 5, 15);
                 const auto vec3Metrics = runBenchCase(runtime, "Bench.GameMath::benchVec3Math", kSteps, 5, 15);
                 const auto trigMetrics = runBenchCase(runtime, "Bench.GameMath::benchTrigSqrtMath", kSteps, 5, 15);
                 const auto quatMetrics = runBenchCase(runtime, "Bench.GameMath::benchQuatMath", kSteps, 5, 15);
                 const auto rigMetrics = runBenchCase(runtime, "Bench.GameMath::benchTransformRigMath", kSteps, 5, 15);
+                const auto inlineMetrics = runBenchCase(runtime, "Bench.GameMath::benchSmallFrameInline", kSteps, 5, 15);
+                const auto intArrMetrics = runBenchCase(runtime, "Bench.GameMath::benchIntArrayLoop", kArrayPasses, 5, 15);
+                const auto floatArrMetrics = runBenchCase(runtime, "Bench.GameMath::benchFloatArrayLoop", kArrayPasses, 5, 15);
+                const auto vec3ArrMetrics = runBenchCase(runtime, "Bench.GameMath::benchVec3ArrayLoop", kArrayPasses, 5, 15);
+                const auto objArrMetrics = runBenchCase(runtime, "Bench.GameMath::benchObjectArrayLoop", kArrayPasses, 5, 15);
+                const auto objFieldScalarMetrics = runBenchCase(runtime, "Bench.GameMath::benchObjectFieldScalar", kSteps, 5, 15);
+                const auto objFieldTransMetrics = runBenchCase(runtime, "Bench.GameMath::benchObjectFieldTransform", kSteps, 5, 15);
+                const auto objAllocMetrics = runBenchCase(runtime, "Bench.GameMath::benchObjectAllocTick", kSteps, 5, 15);
 
                 std::cout << std::fixed << std::setprecision(2);
-                std::cout << "=== RealScript Game Math FlatOpcode Benchmark (10,000 iterations, -O2) ===\n";
-                for (const auto& m : {floatMetrics, fixedMetrics, vec3Metrics, trigMetrics, quatMetrics, rigMetrics}) {
+                std::cout << "=== RealScript Game Math, Typed Array & Object IC/Nursery Benchmark (-O2) ===\n";
+                for (const auto& m : {
+                         floatMetrics, fixedMetrics, vec3Metrics, trigMetrics,
+                         quatMetrics, rigMetrics, inlineMetrics,
+                         intArrMetrics, floatArrMetrics, vec3ArrMetrics, objArrMetrics,
+                         objFieldScalarMetrics, objFieldTransMetrics, objAllocMetrics}) {
                     std::cout << "[PASS] " << m.entry
                               << " | median=" << m.medianMicroseconds << " us"
                               << " (min=" << m.minMicroseconds << " us)"

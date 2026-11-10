@@ -284,6 +284,12 @@ struct ManagedHeap::Impl {
                 ? static_cast<std::size_t>(inlineValueCount)
                 : values.size();
         }
+        [[nodiscard]] const Value* dataPtr() const noexcept {
+            return usesInlineValues ? inlineValues.data() : values.data();
+        }
+        [[nodiscard]] Value* dataPtr() noexcept {
+            return usesInlineValues ? inlineValues.data() : values.data();
+        }
         [[nodiscard]] const Value& valueAt(std::size_t index) const noexcept {
             return usesInlineValues ? inlineValues[index] : values[index];
         }
@@ -291,22 +297,19 @@ struct ManagedHeap::Impl {
             return usesInlineValues ? inlineValues[index] : values[index];
         }
         void clearValues() noexcept {
-            if (usesInlineValues) {
-                if (inlineValueCount != 0) {
-                    std::memset(inlineValues.data(), 0, static_cast<std::size_t>(inlineValueCount) * sizeof(Value));
-                }
-                inlineValueCount = 0;
-                usesInlineValues = false;
+            inlineValueCount = 0;
+            usesInlineValues = false;
+            if (!values.empty()) {
+                values.clear();
             }
-            values.clear();
         }
 
         void reset() noexcept {
             header = Header{};
             clearValues(); // Retain capacity in slot pool to avoid malloc/free churn!
-            stringPayload.clear();
-            referenceFields.reset();
-            rawColumnView.reset();
+            if (!stringPayload.empty()) stringPayload.clear();
+            if (referenceFields) referenceFields.reset();
+            if (rawColumnView.has_value()) rawColumnView.reset();
         }
     };
 
@@ -416,8 +419,10 @@ struct ManagedHeap::Impl {
     std::vector<Slot> slots;
     std::vector<std::uint32_t> freeSlots;
     std::vector<ObjectRef> markStack;
+    std::vector<ObjectRef> youngWorkQueue;
     std::vector<std::uint32_t> nurserySlots;
     std::vector<ObjectRef> rememberedSet;
+    semantic::SymbolId lastRegisteredLayoutTypeId = 0;
     std::unordered_map<RootToken, Value> persistentRoots;
     std::unordered_map<semantic::SymbolId, Value> staticFields;
     std::unordered_map<std::string, NativeEcsColumnTable> nativeEcsTables;
@@ -462,7 +467,8 @@ struct ManagedHeap::Impl {
 
     [[nodiscard]] std::optional<std::uint32_t> acquireSlot(
         std::size_t sizeBytes,
-        RuntimeError* error) {
+        RuntimeError* error,
+        bool* outReallocated = nullptr) {
         if (sizeBytes == std::numeric_limits<std::size_t>::max() ||
             sizeBytes > config.maximumHeapBytes ||
             statistics.liveBytes > config.maximumHeapBytes - sizeBytes) {
@@ -480,6 +486,14 @@ struct ManagedHeap::Impl {
             setHeapError(error, ErrorCode::OutOfMemory,
                 "managed heap exhausted the object handle space");
             return std::nullopt;
+        }
+        if (slots.size() == slots.capacity()) {
+            if (outReallocated) *outReallocated = true;
+            if (slots.empty()) {
+                slots.reserve(64);
+                freeSlots.reserve(64);
+                nurserySlots.reserve(64);
+            }
         }
         const auto slotIndex = static_cast<std::uint32_t>(slots.size());
         slots.emplace_back();
@@ -545,15 +559,29 @@ struct ManagedHeap::Impl {
         std::size_t length,
         const Value& initialValue,
         std::size_t sizeBytes,
-        RuntimeError* error) {
-        const auto slotIndex = acquireSlot(sizeBytes, error);
+        RuntimeError* error,
+        bool* outReallocated = nullptr) {
+        const auto slotIndex = acquireSlot(sizeBytes, error, outReallocated);
         if (!slotIndex) return std::nullopt;
         auto& object = slots[*slotIndex].object.storage;
-        object.clearValues();
-        object.stringPayload.clear();
-        // Reuse existing vector capacity in-place without malloc/free!
-        pinValueInPools(initialValue);
-        object.values.assign(length, initialValue);
+        if (!object.stringPayload.empty()) object.stringPayload.clear();
+        if (object.rawColumnView.has_value()) object.rawColumnView.reset();
+        if (initialValue.isTraceable()) {
+            pinValueInPools(initialValue);
+        }
+        if (length <= HeapObject::InlineFieldCapacity) {
+            if (!object.values.empty()) object.values.clear();
+            object.usesInlineValues = true;
+            object.inlineValueCount = static_cast<std::uint8_t>(length);
+            for (std::size_t i = 0; i < length; ++i) {
+                object.inlineValues[i] = initialValue;
+            }
+        } else {
+            object.inlineValueCount = 0;
+            object.usesInlineValues = false;
+            // Reuse existing vector capacity in-place without malloc/free!
+            object.values.assign(length, initialValue);
+        }
         return finalizeSlotAllocation(
             *slotIndex, ObjectKind::Array, arrayTypeId,
             elementType, elementTypeId, nullptr, sizeBytes);
@@ -600,7 +628,8 @@ struct ManagedHeap::Impl {
         }
         return finalizeSlotAllocation(
             *slotIndex, kind, typeId, elementType, elementTypeId,
-            std::move(referenceFields), sizeBytes);
+            (referenceFields && !referenceFields->empty()) ? std::move(referenceFields) : nullptr,
+            sizeBytes);
     }
 
     void mark(ObjectRef reference) {
@@ -684,7 +713,7 @@ struct ManagedHeap::Impl {
 
     void markRoots(const ShadowStack& shadowStack) {
         lastScannedShadowStackId = shadowStack.instanceId();
-        shadowStack.visitRoots([&](const Value& value) { markValue(value); });
+        shadowStack.visitTraceableRoots([&](const Value& value) { markValue(value); });
         for (const auto& entry : persistentRoots) markValue(entry.second);
         for (const auto& entry : staticFields) markValue(entry.second);
         for (const auto& [typeName, table] : nativeEcsTables) {
@@ -841,6 +870,18 @@ std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
     std::size_t length,
     Value initialValue,
     RuntimeError* error) {
+    return allocateTypedArray(
+        arrayTypeId, elementType, elementTypeId, length, std::move(initialValue), error, nullptr);
+}
+
+std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
+    semantic::SymbolId arrayTypeId,
+    semantic::PrimitiveType elementType,
+    semantic::SymbolId elementTypeId,
+    std::size_t length,
+    Value initialValue,
+    RuntimeError* error,
+    bool* outSlotsReallocated) {
     const bool validElement = elementType == semantic::PrimitiveType::Error ||
         elementType == semantic::PrimitiveType::Bool ||
         semantic::isNumericType(elementType) ||
@@ -876,7 +917,8 @@ std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
         length,
         initialValue,
         Impl::BaseObjectSizeBytes + storage,
-        error);
+        error,
+        outSlotsReallocated);
 }
 
 std::optional<ObjectRef> ManagedHeap::allocateRecord(
@@ -938,6 +980,7 @@ std::optional<ObjectRef> ManagedHeap::allocateObject(
         sharedRefs = std::make_shared<const std::vector<std::size_t>>(std::move(referenceFields));
         impl_->sharedTypeReferenceFields[typeId] = sharedRefs;
     }
+    impl_->lastRegisteredLayoutTypeId = typeId;
     return impl_->allocateValuesSlot(
         ObjectKind::Record,
         typeId,
@@ -947,6 +990,62 @@ std::optional<ObjectRef> ManagedHeap::allocateObject(
         std::move(sharedRefs),
         Impl::BaseObjectSizeBytes + storage,
         error);
+}
+
+std::optional<ObjectRef> ManagedHeap::allocateObjectFromTemplate(
+    semantic::SymbolId typeId,
+    const Value* defaultFields,
+    std::size_t fieldCount,
+    const std::shared_ptr<const std::vector<std::size_t>>& referenceFields,
+    RuntimeError* error,
+    bool* outSlotsReallocated) {
+    if (typeId == 0) {
+        setHeapError(error, ErrorCode::InvalidArguments,
+            "managed object type ID must be non-zero");
+        return std::nullopt;
+    }
+    const auto storage = estimateValueStorage(fieldCount);
+    if (storage == std::numeric_limits<std::size_t>::max()) {
+        setHeapError(error, ErrorCode::OutOfMemory, "managed object is too large");
+        return std::nullopt;
+    }
+    if (typeId != impl_->lastRegisteredLayoutTypeId) {
+        auto& entry = impl_->sharedTypeReferenceFields[typeId];
+        if (!entry) {
+            static const auto emptyRefs = std::make_shared<const std::vector<std::size_t>>();
+            entry = referenceFields ? referenceFields : emptyRefs;
+        }
+        impl_->lastRegisteredLayoutTypeId = typeId;
+    }
+    const std::size_t sizeBytes = Impl::BaseObjectSizeBytes + storage;
+    const auto slotIndex = impl_->acquireSlot(sizeBytes, error, outSlotsReallocated);
+    if (!slotIndex) return std::nullopt;
+    auto& object = impl_->slots[*slotIndex].object.storage;
+    if (!object.stringPayload.empty()) object.stringPayload.clear();
+    if (fieldCount <= Impl::HeapObject::InlineFieldCapacity) {
+        if (!object.values.empty()) object.values.clear();
+        object.usesInlineValues = true;
+        object.inlineValueCount = static_cast<std::uint8_t>(fieldCount);
+        if (fieldCount != 0) {
+            std::memcpy(object.inlineValues.data(), defaultFields, fieldCount * sizeof(Value));
+        }
+    } else {
+        object.inlineValueCount = 0;
+        object.usesInlineValues = false;
+        object.values.assign(defaultFields, defaultFields + fieldCount);
+    }
+    std::shared_ptr<const std::vector<std::size_t>> activeRefs;
+    if (referenceFields && !referenceFields->empty()) {
+        activeRefs = referenceFields;
+    }
+    return impl_->finalizeSlotAllocation(
+        *slotIndex,
+        ObjectKind::Record,
+        typeId,
+        semantic::PrimitiveType::Error,
+        0,
+        std::move(activeRefs),
+        sizeBytes);
 }
 
 bool ManagedHeap::isAlive(ObjectRef reference) const noexcept {
@@ -1184,7 +1283,7 @@ std::optional<std::size_t> ManagedHeap::arrayLength(ObjectRef reference) const {
     if (object->rawColumnView.has_value()) {
         return object->rawColumnView->count;
     }
-    return object->values.size();
+    return object->valueCount();
 }
 
 std::optional<semantic::SymbolId> ManagedHeap::arrayTypeId(
@@ -1229,18 +1328,69 @@ std::optional<Value> ManagedHeap::arrayGet(ObjectRef reference, std::size_t inde
         }
         return Value{makeStructValueFromFields(view.structTypeId, std::move(heapFields))};
     }
-    const auto& values = object->values;
-    if (index >= values.size()) return std::nullopt;
-    return values[index];
+    const auto count = object->valueCount();
+    if (index >= count) return std::nullopt;
+    return object->dataPtr()[index];
 }
 
 const Value* ManagedHeap::arrayGetFast(ObjectRef reference, std::size_t index) const noexcept {
     const auto* object = impl_->get(reference);
     if (!object || object->header.kind != ObjectKind::Array ||
-        object->rawColumnView.has_value() || index >= object->values.size()) {
+        object->rawColumnView.has_value() || index >= object->valueCount()) {
         return nullptr;
     }
-    return &object->values[index];
+    return &object->dataPtr()[index];
+}
+
+bool ManagedHeap::tryBindArrayFastView(ObjectRef reference, ArrayFastView& outView) const noexcept {
+    auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Array ||
+        object->rawColumnView.has_value()) {
+        return false;
+    }
+    const auto count = object->valueCount();
+    if (count > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        return false;
+    }
+    outView.data = object->dataPtr();
+    outView.length = static_cast<std::uint32_t>(count);
+    outView.elementType = object->header.elementType;
+    outView.needsRememberedBarrier = (!object->header.inNursery && !object->header.inRememberedSet);
+    outView.elementTypeId = object->header.elementTypeId;
+    return true;
+}
+
+void ManagedHeap::recordArrayWriteBarrier(ObjectRef arrayRef, const Value& value) noexcept {
+    impl_->writeBarrier(arrayRef, value);
+}
+
+bool ManagedHeap::tryBindObjectFastView(ObjectRef reference, ObjectFastView& outView) const noexcept {
+    auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Record ||
+        object->header.typeId == 0) {
+        return false;
+    }
+    outView.fields = object->dataPtr();
+    outView.fieldCount = static_cast<std::uint32_t>(object->valueCount());
+    outView.typeId = object->header.typeId;
+    outView.needsRememberedBarrier = (!object->header.inNursery && !object->header.inRememberedSet);
+    return true;
+}
+
+void ManagedHeap::recordObjectWriteBarrier(ObjectRef objectRef, const Value& value) noexcept {
+    impl_->writeBarrier(objectRef, value);
+}
+
+const void* ManagedHeap::slotStorageToken() const noexcept {
+    return impl_->slots.data();
+}
+
+semantic::SymbolId ManagedHeap::objectTypeIdFast(ObjectRef reference) const noexcept {
+    const auto* object = impl_->get(reference);
+    if (!object || object->header.kind != ObjectKind::Record) {
+        return 0;
+    }
+    return object->header.typeId;
 }
 
 bool ManagedHeap::arraySetPrevalidated(
@@ -1269,14 +1419,16 @@ bool ManagedHeap::arraySetPrevalidated(
         }
         return true;
     }
-    if (index >= object->values.size()) {
+    if (index >= object->valueCount()) {
         return false;
     }
     if (mayBeReference) {
         impl_->writeBarrier(reference, value);
     }
-    pinValueInPools(value);
-    object->values[index] = value;
+    if (value.isTraceable()) {
+        pinValueInPools(value);
+    }
+    object->dataPtr()[index] = value;
     return true;
 }
 
@@ -1322,8 +1474,9 @@ bool ManagedHeap::arraySet(
         }
         return true;
     }
-    auto& values = object->values;
-    if (index >= values.size()) {
+    const auto valueLen = object->valueCount();
+    Value* values = object->dataPtr();
+    if (index >= valueLen) {
         setHeapError(error, ErrorCode::IndexOutOfRange,
             "managed array index is out of range");
         return false;
@@ -1381,7 +1534,9 @@ bool ManagedHeap::arraySet(
             return false;
         }
     }
-    pinValueInPools(value);
+    if (value.isTraceable()) {
+        pinValueInPools(value);
+    }
     impl_->writeBarrier(reference, value);
     values[index] = std::move(value);
     return true;
@@ -1453,7 +1608,9 @@ bool ManagedHeap::fieldSet(
             index)) {
         impl_->writeBarrier(reference, value);
     }
-    pinValueInPools(value);
+    if (value.isTraceable()) {
+        pinValueInPools(value);
+    }
     object->valueAt(index) = std::move(value);
     return true;
 }
@@ -1483,7 +1640,9 @@ bool ManagedHeap::fieldSetFast(
             index)) {
         impl_->writeBarrier(reference, value);
     }
-    pinValueInPools(value);
+    if (value.isTraceable()) {
+        pinValueInPools(value);
+    }
     object->valueAt(index) = value;
     return true;
 }
@@ -1947,8 +2106,9 @@ std::size_t ManagedHeap::collectYoung(
         }
     }
 
-    std::vector<ObjectRef> youngQueue;
-    std::unordered_set<const StructStorage*> visitedStructs;
+    auto& youngQueue = impl_->youngWorkQueue;
+    youngQueue.clear();
+    std::optional<std::unordered_set<const StructStorage*>> visitedStructs;
     const auto markYoungValue = [&](const auto& self, const Value& val) -> void {
         if (!val.isTraceable()) return;
         const auto t = val.rawTag();
@@ -1963,16 +2123,18 @@ std::size_t ManagedHeap::collectYoung(
         }
         if (t == ValueTag::Struct) {
             const auto& structure = val.asStructUnchecked();
-            if (!structure.isInline && structure.storage &&
-                visitedStructs.insert(structure.storage.get()).second) {
-                for (const auto& field : structure.storage->fields) {
-                    self(self, field);
+            if (!structure.isInline && structure.storage) {
+                if (!visitedStructs.has_value()) visitedStructs.emplace();
+                if (visitedStructs->insert(structure.storage.get()).second) {
+                    for (const auto& field : structure.storage->fields) {
+                        self(self, field);
+                    }
                 }
             }
         }
     };
 
-    shadowStack.visitRoots([&](const Value& val) { markYoungValue(markYoungValue, val); });
+    shadowStack.visitTraceableRoots([&](const Value& val) { markYoungValue(markYoungValue, val); });
     for (const auto& entry : impl_->persistentRoots) markYoungValue(markYoungValue, entry.second);
     for (const auto& entry : impl_->staticFields) markYoungValue(markYoungValue, entry.second);
     for (const auto& [typeName, table] : impl_->nativeEcsTables) {
@@ -2068,9 +2230,10 @@ bool ManagedHeap::readPackedIntArray(
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
         return false;
     }
-    const auto& values = object->values;
-    out.resize(values.size());
-    for (std::size_t i = 0; i < values.size(); ++i) {
+    const auto len = object->valueCount();
+    const Value* values = object->dataPtr();
+    out.resize(len);
+    for (std::size_t i = 0; i < len; ++i) {
         if (const auto* iv = std::get_if<std::int64_t>(&values[i])) {
             out[i] = *iv;
         } else if (const auto* lv = std::get_if<LongValue>(&values[i])) {
@@ -2103,8 +2266,9 @@ bool ManagedHeap::writePackedIntArray(
         setHeapError(error, ErrorCode::TypeMismatch, "array element is not an integer");
         return false;
     }
-    auto& values = object->values;
-    if (count > values.size()) {
+    const auto len = object->valueCount();
+    Value* values = object->dataPtr();
+    if (count > len) {
         setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
         return false;
     }
@@ -2124,9 +2288,10 @@ bool ManagedHeap::readPackedDoubleArray(
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
         return false;
     }
-    const auto& values = object->values;
-    out.resize(values.size());
-    for (std::size_t i = 0; i < values.size(); ++i) {
+    const auto len = object->valueCount();
+    const Value* values = object->dataPtr();
+    out.resize(len);
+    for (std::size_t i = 0; i < len; ++i) {
         if (const auto* dv = std::get_if<double>(&values[i])) {
             out[i] = *dv;
         } else if (const auto* fv = std::get_if<FloatValue>(&values[i])) {
@@ -2159,8 +2324,9 @@ bool ManagedHeap::writePackedDoubleArray(
         setHeapError(error, ErrorCode::TypeMismatch, "array element is not a floating-point number");
         return false;
     }
-    auto& values = object->values;
-    if (count > values.size()) {
+    const auto len = object->valueCount();
+    Value* values = object->dataPtr();
+    if (count > len) {
         setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
         return false;
     }
@@ -2180,9 +2346,10 @@ bool ManagedHeap::readPackedVec2Array(
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
         return false;
     }
-    const auto& values = object->values;
-    out.resize(values.size());
-    for (std::size_t i = 0; i < values.size(); ++i) {
+    const auto len = object->valueCount();
+    const Value* values = object->dataPtr();
+    out.resize(len);
+    for (std::size_t i = 0; i < len; ++i) {
         if (const auto* v2 = std::get_if<Vec2Value>(&values[i])) {
             out[i] = *v2;
         } else {
@@ -2219,8 +2386,9 @@ bool ManagedHeap::writePackedVec2Array(
         setHeapError(error, ErrorCode::TypeMismatch, "array element is not a Vec2");
         return false;
     }
-    auto& values = object->values;
-    if (count > values.size()) {
+    const auto len = object->valueCount();
+    Value* values = object->dataPtr();
+    if (count > len) {
         setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
         return false;
     }
@@ -2437,8 +2605,7 @@ bool ManagedHeap::restore(
                     return false;
                 }
             }
-            if (info.kind == ObjectKind::Record &&
-                info.values.size() <= Impl::HeapObject::InlineFieldCapacity) {
+            if (info.values.size() <= Impl::HeapObject::InlineFieldCapacity) {
                 object.usesInlineValues = true;
                 object.inlineValueCount = static_cast<std::uint8_t>(info.values.size());
                 for (std::size_t fi = 0; fi < info.values.size(); ++fi) {

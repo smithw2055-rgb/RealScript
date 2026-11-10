@@ -1491,6 +1491,58 @@ bool buildDelegateList(
 #define RS_QUICK_UNLIKELY(x) (x)
 #endif
 
+inline bool tryEvaluateQuickIntNoFail(
+    detail::QuickOpcode opcode,
+    bool checkedArithmetic,
+    std::int64_t left,
+    std::int64_t right,
+    Value& output) noexcept {
+    const auto writeChecked = [&](std::int64_t v) noexcept -> bool {
+        if (RS_QUICK_UNLIKELY(
+                v < std::numeric_limits<std::int32_t>::min() ||
+                v > std::numeric_limits<std::int32_t>::max())) {
+            return false;
+        }
+        output.storeInt64(v);
+        return true;
+    };
+    switch (opcode) {
+    case detail::QuickOpcode::AddInt:
+        if (checkedArithmetic) return writeChecked(left + right);
+        output.storeInt64(wrapInt32(left + right));
+        return true;
+    case detail::QuickOpcode::SubtractInt:
+        if (checkedArithmetic) return writeChecked(left - right);
+        output.storeInt64(wrapInt32(left - right));
+        return true;
+    case detail::QuickOpcode::MultiplyInt:
+        if (checkedArithmetic) return writeChecked(left * right);
+        output.storeInt64(wrapInt32(left * right));
+        return true;
+    case detail::QuickOpcode::DivideInt:
+        if (RS_QUICK_UNLIKELY(right == 0 || (left == std::numeric_limits<std::int32_t>::min() && right == -1))) {
+            return false;
+        }
+        output.storeInt64(left / right);
+        return true;
+    case detail::QuickOpcode::RemainderInt:
+        if (RS_QUICK_UNLIKELY(right == 0)) return false;
+        output.storeInt64(
+            (left == std::numeric_limits<std::int32_t>::min() && right == -1)
+                ? std::int64_t{0}
+                : (left % right));
+        return true;
+    case detail::QuickOpcode::LessInt: output.storeBool(left < right); return true;
+    case detail::QuickOpcode::LessOrEqualInt: output.storeBool(left <= right); return true;
+    case detail::QuickOpcode::GreaterInt: output.storeBool(left > right); return true;
+    case detail::QuickOpcode::GreaterOrEqualInt: output.storeBool(left >= right); return true;
+    case detail::QuickOpcode::EqualInt: output.storeBool(left == right); return true;
+    case detail::QuickOpcode::NotEqualInt: output.storeBool(left != right); return true;
+    default:
+        return false;
+    }
+}
+
 inline bool evaluateQuickIntInPlace(
     State& state,
     detail::QuickOpcode opcode,
@@ -3190,11 +3242,62 @@ bool executeFunction(
         const bool gcBudgetEnabled = (state.limits.gcWorkBudget != 0 && state.heap != nullptr);
         bool gcActive = gcBudgetEnabled &&
             (state.heap->phase() != GcPhase::Idle || state.heap->collectionRequested());
+        struct FlatArrayCacheEntry {
+            ObjectRef ref{};
+            ArrayFastView view{};
+            bool valid = false;
+        };
+        struct FlatObjectCacheEntry {
+            ObjectRef ref{};
+            ObjectFastView view{};
+            semantic::SymbolId verifiedBaseTid = 0;
+            bool valid = false;
+        };
+        std::array<FlatArrayCacheEntry, 4> arrayCache{};
+        std::array<FlatObjectCacheEntry, 4> objectCache{};
+        semantic::SymbolId cachedAssignableSubTid = 0;
+        semantic::SymbolId cachedAssignableBaseTid = 0;
+
+        const auto invalidateAllFlatCaches = [&]() noexcept {
+            arrayCache[0].valid = false;
+            arrayCache[1].valid = false;
+            arrayCache[2].valid = false;
+            arrayCache[3].valid = false;
+            objectCache[0].valid = false;
+            objectCache[1].valid = false;
+            objectCache[2].valid = false;
+            objectCache[3].valid = false;
+        };
+
+        const auto bindArrayCacheSlot = [&](const Value& arrVal, FlatArrayCacheEntry& ce) noexcept -> bool {
+            if (RS_FLAT_UNLIKELY(arrVal.rawTag() != ValueTag::ObjectRef || state.heap == nullptr)) {
+                return false;
+            }
+            const ObjectRef ref = arrVal.u_.objectRef;
+            if (RS_FLAT_UNLIKELY(!state.heap->tryBindArrayFastView(ref, ce.view))) {
+                return false;
+            }
+            ce.ref = ref;
+            ce.valid = true;
+            return true;
+        };
+
+        const auto bindObjectCacheEntry = [&](const ObjectRef& ref, FlatObjectCacheEntry& oce) noexcept -> bool {
+            if (RS_FLAT_UNLIKELY(state.heap == nullptr || !state.heap->tryBindObjectFastView(ref, oce.view))) {
+                return false;
+            }
+            oce.ref = ref;
+            oce.verifiedBaseTid = 0;
+            oce.valid = true;
+            return true;
+        };
+
         const auto flushFlatGc = [&]() {
             if (localExecuted > gcAccounted) {
                 state.executed = localExecuted;
                 stepGcIfNeeded(state, localExecuted - gcAccounted);
                 gcAccounted = localExecuted;
+                invalidateAllFlatCaches();
             }
             gcActive = gcBudgetEnabled &&
                 (state.heap->phase() != GcPhase::Idle || state.heap->collectionRequested());
@@ -3202,12 +3305,14 @@ bool executeFunction(
         const auto syncAfterFlatSubcall = [&]() {
             localExecuted = state.executed;
             gcAccounted = localExecuted;
+            invalidateAllFlatCaches();
             if (gcBudgetEnabled) {
                 gcActive = (state.heap->phase() != GcPhase::Idle || state.heap->collectionRequested());
             }
         };
         const std::uint64_t budgetLimit = state.limits.instructionBudget;
         const detail::FlatInstruction* const streamBase = execution->flatStream.data();
+        const detail::FlatColdMeta* const flatColdBase = execution->flatCold.data();
         const detail::FlatInstruction* ip = streamBase + execution->entryStreamOffset;
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -3360,6 +3465,24 @@ bool executeFunction(
             &&L_SuperQuatMulNormalized,
             &&L_SuperQuatMulChain,
             &&L_SuperQuatMulRotateVec3,
+            &&L_SuperMoveParamStoreLocalElided,
+            &&L_SuperBinaryLocalIntConstStoreJump,
+            &&L_SuperBinaryLocalIntLocalStoreJump,
+            &&L_SuperBinaryLocalIntRegStoreJump,
+            &&L_SuperCheckNotNullCallPolledFast,
+            &&L_InlineCallEnter,
+            &&L_InlineReturnVoid,
+            &&L_InlineReturnVoidJump,
+            &&L_InlineReturnScalar,
+            &&L_InlineReturnScalarJump,
+            &&L_LoadElementTypedFast,
+            &&L_StoreElementPrimFast,
+            &&L_StoreElementStructFast,
+            &&L_StoreElementObjFast,
+            &&L_SuperLessLocalArrayLengthBranch,
+            &&L_NewObjectFast,
+            &&L_LoadFieldExactFast,
+            &&L_StoreFieldExactFast,
             &&L_GenericBytecode,
             &&L_TermJumpNoArgs,
             &&L_TermBranchBoolNoArgs,
@@ -3397,110 +3520,169 @@ bool executeFunction(
                 RS_FLAT_DISPATCH_NEXT();
             }
 
+            #define RS_FLAT_SPAN_CHECK() \
+                const std::uint64_t spanCost = ip->span; \
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) { \
+                    if (spanCost > 1u) goto L_FlatSuperFallback; \
+                    goto L_FlatBudgetExceeded; \
+                }
+
             RS_FLAT_CASE(AddIntChecked) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
                 std::int64_t a = 0, b = 0;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(a) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(b))) goto L_FlatTypeMismatch;
+                                     !frameBase[ip->src1Slot].tryGetInt64(b))) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    goto L_FlatTypeMismatch;
+                }
                 const std::int64_t res = a + b;
                 if (RS_FLAT_UNLIKELY(res < std::numeric_limits<std::int32_t>::min() ||
                     res > std::numeric_limits<std::int32_t>::max())) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
                     state.executed = localExecuted;
                     fail(state, ErrorCode::IntegerOverflow, "integer overflow");
                     goto L_FlatError;
                 }
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeInt64(res);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(AddIntUnchecked) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
                 std::int64_t a = 0, b = 0;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(a) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(b))) goto L_FlatTypeMismatch;
+                                     !frameBase[ip->src1Slot].tryGetInt64(b))) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    goto L_FlatTypeMismatch;
+                }
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeInt64(wrapInt32(a + b));
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(SubIntChecked) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
                 std::int64_t a = 0, b = 0;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(a) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(b))) goto L_FlatTypeMismatch;
+                                     !frameBase[ip->src1Slot].tryGetInt64(b))) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    goto L_FlatTypeMismatch;
+                }
                 const std::int64_t res = a - b;
                 if (RS_FLAT_UNLIKELY(res < std::numeric_limits<std::int32_t>::min() ||
                     res > std::numeric_limits<std::int32_t>::max())) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
                     state.executed = localExecuted;
                     fail(state, ErrorCode::IntegerOverflow, "integer overflow");
                     goto L_FlatError;
                 }
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeInt64(res);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(SubIntUnchecked) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
                 std::int64_t a = 0, b = 0;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(a) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(b))) goto L_FlatTypeMismatch;
+                                     !frameBase[ip->src1Slot].tryGetInt64(b))) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    goto L_FlatTypeMismatch;
+                }
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeInt64(wrapInt32(a - b));
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(MulIntChecked) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
                 std::int64_t a = 0, b = 0;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(a) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(b))) goto L_FlatTypeMismatch;
+                                     !frameBase[ip->src1Slot].tryGetInt64(b))) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    goto L_FlatTypeMismatch;
+                }
                 const std::int64_t res = a * b;
                 if (RS_FLAT_UNLIKELY(res < std::numeric_limits<std::int32_t>::min() ||
                     res > std::numeric_limits<std::int32_t>::max())) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
                     state.executed = localExecuted;
                     fail(state, ErrorCode::IntegerOverflow, "integer overflow");
                     goto L_FlatError;
                 }
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeInt64(res);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(MulIntUnchecked) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
                 std::int64_t a = 0, b = 0;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(a) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(b))) goto L_FlatTypeMismatch;
+                                     !frameBase[ip->src1Slot].tryGetInt64(b))) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    goto L_FlatTypeMismatch;
+                }
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeInt64(wrapInt32(a * b));
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(DivInt) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
                 std::int64_t a = 0, b = 0;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(a) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(b))) goto L_FlatTypeMismatch;
+                                     !frameBase[ip->src1Slot].tryGetInt64(b))) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    goto L_FlatTypeMismatch;
+                }
                 if (RS_FLAT_UNLIKELY(b == 0)) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
                     state.executed = localExecuted;
                     fail(state, ErrorCode::DivisionByZero, "division by zero");
                     goto L_FlatError;
                 }
                 if (RS_FLAT_UNLIKELY(a == std::numeric_limits<std::int32_t>::min() && b == -1)) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
                     state.executed = localExecuted;
                     fail(state, ErrorCode::IntegerOverflow, "integer division overflow");
                     goto L_FlatError;
                 }
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeInt64(a / b);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(RemInt) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
                 std::int64_t a = 0, b = 0;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(a) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(b))) goto L_FlatTypeMismatch;
+                                     !frameBase[ip->src1Slot].tryGetInt64(b))) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    goto L_FlatTypeMismatch;
+                }
                 if (RS_FLAT_UNLIKELY(b == 0)) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
                     state.executed = localExecuted;
                     fail(state, ErrorCode::DivisionByZero, "remainder by zero");
                     goto L_FlatError;
                 }
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeInt64(
                     (a == std::numeric_limits<std::int32_t>::min() && b == -1)
                         ? std::int64_t{0}
@@ -3509,55 +3691,85 @@ bool executeFunction(
             }
 
             RS_FLAT_CASE(LessInt) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
                 std::int64_t a = 0, b = 0;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(a) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(b))) goto L_FlatTypeMismatch;
+                                     !frameBase[ip->src1Slot].tryGetInt64(b))) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    goto L_FlatTypeMismatch;
+                }
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeBool(a < b);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(LessOrEqualInt) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
                 std::int64_t a = 0, b = 0;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(a) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(b))) goto L_FlatTypeMismatch;
+                                     !frameBase[ip->src1Slot].tryGetInt64(b))) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    goto L_FlatTypeMismatch;
+                }
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeBool(a <= b);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(GreaterInt) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
                 std::int64_t a = 0, b = 0;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(a) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(b))) goto L_FlatTypeMismatch;
+                                     !frameBase[ip->src1Slot].tryGetInt64(b))) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    goto L_FlatTypeMismatch;
+                }
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeBool(a > b);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(GreaterOrEqualInt) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
                 std::int64_t a = 0, b = 0;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(a) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(b))) goto L_FlatTypeMismatch;
+                                     !frameBase[ip->src1Slot].tryGetInt64(b))) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    goto L_FlatTypeMismatch;
+                }
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeBool(a >= b);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(EqualInt) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
                 std::int64_t a = 0, b = 0;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(a) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(b))) goto L_FlatTypeMismatch;
+                                     !frameBase[ip->src1Slot].tryGetInt64(b))) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    goto L_FlatTypeMismatch;
+                }
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeBool(a == b);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(NotEqualInt) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
                 std::int64_t a = 0, b = 0;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(a) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(b))) goto L_FlatTypeMismatch;
+                                     !frameBase[ip->src1Slot].tryGetInt64(b))) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    goto L_FlatTypeMismatch;
+                }
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeBool(a != b);
                 RS_FLAT_DISPATCH_NEXT();
             }
@@ -3584,7 +3796,7 @@ bool executeFunction(
                 frameBase[ip->aux0Slot].storeInt64(right);
                 localExecuted += 3;
                 state.executed = localExecuted;
-                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checkedArithmetic1, left, right, frameBase[ip->aux1Slot]))) {
+                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checked1(), left, right, frameBase[ip->aux1Slot]))) {
                     goto L_FlatError;
                 }
                 RS_FLAT_DISPATCH_NEXT();
@@ -3602,7 +3814,7 @@ bool executeFunction(
                 localExecuted += 3;
                 state.executed = localExecuted;
                 if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(
-                        state, ip->binaryOpcode1, ip->checkedArithmetic1, left, right,
+                        state, ip->binaryOpcode1, ip->checked1(), left, right,
                         frameBase[ip->aux1Slot], &frameBase[ip->storeSlot]))) {
                     goto L_FlatError;
                 }
@@ -3619,7 +3831,7 @@ bool executeFunction(
                 const std::int64_t right = ip->integerImmediate;
                 localExecuted += 3;
                 state.executed = localExecuted;
-                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checkedArithmetic1, left, right, frameBase[ip->storeSlot]))) {
+                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checked1(), left, right, frameBase[ip->storeSlot]))) {
                     goto L_FlatError;
                 }
                 ++localExecuted;
@@ -3637,7 +3849,7 @@ bool executeFunction(
                 frameBase[ip->aux0Slot].storeInt64(right);
                 localExecuted += 3;
                 state.executed = localExecuted;
-                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checkedArithmetic1, left, right, frameBase[ip->aux1Slot]))) {
+                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checked1(), left, right, frameBase[ip->aux1Slot]))) {
                     goto L_FlatError;
                 }
                 RS_FLAT_DISPATCH_NEXT();
@@ -3655,7 +3867,7 @@ bool executeFunction(
                 localExecuted += 3;
                 state.executed = localExecuted;
                 if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(
-                        state, ip->binaryOpcode1, ip->checkedArithmetic1, left, right,
+                        state, ip->binaryOpcode1, ip->checked1(), left, right,
                         frameBase[ip->aux1Slot], &frameBase[ip->storeSlot]))) {
                     goto L_FlatError;
                 }
@@ -3672,7 +3884,7 @@ bool executeFunction(
                                      !frameBase[ip->src1Slot].tryGetInt64(right))) goto L_FlatTypeMismatch;
                 localExecuted += 3;
                 state.executed = localExecuted;
-                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checkedArithmetic1, left, right, frameBase[ip->storeSlot]))) {
+                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checked1(), left, right, frameBase[ip->storeSlot]))) {
                     goto L_FlatError;
                 }
                 ++localExecuted;
@@ -3689,7 +3901,7 @@ bool executeFunction(
                 frameBase[ip->dstSlot].storeInt64(left);
                 localExecuted += 2;
                 state.executed = localExecuted;
-                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checkedArithmetic1, left, right, frameBase[ip->aux1Slot]))) {
+                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checked1(), left, right, frameBase[ip->aux1Slot]))) {
                     goto L_FlatError;
                 }
                 RS_FLAT_DISPATCH_NEXT();
@@ -3706,7 +3918,7 @@ bool executeFunction(
                 localExecuted += 2;
                 state.executed = localExecuted;
                 if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(
-                        state, ip->binaryOpcode1, ip->checkedArithmetic1, left, right,
+                        state, ip->binaryOpcode1, ip->checked1(), left, right,
                         frameBase[ip->aux1Slot], &frameBase[ip->storeSlot]))) {
                     goto L_FlatError;
                 }
@@ -3723,7 +3935,7 @@ bool executeFunction(
                                      !frameBase[ip->src1Slot].tryGetInt64(right))) goto L_FlatTypeMismatch;
                 localExecuted += 2;
                 state.executed = localExecuted;
-                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checkedArithmetic1, left, right, frameBase[ip->storeSlot]))) {
+                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checked1(), left, right, frameBase[ip->storeSlot]))) {
                     goto L_FlatError;
                 }
                 ++localExecuted;
@@ -3740,7 +3952,7 @@ bool executeFunction(
                 frameBase[ip->dstSlot].storeInt64(left);
                 localExecuted += 2;
                 state.executed = localExecuted;
-                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checkedArithmetic1, left, right1, frameBase[ip->aux0Slot]))) {
+                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checked1(), left, right1, frameBase[ip->aux0Slot]))) {
                     goto L_FlatError;
                 }
                 const auto midInt = frameBase[ip->aux0Slot].asInt64Unchecked();
@@ -3749,7 +3961,7 @@ bool executeFunction(
                 ++localExecuted;
                 state.executed = localExecuted;
                 if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(
-                        state, ip->binaryOpcode2, ip->checkedArithmetic2, midInt, right2,
+                        state, ip->binaryOpcode2, ip->checked2(), midInt, right2,
                         frameBase[ip->aux1Slot], &frameBase[ip->storeSlot]))) {
                     goto L_FlatError;
                 }
@@ -3767,7 +3979,7 @@ bool executeFunction(
                 localExecuted += 2;
                 state.executed = localExecuted;
                 Value midOutput;
-                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checkedArithmetic1, left, right1, midOutput))) {
+                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode1, ip->checked1(), left, right1, midOutput))) {
                     goto L_FlatError;
                 }
                 const auto midInt = midOutput.asInt64Unchecked();
@@ -3775,7 +3987,7 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src2Slot].tryGetInt64(right2))) goto L_FlatTypeMismatch;
                 ++localExecuted;
                 state.executed = localExecuted;
-                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode2, ip->checkedArithmetic2, midInt, right2, frameBase[ip->storeSlot]))) {
+                if (RS_FLAT_UNLIKELY(!evaluateQuickIntInPlace(state, ip->binaryOpcode2, ip->checked2(), midInt, right2, frameBase[ip->storeSlot]))) {
                     goto L_FlatError;
                 }
                 ++localExecuted;
@@ -3831,90 +4043,88 @@ bool executeFunction(
             }
 
             RS_FLAT_CASE(CheckNotNullFast) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                const auto& val = frameBase[ip->src0Slot];
-                if (const auto* ref = std::get_if<ObjectRef>(&val); RS_FLAT_LIKELY(ref != nullptr)) {
-                    if (RS_FLAT_LIKELY(state.heap && state.heap->isAlive(*ref))) {
+                const Value& val = frameBase[ip->src0Slot];
+                if (RS_FLAT_LIKELY(val.rawTag() == ValueTag::ObjectRef)) {
+                    const ObjectRef ref = val.u_.objectRef;
+                    auto& oce = objectCache[ref.slot & 3u];
+                    if (RS_FLAT_LIKELY((oce.valid && oce.ref == ref) || bindObjectCacheEntry(ref, oce))) {
+                        RS_FLAT_SPAN_CHECK();
+                        localExecuted += spanCost;
                         frameBase[ip->dstSlot] = val;
                         RS_FLAT_DISPATCH_NEXT();
                     }
                 }
-                state.executed = localExecuted;
-                if (std::holds_alternative<NullObject>(val)) {
-                    fail(state, ErrorCode::NullReference, "field access attempted to dereference null");
-                } else {
-                    fail(state, ErrorCode::InvalidObjectReference, "field access contains an invalid managed object reference");
-                }
-                goto L_FlatError;
+                goto L_FlatMathFallback;
             }
 
             RS_FLAT_CASE(LoadElementIntFast) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                const auto& arrVal = frameBase[ip->src0Slot];
-                const auto& idxVal = frameBase[ip->src1Slot];
-                if (const auto* ref = std::get_if<ObjectRef>(&arrVal); RS_FLAT_LIKELY(ref != nullptr)) {
-                    const auto idx = std::get<std::int64_t>(idxVal);
-                    if (RS_FLAT_LIKELY(idx >= 0 && state.heap)) {
-                        if (const auto* elem = state.heap->arrayGetFast(*ref, static_cast<std::size_t>(idx));
-                            RS_FLAT_LIKELY(elem != nullptr)) {
-                            frameBase[ip->dstSlot] = *elem;
-                            RS_FLAT_DISPATCH_NEXT();
-                        }
-                    }
-                    state.executed = localExecuted;
-                    if (!state.heap || !state.heap->arrayLength(*ref)) {
-                        fail(state, ErrorCode::InvalidObjectReference, "array element load references an invalid managed array");
-                    } else {
-                        fail(state, ErrorCode::IndexOutOfRange, "array element index is out of range");
-                    }
-                    goto L_FlatError;
+                auto& ce = arrayCache[ip->src0Slot & 3u];
+                const Value& arrVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_UNLIKELY(!ce.valid ||
+                                     arrVal.rawTag() != ValueTag::ObjectRef ||
+                                     arrVal.u_.objectRef != ce.ref)) {
+                    if (!bindArrayCacheSlot(arrVal, ce)) goto L_FlatMathFallback;
                 }
-                state.executed = localExecuted;
-                if (std::holds_alternative<NullArray>(arrVal)) {
-                    fail(state, ErrorCode::NullReference, "array element load attempted to dereference null");
-                } else {
-                    fail(state, ErrorCode::InvalidObjectReference, "array element load contains an invalid managed object reference");
+                if (RS_FLAT_UNLIKELY(ce.view.elementType != semantic::PrimitiveType::Int)) {
+                    goto L_FlatMathFallback;
                 }
-                goto L_FlatError;
+                RS_FLAT_SPAN_CHECK();
+                if ((ip->arithFlags & detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u) {
+                    const auto uIdx = static_cast<std::size_t>(frameBase[ip->src1Slot].asInt64Unchecked());
+                    localExecuted += spanCost;
+                    frameBase[ip->dstSlot] = ce.view.data[uIdx];
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                std::int64_t idx = 0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx) ||
+                                     static_cast<std::uint64_t>(idx) >= ce.view.length)) {
+                    goto L_FlatMathFallback;
+                }
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot] = ce.view.data[static_cast<std::size_t>(idx)];
+                RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(StoreElementIntFast) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                const auto& arrVal = frameBase[ip->src0Slot];
-                const auto& idxVal = frameBase[ip->src1Slot];
-                const auto& storeVal = frameBase[ip->src2Slot];
-                if (const auto* ref = std::get_if<ObjectRef>(&arrVal); RS_FLAT_LIKELY(ref != nullptr)) {
-                    const auto idx = std::get<std::int64_t>(idxVal);
-                    if (RS_FLAT_LIKELY(idx >= 0 && state.heap &&
-                        state.heap->arraySetPrevalidated(*ref, static_cast<std::size_t>(idx), storeVal, false))) {
-                        RS_FLAT_DISPATCH_NEXT();
-                    }
-                    state.executed = localExecuted;
-                    if (!state.heap || !state.heap->arrayLength(*ref)) {
-                        fail(state, ErrorCode::InvalidObjectReference, "array element store references an invalid managed array");
-                    } else {
-                        fail(state, ErrorCode::IndexOutOfRange, "array element index is out of range");
-                    }
-                    goto L_FlatError;
+                auto& ce = arrayCache[ip->src0Slot & 3u];
+                const Value& arrVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_UNLIKELY(!ce.valid ||
+                                     arrVal.rawTag() != ValueTag::ObjectRef ||
+                                     arrVal.u_.objectRef != ce.ref)) {
+                    if (!bindArrayCacheSlot(arrVal, ce)) goto L_FlatMathFallback;
                 }
-                state.executed = localExecuted;
-                if (std::holds_alternative<NullArray>(arrVal)) {
-                    fail(state, ErrorCode::NullReference, "array element store attempted to dereference null");
-                } else {
-                    fail(state, ErrorCode::InvalidObjectReference, "array element store contains an invalid managed object reference");
+                const Value& storeVal = frameBase[ip->src2Slot];
+                if (RS_FLAT_UNLIKELY(ce.view.elementType != semantic::PrimitiveType::Int ||
+                                     storeVal.rawTag() != ValueTag::Int64)) {
+                    goto L_FlatMathFallback;
                 }
-                goto L_FlatError;
+                RS_FLAT_SPAN_CHECK();
+                if ((ip->arithFlags & detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u) {
+                    const auto uIdx = static_cast<std::size_t>(frameBase[ip->src1Slot].asInt64Unchecked());
+                    localExecuted += spanCost;
+                    ce.view.data[uIdx] = storeVal;
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                std::int64_t idx = 0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx) ||
+                                     static_cast<std::uint64_t>(idx) >= ce.view.length)) {
+                    goto L_FlatMathFallback;
+                }
+                localExecuted += spanCost;
+                ce.view.data[static_cast<std::size_t>(idx)] = storeVal;
+                RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(CallDirect0) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
+                const auto& cold = flatColdBase[ip - streamBase];
                 Value callResult;
                 const ValueWindow regWin{&state.values, frameOffset + execution->registerOffset, function.registerTypes.size()};
                 const bool ok = executeFunction(
-                    state, *ip->directTarget, ArgumentSource(regWin),
-                    callResult, ip->directExecution, true);
+                    state, *cold.directTarget, ArgumentSource(regWin),
+                    callResult, cold.directExecution, true);
                 frameBase = state.values.data() + frameOffset;
                 syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
@@ -3928,12 +4138,13 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
+                const auto& cold = flatColdBase[ip - streamBase];
                 Value callResult;
                 const ValueWindow singleWin{&state.values, frameOffset + ip->src0Slot, 1};
                 const bool ok = executeFunction(
-                    state, *ip->directTarget,
+                    state, *cold.directTarget,
                     ArgumentSource(singleWin, static_cast<bytecode::Register>(0)),
-                    callResult, ip->directExecution, true);
+                    callResult, cold.directExecution, true);
                 frameBase = state.values.data() + frameOffset;
                 syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
@@ -3947,15 +4158,16 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
+                const auto& cold = flatColdBase[ip - streamBase];
                 Value callResult;
                 const ValueWindow baseWin{&state.values, frameOffset, execution->totalFrameSlots};
                 const bool ok = executeFunction(
-                    state, *ip->directTarget,
+                    state, *cold.directTarget,
                     ArgumentSource(
                         baseWin,
                         static_cast<bytecode::Register>(ip->src0Slot),
                         static_cast<bytecode::Register>(ip->src1Slot)),
-                    callResult, ip->directExecution, true);
+                    callResult, cold.directExecution, true);
                 frameBase = state.values.data() + frameOffset;
                 syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
@@ -3969,12 +4181,13 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
+                const auto& cold = flatColdBase[ip - streamBase];
                 Value callResult;
                 const ValueWindow regWin{&state.values, frameOffset + execution->registerOffset, function.registerTypes.size()};
                 const bool ok = executeFunction(
-                    state, *ip->directTarget,
-                    ArgumentSource(regWin, ip->bytecode->operands),
-                    callResult, ip->directExecution, true);
+                    state, *cold.directTarget,
+                    ArgumentSource(regWin, cold.bytecode->operands),
+                    callResult, cold.directExecution, true);
                 frameBase = state.values.data() + frameOffset;
                 syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
@@ -3986,17 +4199,48 @@ bool executeFunction(
 
             RS_FLAT_CASE(CallPolledFast) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
-                state.executed = localExecuted;
-                const auto& instruction = *ip->bytecode;
+                const auto& cold = flatColdBase[ip - streamBase];
+                const auto& instruction = *cold.bytecode;
                 const auto* receiver = std::get_if<ObjectRef>(&frameBase[ip->src0Slot]);
                 if (RS_FLAT_LIKELY(receiver != nullptr && state.heap && state.heap->isAlive(*receiver))) {
                     const auto callSite = reinterpret_cast<std::uintptr_t>(&instruction);
                     const auto idx = static_cast<std::size_t>((callSite >> 4U) & 63U);
                     const auto& cached = (*state.inlineCallCache)[idx];
-                    if (RS_FLAT_LIKELY(cached.callSite == &instruction &&
-                        cached.receiver == *receiver &&
-                        cached.target && cached.execution)) {
+                    if (RS_FLAT_LIKELY(
+                            cached.callSite == &instruction &&
+                            cached.target && cached.execution &&
+                            (cached.receiver == *receiver ||
+                             (cached.receiverTypeId != 0 &&
+                              state.heap->objectTypeIdFast(*receiver) == cached.receiverTypeId)))) {
+                        const auto tKind = cached.execution->trivialKind;
+                        if (tKind != detail::TrivialMethodKind::None &&
+                            RS_FLAT_LIKELY(state.stack.size() < state.limits.recursionLimit)) {
+                            const std::uint64_t tCost = cached.execution->trivialInstCost;
+                            if (RS_FLAT_LIKELY(tCost <= budgetLimit - localExecuted)) {
+                                localExecuted += tCost;
+                                ++state.statistics.functionCalls;
+                                if (state.stack.size() + 1 > state.statistics.maximumCallDepth) {
+                                    state.statistics.maximumCallDepth = state.stack.size() + 1;
+                                }
+                                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                                if (ip->dstSlot != detail::InvalidCompactReg) {
+                                    if (tKind == detail::TrivialMethodKind::ReturnConst) {
+                                        frameBase[ip->dstSlot] = cached.execution->trivialConstValue;
+                                    } else if (tKind == detail::TrivialMethodKind::ReturnParam) {
+                                        const std::uint16_t pIdx = cached.execution->trivialParamIndex;
+                                        if (pIdx == 0) {
+                                            frameBase[ip->dstSlot] = frameBase[ip->src0Slot];
+                                        } else {
+                                            frameBase[ip->dstSlot] =
+                                                frameBase[execution->registerOffset + instruction.operands[pIdx]];
+                                        }
+                                    }
+                                }
+                                RS_FLAT_DISPATCH_NEXT();
+                            }
+                        }
+                        if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                        state.executed = localExecuted;
                         Value callResult;
                         const ValueWindow regWin{&state.values, frameOffset + execution->registerOffset, function.registerTypes.size()};
                         const bool ok = (ip->src1Slot == detail::InvalidCompactReg)
@@ -4019,6 +4263,8 @@ bool executeFunction(
                         RS_FLAT_DISPATCH_NEXT();
                     }
                 }
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                state.executed = localExecuted;
                 Value callResult;
                 const ValueWindow regWin{&state.values, frameOffset + execution->registerOffset, function.registerTypes.size()};
                 const bool ok = executeCall(state, *location.module, instruction, regWin, callResult);
@@ -4033,129 +4279,316 @@ bool executeFunction(
 
             RS_FLAT_CASE(ConstantDouble) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = ip->bytecode->activeDoubleImmediate();
+                double dVal = 0.0;
+                std::memcpy(&dVal, &ip->integerImmediate, sizeof(double));
+                frameBase[ip->dstSlot].storeDouble(dVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(AddDouble) {
-                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
-                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
-                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = (*aPtr + *bPtr);
+                double aVal = 0.0, bVal = 0.0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetDouble(aVal) ||
+                                     !frameBase[ip->src1Slot].tryGetDouble(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeDouble(aVal + bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(SubDouble) {
-                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
-                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
-                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = (*aPtr - *bPtr);
+                double aVal = 0.0, bVal = 0.0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetDouble(aVal) ||
+                                     !frameBase[ip->src1Slot].tryGetDouble(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeDouble(aVal - bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(MulDouble) {
-                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
-                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
-                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = (*aPtr * *bPtr);
+                double aVal = 0.0, bVal = 0.0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetDouble(aVal) ||
+                                     !frameBase[ip->src1Slot].tryGetDouble(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeDouble(aVal * bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(DivDouble) {
-                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
-                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
-                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = (*aPtr / *bPtr);
+                double aVal = 0.0, bVal = 0.0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetDouble(aVal) ||
+                                     !frameBase[ip->src1Slot].tryGetDouble(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeDouble(aVal / bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(LessDouble) {
-                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
-                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
-                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = (*aPtr < *bPtr);
+                double aVal = 0.0, bVal = 0.0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetDouble(aVal) ||
+                                     !frameBase[ip->src1Slot].tryGetDouble(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeBool(aVal < bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(LessOrEqualDouble) {
-                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
-                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
-                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = (*aPtr <= *bPtr);
+                double aVal = 0.0, bVal = 0.0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetDouble(aVal) ||
+                                     !frameBase[ip->src1Slot].tryGetDouble(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeBool(aVal <= bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(GreaterDouble) {
-                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
-                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
-                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = (*aPtr > *bPtr);
+                double aVal = 0.0, bVal = 0.0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetDouble(aVal) ||
+                                     !frameBase[ip->src1Slot].tryGetDouble(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeBool(aVal > bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(GreaterOrEqualDouble) {
-                const auto* aPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
-                const auto* bPtr = std::get_if<double>(&frameBase[ip->src1Slot]);
-                if (RS_FLAT_UNLIKELY(!aPtr || !bPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = (*aPtr >= *bPtr);
+                double aVal = 0.0, bVal = 0.0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetDouble(aVal) ||
+                                     !frameBase[ip->src1Slot].tryGetDouble(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeBool(aVal >= bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(LoadFieldFast) {
-                const auto* ref = std::get_if<ObjectRef>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_LIKELY(ref != nullptr && ref->kind == ObjectKind::Record && state.heap)) {
-                    const auto* type = typeDescriptor(*location.module, ip->aux1Slot);
-                    semantic::SymbolId actualTid = 0;
-                    const Value* fieldPtr = state.heap->fieldGetFast(*ref, ip->aux0Slot, &actualTid);
-                    if (RS_FLAT_LIKELY(fieldPtr && type &&
-                        (actualTid == type->id || runtimeAssignable(state, actualTid, type->id)) &&
-                        valueType(*fieldPtr) == type->fields[ip->aux0Slot].type &&
-                        (!std::holds_alternative<ObjectRef>(*fieldPtr) ||
-                         state.heap->isAlive(std::get<ObjectRef>(*fieldPtr))))) {
-                        if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                        frameBase[ip->dstSlot] = *fieldPtr;
-                        RS_FLAT_DISPATCH_NEXT();
+                const Value& recvVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_LIKELY(recvVal.rawTag() == ValueTag::ObjectRef)) {
+                    const ObjectRef ref = recvVal.u_.objectRef;
+                    auto& oce = objectCache[ref.slot & 3u];
+                    if (RS_FLAT_LIKELY((oce.valid && oce.ref == ref) || bindObjectCacheEntry(ref, oce))) {
+                        const auto expectedOwnerTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                        bool ownerOk = (oce.view.typeId == expectedOwnerTid) ||
+                                       (oce.verifiedBaseTid == expectedOwnerTid);
+                        if (RS_FLAT_UNLIKELY(!ownerOk)) {
+                            if (runtimeAssignable(state, oce.view.typeId, expectedOwnerTid)) {
+                                oce.verifiedBaseTid = expectedOwnerTid;
+                                ownerOk = true;
+                            }
+                        }
+                        const std::uint16_t fIdx = ip->aux0Slot;
+                        if (RS_FLAT_LIKELY(ownerOk && fIdx < oce.view.fieldCount)) {
+                            const Value& val = oce.view.fields[fIdx];
+                            const auto fk = static_cast<detail::FastFieldKind>(
+                                static_cast<std::uint8_t>(ip->binaryOpcode2));
+                            if (RS_FLAT_LIKELY(fk == detail::FastFieldKind::ExactValueTag)) {
+                                if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(val.rawTag()) ==
+                                                   static_cast<std::uint8_t>(ip->binaryOpcode1))) {
+                                    RS_FLAT_SPAN_CHECK();
+                                    localExecuted += spanCost;
+                                    frameBase[ip->dstSlot] = val;
+                                    RS_FLAT_DISPATCH_NEXT();
+                                }
+                            } else {
+                                const ValueTag vt = val.rawTag();
+                                bool fieldOk = false;
+                                switch (fk) {
+                                case detail::FastFieldKind::Quat:
+                                    fieldOk = (vt == ValueTag::QuatInline || vt == ValueTag::QuatArena);
+                                    break;
+                                case detail::FastFieldKind::String:
+                                    fieldOk = (vt == ValueTag::NullString || vt == ValueTag::String ||
+                                               (vt == ValueTag::ObjectRef &&
+                                                val.u_.objectRef.kind == ObjectKind::String &&
+                                                state.heap->isAlive(val.u_.objectRef)));
+                                    break;
+                                case detail::FastFieldKind::Object:
+                                    if (vt == ValueTag::NullObject) {
+                                        fieldOk = true;
+                                    } else if (vt == ValueTag::ObjectRef) {
+                                        const auto expTid = detail::executionMirror(*state.program).fieldMetas[ip->auxImm32].fieldTypeId;
+                                        const auto actTid = state.heap->objectTypeIdFast(val.u_.objectRef);
+                                        if (actTid != 0) {
+                                            if (actTid == expTid || expTid == 0 ||
+                                                (actTid == cachedAssignableSubTid && expTid == cachedAssignableBaseTid)) {
+                                                fieldOk = true;
+                                            } else if (runtimeAssignable(state, actTid, expTid)) {
+                                                cachedAssignableSubTid = actTid;
+                                                cachedAssignableBaseTid = expTid;
+                                                fieldOk = true;
+                                            }
+                                        }
+                                    }
+                                    break;
+                                case detail::FastFieldKind::Array:
+                                    if (vt == ValueTag::NullArray) {
+                                        fieldOk = true;
+                                    } else if (vt == ValueTag::ObjectRef) {
+                                        const auto expTid = detail::executionMirror(*state.program).fieldMetas[ip->auxImm32].fieldTypeId;
+                                        const auto actTid = state.heap->arrayTypeId(val.u_.objectRef);
+                                        fieldOk = (actTid.has_value() && (*actTid == expTid || expTid == 0));
+                                    }
+                                    break;
+                                case detail::FastFieldKind::UserStruct:
+                                    fieldOk = (vt == ValueTag::Struct &&
+                                               val.u_.structVal.valid() &&
+                                               val.u_.structVal.typeId == detail::executionMirror(*state.program).fieldMetas[ip->auxImm32].fieldTypeId);
+                                    break;
+                                case detail::FastFieldKind::Enum: {
+                                    EnumValue ev{};
+                                    fieldOk = (val.tryGetEnum(ev) &&
+                                               ev.typeId == detail::executionMirror(*state.program).fieldMetas[ip->auxImm32].fieldTypeId);
+                                    break;
+                                }
+                                default:
+                                    break;
+                                }
+                                if (RS_FLAT_LIKELY(fieldOk)) {
+                                    RS_FLAT_SPAN_CHECK();
+                                    localExecuted += spanCost;
+                                    frameBase[ip->dstSlot] = val;
+                                    RS_FLAT_DISPATCH_NEXT();
+                                }
+                            }
+                        }
                     }
                 }
-                goto L_FlatGenericFallback;
+                goto L_FlatMathFallback;
             }
 
             RS_FLAT_CASE(StoreFieldFast) {
-                const auto* ref = std::get_if<ObjectRef>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_LIKELY(ref != nullptr && ref->kind == ObjectKind::Record && state.heap)) {
-                    const auto* type = typeDescriptor(*location.module, ip->aux1Slot);
-                    if (RS_FLAT_LIKELY(type != nullptr)) {
-                        const auto& rhs = frameBase[ip->src1Slot];
-                        const auto expectedFieldType = type->fields[ip->aux0Slot].type;
-                        if (RS_FLAT_UNLIKELY(localExecuted >= budgetLimit)) goto L_FlatBudgetExceeded;
-                        if (RS_FLAT_LIKELY(state.heap->fieldSetFast(*ref, ip->aux0Slot, rhs, type->id, expectedFieldType))) {
-                            ++localExecuted;
-                            RS_FLAT_DISPATCH_NEXT();
+                const Value& recvVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_LIKELY(recvVal.rawTag() == ValueTag::ObjectRef)) {
+                    const ObjectRef ref = recvVal.u_.objectRef;
+                    auto& oce = objectCache[ref.slot & 3u];
+                    if (RS_FLAT_LIKELY((oce.valid && oce.ref == ref) || bindObjectCacheEntry(ref, oce))) {
+                        const auto expectedOwnerTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                        bool ownerOk = (oce.view.typeId == expectedOwnerTid) ||
+                                       (oce.verifiedBaseTid == expectedOwnerTid);
+                        if (RS_FLAT_UNLIKELY(!ownerOk)) {
+                            if (runtimeAssignable(state, oce.view.typeId, expectedOwnerTid)) {
+                                oce.verifiedBaseTid = expectedOwnerTid;
+                                ownerOk = true;
+                            }
                         }
-                        const auto actualTid = state.heap->objectTypeId(*ref);
-                        if (actualTid && runtimeAssignable(state, *actualTid, type->id) &&
-                            valueType(rhs) == expectedFieldType &&
-                            (!std::holds_alternative<ObjectRef>(rhs) ||
-                             state.heap->isAlive(std::get<ObjectRef>(rhs))) &&
-                            state.heap->fieldSet(*ref, ip->aux0Slot, rhs, nullptr)) {
-                            ++localExecuted;
-                            RS_FLAT_DISPATCH_NEXT();
+                        const std::uint16_t fIdx = ip->aux0Slot;
+                        if (RS_FLAT_LIKELY(ownerOk && fIdx < oce.view.fieldCount)) {
+                            const Value& rhs = frameBase[ip->src1Slot];
+                            const auto fk = static_cast<detail::FastFieldKind>(
+                                static_cast<std::uint8_t>(ip->binaryOpcode2));
+                            if (RS_FLAT_LIKELY(fk == detail::FastFieldKind::ExactValueTag)) {
+                                if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(rhs.rawTag()) ==
+                                                   static_cast<std::uint8_t>(ip->binaryOpcode1))) {
+                                    RS_FLAT_SPAN_CHECK();
+                                    localExecuted += spanCost;
+                                    oce.view.fields[fIdx] = rhs;
+                                    RS_FLAT_DISPATCH_NEXT();
+                                }
+                            } else {
+                                const ValueTag vt = rhs.rawTag();
+                                bool rhsOk = false;
+                                bool needsPin = false;
+                                bool needsBarrier = false;
+                                switch (fk) {
+                                case detail::FastFieldKind::Quat:
+                                    if (vt == ValueTag::QuatInline) {
+                                        rhsOk = true;
+                                    } else if (vt == ValueTag::QuatArena) {
+                                        rhsOk = true;
+                                        needsPin = true;
+                                    }
+                                    break;
+                                case detail::FastFieldKind::String:
+                                    if (vt == ValueTag::NullString) {
+                                        rhsOk = true;
+                                    } else if (vt == ValueTag::String) {
+                                        rhsOk = true;
+                                        needsPin = true;
+                                    } else if (vt == ValueTag::ObjectRef &&
+                                               rhs.u_.objectRef.kind == ObjectKind::String &&
+                                               state.heap->isAlive(rhs.u_.objectRef)) {
+                                        rhsOk = true;
+                                        needsBarrier = true;
+                                    }
+                                    break;
+                                case detail::FastFieldKind::Object:
+                                    if (vt == ValueTag::NullObject) {
+                                        rhsOk = true;
+                                    } else if (vt == ValueTag::ObjectRef) {
+                                        const auto expTid = detail::executionMirror(*state.program).fieldMetas[ip->auxImm32].fieldTypeId;
+                                        const auto actTid = state.heap->objectTypeIdFast(rhs.u_.objectRef);
+                                        if (actTid != 0) {
+                                            if (actTid == expTid || expTid == 0 ||
+                                                (actTid == cachedAssignableSubTid && expTid == cachedAssignableBaseTid)) {
+                                                rhsOk = true;
+                                                needsBarrier = true;
+                                            } else if (runtimeAssignable(state, actTid, expTid)) {
+                                                cachedAssignableSubTid = actTid;
+                                                cachedAssignableBaseTid = expTid;
+                                                rhsOk = true;
+                                                needsBarrier = true;
+                                            }
+                                        }
+                                    }
+                                    break;
+                                case detail::FastFieldKind::Array:
+                                    if (vt == ValueTag::NullArray) {
+                                        rhsOk = true;
+                                    } else if (vt == ValueTag::ObjectRef) {
+                                        const auto expTid = detail::executionMirror(*state.program).fieldMetas[ip->auxImm32].fieldTypeId;
+                                        const auto actTid = state.heap->arrayTypeId(rhs.u_.objectRef);
+                                        if (actTid.has_value() && (*actTid == expTid || expTid == 0)) {
+                                            rhsOk = true;
+                                            needsBarrier = true;
+                                        }
+                                    }
+                                    break;
+                                case detail::FastFieldKind::UserStruct:
+                                    if (vt == ValueTag::Struct &&
+                                        rhs.u_.structVal.valid() &&
+                                        rhs.u_.structVal.typeId == detail::executionMirror(*state.program).fieldMetas[ip->auxImm32].fieldTypeId) {
+                                        rhsOk = true;
+                                        needsPin = true;
+                                        needsBarrier = !rhs.u_.structVal.isInline && rhs.u_.structVal.storage != nullptr;
+                                    }
+                                    break;
+                                case detail::FastFieldKind::Enum: {
+                                    EnumValue ev{};
+                                    if (rhs.tryGetEnum(ev) &&
+                                        ev.typeId == detail::executionMirror(*state.program).fieldMetas[ip->auxImm32].fieldTypeId) {
+                                        rhsOk = true;
+                                        needsPin = (vt == ValueTag::EnumArena);
+                                    }
+                                    break;
+                                }
+                                default:
+                                    break;
+                                }
+                                if (RS_FLAT_LIKELY(rhsOk)) {
+                                    RS_FLAT_SPAN_CHECK();
+                                    if (needsPin) pinValueInPools(rhs);
+                                    if (needsBarrier &&
+                                        (oce.view.needsRememberedBarrier || gcActive || state.heap->phase() != GcPhase::Idle)) {
+                                        state.heap->recordObjectWriteBarrier(oce.ref, rhs);
+                                        oce.view.needsRememberedBarrier = false;
+                                    }
+                                    localExecuted += spanCost;
+                                    oce.view.fields[fIdx] = rhs;
+                                    RS_FLAT_DISPATCH_NEXT();
+                                }
+                            }
                         }
                     }
                 }
-                goto L_FlatGenericFallback;
+                goto L_FlatMathFallback;
             }
 
             RS_FLAT_CASE(LoadStructFieldFast) {
-                const auto* type = typeDescriptor(*location.module, ip->bytecode->typeIndex);
+                const auto* type = typeDescriptor(*location.module, ip->auxImm32);
                 const auto& recv = frameBase[ip->src0Slot];
                 if (RS_FLAT_LIKELY(type != nullptr && structValueTypeId(recv) == type->id)) {
                     const auto expectedFieldType = type->fields[ip->aux0Slot].type;
@@ -4173,7 +4606,7 @@ bool executeFunction(
             }
 
             RS_FLAT_CASE(StoreStructFieldFast) {
-                const auto* type = typeDescriptor(*location.module, ip->bytecode->typeIndex);
+                const auto* type = typeDescriptor(*location.module, ip->auxImm32);
                 const auto& recv = frameBase[ip->src0Slot];
                 const auto& rhs = frameBase[ip->src1Slot];
                 const auto expectedFieldTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
@@ -4203,39 +4636,53 @@ bool executeFunction(
             }
 
             RS_FLAT_CASE(ArrayLengthFast) {
-                const auto* ref = std::get_if<ObjectRef>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_LIKELY(ref != nullptr && state.heap)) {
+                auto& ce = arrayCache[ip->src0Slot & 3u];
+                const Value& arrVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_LIKELY((ce.valid &&
+                                    arrVal.rawTag() == ValueTag::ObjectRef &&
+                                    arrVal.u_.objectRef == ce.ref) ||
+                                   bindArrayCacheSlot(arrVal, ce))) {
+                    RS_FLAT_SPAN_CHECK();
+                    localExecuted += spanCost;
+                    frameBase[ip->dstSlot].storeInt64(static_cast<std::int64_t>(ce.view.length));
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                if (const auto* ref = std::get_if<ObjectRef>(&arrVal); RS_FLAT_LIKELY(ref != nullptr && state.heap)) {
                     if (const auto len = state.heap->arrayLength(*ref);
                         RS_FLAT_LIKELY(len.has_value() &&
                         *len <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))) {
-                        if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                        frameBase[ip->dstSlot] = static_cast<std::int64_t>(*len);
+                        RS_FLAT_SPAN_CHECK();
+                        localExecuted += spanCost;
+                        frameBase[ip->dstSlot].storeInt64(static_cast<std::int64_t>(*len));
                         RS_FLAT_DISPATCH_NEXT();
                     }
                 }
-                goto L_FlatGenericFallback;
+                goto L_FlatMathFallback;
             }
 
             RS_FLAT_CASE(ConvertIntToLongFast) {
                 const auto* vPtr = std::get_if<std::int64_t>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeLong(*vPtr);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(ConvertIntToDoubleFast) {
                 const auto* vPtr = std::get_if<std::int64_t>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot] = static_cast<double>(*vPtr);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(ConvertLongToDoubleFast) {
                 const auto* vPtr = std::get_if<LongValue>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot] = static_cast<double>(vPtr->value);
                 RS_FLAT_DISPATCH_NEXT();
             }
@@ -4336,8 +4783,9 @@ bool executeFunction(
 
             RS_FLAT_CASE(NegateIntUnchecked) {
                 const auto* vPtr = std::get_if<std::int64_t>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot] = (*vPtr == std::numeric_limits<std::int32_t>::min())
                     ? *vPtr
                     : -(*vPtr);
@@ -4346,46 +4794,98 @@ bool executeFunction(
 
             RS_FLAT_CASE(NegateDouble) {
                 const auto* vPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot] = -(*vPtr);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(LogicalNot) {
                 const auto* vPtr = std::get_if<bool>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot] = !(*vPtr);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(NewArrayFast) {
-                const auto& inst = *ip->bytecode;
-                const auto* lenPtr = std::get_if<std::int64_t>(&frameBase[ip->src0Slot]);
+                std::int64_t lenVal = 0;
                 if (RS_FLAT_LIKELY(
-                        lenPtr != nullptr &&
-                        *lenPtr >= 0 &&
-                        static_cast<std::uint64_t>(*lenPtr) <=
+                        frameBase[ip->src0Slot].tryGetInt64(lenVal) &&
+                        lenVal >= 0 &&
+                        static_cast<std::uint64_t>(lenVal) <=
                             static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) &&
                         state.heap != nullptr)) {
-                    if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                    RS_FLAT_SPAN_CHECK();
+                    localExecuted += spanCost;
                     if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                     else gcAccounted = localExecuted;
+
+                    const auto elemType = static_cast<semantic::PrimitiveType>(static_cast<std::uint8_t>(ip->binaryOpcode1));
+                    const auto arrayTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                    Value initVal;
+                    semantic::SymbolId elemTid = 0;
+                    if (ip->aux0Slot == 1) {
+                        switch (elemType) {
+                        case semantic::PrimitiveType::Int: initVal.storeInt64(0); break;
+                        case semantic::PrimitiveType::Float: initVal.storeFloat(0.0f); break;
+                        case semantic::PrimitiveType::Double: initVal.storeDouble(0.0); break;
+                        case semantic::PrimitiveType::Long: initVal.storeLong(0); break;
+                        case semantic::PrimitiveType::Bool: initVal.storeBool(false); break;
+                        case semantic::PrimitiveType::Object:
+                            initVal = NullObject{};
+                            elemTid = flatColdBase[ip - streamBase].bytecode->elementTypeId;
+                            break;
+                        case semantic::PrimitiveType::String: initVal = NullString{}; break;
+                        default:
+                            initVal = defaultValue(*location.module, elemType, 0);
+                            break;
+                        }
+                    } else if (ip->aux0Slot >= 2 && ip->aux0Slot <= 6) {
+                        elemTid = flatColdBase[ip - streamBase].bytecode->elementTypeId;
+                        switch (ip->aux0Slot) {
+                        case 2: initVal = FixedValue{}; break;
+                        case 3: initVal = Fixed16Value{}; break;
+                        case 4: initVal = Vec2Value{}; break;
+                        case 5: initVal = Vec3Value{}; break;
+                        default: initVal = QuatValue{}; break;
+                        }
+                    } else {
+                        const auto& inst = *flatColdBase[ip - streamBase].bytecode;
+                        elemTid = inst.elementTypeId;
+                        initVal = defaultValue(*location.module, elemType, elemTid);
+                    }
+
+                    bool slotsMoved = false;
                     RuntimeError allocErr;
                     const auto ref = state.heap->allocateTypedArray(
-                        function.registerTypeIds[inst.result],
-                        inst.elementType,
-                        inst.elementTypeId,
-                        static_cast<std::size_t>(*lenPtr),
-                        defaultValue(*location.module, inst.elementType, inst.elementTypeId),
-                        &allocErr);
+                        arrayTid,
+                        elemType,
+                        elemTid,
+                        static_cast<std::size_t>(lenVal),
+                        std::move(initVal),
+                        &allocErr,
+                        &slotsMoved);
                     if (RS_FLAT_LIKELY(ref.has_value())) {
+                        if (RS_FLAT_UNLIKELY(slotsMoved)) {
+                            invalidateAllFlatCaches();
+                        }
                         if (gcBudgetEnabled) {
                             gcActive = (state.heap->phase() != GcPhase::Idle || state.heap->collectionRequested());
                         }
                         frameBase[ip->dstSlot] = *ref;
+                        auto& ce = arrayCache[ip->dstSlot & 3u];
+                        if (state.heap->tryBindArrayFastView(*ref, ce.view)) {
+                            ce.ref = *ref;
+                            ce.valid = true;
+                        }
                         RS_FLAT_DISPATCH_NEXT();
+                    }
+                    if (spanCost > 1u) {
+                        localExecuted -= spanCost;
+                        goto L_FlatSuperFallback;
                     }
                     state.executed = localExecuted;
                     fail(state,
@@ -4393,14 +4893,15 @@ bool executeFunction(
                         allocErr.message.empty() ? "managed array allocation failed" : allocErr.message);
                     goto L_FlatError;
                 }
-                goto L_FlatGenericFallback;
+                goto L_FlatMathFallback;
             }
 
             RS_FLAT_CASE(AddFloat) {
                 float aVal = 0.0f, bVal = 0.0f;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetFloat(aVal) ||
-                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeFloat(aVal + bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
@@ -4408,8 +4909,9 @@ bool executeFunction(
             RS_FLAT_CASE(SubFloat) {
                 float aVal = 0.0f, bVal = 0.0f;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetFloat(aVal) ||
-                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeFloat(aVal - bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
@@ -4417,8 +4919,9 @@ bool executeFunction(
             RS_FLAT_CASE(MulFloat) {
                 float aVal = 0.0f, bVal = 0.0f;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetFloat(aVal) ||
-                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeFloat(aVal * bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
@@ -4426,8 +4929,9 @@ bool executeFunction(
             RS_FLAT_CASE(DivFloat) {
                 float aVal = 0.0f, bVal = 0.0f;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetFloat(aVal) ||
-                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeFloat(aVal / bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
@@ -4435,122 +4939,135 @@ bool executeFunction(
             RS_FLAT_CASE(LessFloat) {
                 float aVal = 0.0f, bVal = 0.0f;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetFloat(aVal) ||
-                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = (aVal < bVal);
+                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeBool(aVal < bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(LessOrEqualFloat) {
                 float aVal = 0.0f, bVal = 0.0f;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetFloat(aVal) ||
-                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = (aVal <= bVal);
+                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeBool(aVal <= bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(GreaterFloat) {
                 float aVal = 0.0f, bVal = 0.0f;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetFloat(aVal) ||
-                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = (aVal > bVal);
+                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeBool(aVal > bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(GreaterOrEqualFloat) {
                 float aVal = 0.0f, bVal = 0.0f;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetFloat(aVal) ||
-                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = (aVal >= bVal);
+                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeBool(aVal >= bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(EqualFloat) {
                 float aVal = 0.0f, bVal = 0.0f;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetFloat(aVal) ||
-                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = (aVal == bVal);
+                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeBool(aVal == bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(NotEqualFloat) {
                 float aVal = 0.0f, bVal = 0.0f;
                 if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetFloat(aVal) ||
-                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
-                frameBase[ip->dstSlot] = (aVal != bVal);
+                                     !frameBase[ip->src1Slot].tryGetFloat(bVal))) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeBool(aVal != bVal);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(NegateFloat) {
                 const auto* vPtr = std::get_if<FloatValue>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeFloat(-vPtr->value);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(ConvertIntToFloatFast) {
                 const auto* vPtr = std::get_if<std::int64_t>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeFloat(static_cast<float>(*vPtr));
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(ConvertDoubleToFloatFast) {
                 const auto* vPtr = std::get_if<double>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatMathFallback;
                 const double d = *vPtr;
-                if (ip->checkedArithmetic1) {
+                if (ip->checked1()) {
                     if (RS_FLAT_UNLIKELY(!(d >= -static_cast<double>(std::numeric_limits<float>::max()) &&
                                            d <= static_cast<double>(std::numeric_limits<float>::max())))) {
-                        goto L_FlatGenericFallback;
+                        goto L_FlatMathFallback;
                     }
                 }
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot].storeFloat(static_cast<float>(d));
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(ConvertFloatToIntFast) {
                 const auto* vPtr = std::get_if<FloatValue>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatMathFallback;
                 const double d = static_cast<double>(vPtr->value);
                 if (RS_FLAT_UNLIKELY(!(d >= static_cast<double>(std::numeric_limits<std::int32_t>::min()) &&
                                        d <= static_cast<double>(std::numeric_limits<std::int32_t>::max())))) {
-                    goto L_FlatGenericFallback;
+                    goto L_FlatMathFallback;
                 }
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot] = static_cast<std::int64_t>(d);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(ConvertFloatToDoubleFast) {
                 const auto* vPtr = std::get_if<FloatValue>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatMathFallback;
+                RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                 frameBase[ip->dstSlot] = static_cast<double>(vPtr->value);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
             RS_FLAT_CASE(ConvertLongToIntFast) {
                 const auto* vPtr = std::get_if<LongValue>(&frameBase[ip->src0Slot]);
-                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(!vPtr)) goto L_FlatMathFallback;
                 const std::int64_t val = vPtr->value;
-                if (ip->checkedArithmetic1) {
+                if (ip->checked1()) {
                     if (RS_FLAT_UNLIKELY(val < std::numeric_limits<std::int32_t>::min() ||
                                          val > std::numeric_limits<std::int32_t>::max())) {
-                        goto L_FlatGenericFallback;
+                        goto L_FlatMathFallback;
                     }
-                    if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                    RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                     frameBase[ip->dstSlot] = val;
                 } else {
-                    if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                    RS_FLAT_SPAN_CHECK();
+                localExecuted += spanCost;
                     frameBase[ip->dstSlot] = wrapInt32(val);
                 }
                 RS_FLAT_DISPATCH_NEXT();
@@ -5957,6 +6474,628 @@ bool executeFunction(
             }
 
             #undef RS_FLAT_MATH_CALL_ACCOUNTING
+            #undef RS_FLAT_SPAN_CHECK
+
+            RS_FLAT_CASE(SuperMoveParamStoreLocalElided) {
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || 2u > budgetLimit - localExecuted)) {
+                    goto L_FlatSuperFallback;
+                }
+                localExecuted += 2;
+                frameBase[ip->storeSlot] = frameBase[ip->src0Slot];
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(SuperBinaryLocalIntConstStoreJump) {
+                const std::uint64_t cost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || cost > budgetLimit - localExecuted)) {
+                    goto L_FlatSuperFallback;
+                }
+                std::int64_t left = 0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(left))) goto L_FlatSuperFallback;
+                if (RS_FLAT_UNLIKELY(!tryEvaluateQuickIntNoFail(
+                        ip->binaryOpcode1, ip->checked1(), left, ip->integerImmediate, frameBase[ip->dstSlot]))) {
+                    goto L_FlatSuperFallback;
+                }
+                localExecuted += cost;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                state.statistics.branchesTaken +=
+                    ((ip->arithFlags & detail::FlatInstruction::FlagPreJump1) != 0u) ? 2u : 1u;
+                ip = streamBase + ip->trueTargetOffset;
+                RS_FLAT_DISPATCH_AT_IP();
+            }
+
+            RS_FLAT_CASE(SuperBinaryLocalIntLocalStoreJump) {
+                const std::uint64_t cost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || cost > budgetLimit - localExecuted)) {
+                    goto L_FlatSuperFallback;
+                }
+                std::int64_t left = 0, right = 0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(left) ||
+                                     !frameBase[ip->src1Slot].tryGetInt64(right))) goto L_FlatSuperFallback;
+                if (RS_FLAT_UNLIKELY(!tryEvaluateQuickIntNoFail(
+                        ip->binaryOpcode1, ip->checked1(), left, right, frameBase[ip->dstSlot]))) {
+                    goto L_FlatSuperFallback;
+                }
+                localExecuted += cost;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                state.statistics.branchesTaken +=
+                    ((ip->arithFlags & detail::FlatInstruction::FlagPreJump1) != 0u) ? 2u : 1u;
+                ip = streamBase + ip->trueTargetOffset;
+                RS_FLAT_DISPATCH_AT_IP();
+            }
+
+            RS_FLAT_CASE(SuperBinaryLocalIntRegStoreJump) {
+                const std::uint64_t cost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || cost > budgetLimit - localExecuted)) {
+                    goto L_FlatSuperFallback;
+                }
+                std::int64_t left = 0, right = 0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(left) ||
+                                     !frameBase[ip->src1Slot].tryGetInt64(right))) goto L_FlatSuperFallback;
+                if (RS_FLAT_UNLIKELY(!tryEvaluateQuickIntNoFail(
+                        ip->binaryOpcode1, ip->checked1(), left, right, frameBase[ip->dstSlot]))) {
+                    goto L_FlatSuperFallback;
+                }
+                localExecuted += cost;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                state.statistics.branchesTaken +=
+                    ((ip->arithFlags & detail::FlatInstruction::FlagPreJump1) != 0u) ? 2u : 1u;
+                ip = streamBase + ip->trueTargetOffset;
+                RS_FLAT_DISPATCH_AT_IP();
+            }
+
+            RS_FLAT_CASE(SuperCheckNotNullCallPolledFast) {
+                const std::uint64_t baseCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || baseCost > budgetLimit - localExecuted)) {
+                    goto L_FlatSuperFallback;
+                }
+                const auto* receiver = std::get_if<ObjectRef>(&frameBase[ip->src0Slot]);
+                if (RS_FLAT_UNLIKELY(receiver == nullptr || !state.heap || !state.heap->isAlive(*receiver))) {
+                    goto L_FlatSuperFallback;
+                }
+                const auto& cold = flatColdBase[ip - streamBase];
+                const auto& instruction = *cold.bytecode;
+                const auto callSite = reinterpret_cast<std::uintptr_t>(&instruction);
+                const auto idx = static_cast<std::size_t>((callSite >> 4U) & 63U);
+                const auto& cached = (*state.inlineCallCache)[idx];
+                if (RS_FLAT_LIKELY(
+                        cached.callSite == &instruction &&
+                        cached.target && cached.execution &&
+                        (cached.receiver == *receiver ||
+                         (cached.receiverTypeId != 0 &&
+                          state.heap->objectTypeIdFast(*receiver) == cached.receiverTypeId)))) {
+                    const auto tKind = cached.execution->trivialKind;
+                    if (tKind != detail::TrivialMethodKind::None &&
+                        RS_FLAT_LIKELY(state.stack.size() < state.limits.recursionLimit)) {
+                        const std::uint64_t totalCost = baseCost + cached.execution->trivialInstCost;
+                        if (RS_FLAT_LIKELY(totalCost <= budgetLimit - localExecuted)) {
+                            localExecuted += totalCost;
+                            ++state.statistics.functionCalls;
+                            if (state.stack.size() + 1 > state.statistics.maximumCallDepth) {
+                                state.statistics.maximumCallDepth = state.stack.size() + 1;
+                            }
+                            if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                            if (ip->dstSlot != detail::InvalidCompactReg) {
+                                if (tKind == detail::TrivialMethodKind::ReturnConst) {
+                                    frameBase[ip->dstSlot] = cached.execution->trivialConstValue;
+                                } else if (tKind == detail::TrivialMethodKind::ReturnParam) {
+                                    frameBase[ip->dstSlot] = frameBase[ip->src0Slot];
+                                }
+                            }
+                            RS_FLAT_DISPATCH_NEXT();
+                        }
+                    }
+                    localExecuted += baseCost;
+                    if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                    state.executed = localExecuted;
+                    Value callResult;
+                    const ValueWindow singleWin{&state.values, frameOffset + ip->src0Slot, 1};
+                    const bool ok = executeFunction(
+                        state, *cached.target,
+                        ArgumentSource(singleWin, static_cast<bytecode::Register>(0)),
+                        callResult, cached.execution, true);
+                    frameBase = state.values.data() + frameOffset;
+                    syncAfterFlatSubcall();
+                    if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
+                    if (ip->dstSlot != detail::InvalidCompactReg) {
+                        frameBase[ip->dstSlot] = std::move(callResult);
+                    }
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                goto L_FlatSuperFallback;
+            }
+
+            RS_FLAT_CASE(InlineCallEnter) {
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(state.stack.size() >= state.limits.recursionLimit)) {
+                    state.executed = localExecuted;
+                    fail(state, ErrorCode::RecursionLimitExceeded, "recursion limit exceeded");
+                    goto L_FlatError;
+                }
+                ++state.statistics.functionCalls;
+                if (state.stack.size() + 1 > state.statistics.maximumCallDepth) {
+                    state.statistics.maximumCallDepth = state.stack.size() + 1;
+                }
+                Value* const calleeBase = frameBase + ip->dstSlot;
+                const std::uint32_t nArgs = ip->inlineArgCount;
+                const std::uint32_t nLocals = ip->aux0Slot;
+                if ((ip->arithFlags & detail::FlatInstruction::FlagFastParamPrologue) != 0u &&
+                    RS_FLAT_LIKELY(2u * nArgs <= budgetLimit - localExecuted)) {
+                    Value* const calleeLocals = calleeBase + nArgs;
+                    if (nArgs >= 1u) calleeLocals[0] = frameBase[ip->src0Slot];
+                    if (nArgs >= 2u) calleeLocals[1] = frameBase[ip->src1Slot];
+                    if (nArgs >= 3u) calleeLocals[2] = frameBase[ip->src2Slot];
+                    if (nArgs >= 4u) calleeLocals[3] = frameBase[ip->aux1Slot];
+                    if (nLocals > nArgs) {
+                        std::memset(calleeLocals + nArgs, 0, (nLocals - nArgs) * sizeof(Value));
+                    }
+                    localExecuted += 2u * nArgs;
+                    ip += 1u + nArgs;
+                    RS_FLAT_DISPATCH_AT_IP();
+                }
+                if (nArgs >= 1u) calleeBase[0] = frameBase[ip->src0Slot];
+                if (nArgs >= 2u) calleeBase[1] = frameBase[ip->src1Slot];
+                if (nArgs >= 3u) calleeBase[2] = frameBase[ip->src2Slot];
+                if (nArgs >= 4u) calleeBase[3] = frameBase[ip->aux1Slot];
+                if (nLocals != 0u) {
+                    std::memset(calleeBase + nArgs, 0, nLocals * sizeof(Value));
+                }
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(InlineReturnVoid) {
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                if (ip->integerImmediate != 0) {
+                    const auto packedClear = static_cast<std::uint64_t>(ip->integerImmediate);
+                    std::memset(
+                        frameBase + (packedClear & 0xFFFFu),
+                        0,
+                        static_cast<std::size_t>(packedClear >> 16u) * sizeof(Value));
+                }
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(InlineReturnVoidJump) {
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                if (ip->integerImmediate != 0) {
+                    const auto packedClear = static_cast<std::uint64_t>(ip->integerImmediate);
+                    std::memset(
+                        frameBase + (packedClear & 0xFFFFu),
+                        0,
+                        static_cast<std::size_t>(packedClear >> 16u) * sizeof(Value));
+                }
+                ip = streamBase + ip->trueTargetOffset;
+                RS_FLAT_DISPATCH_AT_IP();
+            }
+
+            RS_FLAT_CASE(InlineReturnScalar) {
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                if (RS_FLAT_UNLIKELY(ip->integerImmediate != 0)) {
+                    const Value retVal = frameBase[ip->src0Slot];
+                    const auto packedClear = static_cast<std::uint64_t>(ip->integerImmediate);
+                    std::memset(
+                        frameBase + (packedClear & 0xFFFFu),
+                        0,
+                        static_cast<std::size_t>(packedClear >> 16u) * sizeof(Value));
+                    if (ip->dstSlot != detail::InvalidCompactReg) {
+                        frameBase[ip->dstSlot] = retVal;
+                    }
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                if (ip->dstSlot != detail::InvalidCompactReg) {
+                    frameBase[ip->dstSlot] = frameBase[ip->src0Slot];
+                }
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(InlineReturnScalarJump) {
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                if (RS_FLAT_UNLIKELY(ip->integerImmediate != 0)) {
+                    const Value retVal = frameBase[ip->src0Slot];
+                    const auto packedClear = static_cast<std::uint64_t>(ip->integerImmediate);
+                    std::memset(
+                        frameBase + (packedClear & 0xFFFFu),
+                        0,
+                        static_cast<std::size_t>(packedClear >> 16u) * sizeof(Value));
+                    if (ip->dstSlot != detail::InvalidCompactReg) {
+                        frameBase[ip->dstSlot] = retVal;
+                    }
+                    ip = streamBase + ip->trueTargetOffset;
+                    RS_FLAT_DISPATCH_AT_IP();
+                }
+                if (ip->dstSlot != detail::InvalidCompactReg) {
+                    frameBase[ip->dstSlot] = frameBase[ip->src0Slot];
+                }
+                ip = streamBase + ip->trueTargetOffset;
+                RS_FLAT_DISPATCH_AT_IP();
+            }
+
+            RS_FLAT_CASE(LoadElementTypedFast) {
+                auto& ce = arrayCache[ip->src0Slot & 3u];
+                const Value& arrVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_UNLIKELY(!ce.valid ||
+                                     arrVal.rawTag() != ValueTag::ObjectRef ||
+                                     arrVal.u_.objectRef != ce.ref)) {
+                    if (!bindArrayCacheSlot(arrVal, ce)) goto L_FlatMathFallback;
+                }
+                const auto expectedType = static_cast<semantic::PrimitiveType>(static_cast<std::uint8_t>(ip->binaryOpcode1));
+                const auto expectedTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                if (RS_FLAT_UNLIKELY(ce.view.elementType != expectedType ||
+                                     ce.view.elementTypeId != expectedTid)) {
+                    goto L_FlatMathFallback;
+                }
+                const std::uint64_t spanCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    goto L_FlatBudgetExceeded;
+                }
+                if ((ip->arithFlags & detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u) {
+                    const auto uIdx = static_cast<std::size_t>(frameBase[ip->src1Slot].asInt64Unchecked());
+                    localExecuted += spanCost;
+                    frameBase[ip->dstSlot] = ce.view.data[uIdx];
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                std::int64_t idx = 0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx) ||
+                                     static_cast<std::uint64_t>(idx) >= ce.view.length)) {
+                    goto L_FlatMathFallback;
+                }
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot] = ce.view.data[static_cast<std::size_t>(idx)];
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(StoreElementPrimFast) {
+                auto& ce = arrayCache[ip->src0Slot & 3u];
+                const Value& arrVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_UNLIKELY(!ce.valid ||
+                                     arrVal.rawTag() != ValueTag::ObjectRef ||
+                                     arrVal.u_.objectRef != ce.ref)) {
+                    if (!bindArrayCacheSlot(arrVal, ce)) goto L_FlatMathFallback;
+                }
+                const auto expectedType = static_cast<semantic::PrimitiveType>(static_cast<std::uint8_t>(ip->binaryOpcode1));
+                const auto expectedTag = static_cast<ValueTag>(static_cast<std::uint8_t>(ip->binaryOpcode2));
+                const Value& storeVal = frameBase[ip->src2Slot];
+                if (RS_FLAT_UNLIKELY(ce.view.elementType != expectedType ||
+                                     ce.view.elementTypeId != 0 ||
+                                     storeVal.rawTag() != expectedTag)) {
+                    goto L_FlatMathFallback;
+                }
+                const std::uint64_t spanCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    goto L_FlatBudgetExceeded;
+                }
+                if ((ip->arithFlags & detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u) {
+                    const auto uIdx = static_cast<std::size_t>(frameBase[ip->src1Slot].asInt64Unchecked());
+                    localExecuted += spanCost;
+                    ce.view.data[uIdx] = storeVal;
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                std::int64_t idx = 0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx) ||
+                                     static_cast<std::uint64_t>(idx) >= ce.view.length)) {
+                    goto L_FlatMathFallback;
+                }
+                localExecuted += spanCost;
+                ce.view.data[static_cast<std::size_t>(idx)] = storeVal;
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(StoreElementStructFast) {
+                auto& ce = arrayCache[ip->src0Slot & 3u];
+                const Value& arrVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_UNLIKELY(!ce.valid ||
+                                     arrVal.rawTag() != ValueTag::ObjectRef ||
+                                     arrVal.u_.objectRef != ce.ref)) {
+                    if (!bindArrayCacheSlot(arrVal, ce)) goto L_FlatMathFallback;
+                }
+                const auto expectedTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                if (RS_FLAT_UNLIKELY(ce.view.elementType != semantic::PrimitiveType::Struct ||
+                                     ce.view.elementTypeId != expectedTid)) {
+                    goto L_FlatMathFallback;
+                }
+                const Value& storeVal = frameBase[ip->src2Slot];
+                const ValueTag vtag = storeVal.rawTag();
+                bool structOk = false;
+                bool needsPoolPin = false;
+                bool mayHaveRefs = false;
+                switch (ip->aux0Slot) {
+                case 1: structOk = (vtag == ValueTag::Fixed); break;
+                case 2: structOk = (vtag == ValueTag::Fixed16); break;
+                case 3: structOk = (vtag == ValueTag::Vec2); break;
+                case 4: structOk = (vtag == ValueTag::Vec3); break;
+                case 5:
+                    if (vtag == ValueTag::QuatInline) {
+                        structOk = true;
+                    } else if (vtag == ValueTag::QuatArena) {
+                        structOk = true;
+                        needsPoolPin = true;
+                    }
+                    break;
+                default:
+                    if (vtag == ValueTag::Struct &&
+                        storeVal.u_.structVal.valid() &&
+                        storeVal.u_.structVal.typeId == expectedTid) {
+                        structOk = true;
+                        needsPoolPin = true;
+                        mayHaveRefs = !storeVal.u_.structVal.isInline && storeVal.u_.structVal.storage != nullptr;
+                    }
+                    break;
+                }
+                if (RS_FLAT_UNLIKELY(!structOk)) goto L_FlatMathFallback;
+
+                const std::uint64_t spanCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    goto L_FlatBudgetExceeded;
+                }
+                std::size_t uIdx = 0;
+                if ((ip->arithFlags & detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u) {
+                    uIdx = static_cast<std::size_t>(frameBase[ip->src1Slot].asInt64Unchecked());
+                } else {
+                    std::int64_t idx = 0;
+                    if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx) ||
+                                         static_cast<std::uint64_t>(idx) >= ce.view.length)) {
+                        goto L_FlatMathFallback;
+                    }
+                    uIdx = static_cast<std::size_t>(idx);
+                }
+                if (needsPoolPin) {
+                    pinValueInPools(storeVal);
+                }
+                if (mayHaveRefs && (ce.view.needsRememberedBarrier || gcActive || state.heap->phase() != GcPhase::Idle)) {
+                    state.heap->recordArrayWriteBarrier(ce.ref, storeVal);
+                    ce.view.needsRememberedBarrier = false;
+                }
+                localExecuted += spanCost;
+                ce.view.data[uIdx] = storeVal;
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(StoreElementObjFast) {
+                auto& ce = arrayCache[ip->src0Slot & 3u];
+                const Value& arrVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_UNLIKELY(!ce.valid ||
+                                     arrVal.rawTag() != ValueTag::ObjectRef ||
+                                     arrVal.u_.objectRef != ce.ref)) {
+                    if (!bindArrayCacheSlot(arrVal, ce)) goto L_FlatMathFallback;
+                }
+                const auto expectedType = static_cast<semantic::PrimitiveType>(static_cast<std::uint8_t>(ip->binaryOpcode1));
+                const auto expectedTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                if (RS_FLAT_UNLIKELY(ce.view.elementType != expectedType ||
+                                     ce.view.elementTypeId != expectedTid)) {
+                    goto L_FlatMathFallback;
+                }
+                const Value& storeVal = frameBase[ip->src2Slot];
+                const ValueTag vtag = storeVal.rawTag();
+                bool needsBarrier = false;
+                bool needsPoolPin = false;
+                if (expectedType == semantic::PrimitiveType::Object) {
+                    if (vtag == ValueTag::NullObject) {
+                        // Valid null reference; no GC barrier needed
+                    } else if (vtag == ValueTag::ObjectRef) {
+                        const semantic::SymbolId actualTid = state.heap->objectTypeIdFast(storeVal.u_.objectRef);
+                        if (RS_FLAT_UNLIKELY(actualTid == 0)) goto L_FlatMathFallback;
+                        if (actualTid != expectedTid && expectedTid != 0) {
+                            if (actualTid != cachedAssignableSubTid || expectedTid != cachedAssignableBaseTid) {
+                                if (RS_FLAT_UNLIKELY(!runtimeAssignable(state, actualTid, expectedTid))) {
+                                    goto L_FlatMathFallback;
+                                }
+                                cachedAssignableSubTid = actualTid;
+                                cachedAssignableBaseTid = expectedTid;
+                            }
+                        }
+                        needsBarrier = true;
+                    } else {
+                        goto L_FlatMathFallback;
+                    }
+                } else {
+                    // PrimitiveType::String
+                    if (vtag == ValueTag::NullString) {
+                        // Valid null string
+                    } else if (vtag == ValueTag::String) {
+                        needsPoolPin = true;
+                    } else if (vtag == ValueTag::ObjectRef &&
+                               storeVal.u_.objectRef.kind == ObjectKind::String &&
+                               state.heap->isAlive(storeVal.u_.objectRef)) {
+                        needsBarrier = true;
+                    } else {
+                        goto L_FlatMathFallback;
+                    }
+                }
+
+                const std::uint64_t spanCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    goto L_FlatBudgetExceeded;
+                }
+                std::size_t uIdx = 0;
+                if ((ip->arithFlags & detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u) {
+                    uIdx = static_cast<std::size_t>(frameBase[ip->src1Slot].asInt64Unchecked());
+                } else {
+                    std::int64_t idx = 0;
+                    if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx) ||
+                                         static_cast<std::uint64_t>(idx) >= ce.view.length)) {
+                        goto L_FlatMathFallback;
+                    }
+                    uIdx = static_cast<std::size_t>(idx);
+                }
+                if (needsPoolPin) {
+                    pinValueInPools(storeVal);
+                }
+                if (needsBarrier && (ce.view.needsRememberedBarrier || gcActive || state.heap->phase() != GcPhase::Idle)) {
+                    state.heap->recordArrayWriteBarrier(ce.ref, storeVal);
+                    ce.view.needsRememberedBarrier = false;
+                }
+                localExecuted += spanCost;
+                ce.view.data[uIdx] = storeVal;
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(SuperLessLocalArrayLengthBranch) {
+                const std::uint64_t cost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || cost > budgetLimit - localExecuted)) {
+                    goto L_FlatSuperFallback;
+                }
+                std::int64_t left = 0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(left))) {
+                    goto L_FlatSuperFallback;
+                }
+                auto& ce = arrayCache[ip->src1Slot & 3u];
+                const Value& arrVal = frameBase[ip->src1Slot];
+                std::int64_t right = 0;
+                if (RS_FLAT_LIKELY((ce.valid &&
+                                    arrVal.rawTag() == ValueTag::ObjectRef &&
+                                    arrVal.u_.objectRef == ce.ref) ||
+                                   bindArrayCacheSlot(arrVal, ce))) {
+                    right = static_cast<std::int64_t>(ce.view.length);
+                } else if (arrVal.rawTag() == ValueTag::ObjectRef && state.heap != nullptr) {
+                    const auto lenOpt = state.heap->arrayLength(arrVal.u_.objectRef);
+                    if (!lenOpt || *lenOpt > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+                        goto L_FlatSuperFallback;
+                    }
+                    right = static_cast<std::int64_t>(*lenOpt);
+                } else {
+                    goto L_FlatSuperFallback;
+                }
+                bool cond = false;
+                switch (ip->binaryOpcode1) {
+                case detail::QuickOpcode::LessInt: cond = (left < right); break;
+                case detail::QuickOpcode::LessOrEqualInt: cond = (left <= right); break;
+                case detail::QuickOpcode::GreaterInt: cond = (left > right); break;
+                case detail::QuickOpcode::GreaterOrEqualInt: cond = (left >= right); break;
+                case detail::QuickOpcode::EqualInt: cond = (left == right); break;
+                case detail::QuickOpcode::NotEqualInt: cond = (left != right); break;
+                default: goto L_FlatSuperFallback;
+                }
+                localExecuted += cost;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                ++state.statistics.branchesTaken;
+                ip = streamBase + (cond ? ip->trueTargetOffset : ip->falseTargetOffset);
+                RS_FLAT_DISPATCH_AT_IP();
+            }
+
+            RS_FLAT_CASE(NewObjectFast) {
+                if (RS_FLAT_UNLIKELY(state.heap == nullptr)) goto L_FlatMathFallback;
+                const std::uint64_t spanCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    goto L_FlatBudgetExceeded;
+                }
+                ++localExecuted;
+                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                else gcAccounted = localExecuted;
+
+                const auto& tmpl = detail::executionMirror(*state.program).objectTemplates[ip->aux0Slot];
+                bool slotsMoved = false;
+                RuntimeError allocErr;
+                const auto ref = state.heap->allocateObjectFromTemplate(
+                    tmpl.typeId,
+                    tmpl.defaultFields.data(),
+                    tmpl.defaultFields.size(),
+                    tmpl.referenceFields,
+                    &allocErr,
+                    &slotsMoved);
+                if (RS_FLAT_LIKELY(ref.has_value())) {
+                    if (RS_FLAT_UNLIKELY(slotsMoved)) {
+                        invalidateAllFlatCaches();
+                    }
+                    if (gcBudgetEnabled) {
+                        gcActive = (state.heap->phase() != GcPhase::Idle || state.heap->collectionRequested());
+                    }
+                    if (spanCost > 1u) {
+                        localExecuted += (spanCost - 1u);
+                    }
+                    frameBase[ip->dstSlot] = *ref;
+                    auto& oce = objectCache[ref->slot & 3u];
+                    if (state.heap->tryBindObjectFastView(*ref, oce.view)) {
+                        oce.ref = *ref;
+                        oce.verifiedBaseTid = 0;
+                        oce.valid = true;
+                    }
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                state.executed = localExecuted;
+                fail(state,
+                    allocErr.code == ErrorCode::None ? ErrorCode::OutOfMemory : allocErr.code,
+                    allocErr.message.empty() ? "managed object allocation failed" : allocErr.message);
+                goto L_FlatError;
+            }
+
+            RS_FLAT_CASE(LoadFieldExactFast) {
+                const Value& recvVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_LIKELY(recvVal.rawTag() == ValueTag::ObjectRef)) {
+                    const ObjectRef ref = recvVal.u_.objectRef;
+                    auto& oce = objectCache[ref.slot & 3u];
+                    if (RS_FLAT_LIKELY((oce.valid && oce.ref == ref) || bindObjectCacheEntry(ref, oce))) {
+                        const auto expectedOwnerTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                        bool ownerOk = (oce.view.typeId == expectedOwnerTid) ||
+                                       (oce.verifiedBaseTid == expectedOwnerTid);
+                        if (RS_FLAT_UNLIKELY(!ownerOk)) {
+                            if (runtimeAssignable(state, oce.view.typeId, expectedOwnerTid)) {
+                                oce.verifiedBaseTid = expectedOwnerTid;
+                                ownerOk = true;
+                            }
+                        }
+                        const std::uint16_t fIdx = ip->aux0Slot;
+                        if (RS_FLAT_LIKELY(ownerOk && fIdx < oce.view.fieldCount)) {
+                            const Value& val = oce.view.fields[fIdx];
+                            if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(val.rawTag()) ==
+                                               static_cast<std::uint8_t>(ip->binaryOpcode1))) {
+                                const std::uint64_t spanCost = ip->span;
+                                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                                    goto L_FlatBudgetExceeded;
+                                }
+                                localExecuted += spanCost;
+                                frameBase[ip->dstSlot] = val;
+                                RS_FLAT_DISPATCH_NEXT();
+                            }
+                        }
+                    }
+                }
+                goto L_FlatMathFallback;
+            }
+
+            RS_FLAT_CASE(StoreFieldExactFast) {
+                const Value& recvVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_LIKELY(recvVal.rawTag() == ValueTag::ObjectRef)) {
+                    const ObjectRef ref = recvVal.u_.objectRef;
+                    auto& oce = objectCache[ref.slot & 3u];
+                    if (RS_FLAT_LIKELY((oce.valid && oce.ref == ref) || bindObjectCacheEntry(ref, oce))) {
+                        const auto expectedOwnerTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                        bool ownerOk = (oce.view.typeId == expectedOwnerTid) ||
+                                       (oce.verifiedBaseTid == expectedOwnerTid);
+                        if (RS_FLAT_UNLIKELY(!ownerOk)) {
+                            if (runtimeAssignable(state, oce.view.typeId, expectedOwnerTid)) {
+                                oce.verifiedBaseTid = expectedOwnerTid;
+                                ownerOk = true;
+                            }
+                        }
+                        const std::uint16_t fIdx = ip->aux0Slot;
+                        if (RS_FLAT_LIKELY(ownerOk && fIdx < oce.view.fieldCount)) {
+                            const Value& rhs = frameBase[ip->src1Slot];
+                            if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(rhs.rawTag()) ==
+                                               static_cast<std::uint8_t>(ip->binaryOpcode1))) {
+                                const std::uint64_t spanCost = ip->span;
+                                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                                    goto L_FlatBudgetExceeded;
+                                }
+                                localExecuted += spanCost;
+                                oce.view.fields[fIdx] = rhs;
+                                RS_FLAT_DISPATCH_NEXT();
+                            }
+                        }
+                    }
+                }
+                goto L_FlatMathFallback;
+            }
 
             RS_FLAT_CASE(GenericBytecode) {
             L_FlatMathFallback:
@@ -5964,11 +7103,52 @@ bool executeFunction(
             L_FlatGenericFallback:
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
+                const auto& cold = flatColdBase[ip - streamBase];
+                if (RS_FLAT_UNLIKELY(cold.inlinedCallee != nullptr)) {
+                    const auto& cLoc = *cold.inlinedCallee;
+                    const auto& cFunc = *cLoc.function;
+                    const auto& cExec = *cold.directExecution;
+                    const std::size_t subOff = frameOffset + cold.inlineFrameBias;
+                    const ValueWindow argWin{&state.values, subOff + cExec.paramOffset, cFunc.parameterTypes.size()};
+                    const ValueWindow locWin{&state.values, subOff + cExec.localOffset, cFunc.localTypes.size()};
+                    const ValueWindow regWin{&state.values, subOff + cExec.registerOffset, cFunc.registerTypes.size()};
+                    state.stack.push_back(&cLoc.qualifiedName);
+                    const bool ok = executeInstruction(
+                        state, *cLoc.module, cFunc, *cold.bytecode, argWin, locWin, regWin);
+                    frameBase = state.values.data() + frameOffset;
+                    syncAfterFlatSubcall();
+                    if (RS_FLAT_UNLIKELY(!ok)) {
+                        if (!state.pendingException) {
+                            refineInterpreterFrameSourceLocation(
+                                state,
+                                cLoc,
+                                cExec.blocks[cold.blockIndex].bytecode->id,
+                                cold.instructionIndexInBlock,
+                                ip->span,
+                                false);
+                        }
+                        state.stack.pop_back();
+                        if (!state.pendingException) {
+                            refineInterpreterFrameSourceLocation(
+                                state,
+                                location,
+                                execution->blocks[cold.callerBlockIndex].bytecode->id,
+                                cold.callerInstIndex,
+                                1,
+                                false);
+                        }
+                        state.valueTop = frameOffset;
+                        state.stack.pop_back();
+                        return false;
+                    }
+                    state.stack.pop_back();
+                    RS_FLAT_DISPATCH_NEXT();
+                }
                 const ValueWindow argWin{&state.values, frameOffset + execution->paramOffset, argCount};
                 const ValueWindow locWin{&state.values, frameOffset + execution->localOffset, function.localTypes.size()};
                 const ValueWindow regWin{&state.values, frameOffset + execution->registerOffset, function.registerTypes.size()};
                 const bool ok = executeInstruction(
-                    state, *location.module, function, *ip->bytecode, argWin, locWin, regWin);
+                    state, *location.module, function, *cold.bytecode, argWin, locWin, regWin);
                 frameBase = state.values.data() + frameOffset;
                 syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
@@ -5976,9 +7156,21 @@ bool executeFunction(
             }
 
             RS_FLAT_CASE(TermJumpNoArgs) {
-                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                const std::uint64_t hopCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || hopCost > budgetLimit - localExecuted)) {
+                    if (hopCost > 1u) {
+                        // Step first hop if 1 budget unit remains
+                        if (localExecuted < budgetLimit) {
+                            ++localExecuted;
+                            ++state.statistics.branchesTaken;
+                            ip = streamBase + ip->auxImm32;
+                        }
+                    }
+                    goto L_FlatBudgetExceeded;
+                }
+                localExecuted += hopCost;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
-                ++state.statistics.branchesTaken;
+                state.statistics.branchesTaken += hopCost;
                 ip = streamBase + ip->trueTargetOffset;
                 RS_FLAT_DISPATCH_AT_IP();
             }
@@ -5986,7 +7178,7 @@ bool executeFunction(
             RS_FLAT_CASE(TermBranchBoolNoArgs) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
-                const bool cond = std::get<bool>(frameBase[ip->src0Slot]);
+                const bool cond = frameBase[ip->src0Slot].asBoolUnchecked();
                 ++state.statistics.branchesTaken;
                 ip = streamBase + (cond ? ip->trueTargetOffset : ip->falseTargetOffset);
                 RS_FLAT_DISPATCH_AT_IP();
@@ -5995,7 +7187,8 @@ bool executeFunction(
             RS_FLAT_CASE(TermBranchGeneric) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
-                const auto& blk = execution->blocks[ip->blockIndex];
+                const auto& cold = flatColdBase[ip - streamBase];
+                const auto& blk = execution->blocks[cold.blockIndex];
                 const auto& terminator = blk.bytecode->terminator;
                 const detail::ExecutionEdge* edge = &blk.branch;
                 std::uint32_t nextStreamOffset = ip->trueTargetOffset;
@@ -6007,7 +7200,7 @@ bool executeFunction(
                         state.executed = localExecuted;
                         goto L_FlatError;
                     }
-                    if (!std::get<bool>(frameBase[execution->registerOffset + condReg])) {
+                    if (!frameBase[execution->registerOffset + condReg].asBoolUnchecked()) {
                         edge = &blk.falseBranch;
                         nextStreamOffset = ip->falseTargetOffset;
                     }
@@ -6074,7 +7267,8 @@ bool executeFunction(
             RS_FLAT_CASE(TermReturnGeneric) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
-                const auto& terminator = execution->blocks[ip->blockIndex].bytecode->terminator;
+                const auto& cold = flatColdBase[ip - streamBase];
+                const auto& terminator = execution->blocks[cold.blockIndex].bytecode->terminator;
                 if (RS_FLAT_UNLIKELY(terminator.value >= function.registerTypes.size())) {
                     state.executed = localExecuted;
                     fail(state, ErrorCode::InvalidProgram, "return register is invalid");
@@ -6095,7 +7289,8 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
-                const auto& terminator = execution->blocks[ip->blockIndex].bytecode->terminator;
+                const auto& cold = flatColdBase[ip - streamBase];
+                const auto& terminator = execution->blocks[cold.blockIndex].bytecode->terminator;
                 if (RS_FLAT_UNLIKELY(terminator.value >= function.registerTypes.size() ||
                     !std::holds_alternative<ObjectRef>(frameBase[execution->registerOffset + terminator.value]))) {
                     fail(state, ErrorCode::NullReference, "throw requires a non-null script object");
@@ -6112,40 +7307,119 @@ bool executeFunction(
 #endif
 
 L_FlatSuperFallback: {
-        // When instruction budget is exhausted mid-superinstruction, step the underlying single instructions
-        // one by one so `state.executed` stops at the exact instruction boundary required by budget tests.
+        // When instruction budget is exhausted mid-superinstruction (or overflow occurs in a folded op),
+        // step the underlying single instructions one by one for exact instruction/location parity.
+        if ((ip->arithFlags & detail::FlatInstruction::FlagPreJump1) != 0u) {
+            if (localExecuted >= budgetLimit) {
+                goto L_FlatBudgetExceeded;
+            }
+            ++localExecuted;
+            ++state.statistics.branchesTaken;
+            ip = streamBase + ip->auxImm32;
+        }
         if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
         state.executed = localExecuted;
-        const auto& blk = execution->blocks[ip->blockIndex];
-        const ValueWindow argWin{&state.values, frameOffset + execution->paramOffset, argCount};
-        const ValueWindow locWin{&state.values, frameOffset + execution->localOffset, function.localTypes.size()};
-        const ValueWindow regWin{&state.values, frameOffset + execution->registerOffset, function.registerTypes.size()};
-        const std::size_t startIdx = ip->instructionIndexInBlock;
+        const auto& cold = flatColdBase[ip - streamBase];
+        const bool isInlined = (cold.inlinedCallee != nullptr);
+        const ProgramImage::FunctionLocation& activeLoc = isInlined ? *cold.inlinedCallee : location;
+        const bytecode::Function& activeFunc = *activeLoc.function;
+        const detail::ExecutionFunction& activeExec = isInlined ? *cold.directExecution : *execution;
+        const std::size_t activeFrameOff = isInlined ? (frameOffset + cold.inlineFrameBias) : frameOffset;
+        const std::size_t activeArgCount = isInlined ? activeFunc.parameterTypes.size() : argCount;
+        const auto& blk = activeExec.blocks[cold.blockIndex];
+        const ValueWindow argWin{&state.values, activeFrameOff + activeExec.paramOffset, activeArgCount};
+        const ValueWindow locWin{&state.values, activeFrameOff + activeExec.localOffset, activeFunc.localTypes.size()};
+        const ValueWindow regWin{&state.values, activeFrameOff + activeExec.registerOffset, activeFunc.registerTypes.size()};
+        const std::size_t startIdx = cold.instructionIndexInBlock;
         const bool includesBranch =
             ip->flatOpcode == detail::FlatOpcode::SuperLessLocalRegBranch ||
-            ip->flatOpcode == detail::FlatOpcode::SuperLessLocalConstBranch;
-        const std::size_t instSpan = includesBranch
+            ip->flatOpcode == detail::FlatOpcode::SuperLessLocalConstBranch ||
+            ip->flatOpcode == detail::FlatOpcode::SuperLessLocalArrayLengthBranch;
+        const bool includesJump =
+            ip->flatOpcode == detail::FlatOpcode::SuperBinaryLocalIntConstStoreJump ||
+            ip->flatOpcode == detail::FlatOpcode::SuperBinaryLocalIntLocalStoreJump ||
+            ip->flatOpcode == detail::FlatOpcode::SuperBinaryLocalIntRegStoreJump;
+        const std::size_t instSpan = (includesBranch || includesJump)
             ? static_cast<std::size_t>(ip->span - 1)
             : static_cast<std::size_t>(ip->span);
+        if (isInlined) {
+            state.stack.push_back(&activeLoc.qualifiedName);
+        }
+        std::size_t executedSubK = 0;
         for (std::size_t k = 0; k < instSpan; ++k) {
+            executedSubK = k;
             const auto& singleDec = blk.instructions[startIdx + k];
             const bool ok = (singleDec.opcode == detail::QuickOpcode::Generic ||
                              singleDec.opcode >= detail::QuickOpcode::ConstantDouble)
-                ? executeInstruction(state, *location.module, function, *singleDec.bytecode, argWin, locWin, regWin)
-                : executeQuickInstruction(state, *location.module, singleDec, argWin, locWin, regWin);
+                ? executeInstruction(state, *activeLoc.module, activeFunc, *singleDec.bytecode, argWin, locWin, regWin)
+                : executeQuickInstruction(state, *activeLoc.module, singleDec, argWin, locWin, regWin);
             frameBase = state.values.data() + frameOffset;
             if (!ok) {
                 syncAfterFlatSubcall();
+                if (isInlined) {
+                    if (!state.pendingException) {
+                        refineInterpreterFrameSourceLocation(
+                            state,
+                            activeLoc,
+                            blk.bytecode->id,
+                            static_cast<std::uint32_t>(startIdx + executedSubK),
+                            1,
+                            false);
+                    }
+                    state.stack.pop_back();
+                    if (!state.pendingException) {
+                        refineInterpreterFrameSourceLocation(
+                            state,
+                            location,
+                            execution->blocks[cold.callerBlockIndex].bytecode->id,
+                            cold.callerInstIndex,
+                            1,
+                            false);
+                    }
+                    if (state.pendingException && execution->hasExceptionHandlers) {
+                        const auto protectedBlockId = execution->blocks[cold.callerBlockIndex].bytecode->id;
+                        const auto handlerOffset = routeFastException(protectedBlockId);
+                        if (handlerOffset != detail::InvalidStreamOffset) {
+                            ip = streamBase + handlerOffset;
+                            RS_FLAT_DISPATCH_AT_IP();
+                        }
+                    }
+                    state.valueTop = frameOffset;
+                    state.stack.pop_back();
+                    return false;
+                }
+                if (!state.pendingException) {
+                    refineInterpreterFrameSourceLocation(
+                        state,
+                        location,
+                        blk.bytecode->id,
+                        static_cast<std::uint32_t>(startIdx + executedSubK),
+                        1,
+                        false);
+                    state.valueTop = frameOffset;
+                    state.stack.pop_back();
+                    return false;
+                }
                 goto L_FlatError;
             }
+        }
+        if (isInlined) {
+            state.stack.pop_back();
         }
         syncAfterFlatSubcall();
         if (includesBranch) {
             if (++localExecuted > budgetLimit) goto L_FlatBudgetExceeded;
             if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
-            const bool cond = std::get<bool>(frameBase[ execution->registerOffset + blk.terminatorReg ]);
+            const bool cond = frameBase[activeFrameOff - frameOffset + activeExec.registerOffset + blk.terminatorReg].asBoolUnchecked();
             ++state.statistics.branchesTaken;
             ip = streamBase + (cond ? ip->trueTargetOffset : ip->falseTargetOffset);
+            RS_FLAT_DISPATCH_AT_IP();
+        }
+        if (includesJump) {
+            if (++localExecuted > budgetLimit) goto L_FlatBudgetExceeded;
+            if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+            ++state.statistics.branchesTaken;
+            ip = streamBase + ip->trueTargetOffset;
             RS_FLAT_DISPATCH_AT_IP();
         }
         RS_FLAT_DISPATCH_NEXT();
@@ -6165,26 +7439,107 @@ L_FlatTypeMismatch:
 
 L_FlatError:
         if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
-        if (state.pendingException && execution->hasExceptionHandlers) {
-            const auto protectedBlockId = execution->blocks[ip->blockIndex].bytecode->id;
-            const auto handlerOffset = routeFastException(protectedBlockId);
-            if (handlerOffset != detail::InvalidStreamOffset) {
-                ip = streamBase + handlerOffset;
-                RS_FLAT_DISPATCH_AT_IP();
+        if (ip >= streamBase && ip < streamBase + execution->flatStream.size()) {
+            const auto& cold = flatColdBase[ip - streamBase];
+            if (cold.inlinedCallee != nullptr) {
+                if (state.pendingException && execution->hasExceptionHandlers) {
+                    const auto protectedBlockId = execution->blocks[cold.callerBlockIndex].bytecode->id;
+                    const auto handlerOffset = routeFastException(protectedBlockId);
+                    if (handlerOffset != detail::InvalidStreamOffset) {
+                        ip = streamBase + handlerOffset;
+                        RS_FLAT_DISPATCH_AT_IP();
+                    }
+                }
+                if (!state.pendingException) {
+                    if (cold.callerBlockIndex < execution->blocks.size()) {
+                        refineInterpreterFrameSourceLocation(
+                            state,
+                            location,
+                            execution->blocks[cold.callerBlockIndex].bytecode->id,
+                            cold.callerInstIndex,
+                            1,
+                            false);
+                    }
+                    const auto& cLoc = *cold.inlinedCallee;
+                    const auto& cExec = *cold.directExecution;
+                    state.stack.push_back(&cLoc.qualifiedName);
+                    state.error.stackTrace.insert(state.error.stackTrace.begin(), cLoc.qualifiedName);
+                    StackTraceLocation calleeTraceLoc;
+                    calleeTraceLoc.function = cLoc.qualifiedName;
+                    if (cLoc.function) {
+                        calleeTraceLoc.symbolId = cLoc.function->symbolId;
+                        const auto& dbg = cLoc.function->debugInfo;
+                        if (!dbg.sequencePoints.empty() && cLoc.module) {
+                            const auto* activeSp = &dbg.sequencePoints.front();
+                            for (const auto& src : cLoc.module->sourceFiles) {
+                                if (src.id == activeSp->range.fileId) {
+                                    calleeTraceLoc.sourcePath = src.path;
+                                    break;
+                                }
+                            }
+                            calleeTraceLoc.sourceLine =
+                                static_cast<std::uint32_t>(activeSp->range.start.line + 1);
+                            calleeTraceLoc.sourceColumn =
+                                static_cast<std::uint32_t>(activeSp->range.start.column + 1);
+                        }
+                    }
+                    state.error.sourceLocations.insert(state.error.sourceLocations.begin(), calleeTraceLoc);
+                    state.error.symbolizedStackTrace.insert(
+                        state.error.symbolizedStackTrace.begin(), calleeTraceLoc.format());
+                    if (cold.blockIndex < cExec.blocks.size()) {
+                        const bool isTerm =
+                            ip->flatOpcode >= detail::FlatOpcode::TermJumpNoArgs ||
+                            (ip->flatOpcode >= detail::FlatOpcode::InlineReturnVoid &&
+                             ip->flatOpcode <= detail::FlatOpcode::InlineReturnScalarJump) ||
+                            ip->flatOpcode == detail::FlatOpcode::SuperLessLocalRegBranch ||
+                            ip->flatOpcode == detail::FlatOpcode::SuperLessLocalConstBranch ||
+                            ip->flatOpcode == detail::FlatOpcode::SuperLessLocalArrayLengthBranch ||
+                            ip->flatOpcode == detail::FlatOpcode::SuperBinaryLocalIntConstStoreJump ||
+                            ip->flatOpcode == detail::FlatOpcode::SuperBinaryLocalIntLocalStoreJump ||
+                            ip->flatOpcode == detail::FlatOpcode::SuperBinaryLocalIntRegStoreJump;
+                        if (!isTerm) {
+                            refineInterpreterFrameSourceLocation(
+                                state,
+                                cLoc,
+                                cExec.blocks[cold.blockIndex].bytecode->id,
+                                cold.instructionIndexInBlock,
+                                ip->span,
+                                false);
+                        }
+                    }
+                    state.stack.pop_back();
+                }
+                state.valueTop = frameOffset;
+                state.stack.pop_back();
+                return false;
             }
-        }
-        if (!state.pendingException &&
-            ip >= streamBase &&
-            ip < streamBase + execution->flatStream.size() &&
-            ip->blockIndex < execution->blocks.size()) {
-            const bool isTerm = ip->flatOpcode >= detail::FlatOpcode::TermJumpNoArgs;
-            refineInterpreterFrameSourceLocation(
-                state,
-                location,
-                execution->blocks[ip->blockIndex].bytecode->id,
-                ip->instructionIndexInBlock,
-                ip->span,
-                isTerm);
+            if (state.pendingException && execution->hasExceptionHandlers) {
+                const auto protectedBlockId = execution->blocks[cold.blockIndex].bytecode->id;
+                const auto handlerOffset = routeFastException(protectedBlockId);
+                if (handlerOffset != detail::InvalidStreamOffset) {
+                    ip = streamBase + handlerOffset;
+                    RS_FLAT_DISPATCH_AT_IP();
+                }
+            }
+            if (!state.pendingException && cold.blockIndex < execution->blocks.size()) {
+                const bool isTerm =
+                    ip->flatOpcode >= detail::FlatOpcode::TermJumpNoArgs ||
+                    ip->flatOpcode == detail::FlatOpcode::SuperLessLocalRegBranch ||
+                    ip->flatOpcode == detail::FlatOpcode::SuperLessLocalConstBranch ||
+                    ip->flatOpcode == detail::FlatOpcode::SuperLessLocalArrayLengthBranch ||
+                    ip->flatOpcode == detail::FlatOpcode::SuperBinaryLocalIntConstStoreJump ||
+                    ip->flatOpcode == detail::FlatOpcode::SuperBinaryLocalIntLocalStoreJump ||
+                    ip->flatOpcode == detail::FlatOpcode::SuperBinaryLocalIntRegStoreJump;
+                if (!isTerm) {
+                    refineInterpreterFrameSourceLocation(
+                        state,
+                        location,
+                        execution->blocks[cold.blockIndex].bytecode->id,
+                        cold.instructionIndexInBlock,
+                        ip->span,
+                        false);
+                }
+            }
         }
         state.valueTop = frameOffset;
         state.stack.pop_back();

@@ -1646,6 +1646,35 @@ public:
         }
     }
 
+    template <typename Visitor>
+    void visitTraceableRoots(Visitor&& visitor) const {
+        const auto visitValues = [&](const std::vector<Value>* values, const std::size_t* limit) {
+            if (!values) return;
+            const std::size_t count = limit
+                ? std::min(*limit, values->size())
+                : values->size();
+            const Value* data = values->data();
+            for (std::size_t index = 0; index < count; ++index) {
+                const Value& v = data[index];
+                if (v.isTraceable()) {
+                    visitor(v);
+                }
+            }
+        };
+        const std::size_t inlineCount = std::min(frameCount_, InlineFrameCapacity);
+        for (std::size_t i = 0; i < inlineCount; ++i) {
+            const auto& frame = inlineFrames_[i];
+            visitValues(frame.arguments, nullptr);
+            visitValues(frame.locals, nullptr);
+            visitValues(frame.registers, frame.activeRegisterLimit);
+        }
+        for (const auto& frame : overflowFrames_) {
+            visitValues(frame.arguments, nullptr);
+            visitValues(frame.locals, nullptr);
+            visitValues(frame.registers, frame.activeRegisterLimit);
+        }
+    }
+
     [[nodiscard]] std::size_t frameCount() const noexcept { return frameCount_; }
     [[nodiscard]] std::uint64_t instanceId() const noexcept { return instanceId_; }
 
@@ -1667,6 +1696,21 @@ private:
     std::uint64_t instanceId_ = 0;
     void* registryShard_ = nullptr;
     std::uint32_t registrySlot_ = InvalidRegistrySlot;
+};
+
+struct ArrayFastView {
+    Value* data = nullptr;
+    std::uint32_t length = 0;
+    semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
+    bool needsRememberedBarrier = false;
+    semantic::SymbolId elementTypeId = 0;
+};
+
+struct ObjectFastView {
+    Value* fields = nullptr;
+    std::uint32_t fieldCount = 0;
+    semantic::SymbolId typeId = 0;
+    bool needsRememberedBarrier = false;
 };
 
 class ManagedHeap {
@@ -1699,6 +1743,14 @@ public:
         std::size_t length,
         Value initialValue,
         RuntimeError* error = nullptr);
+    [[nodiscard]] std::optional<ObjectRef> allocateTypedArray(
+        semantic::SymbolId arrayTypeId,
+        semantic::PrimitiveType elementType,
+        semantic::SymbolId elementTypeId,
+        std::size_t length,
+        Value initialValue,
+        RuntimeError* error,
+        bool* outSlotsReallocated);
     [[nodiscard]] std::optional<ObjectRef> allocateRecord(
         std::size_t fieldCount,
         RuntimeError* error = nullptr);
@@ -1707,6 +1759,13 @@ public:
         std::vector<Value> fields,
         std::vector<std::size_t> referenceFields,
         RuntimeError* error = nullptr);
+    [[nodiscard]] std::optional<ObjectRef> allocateObjectFromTemplate(
+        semantic::SymbolId typeId,
+        const Value* defaultFields,
+        std::size_t fieldCount,
+        const std::shared_ptr<const std::vector<std::size_t>>& referenceFields,
+        RuntimeError* error = nullptr,
+        bool* outSlotsReallocated = nullptr);
 
     [[nodiscard]] bool isAlive(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<std::string_view> stringView(ObjectRef reference) const;
@@ -1719,6 +1778,12 @@ public:
         ObjectRef reference) const;
     [[nodiscard]] std::optional<Value> arrayGet(ObjectRef reference, std::size_t index) const;
     [[nodiscard]] const Value* arrayGetFast(ObjectRef reference, std::size_t index) const noexcept;
+    [[nodiscard]] bool tryBindArrayFastView(ObjectRef reference, ArrayFastView& outView) const noexcept;
+    void recordArrayWriteBarrier(ObjectRef arrayRef, const Value& value) noexcept;
+    [[nodiscard]] bool tryBindObjectFastView(ObjectRef reference, ObjectFastView& outView) const noexcept;
+    void recordObjectWriteBarrier(ObjectRef objectRef, const Value& value) noexcept;
+    [[nodiscard]] const void* slotStorageToken() const noexcept;
+    [[nodiscard]] semantic::SymbolId objectTypeIdFast(ObjectRef reference) const noexcept;
     bool arraySetPrevalidated(ObjectRef reference, std::size_t index, const Value& value, bool mayBeReference) noexcept;
     bool arraySet(
         ObjectRef reference,
