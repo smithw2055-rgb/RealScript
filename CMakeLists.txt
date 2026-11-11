@@ -182,7 +182,7 @@ endif()
 
 include(cmake/RealScriptAot.cmake)
 
-if(REALSCRIPT_BUILD_BENCHMARKS)
+if(REALSCRIPT_BUILD_BENCHMARKS AND NOT REALSCRIPT_SLIM_RUNTIME)
     set(REALSCRIPT_BENCH_INTEGER_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/bench_integer")
     realscript_add_aot_library(
@@ -223,7 +223,7 @@ if(REALSCRIPT_BUILD_BENCHMARKS)
     realscript_enable_cxx_warnings(rsbench_product)
 endif()
 
-if(REALSCRIPT_BUILD_TESTS)
+if(REALSCRIPT_BUILD_TESTS AND NOT REALSCRIPT_SLIM_RUNTIME)
     enable_testing()
 
     function(realscript_add_cpp_test target test_name source)
@@ -675,16 +675,22 @@ if(REALSCRIPT_INSTALL_SDK)
             realscript_debug
             realscript_tooling
             realscript_full
-            rsaot
         EXPORT RealScriptTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
-    install(
-        TARGETS rsc rsdebug rslsp rsbench rsbind
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    )
+    if(NOT REALSCRIPT_SLIM_RUNTIME AND TARGET rsaot)
+        install(
+            TARGETS rsaot
+            EXPORT RealScriptTargets
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        )
+        install(
+            TARGETS rsc rsdebug rslsp rsbench rsbind
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        )
+    endif()
     install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
     install(FILES LICENSE
         DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/RealScript)

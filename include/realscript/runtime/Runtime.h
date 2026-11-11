@@ -2027,6 +2027,14 @@ public:
     bool arrayClear(
         ObjectRef reference,
         RuntimeError* error = nullptr);
+    bool arrayReverse(
+        ObjectRef reference,
+        RuntimeError* error = nullptr);
+    bool arrayWritePrefixWithReset(
+        ObjectRef reference,
+        const Value* values,
+        std::size_t count,
+        RuntimeError* error = nullptr);
 
     void enableArrayChangeTracking(ObjectRef reference);
     [[nodiscard]] bool hasArrayChangeTracking(ObjectRef reference) const noexcept;
@@ -2046,6 +2054,8 @@ public:
         std::vector<CollectionChangeRecord>& outChanges,
         std::uint64_t& outCurrentVersion,
         bool& outRequiresReset) const;
+    void registerObservableListWrapperType(semantic::SymbolId wrapperTypeId);
+    [[nodiscard]] bool isObservableListWrapper(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<std::size_t> fieldCount(ObjectRef reference) const;
     [[nodiscard]] bool isInlineRecordObject(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<semantic::SymbolId> objectTypeId(
@@ -2945,5 +2955,12 @@ void unregisterExternalValuePoolRootMarker(const void* ownerKey) noexcept;
     ManagedHeap* heap,
     Value& result,
     std::string& errorMessage);
+
+[[nodiscard]] bool tryExecuteRuntimeIntrinsic(
+    std::string_view name,
+    ValueSpan arguments,
+    ManagedHeap* heap,
+    Value& result,
+    RuntimeError& error);
 
 } // namespace realscript::runtime

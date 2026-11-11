@@ -3917,13 +3917,23 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
             std::string elemTypeName;
             if (decodeArrayTypeName(receiver->typeName, elemType, elemTypeName)) {
                 if (!elemTypeName.empty()) {
-                    const auto foundElem = visibleTypes_.find(elemTypeName);
-                    if (foundElem != visibleTypes_.end()) {
-                        elemType = foundElem->second.kind == TypeKind::Class
-                            ? PrimitiveType::Object
-                            : (foundElem->second.kind == TypeKind::Struct
-                                ? PrimitiveType::Struct
-                                : PrimitiveType::Enum);
+                    if (elemTypeName.size() >= 2u &&
+                        elemTypeName.compare(elemTypeName.size() - 2u, 2u, "[]") == 0) {
+                        elemType = PrimitiveType::Array;
+                    } else {
+                        const auto foundElem = visibleTypes_.find(elemTypeName);
+                        if (foundElem != visibleTypes_.end()) {
+                            if (foundElem->second.interfaceType || foundElem->second.delegateType) {
+                                elemType = PrimitiveType::Object;
+                            } else {
+                                switch (foundElem->second.kind) {
+                                case TypeKind::Class: elemType = PrimitiveType::Object; break;
+                                case TypeKind::Struct: elemType = PrimitiveType::Struct; break;
+                                case TypeKind::Enum: elemType = PrimitiveType::Enum; break;
+                                default: elemType = PrimitiveType::Object; break;
+                                }
+                            }
+                        }
                     }
                 }
                 std::string intrinsicName;
@@ -5011,10 +5021,23 @@ std::unique_ptr<BoundExpression> Binder::bindElementAccessExpression(
     }
     // Resolve exact named element kind when available.
     if (!elementTypeName.empty()) {
-        const auto found = visibleTypes_.find(elementTypeName);
-        if (found != visibleTypes_.end()) {
-            elementType = found->second.kind == TypeKind::Class ? PrimitiveType::Object :
-                found->second.kind == TypeKind::Struct ? PrimitiveType::Struct : PrimitiveType::Enum;
+        if (elementTypeName.size() >= 2u &&
+            elementTypeName.compare(elementTypeName.size() - 2u, 2u, "[]") == 0) {
+            elementType = PrimitiveType::Array;
+        } else {
+            const auto found = visibleTypes_.find(elementTypeName);
+            if (found != visibleTypes_.end()) {
+                if (found->second.interfaceType || found->second.delegateType) {
+                    elementType = PrimitiveType::Object;
+                } else {
+                    switch (found->second.kind) {
+                    case TypeKind::Class: elementType = PrimitiveType::Object; break;
+                    case TypeKind::Struct: elementType = PrimitiveType::Struct; break;
+                    case TypeKind::Enum: elementType = PrimitiveType::Enum; break;
+                    default: elementType = PrimitiveType::Object; break;
+                    }
+                }
+            }
         }
     }
     auto index = convertExpression(bindExpression(*syntaxTree.index), PrimitiveType::Int, syntaxTree.index->span(), "array index");
@@ -5723,10 +5746,23 @@ std::unique_ptr<BoundExpression> Binder::bindElementAssignmentExpression(
         return makeError(syntaxTree.span());
     }
     if (!elementTypeName.empty()) {
-        const auto found = visibleTypes_.find(elementTypeName);
-        if (found != visibleTypes_.end()) {
-            elementType = found->second.kind == TypeKind::Class ? PrimitiveType::Object :
-                found->second.kind == TypeKind::Struct ? PrimitiveType::Struct : PrimitiveType::Enum;
+        if (elementTypeName.size() >= 2u &&
+            elementTypeName.compare(elementTypeName.size() - 2u, 2u, "[]") == 0) {
+            elementType = PrimitiveType::Array;
+        } else {
+            const auto found = visibleTypes_.find(elementTypeName);
+            if (found != visibleTypes_.end()) {
+                if (found->second.interfaceType || found->second.delegateType) {
+                    elementType = PrimitiveType::Object;
+                } else {
+                    switch (found->second.kind) {
+                    case TypeKind::Class: elementType = PrimitiveType::Object; break;
+                    case TypeKind::Struct: elementType = PrimitiveType::Struct; break;
+                    case TypeKind::Enum: elementType = PrimitiveType::Enum; break;
+                    default: elementType = PrimitiveType::Object; break;
+                    }
+                }
+            }
         }
     }
     auto index = convertExpression(bindExpression(*syntaxTree.index), PrimitiveType::Int, syntaxTree.index->span(), "array index");

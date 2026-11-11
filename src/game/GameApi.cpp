@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstring>
 #include <sstream>
 #include <unordered_map>
@@ -907,7 +908,35 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
                         std::string mVal = trim(item.substr(eqPos + 1));
                         if (firstMember.empty()) firstMember = mName;
                         rsBodyOut << "    " << mName << " = " << mVal << ",\n";
-                        try { nextVal = std::stoll(mVal) + 1; } catch (...) { ++nextVal; }
+                        auto tryParseEnumInt = [](std::string_view s, std::int64_t& out) noexcept -> bool {
+                            while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
+                                s.remove_prefix(1);
+                            }
+                            bool neg = false;
+                            if (!s.empty() && (s.front() == '+' || s.front() == '-')) {
+                                neg = (s.front() == '-');
+                                s.remove_prefix(1);
+                            }
+                            int base = 10;
+                            if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+                                base = 16;
+                                s.remove_prefix(2);
+                            }
+                            if (s.empty()) return false;
+                            std::uint64_t mag = 0;
+                            const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), mag, base);
+                            if (ec != std::errc{} || ptr == s.data()) return false;
+                            out = neg
+                                ? static_cast<std::int64_t>(0ULL - mag)
+                                : static_cast<std::int64_t>(mag);
+                            return true;
+                        };
+                        std::int64_t parsedEnumVal = 0;
+                        if (tryParseEnumInt(mVal, parsedEnumVal)) {
+                            nextVal = static_cast<std::int64_t>(static_cast<std::uint64_t>(parsedEnumVal) + 1ULL);
+                        } else {
+                            ++nextVal;
+                        }
                     } else {
                         if (firstMember.empty()) firstMember = item;
                         rsBodyOut << "    " << item << " = " << nextVal++ << ",\n";

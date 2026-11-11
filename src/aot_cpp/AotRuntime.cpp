@@ -155,9 +155,23 @@ void registerAotProgramObservableTypes(
     if (!program.types || program.typeCount == 0) return;
     for (std::uint32_t index = 0; index < program.typeCount; ++index) {
         const auto& type = program.types[index];
-        if (type.kind != semantic::TypeKind::Class ||
-            type.fieldCount == 0 ||
-            !type.fields) {
+        if (type.kind != semantic::TypeKind::Class) {
+            continue;
+        }
+        if (type.fieldCount == 1u && type.name != nullptr) {
+            std::string_view typeName(type.name);
+            if (const auto sep = typeName.rfind("::"); sep != std::string_view::npos) {
+                typeName.remove_prefix(sep + 2u);
+            }
+            constexpr std::string_view kWrapperPrefix = "ObservableList__";
+            constexpr std::string_view kEnumSuffix = "__Enumerator";
+            if (typeName.rfind(kWrapperPrefix, 0) == 0 &&
+                (typeName.size() <= kEnumSuffix.size() ||
+                 typeName.substr(typeName.size() - kEnumSuffix.size()) != kEnumSuffix)) {
+                heap.registerObservableListWrapperType(type.id);
+            }
+        }
+        if (type.fieldCount == 0 || !type.fields) {
             continue;
         }
         bool hasAnyObservable = type.observable;
@@ -1041,17 +1055,19 @@ bool ExecutionContext::call(
     }
     if (signature.name &&
         std::string_view(signature.name).rfind("$intrinsic::", 0) == 0) {
-        std::string intrinsicError;
+        runtime::RuntimeError intrinsicError;
         if (!runtime::tryExecuteRuntimeIntrinsic(
                 signature.name,
                 runtime::ValueSpan(arguments, argumentCount),
                 heap_.get(),
                 result,
                 intrinsicError)) {
-            const auto code = intrinsicError.find("null") != std::string::npos
-                ? runtime::ErrorCode::NullReference
-                : runtime::ErrorCode::InvalidProgram;
-            return fail(code, intrinsicError);
+            const auto code = intrinsicError.code != runtime::ErrorCode::None
+                ? intrinsicError.code
+                : (intrinsicError.message.find("null") != std::string::npos
+                    ? runtime::ErrorCode::NullReference
+                    : runtime::ErrorCode::InvalidProgram);
+            return fail(code, intrinsicError.message);
         }
         return true;
     }

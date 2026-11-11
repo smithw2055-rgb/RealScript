@@ -1369,13 +1369,15 @@ bool executeCall(
         }
     }
     if (reference.name.rfind("$intrinsic::", 0) == 0) {
-        std::string intrinsicError;
+        RuntimeError intrinsicError;
         if (!tryExecuteRuntimeIntrinsic(
                 reference.name, argSpan, state.heap, result, intrinsicError)) {
-            const auto code = intrinsicError.find("null") != std::string::npos
-                ? ErrorCode::NullReference
-                : ErrorCode::InvalidProgram;
-            return fail(state, code, intrinsicError);
+            const auto code = intrinsicError.code != ErrorCode::None
+                ? intrinsicError.code
+                : (intrinsicError.message.find("null") != std::string::npos
+                    ? ErrorCode::NullReference
+                    : ErrorCode::InvalidProgram);
+            return fail(state, code, intrinsicError.message);
         }
         return true;
     }

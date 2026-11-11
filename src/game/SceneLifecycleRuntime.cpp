@@ -3,6 +3,8 @@
 #include "realscript/game/GameplayMetadata.h"
 
 #include <algorithm>
+#include <cctype>
+#include <charconv>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -43,11 +45,22 @@ int findExecutionOrderAttribute(
             if (attr.target == canonicalTypeName &&
                 (attr.name == "DefaultExecutionOrder" || attr.name == "ExecutionOrder") &&
                 !attr.arguments.empty()) {
-                try {
-                    return std::stoi(attr.arguments.front().value);
-                } catch (...) {
-                    return 0;
+                std::string_view sv = attr.arguments.front().value;
+                while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.front()))) {
+                    sv.remove_prefix(1);
                 }
+                if (!sv.empty() && sv.front() == '+') {
+                    sv.remove_prefix(1);
+                }
+                int parsedOrder = 0;
+                if (!sv.empty()) {
+                    const auto [ptr, ec] = std::from_chars(
+                        sv.data(), sv.data() + sv.size(), parsedOrder, 10);
+                    if (ec == std::errc{} && ptr != sv.data()) {
+                        return parsedOrder;
+                    }
+                }
+                return 0;
             }
         }
     }

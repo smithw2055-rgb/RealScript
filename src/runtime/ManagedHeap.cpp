@@ -321,6 +321,7 @@ struct ArrayOwnerObserver {
 };
 
 struct ArrayCollectionMeta {
+    using RingArray = std::array<CollectionChangeRecord, ManagedHeap::kCollectionDeltaRingCapacity>;
     static constexpr std::uint32_t kRingMask =
         static_cast<std::uint32_t>(ManagedHeap::kCollectionDeltaRingCapacity - 1u);
 
@@ -328,7 +329,8 @@ struct ArrayCollectionMeta {
     std::uint64_t baseVersion = 0;
     std::uint32_t head = 0;
     std::uint32_t count = 0;
-    std::array<CollectionChangeRecord, ManagedHeap::kCollectionDeltaRingCapacity> ring{};
+    bool trackingEnabled = false;
+    std::unique_ptr<RingArray> ring;
     std::vector<ArrayOwnerObserver> owners;
 };
 
@@ -831,11 +833,8 @@ struct ManagedHeap::Impl {
             customSlotSizes.erase(slotIndex);
         }
         if (slot.hasFlag(GcFlag::InDirtyQueue | GcFlag::HasUiObserver)) {
-            if (slot.kind() == ObjectKind::Array) {
-                arrayCollectionMeta.erase(slotIndex);
-            } else {
-                uiObservableMeta.erase(slotIndex);
-            }
+            arrayCollectionMeta.erase(slotIndex);
+            uiObservableMeta.erase(slotIndex);
         }
         switch (slot.storage()) {
         case SlotStorage::Empty:
@@ -876,10 +875,16 @@ struct ManagedHeap::Impl {
                 markValueInPools(data[i]);
             }
         }
+        constexpr std::uint32_t kRingCap =
+            static_cast<std::uint32_t>(ManagedHeap::kCollectionDeltaRingCapacity);
         for (const auto& [slotIdx, meta] : arrayCollectionMeta) {
-            if (slotIdx >= slots.size() || !slots[slotIdx].occupied()) continue;
-            for (std::uint32_t i = 0; i < meta.count; ++i) {
-                const auto& rec = meta.ring[(meta.head + i) & ArrayCollectionMeta::kRingMask];
+            if (slotIdx >= slots.size() || !slots[slotIdx].occupied() ||
+                slots[slotIdx].kind() != ObjectKind::Array || !meta.ring) {
+                continue;
+            }
+            const std::uint32_t activeCount = std::min<std::uint32_t>(meta.count, kRingCap);
+            for (std::uint32_t i = 0; i < activeCount; ++i) {
+                const auto& rec = (*meta.ring)[(meta.head + i) & ArrayCollectionMeta::kRingMask];
                 markValueInPools(rec.oldValue);
                 markValueInPools(rec.newValue);
             }
@@ -1398,10 +1403,13 @@ struct ManagedHeap::Impl {
             layout.mayContainReferences &&
             slot->hasFlag(GcFlag::HasUiObserver)) {
             const auto metaIt = arrayCollectionMeta.find(reference.slot);
-            if (metaIt != arrayCollectionMeta.end()) {
+            if (metaIt != arrayCollectionMeta.end() && metaIt->second.ring) {
                 const auto& meta = metaIt->second;
-                for (std::uint32_t i = 0; i < meta.count; ++i) {
-                    const auto& rec = meta.ring[(meta.head + i) & ArrayCollectionMeta::kRingMask];
+                const std::uint32_t activeCount = std::min<std::uint32_t>(
+                    meta.count,
+                    static_cast<std::uint32_t>(ManagedHeap::kCollectionDeltaRingCapacity));
+                for (std::uint32_t i = 0; i < activeCount; ++i) {
+                    const auto& rec = (*meta.ring)[(meta.head + i) & ArrayCollectionMeta::kRingMask];
                     markValue(rec.oldValue);
                     markValue(rec.newValue);
                 }
@@ -1476,6 +1484,39 @@ struct ManagedHeap::Impl {
         }
     }
 
+    [[nodiscard]] bool isNurseryValue(const Value& val) const noexcept {
+        if (!val.isTraceable()) return false;
+        const auto t = val.rawTag();
+        if (t == ValueTag::ObjectRef) {
+            const auto* slot = getSlot(val.asObjectRefUnchecked());
+            return slot != nullptr && slot->hasFlag(GcFlag::InNursery);
+        }
+        if (t == ValueTag::Struct) {
+            const auto& st = val.asStructUnchecked();
+            if (!st.isInline && st.storage) {
+                for (const auto& field : st.storage->fields) {
+                    if (isNurseryValue(field)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool isArrayTrackingEnabled(
+        std::uint32_t slotIndex,
+        const CompactSlot& slot) const noexcept {
+        if (!slot.hasFlag(GcFlag::HasUiObserver)) return false;
+        const auto it = arrayCollectionMeta.find(slotIndex);
+        return it != arrayCollectionMeta.end() && it->second.trackingEnabled;
+    }
+
+    ArrayCollectionMeta& enableArrayTracking(ObjectRef arrayRef, CompactSlot& slot) {
+        slot.gcFlags |= GcFlag::HasUiObserver;
+        auto& meta = arrayCollectionMeta[arrayRef.slot];
+        meta.trackingEnabled = true;
+        return meta;
+    }
+
     [[nodiscard]] ObjectRef unwrapTrackedBackingArray(const Value& val) const noexcept {
         const auto* ref = std::get_if<ObjectRef>(&val);
         if (!ref || !ref->valid()) return ObjectRef{};
@@ -1507,8 +1548,7 @@ struct ManagedHeap::Impl {
             observableBitIndex == 0xFFu || !getSlot(ownerObject)) {
             return;
         }
-        arrSlot->gcFlags |= GcFlag::HasUiObserver;
-        auto& meta = arrayCollectionMeta[arrayRef.slot];
+        auto& meta = enableArrayTracking(arrayRef, *arrSlot);
         for (auto& existing : meta.owners) {
             if (existing.ownerObject == ownerObject &&
                 existing.ownerFieldIndex == fieldIndex &&
@@ -1571,13 +1611,22 @@ struct ManagedHeap::Impl {
         std::size_t index,
         const Value& oldVal,
         const Value& newVal) {
-        slot.gcFlags |= GcFlag::HasUiObserver;
-        auto& meta = arrayCollectionMeta[arrayRef.slot];
+        if (!slot.hasFlag(GcFlag::HasUiObserver)) return;
+        const auto metaIt = arrayCollectionMeta.find(arrayRef.slot);
+        if (metaIt == arrayCollectionMeta.end() || !metaIt->second.trackingEnabled) {
+            return;
+        }
+        auto& meta = metaIt->second;
+        constexpr std::uint32_t kCap =
+            static_cast<std::uint32_t>(ManagedHeap::kCollectionDeltaRingCapacity);
         if (kind == CollectionChangeKind::Reset) {
             const std::uint64_t nextVer = ++meta.mutationVersion;
             meta.baseVersion = nextVer;
-            for (std::uint32_t i = 0; i < meta.count; ++i) {
-                meta.ring[(meta.head + i) & ArrayCollectionMeta::kRingMask] = CollectionChangeRecord{};
+            if (meta.ring) {
+                const std::uint32_t activeCount = std::min<std::uint32_t>(meta.count, kCap);
+                for (std::uint32_t i = 0; i < activeCount; ++i) {
+                    (*meta.ring)[(meta.head + i) & ArrayCollectionMeta::kRingMask] = CollectionChangeRecord{};
+                }
             }
             meta.head = 0;
             meta.count = 0;
@@ -1587,9 +1636,33 @@ struct ManagedHeap::Impl {
         if (oldVal.isTraceable()) pinValueInPools(oldVal);
         if (newVal.isTraceable()) pinValueInPools(newVal);
 
+        if (!slot.hasFlag(GcFlag::InNursery) &&
+            (isNurseryValue(oldVal) || isNurseryValue(newVal))) {
+            if (!slot.hasFlag(GcFlag::InRememberedSet)) {
+                slot.gcFlags |= GcFlag::InRememberedSet;
+                rememberedSet.push_back(arrayRef);
+            }
+        }
+        if (phase != GcPhase::Idle && slot.hasFlag(GcFlag::Marked)) {
+            bool markedAny = false;
+            if (valueMayContainReferences(oldVal)) {
+                markValue(oldVal);
+                markedAny = true;
+            }
+            if (valueMayContainReferences(newVal)) {
+                markValue(newVal);
+                markedAny = true;
+            }
+            if (markedAny && !markStack.empty()) {
+                reopenMarkFromSweep();
+            }
+        }
+
+        if (!meta.ring) {
+            meta.ring = std::make_unique<ArrayCollectionMeta::RingArray>();
+        }
+
         const std::uint64_t nextVer = ++meta.mutationVersion;
-        constexpr std::uint32_t kCap =
-            static_cast<std::uint32_t>(ManagedHeap::kCollectionDeltaRingCapacity);
         CollectionChangeRecord rec{};
         rec.version = nextVer;
         rec.index = static_cast<std::uint32_t>(index);
@@ -1599,10 +1672,10 @@ struct ManagedHeap::Impl {
 
         if (meta.count < kCap) {
             const std::uint32_t writePos = (meta.head + meta.count) & ArrayCollectionMeta::kRingMask;
-            meta.ring[writePos] = rec;
+            (*meta.ring)[writePos] = rec;
             ++meta.count;
         } else {
-            meta.ring[meta.head] = rec;
+            (*meta.ring)[meta.head] = rec;
             meta.head = (meta.head + 1u) & ArrayCollectionMeta::kRingMask;
             ++meta.baseVersion;
         }
@@ -1611,11 +1684,33 @@ struct ManagedHeap::Impl {
 
     std::vector<Value>* ensureMutableHeapArrayVector(
         CompactSlot& slot,
-        std::size_t reserveCapacity) {
+        std::size_t reserveCapacity,
+        bool exactReserve = false) {
+        const auto computeTargetCapacity = [&](std::size_t currentCap, std::size_t curLen) noexcept -> std::size_t {
+            if (exactReserve) return reserveCapacity;
+            const std::size_t half = currentCap >> 1u;
+            std::size_t grown = (currentCap > std::numeric_limits<std::size_t>::max() - half - 4u)
+                ? reserveCapacity
+                : (currentCap + half + 4u);
+            if (config.maximumHeapBytes > statistics.liveBytes) {
+                const std::size_t maxExtraElems =
+                    (config.maximumHeapBytes - statistics.liveBytes) / sizeof(Value);
+                const std::size_t maxTotalCap =
+                    (curLen > std::numeric_limits<std::size_t>::max() - maxExtraElems)
+                        ? std::numeric_limits<std::size_t>::max()
+                        : (curLen + maxExtraElems);
+                if (grown > maxTotalCap) {
+                    grown = maxTotalCap;
+                }
+            } else {
+                grown = reserveCapacity;
+            }
+            return std::max(reserveCapacity, grown);
+        };
         if (slot.storage() == SlotStorage::HeapValues) {
             auto& vec = largeBuffers.mutableBuffer(slot.payload.s.handle);
             if (vec.capacity() < reserveCapacity) {
-                vec.reserve(reserveCapacity);
+                vec.reserve(computeTargetCapacity(vec.capacity(), vec.size()));
                 slot.payload.s.data = vec.empty() ? emptyValueSlicePtr() : vec.data();
             }
             return &vec;
@@ -1630,7 +1725,7 @@ struct ManagedHeap::Impl {
             const std::uint32_t newHandle = largeBuffers.acquireCopy(oldData, oldLen, newData);
             auto& vec = largeBuffers.mutableBuffer(newHandle);
             if (vec.capacity() < reserveCapacity) {
-                vec.reserve(reserveCapacity);
+                vec.reserve(computeTargetCapacity(vec.capacity(), oldLen));
             }
             slabPool.deallocate(oldCls, oldHandle, oldLen);
             slot.setKindAndStorage(ObjectKind::Array, SlotStorage::HeapValues);
@@ -1669,6 +1764,17 @@ struct ManagedHeap::Impl {
     void attachInitialRecordArrayFields(ObjectRef recordRef, CompactSlot& slot) {
         const auto tid = typeLayouts[slot.payload.s.layoutId].typeId;
         if (tid == 0) return;
+        if (!observableListWrapperTypes.empty() &&
+            observableListWrapperTypes.find(tid) != observableListWrapperTypes.end() &&
+            slot.payload.s.length >= 1u) {
+            if (const auto* innerRef = std::get_if<ObjectRef>(&slot.payload.s.data[0]);
+                innerRef && innerRef->kind == ObjectKind::Array) {
+                if (auto* arrSlot = getSlot(*innerRef);
+                    arrSlot && arrSlot->kind() == ObjectKind::Array) {
+                    (void)enableArrayTracking(*innerRef, *arrSlot);
+                }
+            }
+        }
         const auto foundBits = typeObservableBits.find(tid);
         if (foundBits == typeObservableBits.end()) return;
         const auto& bits = foundBits->second;
@@ -2290,6 +2396,10 @@ bool ManagedHeap::tryBindObjectFastView(ObjectRef reference, ObjectFastView& out
         impl_->typeObservableBits.find(layout.typeId) != impl_->typeObservableBits.end()) {
         return false;
     }
+    if (!impl_->observableListWrapperTypes.empty() &&
+        impl_->observableListWrapperTypes.find(layout.typeId) != impl_->observableListWrapperTypes.end()) {
+        return false;
+    }
     outView.fields = slot->payload.s.data;
     outView.fieldCount = slot->payload.s.length;
     outView.typeId = layout.typeId;
@@ -2343,7 +2453,7 @@ bool ManagedHeap::arraySetPrevalidated(
     if (index >= slot->payload.s.length) {
         return false;
     }
-    const bool tracked = slot->hasFlag(GcFlag::HasUiObserver);
+    const bool tracked = impl_->isArrayTrackingEnabled(reference.slot, *slot);
     const Value oldVal = tracked ? slot->payload.s.data[index] : Value{};
     if (mayBeReference) {
         impl_->writeBarrierArrayElement(reference, index, value);
@@ -2463,7 +2573,7 @@ bool ManagedHeap::arraySet(
             return false;
         }
     }
-    const bool tracked = slot->hasFlag(GcFlag::HasUiObserver);
+    const bool tracked = impl_->isArrayTrackingEnabled(reference.slot, *slot);
     const Value oldVal = tracked ? values[index] : Value{};
     if (value.isTraceable()) {
         pinValueInPools(value);
@@ -2549,7 +2659,30 @@ bool ManagedHeap::arrayReserve(
     if (capacity <= slot->payload.s.length) {
         return true;
     }
-    return impl_->ensureMutableHeapArrayVector(*slot, capacity) != nullptr;
+    const std::size_t totalCapBytes = estimateValueStorage(capacity);
+    const std::size_t extraElems = capacity - static_cast<std::size_t>(slot->payload.s.length);
+    const std::size_t extraBytes = estimateValueStorage(extraElems);
+    const std::size_t budget = impl_->config.maximumHeapBytes > impl_->statistics.liveBytes
+        ? (impl_->config.maximumHeapBytes - impl_->statistics.liveBytes)
+        : 0u;
+    if (totalCapBytes == std::numeric_limits<std::size_t>::max() ||
+        extraBytes == std::numeric_limits<std::size_t>::max() ||
+        extraBytes > budget) {
+        setHeapError(error, ErrorCode::OutOfMemory, "managed array reserve exceeds heap limit");
+        impl_->requested = true;
+        return false;
+    }
+    if (slot->storage() == SlotStorage::HeapValues) {
+        const auto& curVec = impl_->largeBuffers.mutableBuffer(slot->payload.s.handle);
+        if (capacity <= curVec.capacity()) {
+            return true;
+        }
+    }
+    if (!impl_->ensureMutableHeapArrayVector(*slot, capacity, true)) {
+        setHeapError(error, ErrorCode::InvalidObjectReference, "managed array storage is not mutable");
+        return false;
+    }
+    return true;
 }
 
 bool ManagedHeap::arrayPush(
@@ -2570,7 +2703,8 @@ bool ManagedHeap::arrayPush(
     if (!validateDynamicArrayElement(*this, layout, value, typePolicy, error)) {
         return false;
     }
-    if (impl_->statistics.liveBytes > impl_->config.maximumHeapBytes - sizeof(Value)) {
+    if (impl_->config.maximumHeapBytes < sizeof(Value) ||
+        impl_->statistics.liveBytes > impl_->config.maximumHeapBytes - sizeof(Value)) {
         setHeapError(error, ErrorCode::OutOfMemory, "managed array push exceeds heap limit");
         impl_->requested = true;
         return false;
@@ -2590,13 +2724,21 @@ bool ManagedHeap::arrayPush(
     impl_->statistics.bytesAllocated += sizeof(Value);
     impl_->statistics.liveBytes += sizeof(Value);
     impl_->statistics.peakLiveBytes = std::max(impl_->statistics.peakLiveBytes, impl_->statistics.liveBytes);
+    if (slot->hasFlag(GcFlag::CustomSize)) {
+        auto csIt = impl_->customSlotSizes.find(reference.slot);
+        if (csIt != impl_->customSlotSizes.end()) {
+            csIt->second += sizeof(Value);
+        }
+    }
     if (impl_->statistics.liveBytes >= impl_->nextCollectionThreshold) {
         impl_->requested = true;
     }
     impl_->syncOldGenArrayCardsAfterResize(*slot);
     impl_->writeBarrierArrayElement(reference, oldLen, value);
-    impl_->appendArrayChangeRecord(
-        reference, *slot, CollectionChangeKind::Add, oldLen, Value{}, value);
+    if (impl_->isArrayTrackingEnabled(reference.slot, *slot)) {
+        impl_->appendArrayChangeRecord(
+            reference, *slot, CollectionChangeKind::Add, oldLen, Value{}, value);
+    }
     return true;
 }
 
@@ -2624,7 +2766,8 @@ bool ManagedHeap::arrayInsert(
     if (!validateDynamicArrayElement(*this, layout, value, typePolicy, error)) {
         return false;
     }
-    if (impl_->statistics.liveBytes > impl_->config.maximumHeapBytes - sizeof(Value)) {
+    if (impl_->config.maximumHeapBytes < sizeof(Value) ||
+        impl_->statistics.liveBytes > impl_->config.maximumHeapBytes - sizeof(Value)) {
         setHeapError(error, ErrorCode::OutOfMemory, "managed array insert exceeds heap limit");
         impl_->requested = true;
         return false;
@@ -2643,6 +2786,12 @@ bool ManagedHeap::arrayInsert(
     impl_->statistics.bytesAllocated += sizeof(Value);
     impl_->statistics.liveBytes += sizeof(Value);
     impl_->statistics.peakLiveBytes = std::max(impl_->statistics.peakLiveBytes, impl_->statistics.liveBytes);
+    if (slot->hasFlag(GcFlag::CustomSize)) {
+        auto csIt = impl_->customSlotSizes.find(reference.slot);
+        if (csIt != impl_->customSlotSizes.end()) {
+            csIt->second += sizeof(Value);
+        }
+    }
     if (impl_->statistics.liveBytes >= impl_->nextCollectionThreshold) {
         impl_->requested = true;
     }
@@ -2659,8 +2808,10 @@ bool ManagedHeap::arrayInsert(
         }
         impl_->writeBarrierArrayElement(reference, index, value);
     }
-    impl_->appendArrayChangeRecord(
-        reference, *slot, CollectionChangeKind::Insert, index, Value{}, value);
+    if (impl_->isArrayTrackingEnabled(reference.slot, *slot)) {
+        impl_->appendArrayChangeRecord(
+            reference, *slot, CollectionChangeKind::Insert, index, Value{}, value);
+    }
     return true;
 }
 
@@ -2698,6 +2849,12 @@ bool ManagedHeap::arrayRemoveAt(
     if (impl_->statistics.liveBytes >= sizeof(Value)) {
         impl_->statistics.liveBytes -= sizeof(Value);
     }
+    if (slot->hasFlag(GcFlag::CustomSize)) {
+        auto csIt = impl_->customSlotSizes.find(reference.slot);
+        if (csIt != impl_->customSlotSizes.end()) {
+            csIt->second = (csIt->second >= sizeof(Value)) ? (csIt->second - sizeof(Value)) : 0u;
+        }
+    }
     impl_->statistics.bytesReclaimed += sizeof(Value);
     const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
     if (layout.mayContainReferences && !slot->hasFlag(GcFlag::InNursery)) {
@@ -2716,8 +2873,10 @@ bool ManagedHeap::arrayRemoveAt(
             impl_->reopenMarkFromSweep();
         }
     }
-    impl_->appendArrayChangeRecord(
-        reference, *slot, CollectionChangeKind::RemoveAt, index, removed, Value{});
+    if (impl_->isArrayTrackingEnabled(reference.slot, *slot)) {
+        impl_->appendArrayChangeRecord(
+            reference, *slot, CollectionChangeKind::RemoveAt, index, removed, Value{});
+    }
     return true;
 }
 
@@ -2757,22 +2916,140 @@ bool ManagedHeap::arrayClear(
     impl_->statistics.liveBytes = (impl_->statistics.liveBytes >= freedBytes)
         ? (impl_->statistics.liveBytes - freedBytes)
         : 0u;
+    if (slot->hasFlag(GcFlag::CustomSize)) {
+        auto csIt = impl_->customSlotSizes.find(reference.slot);
+        if (csIt != impl_->customSlotSizes.end()) {
+            csIt->second = (csIt->second >= freedBytes) ? (csIt->second - freedBytes) : 0u;
+        }
+    }
     impl_->statistics.bytesReclaimed += freedBytes;
-    impl_->appendArrayChangeRecord(
-        reference, *slot, CollectionChangeKind::Clear, 0u, Value{}, Value{});
+    if (impl_->isArrayTrackingEnabled(reference.slot, *slot)) {
+        impl_->appendArrayChangeRecord(
+            reference, *slot, CollectionChangeKind::Clear, 0u, Value{}, Value{});
+    }
+    return true;
+}
+
+bool ManagedHeap::arrayReverse(
+    ObjectRef reference,
+    RuntimeError* error) {
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) {
+        setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
+        return false;
+    }
+    if (slot->storage() == SlotStorage::RawColumn) {
+        const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
+        if (view.readOnly || (!view.basePtr && view.count > 0)) {
+            setHeapError(error, ErrorCode::CapabilityDenied, "cannot reverse read-only native ECS column view");
+            return false;
+        }
+        const std::size_t len = view.count;
+        for (std::size_t i = 0; i < len / 2u; ++i) {
+            const std::size_t j = len - 1u - i;
+            const auto leftVal = arrayGet(reference, i);
+            const auto rightVal = arrayGet(reference, j);
+            if (!leftVal || !rightVal ||
+                !arraySet(reference, i, *rightVal, error) ||
+                !arraySet(reference, j, *leftVal, error)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    const std::size_t len = slot->payload.s.length;
+    if (len <= 1u) {
+        return true;
+    }
+    Value* values = slot->payload.s.data;
+    for (std::size_t i = 0; i < len / 2u; ++i) {
+        std::swap(values[i], values[len - 1u - i]);
+    }
+    const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+    if (layout.mayContainReferences && !slot->hasFlag(GcFlag::InNursery) &&
+        slot->hasFlag(GcFlag::HasCardTable) && slot->hasFlag(GcFlag::InRememberedSet)) {
+        impl_->cardArena.get(slot->payload.s.cardHandle).markAllDirty();
+    }
+    if (impl_->isArrayTrackingEnabled(reference.slot, *slot)) {
+        impl_->appendArrayChangeRecord(
+            reference, *slot, CollectionChangeKind::Reset, 0u, Value{}, Value{});
+    }
+    return true;
+}
+
+bool ManagedHeap::arrayWritePrefixWithReset(
+    ObjectRef reference,
+    const Value* values,
+    std::size_t count,
+    RuntimeError* error) {
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) {
+        setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
+        return false;
+    }
+    if (count == 0u) {
+        return true;
+    }
+    if (!values) {
+        setHeapError(error, ErrorCode::InvalidArguments, "managed array source buffer is null");
+        return false;
+    }
+    if (slot->storage() == SlotStorage::RawColumn) {
+        const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
+        if (count > view.count) {
+            setHeapError(error, ErrorCode::IndexOutOfRange, "managed array write count exceeds length");
+            return false;
+        }
+        for (std::size_t i = 0; i < count; ++i) {
+            if (!arraySet(reference, i, values[i], error)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (count > slot->payload.s.length) {
+        setHeapError(error, ErrorCode::IndexOutOfRange, "managed array write count exceeds length");
+        return false;
+    }
+    const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!validateDynamicArrayElement(
+                *this, layout, values[i], ArrayStoreTypePolicy::PrevalidatedAssignableObject, error)) {
+            return false;
+        }
+    }
+    if (impl_->phase != GcPhase::Idle && slot->hasFlag(GcFlag::Marked) && layout.mayContainReferences) {
+        for (std::size_t i = 0; i < count; ++i) {
+            impl_->markValue(slot->payload.s.data[i]);
+        }
+    }
+    Value* dst = slot->payload.s.data;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (values[i].isTraceable()) {
+            pinValueInPools(values[i]);
+        }
+        if (layout.mayContainReferences) {
+            impl_->writeBarrierArrayElement(reference, i, values[i]);
+        }
+        dst[i] = values[i];
+    }
+    if (impl_->isArrayTrackingEnabled(reference.slot, *slot)) {
+        impl_->appendArrayChangeRecord(
+            reference, *slot, CollectionChangeKind::Reset, 0u, Value{}, Value{});
+    }
     return true;
 }
 
 void ManagedHeap::enableArrayChangeTracking(ObjectRef reference) {
     if (auto* slot = impl_->getSlot(reference); slot && slot->kind() == ObjectKind::Array) {
-        slot->gcFlags |= GcFlag::HasUiObserver;
-        (void)impl_->arrayCollectionMeta[reference.slot];
+        (void)impl_->enableArrayTracking(reference, *slot);
     }
 }
 
 bool ManagedHeap::hasArrayChangeTracking(ObjectRef reference) const noexcept {
     const auto* slot = impl_->getSlot(reference);
-    return slot && slot->kind() == ObjectKind::Array && slot->hasFlag(GcFlag::HasUiObserver);
+    return slot && slot->kind() == ObjectKind::Array &&
+        impl_->isArrayTrackingEnabled(reference.slot, *slot);
 }
 
 std::uint64_t ManagedHeap::arrayMutationVersion(ObjectRef reference) const noexcept {
@@ -2781,11 +3058,15 @@ std::uint64_t ManagedHeap::arrayMutationVersion(ObjectRef reference) const noexc
         return 0ULL;
     }
     const auto it = impl_->arrayCollectionMeta.find(reference.slot);
-    return (it != impl_->arrayCollectionMeta.end()) ? it->second.mutationVersion : 0ULL;
+    return (it != impl_->arrayCollectionMeta.end() && it->second.trackingEnabled)
+        ? it->second.mutationVersion
+        : 0ULL;
 }
 
 void ManagedHeap::recordArrayReset(ObjectRef reference) {
-    if (auto* slot = impl_->getSlot(reference); slot && slot->kind() == ObjectKind::Array) {
+    if (auto* slot = impl_->getSlot(reference);
+        slot && slot->kind() == ObjectKind::Array &&
+        impl_->isArrayTrackingEnabled(reference.slot, *slot)) {
         impl_->appendArrayChangeRecord(
             reference, *slot, CollectionChangeKind::Reset, 0u, Value{}, Value{});
     }
@@ -2839,7 +3120,7 @@ bool ManagedHeap::readArrayChangesSince(
         return true;
     }
     const auto it = impl_->arrayCollectionMeta.find(arrayRef.slot);
-    if (it == impl_->arrayCollectionMeta.end()) {
+    if (it == impl_->arrayCollectionMeta.end() || !it->second.trackingEnabled) {
         outCurrentVersion = 0ULL;
         if (sinceVersion != 0ULL) {
             outRequiresReset = true;
@@ -2851,7 +3132,7 @@ bool ManagedHeap::readArrayChangesSince(
     if (sinceVersion == meta.mutationVersion) {
         return true;
     }
-    if (sinceVersion < meta.baseVersion || sinceVersion > meta.mutationVersion) {
+    if (sinceVersion < meta.baseVersion || sinceVersion > meta.mutationVersion || !meta.ring) {
         outRequiresReset = true;
         return true;
     }
@@ -2861,7 +3142,7 @@ bool ManagedHeap::readArrayChangesSince(
     for (std::size_t i = 0; i < deltaCount; ++i) {
         const auto ringIdx =
             (meta.head + static_cast<std::uint32_t>(startOffset + i)) & ArrayCollectionMeta::kRingMask;
-        outChanges.push_back(meta.ring[ringIdx]);
+        outChanges.push_back((*meta.ring)[ringIdx]);
     }
     return true;
 }
@@ -2876,11 +3157,11 @@ ObjectRef ObservableListHelper::resolveBackingArray(
         return listOrArray;
     }
     if (listOrArray.kind == ObjectKind::Record) {
-        const ObjectRef unwrapped = heap.impl_->unwrapTrackedBackingArray(Value{listOrArray});
-        if (unwrapped.valid()) {
-            return unwrapped;
+        if (heap.isObservableListWrapper(listOrArray)) {
+            return heap.impl_->unwrapTrackedBackingArray(Value{listOrArray});
         }
-        if (heap.fieldCount(listOrArray) == 1u) {
+        if (heap.impl_->observableListWrapperTypes.empty() &&
+            heap.fieldCount(listOrArray) == 1u) {
             if (const Value* f0 = heap.fieldGetFast(listOrArray, 0u)) {
                 if (const auto* innerRef = std::get_if<ObjectRef>(f0)) {
                     if (innerRef->kind == ObjectKind::Array && heap.isAlive(*innerRef)) {
@@ -2932,6 +3213,7 @@ bool ObservableListHelper::add(
         setHeapError(error, ErrorCode::InvalidObjectReference, "target is not a valid list or array");
         return false;
     }
+    heap.enableArrayChangeTracking(arr);
     return heap.arrayPush(arr, std::move(value), error, ArrayStoreTypePolicy::PrevalidatedAssignableObject);
 }
 
@@ -2946,6 +3228,7 @@ bool ObservableListHelper::insert(
         setHeapError(error, ErrorCode::InvalidObjectReference, "target is not a valid list or array");
         return false;
     }
+    heap.enableArrayChangeTracking(arr);
     return heap.arrayInsert(arr, index, std::move(value), error, ArrayStoreTypePolicy::PrevalidatedAssignableObject);
 }
 
@@ -2960,6 +3243,7 @@ bool ObservableListHelper::removeAt(
         setHeapError(error, ErrorCode::InvalidObjectReference, "target is not a valid list or array");
         return false;
     }
+    heap.enableArrayChangeTracking(arr);
     return heap.arrayRemoveAt(arr, index, outRemoved, error);
 }
 
@@ -2987,6 +3271,7 @@ bool ObservableListHelper::clear(
         setHeapError(error, ErrorCode::InvalidObjectReference, "target is not a valid list or array");
         return false;
     }
+    heap.enableArrayChangeTracking(arr);
     return heap.arrayClear(arr, error);
 }
 
@@ -3099,6 +3384,18 @@ bool ManagedHeap::fieldSet(
     }
     slotVal = std::move(value);
 
+    if (index == 0u && layout.typeId != 0 &&
+        !impl_->observableListWrapperTypes.empty() &&
+        impl_->observableListWrapperTypes.find(layout.typeId) != impl_->observableListWrapperTypes.end()) {
+        if (const auto* innerRef = std::get_if<ObjectRef>(&slotVal);
+            innerRef && innerRef->kind == ObjectKind::Array) {
+            if (auto* arrSlot = impl_->getSlot(*innerRef);
+                arrSlot && arrSlot->kind() == ObjectKind::Array) {
+                (void)impl_->enableArrayTracking(*innerRef, *arrSlot);
+            }
+        }
+    }
+
     std::uint8_t observableBit = 0xFFu;
     const bool hasObserver = slot->hasFlag(GcFlag::HasUiObserver);
     if (layout.typeId != 0) {
@@ -3151,6 +3448,10 @@ bool ManagedHeap::fieldSetFast(
         impl_->typeObservableBits.find(expectedTypeId) != impl_->typeObservableBits.end()) {
         return false;
     }
+    if (!impl_->observableListWrapperTypes.empty() &&
+        impl_->observableListWrapperTypes.find(expectedTypeId) != impl_->observableListWrapperTypes.end()) {
+        return false;
+    }
     if (const auto* childRef = std::get_if<ObjectRef>(&value);
         childRef && !impl_->getSlot(*childRef)) {
         return false;
@@ -3174,12 +3475,55 @@ void ManagedHeap::registerTypeObservableBits(
     impl_->typeObservableBits[typeId] = std::move(fieldObservableBits);
 }
 
+void ManagedHeap::registerObservableListWrapperType(semantic::SymbolId wrapperTypeId) {
+    if (wrapperTypeId == 0) return;
+    if (!impl_->observableListWrapperTypes.insert(wrapperTypeId).second) {
+        return;
+    }
+    for (std::uint32_t slotIdx = 0; slotIdx < impl_->slots.size(); ++slotIdx) {
+        auto& slot = impl_->slots[slotIdx];
+        if (!slot.occupied() || slot.kind() != ObjectKind::Record ||
+            slot.payload.s.length != 1u) {
+            continue;
+        }
+        if (impl_->typeLayouts[slot.payload.s.layoutId].typeId != wrapperTypeId) {
+            continue;
+        }
+        if (const auto* innerRef = std::get_if<ObjectRef>(&slot.payload.s.data[0]);
+            innerRef && innerRef->kind == ObjectKind::Array) {
+            if (auto* arrSlot = impl_->getSlot(*innerRef);
+                arrSlot && arrSlot->kind() == ObjectKind::Array) {
+                (void)impl_->enableArrayTracking(*innerRef, *arrSlot);
+            }
+        }
+    }
+}
+
+bool ManagedHeap::isObservableListWrapper(ObjectRef reference) const noexcept {
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Record || slot->payload.s.length != 1u) {
+        return false;
+    }
+    const auto tid = impl_->typeLayouts[slot->payload.s.layoutId].typeId;
+    return tid != 0 &&
+        impl_->observableListWrapperTypes.find(tid) != impl_->observableListWrapperTypes.end();
+}
+
 void ManagedHeap::registerProgramObservableTypes(const ProgramImage& program) {
+    constexpr std::string_view kWrapperPrefix = "ObservableList__";
+    constexpr std::string_view kEnumSuffix = "__Enumerator";
     for (const auto& mod : program.modules()) {
         for (const auto& type : mod.types) {
-            if (type.kind == semantic::TypeKind::Class &&
-                type.name.rfind("ObservableList__", 0) == 0) {
-                impl_->observableListWrapperTypes.insert(type.id);
+            if (type.kind == semantic::TypeKind::Class && type.fields.size() == 1u) {
+                std::string_view shortName(type.name);
+                if (const auto sep = shortName.rfind("::"); sep != std::string_view::npos) {
+                    shortName.remove_prefix(sep + 2u);
+                }
+                if (shortName.rfind(kWrapperPrefix, 0) == 0 &&
+                    (shortName.size() <= kEnumSuffix.size() ||
+                     shortName.substr(shortName.size() - kEnumSuffix.size()) != kEnumSuffix)) {
+                    registerObservableListWrapperType(type.id);
+                }
             }
             if (type.kind != semantic::TypeKind::Class ||
                 (!type.observable && type.nextObservableBitIndex == 0)) {
@@ -3242,7 +3586,15 @@ void ManagedHeap::removeUiObserver(ObjectRef reference) noexcept {
                 --it->second.uiObserverCount;
             }
             if (it->second.uiObserverCount == 0) {
-                slot->gcFlags &= static_cast<std::uint8_t>(~GcFlag::HasUiObserver);
+                bool keepFlag = false;
+                if (slot->kind() == ObjectKind::Array) {
+                    const auto arrIt = impl_->arrayCollectionMeta.find(reference.slot);
+                    keepFlag = (arrIt != impl_->arrayCollectionMeta.end() &&
+                                arrIt->second.trackingEnabled);
+                }
+                if (!keepFlag) {
+                    slot->gcFlags &= static_cast<std::uint8_t>(~GcFlag::HasUiObserver);
+                }
                 if (it->second.dirtyFieldMask == 0 && !slot->hasFlag(GcFlag::InDirtyQueue)) {
                     impl_->uiObservableMeta.erase(it);
                 }
@@ -3842,29 +4194,33 @@ std::size_t ManagedHeap::collectYoung(
         for (const auto& v : table.values) markYoungValue(markYoungValue, v);
     }
 
-    for (const auto& [slotIdx, meta] : impl_->arrayCollectionMeta) {
-        if (slotIdx >= impl_->slots.size()) continue;
-        const auto& arrSlot = impl_->slots[slotIdx];
-        if (!arrSlot.occupied() || arrSlot.hasFlag(GcFlag::InNursery)) continue;
-        if (!impl_->typeLayouts[arrSlot.payload.s.layoutId].mayContainReferences) continue;
-        for (std::uint32_t i = 0; i < meta.count; ++i) {
-            const auto& rec = meta.ring[(meta.head + i) & ArrayCollectionMeta::kRingMask];
-            markYoungValue(markYoungValue, rec.oldValue);
-            markYoungValue(markYoungValue, rec.newValue);
-        }
-    }
+    constexpr std::uint32_t kRingCap =
+        static_cast<std::uint32_t>(ManagedHeap::kCollectionDeltaRingCapacity);
 
-    // Card-Table-accelerated Remembered Set scan:
+    // Card-Table-accelerated Remembered Set scan (including OldGen array delta rings):
     for (const auto& oldRef : impl_->rememberedSet) {
         auto* oldSlot = impl_->getSlot(oldRef);
         if (!oldSlot || oldSlot->kind() == ObjectKind::String) continue;
         const auto count = Impl::slotValueCount(*oldSlot);
-        if (count == 0) continue;
         const Value* data = oldSlot->payload.s.data;
         const auto& layout = impl_->typeLayouts[oldSlot->payload.s.layoutId];
 
         if (oldSlot->kind() == ObjectKind::Array) {
             if (!layout.mayContainReferences) continue;
+            if (oldSlot->hasFlag(GcFlag::HasUiObserver)) {
+                const auto metaIt = impl_->arrayCollectionMeta.find(oldRef.slot);
+                if (metaIt != impl_->arrayCollectionMeta.end() && metaIt->second.ring) {
+                    const auto& meta = metaIt->second;
+                    const std::uint32_t activeCount = std::min<std::uint32_t>(meta.count, kRingCap);
+                    for (std::uint32_t i = 0; i < activeCount; ++i) {
+                        const auto& rec =
+                            (*meta.ring)[(meta.head + i) & ArrayCollectionMeta::kRingMask];
+                        markYoungValue(markYoungValue, rec.oldValue);
+                        markYoungValue(markYoungValue, rec.newValue);
+                    }
+                }
+            }
+            if (count == 0) continue;
             if (oldSlot->hasFlag(GcFlag::HasCardTable)) {
                 auto& slice = impl_->cardArena.get(oldSlot->payload.s.cardHandle);
                 for (std::uint32_t w = 0; w < slice.wordCount; ++w) {
@@ -3887,6 +4243,7 @@ std::size_t ManagedHeap::collectYoung(
                 markYoungValue(markYoungValue, data[i]);
             }
         } else {
+            if (count == 0) continue;
             for (const auto idx : layout.referenceFields) {
                 if (idx < count) markYoungValue(markYoungValue, data[idx]);
             }
@@ -3899,17 +4256,29 @@ std::size_t ManagedHeap::collectYoung(
         const auto* slot = impl_->getSlot(ref);
         if (!slot || slot->kind() == ObjectKind::String) continue;
         const auto count = Impl::slotValueCount(*slot);
-        if (count != 0) {
-            const Value* data = slot->payload.s.data;
-            const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
-            if (slot->kind() == ObjectKind::Array) {
-                if (layout.mayContainReferences) {
+        const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+        if (slot->kind() == ObjectKind::Array) {
+            if (layout.mayContainReferences) {
+                const auto metaIt = impl_->arrayCollectionMeta.find(ref.slot);
+                if (metaIt != impl_->arrayCollectionMeta.end() && metaIt->second.ring) {
+                    const auto& meta = metaIt->second;
+                    const std::uint32_t activeCount = std::min<std::uint32_t>(meta.count, kRingCap);
+                    for (std::uint32_t i = 0; i < activeCount; ++i) {
+                        const auto& rec =
+                            (*meta.ring)[(meta.head + i) & ArrayCollectionMeta::kRingMask];
+                        markYoungValue(markYoungValue, rec.oldValue);
+                        markYoungValue(markYoungValue, rec.newValue);
+                    }
+                }
+                if (count != 0) {
+                    const Value* data = slot->payload.s.data;
                     for (std::size_t i = 0; i < count; ++i) markYoungValue(markYoungValue, data[i]);
                 }
-            } else {
-                for (const auto idx : layout.referenceFields) {
-                    if (idx < count) markYoungValue(markYoungValue, data[idx]);
-                }
+            }
+        } else if (count != 0) {
+            const Value* data = slot->payload.s.data;
+            for (const auto idx : layout.referenceFields) {
+                if (idx < count) markYoungValue(markYoungValue, data[idx]);
             }
         }
         ++impl_->statistics.markWork;
@@ -4370,6 +4739,7 @@ bool ManagedHeap::restore(
     impl_->cardArena.clear();
     impl_->customSlotSizes.clear();
     impl_->uiObservableMeta.clear();
+    impl_->arrayCollectionMeta.clear();
     impl_->typeLayouts.assign(1, TypeLayoutEntry{});
     impl_->sharedRecordLayoutByTypeId.clear();
     impl_->arrayLayoutByKey.clear();
@@ -4457,6 +4827,14 @@ bool ManagedHeap::restore(
         if (info.sizeBytes != defaultSize) {
             slot.gcFlags |= GcFlag::CustomSize;
             impl_->customSlotSizes[slotIdx] = info.sizeBytes;
+        }
+    }
+
+    if (!impl_->typeObservableBits.empty() || !impl_->observableListWrapperTypes.empty()) {
+        for (const auto& info : snapshot.objects) {
+            if (info.kind == ObjectKind::Record) {
+                impl_->attachInitialRecordArrayFields(info.reference, impl_->slots[info.reference.slot]);
+            }
         }
     }
 
