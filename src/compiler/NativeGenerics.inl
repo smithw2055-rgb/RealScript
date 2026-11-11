@@ -88,7 +88,7 @@ std::map<std::string, std::vector<std::string>> nativeGenericConstraints(
 }
 
 std::size_t nativeBuiltinGenericArity(const std::string& name) {
-    if (name == "List" || name == "Queue" || name == "Stack" ||
+    if (name == "List" || name == "ObservableList" || name == "Queue" || name == "Stack" ||
         name == "Optional" || name == "Nullable" || name == "Box" ||
         name == "HashSet") {
         return 1;
@@ -107,7 +107,43 @@ std::string nativeBuiltinGenericSource(
         ? arguments[1]
         : std::string{};
     std::ostringstream source;
-    if (name == "List") {
+    if (name == "ObservableList") {
+        const auto enumerator = generatedName + "__Enumerator";
+        source << "class " << generatedName << "{" << first << "[] items;"
+            << generatedName << "(){items=new " << first << "[0];}"
+            << generatedName << "(int capacity){items=new " << first << "[0];items.reserve(capacity);}"
+            << "int Count(){return items.length;}int Length(){return items.length;}"
+            << "bool IsEmpty(){return items.length==0;}"
+            << "void Add(" << first << " value){items.push(value);return;}"
+            << "void Push(" << first << " value){items.push(value);return;}"
+            << "void push(" << first << " value){items.push(value);return;}"
+            << "void Insert(int index," << first << " value){items.insert(index,value);return;}"
+            << "void insert(int index," << first << " value){items.insert(index,value);return;}"
+            << "void RemoveAt(int index){items.removeAt(index);return;}"
+            << "void removeAt(int index){items.removeAt(index);return;}"
+            << "bool Remove(" << first << " value){int i=items.IndexOf(value);"
+            << "if(i<0)return false;items.removeAt(i);return true;}"
+            << "int IndexOf(" << first << " value){return items.IndexOf(value);}"
+            << "int LastIndexOf(" << first << " value){return items.LastIndexOf(value);}"
+            << "bool Contains(" << first << " value){return items.Contains(value);}"
+            << first << " Get(int index){return items[index];}"
+            << "void Set(int index," << first << " value){items[index]=value;return;}"
+            << first << " First(){return items[0];}"
+            << first << " Last(){return items[items.length-1];}"
+            << "void Reverse(){items.Reverse();return;}"
+            << "void Sort(){items.Sort();return;}"
+            << first << "[] AsArray(){return items;}"
+            << first << "[] ToArray(){" << first << "[] arr=new " << first
+            << "[items.length];int i=0;while(i<items.length){arr[i]=items[i];i=i+1;}return arr;}"
+            << "void Clear(){items.clear();return;}"
+            << "void clear(){items.clear();return;}"
+            << enumerator << " GetEnumerator(){return new " << enumerator << "(this);}}"
+            << "class " << enumerator << "{" << generatedName
+            << " owner;int index;" << enumerator << "(" << generatedName
+            << " value){owner=value;index=-1;}"
+            << "bool MoveNext(){index=index+1;return index<owner.Count();}"
+            << first << " Current(){return owner.Get(index);}}";
+    } else if (name == "List") {
         const auto enumerator = generatedName + "__Enumerator";
         source << "class " << generatedName << "{" << first
             << "[] items;int count;"

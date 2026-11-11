@@ -7814,7 +7814,105 @@ bool tryExecuteRuntimeIntrinsic(
             result = found;
             return true;
         }
+        if (op.rfind("array_push::", 0) == 0) {
+            if (arguments.size() < 2) {
+                errorMessage = "array_push requires 2 arguments";
+                return false;
+            }
+            RuntimeError mutErr;
+            if (!heap->arrayPush(
+                    *arrRef,
+                    arguments[1],
+                    &mutErr,
+                    ArrayStoreTypePolicy::PrevalidatedAssignableObject)) {
+                errorMessage = mutErr.message.empty() ? "array push failed" : mutErr.message;
+                return false;
+            }
+            result = std::monostate{};
+            return true;
+        }
+        if (op.rfind("array_insert::", 0) == 0) {
+            if (arguments.size() < 3 || !std::holds_alternative<std::int64_t>(arguments[1])) {
+                errorMessage = "array_insert requires (array, int index, value)";
+                return false;
+            }
+            const auto rawIdx = std::get<std::int64_t>(arguments[1]);
+            if (rawIdx < 0 || static_cast<std::size_t>(rawIdx) > len) {
+                errorMessage = "array insert index is out of range";
+                return false;
+            }
+            RuntimeError mutErr;
+            if (!heap->arrayInsert(
+                    *arrRef,
+                    static_cast<std::size_t>(rawIdx),
+                    arguments[2],
+                    &mutErr,
+                    ArrayStoreTypePolicy::PrevalidatedAssignableObject)) {
+                errorMessage = mutErr.message.empty() ? "array insert failed" : mutErr.message;
+                return false;
+            }
+            result = std::monostate{};
+            return true;
+        }
+        if (op.rfind("array_remove_at::", 0) == 0) {
+            if (arguments.size() < 2 || !std::holds_alternative<std::int64_t>(arguments[1])) {
+                errorMessage = "array_remove_at requires (array, int index)";
+                return false;
+            }
+            const auto rawIdx = std::get<std::int64_t>(arguments[1]);
+            if (rawIdx < 0 || static_cast<std::size_t>(rawIdx) >= len) {
+                errorMessage = "array removeAt index is out of range";
+                return false;
+            }
+            RuntimeError mutErr;
+            if (!heap->arrayRemoveAt(*arrRef, static_cast<std::size_t>(rawIdx), nullptr, &mutErr)) {
+                errorMessage = mutErr.message.empty() ? "array removeAt failed" : mutErr.message;
+                return false;
+            }
+            result = std::monostate{};
+            return true;
+        }
+        if (op.rfind("array_pop::", 0) == 0) {
+            if (len == 0) {
+                errorMessage = "cannot pop from an empty array";
+                return false;
+            }
+            Value popped{};
+            RuntimeError mutErr;
+            if (!heap->arrayRemoveAt(*arrRef, len - 1u, &popped, &mutErr)) {
+                errorMessage = mutErr.message.empty() ? "array pop failed" : mutErr.message;
+                return false;
+            }
+            result = std::move(popped);
+            return true;
+        }
+        if (op.rfind("array_clear::", 0) == 0) {
+            RuntimeError mutErr;
+            if (!heap->arrayClear(*arrRef, &mutErr)) {
+                errorMessage = mutErr.message.empty() ? "array clear failed" : mutErr.message;
+                return false;
+            }
+            result = std::monostate{};
+            return true;
+        }
+        if (op.rfind("array_reserve::", 0) == 0) {
+            if (arguments.size() < 2 || !std::holds_alternative<std::int64_t>(arguments[1])) {
+                errorMessage = "array_reserve requires (array, int capacity)";
+                return false;
+            }
+            const auto rawCap = std::get<std::int64_t>(arguments[1]);
+            if (rawCap > 0) {
+                RuntimeError mutErr;
+                if (!heap->arrayReserve(*arrRef, static_cast<std::size_t>(rawCap), &mutErr)) {
+                    errorMessage = mutErr.message.empty() ? "array reserve failed" : mutErr.message;
+                    return false;
+                }
+            }
+            result = std::monostate{};
+            return true;
+        }
         if (op.rfind("array_reverse::", 0) == 0) {
+            const bool tracked = heap->hasArrayChangeTracking(*arrRef);
             for (std::size_t i = 0; i < len / 2; ++i) {
                 const std::size_t j = len - 1 - i;
                 const auto leftVal = heap->arrayGet(*arrRef, i);
@@ -7825,10 +7923,14 @@ bool tryExecuteRuntimeIntrinsic(
                     (void)heap->arraySet(*arrRef, j, *leftVal, &setErr);
                 }
             }
+            if (tracked && len > 1) {
+                heap->recordArrayReset(*arrRef);
+            }
             result = std::monostate{};
             return true;
         }
         if (op.rfind("array_sort::", 0) == 0 || op.rfind("array_sort_range::", 0) == 0) {
+            const bool tracked = heap->hasArrayChangeTracking(*arrRef);
             std::size_t sortLen = len;
             if (op.rfind("array_sort_range::", 0) == 0 && arguments.size() >= 2) {
                 const auto rawCount = std::holds_alternative<std::int64_t>(arguments[1])
@@ -7853,6 +7955,9 @@ bool tryExecuteRuntimeIntrinsic(
                 RuntimeError setErr;
                 for (std::size_t i = 0; i < sortLen; ++i) {
                     (void)heap->arraySet(*arrRef, i, elems[i], &setErr);
+                }
+                if (tracked) {
+                    heap->recordArrayReset(*arrRef);
                 }
             }
             result = std::monostate{};

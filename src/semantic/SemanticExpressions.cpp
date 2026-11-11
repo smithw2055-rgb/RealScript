@@ -3928,25 +3928,50 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
                 }
                 std::string intrinsicName;
                 PrimitiveType returnType = PrimitiveType::Error;
+                std::string returnTypeName;
                 std::vector<std::pair<PrimitiveType, std::string>> expectedParams;
-                if (methodName == "IndexOf" && arguments.size() == 1) {
+                if ((methodName == "IndexOf" || methodName == "indexOf") && arguments.size() == 1) {
                     intrinsicName = "$intrinsic::array_index_of::" + receiver->typeName;
                     returnType = PrimitiveType::Int;
                     expectedParams = {{elemType, elemTypeName}};
-                } else if (methodName == "LastIndexOf" && arguments.size() == 1) {
+                } else if ((methodName == "LastIndexOf" || methodName == "lastIndexOf") && arguments.size() == 1) {
                     intrinsicName = "$intrinsic::array_last_index_of::" + receiver->typeName;
                     returnType = PrimitiveType::Int;
                     expectedParams = {{elemType, elemTypeName}};
-                } else if (methodName == "Contains" && arguments.size() == 1) {
+                } else if ((methodName == "Contains" || methodName == "contains") && arguments.size() == 1) {
                     intrinsicName = "$intrinsic::array_contains::" + receiver->typeName;
                     returnType = PrimitiveType::Bool;
                     expectedParams = {{elemType, elemTypeName}};
-                } else if (methodName == "Reverse" && arguments.empty()) {
+                } else if ((methodName == "Reverse" || methodName == "reverse") && arguments.empty()) {
                     intrinsicName = "$intrinsic::array_reverse::" + receiver->typeName;
                     returnType = PrimitiveType::Void;
-                } else if (methodName == "Sort" && arguments.empty()) {
+                } else if ((methodName == "Sort" || methodName == "sort") && arguments.empty()) {
                     intrinsicName = "$intrinsic::array_sort::" + receiver->typeName;
                     returnType = PrimitiveType::Void;
+                } else if ((methodName == "push" || methodName == "Push" ||
+                            methodName == "add" || methodName == "Add") && arguments.size() == 1) {
+                    intrinsicName = "$intrinsic::array_push::" + receiver->typeName;
+                    returnType = PrimitiveType::Void;
+                    expectedParams = {{elemType, elemTypeName}};
+                } else if ((methodName == "insert" || methodName == "Insert") && arguments.size() == 2) {
+                    intrinsicName = "$intrinsic::array_insert::" + receiver->typeName;
+                    returnType = PrimitiveType::Void;
+                    expectedParams = {{PrimitiveType::Int, ""}, {elemType, elemTypeName}};
+                } else if ((methodName == "removeAt" || methodName == "RemoveAt") && arguments.size() == 1) {
+                    intrinsicName = "$intrinsic::array_remove_at::" + receiver->typeName;
+                    returnType = PrimitiveType::Void;
+                    expectedParams = {{PrimitiveType::Int, ""}};
+                } else if ((methodName == "pop" || methodName == "Pop") && arguments.empty()) {
+                    intrinsicName = "$intrinsic::array_pop::" + receiver->typeName;
+                    returnType = elemType;
+                    returnTypeName = elemTypeName;
+                } else if ((methodName == "clear" || methodName == "Clear") && arguments.empty()) {
+                    intrinsicName = "$intrinsic::array_clear::" + receiver->typeName;
+                    returnType = PrimitiveType::Void;
+                } else if ((methodName == "reserve" || methodName == "Reserve") && arguments.size() == 1) {
+                    intrinsicName = "$intrinsic::array_reserve::" + receiver->typeName;
+                    returnType = PrimitiveType::Void;
+                    expectedParams = {{PrimitiveType::Int, ""}};
                 }
                 if (!intrinsicName.empty()) {
                     std::vector<std::pair<PrimitiveType, std::string>> fullParams;
@@ -3955,8 +3980,9 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
                     auto call = std::make_unique<BoundCallExpression>();
                     call->span = syntaxTree.span();
                     call->type = returnType;
+                    call->typeName = returnTypeName;
                     call->function = makeIntrinsicFunction(
-                        intrinsicName, returnType, "", fullParams);
+                        intrinsicName, returnType, returnTypeName, fullParams);
                     call->function.method = true;
                     call->function.staticMethod = false;
                     call->arguments.push_back(std::move(receiver));

@@ -1882,12 +1882,33 @@ private:
     std::uint32_t registrySlot_ = InvalidRegistrySlot;
 };
 
+enum class CollectionChangeKind : std::uint8_t {
+    Add = 0,
+    Insert = 1,
+    RemoveAt = 2,
+    Replace = 3,
+    Clear = 4,
+    Reset = 5,
+};
+
+struct CollectionChangeRecord {
+    std::uint64_t version = 0;
+    std::uint32_t index = 0;
+    CollectionChangeKind kind = CollectionChangeKind::Reset;
+    std::uint8_t pad0_ = 0;
+    std::uint16_t pad1_ = 0;
+    Value oldValue{};
+    Value newValue{};
+};
+static_assert(sizeof(Value) == 16, "Value ABI must remain 16 bytes");
+
 struct ArrayFastView {
     Value* data = nullptr;
     std::uint8_t* dirtyCards = nullptr;
     std::uint32_t length = 0;
     semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
     bool needsRememberedBarrier = false;
+    bool hasChangeTracking = false;
     semantic::SymbolId elementTypeId = 0;
 };
 
@@ -1980,6 +2001,51 @@ public:
         Value value,
         RuntimeError* error = nullptr,
         ArrayStoreTypePolicy typePolicy = ArrayStoreTypePolicy::Exact);
+
+    static constexpr std::size_t kCollectionDeltaRingCapacity = 256;
+
+    bool arrayReserve(
+        ObjectRef reference,
+        std::size_t capacity,
+        RuntimeError* error = nullptr);
+    bool arrayPush(
+        ObjectRef reference,
+        Value value,
+        RuntimeError* error = nullptr,
+        ArrayStoreTypePolicy typePolicy = ArrayStoreTypePolicy::Exact);
+    bool arrayInsert(
+        ObjectRef reference,
+        std::size_t index,
+        Value value,
+        RuntimeError* error = nullptr,
+        ArrayStoreTypePolicy typePolicy = ArrayStoreTypePolicy::Exact);
+    bool arrayRemoveAt(
+        ObjectRef reference,
+        std::size_t index,
+        Value* outRemoved = nullptr,
+        RuntimeError* error = nullptr);
+    bool arrayClear(
+        ObjectRef reference,
+        RuntimeError* error = nullptr);
+
+    void enableArrayChangeTracking(ObjectRef reference);
+    [[nodiscard]] bool hasArrayChangeTracking(ObjectRef reference) const noexcept;
+    [[nodiscard]] std::uint64_t arrayMutationVersion(ObjectRef reference) const noexcept;
+    void recordArrayReset(ObjectRef reference);
+    void addArrayPropertyObserver(
+        ObjectRef arrayRef,
+        ObjectRef ownerObject,
+        std::uint8_t observableBitIndex);
+    void removeArrayPropertyObserver(
+        ObjectRef arrayRef,
+        ObjectRef ownerObject,
+        std::uint8_t observableBitIndex) noexcept;
+    bool readArrayChangesSince(
+        ObjectRef arrayRef,
+        std::uint64_t sinceVersion,
+        std::vector<CollectionChangeRecord>& outChanges,
+        std::uint64_t& outCurrentVersion,
+        bool& outRequiresReset) const;
     [[nodiscard]] std::optional<std::size_t> fieldCount(ObjectRef reference) const;
     [[nodiscard]] bool isInlineRecordObject(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<semantic::SymbolId> objectTypeId(
@@ -2142,6 +2208,7 @@ public:
 
 private:
     friend class PersistentRoot;
+    friend class ObservableListHelper;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
@@ -2169,6 +2236,153 @@ private:
     ManagedHeap* heap_ = nullptr;
     ManagedHeap::RootToken token_ = 0;
     Value value_{};
+};
+
+class ObservableListHelper {
+public:
+    [[nodiscard]] static ObjectRef resolveBackingArray(
+        const ManagedHeap& heap,
+        ObjectRef listOrArray) noexcept;
+    static void enableTracking(
+        ManagedHeap& heap,
+        ObjectRef listOrArray);
+    static void bindOwnerProperty(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        ObjectRef ownerObject,
+        std::uint8_t observableBitIndex);
+    static void unbindOwnerProperty(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        ObjectRef ownerObject,
+        std::uint8_t observableBitIndex) noexcept;
+    static bool add(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        Value value,
+        RuntimeError* error = nullptr);
+    static bool push(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        Value value,
+        RuntimeError* error = nullptr) {
+        return add(heap, listOrArray, std::move(value), error);
+    }
+    static bool insert(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        std::size_t index,
+        Value value,
+        RuntimeError* error = nullptr);
+    static bool removeAt(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        std::size_t index,
+        Value* outRemoved = nullptr,
+        RuntimeError* error = nullptr);
+    static bool replace(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        std::size_t index,
+        Value value,
+        RuntimeError* error = nullptr);
+    static bool clear(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        RuntimeError* error = nullptr);
+    [[nodiscard]] static std::uint64_t mutationVersion(
+        const ManagedHeap& heap,
+        ObjectRef listOrArray) noexcept;
+    static bool readChangesSince(
+        const ManagedHeap& heap,
+        ObjectRef listOrArray,
+        std::uint64_t sinceVersion,
+        std::vector<CollectionChangeRecord>& outChanges,
+        std::uint64_t& outCurrentVersion,
+        bool& outRequiresReset);
+
+    // PascalCase aliases for host/UI ergonomic symmetry
+    [[nodiscard]] static ObjectRef ResolveBackingArray(
+        const ManagedHeap& heap,
+        ObjectRef listOrArray) noexcept {
+        return resolveBackingArray(heap, listOrArray);
+    }
+    static void EnableTracking(ManagedHeap& heap, ObjectRef listOrArray) {
+        enableTracking(heap, listOrArray);
+    }
+    static void BindOwnerProperty(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        ObjectRef ownerObject,
+        std::uint8_t observableBitIndex) {
+        bindOwnerProperty(heap, listOrArray, ownerObject, observableBitIndex);
+    }
+    static void UnbindOwnerProperty(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        ObjectRef ownerObject,
+        std::uint8_t observableBitIndex) noexcept {
+        unbindOwnerProperty(heap, listOrArray, ownerObject, observableBitIndex);
+    }
+    static bool Add(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        Value value,
+        RuntimeError* error = nullptr) {
+        return add(heap, listOrArray, std::move(value), error);
+    }
+    static bool Push(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        Value value,
+        RuntimeError* error = nullptr) {
+        return add(heap, listOrArray, std::move(value), error);
+    }
+    static bool Insert(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        std::size_t index,
+        Value value,
+        RuntimeError* error = nullptr) {
+        return insert(heap, listOrArray, index, std::move(value), error);
+    }
+    static bool RemoveAt(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        std::size_t index,
+        Value* outRemoved = nullptr,
+        RuntimeError* error = nullptr) {
+        return removeAt(heap, listOrArray, index, outRemoved, error);
+    }
+    static bool Replace(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        std::size_t index,
+        Value value,
+        RuntimeError* error = nullptr) {
+        return replace(heap, listOrArray, index, std::move(value), error);
+    }
+    static bool Clear(
+        ManagedHeap& heap,
+        ObjectRef listOrArray,
+        RuntimeError* error = nullptr) {
+        return clear(heap, listOrArray, error);
+    }
+    [[nodiscard]] static std::uint64_t MutationVersion(
+        const ManagedHeap& heap,
+        ObjectRef listOrArray) noexcept {
+        return mutationVersion(heap, listOrArray);
+    }
+    static bool ReadChangesSince(
+        const ManagedHeap& heap,
+        ObjectRef listOrArray,
+        std::uint64_t sinceVersion,
+        std::vector<CollectionChangeRecord>& outChanges,
+        std::uint64_t& outCurrentVersion,
+        bool& outRequiresReset) {
+        return readChangesSince(
+            heap, listOrArray, sinceVersion, outChanges, outCurrentVersion, outRequiresReset);
+    }
 };
 
 struct WeakRef {
