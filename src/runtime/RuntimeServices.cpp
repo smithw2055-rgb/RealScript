@@ -1304,7 +1304,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
 
     const auto isBuiltinMathModule = [](const bytecode::Module& mod) noexcept {
         return mod.name == "RealScript.Math" &&
-            mod.sourceFiles.size() == 1 &&
+            !mod.sourceFiles.empty() &&
             mod.sourceFiles[0].path == "$builtin/RealScript.Math.rs";
     };
 

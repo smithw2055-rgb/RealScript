@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <utility>
 
@@ -13,7 +14,7 @@ constexpr semantic::SymbolId makeAsyncRecordSymbolId(
     AsyncPayloadKind kind,
     std::uint64_t requestArgumentHash) noexcept {
     const auto folded = static_cast<std::uint32_t>(
-        (requestArgumentHash ^ (requestArgumentHash >> 32u)) & 0x00FFFFFFu);
+        (requestArgumentHash ^ (requestArgumentHash >> 32u)) & 0x0000FFFFu);
     return static_cast<semantic::SymbolId>(
         0xA5000000u | (folded << 8u) | static_cast<std::uint32_t>(kind));
 }
@@ -126,6 +127,7 @@ CancellationSourceHandle CancellationTokenPool::createSource() {
     auto& slot = slots_[slotIndex];
     slot.allocated = true;
     slot.canceled = false;
+    slot.timedOut = false;
     slot.parentRegistrations.clear();
     ++totalCreated_;
     return CancellationSourceHandle{slotIndex, slot.version};
@@ -141,7 +143,11 @@ CancellationSourceHandle CancellationTokenPool::createLinkedSource(
 
     for (std::size_t i = 0; i < parentCount; ++i) {
         if (isCancellationRequested(parents[i])) {
-            cancel(child);
+            if (isTimedOut(parents[i])) {
+                cancelByTimeout(child);
+            } else {
+                cancel(child);
+            }
             return child;
         }
     }
@@ -196,12 +202,27 @@ bool CancellationTokenPool::isCancellationRequested(
     return slot.lastCanceledVersion == token.version;
 }
 
+bool CancellationTokenPool::isTimedOut(CancellationToken token) const noexcept {
+    if (!token.canBeCanceled() || token.isPreCanceledSentinel()) return false;
+    if (token.ctsSlot >= slots_.size()) return false;
+    const auto& slot = slots_[token.ctsSlot];
+    if (slot.allocated && slot.version == token.version) {
+        return slot.timedOut;
+    }
+    return slot.lastTimedOutVersion == token.version;
+}
+
 void CancellationTokenPool::onLinkedParentCanceled(
     void* context,
     std::uint64_t packedChildSource) {
     auto* self = static_cast<CancellationTokenPool*>(context);
     if (!self) return;
-    self->cancel(CancellationSourceHandle::unpack64(packedChildSource));
+    const auto childHandle = CancellationSourceHandle::unpack64(packedChildSource);
+    if (self->activeTimeoutCascade_) {
+        self->cancelByTimeout(childHandle);
+    } else {
+        self->cancel(childHandle);
+    }
 }
 
 void CancellationTokenPool::detachParentRegistrations(CtsSlot& slot) noexcept {
@@ -213,13 +234,19 @@ void CancellationTokenPool::detachParentRegistrations(CtsSlot& slot) noexcept {
     }
 }
 
-std::size_t CancellationTokenPool::cancel(CancellationSourceHandle source) {
+std::size_t CancellationTokenPool::cancelImpl(
+    CancellationSourceHandle source,
+    bool byTimeout) {
     if (!isSourceAlive(source)) return 0;
     auto& slot = slots_[source.slot];
     if (slot.canceled) return 0;
 
     slot.canceled = true;
     slot.lastCanceledVersion = slot.version;
+    if (byTimeout) {
+        slot.timedOut = true;
+        slot.lastTimedOutVersion = slot.version;
+    }
     detachParentRegistrations(slot);
 
     struct PendingInvoke {
@@ -248,15 +275,32 @@ std::size_t CancellationTokenPool::cancel(CancellationSourceHandle source) {
         slot.freeCallbacks.push_back(i);
     }
 
+    const bool prevCascade = activeTimeoutCascade_;
+    struct CascadeRestore {
+        bool& target;
+        bool saved;
+        ~CascadeRestore() { target = saved; }
+    } cascadeGuard{activeTimeoutCascade_, prevCascade};
+
     for (std::size_t i = 0; i < inlineCount; ++i) {
         ++totalCallbacksInvoked_;
+        activeTimeoutCascade_ = byTimeout;
         inlineInvoke[i].fn(inlineInvoke[i].ctx, inlineInvoke[i].tag);
     }
     for (const auto& item : overflowInvoke) {
         ++totalCallbacksInvoked_;
+        activeTimeoutCascade_ = byTimeout;
         item.fn(item.ctx, item.tag);
     }
     return inlineCount + overflowInvoke.size();
+}
+
+std::size_t CancellationTokenPool::cancel(CancellationSourceHandle source) {
+    return cancelImpl(source, false);
+}
+
+std::size_t CancellationTokenPool::cancelByTimeout(CancellationSourceHandle source) {
+    return cancelImpl(source, true);
 }
 
 bool CancellationTokenPool::releaseSource(
@@ -278,6 +322,7 @@ bool CancellationTokenPool::releaseSource(
 
     slot.allocated = false;
     slot.canceled = false;
+    slot.timedOut = false;
     slot.version = nextNonZeroVersion(slot.version);
     freeSlots_.push_back(source.slot);
     ++totalReleased_;
@@ -353,36 +398,46 @@ bool CancellationTokenPool::unregisterCallback(
 }
 
 CancellationToken CancellationTokenPool::getOrCreateEntityDestroyToken(
-    GenerationalEntityHandle entity) {
-    if (!entity.valid()) {
+    GenerationalEntityHandle entity,
+    EntityDestroyDomain domain) {
+    const auto domainIdx = static_cast<std::size_t>(domain);
+    if (!entity.valid() || domainIdx >= kEntityDestroyDomainCount) {
         return CancellationToken::preCanceled();
     }
+    auto& map = entityDestroySources_[domainIdx];
     const std::uint64_t key = entity.pack64();
-    const auto found = entityDestroySources_.find(key);
-    if (found != entityDestroySources_.end() && isSourceAlive(found->second)) {
+    const auto found = map.find(key);
+    if (found != map.end() && isSourceAlive(found->second)) {
         return token(found->second);
     }
     const CancellationSourceHandle created = createSource();
-    entityDestroySources_[key] = created;
+    map[key] = created;
     return token(created);
 }
 
 bool CancellationTokenPool::hasEntityDestroyToken(
-    GenerationalEntityHandle entity) const noexcept {
-    if (!entity.valid()) return false;
-    const auto found = entityDestroySources_.find(entity.pack64());
-    return found != entityDestroySources_.end() && isSourceAlive(found->second);
+    GenerationalEntityHandle entity,
+    EntityDestroyDomain domain) const noexcept {
+    const auto domainIdx = static_cast<std::size_t>(domain);
+    if (!entity.valid() || domainIdx >= kEntityDestroyDomainCount) return false;
+    const auto& map = entityDestroySources_[domainIdx];
+    const auto found = map.find(entity.pack64());
+    return found != map.end() && isSourceAlive(found->second);
 }
 
-bool CancellationTokenPool::cancelEntity(GenerationalEntityHandle entity) {
-    if (!entity.valid()) return false;
+bool CancellationTokenPool::cancelEntity(
+    GenerationalEntityHandle entity,
+    EntityDestroyDomain domain) {
+    const auto domainIdx = static_cast<std::size_t>(domain);
+    if (!entity.valid() || domainIdx >= kEntityDestroyDomainCount) return false;
+    auto& map = entityDestroySources_[domainIdx];
     const std::uint64_t key = entity.pack64();
-    const auto found = entityDestroySources_.find(key);
-    if (found == entityDestroySources_.end()) {
+    const auto found = map.find(key);
+    if (found == map.end()) {
         return false;
     }
     const CancellationSourceHandle handle = found->second;
-    entityDestroySources_.erase(found);
+    map.erase(found);
     if (!isSourceAlive(handle)) {
         return false;
     }
@@ -394,10 +449,13 @@ bool CancellationTokenPool::cancelEntity(GenerationalEntityHandle entity) {
 void CancellationTokenPool::clear() noexcept {
     slots_.clear();
     freeSlots_.clear();
-    entityDestroySources_.clear();
+    for (auto& map : entityDestroySources_) {
+        map.clear();
+    }
     totalCreated_ = 0;
     totalReleased_ = 0;
     totalCallbacksInvoked_ = 0;
+    activeTimeoutCascade_ = false;
 }
 
 CancellationPoolStatistics CancellationTokenPool::statistics() const noexcept {
@@ -407,7 +465,11 @@ CancellationPoolStatistics CancellationTokenPool::statistics() const noexcept {
     stats.activeSources = stats.capacity >= stats.freeSources
         ? (stats.capacity - stats.freeSources)
         : 0;
-    stats.activeEntityTokens = entityDestroySources_.size();
+    std::size_t totalEntityTokens = 0;
+    for (const auto& map : entityDestroySources_) {
+        totalEntityTokens += map.size();
+    }
+    stats.activeEntityTokens = totalEntityTokens;
     stats.totalCreated = totalCreated_;
     stats.totalReleased = totalReleased_;
     stats.totalCallbacksInvoked = totalCallbacksInvoked_;
@@ -983,6 +1045,46 @@ bool AwaitableCorePool::discard(AwaitableHandle handle) noexcept {
     }
     slot.autoRecycleOnComplete = true;
     return true;
+}
+
+std::size_t AwaitableCorePool::cancelContinuationsForContext(
+    const void* context) noexcept {
+    if (!context) return 0;
+    std::size_t removed = 0;
+
+    for (std::uint32_t i = 0; i < nextNeverUsedSlot_; ++i) {
+        auto& slot = slotAt(i);
+        if (!slot.allocated || !slot.hasContinuation) continue;
+        if (slot.continuation.context != context) continue;
+
+        releaseRootToken(slot.continuationTargetRootToken);
+        slot.hasContinuation = false;
+        slot.continuation = AsyncContinuation{};
+        ++removed;
+
+        if (slot.status != AwaitStatus::Pending) {
+            recycleSlotAt(i);
+        } else {
+            slot.autoRecycleOnComplete = true;
+        }
+    }
+
+    for (auto& rq : readyQueues_) {
+        for (std::size_t i = rq.head; i < rq.items.size(); ++i) {
+            auto& item = rq.items[i];
+            if (!item.callback || item.context != context) continue;
+            item.callback = nullptr;
+            item.context = nullptr;
+            releaseRootToken(item.pinnedTargetToken);
+            if (!item.completedHandle.isCompletedVoidSentinel() &&
+                isValid(item.completedHandle)) {
+                recycleSlotAt(item.completedHandle.slot);
+            }
+            ++removed;
+        }
+    }
+
+    return removed;
 }
 
 std::uint32_t AwaitableCorePool::allocateCombinatorSlot() {
@@ -2120,9 +2222,12 @@ CoroutineFrameHandle CoroutineFramePool::allocateFrame(
     slot.frame.resumeQueue = resumeQueue;
     slot.frame.suspended = false;
     slot.frame.completed = false;
+    slot.frame.usesScalarBuffer = false;
+    slot.frame.scalarByteSize = 0;
     slot.frame.resumeCallback = nullptr;
     slot.frame.runnerContext = nullptr;
     slot.frame.runnerOwner.reset();
+    slot.frame.overflowScalarBytes.clear();
     slot.frame.savedArguments.clear();
     slot.frame.savedLocals.clear();
     slot.frame.savedRegisters.clear();
@@ -2207,6 +2312,82 @@ bool CoroutineFramePool::suspendFrame(
     if (!slot.allocated || slot.version != handle.version) return false;
 
     snapshotAndPinValues(slot, args, argCount, locals, localCount, regs, regCount);
+    slot.frame.usesScalarBuffer = false;
+    slot.frame.scalarByteSize = 0;
+    slot.frame.resumeBlockId = resumeBlockId;
+    slot.frame.awaitedHandle = awaitedHandle;
+    slot.frame.suspended = true;
+    slot.frame.completed = false;
+    slot.frame.resumeCallback = resumeCallback;
+    slot.frame.runnerContext = runnerContext;
+    if (runnerOwner) {
+        slot.frame.runnerOwner = std::move(runnerOwner);
+    }
+
+    AsyncContinuation cont;
+    cont.callback = &CoroutineFramePool::onAwaitedCompletedCallback;
+    cont.context = this;
+    cont.userTag = handle.pack64();
+    cont.resumeQueue = slot.frame.resumeQueue;
+    cont.runInlineOnComplete = false;
+    if (!ownerContext_->awaitables().onCompleted(awaitedHandle, cont)) {
+        slot.frame.suspended = false;
+        releasePinnedRoots(slot);
+        return false;
+    }
+
+    ++totalSuspensions_;
+    return true;
+}
+
+bool CoroutineFramePool::suspendScalarFrame(
+    CoroutineFrameHandle handle,
+    const void* scalarData,
+    std::size_t scalarByteSize,
+    const Value* refSlots,
+    std::size_t refCount,
+    std::uint32_t resumeBlockId,
+    AwaitableHandle awaitedHandle,
+    CoroutineResumeCallback resumeCallback,
+    void* runnerContext,
+    std::shared_ptr<const void> runnerOwner) {
+    if (!ownerContext_ || !resumeCallback) return false;
+    if (!handle.valid() || handle.slot >= slots_.size()) return false;
+    auto& slot = slots_[handle.slot];
+    if (!slot.allocated || slot.version != handle.version) return false;
+
+    releasePinnedRoots(slot);
+    if (!slot.frame.savedArguments.empty()) slot.frame.savedArguments.clear();
+    if (!slot.frame.savedRegisters.empty()) slot.frame.savedRegisters.clear();
+
+    slot.frame.usesScalarBuffer = true;
+    slot.frame.scalarByteSize = static_cast<std::uint32_t>(scalarByteSize);
+    if (scalarByteSize > 0 && scalarData != nullptr) {
+        if (scalarByteSize <= CoroutineFrame::kInlineScalarBytes) {
+            std::memcpy(slot.frame.inlineScalarBytes.data(), scalarData, scalarByteSize);
+        } else {
+            slot.frame.overflowScalarBytes.resize(scalarByteSize);
+            std::memcpy(slot.frame.overflowScalarBytes.data(), scalarData, scalarByteSize);
+        }
+    }
+
+    if (refCount > 0 && refSlots != nullptr) {
+        slot.frame.savedLocals.assign(refSlots, refSlots + refCount);
+        if (heap_) {
+            for (const auto& v : slot.frame.savedLocals) {
+                if (valueNeedsManagedHeapRoot(v)) {
+                    const auto tok = heap_->addPersistentRoot(v);
+                    if (tok != 0) {
+                        ++activeGcRoots_;
+                        slot.pinnedRootTokens.push_back(tok);
+                    }
+                }
+            }
+        }
+    } else if (!slot.frame.savedLocals.empty()) {
+        slot.frame.savedLocals.clear();
+    }
+
     slot.frame.resumeBlockId = resumeBlockId;
     slot.frame.awaitedHandle = awaitedHandle;
     slot.frame.suspended = true;
@@ -2280,6 +2461,9 @@ void CoroutineFramePool::recycleFrame(CoroutineFrameHandle handle) noexcept {
     if (!slot.allocated || slot.version != handle.version) return;
 
     releasePinnedRoots(slot);
+    slot.frame.usesScalarBuffer = false;
+    slot.frame.scalarByteSize = 0;
+    slot.frame.overflowScalarBytes.clear();
     slot.frame.savedArguments.clear();
     slot.frame.savedLocals.clear();
     slot.frame.savedRegisters.clear();
@@ -2292,6 +2476,44 @@ void CoroutineFramePool::recycleFrame(CoroutineFrameHandle handle) noexcept {
     slot.version = nextNonZeroVersion(slot.version);
     freeSlots_.push_back(handle.slot);
     ++totalRecycled_;
+}
+
+std::size_t CoroutineFramePool::abortAllSuspendedFrames() {
+    if (slots_.empty()) return 0;
+    std::vector<CoroutineFrameHandle> activeHandles;
+    activeHandles.reserve(slots_.size());
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(slots_.size()); ++i) {
+        if (slots_[i].allocated) {
+            activeHandles.push_back(CoroutineFrameHandle{i, slots_[i].version});
+        }
+    }
+    if (activeHandles.empty()) return 0;
+
+    if (ownerContext_) {
+        (void)ownerContext_->awaitables().cancelContinuationsForContext(this);
+    }
+
+    std::size_t aborted = 0;
+    for (const auto handle : activeHandles) {
+        if (handle.slot >= slots_.size()) continue;
+        auto& slot = slots_[handle.slot];
+        if (!slot.allocated || slot.version != handle.version) continue;
+
+        const AwaitableHandle completion = slot.frame.completionHandle;
+        const AwaitableHandle awaited = slot.frame.awaitedHandle;
+        recycleFrame(handle);
+        ++aborted;
+
+        if (ownerContext_) {
+            if (awaited.valid() && !awaited.isCompletedVoidSentinel()) {
+                (void)ownerContext_->awaitables().discard(awaited);
+            }
+            if (completion.valid() && !completion.isCompletedVoidSentinel()) {
+                (void)ownerContext_->awaitables().trySetCanceled(completion);
+            }
+        }
+    }
+    return aborted;
 }
 
 void CoroutineFramePool::clear() noexcept {
@@ -2629,6 +2851,44 @@ bool tryExecuteAsyncIntrinsic(
         result = Value(LongValue{static_cast<std::int64_t>(h.pack64())});
         return true;
     }
+    if (op == "CtsCreateLinked2") {
+        std::uint64_t packedA = 0;
+        std::uint64_t packedB = 0;
+        if (arguments.size() >= 1) (void)tryExtractPackedInt64(arguments[0], packedA);
+        if (arguments.size() >= 2) (void)tryExtractPackedInt64(arguments[1], packedB);
+        const std::array<CancellationToken, 2> parents{
+            CancellationToken::unpack64(packedA),
+            CancellationToken::unpack64(packedB),
+        };
+        const auto h = ctsPool.createLinkedSource(parents.data(), parents.size());
+        result = Value(LongValue{static_cast<std::int64_t>(h.pack64())});
+        return true;
+    }
+    if (op == "CtsCreateTimeout") {
+        double secs = 0.0;
+        if (!arguments.empty()) {
+            if (const auto* d = std::get_if<double>(&arguments[0])) secs = *d;
+            else if (const auto* f = std::get_if<FloatValue>(&arguments[0])) secs = f->value;
+            else if (const auto* i = std::get_if<std::int64_t>(&arguments[0])) secs = static_cast<double>(*i);
+        }
+        const auto h = asyncContext->createTimeoutSource(secs, false);
+        result = Value(LongValue{static_cast<std::int64_t>(h.pack64())});
+        return true;
+    }
+    if (op == "CtsCreateLinkedTimeout") {
+        std::uint64_t packedParent = 0;
+        double secs = 0.0;
+        if (arguments.size() >= 1) (void)tryExtractPackedInt64(arguments[0], packedParent);
+        if (arguments.size() >= 2) {
+            if (const auto* d = std::get_if<double>(&arguments[1])) secs = *d;
+            else if (const auto* f = std::get_if<FloatValue>(&arguments[1])) secs = f->value;
+            else if (const auto* i = std::get_if<std::int64_t>(&arguments[1])) secs = static_cast<double>(*i);
+        }
+        const auto parentTok = CancellationToken::unpack64(packedParent);
+        const auto h = asyncContext->createLinkedTimeoutSource(&parentTok, 1u, secs, false);
+        result = Value(LongValue{static_cast<std::int64_t>(h.pack64())});
+        return true;
+    }
     if (op == "CtsToken") {
         std::uint64_t packedCts = 0;
         if (arguments.empty() || !tryExtractPackedInt64(arguments[0], packedCts)) {
@@ -2673,6 +2933,27 @@ bool tryExecuteAsyncIntrinsic(
             CancellationToken::unpack64(packedTok)));
         return true;
     }
+    if (op == "TokenIsTimedOut") {
+        std::uint64_t packedTok = 0;
+        if (arguments.empty() || !tryExtractPackedInt64(arguments[0], packedTok)) {
+            result = Value(false);
+            return true;
+        }
+        result = Value(ctsPool.isTimedOut(
+            CancellationToken::unpack64(packedTok)));
+        return true;
+    }
+    if (op == "AdvanceTimeouts") {
+        double dt = 0.0;
+        if (!arguments.empty()) {
+            if (const auto* d = std::get_if<double>(&arguments[0])) dt = *d;
+            else if (const auto* f = std::get_if<FloatValue>(&arguments[0])) dt = f->value;
+            else if (const auto* i = std::get_if<std::int64_t>(&arguments[0])) dt = static_cast<double>(*i);
+        }
+        const std::size_t fired = asyncContext->advanceTimeouts(dt);
+        result = Value(static_cast<std::int64_t>(fired));
+        return true;
+    }
     if (op == "StepUpdate") {
         std::size_t maxCount = 0;
         if (!arguments.empty()) {
@@ -2714,6 +2995,99 @@ AwaitableHandle AsyncRuntimeContext::enqueueYield(CancellationToken token) {
         pendingYields_.push_back(h);
     }
     return h;
+}
+
+CancellationSourceHandle AsyncRuntimeContext::createTimeoutSource(
+    double timeoutSeconds,
+    bool autoReleaseOnFire) {
+    const CancellationSourceHandle src = cancellations_.createSource();
+    if (std::isnan(timeoutSeconds) || timeoutSeconds <= 0.0) {
+        (void)cancellations_.cancelByTimeout(src);
+        if (autoReleaseOnFire) {
+            (void)cancellations_.releaseSource(src);
+        }
+        return src;
+    }
+    if (!std::isfinite(timeoutSeconds)) {
+        return src;
+    }
+    scheduledTimeouts_.push_back(ScheduledTimeout{
+        virtualTimeSeconds_ + timeoutSeconds,
+        src,
+        autoReleaseOnFire,
+    });
+    return src;
+}
+
+CancellationSourceHandle AsyncRuntimeContext::createLinkedTimeoutSource(
+    const CancellationToken* parents,
+    std::size_t parentCount,
+    double timeoutSeconds,
+    bool autoReleaseOnFire) {
+    const CancellationSourceHandle src =
+        cancellations_.createLinkedSource(parents, parentCount);
+    const CancellationToken tok = cancellations_.token(src);
+    if (cancellations_.isCancellationRequested(tok)) {
+        return src;
+    }
+    if (std::isnan(timeoutSeconds) || timeoutSeconds <= 0.0) {
+        (void)cancellations_.cancelByTimeout(src);
+        if (autoReleaseOnFire) {
+            (void)cancellations_.releaseSource(src);
+        }
+        return src;
+    }
+    if (!std::isfinite(timeoutSeconds)) {
+        return src;
+    }
+    scheduledTimeouts_.push_back(ScheduledTimeout{
+        virtualTimeSeconds_ + timeoutSeconds,
+        src,
+        autoReleaseOnFire,
+    });
+    return src;
+}
+
+std::size_t AsyncRuntimeContext::advanceTimeouts(double deltaSeconds) {
+    if (std::isfinite(deltaSeconds) && deltaSeconds > 0.0) {
+        virtualTimeSeconds_ += deltaSeconds;
+    }
+    if (scheduledTimeouts_.empty()) {
+        return 0;
+    }
+    std::vector<ScheduledTimeout> due;
+    std::size_t writeIdx = 0;
+    for (std::size_t i = 0; i < scheduledTimeouts_.size(); ++i) {
+        const auto item = scheduledTimeouts_[i];
+        if (!cancellations_.isSourceAlive(item.source)) {
+            continue;
+        }
+        if (cancellations_.isCancellationRequested(cancellations_.token(item.source))) {
+            continue;
+        }
+        if (virtualTimeSeconds_ + 1e-12 >= item.deadlineSeconds) {
+            due.push_back(item);
+            continue;
+        }
+        if (writeIdx != i) {
+            scheduledTimeouts_[writeIdx] = item;
+        }
+        ++writeIdx;
+    }
+    scheduledTimeouts_.resize(writeIdx);
+
+    std::size_t firedCount = 0;
+    for (const auto& item : due) {
+        if (!cancellations_.isSourceAlive(item.source)) continue;
+        if (!cancellations_.isCancellationRequested(cancellations_.token(item.source))) {
+            (void)cancellations_.cancelByTimeout(item.source);
+            ++firedCount;
+        }
+        if (item.autoReleaseOnFire) {
+            (void)cancellations_.releaseSource(item.source);
+        }
+    }
+    return firedCount;
 }
 
 bool AsyncRuntimeContext::stepPreTickIo(
@@ -2760,6 +3134,8 @@ std::size_t AsyncRuntimeContext::stepResumeQueue(
 
 void AsyncRuntimeContext::reset() noexcept {
     pendingYields_.clear();
+    virtualTimeSeconds_ = 0.0;
+    scheduledTimeouts_.clear();
     completionQueue_.reset();
     coroutines_.clear();
     awaitables_.clear();

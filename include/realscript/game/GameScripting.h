@@ -542,6 +542,10 @@ public:
     [[nodiscard]] std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles() const noexcept {
         return nativeHandles_;
     }
+    [[nodiscard]] std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime() const noexcept {
+        return asyncRuntime_;
+    }
+    void setAsyncRuntime(std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime) noexcept;
 
     [[nodiscard]] std::optional<ScriptObject> allocateUninitializedObject(
         const ScriptType& type,
@@ -578,6 +582,7 @@ private:
     std::shared_ptr<const runtime::BindingRegistry> bindings_;
     std::shared_ptr<runtime::ManagedHeap> heap_;
     std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles_;
+    std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime_;
     runtime::Interpreter interpreter_;
     ScriptExecutionBackend backend_ = ScriptExecutionBackend::Interpreter;
     std::shared_ptr<jit::Module> jitModule_;
@@ -747,6 +752,9 @@ public:
 
     explicit SceneScriptRuntime(ScriptRuntime& runtime)
         : runtime_(runtime) {}
+    ~SceneScriptRuntime() noexcept;
+    SceneScriptRuntime(const SceneScriptRuntime&) = delete;
+    SceneScriptRuntime& operator=(const SceneScriptRuntime&) = delete;
 
     bool attach(
         SceneEntityId entity,
@@ -787,6 +795,11 @@ public:
 
     void setExecutionMode(SceneExecutionMode mode) noexcept {
         executionMode_ = mode;
+        if (mode == SceneExecutionMode::Editor) {
+            sceneStarted_ = false;
+        } else {
+            hasUnstartedPlayComponents_ = true;
+        }
     }
     [[nodiscard]] SceneExecutionMode executionMode() const noexcept {
         return executionMode_;
@@ -991,6 +1004,15 @@ public:
     void setExecutionOptions(runtime::ExecutionOptions options) {
         executionOptions_ = std::move(options);
     }
+    void setDeterminismSession(runtime::DeterminismSession* session) noexcept {
+        determinismSession_ = session;
+    }
+    [[nodiscard]] runtime::DeterminismSession* determinismSession() const noexcept {
+        return determinismSession_;
+    }
+    [[nodiscard]] std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime() const noexcept {
+        return runtime_.asyncRuntime();
+    }
     [[nodiscard]] const std::vector<SceneScriptError>& errors() const noexcept {
         return errors_;
     }
@@ -1066,6 +1088,172 @@ public:
         std::string componentType = {});
     std::size_t flushCompletedAsyncRequests();
 
+    // Stage 3: Unified Pooled Awaitable Scene Streaming, Asset Loading, SaveGame I/O
+    // & Entity-Destroy CancellationToken Lifecycle Bridge
+    [[nodiscard]] runtime::CancellationToken entityDestroyToken(SceneEntityId entity);
+    [[nodiscard]] bool hasEntityDestroyToken(SceneEntityId entity) const noexcept;
+    bool cancelEntityDestroyToken(SceneEntityId entity);
+
+    bool stepAsyncPreTickIo();
+    std::size_t stepAsyncResumeQueue(
+        runtime::ResumeQueue queue,
+        std::size_t maxContinuations = 0);
+
+    void setAsyncIoLatencyFrames(std::uint32_t frames) noexcept {
+        asyncIoLatencyFrames_ = frames;
+    }
+    [[nodiscard]] std::uint32_t asyncIoLatencyFrames() const noexcept {
+        return asyncIoLatencyFrames_;
+    }
+
+    using AsyncPrefabStreamWorker = std::function<void(
+        const std::string& prefabKey,
+        runtime::AsyncRequestId requestId,
+        runtime::CancellationToken token,
+        runtime::AsyncCompletionQueue& completionQueue)>;
+    using AsyncAssetLoadWorker = std::function<void(
+        const std::string& assetPath,
+        const std::string& canonicalTypeName,
+        runtime::AsyncRequestId requestId,
+        runtime::CancellationToken token,
+        runtime::AsyncCompletionQueue& completionQueue)>;
+    using AsyncSaveWriteWorker = std::function<void(
+        const std::string& slotKey,
+        const std::string& payload,
+        runtime::AsyncRequestId requestId,
+        runtime::CancellationToken token,
+        runtime::AsyncCompletionQueue& completionQueue)>;
+    using AsyncSaveReadWorker = std::function<void(
+        const std::string& slotKey,
+        runtime::AsyncRequestId requestId,
+        runtime::CancellationToken token,
+        runtime::AsyncCompletionQueue& completionQueue)>;
+
+    void registerPrefabTemplate(std::string prefabKey, PrefabNodeTemplate prefab);
+    bool unregisterPrefabTemplate(const std::string& prefabKey);
+    [[nodiscard]] bool hasPrefabTemplate(const std::string& prefabKey) const;
+    void setPrefabStreamWorker(AsyncPrefabStreamWorker worker);
+    [[nodiscard]] runtime::AwaitableHandle loadPrefabSceneAsync(
+        std::string prefabKey,
+        SceneEntityId parentEntity = 0,
+        runtime::CancellationToken token = runtime::CancellationToken::none());
+
+    void registerAsyncAssetDefinition(
+        std::string assetPath,
+        std::map<std::string, runtime::Value> initialFields = {});
+    bool unregisterAsyncAssetDefinition(const std::string& assetPath);
+    void setAssetLoadWorker(AsyncAssetLoadWorker worker);
+    [[nodiscard]] runtime::AwaitableHandle loadAssetAsync(
+        std::string assetPath,
+        std::string canonicalTypeName,
+        runtime::CancellationToken token = runtime::CancellationToken::none());
+
+    void setSaveGameSlot(std::string slotKey, std::string payload);
+    [[nodiscard]] std::optional<std::string> getSaveGameSlot(const std::string& slotKey) const;
+    bool eraseSaveGameSlot(const std::string& slotKey);
+    void setSaveWriteWorker(AsyncSaveWriteWorker worker);
+    void setSaveReadWorker(AsyncSaveReadWorker worker);
+    [[nodiscard]] runtime::AwaitableHandle saveGameAsync(
+        std::string slotKey,
+        std::string payload,
+        runtime::CancellationToken token = runtime::CancellationToken::none());
+    [[nodiscard]] runtime::AwaitableHandle loadGameAsync(
+        std::string slotKey,
+        runtime::CancellationToken token = runtime::CancellationToken::none());
+
+    [[nodiscard]] std::uint64_t legacySequenceCancelChecks() const noexcept {
+        return legacySequenceCancelChecks_;
+    }
+    [[nodiscard]] std::uint64_t legacySequenceCancelInvocations() const noexcept {
+        return legacySequenceCancelInvocations_;
+    }
+
+    // Stage 4: Network (HTTP & WebSocket) Awaitable Bridges with Timeout-Linked Cancellation
+    // Advanced automatically once per frame by `update(deltaTime)`; hosts driving only
+    // `fixedUpdate(fixedDt)` may call `advanceAsyncTimeouts(fixedDt)` explicitly.
+    std::size_t advanceAsyncTimeouts(double deltaSeconds);
+
+    struct HttpRequestSpec {
+        std::string method = "GET";
+        std::string url;
+        std::string body;
+        double timeoutSeconds = 0.0;
+    };
+
+    using AsyncHttpWorker = std::function<void(
+        const HttpRequestSpec& request,
+        runtime::AsyncRequestId requestId,
+        runtime::CancellationToken linkedToken,
+        runtime::AsyncCompletionQueue& completionQueue)>;
+
+    [[nodiscard]] static std::string encodeHttpWirePacket(
+        int statusCode,
+        std::string_view responseBody);
+    [[nodiscard]] static bool decodeHttpWirePacket(
+        std::string_view packet,
+        int& outStatusCode,
+        std::string& outBody);
+
+    void registerHttpEndpoint(
+        std::string method,
+        std::string url,
+        int statusCode,
+        std::string responseBody,
+        std::uint32_t latencyFrames = 0);
+    bool unregisterHttpEndpoint(const std::string& method, const std::string& url);
+    void setHttpWorker(AsyncHttpWorker worker);
+    [[nodiscard]] runtime::AwaitableHandle httpRequestAsync(
+        HttpRequestSpec request,
+        bool returnStatusOnly = false,
+        runtime::CancellationToken callerToken = runtime::CancellationToken::none());
+    [[nodiscard]] int lastHttpStatusCode() const noexcept { return lastHttpStatusCode_; }
+    [[nodiscard]] const std::string& lastHttpResponseBody() const noexcept {
+        return lastHttpResponseBody_;
+    }
+    [[nodiscard]] bool lastHttpTimedOut() const noexcept { return lastHttpTimedOut_; }
+
+    using WebSocketHandle = std::int64_t;
+    using AsyncWebSocketConnectWorker = std::function<void(
+        WebSocketHandle wsHandle,
+        const std::string& url,
+        runtime::AsyncRequestId requestId,
+        runtime::CancellationToken linkedToken,
+        runtime::AsyncCompletionQueue& completionQueue)>;
+    using AsyncWebSocketSendWorker = std::function<void(
+        WebSocketHandle wsHandle,
+        const std::string& payload,
+        runtime::AsyncRequestId requestId,
+        runtime::CancellationToken linkedToken,
+        runtime::AsyncCompletionQueue& completionQueue)>;
+
+    void registerWebSocketEndpoint(
+        std::string url,
+        bool autoEcho = false,
+        std::uint32_t connectLatencyFrames = 0);
+    bool unregisterWebSocketEndpoint(const std::string& url);
+    void setWebSocketConnectWorker(AsyncWebSocketConnectWorker worker);
+    void setWebSocketSendWorker(AsyncWebSocketSendWorker worker);
+    bool pushWebSocketInboundMessage(WebSocketHandle wsHandle, std::string message);
+    bool closeWebSocketFromHost(WebSocketHandle wsHandle, std::string reason = {});
+    [[nodiscard]] bool isWebSocketConnected(WebSocketHandle wsHandle) const noexcept;
+    [[nodiscard]] std::vector<std::string> getWebSocketSentMessages(WebSocketHandle wsHandle) const;
+
+    [[nodiscard]] runtime::AwaitableHandle wsConnectAsync(
+        std::string url,
+        SceneEntityId ownerEntity = 0,
+        double timeoutSeconds = 0.0,
+        runtime::CancellationToken callerToken = runtime::CancellationToken::none());
+    [[nodiscard]] runtime::AwaitableHandle wsSendAsync(
+        WebSocketHandle wsHandle,
+        std::string payload,
+        double timeoutSeconds = 0.0,
+        runtime::CancellationToken callerToken = runtime::CancellationToken::none());
+    [[nodiscard]] runtime::AwaitableHandle wsReceiveAsync(
+        WebSocketHandle wsHandle,
+        double timeoutSeconds = 0.0,
+        runtime::CancellationToken callerToken = runtime::CancellationToken::none());
+    [[nodiscard]] runtime::AwaitableHandle wsCloseAsync(WebSocketHandle wsHandle);
+
 private:
     struct AsyncRequestWaiter {
         SceneEntityId targetEntity = 0;
@@ -1098,8 +1286,120 @@ private:
         std::optional<ScriptMethod> method;
     };
 
+    struct SequenceCancelSlot {
+        std::size_t stateFieldIndex = static_cast<std::size_t>(-1);
+        ScriptMethod cancelMethod;
+    };
+
+    struct SequenceCancelPlan {
+        std::size_t sharedTimerFieldIndex = static_cast<std::size_t>(-1);
+        std::vector<SequenceCancelSlot> slots;
+    };
+
+    struct PendingPrefabMaterializeOp {
+        std::string prefabKey;
+        SceneEntityId parentEntity = 0;
+        runtime::CancellationToken token = runtime::CancellationToken::none();
+        runtime::AwaitableHandle ioHandle{};
+        runtime::AwaitableHandle outerHandle{};
+    };
+
+    struct PendingAssetMaterializeOp {
+        std::string assetPath;
+        std::string canonicalTypeName;
+        runtime::CancellationToken token = runtime::CancellationToken::none();
+        runtime::AwaitableHandle ioHandle{};
+        runtime::AwaitableHandle outerHandle{};
+    };
+
+    struct DeferredAsyncIoPacket {
+        enum class Kind : std::uint8_t {
+            ScalarBool,
+            String,
+            SaveCommit,
+            SaveRead,
+            WsMockSend,
+            Failure,
+        };
+        std::uint32_t remainingFrames = 0;
+        runtime::AsyncRequestId requestId = 0;
+        runtime::AwaitableHandle targetHandle{};
+        runtime::CancellationToken token = runtime::CancellationToken::none();
+        Kind kind = Kind::ScalarBool;
+        bool boolValue = false;
+        WebSocketHandle wsHandle = 0;
+        std::string key;
+        std::string textPayload;
+        runtime::ErrorCode errorCode = runtime::ErrorCode::None;
+    };
+
+    struct PendingLifecycleCoroutine {
+        SceneEntityId entity = 0;
+        std::string callback;
+    };
+
+    struct HttpMockEndpoint {
+        int statusCode = 200;
+        std::string responseBody;
+        std::uint32_t latencyFrames = 0;
+    };
+
+    struct PendingHttpMaterializeOp {
+        bool returnStatusOnly = false;
+        runtime::CancellationToken effectiveToken = runtime::CancellationToken::none();
+        runtime::CancellationSourceHandle ownedLinkedCts{};
+        runtime::AwaitableHandle ioHandle{};
+        runtime::AwaitableHandle outerHandle{};
+    };
+
+    struct WebSocketEndpointConfig {
+        bool autoEcho = false;
+        std::uint32_t connectLatencyFrames = 0;
+    };
+
+    struct PendingWsReceiveWaiter {
+        runtime::AsyncRequestId requestId = 0;
+        runtime::CancellationToken token = runtime::CancellationToken::none();
+    };
+
+    struct WebSocketSessionSlot {
+        std::uint32_t generation = 1;
+        bool allocated = false;
+        bool connected = false;
+        bool closed = false;
+        bool autoEcho = false;
+        std::string url;
+        std::string closeReason;
+        SceneEntityId ownerEntity = 0;
+        std::uint64_t nextReceiveSeq = 1;
+        std::uint64_t nextSendSeq = 1;
+        std::deque<std::string> inboundQueue;
+        std::vector<std::string> sentMessages;
+        std::deque<PendingWsReceiveWaiter> pendingReceivers;
+    };
+
+    struct PendingWsConnectOp {
+        WebSocketHandle wsHandle = 0;
+        runtime::CancellationToken effectiveToken = runtime::CancellationToken::none();
+        runtime::CancellationSourceHandle ownedLinkedCts{};
+        runtime::AwaitableHandle ioHandle{};
+        runtime::AwaitableHandle outerHandle{};
+    };
+
+    struct PendingNetTokenCleanupOp {
+        runtime::CancellationSourceHandle ownedLinkedCts{};
+        runtime::AwaitableHandle ioHandle{};
+        runtime::AwaitableHandle outerHandle{};
+        WebSocketHandle wsHandle = 0;
+        runtime::AsyncRequestId requestId = 0;
+        bool isReceiveOp = false;
+        bool recordSentOnSuccess = false;
+        std::string sentPayload;
+    };
+
     struct Instance {
         ScriptObject object;
+        std::shared_ptr<const SequenceCancelPlan> sequenceCancelPlan;
         bool enabled = true;
         bool started = false;
         bool executeInEditMode = false;
@@ -1135,6 +1435,53 @@ private:
     };
 
     void bindLifecycleMethods(Instance& instance) const;
+    void startPendingComponents();
+    [[nodiscard]] std::shared_ptr<const SequenceCancelPlan> resolveSequenceCancelPlan(
+        const ScriptType& type) const;
+    void cancelInstanceSequencesFast(const Instance& instance) const;
+    [[nodiscard]] runtime::GenerationalEntityHandle resolveActiveDestroyTokenHandle(
+        SceneEntityId entity) const noexcept;
+    [[nodiscard]] runtime::GenerationalEntityHandle getOrAssignDestroyTokenHandle(
+        SceneEntityId entity);
+    void releaseAsyncTemplateRoots() noexcept;
+    void releasePendingNetworkAsyncOps() noexcept;
+    void advanceDeferredAsyncIoPackets();
+    static void onAsyncPrefabIoCompleted(
+        void* context,
+        runtime::AwaitableHandle ioHandle,
+        runtime::AwaitStatus status,
+        std::uint64_t opId);
+    static void onAsyncAssetIoCompleted(
+        void* context,
+        runtime::AwaitableHandle ioHandle,
+        runtime::AwaitStatus status,
+        std::uint64_t opId);
+    static void onLifecycleCoroutineCompleted(
+        void* context,
+        runtime::AwaitableHandle handle,
+        runtime::AwaitStatus status,
+        std::uint64_t packedHandle);
+    [[nodiscard]] runtime::CancellationToken buildScopedNetToken(
+        SceneEntityId optionalOwnerEntity,
+        runtime::CancellationToken callerToken,
+        double timeoutSeconds,
+        runtime::CancellationSourceHandle& outOwnedCts);
+    void closeEntityOwnedWebSockets(SceneEntityId entity);
+    static void onAsyncHttpIoCompleted(
+        void* context,
+        runtime::AwaitableHandle ioHandle,
+        runtime::AwaitStatus status,
+        std::uint64_t opId);
+    static void onAsyncWsConnectIoCompleted(
+        void* context,
+        runtime::AwaitableHandle ioHandle,
+        runtime::AwaitStatus status,
+        std::uint64_t opId);
+    static void onAsyncNetPassthroughCompleted(
+        void* context,
+        runtime::AwaitableHandle ioHandle,
+        runtime::AwaitStatus status,
+        std::uint64_t opId);
     [[nodiscard]] bool shouldTickInCurrentMode(const Instance& instance) const noexcept;
     [[nodiscard]] bool matchesComponentType(
         const ScriptType& componentType,
@@ -1165,6 +1512,11 @@ private:
         const std::optional<ScriptMethod>& method,
         const std::vector<runtime::Value>& arguments,
         const char* callback);
+    bool consumeFireAndForgetInvocationResult(
+        SceneEntityId entity,
+        const ScriptMethod& method,
+        const runtime::ExecutionResult& result,
+        std::string_view callback);
     void recordError(
         SceneEntityId entity,
         std::string callback,
@@ -1173,6 +1525,8 @@ private:
     ScriptRuntime& runtime_;
     runtime::ExecutionOptions executionOptions_;
     SceneExecutionMode executionMode_ = SceneExecutionMode::Play;
+    bool sceneStarted_ = false;
+    bool hasUnstartedPlayComponents_ = false;
     std::unordered_map<SceneEntityId, std::vector<Instance>> instances_;
     std::unordered_map<SceneEntityId, SceneEntityId> parentByEntity_;
     std::unordered_map<SceneEntityId, std::vector<SceneEntityId>> childrenByEntity_;
@@ -1208,6 +1562,45 @@ private:
     std::unordered_map<AsyncRequestId, AsyncRequestEntry> asyncRequests_;
     std::vector<PendingAsyncCompletion> pendingAsyncCompletions_;
     std::unordered_map<std::size_t, std::vector<MethodCacheEntry>> methodCache_;
+    mutable std::unordered_map<
+        semantic::SymbolId,
+        std::shared_ptr<const SequenceCancelPlan>> sequenceCancelPlanCache_;
+    mutable std::uint64_t legacySequenceCancelChecks_ = 0;
+    mutable std::uint64_t legacySequenceCancelInvocations_ = 0;
+    runtime::DeterminismSession* determinismSession_ = nullptr;
+    std::unordered_map<std::uint32_t, std::uint32_t> nonGenDestroyEpoch_;
+    std::uint32_t detachDepth_ = 0;
+    bool pendingCanceledUnwind_ = false;
+    bool inFrameQueueDrain_ = false;
+    std::uint32_t asyncIoLatencyFrames_ = 0;
+    mutable std::mutex asyncIoMutex_;
+    std::unordered_map<std::string, PrefabNodeTemplate> prefabTemplates_;
+    std::unordered_map<std::string, std::map<std::string, runtime::Value>> asyncAssetDefinitions_;
+    std::unordered_map<std::string, std::vector<runtime::ManagedHeap::RootToken>> prefabTemplateRootTokens_;
+    std::unordered_map<std::string, std::vector<runtime::ManagedHeap::RootToken>> asyncAssetDefRootTokens_;
+    std::unordered_map<std::string, std::string> saveGameSlots_;
+    AsyncPrefabStreamWorker prefabStreamWorker_;
+    AsyncAssetLoadWorker assetLoadWorker_;
+    AsyncSaveWriteWorker saveWriteWorker_;
+    AsyncSaveReadWorker saveReadWorker_;
+    std::uint64_t nextMaterializeOpId_ = 1;
+    std::unordered_map<std::uint64_t, PendingPrefabMaterializeOp> pendingPrefabOps_;
+    std::unordered_map<std::uint64_t, PendingAssetMaterializeOp> pendingAssetOps_;
+    std::vector<DeferredAsyncIoPacket> deferredAsyncIoPackets_;
+    std::unordered_map<std::uint64_t, PendingLifecycleCoroutine> pendingLifecycleCoroutines_;
+    std::unordered_map<std::string, HttpMockEndpoint> httpEndpoints_;
+    AsyncHttpWorker httpWorker_;
+    int lastHttpStatusCode_ = 0;
+    std::string lastHttpResponseBody_;
+    bool lastHttpTimedOut_ = false;
+    std::unordered_map<std::uint64_t, PendingHttpMaterializeOp> pendingHttpOps_;
+    std::unordered_map<std::string, WebSocketEndpointConfig> wsEndpoints_;
+    AsyncWebSocketConnectWorker wsConnectWorker_;
+    AsyncWebSocketSendWorker wsSendWorker_;
+    std::deque<WebSocketSessionSlot> wsSessions_;
+    std::vector<std::uint32_t> freeWsSessionSlots_;
+    std::unordered_map<std::uint64_t, PendingWsConnectOp> pendingWsConnectOps_;
+    std::unordered_map<std::uint64_t, PendingNetTokenCleanupOp> pendingNetTokenOps_;
     std::vector<ScriptEvent> eventQueue_;
     std::map<std::string, ScriptTrigger> triggers_;
     std::vector<SceneScriptError> errors_;

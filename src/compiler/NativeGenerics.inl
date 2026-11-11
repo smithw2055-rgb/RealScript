@@ -869,6 +869,11 @@ private:
             }
             return arg;
         };
+        auto isMathStructTypeArg = [&](const std::string& rawArg) noexcept {
+            const std::string arg = stripArrayAndNullable(rawArg);
+            return arg == "Fixed" || arg == "Fixed16" ||
+                arg == "Vec2" || arg == "Vec3" || arg == "Vec4" || arg == "Quat";
+        };
         auto isCanonicalBuiltinTypeArg = [&](const std::string& rawArg) noexcept {
             const std::string arg = stripArrayAndNullable(rawArg);
             return arg == "bool" || arg == "byte" || arg == "sbyte" ||
@@ -876,7 +881,8 @@ private:
                 arg == "uint" || arg == "long" || arg == "ulong" ||
                 arg == "float" || arg == "double" || arg == "char" ||
                 arg == "string" || arg == "fixed" || arg == "fixed16" ||
-                arg == "vec2" || arg == "vec3" || arg == "quat" ||
+                arg == "vec2" || arg == "vec3" || arg == "vec4" || arg == "quat" ||
+                isMathStructTypeArg(rawArg) ||
                 arg == "Awaitable" || arg == "CancellationToken";
         };
         auto moduleDeclaresTypeName = [&](const std::string& modName,
@@ -906,6 +912,10 @@ private:
         auto resolveAwaitableOwnerModule = [&](const std::string& rawArg) -> std::string {
             if (isCanonicalBuiltinTypeArg(rawArg) &&
                 modules_.find("RealScript.Async") != modules_.end()) {
+                if (isMathStructTypeArg(rawArg) &&
+                    modules_.find("RealScript.Math") != modules_.end()) {
+                    modules_["RealScript.Async"].imports.insert("RealScript.Math");
+                }
                 return "RealScript.Async";
             }
             const std::string baseType = stripArrayAndNullable(rawArg);

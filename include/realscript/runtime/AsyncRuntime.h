@@ -212,6 +212,20 @@ struct CancellationPoolStatistics {
 };
 
 /**
+ * Isolated keyspace domains for `CancellationTokenPool` entity-destroy tokens,
+ * preventing handle collisions when `SceneScriptRuntime` and `GameplayHost`
+ * share a single `AsyncRuntimeContext`.
+ */
+enum class EntityDestroyDomain : std::uint8_t {
+    SceneGenerational = 0,
+    SceneNonGenerational = 1,
+    GameplayCore = 2,
+    Custom = 3,
+};
+
+inline constexpr std::size_t kEntityDestroyDomainCount = 4;
+
+/**
  * Pooled Generational `CancellationTokenSource` & Entity Destroy Token Manager.
  */
 class CancellationTokenPool {
@@ -235,8 +249,10 @@ public:
     [[nodiscard]] CancellationToken token(CancellationSourceHandle source) const noexcept;
     [[nodiscard]] bool isSourceAlive(CancellationSourceHandle source) const noexcept;
     [[nodiscard]] bool isCancellationRequested(CancellationToken token) const noexcept;
+    [[nodiscard]] bool isTimedOut(CancellationToken token) const noexcept;
 
     std::size_t cancel(CancellationSourceHandle source);
+    std::size_t cancelByTimeout(CancellationSourceHandle source);
     bool releaseSource(CancellationSourceHandle source) noexcept;
 
     [[nodiscard]] CancellationRegistration registerCallback(
@@ -247,10 +263,14 @@ public:
     bool unregisterCallback(CancellationRegistration registration) noexcept;
 
     [[nodiscard]] CancellationToken getOrCreateEntityDestroyToken(
-        GenerationalEntityHandle entity);
+        GenerationalEntityHandle entity,
+        EntityDestroyDomain domain = EntityDestroyDomain::SceneGenerational);
     [[nodiscard]] bool hasEntityDestroyToken(
-        GenerationalEntityHandle entity) const noexcept;
-    bool cancelEntity(GenerationalEntityHandle entity);
+        GenerationalEntityHandle entity,
+        EntityDestroyDomain domain = EntityDestroyDomain::SceneGenerational) const noexcept;
+    bool cancelEntity(
+        GenerationalEntityHandle entity,
+        EntityDestroyDomain domain = EntityDestroyDomain::SceneGenerational);
 
     void clear() noexcept;
     [[nodiscard]] CancellationPoolStatistics statistics() const noexcept;
@@ -267,22 +287,28 @@ private:
     struct CtsSlot {
         std::uint32_t version = 1;
         std::uint32_t lastCanceledVersion = 0;
+        std::uint32_t lastTimedOutVersion = 0;
         bool allocated = false;
         bool canceled = false;
+        bool timedOut = false;
         std::vector<CallbackSlot> callbacks;
         std::vector<std::uint32_t> freeCallbacks;
         std::vector<CancellationRegistration> parentRegistrations;
     };
 
     static void onLinkedParentCanceled(void* context, std::uint64_t packedChildSource);
+    std::size_t cancelImpl(CancellationSourceHandle source, bool byTimeout);
     void detachParentRegistrations(CtsSlot& slot) noexcept;
 
     std::deque<CtsSlot> slots_;
     std::vector<std::uint32_t> freeSlots_;
-    std::unordered_map<std::uint64_t, CancellationSourceHandle> entityDestroySources_;
+    std::array<
+        std::unordered_map<std::uint64_t, CancellationSourceHandle>,
+        kEntityDestroyDomainCount> entityDestroySources_;
     std::uint64_t totalCreated_ = 0;
     std::uint64_t totalReleased_ = 0;
     std::uint64_t totalCallbacksInvoked_ = 0;
+    bool activeTimeoutCascade_ = false;
 };
 
 /**
@@ -411,6 +437,7 @@ public:
         RuntimeError& outError);
 
     bool discard(AwaitableHandle handle) noexcept;
+    std::size_t cancelContinuationsForContext(const void* context) noexcept;
 
     [[nodiscard]] AwaitableHandle whenAll(
         const AwaitableHandle* tasks,
@@ -752,6 +779,8 @@ using CoroutineResumeCallback = void (*)(
     AsyncRuntimeContext& asyncContext);
 
 struct CoroutineFrame {
+    static constexpr std::size_t kInlineScalarBytes = 256;
+
     semantic::SymbolId functionSymbolId = 0;
     semantic::SymbolId returnStructTypeId = 0;
     AwaitableHandle completionHandle{};
@@ -760,12 +789,22 @@ struct CoroutineFrame {
     ResumeQueue resumeQueue = ResumeQueue::Update;
     bool suspended = false;
     bool completed = false;
+    bool usesScalarBuffer = false;
+    std::uint32_t scalarByteSize = 0;
     CoroutineResumeCallback resumeCallback = nullptr;
     void* runnerContext = nullptr;
     std::shared_ptr<const void> runnerOwner{};
+    alignas(16) std::array<std::uint8_t, kInlineScalarBytes> inlineScalarBytes{};
+    std::vector<std::uint8_t> overflowScalarBytes;
     std::vector<Value> savedArguments;
     std::vector<Value> savedLocals;
     std::vector<Value> savedRegisters;
+
+    [[nodiscard]] const void* scalarBufferData() const noexcept {
+        return scalarByteSize <= kInlineScalarBytes
+            ? static_cast<const void*>(inlineScalarBytes.data())
+            : static_cast<const void*>(overflowScalarBytes.data());
+    }
 };
 
 struct CoroutinePoolStatistics {
@@ -819,7 +858,20 @@ public:
         void* runnerContext,
         std::shared_ptr<const void> runnerOwner = {});
 
+    bool suspendScalarFrame(
+        CoroutineFrameHandle handle,
+        const void* scalarData,
+        std::size_t scalarByteSize,
+        const Value* refSlots,
+        std::size_t refCount,
+        std::uint32_t resumeBlockId,
+        AwaitableHandle awaitedHandle,
+        CoroutineResumeCallback resumeCallback,
+        void* runnerContext,
+        std::shared_ptr<const void> runnerOwner = {});
+
     void recycleFrame(CoroutineFrameHandle handle) noexcept;
+    std::size_t abortAllSuspendedFrames();
     void clear() noexcept;
     [[nodiscard]] CoroutinePoolStatistics statistics() const noexcept;
 
@@ -904,6 +956,17 @@ public:
 
     [[nodiscard]] AwaitableHandle enqueueYield(CancellationToken token = CancellationToken::none());
 
+    [[nodiscard]] double virtualTimeSeconds() const noexcept { return virtualTimeSeconds_; }
+    [[nodiscard]] CancellationSourceHandle createTimeoutSource(
+        double timeoutSeconds,
+        bool autoReleaseOnFire = false);
+    [[nodiscard]] CancellationSourceHandle createLinkedTimeoutSource(
+        const CancellationToken* parents,
+        std::size_t parentCount,
+        double timeoutSeconds,
+        bool autoReleaseOnFire = false);
+    std::size_t advanceTimeouts(double deltaSeconds);
+
     [[nodiscard]] AsyncCompletionQueue& completionQueue() noexcept { return completionQueue_; }
     [[nodiscard]] const AsyncCompletionQueue& completionQueue() const noexcept {
         return completionQueue_;
@@ -928,9 +991,17 @@ private:
     AwaitableCorePool awaitables_;
     CoroutineFramePool coroutines_;
     AsyncCompletionQueue completionQueue_;
+    struct ScheduledTimeout {
+        double deadlineSeconds = 0.0;
+        CancellationSourceHandle source{};
+        bool autoReleaseOnFire = false;
+    };
+
     void* activeInterpreterState_ = nullptr;
     void* activeAotContext_ = nullptr;
     std::vector<AwaitableHandle> pendingYields_;
+    double virtualTimeSeconds_ = 0.0;
+    std::vector<ScheduledTimeout> scheduledTimeouts_;
 };
 
 } // namespace realscript::runtime

@@ -109,8 +109,8 @@ bool SceneScriptRuntime::dispatch(const ScriptEvent& event) {
             matchedAny = true;
             auto result = runtime_.invoke(
                 instance.object, *method, event.arguments, executionOptions_);
-            if (!result.succeeded) {
-                recordError(event.target, event.callback, result.error);
+            if (!consumeFireAndForgetInvocationResult(
+                    event.target, *method, result, event.callback)) {
                 allSucceeded = false;
             }
         }
@@ -134,8 +134,8 @@ bool SceneScriptRuntime::dispatch(const ScriptEvent& event) {
             if (!method) continue;
             auto result = runtime_.invoke(
                 instance.object, *method, event.arguments, executionOptions_);
-            if (!result.succeeded) {
-                recordError(entity, event.callback, result.error);
+            if (!consumeFireAndForgetInvocationResult(
+                    entity, *method, result, event.callback)) {
                 succeeded = false;
             }
         }
@@ -771,8 +771,295 @@ bool installSceneComponentBindings(
                     static_cast<SceneEntityId>(targetEntity),
                     std::move(callback));
                 return okWait ? requestId : 0;
+            }) &&
+        api.function(
+            moduleName,
+            "EntityDestroyToken",
+            [scenePtr](std::int64_t entityId) -> runtime::CancellationToken {
+                if (entityId <= 0) {
+                    return runtime::CancellationToken::preCanceled();
+                }
+                return scenePtr->entityDestroyToken(static_cast<SceneEntityId>(entityId));
+            }) &&
+        api.function(
+            moduleName,
+            "LoadPrefabSceneAsync",
+            [scenePtr](
+                std::string prefabKey,
+                std::int64_t parentEntity,
+                runtime::CancellationToken token) -> TypedAwaitable<std::int64_t> {
+                const SceneEntityId parentId =
+                    parentEntity > 0 ? static_cast<SceneEntityId>(parentEntity) : SceneEntityId{0};
+                return TypedAwaitable<std::int64_t>{
+                    scenePtr->loadPrefabSceneAsync(std::move(prefabKey), parentId, token)};
+            }) &&
+        api.function(
+            moduleName,
+            "LoadAssetAsync",
+            [scenePtr](
+                std::string assetPath,
+                std::string typeName,
+                runtime::CancellationToken token) -> TypedAwaitable<bool> {
+                return TypedAwaitable<bool>{
+                    scenePtr->loadAssetAsync(std::move(assetPath), std::move(typeName), token)};
+            }) &&
+        api.function(
+            moduleName,
+            "HasLoadedAsset",
+            [scenePtr](std::string assetPath) -> bool {
+                return scenePtr->runtime().findAsset(assetPath) != nullptr;
+            }) &&
+        api.function(
+            moduleName,
+            "UnloadLoadedAsset",
+            [scenePtr](std::string assetPath) -> bool {
+                return scenePtr->runtime().unloadAsset(assetPath);
+            }) &&
+        api.function(
+            moduleName,
+            "GetLoadedAssetInt",
+            [scenePtr](std::string assetPath, std::string fieldName) -> std::int32_t {
+                const auto* asset = scenePtr->runtime().findAsset(assetPath);
+                if (!asset) return 0;
+                runtime::RuntimeError err;
+                const auto val = scenePtr->runtime().getMember(*asset, fieldName, err);
+                if (val && std::holds_alternative<std::int64_t>(*val)) {
+                    return static_cast<std::int32_t>(std::get<std::int64_t>(*val));
+                }
+                return 0;
+            }) &&
+        api.function(
+            moduleName,
+            "GetLoadedAssetString",
+            [scenePtr](std::string assetPath, std::string fieldName) -> std::string {
+                const auto* asset = scenePtr->runtime().findAsset(assetPath);
+                if (!asset) return {};
+                runtime::RuntimeError err;
+                const auto val = scenePtr->runtime().getMember(*asset, fieldName, err);
+                if (!val) return {};
+                if (const auto* sv = std::get_if<std::string>(&*val)) return *sv;
+                if (const auto* ref = std::get_if<runtime::ObjectRef>(&*val);
+                    ref && scenePtr->runtime().heap()) {
+                    if (const auto view = scenePtr->runtime().heap()->stringView(*ref)) {
+                        return std::string(*view);
+                    }
+                }
+                return {};
+            }) &&
+        api.function(
+            moduleName,
+            "SaveGameAsync",
+            [scenePtr](
+                std::string slotKey,
+                std::string payload,
+                runtime::CancellationToken token) -> TypedAwaitable<bool> {
+                return TypedAwaitable<bool>{
+                    scenePtr->saveGameAsync(std::move(slotKey), std::move(payload), token)};
+            }) &&
+        api.function(
+            moduleName,
+            "LoadGameAsync",
+            [scenePtr](
+                std::string slotKey,
+                runtime::CancellationToken token) -> TypedAwaitable<std::string> {
+                return TypedAwaitable<std::string>{
+                    scenePtr->loadGameAsync(std::move(slotKey), token)};
+            }) &&
+        api.function(
+            moduleName,
+            "HttpGetAsync",
+            [scenePtr](
+                std::string url,
+                double timeoutSeconds,
+                runtime::CancellationToken token) -> TypedAwaitable<std::string> {
+                SceneScriptRuntime::HttpRequestSpec spec;
+                spec.method = "GET";
+                spec.url = std::move(url);
+                spec.timeoutSeconds = timeoutSeconds;
+                return TypedAwaitable<std::string>{
+                    scenePtr->httpRequestAsync(std::move(spec), false, token)};
+            }) &&
+        api.function(
+            moduleName,
+            "HttpPostAsync",
+            [scenePtr](
+                std::string url,
+                std::string body,
+                double timeoutSeconds,
+                runtime::CancellationToken token) -> TypedAwaitable<std::string> {
+                SceneScriptRuntime::HttpRequestSpec spec;
+                spec.method = "POST";
+                spec.url = std::move(url);
+                spec.body = std::move(body);
+                spec.timeoutSeconds = timeoutSeconds;
+                return TypedAwaitable<std::string>{
+                    scenePtr->httpRequestAsync(std::move(spec), false, token)};
+            }) &&
+        api.function(
+            moduleName,
+            "HttpSendStatusAsync",
+            [scenePtr](
+                std::string method,
+                std::string url,
+                std::string body,
+                double timeoutSeconds,
+                runtime::CancellationToken token) -> TypedAwaitable<std::int32_t> {
+                SceneScriptRuntime::HttpRequestSpec spec;
+                spec.method = std::move(method);
+                spec.url = std::move(url);
+                spec.body = std::move(body);
+                spec.timeoutSeconds = timeoutSeconds;
+                return TypedAwaitable<std::int32_t>{
+                    scenePtr->httpRequestAsync(std::move(spec), true, token)};
+            }) &&
+        api.function(
+            moduleName,
+            "GetLastHttpStatus",
+            [scenePtr]() -> std::int32_t {
+                return static_cast<std::int32_t>(scenePtr->lastHttpStatusCode());
+            }) &&
+        api.function(
+            moduleName,
+            "GetLastHttpBody",
+            [scenePtr]() -> std::string {
+                return scenePtr->lastHttpResponseBody();
+            }) &&
+        api.function(
+            moduleName,
+            "GetLastHttpTimedOut",
+            [scenePtr]() -> bool {
+                return scenePtr->lastHttpTimedOut();
+            }) &&
+        api.function(
+            moduleName,
+            "WsConnectAsync",
+            [scenePtr](
+                std::string url,
+                std::int64_t ownerEntity,
+                double timeoutSeconds,
+                runtime::CancellationToken token) -> TypedAwaitable<std::int64_t> {
+                const SceneEntityId owner =
+                    ownerEntity > 0 ? static_cast<SceneEntityId>(ownerEntity) : SceneEntityId{0};
+                return TypedAwaitable<std::int64_t>{
+                    scenePtr->wsConnectAsync(std::move(url), owner, timeoutSeconds, token)};
+            }) &&
+        api.function(
+            moduleName,
+            "WsSendAsync",
+            [scenePtr](
+                std::int64_t wsHandle,
+                std::string message,
+                double timeoutSeconds,
+                runtime::CancellationToken token) -> TypedAwaitable<bool> {
+                return TypedAwaitable<bool>{
+                    scenePtr->wsSendAsync(wsHandle, std::move(message), timeoutSeconds, token)};
+            }) &&
+        api.function(
+            moduleName,
+            "WsReceiveAsync",
+            [scenePtr](
+                std::int64_t wsHandle,
+                double timeoutSeconds,
+                runtime::CancellationToken token) -> TypedAwaitable<std::string> {
+                return TypedAwaitable<std::string>{
+                    scenePtr->wsReceiveAsync(wsHandle, timeoutSeconds, token)};
+            }) &&
+        api.function(
+            moduleName,
+            "WsCloseAsync",
+            [scenePtr](std::int64_t wsHandle) -> TypedAwaitable<bool> {
+                return TypedAwaitable<bool>{scenePtr->wsCloseAsync(wsHandle)};
+            }) &&
+        api.function(
+            moduleName,
+            "WsIsConnected",
+            [scenePtr](std::int64_t wsHandle) -> bool {
+                return scenePtr->isWebSocketConnected(wsHandle);
             });
     return ok && api.valid();
+}
+
+void SceneScriptRuntime::onLifecycleCoroutineCompleted(
+    void* context,
+    runtime::AwaitableHandle handle,
+    runtime::AwaitStatus,
+    std::uint64_t packedHandle) {
+    auto* self = static_cast<SceneScriptRuntime*>(context);
+    if (!self) return;
+    PendingLifecycleCoroutine meta{};
+    bool hasMeta = false;
+    const auto it = self->pendingLifecycleCoroutines_.find(packedHandle);
+    if (it != self->pendingLifecycleCoroutines_.end()) {
+        meta = std::move(it->second);
+        self->pendingLifecycleCoroutines_.erase(it);
+        hasMeta = true;
+    }
+    const auto ctx = self->runtime_.asyncRuntime();
+    if (!ctx) return;
+
+    runtime::Value unused{};
+    runtime::RuntimeError faultErr{};
+    const auto terminal = ctx->awaitables().getResult(handle, unused, faultErr);
+    if (terminal == runtime::AwaitStatus::Faulted && hasMeta) {
+        self->recordError(meta.entity, std::move(meta.callback), faultErr);
+    }
+}
+
+bool SceneScriptRuntime::consumeFireAndForgetInvocationResult(
+    SceneEntityId entity,
+    const ScriptMethod& method,
+    const runtime::ExecutionResult& result,
+    std::string_view callback) {
+    if (!result.succeeded) {
+        recordError(entity, std::string(callback), result.error);
+        return false;
+    }
+
+    if (semantic::storageReturnTypeOf(method.descriptor) ==
+        semantic::PrimitiveType::Struct) {
+        const std::string& retTypeName =
+            semantic::storageReturnTypeNameOf(method.descriptor);
+        const bool isAwaitable =
+            retTypeName == "RealScript.Async::Awaitable" ||
+            retTypeName.find("::Awaitable__") != std::string::npos;
+        const auto* sVal = std::get_if<runtime::StructValue>(&result.value);
+        if (isAwaitable && sVal && sVal->valid() &&
+            sVal->typeId == semantic::stableTypeId(retTypeName)) {
+            runtime::AwaitableHandle awaitableHandle{};
+            if (runtime::tryExtractAwaitableHandle(result.value, awaitableHandle) &&
+                awaitableHandle.valid()) {
+                if (awaitableHandle.isCompletedVoidSentinel()) {
+                    return true;
+                }
+                if (const auto ctx = runtime_.asyncRuntime()) {
+                    auto& pool = ctx->awaitables();
+                    const auto st = pool.status(awaitableHandle);
+                    if (st == runtime::AwaitStatus::Pending) {
+                        const std::uint64_t key = awaitableHandle.pack64();
+                        pendingLifecycleCoroutines_[key] = PendingLifecycleCoroutine{
+                            entity,
+                            std::string(callback),
+                        };
+                        runtime::AsyncContinuation cont{};
+                        cont.callback = &SceneScriptRuntime::onLifecycleCoroutineCompleted;
+                        cont.context = this;
+                        cont.userTag = key;
+                        cont.runInlineOnComplete = true;
+                        (void)pool.onCompleted(awaitableHandle, cont);
+                        return true;
+                    }
+                    runtime::Value unused{};
+                    runtime::RuntimeError faultErr{};
+                    const auto terminal = pool.getResult(awaitableHandle, unused, faultErr);
+                    if (terminal == runtime::AwaitStatus::Faulted) {
+                        recordError(entity, std::string(callback), faultErr);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
 }
 
 bool SceneScriptRuntime::invokeLifecycle(
@@ -784,9 +1071,11 @@ bool SceneScriptRuntime::invokeLifecycle(
     if (!method) return true;
     auto result = runtime_.invoke(
         instance.object, *method, arguments, executionOptions_);
-    if (result.succeeded) return true;
-    recordError(entity, callback, result.error);
-    return false;
+    return consumeFireAndForgetInvocationResult(
+        entity,
+        *method,
+        result,
+        callback ? std::string_view(callback) : std::string_view{});
 }
 
 void SceneScriptRuntime::recordError(

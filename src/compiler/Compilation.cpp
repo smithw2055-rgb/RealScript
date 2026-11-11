@@ -2501,6 +2501,10 @@ public struct CancellationToken {
     public bool IsCancellationRequested() {
         return Async.__TokenIsCanceled(__handle);
     }
+
+    public bool IsTimedOut() {
+        return Async.__TokenIsTimedOut(__handle);
+    }
 }
 
 public struct CancellationTokenSource {
@@ -2518,6 +2522,24 @@ public struct CancellationTokenSource {
         return new CancellationTokenSource(Async.__CtsCreateLinked(parent.__handle));
     }
 
+    public static CancellationTokenSource CreateLinked2(
+        CancellationToken parentA,
+        CancellationToken parentB) {
+        return new CancellationTokenSource(
+            Async.__CtsCreateLinked2(parentA.__handle, parentB.__handle));
+    }
+
+    public static CancellationTokenSource CreateTimeout(double timeoutSeconds) {
+        return new CancellationTokenSource(Async.__CtsCreateTimeout(timeoutSeconds));
+    }
+
+    public static CancellationTokenSource CreateLinkedTimeout(
+        CancellationToken parent,
+        double timeoutSeconds) {
+        return new CancellationTokenSource(
+            Async.__CtsCreateLinkedTimeout(parent.__handle, timeoutSeconds));
+    }
+
     public CancellationToken Token() {
         return new CancellationToken(Async.__CtsToken(__handle));
     }
@@ -2528,6 +2550,10 @@ public struct CancellationTokenSource {
 
     public bool IsCancellationRequested() {
         return Async.__TokenIsCanceled(Async.__CtsToken(__handle));
+    }
+
+    public bool IsTimedOut() {
+        return Async.__TokenIsTimedOut(Async.__CtsToken(__handle));
     }
 
     public bool Release() {
@@ -2587,11 +2613,16 @@ public class Async {
     public static long __WhenAnyIndex(Awaitable[] tasks, long tokenHandle, long cancelLosersCtsHandle) { return 0L; }
     public static long __CtsCreate() { return 0L; }
     public static long __CtsCreateLinked(long parentTokenHandle) { return 0L; }
+    public static long __CtsCreateLinked2(long parentA, long parentB) { return 0L; }
+    public static long __CtsCreateTimeout(double timeoutSeconds) { return 0L; }
+    public static long __CtsCreateLinkedTimeout(long parentTokenHandle, double timeoutSeconds) { return 0L; }
     public static long __CtsToken(long ctsHandle) { return 0L; }
     public static int __CtsCancel(long ctsHandle) { return 0; }
     public static bool __CtsRelease(long ctsHandle) { return false; }
     public static long __TokenPreCanceled() { return 0L; }
     public static bool __TokenIsCanceled(long tokenHandle) { return false; }
+    public static bool __TokenIsTimedOut(long tokenHandle) { return false; }
+    public static int __AdvanceTimeouts(double deltaSeconds) { return 0; }
     public static int __StepUpdate(int maxCount) { return 0; }
     public static int __ReadyUpdateCount() { return 0; }
 
@@ -2657,6 +2688,10 @@ public class Async {
 
     public static int ReadyUpdateCount() {
         return __ReadyUpdateCount();
+    }
+
+    public static int AdvanceTimeouts(double deltaSeconds) {
+        return __AdvanceTimeouts(deltaSeconds);
     }
 }
 )RS";

@@ -93,8 +93,22 @@ ScriptRuntime::ScriptRuntime(
       nativeHandles_(nativeHandles
           ? std::move(nativeHandles)
           : std::make_shared<runtime::NativeHandleRegistry>()),
+      asyncRuntime_(std::make_shared<runtime::AsyncRuntimeContext>(heap_.get())),
       interpreter_(program_, heap_) {
     interpreter_.setBindingRegistry(bindings_);
+    interpreter_.setAsyncRuntime(asyncRuntime_);
+}
+
+void ScriptRuntime::setAsyncRuntime(
+    std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime) noexcept {
+    asyncRuntime_ = asyncRuntime
+        ? std::move(asyncRuntime)
+        : std::make_shared<runtime::AsyncRuntimeContext>(heap_.get());
+    asyncRuntime_->setHeap(heap_.get());
+    interpreter_.setAsyncRuntime(asyncRuntime_);
+    if (nativeProgram_) {
+        nativeProgram_->setAsyncRuntime(asyncRuntime_);
+    }
 }
 
 std::optional<ScriptType> ScriptRuntime::findType(
@@ -461,8 +475,14 @@ void ScriptRuntime::replaceProgram(const GameProgram& program) {
     if (program.bindings()) {
         bindings_ = program.bindings();
     }
+    if (!asyncRuntime_) {
+        asyncRuntime_ = std::make_shared<runtime::AsyncRuntimeContext>(heap_.get());
+    } else {
+        asyncRuntime_->setHeap(heap_.get());
+    }
     interpreter_ = runtime::Interpreter(program_, heap_);
     interpreter_.setBindingRegistry(bindings_);
+    interpreter_.setAsyncRuntime(asyncRuntime_);
     clearNativeBackend();
     if (remoteDebugger_) {
         remoteDebugger_->rebindProgram(program_);
@@ -517,6 +537,7 @@ void ScriptRuntime::setAotBackend(const aot::ProgramDescriptor* descriptor) {
     nativeProgram_ = std::make_shared<aot::Program>(*descriptor);
     nativeProgram_->setBindings(bindings_);
     nativeProgram_->setHeap(heap_);
+    nativeProgram_->setAsyncRuntime(asyncRuntime_);
     backend_ = ScriptExecutionBackend::Aot;
 }
 
@@ -531,6 +552,7 @@ void ScriptRuntime::setJitBackend(std::shared_ptr<jit::Module> jitModule) {
     nativeProgram_ = std::make_shared<aot::Program>(*jitModule_->descriptor());
     nativeProgram_->setBindings(bindings_);
     nativeProgram_->setHeap(heap_);
+    nativeProgram_->setAsyncRuntime(asyncRuntime_);
     backend_ = ScriptExecutionBackend::Jit;
 }
 

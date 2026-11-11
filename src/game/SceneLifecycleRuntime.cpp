@@ -3,6 +3,8 @@
 #include "realscript/game/GameplayMetadata.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -99,32 +101,38 @@ std::string findRenamedFieldSource(
     return {};
 }
 
-void cancelActiveInstanceSequences(
-    const ScriptRuntime& runtime,
-    const ScriptObject& object,
-    const runtime::ExecutionOptions& options) {
-    if (!object.valid()) return;
-    static constexpr const char* kPrefix = "$sequence_state_";
-    const std::size_t prefixLen = std::strlen(kPrefix);
-    for (const auto& field : object.type().descriptor.fields) {
-        if (!field.synthetic) continue;
-        if (field.name.size() > prefixLen &&
-            field.name.rfind(kPrefix, 0) == 0) {
-            const std::string seqName = field.name.substr(prefixLen);
-            if (const auto cancelMethod = runtime.findMethod(
-                    object.type(), "Cancel" + seqName, 0)) {
-                (void)runtime.invoke(object, *cancelMethod, {}, options);
-            }
-        } else if (field.name == "$sequence_timer") {
-            for (const auto& method : object.type().descriptor.methods) {
-                if (method.synthetic &&
-                    method.name.rfind("Cancel", 0) == 0 &&
-                    method.parameters.size() == 1) {
-                    (void)runtime.invoke(object, ScriptMethod{method}, {}, options);
-                }
-            }
-        }
+bool isNonZeroSequenceValue(const std::optional<runtime::Value>& val) noexcept {
+    if (!val) return false;
+    if (const auto* iv = std::get_if<std::int64_t>(&*val)) {
+        return *iv != 0;
     }
+    if (const auto* lv = std::get_if<runtime::LongValue>(&*val)) {
+        return lv->value != 0;
+    }
+    if (const auto* dv = std::get_if<double>(&*val)) {
+        return *dv != 0.0;
+    }
+    if (const auto* bv = std::get_if<bool>(&*val)) {
+        return *bv;
+    }
+    return true;
+}
+
+std::uint64_t hashAsyncBridgeArgs(std::string_view a, std::string_view b = {}, std::uint64_t extra = 0) noexcept {
+    std::uint64_t h = 14695981039346656037ULL;
+    for (const char ch : a) {
+        h ^= static_cast<unsigned char>(ch);
+        h *= 1099511628211ULL;
+    }
+    h ^= 0xFFu;
+    h *= 1099511628211ULL;
+    for (const char ch : b) {
+        h ^= static_cast<unsigned char>(ch);
+        h *= 1099511628211ULL;
+    }
+    h ^= extra;
+    h *= 1099511628211ULL;
+    return h;
 }
 
 void patchMigratedObjectRefsInHeapObject(
@@ -203,7 +211,179 @@ void patchMigratedObjectRefsInHeapObject(
     }
 }
 
+void collectPrefabTraceableValues(
+    const PrefabNodeTemplate& node,
+    std::vector<runtime::Value>& outValues) {
+    if (node.components.empty() && node.children.empty()) return;
+    for (const auto& comp : node.components) {
+        if (comp.options.owner.isTraceable()) {
+            outValues.push_back(comp.options.owner);
+        }
+        for (const auto& [_, val] : comp.options.initialMembers) {
+            if (val.isTraceable()) {
+                outValues.push_back(val);
+            }
+        }
+    }
+    for (const auto& child : node.children) {
+        collectPrefabTraceableValues(child, outValues);
+    }
+}
+
+void releaseRootTokenList(
+    runtime::ManagedHeap* heap,
+    std::vector<runtime::ManagedHeap::RootToken>& tokens) noexcept {
+    if (heap) {
+        for (const auto tok : tokens) {
+            if (tok != 0) {
+                (void)heap->removePersistentRoot(tok);
+            }
+        }
+    }
+    tokens.clear();
+}
+
+constexpr std::uint64_t packWsHandle(std::uint32_t slot, std::uint32_t generation) noexcept {
+    return (static_cast<std::uint64_t>(generation) << 32u) | static_cast<std::uint64_t>(slot);
+}
+
+constexpr void unpackWsHandle(
+    SceneScriptRuntime::WebSocketHandle raw,
+    std::uint32_t& outSlot,
+    std::uint32_t& outGen) noexcept {
+    const auto u = static_cast<std::uint64_t>(raw);
+    outSlot = static_cast<std::uint32_t>(u & 0xFFFFFFFFULL);
+    outGen = static_cast<std::uint32_t>(u >> 32u);
+}
+
+std::string normalizeHttpKey(std::string_view method, std::string_view url) {
+    std::string m(method);
+    for (char& ch : m) {
+        if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
+    }
+    return m + " " + std::string(url);
+}
+
 } // namespace
+
+SceneScriptRuntime::~SceneScriptRuntime() noexcept {
+    releaseAsyncTemplateRoots();
+    releasePendingNetworkAsyncOps();
+    if (const auto ctx = runtime_.asyncRuntime()) {
+        (void)ctx->awaitables().cancelContinuationsForContext(this);
+        for (const auto& [_, op] : pendingPrefabOps_) {
+            if (op.ioHandle.valid() && !op.ioHandle.isCompletedVoidSentinel()) {
+                (void)ctx->awaitables().trySetCanceled(op.ioHandle);
+                (void)ctx->awaitables().discard(op.ioHandle);
+            }
+            if (op.outerHandle.valid() && !op.outerHandle.isCompletedVoidSentinel()) {
+                (void)ctx->awaitables().trySetCanceled(op.outerHandle);
+            }
+        }
+        for (const auto& [_, op] : pendingAssetOps_) {
+            if (op.ioHandle.valid() && !op.ioHandle.isCompletedVoidSentinel()) {
+                (void)ctx->awaitables().trySetCanceled(op.ioHandle);
+                (void)ctx->awaitables().discard(op.ioHandle);
+            }
+            if (op.outerHandle.valid() && !op.outerHandle.isCompletedVoidSentinel()) {
+                (void)ctx->awaitables().trySetCanceled(op.outerHandle);
+            }
+        }
+        for (const auto& pkt : deferredAsyncIoPackets_) {
+            (void)ctx->completionQueue().cancelRequest(pkt.requestId);
+            if (pkt.targetHandle.valid() && !pkt.targetHandle.isCompletedVoidSentinel()) {
+                (void)ctx->awaitables().trySetCanceled(pkt.targetHandle);
+            }
+        }
+        pendingPrefabOps_.clear();
+        pendingAssetOps_.clear();
+        deferredAsyncIoPackets_.clear();
+        pendingLifecycleCoroutines_.clear();
+        (void)ctx->completionQueue().pruneStaleRequests(ctx->awaitables());
+        for (const auto& [slot, gen] : slotGenerations_) {
+            if (gen != 0) {
+                (void)ctx->cancellations().cancelEntity(
+                    runtime::GenerationalEntityHandle{slot, gen},
+                    runtime::EntityDestroyDomain::SceneGenerational);
+            }
+        }
+        for (const auto& [slot, ep] : nonGenDestroyEpoch_) {
+            if (ep != 0) {
+                (void)ctx->cancellations().cancelEntity(
+                    runtime::GenerationalEntityHandle{slot, 0x80000000u | ep},
+                    runtime::EntityDestroyDomain::SceneNonGenerational);
+            }
+        }
+    }
+}
+
+void SceneScriptRuntime::releaseAsyncTemplateRoots() noexcept {
+    auto* heap = runtime_.heap().get();
+    for (auto& [_, tokens] : prefabTemplateRootTokens_) {
+        releaseRootTokenList(heap, tokens);
+    }
+    prefabTemplateRootTokens_.clear();
+    for (auto& [_, tokens] : asyncAssetDefRootTokens_) {
+        releaseRootTokenList(heap, tokens);
+    }
+    asyncAssetDefRootTokens_.clear();
+}
+
+void SceneScriptRuntime::releasePendingNetworkAsyncOps() noexcept {
+    std::vector<runtime::AsyncRequestId> receiverReqs;
+    {
+        std::lock_guard<std::mutex> lock(asyncIoMutex_);
+        for (auto& sess : wsSessions_) {
+            while (!sess.pendingReceivers.empty()) {
+                receiverReqs.push_back(sess.pendingReceivers.front().requestId);
+                sess.pendingReceivers.pop_front();
+            }
+            sess.inboundQueue.clear();
+            sess.allocated = false;
+            sess.connected = false;
+            sess.closed = true;
+        }
+        wsSessions_.clear();
+        freeWsSessionSlots_.clear();
+    }
+
+    if (const auto ctx = runtime_.asyncRuntime()) {
+        for (const auto reqId : receiverReqs) {
+            (void)ctx->completionQueue().cancelRequest(reqId);
+        }
+        (void)ctx->awaitables().cancelContinuationsForContext(this);
+
+        auto cancelAndRecycleInternal = [&](runtime::AwaitableHandle ioH,
+                                            runtime::AwaitableHandle outerH,
+                                            runtime::CancellationSourceHandle ctsH) {
+            if (ioH.valid() && !ioH.isCompletedVoidSentinel()) {
+                (void)ctx->awaitables().trySetCanceled(ioH);
+                (void)ctx->awaitables().discard(ioH);
+            }
+            if (outerH.valid() && !outerH.isCompletedVoidSentinel()) {
+                (void)ctx->awaitables().trySetCanceled(outerH);
+            }
+            if (ctsH.valid()) {
+                (void)ctx->cancellations().cancel(ctsH);
+                (void)ctx->cancellations().releaseSource(ctsH);
+            }
+        };
+
+        for (const auto& [_, op] : pendingHttpOps_) {
+            cancelAndRecycleInternal(op.ioHandle, op.outerHandle, op.ownedLinkedCts);
+        }
+        for (const auto& [_, op] : pendingWsConnectOps_) {
+            cancelAndRecycleInternal(op.ioHandle, op.outerHandle, op.ownedLinkedCts);
+        }
+        for (const auto& [_, op] : pendingNetTokenOps_) {
+            cancelAndRecycleInternal(op.ioHandle, op.outerHandle, op.ownedLinkedCts);
+        }
+    }
+
+    pendingHttpOps_.clear();
+    pendingWsConnectOps_.clear();
+    pendingNetTokenOps_.clear();
+}
 
 void SceneScriptRuntime::bindLifecycleMethods(Instance& instance) const {
     const auto& type = instance.object.type();
@@ -229,10 +409,89 @@ void SceneScriptRuntime::bindLifecycleMethods(Instance& instance) const {
     instance.onTriggerEnter3D = runtime_.findMethod(type, "OnTriggerEnter3D", 1);
     instance.onTriggerStay3D = runtime_.findMethod(type, "OnTriggerStay3D", 1);
     instance.onTriggerExit3D = runtime_.findMethod(type, "OnTriggerExit3D", 1);
+    instance.sequenceCancelPlan = resolveSequenceCancelPlan(type);
     instance.executeInEditMode = hasEditModeAttribute(
         runtime_.program().get(), type.canonicalName());
     instance.executionOrder = findExecutionOrderAttribute(
         runtime_.program().get(), type.canonicalName());
+}
+
+std::shared_ptr<const SceneScriptRuntime::SequenceCancelPlan>
+SceneScriptRuntime::resolveSequenceCancelPlan(const ScriptType& type) const {
+    const auto found = sequenceCancelPlanCache_.find(type.descriptor.id);
+    if (found != sequenceCancelPlanCache_.end()) {
+        return found->second;
+    }
+
+    static constexpr const char* kPrefix = "$sequence_state_";
+    const std::size_t prefixLen = std::strlen(kPrefix);
+    constexpr std::size_t kNpos = static_cast<std::size_t>(-1);
+
+    std::size_t sharedTimerIdx = kNpos;
+    std::vector<SequenceCancelSlot> slots;
+    std::unordered_set<semantic::SymbolId> addedMethodIds;
+
+    for (const auto& field : type.descriptor.fields) {
+        if (!field.synthetic) continue;
+        if (field.name.size() > prefixLen && field.name.rfind(kPrefix, 0) == 0) {
+            const std::string seqName = field.name.substr(prefixLen);
+            if (const auto cancelMethod = runtime_.findMethod(type, "Cancel" + seqName, 0)) {
+                if (addedMethodIds.insert(cancelMethod->descriptor.id).second) {
+                    slots.push_back(SequenceCancelSlot{field.index, *cancelMethod});
+                }
+            }
+        } else if (field.name == "$sequence_timer") {
+            sharedTimerIdx = field.index;
+        }
+    }
+
+    if (sharedTimerIdx != kNpos) {
+        for (const auto& method : type.descriptor.methods) {
+            if (method.synthetic &&
+                method.name.rfind("Cancel", 0) == 0 &&
+                method.parameters.size() == 1 &&
+                addedMethodIds.insert(method.id).second) {
+                slots.push_back(SequenceCancelSlot{kNpos, ScriptMethod{method}});
+            }
+        }
+    }
+
+    std::shared_ptr<const SequenceCancelPlan> plan;
+    if (!slots.empty()) {
+        auto built = std::make_shared<SequenceCancelPlan>();
+        built->sharedTimerFieldIndex = sharedTimerIdx;
+        built->slots = std::move(slots);
+        plan = std::move(built);
+    }
+    sequenceCancelPlanCache_.emplace(type.descriptor.id, plan);
+    return plan;
+}
+
+void SceneScriptRuntime::cancelInstanceSequencesFast(const Instance& instance) const {
+    ++legacySequenceCancelChecks_;
+    if (!instance.sequenceCancelPlan || !instance.object.valid()) {
+        return;
+    }
+    auto* heap = runtime_.heap().get();
+    if (!heap) return;
+
+    constexpr std::size_t kNpos = static_cast<std::size_t>(-1);
+    const auto& plan = *instance.sequenceCancelPlan;
+    const runtime::ObjectRef objRef = instance.object.reference();
+    const bool sharedTimerActive =
+        plan.sharedTimerFieldIndex != kNpos &&
+        isNonZeroSequenceValue(heap->fieldGet(objRef, plan.sharedTimerFieldIndex));
+
+    for (const auto& slot : plan.slots) {
+        const bool active = (slot.stateFieldIndex != kNpos)
+            ? (isNonZeroSequenceValue(heap->fieldGet(objRef, slot.stateFieldIndex)) ||
+               sharedTimerActive)
+            : sharedTimerActive;
+        if (active) {
+            ++legacySequenceCancelInvocations_;
+            (void)runtime_.invoke(instance.object, slot.cancelMethod, {}, executionOptions_);
+        }
+    }
 }
 
 bool SceneScriptRuntime::shouldTickInCurrentMode(
@@ -337,6 +596,7 @@ bool SceneScriptRuntime::attachComponentWithoutLifecycle(
     auto& list = instances_[entity];
     outCompIndex = list.size();
     list.push_back(std::move(instance));
+    hasUnstartedPlayComponents_ = true;
     tickOrderDirty_ = true;
     return true;
 }
@@ -401,6 +661,7 @@ bool SceneScriptRuntime::attachComponent(
 
     auto& list = instances_[entity];
     list.push_back(std::move(instance));
+    hasUnstartedPlayComponents_ = true;
     tickOrderDirty_ = true;
     auto& stored = list.back();
     const bool hasOwner = !std::holds_alternative<std::monostate>(options.owner);
@@ -431,6 +692,30 @@ bool SceneScriptRuntime::attachComponent(
 
 bool SceneScriptRuntime::detach(SceneEntityId entity) {
     if (entity == BroadcastTarget) return false;
+    struct DetachDepthScope {
+        SceneScriptRuntime& self;
+        explicit DetachDepthScope(SceneScriptRuntime& s) noexcept : self(s) {
+            ++self.detachDepth_;
+        }
+        ~DetachDepthScope() {
+            if (--self.detachDepth_ == 0 &&
+                self.pendingCanceledUnwind_ &&
+                !self.inFrameQueueDrain_) {
+                self.pendingCanceledUnwind_ = false;
+                if (const auto ctx = self.runtime_.asyncRuntime()) {
+                    (void)ctx->awaitables().drainReadyContinuations(
+                        runtime::ResumeQueue::PreTickIo, 0);
+                    (void)ctx->completionQueue().pruneStaleRequests(ctx->awaitables());
+                    (void)ctx->awaitables().drainReadyContinuations(
+                        runtime::ResumeQueue::FixedTick, 0);
+                    (void)ctx->awaitables().drainReadyContinuations(
+                        runtime::ResumeQueue::Update, 0);
+                    (void)ctx->awaitables().drainReadyContinuations(
+                        runtime::ResumeQueue::EndOfFrame, 0);
+                }
+            }
+        }
+    } depthScope(*this);
     const auto childrenIt = childrenByEntity_.find(entity);
     if (childrenIt != childrenByEntity_.end()) {
         const auto childrenCopy = childrenIt->second;
@@ -473,6 +758,11 @@ bool SceneScriptRuntime::detach(SceneEntityId entity) {
     (void)removeEntityCollider2D(entity);
     (void)removeEntityCollider3D(entity);
 
+    closeEntityOwnedWebSockets(entity);
+    if (cancelEntityDestroyToken(entity)) {
+        pendingCanceledUnwind_ = true;
+    }
+
     const std::uint32_t gen = entityIdGeneration(entity);
     const std::uint32_t slot = entityIdSlot(entity);
     if (gen != 0) {
@@ -500,7 +790,7 @@ bool SceneScriptRuntime::detach(SceneEntityId entity) {
         return hadHierarchyOrTransform;
     }
     for (auto& instance : found->second) {
-        cancelActiveInstanceSequences(runtime_, instance.object, executionOptions_);
+        cancelInstanceSequencesFast(instance);
         if (shouldTickInCurrentMode(instance) || instance.started) {
             if (instance.enabled && wasActiveInHierarchy) {
                 (void)invokeLifecycle(entity, instance, instance.onDisable, {}, "OnDisable");
@@ -523,7 +813,7 @@ bool SceneScriptRuntime::detachComponent(
         if (matchesComponentType(it->object.type(), scriptType)) {
             const std::string canonicalRemoved = it->object.type().canonicalName();
             removeSignalsForEntityOrComponent(entity, canonicalRemoved);
-            cancelActiveInstanceSequences(runtime_, it->object, executionOptions_);
+            cancelInstanceSequencesFast(*it);
             if (shouldTickInCurrentMode(*it) || it->started) {
                 if (it->enabled && isActiveInHierarchy(entity)) {
                     (void)invokeLifecycle(entity, *it, it->onDisable, {}, "OnDisable");
@@ -561,6 +851,9 @@ bool SceneScriptRuntime::setEntityActive(SceneEntityId entity, bool active) {
     tickOrderDirty_ = true;
 
     const bool nowActiveInHierarchy = active && parentActive;
+    if (nowActiveInHierarchy) {
+        hasUnstartedPlayComponents_ = true;
+    }
     if (wasActiveInHierarchy == nowActiveInHierarchy) {
         return true;
     }
@@ -582,7 +875,7 @@ bool SceneScriptRuntime::setEntityActive(SceneEntityId entity, bool active) {
         for (auto& comp : instIt->second) {
             if (!comp.enabled) continue;
             if (!becomingActive) {
-                cancelActiveInstanceSequences(runtime_, comp.object, executionOptions_);
+                cancelInstanceSequencesFast(comp);
             }
             const auto& cb = becomingActive ? comp.onEnable : comp.onDisable;
             if (!invokeLifecycle(
@@ -627,7 +920,7 @@ bool SceneScriptRuntime::setEnabled(SceneEntityId entity, bool enabled) {
         getParent(entity) == BroadcastTarget || isActiveInHierarchy(getParent(entity));
     auto& instance = found->second.front();
     if (!enabled) {
-        cancelActiveInstanceSequences(runtime_, instance.object, executionOptions_);
+        cancelInstanceSequencesFast(instance);
         // Only terminate entity-wide fibers if this is the sole component on the entity
         if (fiberScheduler_ && found->second.size() == 1) {
             const std::uint32_t entGen = entityIdGeneration(entity);
@@ -652,6 +945,9 @@ bool SceneScriptRuntime::setEnabled(SceneEntityId entity, bool enabled) {
         }
     }
     instance.enabled = enabled;
+    if (enabled && !instance.started) {
+        hasUnstartedPlayComponents_ = true;
+    }
     (void)wasEntityActive;
     tickOrderDirty_ = true;
     return true;
@@ -667,7 +963,7 @@ bool SceneScriptRuntime::setComponentEnabled(
         if (!matchesComponentType(instance.object.type(), scriptType)) continue;
         if (instance.enabled == enabled) return false;
         if (!enabled) {
-            cancelActiveInstanceSequences(runtime_, instance.object, executionOptions_);
+            cancelInstanceSequencesFast(instance);
         }
         const auto& callback = enabled ? instance.onEnable : instance.onDisable;
         if (isActiveInHierarchy(entity)) {
@@ -681,6 +977,9 @@ bool SceneScriptRuntime::setComponentEnabled(
             }
         }
         instance.enabled = enabled;
+        if (enabled && !instance.started) {
+            hasUnstartedPlayComponents_ = true;
+        }
         tickOrderDirty_ = true;
         return true;
     }
@@ -749,10 +1048,13 @@ void SceneScriptRuntime::clearForSnapshotImport() {
             }
         }
     }
+    for (const auto ent : entities()) {
+        (void)cancelEntityDestroyToken(ent);
+    }
     for (auto& [entity, comps] : instances_) {
         (void)entity;
         for (auto& comp : comps) {
-            cancelActiveInstanceSequences(runtime_, comp.object, executionOptions_);
+            cancelInstanceSequencesFast(comp);
         }
     }
     instances_.clear();
@@ -783,30 +1085,64 @@ void SceneScriptRuntime::clearForSnapshotImport() {
     asyncRequests_.clear();
     pendingAsyncCompletions_.clear();
     nextAsyncRequestId_ = 1;
+    nonGenDestroyEpoch_.clear();
+    sceneStarted_ = false;
+    hasUnstartedPlayComponents_ = false;
+    pendingCanceledUnwind_ = false;
+    releasePendingNetworkAsyncOps();
+    lastHttpStatusCode_ = 0;
+    lastHttpResponseBody_.clear();
+    lastHttpTimedOut_ = false;
+    pendingPrefabOps_.clear();
+    pendingAssetOps_.clear();
+    deferredAsyncIoPackets_.clear();
+    pendingLifecycleCoroutines_.clear();
+    if (const auto ctx = runtime_.asyncRuntime()) {
+        ctx->reset();
+    }
     eventQueue_.clear();
     resetGenerationalSlots();
 }
 
-void SceneScriptRuntime::start() {
-    rebuildTickOrderIfNeeded();
-    const auto snapshot = cachedTickOrder_;
-    for (const auto& ref : snapshot) {
-        if (!isActiveInHierarchy(ref.entity)) continue;
-        const auto it = instances_.find(ref.entity);
-        if (it == instances_.end() || ref.compIndex >= it->second.size()) continue;
-        auto& instance = it->second[ref.compIndex];
-        if (!instance.enabled || instance.started ||
-            !shouldTickInCurrentMode(instance)) {
-            continue;
+void SceneScriptRuntime::startPendingComponents() {
+    for (std::size_t pass = 0; pass < 16u; ++pass) {
+        hasUnstartedPlayComponents_ = false;
+        rebuildTickOrderIfNeeded();
+        const auto snapshot = cachedTickOrder_;
+        for (const auto& ref : snapshot) {
+            if (!isActiveInHierarchy(ref.entity)) continue;
+            const auto it = instances_.find(ref.entity);
+            if (it == instances_.end() || ref.compIndex >= it->second.size()) continue;
+            auto& instance = it->second[ref.compIndex];
+            if (!instance.enabled || instance.started ||
+                !shouldTickInCurrentMode(instance)) {
+                continue;
+            }
+            if (invokeLifecycle(ref.entity, instance, instance.onStart, {}, "OnStart")) {
+                instance.started = true;
+            }
         }
-        if (invokeLifecycle(ref.entity, instance, instance.onStart, {}, "OnStart")) {
-            instance.started = true;
+        if (!hasUnstartedPlayComponents_) {
+            break;
         }
     }
 }
 
+void SceneScriptRuntime::start() {
+    if (executionMode_ == SceneExecutionMode::Play) {
+        sceneStarted_ = true;
+    }
+    startPendingComponents();
+}
+
 void SceneScriptRuntime::update(double deltaTime) {
+    (void)advanceAsyncTimeouts(deltaTime);
+    (void)stepAsyncPreTickIo();
     (void)flushCompletedAsyncRequests();
+    if (sceneStarted_ && executionMode_ == SceneExecutionMode::Play &&
+        hasUnstartedPlayComponents_) {
+        startPendingComponents();
+    }
     rebuildTickOrderIfNeeded();
     const auto snapshot = cachedTickOrder_;
     for (const auto& ref : snapshot) {
@@ -821,10 +1157,15 @@ void SceneScriptRuntime::update(double deltaTime) {
         (void)invokeLifecycle(
             ref.entity, instance, instance.onUpdate, {deltaTime}, "OnUpdate");
     }
+    (void)stepAsyncResumeQueue(runtime::ResumeQueue::Update);
     (void)flushDestroyedEntities();
 }
 
 void SceneScriptRuntime::fixedUpdate(double fixedDeltaTime) {
+    if (sceneStarted_ && executionMode_ == SceneExecutionMode::Play &&
+        hasUnstartedPlayComponents_) {
+        startPendingComponents();
+    }
     rebuildTickOrderIfNeeded();
     const auto snapshot = cachedTickOrder_;
     for (const auto& ref : snapshot) {
@@ -843,10 +1184,15 @@ void SceneScriptRuntime::fixedUpdate(double fixedDeltaTime) {
             {fixedDeltaTime},
             "OnFixedUpdate");
     }
+    (void)stepAsyncResumeQueue(runtime::ResumeQueue::FixedTick);
     (void)flushDestroyedEntities();
 }
 
 void SceneScriptRuntime::lateUpdate(double deltaTime) {
+    if (sceneStarted_ && executionMode_ == SceneExecutionMode::Play &&
+        hasUnstartedPlayComponents_) {
+        startPendingComponents();
+    }
     rebuildTickOrderIfNeeded();
     const auto snapshot = cachedTickOrder_;
     for (const auto& ref : snapshot) {
@@ -861,6 +1207,7 @@ void SceneScriptRuntime::lateUpdate(double deltaTime) {
         (void)invokeLifecycle(
             ref.entity, instance, instance.onLateUpdate, {deltaTime}, "OnLateUpdate");
     }
+    (void)stepAsyncResumeQueue(runtime::ResumeQueue::EndOfFrame);
     (void)flushDestroyedEntities();
 }
 
@@ -878,6 +1225,10 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         mergedMetadata = *metadata;
     }
     mergedMetadata.populateFromProgram(newProgram);
+
+    if (const auto ctx = runtime_.asyncRuntime()) {
+        (void)ctx->coroutines().abortAllSuspendedFrames();
+    }
 
     struct SavedComponentState {
         std::string canonicalTypeName;
@@ -925,6 +1276,7 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
 
     runtime_.replaceProgram(newProgram);
     methodCache_.clear();
+    sequenceCancelPlanCache_.clear();
     tickOrderDirty_ = true;
 
     std::unordered_map<std::uint64_t, runtime::ObjectRef> migratedRefMap;
@@ -1036,7 +1388,7 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
             const auto& saved = savedList[idx];
             const auto newType = runtime_.findType(saved.canonicalTypeName);
             if (!newType) {
-                cancelActiveInstanceSequences(runtime_, instance.object, executionOptions_);
+                cancelInstanceSequencesFast(instance);
                 removeSignalsForEntityOrComponent(entity, saved.canonicalTypeName);
                 report.errors.push_back(
                     "script type '" + saved.canonicalTypeName +
@@ -1046,7 +1398,7 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
             runtime::RuntimeError allocError;
             auto newObj = runtime_.allocateUninitializedObject(*newType, allocError);
             if (!newObj) {
-                cancelActiveInstanceSequences(runtime_, instance.object, executionOptions_);
+                cancelInstanceSequencesFast(instance);
                 removeSignalsForEntityOrComponent(entity, saved.canonicalTypeName);
                 report.errors.push_back(
                     "failed to allocate migrated instance of '" +
@@ -1066,6 +1418,9 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
             instance.object = std::move(*newObj);
             instance.enabled = saved.enabled;
             instance.started = saved.started;
+            if (!instance.started) {
+                hasUnstartedPlayComponents_ = true;
+            }
             bindLifecycleMethods(instance);
             if (mergedMetadata.findTypeAttribute(saved.canonicalTypeName, "Tool") ||
                 mergedMetadata.findTypeAttribute(
@@ -1560,6 +1915,9 @@ bool SceneScriptRuntime::setParent(SceneEntityId child, SceneEntityId parent) {
 
     const bool nowActiveInHierarchy = isActiveInHierarchy(child);
     if (wasActiveInHierarchy != nowActiveInHierarchy) {
+        if (nowActiveInHierarchy) {
+            hasUnstartedPlayComponents_ = true;
+        }
         tickOrderDirty_ = true;
         const auto notifyNodeComponents = [&](SceneEntityId nodeId, bool becomingActive) {
             if (!becomingActive && fiberScheduler_) {
@@ -1577,7 +1935,7 @@ bool SceneScriptRuntime::setParent(SceneEntityId child, SceneEntityId parent) {
             for (auto& comp : instIt->second) {
                 if (!comp.enabled) continue;
                 if (!becomingActive) {
-                    cancelActiveInstanceSequences(runtime_, comp.object, executionOptions_);
+                    cancelInstanceSequencesFast(comp);
                 }
                 const auto& cb = becomingActive ? comp.onEnable : comp.onDisable;
                 (void)invokeLifecycle(
@@ -1735,10 +2093,27 @@ SceneEntityId SceneScriptRuntime::instantiatePrefab(
         const PrefabNodeTemplate& node,
         SceneEntityId parentId,
         bool isRoot) -> SceneEntityId {
+        while (nextEntityId == BroadcastTarget ||
+               entityIdGeneration(nextEntityId) != 0 ||
+               slotGenerations_.find(static_cast<std::uint32_t>(nextEntityId)) !=
+                   slotGenerations_.end() ||
+               entityActiveSelf_.find(nextEntityId) != entityActiveSelf_.end() ||
+               instances_.find(nextEntityId) != instances_.end() ||
+               localTransforms_.find(nextEntityId) != localTransforms_.end() ||
+               parentByEntity_.find(nextEntityId) != parentByEntity_.end() ||
+               childrenByEntity_.find(nextEntityId) != childrenByEntity_.end() ||
+               entityNames_.find(nextEntityId) != entityNames_.end() ||
+               colliders2D_.find(nextEntityId) != colliders2D_.end() ||
+               colliders3D_.find(nextEntityId) != colliders3D_.end()) {
+            ++nextEntityId;
+        }
         const SceneEntityId entityId = nextEntityId++;
         allocatedEntities.push_back(entityId);
         entityActiveSelf_[entityId] = true;
         localTransforms_[entityId] = node.localTransform;
+        if (!node.name.empty()) {
+            entityNames_[entityId] = node.name;
+        }
         if (parentId != BroadcastTarget) {
             (void)setParent(entityId, parentId);
         }
@@ -1867,6 +2242,18 @@ SceneEntityId SceneScriptRuntime::instantiatePrefab(
                     item.entity, stored, stored.onEnable, {}, "OnEnable")) {
                 (void)detach(rootEntityId);
                 return BroadcastTarget;
+            }
+        }
+    }
+
+    for (const SceneEntityId eid : allocatedEntities) {
+        if (entityIdGeneration(eid) == 0) {
+            const auto slot = static_cast<std::uint32_t>(eid);
+            if (nextGenerationalSlot_ <= slot) {
+                nextGenerationalSlot_ = slot + 1u;
+            }
+            if (nextAutoEntityId_ <= eid) {
+                nextAutoEntityId_ = eid + 1u;
             }
         }
     }
@@ -2019,9 +2406,29 @@ std::size_t SceneScriptRuntime::emitSignal(
             conn.sourceComponent != sourceComponent) {
             continue;
         }
-        const auto res = invokeComponent(
-            conn.targetEntity, conn.targetComponent, conn.targetMethod, arguments);
-        if (res.succeeded) ++invokedCount;
+        const auto foundTarget = instances_.find(conn.targetEntity);
+        if (foundTarget == instances_.end()) continue;
+        for (auto& targetInst : foundTarget->second) {
+            if (!matchesComponentType(targetInst.object.type(), conn.targetComponent)) {
+                continue;
+            }
+            const auto* method = findCachedMethod(
+                targetInst.object.type(), conn.targetMethod, arguments.size());
+            if (!method) {
+                runtime::RuntimeError missingErr{
+                    runtime::ErrorCode::FunctionNotFound,
+                    "script callback '" + conn.targetMethod + "' was not found"};
+                recordError(conn.targetEntity, conn.targetMethod, missingErr);
+                break;
+            }
+            const auto res = runtime_.invoke(
+                targetInst.object, *method, arguments, executionOptions_);
+            if (consumeFireAndForgetInvocationResult(
+                    conn.targetEntity, *method, res, conn.targetMethod)) {
+                ++invokedCount;
+            }
+            break;
+        }
     }
 
     if (signalTopicPublisher_) {
@@ -3329,6 +3736,1750 @@ std::vector<std::string> SceneScriptRuntime::getEntityGroups(SceneEntityId entit
     }
     std::sort(result.begin(), result.end());
     return result;
+}
+
+runtime::GenerationalEntityHandle SceneScriptRuntime::resolveActiveDestroyTokenHandle(
+    SceneEntityId entity) const noexcept {
+    if (entity == BroadcastTarget || isStaleGenerationalEntity(entity)) {
+        return {};
+    }
+    const std::uint32_t gen = entityIdGeneration(entity);
+    const std::uint32_t slot = entityIdSlot(entity);
+    if (gen != 0) {
+        return runtime::GenerationalEntityHandle{slot, gen};
+    }
+    const auto epIt = nonGenDestroyEpoch_.find(slot);
+    if (epIt == nonGenDestroyEpoch_.end()) {
+        return {};
+    }
+    return runtime::GenerationalEntityHandle{slot, 0x80000000u | epIt->second};
+}
+
+runtime::GenerationalEntityHandle SceneScriptRuntime::getOrAssignDestroyTokenHandle(
+    SceneEntityId entity) {
+    const std::uint32_t gen = entityIdGeneration(entity);
+    const std::uint32_t slot = entityIdSlot(entity);
+    if (gen != 0) {
+        return runtime::GenerationalEntityHandle{slot, gen};
+    }
+    auto& epoch = nonGenDestroyEpoch_[slot];
+    if (epoch == 0) {
+        epoch = 1u;
+    }
+    return runtime::GenerationalEntityHandle{slot, 0x80000000u | epoch};
+}
+
+runtime::CancellationToken SceneScriptRuntime::entityDestroyToken(SceneEntityId entity) {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx || entity == BroadcastTarget || !isEntityAlive(entity)) {
+        return runtime::CancellationToken::preCanceled();
+    }
+    const auto handle = getOrAssignDestroyTokenHandle(entity);
+    const auto domain = entityIdGeneration(entity) != 0
+        ? runtime::EntityDestroyDomain::SceneGenerational
+        : runtime::EntityDestroyDomain::SceneNonGenerational;
+    return ctx->cancellations().getOrCreateEntityDestroyToken(handle, domain);
+}
+
+bool SceneScriptRuntime::hasEntityDestroyToken(SceneEntityId entity) const noexcept {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return false;
+    const auto handle = resolveActiveDestroyTokenHandle(entity);
+    const auto domain = entityIdGeneration(entity) != 0
+        ? runtime::EntityDestroyDomain::SceneGenerational
+        : runtime::EntityDestroyDomain::SceneNonGenerational;
+    return handle.valid() && ctx->cancellations().hasEntityDestroyToken(handle, domain);
+}
+
+bool SceneScriptRuntime::cancelEntityDestroyToken(SceneEntityId entity) {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx || entity == BroadcastTarget) return false;
+    const auto handle = resolveActiveDestroyTokenHandle(entity);
+    const auto domain = entityIdGeneration(entity) != 0
+        ? runtime::EntityDestroyDomain::SceneGenerational
+        : runtime::EntityDestroyDomain::SceneNonGenerational;
+    bool canceled = false;
+    if (handle.valid()) {
+        canceled = ctx->cancellations().cancelEntity(handle, domain);
+    }
+    if (entityIdGeneration(entity) == 0) {
+        const auto epIt = nonGenDestroyEpoch_.find(entityIdSlot(entity));
+        if (epIt != nonGenDestroyEpoch_.end()) {
+            epIt->second = (epIt->second + 1u) & 0x7FFFFFFFu;
+            if (epIt->second == 0u) epIt->second = 1u;
+        }
+    }
+    return canceled;
+}
+
+void SceneScriptRuntime::advanceDeferredAsyncIoPackets() {
+    if (deferredAsyncIoPackets_.empty()) return;
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) {
+        deferredAsyncIoPackets_.clear();
+        return;
+    }
+    auto& cq = ctx->completionQueue();
+    auto& cancellations = ctx->cancellations();
+
+    std::size_t writeIdx = 0;
+    for (std::size_t i = 0; i < deferredAsyncIoPackets_.size(); ++i) {
+        auto& pkt = deferredAsyncIoPackets_[i];
+        if (pkt.remainingFrames > 0) {
+            --pkt.remainingFrames;
+        }
+        if (pkt.remainingFrames > 0) {
+            if (writeIdx != i) {
+                deferredAsyncIoPackets_[writeIdx] = std::move(pkt);
+            }
+            ++writeIdx;
+            continue;
+        }
+        if (cancellations.isCancellationRequested(pkt.token)) {
+            cq.submitCanceled(pkt.requestId);
+            continue;
+        }
+        switch (pkt.kind) {
+        case DeferredAsyncIoPacket::Kind::ScalarBool:
+            cq.submitScalar(pkt.requestId, runtime::Value(pkt.boolValue));
+            break;
+        case DeferredAsyncIoPacket::Kind::String:
+            cq.submitString(pkt.requestId, std::move(pkt.textPayload));
+            break;
+        case DeferredAsyncIoPacket::Kind::SaveCommit: {
+            {
+                std::lock_guard<std::mutex> lock(asyncIoMutex_);
+                saveGameSlots_[pkt.key] = std::move(pkt.textPayload);
+            }
+            cq.submitScalar(pkt.requestId, runtime::Value(true));
+            break;
+        }
+        case DeferredAsyncIoPacket::Kind::SaveRead: {
+            std::optional<std::string> stored;
+            {
+                std::lock_guard<std::mutex> lock(asyncIoMutex_);
+                const auto found = saveGameSlots_.find(pkt.key);
+                if (found != saveGameSlots_.end()) {
+                    stored = found->second;
+                }
+            }
+            if (stored) {
+                cq.submitString(pkt.requestId, std::move(*stored));
+            } else {
+                cq.submitFailure(
+                    pkt.requestId,
+                    runtime::ErrorCode::InvalidArguments,
+                    "save slot '" + pkt.key + "' does not exist");
+            }
+            break;
+        }
+        case DeferredAsyncIoPacket::Kind::WsMockSend: {
+            std::uint32_t slotIdx = 0;
+            std::uint32_t gen = 0;
+            unpackWsHandle(pkt.wsHandle, slotIdx, gen);
+            bool sentOk = false;
+            bool doEcho = false;
+            std::string echoPayload;
+            {
+                std::lock_guard<std::mutex> lock(asyncIoMutex_);
+                if (slotIdx < wsSessions_.size()) {
+                    auto& sess = wsSessions_[slotIdx];
+                    if (sess.allocated && sess.generation == gen &&
+                        sess.connected && !sess.closed) {
+                        sess.sentMessages.push_back(pkt.textPayload);
+                        sentOk = true;
+                        doEcho = sess.autoEcho;
+                        if (doEcho) {
+                            echoPayload = "echo:" + pkt.textPayload;
+                        }
+                    }
+                }
+            }
+            if (sentOk) {
+                cq.submitScalar(pkt.requestId, runtime::Value(true));
+                if (doEcho) {
+                    (void)pushWebSocketInboundMessage(pkt.wsHandle, std::move(echoPayload));
+                }
+            } else {
+                cq.submitFailure(
+                    pkt.requestId,
+                    runtime::ErrorCode::ScriptException,
+                    "WebSocket is not connected");
+            }
+            break;
+        }
+        case DeferredAsyncIoPacket::Kind::Failure:
+            cq.submitFailure(pkt.requestId, pkt.errorCode, std::move(pkt.textPayload));
+            break;
+        }
+    }
+    deferredAsyncIoPackets_.resize(writeIdx);
+}
+
+bool SceneScriptRuntime::stepAsyncPreTickIo() {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return true;
+    const bool isReplay =
+        determinismSession_ &&
+        determinismSession_->mode() == runtime::DeterminismMode::Replay;
+    if (!isReplay) {
+        advanceDeferredAsyncIoPackets();
+    }
+
+    const bool prevDrain = inFrameQueueDrain_;
+    inFrameQueueDrain_ = true;
+    runtime::RuntimeError ioErr;
+    const bool ok = ctx->stepPreTickIo(determinismSession_, ioErr);
+    inFrameQueueDrain_ = prevDrain;
+    if (!ok) {
+        recordError(BroadcastTarget, "AsyncPreTickIo", ioErr);
+        return false;
+    }
+    return true;
+}
+
+std::size_t SceneScriptRuntime::stepAsyncResumeQueue(
+    runtime::ResumeQueue queue,
+    std::size_t maxContinuations) {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return 0;
+    const bool prevDrain = inFrameQueueDrain_;
+    inFrameQueueDrain_ = true;
+    const std::size_t ran = ctx->stepResumeQueue(queue, maxContinuations);
+    inFrameQueueDrain_ = prevDrain;
+    return ran;
+}
+
+void SceneScriptRuntime::registerPrefabTemplate(
+    std::string prefabKey,
+    PrefabNodeTemplate prefab) {
+    if (prefabKey.empty()) return;
+    if (auto* heap = runtime_.heap().get()) {
+        auto& tokens = prefabTemplateRootTokens_[prefabKey];
+        releaseRootTokenList(heap, tokens);
+        std::vector<runtime::Value> traceables;
+        collectPrefabTraceableValues(prefab, traceables);
+        for (const auto& val : traceables) {
+            const auto tok = heap->addPersistentRoot(val);
+            if (tok != 0) tokens.push_back(tok);
+        }
+        if (tokens.empty()) {
+            prefabTemplateRootTokens_.erase(prefabKey);
+        }
+    }
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    prefabTemplates_.insert_or_assign(std::move(prefabKey), std::move(prefab));
+}
+
+bool SceneScriptRuntime::unregisterPrefabTemplate(const std::string& prefabKey) {
+    if (const auto tokIt = prefabTemplateRootTokens_.find(prefabKey);
+        tokIt != prefabTemplateRootTokens_.end()) {
+        releaseRootTokenList(runtime_.heap().get(), tokIt->second);
+        prefabTemplateRootTokens_.erase(tokIt);
+    }
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    return prefabTemplates_.erase(prefabKey) != 0;
+}
+
+bool SceneScriptRuntime::hasPrefabTemplate(const std::string& prefabKey) const {
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    return prefabTemplates_.find(prefabKey) != prefabTemplates_.end();
+}
+
+void SceneScriptRuntime::setPrefabStreamWorker(AsyncPrefabStreamWorker worker) {
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    prefabStreamWorker_ = std::move(worker);
+}
+
+void SceneScriptRuntime::onAsyncPrefabIoCompleted(
+    void* context,
+    runtime::AwaitableHandle ioHandle,
+    runtime::AwaitStatus,
+    std::uint64_t opId) {
+    auto* self = static_cast<SceneScriptRuntime*>(context);
+    if (!self) return;
+    const auto ctx = self->runtime_.asyncRuntime();
+    if (!ctx) return;
+
+    auto& pool = ctx->awaitables();
+    runtime::Value ioValue{};
+    runtime::RuntimeError ioError{};
+    const auto terminal = pool.getResult(ioHandle, ioValue, ioError);
+
+    const auto opIt = self->pendingPrefabOps_.find(opId);
+    if (opIt == self->pendingPrefabOps_.end()) {
+        return;
+    }
+    PendingPrefabMaterializeOp op = std::move(opIt->second);
+    self->pendingPrefabOps_.erase(opIt);
+
+    if (!pool.isValid(op.outerHandle) || pool.isCompleted(op.outerHandle)) {
+        return;
+    }
+
+    if (terminal == runtime::AwaitStatus::Canceled ||
+        ctx->cancellations().isCancellationRequested(op.token) ||
+        (op.parentEntity != BroadcastTarget && !self->isEntityAlive(op.parentEntity))) {
+        (void)pool.trySetCanceled(op.outerHandle);
+        return;
+    }
+
+    if (terminal == runtime::AwaitStatus::Faulted) {
+        (void)pool.trySetFaulted(
+            op.outerHandle,
+            ioError.code == runtime::ErrorCode::None
+                ? runtime::ErrorCode::ScriptException
+                : ioError.code,
+            ioError.message.empty()
+                ? "prefab async stream failed"
+                : std::move(ioError.message));
+        return;
+    }
+
+    std::optional<PrefabNodeTemplate> tpl;
+    {
+        std::lock_guard<std::mutex> lock(self->asyncIoMutex_);
+        const auto found = self->prefabTemplates_.find(op.prefabKey);
+        if (found != self->prefabTemplates_.end()) {
+            tpl = found->second;
+        }
+    }
+    if (!tpl) {
+        (void)pool.trySetFaulted(
+            op.outerHandle,
+            runtime::ErrorCode::InvalidArguments,
+            "unknown prefab template '" + op.prefabKey + "'");
+        return;
+    }
+
+    const SceneEntityId spawnedRoot = self->instantiatePrefab(
+        *tpl, self->nextAutoEntityId_, op.parentEntity);
+    if (spawnedRoot == BroadcastTarget) {
+        (void)pool.trySetFaulted(
+            op.outerHandle,
+            runtime::ErrorCode::ScriptException,
+            "failed to instantiate streamed prefab '" + op.prefabKey + "'");
+        return;
+    }
+
+    (void)pool.trySetResult(
+        op.outerHandle,
+        runtime::Value{runtime::LongValue{static_cast<std::int64_t>(spawnedRoot)}});
+}
+
+runtime::AwaitableHandle SceneScriptRuntime::loadPrefabSceneAsync(
+    std::string prefabKey,
+    SceneEntityId parentEntity,
+    runtime::CancellationToken token) {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return runtime::AwaitableHandle::invalid();
+    auto& pool = ctx->awaitables();
+
+    if (ctx->cancellations().isCancellationRequested(token) ||
+        (parentEntity != BroadcastTarget && !isEntityAlive(parentEntity))) {
+        return pool.fromCanceled();
+    }
+    if (prefabKey.empty()) {
+        return pool.fromFaulted(
+            runtime::ErrorCode::InvalidArguments,
+            "prefab key must not be empty");
+    }
+
+    const auto ioHandle = pool.allocatePending(runtime::ResumeQueue::PreTickIo, token);
+    const auto outerHandle = pool.allocatePending(runtime::ResumeQueue::Update, token);
+    const std::uint64_t opId = nextMaterializeOpId_++;
+    pendingPrefabOps_.emplace(opId, PendingPrefabMaterializeOp{
+        prefabKey,
+        parentEntity,
+        token,
+        ioHandle,
+        outerHandle,
+    });
+
+    runtime::AsyncContinuation cont{};
+    cont.callback = &SceneScriptRuntime::onAsyncPrefabIoCompleted;
+    cont.context = this;
+    cont.userTag = opId;
+    cont.resumeQueue = runtime::ResumeQueue::PreTickIo;
+    (void)pool.onCompleted(ioHandle, cont);
+
+    const auto reqId = ctx->completionQueue().registerRequest(
+        ioHandle,
+        "Scene.LoadPrefabSceneAsync",
+        hashAsyncBridgeArgs(prefabKey, {}, parentEntity),
+        runtime::BindingDeterminism::Recordable,
+        token);
+
+    const bool isReplay =
+        determinismSession_ &&
+        determinismSession_->mode() == runtime::DeterminismMode::Replay;
+    if (!isReplay) {
+        AsyncPrefabStreamWorker worker;
+        bool exists = false;
+        {
+            std::lock_guard<std::mutex> lock(asyncIoMutex_);
+            worker = prefabStreamWorker_;
+            exists = prefabTemplates_.find(prefabKey) != prefabTemplates_.end();
+        }
+        if (worker) {
+            worker(prefabKey, reqId, token, ctx->completionQueue());
+        } else if (asyncIoLatencyFrames_ > 0) {
+            DeferredAsyncIoPacket pkt;
+            pkt.remainingFrames = asyncIoLatencyFrames_;
+            pkt.requestId = reqId;
+            pkt.token = token;
+            if (exists) {
+                pkt.kind = DeferredAsyncIoPacket::Kind::ScalarBool;
+                pkt.boolValue = true;
+            } else {
+                pkt.kind = DeferredAsyncIoPacket::Kind::Failure;
+                pkt.errorCode = runtime::ErrorCode::InvalidArguments;
+                pkt.textPayload = "unknown prefab template '" + prefabKey + "'";
+            }
+            deferredAsyncIoPackets_.push_back(std::move(pkt));
+        } else if (exists) {
+            ctx->completionQueue().submitScalar(reqId, runtime::Value(true));
+        } else {
+            ctx->completionQueue().submitFailure(
+                reqId,
+                runtime::ErrorCode::InvalidArguments,
+                "unknown prefab template '" + prefabKey + "'");
+        }
+    }
+
+    return outerHandle;
+}
+
+void SceneScriptRuntime::registerAsyncAssetDefinition(
+    std::string assetPath,
+    std::map<std::string, runtime::Value> initialFields) {
+    if (assetPath.empty()) return;
+    if (auto* heap = runtime_.heap().get()) {
+        auto& tokens = asyncAssetDefRootTokens_[assetPath];
+        releaseRootTokenList(heap, tokens);
+        for (const auto& [_, val] : initialFields) {
+            if (val.isTraceable()) {
+                const auto tok = heap->addPersistentRoot(val);
+                if (tok != 0) tokens.push_back(tok);
+            }
+        }
+        if (tokens.empty()) {
+            asyncAssetDefRootTokens_.erase(assetPath);
+        }
+    }
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    asyncAssetDefinitions_.insert_or_assign(std::move(assetPath), std::move(initialFields));
+}
+
+bool SceneScriptRuntime::unregisterAsyncAssetDefinition(const std::string& assetPath) {
+    if (const auto tokIt = asyncAssetDefRootTokens_.find(assetPath);
+        tokIt != asyncAssetDefRootTokens_.end()) {
+        releaseRootTokenList(runtime_.heap().get(), tokIt->second);
+        asyncAssetDefRootTokens_.erase(tokIt);
+    }
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    return asyncAssetDefinitions_.erase(assetPath) != 0;
+}
+
+void SceneScriptRuntime::setAssetLoadWorker(AsyncAssetLoadWorker worker) {
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    assetLoadWorker_ = std::move(worker);
+}
+
+void SceneScriptRuntime::onAsyncAssetIoCompleted(
+    void* context,
+    runtime::AwaitableHandle ioHandle,
+    runtime::AwaitStatus,
+    std::uint64_t opId) {
+    auto* self = static_cast<SceneScriptRuntime*>(context);
+    if (!self) return;
+    const auto ctx = self->runtime_.asyncRuntime();
+    if (!ctx) return;
+
+    auto& pool = ctx->awaitables();
+    runtime::Value ioValue{};
+    runtime::RuntimeError ioError{};
+    const auto terminal = pool.getResult(ioHandle, ioValue, ioError);
+
+    const auto opIt = self->pendingAssetOps_.find(opId);
+    if (opIt == self->pendingAssetOps_.end()) {
+        return;
+    }
+    PendingAssetMaterializeOp op = std::move(opIt->second);
+    self->pendingAssetOps_.erase(opIt);
+
+    if (!pool.isValid(op.outerHandle) || pool.isCompleted(op.outerHandle)) {
+        return;
+    }
+
+    if (terminal == runtime::AwaitStatus::Canceled ||
+        ctx->cancellations().isCancellationRequested(op.token)) {
+        (void)pool.trySetCanceled(op.outerHandle);
+        return;
+    }
+
+    if (terminal == runtime::AwaitStatus::Faulted) {
+        (void)pool.trySetFaulted(
+            op.outerHandle,
+            ioError.code == runtime::ErrorCode::None
+                ? runtime::ErrorCode::ScriptException
+                : ioError.code,
+            ioError.message.empty()
+                ? "asset async load failed"
+                : std::move(ioError.message));
+        return;
+    }
+
+    std::map<std::string, runtime::Value> fields;
+    {
+        std::lock_guard<std::mutex> lock(self->asyncIoMutex_);
+        const auto found = self->asyncAssetDefinitions_.find(op.assetPath);
+        if (found != self->asyncAssetDefinitions_.end()) {
+            fields = found->second;
+        }
+    }
+
+    runtime::RuntimeError createErr;
+    const auto created = self->runtime_.createAsset(
+        op.assetPath, op.canonicalTypeName, createErr, fields);
+    if (!created) {
+        (void)pool.trySetFaulted(
+            op.outerHandle,
+            createErr.code == runtime::ErrorCode::None
+                ? runtime::ErrorCode::ScriptException
+                : createErr.code,
+            createErr.message.empty()
+                ? "failed to materialize asset '" + op.assetPath + "'"
+                : std::move(createErr.message));
+        return;
+    }
+
+    (void)pool.trySetResult(op.outerHandle, runtime::Value(true));
+}
+
+runtime::AwaitableHandle SceneScriptRuntime::loadAssetAsync(
+    std::string assetPath,
+    std::string canonicalTypeName,
+    runtime::CancellationToken token) {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return runtime::AwaitableHandle::invalid();
+    auto& pool = ctx->awaitables();
+
+    if (ctx->cancellations().isCancellationRequested(token)) {
+        return pool.fromCanceled();
+    }
+    if (assetPath.empty() || canonicalTypeName.empty()) {
+        return pool.fromFaulted(
+            runtime::ErrorCode::InvalidArguments,
+            "asset path and type name must not be empty");
+    }
+
+    const auto ioHandle = pool.allocatePending(runtime::ResumeQueue::PreTickIo, token);
+    const auto outerHandle = pool.allocatePending(runtime::ResumeQueue::Update, token);
+    const std::uint64_t opId = nextMaterializeOpId_++;
+    pendingAssetOps_.emplace(opId, PendingAssetMaterializeOp{
+        assetPath,
+        canonicalTypeName,
+        token,
+        ioHandle,
+        outerHandle,
+    });
+
+    runtime::AsyncContinuation cont{};
+    cont.callback = &SceneScriptRuntime::onAsyncAssetIoCompleted;
+    cont.context = this;
+    cont.userTag = opId;
+    cont.resumeQueue = runtime::ResumeQueue::PreTickIo;
+    (void)pool.onCompleted(ioHandle, cont);
+
+    const auto reqId = ctx->completionQueue().registerRequest(
+        ioHandle,
+        "Scene.LoadAssetAsync",
+        hashAsyncBridgeArgs(assetPath, canonicalTypeName, 0),
+        runtime::BindingDeterminism::Recordable,
+        token);
+
+    const bool isReplay =
+        determinismSession_ &&
+        determinismSession_->mode() == runtime::DeterminismMode::Replay;
+    if (!isReplay) {
+        AsyncAssetLoadWorker worker;
+        {
+            std::lock_guard<std::mutex> lock(asyncIoMutex_);
+            worker = assetLoadWorker_;
+        }
+        if (worker) {
+            worker(assetPath, canonicalTypeName, reqId, token, ctx->completionQueue());
+        } else if (asyncIoLatencyFrames_ > 0) {
+            DeferredAsyncIoPacket pkt;
+            pkt.remainingFrames = asyncIoLatencyFrames_;
+            pkt.requestId = reqId;
+            pkt.token = token;
+            pkt.kind = DeferredAsyncIoPacket::Kind::ScalarBool;
+            pkt.boolValue = true;
+            deferredAsyncIoPackets_.push_back(std::move(pkt));
+        } else {
+            ctx->completionQueue().submitScalar(reqId, runtime::Value(true));
+        }
+    }
+
+    return outerHandle;
+}
+
+void SceneScriptRuntime::setSaveGameSlot(std::string slotKey, std::string payload) {
+    if (slotKey.empty()) return;
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    saveGameSlots_.insert_or_assign(std::move(slotKey), std::move(payload));
+}
+
+std::optional<std::string> SceneScriptRuntime::getSaveGameSlot(
+    const std::string& slotKey) const {
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    const auto found = saveGameSlots_.find(slotKey);
+    if (found == saveGameSlots_.end()) return std::nullopt;
+    return found->second;
+}
+
+bool SceneScriptRuntime::eraseSaveGameSlot(const std::string& slotKey) {
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    return saveGameSlots_.erase(slotKey) != 0;
+}
+
+void SceneScriptRuntime::setSaveWriteWorker(AsyncSaveWriteWorker worker) {
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    saveWriteWorker_ = std::move(worker);
+}
+
+void SceneScriptRuntime::setSaveReadWorker(AsyncSaveReadWorker worker) {
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    saveReadWorker_ = std::move(worker);
+}
+
+runtime::AwaitableHandle SceneScriptRuntime::saveGameAsync(
+    std::string slotKey,
+    std::string payload,
+    runtime::CancellationToken token) {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return runtime::AwaitableHandle::invalid();
+    auto& pool = ctx->awaitables();
+
+    if (ctx->cancellations().isCancellationRequested(token)) {
+        return pool.fromCanceled();
+    }
+    if (slotKey.empty()) {
+        return pool.fromFaulted(
+            runtime::ErrorCode::InvalidArguments,
+            "save slot key must not be empty");
+    }
+
+    const auto target = pool.allocatePending(runtime::ResumeQueue::Update, token);
+    const auto reqId = ctx->completionQueue().registerRequest(
+        target,
+        "Scene.SaveGameAsync",
+        hashAsyncBridgeArgs(slotKey, payload, 0),
+        runtime::BindingDeterminism::Recordable,
+        token);
+
+    const bool isReplay =
+        determinismSession_ &&
+        determinismSession_->mode() == runtime::DeterminismMode::Replay;
+    if (!isReplay) {
+        AsyncSaveWriteWorker worker;
+        {
+            std::lock_guard<std::mutex> lock(asyncIoMutex_);
+            worker = saveWriteWorker_;
+        }
+        if (worker) {
+            worker(slotKey, payload, reqId, token, ctx->completionQueue());
+        } else if (asyncIoLatencyFrames_ > 0) {
+            DeferredAsyncIoPacket pkt;
+            pkt.remainingFrames = asyncIoLatencyFrames_;
+            pkt.requestId = reqId;
+            pkt.targetHandle = target;
+            pkt.token = token;
+            pkt.kind = DeferredAsyncIoPacket::Kind::SaveCommit;
+            pkt.key = std::move(slotKey);
+            pkt.textPayload = std::move(payload);
+            deferredAsyncIoPackets_.push_back(std::move(pkt));
+        } else {
+            {
+                std::lock_guard<std::mutex> lock(asyncIoMutex_);
+                saveGameSlots_.insert_or_assign(std::move(slotKey), std::move(payload));
+            }
+            ctx->completionQueue().submitScalar(reqId, runtime::Value(true));
+        }
+    }
+
+    return target;
+}
+
+runtime::AwaitableHandle SceneScriptRuntime::loadGameAsync(
+    std::string slotKey,
+    runtime::CancellationToken token) {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return runtime::AwaitableHandle::invalid();
+    auto& pool = ctx->awaitables();
+
+    if (ctx->cancellations().isCancellationRequested(token)) {
+        return pool.fromCanceled();
+    }
+    if (slotKey.empty()) {
+        return pool.fromFaulted(
+            runtime::ErrorCode::InvalidArguments,
+            "save slot key must not be empty");
+    }
+
+    const auto target = pool.allocatePending(runtime::ResumeQueue::Update, token);
+    const auto reqId = ctx->completionQueue().registerRequest(
+        target,
+        "Scene.LoadGameAsync",
+        hashAsyncBridgeArgs(slotKey, {}, 0),
+        runtime::BindingDeterminism::Recordable,
+        token);
+
+    const bool isReplay =
+        determinismSession_ &&
+        determinismSession_->mode() == runtime::DeterminismMode::Replay;
+    if (!isReplay) {
+        AsyncSaveReadWorker worker;
+        std::optional<std::string> stored;
+        {
+            std::lock_guard<std::mutex> lock(asyncIoMutex_);
+            worker = saveReadWorker_;
+            if (!worker) {
+                const auto found = saveGameSlots_.find(slotKey);
+                if (found != saveGameSlots_.end()) {
+                    stored = found->second;
+                }
+            }
+        }
+        if (worker) {
+            worker(slotKey, reqId, token, ctx->completionQueue());
+        } else if (asyncIoLatencyFrames_ > 0) {
+            DeferredAsyncIoPacket pkt;
+            pkt.remainingFrames = asyncIoLatencyFrames_;
+            pkt.requestId = reqId;
+            pkt.targetHandle = target;
+            pkt.token = token;
+            pkt.kind = DeferredAsyncIoPacket::Kind::SaveRead;
+            pkt.key = std::move(slotKey);
+            deferredAsyncIoPackets_.push_back(std::move(pkt));
+        } else if (stored) {
+            ctx->completionQueue().submitString(reqId, std::move(*stored));
+        } else {
+            ctx->completionQueue().submitFailure(
+                reqId,
+                runtime::ErrorCode::InvalidArguments,
+                "save slot '" + slotKey + "' does not exist");
+        }
+    }
+
+    return target;
+}
+
+// ============================================================================
+// Stage 4: Timeout-Linked HTTP & WebSocket Awaitable Bridges
+// ============================================================================
+
+std::size_t SceneScriptRuntime::advanceAsyncTimeouts(double deltaSeconds) {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return 0;
+    return ctx->advanceTimeouts(deltaSeconds);
+}
+
+runtime::CancellationToken SceneScriptRuntime::buildScopedNetToken(
+    SceneEntityId optionalOwnerEntity,
+    runtime::CancellationToken callerToken,
+    double timeoutSeconds,
+    runtime::CancellationSourceHandle& outOwnedCts) {
+    outOwnedCts = {};
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return runtime::CancellationToken::preCanceled();
+
+    std::array<runtime::CancellationToken, 2> parents{};
+    std::size_t parentCount = 0;
+    if (callerToken.canBeCanceled()) {
+        parents[parentCount++] = callerToken;
+    }
+    if (optionalOwnerEntity != BroadcastTarget) {
+        const auto entTok = entityDestroyToken(optionalOwnerEntity);
+        if (entTok.canBeCanceled()) {
+            parents[parentCount++] = entTok;
+        }
+    }
+
+    if (std::isnan(timeoutSeconds) ||
+        (std::isfinite(timeoutSeconds) && timeoutSeconds > 0.0)) {
+        if (parentCount > 0) {
+            outOwnedCts = ctx->createLinkedTimeoutSource(
+                parents.data(), parentCount, timeoutSeconds, false);
+        } else {
+            outOwnedCts = ctx->createTimeoutSource(timeoutSeconds, false);
+        }
+        return ctx->cancellations().token(outOwnedCts);
+    }
+
+    if (parentCount == 0) {
+        return runtime::CancellationToken::none();
+    }
+    if (parentCount == 1) {
+        return parents[0];
+    }
+    outOwnedCts = ctx->cancellations().createLinkedSource(parents.data(), parentCount);
+    return ctx->cancellations().token(outOwnedCts);
+}
+
+std::string SceneScriptRuntime::encodeHttpWirePacket(
+    int statusCode,
+    std::string_view responseBody) {
+    std::string out = std::to_string(statusCode);
+    out.push_back('\n');
+    out.append(responseBody.data(), responseBody.size());
+    return out;
+}
+
+bool SceneScriptRuntime::decodeHttpWirePacket(
+    std::string_view packet,
+    int& outStatusCode,
+    std::string& outBody) {
+    const auto nl = packet.find('\n');
+    if (nl == std::string_view::npos || nl == 0) return false;
+    int code = 0;
+    for (std::size_t i = 0; i < nl; ++i) {
+        const char ch = packet[i];
+        if (ch < '0' || ch > '9') return false;
+        code = code * 10 + (ch - '0');
+    }
+    outStatusCode = code;
+    outBody.assign(packet.substr(nl + 1));
+    return true;
+}
+
+void SceneScriptRuntime::registerHttpEndpoint(
+    std::string method,
+    std::string url,
+    int statusCode,
+    std::string responseBody,
+    std::uint32_t latencyFrames) {
+    if (url.empty()) return;
+    const std::string key = normalizeHttpKey(method, url);
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    httpEndpoints_.insert_or_assign(
+        key,
+        HttpMockEndpoint{statusCode, std::move(responseBody), latencyFrames});
+}
+
+bool SceneScriptRuntime::unregisterHttpEndpoint(
+    const std::string& method,
+    const std::string& url) {
+    const std::string key = normalizeHttpKey(method, url);
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    return httpEndpoints_.erase(key) != 0;
+}
+
+void SceneScriptRuntime::setHttpWorker(AsyncHttpWorker worker) {
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    httpWorker_ = std::move(worker);
+}
+
+void SceneScriptRuntime::onAsyncHttpIoCompleted(
+    void* context,
+    runtime::AwaitableHandle ioHandle,
+    runtime::AwaitStatus,
+    std::uint64_t opId) {
+    auto* self = static_cast<SceneScriptRuntime*>(context);
+    if (!self) return;
+    const auto ctx = self->runtime_.asyncRuntime();
+    if (!ctx) return;
+
+    auto& pool = ctx->awaitables();
+    runtime::Value ioValue{};
+    runtime::RuntimeError ioError{};
+    const auto terminal = pool.getResult(ioHandle, ioValue, ioError);
+
+    const auto opIt = self->pendingHttpOps_.find(opId);
+    if (opIt == self->pendingHttpOps_.end()) return;
+    PendingHttpMaterializeOp op = std::move(opIt->second);
+    self->pendingHttpOps_.erase(opIt);
+
+    const bool timedOut = ctx->cancellations().isTimedOut(op.effectiveToken);
+    self->lastHttpTimedOut_ = timedOut;
+    if (op.ownedLinkedCts.valid()) {
+        (void)ctx->cancellations().releaseSource(op.ownedLinkedCts);
+    }
+
+    if (!pool.isValid(op.outerHandle)) {
+        return;
+    }
+
+    if (terminal == runtime::AwaitStatus::Canceled ||
+        ctx->cancellations().isCancellationRequested(op.effectiveToken)) {
+        self->lastHttpStatusCode_ = timedOut ? 408 : 0;
+        self->lastHttpResponseBody_.clear();
+        (void)pool.trySetCanceled(op.outerHandle);
+        return;
+    }
+
+    if (terminal == runtime::AwaitStatus::Faulted) {
+        (void)pool.trySetFaulted(
+            op.outerHandle,
+            ioError.code == runtime::ErrorCode::None
+                ? runtime::ErrorCode::ScriptException
+                : ioError.code,
+            ioError.message.empty() ? "HTTP async request failed" : std::move(ioError.message));
+        return;
+    }
+
+    std::string rawWire;
+    if (const auto* sv = std::get_if<std::string>(&ioValue)) {
+        rawWire = *sv;
+    } else if (const auto* ref = std::get_if<runtime::ObjectRef>(&ioValue);
+               ref && self->runtime_.heap()) {
+        if (const auto view = self->runtime_.heap()->stringView(*ref)) {
+            rawWire.assign(view->data(), view->size());
+        }
+    }
+
+    int statusCode = 0;
+    std::string body;
+    if (!decodeHttpWirePacket(rawWire, statusCode, body)) {
+        (void)pool.trySetFaulted(
+            op.outerHandle,
+            runtime::ErrorCode::InvalidArguments,
+            "malformed HTTP wire packet");
+        return;
+    }
+
+    self->lastHttpStatusCode_ = statusCode;
+    self->lastHttpResponseBody_ = body;
+
+    if (op.returnStatusOnly) {
+        (void)pool.trySetResult(op.outerHandle, runtime::Value(static_cast<std::int64_t>(statusCode)));
+        return;
+    }
+
+    if (statusCode < 200 || statusCode >= 400) {
+        (void)pool.trySetFaulted(
+            op.outerHandle,
+            runtime::ErrorCode::ScriptException,
+            "HTTP " + std::to_string(statusCode) + ": " + body);
+        return;
+    }
+
+    if (auto* heap = self->runtime_.heap().get()) {
+        runtime::RuntimeError allocErr;
+        const auto strRef = heap->allocateString(std::move(body), &allocErr);
+        if (!strRef) {
+            (void)pool.trySetFaulted(
+                op.outerHandle,
+                runtime::ErrorCode::OutOfMemory,
+                allocErr.message);
+            return;
+        }
+        (void)pool.trySetResult(op.outerHandle, runtime::Value(*strRef));
+    } else {
+        (void)pool.trySetResult(op.outerHandle, runtime::Value(std::move(body)));
+    }
+}
+
+runtime::AwaitableHandle SceneScriptRuntime::httpRequestAsync(
+    HttpRequestSpec request,
+    bool returnStatusOnly,
+    runtime::CancellationToken callerToken) {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return runtime::AwaitableHandle::invalid();
+    auto& pool = ctx->awaitables();
+
+    if (request.url.empty()) {
+        return pool.fromFaulted(
+            runtime::ErrorCode::InvalidArguments,
+            "HTTP request URL must not be empty");
+    }
+
+    auto schedulePreCanceledHttp = [&](runtime::CancellationToken tok,
+                                       runtime::CancellationSourceHandle ownedCts) {
+        const auto ioHandle = pool.allocatePending(runtime::ResumeQueue::Update);
+        const auto outerHandle = pool.allocatePending(runtime::ResumeQueue::Update);
+        const std::uint64_t opId = nextMaterializeOpId_++;
+        pendingHttpOps_.emplace(opId, PendingHttpMaterializeOp{
+            returnStatusOnly,
+            tok,
+            ownedCts,
+            ioHandle,
+            outerHandle,
+        });
+        runtime::AsyncContinuation cont{};
+        cont.callback = &SceneScriptRuntime::onAsyncHttpIoCompleted;
+        cont.context = this;
+        cont.userTag = opId;
+        cont.resumeQueue = runtime::ResumeQueue::Update;
+        cont.runInlineOnComplete = false;
+        (void)pool.onCompleted(ioHandle, cont);
+        (void)pool.trySetCanceled(ioHandle);
+        return outerHandle;
+    };
+
+    if (ctx->cancellations().isCancellationRequested(callerToken)) {
+        return schedulePreCanceledHttp(callerToken, {});
+    }
+
+    runtime::CancellationSourceHandle ownedCts{};
+    const auto effectiveToken = buildScopedNetToken(
+        BroadcastTarget, callerToken, request.timeoutSeconds, ownedCts);
+    if (ctx->cancellations().isCancellationRequested(effectiveToken)) {
+        return schedulePreCanceledHttp(effectiveToken, ownedCts);
+    }
+
+    const auto ioHandle = pool.allocatePending(runtime::ResumeQueue::PreTickIo, effectiveToken);
+    const auto outerHandle = pool.allocatePending(runtime::ResumeQueue::Update, effectiveToken);
+    const std::uint64_t opId = nextMaterializeOpId_++;
+    pendingHttpOps_.emplace(opId, PendingHttpMaterializeOp{
+        returnStatusOnly,
+        effectiveToken,
+        ownedCts,
+        ioHandle,
+        outerHandle,
+    });
+
+    runtime::AsyncContinuation cont{};
+    cont.callback = &SceneScriptRuntime::onAsyncHttpIoCompleted;
+    cont.context = this;
+    cont.userTag = opId;
+    cont.resumeQueue = runtime::ResumeQueue::PreTickIo;
+    cont.runInlineOnComplete = true;
+    (void)pool.onCompleted(ioHandle, cont);
+
+    const std::string key = normalizeHttpKey(request.method, request.url);
+    const auto reqId = ctx->completionQueue().registerRequest(
+        ioHandle,
+        "Scene.HttpRequestAsync",
+        hashAsyncBridgeArgs(key, request.body, returnStatusOnly ? 1u : 0u),
+        runtime::BindingDeterminism::Recordable,
+        effectiveToken);
+
+    const bool isReplay =
+        determinismSession_ &&
+        determinismSession_->mode() == runtime::DeterminismMode::Replay;
+    if (!isReplay) {
+        AsyncHttpWorker worker;
+        std::optional<HttpMockEndpoint> mockRoute;
+        {
+            std::lock_guard<std::mutex> lock(asyncIoMutex_);
+            const auto found = httpEndpoints_.find(key);
+            if (found != httpEndpoints_.end()) {
+                mockRoute = found->second;
+            } else {
+                worker = httpWorker_;
+            }
+        }
+        if (mockRoute) {
+            const std::uint32_t waitFrames =
+                mockRoute->latencyFrames > 0 ? mockRoute->latencyFrames : asyncIoLatencyFrames_;
+            std::string wire = encodeHttpWirePacket(mockRoute->statusCode, mockRoute->responseBody);
+            if (waitFrames > 0) {
+                DeferredAsyncIoPacket pkt;
+                pkt.remainingFrames = waitFrames;
+                pkt.requestId = reqId;
+                pkt.targetHandle = ioHandle;
+                pkt.token = effectiveToken;
+                pkt.kind = DeferredAsyncIoPacket::Kind::String;
+                pkt.textPayload = std::move(wire);
+                deferredAsyncIoPackets_.push_back(std::move(pkt));
+            } else {
+                ctx->completionQueue().submitString(reqId, std::move(wire));
+            }
+        } else if (worker) {
+            worker(request, reqId, effectiveToken, ctx->completionQueue());
+        } else {
+            ctx->completionQueue().submitFailure(
+                reqId,
+                runtime::ErrorCode::InvalidArguments,
+                "unregistered HTTP endpoint '" + key + "'");
+        }
+    }
+
+    return outerHandle;
+}
+
+void SceneScriptRuntime::registerWebSocketEndpoint(
+    std::string url,
+    bool autoEcho,
+    std::uint32_t connectLatencyFrames) {
+    if (url.empty()) return;
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    wsEndpoints_.insert_or_assign(
+        std::move(url),
+        WebSocketEndpointConfig{autoEcho, connectLatencyFrames});
+}
+
+bool SceneScriptRuntime::unregisterWebSocketEndpoint(const std::string& url) {
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    return wsEndpoints_.erase(url) != 0;
+}
+
+void SceneScriptRuntime::setWebSocketConnectWorker(AsyncWebSocketConnectWorker worker) {
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    wsConnectWorker_ = std::move(worker);
+}
+
+void SceneScriptRuntime::setWebSocketSendWorker(AsyncWebSocketSendWorker worker) {
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    wsSendWorker_ = std::move(worker);
+}
+
+bool SceneScriptRuntime::pushWebSocketInboundMessage(
+    WebSocketHandle wsHandle,
+    std::string message) {
+    if (wsHandle <= 0) return false;
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return false;
+
+    std::uint32_t slotIdx = 0;
+    std::uint32_t gen = 0;
+    unpackWsHandle(wsHandle, slotIdx, gen);
+
+    runtime::AsyncRequestId matchedReqId = 0;
+    {
+        std::lock_guard<std::mutex> lock(asyncIoMutex_);
+        if (slotIdx >= wsSessions_.size()) return false;
+        auto& sess = wsSessions_[slotIdx];
+        if (!sess.allocated || sess.generation != gen || sess.closed) {
+            return false;
+        }
+        while (!sess.pendingReceivers.empty()) {
+            const auto waiter = sess.pendingReceivers.front();
+            sess.pendingReceivers.pop_front();
+            if (ctx->cancellations().isCancellationRequested(waiter.token)) {
+                continue;
+            }
+            matchedReqId = waiter.requestId;
+            break;
+        }
+        if (matchedReqId == 0) {
+            sess.inboundQueue.push_back(std::move(message));
+            return true;
+        }
+    }
+
+    ctx->completionQueue().submitString(matchedReqId, std::move(message));
+    return true;
+}
+
+bool SceneScriptRuntime::closeWebSocketFromHost(
+    WebSocketHandle wsHandle,
+    std::string reason) {
+    if (wsHandle <= 0) return false;
+    const auto ctx = runtime_.asyncRuntime();
+    std::uint32_t slotIdx = 0;
+    std::uint32_t gen = 0;
+    unpackWsHandle(wsHandle, slotIdx, gen);
+
+    std::vector<runtime::AsyncRequestId> toFailOrCancel;
+    std::string errText = reason.empty() ? "WebSocket closed" : std::move(reason);
+    {
+        std::lock_guard<std::mutex> lock(asyncIoMutex_);
+        if (slotIdx >= wsSessions_.size()) return false;
+        auto& sess = wsSessions_[slotIdx];
+        if (!sess.allocated || sess.generation != gen || sess.closed) {
+            return false;
+        }
+        sess.connected = false;
+        sess.closed = true;
+        sess.closeReason = errText;
+        while (!sess.pendingReceivers.empty()) {
+            toFailOrCancel.push_back(sess.pendingReceivers.front().requestId);
+            sess.pendingReceivers.pop_front();
+        }
+        sess.inboundQueue.clear();
+        sess.allocated = false;
+        sess.generation = (sess.generation + 1u == 0u) ? 1u : (sess.generation + 1u);
+        freeWsSessionSlots_.push_back(slotIdx);
+    }
+
+    if (ctx) {
+        for (const auto reqId : toFailOrCancel) {
+            ctx->completionQueue().submitCanceled(reqId);
+        }
+    }
+    return true;
+}
+
+void SceneScriptRuntime::closeEntityOwnedWebSockets(SceneEntityId entity) {
+    if (entity == BroadcastTarget) return;
+    std::vector<WebSocketHandle> ownedHandles;
+    {
+        std::lock_guard<std::mutex> lock(asyncIoMutex_);
+        for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(wsSessions_.size()); ++i) {
+            const auto& sess = wsSessions_[i];
+            if (sess.allocated && !sess.closed && sess.ownerEntity == entity) {
+                ownedHandles.push_back(static_cast<WebSocketHandle>(packWsHandle(i, sess.generation)));
+            }
+        }
+    }
+    for (const auto h : ownedHandles) {
+        (void)closeWebSocketFromHost(h, "owner entity destroyed");
+    }
+}
+
+bool SceneScriptRuntime::isWebSocketConnected(WebSocketHandle wsHandle) const noexcept {
+    if (wsHandle <= 0) return false;
+    std::uint32_t slotIdx = 0;
+    std::uint32_t gen = 0;
+    unpackWsHandle(wsHandle, slotIdx, gen);
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    if (slotIdx >= wsSessions_.size()) return false;
+    const auto& sess = wsSessions_[slotIdx];
+    return sess.allocated && sess.generation == gen && sess.connected && !sess.closed;
+}
+
+std::vector<std::string> SceneScriptRuntime::getWebSocketSentMessages(
+    WebSocketHandle wsHandle) const {
+    if (wsHandle <= 0) return {};
+    std::uint32_t slotIdx = 0;
+    std::uint32_t gen = 0;
+    unpackWsHandle(wsHandle, slotIdx, gen);
+    std::lock_guard<std::mutex> lock(asyncIoMutex_);
+    if (slotIdx >= wsSessions_.size()) return {};
+    const auto& sess = wsSessions_[slotIdx];
+    if (!sess.allocated || sess.generation != gen) return {};
+    return sess.sentMessages;
+}
+
+void SceneScriptRuntime::onAsyncWsConnectIoCompleted(
+    void* context,
+    runtime::AwaitableHandle ioHandle,
+    runtime::AwaitStatus,
+    std::uint64_t opId) {
+    auto* self = static_cast<SceneScriptRuntime*>(context);
+    if (!self) return;
+    const auto ctx = self->runtime_.asyncRuntime();
+    if (!ctx) return;
+
+    auto& pool = ctx->awaitables();
+    runtime::Value ioValue{};
+    runtime::RuntimeError ioError{};
+    const auto terminal = pool.getResult(ioHandle, ioValue, ioError);
+
+    const auto opIt = self->pendingWsConnectOps_.find(opId);
+    if (opIt == self->pendingWsConnectOps_.end()) return;
+    PendingWsConnectOp op = std::move(opIt->second);
+    self->pendingWsConnectOps_.erase(opIt);
+
+    const bool canceled =
+        terminal == runtime::AwaitStatus::Canceled ||
+        ctx->cancellations().isCancellationRequested(op.effectiveToken);
+    if (op.ownedLinkedCts.valid()) {
+        (void)ctx->cancellations().releaseSource(op.ownedLinkedCts);
+    }
+
+    if (canceled) {
+        (void)self->closeWebSocketFromHost(op.wsHandle, "connect canceled");
+        if (pool.isValid(op.outerHandle)) {
+            (void)pool.trySetCanceled(op.outerHandle);
+        }
+        return;
+    }
+
+    if (terminal == runtime::AwaitStatus::Faulted) {
+        (void)self->closeWebSocketFromHost(op.wsHandle, ioError.message);
+        if (pool.isValid(op.outerHandle)) {
+            (void)pool.trySetFaulted(
+                op.outerHandle,
+                ioError.code == runtime::ErrorCode::None
+                    ? runtime::ErrorCode::ScriptException
+                    : ioError.code,
+                ioError.message.empty() ? "WebSocket connect failed" : std::move(ioError.message));
+        }
+        return;
+    }
+
+    std::uint32_t slotIdx = 0;
+    std::uint32_t gen = 0;
+    unpackWsHandle(op.wsHandle, slotIdx, gen);
+    bool alive = false;
+    {
+        std::lock_guard<std::mutex> lock(self->asyncIoMutex_);
+        if (slotIdx < self->wsSessions_.size()) {
+            auto& sess = self->wsSessions_[slotIdx];
+            if (sess.allocated && sess.generation == gen && !sess.closed) {
+                if (sess.ownerEntity != BroadcastTarget && !self->isEntityAlive(sess.ownerEntity)) {
+                    alive = false;
+                } else {
+                    sess.connected = true;
+                    alive = true;
+                }
+            }
+        }
+    }
+    if (!alive) {
+        (void)self->closeWebSocketFromHost(op.wsHandle, "owner dead");
+        if (pool.isValid(op.outerHandle)) {
+            (void)pool.trySetCanceled(op.outerHandle);
+        }
+        return;
+    }
+
+    if (pool.isValid(op.outerHandle)) {
+        (void)pool.trySetResult(
+            op.outerHandle,
+            runtime::Value{runtime::LongValue{op.wsHandle}});
+    }
+}
+
+void SceneScriptRuntime::onAsyncNetPassthroughCompleted(
+    void* context,
+    runtime::AwaitableHandle ioHandle,
+    runtime::AwaitStatus,
+    std::uint64_t opId) {
+    auto* self = static_cast<SceneScriptRuntime*>(context);
+    if (!self) return;
+    const auto ctx = self->runtime_.asyncRuntime();
+    if (!ctx) return;
+
+    auto& pool = ctx->awaitables();
+    runtime::Value ioValue{};
+    runtime::RuntimeError ioError{};
+    const auto terminal = pool.getResult(ioHandle, ioValue, ioError);
+
+    const auto opIt = self->pendingNetTokenOps_.find(opId);
+    if (opIt == self->pendingNetTokenOps_.end()) return;
+    PendingNetTokenCleanupOp op = std::move(opIt->second);
+    self->pendingNetTokenOps_.erase(opIt);
+
+    if (op.ownedLinkedCts.valid()) {
+        (void)ctx->cancellations().releaseSource(op.ownedLinkedCts);
+    }
+
+    if (op.isReceiveOp && terminal != runtime::AwaitStatus::Succeeded && op.wsHandle > 0) {
+        if (op.requestId != 0) {
+            (void)ctx->completionQueue().cancelRequest(op.requestId);
+        }
+        std::uint32_t slotIdx = 0;
+        std::uint32_t gen = 0;
+        unpackWsHandle(op.wsHandle, slotIdx, gen);
+        std::lock_guard<std::mutex> lock(self->asyncIoMutex_);
+        if (slotIdx < self->wsSessions_.size()) {
+            auto& sess = self->wsSessions_[slotIdx];
+            if (sess.allocated && sess.generation == gen) {
+                sess.pendingReceivers.erase(
+                    std::remove_if(
+                        sess.pendingReceivers.begin(),
+                        sess.pendingReceivers.end(),
+                        [&](const PendingWsReceiveWaiter& w) {
+                            return w.requestId == op.requestId ||
+                                ctx->cancellations().isCancellationRequested(w.token);
+                        }),
+                    sess.pendingReceivers.end());
+            }
+        }
+    }
+
+    if (op.recordSentOnSuccess && terminal == runtime::AwaitStatus::Succeeded && op.wsHandle > 0) {
+        const auto* boolVal = std::get_if<bool>(&ioValue);
+        if (!boolVal || *boolVal) {
+            std::uint32_t slotIdx = 0;
+            std::uint32_t gen = 0;
+            unpackWsHandle(op.wsHandle, slotIdx, gen);
+            bool openOk = false;
+            {
+                std::lock_guard<std::mutex> lock(self->asyncIoMutex_);
+                if (slotIdx < self->wsSessions_.size()) {
+                    auto& sess = self->wsSessions_[slotIdx];
+                    if (sess.allocated && sess.generation == gen &&
+                        sess.connected && !sess.closed) {
+                        sess.sentMessages.push_back(op.sentPayload);
+                        openOk = true;
+                    }
+                }
+            }
+            if (!openOk) {
+                if (pool.isValid(op.outerHandle)) {
+                    (void)pool.trySetFaulted(
+                        op.outerHandle,
+                        runtime::ErrorCode::ScriptException,
+                        "WebSocket closed before send completed");
+                }
+                return;
+            }
+        }
+    }
+
+    if (!pool.isValid(op.outerHandle)) {
+        return;
+    }
+    if (terminal == runtime::AwaitStatus::Canceled) {
+        (void)pool.trySetCanceled(op.outerHandle);
+    } else if (terminal == runtime::AwaitStatus::Faulted) {
+        (void)pool.trySetFaulted(
+            op.outerHandle,
+            ioError.code == runtime::ErrorCode::None
+                ? runtime::ErrorCode::ScriptException
+                : ioError.code,
+            std::move(ioError.message));
+    } else {
+        (void)pool.trySetResult(op.outerHandle, std::move(ioValue));
+    }
+}
+
+runtime::AwaitableHandle SceneScriptRuntime::wsConnectAsync(
+    std::string url,
+    SceneEntityId ownerEntity,
+    double timeoutSeconds,
+    runtime::CancellationToken callerToken) {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return runtime::AwaitableHandle::invalid();
+    auto& pool = ctx->awaitables();
+
+    if (url.empty()) {
+        return pool.fromFaulted(
+            runtime::ErrorCode::InvalidArguments,
+            "WebSocket URL must not be empty");
+    }
+    if (ownerEntity != BroadcastTarget && !isEntityAlive(ownerEntity)) {
+        return pool.fromCanceled();
+    }
+
+    runtime::CancellationSourceHandle ownedCts{};
+    const auto effectiveToken = buildScopedNetToken(
+        ownerEntity, callerToken, timeoutSeconds, ownedCts);
+    if (ctx->cancellations().isCancellationRequested(effectiveToken)) {
+        if (ownedCts.valid()) (void)ctx->cancellations().releaseSource(ownedCts);
+        return pool.fromCanceled();
+    }
+
+    WebSocketHandle wsHandle = 0;
+    AsyncWebSocketConnectWorker worker;
+    std::optional<WebSocketEndpointConfig> endpointCfg;
+    {
+        std::lock_guard<std::mutex> lock(asyncIoMutex_);
+        worker = wsConnectWorker_;
+        const auto cfgIt = wsEndpoints_.find(url);
+        if (cfgIt != wsEndpoints_.end()) {
+            endpointCfg = cfgIt->second;
+        }
+        std::uint32_t slotIdx = 0;
+        if (!freeWsSessionSlots_.empty()) {
+            slotIdx = freeWsSessionSlots_.back();
+            freeWsSessionSlots_.pop_back();
+        } else {
+            slotIdx = static_cast<std::uint32_t>(wsSessions_.size());
+            wsSessions_.emplace_back();
+        }
+        auto& sess = wsSessions_[slotIdx];
+        if (sess.generation == 0u || sess.generation >= 0x7FFFFFFFu) {
+            sess.generation = 1u;
+        }
+        sess.allocated = true;
+        sess.connected = false;
+        sess.closed = false;
+        sess.autoEcho = endpointCfg ? endpointCfg->autoEcho : false;
+        sess.url = url;
+        sess.closeReason.clear();
+        sess.ownerEntity = ownerEntity;
+        sess.nextReceiveSeq = 1;
+        sess.nextSendSeq = 1;
+        sess.inboundQueue.clear();
+        sess.sentMessages.clear();
+        sess.pendingReceivers.clear();
+        wsHandle = static_cast<WebSocketHandle>(packWsHandle(slotIdx, sess.generation));
+    }
+
+    const auto ioHandle = pool.allocatePending(runtime::ResumeQueue::PreTickIo, effectiveToken);
+    const auto outerHandle = pool.allocatePending(runtime::ResumeQueue::Update, effectiveToken);
+    const std::uint64_t opId = nextMaterializeOpId_++;
+    pendingWsConnectOps_.emplace(opId, PendingWsConnectOp{
+        wsHandle,
+        effectiveToken,
+        ownedCts,
+        ioHandle,
+        outerHandle,
+    });
+
+    runtime::AsyncContinuation cont{};
+    cont.callback = &SceneScriptRuntime::onAsyncWsConnectIoCompleted;
+    cont.context = this;
+    cont.userTag = opId;
+    cont.resumeQueue = runtime::ResumeQueue::PreTickIo;
+    cont.runInlineOnComplete = true;
+    (void)pool.onCompleted(ioHandle, cont);
+
+    const auto reqId = ctx->completionQueue().registerRequest(
+        ioHandle,
+        "Scene.WsConnectAsync",
+        hashAsyncBridgeArgs(url, {}, ownerEntity),
+        runtime::BindingDeterminism::Recordable,
+        effectiveToken);
+
+    const bool isReplay =
+        determinismSession_ &&
+        determinismSession_->mode() == runtime::DeterminismMode::Replay;
+    if (!isReplay) {
+        if (worker) {
+            worker(wsHandle, url, reqId, effectiveToken, ctx->completionQueue());
+        } else if (endpointCfg) {
+            const std::uint32_t waitFrames =
+                endpointCfg->connectLatencyFrames > 0
+                    ? endpointCfg->connectLatencyFrames
+                    : asyncIoLatencyFrames_;
+            if (waitFrames > 0) {
+                DeferredAsyncIoPacket pkt;
+                pkt.remainingFrames = waitFrames;
+                pkt.requestId = reqId;
+                pkt.targetHandle = ioHandle;
+                pkt.token = effectiveToken;
+                pkt.kind = DeferredAsyncIoPacket::Kind::ScalarBool;
+                pkt.boolValue = true;
+                deferredAsyncIoPackets_.push_back(std::move(pkt));
+            } else {
+                ctx->completionQueue().submitScalar(reqId, runtime::Value(true));
+            }
+        } else {
+            ctx->completionQueue().submitFailure(
+                reqId,
+                runtime::ErrorCode::InvalidArguments,
+                "unregistered WebSocket endpoint '" + url + "'");
+        }
+    }
+
+    return outerHandle;
+}
+
+runtime::AwaitableHandle SceneScriptRuntime::wsSendAsync(
+    WebSocketHandle wsHandle,
+    std::string payload,
+    double timeoutSeconds,
+    runtime::CancellationToken callerToken) {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return runtime::AwaitableHandle::invalid();
+    auto& pool = ctx->awaitables();
+
+    if (wsHandle <= 0) {
+        return pool.fromFaulted(
+            runtime::ErrorCode::InvalidArguments,
+            "invalid WebSocket handle");
+    }
+
+    std::uint32_t slotIdx = 0;
+    std::uint32_t gen = 0;
+    unpackWsHandle(wsHandle, slotIdx, gen);
+
+    SceneEntityId ownerEntity = 0;
+    bool autoEcho = false;
+    std::uint64_t sendSeq = 0;
+    AsyncWebSocketSendWorker worker;
+    {
+        std::lock_guard<std::mutex> lock(asyncIoMutex_);
+        if (slotIdx >= wsSessions_.size()) {
+            return pool.fromFaulted(runtime::ErrorCode::InvalidArguments, "invalid WebSocket slot");
+        }
+        auto& sess = wsSessions_[slotIdx];
+        if (!sess.allocated || sess.generation != gen || !sess.connected || sess.closed) {
+            return pool.fromFaulted(runtime::ErrorCode::ScriptException, "WebSocket is not connected");
+        }
+        ownerEntity = sess.ownerEntity;
+        autoEcho = sess.autoEcho;
+        sendSeq = sess.nextSendSeq++;
+        worker = wsSendWorker_;
+    }
+
+    runtime::CancellationSourceHandle ownedCts{};
+    const auto effectiveToken = buildScopedNetToken(
+        ownerEntity, callerToken, timeoutSeconds, ownedCts);
+    if (ctx->cancellations().isCancellationRequested(effectiveToken)) {
+        if (ownedCts.valid()) (void)ctx->cancellations().releaseSource(ownedCts);
+        return pool.fromCanceled();
+    }
+
+    const bool isReplay =
+        determinismSession_ &&
+        determinismSession_->mode() == runtime::DeterminismMode::Replay;
+    const bool deferRecordToCompletion = isReplay || static_cast<bool>(worker);
+
+    const auto ioHandle = pool.allocatePending(runtime::ResumeQueue::PreTickIo, effectiveToken);
+    const auto outerHandle = pool.allocatePending(runtime::ResumeQueue::Update, effectiveToken);
+    const std::uint64_t opId = nextMaterializeOpId_++;
+    pendingNetTokenOps_.emplace(opId, PendingNetTokenCleanupOp{
+        ownedCts,
+        ioHandle,
+        outerHandle,
+        wsHandle,
+        0,
+        false,
+        deferRecordToCompletion,
+        deferRecordToCompletion ? payload : std::string{},
+    });
+
+    runtime::AsyncContinuation cont{};
+    cont.callback = &SceneScriptRuntime::onAsyncNetPassthroughCompleted;
+    cont.context = this;
+    cont.userTag = opId;
+    cont.resumeQueue = runtime::ResumeQueue::PreTickIo;
+    cont.runInlineOnComplete = true;
+    (void)pool.onCompleted(ioHandle, cont);
+
+    const auto reqId = ctx->completionQueue().registerRequest(
+        ioHandle,
+        "Scene.WsSendAsync",
+        hashAsyncBridgeArgs(payload, {}, sendSeq),
+        runtime::BindingDeterminism::Recordable,
+        effectiveToken);
+
+    if (!isReplay) {
+        if (worker) {
+            worker(wsHandle, payload, reqId, effectiveToken, ctx->completionQueue());
+        } else if (asyncIoLatencyFrames_ > 0) {
+            DeferredAsyncIoPacket pkt;
+            pkt.remainingFrames = asyncIoLatencyFrames_;
+            pkt.requestId = reqId;
+            pkt.targetHandle = ioHandle;
+            pkt.token = effectiveToken;
+            pkt.kind = DeferredAsyncIoPacket::Kind::WsMockSend;
+            pkt.wsHandle = wsHandle;
+            pkt.textPayload = std::move(payload);
+            deferredAsyncIoPackets_.push_back(std::move(pkt));
+        } else {
+            bool sentOk = false;
+            {
+                std::lock_guard<std::mutex> lock(asyncIoMutex_);
+                if (slotIdx < wsSessions_.size()) {
+                    auto& sess = wsSessions_[slotIdx];
+                    if (sess.allocated && sess.generation == gen &&
+                        sess.connected && !sess.closed) {
+                        sess.sentMessages.push_back(payload);
+                        sentOk = true;
+                    }
+                }
+            }
+            if (sentOk) {
+                ctx->completionQueue().submitScalar(reqId, runtime::Value(true));
+                if (autoEcho) {
+                    (void)pushWebSocketInboundMessage(wsHandle, "echo:" + payload);
+                }
+            } else {
+                ctx->completionQueue().submitFailure(
+                    reqId,
+                    runtime::ErrorCode::ScriptException,
+                    "WebSocket is not connected");
+            }
+        }
+    }
+
+    return outerHandle;
+}
+
+runtime::AwaitableHandle SceneScriptRuntime::wsReceiveAsync(
+    WebSocketHandle wsHandle,
+    double timeoutSeconds,
+    runtime::CancellationToken callerToken) {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return runtime::AwaitableHandle::invalid();
+    auto& pool = ctx->awaitables();
+
+    if (wsHandle <= 0) {
+        return pool.fromFaulted(
+            runtime::ErrorCode::InvalidArguments,
+            "invalid WebSocket handle");
+    }
+
+    std::uint32_t slotIdx = 0;
+    std::uint32_t gen = 0;
+    unpackWsHandle(wsHandle, slotIdx, gen);
+
+    SceneEntityId ownerEntity = 0;
+    std::uint64_t recvSeq = 0;
+    {
+        std::lock_guard<std::mutex> lock(asyncIoMutex_);
+        if (slotIdx >= wsSessions_.size()) {
+            return pool.fromFaulted(runtime::ErrorCode::InvalidArguments, "invalid WebSocket slot");
+        }
+        auto& sess = wsSessions_[slotIdx];
+        if (!sess.allocated || sess.generation != gen || !sess.connected || sess.closed) {
+            return pool.fromFaulted(runtime::ErrorCode::ScriptException, "WebSocket is not connected");
+        }
+        ownerEntity = sess.ownerEntity;
+        recvSeq = sess.nextReceiveSeq++;
+    }
+
+    runtime::CancellationSourceHandle ownedCts{};
+    const auto effectiveToken = buildScopedNetToken(
+        ownerEntity, callerToken, timeoutSeconds, ownedCts);
+    if (ctx->cancellations().isCancellationRequested(effectiveToken)) {
+        if (ownedCts.valid()) (void)ctx->cancellations().releaseSource(ownedCts);
+        return pool.fromCanceled();
+    }
+
+    const auto ioHandle = pool.allocatePending(runtime::ResumeQueue::PreTickIo, effectiveToken);
+    const auto outerHandle = pool.allocatePending(runtime::ResumeQueue::Update, effectiveToken);
+    const auto reqId = ctx->completionQueue().registerRequest(
+        ioHandle,
+        "Scene.WsReceiveAsync",
+        hashAsyncBridgeArgs("ws_recv", {}, recvSeq ^ static_cast<std::uint64_t>(wsHandle)),
+        runtime::BindingDeterminism::Recordable,
+        effectiveToken);
+
+    const std::uint64_t opId = nextMaterializeOpId_++;
+    pendingNetTokenOps_.emplace(opId, PendingNetTokenCleanupOp{
+        ownedCts,
+        ioHandle,
+        outerHandle,
+        wsHandle,
+        reqId,
+        true,
+        false,
+        {},
+    });
+
+    runtime::AsyncContinuation cont{};
+    cont.callback = &SceneScriptRuntime::onAsyncNetPassthroughCompleted;
+    cont.context = this;
+    cont.userTag = opId;
+    cont.resumeQueue = runtime::ResumeQueue::PreTickIo;
+    cont.runInlineOnComplete = true;
+    (void)pool.onCompleted(ioHandle, cont);
+
+    const bool isReplay =
+        determinismSession_ &&
+        determinismSession_->mode() == runtime::DeterminismMode::Replay;
+    if (!isReplay) {
+        std::optional<std::string> readyMsg;
+        {
+            std::lock_guard<std::mutex> lock(asyncIoMutex_);
+            if (slotIdx < wsSessions_.size()) {
+                auto& sess = wsSessions_[slotIdx];
+                if (sess.allocated && sess.generation == gen && !sess.closed) {
+                    if (!sess.inboundQueue.empty()) {
+                        readyMsg = std::move(sess.inboundQueue.front());
+                        sess.inboundQueue.pop_front();
+                    } else {
+                        sess.pendingReceivers.erase(
+                            std::remove_if(
+                                sess.pendingReceivers.begin(),
+                                sess.pendingReceivers.end(),
+                                [&](const PendingWsReceiveWaiter& w) {
+                                    return ctx->cancellations().isCancellationRequested(w.token);
+                                }),
+                            sess.pendingReceivers.end());
+                        sess.pendingReceivers.push_back(PendingWsReceiveWaiter{
+                            reqId,
+                            effectiveToken,
+                        });
+                    }
+                }
+            }
+        }
+        if (readyMsg) {
+            ctx->completionQueue().submitString(reqId, std::move(*readyMsg));
+        }
+    }
+
+    return outerHandle;
+}
+
+runtime::AwaitableHandle SceneScriptRuntime::wsCloseAsync(WebSocketHandle wsHandle) {
+    const auto ctx = runtime_.asyncRuntime();
+    if (!ctx) return runtime::AwaitableHandle::invalid();
+    const bool closed = closeWebSocketFromHost(wsHandle, "client close");
+    return ctx->awaitables().fromResult(runtime::Value(closed));
 }
 
 } // namespace realscript::game

@@ -1034,6 +1034,329 @@ public:
         runtime::CoroutineFrameHandle activeCoroutine,
         semantic::SymbolId returnStructTypeId,
         runtime::Value& outResult);
+
+    [[nodiscard]] inline bool isResumingCoroutine(
+        semantic::SymbolId functionSymbolId) const noexcept {
+        if (RS_AOT_LIKELY(resumingFramePtr_ == nullptr)) return false;
+        return resumingCoroutine_.valid() &&
+               resumingFramePtr_->functionSymbolId == functionSymbolId;
+    }
+    [[nodiscard]] inline bool enterResumingScalarCoroutine(
+        semantic::SymbolId functionSymbolId,
+        void* outScalarBuffer,
+        std::size_t scalarByteSize,
+        runtime::Value* outRefSlots,
+        std::size_t refCount,
+        std::uint32_t& outResumeBlockId,
+        runtime::CoroutineFrameHandle& outActiveCoroutine) {
+        if (RS_AOT_LIKELY(resumingFramePtr_ == nullptr)) return false;
+        return enterResumingScalarCoroutineSlow(
+            functionSymbolId,
+            outScalarBuffer,
+            scalarByteSize,
+            outRefSlots,
+            refCount,
+            outResumeBlockId,
+            outActiveCoroutine);
+    }
+    [[nodiscard]] bool enterResumingScalarCoroutineSlow(
+        semantic::SymbolId functionSymbolId,
+        void* outScalarBuffer,
+        std::size_t scalarByteSize,
+        runtime::Value* outRefSlots,
+        std::size_t refCount,
+        std::uint32_t& outResumeBlockId,
+        runtime::CoroutineFrameHandle& outActiveCoroutine);
+    [[nodiscard]] inline bool canSkipAwaitSuspendFast(
+        std::int64_t packedAwaitable) const noexcept {
+        const auto h = runtime::AwaitableHandle::unpack64(
+            static_cast<std::uint64_t>(packedAwaitable));
+        if (h.isCompletedVoidSentinel()) return asyncRuntime_ != nullptr;
+        return asyncRuntime_ != nullptr &&
+               asyncRuntime_->awaitables().isValid(h) &&
+               asyncRuntime_->awaitables().isCompleted(h);
+    }
+    [[nodiscard]] bool awaitSuspendScalar(
+        semantic::SymbolId functionSymbolId,
+        semantic::SymbolId returnStructTypeId,
+        std::int64_t packedAwaitable,
+        std::uint32_t resumeBlockId,
+        const void* scalarData,
+        std::size_t scalarByteSize,
+        const runtime::Value* refSlots,
+        std::size_t refCount,
+        runtime::CoroutineFrameHandle& ioActiveCoroutine,
+        bool& outSuspendedNow,
+        std::int64_t& outPackedResult);
+    [[nodiscard]] inline bool awaitResumeVoidScalar(
+        std::int64_t& ioPackedAwaitable) {
+        const auto h = runtime::AwaitableHandle::unpack64(
+            static_cast<std::uint64_t>(ioPackedAwaitable));
+        if (RS_AOT_LIKELY(h.isCompletedVoidSentinel() && asyncRuntime_ != nullptr)) {
+            ioPackedAwaitable = 0;
+            return true;
+        }
+        return awaitResumeVoidScalarSlow(ioPackedAwaitable);
+    }
+    [[nodiscard]] bool awaitResumeVoidScalarSlow(std::int64_t& ioPackedAwaitable);
+    [[nodiscard]] bool awaitResumeInt64Scalar(
+        std::int64_t& ioPackedAwaitable,
+        semantic::PrimitiveType expectedType,
+        std::int64_t& outValue);
+    [[nodiscard]] bool awaitResumeDoubleScalar(
+        std::int64_t& ioPackedAwaitable,
+        double& outValue);
+    [[nodiscard]] bool awaitResumeBoolScalar(
+        std::int64_t& ioPackedAwaitable,
+        bool& outValue);
+    [[nodiscard]] bool awaitResumeBoxedScalar(
+        std::int64_t& ioPackedAwaitable,
+        semantic::PrimitiveType expectedType,
+        semantic::SymbolId expectedTypeId,
+        runtime::Value& outValue);
+    [[nodiscard]] inline bool asyncResolveVoidScalar(
+        runtime::CoroutineFrameHandle activeCoroutine,
+        std::int64_t& outPackedResult) {
+        if (RS_AOT_LIKELY(!activeCoroutine.valid() && asyncRuntime_ != nullptr)) {
+            outPackedResult = static_cast<std::int64_t>(
+                runtime::AwaitableHandle::completedVoid().pack64());
+            return true;
+        }
+        return asyncResolveVoidScalarSlow(activeCoroutine, outPackedResult);
+    }
+    [[nodiscard]] bool asyncResolveVoidScalarSlow(
+        runtime::CoroutineFrameHandle activeCoroutine,
+        std::int64_t& outPackedResult);
+    [[nodiscard]] bool asyncResolveIntScalar(
+        runtime::CoroutineFrameHandle activeCoroutine,
+        std::int64_t payload,
+        bool isLong,
+        std::int64_t& outPackedResult);
+    [[nodiscard]] bool asyncResolveDoubleScalar(
+        runtime::CoroutineFrameHandle activeCoroutine,
+        double payload,
+        std::int64_t& outPackedResult);
+    [[nodiscard]] bool asyncResolveBoolScalar(
+        runtime::CoroutineFrameHandle activeCoroutine,
+        bool payload,
+        std::int64_t& outPackedResult);
+    [[nodiscard]] bool asyncResolveBoxedScalar(
+        runtime::CoroutineFrameHandle activeCoroutine,
+        const runtime::Value& payload,
+        std::int64_t& outPackedResult);
+    [[nodiscard]] bool finishUncaughtAsyncExceptionScalar(
+        runtime::CoroutineFrameHandle activeCoroutine,
+        semantic::SymbolId returnStructTypeId,
+        std::int64_t& outPackedResult);
+
+    // Zero-boxing TrustedRelease inline intrinsics for RealScript.Async::Async.__*
+    [[nodiscard]] inline bool asyncIntrinsicYieldFast(
+        std::int64_t tokenPacked,
+        std::int64_t& outHandle) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        const auto h = asyncRuntime_->enqueueYield(
+            runtime::CancellationToken::unpack64(static_cast<std::uint64_t>(tokenPacked)));
+        outHandle = static_cast<std::int64_t>(h.pack64());
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicNewPendingFast(
+        std::int64_t tokenPacked,
+        std::int64_t& outHandle) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        const auto h = asyncRuntime_->awaitables().allocatePending(
+            runtime::ResumeQueue::Update,
+            runtime::CancellationToken::unpack64(static_cast<std::uint64_t>(tokenPacked)));
+        outHandle = static_cast<std::int64_t>(h.pack64());
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicFromCanceledFast(std::int64_t& outHandle) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        outHandle = static_cast<std::int64_t>(asyncRuntime_->awaitables().fromCanceled().pack64());
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicCompleteVoidFast(
+        std::int64_t handlePacked,
+        bool& outOk) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        outOk = asyncRuntime_->awaitables().trySetResult(
+            runtime::AwaitableHandle::unpack64(static_cast<std::uint64_t>(handlePacked)),
+            runtime::Value{});
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicCompleteIntFast(
+        std::int64_t handlePacked,
+        std::int64_t value,
+        bool& outOk) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        outOk = asyncRuntime_->awaitables().trySetResult(
+            runtime::AwaitableHandle::unpack64(static_cast<std::uint64_t>(handlePacked)),
+            runtime::Value{value});
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicCompleteCancelFast(
+        std::int64_t handlePacked,
+        bool& outOk) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        outOk = asyncRuntime_->awaitables().trySetCanceled(
+            runtime::AwaitableHandle::unpack64(static_cast<std::uint64_t>(handlePacked)));
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicIsCompletedFast(
+        std::int64_t handlePacked,
+        bool& outDone) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        outDone = asyncRuntime_->awaitables().isCompleted(
+            runtime::AwaitableHandle::unpack64(static_cast<std::uint64_t>(handlePacked)));
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicCtsCreateFast(std::int64_t& outHandle) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        outHandle = static_cast<std::int64_t>(asyncRuntime_->cancellations().createSource().pack64());
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicCtsCreateLinkedFast(
+        std::int64_t parentPacked,
+        std::int64_t& outHandle) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        const auto p = runtime::CancellationToken::unpack64(static_cast<std::uint64_t>(parentPacked));
+        outHandle = static_cast<std::int64_t>(
+            asyncRuntime_->cancellations().createLinkedSource(&p, 1u).pack64());
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicCtsCreateLinked2Fast(
+        std::int64_t parentAPacked,
+        std::int64_t parentBPacked,
+        std::int64_t& outHandle) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        const std::array<runtime::CancellationToken, 2> parents{{
+            runtime::CancellationToken::unpack64(static_cast<std::uint64_t>(parentAPacked)),
+            runtime::CancellationToken::unpack64(static_cast<std::uint64_t>(parentBPacked)),
+        }};
+        outHandle = static_cast<std::int64_t>(
+            asyncRuntime_->cancellations().createLinkedSource(parents.data(), parents.size()).pack64());
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicCtsCreateTimeoutFast(
+        double timeoutSeconds,
+        std::int64_t& outHandle) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        outHandle = static_cast<std::int64_t>(
+            asyncRuntime_->createTimeoutSource(timeoutSeconds, false).pack64());
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicCtsCreateLinkedTimeoutFast(
+        std::int64_t parentPacked,
+        double timeoutSeconds,
+        std::int64_t& outHandle) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        const auto p = runtime::CancellationToken::unpack64(static_cast<std::uint64_t>(parentPacked));
+        outHandle = static_cast<std::int64_t>(
+            asyncRuntime_->createLinkedTimeoutSource(&p, 1u, timeoutSeconds, false).pack64());
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicCtsTokenFast(
+        std::int64_t ctsPacked,
+        std::int64_t& outTokPacked) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        const auto tok = asyncRuntime_->cancellations().token(
+            runtime::CancellationSourceHandle::unpack64(static_cast<std::uint64_t>(ctsPacked)));
+        outTokPacked = static_cast<std::int64_t>(tok.pack64());
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicCtsCancelFast(
+        std::int64_t ctsPacked,
+        std::int64_t& outCount) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        outCount = static_cast<std::int64_t>(asyncRuntime_->cancellations().cancel(
+            runtime::CancellationSourceHandle::unpack64(static_cast<std::uint64_t>(ctsPacked))));
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicCtsReleaseFast(
+        std::int64_t ctsPacked,
+        bool& outOk) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        outOk = asyncRuntime_->cancellations().releaseSource(
+            runtime::CancellationSourceHandle::unpack64(static_cast<std::uint64_t>(ctsPacked)));
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicTokenIsCanceledFast(
+        std::int64_t tokPacked,
+        bool& outCanceled) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        outCanceled = asyncRuntime_->cancellations().isCancellationRequested(
+            runtime::CancellationToken::unpack64(static_cast<std::uint64_t>(tokPacked)));
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicTokenIsTimedOutFast(
+        std::int64_t tokPacked,
+        bool& outTimedOut) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        outTimedOut = asyncRuntime_->cancellations().isTimedOut(
+            runtime::CancellationToken::unpack64(static_cast<std::uint64_t>(tokPacked)));
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicAdvanceTimeoutsFast(
+        double deltaSeconds,
+        std::int64_t& outFired) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        outFired = static_cast<std::int64_t>(asyncRuntime_->advanceTimeouts(deltaSeconds));
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicStepUpdateFast(
+        std::int64_t maxCount,
+        std::int64_t& outDrained) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        outDrained = static_cast<std::int64_t>(asyncRuntime_->stepResumeQueue(
+            runtime::ResumeQueue::Update,
+            maxCount > 0 ? static_cast<std::size_t>(maxCount) : 0u));
+        return true;
+    }
+    [[nodiscard]] inline bool asyncIntrinsicReadyUpdateCountFast(std::int64_t& outReady) {
+        if (RS_AOT_UNLIKELY(!asyncRuntime_)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "Async intrinsic requires AsyncRuntimeContext");
+        }
+        outReady = static_cast<std::int64_t>(
+            asyncRuntime_->awaitables().readyContinuationCount(runtime::ResumeQueue::Update));
+        return true;
+    }
     [[nodiscard]] runtime::ShadowStack& shadowStack() noexcept;
     [[nodiscard]] const runtime::RuntimeError& error() const noexcept;
     [[nodiscard]] const runtime::RuntimeStatistics& statistics() const noexcept;

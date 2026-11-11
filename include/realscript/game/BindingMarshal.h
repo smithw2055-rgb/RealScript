@@ -128,6 +128,31 @@ std::optional<runtime::Value> writeNativeObject(
     return runtime::Value{*object};
 }
 
+template <typename Element>
+[[nodiscard]] std::optional<semantic::SymbolId> resolveTypedAwaitableTypeId(
+    const std::shared_ptr<GameApiState>& state) {
+    auto elemRef = resolveScriptType<Element>(state);
+    if (!elemRef || elemRef->category == ScriptTypeCategory::Void) {
+        return std::nullopt;
+    }
+    std::string sanitized = elemRef->sourceName;
+    for (char& ch : sanitized) {
+        const bool alphaNum =
+            (ch >= 'a' && ch <= 'z') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '_';
+        if (!alphaNum) ch = '_';
+    }
+    const bool isAsyncOwnedBuiltin =
+        elemRef->moduleName.empty() ||
+        elemRef->moduleName == "RealScript.Async" ||
+        elemRef->moduleName == "RealScript.Math";
+    const std::string ownerModule =
+        isAsyncOwnedBuiltin ? std::string("RealScript.Async") : elemRef->moduleName;
+    return semantic::stableTypeId(ownerModule + "::Awaitable__" + sanitized);
+}
+
 template <typename T>
 std::optional<RemoveCvRef<T>> readValue(
     const std::shared_ptr<GameApiState>& state,
@@ -293,6 +318,45 @@ std::optional<RemoveCvRef<T>> readValue(
         }
         setTypeMismatch(error, "expected Quat argument");
         return std::nullopt;
+    } else if constexpr (std::is_same_v<ValueType, runtime::CancellationToken>) {
+        const auto* sVal = std::get_if<runtime::StructValue>(&value);
+        if (sVal && sVal->valid() &&
+            sVal->typeId == semantic::stableTypeId("RealScript.Async::CancellationToken")) {
+            if (const auto f0 = runtime::structValueFieldAt(*sVal, 0)) {
+                if (const auto* lv = std::get_if<runtime::LongValue>(&*f0)) {
+                    return runtime::CancellationToken::unpack64(
+                        static_cast<std::uint64_t>(lv->value));
+                }
+                if (const auto* iv = std::get_if<std::int64_t>(&*f0)) {
+                    return runtime::CancellationToken::unpack64(
+                        static_cast<std::uint64_t>(*iv));
+                }
+            }
+        }
+        setTypeMismatch(error, "expected CancellationToken argument");
+        return std::nullopt;
+    } else if constexpr (std::is_same_v<ValueType, runtime::AwaitableHandle>) {
+        const auto* sVal = std::get_if<runtime::StructValue>(&value);
+        runtime::AwaitableHandle handle{};
+        if (sVal && sVal->valid() &&
+            sVal->typeId == runtime::awaitableVoidTypeId() &&
+            runtime::tryExtractAwaitableHandle(value, handle)) {
+            return handle;
+        }
+        setTypeMismatch(error, "expected Awaitable argument");
+        return std::nullopt;
+    } else if constexpr (IsTypedAwaitable<ValueType>::value) {
+        using Element = typename IsTypedAwaitable<ValueType>::Element;
+        const auto expectedTid = resolveTypedAwaitableTypeId<Element>(state);
+        const auto* sVal = std::get_if<runtime::StructValue>(&value);
+        runtime::AwaitableHandle handle{};
+        if (expectedTid && sVal && sVal->valid() &&
+            sVal->typeId == *expectedTid &&
+            runtime::tryExtractAwaitableHandle(value, handle)) {
+            return ValueType{handle};
+        }
+        setTypeMismatch(error, "expected Awaitable<T> argument");
+        return std::nullopt;
     } else if constexpr (IsSharedPtr<ValueType>::value) {
         using Element = typename IsSharedPtr<ValueType>::Element;
         return readNativeObject<Element>(state, value, error);
@@ -407,6 +471,22 @@ std::optional<runtime::Value> writeValue(
         return runtime::Value{runtime::Vec3Value{value.x.raw, value.y.raw, value.z.raw}};
     } else if constexpr (std::is_same_v<ValueType, Quat>) {
         return runtime::Value{runtime::QuatValue{value.x.raw, value.y.raw, value.z.raw, value.w.raw}};
+    } else if constexpr (std::is_same_v<ValueType, runtime::CancellationToken>) {
+        const runtime::Value field{
+            runtime::LongValue{static_cast<std::int64_t>(value.pack64())}};
+        return runtime::Value{runtime::makeStructValueFromFields(
+            semantic::stableTypeId("RealScript.Async::CancellationToken"),
+            runtime::ValueSpan(&field, 1))};
+    } else if constexpr (std::is_same_v<ValueType, runtime::AwaitableHandle>) {
+        return runtime::makeAwaitableStructValue(runtime::awaitableVoidTypeId(), value);
+    } else if constexpr (IsTypedAwaitable<ValueType>::value) {
+        using Element = typename IsTypedAwaitable<ValueType>::Element;
+        const auto tid = resolveTypedAwaitableTypeId<Element>(state);
+        if (!tid) {
+            setTypeMismatch(error, "unsupported TypedAwaitable<T> element type");
+            return std::nullopt;
+        }
+        return runtime::makeAwaitableStructValue(*tid, value.handle);
     } else if constexpr (IsSharedPtr<ValueType>::value) {
         using Element = typename IsSharedPtr<ValueType>::Element;
         return writeNativeObject<Element>(state, std::forward<T>(value), error);
@@ -617,6 +697,11 @@ inline void collectImports(
     const ScriptTypeRef& type) {
     if (!type.moduleName.empty() && type.moduleName != module.name) {
         module.imports.insert(type.moduleName);
+    }
+    for (const auto& imp : type.extraImports) {
+        if (!imp.empty() && imp != module.name) {
+            module.imports.insert(imp);
+        }
     }
 }
 

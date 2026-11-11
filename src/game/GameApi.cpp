@@ -36,6 +36,17 @@ std::string dummyReturn(const detail::ScriptTypeRef& type) {
         return type.sourceName == "float" ? "return (float)0.0;" : "return 0.0;";
     case detail::ScriptTypeCategory::String: return "return \"\";";
     case detail::ScriptTypeCategory::Struct:
+        if (type.moduleName == "RealScript.Async") {
+            if (type.sourceName == "CancellationToken") {
+                return "return CancellationToken.None();";
+            }
+            if (type.sourceName == "Awaitable") {
+                return "return Awaitable.Completed();";
+            }
+            if (type.sourceName.rfind("Awaitable<", 0) == 0) {
+                return "return " + type.sourceName + ".FromHandle(0L);";
+            }
+        }
         return "return new " + type.sourceName + "();";
     case detail::ScriptTypeCategory::NativeObject:
     case detail::ScriptTypeCategory::Array: return "return null;";

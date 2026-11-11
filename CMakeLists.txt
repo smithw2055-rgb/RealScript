@@ -397,6 +397,10 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase26_async_coroutines_tests
         realscript.phase26.async-coroutines
         tests/phase26_async_coroutines_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_phase27_scene_async_lifecycle_tests
+        realscript.phase27.scene-async-lifecycle
+        tests/phase27_scene_async_lifecycle_tests.cpp)
     set(REALSCRIPT_PHASE20_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/phase20")
     realscript_add_aot_library(
@@ -601,6 +605,49 @@ if(REALSCRIPT_BUILD_TESTS)
     add_test(
         NAME realscript.aot-trusted-and-zero-copy-ecs
         COMMAND realscript_aot_trusted_and_zero_copy_ecs_tests)
+
+    set(REALSCRIPT_PHASE28_STD_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase28_std")
+    realscript_add_aot_library(
+        realscript_phase28_std_generated
+        PROGRAM_NAME Phase28Std
+        CPP_NAMESPACE phase28_ns_std
+        QUERY_SYMBOL rs_module_query_phase28_std
+        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE28_STD_GENERATED_DIR}"
+        OPT_LEVEL 2
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase28_trusted_async_aot.rs"
+    )
+    set(REALSCRIPT_PHASE28_TRUSTED_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase28_trusted")
+    realscript_add_aot_library(
+        realscript_phase28_trusted_generated
+        PROGRAM_NAME Phase28Trusted
+        CPP_NAMESPACE phase28_ns_trusted
+        QUERY_SYMBOL rs_module_query_phase28_trusted
+        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE28_TRUSTED_GENERATED_DIR}"
+        OPT_LEVEL 2
+        TRUSTED_RELEASE
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase28_trusted_async_aot.rs"
+    )
+    add_executable(
+        realscript_phase28_net_async_and_trusted_aot_tests
+        tests/phase28_net_async_and_trusted_aot_tests.cpp)
+    target_link_libraries(
+        realscript_phase28_net_async_and_trusted_aot_tests
+        PRIVATE
+            realscript_phase28_std_generated
+            realscript_phase28_trusted_generated
+            RealScript::Full)
+    target_compile_features(
+        realscript_phase28_net_async_and_trusted_aot_tests PRIVATE cxx_std_17)
+    target_compile_definitions(
+        realscript_phase28_net_async_and_trusted_aot_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME realscript.phase28.net-async-and-trusted-aot
+        COMMAND realscript_phase28_net_async_and_trusted_aot_tests)
     if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
         target_compile_definitions(
             realscript_phase19_runtime_polymorphism_tests

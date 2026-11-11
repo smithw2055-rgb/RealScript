@@ -3,6 +3,7 @@
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
 #include "realscript/game/DeterministicMath.h"
+#include "realscript/runtime/AsyncRuntime.h"
 #include "realscript/runtime/Runtime.h"
 
 #include <algorithm>
@@ -25,6 +26,15 @@
 
 namespace realscript::game {
 
+template <typename T>
+struct TypedAwaitable {
+    runtime::AwaitableHandle handle{};
+
+    constexpr TypedAwaitable() noexcept = default;
+    constexpr explicit TypedAwaitable(runtime::AwaitableHandle h) noexcept
+        : handle(h) {}
+};
+
 namespace detail {
 
 enum class ScriptTypeCategory {
@@ -43,6 +53,7 @@ struct ScriptTypeRef {
     std::string sourceName;
     std::string moduleName;
     ScriptTypeCategory category = ScriptTypeCategory::Void;
+    std::set<std::string> extraImports = {};
 };
 
 struct ParameterDeclaration {
@@ -143,6 +154,14 @@ struct IsStdVector<std::vector<T, Alloc>> : std::true_type {
 };
 
 template <typename T>
+struct IsTypedAwaitable : std::false_type {};
+
+template <typename T>
+struct IsTypedAwaitable<TypedAwaitable<T>> : std::true_type {
+    using Element = T;
+};
+
+template <typename T>
 using RemoveCvRef = std::remove_cv_t<std::remove_reference_t<T>>;
 
 template <typename T>
@@ -225,6 +244,27 @@ std::optional<ScriptTypeRef> resolveScriptType(
         return ScriptTypeRef{"Vec3", "RealScript.Math", ScriptTypeCategory::Struct};
     } else if constexpr (std::is_same_v<ValueType, Quat>) {
         return ScriptTypeRef{"Quat", "RealScript.Math", ScriptTypeCategory::Struct};
+    } else if constexpr (std::is_same_v<ValueType, runtime::CancellationToken>) {
+        return ScriptTypeRef{"CancellationToken", "RealScript.Async", ScriptTypeCategory::Struct};
+    } else if constexpr (std::is_same_v<ValueType, runtime::AwaitableHandle>) {
+        return ScriptTypeRef{"Awaitable", "RealScript.Async", ScriptTypeCategory::Struct};
+    } else if constexpr (IsTypedAwaitable<ValueType>::value) {
+        using Element = typename IsTypedAwaitable<ValueType>::Element;
+        auto elemRef = resolveScriptType<Element>(state);
+        if (!elemRef || elemRef->category == ScriptTypeCategory::Void) {
+            return std::nullopt;
+        }
+        ScriptTypeRef out{
+            "Awaitable<" + elemRef->sourceName + ">",
+            "RealScript.Async",
+            ScriptTypeCategory::Struct};
+        if (!elemRef->moduleName.empty()) {
+            out.extraImports.insert(elemRef->moduleName);
+        }
+        for (const auto& imp : elemRef->extraImports) {
+            out.extraImports.insert(imp);
+        }
+        return out;
     } else if constexpr (IsSharedPtr<ValueType>::value) {
         using Element = typename IsSharedPtr<ValueType>::Element;
         const auto found = state->nativeTypeByCppType.find(std::type_index(typeid(Element)));

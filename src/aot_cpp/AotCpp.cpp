@@ -848,10 +848,14 @@ bool supportsTypedPrimitiveAot(
     if (!function.exceptionHandlers.empty()) {
         return false;
     }
-    if (!function.blocks.empty() &&
+    const bool isAsyncFunction = !function.blocks.empty() &&
         !function.blocks.front().instructions.empty() &&
-        function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter) {
-        return false;
+        function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
+    if (isAsyncFunction) {
+        if (function.returnType != semantic::PrimitiveType::Struct ||
+            customStructs.find(function.returnTypeId) == customStructs.end()) {
+            return false;
+        }
     }
     if (function.returnType != semantic::PrimitiveType::Void &&
         !isTypedAotSlot({function.returnType, function.returnTypeId}, &customStructs)) {
@@ -1046,6 +1050,60 @@ bool supportsTypedPrimitiveAot(
                 }
                 break;
             }
+            case mir::Opcode::AsyncEnter:
+                if (!isAsyncFunction) return false;
+                break;
+            case mir::Opcode::AwaitSuspend: {
+                if (!isAsyncFunction ||
+                    instruction.operands.size() != 1 ||
+                    instruction.localIndex >= function.localTypes.size()) {
+                    return false;
+                }
+                const auto opSlot = operandSlot(instruction, 0);
+                const auto locTid = instruction.localIndex < function.localTypeIds.size()
+                    ? function.localTypeIds[instruction.localIndex]
+                    : 0;
+                if (opSlot.primitive != semantic::PrimitiveType::Struct ||
+                    customStructs.find(opSlot.typeId) == customStructs.end() ||
+                    function.localTypes[instruction.localIndex] != semantic::PrimitiveType::Struct ||
+                    locTid != opSlot.typeId) {
+                    return false;
+                }
+                break;
+            }
+            case mir::Opcode::AwaitResume: {
+                if (!isAsyncFunction ||
+                    instruction.localIndex >= function.localTypes.size() ||
+                    function.localTypes[instruction.localIndex] != semantic::PrimitiveType::Struct) {
+                    return false;
+                }
+                const auto locTid = instruction.localIndex < function.localTypeIds.size()
+                    ? function.localTypeIds[instruction.localIndex]
+                    : 0;
+                if (customStructs.find(locTid) == customStructs.end()) {
+                    return false;
+                }
+                if (instruction.result >= 0 &&
+                    instruction.elementType != semantic::PrimitiveType::Void &&
+                    !isTypedAotSlot({instruction.elementType, instruction.elementTypeId}, &customStructs)) {
+                    return false;
+                }
+                break;
+            }
+            case mir::Opcode::AsyncResolve: {
+                if (!isAsyncFunction ||
+                    instruction.result < 0 ||
+                    instruction.resultType != semantic::PrimitiveType::Struct ||
+                    customStructs.find(instruction.typeId) == customStructs.end() ||
+                    instruction.operands.size() > 1) {
+                    return false;
+                }
+                if (instruction.operands.size() == 1 &&
+                    !isTypedAotSlot(operandSlot(instruction, 0), &customStructs)) {
+                    return false;
+                }
+                break;
+            }
             case mir::Opcode::Call: {
                 if (instruction.virtualDispatch && instruction.interfaceDispatch) {
                     return false;
@@ -1055,8 +1113,10 @@ bool supportsTypedPrimitiveAot(
                     symName.rfind("$intrinsic::static_get::ecs_col::", 0) == 0 ||
                     symName.rfind("$intrinsic::static_get::ecs_ent::", 0) == 0 ||
                     symName.rfind("$intrinsic::ecs_writeback::", 0) == 0;
-                bool hasPolyOrLoopInFn = function.blocks.size() > 1;
-                if (!hasPolyOrLoopInFn && usesReferenceSlots && !isEcsIntrinsic) {
+                const bool isAsyncIntrinsic =
+                    symName.rfind("$intrinsic::Async.__", 0) == 0;
+                bool hasPolyOrLoopInFn = function.blocks.size() > 1 || isAsyncFunction;
+                if (!hasPolyOrLoopInFn && usesReferenceSlots && !isEcsIntrinsic && !isAsyncIntrinsic) {
                     for (const auto& scanBlk : function.blocks) {
                         for (const auto& scanInst : scanBlk.instructions) {
                             if (scanInst.opcode == mir::Opcode::IsType ||
@@ -1079,7 +1139,8 @@ bool supportsTypedPrimitiveAot(
                 }
                 if (!symName.empty() &&
                     symName.rfind("$intrinsic::", 0) == 0 &&
-                    !isEcsIntrinsic) {
+                    !isEcsIntrinsic &&
+                    !isAsyncIntrinsic) {
                     return false;
                 }
                 if (instruction.resultType != semantic::PrimitiveType::Void &&
@@ -1423,6 +1484,9 @@ bool typedInstructionCanFail(
     case mir::Opcode::CombineDelegate:
     case mir::Opcode::RemoveDelegate:
     case mir::Opcode::InvokeDelegate:
+    case mir::Opcode::AwaitSuspend:
+    case mir::Opcode::AwaitResume:
+    case mir::Opcode::AsyncResolve:
         return true;
     case mir::Opcode::AddInt:
     case mir::Opcode::SubtractInt:
@@ -2251,10 +2315,14 @@ void emitTypedPrimitiveFunction(
     source.line("        return context.fail(code, message, typedActiveGenLine);");
     source.line("    };");
     source.line("    (void)typedFail;");
+    const bool isAsyncFunction = !function.blocks.empty() &&
+        !function.blocks.front().instructions.empty() &&
+        function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
     std::vector<std::size_t> localStoreCounts(function.localTypes.size(), 0);
     for (const auto& blk : function.blocks) {
         for (const auto& inst : blk.instructions) {
-            if (inst.opcode == mir::Opcode::StoreLocal &&
+            if ((inst.opcode == mir::Opcode::StoreLocal ||
+                 inst.opcode == mir::Opcode::AwaitSuspend) &&
                 inst.localIndex < localStoreCounts.size()) {
                 ++localStoreCounts[inst.localIndex];
             }
@@ -2335,6 +2403,226 @@ void emitTypedPrimitiveFunction(
             }
         }
     }
+    struct CoroSavedField {
+        std::string cppType;
+        std::string exprName;
+        std::string memberName;
+        std::size_t guardSlot = std::numeric_limits<std::size_t>::max();
+        std::size_t arrayLocalIndex = std::numeric_limits<std::size_t>::max();
+    };
+    std::vector<CoroSavedField> podCoroFields;
+    std::vector<CoroSavedField> refCoroFields;
+    std::vector<std::uint32_t> asyncResumeBlockIds;
+    if (isAsyncFunction) {
+        std::set<std::uint32_t> resumeBlockSet;
+        std::vector<std::int64_t> defBlock(types.size(), -1);
+        std::vector<std::size_t> defInstIdx(types.size(), 0);
+        std::vector<bool> regLiveAcrossSuspend(types.size(), false);
+        for (const auto& blk : function.blocks) {
+            for (const auto& bp : blk.parameters) {
+                if (bp.value >= 0 && static_cast<std::size_t>(bp.value) < types.size()) {
+                    regLiveAcrossSuspend[static_cast<std::size_t>(bp.value)] = true;
+                }
+            }
+            for (std::size_t iIdx = 0; iIdx < blk.instructions.size(); ++iIdx) {
+                const auto& inst = blk.instructions[iIdx];
+                if (inst.opcode == mir::Opcode::AwaitSuspend) {
+                    resumeBlockSet.insert(static_cast<std::uint32_t>(inst.integerImmediate));
+                }
+                if (inst.result >= 0 && static_cast<std::size_t>(inst.result) < types.size()) {
+                    defBlock[static_cast<std::size_t>(inst.result)] = static_cast<std::int64_t>(blk.id);
+                    defInstIdx[static_cast<std::size_t>(inst.result)] = iIdx;
+                }
+            }
+        }
+        for (const auto& blk : function.blocks) {
+            std::vector<std::size_t> suspendPositions;
+            for (std::size_t iIdx = 0; iIdx < blk.instructions.size(); ++iIdx) {
+                if (blk.instructions[iIdx].opcode == mir::Opcode::AwaitSuspend) {
+                    suspendPositions.push_back(iIdx);
+                }
+            }
+            auto checkUse = [&](mir::ValueId vid, std::size_t usePos) {
+                if (vid < 0 || static_cast<std::size_t>(vid) >= types.size()) return;
+                const auto idx = static_cast<std::size_t>(vid);
+                if (defBlock[idx] != static_cast<std::int64_t>(blk.id)) {
+                    regLiveAcrossSuspend[idx] = true;
+                    return;
+                }
+                for (const auto sp : suspendPositions) {
+                    if (defInstIdx[idx] < sp && usePos > sp) {
+                        regLiveAcrossSuspend[idx] = true;
+                        return;
+                    }
+                }
+            };
+            for (std::size_t iIdx = 0; iIdx < blk.instructions.size(); ++iIdx) {
+                for (const auto op : blk.instructions[iIdx].operands) {
+                    checkUse(op, iIdx);
+                }
+            }
+            const std::size_t termPos = blk.instructions.size();
+            checkUse(blk.terminator.value, termPos);
+            checkUse(blk.terminator.condition, termPos);
+            for (const auto arg : blk.terminator.arguments) checkUse(arg, termPos);
+            for (const auto arg : blk.terminator.falseArguments) checkUse(arg, termPos);
+        }
+        asyncResumeBlockIds.assign(resumeBlockSet.begin(), resumeBlockSet.end());
+
+        auto addSlotField = [&](
+            TypedSlotType slot,
+            const std::string& expr,
+            const std::string& member,
+            std::size_t guardSlot = std::numeric_limits<std::size_t>::max(),
+            std::size_t arrayLocIdx = std::numeric_limits<std::size_t>::max()) {
+            if (slot.primitive == semantic::PrimitiveType::Void ||
+                slot.primitive == semantic::PrimitiveType::Error) {
+                return;
+            }
+            const bool isRef =
+                slot.primitive == semantic::PrimitiveType::Object ||
+                slot.primitive == semantic::PrimitiveType::Array ||
+                slot.primitive == semantic::PrimitiveType::Null;
+            if (isRef) {
+                refCoroFields.push_back({
+                    typedCppType(slot),
+                    expr,
+                    member,
+                    guardSlot,
+                    arrayLocIdx,
+                });
+            } else {
+                podCoroFields.push_back({
+                    typedCppType(slot),
+                    expr,
+                    member,
+                });
+            }
+        };
+
+        for (std::size_t pIdx = 0; pIdx < function.parameterTypes.size(); ++pIdx) {
+            const auto tid = pIdx < function.parameterTypeIds.size() ? function.parameterTypeIds[pIdx] : 0;
+            addSlotField(
+                {function.parameterTypes[pIdx], tid},
+                "typedArg_" + std::to_string(pIdx),
+                "arg_" + std::to_string(pIdx),
+                paramGuardSlot[pIdx]);
+        }
+        for (std::size_t lIdx = 0; lIdx < function.localTypes.size(); ++lIdx) {
+            const auto tid = lIdx < function.localTypeIds.size() ? function.localTypeIds[lIdx] : 0;
+            const auto arrLocIdx = function.localTypes[lIdx] == semantic::PrimitiveType::Array
+                ? lIdx
+                : std::numeric_limits<std::size_t>::max();
+            addSlotField(
+                {function.localTypes[lIdx], tid},
+                typedLocalExpression(lIdx),
+                "loc_" + std::to_string(lIdx),
+                localGuardSlot[lIdx],
+                arrLocIdx);
+        }
+        for (std::size_t rIdx = 0; rIdx < types.size(); ++rIdx) {
+            if (!regLiveAcrossSuspend[rIdx]) continue;
+            addSlotField(
+                types[rIdx],
+                typedValueExpression(static_cast<mir::ValueId>(rIdx)),
+                "reg_" + std::to_string(rIdx),
+                regGuardSlot[rIdx]);
+        }
+
+        source.line("    struct ScalarCoroPodState {");
+        if (podCoroFields.empty()) {
+            source.line("        std::uint8_t _empty = 0;");
+        } else {
+            for (const auto& f : podCoroFields) {
+                source.line("        " + f.cppType + " " + f.memberName + "{};");
+            }
+        }
+        source.line("    };");
+        source.line("    static_assert(std::is_trivially_copyable_v<ScalarCoroPodState>, "
+                    "\"ScalarCoroPodState must be trivially copyable\");");
+        source.line("    runtime::CoroutineFrameHandle activeCoroutine{};");
+        source.line("    (void)activeCoroutine;");
+        if (!asyncResumeBlockIds.empty()) {
+            source.line("    {");
+            source.line("        std::uint32_t resumeBlockId = 0;");
+            source.line("        ScalarCoroPodState restoredPod{};");
+            if (!refCoroFields.empty()) {
+                source.line("        std::array<runtime::Value, " +
+                    std::to_string(refCoroFields.size()) + "> restoredRefs{};");
+            }
+            const std::string refPtrExpr = refCoroFields.empty()
+                ? std::string("nullptr")
+                : std::string("restoredRefs.data()");
+            source.line("        if (RS_AOT_UNLIKELY(context.enterResumingScalarCoroutine(0x" +
+                hexId(function.symbolId) + "ULL, &restoredPod, sizeof(ScalarCoroPodState), " +
+                refPtrExpr + ", " + std::to_string(refCoroFields.size()) +
+                "u, resumeBlockId, activeCoroutine))) {");
+            for (const auto& f : podCoroFields) {
+                source.line("            " + f.exprName + " = restoredPod." + f.memberName + ";");
+            }
+            for (std::size_t rfIdx = 0; rfIdx < refCoroFields.size(); ++rfIdx) {
+                source.line("            " + refCoroFields[rfIdx].exprName +
+                    " = restoredRefs[" + std::to_string(rfIdx) + "];");
+            }
+            bool anyHeapRefField = false;
+            for (const auto& rf : refCoroFields) {
+                if (rf.guardSlot != std::numeric_limits<std::size_t>::max()) {
+                    anyHeapRefField = true;
+                    break;
+                }
+            }
+            if (anyHeapRefField) {
+                source.line("            if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
+                source.line("                if (auto* rawH = context.rawHeap()) {");
+                for (const auto& rf : refCoroFields) {
+                    if (rf.guardSlot == std::numeric_limits<std::size_t>::max()) continue;
+                    source.line("                    aot::retainTypedGcSlot(rawH, typedLocalGcGuards[" +
+                        std::to_string(rf.guardSlot) + "], " + rf.exprName + ");");
+                }
+                source.line("                }");
+                source.line("            }");
+            }
+            for (const auto& rf : refCoroFields) {
+                if (rf.arrayLocalIndex == std::numeric_limits<std::size_t>::max()) continue;
+                const auto lIdx = rf.arrayLocalIndex;
+                const auto elemTypeIt = arrayLocalStructElemType.find(lIdx);
+                if (elemTypeIt != arrayLocalStructElemType.end()) {
+                    const std::string structName = "AotStruct_" + hexId(elemTypeIt->second);
+                    source.line("            typedLocalRawCol_" + std::to_string(lIdx) +
+                        " = context.acquireRawColumnCache(" + typedLocalExpression(lIdx) +
+                        ", 0x" + hexId(elemTypeIt->second) + "ULL, sizeof(" +
+                        structName + "), " + structName + "_layout, " +
+                        structName + "::kFieldCount);");
+                } else {
+                    source.line("            typedLocalRawCol_" + std::to_string(lIdx) +
+                        " = context.acquireRawColumnCache(" + typedLocalExpression(lIdx) + ");");
+                }
+            }
+            source.line("            switch (resumeBlockId) {");
+            for (const auto rbId : asyncResumeBlockIds) {
+                source.line("            case " + std::to_string(rbId) +
+                    "u: goto typedBlock_" + std::to_string(rbId) + ";");
+            }
+            source.line("            default: return typedFail(runtime::ErrorCode::InvalidProgram, "
+                        "\"AOT scalar coroutine resume block is invalid\");");
+            source.line("            }");
+            source.line("        }");
+            source.line("    }");
+        }
+    }
+    const auto emitScalarCallFailureReturn = [&](const std::string& indent, const std::string& okVar) {
+        if (isAsyncFunction) {
+            source.line(indent + "if (!" + okVar + ") {");
+            source.line(indent + "    if (context.hasPendingException()) {");
+            source.line(indent + "        return context.finishUncaughtAsyncExceptionScalar(activeCoroutine, 0x" +
+                hexId(function.returnTypeId) + "ULL, typedOutResult.f_0);");
+            source.line(indent + "    }");
+            source.line(indent + "    return false;");
+            source.line(indent + "}");
+        } else {
+            source.line(indent + "if (!" + okVar + ") return false;");
+        }
+    };
     source.line("    goto typedBlock_0;");
 
     const auto vectorizedEcsLoops =
@@ -3156,7 +3444,7 @@ void emitTypedPrimitiveFunction(
                     source.line("                rawAccounting.resumeAfterCall();");
                     source.line("                determinismAccounting.resumeAfterCall();");
                     source.line("            }");
-                    source.line("            if (!polyCallOk_" + suffix + ") return false;");
+                    emitScalarCallFailureReturn("            ", "polyCallOk_" + suffix);
                     if (instruction.result >= 0 &&
                         instruction.resultType != semantic::PrimitiveType::Void) {
                         source.line("            " + result + " = polyCallRes_" + suffix + ";");
@@ -3210,7 +3498,7 @@ void emitTypedPrimitiveFunction(
                     source.line("                rawAccounting.resumeAfterCall();");
                     source.line("                determinismAccounting.resumeAfterCall();");
                     source.line("            }");
-                    source.line("            if (!directCallOk_" + suffix + ") return false;");
+                    emitScalarCallFailureReturn("            ", "directCallOk_" + suffix);
                     if (instruction.result >= 0 &&
                         instruction.resultType != semantic::PrimitiveType::Void) {
                         source.line("            " + result + " = directCallRes_" + suffix + ";");
@@ -3291,9 +3579,65 @@ void emitTypedPrimitiveFunction(
                             emitRetainRegResult();
                         }
                     } else {
+                        std::string fastAsyncExpr;
+                        if (symName.rfind("$intrinsic::Async.__", 0) == 0 && instruction.result >= 0) {
+                            const auto asyncOp = symName.substr(std::string_view("$intrinsic::Async.__").size());
+                            if (asyncOp == "CompletedVoid" && instruction.operands.empty()) {
+                                fastAsyncExpr = "(" + result + " = static_cast<std::int64_t>(runtime::AwaitableHandle::completedVoid().pack64()), true)";
+                            } else if (asyncOp == "TokenPreCanceled" && instruction.operands.empty()) {
+                                fastAsyncExpr = "(" + result + " = static_cast<std::int64_t>(runtime::CancellationToken::preCanceled().pack64()), true)";
+                            } else if (asyncOp == "FromCanceled" && instruction.operands.empty()) {
+                                fastAsyncExpr = "context.asyncIntrinsicFromCanceledFast(" + result + ")";
+                            } else if (asyncOp == "Yield" && instruction.operands.size() == 1) {
+                                fastAsyncExpr = "context.asyncIntrinsicYieldFast(" + operand(0) + ", " + result + ")";
+                            } else if (asyncOp == "NewPending" && instruction.operands.size() == 1) {
+                                fastAsyncExpr = "context.asyncIntrinsicNewPendingFast(" + operand(0) + ", " + result + ")";
+                            } else if (asyncOp == "CompleteVoid" && instruction.operands.size() == 1) {
+                                fastAsyncExpr = "context.asyncIntrinsicCompleteVoidFast(" + operand(0) + ", " + result + ")";
+                            } else if (asyncOp == "CompleteInt" && instruction.operands.size() == 2) {
+                                fastAsyncExpr = "context.asyncIntrinsicCompleteIntFast(" + operand(0) + ", " + operand(1) + ", " + result + ")";
+                            } else if (asyncOp == "CompleteCancel" && instruction.operands.size() == 1) {
+                                fastAsyncExpr = "context.asyncIntrinsicCompleteCancelFast(" + operand(0) + ", " + result + ")";
+                            } else if (asyncOp == "IsCompleted" && instruction.operands.size() == 1) {
+                                fastAsyncExpr = "context.asyncIntrinsicIsCompletedFast(" + operand(0) + ", " + result + ")";
+                            } else if (asyncOp == "CtsCreate" && instruction.operands.empty()) {
+                                fastAsyncExpr = "context.asyncIntrinsicCtsCreateFast(" + result + ")";
+                            } else if (asyncOp == "CtsCreateLinked" && instruction.operands.size() == 1) {
+                                fastAsyncExpr = "context.asyncIntrinsicCtsCreateLinkedFast(" + operand(0) + ", " + result + ")";
+                            } else if (asyncOp == "CtsCreateLinked2" && instruction.operands.size() == 2) {
+                                fastAsyncExpr = "context.asyncIntrinsicCtsCreateLinked2Fast(" + operand(0) + ", " + operand(1) + ", " + result + ")";
+                            } else if (asyncOp == "CtsCreateTimeout" && instruction.operands.size() == 1) {
+                                fastAsyncExpr = "context.asyncIntrinsicCtsCreateTimeoutFast(" + operand(0) + ", " + result + ")";
+                            } else if (asyncOp == "CtsCreateLinkedTimeout" && instruction.operands.size() == 2) {
+                                fastAsyncExpr = "context.asyncIntrinsicCtsCreateLinkedTimeoutFast(" + operand(0) + ", " + operand(1) + ", " + result + ")";
+                            } else if (asyncOp == "CtsToken" && instruction.operands.size() == 1) {
+                                fastAsyncExpr = "context.asyncIntrinsicCtsTokenFast(" + operand(0) + ", " + result + ")";
+                            } else if (asyncOp == "CtsCancel" && instruction.operands.size() == 1) {
+                                fastAsyncExpr = "context.asyncIntrinsicCtsCancelFast(" + operand(0) + ", " + result + ")";
+                            } else if (asyncOp == "CtsRelease" && instruction.operands.size() == 1) {
+                                fastAsyncExpr = "context.asyncIntrinsicCtsReleaseFast(" + operand(0) + ", " + result + ")";
+                            } else if (asyncOp == "TokenIsCanceled" && instruction.operands.size() == 1) {
+                                fastAsyncExpr = "context.asyncIntrinsicTokenIsCanceledFast(" + operand(0) + ", " + result + ")";
+                            } else if (asyncOp == "TokenIsTimedOut" && instruction.operands.size() == 1) {
+                                fastAsyncExpr = "context.asyncIntrinsicTokenIsTimedOutFast(" + operand(0) + ", " + result + ")";
+                            } else if (asyncOp == "AdvanceTimeouts" && instruction.operands.size() == 1) {
+                                fastAsyncExpr = "context.asyncIntrinsicAdvanceTimeoutsFast(" + operand(0) + ", " + result + ")";
+                            } else if (asyncOp == "StepUpdate" && instruction.operands.size() == 1) {
+                                fastAsyncExpr = "context.asyncIntrinsicStepUpdateFast(" + operand(0) + ", " + result + ")";
+                            } else if (asyncOp == "ReadyUpdateCount" && instruction.operands.empty()) {
+                                fastAsyncExpr = "context.asyncIntrinsicReadyUpdateCountFast(" + result + ")";
+                            }
+                        }
+                        if (!fastAsyncExpr.empty()) {
+                            source.line("            if constexpr (TrustedRelease) {");
+                            source.line("                const bool fastIntrOk_" + suffix + " = " + fastAsyncExpr + ";");
+                            emitScalarCallFailureReturn("                ", "fastIntrOk_" + suffix);
+                            source.line("            } else {");
+                        }
+                        const std::string brIndent = fastAsyncExpr.empty() ? "            " : "                ";
                         std::string argPtr = "nullptr";
                         if (!instruction.operands.empty()) {
-                            source.line("            std::array<runtime::Value, " +
+                            source.line(brIndent + "std::array<runtime::Value, " +
                                 std::to_string(instruction.operands.size()) +
                                 "> bridgeArgs_" + suffix + "{{");
                             for (std::size_t argIndex = 0; argIndex < instruction.operands.size(); ++argIndex) {
@@ -3302,36 +3646,39 @@ void emitTypedPrimitiveFunction(
                                                       argSlot.primitive == semantic::PrimitiveType::Null)
                                     ? instruction.parameterTypes[argIndex]
                                     : argSlot.primitive;
-                                source.line("                aot::typedBoxScalar(" +
+                                source.line(brIndent + "    aot::typedBoxScalar(" +
                                     primitiveExpression(boxPrim) + ", " +
                                     callOperandExpr(argIndex) + "),");
                             }
-                            source.line("            }};");
+                            source.line(brIndent + "}};");
                             argPtr = "bridgeArgs_" + suffix + ".data()";
                         }
-                        source.line("            context.setActiveGeneratedLine(typedActiveGenLine);");
-                        source.line("            runtime::Value bridgeRes_" + suffix + ";");
-                        source.line("            const bool bridgeOk_" + suffix +
+                        source.line(brIndent + "context.setActiveGeneratedLine(typedActiveGenLine);");
+                        source.line(brIndent + "runtime::Value bridgeRes_" + suffix + ";");
+                        source.line(brIndent + "const bool bridgeOk_" + suffix +
                             " = context.call(call_" + std::to_string(callId) +
                             "_signature, " + argPtr + ", " +
                             std::to_string(instruction.operands.size()) +
                             "u, bridgeRes_" + suffix + ");");
-                        source.line("            if constexpr (!TrustedRelease) {");
-                        source.line("                rawAccounting.resumeAfterCall();");
-                        source.line("                determinismAccounting.resumeAfterCall();");
-                        source.line("            }");
-                        source.line("            if (!bridgeOk_" + suffix + ") return false;");
+                        source.line(brIndent + "if constexpr (!TrustedRelease) {");
+                        source.line(brIndent + "    rawAccounting.resumeAfterCall();");
+                        source.line(brIndent + "    determinismAccounting.resumeAfterCall();");
+                        source.line(brIndent + "}");
+                        emitScalarCallFailureReturn(brIndent, "bridgeOk_" + suffix);
                         if (instruction.result >= 0 &&
                             instruction.resultType != semantic::PrimitiveType::Void) {
-                            source.line("            if (!aot::typedUnboxScalar(" +
+                            source.line(brIndent + "if (!aot::typedUnboxScalar(" +
                                 primitiveExpression(instruction.resultType) +
                                 ", bridgeRes_" + suffix + ", " + result +
                                 ")) return typedFail(runtime::ErrorCode::TypeMismatch, "
                                 "\"AOT call return type mismatch\");");
                             if (instruction.resultType == semantic::PrimitiveType::Array ||
                                 instruction.resultType == semantic::PrimitiveType::Object) {
-                                emitRetainRegResult();
+                                emitRetainRegResult(brIndent);
                             }
+                        }
+                        if (!fastAsyncExpr.empty()) {
+                            source.line("            }");
                         }
                     }
                 }
@@ -3628,13 +3975,140 @@ void emitTypedPrimitiveFunction(
                 source.line("                rawAccounting.resumeAfterCall();");
                 source.line("                determinismAccounting.resumeAfterCall();");
                 source.line("            }");
-                source.line("            if (!delCallOk_" + suffix + ") return false;");
+                emitScalarCallFailureReturn("            ", "delCallOk_" + suffix);
                 if (instruction.result >= 0 &&
                     instruction.resultType != semantic::PrimitiveType::Void) {
                     source.line("            " + result + " = delCallRes_" + suffix + ";");
                     if (instruction.resultType == semantic::PrimitiveType::Array ||
                         instruction.resultType == semantic::PrimitiveType::Object) {
                         emitRetainRegResult();
+                    }
+                }
+                break;
+            }
+            case mir::Opcode::AsyncEnter:
+                break;
+            case mir::Opcode::AwaitSuspend: {
+                const auto awaitLocExpr = typedLocalExpression(instruction.localIndex);
+                source.line("            " + awaitLocExpr + " = " + operand(0) + ";");
+                source.line("            if (!context.canSkipAwaitSuspendFast(" + awaitLocExpr + ".f_0)) {");
+                source.line("                ScalarCoroPodState savedPod{};");
+                for (const auto& f : podCoroFields) {
+                    source.line("                savedPod." + f.memberName + " = " + f.exprName + ";");
+                }
+                std::string savedRefPtr = "nullptr";
+                if (!refCoroFields.empty()) {
+                    source.line("                std::array<runtime::Value, " +
+                        std::to_string(refCoroFields.size()) + "> savedRefs{{");
+                    for (const auto& rf : refCoroFields) {
+                        source.line("                    " + rf.exprName + ",");
+                    }
+                    source.line("                }};");
+                    savedRefPtr = "savedRefs.data()";
+                }
+                source.line("                if constexpr (!TrustedRelease) context.setActiveGeneratedLine(typedActiveGenLine);");
+                source.line("                bool suspendedNow = false;");
+                source.line("                std::int64_t packedCoroResult = 0;");
+                source.line("                if (!context.awaitSuspendScalar(0x" +
+                    hexId(function.symbolId) + "ULL, 0x" +
+                    hexId(function.returnTypeId) + "ULL, " +
+                    awaitLocExpr + ".f_0, " +
+                    std::to_string(instruction.integerImmediate) +
+                    "u, &savedPod, sizeof(ScalarCoroPodState), " +
+                    savedRefPtr + ", " + std::to_string(refCoroFields.size()) +
+                    "u, activeCoroutine, suspendedNow, packedCoroResult)) return false;");
+                source.line("                if (suspendedNow) {");
+                source.line("                    typedOutResult.f_0 = packedCoroResult;");
+                source.line("                    return true;");
+                source.line("                }");
+                source.line("            }");
+                break;
+            }
+            case mir::Opcode::AwaitResume: {
+                const auto awaitLocExpr = typedLocalExpression(instruction.localIndex);
+                source.line("            if constexpr (!TrustedRelease) context.setActiveGeneratedLine(typedActiveGenLine);");
+                if (instruction.result < 0 ||
+                    instruction.elementType == semantic::PrimitiveType::Void) {
+                    source.line("            if (!context.awaitResumeVoidScalar(" + awaitLocExpr + ".f_0)) {");
+                    source.line("                if (context.hasPendingException()) {");
+                    source.line("                    return context.finishUncaughtAsyncExceptionScalar(activeCoroutine, 0x" +
+                        hexId(function.returnTypeId) + "ULL, typedOutResult.f_0);");
+                    source.line("                }");
+                    source.line("                return false;");
+                    source.line("            }");
+                } else if (instruction.elementType == semantic::PrimitiveType::Int ||
+                           instruction.elementType == semantic::PrimitiveType::Long) {
+                    source.line("            if (!context.awaitResumeInt64Scalar(" + awaitLocExpr + ".f_0, " +
+                        primitiveExpression(instruction.elementType) + ", " + result + ")) {");
+                    source.line("                if (context.hasPendingException()) {");
+                    source.line("                    return context.finishUncaughtAsyncExceptionScalar(activeCoroutine, 0x" +
+                        hexId(function.returnTypeId) + "ULL, typedOutResult.f_0);");
+                    source.line("                }");
+                    source.line("                return false;");
+                    source.line("            }");
+                } else if (instruction.elementType == semantic::PrimitiveType::Double) {
+                    source.line("            if (!context.awaitResumeDoubleScalar(" + awaitLocExpr + ".f_0, " + result + ")) {");
+                    source.line("                if (context.hasPendingException()) {");
+                    source.line("                    return context.finishUncaughtAsyncExceptionScalar(activeCoroutine, 0x" +
+                        hexId(function.returnTypeId) + "ULL, typedOutResult.f_0);");
+                    source.line("                }");
+                    source.line("                return false;");
+                    source.line("            }");
+                } else if (instruction.elementType == semantic::PrimitiveType::Bool) {
+                    source.line("            if (!context.awaitResumeBoolScalar(" + awaitLocExpr + ".f_0, " + result + ")) {");
+                    source.line("                if (context.hasPendingException()) {");
+                    source.line("                    return context.finishUncaughtAsyncExceptionScalar(activeCoroutine, 0x" +
+                        hexId(function.returnTypeId) + "ULL, typedOutResult.f_0);");
+                    source.line("                }");
+                    source.line("                return false;");
+                    source.line("            }");
+                } else {
+                    source.line("            {");
+                    source.line("                runtime::Value awaitedBoxedVal;");
+                    source.line("                if (!context.awaitResumeBoxedScalar(" + awaitLocExpr + ".f_0, " +
+                        primitiveExpression(instruction.elementType) + ", 0x" +
+                        hexId(instruction.elementTypeId) + "ULL, awaitedBoxedVal)) {");
+                    source.line("                    if (context.hasPendingException()) {");
+                    source.line("                        return context.finishUncaughtAsyncExceptionScalar(activeCoroutine, 0x" +
+                        hexId(function.returnTypeId) + "ULL, typedOutResult.f_0);");
+                    source.line("                    }");
+                    source.line("                    return false;");
+                    source.line("                }");
+                    source.line("                if (!aot::typedUnboxScalar(" +
+                        primitiveExpression(instruction.elementType) + ", awaitedBoxedVal, " + result + ")) {");
+                    source.line("                    return typedFail(runtime::ErrorCode::TypeMismatch, \"AOT await result type mismatch\");");
+                    source.line("                }");
+                    if (instruction.elementType == semantic::PrimitiveType::Array ||
+                        instruction.elementType == semantic::PrimitiveType::Object) {
+                        emitRetainRegResult("                ");
+                    }
+                    source.line("            }");
+                }
+                break;
+            }
+            case mir::Opcode::AsyncResolve: {
+                source.line("            if constexpr (!TrustedRelease) context.setActiveGeneratedLine(typedActiveGenLine);");
+                if (instruction.operands.empty()) {
+                    source.line("            if (!context.asyncResolveVoidScalar(activeCoroutine, " +
+                        result + ".f_0)) return false;");
+                } else {
+                    const auto payloadSlot = operandSlot(0);
+                    if (payloadSlot.primitive == semantic::PrimitiveType::Int) {
+                        source.line("            if (!context.asyncResolveIntScalar(activeCoroutine, " +
+                            operand(0) + ", false, " + result + ".f_0)) return false;");
+                    } else if (payloadSlot.primitive == semantic::PrimitiveType::Long) {
+                        source.line("            if (!context.asyncResolveIntScalar(activeCoroutine, " +
+                            operand(0) + ", true, " + result + ".f_0)) return false;");
+                    } else if (payloadSlot.primitive == semantic::PrimitiveType::Double) {
+                        source.line("            if (!context.asyncResolveDoubleScalar(activeCoroutine, " +
+                            operand(0) + ", " + result + ".f_0)) return false;");
+                    } else if (payloadSlot.primitive == semantic::PrimitiveType::Bool) {
+                        source.line("            if (!context.asyncResolveBoolScalar(activeCoroutine, " +
+                            operand(0) + ", " + result + ".f_0)) return false;");
+                    } else {
+                        source.line("            if (!context.asyncResolveBoxedScalar(activeCoroutine, aot::typedBoxScalar(" +
+                            primitiveExpression(payloadSlot.primitive) + ", " + operand(0) +
+                            "), " + result + ".f_0)) return false;");
                     }
                 }
                 break;
@@ -3767,8 +4241,17 @@ void emitTypedPrimitiveFunction(
     source.line("    (void)argumentCount;");
     source.line("    (void)result;");
     source.line("    std::conditional_t<!FastAccounting && !DeterminismAccounting && !TrustedRelease, std::vector<runtime::PersistentRoot>, aot::EmptyGcGuards> typedGcGuards;");
+    const bool guardResumeArgs = isAsyncFunction && !function.parameterTypes.empty();
+    if (guardResumeArgs) {
+        source.line("    const bool isResumingCoro = context.isResumingCoroutine(0x" +
+            hexId(function.symbolId) + "ULL);");
+    }
     source.line("    if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
-    source.line("        if (context.heap() != nullptr) {");
+    if (guardResumeArgs) {
+        source.line("        if (RS_AOT_LIKELY(!isResumingCoro) && context.heap() != nullptr) {");
+    } else {
+        source.line("        if (context.heap() != nullptr) {");
+    }
     source.line("            for (std::size_t idx = 0; idx < argumentCount; ++idx) {");
     source.line("                if (std::holds_alternative<runtime::ObjectRef>(arguments[idx])) {");
     source.line("                    typedGcGuards.push_back(context.heap()->retain(arguments[idx]));");
@@ -3783,15 +4266,31 @@ void emitTypedPrimitiveFunction(
         const TypedSlotType paramSlot{function.parameterTypes[index], typeId};
         const auto argName = "unboxedArg_" + std::to_string(index);
         source.line("    " + typedCppType(paramSlot) + " " + argName + "{};");
-        source.line("    if (" + std::to_string(index) +
-            "u >= argumentCount) return context.fail("
-            "runtime::ErrorCode::InvalidArguments, "
-            "\"AOT parameter index is invalid\");");
-        source.line("    if (!aot::typedUnboxScalar(" +
-            primitiveExpression(paramSlot.primitive) + ", arguments[" +
-            std::to_string(index) + "], " + argName +
-            ")) return context.fail(runtime::ErrorCode::TypeMismatch, "
-            "\"AOT parameter type mismatch\");");
+    }
+    if (!function.parameterTypes.empty()) {
+        if (guardResumeArgs) {
+            source.line("    if (RS_AOT_LIKELY(!isResumingCoro)) {");
+        }
+        const std::string pInd = guardResumeArgs ? "        " : "    ";
+        for (std::size_t index = 0; index < function.parameterTypes.size(); ++index) {
+            const auto typeId = index < function.parameterTypeIds.size()
+                ? function.parameterTypeIds[index]
+                : 0;
+            const TypedSlotType paramSlot{function.parameterTypes[index], typeId};
+            const auto argName = "unboxedArg_" + std::to_string(index);
+            source.line(pInd + "if (" + std::to_string(index) +
+                "u >= argumentCount) return context.fail("
+                "runtime::ErrorCode::InvalidArguments, "
+                "\"AOT parameter index is invalid\");");
+            source.line(pInd + "if (!aot::typedUnboxScalar(" +
+                primitiveExpression(paramSlot.primitive) + ", arguments[" +
+                std::to_string(index) + "], " + argName +
+                ")) return context.fail(runtime::ErrorCode::TypeMismatch, "
+                "\"AOT parameter type mismatch\");");
+        }
+        if (guardResumeArgs) {
+            source.line("    }");
+        }
     }
     std::string scalarCallArgs = "context";
     for (std::size_t index = 0; index < function.parameterTypes.size(); ++index) {
@@ -4380,6 +4879,10 @@ GeneratedProgram CppGenerator::generate(
 
     std::unordered_map<semantic::SymbolId, const FunctionView*> typedFunctions;
     for (const auto& view : functions) {
+        if (view.module->name == "RealScript.Async" &&
+            view.function->name.rfind("Async.__", 0) == 0) {
+            continue;
+        }
         if (supportsTypedPrimitiveAot(*view.function, unboxableCustomStructs)) {
             typedFunctions.emplace(view.function->symbolId, &view);
         }

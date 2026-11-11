@@ -91,6 +91,16 @@ public:
         return core_;
     }
 
+    void setAsyncRuntime(
+        std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime) noexcept {
+        asyncRuntime_ = std::move(asyncRuntime);
+    }
+    [[nodiscard]] std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime() const noexcept {
+        return asyncRuntime_;
+    }
+    [[nodiscard]] runtime::CancellationToken entityDestroyToken(EntityId entity);
+    bool destroyEntity(EntityId entity);
+
     [[nodiscard]] TimerId scheduleCall(
         SceneEntityId target,
         std::string callback,
@@ -158,6 +168,7 @@ private:
     void detachTimerFromSequences(TimerId timerId);
 
     DeterministicGameplayRuntime core_;
+    std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime_;
     ScriptPayloadId nextPayloadId_ = 1;
     SubscriptionId nextSubscriptionId_ = 1;
     SequenceId nextSequenceId_ = 1;

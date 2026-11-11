@@ -573,11 +573,31 @@ std::optional<GameplayValue> toGameplayValue(const runtime::Value& value) {
     return std::nullopt;
 }
 
+runtime::CancellationToken GameplayHost::entityDestroyToken(EntityId entity) {
+    if (!entity.valid() || !core_.entities().alive(entity) || !asyncRuntime_) {
+        return runtime::CancellationToken::preCanceled();
+    }
+    return asyncRuntime_->cancellations().getOrCreateEntityDestroyToken(
+        runtime::GenerationalEntityHandle{entity.index, entity.generation},
+        runtime::EntityDestroyDomain::GameplayCore);
+}
+
+bool GameplayHost::destroyEntity(EntityId entity) {
+    if (!entity.valid()) return false;
+    if (asyncRuntime_) {
+        (void)asyncRuntime_->cancellations().cancelEntity(
+            runtime::GenerationalEntityHandle{entity.index, entity.generation},
+            runtime::EntityDestroyDomain::GameplayCore);
+    }
+    return core_.entities().destroy(entity);
+}
+
 SceneGameplayDriver::SceneGameplayDriver(
     SceneScriptRuntime& scene,
     std::shared_ptr<GameplayHost> host)
     : scene_(scene), host_(std::move(host)) {
     if (host_) {
+        host_->setAsyncRuntime(scene_.asyncRuntime());
         auto h = host_;
         scene_.setSignalTopicPublisherCounted([h](const std::string& topic) -> std::size_t {
             const auto matched = h->subscriberCount(topic);
@@ -684,7 +704,7 @@ bool installGameplayBindings(
             : std::int64_t{0};
     }) && valid;
     valid = api.function(moduleName, "DestroyEntity", [host](std::int64_t value) {
-        return host->core().entities().destroy(
+        return host->destroyEntity(
             EntityId::fromPacked(static_cast<std::uint64_t>(value)));
     }) && valid;
     valid = api.function(moduleName, "IsEntityAlive", [host](std::int64_t value) {
