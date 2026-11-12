@@ -628,6 +628,7 @@ SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
     occurrences_.clear();
     visibleTypes_ = input.visibleTypes;
     hygienicAccessibleModules_ = input.hygienicAccessibleModules;
+    obsoleteSymbols_ = input.obsoleteSymbols;
     pendingFunctionBindings_.clear();
     pendingTypes_.clear();
 
@@ -758,6 +759,8 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     }
     currentDeterministicContext_ = input.symbol.deterministic ||
         (currentOwnerType_ && currentOwnerType_->deterministic);
+    currentFunctionIsSynthetic_ =
+        input.syntheticAutoGetter || input.syntheticAutoSetter;
 
     std::vector<std::unique_ptr<BoundStatement>>
         capturedParameterInitializers;
@@ -3927,14 +3930,74 @@ std::unique_ptr<BoundStatement> Binder::bindReturnStatement(
     return result;
 }
 
+namespace {
+
+bool patternHasVariables(const syntax::PatternSyntax& pattern) noexcept {
+    switch (pattern.kind()) {
+    case syntax::SyntaxKind::VarPattern:
+        return true;
+    case syntax::SyntaxKind::TypePattern:
+        return static_cast<const syntax::TypePatternSyntax&>(pattern).designationToken.has_value();
+    case syntax::SyntaxKind::PropertyPattern: {
+        const auto& pp = static_cast<const syntax::PropertyPatternSyntax&>(pattern);
+        if (pp.designationToken.has_value()) return true;
+        for (const auto& sub : pp.properties) {
+            if (sub.pattern && patternHasVariables(*sub.pattern)) return true;
+        }
+        return false;
+    }
+    case syntax::SyntaxKind::UnaryPattern: {
+        const auto& un = static_cast<const syntax::UnaryPatternSyntax&>(pattern);
+        return un.pattern && patternHasVariables(*un.pattern);
+    }
+    case syntax::SyntaxKind::BinaryPattern: {
+        const auto& bin = static_cast<const syntax::BinaryPatternSyntax&>(pattern);
+        return (bin.left && patternHasVariables(*bin.left)) ||
+            (bin.right && patternHasVariables(*bin.right));
+    }
+    case syntax::SyntaxKind::ParenthesizedPattern: {
+        const auto& paren = static_cast<const syntax::ParenthesizedPatternSyntax&>(pattern);
+        return paren.pattern && patternHasVariables(*paren.pattern);
+    }
+    default:
+        return false;
+    }
+}
+
+bool expressionHasPatternVariables(const syntax::ExpressionSyntax& expr) noexcept {
+    switch (expr.kind()) {
+    case syntax::SyntaxKind::TypeBinaryExpression: {
+        const auto& tb = static_cast<const syntax::TypeBinaryExpressionSyntax&>(expr);
+        if (tb.expression && expressionHasPatternVariables(*tb.expression)) return true;
+        if (tb.pattern) return patternHasVariables(*tb.pattern);
+        return tb.designationToken.has_value();
+    }
+    case syntax::SyntaxKind::ParenthesizedExpression: {
+        const auto& p = static_cast<const syntax::ParenthesizedExpressionSyntax&>(expr);
+        return p.expression && expressionHasPatternVariables(*p.expression);
+    }
+    case syntax::SyntaxKind::UnaryExpression: {
+        const auto& u = static_cast<const syntax::UnaryExpressionSyntax&>(expr);
+        return u.operand && expressionHasPatternVariables(*u.operand);
+    }
+    case syntax::SyntaxKind::BinaryExpression: {
+        const auto& b = static_cast<const syntax::BinaryExpressionSyntax&>(expr);
+        return (b.left && expressionHasPatternVariables(*b.left)) ||
+            (b.right && expressionHasPatternVariables(*b.right));
+    }
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
 std::unique_ptr<BoundStatement> Binder::bindIfStatement(
     const syntax::IfStatementSyntax& syntaxTree) {
     auto result = std::make_unique<BoundIfStatement>();
     result->span = syntaxTree.span();
     const bool patternScope = syntaxTree.condition &&
-        syntaxTree.condition->kind() == syntax::SyntaxKind::TypeBinaryExpression &&
-        static_cast<const syntax::TypeBinaryExpressionSyntax&>(
-            *syntaxTree.condition).designationToken.has_value();
+        expressionHasPatternVariables(*syntaxTree.condition);
     if (patternScope) pushScope(syntaxTree.span());
     result->condition = convertExpression(
         bindExpression(*syntaxTree.condition),
@@ -3942,10 +4005,10 @@ std::unique_ptr<BoundStatement> Binder::bindIfStatement(
         syntaxTree.condition->span(),
         "if condition");
     result->thenStatement = bindEmbeddedStatement(*syntaxTree.thenStatement);
-    if (patternScope) popScope();
     if (syntaxTree.elseStatement) {
         result->elseStatement = bindEmbeddedStatement(*syntaxTree.elseStatement);
     }
+    if (patternScope) popScope();
     return result;
 }
 
@@ -3954,9 +4017,7 @@ std::unique_ptr<BoundStatement> Binder::bindWhileStatement(
     auto result = std::make_unique<BoundWhileStatement>();
     result->span = syntaxTree.span();
     const bool patternScope = syntaxTree.condition &&
-        syntaxTree.condition->kind() == syntax::SyntaxKind::TypeBinaryExpression &&
-        static_cast<const syntax::TypeBinaryExpressionSyntax&>(
-            *syntaxTree.condition).designationToken.has_value();
+        expressionHasPatternVariables(*syntaxTree.condition);
     if (patternScope) pushScope(syntaxTree.span());
     result->condition = convertExpression(
         bindExpression(*syntaxTree.condition),
@@ -4505,10 +4566,19 @@ std::unique_ptr<BoundStatement> Binder::bindSwitchStatement(
     result->span = syntaxTree.span();
     result->expression = bindExpression(*syntaxTree.expression);
     pushScope(syntaxTree.span());
+    if (result->expression->type == PrimitiveType::Null) {
+        result->expression = convertExpression(
+            std::move(result->expression),
+            PrimitiveType::Object,
+            syntaxTree.expression->span(),
+            "switch expression");
+    }
     result->valueVariable.name =
         "$switch_value_" + std::to_string(nextVariableIndex_);
     result->valueVariable.type = result->expression->type;
     result->valueVariable.typeName = result->expression->typeName;
+    result->valueVariable.storageType = result->expression->type;
+    result->valueVariable.storageTypeName = result->expression->typeName;
     result->valueVariable.index = nextVariableIndex_++;
     result->valueVariable.id = stableTypeId(
         std::to_string(currentFunctionId_) +
@@ -4520,38 +4590,31 @@ std::unique_ptr<BoundStatement> Binder::bindSwitchStatement(
         BoundSwitchSection section;
         section.span = sourceSection.span();
         pushScope(sourceSection.span());
-        if (sourceSection.label) {
-            section.label = convertExpression(
-                bindExpression(*sourceSection.label), result->expression->type,
-                sourceSection.label->span(), "switch case",
-                result->expression->typeName);
+        PrimitiveType swInputType = result->expression->type;
+        std::string swInputTypeName = result->expression->typeName;
+        if (swInputType == PrimitiveType::Null) {
+            swInputType = PrimitiveType::Object;
+            swInputTypeName.clear();
+            result->valueVariable.type = PrimitiveType::Object;
+            result->valueVariable.typeName.clear();
+            result->expression = convertExpression(
+                std::move(result->expression),
+                PrimitiveType::Object,
+                syntaxTree.expression->span(),
+                "switch expression");
         }
-        if (sourceSection.patternType) {
-            section.patternType = bindType(
-                *sourceSection.patternType, false,
-                &section.patternTypeName);
-            section.patternTypeId = isExactType(section.patternType)
-                ? stableTypeId(section.patternTypeName)
-                : 0;
-            if (!isReferenceType(result->expression->type) ||
-                !isReferenceType(section.patternType)) {
-                diagnostics_.report(
-                    "RS8921", "switch type patterns require reference types",
-                    sourceSection.span());
-            }
-            if (sourceSection.patternDesignation) {
-                VariableSymbol variable;
-                variable.name = sourceSection.patternDesignation->text;
-                variable.type = section.patternType;
-                variable.typeName = section.patternTypeName;
-                variable.storageType = section.patternType;
-                variable.storageTypeName = section.patternTypeName;
-                variable.index = nextVariableIndex_++;
-                if (declareVariable(
-                        variable, sourceSection.patternDesignation->span)) {
-                    section.patternVariable = *lookupVariable(variable.name);
-                }
-            }
+        if (sourceSection.pattern) {
+            section.pattern = bindPattern(
+                *sourceSection.pattern,
+                swInputType,
+                swInputTypeName,
+                true,
+                true);
+        } else if (sourceSection.label) {
+            section.label = convertExpression(
+                bindExpression(*sourceSection.label), swInputType,
+                sourceSection.label->span(), "switch case",
+                swInputTypeName);
         }
         if (sourceSection.guard) {
             section.guard = convertExpression(
@@ -5496,6 +5559,11 @@ PrimitiveType Binder::bindType(
                     syntaxTree.span());
                 return PrimitiveType::Error;
             }
+            checkObsoleteReference(
+                found->second.id,
+                "type",
+                canonicalTypeName(found->second),
+                syntaxTree.span());
             if (found->second.id != 0 && !syntaxTree.name.span.empty()) {
                 SymbolOccurrence occ;
                 occ.id = found->second.id;
@@ -5610,6 +5678,37 @@ void Binder::popScope() {
     scopes_.pop_back();
     referenceAliasScopes_.pop_back();
     scopeSpans_.pop_back();
+}
+
+void Binder::checkObsoleteReference(
+    SymbolId symbolId,
+    std::string_view kindLabel,
+    const std::string& displayName,
+    text::TextSpan span) {
+    if (symbolId == 0 || currentFunctionIsSynthetic_) return;
+    if (currentFunctionId_ == symbolId) return;
+    if (currentOwnerType_ && currentOwnerType_->id == symbolId) return;
+    if (currentFunctionId_ != 0 &&
+        obsoleteSymbols_.find(currentFunctionId_) != obsoleteSymbols_.end()) {
+        return;
+    }
+    if (currentOwnerType_ &&
+        obsoleteSymbols_.find(currentOwnerType_->id) != obsoleteSymbols_.end()) {
+        return;
+    }
+    const auto it = obsoleteSymbols_.find(symbolId);
+    if (it == obsoleteSymbols_.end()) return;
+    std::string msg = "'" + displayName + "' (" + std::string(kindLabel) + ") is obsolete";
+    if (!it->second.message.empty()) {
+        msg += ": " + it->second.message;
+    }
+    diagnostics_.report(
+        it->second.isError ? "RS4102" : "RS4101",
+        std::move(msg),
+        span,
+        it->second.isError
+            ? diagnostics::DiagnosticSeverity::Error
+            : diagnostics::DiagnosticSeverity::Warning);
 }
 
 std::unique_ptr<BoundErrorExpression> Binder::makeError(

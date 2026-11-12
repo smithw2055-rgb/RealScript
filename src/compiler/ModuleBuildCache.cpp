@@ -1412,7 +1412,11 @@ std::string formatParameterSignature(
     const semantic::TypeSymbol* enclosingType,
     const semantic::TypeSymbolMap& visibleTypes) {
     std::ostringstream out;
+    if (!param.attributes.empty()) {
+        out << formatAttributesCanonical(param.attributes, source) << ' ';
+    }
     if (param.paramsKeyword) out << "params ";
+    if (param.thisKeyword) out << "this ";
     if (param.modifierToken) out << param.modifierToken->text << ' ';
     out << canonicalizeTypeSyntax(param.type, visibleTypes) << ' ' << param.identifierToken.text;
     if (param.defaultValue) {
@@ -1434,7 +1438,29 @@ std::string renderParameterForStub(
     const semantic::TypeSymbol* enclosingType,
     const semantic::TypeSymbolMap& visibleTypes) {
     std::ostringstream out;
+    for (const auto& list : param.attributes) {
+        if (list.attributes.empty()) continue;
+        out << '[';
+        for (std::size_t i = 0; i < list.attributes.size(); ++i) {
+            if (i != 0) out << ", ";
+            const auto& attr = list.attributes[i];
+            out << attr.nameToken.text;
+            if (attr.openParenToken) {
+                out << '(';
+                for (std::size_t j = 0; j < attr.arguments.size(); ++j) {
+                    if (j != 0) out << ", ";
+                    const auto& arg = attr.arguments[j];
+                    if (arg.nameToken) out << arg.nameToken->text << " = ";
+                    const auto sp = arg.valueSpan();
+                    if (!sp.empty()) out << source.view(sp);
+                }
+                out << ')';
+            }
+        }
+        out << "] ";
+    }
     if (param.paramsKeyword) out << "params ";
+    if (param.thisKeyword) out << "this ";
     if (param.modifierToken) out << param.modifierToken->text << ' ';
     out << renderTypeSyntaxForStub(param.type) << ' ' << param.identifierToken.text;
     if (param.defaultValue) {
@@ -2398,8 +2424,14 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                         stubBody << renderParameterForStub(
                             m.parameters[pi], *u.sourceText, nullptr, visibleTypes);
                     }
-                    sig << ");";
-                    stubBody << ");\n";
+                    if (m.hasBody()) {
+                        moduleHasPublicGenerics = true;
+                        sig << ')' << normalizedSpanTokens(u.tokens, m.body->span()) << ';';
+                        stubBody << ") " << u.sourceText->view(m.body->span()) << "\n";
+                    } else {
+                        sig << ");";
+                        stubBody << ");\n";
+                    }
                 }
                 sig << '}';
                 stubBody << "}\n\n";

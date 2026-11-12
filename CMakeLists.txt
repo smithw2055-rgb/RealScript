@@ -497,6 +497,9 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_p3_stage1_modular_build_and_abi_governance_tests
         realscript.p3.stage1-modular-build-and-abi-governance
         tests/p3_stage1_modular_build_and_abi_governance_tests.cpp)
+    target_compile_definitions(
+        realscript_p3_stage1_modular_build_and_abi_governance_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     realscript_add_cpp_test(
         realscript_p3_stage2_formatter_linter_and_fuzzer_tests
         realscript.p3.stage2-formatter-linter-and-fuzzer
@@ -504,9 +507,19 @@ if(REALSCRIPT_BUILD_TESTS)
     target_compile_definitions(
         realscript_p3_stage2_formatter_linter_and_fuzzer_tests
         PRIVATE REALSCRIPT_RSC_PATH="$<TARGET_FILE:rsc>")
-    target_compile_definitions(
-        realscript_p3_stage1_modular_build_and_abi_governance_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    realscript_add_cpp_test(
+        realscript_p3_stage3_language_extensibility_tests
+        realscript.p3.stage3-language-extensibility
+        tests/p3_stage3_language_extensibility_tests.cpp)
+    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
+        target_compile_definitions(
+            realscript_p3_stage3_language_extensibility_tests
+            PRIVATE
+                REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
+                REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
+                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/p3-stage3-jit-cache")
+    endif()
     realscript_add_cpp_test(
         realscript_p2_stage4_stencil_jit_tests
         realscript.p2.stage4-stencil-jit

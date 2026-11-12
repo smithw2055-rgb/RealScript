@@ -183,6 +183,16 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(InitializerElement);
         RS_KIND(NewObjectExpression);
         RS_KIND(NewArrayExpression);
+        RS_KIND(CharLiteralToken);
+        RS_KIND(ConstantPattern);
+        RS_KIND(DiscardPattern);
+        RS_KIND(VarPattern);
+        RS_KIND(TypePattern);
+        RS_KIND(RelationalPattern);
+        RS_KIND(UnaryPattern);
+        RS_KIND(BinaryPattern);
+        RS_KIND(PropertyPattern);
+        RS_KIND(ParenthesizedPattern);
 #undef RS_KIND
     }
     return "UnknownSyntaxKind";

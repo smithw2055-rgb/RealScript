@@ -1053,21 +1053,47 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         std::optional<std::size_t> defaultIndex;
         for (std::size_t i = 0; i < value.sections.size(); ++i) {
             sectionBlocks.push_back(createBlock());
-            if (!value.sections[i].label &&
+            if (!value.sections[i].pattern &&
+                !value.sections[i].label &&
                 value.sections[i].patternType ==
                     semantic::PrimitiveType::Error) {
                 defaultIndex = i;
             }
         }
+        bool checksExhausted = false;
         for (std::size_t i = 0; i < value.sections.size(); ++i) {
             const auto& section = value.sections[i];
-            if (!section.label &&
+            if (!section.pattern &&
+                !section.label &&
                 section.patternType == semantic::PrimitiveType::Error) continue;
+            if (!section.guard && section.pattern &&
+                (section.pattern->kind == semantic::BoundPatternKind::Discard ||
+                 section.pattern->kind == semantic::BoundPatternKind::Var)) {
+                if (section.pattern->kind == semantic::BoundPatternKind::Var &&
+                    section.pattern->variable) {
+                    const auto switchValue =
+                        emitLoadLocal(value.valueVariable, value.expression->span);
+                    emitStoreLocal(
+                        section.pattern->variable->index, switchValue, section.span);
+                }
+                emitJump(sectionBlocks[i], {}, section.span);
+                checksExhausted = true;
+                break;
+            }
             const auto nextCheck = createBlock();
-            const auto switchValue =
-                emitLoadLocal(value.valueVariable, value.expression->span);
             ValueId matched = -1;
-            if (section.patternType != semantic::PrimitiveType::Error) {
+            if (section.pattern) {
+                semantic::BoundTypeBinaryExpression synthTest;
+                synthTest.span = section.span;
+                synthTest.type = semantic::PrimitiveType::Bool;
+                synthTest.safeCast = false;
+                synthTest.patternInputVariable = value.valueVariable;
+                synthTest.inputAlreadyInVariable = true;
+                synthTest.borrowedPattern = section.pattern.get();
+                matched = lowerExpression(synthTest);
+            } else if (section.patternType != semantic::PrimitiveType::Error) {
+                const auto switchValue =
+                    emitLoadLocal(value.valueVariable, value.expression->span);
                 matched = emitValue(
                     Opcode::IsType, semantic::PrimitiveType::Bool,
                     {switchValue}, section.span);
@@ -1090,6 +1116,8 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                         section.patternVariable->index, cast, section.span);
                 }
             } else {
+                const auto switchValue =
+                    emitLoadLocal(value.valueVariable, value.expression->span);
                 const auto caseValue = lowerExpression(*section.label);
                 matched = emitValue(
                     Opcode::Equal, semantic::PrimitiveType::Bool,
@@ -1111,16 +1139,18 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
             }
             setCurrentBlock(nextCheck);
         }
-        if (defaultIndex && value.sections[*defaultIndex].guard) {
-            const auto& fallback = value.sections[*defaultIndex];
-            const auto guard = lowerExpression(*fallback.guard);
-            emitBranch(
-                guard, sectionBlocks[*defaultIndex], exitBlock,
-                {}, {}, fallback.span);
-            exitReachable = true;
-        } else {
-            emitJump(defaultIndex ? sectionBlocks[*defaultIndex] : exitBlock, {}, statement.span);
-            exitReachable = !defaultIndex.has_value();
+        if (!checksExhausted) {
+            if (defaultIndex && value.sections[*defaultIndex].guard) {
+                const auto& fallback = value.sections[*defaultIndex];
+                const auto guard = lowerExpression(*fallback.guard);
+                emitBranch(
+                    guard, sectionBlocks[*defaultIndex], exitBlock,
+                    {}, {}, fallback.span);
+                exitReachable = true;
+            } else {
+                emitJump(defaultIndex ? sectionBlocks[*defaultIndex] : exitBlock, {}, statement.span);
+                exitReachable = !defaultIndex.has_value();
+            }
         }
         breakTargets_.push_back(exitBlock); breakFinalizerDepths_.push_back(finalizers_.size()); breakEcsWriteBackDepths_.push_back(ecsWriteBacks_.size());
         for (std::size_t i = 0; i < value.sections.size(); ++i) {
@@ -1131,8 +1161,12 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 lowerStatement(*child); if (!hasCurrentBlock() || currentBlockTerminated()) break;
             }
             if (hasCurrentBlock() && !currentBlockTerminated()) {
-                emitJump(exitBlock, {}, value.sections[i].span);
-                exitReachable = true;
+                if (value.sections[i].statements.empty() && i + 1 < value.sections.size()) {
+                    emitJump(sectionBlocks[i + 1], {}, value.sections[i].span);
+                } else {
+                    emitJump(exitBlock, {}, value.sections[i].span);
+                    exitReachable = true;
+                }
             }
         }
         breakTargets_.pop_back(); breakFinalizerDepths_.pop_back(); breakEcsWriteBackDepths_.pop_back();

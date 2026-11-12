@@ -126,10 +126,19 @@ bool evaluateConstantExpressionImpl(
         const auto& lit = static_cast<const syntax::LiteralExpressionSyntax&>(expr).literalToken;
         outValue = lit.value;
         switch (lit.kind) {
-        case syntax::SyntaxKind::IntegerLiteralToken:
-            outType = (!lit.text.empty() && (lit.text.back() == 'l' || lit.text.back() == 'L'))
-                ? PrimitiveType::Long
-                : PrimitiveType::Int;
+        case syntax::SyntaxKind::IntegerLiteralToken: {
+            const bool hasU = lit.text.find('u') != std::string::npos ||
+                lit.text.find('U') != std::string::npos;
+            const bool hasL = lit.text.find('l') != std::string::npos ||
+                lit.text.find('L') != std::string::npos;
+            if (hasU && hasL) outType = PrimitiveType::ULong;
+            else if (hasU) outType = PrimitiveType::UInt;
+            else if (hasL) outType = PrimitiveType::Long;
+            else outType = PrimitiveType::Int;
+            return true;
+        }
+        case syntax::SyntaxKind::CharLiteralToken:
+            outType = PrimitiveType::Char;
             return true;
         case syntax::SyntaxKind::FloatLiteralToken:
             outType = (!lit.text.empty() && (lit.text.back() == 'f' || lit.text.back() == 'F'))
@@ -590,15 +599,24 @@ void appendSyntaxParameters(
     for (std::size_t syntaxIndex = 0;
          syntaxIndex < parameters.size(); ++syntaxIndex) {
         const auto& parameterSyntax = parameters[syntaxIndex];
-        if (parameterSyntax.modifierToken &&
-            parameterSyntax.modifierToken->kind == syntax::SyntaxKind::ThisKeyword) {
+        if (parameterSyntax.hasThisModifier()) {
+            const auto thisSpan = parameterSyntax.thisKeyword
+                ? parameterSyntax.thisKeyword->span
+                : parameterSyntax.modifierToken->span;
             if (syntaxIndex == 0 && (!result.method || result.staticMethod) && !result.constructor) {
                 result.extensionMethod = true;
+                if (parameterSyntax.modifierToken &&
+                    parameterSyntax.modifierToken->kind == syntax::SyntaxKind::OutKeyword) {
+                    diagnostics.report(
+                        "RS8920",
+                        "extension receiver parameter cannot use 'out' modifier",
+                        parameterSyntax.modifierToken->span);
+                }
             } else {
                 diagnostics.report(
                     "RS8920",
                     "'this' parameter modifier is only valid on the first parameter of a static or free function",
-                    parameterSyntax.modifierToken->span);
+                    thisSpan);
             }
         }
         const auto parameterType = resolveType(
@@ -660,6 +678,9 @@ void appendSyntaxParameters(
                         parameter.defaultValue = -std::get<double>(
                             parameter.defaultValue);
                     }
+                    break;
+                case syntax::SyntaxKind::CharLiteralToken:
+                    parameter.defaultValueType = PrimitiveType::Char;
                     break;
                 case syntax::SyntaxKind::StringLiteralToken:
                     parameter.defaultValueType = PrimitiveType::String;
@@ -1408,7 +1429,9 @@ FunctionSymbol declareFunctionSymbol(
         result, syntaxTree.parameters, visibleTypes, diagnostics, owner);
     result.id = stableFunctionId(result);
     result.declarationSpan = syntaxTree.identifierToken.span;
-    result.bodySpan = syntaxTree.semicolonToken.span;
+    result.bodySpan = syntaxTree.semicolonToken
+        ? syntaxTree.semicolonToken->span
+        : (syntaxTree.body ? syntaxTree.body->span() : syntaxTree.closeParenToken.span);
     for (auto& parameter : result.parameters) {
         parameter.id = fnv1a(std::to_string(result.id) + "::local:" +
             std::to_string(parameter.index) + ":" + parameter.name);

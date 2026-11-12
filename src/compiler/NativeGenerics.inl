@@ -11,6 +11,9 @@ struct NativeGenericTemplate {
     text::TextSpan span;
     std::vector<std::string> parameters;
     std::vector<std::string> parameterTypes;
+    std::vector<syntax::TypeSyntax> parameterTypeSyntaxes;
+    std::optional<syntax::TypeSyntax> returnTypeSyntax;
+    bool isExtension = false;
     std::map<std::string, std::vector<std::string>> constraints;
     const ParsedUnit* unit = nullptr;
     std::shared_ptr<syntax::ClassDeclarationSyntax> classSyntax;
@@ -468,6 +471,64 @@ inline bool& arrayRankOverflowFlag() noexcept {
     return flag;
 }
 
+inline void collectPatternVariablesFromPattern(
+    const syntax::PatternSyntax& pattern,
+    std::set<std::string>& out,
+    bool positiveOnly) {
+    switch (pattern.kind()) {
+    case syntax::SyntaxKind::VarPattern: {
+        const auto& vp = static_cast<const syntax::VarPatternSyntax&>(pattern);
+        if (!vp.designationToken.text.empty() && vp.designationToken.text != "_") {
+            out.insert(vp.designationToken.text);
+        }
+        return;
+    }
+    case syntax::SyntaxKind::TypePattern: {
+        const auto& tp = static_cast<const syntax::TypePatternSyntax&>(pattern);
+        if (tp.designationToken && !tp.designationToken->text.empty() &&
+            tp.designationToken->text != "_") {
+            out.insert(tp.designationToken->text);
+        }
+        return;
+    }
+    case syntax::SyntaxKind::PropertyPattern: {
+        const auto& pp = static_cast<const syntax::PropertyPatternSyntax&>(pattern);
+        for (const auto& prop : pp.properties) {
+            if (prop.pattern) {
+                collectPatternVariablesFromPattern(*prop.pattern, out, positiveOnly);
+            }
+        }
+        if (pp.designationToken && !pp.designationToken->text.empty() &&
+            pp.designationToken->text != "_") {
+            out.insert(pp.designationToken->text);
+        }
+        return;
+    }
+    case syntax::SyntaxKind::ParenthesizedPattern: {
+        const auto& paren = static_cast<const syntax::ParenthesizedPatternSyntax&>(pattern);
+        if (paren.pattern) collectPatternVariablesFromPattern(*paren.pattern, out, positiveOnly);
+        return;
+    }
+    case syntax::SyntaxKind::BinaryPattern: {
+        const auto& bin = static_cast<const syntax::BinaryPatternSyntax&>(pattern);
+        if (!positiveOnly || bin.operatorToken.text == "and") {
+            if (bin.left) collectPatternVariablesFromPattern(*bin.left, out, positiveOnly);
+            if (bin.right) collectPatternVariablesFromPattern(*bin.right, out, positiveOnly);
+        }
+        return;
+    }
+    case syntax::SyntaxKind::UnaryPattern: {
+        const auto& un = static_cast<const syntax::UnaryPatternSyntax&>(pattern);
+        if (!positiveOnly && un.pattern) {
+            collectPatternVariablesFromPattern(*un.pattern, out, positiveOnly);
+        }
+        return;
+    }
+    default:
+        return;
+    }
+}
+
 inline void collectIntroducedPatternVariables(
     const syntax::ExpressionSyntax& expr,
     std::set<std::string>& out) {
@@ -475,7 +536,10 @@ inline void collectIntroducedPatternVariables(
     case syntax::SyntaxKind::TypeBinaryExpression: {
         const auto& tb = static_cast<const syntax::TypeBinaryExpressionSyntax&>(expr);
         if (tb.expression) collectIntroducedPatternVariables(*tb.expression, out);
-        if (tb.designationToken && !tb.designationToken->text.empty()) {
+        if (tb.pattern) {
+            collectPatternVariablesFromPattern(*tb.pattern, out, true);
+        } else if (tb.designationToken && !tb.designationToken->text.empty() &&
+                   tb.designationToken->text != "_") {
             out.insert(tb.designationToken->text);
         }
         return;
@@ -561,6 +625,80 @@ inline void substituteExpression(
     syntax::ExpressionSyntax& expression,
     const SubstitutionMap& subs,
     const std::set<std::string>& shadowedValueNames,
+    bool& hasGenericSyntax);
+
+inline void substitutePattern(
+    syntax::PatternSyntax& pattern,
+    const SubstitutionMap& subs,
+    const std::set<std::string>& shadowedValueNames,
+    bool& hasGenericSyntax) {
+    switch (pattern.kind()) {
+    case syntax::SyntaxKind::ConstantPattern: {
+        auto& cp = static_cast<syntax::ConstantPatternSyntax&>(pattern);
+        if (cp.expression) {
+            substituteExpression(*cp.expression, subs, shadowedValueNames, hasGenericSyntax);
+        }
+        return;
+    }
+    case syntax::SyntaxKind::RelationalPattern: {
+        auto& rp = static_cast<syntax::RelationalPatternSyntax&>(pattern);
+        if (rp.operand) {
+            substituteExpression(*rp.operand, subs, shadowedValueNames, hasGenericSyntax);
+        }
+        return;
+    }
+    case syntax::SyntaxKind::TypePattern: {
+        auto& tp = static_cast<syntax::TypePatternSyntax&>(pattern);
+        const bool shadowedConst =
+            !tp.designationToken && !tp.type.isGeneric() &&
+            !tp.type.isArray() && !tp.type.isNullable() &&
+            shadowedValueNames.find(tp.type.name.text) != shadowedValueNames.end();
+        if (!shadowedConst) {
+            substituteType(tp.type, subs, hasGenericSyntax);
+        }
+        return;
+    }
+    case syntax::SyntaxKind::PropertyPattern: {
+        auto& pp = static_cast<syntax::PropertyPatternSyntax&>(pattern);
+        if (pp.type) {
+            substituteType(*pp.type, subs, hasGenericSyntax);
+        }
+        for (auto& prop : pp.properties) {
+            if (prop.pattern) {
+                substitutePattern(*prop.pattern, subs, shadowedValueNames, hasGenericSyntax);
+            }
+        }
+        return;
+    }
+    case syntax::SyntaxKind::UnaryPattern: {
+        auto& un = static_cast<syntax::UnaryPatternSyntax&>(pattern);
+        if (un.pattern) {
+            substitutePattern(*un.pattern, subs, shadowedValueNames, hasGenericSyntax);
+        }
+        return;
+    }
+    case syntax::SyntaxKind::BinaryPattern: {
+        auto& bin = static_cast<syntax::BinaryPatternSyntax&>(pattern);
+        if (bin.left) substitutePattern(*bin.left, subs, shadowedValueNames, hasGenericSyntax);
+        if (bin.right) substitutePattern(*bin.right, subs, shadowedValueNames, hasGenericSyntax);
+        return;
+    }
+    case syntax::SyntaxKind::ParenthesizedPattern: {
+        auto& paren = static_cast<syntax::ParenthesizedPatternSyntax&>(pattern);
+        if (paren.pattern) {
+            substitutePattern(*paren.pattern, subs, shadowedValueNames, hasGenericSyntax);
+        }
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+inline void substituteExpression(
+    syntax::ExpressionSyntax& expression,
+    const SubstitutionMap& subs,
+    const std::set<std::string>& shadowedValueNames,
     bool& hasGenericSyntax) {
     switch (expression.kind()) {
     case syntax::SyntaxKind::NameExpression: {
@@ -607,7 +745,14 @@ inline void substituteExpression(
     case syntax::SyntaxKind::TypeBinaryExpression: {
         auto& expr = static_cast<syntax::TypeBinaryExpressionSyntax&>(expression);
         if (expr.expression) substituteExpression(*expr.expression, subs, shadowedValueNames, hasGenericSyntax);
-        substituteType(expr.type, subs, hasGenericSyntax);
+        if (expr.pattern) {
+            substitutePattern(*expr.pattern, subs, shadowedValueNames, hasGenericSyntax);
+            if (expr.pattern->kind() == syntax::SyntaxKind::TypePattern) {
+                expr.type = static_cast<const syntax::TypePatternSyntax&>(*expr.pattern).type;
+            }
+        } else {
+            substituteType(expr.type, subs, hasGenericSyntax);
+        }
         return;
     }
     case syntax::SyntaxKind::TypeOfExpression: {
@@ -620,9 +765,17 @@ inline void substituteExpression(
         if (expr.expression) substituteExpression(*expr.expression, subs, shadowedValueNames, hasGenericSyntax);
         for (auto& arm : expr.arms) {
             auto armShadowed = shadowedValueNames;
-            if (arm.patternType) substituteType(*arm.patternType, subs, hasGenericSyntax);
-            if (arm.patternDesignation) armShadowed.insert(arm.patternDesignation->text);
-            if (arm.label) substituteExpression(*arm.label, subs, armShadowed, hasGenericSyntax);
+            if (arm.pattern) {
+                substitutePattern(*arm.pattern, subs, armShadowed, hasGenericSyntax);
+                collectPatternVariablesFromPattern(*arm.pattern, armShadowed, false);
+                if (arm.pattern->kind() == syntax::SyntaxKind::TypePattern) {
+                    arm.patternType = static_cast<const syntax::TypePatternSyntax&>(*arm.pattern).type;
+                }
+            } else {
+                if (arm.patternType) substituteType(*arm.patternType, subs, hasGenericSyntax);
+                if (arm.patternDesignation) armShadowed.insert(arm.patternDesignation->text);
+                if (arm.label) substituteExpression(*arm.label, subs, armShadowed, hasGenericSyntax);
+            }
             if (arm.guard) substituteExpression(*arm.guard, subs, armShadowed, hasGenericSyntax);
             if (arm.value) substituteExpression(*arm.value, subs, armShadowed, hasGenericSyntax);
         }
@@ -809,9 +962,17 @@ inline void substituteStatement(
         if (stmt.expression) substituteExpression(*stmt.expression, subs, shadowedValueNames, hasGenericSyntax);
         for (auto& sec : stmt.sections) {
             auto secShadowed = shadowedValueNames;
-            if (sec.patternType) substituteType(*sec.patternType, subs, hasGenericSyntax);
-            if (sec.patternDesignation) secShadowed.insert(sec.patternDesignation->text);
-            if (sec.label) substituteExpression(*sec.label, subs, secShadowed, hasGenericSyntax);
+            if (sec.pattern) {
+                substitutePattern(*sec.pattern, subs, secShadowed, hasGenericSyntax);
+                collectPatternVariablesFromPattern(*sec.pattern, secShadowed, false);
+                if (sec.pattern->kind() == syntax::SyntaxKind::TypePattern) {
+                    sec.patternType = static_cast<const syntax::TypePatternSyntax&>(*sec.pattern).type;
+                }
+            } else {
+                if (sec.patternType) substituteType(*sec.patternType, subs, hasGenericSyntax);
+                if (sec.patternDesignation) secShadowed.insert(sec.patternDesignation->text);
+                if (sec.label) substituteExpression(*sec.label, subs, secShadowed, hasGenericSyntax);
+            }
             if (sec.guard) substituteExpression(*sec.guard, subs, secShadowed, hasGenericSyntax);
             for (auto& child : sec.statements) {
                 if (child) substituteStatement(*child, subs, secShadowed, hasGenericSyntax);
@@ -990,9 +1151,21 @@ inline void substituteCompilationUnit(
         substituteTypeLikeDeclaration(st, name, name, subs, hasGenericSyntax);
     }
     for (auto& iface : unit.interfaces) {
+        std::set<std::string> ifaceMembers;
+        for (const auto& m : iface.methods) ifaceMembers.insert(m.identifierToken.text);
         for (auto& m : iface.methods) {
             substituteType(m.returnType, subs, hasGenericSyntax);
-            for (auto& p : m.parameters) substituteType(p.type, subs, hasGenericSyntax);
+            auto shadowed = ifaceMembers;
+            for (auto& p : m.parameters) {
+                substituteType(p.type, subs, hasGenericSyntax);
+                if (p.defaultValue) {
+                    substituteExpression(*p.defaultValue, subs, shadowed, hasGenericSyntax);
+                }
+                shadowed.insert(p.identifierToken.text);
+            }
+            if (m.hasBody()) {
+                substituteStatement(*m.body, subs, shadowed, hasGenericSyntax);
+            }
         }
     }
     for (auto& del : unit.delegates) {
@@ -1210,9 +1383,13 @@ private:
         for (const auto& parameter : function.typeParameters) {
             declaration.parameters.push_back(parameter.text);
         }
+        declaration.returnTypeSyntax = function.returnType;
+        declaration.isExtension = !function.parameters.empty() &&
+            function.parameters.front().hasThisModifier();
         for (const auto& parameter : function.parameters) {
             declaration.parameterTypes.push_back(
                 nativeGenericTypeText(parameter.type));
+            declaration.parameterTypeSyntaxes.push_back(parameter.type);
         }
         declaration.constraints = nativeGenericConstraints(function.constraints);
         auto& table = registry_.functions[moduleName];
@@ -1247,9 +1424,13 @@ private:
         for (const auto& parameter : function.typeParameters) {
             declaration.parameters.push_back(parameter.text);
         }
+        declaration.returnTypeSyntax = function.returnType;
+        declaration.isExtension = !function.parameters.empty() &&
+            function.parameters.front().hasThisModifier();
         for (const auto& parameter : function.parameters) {
             declaration.parameterTypes.push_back(
                 nativeGenericTypeText(parameter.type));
+            declaration.parameterTypeSyntaxes.push_back(parameter.type);
         }
         declaration.constraints = nativeGenericConstraints(function.constraints);
         registry_.members[moduleName][function.identifierToken.text]
@@ -1390,8 +1571,125 @@ private:
         return nativeGenericTypeText(type);
     }
 
+    std::string findFieldOrPropertyType(
+        const std::string& rawOwnerType,
+        const std::string& memberName) const {
+        if (rawOwnerType.empty()) return {};
+        if (rawOwnerType == "string" && (memberName == "Length" || memberName == "Count")) {
+            return "int";
+        }
+        if (rawOwnerType.size() > 2 && rawOwnerType.substr(rawOwnerType.size() - 2) == "[]" &&
+            (memberName == "Length" || memberName == "Count" || memberName == "length")) {
+            return "int";
+        }
+        const auto simpleOwner = stripCanonicalModulePrefix(rawOwnerType);
+        for (const auto& unit : units_) {
+            if (!unit || !unit->syntaxTree) continue;
+            for (const auto& cls : unit->syntaxTree->classes) {
+                if (!cls.typeParameters.empty() || cls.identifierToken.text != simpleOwner) continue;
+                for (const auto& f : cls.fields) {
+                    if (f.identifierToken.text == memberName) return typeText(f.type);
+                }
+                for (const auto& p : cls.properties) {
+                    if (p.identifierToken.text == memberName) return typeText(p.type);
+                }
+            }
+            for (const auto& st : unit->syntaxTree->structs) {
+                if (!st.typeParameters.empty() || st.identifierToken.text != simpleOwner) continue;
+                for (const auto& f : st.fields) {
+                    if (f.identifierToken.text == memberName) return typeText(f.type);
+                }
+                for (const auto& p : st.properties) {
+                    if (p.identifierToken.text == memberName) return typeText(p.type);
+                }
+            }
+            for (const auto& en : unit->syntaxTree->enums) {
+                if (en.identifierToken.text == simpleOwner) {
+                    for (const auto& em : en.members) {
+                        if (em.identifierToken.text == memberName) return rawOwnerType;
+                    }
+                }
+            }
+        }
+        return {};
+    }
+
+    std::string findKnownCallableReturnType(
+        const std::string& rawOwnerType,
+        const std::string& callName,
+        std::size_t argCount,
+        bool isMemberCall) const {
+        const auto simpleCall = stripCanonicalModulePrefix(callName);
+        if (const auto specIt = specializedReturnTypes_.find(simpleCall);
+            specIt != specializedReturnTypes_.end()) {
+            return specIt->second;
+        }
+        const auto simpleOwner = stripCanonicalModulePrefix(rawOwnerType);
+        for (const auto& unit : units_) {
+            if (!unit || !unit->syntaxTree) continue;
+            if (isMemberCall && !simpleOwner.empty()) {
+                for (const auto& cls : unit->syntaxTree->classes) {
+                    if (!cls.typeParameters.empty() || cls.identifierToken.text != simpleOwner) continue;
+                    for (const auto& m : cls.methods) {
+                        if (m.typeParameters.empty() && m.identifierToken.text == simpleCall &&
+                            m.parameters.size() == argCount) {
+                            return typeText(m.returnType);
+                        }
+                    }
+                }
+                for (const auto& st : unit->syntaxTree->structs) {
+                    if (!st.typeParameters.empty() || st.identifierToken.text != simpleOwner) continue;
+                    for (const auto& m : st.methods) {
+                        if (m.typeParameters.empty() && m.identifierToken.text == simpleCall &&
+                            m.parameters.size() == argCount) {
+                            return typeText(m.returnType);
+                        }
+                    }
+                }
+                for (const auto& iface : unit->syntaxTree->interfaces) {
+                    if (!iface.typeParameters.empty() || iface.identifierToken.text != simpleOwner) continue;
+                    for (const auto& m : iface.methods) {
+                        if (m.typeParameters.empty() && m.identifierToken.text == simpleCall &&
+                            m.parameters.size() == argCount) {
+                            return typeText(m.returnType);
+                        }
+                    }
+                }
+            }
+            for (const auto& fn : unit->syntaxTree->functions) {
+                if (!fn.typeParameters.empty() || fn.identifierToken.text != simpleCall) continue;
+                const std::size_t expected = (isMemberCall && !fn.parameters.empty() && fn.parameters.front().hasThisModifier())
+                    ? (argCount + 1)
+                    : argCount;
+                if (fn.parameters.size() == expected) {
+                    return typeText(fn.returnType);
+                }
+            }
+            if (isMemberCall) {
+                for (const auto& cls : unit->syntaxTree->classes) {
+                    if (!cls.typeParameters.empty()) continue;
+                    for (const auto& m : cls.methods) {
+                        if (!m.typeParameters.empty() || m.identifierToken.text != simpleCall) continue;
+                        if (!m.parameters.empty() && m.parameters.front().hasThisModifier() &&
+                            m.parameters.size() == argCount + 1) {
+                            return typeText(m.returnType);
+                        }
+                        if (simpleOwner == cls.identifierToken.text && m.parameters.size() == argCount) {
+                            return typeText(m.returnType);
+                        }
+                    }
+                }
+            }
+        }
+        return {};
+    }
+
     std::string expressionType(const syntax::ExpressionSyntax& expression) const {
         switch (expression.kind()) {
+        case syntax::SyntaxKind::ThisExpression: {
+            const auto found = localTypes_.find("this");
+            return found == localTypes_.end() ? std::string{} : found->second;
+        }
         case syntax::SyntaxKind::NameExpression: {
             const auto& name = static_cast<const
                 syntax::NameExpressionSyntax&>(expression).identifierToken.text;
@@ -1402,15 +1700,21 @@ private:
             const auto& tok = static_cast<const
                 syntax::LiteralExpressionSyntax&>(expression).literalToken;
             if (tok.kind == syntax::SyntaxKind::IntegerLiteralToken) {
-                return (!tok.text.empty() && (tok.text.back() == 'l' || tok.text.back() == 'L'))
-                    ? "long"
-                    : "int";
+                const bool hasU = tok.text.find('u') != std::string::npos ||
+                    tok.text.find('U') != std::string::npos;
+                const bool hasL = tok.text.find('l') != std::string::npos ||
+                    tok.text.find('L') != std::string::npos;
+                if (hasU && hasL) return "ulong";
+                if (hasU) return "uint";
+                if (hasL) return "long";
+                return "int";
             }
             if (tok.kind == syntax::SyntaxKind::FloatLiteralToken) {
                 return (!tok.text.empty() && (tok.text.back() == 'f' || tok.text.back() == 'F'))
                     ? "float"
                     : "double";
             }
+            if (tok.kind == syntax::SyntaxKind::CharLiteralToken) return "char";
             if (tok.kind == syntax::SyntaxKind::StringLiteralToken) return "string";
             if (tok.kind == syntax::SyntaxKind::TrueKeyword ||
                 tok.kind == syntax::SyntaxKind::FalseKeyword) return "bool";
@@ -1419,6 +1723,111 @@ private:
         case syntax::SyntaxKind::ParenthesizedExpression:
             return expressionType(*static_cast<const
                 syntax::ParenthesizedExpressionSyntax&>(expression).expression);
+        case syntax::SyntaxKind::CastExpression:
+            return typeText(static_cast<const
+                syntax::CastExpressionSyntax&>(expression).type);
+        case syntax::SyntaxKind::UnaryExpression: {
+            const auto& un = static_cast<const syntax::UnaryExpressionSyntax&>(expression);
+            if (un.operatorToken.kind == syntax::SyntaxKind::BangToken) return "bool";
+            if (!un.operand) return {};
+            auto inner = expressionType(*un.operand);
+            if (un.operatorToken.kind == syntax::SyntaxKind::MinusToken ||
+                un.operatorToken.kind == syntax::SyntaxKind::PlusToken) {
+                if (inner == "byte" || inner == "sbyte" || inner == "short" ||
+                    inner == "ushort" || inner == "char") return "int";
+                if (inner == "uint") return "long";
+            }
+            return inner;
+        }
+        case syntax::SyntaxKind::BinaryExpression: {
+            const auto& bin = static_cast<const syntax::BinaryExpressionSyntax&>(expression);
+            switch (bin.operatorToken.kind) {
+            case syntax::SyntaxKind::EqualsEqualsToken:
+            case syntax::SyntaxKind::BangEqualsToken:
+            case syntax::SyntaxKind::LessToken:
+            case syntax::SyntaxKind::LessOrEqualsToken:
+            case syntax::SyntaxKind::GreaterToken:
+            case syntax::SyntaxKind::GreaterOrEqualsToken:
+            case syntax::SyntaxKind::AmpersandAmpersandToken:
+            case syntax::SyntaxKind::PipePipeToken:
+                return "bool";
+            default:
+                break;
+            }
+            const auto lt = bin.left ? expressionType(*bin.left) : std::string{};
+            const auto rt = bin.right ? expressionType(*bin.right) : std::string{};
+            if (bin.operatorToken.kind == syntax::SyntaxKind::PlusToken &&
+                (lt == "string" || rt == "string")) {
+                return "string";
+            }
+            if (bin.operatorToken.kind == syntax::SyntaxKind::QuestionQuestionToken) {
+                return !rt.empty() ? rt : lt;
+            }
+            if (lt == "double" || rt == "double") return "double";
+            if (lt == "float" || rt == "float") return "float";
+            if (lt == "ulong" || rt == "ulong") return "ulong";
+            if (lt == "long" || rt == "long") return "long";
+            if (lt == "uint" || rt == "uint") return "long";
+            if (!lt.empty()) return lt;
+            return rt;
+        }
+        case syntax::SyntaxKind::TypeBinaryExpression: {
+            const auto& tb = static_cast<const syntax::TypeBinaryExpressionSyntax&>(expression);
+            if (tb.operatorToken.kind == syntax::SyntaxKind::AsKeyword) {
+                return typeText(tb.type);
+            }
+            return "bool";
+        }
+        case syntax::SyntaxKind::ConditionalExpression: {
+            const auto& cond = static_cast<const syntax::ConditionalExpressionSyntax&>(expression);
+            auto tt = cond.whenTrue ? expressionType(*cond.whenTrue) : std::string{};
+            if (!tt.empty()) return tt;
+            return cond.whenFalse ? expressionType(*cond.whenFalse) : std::string{};
+        }
+        case syntax::SyntaxKind::MemberAccessExpression: {
+            const auto& ma = static_cast<const syntax::MemberAccessExpressionSyntax&>(expression);
+            std::string recvType = ma.receiver ? expressionType(*ma.receiver) : std::string{};
+            if (recvType.empty() && ma.receiver &&
+                ma.receiver->kind() == syntax::SyntaxKind::NameExpression) {
+                recvType = static_cast<const syntax::NameExpressionSyntax&>(
+                    *ma.receiver).identifierToken.text;
+            }
+            return findFieldOrPropertyType(recvType, ma.nameToken.text);
+        }
+        case syntax::SyntaxKind::ElementAccessExpression: {
+            const auto& ea = static_cast<const syntax::ElementAccessExpressionSyntax&>(expression);
+            const auto recvType = ea.receiver ? expressionType(*ea.receiver) : std::string{};
+            if (recvType.size() > 2 && recvType.substr(recvType.size() - 2) == "[]") {
+                return recvType.substr(0, recvType.size() - 2);
+            }
+            return {};
+        }
+        case syntax::SyntaxKind::CallExpression: {
+            const auto& call = static_cast<const syntax::CallExpressionSyntax&>(expression);
+            return findKnownCallableReturnType({}, call.identifierToken.text, call.arguments.size(), false);
+        }
+        case syntax::SyntaxKind::MemberCallExpression: {
+            const auto& call = static_cast<const syntax::MemberCallExpressionSyntax&>(expression);
+            std::string recvType = call.receiver ? expressionType(*call.receiver) : std::string{};
+            if (recvType.empty() && call.receiver &&
+                call.receiver->kind() == syntax::SyntaxKind::NameExpression) {
+                recvType = static_cast<const syntax::NameExpressionSyntax&>(
+                    *call.receiver).identifierToken.text;
+            }
+            if (recvType == "string") {
+                if (call.nameToken.text == "Length" || call.nameToken.text == "Count" ||
+                    call.nameToken.text == "IndexOf" || call.nameToken.text == "LastIndexOf") return "int";
+                if (call.nameToken.text == "Contains" || call.nameToken.text == "StartsWith" ||
+                    call.nameToken.text == "EndsWith" || call.nameToken.text == "IsEmpty") return "bool";
+                if (call.nameToken.text == "Substring" || call.nameToken.text == "Trim" ||
+                    call.nameToken.text == "TrimStart" || call.nameToken.text == "TrimEnd" ||
+                    call.nameToken.text == "Replace" || call.nameToken.text == "ToUpper" ||
+                    call.nameToken.text == "ToLower") return "string";
+                if (call.nameToken.text == "Split") return "string[]";
+            }
+            return findKnownCallableReturnType(
+                recvType, call.nameToken.text, call.arguments.size(), true);
+        }
         case syntax::SyntaxKind::NewObjectExpression:
             return typeText(static_cast<const
                 syntax::NewObjectExpressionSyntax&>(expression).type);
@@ -1430,44 +1839,195 @@ private:
         }
     }
 
-    std::optional<std::vector<std::string>> inferArguments(
-        const NativeGenericTemplate& declaration,
-        const std::vector<std::unique_ptr<syntax::ExpressionSyntax>>& arguments) const {
-        if (declaration.parameterTypes.size() != arguments.size()) {
-            return std::nullopt;
+    bool matchFormalTypeAgainstActual(
+        const syntax::TypeSyntax& formal,
+        const std::string& actual,
+        const std::set<std::string>& typeParamSet,
+        std::map<std::string, std::string>& inferred) const {
+        if (actual.empty()) return false;
+        if (formal.isArray()) {
+            if (actual.size() <= 2 || actual.substr(actual.size() - 2) != "[]") {
+                return false;
+            }
+            auto elemFormal = formal;
+            elemFormal.openBracketToken.reset();
+            elemFormal.closeBracketToken.reset();
+            return matchFormalTypeAgainstActual(
+                elemFormal, actual.substr(0, actual.size() - 2), typeParamSet, inferred);
         }
-        std::map<std::string, std::string> inferred;
-        for (std::size_t index = 0; index < arguments.size(); ++index) {
-            const auto actual = expressionType(*arguments[index]);
-            if (actual.empty()) return std::nullopt;
-            const auto& formal = declaration.parameterTypes[index];
-            for (const auto& parameter : declaration.parameters) {
-                bool matched = false;
-                std::string candidate;
-                if (formal == parameter) {
-                    matched = true;
-                    candidate = actual;
-                } else if (formal == parameter + "[]" &&
-                           actual.size() > 2 &&
-                           actual.substr(actual.size() - 2) == "[]") {
-                    matched = true;
-                    candidate = actual.substr(0, actual.size() - 2);
+        if (formal.isGeneric()) {
+            const auto formalSimple = stripCanonicalModulePrefix(formal.name.text);
+            const auto actualSimple = stripCanonicalModulePrefix(actual);
+            const auto instIt = instantiatedTypes_.find(actualSimple);
+            if (instIt == instantiatedTypes_.end()) return false;
+            if (instIt->second.first != formalSimple ||
+                instIt->second.second.size() != formal.typeArguments.size()) {
+                return false;
+            }
+            for (std::size_t i = 0; i < formal.typeArguments.size(); ++i) {
+                if (!matchFormalTypeAgainstActual(
+                        formal.typeArguments[i],
+                        instIt->second.second[i],
+                        typeParamSet,
+                        inferred)) {
+                    return false;
                 }
-                if (!matched) continue;
-                const auto previous = inferred.find(parameter);
-                if (previous != inferred.end() && previous->second != candidate) {
-                    return std::nullopt;
+            }
+            return true;
+        }
+        if (typeParamSet.find(formal.name.text) != typeParamSet.end()) {
+            const auto prev = inferred.find(formal.name.text);
+            if (prev != inferred.end()) {
+                if (prev->second == actual) return true;
+                if (stripCanonicalModulePrefix(prev->second) ==
+                    stripCanonicalModulePrefix(actual)) {
+                    return true;
                 }
-                inferred[parameter] = std::move(candidate);
+                return false;
+            }
+            inferred[formal.name.text] = actual;
+            return true;
+        }
+        return stripCanonicalModulePrefix(formal.name.text) ==
+            stripCanonicalModulePrefix(actual);
+    }
+
+    const NativeGenericTemplate* findDelegateTemplateByName(
+        const std::string& consumerModule,
+        const std::string& rawName) const {
+        const auto simple = stripCanonicalModulePrefix(rawName);
+        const auto checkMod = [&](const std::string& modName) -> const NativeGenericTemplate* {
+            const auto modIt = registry_.types.find(modName);
+            if (modIt == registry_.types.end()) return nullptr;
+            const auto found = modIt->second.find(simple);
+            if (found != modIt->second.end() &&
+                found->second.kind == NativeGenericTemplate::Kind::Delegate &&
+                found->second.delegateSyntax) {
+                return &found->second;
+            }
+            return nullptr;
+        };
+        if (const auto* own = checkMod(consumerModule)) return own;
+        if (const auto modIt = modules_.find(consumerModule); modIt != modules_.end()) {
+            for (const auto& imp : modIt->second.imports) {
+                if (const auto* d = checkMod(imp)) return d;
             }
         }
+        for (const auto& [modName, table] : registry_.types) {
+            (void)table;
+            if (const auto* d = checkMod(modName)) return d;
+        }
+        return nullptr;
+    }
+
+    std::optional<std::vector<std::string>> inferCallTypeArguments(
+        const NativeGenericTemplate& declaration,
+        const std::vector<const syntax::ExpressionSyntax*>& arguments,
+        const std::string& consumerModule) {
+        if (declaration.parameterTypeSyntaxes.size() != arguments.size()) {
+            return std::nullopt;
+        }
+        std::set<std::string> typeParamSet(
+            declaration.parameters.begin(), declaration.parameters.end());
+        std::map<std::string, std::string> inferred;
+
+        // Pass 1: infer from all non-lambda arguments
+        for (std::size_t index = 0; index < arguments.size(); ++index) {
+            if (!arguments[index]) return std::nullopt;
+            if (arguments[index]->kind() == syntax::SyntaxKind::LambdaExpression) {
+                continue;
+            }
+            const auto actual = expressionType(*arguments[index]);
+            if (actual.empty()) continue;
+            if (!matchFormalTypeAgainstActual(
+                    declaration.parameterTypeSyntaxes[index],
+                    actual,
+                    typeParamSet,
+                    inferred)) {
+                return std::nullopt;
+            }
+        }
+
+        // Pass 2: infer from lambda arguments using already-inferred parameter types
+        for (std::size_t index = 0; index < arguments.size(); ++index) {
+            if (!arguments[index] ||
+                arguments[index]->kind() != syntax::SyntaxKind::LambdaExpression) {
+                continue;
+            }
+            const auto& lambda = static_cast<const syntax::LambdaExpressionSyntax&>(
+                *arguments[index]);
+            const auto& formal = declaration.parameterTypeSyntaxes[index];
+            if (!formal.isGeneric()) continue;
+            const auto* delTmpl = findDelegateTemplateByName(
+                declaration.moduleName.empty() ? consumerModule : declaration.moduleName,
+                formal.name.text);
+            if (!delTmpl || !delTmpl->delegateSyntax) continue;
+            const auto& delSyn = *delTmpl->delegateSyntax;
+            if (delSyn.parameters.size() != lambda.parameterTokens.size() ||
+                delTmpl->parameters.size() != formal.typeArguments.size()) {
+                continue;
+            }
+
+            // Map delegate type parameter -> method type expression using current 'inferred'
+            std::map<std::string, syntax::TypeSyntax> delParamToMethodType;
+            for (std::size_t ti = 0; ti < delTmpl->parameters.size(); ++ti) {
+                delParamToMethodType[delTmpl->parameters[ti]] = formal.typeArguments[ti];
+            }
+            auto resolveDelFormalType = [&](const syntax::TypeSyntax& dt) -> std::string {
+                if (!dt.isGeneric() && !dt.isArray()) {
+                    if (const auto dm = delParamToMethodType.find(dt.name.text);
+                        dm != delParamToMethodType.end()) {
+                        const auto& mt = dm->second;
+                        if (!mt.isGeneric() && !mt.isArray()) {
+                            if (const auto inf = inferred.find(mt.name.text);
+                                inf != inferred.end()) {
+                                return inf->second;
+                            }
+                        }
+                        return typeText(mt);
+                    }
+                }
+                return typeText(dt);
+            };
+
+            const auto savedLocal = localTypes_;
+            for (std::size_t pi = 0; pi < lambda.parameterTokens.size(); ++pi) {
+                const auto pType = resolveDelFormalType(delSyn.parameters[pi].type);
+                if (!pType.empty()) {
+                    localTypes_[lambda.parameterTokens[pi].text] = pType;
+                }
+            }
+            const auto bodyType = lambda.body ? expressionType(*lambda.body) : std::string{};
+            localTypes_ = savedLocal;
+            if (!bodyType.empty() && !delSyn.returnType.isGeneric() && !delSyn.returnType.isArray()) {
+                if (const auto dm = delParamToMethodType.find(delSyn.returnType.name.text);
+                    dm != delParamToMethodType.end()) {
+                    if (!matchFormalTypeAgainstActual(
+                            dm->second, bodyType, typeParamSet, inferred)) {
+                        return std::nullopt;
+                    }
+                }
+            }
+        }
+
         std::vector<std::string> result;
+        result.reserve(declaration.parameters.size());
         for (const auto& parameter : declaration.parameters) {
             const auto found = inferred.find(parameter);
             if (found == inferred.end()) return std::nullopt;
             result.push_back(found->second);
         }
         return result;
+    }
+
+    std::optional<std::vector<std::string>> inferArguments(
+        const NativeGenericTemplate& declaration,
+        const std::vector<std::unique_ptr<syntax::ExpressionSyntax>>& arguments,
+        const std::string& consumerModule = {}) {
+        std::vector<const syntax::ExpressionSyntax*> ptrs;
+        ptrs.reserve(arguments.size());
+        for (const auto& arg : arguments) ptrs.push_back(arg.get());
+        return inferCallTypeArguments(declaration, ptrs, consumerModule);
     }
 
     static bool isPrimitiveOrKeywordTypeName(const std::string& name) noexcept {
@@ -1840,8 +2400,22 @@ private:
             ? (targetModule + "::" + generatedName)
             : generatedName;
 
-        if (!function && targetModule != consumerModule) {
+        if (targetModule != consumerModule &&
+            (!function || (declaration && declaration->isExtension))) {
             modules_[consumerModule].hygienicModules.insert(targetModule);
+        }
+        if (!function) {
+            std::vector<std::string> rawResolvedArgNames;
+            rawResolvedArgNames.reserve(resolvedArgs.size());
+            for (const auto& rArg : resolvedArgs) {
+                std::string argName = rArg.canonicalBaseName.empty()
+                    ? rArg.simpleBaseName
+                    : rArg.canonicalBaseName;
+                if (rArg.isNullable) argName = "Nullable__" + stripCanonicalModulePrefix(argName);
+                if (rArg.isArray) argName += "[]";
+                rawResolvedArgNames.push_back(std::move(argName));
+            }
+            instantiatedTypes_[generatedName] = {baseTemplateName, std::move(rawResolvedArgNames)};
         }
         std::set<std::string> specUnitHygienic;
         if (declaration && !declaration->moduleName.empty()) {
@@ -1935,10 +2509,24 @@ private:
                     cloned.typeParameterCommaTokens.clear();
                     cloned.typeParameterGreaterToken.reset();
                     cloned.constraints.clear();
+                    std::set<std::string> ifaceMethodNames;
+                    for (const auto& m : cloned.methods) {
+                        ifaceMethodNames.insert(m.identifierToken.text);
+                    }
                     for (auto& m : cloned.methods) {
                         ast_monomorphizer::substituteType(m.returnType, subs, hasRemainingGenerics);
+                        auto shadowed = ifaceMethodNames;
                         for (auto& p : m.parameters) {
                             ast_monomorphizer::substituteType(p.type, subs, hasRemainingGenerics);
+                            if (p.defaultValue) {
+                                ast_monomorphizer::substituteExpression(
+                                    *p.defaultValue, subs, shadowed, hasRemainingGenerics);
+                            }
+                            shadowed.insert(p.identifierToken.text);
+                        }
+                        if (m.hasBody()) {
+                            ast_monomorphizer::substituteStatement(
+                                *m.body, subs, shadowed, hasRemainingGenerics);
                         }
                     }
                     unit->syntaxTree->interfaces.push_back(std::move(cloned));
@@ -1972,6 +2560,13 @@ private:
                     std::set<std::string> emptyMembers;
                     ast_monomorphizer::substituteFunctionDeclaration(
                         cloned, subs, emptyMembers, hasRemainingGenerics);
+                    auto retCopy = cloned.returnType;
+                    if (retCopy.isGeneric()) {
+                        const auto savedLocal = localTypes_;
+                        rewriteType(retCopy, targetModule, declaration->sourceName, queue);
+                        localTypes_ = savedLocal;
+                    }
+                    specializedReturnTypes_[generatedName] = typeText(retCopy);
                     unit->syntaxTree->functions.push_back(std::move(cloned));
                 }
                 break;
@@ -2486,8 +3081,38 @@ private:
                 modules_[declaration.moduleName].hygienicModules.insert(rArg.ownerModule);
             }
         }
+        if (!declaration.moduleName.empty() && declaration.moduleName != consumerModule) {
+            modules_[consumerModule].hygienicModules.insert(declaration.moduleName);
+        }
         const auto generated = nativeGenericGeneratedName(
             declaration.name, mangleArgs);
+        if (declaration.returnTypeSyntax) {
+            ast_monomorphizer::SubstitutionMap retSubs;
+            for (std::size_t idx = 0;
+                 idx < declaration.parameters.size() && idx < resolvedArgs.size();
+                 ++idx) {
+                auto rArg = resolvedArgs[idx];
+                if (rArg.ownerModule == declaration.moduleName) {
+                    rArg.canonicalBaseName = rArg.simpleBaseName;
+                }
+                retSubs.emplace(declaration.parameters[idx], std::move(rArg));
+            }
+            auto retCopy = *declaration.returnTypeSyntax;
+            bool dummyHasGen = false;
+            ast_monomorphizer::substituteType(retCopy, retSubs, dummyHasGen);
+            if (retCopy.isGeneric()) {
+                const auto savedLocal = localTypes_;
+                std::vector<ParsedUnit*> retQueue;
+                rewriteType(retCopy, declaration.moduleName, declaration.sourceName, retQueue);
+                for (std::size_t qi = 0; qi < retQueue.size(); ++qi) {
+                    auto* u = retQueue[qi];
+                    if (!u || !processed_.insert(u).second) continue;
+                    rewriteUnit(*u, retQueue);
+                }
+                localTypes_ = savedLocal;
+            }
+            specializedReturnTypes_[generated] = typeText(retCopy);
+        }
         const auto key = declaration.moduleName + "::member:" +
             declaration.ownerName + "::" + generated;
         if (specializations_.insert(key).second) {
@@ -2678,6 +3303,122 @@ private:
         return true;
     }
 
+    void rewritePattern(
+        syntax::PatternSyntax& pattern,
+        const std::string& inputType,
+        const std::string& moduleName,
+        const std::string& sourceName,
+        std::vector<ParsedUnit*>& queue) {
+        switch (pattern.kind()) {
+        case syntax::SyntaxKind::ConstantPattern: {
+            auto& cp = static_cast<syntax::ConstantPatternSyntax&>(pattern);
+            if (cp.expression) rewriteExpression(*cp.expression, moduleName, sourceName, queue);
+            return;
+        }
+        case syntax::SyntaxKind::RelationalPattern: {
+            auto& rp = static_cast<syntax::RelationalPatternSyntax&>(pattern);
+            if (rp.operand) rewriteExpression(*rp.operand, moduleName, sourceName, queue);
+            return;
+        }
+        case syntax::SyntaxKind::VarPattern: {
+            auto& vp = static_cast<syntax::VarPatternSyntax&>(pattern);
+            if (!inputType.empty() && !vp.designationToken.text.empty() &&
+                vp.designationToken.text != "_") {
+                localTypes_[vp.designationToken.text] = inputType;
+            }
+            return;
+        }
+        case syntax::SyntaxKind::TypePattern: {
+            auto& tp = static_cast<syntax::TypePatternSyntax&>(pattern);
+            rewriteType(tp.type, moduleName, sourceName, queue);
+            if (tp.designationToken && !tp.designationToken->text.empty() &&
+                tp.designationToken->text != "_") {
+                localTypes_[tp.designationToken->text] = typeText(tp.type);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::PropertyPattern: {
+            auto& pp = static_cast<syntax::PropertyPatternSyntax&>(pattern);
+            std::string effectiveType = inputType;
+            if (pp.type) {
+                rewriteType(*pp.type, moduleName, sourceName, queue);
+                effectiveType = typeText(*pp.type);
+            }
+            if (pp.designationToken && !pp.designationToken->text.empty() &&
+                pp.designationToken->text != "_" && !effectiveType.empty()) {
+                localTypes_[pp.designationToken->text] = effectiveType;
+            }
+            for (auto& sub : pp.properties) {
+                const auto memberType = findFieldOrPropertyType(
+                    effectiveType, sub.memberToken.text);
+                if (sub.pattern) {
+                    rewritePattern(*sub.pattern, memberType, moduleName, sourceName, queue);
+                }
+            }
+            return;
+        }
+        case syntax::SyntaxKind::UnaryPattern: {
+            auto& un = static_cast<syntax::UnaryPatternSyntax&>(pattern);
+            if (un.pattern) rewritePattern(*un.pattern, inputType, moduleName, sourceName, queue);
+            return;
+        }
+        case syntax::SyntaxKind::BinaryPattern: {
+            auto& bin = static_cast<syntax::BinaryPatternSyntax&>(pattern);
+            if (bin.left) rewritePattern(*bin.left, inputType, moduleName, sourceName, queue);
+            if (bin.right) rewritePattern(*bin.right, inputType, moduleName, sourceName, queue);
+            return;
+        }
+        case syntax::SyntaxKind::ParenthesizedPattern: {
+            auto& paren = static_cast<syntax::ParenthesizedPatternSyntax&>(pattern);
+            if (paren.pattern) {
+                rewritePattern(*paren.pattern, inputType, moduleName, sourceName, queue);
+            }
+            return;
+        }
+        default:
+            return;
+        }
+    }
+
+    std::vector<const NativeGenericTemplate*> collectExtensionTemplates(
+        const std::string& moduleName,
+        const std::string& methodName) const {
+        std::vector<const NativeGenericTemplate*> out;
+        std::set<const NativeGenericTemplate*> seen;
+        const auto scanModule = [&](const std::string& modName) {
+            if (const auto memMod = registry_.members.find(modName);
+                memMod != registry_.members.end()) {
+                if (const auto found = memMod->second.find(methodName);
+                    found != memMod->second.end()) {
+                    for (const auto& tmpl : found->second) {
+                        if (tmpl.isExtension && seen.insert(&tmpl).second) {
+                            out.push_back(&tmpl);
+                        }
+                    }
+                }
+            }
+            if (const auto fnMod = registry_.functions.find(modName);
+                fnMod != registry_.functions.end()) {
+                if (const auto found = fnMod->second.find(methodName);
+                    found != fnMod->second.end() &&
+                    found->second.isExtension &&
+                    seen.insert(&found->second).second) {
+                    out.push_back(&found->second);
+                }
+            }
+        };
+        scanModule(moduleName);
+        if (const auto modIt = modules_.find(moduleName); modIt != modules_.end()) {
+            for (const auto& imp : modIt->second.imports) scanModule(imp);
+            for (const auto& hyg : modIt->second.hygienicModules) scanModule(hyg);
+        }
+        if (currentRewritingUnit_) {
+            for (const auto& hyg : currentRewritingUnit_->unitHygienicModules) scanModule(hyg);
+        }
+        for (const auto& hyg : currentMethodHygienicModules_) scanModule(hyg);
+        return out;
+    }
+
     void rewriteExpression(
         syntax::ExpressionSyntax& expression,
         const std::string& moduleName,
@@ -2703,7 +3444,15 @@ private:
         case syntax::SyntaxKind::TypeBinaryExpression: {
             auto& value = static_cast<syntax::TypeBinaryExpressionSyntax&>(expression);
             rewriteExpression(*value.expression, moduleName, sourceName, queue);
-            rewriteType(value.type, moduleName, sourceName, queue);
+            const auto inputType = expressionType(*value.expression);
+            if (value.pattern) {
+                rewritePattern(*value.pattern, inputType, moduleName, sourceName, queue);
+                if (value.pattern->kind() == syntax::SyntaxKind::TypePattern) {
+                    value.type = static_cast<const syntax::TypePatternSyntax&>(*value.pattern).type;
+                }
+            } else {
+                rewriteType(value.type, moduleName, sourceName, queue);
+            }
             return;
         }
         case syntax::SyntaxKind::TypeOfExpression: {
@@ -2714,11 +3463,21 @@ private:
         case syntax::SyntaxKind::SwitchExpression: {
             auto& value = static_cast<syntax::SwitchExpressionSyntax&>(expression);
             rewriteExpression(*value.expression, moduleName, sourceName, queue);
+            const auto inputType = expressionType(*value.expression);
             for (auto& arm : value.arms) {
-                if (arm.patternType) rewriteType(*arm.patternType, moduleName, sourceName, queue);
-                if (arm.label) rewriteExpression(*arm.label, moduleName, sourceName, queue);
+                const auto savedLocal = localTypes_;
+                if (arm.pattern) {
+                    rewritePattern(*arm.pattern, inputType, moduleName, sourceName, queue);
+                    if (arm.pattern->kind() == syntax::SyntaxKind::TypePattern) {
+                        arm.patternType = static_cast<const syntax::TypePatternSyntax&>(*arm.pattern).type;
+                    }
+                } else {
+                    if (arm.patternType) rewriteType(*arm.patternType, moduleName, sourceName, queue);
+                    if (arm.label) rewriteExpression(*arm.label, moduleName, sourceName, queue);
+                }
                 if (arm.guard) rewriteExpression(*arm.guard, moduleName, sourceName, queue);
                 if (arm.value) rewriteExpression(*arm.value, moduleName, sourceName, queue);
+                localTypes_ = savedLocal;
             }
             return;
         }
@@ -2801,7 +3560,7 @@ private:
                            true,
                            call.span(),
                            sourceName)) {
-                const auto inferred = inferArguments(*declaration, call.arguments);
+                const auto inferred = inferArguments(*declaration, call.arguments, moduleName);
                 if (inferred) {
                     call.identifierToken.text = request(
                         moduleName,
@@ -2829,36 +3588,122 @@ private:
             auto& call = static_cast<syntax::MemberCallExpressionSyntax&>(expression);
             rewriteExpression(*call.receiver, moduleName, sourceName, queue);
             for (auto& argument : call.arguments) {
-                rewriteExpression(*argument, moduleName, sourceName, queue);
+                if (argument && argument->kind() != syntax::SyntaxKind::LambdaExpression) {
+                    rewriteExpression(*argument, moduleName, sourceName, queue);
+                }
             }
-            const auto receiverType = expressionType(*call.receiver);
-            const auto* declaration = resolveMember(
-                moduleName,
-                call.nameToken.text,
-                receiverType,
-                call.span(),
-                sourceName);
+            auto receiverType = expressionType(*call.receiver);
+            bool staticTypeReceiver = false;
+            if (receiverType.empty() && call.receiver &&
+                call.receiver->kind() == syntax::SyntaxKind::NameExpression) {
+                const auto& rName = static_cast<const syntax::NameExpressionSyntax&>(
+                    *call.receiver).identifierToken.text;
+                if (localTypes_.find(rName) == localTypes_.end()) {
+                    receiverType = rName;
+                    staticTypeReceiver = true;
+                }
+            }
+
+            const NativeGenericTemplate* declaration = nullptr;
+            if (!receiverType.empty()) {
+                declaration = resolveMember(
+                    moduleName,
+                    call.nameToken.text,
+                    receiverType,
+                    call.span(),
+                    sourceName);
+                if (declaration && declaration->isExtension && !staticTypeReceiver) {
+                    declaration = nullptr;
+                }
+            }
+
+            std::vector<std::string> explicitTypeArgs;
             if (call.lessToken) {
-                if (declaration) {
-                    std::vector<std::string> arguments;
-                    for (auto& argument : call.typeArguments) {
-                        rewriteType(argument, moduleName, sourceName, queue);
-                        arguments.push_back(typeText(argument));
-                    }
+                for (auto& argument : call.typeArguments) {
+                    rewriteType(argument, moduleName, sourceName, queue);
+                    explicitTypeArgs.push_back(typeText(argument));
+                }
+            }
+
+            if (declaration) {
+                if (call.lessToken) {
                     call.nameToken.text = requestMember(
-                        moduleName, *declaration, arguments,
+                        moduleName, *declaration, explicitTypeArgs,
+                        call.span(), sourceName);
+                } else if (const auto inferred = inferArguments(
+                               *declaration, call.arguments, moduleName)) {
+                    call.nameToken.text = requestMember(
+                        moduleName, *declaration, *inferred,
                         call.span(), sourceName);
                 }
+            } else if (!staticTypeReceiver) {
+                auto extTemplates = collectExtensionTemplates(moduleName, call.nameToken.text);
+                std::vector<const syntax::ExpressionSyntax*> combinedArgs;
+                combinedArgs.reserve(call.arguments.size() + 1);
+                combinedArgs.push_back(call.receiver.get());
+                for (const auto& a : call.arguments) combinedArgs.push_back(a.get());
+
+                const NativeGenericTemplate* matchedExt = nullptr;
+                std::vector<std::string> matchedTypeArgs;
+                for (const auto* ext : extTemplates) {
+                    if (ext->parameterTypeSyntaxes.size() != combinedArgs.size()) continue;
+                    if (call.lessToken) {
+                        if (ext->parameters.size() != explicitTypeArgs.size()) continue;
+                        matchedExt = ext;
+                        matchedTypeArgs = explicitTypeArgs;
+                        break;
+                    }
+                    if (auto inferred = inferCallTypeArguments(*ext, combinedArgs, moduleName)) {
+                        matchedExt = ext;
+                        matchedTypeArgs = std::move(*inferred);
+                        break;
+                    }
+                }
+
+                if (matchedExt) {
+                    if (!matchedExt->ownerName.empty()) {
+                        call.nameToken.text = requestMember(
+                            moduleName, *matchedExt, matchedTypeArgs,
+                            call.span(), sourceName);
+                    } else {
+                        const std::string qualifiedFn = matchedExt->moduleName.empty()
+                            ? matchedExt->name
+                            : (matchedExt->moduleName + "::" + matchedExt->name);
+                        call.nameToken.text = stripCanonicalModulePrefix(request(
+                            moduleName,
+                            qualifiedFn,
+                            matchedTypeArgs,
+                            true,
+                            call.span(),
+                            sourceName,
+                            queue));
+                    }
+                } else if (receiverType.empty()) {
+                    if (const auto* fallback = resolveMember(
+                            moduleName, call.nameToken.text, {}, call.span(), sourceName)) {
+                        if (call.lessToken) {
+                            call.nameToken.text = requestMember(
+                                moduleName, *fallback, explicitTypeArgs,
+                                call.span(), sourceName);
+                        } else if (const auto inferred = inferArguments(
+                                       *fallback, call.arguments, moduleName)) {
+                            call.nameToken.text = requestMember(
+                                moduleName, *fallback, *inferred,
+                                call.span(), sourceName);
+                        }
+                    }
+                }
+            }
+
+            if (call.lessToken) {
                 call.lessToken.reset();
                 call.typeArguments.clear();
                 call.typeArgumentCommaTokens.clear();
                 call.greaterToken.reset();
-            } else if (declaration) {
-                const auto inferred = inferArguments(*declaration, call.arguments);
-                if (inferred) {
-                    call.nameToken.text = requestMember(
-                        moduleName, *declaration, *inferred,
-                        call.span(), sourceName);
+            }
+            for (auto& argument : call.arguments) {
+                if (argument && argument->kind() == syntax::SyntaxKind::LambdaExpression) {
+                    rewriteExpression(*argument, moduleName, sourceName, queue);
                 }
             }
             return;
@@ -3044,11 +3889,22 @@ private:
         case syntax::SyntaxKind::SwitchStatement: {
             auto& value = static_cast<syntax::SwitchStatementSyntax&>(statement);
             rewriteExpression(*value.expression, moduleName, sourceName, queue);
+            const auto inputType = expressionType(*value.expression);
             for (auto& section : value.sections) {
-                if (section.patternType) rewriteType(*section.patternType, moduleName, sourceName, queue);
-                if (section.label) rewriteExpression(*section.label, moduleName, sourceName, queue);
+                const auto savedLocal = localTypes_;
+                if (section.pattern) {
+                    rewritePattern(*section.pattern, inputType, moduleName, sourceName, queue);
+                    if (section.pattern->kind() == syntax::SyntaxKind::TypePattern) {
+                        section.patternType = static_cast<const syntax::TypePatternSyntax&>(
+                            *section.pattern).type;
+                    }
+                } else {
+                    if (section.patternType) rewriteType(*section.patternType, moduleName, sourceName, queue);
+                    if (section.label) rewriteExpression(*section.label, moduleName, sourceName, queue);
+                }
                 if (section.guard) rewriteExpression(*section.guard, moduleName, sourceName, queue);
                 for (auto& child : section.statements) rewriteStatement(*child, moduleName, sourceName, queue);
+                localTypes_ = savedLocal;
             }
             return;
         }
@@ -3134,6 +3990,9 @@ private:
         if (!function.typeParameters.empty()) return;
         const auto previousLocalTypes = localTypes_;
         localTypes_.clear();
+        if (!currentOwnerTypeName_.empty() && !function.staticKeyword) {
+            localTypes_["this"] = currentOwnerTypeName_;
+        }
         rewriteType(function.returnType, moduleName, sourceName, queue);
         for (auto& parameter : function.parameters) {
             rewriteParameter(parameter, moduleName, sourceName, queue);
@@ -3152,6 +4011,8 @@ private:
         const std::string& sourceName,
         std::vector<ParsedUnit*>& queue) {
         if (!declaration.typeParameters.empty()) return;
+        const auto savedOwnerName = currentOwnerTypeName_;
+        currentOwnerTypeName_ = declaration.identifierToken.text;
         for (auto& interfaceType : declaration.interfaces) rewriteType(interfaceType, moduleName, sourceName, queue);
         for (auto& field : declaration.fields) {
             rewriteType(field.type, moduleName, sourceName, queue);
@@ -3183,6 +4044,7 @@ private:
             if (property.setter && property.setter->body) rewriteStatement(*property.setter->body, moduleName, sourceName, queue);
             if (property.initializer) rewriteExpression(*property.initializer, moduleName, sourceName, queue);
         }
+        currentOwnerTypeName_ = savedOwnerName;
     }
 
     static void detachSyntaxTree(ParsedUnit& unit) {
@@ -3209,10 +4071,23 @@ private:
         for (auto& declaration : unit.syntaxTree->structs) rewriteTypeDeclaration(declaration, moduleName, sourceName, queue);
         for (auto& declaration : unit.syntaxTree->interfaces) {
             if (!declaration.typeParameters.empty()) continue;
+            const auto savedOwner = currentOwnerTypeName_;
+            currentOwnerTypeName_ = declaration.identifierToken.text;
             for (auto& method : declaration.methods) {
+                const auto savedLocal = localTypes_;
+                localTypes_.clear();
+                localTypes_["this"] = declaration.identifierToken.text;
                 rewriteType(method.returnType, moduleName, sourceName, queue);
-                for (auto& parameter : method.parameters) rewriteParameter(parameter, moduleName, sourceName, queue);
+                for (auto& parameter : method.parameters) {
+                    rewriteParameter(parameter, moduleName, sourceName, queue);
+                    localTypes_[parameter.identifierToken.text] = typeText(parameter.type);
+                }
+                if (method.hasBody()) {
+                    rewriteStatement(*method.body, moduleName, sourceName, queue);
+                }
+                localTypes_ = savedLocal;
             }
+            currentOwnerTypeName_ = savedOwner;
         }
         for (auto& declaration : unit.syntaxTree->delegates) {
             if (!declaration.typeParameters.empty()) continue;
@@ -3235,6 +4110,9 @@ private:
     const ParsedUnit* currentRewritingUnit_ = nullptr;
     std::uint32_t currentGenericDepth_ = 0;
     std::set<std::string> currentMethodHygienicModules_;
+    std::string currentOwnerTypeName_;
+    std::map<std::string, std::pair<std::string, std::vector<std::string>>> instantiatedTypes_;
+    std::map<std::string, std::string> specializedReturnTypes_;
 };
 
 void specializeNativeGenerics(

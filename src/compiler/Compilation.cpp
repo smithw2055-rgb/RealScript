@@ -38,7 +38,12 @@ struct InterfaceMethodContract {
     std::string name;
     InterfaceTypeRef returnType;
     std::vector<InterfaceTypeRef> parameters;
+    std::vector<semantic::ParameterModifier> parameterModifiers;
     text::TextSpan declarationSpan;
+    bool hasDefaultImplementation = false;
+    const syntax::InterfaceMethodDeclarationSyntax* methodSyntax = nullptr;
+    std::string sourceName;
+    std::set<std::string> hygienicModules;
 };
 
 struct InterfaceContract {
@@ -52,6 +57,7 @@ struct InterfaceContract {
 struct InterfaceDeclarationInput {
     const syntax::InterfaceDeclarationSyntax* syntax = nullptr;
     std::string sourceName;
+    std::set<std::string> unitHygienicModules;
 };
 
 using InterfaceMap = std::map<std::string, InterfaceContract>;
@@ -103,6 +109,7 @@ struct ModuleWork {
     DelegateMap visibleDelegates;
     std::vector<semantic::FunctionSymbol> declarations;
     std::vector<semantic::FunctionBindingInput> functionBindings;
+    std::vector<std::unique_ptr<syntax::FunctionDeclarationSyntax>> synthesizedMethods;
     std::uint64_t sourceFingerprint = 0;
     std::uint64_t transitiveSourceFingerprint = 0;
     std::uint64_t publicFingerprint = 0;
@@ -384,7 +391,14 @@ std::string interfaceMethodSignature(
     const InterfaceMethodContract& method) {
     std::ostringstream out;
     out << method.name << '(';
-    for (const auto& parameter : method.parameters) {
+    for (std::size_t idx = 0; idx < method.parameters.size(); ++idx) {
+        const auto& parameter = method.parameters[idx];
+        const auto mod = idx < method.parameterModifiers.size()
+            ? method.parameterModifiers[idx]
+            : semantic::ParameterModifier::None;
+        if (mod != semantic::ParameterModifier::None) {
+            out << static_cast<int>(mod) << '@';
+        }
         out << semantic::primitiveTypeName(parameter.type) << '#'
             << parameter.typeName << ';';
     }
@@ -4427,7 +4441,10 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 type.declarationSpan = node.identifierToken.span;
                 module.types.push_back(std::move(type));
                 module.interfaceInputs.push_back(
-                    InterfaceDeclarationInput{&node, unit->source->name()});
+                    InterfaceDeclarationInput{
+                        &node,
+                        unit->source->name(),
+                        unit->unitHygienicModules});
             }
             for (const auto& node : unit->syntaxTree->delegates) {
                 if (!node.typeParameters.empty()) continue;
@@ -4493,12 +4510,33 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     input.sourceName,
                     true);
                 for (const auto& parameter : methodSyntax.parameters) {
+                    semantic::ParameterModifier pMod = semantic::ParameterModifier::None;
+                    if (parameter.modifierToken) {
+                        if (parameter.modifierToken->kind == syntax::SyntaxKind::RefKeyword)
+                            pMod = semantic::ParameterModifier::Ref;
+                        else if (parameter.modifierToken->kind == syntax::SyntaxKind::OutKeyword)
+                            pMod = semantic::ParameterModifier::Out;
+                        else if (parameter.modifierToken->kind == syntax::SyntaxKind::InKeyword)
+                            pMod = semantic::ParameterModifier::In;
+                    }
+                    method.parameterModifiers.push_back(pMod);
                     method.parameters.push_back(resolveInterfaceType(
                         parameter.type,
                         module.visibleTypes,
                         result.diagnostics,
                         input.sourceName,
                         false));
+                }
+                if (methodSyntax.hasBody()) {
+                    method.hasDefaultImplementation = true;
+                    method.methodSyntax = &methodSyntax;
+                    method.sourceName = input.sourceName;
+                    method.hygienicModules.insert(moduleName);
+                    method.hygienicModules.insert(module.imports.begin(), module.imports.end());
+                    method.hygienicModules.insert(
+                        input.unitHygienicModules.begin(),
+                        input.unitHygienicModules.end());
+
                 }
                 const auto signature = interfaceMethodSignature(method);
                 if (!signatures.insert(signature).second) {
@@ -6436,6 +6474,235 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             }
                         }
                     }
+                    // Synthesize default interface implementations (Trait Mixins)
+                    if (!owner.interfaceType && !owner.delegateType && !owner.staticType) {
+                        std::map<std::string, const InterfaceContract*> allContractsByName;
+                        const auto findGlobalInterfaceContractById =
+                            [&](semantic::SymbolId ifaceId) -> const InterfaceContract* {
+                            for (const auto& [mName, mWork] : modules) {
+                                (void)mName;
+                                for (const auto& [iName, c] : mWork.interfaces) {
+                                    (void)iName;
+                                    if (semantic::stableTypeId(
+                                            canonicalInterfaceName(c.moduleName, c.name)) == ifaceId) {
+                                        return &c;
+                                    }
+                                }
+                            }
+                            return nullptr;
+                        };
+                        for (const auto& inheritedMap : owner.interfaceDispatchMaps) {
+                            if (const auto* ic = findGlobalInterfaceContractById(
+                                    inheritedMap.interfaceTypeId)) {
+                                allContractsByName[canonicalInterfaceName(ic->moduleName, ic->name)] = ic;
+                            }
+                        }
+                        for (std::size_t ifaceIdx = 0;
+                             ifaceIdx < typeSyntax.interfaces.size();
+                             ++ifaceIdx) {
+                            const auto& ifaceSyn = typeSyntax.interfaces[ifaceIdx];
+                            if (ifaceIdx == 0 && !owner.baseTypeName.empty()) {
+                                const auto cand = module.visibleTypes.find(ifaceSyn.name.text);
+                                if (cand != module.visibleTypes.end() &&
+                                    semantic::canonicalTypeName(cand->second) == owner.baseTypeName) {
+                                    continue;
+                                }
+                            }
+                            const auto foundIface = module.visibleInterfaces.find(ifaceSyn.name.text);
+                            if (foundIface != module.visibleInterfaces.end()) {
+                                const auto canonIface = canonicalInterfaceName(
+                                    foundIface->second.moduleName, foundIface->second.name);
+                                allContractsByName[canonIface] = &foundIface->second;
+                            }
+                        }
+
+                        if (!allContractsByName.empty()) {
+                            auto matchesReq = [](const semantic::FunctionSymbol& candidate,
+                                                 const InterfaceMethodContract& required) -> bool {
+                                if (candidate.staticMethod || candidate.name != required.name) {
+                                    return false;
+                                }
+                                const std::size_t paramOffset =
+                                    candidate.method && !candidate.staticMethod ? 1u : 0u;
+                                if (candidate.parameters.size() < paramOffset ||
+                                    candidate.parameters.size() - paramOffset !=
+                                        required.parameters.size()) {
+                                    return false;
+                                }
+                                if (!sameInterfaceType(
+                                        required.returnType,
+                                        candidate.returnType,
+                                        candidate.returnTypeName)) {
+                                    return false;
+                                }
+                                for (std::size_t p = 0; p < required.parameters.size(); ++p) {
+                                    const auto& actual = candidate.parameters[p + paramOffset];
+                                    const auto reqMod = p < required.parameterModifiers.size()
+                                        ? required.parameterModifiers[p]
+                                        : semantic::ParameterModifier::None;
+                                    if (actual.modifier != reqMod ||
+                                        !sameInterfaceType(
+                                            required.parameters[p],
+                                            actual.type,
+                                            actual.typeName)) {
+                                        return false;
+                                    }
+                                }
+                                return true;
+                            };
+
+                            struct DefaultProvider {
+                                std::string canonicalInterface;
+                                const InterfaceMethodContract* method = nullptr;
+                            };
+                            std::map<std::string, std::vector<DefaultProvider>> providersBySig;
+                            std::map<std::string, const InterfaceMethodContract*> sampleBySig;
+                            for (const auto& [canonIface, contractPtr] : allContractsByName) {
+                                for (const auto& req : contractPtr->methods) {
+                                    const auto sig = interfaceMethodSignature(req);
+                                    sampleBySig.try_emplace(sig, &req);
+                                    if (req.hasDefaultImplementation &&
+                                        req.methodSyntax &&
+                                        req.methodSyntax->body) {
+                                        providersBySig[sig].push_back(
+                                            DefaultProvider{canonIface, &req});
+                                    }
+                                }
+                            }
+
+                            for (const auto& [sig, providers] : providersBySig) {
+                                if (providers.empty()) continue;
+                                const auto* reqSample = sampleBySig.at(sig);
+                                bool hasExplicitImpl = false;
+                                std::optional<std::size_t> existingSynthIdx;
+                                std::optional<std::size_t> existingAbstractIdx;
+                                for (std::size_t mIdx = 0; mIdx < owner.methods.size(); ++mIdx) {
+                                    const auto& cand = owner.methods[mIdx];
+                                    if (!matchesReq(cand, *reqSample)) continue;
+                                    if (!cand.synthetic) {
+                                        if (!cand.abstractMethod || owner.abstractType) {
+                                            hasExplicitImpl = true;
+                                            break;
+                                        }
+                                        existingAbstractIdx = mIdx;
+                                    } else {
+                                        existingSynthIdx = mIdx;
+                                    }
+                                }
+                                if (hasExplicitImpl) continue;
+
+                                if (providers.size() > 1) {
+                                    std::ostringstream conflictList;
+                                    for (std::size_t pi = 0; pi < providers.size(); ++pi) {
+                                        if (pi != 0) conflictList << "' and '";
+                                        conflictList << providers[pi].canonicalInterface;
+                                    }
+                                    result.diagnostics.report(
+                                        "RS3415",
+                                        "type '" + semantic::canonicalTypeName(owner) +
+                                            "' does not implement interface member '" +
+                                            reqSample->name +
+                                            "' and inherits ambiguous default implementations from '" +
+                                            conflictList.str() + "'",
+                                        typeSyntax.identifierToken.span,
+                                        diagnostics::DiagnosticSeverity::Error,
+                                        unit->source->name());
+                                    module.invalid = true;
+                                    continue;
+                                }
+
+                                if (existingSynthIdx.has_value()) {
+                                    continue;
+                                }
+
+                                const auto& chosen = *providers.front().method;
+                                const auto& ifaceMethodSyn = *chosen.methodSyntax;
+                                bool addedHyg = false;
+                                for (const auto& hm : chosen.hygienicModules) {
+                                    if (hm != moduleName &&
+                                        module.hygienicModules.insert(hm).second) {
+                                        addedHyg = true;
+                                    }
+                                }
+                                if (addedHyg) {
+                                    refreshVisibleTypes(modules, module);
+                                    refreshVisibleInterfaces(modules, module);
+                                    refreshVisibleDelegates(modules, module);
+                                }
+
+                                auto synthFn = std::make_unique<syntax::FunctionDeclarationSyntax>();
+                                synthFn->modifiers.push_back(syntax::SyntaxToken{
+                                    syntax::SyntaxKind::PublicKeyword,
+                                    ifaceMethodSyn.identifierToken.span,
+                                    "public",
+                                    {},
+                                    true});
+                                synthFn->returnType = ifaceMethodSyn.returnType;
+                                synthFn->identifierToken = ifaceMethodSyn.identifierToken;
+                                synthFn->openParenToken = ifaceMethodSyn.openParenToken;
+                                for (const auto& p : ifaceMethodSyn.parameters) {
+                                    synthFn->parameters.push_back(syntax::cloneParameterSyntax(p));
+                                }
+                                synthFn->commaTokens = ifaceMethodSyn.commaTokens;
+                                synthFn->closeParenToken = ifaceMethodSyn.closeParenToken;
+                                if (auto clonedBody = syntax::cloneStatementSyntax(*ifaceMethodSyn.body)) {
+                                    synthFn->body = std::move(
+                                        static_cast<syntax::BlockStatementSyntax&>(*clonedBody));
+                                }
+
+                                diagnostics::DiagnosticBag synthDeclBag;
+                                auto synthSym = semantic::declareFunctionSymbol(
+                                    moduleName,
+                                    *synthFn,
+                                    module.visibleTypes,
+                                    synthDeclBag,
+                                    &owner);
+                                appendStampedDiagnostics(
+                                    result.diagnostics, synthDeclBag, unit->source->name());
+                                if (synthDeclBag.hasErrors()) module.invalid = true;
+                                synthSym.accessibility = semantic::Accessibility::Public;
+                                synthSym.synthetic = true;
+                                synthSym.sourceName = unit->source->name();
+
+                                if (owner.kind == semantic::TypeKind::Class) {
+                                    synthSym.virtualMethod = true;
+                                    if (existingAbstractIdx.has_value() &&
+                                        owner.methods[*existingAbstractIdx].virtualSlot !=
+                                            std::numeric_limits<std::uint32_t>::max()) {
+                                        synthSym.virtualSlot =
+                                            owner.methods[*existingAbstractIdx].virtualSlot;
+                                        if (owner.virtualDispatchTable.size() <= synthSym.virtualSlot) {
+                                            owner.virtualDispatchTable.resize(
+                                                static_cast<std::size_t>(synthSym.virtualSlot) + 1, 0);
+                                        }
+                                        owner.virtualDispatchTable[synthSym.virtualSlot] = synthSym.id;
+                                        owner.methods[*existingAbstractIdx] = synthSym;
+                                    } else {
+                                        synthSym.virtualSlot = static_cast<std::uint32_t>(
+                                            owner.virtualDispatchTable.size());
+                                        owner.virtualDispatchTable.push_back(synthSym.id);
+                                        owner.methods.push_back(synthSym);
+                                    }
+                                } else {
+                                    owner.methods.push_back(synthSym);
+                                }
+
+                                semantic::FunctionBindingInput synthBinding;
+                                synthBinding.symbol = synthSym;
+                                synthBinding.sourceName = unit->source->name();
+                                synthBinding.body = &synthFn->body;
+                                synthBinding.parameterNames.push_back("this");
+                                synthBinding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                                synthBinding.hygienicAccessibleModules.insert(
+                                    chosen.hygienicModules.begin(),
+                                    chosen.hygienicModules.end());
+                                appendParameters(synthBinding, synthFn->parameters);
+                                module.synthesizedMethods.push_back(std::move(synthFn));
+                                addBinding(module, std::move(synthBinding), typeSyntax.identifierToken.span);
+                            }
+                        }
+                    }
+
                     validateConcreteClassType(owner, module, result);
                     *ownerPointer = std::move(owner);
                     module.visibleTypes[ownerPointer->name] = *ownerPointer;
@@ -6860,10 +7127,14 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                                     candidate.parameters[
                                         parameter +
                                         parameterOffset];
-                                compatible = sameInterfaceType(
-                                    required.parameters[parameter],
-                                    actual.type,
-                                    actual.typeName);
+                                const auto reqMod = parameter < required.parameterModifiers.size()
+                                    ? required.parameterModifiers[parameter]
+                                    : semantic::ParameterModifier::None;
+                                compatible = (actual.modifier == reqMod) &&
+                                    sameInterfaceType(
+                                        required.parameters[parameter],
+                                        actual.type,
+                                        actual.typeName);
                             }
                             if (compatible) {
                                 matched = &candidate;
@@ -7016,7 +7287,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 << canonicalInterfaceName(contract.moduleName, contract.name)
                 << '{';
             for (const auto& method : contract.methods) {
-                interfaceSignature << interfaceMethodSignature(method) << ';';
+                interfaceSignature << interfaceMethodSignature(method)
+                    << (method.hasDefaultImplementation ? "=default;" : ";");
             }
             interfaceSignature << '}';
             signatures.push_back(interfaceSignature.str());
@@ -7242,6 +7514,652 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         }
     }
 
+    // Strongly-Typed Attribute Contracts ([AttributeUsage] & [Obsolete])
+    std::unordered_map<semantic::SymbolId, semantic::ObsoleteInfo> globalObsoleteSymbols;
+    {
+        enum AttrTargetFlags : std::uint32_t {
+            AttrTarget_None      = 0u,
+            AttrTarget_Class     = 1u << 0,
+            AttrTarget_Struct    = 1u << 1,
+            AttrTarget_Interface = 1u << 2,
+            AttrTarget_Enum      = 1u << 3,
+            AttrTarget_Delegate  = 1u << 4,
+            AttrTarget_Ctor      = 1u << 5,
+            AttrTarget_Method    = 1u << 6,
+            AttrTarget_Function  = 1u << 7,
+            AttrTarget_Field     = 1u << 8,
+            AttrTarget_Property  = 1u << 9,
+            AttrTarget_Parameter = 1u << 10,
+            AttrTarget_Event     = 1u << 11,
+            AttrTarget_Module    = 1u << 12,
+            AttrTarget_All       = 0xFFFFFFFFu
+        };
+        struct AttributeUsageRule {
+            std::uint32_t validTargets = AttrTarget_All;
+            bool allowMultiple = false;
+        };
+
+        auto toLowerAscii = [](std::string s) {
+            for (char& c : s) {
+                if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            }
+            return s;
+        };
+        auto stripAttributeSuffix = [](const std::string& name) -> std::string {
+            constexpr std::string_view sfx = "Attribute";
+            if (name.size() > sfx.size() &&
+                name.compare(name.size() - sfx.size(), sfx.size(), sfx) == 0) {
+                return name.substr(0, name.size() - sfx.size());
+            }
+            return name;
+        };
+        auto parseTargetString = [&](const std::string& spec) -> std::uint32_t {
+            std::uint32_t flags = AttrTarget_None;
+            std::string cur;
+            auto flushToken = [&]() {
+                if (cur.empty()) return;
+                const auto low = toLowerAscii(cur);
+                cur.clear();
+                if (low == "all") flags |= AttrTarget_All;
+                else if (low == "class" || low == "classes") flags |= AttrTarget_Class;
+                else if (low == "struct" || low == "structs") flags |= AttrTarget_Struct;
+                else if (low == "interface" || low == "interfaces") flags |= AttrTarget_Interface;
+                else if (low == "enum" || low == "enums" || low == "enummember") flags |= AttrTarget_Enum;
+                else if (low == "delegate" || low == "delegates") flags |= AttrTarget_Delegate;
+                else if (low == "constructor" || low == "constructors" || low == "ctor") flags |= AttrTarget_Ctor;
+                else if (low == "method" || low == "methods") flags |= (AttrTarget_Method | AttrTarget_Function);
+                else if (low == "function" || low == "functions") flags |= (AttrTarget_Function | AttrTarget_Method);
+                else if (low == "field" || low == "fields") flags |= AttrTarget_Field;
+                else if (low == "property" || low == "properties") flags |= AttrTarget_Property;
+                else if (low == "parameter" || low == "parameters" || low == "param") flags |= AttrTarget_Parameter;
+                else if (low == "event" || low == "events") flags |= AttrTarget_Event;
+                else if (low == "module" || low == "modules") flags |= AttrTarget_Module;
+            };
+            for (const char ch : spec) {
+                const bool isAlpha = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+                if (isAlpha) cur.push_back(ch);
+                else flushToken();
+            }
+            flushToken();
+            return flags == AttrTarget_None ? AttrTarget_All : flags;
+        };
+        auto evalAttrConstValue = [&](const syntax::AttributeArgumentSyntax& arg,
+                                      const text::SourceText& src,
+                                      const semantic::TypeSymbolMap& visTypes,
+                                      syntax::TokenValue& outVal) -> bool {
+            const auto sp = arg.valueSpan();
+            if (sp.empty()) return false;
+            text::SourceText wrapSrc(
+                "class __RsAttrEval { const int __V = " + std::string(src.view(sp)) + "; }",
+                "$attr_eval");
+            diagnostics::DiagnosticBag ignored;
+            syntax::Parser p(wrapSrc, ignored);
+            auto cu = p.parseCompilationUnit();
+            if (ignored.hasErrors() || cu.classes.empty() ||
+                cu.classes[0].fields.empty() || !cu.classes[0].fields[0].initializer) {
+                return false;
+            }
+            semantic::PrimitiveType pt = semantic::PrimitiveType::Error;
+            return semantic::evaluateConstantSyntaxExpression(
+                *cu.classes[0].fields[0].initializer, nullptr, visTypes, outVal, pt);
+        };
+        auto evalAttrArgString = [&](const syntax::AttributeArgumentSyntax& arg,
+                                     const text::SourceText& src,
+                                     const semantic::TypeSymbolMap& visTypes) -> std::optional<std::string> {
+            if (arg.valueTokens.size() == 1 &&
+                arg.valueTokens[0].kind == syntax::SyntaxKind::StringLiteralToken &&
+                std::holds_alternative<std::string>(arg.valueTokens[0].value)) {
+                return std::get<std::string>(arg.valueTokens[0].value);
+            }
+            syntax::TokenValue tv;
+            if (evalAttrConstValue(arg, src, visTypes, tv)) {
+                if (const auto* s = std::get_if<std::string>(&tv)) return *s;
+            }
+            for (const auto& tok : arg.valueTokens) {
+                if (tok.kind == syntax::SyntaxKind::StringLiteralToken &&
+                    std::holds_alternative<std::string>(tok.value)) {
+                    return std::get<std::string>(tok.value);
+                }
+            }
+            return std::nullopt;
+        };
+        auto evalAttrArgBool = [&](const syntax::AttributeArgumentSyntax& arg,
+                                   const text::SourceText& src,
+                                   const semantic::TypeSymbolMap& visTypes) -> std::optional<bool> {
+            if (arg.valueTokens.size() == 1) {
+                if (arg.valueTokens[0].kind == syntax::SyntaxKind::TrueKeyword) return true;
+                if (arg.valueTokens[0].kind == syntax::SyntaxKind::FalseKeyword) return false;
+            }
+            syntax::TokenValue tv;
+            if (evalAttrConstValue(arg, src, visTypes, tv)) {
+                if (const auto* b = std::get_if<bool>(&tv)) return *b;
+            }
+            return std::nullopt;
+        };
+
+        // 1. Collect [AttributeUsage] contracts across all custom attribute types
+        std::unordered_map<semantic::SymbolId, AttributeUsageRule> usageByTypeId;
+        usageByTypeId.reserve(32);
+        const auto scanAttrTypeDecls = [&](ModuleWork& mod, const ParsedUnit& unit, const auto& decls) {
+            for (const auto& decl : decls) {
+                if (!decl.typeParameters.empty()) continue;
+                const auto* owner = findOwnType(mod, decl.identifierToken.text);
+                if (!owner) continue;
+                for (const auto& list : decl.attributes) {
+                    for (const auto& attr : list.attributes) {
+                        const auto baseName = stripAttributeSuffix(attr.nameToken.text);
+                        if (baseName != "AttributeUsage") continue;
+                        AttributeUsageRule rule;
+                        rule.validTargets = AttrTarget_All;
+                        rule.allowMultiple = false;
+                        std::size_t posIdx = 0;
+                        for (const auto& arg : attr.arguments) {
+                            if (arg.nameToken) {
+                                const auto argName = arg.nameToken->text;
+                                if (argName == "validOn" || argName == "targets") {
+                                    if (const auto s = evalAttrArgString(arg, *unit.source, mod.visibleTypes)) {
+                                        rule.validTargets = parseTargetString(*s);
+                                    }
+                                } else if (argName == "allowMultiple" || argName == "AllowMultiple") {
+                                    if (const auto b = evalAttrArgBool(arg, *unit.source, mod.visibleTypes)) {
+                                        rule.allowMultiple = *b;
+                                    }
+                                }
+                            } else {
+                                if (posIdx == 0) {
+                                    if (const auto s = evalAttrArgString(arg, *unit.source, mod.visibleTypes)) {
+                                        rule.validTargets = parseTargetString(*s);
+                                    }
+                                } else if (posIdx == 1) {
+                                    if (const auto b = evalAttrArgBool(arg, *unit.source, mod.visibleTypes)) {
+                                        rule.allowMultiple = *b;
+                                    }
+                                }
+                                ++posIdx;
+                            }
+                        }
+                        usageByTypeId[owner->id] = rule;
+                    }
+                }
+            }
+        };
+        for (auto& [modName, mod] : modules) {
+            (void)modName;
+            for (const auto* unit : mod.units) {
+                if (!unit || !unit->syntaxTree) continue;
+                scanAttrTypeDecls(mod, *unit, unit->syntaxTree->classes);
+                scanAttrTypeDecls(mod, *unit, unit->syntaxTree->structs);
+            }
+        }
+
+        // Helper to extract [Obsolete] info from attribute lists
+        const auto extractObsolete = [&](const std::vector<syntax::AttributeListSyntax>& lists,
+                                         const text::SourceText& src,
+                                         const semantic::TypeSymbolMap& visTypes)
+            -> std::optional<semantic::ObsoleteInfo> {
+            for (const auto& list : lists) {
+                for (const auto& attr : list.attributes) {
+                    if (stripAttributeSuffix(attr.nameToken.text) != "Obsolete") continue;
+                    semantic::ObsoleteInfo info;
+                    std::size_t posIdx = 0;
+                    for (const auto& arg : attr.arguments) {
+                        if (arg.nameToken) {
+                            const auto& an = arg.nameToken->text;
+                            if (an == "message" || an == "reason") {
+                                if (const auto s = evalAttrArgString(arg, src, visTypes)) {
+                                    info.message = *s;
+                                }
+                            } else if (an == "error" || an == "isError") {
+                                if (const auto b = evalAttrArgBool(arg, src, visTypes)) {
+                                    info.isError = *b;
+                                }
+                            }
+                        } else {
+                            if (posIdx == 0) {
+                                if (const auto s = evalAttrArgString(arg, src, visTypes)) {
+                                    info.message = *s;
+                                } else if (const auto b = evalAttrArgBool(arg, src, visTypes)) {
+                                    info.isError = *b;
+                                }
+                            } else if (posIdx == 1) {
+                                if (const auto b = evalAttrArgBool(arg, src, visTypes)) {
+                                    info.isError = *b;
+                                }
+                            }
+                            ++posIdx;
+                        }
+                    }
+                    return info;
+                }
+            }
+            return std::nullopt;
+        };
+
+        // 2. Validate attribute contracts ([AttributeUsage]) & populate globalObsoleteSymbols
+        const auto targetKindLabel = [](std::uint32_t flag) -> const char* {
+            switch (flag) {
+            case AttrTarget_Class: return "class";
+            case AttrTarget_Struct: return "struct";
+            case AttrTarget_Interface: return "interface";
+            case AttrTarget_Enum: return "enum";
+            case AttrTarget_Delegate: return "delegate";
+            case AttrTarget_Ctor: return "constructor";
+            case AttrTarget_Method: return "method";
+            case AttrTarget_Function: return "function";
+            case AttrTarget_Field: return "field";
+            case AttrTarget_Property: return "property";
+            case AttrTarget_Parameter: return "parameter";
+            case AttrTarget_Event: return "event";
+            case AttrTarget_Module: return "module";
+            default: return "declaration";
+            }
+        };
+
+        const auto validateAttrLists = [&](ModuleWork& mod,
+                                           const std::string& srcName,
+                                           const std::vector<syntax::AttributeListSyntax>& lists,
+                                           std::uint32_t targetFlag) {
+            if (lists.empty()) return;
+            std::unordered_set<std::string> seenSingleUseKeys;
+            for (const auto& list : lists) {
+                for (const auto& attr : list.attributes) {
+                    const auto rawName = attr.nameToken.text;
+                    const auto shortName = stripAttributeSuffix(rawName);
+                    if (shortName == "AttributeUsage") {
+                        const std::uint32_t validOn = AttrTarget_Class | AttrTarget_Struct;
+                        if ((validOn & targetFlag) == 0) {
+                            result.diagnostics.report(
+                                "RS4103",
+                                "attribute '" + rawName + "' is not valid on '" +
+                                    std::string(targetKindLabel(targetFlag)) + "' declarations",
+                                attr.nameToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                srcName);
+                            mod.invalid = true;
+                        }
+                        if (!seenSingleUseKeys.insert("$builtin::AttributeUsage").second) {
+                            result.diagnostics.report(
+                                "RS4104",
+                                "duplicate attribute '" + rawName +
+                                    "' is not allowed because allowMultiple is false",
+                                attr.nameToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                srcName);
+                            mod.invalid = true;
+                        }
+                        continue;
+                    }
+                    if (shortName == "Obsolete") {
+                        const std::uint32_t validOn =
+                            AttrTarget_Class | AttrTarget_Struct | AttrTarget_Interface |
+                            AttrTarget_Enum | AttrTarget_Delegate | AttrTarget_Ctor |
+                            AttrTarget_Method | AttrTarget_Function | AttrTarget_Field |
+                            AttrTarget_Property | AttrTarget_Event;
+                        if ((validOn & targetFlag) == 0) {
+                            result.diagnostics.report(
+                                "RS4103",
+                                "attribute '" + rawName + "' is not valid on '" +
+                                    std::string(targetKindLabel(targetFlag)) + "' declarations",
+                                attr.nameToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                srcName);
+                            mod.invalid = true;
+                        }
+                        if (!seenSingleUseKeys.insert("$builtin::Obsolete").second) {
+                            result.diagnostics.report(
+                                "RS4104",
+                                "duplicate attribute '" + rawName +
+                                    "' is not allowed because allowMultiple is false",
+                                attr.nameToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                srcName);
+                            mod.invalid = true;
+                        }
+                        continue;
+                    }
+
+                    const semantic::TypeSymbol* attrType = nullptr;
+                    auto it = mod.visibleTypes.find(rawName);
+                    if (it != mod.visibleTypes.end()) {
+                        attrType = &it->second;
+                    } else {
+                        const auto withSuffix = shortName + "Attribute";
+                        it = mod.visibleTypes.find(withSuffix);
+                        if (it != mod.visibleTypes.end()) {
+                            attrType = &it->second;
+                        }
+                    }
+                    if (!attrType) continue;
+                    const auto ruleIt = usageByTypeId.find(attrType->id);
+                    if (ruleIt == usageByTypeId.end()) continue;
+                    const auto& rule = ruleIt->second;
+                    if ((rule.validTargets & targetFlag) == 0) {
+                        result.diagnostics.report(
+                            "RS4103",
+                            "attribute '" + rawName + "' is not valid on '" +
+                                std::string(targetKindLabel(targetFlag)) + "' declarations",
+                            attr.nameToken.span,
+                            diagnostics::DiagnosticSeverity::Error,
+                            srcName);
+                        mod.invalid = true;
+                    }
+                    if (!rule.allowMultiple) {
+                        const std::string key = "id:" + std::to_string(attrType->id);
+                        if (!seenSingleUseKeys.insert(key).second) {
+                            result.diagnostics.report(
+                                "RS4104",
+                                "duplicate attribute '" + rawName +
+                                    "' is not allowed because allowMultiple is false",
+                                attr.nameToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                srcName);
+                            mod.invalid = true;
+                        }
+                    }
+                }
+            }
+        };
+
+        for (auto& [modName, mod] : modules) {
+            (void)modName;
+            for (const auto* unit : mod.units) {
+                if (!unit || !unit->syntaxTree) continue;
+                const auto& srcName = unit->source->name();
+                const bool validateThisMod = !mod.frontendCached;
+
+                if (validateThisMod && unit->syntaxTree->moduleDeclaration) {
+                    validateAttrLists(
+                        mod, srcName, unit->syntaxTree->moduleDeclaration->attributes, AttrTarget_Module);
+                }
+
+                const auto processRecordAttrs = [&](const auto& decls, std::uint32_t recordFlag) {
+                    for (const auto& decl : decls) {
+                        if (!decl.typeParameters.empty()) continue;
+                        if (validateThisMod) {
+                            validateAttrLists(mod, srcName, decl.attributes, recordFlag);
+                        }
+                        const auto* owner = findOwnType(mod, decl.identifierToken.text);
+                        if (owner) {
+                            if (const auto obs = extractObsolete(decl.attributes, *unit->source, mod.visibleTypes)) {
+                                globalObsoleteSymbols[owner->id] = *obs;
+                            }
+                        }
+                        for (const auto& fSyn : decl.fields) {
+                            if (validateThisMod) {
+                                validateAttrLists(mod, srcName, fSyn.attributes, AttrTarget_Field);
+                            }
+                            if (owner) {
+                                for (const auto& fSym : owner->fields) {
+                                    if (fSym.declaringTypeId == owner->id &&
+                                        fSym.name == fSyn.identifierToken.text) {
+                                        if (const auto obs = extractObsolete(
+                                                fSyn.attributes, *unit->source, mod.visibleTypes)) {
+                                            globalObsoleteSymbols[fSym.id] = *obs;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for (const auto& pSyn : decl.properties) {
+                            if (validateThisMod) {
+                                validateAttrLists(mod, srcName, pSyn.attributes, AttrTarget_Property);
+                            }
+                            if (owner) {
+                                for (const auto& pSym : owner->properties) {
+                                    if (pSym.declaringTypeId == owner->id &&
+                                        pSym.name == pSyn.identifierToken.text) {
+                                        if (const auto obs = extractObsolete(
+                                                pSyn.attributes, *unit->source, mod.visibleTypes)) {
+                                            globalObsoleteSymbols[pSym.id] = *obs;
+                                            if (pSym.getter) globalObsoleteSymbols[pSym.getter->id] = *obs;
+                                            if (pSym.setter) globalObsoleteSymbols[pSym.setter->id] = *obs;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for (const auto& evSyn : decl.events) {
+                            if (validateThisMod) {
+                                validateAttrLists(mod, srcName, evSyn.attributes, AttrTarget_Event);
+                            }
+                        }
+                        for (const auto& cSyn : decl.constructors) {
+                            if (validateThisMod) {
+                                validateAttrLists(mod, srcName, cSyn.attributes, AttrTarget_Ctor);
+                                for (const auto& param : cSyn.parameters) {
+                                    validateAttrLists(mod, srcName, param.attributes, AttrTarget_Parameter);
+                                }
+                            }
+                            if (owner) {
+                                if (const auto obs = extractObsolete(
+                                        cSyn.attributes, *unit->source, mod.visibleTypes)) {
+                                    diagnostics::DiagnosticBag ignored;
+                                    const auto cSym = semantic::declareConstructorSymbol(
+                                        mod.name, cSyn, *owner, mod.visibleTypes, ignored);
+                                    globalObsoleteSymbols[cSym.id] = *obs;
+                                }
+                            }
+                        }
+                        for (const auto& mSyn : decl.methods) {
+                            if (!mSyn.typeParameters.empty()) continue;
+                            if (validateThisMod) {
+                                validateAttrLists(mod, srcName, mSyn.attributes, AttrTarget_Method);
+                                for (const auto& param : mSyn.parameters) {
+                                    validateAttrLists(mod, srcName, param.attributes, AttrTarget_Parameter);
+                                }
+                            }
+                            if (owner) {
+                                if (const auto obs = extractObsolete(
+                                        mSyn.attributes, *unit->source, mod.visibleTypes)) {
+                                    diagnostics::DiagnosticBag ignored;
+                                    const auto mSym = semantic::declareFunctionSymbol(
+                                        mod.name, mSyn, mod.visibleTypes, ignored, owner);
+                                    globalObsoleteSymbols[mSym.id] = *obs;
+                                }
+                            }
+                        }
+                        for (const auto& sSyn : decl.sequences) {
+                            if (validateThisMod) {
+                                validateAttrLists(mod, srcName, sSyn.attributes, AttrTarget_Method);
+                                for (const auto& param : sSyn.parameters) {
+                                    validateAttrLists(mod, srcName, param.attributes, AttrTarget_Parameter);
+                                }
+                            }
+                        }
+                    }
+                };
+                processRecordAttrs(unit->syntaxTree->classes, AttrTarget_Class);
+                processRecordAttrs(unit->syntaxTree->structs, AttrTarget_Struct);
+
+                for (const auto& en : unit->syntaxTree->enums) {
+                    if (validateThisMod) {
+                        validateAttrLists(mod, srcName, en.attributes, AttrTarget_Enum);
+                    }
+                    const auto* owner = findOwnType(mod, en.identifierToken.text);
+                    if (owner) {
+                        if (const auto obs = extractObsolete(en.attributes, *unit->source, mod.visibleTypes)) {
+                            globalObsoleteSymbols[owner->id] = *obs;
+                        }
+                    }
+                    for (const auto& em : en.members) {
+                        if (validateThisMod) {
+                            validateAttrLists(mod, srcName, em.attributes, AttrTarget_Field);
+                        }
+                        if (owner) {
+                            if (const auto obs = extractObsolete(em.attributes, *unit->source, mod.visibleTypes)) {
+                                for (const auto& emSym : owner->enumMembers) {
+                                    if (emSym.name == em.identifierToken.text) {
+                                        globalObsoleteSymbols[emSym.id] = *obs;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (const auto& iface : unit->syntaxTree->interfaces) {
+                    if (!iface.typeParameters.empty()) continue;
+                    if (validateThisMod) {
+                        validateAttrLists(mod, srcName, iface.attributes, AttrTarget_Interface);
+                    }
+                    const auto* owner = findOwnType(mod, iface.identifierToken.text);
+                    if (owner) {
+                        if (const auto obs = extractObsolete(iface.attributes, *unit->source, mod.visibleTypes)) {
+                            globalObsoleteSymbols[owner->id] = *obs;
+                        }
+                    }
+                    for (const auto& im : iface.methods) {
+                        if (validateThisMod) {
+                            validateAttrLists(mod, srcName, im.attributes, AttrTarget_Method);
+                            for (const auto& param : im.parameters) {
+                                validateAttrLists(mod, srcName, param.attributes, AttrTarget_Parameter);
+                            }
+                        }
+                        if (owner) {
+                            if (const auto obs = extractObsolete(im.attributes, *unit->source, mod.visibleTypes)) {
+                                diagnostics::DiagnosticBag ignored;
+                                const auto imSym = semantic::declareFunctionSymbol(
+                                    mod.name, im, mod.visibleTypes, ignored, owner);
+                                globalObsoleteSymbols[imSym.id] = *obs;
+                            }
+                        }
+                    }
+                }
+
+                for (const auto& del : unit->syntaxTree->delegates) {
+                    if (!del.typeParameters.empty()) continue;
+                    if (validateThisMod) {
+                        validateAttrLists(mod, srcName, del.attributes, AttrTarget_Delegate);
+                        for (const auto& param : del.parameters) {
+                            validateAttrLists(mod, srcName, param.attributes, AttrTarget_Parameter);
+                        }
+                    }
+                    const auto* owner = findOwnType(mod, del.identifierToken.text);
+                    if (owner) {
+                        if (const auto obs = extractObsolete(del.attributes, *unit->source, mod.visibleTypes)) {
+                            globalObsoleteSymbols[owner->id] = *obs;
+                        }
+                    }
+                }
+
+                for (const auto& fn : unit->syntaxTree->functions) {
+                    if (!fn.typeParameters.empty()) continue;
+                    if (validateThisMod) {
+                        validateAttrLists(mod, srcName, fn.attributes, AttrTarget_Function);
+                        for (const auto& param : fn.parameters) {
+                            validateAttrLists(mod, srcName, param.attributes, AttrTarget_Parameter);
+                        }
+                    }
+                    if (const auto obs = extractObsolete(fn.attributes, *unit->source, mod.visibleTypes)) {
+                        diagnostics::DiagnosticBag ignored;
+                        const auto fnSym = semantic::declareFunctionSymbol(
+                            mod.name, fn, mod.visibleTypes, ignored);
+                        globalObsoleteSymbols[fnSym.id] = *obs;
+                    }
+                }
+            }
+        }
+
+        // 3. Check declaration-signature TypeSyntax references for [Obsolete] types
+        if (!globalObsoleteSymbols.empty()) {
+            std::function<void(
+                ModuleWork&,
+                const std::string&,
+                const syntax::TypeSyntax&,
+                semantic::SymbolId,
+                bool)> checkSignatureTypeObs;
+            checkSignatureTypeObs = [&](ModuleWork& mod,
+                                        const std::string& srcName,
+                                        const syntax::TypeSyntax& typeSyn,
+                                        semantic::SymbolId selfTypeId,
+                                        bool contextIsObsolete) {
+                if (contextIsObsolete) return;
+                if (semantic::resolvePrimitiveType(typeSyn.name.text) == semantic::PrimitiveType::Error) {
+                    const auto it = mod.visibleTypes.find(typeSyn.name.text);
+                    if (it != mod.visibleTypes.end() && it->second.id != selfTypeId) {
+                        const auto obsIt = globalObsoleteSymbols.find(it->second.id);
+                        if (obsIt != globalObsoleteSymbols.end()) {
+                            std::string msg = "type '" + semantic::canonicalTypeName(it->second) + "' is obsolete";
+                            if (!obsIt->second.message.empty()) {
+                                msg += ": " + obsIt->second.message;
+                            }
+                            result.diagnostics.report(
+                                obsIt->second.isError ? "RS4102" : "RS4101",
+                                std::move(msg),
+                                typeSyn.span(),
+                                obsIt->second.isError
+                                    ? diagnostics::DiagnosticSeverity::Error
+                                    : diagnostics::DiagnosticSeverity::Warning,
+                                srcName);
+                            if (obsIt->second.isError) mod.invalid = true;
+                        }
+                    }
+                }
+                for (const auto& arg : typeSyn.typeArguments) {
+                    checkSignatureTypeObs(mod, srcName, arg, selfTypeId, contextIsObsolete);
+                }
+            };
+
+            for (auto& [modName, mod] : modules) {
+                (void)modName;
+                if (mod.frontendCached) continue;
+                for (const auto* unit : mod.units) {
+                    if (!unit || !unit->syntaxTree || unit->isGenericSpecialization) continue;
+                    const auto& srcName = unit->source->name();
+                    const auto checkRecordDeclSigs = [&](const auto& decls) {
+                        for (const auto& decl : decls) {
+                            if (!decl.typeParameters.empty()) continue;
+                            const auto* owner = findOwnType(mod, decl.identifierToken.text);
+                            const semantic::SymbolId ownerId = owner ? owner->id : 0;
+                            const bool ownerObs = ownerId != 0 &&
+                                globalObsoleteSymbols.find(ownerId) != globalObsoleteSymbols.end();
+                            for (const auto& ifaceSyn : decl.interfaces) {
+                                checkSignatureTypeObs(mod, srcName, ifaceSyn, ownerId, ownerObs);
+                            }
+                            for (const auto& fSyn : decl.fields) {
+                                const bool fObs = ownerObs ||
+                                    extractObsolete(fSyn.attributes, *unit->source, mod.visibleTypes).has_value();
+                                checkSignatureTypeObs(mod, srcName, fSyn.type, ownerId, fObs);
+                            }
+                            for (const auto& pSyn : decl.properties) {
+                                const bool pObs = ownerObs ||
+                                    extractObsolete(pSyn.attributes, *unit->source, mod.visibleTypes).has_value();
+                                checkSignatureTypeObs(mod, srcName, pSyn.type, ownerId, pObs);
+                            }
+                            for (const auto& cSyn : decl.constructors) {
+                                const bool cObs = ownerObs ||
+                                    extractObsolete(cSyn.attributes, *unit->source, mod.visibleTypes).has_value();
+                                for (const auto& param : cSyn.parameters) {
+                                    checkSignatureTypeObs(mod, srcName, param.type, ownerId, cObs);
+                                }
+                            }
+                            for (const auto& mSyn : decl.methods) {
+                                if (!mSyn.typeParameters.empty()) continue;
+                                const bool mObs = ownerObs ||
+                                    extractObsolete(mSyn.attributes, *unit->source, mod.visibleTypes).has_value();
+                                checkSignatureTypeObs(mod, srcName, mSyn.returnType, ownerId, mObs);
+                                for (const auto& param : mSyn.parameters) {
+                                    checkSignatureTypeObs(mod, srcName, param.type, ownerId, mObs);
+                                }
+                            }
+                        }
+                    };
+                    checkRecordDeclSigs(unit->syntaxTree->classes);
+                    checkRecordDeclSigs(unit->syntaxTree->structs);
+                    for (const auto& fn : unit->syntaxTree->functions) {
+                        if (!fn.typeParameters.empty()) continue;
+                        const bool fnObs =
+                            extractObsolete(fn.attributes, *unit->source, mod.visibleTypes).has_value();
+                        checkSignatureTypeObs(mod, srcName, fn.returnType, 0, fnObs);
+                        for (const auto& param : fn.parameters) {
+                            checkSignatureTypeObs(mod, srcName, param.type, 0, fnObs);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Reject recursive value-type layouts before lowering. A struct must have a
     // finite inline representation; reference fields may be recursive, value
     // fields may not.
@@ -7440,6 +8358,18 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 visibleFunctions[function.name].push_back(function);
             }
         }
+        for (const auto& hygModName : module.hygienicModules) {
+            if (hygModName == moduleName || module.imports.count(hygModName) != 0) continue;
+            const auto hygIt = modules.find(hygModName);
+            if (hygIt == modules.end()) continue;
+            for (const auto& function : hygIt->second.declarations) {
+                if (!function.method &&
+                    ownFreeFnSignatures.find(freeFunctionParamKey(function)) ==
+                        ownFreeFnSignatures.end()) {
+                    visibleFunctions[function.name].push_back(function);
+                }
+            }
+        }
 
         semantic::ModuleBindingInput bindingInput;
         // Hygiene is scoped strictly per instantiated template unit/symbol,
@@ -7496,6 +8426,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         }
         bindingInput.visibleFunctions = std::move(visibleFunctions);
         bindingInput.visibleTypes = module.visibleTypes;
+        bindingInput.obsoleteSymbols = globalObsoleteSymbols;
         for (const auto* unit : module.units) bindingInput.units.push_back(unit->syntaxTree.get());
 
         diagnostics::DiagnosticBag moduleDiagnostics;

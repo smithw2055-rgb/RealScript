@@ -167,19 +167,24 @@ private:
             analyzeExpression(*static_cast<const BoundAwaitExpression&>(expression).operand, assigned); return;
         case BoundNodeKind::BinaryExpression: {
             const auto& value = static_cast<const BoundBinaryExpression&>(expression);
-            analyzeExpression(*value.left, assigned);
             if (value.operatorKind == BoundBinaryOperatorKind::LogicalAnd ||
                 value.operatorKind == BoundBinaryOperatorKind::LogicalOr) {
-                auto copy = assigned; analyzeExpression(*value.right, copy);
-            } else analyzeExpression(*value.right, assigned);
+                AssignedSet trueSet;
+                AssignedSet falseSet;
+                analyzeCondition(expression, assigned, trueSet, falseSet);
+                assigned = intersectAssigned(trueSet, falseSet);
+            } else {
+                analyzeExpression(*value.left, assigned);
+                analyzeExpression(*value.right, assigned);
+            }
             return;
         }
         case BoundNodeKind::ConditionalExpression: {
             const auto& value = static_cast<const
                 BoundConditionalExpression&>(expression);
-            analyzeExpression(*value.condition, assigned);
-            auto whenTrue = assigned;
-            auto whenFalse = assigned;
+            AssignedSet whenTrue;
+            AssignedSet whenFalse;
+            analyzeCondition(*value.condition, assigned, whenTrue, whenFalse);
             analyzeExpression(*value.whenTrue, whenTrue);
             analyzeExpression(*value.whenFalse, whenFalse);
             assigned = intersectAssigned(whenTrue, whenFalse);
@@ -198,8 +203,8 @@ private:
             const auto& type = static_cast<const
                 BoundTypeBinaryExpression&>(expression);
             analyzeExpression(*type.expression, assigned);
-            if (type.patternVariable) {
-                assigned.insert(type.patternVariable->index);
+            if (type.pattern) {
+                analyzePatternSubexpressions(*type.pattern, assigned);
             }
             return;
         }
@@ -213,9 +218,14 @@ private:
             bool first = true;
             for (const auto& arm : value.arms) {
                 auto armAssigned = assigned;
-                if (arm.label) analyzeExpression(*arm.label, armAssigned);
-                if (arm.patternVariable) {
-                    armAssigned.insert(arm.patternVariable->index);
+                if (arm.pattern) {
+                    analyzePatternSubexpressions(*arm.pattern, armAssigned);
+                    collectPatternDefiniteVariables(*arm.pattern, armAssigned);
+                } else {
+                    if (arm.label) analyzeExpression(*arm.label, armAssigned);
+                    if (arm.patternVariable) {
+                        armAssigned.insert(arm.patternVariable->index);
+                    }
                 }
                 if (arm.guard) analyzeExpression(*arm.guard, armAssigned);
                 analyzeExpression(*arm.value, armAssigned);
@@ -317,6 +327,116 @@ private:
         }
     }
 
+    void analyzePatternSubexpressions(
+        const BoundPattern& pattern,
+        AssignedSet& assigned) {
+        if (pattern.constantValue) {
+            analyzeExpression(*pattern.constantValue, assigned);
+        }
+        if (pattern.left) analyzePatternSubexpressions(*pattern.left, assigned);
+        if (pattern.right) analyzePatternSubexpressions(*pattern.right, assigned);
+        for (const auto& prop : pattern.properties) {
+            if (prop.pattern) analyzePatternSubexpressions(*prop.pattern, assigned);
+        }
+    }
+
+    void collectPatternDefiniteVariables(
+        const BoundPattern& pattern,
+        AssignedSet& assignedWhenMatched) {
+        switch (pattern.kind) {
+        case BoundPatternKind::Var:
+        case BoundPatternKind::Type:
+            if (pattern.variable) {
+                assignedWhenMatched.insert(pattern.variable->index);
+            }
+            return;
+        case BoundPatternKind::Property:
+            if (pattern.variable) {
+                assignedWhenMatched.insert(pattern.variable->index);
+            }
+            for (const auto& prop : pattern.properties) {
+                if (prop.pattern) {
+                    collectPatternDefiniteVariables(*prop.pattern, assignedWhenMatched);
+                }
+            }
+            return;
+        case BoundPatternKind::LogicalAnd:
+            if (pattern.left) collectPatternDefiniteVariables(*pattern.left, assignedWhenMatched);
+            if (pattern.right) collectPatternDefiniteVariables(*pattern.right, assignedWhenMatched);
+            return;
+        default:
+            return;
+        }
+    }
+
+    void analyzeCondition(
+        const BoundExpression& condition,
+        const AssignedSet& incoming,
+        AssignedSet& whenTrue,
+        AssignedSet& whenFalse) {
+        if (condition.kind() == BoundNodeKind::ConversionExpression) {
+            const auto& conv = static_cast<const BoundConversionExpression&>(condition);
+            if (conv.expression) {
+                analyzeCondition(*conv.expression, incoming, whenTrue, whenFalse);
+                return;
+            }
+        }
+        if (condition.kind() == BoundNodeKind::UnaryExpression) {
+            const auto& un = static_cast<const BoundUnaryExpression&>(condition);
+            if (un.operatorKind == BoundUnaryOperatorKind::LogicalNegation && un.operand) {
+                analyzeCondition(*un.operand, incoming, whenFalse, whenTrue);
+                return;
+            }
+        }
+        if (condition.kind() == BoundNodeKind::BinaryExpression) {
+            const auto& bin = static_cast<const BoundBinaryExpression&>(condition);
+            if (bin.operatorKind == BoundBinaryOperatorKind::LogicalAnd) {
+                AssignedSet leftTrue;
+                AssignedSet leftFalse;
+                analyzeCondition(*bin.left, incoming, leftTrue, leftFalse);
+                AssignedSet rightTrue;
+                AssignedSet rightFalse;
+                analyzeCondition(*bin.right, leftTrue, rightTrue, rightFalse);
+                whenTrue = std::move(rightTrue);
+                whenFalse = intersectAssigned(leftFalse, rightFalse);
+                return;
+            }
+            if (bin.operatorKind == BoundBinaryOperatorKind::LogicalOr) {
+                AssignedSet leftTrue;
+                AssignedSet leftFalse;
+                analyzeCondition(*bin.left, incoming, leftTrue, leftFalse);
+                AssignedSet rightTrue;
+                AssignedSet rightFalse;
+                analyzeCondition(*bin.right, leftFalse, rightTrue, rightFalse);
+                whenTrue = intersectAssigned(leftTrue, rightTrue);
+                whenFalse = std::move(rightFalse);
+                return;
+            }
+        }
+        if (condition.kind() == BoundNodeKind::TypeBinaryExpression) {
+            const auto& tb = static_cast<const BoundTypeBinaryExpression&>(condition);
+            auto base = incoming;
+            analyzeExpression(*tb.expression, base);
+            if (tb.pattern) {
+                analyzePatternSubexpressions(*tb.pattern, base);
+                whenFalse = base;
+                whenTrue = std::move(base);
+                collectPatternDefiniteVariables(*tb.pattern, whenTrue);
+                return;
+            }
+            whenFalse = base;
+            whenTrue = std::move(base);
+            if (tb.patternVariable) {
+                whenTrue.insert(tb.patternVariable->index);
+            }
+            return;
+        }
+        auto base = incoming;
+        analyzeExpression(condition, base);
+        whenTrue = base;
+        whenFalse = std::move(base);
+    }
+
     State analyzeBlock(const std::vector<std::unique_ptr<BoundStatement>>& statements, State state) {
         for (const auto& child : statements) {
             if (state.exit != ExitKind::None) break;
@@ -395,10 +515,12 @@ private:
             analyzeExpression(*static_cast<const BoundExpressionStatement&>(statement).expression, state.assigned); return state;
         case BoundNodeKind::IfStatement: {
             const auto& value = static_cast<const BoundIfStatement&>(statement);
-            analyzeExpression(*value.condition, state.assigned);
-            auto left = analyzeStatement(*value.thenStatement, {state.assigned, ExitKind::None});
-            auto right = value.elseStatement ? analyzeStatement(*value.elseStatement, {state.assigned, ExitKind::None})
-                                             : State{state.assigned, ExitKind::None};
+            AssignedSet trueAssigned;
+            AssignedSet falseAssigned;
+            analyzeCondition(*value.condition, state.assigned, trueAssigned, falseAssigned);
+            auto left = analyzeStatement(*value.thenStatement, {std::move(trueAssigned), ExitKind::None});
+            auto right = value.elseStatement ? analyzeStatement(*value.elseStatement, {std::move(falseAssigned), ExitKind::None})
+                                             : State{std::move(falseAssigned), ExitKind::None};
             if (left.exit == right.exit && left.exit != ExitKind::None) return {{}, left.exit};
             if (left.exit == ExitKind::None && right.exit == ExitKind::None)
                 return {intersectAssigned(left.assigned, right.assigned), ExitKind::None};
@@ -406,8 +528,11 @@ private:
         }
         case BoundNodeKind::WhileStatement: {
             const auto& value = static_cast<const BoundWhileStatement&>(statement);
-            analyzeExpression(*value.condition, state.assigned);
-            (void)analyzeStatement(*value.body, {state.assigned, ExitKind::None});
+            AssignedSet trueAssigned;
+            AssignedSet falseAssigned;
+            analyzeCondition(*value.condition, state.assigned, trueAssigned, falseAssigned);
+            (void)analyzeStatement(*value.body, {std::move(trueAssigned), ExitKind::None});
+            state.assigned = std::move(falseAssigned);
             if (isLiteralTrue(*value.condition) && !containsBreakForCurrentTarget(*value.body)) state.exit = ExitKind::Return;
             return state;
         }
@@ -467,13 +592,23 @@ private:
             bool first = true;
             for (const auto& section : value.sections) {
                 auto sectionAssigned = state.assigned;
-                if (section.label) {
-                    analyzeExpression(*section.label, sectionAssigned);
-                } else if (section.patternType == PrimitiveType::Error) {
-                    hasDefault = true;
-                }
-                if (section.patternVariable) {
-                    sectionAssigned.insert(section.patternVariable->index);
+                if (section.pattern) {
+                    analyzePatternSubexpressions(*section.pattern, sectionAssigned);
+                    collectPatternDefiniteVariables(*section.pattern, sectionAssigned);
+                    if ((section.pattern->kind == BoundPatternKind::Discard ||
+                         section.pattern->kind == BoundPatternKind::Var) &&
+                        !section.guard) {
+                        hasDefault = true;
+                    }
+                } else {
+                    if (section.label) {
+                        analyzeExpression(*section.label, sectionAssigned);
+                    } else if (section.patternType == PrimitiveType::Error && !section.guard) {
+                        hasDefault = true;
+                    }
+                    if (section.patternVariable) {
+                        sectionAssigned.insert(section.patternVariable->index);
+                    }
                 }
                 if (section.guard) {
                     analyzeExpression(*section.guard, sectionAssigned);

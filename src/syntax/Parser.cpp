@@ -159,7 +159,8 @@ std::vector<AttributeListSyntax> Parser::parseAttributeLists() {
 AttributeArgumentSyntax Parser::parseAttributeArgument() {
     AttributeArgumentSyntax result;
     if (current().kind == SyntaxKind::IdentifierToken &&
-        peek(1).kind == SyntaxKind::EqualsToken) {
+        (peek(1).kind == SyntaxKind::EqualsToken ||
+         peek(1).kind == SyntaxKind::ColonToken)) {
         result.nameToken = nextToken();
         result.equalsToken = nextToken();
     }
@@ -344,14 +345,23 @@ TypeSyntax Parser::parseType() {
 
 ParameterSyntax Parser::parseParameter() {
     ParameterSyntax result;
+    result.attributes = parseAttributeLists();
     if (current().kind == SyntaxKind::ParamsKeyword) {
         result.paramsKeyword = nextToken();
     }
-    if (current().kind == SyntaxKind::RefKeyword ||
-        current().kind == SyntaxKind::OutKeyword ||
-        current().kind == SyntaxKind::InKeyword ||
-        current().kind == SyntaxKind::ThisKeyword) {
-        result.modifierToken = nextToken();
+    for (int modStep = 0; modStep < 2; ++modStep) {
+        if (!result.thisKeyword && current().kind == SyntaxKind::ThisKeyword) {
+            result.thisKeyword = nextToken();
+            continue;
+        }
+        if (!result.modifierToken &&
+            (current().kind == SyntaxKind::RefKeyword ||
+             current().kind == SyntaxKind::OutKeyword ||
+             current().kind == SyntaxKind::InKeyword)) {
+            result.modifierToken = nextToken();
+            continue;
+        }
+        break;
     }
     result.type = parseType();
     result.identifierToken = match(SyntaxKind::IdentifierToken);
@@ -805,12 +815,7 @@ ClassDeclarationSyntax Parser::parseClassDeclaration(
                         getter.identifierToken.span = thisTok.span;
                         getter.identifierToken.text = "Get";
                         for (const auto& ip : idxParams) {
-                            ParameterSyntax cp;
-                            cp.paramsKeyword = ip.paramsKeyword;
-                            cp.modifierToken = ip.modifierToken;
-                            cp.type = ip.type;
-                            cp.identifierToken = ip.identifierToken;
-                            getter.parameters.push_back(std::move(cp));
+                            getter.parameters.push_back(cloneParameterSyntax(ip));
                         }
                         getter.commaTokens = idxCommas;
                         getter.body = std::move(*accessor.body);
@@ -829,12 +834,7 @@ ClassDeclarationSyntax Parser::parseClassDeclaration(
                         setter.identifierToken.span = thisTok.span;
                         setter.identifierToken.text = "Set";
                         for (const auto& ip : idxParams) {
-                            ParameterSyntax cp;
-                            cp.paramsKeyword = ip.paramsKeyword;
-                            cp.modifierToken = ip.modifierToken;
-                            cp.type = ip.type;
-                            cp.identifierToken = ip.identifierToken;
-                            setter.parameters.push_back(std::move(cp));
+                            setter.parameters.push_back(cloneParameterSyntax(ip));
                         }
                         setter.commaTokens = idxCommas;
                         ParameterSyntax valParam;
@@ -1059,12 +1059,7 @@ StructDeclarationSyntax Parser::parseStructDeclaration(
                         getter.identifierToken.span = thisTok.span;
                         getter.identifierToken.text = "Get";
                         for (const auto& ip : idxParams) {
-                            ParameterSyntax cp;
-                            cp.paramsKeyword = ip.paramsKeyword;
-                            cp.modifierToken = ip.modifierToken;
-                            cp.type = ip.type;
-                            cp.identifierToken = ip.identifierToken;
-                            getter.parameters.push_back(std::move(cp));
+                            getter.parameters.push_back(cloneParameterSyntax(ip));
                         }
                         getter.commaTokens = idxCommas;
                         getter.body = std::move(*accessor.body);
@@ -1083,12 +1078,7 @@ StructDeclarationSyntax Parser::parseStructDeclaration(
                         setter.identifierToken.span = thisTok.span;
                         setter.identifierToken.text = "Set";
                         for (const auto& ip : idxParams) {
-                            ParameterSyntax cp;
-                            cp.paramsKeyword = ip.paramsKeyword;
-                            cp.modifierToken = ip.modifierToken;
-                            cp.type = ip.type;
-                            cp.identifierToken = ip.identifierToken;
-                            setter.parameters.push_back(std::move(cp));
+                            setter.parameters.push_back(cloneParameterSyntax(ip));
                         }
                         setter.commaTokens = idxCommas;
                         ParameterSyntax valParam;
@@ -1155,6 +1145,11 @@ InterfaceMethodDeclarationSyntax Parser::parseInterfaceMethodDeclaration(
     result.modifiers = std::move(modifiers);
     result.returnType = parseType();
     result.identifierToken = match(SyntaxKind::IdentifierToken);
+    parseTypeParameterList(
+        result.typeParameterLessToken,
+        result.typeParameters,
+        result.typeParameterCommaTokens,
+        result.typeParameterGreaterToken);
     result.openParenToken = match(SyntaxKind::OpenParenToken);
     if (current().kind != SyntaxKind::CloseParenToken &&
         current().kind != SyntaxKind::EndOfFileToken) {
@@ -1165,7 +1160,12 @@ InterfaceMethodDeclarationSyntax Parser::parseInterfaceMethodDeclaration(
         }
     }
     result.closeParenToken = match(SyntaxKind::CloseParenToken);
-    result.semicolonToken = match(SyntaxKind::SemicolonToken);
+    parseGenericConstraintClauses(result.constraints);
+    if (current().kind == SyntaxKind::OpenBraceToken) {
+        result.body = parseBlockStatement();
+    } else {
+        result.semicolonToken = match(SyntaxKind::SemicolonToken);
+    }
     return result;
 }
 
@@ -1682,18 +1682,11 @@ std::unique_ptr<StatementSyntax> Parser::parseSwitchStatement() {
         SwitchSectionSyntax section;
         if (current().kind == SyntaxKind::CaseKeyword) {
             section.caseKeyword = nextToken();
-            const bool typePattern =
-                (current().kind == SyntaxKind::IdentifierToken &&
-                 peek(1).kind == SyntaxKind::IdentifierToken) ||
-                (current().kind >= SyntaxKind::BoolKeyword &&
-                 current().kind <= SyntaxKind::VoidKeyword);
-            if (typePattern) {
-                section.patternType = parseType();
-                if (current().kind == SyntaxKind::IdentifierToken) {
-                    section.patternDesignation = nextToken();
-                }
-            } else {
-                section.label = parseExpression();
+            section.pattern = parsePattern();
+            if (section.pattern && section.pattern->kind() == SyntaxKind::TypePattern) {
+                const auto& tp = static_cast<const TypePatternSyntax&>(*section.pattern);
+                section.patternType = tp.type;
+                section.patternDesignation = tp.designationToken;
             }
             if (current().kind == SyntaxKind::WhenKeyword) {
                 section.whenKeyword = nextToken();
@@ -1986,21 +1979,15 @@ std::unique_ptr<ExpressionSyntax> Parser::parseConditionalExpression() {
         while (current().kind != SyntaxKind::CloseBraceToken &&
                current().kind != SyntaxKind::EndOfFileToken) {
             SwitchExpressionArmSyntax arm;
-            const bool typePattern =
-                (current().kind == SyntaxKind::IdentifierToken &&
-                 peek(1).kind == SyntaxKind::IdentifierToken) ||
-                (current().kind >= SyntaxKind::BoolKeyword &&
-                 current().kind <= SyntaxKind::VoidKeyword);
-            if (current().kind == SyntaxKind::IdentifierToken &&
-                current().text == "_") {
-                arm.discardToken = nextToken();
-            } else if (typePattern) {
-                arm.patternType = parseType();
-                if (current().kind == SyntaxKind::IdentifierToken) {
-                    arm.patternDesignation = nextToken();
+            arm.pattern = parsePattern();
+            if (arm.pattern) {
+                if (arm.pattern->kind() == SyntaxKind::DiscardPattern) {
+                    arm.discardToken = static_cast<const DiscardPatternSyntax&>(*arm.pattern).underscoreToken;
+                } else if (arm.pattern->kind() == SyntaxKind::TypePattern) {
+                    const auto& tp = static_cast<const TypePatternSyntax&>(*arm.pattern);
+                    arm.patternType = tp.type;
+                    arm.patternDesignation = tp.designationToken;
                 }
-            } else {
-                arm.label = parseExpression();
             }
             if (current().kind == SyntaxKind::WhenKeyword) {
                 arm.whenKeyword = nextToken();
@@ -2060,28 +2047,19 @@ std::unique_ptr<ExpressionSyntax> Parser::parseBinaryExpression(int parentPreced
         }
         if (typeOperator) {
             const auto operatorToken = nextToken();
-            if (operatorToken.kind == SyntaxKind::IsKeyword &&
-                (current().kind == SyntaxKind::NullKeyword ||
-                 current().kind == SyntaxKind::TrueKeyword ||
-                 current().kind == SyntaxKind::FalseKeyword ||
-                 current().kind == SyntaxKind::IntegerLiteralToken ||
-                 current().kind == SyntaxKind::FloatLiteralToken ||
-                 current().kind == SyntaxKind::StringLiteralToken)) {
-                auto expression = std::make_unique<BinaryExpressionSyntax>();
-                expression->left = std::move(left);
-                expression->operatorToken = operatorToken;
-                expression->operatorToken.kind = SyntaxKind::EqualsEqualsToken;
-                expression->right = parsePrimaryExpression();
-                left = std::move(expression);
-                continue;
-            }
             auto expression = std::make_unique<TypeBinaryExpressionSyntax>();
             expression->expression = std::move(left);
             expression->operatorToken = operatorToken;
-            expression->type = parseType();
-            if (operatorToken.kind == SyntaxKind::IsKeyword &&
-                current().kind == SyntaxKind::IdentifierToken) {
-                expression->designationToken = nextToken();
+            if (operatorToken.kind == SyntaxKind::IsKeyword) {
+                expression->pattern = parsePattern();
+                if (expression->pattern &&
+                    expression->pattern->kind() == SyntaxKind::TypePattern) {
+                    const auto& tp = static_cast<const TypePatternSyntax&>(*expression->pattern);
+                    expression->type = tp.type;
+                    expression->designationToken = tp.designationToken;
+                }
+            } else {
+                expression->type = parseType();
             }
             left = std::move(expression);
             continue;
@@ -2331,6 +2309,9 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
             case SyntaxKind::IntegerLiteralToken:
             case SyntaxKind::FloatLiteralToken:
             case SyntaxKind::StringLiteralToken:
+            case SyntaxKind::CharLiteralToken:
+            case SyntaxKind::MinusToken:
+            case SyntaxKind::PlusToken:
             case SyntaxKind::InterpolatedStringToken:
             case SyntaxKind::TrueKeyword:
             case SyntaxKind::FalseKeyword:
@@ -2369,7 +2350,8 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
     case SyntaxKind::NullKeyword:
     case SyntaxKind::IntegerLiteralToken:
     case SyntaxKind::FloatLiteralToken:
-    case SyntaxKind::StringLiteralToken: {
+    case SyntaxKind::StringLiteralToken:
+    case SyntaxKind::CharLiteralToken: {
         auto result = std::make_unique<LiteralExpressionSyntax>();
         result->literalToken = nextToken();
         return result;
@@ -2806,6 +2788,279 @@ bool Parser::isUsingDeclarationStart() const noexcept {
     return current().kind == SyntaxKind::IdentifierToken &&
         current().text == "using" &&
         isVariableDeclarationStartAt(1, false);
+}
+
+
+namespace {
+
+bool isPatternDesignation(const SyntaxToken& token) noexcept {
+    return token.kind == SyntaxKind::IdentifierToken &&
+        token.text != "and" &&
+        token.text != "or" &&
+        token.text != "not";
+}
+
+bool isArithmeticContinuation(SyntaxKind kind) noexcept {
+    return kind == SyntaxKind::PlusToken ||
+        kind == SyntaxKind::MinusToken ||
+        kind == SyntaxKind::StarToken ||
+        kind == SyntaxKind::SlashToken ||
+        kind == SyntaxKind::PercentToken;
+}
+
+} // namespace
+
+bool Parser::canStartPattern(std::size_t offset) const noexcept {
+    const auto& tok = peek(offset);
+    switch (tok.kind) {
+    case SyntaxKind::LessToken:
+    case SyntaxKind::LessOrEqualsToken:
+    case SyntaxKind::GreaterToken:
+    case SyntaxKind::GreaterOrEqualsToken:
+    case SyntaxKind::OpenBraceToken:
+    case SyntaxKind::OpenParenToken:
+    case SyntaxKind::NullKeyword:
+    case SyntaxKind::TrueKeyword:
+    case SyntaxKind::FalseKeyword:
+    case SyntaxKind::IntegerLiteralToken:
+    case SyntaxKind::FloatLiteralToken:
+    case SyntaxKind::StringLiteralToken:
+    case SyntaxKind::CharLiteralToken:
+    case SyntaxKind::MinusToken:
+    case SyntaxKind::PlusToken:
+    case SyntaxKind::IdentifierToken:
+        return true;
+    default:
+        return isPrimitiveTypeKeyword(tok.kind);
+    }
+}
+
+std::unique_ptr<PatternSyntax> Parser::parsePattern() {
+    return parseOrPattern();
+}
+
+std::unique_ptr<PatternSyntax> Parser::parseOrPattern() {
+    auto left = parseAndPattern();
+    while (current().kind == SyntaxKind::IdentifierToken &&
+           current().text == "or" &&
+           canStartPattern(1)) {
+        auto bin = std::make_unique<BinaryPatternSyntax>();
+        bin->left = std::move(left);
+        bin->operatorToken = nextToken();
+        bin->right = parseAndPattern();
+        left = std::move(bin);
+    }
+    return left;
+}
+
+std::unique_ptr<PatternSyntax> Parser::parseAndPattern() {
+    auto left = parseUnaryPattern();
+    while (current().kind == SyntaxKind::IdentifierToken &&
+           current().text == "and" &&
+           canStartPattern(1)) {
+        auto bin = std::make_unique<BinaryPatternSyntax>();
+        bin->left = std::move(left);
+        bin->operatorToken = nextToken();
+        bin->right = parseUnaryPattern();
+        left = std::move(bin);
+    }
+    return left;
+}
+
+std::unique_ptr<PatternSyntax> Parser::parseUnaryPattern() {
+    if (current().kind == SyntaxKind::IdentifierToken &&
+        current().text == "not" &&
+        canStartPattern(1)) {
+        auto unary = std::make_unique<UnaryPatternSyntax>();
+        unary->operatorToken = nextToken();
+        unary->pattern = parseUnaryPattern();
+        return unary;
+    }
+    return parsePrimaryPattern();
+}
+
+PropertyPatternSyntax Parser::parsePropertyPatternTail(std::optional<TypeSyntax> leadingType) {
+    PropertyPatternSyntax prop;
+    prop.type = std::move(leadingType);
+    prop.openBraceToken = match(SyntaxKind::OpenBraceToken);
+    while (current().kind != SyntaxKind::CloseBraceToken &&
+           current().kind != SyntaxKind::EndOfFileToken) {
+        PropertySubpatternSyntax sub;
+        sub.memberToken = match(SyntaxKind::IdentifierToken);
+        sub.colonToken = match(SyntaxKind::ColonToken);
+        sub.pattern = parsePattern();
+        prop.properties.push_back(std::move(sub));
+        if (current().kind != SyntaxKind::CommaToken) break;
+        prop.commaTokens.push_back(nextToken());
+        if (current().kind == SyntaxKind::CloseBraceToken) break;
+    }
+    prop.closeBraceToken = match(SyntaxKind::CloseBraceToken);
+    if (isPatternDesignation(current())) {
+        prop.designationToken = nextToken();
+    }
+    return prop;
+}
+
+std::unique_ptr<PatternSyntax> Parser::parsePrimaryPattern() {
+    // 1. Relational pattern: <, <=, >, >= followed by constant expression (precedence > 4)
+    if (current().kind == SyntaxKind::LessToken ||
+        current().kind == SyntaxKind::LessOrEqualsToken ||
+        current().kind == SyntaxKind::GreaterToken ||
+        current().kind == SyntaxKind::GreaterOrEqualsToken) {
+        auto rel = std::make_unique<RelationalPatternSyntax>();
+        rel->operatorToken = nextToken();
+        rel->operand = parseBinaryExpression(4);
+        return rel;
+    }
+
+    // 2. Anonymous property pattern: { Prop: subpattern, ... } [designation]
+    if (current().kind == SyntaxKind::OpenBraceToken) {
+        return std::make_unique<PropertyPatternSyntax>(parsePropertyPatternTail(std::nullopt));
+    }
+
+    // 3. Parenthesized pattern vs parenthesized / cast constant expression
+    if (current().kind == SyntaxKind::OpenParenToken) {
+        const auto startsAfterCast = [](SyntaxKind k) noexcept {
+            switch (k) {
+            case SyntaxKind::IdentifierToken:
+            case SyntaxKind::IntegerLiteralToken:
+            case SyntaxKind::FloatLiteralToken:
+            case SyntaxKind::StringLiteralToken:
+            case SyntaxKind::CharLiteralToken:
+            case SyntaxKind::InterpolatedStringToken:
+            case SyntaxKind::TrueKeyword:
+            case SyntaxKind::FalseKeyword:
+            case SyntaxKind::NullKeyword:
+            case SyntaxKind::OpenParenToken:
+            case SyntaxKind::MinusToken:
+            case SyntaxKind::PlusToken:
+            case SyntaxKind::BangToken:
+                return true;
+            default:
+                return false;
+            }
+        };
+        const bool isCastConst =
+            (isPrimitiveTypeKeyword(peek(1).kind) &&
+             peek(2).kind == SyntaxKind::CloseParenToken &&
+             startsAfterCast(peek(3).kind)) ||
+            (peek(1).kind == SyntaxKind::IdentifierToken &&
+             peek(2).kind == SyntaxKind::CloseParenToken &&
+             startsAfterCast(peek(3).kind));
+        if (isCastConst) {
+            auto cp = std::make_unique<ConstantPatternSyntax>();
+            cp->expression = parseBinaryExpression(4);
+            return cp;
+        }
+
+        // Scan balanced parens to distinguish arithmetic constant expression (1 + 2) from pattern
+        std::size_t depth = 1;
+        std::size_t offset = 1;
+        bool hasTopLevelArithmetic = false;
+        while (peek(offset).kind != SyntaxKind::EndOfFileToken && depth > 0) {
+            const auto& tk = peek(offset);
+            if (tk.kind == SyntaxKind::OpenParenToken ||
+                tk.kind == SyntaxKind::OpenBraceToken ||
+                tk.kind == SyntaxKind::OpenBracketToken) {
+                ++depth;
+            } else if (tk.kind == SyntaxKind::CloseParenToken ||
+                       tk.kind == SyntaxKind::CloseBraceToken ||
+                       tk.kind == SyntaxKind::CloseBracketToken) {
+                --depth;
+                if (depth == 0) break;
+            } else if (depth == 1) {
+                if (tk.kind == SyntaxKind::PlusToken ||
+                    tk.kind == SyntaxKind::StarToken ||
+                    tk.kind == SyntaxKind::SlashToken ||
+                    tk.kind == SyntaxKind::PercentToken) {
+                    if (offset > 1) hasTopLevelArithmetic = true;
+                } else if (tk.kind == SyntaxKind::MinusToken && offset > 1) {
+                    const auto prevKind = peek(offset - 1).kind;
+                    if (prevKind == SyntaxKind::IntegerLiteralToken ||
+                        prevKind == SyntaxKind::FloatLiteralToken ||
+                        prevKind == SyntaxKind::CharLiteralToken ||
+                        prevKind == SyntaxKind::IdentifierToken ||
+                        prevKind == SyntaxKind::CloseParenToken) {
+                        hasTopLevelArithmetic = true;
+                    }
+                }
+            }
+            ++offset;
+        }
+        const auto afterClose = peek(offset + 1).kind;
+        if (hasTopLevelArithmetic || isArithmeticContinuation(afterClose) ||
+            afterClose == SyntaxKind::DotToken) {
+            auto cp = std::make_unique<ConstantPatternSyntax>();
+            cp->expression = parseBinaryExpression(4);
+            return cp;
+        }
+
+        auto paren = std::make_unique<ParenthesizedPatternSyntax>();
+        paren->openParenToken = nextToken();
+        paren->pattern = parsePattern();
+        paren->closeParenToken = match(SyntaxKind::CloseParenToken);
+        return paren;
+    }
+
+    // 4. Discard pattern '_'
+    if (current().kind == SyntaxKind::IdentifierToken &&
+        current().text == "_" &&
+        peek(1).kind != SyntaxKind::DotToken &&
+        peek(1).kind != SyntaxKind::OpenBraceToken &&
+        peek(1).kind != SyntaxKind::OpenBracketToken) {
+        auto disc = std::make_unique<DiscardPatternSyntax>();
+        disc->underscoreToken = nextToken();
+        return disc;
+    }
+
+    // 5. 'var x' pattern
+    if (current().kind == SyntaxKind::IdentifierToken &&
+        current().text == "var" &&
+        isPatternDesignation(peek(1))) {
+        auto vp = std::make_unique<VarPatternSyntax>();
+        vp->varKeyword = nextToken();
+        vp->designationToken = nextToken();
+        return vp;
+    }
+
+    // 6. Literals, unary +/- constants, or member-access constants (e.g. Enum.Member, Limits.Max)
+    if (current().kind == SyntaxKind::NullKeyword ||
+        current().kind == SyntaxKind::TrueKeyword ||
+        current().kind == SyntaxKind::FalseKeyword ||
+        current().kind == SyntaxKind::IntegerLiteralToken ||
+        current().kind == SyntaxKind::FloatLiteralToken ||
+        current().kind == SyntaxKind::StringLiteralToken ||
+        current().kind == SyntaxKind::CharLiteralToken ||
+        current().kind == SyntaxKind::MinusToken ||
+        current().kind == SyntaxKind::PlusToken ||
+        (current().kind == SyntaxKind::IdentifierToken &&
+         (peek(1).kind == SyntaxKind::DotToken ||
+          isArithmeticContinuation(peek(1).kind)))) {
+        auto cp = std::make_unique<ConstantPatternSyntax>();
+        cp->expression = parseBinaryExpression(4);
+        return cp;
+    }
+
+    // 7. Type pattern, typed property pattern, or bare const-identifier pattern
+    if (isPrimitiveTypeKeyword(current().kind) ||
+        current().kind == SyntaxKind::IdentifierToken) {
+        auto parsedType = parseType();
+        if (current().kind == SyntaxKind::OpenBraceToken) {
+            return std::make_unique<PropertyPatternSyntax>(
+                parsePropertyPatternTail(std::move(parsedType)));
+        }
+        auto tp = std::make_unique<TypePatternSyntax>();
+        tp->type = std::move(parsedType);
+        if (isPatternDesignation(current())) {
+            tp->designationToken = nextToken();
+        }
+        return tp;
+    }
+
+    // Fallback: parse constant expression for error recovery
+    auto cp = std::make_unique<ConstantPatternSyntax>();
+    cp->expression = parseBinaryExpression(4);
+    return cp;
 }
 
 } // namespace realscript::syntax

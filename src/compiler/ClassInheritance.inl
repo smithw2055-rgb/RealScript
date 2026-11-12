@@ -297,6 +297,18 @@ std::optional<std::size_t> prepareVirtualMethod(
     }
 
     if (inheritedIndex) {
+        const auto& inherited = owner.methods[*inheritedIndex];
+        if (inherited.synthetic && inherited.virtualSlot != invalidSlot) {
+            method.virtualMethod = true;
+            method.virtualSlot = inherited.virtualSlot;
+            if (owner.virtualDispatchTable.size() <= method.virtualSlot) {
+                owner.virtualDispatchTable.resize(
+                    static_cast<std::size_t>(method.virtualSlot) + 1, 0);
+            }
+            owner.virtualDispatchTable[method.virtualSlot] =
+                method.abstractMethod ? 0 : method.id;
+            return inheritedIndex;
+        }
         report("RS2521", "method hides an inherited member; use override");
     }
     if (method.virtualMethod || method.abstractMethod) {

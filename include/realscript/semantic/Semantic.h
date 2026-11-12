@@ -449,6 +449,11 @@ struct FunctionBindingInput {
     std::unordered_set<std::string> hygienicAccessibleModules;
 };
 
+struct ObsoleteInfo {
+    std::string message;
+    bool isError = false;
+};
+
 struct ModuleBindingInput {
     std::string moduleName;
     std::vector<const syntax::CompilationUnitSyntax*> units;
@@ -458,6 +463,7 @@ struct ModuleBindingInput {
     FunctionOverloadMap visibleFunctions;
     TypeSymbolMap visibleTypes;
     std::unordered_set<std::string> hygienicAccessibleModules;
+    std::unordered_map<SymbolId, ObsoleteInfo> obsoleteSymbols;
 };
 
 enum class BoundNodeKind {
@@ -594,6 +600,61 @@ struct BoundBinaryExpression final : BoundExpression {
     }
 };
 
+enum class BoundPatternKind {
+    Constant,
+    Discard,
+    Var,
+    Type,
+    Relational,
+    LogicalNot,
+    LogicalAnd,
+    LogicalOr,
+    Property,
+};
+
+struct BoundPattern;
+
+struct BoundPropertySubpattern {
+    text::TextSpan span;
+    std::optional<VariableSymbol> memberTempVariable;
+    std::unique_ptr<BoundExpression> memberAccess;
+    std::unique_ptr<BoundPattern> pattern;
+};
+
+struct BoundPattern {
+    BoundPatternKind kind = BoundPatternKind::Discard;
+    text::TextSpan span;
+    PrimitiveType inputType = PrimitiveType::Error;
+    std::string inputTypeName;
+
+    bool unwrapsNullableStruct = false;
+    TypeSymbol nullableStructType;
+    FieldSymbol nullableHasValueField;
+    FieldSymbol nullableValueField;
+    std::optional<VariableSymbol> unwrappedTempVariable;
+
+    bool hasStaticBool = false;
+    bool staticBoolValue = false;
+
+    BoundBinaryOperatorKind comparisonOperator = BoundBinaryOperatorKind::Equals;
+    std::unique_ptr<BoundExpression> constantValue;
+    PrimitiveType comparisonType = PrimitiveType::Error;
+    bool constantNullCheck = false;
+
+    bool hasTypeCheck = false;
+    PrimitiveType targetType = PrimitiveType::Error;
+    std::string targetTypeName;
+    SymbolId targetTypeId = 0;
+    bool staticTypeMatch = false;
+
+    std::optional<VariableSymbol> receiverTempVariable;
+    std::optional<VariableSymbol> variable;
+
+    std::unique_ptr<BoundPattern> left;
+    std::unique_ptr<BoundPattern> right;
+    std::vector<BoundPropertySubpattern> properties;
+};
+
 struct BoundTypeBinaryExpression final : BoundExpression {
     std::unique_ptr<BoundExpression> expression;
     PrimitiveType targetType = PrimitiveType::Error;
@@ -601,6 +662,10 @@ struct BoundTypeBinaryExpression final : BoundExpression {
     SymbolId targetTypeId = 0;
     bool safeCast = false;
     std::optional<VariableSymbol> patternVariable;
+    std::optional<VariableSymbol> patternInputVariable;
+    bool inputAlreadyInVariable = false;
+    const BoundPattern* borrowedPattern = nullptr;
+    std::unique_ptr<BoundPattern> pattern;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::TypeBinaryExpression;
     }
@@ -616,6 +681,7 @@ struct BoundTypeOfExpression final : BoundExpression {
 };
 
 struct BoundSwitchExpressionArm {
+    std::unique_ptr<BoundPattern> pattern;
     std::unique_ptr<BoundExpression> label;
     PrimitiveType patternType = PrimitiveType::Error;
     std::string patternTypeName;
@@ -628,6 +694,7 @@ struct BoundSwitchExpressionArm {
 };
 
 struct BoundSwitchExpression final : BoundExpression {
+    std::optional<VariableSymbol> valueVariable;
     std::unique_ptr<BoundExpression> expression;
     std::vector<BoundSwitchExpressionArm> arms;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
@@ -1024,6 +1091,7 @@ struct BoundContinueStatement final : BoundStatement {
 };
 
 struct BoundSwitchSection {
+    std::unique_ptr<BoundPattern> pattern;
     std::unique_ptr<BoundExpression> label;
     PrimitiveType patternType = PrimitiveType::Error;
     std::string patternTypeName;
@@ -1221,6 +1289,17 @@ private:
         text::TextSpan span);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindTypeBinaryExpression(
         const syntax::TypeBinaryExpressionSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundPattern> bindPattern(
+        const syntax::PatternSyntax& syntax,
+        PrimitiveType inputType,
+        const std::string& inputTypeName,
+        bool allowVariables,
+        bool isSwitchPattern = false);
+    void checkObsoleteReference(
+        SymbolId symbolId,
+        std::string_view kindLabel,
+        const std::string& displayName,
+        text::TextSpan span);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindTypeOfExpression(
         const syntax::TypeOfExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindSwitchExpression(
@@ -1379,7 +1458,9 @@ private:
     std::size_t breakableDepth_ = 0;
     bool checkedArithmetic_ = true;
     bool currentDeterministicContext_ = false;
+    bool currentFunctionIsSynthetic_ = false;
     std::unordered_set<SymbolId> bindingStaticFields_;
+    std::unordered_map<SymbolId, ObsoleteInfo> obsoleteSymbols_;
 };
 
 } // namespace realscript::semantic

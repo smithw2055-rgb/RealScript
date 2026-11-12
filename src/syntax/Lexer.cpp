@@ -1,3 +1,4 @@
+#include <climits>
 #include "realscript/syntax/Syntax.h"
 
 #include <charconv>
@@ -93,11 +94,20 @@ SyntaxToken Lexer::lexNumber() {
         return {SyntaxKind::FloatLiteralToken, span, tokenText, value, false};
     }
 
+    std::uint64_t unsignedValue = 0;
+    const auto uResult = std::from_chars(
+        digitsText.data(), digitsText.data() + digitsText.size(), unsignedValue);
+    const bool hasUnsignedSuffix =
+        tokenText.find('u') != std::string::npos ||
+        tokenText.find('U') != std::string::npos;
     std::int64_t value = 0;
-    const auto result = std::from_chars(digitsText.data(), digitsText.data() + digitsText.size(), value);
-    if (result.ec != std::errc{}) {
+    if (uResult.ec != std::errc{} ||
+        (!hasUnsignedSuffix &&
+         unsignedValue > static_cast<std::uint64_t>(LLONG_MAX) + 1ULL)) {
         diagnostics_.report("RS1004", "integer literal is outside the supported range", span);
         value = 0;
+    } else {
+        value = static_cast<std::int64_t>(unsignedValue);
     }
     return {SyntaxKind::IntegerLiteralToken, span, tokenText, value, false};
 }
@@ -161,6 +171,80 @@ SyntaxToken Lexer::lexString() {
         diagnostics_.report("RS1001", "unterminated string literal", span);
     }
     return {SyntaxKind::StringLiteralToken, span, std::string(source_.view(span)), std::move(value), false};
+}
+
+SyntaxToken Lexer::lexCharacter() {
+    const auto start = position_;
+    advance(); // skip opening '''
+    std::int64_t codeUnit = 0;
+    bool valid = true;
+    if (current() == '\0' || current() == '\r' || current() == '\n' || current() == '\'') {
+        valid = false;
+    } else if (current() == '\\') {
+        const char escaped = peek(1);
+        switch (escaped) {
+        case 'n': codeUnit = '\n'; advance(2); break;
+        case 'r': codeUnit = '\r'; advance(2); break;
+        case 't': codeUnit = '\t'; advance(2); break;
+        case '0': codeUnit = '\0'; advance(2); break;
+        case '\\': codeUnit = '\\'; advance(2); break;
+        case '\'': codeUnit = '\''; advance(2); break;
+        case '"': codeUnit = '"'; advance(2); break;
+        case 'u': {
+            advance(2);
+            std::uint32_t hexVal = 0;
+            for (int i = 0; i < 4; ++i) {
+                const char c = current();
+                hexVal <<= 4;
+                if (c >= '0' && c <= '9') hexVal |= static_cast<std::uint32_t>(c - '0');
+                else if (c >= 'a' && c <= 'f') hexVal |= static_cast<std::uint32_t>(c - 'a' + 10);
+                else if (c >= 'A' && c <= 'F') hexVal |= static_cast<std::uint32_t>(c - 'A' + 10);
+                else { valid = false; break; }
+                advance();
+            }
+            codeUnit = static_cast<std::int64_t>(hexVal & 0xFFFFu);
+            break;
+        }
+        default:
+            diagnostics_.report("RS1005", "unsupported escape sequence", {position_, 2});
+            codeUnit = static_cast<unsigned char>(escaped);
+            advance(2);
+            break;
+        }
+    } else {
+        const auto b0 = static_cast<unsigned char>(current());
+        if (b0 < 0x80u) {
+            codeUnit = b0;
+            advance();
+        } else if ((b0 & 0xE0u) == 0xC0u) {
+            const auto b1 = static_cast<unsigned char>(peek(1));
+            codeUnit = static_cast<std::int64_t>(((b0 & 0x1Fu) << 6) | (b1 & 0x3Fu));
+            advance(2);
+        } else if ((b0 & 0xF0u) == 0xE0u) {
+            const auto b1 = static_cast<unsigned char>(peek(1));
+            const auto b2 = static_cast<unsigned char>(peek(2));
+            codeUnit = static_cast<std::int64_t>(
+                ((b0 & 0x0Fu) << 12) | ((b1 & 0x3Fu) << 6) | (b2 & 0x3Fu));
+            advance(3);
+        } else {
+            valid = false;
+            advance();
+        }
+    }
+    if (current() == '\'') {
+        advance();
+    } else {
+        valid = false;
+        while (current() != '\0' && current() != '\'' && current() != '\r' && current() != '\n') {
+            advance();
+        }
+        if (current() == '\'') advance();
+    }
+    const auto span = text::TextSpan{start, position_ - start};
+    if (!valid) {
+        diagnostics_.report("RS1006", "invalid or unterminated character literal", span);
+    }
+    return {SyntaxKind::CharLiteralToken, span, std::string(source_.view(span)), codeUnit, false};
 }
 
 SyntaxToken Lexer::lexInterpolatedString() {
@@ -294,6 +378,9 @@ SyntaxToken Lexer::nextToken() {
     }
     if (current() == '"') {
         return lexString();
+    }
+    if (current() == '\'') {
+        return lexCharacter();
     }
 
     auto single = [&](SyntaxKind kind) {

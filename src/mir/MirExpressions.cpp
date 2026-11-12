@@ -112,6 +112,369 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         valueStore.symbolName = semantic::canonicalTypeName(type);
         return value;
     };
+    auto emitLoadPatternVar = [&](const semantic::VariableSymbol& var,
+                                  text::TextSpan span) -> ValueId {
+        const auto st = semantic::storageTypeOf(var);
+        const auto& stName = semantic::storageTypeNameOf(var);
+        const auto raw = emitValue(Opcode::LoadLocal, st, {}, span);
+        auto& loadInst = block(*currentBlockId_).instructions.back();
+        loadInst.localIndex = var.index;
+        loadInst.resultTypeId = semantic::isExactType(st)
+            ? semantic::stableTypeId(stName)
+            : 0;
+        if (st != var.type && var.modifier == semantic::ParameterModifier::None) {
+            const auto cellTypeId = loadInst.resultTypeId;
+            const auto inner = emitValue(Opcode::LoadField, var.type, {raw}, span);
+            auto& fld = block(*currentBlockId_).instructions.back();
+            fld.typeId = cellTypeId;
+            fld.resultTypeId = semantic::isExactType(var.type)
+                ? semantic::stableTypeId(var.typeName)
+                : 0;
+            fld.fieldIndex = 0;
+            fld.symbolName = stName;
+            return inner;
+        }
+        return raw;
+    };
+    auto emitStorePatternVar = [&](const semantic::VariableSymbol& var,
+                                   ValueId val,
+                                   text::TextSpan span) {
+        if (semantic::storageTypeOf(var) != var.type &&
+            var.modifier == semantic::ParameterModifier::None) {
+            const auto cell = emitValue(
+                Opcode::NewObject, semantic::PrimitiveType::Object, {}, span);
+            auto& alloc = block(*currentBlockId_).instructions.back();
+            alloc.typeId = semantic::stableTypeId(semantic::storageTypeNameOf(var));
+            alloc.resultTypeId = alloc.typeId;
+            alloc.symbolName = semantic::storageTypeNameOf(var);
+            const auto cellTid = alloc.typeId;
+            const auto cellSym = alloc.symbolName;
+            Instruction storeField;
+            storeField.resultType = semantic::PrimitiveType::Void;
+            storeField.opcode = Opcode::StoreField;
+            storeField.operands = {cell, val};
+            storeField.typeId = cellTid;
+            storeField.fieldIndex = 0;
+            storeField.symbolName = cellSym;
+            storeField.sourceSpan = span;
+            block(*currentBlockId_).instructions.push_back(std::move(storeField));
+            emitStoreLocal(var.index, cell, span);
+            return;
+        }
+        emitStoreLocal(var.index, val, span);
+    };
+    auto emitConvertToCarrier = [&](ValueId val,
+                                    semantic::PrimitiveType fromType,
+                                    semantic::PrimitiveType toType,
+                                    text::TextSpan span) -> ValueId {
+        if (fromType == toType) return val;
+        if (fromType == semantic::PrimitiveType::Int &&
+            toType == semantic::PrimitiveType::Long) {
+            return emitValue(Opcode::ConvertIntToLong, toType, {val}, span);
+        }
+        if (fromType == semantic::PrimitiveType::Int &&
+            toType == semantic::PrimitiveType::Double) {
+            return emitValue(Opcode::ConvertIntToDouble, toType, {val}, span);
+        }
+        if (fromType == semantic::PrimitiveType::Long &&
+            toType == semantic::PrimitiveType::Double) {
+            return emitValue(Opcode::ConvertLongToDouble, toType, {val}, span);
+        }
+        const auto conv = emitValue(Opcode::ConvertNumeric, toType, {val}, span);
+        block(*currentBlockId_).instructions.back().checkedArithmetic = false;
+        return conv;
+    };
+    auto emitDefaultValueForType = [&](semantic::PrimitiveType t,
+                                       const std::string& tName,
+                                       text::TextSpan span) -> ValueId {
+        const auto tid = semantic::isExactType(t) ? semantic::stableTypeId(tName) : 0;
+        if (t == semantic::PrimitiveType::Int ||
+            t == semantic::PrimitiveType::Long ||
+            t == semantic::PrimitiveType::Enum) {
+            const auto v = emitValue(Opcode::ConstantInt, t, {}, span);
+            auto& inst = block(*currentBlockId_).instructions.back();
+            inst.integerImmediate = 0;
+            inst.resultTypeId = (t == semantic::PrimitiveType::Enum) ? tid : 0;
+            return v;
+        }
+        if (semantic::isIntegralType(t)) {
+            const auto v = emitValue(Opcode::ConstantInt, semantic::PrimitiveType::Int, {}, span);
+            block(*currentBlockId_).instructions.back().integerImmediate = 0;
+            const auto c = emitValue(Opcode::ConvertNumeric, t, {v}, span);
+            block(*currentBlockId_).instructions.back().checkedArithmetic = false;
+            return c;
+        }
+        if (t == semantic::PrimitiveType::Double || t == semantic::PrimitiveType::Float) {
+            const auto v = emitValue(
+                Opcode::ConstantDouble, semantic::PrimitiveType::Double, {}, span);
+            block(*currentBlockId_).instructions.back().doubleImmediate = 0.0;
+            if (t == semantic::PrimitiveType::Float) {
+                const auto c = emitValue(Opcode::ConvertNumeric, t, {v}, span);
+                block(*currentBlockId_).instructions.back().checkedArithmetic = false;
+                return c;
+            }
+            return v;
+        }
+        if (t == semantic::PrimitiveType::Bool) {
+            const auto v = emitValue(Opcode::ConstantBool, t, {}, span);
+            block(*currentBlockId_).instructions.back().boolImmediate = false;
+            return v;
+        }
+        if (t == semantic::PrimitiveType::Struct) {
+            const auto v = emitValue(Opcode::NewStruct, semantic::PrimitiveType::Struct, {}, span);
+            auto& inst = block(*currentBlockId_).instructions.back();
+            inst.typeId = tid;
+            inst.resultTypeId = tid;
+            inst.symbolName = tName;
+            return v;
+        }
+        return emitTypedNull(t, tName, span);
+    };
+    auto emitPatternBranch = [&](auto& self,
+                                 const semantic::BoundPattern& pat,
+                                 const semantic::VariableSymbol& inputVar,
+                                 BlockId trueTarget,
+                                 BlockId falseTarget) -> void {
+        if (pat.kind == semantic::BoundPatternKind::Constant &&
+            pat.constantNullCheck && pat.unwrapsNullableStruct) {
+            const auto sVal = emitLoadPatternVar(inputVar, pat.span);
+            const auto hasVal = emitValue(
+                Opcode::LoadStructField, semantic::PrimitiveType::Bool, {sVal}, pat.span);
+            auto& loadInst = block(*currentBlockId_).instructions.back();
+            loadInst.typeId = pat.nullableStructType.id;
+            loadInst.fieldIndex = pat.nullableHasValueField.index;
+            loadInst.symbolName = semantic::canonicalTypeName(pat.nullableStructType);
+            emitBranch(hasVal, falseTarget, trueTarget, {}, {}, pat.span);
+            return;
+        }
+
+        semantic::VariableSymbol activeVar = inputVar;
+        if (pat.unwrapsNullableStruct && pat.unwrappedTempVariable) {
+            const auto sVal = emitLoadPatternVar(inputVar, pat.span);
+            const auto hasVal = emitValue(
+                Opcode::LoadStructField, semantic::PrimitiveType::Bool, {sVal}, pat.span);
+            auto& hasLoad = block(*currentBlockId_).instructions.back();
+            hasLoad.typeId = pat.nullableStructType.id;
+            hasLoad.fieldIndex = pat.nullableHasValueField.index;
+            hasLoad.symbolName = semantic::canonicalTypeName(pat.nullableStructType);
+            const auto unwrapBlock = createBlock();
+            emitBranch(hasVal, unwrapBlock, falseTarget, {}, {}, pat.span);
+            setCurrentBlock(unwrapBlock);
+            const auto sVal2 = emitLoadPatternVar(inputVar, pat.span);
+            const auto innerVal = emitValue(
+                Opcode::LoadStructField, pat.nullableValueField.type, {sVal2}, pat.span);
+            auto& valLoad = block(*currentBlockId_).instructions.back();
+            valLoad.typeId = pat.nullableStructType.id;
+            valLoad.fieldIndex = pat.nullableValueField.index;
+            valLoad.resultTypeId = semantic::isExactType(pat.nullableValueField.type)
+                ? semantic::stableTypeId(pat.nullableValueField.typeName)
+                : 0;
+            valLoad.symbolName = semantic::canonicalTypeName(pat.nullableStructType);
+            emitStoreLocal(pat.unwrappedTempVariable->index, innerVal, pat.span);
+            activeVar = *pat.unwrappedTempVariable;
+        }
+
+        switch (pat.kind) {
+        case semantic::BoundPatternKind::Discard:
+            emitJump(trueTarget, {}, pat.span);
+            return;
+        case semantic::BoundPatternKind::Var:
+            if (pat.variable) {
+                const auto curVal = emitLoadPatternVar(activeVar, pat.span);
+                emitStorePatternVar(*pat.variable, curVal, pat.span);
+            }
+            emitJump(trueTarget, {}, pat.span);
+            return;
+        case semantic::BoundPatternKind::Constant: {
+            if (pat.hasStaticBool) {
+                emitJump(pat.staticBoolValue ? trueTarget : falseTarget, {}, pat.span);
+                return;
+            }
+            if (!pat.constantValue && !pat.constantNullCheck) {
+                emitJump(falseTarget, {}, pat.span);
+                return;
+            }
+            auto lhs = emitLoadPatternVar(activeVar, pat.span);
+            if (pat.constantNullCheck) {
+                const auto nullVal = emitTypedNull(activeVar.type, activeVar.typeName, pat.span);
+                const auto eq = emitValue(
+                    Opcode::Equal, semantic::PrimitiveType::Bool, {lhs, nullVal}, pat.span);
+                emitBranch(eq, trueTarget, falseTarget, {}, {}, pat.span);
+                return;
+            }
+            lhs = emitConvertToCarrier(lhs, activeVar.type, pat.comparisonType, pat.span);
+            const auto rhs = lowerExpression(*pat.constantValue);
+            const auto eq = emitValue(
+                Opcode::Equal, semantic::PrimitiveType::Bool, {lhs, rhs}, pat.span);
+            emitBranch(eq, trueTarget, falseTarget, {}, {}, pat.span);
+            return;
+        }
+        case semantic::BoundPatternKind::Relational: {
+            if (!pat.constantValue) {
+                emitJump(falseTarget, {}, pat.span);
+                return;
+            }
+            auto lhs = emitLoadPatternVar(activeVar, pat.span);
+            lhs = emitConvertToCarrier(lhs, activeVar.type, pat.comparisonType, pat.span);
+            const auto rhs = lowerExpression(*pat.constantValue);
+            const bool isDouble = semantic::isFloatingPointType(pat.comparisonType);
+            const bool isLong = (pat.comparisonType == semantic::PrimitiveType::Long ||
+                                 pat.comparisonType == semantic::PrimitiveType::ULong);
+            Opcode cmpOp = Opcode::LessInt;
+            switch (pat.comparisonOperator) {
+            case semantic::BoundBinaryOperatorKind::Less:
+                cmpOp = isDouble ? Opcode::LessDouble
+                    : (isLong ? Opcode::LessLong : Opcode::LessInt);
+                break;
+            case semantic::BoundBinaryOperatorKind::LessOrEquals:
+                cmpOp = isDouble ? Opcode::LessOrEqualDouble
+                    : (isLong ? Opcode::LessOrEqualLong : Opcode::LessOrEqualInt);
+                break;
+            case semantic::BoundBinaryOperatorKind::Greater:
+                cmpOp = isDouble ? Opcode::GreaterDouble
+                    : (isLong ? Opcode::GreaterLong : Opcode::GreaterInt);
+                break;
+            default:
+                cmpOp = isDouble ? Opcode::GreaterOrEqualDouble
+                    : (isLong ? Opcode::GreaterOrEqualLong : Opcode::GreaterOrEqualInt);
+                break;
+            }
+            const auto cmpVal = emitValue(
+                cmpOp, semantic::PrimitiveType::Bool, {lhs, rhs}, pat.span);
+            emitBranch(cmpVal, trueTarget, falseTarget, {}, {}, pat.span);
+            return;
+        }
+        case semantic::BoundPatternKind::LogicalNot:
+            if (!pat.left) {
+                emitJump(falseTarget, {}, pat.span);
+                return;
+            }
+            self(self, *pat.left, activeVar, falseTarget, trueTarget);
+            return;
+        case semantic::BoundPatternKind::LogicalAnd: {
+            if (!pat.left || !pat.right) {
+                emitJump(falseTarget, {}, pat.span);
+                return;
+            }
+            const auto rhsBlock = createBlock();
+            self(self, *pat.left, activeVar, rhsBlock, falseTarget);
+            setCurrentBlock(rhsBlock);
+            self(self, *pat.right, activeVar, trueTarget, falseTarget);
+            return;
+        }
+        case semantic::BoundPatternKind::LogicalOr: {
+            if (!pat.left || !pat.right) {
+                emitJump(falseTarget, {}, pat.span);
+                return;
+            }
+            const auto rhsBlock = createBlock();
+            self(self, *pat.left, activeVar, trueTarget, rhsBlock);
+            setCurrentBlock(rhsBlock);
+            self(self, *pat.right, activeVar, trueTarget, falseTarget);
+            return;
+        }
+        case semantic::BoundPatternKind::Type: {
+            if (pat.staticTypeMatch) {
+                if (pat.variable) {
+                    const auto curVal = emitLoadPatternVar(activeVar, pat.span);
+                    emitStorePatternVar(*pat.variable, curVal, pat.span);
+                }
+                emitJump(trueTarget, {}, pat.span);
+                return;
+            }
+            const auto curVal = emitLoadPatternVar(activeVar, pat.span);
+            const auto isMatch = emitValue(
+                Opcode::IsType, semantic::PrimitiveType::Bool, {curVal}, pat.span);
+            auto& test = block(*currentBlockId_).instructions.back();
+            test.elementType = pat.targetType;
+            test.elementTypeId = pat.targetTypeId;
+            test.parameterTypes = {activeVar.type};
+            test.symbolName = pat.targetTypeName;
+            if (pat.variable) {
+                const auto castBlock = createBlock();
+                emitBranch(isMatch, castBlock, falseTarget, {}, {}, pat.span);
+                setCurrentBlock(castBlock);
+                const auto curVal2 = emitLoadPatternVar(activeVar, pat.span);
+                const auto castVal = emitValue(
+                    Opcode::AsType, pat.targetType, {curVal2}, pat.span);
+                auto& asInst = block(*currentBlockId_).instructions.back();
+                asInst.elementType = pat.targetType;
+                asInst.elementTypeId = pat.targetTypeId;
+                asInst.parameterTypes = {activeVar.type};
+                asInst.resultTypeId = pat.targetTypeId;
+                asInst.symbolName = pat.targetTypeName;
+                emitStorePatternVar(*pat.variable, castVal, pat.span);
+                emitJump(trueTarget, {}, pat.span);
+                return;
+            }
+            emitBranch(isMatch, trueTarget, falseTarget, {}, {}, pat.span);
+            return;
+        }
+        case semantic::BoundPatternKind::Property: {
+            if (!pat.receiverTempVariable) {
+                emitJump(falseTarget, {}, pat.span);
+                return;
+            }
+            if (pat.hasTypeCheck && !pat.staticTypeMatch) {
+                const auto curVal = emitLoadPatternVar(activeVar, pat.span);
+                const auto isMatch = emitValue(
+                    Opcode::IsType, semantic::PrimitiveType::Bool, {curVal}, pat.span);
+                auto& test = block(*currentBlockId_).instructions.back();
+                test.elementType = pat.targetType;
+                test.elementTypeId = pat.targetTypeId;
+                test.parameterTypes = {activeVar.type};
+                test.symbolName = pat.targetTypeName;
+                const auto castBlock = createBlock();
+                emitBranch(isMatch, castBlock, falseTarget, {}, {}, pat.span);
+                setCurrentBlock(castBlock);
+                const auto curVal2 = emitLoadPatternVar(activeVar, pat.span);
+                const auto castVal = emitValue(
+                    Opcode::AsType, pat.targetType, {curVal2}, pat.span);
+                auto& asInst = block(*currentBlockId_).instructions.back();
+                asInst.elementType = pat.targetType;
+                asInst.elementTypeId = pat.targetTypeId;
+                asInst.parameterTypes = {activeVar.type};
+                asInst.resultTypeId = pat.targetTypeId;
+                asInst.symbolName = pat.targetTypeName;
+                emitStoreLocal(pat.receiverTempVariable->index, castVal, pat.span);
+            } else if (semantic::isReferenceType(activeVar.type)) {
+                const auto curVal = emitLoadPatternVar(activeVar, pat.span);
+                const auto nullVal = emitTypedNull(activeVar.type, activeVar.typeName, pat.span);
+                const auto nonNull = emitValue(
+                    Opcode::NotEqual, semantic::PrimitiveType::Bool,
+                    {curVal, nullVal}, pat.span);
+                const auto nonNullBlock = createBlock();
+                emitBranch(nonNull, nonNullBlock, falseTarget, {}, {}, pat.span);
+                setCurrentBlock(nonNullBlock);
+                const auto curVal2 = emitLoadPatternVar(activeVar, pat.span);
+                emitStoreLocal(pat.receiverTempVariable->index, curVal2, pat.span);
+            } else {
+                const auto curVal = emitLoadPatternVar(activeVar, pat.span);
+                emitStoreLocal(pat.receiverTempVariable->index, curVal, pat.span);
+            }
+
+            for (const auto& sub : pat.properties) {
+                if (!sub.memberTempVariable || !sub.memberAccess || !sub.pattern) {
+                    emitJump(falseTarget, {}, sub.span);
+                    return;
+                }
+                const auto memVal = lowerExpression(*sub.memberAccess);
+                emitStoreLocal(sub.memberTempVariable->index, memVal, sub.span);
+                const auto nextSubBlock = createBlock();
+                self(self, *sub.pattern, *sub.memberTempVariable, nextSubBlock, falseTarget);
+                setCurrentBlock(nextSubBlock);
+            }
+
+            if (pat.variable) {
+                const auto recvVal = emitLoadPatternVar(*pat.receiverTempVariable, pat.span);
+                emitStorePatternVar(*pat.variable, recvVal, pat.span);
+            }
+            emitJump(trueTarget, {}, pat.span);
+            return;
+        }
+        }
+        emitJump(falseTarget, {}, pat.span);
+    };
 
     switch (expression.kind()) {
     case semantic::BoundNodeKind::AwaitExpression: {
@@ -2230,6 +2593,12 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         const auto& switchExpression = static_cast<const
             semantic::BoundSwitchExpression&>(expression);
         const auto input = lowerExpression(*switchExpression.expression);
+        if (switchExpression.valueVariable) {
+            emitStoreLocal(
+                switchExpression.valueVariable->index,
+                input,
+                switchExpression.expression->span);
+        }
         const auto mergeBlock = createBlock();
         const auto resultTypeId = semantic::isExactType(expression.type)
             ? semantic::stableTypeId(expression.typeName)
@@ -2246,16 +2615,62 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 discardIndex = index;
             }
         }
+        bool checksExhausted = false;
         for (std::size_t index = 0;
              index < switchExpression.arms.size(); ++index) {
             const auto& arm = switchExpression.arms[index];
             if (arm.discard) continue;
+            if (!arm.guard && arm.pattern && switchExpression.valueVariable &&
+                (arm.pattern->kind == semantic::BoundPatternKind::Discard ||
+                 arm.pattern->kind == semantic::BoundPatternKind::Var)) {
+                if (arm.pattern->kind == semantic::BoundPatternKind::Var &&
+                    arm.pattern->variable) {
+                    const auto curVal = emitLoadPatternVar(
+                        *switchExpression.valueVariable, arm.span);
+                    emitStorePatternVar(*arm.pattern->variable, curVal, arm.span);
+                }
+                emitJump(armBlocks[index], {}, arm.span);
+                checksExhausted = true;
+                break;
+            }
             const auto nextCheck = createBlock();
+            if (arm.pattern && switchExpression.valueVariable) {
+                if (arm.guard) {
+                    const auto guardBlock = createBlock();
+                    emitPatternBranch(
+                        emitPatternBranch,
+                        *arm.pattern,
+                        *switchExpression.valueVariable,
+                        guardBlock,
+                        nextCheck);
+                    setCurrentBlock(guardBlock);
+                    emitBranch(
+                        lowerExpression(*arm.guard),
+                        armBlocks[index],
+                        nextCheck,
+                        {},
+                        {},
+                        arm.span);
+                } else {
+                    emitPatternBranch(
+                        emitPatternBranch,
+                        *arm.pattern,
+                        *switchExpression.valueVariable,
+                        armBlocks[index],
+                        nextCheck);
+                }
+                setCurrentBlock(nextCheck);
+                continue;
+            }
+
+            const auto armInput = switchExpression.valueVariable
+                ? emitLoadPatternVar(*switchExpression.valueVariable, arm.span)
+                : input;
             ValueId matched = -1;
             if (arm.patternType != semantic::PrimitiveType::Error) {
                 matched = emitValue(
                     Opcode::IsType, semantic::PrimitiveType::Bool,
-                    {input}, arm.span);
+                    {armInput}, arm.span);
                 auto& test = block(*currentBlockId_).instructions.back();
                 test.elementType = arm.patternType;
                 test.elementTypeId = arm.patternTypeId;
@@ -2263,7 +2678,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 test.symbolName = arm.patternTypeName;
                 if (arm.patternVariable) {
                     const auto cast = emitValue(
-                        Opcode::AsType, arm.patternType, {input}, arm.span);
+                        Opcode::AsType, arm.patternType, {armInput}, arm.span);
                     auto& asType = block(*currentBlockId_).instructions.back();
                     asType.elementType = arm.patternType;
                     asType.elementTypeId = arm.patternTypeId;
@@ -2277,7 +2692,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 const auto label = lowerExpression(*arm.label);
                 matched = emitValue(
                     Opcode::Equal, semantic::PrimitiveType::Bool,
-                    {input, label}, arm.span);
+                    {armInput, label}, arm.span);
             }
             if (arm.guard) {
                 const auto guardBlock = createBlock();
@@ -2293,20 +2708,32 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             }
             setCurrentBlock(nextCheck);
         }
-        if (!discardIndex) {
-            throw std::logic_error(
-                "non-exhaustive switch expression reached MIR lowering");
-        }
-        const auto& discard = switchExpression.arms[*discardIndex];
-        if (discard.guard) {
-            emitBranch(
-                lowerExpression(*discard.guard), armBlocks[*discardIndex],
-                mergeBlock, {}, {}, discard.span);
-        } else {
-            emitJump(armBlocks[*discardIndex], {}, expression.span);
+        if (!checksExhausted) {
+            if (discardIndex) {
+                const auto& discard = switchExpression.arms[*discardIndex];
+                if (discard.guard) {
+                    const auto fallbackBlock = createBlock();
+                    emitBranch(
+                        lowerExpression(*discard.guard), armBlocks[*discardIndex],
+                        fallbackBlock, {}, {}, discard.span);
+                    setCurrentBlock(fallbackBlock);
+                    const auto defVal = emitDefaultValueForType(
+                        expression.type, expression.typeName, expression.span);
+                    emitJump(mergeBlock, {defVal}, expression.span);
+                } else {
+                    emitJump(armBlocks[*discardIndex], {}, expression.span);
+                }
+            } else {
+                const auto defVal = emitDefaultValueForType(
+                    expression.type, expression.typeName, expression.span);
+                emitJump(mergeBlock, {defVal}, expression.span);
+            }
         }
         for (std::size_t index = 0;
              index < switchExpression.arms.size(); ++index) {
+            if (block(armBlocks[index]).terminator.kind != TerminatorKind::None) {
+                continue;
+            }
             setCurrentBlock(armBlocks[index]);
             const auto value = lowerExpression(
                 *switchExpression.arms[index].value);
@@ -2318,6 +2745,43 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
     case semantic::BoundNodeKind::TypeBinaryExpression: {
         const auto& typeTest = static_cast<const
             semantic::BoundTypeBinaryExpression&>(expression);
+        const semantic::BoundPattern* activePat = typeTest.borrowedPattern
+            ? typeTest.borrowedPattern
+            : typeTest.pattern.get();
+        if (!typeTest.safeCast && activePat && typeTest.patternInputVariable) {
+            if (!typeTest.inputAlreadyInVariable && typeTest.expression) {
+                const auto evaluated = lowerExpression(*typeTest.expression);
+                emitStoreLocal(
+                    typeTest.patternInputVariable->index,
+                    evaluated,
+                    typeTest.expression->span);
+            }
+            const auto trueBlock = createBlock();
+            const auto falseBlock = createBlock();
+            const auto mergeBlock = createBlock();
+            const auto mergeValue = addBlockParameter(
+                mergeBlock, semantic::PrimitiveType::Bool, 0);
+            emitPatternBranch(
+                emitPatternBranch,
+                *activePat,
+                *typeTest.patternInputVariable,
+                trueBlock,
+                falseBlock);
+            setCurrentBlock(trueBlock);
+            const auto trueVal = emitValue(
+                Opcode::ConstantBool, semantic::PrimitiveType::Bool, {}, expression.span);
+            block(*currentBlockId_).instructions.back().boolImmediate = true;
+            emitJump(mergeBlock, {trueVal}, expression.span);
+
+            setCurrentBlock(falseBlock);
+            const auto falseVal = emitValue(
+                Opcode::ConstantBool, semantic::PrimitiveType::Bool, {}, expression.span);
+            block(*currentBlockId_).instructions.back().boolImmediate = false;
+            emitJump(mergeBlock, {falseVal}, expression.span);
+
+            setCurrentBlock(mergeBlock);
+            return mergeValue;
+        }
         const auto operand = lowerExpression(*typeTest.expression);
         const auto value = emitValue(
             typeTest.safeCast ? Opcode::AsType : Opcode::IsType,
@@ -2340,8 +2804,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             castInstruction.parameterTypes = {typeTest.expression->type};
             castInstruction.resultTypeId = typeTest.targetTypeId;
             castInstruction.symbolName = typeTest.targetTypeName;
-            emitStoreLocal(
-                typeTest.patternVariable->index, cast, expression.span);
+            emitStorePatternVar(
+                *typeTest.patternVariable, cast, expression.span);
         }
         return value;
     }

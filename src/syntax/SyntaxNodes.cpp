@@ -68,6 +68,47 @@ text::TextSpan TypeSyntax::span() const noexcept {
     return name.span;
 }
 
+text::TextSpan ConstantPatternSyntax::span() const noexcept {
+    return expression ? expression->span() : text::TextSpan{};
+}
+
+text::TextSpan VarPatternSyntax::span() const noexcept {
+    return combine(varKeyword.span, designationToken.span);
+}
+
+text::TextSpan TypePatternSyntax::span() const noexcept {
+    return designationToken ? combine(type.span(), designationToken->span) : type.span();
+}
+
+text::TextSpan RelationalPatternSyntax::span() const noexcept {
+    return operand ? combine(operatorToken.span, operand->span()) : operatorToken.span;
+}
+
+text::TextSpan UnaryPatternSyntax::span() const noexcept {
+    return pattern ? combine(operatorToken.span, pattern->span()) : operatorToken.span;
+}
+
+text::TextSpan BinaryPatternSyntax::span() const noexcept {
+    if (left && right) return combine(left->span(), right->span());
+    if (left) return combine(left->span(), operatorToken.span);
+    return operatorToken.span;
+}
+
+text::TextSpan PropertySubpatternSyntax::span() const noexcept {
+    return pattern ? combine(memberToken.span, pattern->span())
+                   : combine(memberToken.span, colonToken.span);
+}
+
+text::TextSpan PropertyPatternSyntax::span() const noexcept {
+    const auto start = type ? type->span() : openBraceToken.span;
+    const auto end = designationToken ? designationToken->span : closeBraceToken.span;
+    return combine(start, end);
+}
+
+text::TextSpan ParenthesizedPatternSyntax::span() const noexcept {
+    return combine(openParenToken.span, closeParenToken.span);
+}
+
 text::TextSpan LambdaExpressionSyntax::span() const noexcept {
     const auto start = openParenToken
         ? openParenToken->span
@@ -86,6 +127,9 @@ text::TextSpan BinaryExpressionSyntax::span() const noexcept {
 }
 
 text::TextSpan TypeBinaryExpressionSyntax::span() const noexcept {
+    if (pattern) {
+        return combine(expression->span(), pattern->span());
+    }
     return combine(expression->span(),
         designationToken ? designationToken->span : type.span());
 }
@@ -95,8 +139,9 @@ text::TextSpan TypeOfExpressionSyntax::span() const noexcept {
 }
 
 text::TextSpan SwitchExpressionArmSyntax::span() const noexcept {
-    const auto start = patternType ? patternType->span() :
-        (discardToken ? discardToken->span : label->span());
+    const auto start = pattern ? pattern->span() :
+        (patternType ? patternType->span() :
+         (discardToken ? discardToken->span : (label ? label->span() : arrowToken.span)));
     return combine(start, value ? value->span() : arrowToken.span);
 }
 
@@ -254,9 +299,13 @@ text::TextSpan BlockStatementSyntax::span() const noexcept {
 }
 
 text::TextSpan ParameterSyntax::span() const noexcept {
+    text::TextSpan first = type.span();
+    if (modifierToken && modifierToken->span.start < first.start) first = modifierToken->span;
+    if (thisKeyword && thisKeyword->span.start < first.start) first = thisKeyword->span;
+    if (paramsKeyword) first = paramsKeyword->span;
+    if (!attributes.empty()) first = attributes.front().span();
     return combine(
-        paramsKeyword ? paramsKeyword->span :
-            (modifierToken ? modifierToken->span : type.span()),
+        first,
         defaultValue ? defaultValue->span() : identifierToken.span);
 }
 
@@ -305,9 +354,11 @@ text::TextSpan StructDeclarationSyntax::span() const noexcept {
 }
 
 text::TextSpan InterfaceMethodDeclarationSyntax::span() const noexcept {
+    const auto end = body ? body->span()
+                          : (semicolonToken ? semicolonToken->span : closeParenToken.span);
     return combine(
         declarationStart(attributes, returnType.span()),
-        semicolonToken.span);
+        end);
 }
 
 text::TextSpan InterfaceDeclarationSyntax::span() const noexcept {
@@ -404,6 +455,86 @@ TypeSyntax cloneTypeSyntax(const TypeSyntax& value) {
     return value;
 }
 
+std::unique_ptr<PatternSyntax> clonePatternSyntax(const PatternSyntax& value) {
+    switch (value.kind()) {
+    case SyntaxKind::ConstantPattern: {
+        const auto& src = static_cast<const ConstantPatternSyntax&>(value);
+        auto out = std::make_unique<ConstantPatternSyntax>();
+        if (src.expression) out->expression = cloneExpressionSyntax(*src.expression);
+        return out;
+    }
+    case SyntaxKind::DiscardPattern: {
+        const auto& src = static_cast<const DiscardPatternSyntax&>(value);
+        auto out = std::make_unique<DiscardPatternSyntax>();
+        out->underscoreToken = src.underscoreToken;
+        return out;
+    }
+    case SyntaxKind::VarPattern: {
+        const auto& src = static_cast<const VarPatternSyntax&>(value);
+        auto out = std::make_unique<VarPatternSyntax>();
+        out->varKeyword = src.varKeyword;
+        out->designationToken = src.designationToken;
+        return out;
+    }
+    case SyntaxKind::TypePattern: {
+        const auto& src = static_cast<const TypePatternSyntax&>(value);
+        auto out = std::make_unique<TypePatternSyntax>();
+        out->type = src.type;
+        out->designationToken = src.designationToken;
+        return out;
+    }
+    case SyntaxKind::RelationalPattern: {
+        const auto& src = static_cast<const RelationalPatternSyntax&>(value);
+        auto out = std::make_unique<RelationalPatternSyntax>();
+        out->operatorToken = src.operatorToken;
+        if (src.operand) out->operand = cloneExpressionSyntax(*src.operand);
+        return out;
+    }
+    case SyntaxKind::UnaryPattern: {
+        const auto& src = static_cast<const UnaryPatternSyntax&>(value);
+        auto out = std::make_unique<UnaryPatternSyntax>();
+        out->operatorToken = src.operatorToken;
+        if (src.pattern) out->pattern = clonePatternSyntax(*src.pattern);
+        return out;
+    }
+    case SyntaxKind::BinaryPattern: {
+        const auto& src = static_cast<const BinaryPatternSyntax&>(value);
+        auto out = std::make_unique<BinaryPatternSyntax>();
+        if (src.left) out->left = clonePatternSyntax(*src.left);
+        out->operatorToken = src.operatorToken;
+        if (src.right) out->right = clonePatternSyntax(*src.right);
+        return out;
+    }
+    case SyntaxKind::PropertyPattern: {
+        const auto& src = static_cast<const PropertyPatternSyntax&>(value);
+        auto out = std::make_unique<PropertyPatternSyntax>();
+        out->type = src.type;
+        out->openBraceToken = src.openBraceToken;
+        for (const auto& prop : src.properties) {
+            PropertySubpatternSyntax sub;
+            sub.memberToken = prop.memberToken;
+            sub.colonToken = prop.colonToken;
+            if (prop.pattern) sub.pattern = clonePatternSyntax(*prop.pattern);
+            out->properties.push_back(std::move(sub));
+        }
+        out->commaTokens = src.commaTokens;
+        out->closeBraceToken = src.closeBraceToken;
+        out->designationToken = src.designationToken;
+        return out;
+    }
+    case SyntaxKind::ParenthesizedPattern: {
+        const auto& src = static_cast<const ParenthesizedPatternSyntax&>(value);
+        auto out = std::make_unique<ParenthesizedPatternSyntax>();
+        out->openParenToken = src.openParenToken;
+        if (src.pattern) out->pattern = clonePatternSyntax(*src.pattern);
+        out->closeParenToken = src.closeParenToken;
+        return out;
+    }
+    default:
+        return nullptr;
+    }
+}
+
 namespace {
 
 InitializerElementSyntax cloneInitializerElement(const InitializerElementSyntax& value) {
@@ -421,6 +552,7 @@ InitializerElementSyntax cloneInitializerElement(const InitializerElementSyntax&
 
 SwitchExpressionArmSyntax cloneSwitchExpressionArm(const SwitchExpressionArmSyntax& value) {
     SwitchExpressionArmSyntax out;
+    if (value.pattern) out.pattern = clonePatternSyntax(*value.pattern);
     if (value.label) out.label = cloneExpressionSyntax(*value.label);
     out.patternType = value.patternType;
     out.patternDesignation = value.patternDesignation;
@@ -447,6 +579,7 @@ SwitchSectionSyntax cloneSwitchSection(const SwitchSectionSyntax& value) {
     SwitchSectionSyntax out;
     out.caseKeyword = value.caseKeyword;
     out.defaultKeyword = value.defaultKeyword;
+    if (value.pattern) out.pattern = clonePatternSyntax(*value.pattern);
     if (value.label) out.label = cloneExpressionSyntax(*value.label);
     out.patternType = value.patternType;
     out.patternDesignation = value.patternDesignation;
@@ -523,6 +656,7 @@ std::unique_ptr<ExpressionSyntax> cloneExpressionSyntax(const ExpressionSyntax& 
         out->operatorToken = src.operatorToken;
         out->type = src.type;
         out->designationToken = src.designationToken;
+        if (src.pattern) out->pattern = clonePatternSyntax(*src.pattern);
         return out;
     }
     case SyntaxKind::TypeOfExpression: {
@@ -911,7 +1045,9 @@ std::unique_ptr<StatementSyntax> cloneStatementSyntax(const StatementSyntax& val
 
 ParameterSyntax cloneParameterSyntax(const ParameterSyntax& value) {
     ParameterSyntax out;
+    out.attributes = value.attributes;
     out.paramsKeyword = value.paramsKeyword;
+    out.thisKeyword = value.thisKeyword;
     out.modifierToken = value.modifierToken;
     out.type = value.type;
     out.identifierToken = value.identifierToken;
@@ -1090,6 +1226,11 @@ InterfaceDeclarationSyntax cloneInterfaceDeclarationSyntax(const InterfaceDeclar
         method.modifiers = m.modifiers;
         method.returnType = m.returnType;
         method.identifierToken = m.identifierToken;
+        method.typeParameterLessToken = m.typeParameterLessToken;
+        method.typeParameters = m.typeParameters;
+        method.typeParameterCommaTokens = m.typeParameterCommaTokens;
+        method.typeParameterGreaterToken = m.typeParameterGreaterToken;
+        method.constraints = m.constraints;
         method.openParenToken = m.openParenToken;
         for (const auto& param : m.parameters) {
             method.parameters.push_back(cloneParameterSyntax(param));
@@ -1097,6 +1238,7 @@ InterfaceDeclarationSyntax cloneInterfaceDeclarationSyntax(const InterfaceDeclar
         method.commaTokens = m.commaTokens;
         method.closeParenToken = m.closeParenToken;
         method.semicolonToken = m.semicolonToken;
+        if (m.body) method.body = cloneBlockStatementSyntax(*m.body);
         out.methods.push_back(std::move(method));
     }
     out.closeBraceToken = value.closeBraceToken;
