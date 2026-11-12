@@ -505,7 +505,263 @@ enum class SlotStorage : std::uint8_t {
     SlabValues = 3,
     HeapValues = 4,
     RawColumn  = 5,
+    PackedB8   = 6, // 1 byte/element (bool, byte, sbyte -> 16x compression)
+    PackedB16  = 7, // 2 bytes/element (short, ushort, char -> 8x compression)
+    PackedI32  = 8, // 4 bytes/element (int, uint, float, enum -> 4x compression)
+    PackedI64  = 9, // 8 bytes/element (long, ulong, double, wide-int/enum -> 2x compression)
 };
+
+[[nodiscard]] constexpr bool isPackedStorage(SlotStorage st) noexcept {
+    return st >= SlotStorage::PackedB8 && st <= SlotStorage::PackedI64;
+}
+
+[[nodiscard]] constexpr std::uint16_t packPackedAuxMeta(
+    PackedElemEncoding encoding,
+    std::uint8_t elemShift) noexcept {
+    return static_cast<std::uint16_t>(
+        static_cast<std::uint16_t>(encoding) |
+        (static_cast<std::uint16_t>(elemShift & 0x03u) << 8u));
+}
+
+[[nodiscard]] constexpr PackedElemEncoding unpackPackedEncoding(std::uint16_t auxMeta) noexcept {
+    return static_cast<PackedElemEncoding>(auxMeta & 0xFFu);
+}
+
+[[nodiscard]] constexpr std::uint8_t unpackPackedShift(std::uint16_t auxMeta) noexcept {
+    return static_cast<std::uint8_t>((auxMeta >> 8u) & 0x03u);
+}
+
+struct PackedStorageSpec {
+    SlotStorage storage = SlotStorage::Empty;
+    PackedElemEncoding encoding = PackedElemEncoding::None;
+    std::uint8_t elemShift = 0;
+};
+
+[[nodiscard]] inline bool tryClassifyPackedArray(
+    semantic::PrimitiveType elementType,
+    semantic::SymbolId elementTypeId,
+    const Value* initialSample,
+    PackedStorageSpec& outSpec) noexcept {
+    switch (elementType) {
+    case semantic::PrimitiveType::Bool:
+        outSpec = {SlotStorage::PackedB8, PackedElemEncoding::Bool, 0};
+        return true;
+    case semantic::PrimitiveType::Byte:
+        outSpec = {SlotStorage::PackedB8, PackedElemEncoding::Byte, 0};
+        return true;
+    case semantic::PrimitiveType::SByte:
+        outSpec = {SlotStorage::PackedB8, PackedElemEncoding::SByte, 0};
+        return true;
+    case semantic::PrimitiveType::Short:
+        outSpec = {SlotStorage::PackedB16, PackedElemEncoding::Short, 1};
+        return true;
+    case semantic::PrimitiveType::UShort:
+        outSpec = {SlotStorage::PackedB16, PackedElemEncoding::UShort, 1};
+        return true;
+    case semantic::PrimitiveType::Char:
+        outSpec = {SlotStorage::PackedB16, PackedElemEncoding::Char, 1};
+        return true;
+    case semantic::PrimitiveType::Int: {
+        std::int64_t initI64 = 0;
+        if (initialSample && initialSample->tryGetInt64(initI64) &&
+            (initI64 < std::numeric_limits<std::int32_t>::min() ||
+             initI64 > std::numeric_limits<std::int32_t>::max())) {
+            outSpec = {SlotStorage::PackedI64, PackedElemEncoding::Int64Wide, 3};
+        } else {
+            outSpec = {SlotStorage::PackedI32, PackedElemEncoding::Int32, 2};
+        }
+        return true;
+    }
+    case semantic::PrimitiveType::UInt:
+        outSpec = {SlotStorage::PackedI32, PackedElemEncoding::UInt32, 2};
+        return true;
+    case semantic::PrimitiveType::Float:
+        outSpec = {SlotStorage::PackedI32, PackedElemEncoding::Float32, 2};
+        return true;
+    case semantic::PrimitiveType::Enum: {
+        if (elementTypeId == 0) return false;
+        EnumValue ev{};
+        if (initialSample && initialSample->tryGetEnum(ev) &&
+            (ev.value < std::numeric_limits<std::int32_t>::min() ||
+             ev.value > std::numeric_limits<std::int32_t>::max())) {
+            outSpec = {SlotStorage::PackedI64, PackedElemEncoding::EnumWide, 3};
+        } else {
+            outSpec = {SlotStorage::PackedI32, PackedElemEncoding::EnumInline, 2};
+        }
+        return true;
+    }
+    case semantic::PrimitiveType::Long:
+        outSpec = {SlotStorage::PackedI64, PackedElemEncoding::Int64, 3};
+        return true;
+    case semantic::PrimitiveType::ULong:
+        outSpec = {SlotStorage::PackedI64, PackedElemEncoding::UInt64, 3};
+        return true;
+    case semantic::PrimitiveType::Double:
+        outSpec = {SlotStorage::PackedI64, PackedElemEncoding::Float64, 3};
+        return true;
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] inline Value readPackedElementValue(
+    const void* basePtr,
+    std::size_t index,
+    PackedElemEncoding encoding,
+    semantic::SymbolId elemTypeId) noexcept {
+    const auto* bytes = static_cast<const std::uint8_t*>(basePtr);
+    switch (encoding) {
+    case PackedElemEncoding::Bool:
+        return Value{bytes[index] != 0u};
+    case PackedElemEncoding::Byte:
+        return Value{ByteValue{bytes[index]}};
+    case PackedElemEncoding::SByte:
+        return Value{SByteValue{static_cast<std::int8_t>(bytes[index])}};
+    case PackedElemEncoding::Short:
+        return Value{ShortValue{reinterpret_cast<const std::int16_t*>(bytes)[index]}};
+    case PackedElemEncoding::UShort:
+        return Value{UShortValue{reinterpret_cast<const std::uint16_t*>(bytes)[index]}};
+    case PackedElemEncoding::Char:
+        return Value{CharValue{reinterpret_cast<const std::uint16_t*>(bytes)[index]}};
+    case PackedElemEncoding::Int32:
+        return Value{static_cast<std::int64_t>(reinterpret_cast<const std::int32_t*>(bytes)[index])};
+    case PackedElemEncoding::UInt32:
+        return Value{UIntValue{reinterpret_cast<const std::uint32_t*>(bytes)[index]}};
+    case PackedElemEncoding::Float32:
+        return Value{FloatValue{reinterpret_cast<const float*>(bytes)[index]}};
+    case PackedElemEncoding::EnumInline:
+        return Value{EnumValue{elemTypeId, static_cast<std::int64_t>(reinterpret_cast<const std::int32_t*>(bytes)[index])}};
+    case PackedElemEncoding::Int64:
+        return Value{LongValue{reinterpret_cast<const std::int64_t*>(bytes)[index]}};
+    case PackedElemEncoding::UInt64:
+        return Value{ULongValue{reinterpret_cast<const std::uint64_t*>(bytes)[index]}};
+    case PackedElemEncoding::Float64:
+        return Value{reinterpret_cast<const double*>(bytes)[index]};
+    case PackedElemEncoding::Int64Wide:
+        return Value{reinterpret_cast<const std::int64_t*>(bytes)[index]};
+    case PackedElemEncoding::EnumWide:
+        return Value{EnumValue{elemTypeId, reinterpret_cast<const std::int64_t*>(bytes)[index]}};
+    case PackedElemEncoding::None:
+        break;
+    }
+    return Value{};
+}
+
+[[nodiscard]] inline bool writePackedElementValue(
+    void* basePtr,
+    std::size_t index,
+    PackedElemEncoding encoding,
+    semantic::SymbolId elemTypeId,
+    const Value& value,
+    bool& outNeedsWidenTo64) noexcept {
+    outNeedsWidenTo64 = false;
+    auto* bytes = static_cast<std::uint8_t*>(basePtr);
+    switch (encoding) {
+    case PackedElemEncoding::Bool: {
+        bool b = false;
+        if (!value.tryGetBool(b)) return false;
+        bytes[index] = b ? 1u : 0u;
+        return true;
+    }
+    case PackedElemEncoding::Byte: {
+        const auto* v = std::get_if<ByteValue>(&value);
+        if (!v) return false;
+        bytes[index] = v->value;
+        return true;
+    }
+    case PackedElemEncoding::SByte: {
+        const auto* v = std::get_if<SByteValue>(&value);
+        if (!v) return false;
+        bytes[index] = static_cast<std::uint8_t>(v->value);
+        return true;
+    }
+    case PackedElemEncoding::Short: {
+        const auto* v = std::get_if<ShortValue>(&value);
+        if (!v) return false;
+        reinterpret_cast<std::int16_t*>(bytes)[index] = v->value;
+        return true;
+    }
+    case PackedElemEncoding::UShort: {
+        const auto* v = std::get_if<UShortValue>(&value);
+        if (!v) return false;
+        reinterpret_cast<std::uint16_t*>(bytes)[index] = v->value;
+        return true;
+    }
+    case PackedElemEncoding::Char: {
+        const auto* v = std::get_if<CharValue>(&value);
+        if (!v) return false;
+        reinterpret_cast<std::uint16_t*>(bytes)[index] = v->value;
+        return true;
+    }
+    case PackedElemEncoding::Int32: {
+        std::int64_t iv = 0;
+        if (!value.tryGetInt64(iv)) return false;
+        if (iv < std::numeric_limits<std::int32_t>::min() ||
+            iv > std::numeric_limits<std::int32_t>::max()) {
+            outNeedsWidenTo64 = true;
+            return false;
+        }
+        reinterpret_cast<std::int32_t*>(bytes)[index] = static_cast<std::int32_t>(iv);
+        return true;
+    }
+    case PackedElemEncoding::UInt32: {
+        const auto* v = std::get_if<UIntValue>(&value);
+        if (!v) return false;
+        reinterpret_cast<std::uint32_t*>(bytes)[index] = v->value;
+        return true;
+    }
+    case PackedElemEncoding::Float32: {
+        float fv = 0.0f;
+        if (!value.tryGetFloat(fv)) return false;
+        reinterpret_cast<float*>(bytes)[index] = fv;
+        return true;
+    }
+    case PackedElemEncoding::EnumInline: {
+        EnumValue ev{};
+        if (!value.tryGetEnum(ev) || ev.typeId != elemTypeId) return false;
+        if (ev.value < std::numeric_limits<std::int32_t>::min() ||
+            ev.value > std::numeric_limits<std::int32_t>::max()) {
+            outNeedsWidenTo64 = true;
+            return false;
+        }
+        reinterpret_cast<std::int32_t*>(bytes)[index] = static_cast<std::int32_t>(ev.value);
+        return true;
+    }
+    case PackedElemEncoding::Int64: {
+        std::int64_t lv = 0;
+        if (!value.tryGetLong(lv)) return false;
+        reinterpret_cast<std::int64_t*>(bytes)[index] = lv;
+        return true;
+    }
+    case PackedElemEncoding::UInt64: {
+        const auto* v = std::get_if<ULongValue>(&value);
+        if (!v) return false;
+        reinterpret_cast<std::uint64_t*>(bytes)[index] = v->value;
+        return true;
+    }
+    case PackedElemEncoding::Float64: {
+        double dv = 0.0;
+        if (!value.tryGetDouble(dv)) return false;
+        reinterpret_cast<double*>(bytes)[index] = dv;
+        return true;
+    }
+    case PackedElemEncoding::Int64Wide: {
+        std::int64_t iv = 0;
+        if (!value.tryGetInt64(iv)) return false;
+        reinterpret_cast<std::int64_t*>(bytes)[index] = iv;
+        return true;
+    }
+    case PackedElemEncoding::EnumWide: {
+        EnumValue ev{};
+        if (!value.tryGetEnum(ev) || ev.typeId != elemTypeId) return false;
+        reinterpret_cast<std::int64_t*>(bytes)[index] = ev.value;
+        return true;
+    }
+    case PackedElemEncoding::None:
+        break;
+    }
+    return false;
+}
 
 namespace GcFlag {
     constexpr std::uint8_t Marked          = 1u << 0;
@@ -660,6 +916,88 @@ private:
     };
     std::array<ClassArena, 3> classes_;
     Value emptyValue_{};
+};
+
+alignas(16) static std::uint8_t gEmptyPackedSentinel[16] = {};
+
+class PackedByteBufferPool {
+public:
+    static constexpr std::size_t kAlignment = 16;
+
+    struct AlignedBlock {
+        std::uint8_t* ptr = nullptr;
+        std::size_t cap = 0;
+
+        AlignedBlock() noexcept = default;
+        ~AlignedBlock() { reset(); }
+        AlignedBlock(const AlignedBlock&) = delete;
+        AlignedBlock& operator=(const AlignedBlock&) = delete;
+        AlignedBlock(AlignedBlock&& other) noexcept
+            : ptr(std::exchange(other.ptr, nullptr)),
+              cap(std::exchange(other.cap, 0)) {}
+        AlignedBlock& operator=(AlignedBlock&& other) noexcept {
+            if (this != &other) {
+                reset();
+                ptr = std::exchange(other.ptr, nullptr);
+                cap = std::exchange(other.cap, 0);
+            }
+            return *this;
+        }
+
+        void ensureZeroed(std::size_t byteSize) {
+            if (byteSize == 0) return;
+            if (cap < byteSize || cap > byteSize * 4u) {
+                reset();
+                ptr = static_cast<std::uint8_t*>(
+                    ::operator new(byteSize, std::align_val_t{kAlignment}));
+                cap = byteSize;
+            }
+            std::memset(ptr, 0, byteSize);
+        }
+
+        void reset() noexcept {
+            if (ptr) {
+                ::operator delete(ptr, cap, std::align_val_t{kAlignment});
+                ptr = nullptr;
+                cap = 0;
+            }
+        }
+    };
+
+    std::uint32_t acquireZeroed(std::size_t byteSize, Value*& outAlignedPtr) {
+        if (byteSize == 0) {
+            outAlignedPtr = reinterpret_cast<Value*>(gEmptyPackedSentinel);
+            return CompactSlot::kInvalidHandle;
+        }
+        std::uint32_t id = 0;
+        if (!freeIds_.empty()) {
+            id = freeIds_.back();
+            freeIds_.pop_back();
+        } else {
+            id = static_cast<std::uint32_t>(blocks_.size());
+            blocks_.emplace_back();
+        }
+        blocks_[id].ensureZeroed(byteSize);
+        outAlignedPtr = reinterpret_cast<Value*>(blocks_[id].ptr);
+        return id;
+    }
+
+    void release(std::uint32_t id) noexcept {
+        if (id >= blocks_.size()) return;
+        if (blocks_[id].cap > 65536u) {
+            blocks_[id].reset();
+        }
+        freeIds_.push_back(id);
+    }
+
+    void clear() noexcept {
+        blocks_.clear();
+        freeIds_.clear();
+    }
+
+private:
+    std::vector<AlignedBlock> blocks_;
+    std::vector<std::uint32_t> freeIds_;
 };
 
 class LargeValueBufferPool {
@@ -1024,6 +1362,12 @@ struct ManagedHeap::Impl {
         case SlotStorage::SlabValues:
         case SlotStorage::HeapValues:
             return BaseObjectSizeBytes + static_cast<std::size_t>(slot.payload.s.length) * sizeof(Value);
+        case SlotStorage::PackedB8:
+        case SlotStorage::PackedB16:
+        case SlotStorage::PackedI32:
+        case SlotStorage::PackedI64:
+            return BaseObjectSizeBytes +
+                (static_cast<std::size_t>(slot.payload.s.length) << unpackPackedShift(slot.auxMeta));
         case SlotStorage::RawColumn:
         case SlotStorage::Empty:
             return BaseObjectSizeBytes;
@@ -1051,6 +1395,12 @@ struct ManagedHeap::Impl {
             break;
         case SlotStorage::HeapValues:
             largeBuffers.release(slot.payload.s.handle);
+            break;
+        case SlotStorage::PackedB8:
+        case SlotStorage::PackedB16:
+        case SlotStorage::PackedI32:
+        case SlotStorage::PackedI64:
+            packedBuffers.release(slot.payload.s.handle);
             break;
         case SlotStorage::RawColumn:
             rawColumns.release(slot.payload.s.handle);
@@ -1210,6 +1560,7 @@ struct ManagedHeap::Impl {
 
     PagedValueSlabPool slabPool;
     LargeValueBufferPool largeBuffers;
+    PackedByteBufferPool packedBuffers;
     HeapStringPool stringPool;
     RawColumnPool rawColumns;
     CardTableArena cardArena;
@@ -1359,6 +1710,43 @@ struct ManagedHeap::Impl {
         return finalizeSlotAllocation(*slotIndex, ObjectKind::String, SlotStorage::HeapString, sizeBytes);
     }
 
+    bool widenPackedSlotTo64Unlocked(std::uint32_t slotIndex, CompactSlot& slot) {
+        const auto oldEnc = unpackPackedEncoding(slot.auxMeta);
+        if (oldEnc != PackedElemEncoding::Int32 && oldEnc != PackedElemEncoding::EnumInline) {
+            return false;
+        }
+        const std::size_t len = slot.payload.s.length;
+        const std::size_t oldBytes = len << 2u;
+        const std::size_t newBytes = len << 3u;
+        const std::size_t delta = newBytes - oldBytes;
+        if (!slot.hasFlag(GcFlag::CustomSize) &&
+            statistics.liveBytes + delta > config.maximumHeapBytes) {
+            return false;
+        }
+        Value* newAlignedPtr = nullptr;
+        const std::uint32_t newHandle = packedBuffers.acquireZeroed(newBytes, newAlignedPtr);
+        const auto* src32 = reinterpret_cast<const std::int32_t*>(slot.payload.s.data);
+        auto* dst64 = reinterpret_cast<std::int64_t*>(newAlignedPtr);
+        for (std::size_t i = 0; i < len; ++i) {
+            dst64[i] = static_cast<std::int64_t>(src32[i]);
+        }
+        packedBuffers.release(slot.payload.s.handle);
+        const auto newEnc = (oldEnc == PackedElemEncoding::Int32)
+            ? PackedElemEncoding::Int64Wide
+            : PackedElemEncoding::EnumWide;
+        slot.setKindAndStorage(ObjectKind::Array, SlotStorage::PackedI64);
+        slot.auxMeta = packPackedAuxMeta(newEnc, 3u);
+        slot.payload.s.data = newAlignedPtr;
+        slot.payload.s.handle = newHandle;
+        if (!slot.hasFlag(GcFlag::CustomSize)) {
+            statistics.bytesAllocated += delta;
+            statistics.liveBytes += delta;
+            statistics.peakLiveBytes = std::max(statistics.peakLiveBytes, statistics.liveBytes);
+        }
+        (void)slotIndex;
+        return true;
+    }
+
     [[nodiscard]] std::optional<ObjectRef> allocateArraySlot(
         semantic::SymbolId arrayTypeId,
         semantic::PrimitiveType elementType,
@@ -1369,6 +1757,41 @@ struct ManagedHeap::Impl {
         RuntimeError* error,
         bool* outReallocated = nullptr) {
         const std::uint32_t layoutId = internArrayLayout(arrayTypeId, elementType, elementTypeId);
+        PackedStorageSpec packedSpec{};
+        if (length <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) &&
+            tryClassifyPackedArray(
+                elementType,
+                elementTypeId,
+                length > 0 ? &initialValue : nullptr,
+                packedSpec)) {
+            const std::size_t packedBytes = length << packedSpec.elemShift;
+            const std::size_t packedTotalBytes = BaseObjectSizeBytes + packedBytes;
+            const auto slotIndex = acquireSlot(packedTotalBytes, error, outReallocated);
+            if (!slotIndex) return std::nullopt;
+            Value* alignedPtr = nullptr;
+            const std::uint32_t bufHandle = packedBuffers.acquireZeroed(packedBytes, alignedPtr);
+            if (length > 0) {
+                bool dummyWiden = false;
+                // Check if initialValue is non-zero; if zero, acquireZeroed already zero-filled the block!
+                Value zeroSample = readPackedElementValue(alignedPtr, 0, packedSpec.encoding, elementTypeId);
+                if (!(zeroSample == initialValue)) {
+                    for (std::size_t i = 0; i < length; ++i) {
+                        (void)writePackedElementValue(
+                            alignedPtr, i, packedSpec.encoding, elementTypeId, initialValue, dummyWiden);
+                    }
+                }
+            }
+            auto& slot = slots[*slotIndex];
+            slot.auxMeta = packPackedAuxMeta(packedSpec.encoding, packedSpec.elemShift);
+            slot.payload.s = {
+                layoutId,
+                static_cast<std::uint32_t>(length),
+                alignedPtr,
+                bufHandle,
+                CompactSlot::kInvalidHandle,
+            };
+            return finalizeSlotAllocation(*slotIndex, ObjectKind::Array, packedSpec.storage, packedTotalBytes);
+        }
         const auto slotIndex = acquireSlot(sizeBytes, error, outReallocated);
         if (!slotIndex) return std::nullopt;
         if (length > 0) {
@@ -2030,8 +2453,16 @@ std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
             "managed array initial value does not match its element type");
         return std::nullopt;
     }
-    const auto storage = estimateValueStorage(length);
-    if (storage == std::numeric_limits<std::size_t>::max()) {
+    PackedStorageSpec preSpec{};
+    std::size_t storage = 0;
+    if (length <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) &&
+        tryClassifyPackedArray(elementType, elementTypeId, length > 0 ? &initialValue : nullptr, preSpec)) {
+        storage = length << preSpec.elemShift;
+    } else {
+        storage = estimateValueStorage(length);
+    }
+    if (storage == std::numeric_limits<std::size_t>::max() ||
+        storage > std::numeric_limits<std::size_t>::max() - Impl::BaseObjectSizeBytes) {
         setHeapError(error, ErrorCode::OutOfMemory, "managed array is too large");
         return std::nullopt;
     }
@@ -2592,6 +3023,15 @@ std::optional<Value> ManagedHeap::arrayGet(ObjectRef reference, std::size_t inde
         HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
         const auto* slot = impl_->getSlot(reference);
         if (!slot || slot->kind() != ObjectKind::Array) return std::nullopt;
+        if (isPackedStorage(slot->storage())) {
+            if (index >= slot->payload.s.length) return std::nullopt;
+            const auto elemTid = impl_->typeLayouts[slot->payload.s.layoutId].elementTypeId;
+            return readPackedElementValue(
+                slot->payload.s.data,
+                index,
+                unpackPackedEncoding(slot->auxMeta),
+                elemTid);
+        }
         if (slot->storage() != SlotStorage::RawColumn) {
             if (index >= slot->payload.s.length) return std::nullopt;
             return slot->payload.s.data[index];
@@ -2618,21 +3058,99 @@ std::optional<Value> ManagedHeap::arrayGet(ObjectRef reference, std::size_t inde
     return Value{makeStructValueFromFields(rawStructTypeId, std::move(heapFields))};
 }
 
+bool ManagedHeap::isPackedArray(ObjectRef reference) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    const auto* slot = impl_->getSlot(reference);
+    return slot && slot->kind() == ObjectKind::Array && isPackedStorage(slot->storage());
+}
+
+std::optional<std::size_t> ManagedHeap::objectSizeBytes(ObjectRef reference) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot) return std::nullopt;
+    return impl_->slotSizeBytes(reference.slot, *slot);
+}
+
 const Value* ManagedHeap::arrayGetFast(ObjectRef reference, std::size_t index) const noexcept {
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array ||
-        slot->storage() == SlotStorage::RawColumn || index >= slot->payload.s.length) {
+        slot->storage() == SlotStorage::RawColumn ||
+        isPackedStorage(slot->storage()) ||
+        index >= slot->payload.s.length) {
         return nullptr;
     }
     return &slot->payload.s.data[index];
+}
+
+bool ManagedHeap::tryBindPackedArrayFastView(
+    ObjectRef reference,
+    PackedArrayFastView& outView) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array || !isPackedStorage(slot->storage())) {
+        outView = {};
+        return false;
+    }
+    const std::uint32_t count = slot->payload.s.length;
+    if (count > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+        outView = {};
+        return false;
+    }
+    const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+    outView.rawData = slot->payload.s.data;
+    outView.length = count;
+    outView.encoding = unpackPackedEncoding(slot->auxMeta);
+    outView.elementType = layout.elementType;
+    outView.elementTypeId = layout.elementTypeId;
+    return true;
+}
+
+bool ManagedHeap::tryBindPackedInt32Array(
+    ObjectRef reference,
+    std::int32_t*& outData,
+    std::uint32_t& outLength) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array || slot->storage() != SlotStorage::PackedI32) {
+        outData = nullptr;
+        outLength = 0;
+        return false;
+    }
+    const auto enc = unpackPackedEncoding(slot->auxMeta);
+    if (enc != PackedElemEncoding::Int32 && enc != PackedElemEncoding::EnumInline) {
+        outData = nullptr;
+        outLength = 0;
+        return false;
+    }
+    outData = reinterpret_cast<std::int32_t*>(slot->payload.s.data);
+    outLength = slot->payload.s.length;
+    return true;
+}
+
+bool ManagedHeap::tryBindPackedDoubleArray(
+    ObjectRef reference,
+    double*& outData,
+    std::uint32_t& outLength) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array || slot->storage() != SlotStorage::PackedI64 ||
+        unpackPackedEncoding(slot->auxMeta) != PackedElemEncoding::Float64) {
+        outData = nullptr;
+        outLength = 0;
+        return false;
+    }
+    outData = reinterpret_cast<double*>(slot->payload.s.data);
+    outLength = slot->payload.s.length;
+    return true;
 }
 
 bool ManagedHeap::tryBindArrayFastView(ObjectRef reference, ArrayFastView& outView) const noexcept {
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array ||
-        slot->storage() == SlotStorage::RawColumn) {
+        slot->storage() == SlotStorage::RawColumn ||
+        isPackedStorage(slot->storage())) {
         return false;
     }
     const std::uint32_t count = slot->payload.s.length;
@@ -2738,6 +3256,19 @@ bool ManagedHeap::arraySetPrevalidated(
         return true;
     }
     if (index >= slot->payload.s.length) {
+        return false;
+    }
+    if (isPackedStorage(slot->storage())) {
+        const auto elemTid = impl_->typeLayouts[slot->payload.s.layoutId].elementTypeId;
+        bool needsWiden = false;
+        if (writePackedElementValue(
+                slot->payload.s.data, index, unpackPackedEncoding(slot->auxMeta), elemTid, value, needsWiden)) {
+            return true;
+        }
+        if (needsWiden && impl_->widenPackedSlotTo64Unlocked(reference.slot, *slot)) {
+            return writePackedElementValue(
+                slot->payload.s.data, index, unpackPackedEncoding(slot->auxMeta), elemTid, value, needsWiden);
+        }
         return false;
     }
     if (mayBeReference) {
@@ -2852,6 +3383,32 @@ bool ManagedHeap::arraySet(
                 "managed array native handle type mismatch");
             return false;
         }
+    }
+    if (isPackedStorage(slot->storage())) {
+        bool needsWiden = false;
+        if (writePackedElementValue(
+                slot->payload.s.data,
+                index,
+                unpackPackedEncoding(slot->auxMeta),
+                expectedTypeId,
+                value,
+                needsWiden)) {
+            return true;
+        }
+        if (needsWiden && impl_->widenPackedSlotTo64Unlocked(reference.slot, *slot)) {
+            if (writePackedElementValue(
+                    slot->payload.s.data,
+                    index,
+                    unpackPackedEncoding(slot->auxMeta),
+                    expectedTypeId,
+                    value,
+                    needsWiden)) {
+                return true;
+            }
+        }
+        setHeapError(error, ErrorCode::OutOfMemory,
+            "managed packed array widening exceeded heap budget");
+        return false;
     }
     impl_->pinHeapValueIfNeededUnlocked(value);
     impl_->writeBarrierArrayElement(reference, index, value);
@@ -3638,6 +4195,24 @@ bool ManagedHeap::readPackedIntArray(
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
         return false;
     }
+    if (isPackedStorage(slot->storage())) {
+        const std::size_t len = slot->payload.s.length;
+        const auto enc = unpackPackedEncoding(slot->auxMeta);
+        out.resize(len);
+        if (enc == PackedElemEncoding::Int32) {
+            const auto* src = reinterpret_cast<const std::int32_t*>(slot->payload.s.data);
+            for (std::size_t i = 0; i < len; ++i) out[i] = static_cast<std::int64_t>(src[i]);
+            return true;
+        }
+        if (enc == PackedElemEncoding::Int64 || enc == PackedElemEncoding::Int64Wide) {
+            if (len > 0) {
+                std::memcpy(out.data(), slot->payload.s.data, len * sizeof(std::int64_t));
+            }
+            return true;
+        }
+        setHeapError(error, ErrorCode::TypeMismatch, "array element is not an integer");
+        return false;
+    }
     const auto len = Impl::slotValueCount(*slot);
     const Value* values = slot->payload.s.data;
     out.resize(len);
@@ -3676,6 +4251,43 @@ bool ManagedHeap::writePackedIntArray(
         setHeapError(error, ErrorCode::TypeMismatch, "array element is not an integer");
         return false;
     }
+    if (isPackedStorage(slot->storage())) {
+        const std::size_t len = slot->payload.s.length;
+        if (count > len) {
+            setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
+            return false;
+        }
+        auto enc = unpackPackedEncoding(slot->auxMeta);
+        if (enc == PackedElemEncoding::Int32) {
+            bool anyWide = false;
+            for (std::size_t i = 0; i < count; ++i) {
+                if (data[i] < std::numeric_limits<std::int32_t>::min() ||
+                    data[i] > std::numeric_limits<std::int32_t>::max()) {
+                    anyWide = true;
+                    break;
+                }
+            }
+            if (anyWide) {
+                if (!impl_->widenPackedSlotTo64Unlocked(reference.slot, *slot)) {
+                    setHeapError(error, ErrorCode::OutOfMemory, "packed array widening failed");
+                    return false;
+                }
+                enc = unpackPackedEncoding(slot->auxMeta);
+            } else {
+                auto* dst = reinterpret_cast<std::int32_t*>(slot->payload.s.data);
+                for (std::size_t i = 0; i < count; ++i) dst[i] = static_cast<std::int32_t>(data[i]);
+                return true;
+            }
+        }
+        if (enc == PackedElemEncoding::Int64 || enc == PackedElemEncoding::Int64Wide) {
+            if (count > 0) {
+                std::memcpy(static_cast<void*>(slot->payload.s.data), data, count * sizeof(std::int64_t));
+            }
+            return true;
+        }
+        setHeapError(error, ErrorCode::TypeMismatch, "array element is not an integer");
+        return false;
+    }
     const auto len = Impl::slotValueCount(*slot);
     if (count > len) {
         setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
@@ -3697,6 +4309,24 @@ bool ManagedHeap::readPackedDoubleArray(
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
+        return false;
+    }
+    if (isPackedStorage(slot->storage())) {
+        const std::size_t len = slot->payload.s.length;
+        const auto enc = unpackPackedEncoding(slot->auxMeta);
+        out.resize(len);
+        if (enc == PackedElemEncoding::Float64) {
+            if (len > 0) {
+                std::memcpy(out.data(), slot->payload.s.data, len * sizeof(double));
+            }
+            return true;
+        }
+        if (enc == PackedElemEncoding::Float32) {
+            const auto* src = reinterpret_cast<const float*>(slot->payload.s.data);
+            for (std::size_t i = 0; i < len; ++i) out[i] = static_cast<double>(src[i]);
+            return true;
+        }
+        setHeapError(error, ErrorCode::TypeMismatch, "array element is not a floating-point number");
         return false;
     }
     const auto len = Impl::slotValueCount(*slot);
@@ -3734,6 +4364,27 @@ bool ManagedHeap::writePackedDoubleArray(
     if (elemType != semantic::PrimitiveType::Double &&
         elemType != semantic::PrimitiveType::Float &&
         elemType != semantic::PrimitiveType::Error) {
+        setHeapError(error, ErrorCode::TypeMismatch, "array element is not a floating-point number");
+        return false;
+    }
+    if (isPackedStorage(slot->storage())) {
+        const std::size_t len = slot->payload.s.length;
+        if (count > len) {
+            setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
+            return false;
+        }
+        const auto enc = unpackPackedEncoding(slot->auxMeta);
+        if (enc == PackedElemEncoding::Float64) {
+            if (count > 0) {
+                std::memcpy(static_cast<void*>(slot->payload.s.data), data, count * sizeof(double));
+            }
+            return true;
+        }
+        if (enc == PackedElemEncoding::Float32) {
+            auto* dst = reinterpret_cast<float*>(slot->payload.s.data);
+            for (std::size_t i = 0; i < count; ++i) dst[i] = static_cast<float>(data[i]);
+            return true;
+        }
         setHeapError(error, ErrorCode::TypeMismatch, "array element is not a floating-point number");
         return false;
     }
@@ -3852,11 +4503,22 @@ HeapSnapshot ManagedHeap::Impl::snapshotUnlocked(const ShadowStack* shadowStack)
             info.typeId = layout.typeId;
             info.elementType = layout.elementType;
             info.elementTypeId = layout.elementTypeId;
-            const auto count = Impl::slotValueCount(slot);
-            info.valueCount = count;
-            info.values.resize(count);
-            for (std::size_t i = 0; i < count; ++i) {
-                info.values[i] = slot.payload.s.data[i];
+            if (isPackedStorage(slot.storage())) {
+                const std::size_t pCount = slot.payload.s.length;
+                const auto enc = unpackPackedEncoding(slot.auxMeta);
+                info.valueCount = pCount;
+                info.values.resize(pCount);
+                for (std::size_t i = 0; i < pCount; ++i) {
+                    info.values[i] = readPackedElementValue(
+                        slot.payload.s.data, i, enc, layout.elementTypeId);
+                }
+            } else {
+                const auto count = Impl::slotValueCount(slot);
+                info.valueCount = count;
+                info.values.resize(count);
+                for (std::size_t i = 0; i < count; ++i) {
+                    info.values[i] = slot.payload.s.data[i];
+                }
             }
             const auto& values = info.values;
             if (!layout.referenceFields.empty()) {
@@ -4064,6 +4726,7 @@ bool ManagedHeap::restore(
     // All validation passed; rebuild pools and slots cleanly
     impl_->slabPool.clear();
     impl_->largeBuffers.clear();
+    impl_->packedBuffers.clear();
     impl_->stringPool.clear();
     impl_->rawColumns.clear();
     impl_->cardArena.clear();
@@ -4113,7 +4776,53 @@ bool ManagedHeap::restore(
             }
 
             const std::size_t count = info.values.size();
-            if (count <= CompactSlot::kInlineValueCapacity) {
+            PackedStorageSpec restorePacked{};
+            if (info.kind == ObjectKind::Array &&
+                count <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) &&
+                tryClassifyPackedArray(
+                    info.elementType,
+                    info.elementTypeId,
+                    count > 0 ? &info.values[0] : nullptr,
+                    restorePacked)) {
+                if (restorePacked.encoding == PackedElemEncoding::Int32) {
+                    for (const auto& v : info.values) {
+                        std::int64_t iv = 0;
+                        if (v.tryGetInt64(iv) &&
+                            (iv < std::numeric_limits<std::int32_t>::min() ||
+                             iv > std::numeric_limits<std::int32_t>::max())) {
+                            restorePacked = {SlotStorage::PackedI64, PackedElemEncoding::Int64Wide, 3};
+                            break;
+                        }
+                    }
+                } else if (restorePacked.encoding == PackedElemEncoding::EnumInline) {
+                    for (const auto& v : info.values) {
+                        EnumValue ev{};
+                        if (v.tryGetEnum(ev) &&
+                            (ev.value < std::numeric_limits<std::int32_t>::min() ||
+                             ev.value > std::numeric_limits<std::int32_t>::max())) {
+                            restorePacked = {SlotStorage::PackedI64, PackedElemEncoding::EnumWide, 3};
+                            break;
+                        }
+                    }
+                }
+                const std::size_t pBytes = count << restorePacked.elemShift;
+                Value* alignedPtr = nullptr;
+                const std::uint32_t handle = impl_->packedBuffers.acquireZeroed(pBytes, alignedPtr);
+                bool dummyWiden = false;
+                for (std::size_t fi = 0; fi < count; ++fi) {
+                    (void)writePackedElementValue(
+                        alignedPtr, fi, restorePacked.encoding, info.elementTypeId, info.values[fi], dummyWiden);
+                }
+                slot.setKindAndStorage(ObjectKind::Array, restorePacked.storage);
+                slot.auxMeta = packPackedAuxMeta(restorePacked.encoding, restorePacked.elemShift);
+                slot.payload.s = {
+                    layoutId,
+                    static_cast<std::uint32_t>(count),
+                    alignedPtr,
+                    handle,
+                    CompactSlot::kInvalidHandle,
+                };
+            } else if (count <= CompactSlot::kInlineValueCapacity) {
                 std::uint16_t cls = 0;
                 std::uint32_t handle = CompactSlot::kInvalidHandle;
                 Value* ptr = impl_->slabPool.allocate(count, cls, handle);

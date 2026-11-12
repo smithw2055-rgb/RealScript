@@ -195,7 +195,7 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
                     }},
                 }},
                 {"completionProvider", Json::Object{
-                    {"triggerCharacters", Json::Array{"."}},
+                    {"triggerCharacters", Json::Array{".", "\"", "/"}},
                 }},
                 {"signatureHelpProvider", Json::Object{
                     {"triggerCharacters", Json::Array{"(", ","}},
@@ -206,7 +206,15 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
                 {"documentSymbolProvider", true},
                 {"workspaceSymbolProvider", true},
                 {"documentFormattingProvider", true},
-                {"renameProvider", true},
+                {"codeActionProvider", Json::Object{
+                    {"codeActionKinds", Json::Array{"quickfix"}},
+                }},
+                {"renameProvider", Json::Object{
+                    {"prepareProvider", true},
+                }},
+                {"executeCommandProvider", Json::Object{
+                    {"commands", Json::Array{"realscript.refreshManifest"}},
+                }},
                 {"inlayHintProvider", true},
                 {"semanticTokensProvider", Json::Object{
                     {"full", true},
@@ -432,11 +440,31 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
         }
         return response(message, Json(std::move(values)));
     }
+    if (method == "textDocument/prepareRename") {
+        const auto prep = service_.prepareRename(path, cursor);
+        if (!prep.valid) {
+            return error(
+                message,
+                -32602,
+                prep.errorMessage.empty() ? "symbol cannot be renamed" : prep.errorMessage);
+        }
+        return response(message, Json::Object{
+            {"range", range(prep.range)},
+            {"placeholder", prep.placeholder},
+        });
+    }
     if (method == "textDocument/rename") {
         const auto* newName = params ? params->find("newName") : nullptr;
+        const std::string requestedName = newName ? newName->stringValue() : std::string{};
+        const auto prep = service_.prepareRename(path, cursor);
+        if (!prep.valid) {
+            return error(
+                message,
+                -32602,
+                prep.errorMessage.empty() ? "symbol cannot be renamed" : prep.errorMessage);
+        }
         Json::Object changes;
-        for (const auto& edit : service_.rename(
-                 path, cursor, newName ? newName->stringValue() : std::string{})) {
+        for (const auto& edit : service_.rename(path, cursor, requestedName)) {
             auto& array = changes[pathToUri(edit.location.path)].arrayValue();
             array.emplace_back(Json::Object{
                 {"range", range(edit.location.range)},
@@ -444,6 +472,51 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
             });
         }
         return response(message, Json::Object{{"changes", Json(std::move(changes))}});
+    }
+    if (method == "textDocument/codeAction") {
+        debug::SourceRange reqRange{};
+        if (const auto* rangeObj = params ? params->find("range") : nullptr;
+            rangeObj && rangeObj->isObject()) {
+            reqRange.start = readPosition(rangeObj->find("start"));
+            reqRange.end = readPosition(rangeObj->find("end"));
+        } else {
+            reqRange.start = cursor;
+            reqRange.end = cursor;
+        }
+        Json::Array actionsJson;
+        for (const auto& act : service_.codeActions(path, reqRange)) {
+            Json::Object changes;
+            for (const auto& edit : act.edits) {
+                auto& arr = changes[pathToUri(edit.location.path)].arrayValue();
+                arr.emplace_back(Json::Object{
+                    {"range", range(edit.location.range)},
+                    {"newText", edit.replacement},
+                });
+            }
+            actionsJson.emplace_back(Json::Object{
+                {"title", act.title},
+                {"kind", act.kind},
+                {"isPreferred", act.isPreferred},
+                {"edit", Json::Object{{"changes", Json(std::move(changes))}}},
+            });
+        }
+        return response(message, Json(std::move(actionsJson)));
+    }
+    if (method == "workspace/executeCommand") {
+        const std::string cmd = (params && params->find("command"))
+            ? params->find("command")->stringValue()
+            : std::string{};
+        if (cmd == "realscript.refreshManifest") {
+            service_.refreshSceneManifest();
+            const auto manifest = service_.sceneManifest();
+            return response(message, Json::Object{
+                {"refreshed", true},
+                {"entities", static_cast<std::int64_t>(manifest.entities.size())},
+                {"signals", static_cast<std::int64_t>(manifest.signals.size())},
+                {"resources", static_cast<std::int64_t>(manifest.resources.size())},
+            });
+        }
+        return error(message, -32601, "unknown command: " + cmd);
     }
     if (method == "textDocument/semanticTokens/full") {
         Json::Array data;

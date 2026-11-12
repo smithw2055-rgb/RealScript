@@ -4,6 +4,8 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
+#include <unordered_set>
 #include <utility>
 
 namespace realscript::debug {
@@ -112,6 +114,7 @@ bool tryAsInt64(const runtime::Value& value, std::int64_t& out) noexcept {
     if (const auto* v = std::get_if<runtime::UShortValue>(&value)) { out = v->value; return true; }
     if (const auto* v = std::get_if<runtime::UIntValue>(&value)) { out = static_cast<std::int64_t>(v->value); return true; }
     if (const auto* v = std::get_if<runtime::ULongValue>(&value)) { out = static_cast<std::int64_t>(v->value); return true; }
+    if (const auto* v = std::get_if<runtime::CharValue>(&value)) { out = v->value; return true; }
     if (runtime::EnumValue v{}; value.tryGetEnum(v)) { out = v.value; return true; }
     return false;
 }
@@ -119,6 +122,14 @@ bool tryAsInt64(const runtime::Value& value, std::int64_t& out) noexcept {
 bool tryAsDouble(const runtime::Value& value, double& out) noexcept {
     if (const auto* v = std::get_if<double>(&value)) { out = *v; return true; }
     if (const auto* v = std::get_if<runtime::FloatValue>(&value)) { out = v->value; return true; }
+    if (const auto* v = std::get_if<runtime::FixedValue>(&value)) {
+        out = static_cast<double>(v->raw) / 256.0;
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::Fixed16Value>(&value)) {
+        out = static_cast<double>(v->raw) / 65536.0;
+        return true;
+    }
     std::int64_t integer = 0;
     if (tryAsInt64(value, integer)) {
         out = static_cast<double>(integer);
@@ -133,6 +144,10 @@ bool tryAsString(
     std::string& out) {
     if (const auto* text = std::get_if<std::string>(&value)) {
         out = *text;
+        return true;
+    }
+    if (const auto* sv = std::get_if<runtime::StringValue>(&value)) {
+        out = sv->str();
         return true;
     }
     if (const auto* ref = std::get_if<runtime::ObjectRef>(&value)) {
@@ -162,17 +177,174 @@ bool isNullValue(const runtime::Value& value) noexcept {
     return false;
 }
 
+bool valuesEqualForEval(
+    const runtime::Value& left,
+    const runtime::Value& right,
+    runtime::ManagedHeap* heap) {
+    if (isNullValue(left) || isNullValue(right)) {
+        return isNullValue(left) && isNullValue(right);
+    }
+    std::int64_t li = 0, ri = 0;
+    if (tryAsInt64(left, li) && tryAsInt64(right, ri)) {
+        return li == ri;
+    }
+    double ld = 0.0, rd = 0.0;
+    if (tryAsDouble(left, ld) && tryAsDouble(right, rd)) {
+        return ld == rd;
+    }
+    std::string ls, rs;
+    if (tryAsString(left, heap, ls) && tryAsString(right, heap, rs)) {
+        return ls == rs;
+    }
+    return left == right;
+}
+
+std::optional<runtime::Value> tokenValueToRuntimeValue(const syntax::TokenValue& tv) {
+    if (const auto* i = std::get_if<std::int64_t>(&tv)) return runtime::Value{*i};
+    if (const auto* d = std::get_if<double>(&tv)) return runtime::Value{*d};
+    if (const auto* b = std::get_if<bool>(&tv)) return runtime::Value{*b};
+    if (const auto* s = std::get_if<std::string>(&tv)) return runtime::Value{*s};
+    return std::nullopt;
+}
+
+// Verifies that a bytecode::Function (and any transitive callees up to depth 4)
+// performs strictly side-effect-free read-only operations and never mutates heap,
+// static fields, arrays, structs, or external native state.
+bool isPureBytecodeFunction(
+    const runtime::ProgramImage& program,
+    const bytecode::Module& module,
+    const bytecode::Function& fn,
+    std::size_t depth,
+    std::unordered_set<semantic::SymbolId>& visited) {
+    if (depth > 4) return false;
+    if (fn.symbolId != 0 && !visited.insert(fn.symbolId).second) {
+        // Recursive cycle: still pure so long as instructions are pure (bounded by instructionBudget)
+        return true;
+    }
+    for (const auto& block : fn.blocks) {
+        if (block.terminator.kind == bytecode::TerminatorKind::Throw) {
+            return false;
+        }
+        for (const auto& inst : block.instructions) {
+            switch (inst.opcode) {
+            case bytecode::Opcode::LoadParameter:
+            case bytecode::Opcode::ConstantInt:
+            case bytecode::Opcode::ConstantDouble:
+            case bytecode::Opcode::ConstantBool:
+            case bytecode::Opcode::ConstantString:
+            case bytecode::Opcode::ConstantNull:
+            case bytecode::Opcode::ConstantTypeId:
+            case bytecode::Opcode::LoadLocal:
+            case bytecode::Opcode::StoreLocal:
+            case bytecode::Opcode::ConvertNullToString:
+            case bytecode::Opcode::ConvertNullToObject:
+            case bytecode::Opcode::ConvertNullToArray:
+            case bytecode::Opcode::ConvertIntToLong:
+            case bytecode::Opcode::ConvertIntToDouble:
+            case bytecode::Opcode::ConvertLongToDouble:
+            case bytecode::Opcode::ConvertNumeric:
+            case bytecode::Opcode::NewStruct:
+            case bytecode::Opcode::CheckNotNull:
+            case bytecode::Opcode::ArrayLength:
+            case bytecode::Opcode::LoadElement:
+            case bytecode::Opcode::LoadField:
+            case bytecode::Opcode::LoadStructField:
+            case bytecode::Opcode::NegateInt:
+            case bytecode::Opcode::NegateLong:
+            case bytecode::Opcode::NegateDouble:
+            case bytecode::Opcode::LogicalNot:
+            case bytecode::Opcode::AddInt:
+            case bytecode::Opcode::SubtractInt:
+            case bytecode::Opcode::MultiplyInt:
+            case bytecode::Opcode::DivideInt:
+            case bytecode::Opcode::RemainderInt:
+            case bytecode::Opcode::Equal:
+            case bytecode::Opcode::NotEqual:
+            case bytecode::Opcode::LessInt:
+            case bytecode::Opcode::LessOrEqualInt:
+            case bytecode::Opcode::GreaterInt:
+            case bytecode::Opcode::GreaterOrEqualInt:
+            case bytecode::Opcode::AddLong:
+            case bytecode::Opcode::SubtractLong:
+            case bytecode::Opcode::MultiplyLong:
+            case bytecode::Opcode::DivideLong:
+            case bytecode::Opcode::RemainderLong:
+            case bytecode::Opcode::LessLong:
+            case bytecode::Opcode::LessOrEqualLong:
+            case bytecode::Opcode::GreaterLong:
+            case bytecode::Opcode::GreaterOrEqualLong:
+            case bytecode::Opcode::AddDouble:
+            case bytecode::Opcode::SubtractDouble:
+            case bytecode::Opcode::MultiplyDouble:
+            case bytecode::Opcode::DivideDouble:
+            case bytecode::Opcode::LessDouble:
+            case bytecode::Opcode::LessOrEqualDouble:
+            case bytecode::Opcode::GreaterDouble:
+            case bytecode::Opcode::GreaterOrEqualDouble:
+            case bytecode::Opcode::IsType:
+            case bytecode::Opcode::AsType:
+                break;
+
+            case bytecode::Opcode::Call: {
+                if (inst.index >= module.functionReferences.size()) return false;
+                const auto& fnRef = module.functionReferences[inst.index];
+                if (fnRef.virtualDispatch || fnRef.interfaceDispatch) return false;
+                if (fnRef.name.rfind("RealScript.Math::", 0) == 0 ||
+                    fnRef.name.rfind("$intrinsic::static_get::", 0) == 0 ||
+                    fnRef.name.rfind("$intrinsic::nullable_", 0) == 0 ||
+                    fnRef.name.rfind("$intrinsic::string_", 0) == 0) {
+                    break;
+                }
+                const auto* targetLoc = program.resolveFunction(fnRef.symbolId);
+                if (!targetLoc || !targetLoc->module || !targetLoc->function) {
+                    return false; // External C++ host binding or unresolved
+                }
+                if (!isPureBytecodeFunction(
+                        program, *targetLoc->module, *targetLoc->function, depth + 1, visited)) {
+                    return false;
+                }
+                break;
+            }
+
+            // Mutating, heap-allocating, delegate, or async opcodes are rejected
+            case bytecode::Opcode::NewObject:
+            case bytecode::Opcode::NewArray:
+            case bytecode::Opcode::StoreElement:
+            case bytecode::Opcode::StoreField:
+            case bytecode::Opcode::StoreStructField:
+            case bytecode::Opcode::NewDelegate:
+            case bytecode::Opcode::InvokeDelegate:
+            case bytecode::Opcode::CombineDelegate:
+            case bytecode::Opcode::RemoveDelegate:
+            case bytecode::Opcode::AsyncEnter:
+            case bytecode::Opcode::AwaitSuspend:
+            case bytecode::Opcode::AwaitResume:
+            case bytecode::Opcode::AsyncResolve:
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 class ExpressionEvaluator {
 public:
     ExpressionEvaluator(
         const std::string& text,
         const DebugStackFrame& frame,
         const std::unordered_map<semantic::SymbolId, semantic::TypeSymbol>& types,
+        const std::unordered_map<std::string, semantic::SymbolId>& typesByName,
+        const runtime::ProgramImage* program,
         runtime::ManagedHeap* heap)
-        : text_(text), frame_(frame), types_(types), heap_(heap) {}
+        : text_(text),
+          frame_(frame),
+          types_(types),
+          typesByName_(typesByName),
+          program_(program),
+          heap_(heap) {}
 
     std::optional<runtime::Value> evaluate(std::string* errorOut) {
-        auto result = parseLogicalOr();
+        auto result = parseConditional();
         skipWhitespace();
         if (result && pos_ < text_.size()) {
             setError("unexpected trailing token in expression");
@@ -185,8 +357,17 @@ public:
     }
 
 private:
+    struct ScopedSuppress {
+        bool& flag;
+        bool prev;
+        ScopedSuppress(bool& f, bool enable) noexcept : flag(f), prev(f) {
+            if (enable) flag = true;
+        }
+        ~ScopedSuppress() noexcept { flag = prev; }
+    };
+
     void setError(std::string message) {
-        if (error_.empty()) error_ = std::move(message);
+        if (!suppressEval_ && error_.empty()) error_ = std::move(message);
     }
 
     void skipWhitespace() noexcept {
@@ -208,9 +389,217 @@ private:
         return text_.compare(pos_, token.size(), token) == 0;
     }
 
-    std::optional<runtime::Value> resolveMember(
+    const semantic::TypeSymbol* findBaseType(const semantic::TypeSymbol& type) const noexcept {
+        if (type.baseTypeId != 0) {
+            const auto it = types_.find(type.baseTypeId);
+            if (it != types_.end()) return &it->second;
+        }
+        if (!type.baseTypeName.empty()) {
+            const auto itName = typesByName_.find(type.baseTypeName);
+            if (itName != typesByName_.end()) {
+                const auto it = types_.find(itName->second);
+                if (it != types_.end()) return &it->second;
+            }
+        }
+        return nullptr;
+    }
+
+    std::optional<runtime::Value> invokePureSandbox(
+        semantic::SymbolId fnSymbolId,
+        const std::vector<runtime::Value>& callArgs,
+        const std::string& displayLabel) {
+        if (!program_) {
+            setError("program image is unavailable to evaluate '" + displayLabel + "'");
+            return std::nullopt;
+        }
+        const auto* loc = program_->resolveFunction(fnSymbolId);
+        if (!loc || !loc->module || !loc->function) {
+            setError("cannot evaluate external or native function '" + displayLabel + "' in watch sandbox");
+            return std::nullopt;
+        }
+        std::unordered_set<semantic::SymbolId> visited;
+        if (!isPureBytecodeFunction(*program_, *loc->module, *loc->function, 0, visited)) {
+            setError("refusing to evaluate '" + displayLabel + "': function has potential side effects");
+            return std::nullopt;
+        }
+        // Aliasing shared_ptrs with empty control block: safe non-owning view for synchronous sandbox call
+        std::shared_ptr<const runtime::ProgramImage> progAlias(
+            std::shared_ptr<const runtime::ProgramImage>{}, program_);
+        std::shared_ptr<runtime::ManagedHeap> heapAlias = heap_
+            ? std::shared_ptr<runtime::ManagedHeap>(std::shared_ptr<runtime::ManagedHeap>{}, heap_)
+            : std::shared_ptr<runtime::ManagedHeap>{};
+        runtime::Interpreter sandbox(std::move(progAlias), std::move(heapAlias));
+        runtime::ExecutionOptions opts;
+        opts.debugger = nullptr; // Never trigger breakpoints or re-enter DebugController!
+        opts.limits.instructionBudget = 2048;
+        opts.limits.recursionLimit = 16;
+        auto execRes = sandbox.invoke(fnSymbolId, callArgs, std::move(opts));
+        if (!execRes.succeeded) {
+            setError("evaluation of '" + displayLabel + "' failed: " + execRes.error.message);
+            return std::nullopt;
+        }
+        return execRes.value;
+    }
+
+    std::optional<runtime::Value> getNamedObjectField(
+        runtime::ObjectRef ref,
+        const semantic::TypeSymbol& typeDesc,
+        std::string_view fieldName,
+        std::size_t fallbackIdx) const {
+        if (!heap_) return std::nullopt;
+        for (std::size_t i = 0; i < typeDesc.fields.size(); ++i) {
+            if (typeDesc.fields[i].name == fieldName) {
+                return heap_->fieldGet(ref, i);
+            }
+        }
+        return heap_->fieldGet(ref, fallbackIdx);
+    }
+
+    bool isNullableNull(const runtime::Value& val) const {
+        const auto tid = runtime::structValueTypeId(val);
+        if (!tid || *tid == 0) return false;
+        const auto it = types_.find(*tid);
+        if (it == types_.end() || it->second.name.rfind("Nullable__", 0) != 0) return false;
+        std::optional<runtime::Value> hv;
+        if (const auto* sv = std::get_if<runtime::StructValue>(&val)) {
+            if (sv->valid()) hv = runtime::structValueFieldAt(*sv, 0);
+        } else {
+            hv = runtime::loadInlineStructField(val, 0);
+        }
+        if (hv) {
+            if (const auto* b = std::get_if<bool>(&*hv)) return !*b;
+        }
+        return false;
+    }
+
+    std::optional<runtime::Value> unwrapNullableIfPresent(const runtime::Value& val) const {
+        const auto tid = runtime::structValueTypeId(val);
+        if (!tid || *tid == 0) return val;
+        const auto it = types_.find(*tid);
+        if (it == types_.end() || it->second.name.rfind("Nullable__", 0) != 0) return val;
+        std::optional<runtime::Value> hv, inner;
+        if (const auto* sv = std::get_if<runtime::StructValue>(&val)) {
+            if (sv->valid()) {
+                hv = runtime::structValueFieldAt(*sv, 0);
+                inner = runtime::structValueFieldAt(*sv, 1);
+            }
+        } else {
+            hv = runtime::loadInlineStructField(val, 0);
+            inner = runtime::loadInlineStructField(val, 1);
+        }
+        if (hv && std::holds_alternative<bool>(*hv) && std::get<bool>(*hv) && inner) {
+            return *inner;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<runtime::Value> resolveStaticMember(
+        semantic::SymbolId typeId,
+        const std::string& member,
+        const std::vector<runtime::Value>* callArgs) {
+        const auto found = types_.find(typeId);
+        if (found == types_.end()) {
+            setError("unknown type metadata");
+            return std::nullopt;
+        }
+        std::unordered_set<semantic::SymbolId> visited;
+        const semantic::TypeSymbol* curr = &found->second;
+        while (curr && visited.insert(curr->id).second) {
+            if (!callArgs) {
+                for (const auto& em : curr->enumMembers) {
+                    if (em.name == member) {
+                        return runtime::Value{runtime::EnumValue{curr->id, em.value}};
+                    }
+                }
+                for (const auto& field : curr->fields) {
+                    if (field.name != member) continue;
+                    if (field.constField && field.hasConstantValue) {
+                        if (auto cv = tokenValueToRuntimeValue(field.constantValue)) return *cv;
+                    }
+                    if (field.staticField) {
+                        if (heap_ && heap_->hasStaticField(field.id)) {
+                            if (auto sv = heap_->getStaticField(field.id)) return *sv;
+                        }
+                        if (field.hasConstantValue) {
+                            if (auto cv = tokenValueToRuntimeValue(field.constantValue)) return *cv;
+                        }
+                        return runtime::Value{std::int64_t{0}};
+                    }
+                }
+                for (const auto& prop : curr->properties) {
+                    if (prop.name == member && prop.staticProperty) {
+                        if (prop.backingFieldIndex < curr->fields.size()) {
+                            const auto& bf = curr->fields[prop.backingFieldIndex];
+                            if (heap_ && heap_->hasStaticField(bf.id)) {
+                                if (auto sv = heap_->getStaticField(bf.id)) return *sv;
+                            }
+                        }
+                        if (prop.getter) {
+                            return invokePureSandbox(prop.getter->id, {}, curr->name + "." + member);
+                        }
+                    }
+                }
+            } else {
+                for (const auto& method : curr->methods) {
+                    if (method.name == member && method.staticMethod &&
+                        method.parameters.size() == callArgs->size()) {
+                        return invokePureSandbox(method.id, *callArgs, curr->name + "." + member);
+                    }
+                }
+            }
+            curr = findBaseType(*curr);
+        }
+        setError("unknown static member '" + member + "' on '" + found->second.name + "'");
+        return std::nullopt;
+    }
+
+    std::optional<runtime::Value> resolveMemberOrCall(
         const runtime::Value& target,
-        const std::string& member) {
+        const std::string& member,
+        const std::vector<runtime::Value>* callArgs) {
+        // 1. Inline Math & Fixed primitives (supports both inline cells and StructValue wrappers)
+        if (std::int32_t fxRaw = 0; target.tryGetFixed(fxRaw)) {
+            if (!callArgs && (member == "raw" || member == "Raw")) return runtime::Value{static_cast<std::int64_t>(fxRaw)};
+            if (callArgs && callArgs->empty() && member == "ToDouble") return runtime::Value{static_cast<double>(fxRaw) / 256.0};
+            if (callArgs && callArgs->empty() && member == "ToInt") return runtime::Value{static_cast<std::int64_t>(fxRaw / 256)};
+        }
+        if (const auto* fx16 = std::get_if<runtime::Fixed16Value>(&target)) {
+            if (!callArgs && (member == "raw" || member == "Raw")) return runtime::Value{static_cast<std::int64_t>(fx16->raw)};
+            if (callArgs && callArgs->empty() && member == "ToDouble") return runtime::Value{static_cast<double>(fx16->raw) / 65536.0};
+            if (callArgs && callArgs->empty() && member == "ToInt") return runtime::Value{static_cast<std::int64_t>(fx16->raw / 65536)};
+        }
+        if (runtime::Vec2Value v2{}; target.tryGetVec2(v2)) {
+            if (!callArgs) {
+                if (member == "x") return runtime::Value{runtime::FixedValue{v2.x}};
+                if (member == "y") return runtime::Value{runtime::FixedValue{v2.y}};
+            } else if (callArgs->empty() && member == "LengthSquared") {
+                const std::int64_t xx = (static_cast<std::int64_t>(v2.x) * v2.x) >> 8;
+                const std::int64_t yy = (static_cast<std::int64_t>(v2.y) * v2.y) >> 8;
+                return runtime::Value{runtime::FixedValue{static_cast<std::int32_t>(xx + yy)}};
+            }
+        }
+        if (runtime::Vec3Value v3{}; target.tryGetVec3(v3)) {
+            if (!callArgs) {
+                if (member == "x") return runtime::Value{runtime::FixedValue{v3.x}};
+                if (member == "y") return runtime::Value{runtime::FixedValue{v3.y}};
+                if (member == "z") return runtime::Value{runtime::FixedValue{v3.z}};
+            } else if (callArgs->empty() && member == "LengthSquared") {
+                const std::int64_t xx = (static_cast<std::int64_t>(v3.x) * v3.x) >> 8;
+                const std::int64_t yy = (static_cast<std::int64_t>(v3.y) * v3.y) >> 8;
+                const std::int64_t zz = (static_cast<std::int64_t>(v3.z) * v3.z) >> 8;
+                return runtime::Value{runtime::FixedValue{static_cast<std::int32_t>(xx + yy + zz)}};
+            }
+        }
+        if (runtime::QuatValue q{}; target.tryGetQuat(q)) {
+            if (!callArgs) {
+                if (member == "x") return runtime::Value{runtime::FixedValue{q.x}};
+                if (member == "y") return runtime::Value{runtime::FixedValue{q.y}};
+                if (member == "z") return runtime::Value{runtime::FixedValue{q.z}};
+                if (member == "w") return runtime::Value{runtime::FixedValue{q.w}};
+            }
+        }
+
+        // 2. Value-type structs (including Nullable<T>)
         const auto structTypeId = runtime::structValueTypeId(target);
         if (structTypeId && *structTypeId != 0) {
             const auto foundType = types_.find(*structTypeId);
@@ -218,30 +607,102 @@ private:
                 setError("unknown struct type metadata");
                 return std::nullopt;
             }
-            if (const auto* structVal = std::get_if<runtime::StructValue>(&target)) {
-                if (!structVal->valid()) {
-                    setError("struct storage is null");
-                    return std::nullopt;
+            const auto readStructSlot = [&](std::size_t idx) -> std::optional<runtime::Value> {
+                if (const auto* sv = std::get_if<runtime::StructValue>(&target)) {
+                    if (!sv->valid()) return std::nullopt;
+                    return runtime::structValueFieldAt(*sv, idx);
                 }
-                for (std::size_t index = 0; index < foundType->second.fields.size(); ++index) {
-                    if (foundType->second.fields[index].name == member) {
-                        if (auto fieldVal = runtime::structValueFieldAt(*structVal, index)) {
-                            return *fieldVal;
+                return runtime::loadInlineStructField(target, idx);
+            };
+            if (foundType->second.name.rfind("Nullable__", 0) == 0) {
+                const auto hv = readStructSlot(0);
+                const bool hasVal = hv && std::holds_alternative<bool>(*hv) && std::get<bool>(*hv);
+                if (!callArgs) {
+                    if (member == "HasValue" || member == "hasValue") return runtime::Value{hasVal};
+                    if (member == "Value" || member == "value") {
+                        if (!hasVal) {
+                            setError("Nullable value has no value");
+                            return std::nullopt;
                         }
+                        return readStructSlot(1);
                     }
-                }
-            } else {
-                for (std::size_t index = 0; index < foundType->second.fields.size(); ++index) {
-                    if (foundType->second.fields[index].name == member) {
-                        if (auto fieldVal = runtime::loadInlineStructField(target, index)) {
-                            return *fieldVal;
-                        }
+                } else if (member == "GetValueOrDefault") {
+                    if (callArgs->empty()) {
+                        return readStructSlot(1);
+                    }
+                    if (callArgs->size() == 1) {
+                        return hasVal ? readStructSlot(1) : (*callArgs)[0];
                     }
                 }
             }
-            setError("unknown struct field '" + member + "'");
+            if (!callArgs) {
+                for (std::size_t index = 0; index < foundType->second.fields.size(); ++index) {
+                    if (foundType->second.fields[index].name == member) {
+                        if (auto fieldVal = readStructSlot(index)) return *fieldVal;
+                    }
+                }
+                for (const auto& prop : foundType->second.properties) {
+                    if (prop.name == member && !prop.staticProperty) {
+                        if (prop.backingFieldIndex < foundType->second.fields.size()) {
+                            if (auto bfVal = readStructSlot(prop.backingFieldIndex)) return *bfVal;
+                        }
+                        if (prop.getter) {
+                            return invokePureSandbox(
+                                prop.getter->id, {target}, foundType->second.name + "." + member);
+                        }
+                    }
+                }
+                for (const auto& method : foundType->second.methods) {
+                    if (method.name == "get_" + member && !method.staticMethod && method.parameters.size() == 1) {
+                        return invokePureSandbox(method.id, {target}, foundType->second.name + "." + member);
+                    }
+                }
+            } else {
+                std::vector<runtime::Value> fullArgs;
+                fullArgs.reserve(callArgs->size() + 1);
+                fullArgs.push_back(target);
+                fullArgs.insert(fullArgs.end(), callArgs->begin(), callArgs->end());
+                for (const auto& method : foundType->second.methods) {
+                    if (method.name == member && !method.staticMethod &&
+                        method.parameters.size() == fullArgs.size()) {
+                        return invokePureSandbox(method.id, fullArgs, foundType->second.name + "." + member);
+                    }
+                }
+            }
+            setError("unknown struct member '" + member + "'");
             return std::nullopt;
         }
+
+        // 3. String intrinsics (value strings & heap strings)
+        std::string strValue;
+        if (tryAsString(target, heap_, strValue)) {
+            if (!callArgs || callArgs->empty()) {
+                if (member == "Length" || member == "Count" || member == "length") {
+                    return runtime::Value{static_cast<std::int64_t>(strValue.size())};
+                }
+                if (member == "IsEmpty") {
+                    return runtime::Value{strValue.empty()};
+                }
+            }
+            if (callArgs && callArgs->size() == 1) {
+                std::string argStr;
+                if (tryAsString((*callArgs)[0], heap_, argStr)) {
+                    if (member == "Contains") {
+                        return runtime::Value{strValue.find(argStr) != std::string::npos};
+                    }
+                    if (member == "StartsWith") {
+                        return runtime::Value{strValue.size() >= argStr.size() &&
+                            strValue.compare(0, argStr.size(), argStr) == 0};
+                    }
+                    if (member == "EndsWith") {
+                        return runtime::Value{strValue.size() >= argStr.size() &&
+                            strValue.compare(strValue.size() - argStr.size(), argStr.size(), argStr) == 0};
+                    }
+                }
+            }
+        }
+
+        // 4. Managed Heap Objects & Arrays (including Monomorphized Built-in Containers)
         if (const auto* ref = std::get_if<runtime::ObjectRef>(&target)) {
             if (!ref->valid()) {
                 setError("null object reference");
@@ -251,15 +712,19 @@ private:
                 setError("managed heap is unavailable for object inspection");
                 return std::nullopt;
             }
-            if (ref->kind == runtime::ObjectKind::Array && member == "Length") {
+            if (ref->kind == runtime::ObjectKind::Array) {
                 if (const auto len = heap_->arrayLength(*ref)) {
-                    return static_cast<std::int64_t>(*len);
+                    if (!callArgs || callArgs->empty()) {
+                        if (member == "Length" || member == "Count" || member == "length") {
+                            return runtime::Value{static_cast<std::int64_t>(*len)};
+                        }
+                        if (member == "IsEmpty") {
+                            return runtime::Value{*len == 0};
+                        }
+                    }
                 }
-            }
-            if (ref->kind == runtime::ObjectKind::String && member == "Length") {
-                if (const auto view = heap_->stringView(*ref)) {
-                    return static_cast<std::int64_t>(view->size());
-                }
+                setError("unknown array member '" + member + "'");
+                return std::nullopt;
             }
             const auto typeId = heap_->objectTypeId(*ref);
             if (!typeId) {
@@ -271,38 +736,499 @@ private:
                 setError("unknown object type metadata");
                 return std::nullopt;
             }
-            for (std::size_t index = 0; index < foundType->second.fields.size(); ++index) {
-                if (foundType->second.fields[index].name == member) {
+            const auto& tDesc = foundType->second;
+            const std::string& tName = tDesc.name;
+
+            // Built-in container logical properties & side-effect-free queries
+            const bool isList = (tName.rfind("List__", 0) == 0);
+            const bool isHashSet = (tName.rfind("HashSet__", 0) == 0);
+            const bool isStack = (tName.rfind("Stack__", 0) == 0);
+            const bool isQueue = (tName.rfind("Queue__", 0) == 0);
+            const bool isDict = (tName.rfind("Dictionary__", 0) == 0);
+            if (isList || isHashSet || isStack || isQueue || isDict) {
+                const auto fCount = heap_->fieldCount(*ref).value_or(0);
+                const std::size_t countFallback = isHashSet ? (fCount > 0 ? fCount - 1 : 0)
+                    : (isQueue ? 3 : (isDict ? 4 : 1));
+                const auto countVal = getNamedObjectField(*ref, tDesc, "count", countFallback);
+                const auto backingVal = isHashSet
+                    ? getNamedObjectField(*ref, tDesc, "values", 1)
+                    : (isDict ? getNamedObjectField(*ref, tDesc, "keys", 0)
+                              : getNamedObjectField(*ref, tDesc, "items", 0));
+                std::int64_t logicalCount = 0;
+                if (countVal) (void)tryAsInt64(*countVal, logicalCount);
+                if (logicalCount < 0) logicalCount = 0;
+
+                if (!callArgs || callArgs->empty()) {
+                    if (member == "Count") return runtime::Value{logicalCount};
+                    if (member == "IsEmpty") return runtime::Value{logicalCount == 0};
+                    if (member == "Capacity") {
+                        std::int64_t cap = 0;
+                        if (backingVal) {
+                            if (const auto* bRef = std::get_if<runtime::ObjectRef>(&*backingVal);
+                                bRef && bRef->valid() && bRef->kind == runtime::ObjectKind::Array) {
+                                cap = static_cast<std::int64_t>(heap_->arrayLength(*bRef).value_or(0));
+                            }
+                        }
+                        return runtime::Value{cap};
+                    }
+                    if (member == "Peek" && callArgs && callArgs->empty()) {
+                        if (logicalCount <= 0) {
+                            setError("cannot Peek an empty container");
+                            return std::nullopt;
+                        }
+                        if (isStack && backingVal) {
+                            if (const auto* bRef = std::get_if<runtime::ObjectRef>(&*backingVal)) {
+                                return heap_->arrayGet(*bRef, static_cast<std::size_t>(logicalCount - 1));
+                            }
+                        }
+                        if (isQueue && backingVal) {
+                            const auto headVal = getNamedObjectField(*ref, tDesc, "head", 1);
+                            std::int64_t headIdx = 0;
+                            if (headVal) (void)tryAsInt64(*headVal, headIdx);
+                            if (const auto* bRef = std::get_if<runtime::ObjectRef>(&*backingVal)) {
+                                const auto arrLen = heap_->arrayLength(*bRef).value_or(0);
+                                if (arrLen > 0) {
+                                    return heap_->arrayGet(*bRef, static_cast<std::size_t>(headIdx) % arrLen);
+                                }
+                            }
+                        }
+                    }
+                }
+                if (callArgs && callArgs->size() == 1) {
+                    const auto& queryArg = (*callArgs)[0];
+                    if ((isList || isHashSet || isStack) && member == "Contains") {
+                        bool found = false;
+                        if (backingVal) {
+                            if (const auto* bRef = std::get_if<runtime::ObjectRef>(&*backingVal);
+                                bRef && bRef->valid()) {
+                                for (std::int64_t i = 0; i < logicalCount; ++i) {
+                                    if (const auto elem = heap_->arrayGet(*bRef, static_cast<std::size_t>(i));
+                                        elem && valuesEqualForEval(*elem, queryArg, heap_)) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        return runtime::Value{found};
+                    }
+                    if (isQueue && member == "Contains") {
+                        bool found = false;
+                        const auto headVal = getNamedObjectField(*ref, tDesc, "head", 1);
+                        std::int64_t headIdx = 0;
+                        if (headVal) (void)tryAsInt64(*headVal, headIdx);
+                        if (backingVal) {
+                            if (const auto* bRef = std::get_if<runtime::ObjectRef>(&*backingVal);
+                                bRef && bRef->valid()) {
+                                const auto arrLen = heap_->arrayLength(*bRef).value_or(0);
+                                if (arrLen > 0) {
+                                    for (std::int64_t i = 0; i < logicalCount; ++i) {
+                                        const std::size_t phys =
+                                            (static_cast<std::size_t>(headIdx) + static_cast<std::size_t>(i)) % arrLen;
+                                        if (const auto elem = heap_->arrayGet(*bRef, phys);
+                                            elem && valuesEqualForEval(*elem, queryArg, heap_)) {
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return runtime::Value{found};
+                    }
+                    if (isDict && (member == "ContainsKey" || member == "ContainsValue")) {
+                        const auto arrVal = (member == "ContainsKey")
+                            ? getNamedObjectField(*ref, tDesc, "keys", 0)
+                            : getNamedObjectField(*ref, tDesc, "values", 1);
+                        bool found = false;
+                        if (arrVal) {
+                            if (const auto* bRef = std::get_if<runtime::ObjectRef>(&*arrVal);
+                                bRef && bRef->valid()) {
+                                for (std::int64_t i = 0; i < logicalCount; ++i) {
+                                    if (const auto elem = heap_->arrayGet(*bRef, static_cast<std::size_t>(i));
+                                        elem && valuesEqualForEval(*elem, queryArg, heap_)) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        return runtime::Value{found};
+                    }
+                }
+            }
+
+            // General class hierarchy lookup (fields -> auto-properties -> pure getters -> pure methods)
+            if (!callArgs) {
+                for (std::size_t index = 0; index < tDesc.fields.size(); ++index) {
+                    const auto& fld = tDesc.fields[index];
+                    if (fld.name != member) continue;
+                    if (fld.constField && fld.hasConstantValue) {
+                        if (auto cv = tokenValueToRuntimeValue(fld.constantValue)) return *cv;
+                    }
+                    if (fld.staticField) {
+                        if (heap_->hasStaticField(fld.id)) {
+                            if (auto sv = heap_->getStaticField(fld.id)) return *sv;
+                        }
+                        return runtime::Value{std::int64_t{0}};
+                    }
                     if (const auto fieldVal = heap_->fieldGet(*ref, index)) {
                         return *fieldVal;
                     }
-                    break;
                 }
+                std::unordered_set<semantic::SymbolId> visited;
+                const semantic::TypeSymbol* curr = &tDesc;
+                while (curr && visited.insert(curr->id).second) {
+                    for (const auto& prop : curr->properties) {
+                        if (prop.name != member) continue;
+                        if (!prop.staticProperty && prop.backingFieldIndex < tDesc.fields.size()) {
+                            if (const auto bfVal = heap_->fieldGet(*ref, prop.backingFieldIndex)) {
+                                return *bfVal;
+                            }
+                        }
+                        if (prop.getter) {
+                            if (prop.staticProperty) {
+                                return invokePureSandbox(prop.getter->id, {}, curr->name + "." + member);
+                            }
+                            return invokePureSandbox(prop.getter->id, {target}, curr->name + "." + member);
+                        }
+                    }
+                    for (const auto& method : curr->methods) {
+                        if (method.name == "get_" + member && !method.staticMethod &&
+                            method.parameters.size() == 1) {
+                            return invokePureSandbox(method.id, {target}, curr->name + "." + member);
+                        }
+                    }
+                    for (const auto& fld : curr->fields) {
+                        if (fld.name != member) continue;
+                        if (fld.constField && fld.hasConstantValue) {
+                            if (auto cv = tokenValueToRuntimeValue(fld.constantValue)) return *cv;
+                        }
+                        if (fld.staticField && heap_->hasStaticField(fld.id)) {
+                            if (auto sv = heap_->getStaticField(fld.id)) return *sv;
+                        }
+                    }
+                    curr = findBaseType(*curr);
+                }
+                setError("unknown object field or property '" + member + "'");
+                return std::nullopt;
+            } else {
+                std::vector<runtime::Value> fullArgs;
+                fullArgs.reserve(callArgs->size() + 1);
+                fullArgs.push_back(target);
+                fullArgs.insert(fullArgs.end(), callArgs->begin(), callArgs->end());
+
+                std::unordered_set<semantic::SymbolId> visited;
+                const semantic::TypeSymbol* curr = &tDesc;
+                while (curr && visited.insert(curr->id).second) {
+                    for (const auto& method : curr->methods) {
+                        if (method.name == member && !method.staticMethod &&
+                            method.parameters.size() == fullArgs.size()) {
+                            return invokePureSandbox(method.id, fullArgs, curr->name + "." + member);
+                        }
+                        if (method.name == member && method.staticMethod &&
+                            method.parameters.size() == callArgs->size()) {
+                            return invokePureSandbox(method.id, *callArgs, curr->name + "." + member);
+                        }
+                    }
+                    curr = findBaseType(*curr);
+                }
+                setError("unknown or unsupported method '" + member + "' on '" + tDesc.name + "'");
+                return std::nullopt;
             }
-            setError("unknown object field '" + member + "'");
-            return std::nullopt;
         }
-        std::string strValue;
-        if (tryAsString(target, heap_, strValue) && member == "Length") {
-            return static_cast<std::int64_t>(strValue.size());
+
+        if (isNullValue(target)) {
+            setError("null object reference");
+            return std::nullopt;
         }
         setError("cannot access member '" + member + "' on value");
         return std::nullopt;
+    }
+
+    std::optional<runtime::Value> resolveIndex(
+        const runtime::Value& target,
+        const runtime::Value& keyVal) {
+        // 1. Inline Math vectors & quaternions (both inline cells and StructValue wrappers)
+        if (runtime::Vec2Value v2{}; target.tryGetVec2(v2)) {
+            std::int64_t idx = 0;
+            if (!tryAsInt64(keyVal, idx) || idx < 0 || idx >= 2) {
+                setError("Vec2 index out of range");
+                return std::nullopt;
+            }
+            return runtime::Value{runtime::FixedValue{idx == 0 ? v2.x : v2.y}};
+        }
+        if (runtime::Vec3Value v3{}; target.tryGetVec3(v3)) {
+            std::int64_t idx = 0;
+            if (!tryAsInt64(keyVal, idx) || idx < 0 || idx >= 3) {
+                setError("Vec3 index out of range");
+                return std::nullopt;
+            }
+            const std::int32_t raw = (idx == 0) ? v3.x : ((idx == 1) ? v3.y : v3.z);
+            return runtime::Value{runtime::FixedValue{raw}};
+        }
+        if (runtime::QuatValue q{}; target.tryGetQuat(q)) {
+            std::int64_t idx = 0;
+            if (!tryAsInt64(keyVal, idx) || idx < 0 || idx >= 4) {
+                setError("Quat index out of range");
+                return std::nullopt;
+            }
+            std::int32_t raw = q.w;
+            if (idx == 0) raw = q.x;
+            else if (idx == 1) raw = q.y;
+            else if (idx == 2) raw = q.z;
+            return runtime::Value{runtime::FixedValue{raw}};
+        }
+
+        // 2. String character indexing
+        std::string strVal;
+        if (tryAsString(target, heap_, strVal)) {
+            std::int64_t idx = 0;
+            if (!tryAsInt64(keyVal, idx) || idx < 0 || static_cast<std::size_t>(idx) >= strVal.size()) {
+                setError("string index out of range");
+                return std::nullopt;
+            }
+            return runtime::Value{std::string(1, strVal[static_cast<std::size_t>(idx)])};
+        }
+
+        // 3. Struct custom indexer get_Item
+        if (const auto structTid = runtime::structValueTypeId(target); structTid && *structTid != 0) {
+            std::vector<runtime::Value> args{keyVal};
+            return resolveMemberOrCall(target, "get_Item", &args);
+        }
+
+        // 4. Managed Arrays & Containers & Class Indexers
+        const auto* ref = std::get_if<runtime::ObjectRef>(&target);
+        if (!ref || !ref->valid() || !heap_) {
+            setError("indexed value is not a valid array or collection");
+            return std::nullopt;
+        }
+        if (ref->kind == runtime::ObjectKind::Array) {
+            std::int64_t idx = 0;
+            if (!tryAsInt64(keyVal, idx) || idx < 0) {
+                setError("array index must be a non-negative integer");
+                return std::nullopt;
+            }
+            const auto elem = heap_->arrayGet(*ref, static_cast<std::size_t>(idx));
+            if (!elem) {
+                setError("array index out of range");
+                return std::nullopt;
+            }
+            return *elem;
+        }
+
+        const auto typeId = heap_->objectTypeId(*ref);
+        if (!typeId) {
+            setError("indexed object is no longer alive");
+            return std::nullopt;
+        }
+        const auto foundType = types_.find(*typeId);
+        if (foundType == types_.end()) {
+            setError("unknown indexed object type metadata");
+            return std::nullopt;
+        }
+        const auto& tDesc = foundType->second;
+        const std::string& tName = tDesc.name;
+
+        if (tName.rfind("List__", 0) == 0) {
+            std::int64_t idx = 0;
+            if (!tryAsInt64(keyVal, idx) || idx < 0) {
+                setError("List index must be a non-negative integer");
+                return std::nullopt;
+            }
+            const auto itemsVal = getNamedObjectField(*ref, tDesc, "items", 0);
+            const auto countVal = getNamedObjectField(*ref, tDesc, "count", 1);
+            std::int64_t count = 0;
+            if (countVal) (void)tryAsInt64(*countVal, count);
+            if (idx >= count || !itemsVal) {
+                setError("List index out of range");
+                return std::nullopt;
+            }
+            if (const auto* arrRef = std::get_if<runtime::ObjectRef>(&*itemsVal);
+                arrRef && arrRef->valid()) {
+                if (const auto elem = heap_->arrayGet(*arrRef, static_cast<std::size_t>(idx))) {
+                    return *elem;
+                }
+            }
+            setError("List backing storage unavailable");
+            return std::nullopt;
+        }
+
+        if (tName.rfind("Stack__", 0) == 0) {
+            std::int64_t idx = 0;
+            if (!tryAsInt64(keyVal, idx) || idx < 0) {
+                setError("Stack index must be a non-negative integer");
+                return std::nullopt;
+            }
+            const auto itemsVal = getNamedObjectField(*ref, tDesc, "items", 0);
+            const auto countVal = getNamedObjectField(*ref, tDesc, "count", 1);
+            std::int64_t count = 0;
+            if (countVal) (void)tryAsInt64(*countVal, count);
+            if (idx >= count || !itemsVal) {
+                setError("Stack index out of range");
+                return std::nullopt;
+            }
+            const std::size_t physIdx = static_cast<std::size_t>(count - 1 - idx);
+            if (const auto* arrRef = std::get_if<runtime::ObjectRef>(&*itemsVal);
+                arrRef && arrRef->valid()) {
+                if (const auto elem = heap_->arrayGet(*arrRef, physIdx)) {
+                    return *elem;
+                }
+            }
+            setError("Stack backing storage unavailable");
+            return std::nullopt;
+        }
+
+        if (tName.rfind("Queue__", 0) == 0) {
+            std::int64_t idx = 0;
+            if (!tryAsInt64(keyVal, idx) || idx < 0) {
+                setError("Queue index must be a non-negative integer");
+                return std::nullopt;
+            }
+            const auto itemsVal = getNamedObjectField(*ref, tDesc, "items", 0);
+            const auto headVal = getNamedObjectField(*ref, tDesc, "head", 1);
+            const auto countVal = getNamedObjectField(*ref, tDesc, "count", 3);
+            std::int64_t count = 0, head = 0;
+            if (countVal) (void)tryAsInt64(*countVal, count);
+            if (headVal) (void)tryAsInt64(*headVal, head);
+            if (idx >= count || !itemsVal) {
+                setError("Queue index out of range");
+                return std::nullopt;
+            }
+            if (const auto* arrRef = std::get_if<runtime::ObjectRef>(&*itemsVal);
+                arrRef && arrRef->valid()) {
+                const auto arrLen = heap_->arrayLength(*arrRef).value_or(0);
+                if (arrLen > 0) {
+                    const std::size_t physIdx =
+                        (static_cast<std::size_t>(head) + static_cast<std::size_t>(idx)) % arrLen;
+                    if (const auto elem = heap_->arrayGet(*arrRef, physIdx)) {
+                        return *elem;
+                    }
+                }
+            }
+            setError("Queue backing storage unavailable");
+            return std::nullopt;
+        }
+
+        if (tName.rfind("Dictionary__", 0) == 0) {
+            const auto keysVal = getNamedObjectField(*ref, tDesc, "keys", 0);
+            const auto valsVal = getNamedObjectField(*ref, tDesc, "values", 1);
+            const auto countVal = getNamedObjectField(*ref, tDesc, "count", 4);
+            std::int64_t count = 0;
+            if (countVal) (void)tryAsInt64(*countVal, count);
+            if (keysVal && valsVal) {
+                const auto* kRef = std::get_if<runtime::ObjectRef>(&*keysVal);
+                const auto* vRef = std::get_if<runtime::ObjectRef>(&*valsVal);
+                if (kRef && kRef->valid() && vRef && vRef->valid()) {
+                    for (std::int64_t i = 0; i < count; ++i) {
+                        const auto kElem = heap_->arrayGet(*kRef, static_cast<std::size_t>(i));
+                        if (kElem && valuesEqualForEval(*kElem, keyVal, heap_)) {
+                            if (const auto vElem = heap_->arrayGet(*vRef, static_cast<std::size_t>(i))) {
+                                return *vElem;
+                            }
+                        }
+                    }
+                }
+            }
+            setError("key not found in Dictionary");
+            return std::nullopt;
+        }
+
+        // Custom class indexer `this[key]` lowered to `get_Item(key)`
+        std::vector<runtime::Value> args{keyVal};
+        return resolveMemberOrCall(target, "get_Item", &args);
+    }
+
+    std::optional<runtime::Value> parseConditional() {
+        auto cond = parseNullCoalescing();
+        if (!cond) return std::nullopt;
+        skipWhitespace();
+        if (pos_ < text_.size() && text_[pos_] == '?' &&
+            (pos_ + 1 >= text_.size() ||
+             (text_[pos_ + 1] != '?' && text_[pos_ + 1] != '.' && text_[pos_ + 1] != '['))) {
+            ++pos_; // consume '?'
+            bool condTrue = false;
+            if (!suppressEval_) {
+                const auto* b = std::get_if<bool>(&*cond);
+                if (!b) {
+                    setError("ternary '?:' condition must be bool");
+                    return std::nullopt;
+                }
+                condTrue = *b;
+            }
+            std::optional<runtime::Value> thenVal;
+            {
+                ScopedSuppress sup(suppressEval_, !condTrue);
+                thenVal = parseConditional();
+            }
+            if (!thenVal || !match(":")) {
+                setError("expected ':' in ternary expression");
+                return std::nullopt;
+            }
+            std::optional<runtime::Value> elseVal;
+            {
+                ScopedSuppress sup(suppressEval_, condTrue);
+                elseVal = parseConditional();
+            }
+            if (!elseVal) return std::nullopt;
+            return condTrue ? thenVal : elseVal;
+        }
+        return cond;
+    }
+
+    std::optional<runtime::Value> parseNullCoalescing() {
+        auto left = parseLogicalOr();
+        if (!left) return std::nullopt;
+        while (match("??")) {
+            const bool leftIsNull = !suppressEval_ && (isNullValue(*left) || isNullableNull(*left));
+            std::optional<runtime::Value> right;
+            {
+                ScopedSuppress sup(suppressEval_, !leftIsNull);
+                right = parseLogicalOr();
+            }
+            if (!right) return std::nullopt;
+            if (!suppressEval_) {
+                if (leftIsNull) {
+                    left = *right;
+                } else if (auto unwrapped = unwrapNullableIfPresent(*left)) {
+                    left = *unwrapped;
+                }
+            }
+        }
+        return left;
     }
 
     std::optional<runtime::Value> parseLogicalOr() {
         auto left = parseLogicalAnd();
         if (!left) return std::nullopt;
         while (match("||")) {
-            auto right = parseLogicalAnd();
-            if (!right) return std::nullopt;
-            const auto* lb = std::get_if<bool>(&*left);
-            const auto* rb = std::get_if<bool>(&*right);
-            if (!lb || !rb) {
-                setError("'||' requires bool operands");
-                return std::nullopt;
+            bool lhsBool = false;
+            if (!suppressEval_) {
+                const auto* lb = std::get_if<bool>(&*left);
+                if (!lb) {
+                    setError("'||' requires bool operands");
+                    return std::nullopt;
+                }
+                lhsBool = *lb;
             }
-            left = runtime::Value{*lb || *rb};
+            std::optional<runtime::Value> right;
+            {
+                ScopedSuppress sup(suppressEval_, lhsBool);
+                right = parseLogicalAnd();
+            }
+            if (!right) return std::nullopt;
+            if (!suppressEval_) {
+                if (lhsBool) {
+                    left = runtime::Value{true};
+                } else {
+                    const auto* rb = std::get_if<bool>(&*right);
+                    if (!rb) {
+                        setError("'||' requires bool operands");
+                        return std::nullopt;
+                    }
+                    left = runtime::Value{*rb};
+                }
+            }
         }
         return left;
     }
@@ -311,15 +1237,33 @@ private:
         auto left = parseEquality();
         if (!left) return std::nullopt;
         while (match("&&")) {
-            auto right = parseEquality();
-            if (!right) return std::nullopt;
-            const auto* lb = std::get_if<bool>(&*left);
-            const auto* rb = std::get_if<bool>(&*right);
-            if (!lb || !rb) {
-                setError("'&&' requires bool operands");
-                return std::nullopt;
+            bool lhsBool = true;
+            if (!suppressEval_) {
+                const auto* lb = std::get_if<bool>(&*left);
+                if (!lb) {
+                    setError("'&&' requires bool operands");
+                    return std::nullopt;
+                }
+                lhsBool = *lb;
             }
-            left = runtime::Value{*lb && *rb};
+            std::optional<runtime::Value> right;
+            {
+                ScopedSuppress sup(suppressEval_, !lhsBool);
+                right = parseEquality();
+            }
+            if (!right) return std::nullopt;
+            if (!suppressEval_) {
+                if (!lhsBool) {
+                    left = runtime::Value{false};
+                } else {
+                    const auto* rb = std::get_if<bool>(&*right);
+                    if (!rb) {
+                        setError("'&&' requires bool operands");
+                        return std::nullopt;
+                    }
+                    left = runtime::Value{*rb};
+                }
+            }
         }
         return left;
     }
@@ -333,24 +1277,11 @@ private:
             if (!isEq && !isNe) break;
             auto right = parseComparison();
             if (!right) return std::nullopt;
-            bool equal = false;
-            std::int64_t li = 0;
-            std::int64_t ri = 0;
-            double ld = 0.0;
-            double rd = 0.0;
-            std::string ls;
-            std::string rs;
-            if (isNullValue(*left) || isNullValue(*right)) {
-                equal = isNullValue(*left) && isNullValue(*right);
-            } else if (tryAsInt64(*left, li) && tryAsInt64(*right, ri)) {
-                equal = (li == ri);
-            } else if (tryAsDouble(*left, ld) && tryAsDouble(*right, rd)) {
-                equal = (ld == rd);
-            } else if (tryAsString(*left, heap_, ls) && tryAsString(*right, heap_, rs)) {
-                equal = (ls == rs);
-            } else {
-                equal = (*left == *right);
+            if (suppressEval_) {
+                left = runtime::Value{false};
+                continue;
             }
+            const bool equal = valuesEqualForEval(*left, *right, heap_);
             left = runtime::Value{isEq ? equal : !equal};
         }
         return left;
@@ -370,6 +1301,10 @@ private:
 
             auto right = parseAdditive();
             if (!right) return std::nullopt;
+            if (suppressEval_) {
+                left = runtime::Value{false};
+                continue;
+            }
             std::int64_t li = 0;
             std::int64_t ri = 0;
             if (tryAsInt64(*left, li) && tryAsInt64(*right, ri)) {
@@ -409,6 +1344,10 @@ private:
             if (!isAdd && !isSub) break;
             auto right = parseMultiplicative();
             if (!right) return std::nullopt;
+            if (suppressEval_) {
+                left = runtime::Value{std::int64_t{0}};
+                continue;
+            }
             if (isAdd) {
                 std::string ls;
                 std::string rs;
@@ -452,6 +1391,10 @@ private:
 
             auto right = parseUnary();
             if (!right) return std::nullopt;
+            if (suppressEval_) {
+                left = runtime::Value{std::int64_t{0}};
+                continue;
+            }
             std::int64_t li = 0;
             std::int64_t ri = 0;
             if (tryAsInt64(*left, li) && tryAsInt64(*right, ri)) {
@@ -484,6 +1427,7 @@ private:
         if (match("!")) {
             auto operand = parseUnary();
             if (!operand) return std::nullopt;
+            if (suppressEval_) return runtime::Value{false};
             if (const auto* b = std::get_if<bool>(&*operand)) {
                 return runtime::Value{!*b};
             }
@@ -493,6 +1437,7 @@ private:
         if (match("-")) {
             auto operand = parseUnary();
             if (!operand) return std::nullopt;
+            if (suppressEval_) return runtime::Value{std::int64_t{0}};
             std::int64_t integer = 0;
             if (tryAsInt64(*operand, integer)) return runtime::Value{-integer};
             double number = 0.0;
@@ -506,45 +1451,120 @@ private:
         return parsePostfix();
     }
 
-    std::optional<runtime::Value> parsePostfix() {
-        auto current = parsePrimary();
-        if (!current) return std::nullopt;
+    bool parseArgumentList(std::vector<runtime::Value>& outArgs, bool skipValues) {
+        outArgs.clear();
+        if (match(")")) return true;
         for (;;) {
-            if (match(".")) {
+            std::optional<runtime::Value> argVal;
+            {
+                ScopedSuppress sup(suppressEval_, skipValues);
+                argVal = parseConditional();
+            }
+            if (!argVal) return false;
+            outArgs.push_back(std::move(*argVal));
+            if (match(",")) continue;
+            if (match(")")) return true;
+            setError("expected ',' or ')' in argument list");
+            return false;
+        }
+    }
+
+    std::optional<runtime::Value> parsePostfix() {
+        semantic::SymbolId pendingStaticTypeId = 0;
+        auto current = parsePrimary(&pendingStaticTypeId);
+        if (!current) return std::nullopt;
+        bool nullShortCircuited = false;
+
+        for (;;) {
+            const bool nullCondDot = match("?.");
+            const bool normalDot = !nullCondDot && match(".");
+            if (nullCondDot || normalDot) {
                 const auto member = parseIdentifier();
                 if (member.empty()) {
                     setError("expected member name after '.'");
                     return std::nullopt;
                 }
-                current = resolveMember(*current, member);
+                const bool hasCallParens = match("(");
+                std::vector<runtime::Value> callArgs;
+                const bool shouldSkipArgs =
+                    suppressEval_ || nullShortCircuited ||
+                    (nullCondDot && pendingStaticTypeId == 0 &&
+                     (isNullValue(*current) || isNullableNull(*current)));
+                if (hasCallParens) {
+                    if (!parseArgumentList(callArgs, shouldSkipArgs)) return std::nullopt;
+                }
+
+                if (suppressEval_) {
+                    pendingStaticTypeId = 0;
+                    current = runtime::Value{std::int64_t{0}};
+                    continue;
+                }
+                if (nullShortCircuited) {
+                    continue;
+                }
+                if (pendingStaticTypeId != 0) {
+                    const auto tid = pendingStaticTypeId;
+                    pendingStaticTypeId = 0;
+                    current = resolveStaticMember(tid, member, hasCallParens ? &callArgs : nullptr);
+                    if (!current) return std::nullopt;
+                    continue;
+                }
+                if (nullCondDot && (isNullValue(*current) || isNullableNull(*current))) {
+                    nullShortCircuited = true;
+                    current = runtime::Value{runtime::NullObject{}};
+                    continue;
+                }
+                runtime::Value effectiveTarget = *current;
+                if (nullCondDot) {
+                    if (auto unwrapped = unwrapNullableIfPresent(effectiveTarget)) {
+                        effectiveTarget = *unwrapped;
+                    }
+                }
+                current = resolveMemberOrCall(
+                    effectiveTarget, member, hasCallParens ? &callArgs : nullptr);
                 if (!current) return std::nullopt;
                 continue;
             }
-            if (match("[")) {
-                auto indexVal = parseLogicalOr();
+
+            const bool nullCondBracket = match("?[");
+            const bool normalBracket = !nullCondBracket && match("[");
+            if (nullCondBracket || normalBracket) {
+                if (pendingStaticTypeId != 0) {
+                    setError("cannot index a type name");
+                    return std::nullopt;
+                }
+                const bool targetIsNull = !suppressEval_ && !nullShortCircuited &&
+                    nullCondBracket && (isNullValue(*current) || isNullableNull(*current));
+                std::optional<runtime::Value> indexVal;
+                {
+                    ScopedSuppress sup(suppressEval_, nullShortCircuited || targetIsNull);
+                    indexVal = parseConditional();
+                }
                 if (!indexVal || !match("]")) {
                     setError("invalid index expression");
                     return std::nullopt;
                 }
-                std::int64_t idx = 0;
-                if (!tryAsInt64(*indexVal, idx) || idx < 0) {
-                    setError("array index must be a non-negative integer");
-                    return std::nullopt;
+                if (suppressEval_) {
+                    current = runtime::Value{std::int64_t{0}};
+                    continue;
                 }
-                const auto* ref = std::get_if<runtime::ObjectRef>(&*current);
-                if (!ref || !ref->valid() || ref->kind != runtime::ObjectKind::Array || !heap_) {
-                    setError("indexed value is not a valid array");
-                    return std::nullopt;
+                if (nullShortCircuited) {
+                    continue;
                 }
-                const auto elem = heap_->arrayGet(*ref, static_cast<std::size_t>(idx));
-                if (!elem) {
-                    setError("array index out of range");
-                    return std::nullopt;
+                if (targetIsNull) {
+                    nullShortCircuited = true;
+                    current = runtime::Value{runtime::NullObject{}};
+                    continue;
                 }
-                current = *elem;
+                current = resolveIndex(*current, *indexVal);
+                if (!current) return std::nullopt;
                 continue;
             }
             break;
+        }
+        if (pendingStaticTypeId != 0 && !suppressEval_) {
+            setError("type name cannot be used as a standalone value");
+            return std::nullopt;
         }
         return current;
     }
@@ -563,14 +1583,14 @@ private:
         return text_.substr(start, pos_ - start);
     }
 
-    std::optional<runtime::Value> parsePrimary() {
+    std::optional<runtime::Value> parsePrimary(semantic::SymbolId* outStaticTypeId) {
         skipWhitespace();
         if (pos_ >= text_.size()) {
             setError("unexpected end of expression");
             return std::nullopt;
         }
         if (match("(")) {
-            auto inner = parseLogicalOr();
+            auto inner = parseConditional();
             if (!inner || !match(")")) {
                 setError("expected ')'");
                 return std::nullopt;
@@ -621,7 +1641,7 @@ private:
             }
             return runtime::Value{static_cast<std::int64_t>(intVal)};
         }
-        const auto ident = parseIdentifier();
+        auto ident = parseIdentifier();
         if (ident.empty()) {
             setError("unexpected token in expression");
             return std::nullopt;
@@ -629,6 +1649,88 @@ private:
         if (ident == "true") return runtime::Value{true};
         if (ident == "false") return runtime::Value{false};
         if (ident == "null") return runtime::Value{runtime::NullObject{}};
+
+        // Support Module.Sub::TypeName or Type::Member qualified prefix
+        if (peek(".") || peek("::")) {
+            const std::size_t savedPos = pos_;
+            std::string fullQual = ident;
+            bool sawScope = false;
+            for (;;) {
+                if (match("::")) {
+                    const auto nextSeg = parseIdentifier();
+                    if (nextSeg.empty()) { pos_ = savedPos; break; }
+                    fullQual += "::" + nextSeg;
+                    sawScope = true;
+                    break;
+                }
+                // Check if ident.Next::Type occurs
+                const std::size_t beforeDot = pos_;
+                if (match(".")) {
+                    const auto nextSeg = parseIdentifier();
+                    if (!nextSeg.empty() && (peek(".") || peek("::"))) {
+                        fullQual += "." + nextSeg;
+                        continue;
+                    }
+                }
+                pos_ = beforeDot;
+                break;
+            }
+            if (sawScope) {
+                if (const auto tIt = typesByName_.find(fullQual); tIt != typesByName_.end()) {
+                    if (outStaticTypeId) *outStaticTypeId = tIt->second;
+                    return runtime::Value{std::int64_t{0}};
+                }
+                if (program_) {
+                    if (const auto fnId = program_->findFunction(fullQual); fnId && match("(")) {
+                        std::vector<runtime::Value> args;
+                        if (!parseArgumentList(args, suppressEval_)) return std::nullopt;
+                        if (suppressEval_) return runtime::Value{std::int64_t{0}};
+                        return invokePureSandbox(*fnId, args, fullQual);
+                    }
+                }
+                pos_ = savedPos;
+            } else {
+                pos_ = savedPos;
+            }
+        }
+
+        if (suppressEval_) {
+            if (match("(")) {
+                std::vector<runtime::Value> dummyArgs;
+                if (!parseArgumentList(dummyArgs, true)) return std::nullopt;
+            }
+            return runtime::Value{std::int64_t{0}};
+        }
+
+        // Unqualified call `Method(args)` on `this` or current module free function
+        if (match("(")) {
+            std::vector<runtime::Value> callArgs;
+            if (!parseArgumentList(callArgs, false)) return std::nullopt;
+            for (const auto& arg : frame_.arguments) {
+                if (arg.name == "this") {
+                    const std::string prevErr = error_;
+                    error_.clear();
+                    if (auto mVal = resolveMemberOrCall(arg.value, ident, &callArgs)) {
+                        return mVal;
+                    }
+                    if (error_.find("side effects") != std::string::npos) {
+                        return std::nullopt;
+                    }
+                    error_ = prevErr;
+                }
+            }
+            if (program_) {
+                const auto sep = frame_.function.find("::");
+                if (sep != std::string::npos) {
+                    const std::string qualFn = frame_.function.substr(0, sep) + "::" + ident;
+                    if (const auto fnId = program_->findFunction(qualFn)) {
+                        return invokePureSandbox(*fnId, callArgs, ident);
+                    }
+                }
+            }
+            setError("unknown or impure function '" + ident + "'");
+            return std::nullopt;
+        }
 
         for (auto it = frame_.locals.rbegin(); it != frame_.locals.rend(); ++it) {
             if (it->name == ident) return it->value;
@@ -638,8 +1740,20 @@ private:
         }
         for (const auto& arg : frame_.arguments) {
             if (arg.name == "this") {
-                return resolveMember(arg.value, ident);
+                const std::string prevErr = error_;
+                error_.clear();
+                if (auto mVal = resolveMemberOrCall(arg.value, ident, nullptr)) {
+                    return mVal;
+                }
+                if (error_.find("side effects") != std::string::npos) {
+                    return std::nullopt;
+                }
+                error_ = prevErr;
             }
+        }
+        if (const auto tIt = typesByName_.find(ident); tIt != typesByName_.end()) {
+            if (outStaticTypeId) *outStaticTypeId = tIt->second;
+            return runtime::Value{std::int64_t{0}};
         }
         setError("unknown identifier '" + ident + "'");
         return std::nullopt;
@@ -648,8 +1762,11 @@ private:
     const std::string& text_;
     const DebugStackFrame& frame_;
     const std::unordered_map<semantic::SymbolId, semantic::TypeSymbol>& types_;
+    const std::unordered_map<std::string, semantic::SymbolId>& typesByName_;
+    const runtime::ProgramImage* program_ = nullptr;
     runtime::ManagedHeap* heap_ = nullptr;
     std::size_t pos_ = 0;
+    bool suppressEval_ = false;
     std::string error_;
 };
 
@@ -657,16 +1774,33 @@ private:
 
 void DebugController::bindProgram(const runtime::ProgramImage& program) {
     bindModules(program.modules());
+    std::lock_guard<std::mutex> lock(mutex_);
+    boundProgram_ = &program;
+    synthesizedProgram_.reset();
 }
 
 void DebugController::bindModules(const std::vector<bytecode::Module>& modules) {
+    std::shared_ptr<const runtime::ProgramImage> linkedFallback;
+    if (!modules.empty()) {
+        runtime::RuntimeError linkErr;
+        if (auto linked = runtime::ProgramImage::link(modules, linkErr)) {
+            linkedFallback = std::make_shared<const runtime::ProgramImage>(std::move(*linked));
+        }
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     const bool hadModulesBefore = !executableLocations_.empty();
     executableLocations_.clear();
     types_.clear();
+    typesByName_.clear();
+    boundProgram_ = nullptr;
+    synthesizedProgram_ = std::move(linkedFallback);
     for (const auto& module : modules) {
         for (const auto& type : module.types) {
             types_[type.id] = type;
+            typesByName_[semantic::canonicalTypeName(type)] = type.id;
+            if (!type.synthetic || type.name.find("__") == std::string::npos) {
+                typesByName_.emplace(type.name, type.id);
+            }
         }
         for (const auto& function : module.functions) {
             for (const auto& point : function.debugInfo.sequencePoints) {
@@ -854,10 +1988,14 @@ std::optional<runtime::Value> DebugController::evaluateInFrameUnlocked(
     const DebugStackFrame& frame,
     runtime::ManagedHeap* heap,
     std::string* errorMessage) const {
+    const runtime::ProgramImage* activeProgram =
+        boundProgram_ ? boundProgram_ : synthesizedProgram_.get();
     ExpressionEvaluator evaluator(
         expression,
         frame,
         types_,
+        typesByName_,
+        activeProgram,
         heap ? heap : lastHeap_);
     return evaluator.evaluate(errorMessage);
 }

@@ -291,6 +291,21 @@ enum class FlatOpcode : std::uint8_t {
     AwaitSuspend,
     AwaitResume,
     AsyncResolve,
+    // 7e. P0-B Static-Type-Proven Trusted Fast-Path Opcodes (Zero ValueTag Checks)
+    AddIntTrustedChecked,
+    AddIntTrustedUnchecked,
+    SubIntTrustedChecked,
+    SubIntTrustedUnchecked,
+    MulIntTrustedChecked,
+    MulIntTrustedUnchecked,
+    LessIntTrusted,
+    AddDoubleTrusted,
+    SubDoubleTrusted,
+    MulDoubleTrusted,
+    DivDoubleTrusted,
+    AddFloatTrusted,
+    SubFloatTrusted,
+    MulFloatTrusted,
     GenericBytecode,
     // 8. Flattened block terminators
     TermJumpNoArgs,
@@ -356,6 +371,8 @@ struct alignas(32) FlatInstruction {
     static constexpr std::uint8_t FlagArrayNoNullCheck = 0x08u;
     static constexpr std::uint8_t FlagArrayNoBoundsCheck = 0x10u;
     static constexpr std::uint8_t FlagPreJump1 = 0x20u;
+    static constexpr std::uint8_t FlagTrustedSrc0 = 0x40u;
+    static constexpr std::uint8_t FlagTrustedSrc1 = 0x80u;
 
     std::int64_t integerImmediate = 0; // bytes 0..7
     union {                            // bytes 8..15

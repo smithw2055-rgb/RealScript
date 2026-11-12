@@ -85,6 +85,50 @@ struct InlayHint {
     std::uint32_t kind = 1; // 1 = Type, 2 = Parameter
 };
 
+struct CodeAction {
+    std::string title;
+    std::string kind = "quickfix";
+    std::vector<TextEdit> edits;
+    bool isPreferred = false;
+};
+
+struct PrepareRenameResult {
+    bool valid = false;
+    debug::SourceRange range{};
+    std::string placeholder;
+    std::string errorMessage;
+};
+
+struct SceneEntityInfo {
+    std::string name;
+    std::string nodePath;
+    std::uint64_t entityId = 0;
+    std::string guid;
+    std::vector<std::string> components;
+    std::string sourceFile;
+};
+
+struct SignalInfo {
+    std::string name;
+    std::string ownerType;
+    std::string signature;
+    std::string sourceFile;
+};
+
+struct AssetResourceInfo {
+    std::string path;
+    std::string guid;
+    std::string resourceType;
+    std::string sourceFile;
+};
+
+struct SceneAssetManifest {
+    std::vector<SceneEntityInfo> entities;
+    std::vector<SignalInfo> signals;
+    std::vector<AssetResourceInfo> resources;
+    std::unordered_map<std::string, std::string> scriptGuidsByType;
+};
+
 class LanguageService {
 public:
     void open(std::string path, std::string content, std::int64_t version = 1);
@@ -132,10 +176,18 @@ public:
         const std::string& path,
         text::LinePosition position,
         bool includeDefinition = true);
+    [[nodiscard]] PrepareRenameResult prepareRename(
+        const std::string& path,
+        text::LinePosition position);
     [[nodiscard]] std::vector<TextEdit> rename(
         const std::string& path,
         text::LinePosition position,
         const std::string& newName);
+    [[nodiscard]] std::vector<CodeAction> codeActions(
+        const std::string& path,
+        debug::SourceRange range);
+    void refreshSceneManifest();
+    [[nodiscard]] SceneAssetManifest sceneManifest() const;
     [[nodiscard]] std::vector<DocumentSymbol> documentSymbols(const std::string& path);
     [[nodiscard]] std::vector<SemanticToken> semanticTokens(const std::string& path);
     [[nodiscard]] std::vector<std::uint32_t> semanticTokensEncoded(const std::string& path);
@@ -217,6 +269,18 @@ private:
     mutable bool hasCachedDiagnostics_ = false;
     bool hasSnapshot_ = false;
     bool dirty_ = true;
+
+    struct ManifestConfigData {
+        std::vector<SceneEntityInfo> entities;
+        std::vector<SignalInfo> signals;
+        std::vector<AssetResourceInfo> resources;
+    };
+    ManifestConfigData configManifest_;
+    std::unordered_map<std::string, std::string> sceneDiskFiles_;
+    mutable SceneAssetManifest mergedManifest_;
+    mutable bool manifestDirty_ = true;
+
+    void rebuildSceneManifestIfNeeded() const;
 };
 
 [[nodiscard]] const char* symbolKindName(semantic::SymbolKind kind) noexcept;

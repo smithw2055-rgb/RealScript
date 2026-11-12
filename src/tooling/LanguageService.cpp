@@ -2,6 +2,7 @@
 
 #include "realscript/syntax/Syntax.h"
 #include "realscript/text/Text.h"
+#include "realscript/game/GameProductization.h"
 #include "realscript/tooling/Json.h"
 
 #include <algorithm>
@@ -178,6 +179,13 @@ bool hasRealScriptExtension(const std::filesystem::path& p) {
     const std::string filename = p.filename().string();
     return endsWithIgnoreCase(filename, ".d.rscript") ||
         endsWithIgnoreCase(filename, ".rscript");
+}
+
+bool hasSceneOrPrefabExtension(const std::filesystem::path& p) {
+    const std::string filename = p.filename().string();
+    return endsWithIgnoreCase(filename, ".scene.txt") ||
+        endsWithIgnoreCase(filename, ".prefab.txt") ||
+        endsWithIgnoreCase(filename, ".guid.txt");
 }
 
 bool isDeclarationStubPath(const std::string& path) noexcept {
@@ -518,9 +526,92 @@ bool LanguageService::loadProjectConfigJson(
         loadedAnySection = true;
     }
 
+    if (const auto* sceneEnts = parsed->find("sceneEntities");
+        sceneEnts && sceneEnts->isArray()) {
+        if (!merge) configManifest_.entities.clear();
+        for (const auto& item : sceneEnts->arrayValue()) {
+            if (item.isString() && !item.stringValue().empty()) {
+                SceneEntityInfo info;
+                info.name = item.stringValue();
+                info.nodePath = "/" + info.name;
+                configManifest_.entities.push_back(std::move(info));
+                continue;
+            }
+            if (!item.isObject()) continue;
+            SceneEntityInfo info;
+            if (const auto* n = item.find("name"); n && n->isString()) info.name = n->stringValue();
+            if (const auto* np = item.find("nodePath"); np && np->isString()) info.nodePath = np->stringValue();
+            else if (const auto* p = item.find("path"); p && p->isString()) info.nodePath = p->stringValue();
+            if (const auto* idVal = item.find("id"); idVal && idVal->isNumber()) {
+                info.entityId = static_cast<std::uint64_t>(std::max<std::int64_t>(0, idVal->integerValue()));
+            }
+            if (const auto* g = item.find("guid"); g && g->isString()) info.guid = g->stringValue();
+            if (const auto* comps = item.find("components"); comps && comps->isArray()) {
+                for (const auto& c : comps->arrayValue()) {
+                    if (c.isString() && !c.stringValue().empty()) info.components.push_back(c.stringValue());
+                }
+            }
+            if (!info.name.empty() || !info.nodePath.empty()) {
+                if (info.name.empty()) info.name = info.nodePath;
+                if (info.nodePath.empty()) info.nodePath = "/" + info.name;
+                configManifest_.entities.push_back(std::move(info));
+            }
+        }
+        manifestDirty_ = true;
+        loadedAnySection = true;
+    }
+
+    if (const auto* sigArr = parsed->find("signals");
+        sigArr && sigArr->isArray()) {
+        if (!merge) configManifest_.signals.clear();
+        for (const auto& item : sigArr->arrayValue()) {
+            if (item.isString() && !item.stringValue().empty()) {
+                SignalInfo s;
+                s.name = item.stringValue();
+                configManifest_.signals.push_back(std::move(s));
+                continue;
+            }
+            if (!item.isObject()) continue;
+            SignalInfo s;
+            if (const auto* n = item.find("name"); n && n->isString()) s.name = n->stringValue();
+            if (const auto* o = item.find("ownerType"); o && o->isString()) s.ownerType = o->stringValue();
+            if (const auto* sig = item.find("signature"); sig && sig->isString()) s.signature = sig->stringValue();
+            if (!s.name.empty()) configManifest_.signals.push_back(std::move(s));
+        }
+        manifestDirty_ = true;
+        loadedAnySection = true;
+    }
+
+    if (const auto* resArr = parsed->find("resources");
+        resArr && resArr->isArray()) {
+        if (!merge) configManifest_.resources.clear();
+        for (const auto& item : resArr->arrayValue()) {
+            if (item.isString() && !item.stringValue().empty()) {
+                AssetResourceInfo r;
+                r.path = item.stringValue();
+                r.guid = game::AssetGuid::fromAssetPath(r.path).toString();
+                configManifest_.resources.push_back(std::move(r));
+                continue;
+            }
+            if (!item.isObject()) continue;
+            AssetResourceInfo r;
+            if (const auto* p = item.find("path"); p && p->isString()) r.path = p->stringValue();
+            if (const auto* g = item.find("guid"); g && g->isString()) r.guid = g->stringValue();
+            if (const auto* t = item.find("resourceType"); t && t->isString()) r.resourceType = t->stringValue();
+            else if (const auto* ty = item.find("type"); ty && ty->isString()) r.resourceType = ty->stringValue();
+            if (!r.path.empty()) {
+                if (r.guid.empty()) r.guid = game::AssetGuid::fromAssetPath(r.path).toString();
+                configManifest_.resources.push_back(std::move(r));
+            }
+        }
+        manifestDirty_ = true;
+        loadedAnySection = true;
+    }
+
     if (!loadedAnySection) return false;
     structuralDirty_ = true;
     dirty_ = true;
+    manifestDirty_ = true;
     hasCachedDefinitions_ = false;
     hasCachedDiagnostics_ = false;
     return true;
@@ -586,6 +677,12 @@ std::size_t LanguageService::addWorkspaceRoot(const std::string& rawRootPath) {
                 if (reloadDiskFileIntoWorkspace(normFile)) {
                     ++indexedCount;
                 }
+            } else if (hasSceneOrPrefabExtension(p)) {
+                std::string sceneText;
+                if (readFileContents(p, sceneText)) {
+                    sceneDiskFiles_[normalizeDocPath(p.generic_string())] = std::move(sceneText);
+                    manifestDirty_ = true;
+                }
             }
         }
         it.increment(ec);
@@ -638,6 +735,22 @@ void LanguageService::removeWorkspaceRoot(const std::string& rawRootPath) {
             ++it;
         }
     }
+    for (auto it = sceneDiskFiles_.begin(); it != sceneDiskFiles_.end();) {
+        if (!isPathWithinRoot(it->first, rootPath)) {
+            ++it;
+            continue;
+        }
+        bool covered = false;
+        for (const auto& otherRoot : workspaceRoots_) {
+            if (isPathWithinRoot(it->first, otherRoot)) {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) it = sceneDiskFiles_.erase(it);
+        else ++it;
+    }
+    manifestDirty_ = true;
     structuralDirty_ = true;
     dirty_ = true;
     hasCachedDefinitions_ = false;
@@ -650,6 +763,13 @@ bool LanguageService::syncDiskFile(const std::string& rawPath) {
     const std::filesystem::path fsPath(path);
     if (fsPath.filename() == "realscript.project.json") {
         return loadProjectConfigFile(path, !workspaceRoots_.empty() || !ambientDocuments_.empty());
+    }
+    if (hasSceneOrPrefabExtension(fsPath)) {
+        std::string sceneText;
+        if (!readFileContents(fsPath, sceneText)) return false;
+        sceneDiskFiles_[path] = std::move(sceneText);
+        manifestDirty_ = true;
+        return true;
     }
     const bool wasInWorkspace = (workspaceDocuments_.find(path) != workspaceDocuments_.end());
     if (!reloadDiskFileIntoWorkspace(path)) {
@@ -671,6 +791,10 @@ bool LanguageService::syncDiskFile(const std::string& rawPath) {
 
 bool LanguageService::removeDiskFile(const std::string& rawPath) {
     const std::string path = normalizeDocPath(rawPath);
+    if (sceneDiskFiles_.erase(path) > 0) {
+        manifestDirty_ = true;
+        return true;
+    }
     const bool erased = (workspaceDocuments_.erase(path) > 0);
     if (erased && documents_.find(path) == documents_.end()) {
         structuralDirty_ = true;
@@ -1089,6 +1213,7 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
     moduleSymbolSlices_[dirtyMod] = slice;
 
     dirtyPaths_.clear();
+    manifestDirty_ = true;
     hasCachedDefinitions_ = false;
     hasCachedDiagnostics_ = false;
     dirty_ = false;
@@ -1141,6 +1266,7 @@ void LanguageService::rebuild() {
         hasSnapshot_ = true;
     }
     recordFullBuildGraph();
+    manifestDirty_ = true;
     hasCachedDefinitions_ = false;
     hasCachedDiagnostics_ = false;
     dirty_ = false;
@@ -1549,6 +1675,120 @@ std::vector<CompletionItem> LanguageService::completion(
         return std::min(start + pos.column, doc->content.size());
     };
     const auto rawCursorOffset = computeByteOffset(position);
+
+    // P1-B: String-literal Scene Entity / Signal / Asset Resource completion inside engine calls
+    if (doc && rawCursorOffset > 0) {
+        // Check if cursor is inside a string literal argument of FindEntity / GetNode / EmitSignal / ConnectSignal / wait_signal / Load
+        std::size_t lineStart = rawCursorOffset;
+        while (lineStart > 0 && doc->content[lineStart - 1] != '\n') {
+            --lineStart;
+        }
+        int quoteCountBefore = 0;
+        std::size_t openQuotePos = std::string::npos;
+        for (std::size_t qi = lineStart; qi < rawCursorOffset; ++qi) {
+            if (doc->content[qi] == '"' && (qi == lineStart || doc->content[qi - 1] != '\\')) {
+                ++quoteCountBefore;
+                openQuotePos = qi;
+            }
+        }
+        if ((quoteCountBefore % 2) == 1 && openQuotePos != std::string::npos) {
+            const std::string typedPrefix = doc->content.substr(openQuotePos + 1, rawCursorOffset - (openQuotePos + 1));
+            std::size_t scanParen = openQuotePos;
+            int pDepth = 0;
+            std::size_t callOpenParen = std::string::npos;
+            std::size_t commaCount = 0;
+            while (scanParen > lineStart) {
+                --scanParen;
+                const char c = doc->content[scanParen];
+                if (c == ')') ++pDepth;
+                else if (c == '(') {
+                    if (pDepth == 0) { callOpenParen = scanParen; break; }
+                    --pDepth;
+                } else if (c == ',' && pDepth == 0) {
+                    ++commaCount;
+                }
+            }
+            if (callOpenParen != std::string::npos) {
+                std::size_t fnEnd = callOpenParen;
+                while (fnEnd > lineStart && std::isspace(static_cast<unsigned char>(doc->content[fnEnd - 1]))) --fnEnd;
+                std::size_t fnStart = fnEnd;
+                while (fnStart > lineStart &&
+                       (std::isalnum(static_cast<unsigned char>(doc->content[fnStart - 1])) ||
+                        doc->content[fnStart - 1] == '_' || doc->content[fnStart - 1] == '.')) {
+                    --fnStart;
+                }
+                const std::string callExpr = doc->content.substr(fnStart, fnEnd - fnStart);
+                const auto lastDot = callExpr.rfind('.');
+                const std::string shortCallee = (lastDot == std::string::npos) ? callExpr : callExpr.substr(lastDot + 1);
+
+                rebuildSceneManifestIfNeeded();
+                std::vector<CompletionItem> manifestItems;
+                std::set<std::string> seenLabels;
+
+                const bool isEntityCall =
+                    (shortCallee == "FindEntity" || shortCallee == "GetNode" ||
+                     shortCallee == "GetEntity" || shortCallee == "FindNode") && commaCount == 0;
+                const bool isSignalCall =
+                    ((shortCallee == "EmitSignal" || shortCallee == "wait_signal" || shortCallee == "HasSignal") && commaCount == 0) ||
+                    (shortCallee == "ConnectSignal" && (commaCount == 0 || commaCount == 1));
+                const bool isResourceCall =
+                    (shortCallee == "Load" || shortCallee == "LoadAsync" || shortCallee == "Preload" ||
+                     callExpr == "ResourceServer.Load" || callExpr == "ResourceServer.LoadAsync") && commaCount == 0;
+
+                if (isEntityCall) {
+                    for (const auto& ent : mergedManifest_.entities) {
+                        std::string detail = "Entity";
+                        if (ent.entityId != 0) detail += " #" + std::to_string(ent.entityId);
+                        if (!ent.components.empty()) {
+                            detail += " [";
+                            for (std::size_t ci = 0; ci < ent.components.size(); ++ci) {
+                                if (ci > 0) detail += ", ";
+                                detail += ent.components[ci];
+                            }
+                            detail += "]";
+                        }
+                        if (!ent.name.empty() && ent.name.find(typedPrefix) == 0 &&
+                            seenLabels.insert(ent.name).second) {
+                            manifestItems.push_back({ent.name, detail, semantic::SymbolKind::Field});
+                        }
+                        if (!ent.nodePath.empty() && ent.nodePath != ent.name &&
+                            ent.nodePath.find(typedPrefix) == 0 &&
+                            seenLabels.insert(ent.nodePath).second) {
+                            manifestItems.push_back({ent.nodePath, detail, semantic::SymbolKind::Field});
+                        }
+                    }
+                    return manifestItems;
+                }
+                if (isSignalCall) {
+                    for (const auto& sig : mergedManifest_.signals) {
+                        if (sig.name.find(typedPrefix) != 0) continue;
+                        if (!seenLabels.insert(sig.name).second) continue;
+                        std::string detail = "signal";
+                        if (!sig.ownerType.empty()) detail += " on " + sig.ownerType;
+                        if (!sig.signature.empty()) detail += " " + sig.signature;
+                        manifestItems.push_back({sig.name, detail, semantic::SymbolKind::Property});
+                    }
+                    return manifestItems;
+                }
+                if (isResourceCall) {
+                    for (const auto& res : mergedManifest_.resources) {
+                        if (res.path.find(typedPrefix) == 0 && seenLabels.insert(res.path).second) {
+                            std::string detail = res.resourceType.empty() ? "Resource" : res.resourceType;
+                            if (!res.guid.empty()) detail += " (guid: " + res.guid + ")";
+                            manifestItems.push_back({res.path, detail, semantic::SymbolKind::Module});
+                        }
+                        if (!res.guid.empty()) {
+                            const std::string guidUri = "guid://" + res.guid;
+                            if (guidUri.find(typedPrefix) == 0 && seenLabels.insert(guidUri).second) {
+                                manifestItems.push_back({guidUri, "AssetGuid -> " + res.path, semantic::SymbolKind::Module});
+                            }
+                        }
+                    }
+                    return manifestItems;
+                }
+            }
+        }
+    }
 
     if (doc && rawCursorOffset > 0) {
         std::size_t scan = rawCursorOffset;
@@ -2131,11 +2371,69 @@ std::optional<HoverInfo> LanguageService::hover(
     text::LinePosition position) {
     const std::string path = normalizeDocPath(rawPath);
     (void)build();
+    if (const auto tok = tokenAt(path, position);
+        tok && tok->kind == syntax::SyntaxKind::StringLiteralToken) {
+        std::string unquoted = tok->text;
+        if (unquoted.size() >= 2 && unquoted.front() == '"' && unquoted.back() == '"') {
+            unquoted = unquoted.substr(1, unquoted.size() - 2);
+        }
+        rebuildSceneManifestIfNeeded();
+        const Location tokLoc{path, rangeFor(path, tok->span)};
+        for (const auto& ent : mergedManifest_.entities) {
+            if (ent.name == unquoted || ent.nodePath == unquoted || (!ent.guid.empty() && ent.guid == unquoted)) {
+                std::string info = "scene entity " + ent.name;
+                if (!ent.nodePath.empty()) info += " (" + ent.nodePath + ")";
+                if (ent.entityId != 0) info += " [id=" + std::to_string(ent.entityId) + "]";
+                if (!ent.guid.empty()) info += " guid=" + ent.guid;
+                if (!ent.components.empty()) {
+                    info += " components: ";
+                    for (std::size_t i = 0; i < ent.components.size(); ++i) {
+                        if (i > 0) info += ", ";
+                        info += ent.components[i];
+                    }
+                }
+                return HoverInfo{std::move(info), tokLoc};
+            }
+        }
+        for (const auto& sig : mergedManifest_.signals) {
+            if (sig.name == unquoted) {
+                std::string info = "signal " + sig.name;
+                if (!sig.ownerType.empty()) info += " (owner: " + sig.ownerType + ")";
+                if (!sig.signature.empty()) info += " " + sig.signature;
+                return HoverInfo{std::move(info), tokLoc};
+            }
+        }
+        std::string guidLookup = unquoted;
+        if (guidLookup.rfind("guid://", 0) == 0) guidLookup = guidLookup.substr(7);
+        for (const auto& res : mergedManifest_.resources) {
+            if (res.path == unquoted || (!res.guid.empty() && res.guid == guidLookup)) {
+                std::string info = "resource " + res.path;
+                if (!res.resourceType.empty()) info += " [" + res.resourceType + "]";
+                if (!res.guid.empty()) info += " guid=" + res.guid;
+                return HoverInfo{std::move(info), tokLoc};
+            }
+        }
+        for (const auto& [typeName, scriptGuid] : mergedManifest_.scriptGuidsByType) {
+            if (scriptGuid == guidLookup) {
+                return HoverInfo{"script component " + typeName + " guid=" + scriptGuid, tokLoc};
+            }
+        }
+    }
     const auto symbol = resolve(path, position);
     if (!symbol) return std::nullopt;
-    return HoverInfo{symbolKindName(symbol->kind) + std::string{" "} +
-        symbol->name + (symbol->detail.empty() ? "" : ": " + symbol->detail),
-        symbol->location};
+    std::string hoverText = symbolKindName(symbol->kind) + std::string{" "} +
+        symbol->name + (symbol->detail.empty() ? "" : ": " + symbol->detail);
+    if (symbol->kind == semantic::SymbolKind::Type) {
+        rebuildSceneManifestIfNeeded();
+        if (const auto gIt = mergedManifest_.scriptGuidsByType.find(symbol->detail);
+            gIt != mergedManifest_.scriptGuidsByType.end()) {
+            hoverText += " [Guid=" + gIt->second + "]";
+        } else if (const auto gIt2 = mergedManifest_.scriptGuidsByType.find(symbol->name);
+                   gIt2 != mergedManifest_.scriptGuidsByType.end()) {
+            hoverText += " [Guid=" + gIt2->second + "]";
+        }
+    }
+    return HoverInfo{std::move(hoverText), symbol->location};
 }
 
 std::optional<Location> LanguageService::definition(
@@ -2212,16 +2510,853 @@ std::vector<Location> LanguageService::references(
     return output;
 }
 
+PrepareRenameResult LanguageService::prepareRename(
+    const std::string& rawPath,
+    text::LinePosition position) {
+    const std::string path = normalizeDocPath(rawPath);
+    (void)build();
+    const auto* doc = document(path);
+    if (!doc) {
+        return {false, {}, {}, "document is not open or indexed in workspace"};
+    }
+    if (isDeclarationStubPath(path) ||
+        (ambientDocuments_.find(path) != ambientDocuments_.end() &&
+         documents_.find(path) == documents_.end() &&
+         workspaceDocuments_.find(path) == workspaceDocuments_.end())) {
+        return {false, {}, {}, "cannot rename host C++ ambient declarations (.d.rscript)"};
+    }
+    const auto token = tokenAt(path, position);
+    if (!token) {
+        return {false, {}, {}, "no symbol at cursor position"};
+    }
+    if (token->kind != syntax::SyntaxKind::IdentifierToken) {
+        if (syntax::isPrimitiveTypeKeyword(token->kind) ||
+            (!token->text.empty() && std::isalpha(static_cast<unsigned char>(token->text.front())))) {
+            return {false, {}, {}, "cannot rename language keyword '" + token->text + "'"};
+        }
+        return {false, {}, {}, "cannot rename literal or punctuation token"};
+    }
+    const auto isDeclaredInAmbientStub = [&](const std::string& symName) -> bool {
+        for (const auto& [ambPath, ambDoc] : ambientDocuments_) {
+            if (documents_.find(ambPath) != documents_.end() ||
+                workspaceDocuments_.find(ambPath) != workspaceDocuments_.end()) {
+                continue;
+            }
+            for (const auto& t : documentTokens(ambPath, ambDoc)) {
+                if (t.kind == syntax::SyntaxKind::IdentifierToken && t.text == symName) {
+                    return true;
+                }
+            }
+        }
+        for (const auto& wsPath : documentPaths()) {
+            if (!isDeclarationStubPath(wsPath)) continue;
+            if (const auto* dPtr = document(wsPath)) {
+                for (const auto& t : documentTokens(wsPath, *dPtr)) {
+                    if (t.kind == syntax::SyntaxKind::IdentifierToken && t.text == symName) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    };
+
+    const auto symbol = resolve(path, position);
+    if (!symbol) {
+        if (isDeclaredInAmbientStub(token->text)) {
+            return {false, {}, {}, "cannot rename host C++ ambient symbol '" + token->text + "' (.d.rscript)"};
+        }
+        return {false, {}, {}, "cannot resolve symbol '" + token->text + "' for rename"};
+    }
+    if (isDeclarationStubPath(symbol->location.path) ||
+        (ambientDocuments_.find(symbol->location.path) != ambientDocuments_.end() &&
+         documents_.find(symbol->location.path) == documents_.end() &&
+         workspaceDocuments_.find(symbol->location.path) == workspaceDocuments_.end())) {
+        return {false, {}, {}, "cannot rename host C++ ambient symbol '" + symbol->name + "' declared in '" + symbol->location.path + "'"};
+    }
+    // Guard call-site fallback when ambient function has no user .rscript definition occurrence
+    bool hasUserDefinition = false;
+    for (const auto& occ : result_.symbols) {
+        if (occ.id == symbol->id && occ.definition && !isDeclarationStubPath(occ.sourceName) &&
+            (documents_.find(occ.sourceName) != documents_.end() ||
+             workspaceDocuments_.find(occ.sourceName) != workspaceDocuments_.end())) {
+            hasUserDefinition = true;
+            break;
+        }
+    }
+    if (!hasUserDefinition) {
+        for (const auto& def : allDefinitionsRef()) {
+            if (def.id == symbol->id && !isDeclarationStubPath(def.location.path) &&
+                (documents_.find(def.location.path) != documents_.end() ||
+                 workspaceDocuments_.find(def.location.path) != workspaceDocuments_.end())) {
+                hasUserDefinition = true;
+                break;
+            }
+        }
+    }
+    if (!hasUserDefinition && isDeclaredInAmbientStub(token->text)) {
+        return {false, {}, {}, "cannot rename host C++ ambient symbol '" + token->text + "' (.d.rscript)"};
+    }
+    return {true, rangeFor(path, token->span), token->text, {}};
+}
+
 std::vector<TextEdit> LanguageService::rename(
     const std::string& path,
     text::LinePosition position,
     const std::string& newName) {
     if (!identifier(newName)) return {};
+    const auto prep = prepareRename(path, position);
+    if (!prep.valid) return {};
     std::vector<TextEdit> edits;
     for (const auto& location : references(path, position, true)) {
+        if (isDeclarationStubPath(location.path)) continue;
         edits.push_back({location, newName});
     }
     return edits;
+}
+
+namespace {
+
+bool rangesOverlap(const debug::SourceRange& a, const debug::SourceRange& b) noexcept {
+    const auto before = [](text::LinePosition lhs, text::LinePosition rhs) noexcept {
+        return lhs.line != rhs.line ? (lhs.line < rhs.line) : (lhs.column < rhs.column);
+    };
+    if (before(a.end, b.start) || before(b.end, a.start)) return false;
+    return true;
+}
+
+std::string defaultReturnStatementForType(
+    semantic::PrimitiveType prim,
+    const std::string& typeName) {
+    const std::string t = typeDetail(prim, typeName);
+    if (t == "void" || prim == semantic::PrimitiveType::Void) return {};
+    if (t == "bool" || prim == semantic::PrimitiveType::Bool) return "return false;";
+    if (t == "double" || prim == semantic::PrimitiveType::Double ||
+        t == "float" || prim == semantic::PrimitiveType::Float) {
+        return "return 0.0;";
+    }
+    if (t == "string" || prim == semantic::PrimitiveType::String) return "return \"\";";
+    if (t == "int" || t == "long" || t == "byte" || t == "sbyte" ||
+        t == "short" || t == "ushort" || t == "uint" || t == "ulong" ||
+        semantic::isNumericType(prim)) {
+        return "return 0;";
+    }
+    if (t == "Fixed") return "return Fixed.FromInt(0);";
+    if (t == "Vec2") return "return Vec2.Zero();";
+    if (t == "Vec3") return "return Vec3.Zero();";
+    return "return null;";
+}
+
+bool unescapeManifestValue(std::string_view raw, std::string& out) {
+    while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.front()))) raw.remove_prefix(1);
+    while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.back()))) raw.remove_suffix(1);
+    if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
+        out.clear();
+        for (std::size_t i = 1; i + 1 < raw.size(); ++i) {
+            if (raw[i] == '\\' && i + 2 < raw.size()) {
+                ++i;
+                switch (raw[i]) {
+                case 'n': out.push_back('\n'); break;
+                case 't': out.push_back('\t'); break;
+                case 'r': out.push_back('\r'); break;
+                default: out.push_back(raw[i]); break;
+                }
+            } else {
+                out.push_back(raw[i]);
+            }
+        }
+        return true;
+    }
+    out.assign(raw.data(), raw.size());
+    return !out.empty();
+}
+
+} // namespace
+
+std::vector<CodeAction> LanguageService::codeActions(
+    const std::string& rawPath,
+    debug::SourceRange range) {
+    const std::string path = normalizeDocPath(rawPath);
+    const auto diags = diagnostics(path);
+    const auto* doc = document(path);
+    if (!doc) return {};
+
+    std::vector<CodeAction> actions;
+    const auto hdr = parseDocHeader(*doc);
+    const auto& allTokens = documentTokens(path, *doc);
+
+    // Compute import insertion point (immediately after last `import ...;` or `module ...;`)
+    std::size_t importInsertOffset = 0;
+    for (std::size_t i = 0; i < allTokens.size(); ++i) {
+        if (allTokens[i].text == "module" || allTokens[i].text == "import") {
+            std::size_t j = i + 1;
+            while (j < allTokens.size() &&
+                   allTokens[j].kind != syntax::SyntaxKind::SemicolonToken &&
+                   allTokens[j].kind != syntax::SyntaxKind::EndOfFileToken) {
+                ++j;
+            }
+            if (j < allTokens.size() && allTokens[j].kind == syntax::SyntaxKind::SemicolonToken) {
+                std::size_t afterSemi = allTokens[j].span.end();
+                if (afterSemi < doc->content.size() && doc->content[afterSemi] == '\r') ++afterSemi;
+                if (afterSemi < doc->content.size() && doc->content[afterSemi] == '\n') ++afterSemi;
+                importInsertOffset = afterSemi;
+                i = j;
+            }
+        } else if (allTokens[i].kind != syntax::SyntaxKind::OpenBracketToken) {
+            break;
+        }
+    }
+
+    // 1. Quick Fix: Auto-import missing module for unresolved types / functions
+    std::set<std::string> candidateMissingNames;
+    for (const auto& d : diags) {
+        if (!rangesOverlap(d.location.range, range)) continue;
+        std::size_t q1 = d.message.find('\'');
+        while (q1 != std::string::npos) {
+            const std::size_t q2 = d.message.find('\'', q1 + 1);
+            if (q2 == std::string::npos) break;
+            const std::string tokName = d.message.substr(q1 + 1, q2 - q1 - 1);
+            if (identifier(tokName)) candidateMissingNames.insert(tokName);
+            q1 = d.message.find('\'', q2 + 1);
+        }
+    }
+    if (const auto tok = tokenAt(path, range.start);
+        tok && tok->kind == syntax::SyntaxKind::IdentifierToken) {
+        if (!resolve(path, range.start)) {
+            candidateMissingNames.insert(tok->text);
+        }
+    }
+
+    if (!candidateMissingNames.empty()) {
+        std::set<std::pair<std::string, std::string>> emittedImports; // (moduleName, symbolName)
+        const auto considerExport = [&](const std::string& modName, const std::string& symName) {
+            if (modName.empty() || modName == "$global" || modName == hdr.moduleName) return;
+            if (hdr.imports.find(modName) != hdr.imports.end()) return;
+            if (candidateMissingNames.find(symName) == candidateMissingNames.end()) return;
+            if (!emittedImports.emplace(modName, symName).second) return;
+
+            const auto insertRange = rangeFor(path, text::TextSpan{importInsertOffset, 0});
+            CodeAction act;
+            act.title = "Import '" + modName + "' for '" + symName + "'";
+            act.kind = "quickfix";
+            act.isPreferred = emittedImports.size() == 1;
+            act.edits.push_back(TextEdit{
+                Location{path, insertRange},
+                "import " + modName + ";\n",
+            });
+            actions.push_back(std::move(act));
+        };
+
+        for (const auto& module : result_.modules) {
+            for (const auto& type : module.types) {
+                if (!type.synthetic && type.accessibility == semantic::Accessibility::Public) {
+                    considerExport(module.name, type.name);
+                }
+            }
+            for (const auto& fn : module.functions) {
+                if (fn.name.find('$') == std::string::npos && fn.name.find("__") == std::string::npos) {
+                    considerExport(module.name, fn.name);
+                }
+            }
+        }
+        for (const auto& [modName, cachedMod] : snapshot_.modules) {
+            for (const auto& type : cachedMod.module.types) {
+                if (!type.synthetic && type.accessibility == semantic::Accessibility::Public) {
+                    considerExport(modName, type.name);
+                }
+            }
+            for (const auto& fn : cachedMod.module.functions) {
+                if (fn.name.find('$') == std::string::npos && fn.name.find("__") == std::string::npos) {
+                    considerExport(modName, fn.name);
+                }
+            }
+        }
+    }
+
+    // 2. Quick Fix: Implement missing interface method stubs on class declarations
+    struct ParsedIfaceMethod {
+        std::string returnType;
+        std::string name;
+        std::vector<std::pair<std::string, std::string>> params; // (type, name)
+    };
+    std::unordered_map<std::string, std::vector<ParsedIfaceMethod>> ifaceMethodsByName;
+    const auto collectCompiledInterface = [&](const semantic::TypeSymbol& t) {
+        if (!t.interfaceType) return;
+        auto& vec = ifaceMethodsByName[t.name];
+        if (!vec.empty()) return;
+        for (const auto& m : t.methods) {
+            if (m.synthetic) continue;
+            ParsedIfaceMethod pm;
+            pm.returnType = typeDetail(m.returnType, m.returnTypeName);
+            pm.name = m.name;
+            const std::size_t startIdx = (m.method && !m.staticMethod) ? 1 : 0;
+            for (std::size_t pi = startIdx; pi < m.parameters.size(); ++pi) {
+                pm.params.emplace_back(
+                    typeDetail(m.parameters[pi].type, m.parameters[pi].typeName),
+                    m.parameters[pi].name.empty() ? ("arg" + std::to_string(pi)) : m.parameters[pi].name);
+            }
+            vec.push_back(std::move(pm));
+        }
+        ifaceMethodsByName[semantic::canonicalTypeName(t)] = vec;
+    };
+    for (const auto& mod : result_.modules) {
+        for (const auto& t : mod.types) collectCompiledInterface(t);
+    }
+    for (const auto& [mName, cachedMod] : snapshot_.modules) {
+        (void)mName;
+        for (const auto& t : cachedMod.module.types) collectCompiledInterface(t);
+    }
+
+    // Fallback token scan for interfaces declared in open/workspace/ambient docs (resilient when current module has errors)
+    const auto scanDocForInterfaces = [&](const std::string& dPath, const Document& dDoc) {
+        const auto& toks = documentTokens(dPath, dDoc);
+        for (std::size_t i = 0; i + 3 < toks.size(); ++i) {
+            if (toks[i].text != "interface") continue;
+            if (toks[i + 1].kind != syntax::SyntaxKind::IdentifierToken) continue;
+            const std::string ifName = toks[i + 1].text;
+            if (ifaceMethodsByName.find(ifName) != ifaceMethodsByName.end()) continue;
+            std::size_t b = i + 2;
+            while (b < toks.size() && toks[b].kind != syntax::SyntaxKind::OpenBraceToken &&
+                   toks[b].kind != syntax::SyntaxKind::SemicolonToken) {
+                ++b;
+            }
+            if (b >= toks.size() || toks[b].kind != syntax::SyntaxKind::OpenBraceToken) continue;
+            std::vector<ParsedIfaceMethod> methods;
+            int depth = 1;
+            std::size_t cur = b + 1;
+            while (cur < toks.size() && depth > 0) {
+                if (toks[cur].kind == syntax::SyntaxKind::OpenBraceToken) { ++depth; ++cur; continue; }
+                if (toks[cur].kind == syntax::SyntaxKind::CloseBraceToken) { --depth; ++cur; continue; }
+                if (depth == 1) {
+                    // Parse `<RetType> <MethodName>(<Params>);`
+                    if (toks[cur].text == "public") ++cur;
+                    std::size_t pOpen = cur;
+                    while (pOpen < toks.size() &&
+                           toks[pOpen].kind != syntax::SyntaxKind::OpenParenToken &&
+                           toks[pOpen].kind != syntax::SyntaxKind::SemicolonToken &&
+                           toks[pOpen].kind != syntax::SyntaxKind::CloseBraceToken) {
+                        ++pOpen;
+                    }
+                    if (pOpen >= cur + 2 && pOpen < toks.size() &&
+                        toks[pOpen].kind == syntax::SyntaxKind::OpenParenToken &&
+                        toks[pOpen - 1].kind == syntax::SyntaxKind::IdentifierToken) {
+                        ParsedIfaceMethod pm;
+                        pm.name = toks[pOpen - 1].text;
+                        for (std::size_t rt = cur; rt + 1 < pOpen; ++rt) {
+                            pm.returnType += toks[rt].text;
+                        }
+                        std::size_t pClose = pOpen + 1;
+                        int pDepth = 1;
+                        std::vector<syntax::SyntaxToken> paramToks;
+                        while (pClose < toks.size() && pDepth > 0) {
+                            if (toks[pClose].kind == syntax::SyntaxKind::OpenParenToken) ++pDepth;
+                            else if (toks[pClose].kind == syntax::SyntaxKind::CloseParenToken) --pDepth;
+                            if (pDepth > 0) paramToks.push_back(toks[pClose]);
+                            ++pClose;
+                        }
+                        std::size_t ps = 0;
+                        std::size_t argIdx = 0;
+                        while (ps < paramToks.size()) {
+                            std::size_t pe = ps;
+                            int gDepth = 0;
+                            while (pe < paramToks.size()) {
+                                if (paramToks[pe].text == "<") ++gDepth;
+                                else if (paramToks[pe].text == ">" && gDepth > 0) --gDepth;
+                                else if (paramToks[pe].kind == syntax::SyntaxKind::CommaToken && gDepth == 0) break;
+                                ++pe;
+                            }
+                            if (pe >= ps + 2) {
+                                std::string pType;
+                                for (std::size_t k = ps; k + 1 < pe; ++k) pType += paramToks[k].text;
+                                pm.params.emplace_back(std::move(pType), paramToks[pe - 1].text);
+                            } else if (pe == ps + 1) {
+                                pm.params.emplace_back(paramToks[ps].text, "arg" + std::to_string(argIdx));
+                            }
+                            ++argIdx;
+                            ps = pe + 1;
+                        }
+                        methods.push_back(std::move(pm));
+                        cur = pClose;
+                        while (cur < toks.size() && toks[cur].kind != syntax::SyntaxKind::SemicolonToken &&
+                               toks[cur].kind != syntax::SyntaxKind::CloseBraceToken) {
+                            ++cur;
+                        }
+                        if (cur < toks.size() && toks[cur].kind == syntax::SyntaxKind::SemicolonToken) ++cur;
+                        continue;
+                    }
+                }
+                ++cur;
+            }
+            if (!methods.empty()) ifaceMethodsByName[ifName] = std::move(methods);
+        }
+    };
+    scanDocForInterfaces(path, *doc);
+    for (const auto& [dPath, dDoc] : documents_) scanDocForInterfaces(dPath, dDoc);
+    for (const auto& [dPath, dDoc] : workspaceDocuments_) {
+        if (documents_.find(dPath) == documents_.end()) scanDocForInterfaces(dPath, dDoc);
+    }
+    for (const auto& [dPath, dDoc] : ambientDocuments_) scanDocForInterfaces(dPath, dDoc);
+
+    // Inspect classes in `path` overlapping `range`
+    for (std::size_t i = 0; i + 4 < allTokens.size(); ++i) {
+        if (allTokens[i].text != "class" && allTokens[i].text != "struct") continue;
+        if (allTokens[i + 1].kind != syntax::SyntaxKind::IdentifierToken) continue;
+        const std::string className = allTokens[i + 1].text;
+        std::size_t colonIdx = i + 2;
+        if (colonIdx < allTokens.size() && allTokens[colonIdx].text == "<") {
+            int gDepth = 1;
+            ++colonIdx;
+            while (colonIdx < allTokens.size() && gDepth > 0) {
+                if (allTokens[colonIdx].text == "<") ++gDepth;
+                else if (allTokens[colonIdx].text == ">") --gDepth;
+                ++colonIdx;
+            }
+        }
+        if (colonIdx >= allTokens.size() || allTokens[colonIdx].kind != syntax::SyntaxKind::ColonToken) continue;
+
+        std::vector<std::string> baseList;
+        std::size_t cur = colonIdx + 1;
+        std::string curBase;
+        while (cur < allTokens.size() &&
+               allTokens[cur].kind != syntax::SyntaxKind::OpenBraceToken &&
+               allTokens[cur].text != "where") {
+            if (allTokens[cur].kind == syntax::SyntaxKind::CommaToken) {
+                if (!curBase.empty()) { baseList.push_back(curBase); curBase.clear(); }
+            } else {
+                curBase += allTokens[cur].text;
+            }
+            ++cur;
+        }
+        if (!curBase.empty()) baseList.push_back(curBase);
+        while (cur < allTokens.size() && allTokens[cur].kind != syntax::SyntaxKind::OpenBraceToken) ++cur;
+        if (cur >= allTokens.size()) continue;
+
+        const std::size_t openBraceIdx = cur;
+        int braceDepth = 1;
+        std::size_t closeBraceIdx = openBraceIdx + 1;
+        std::unordered_set<std::string> declaredMethodNames;
+        while (closeBraceIdx < allTokens.size() && braceDepth > 0) {
+            const auto k = allTokens[closeBraceIdx].kind;
+            if (k == syntax::SyntaxKind::OpenBraceToken) {
+                ++braceDepth;
+            } else if (k == syntax::SyntaxKind::CloseBraceToken) {
+                --braceDepth;
+                if (braceDepth == 0) break;
+            } else if (braceDepth == 1 && k == syntax::SyntaxKind::OpenParenToken && closeBraceIdx > openBraceIdx + 1) {
+                if (allTokens[closeBraceIdx - 1].kind == syntax::SyntaxKind::IdentifierToken) {
+                    declaredMethodNames.insert(allTokens[closeBraceIdx - 1].text);
+                }
+            }
+            ++closeBraceIdx;
+        }
+        if (closeBraceIdx >= allTokens.size()) continue;
+
+        const auto classRange = rangeFor(
+            path,
+            text::TextSpan{
+                allTokens[i].span.start,
+                allTokens[closeBraceIdx].span.end() - allTokens[i].span.start});
+        if (!rangesOverlap(classRange, range)) continue;
+
+        for (const auto& baseName : baseList) {
+            const auto ifIt = ifaceMethodsByName.find(baseName);
+            if (ifIt == ifaceMethodsByName.end()) continue;
+            std::vector<const ParsedIfaceMethod*> missing;
+            for (const auto& im : ifIt->second) {
+                if (declaredMethodNames.find(im.name) == declaredMethodNames.end()) {
+                    missing.push_back(&im);
+                }
+            }
+            if (missing.empty()) continue;
+
+            std::string stubs;
+            const std::size_t insertPos = allTokens[closeBraceIdx].span.start;
+            if (insertPos > 0 && doc->content[insertPos - 1] != '\n') {
+                stubs += "\n";
+            }
+            for (const auto* im : missing) {
+                stubs += "    public " + im->returnType + " " + im->name + "(";
+                for (std::size_t pi = 0; pi < im->params.size(); ++pi) {
+                    if (pi > 0) stubs += ", ";
+                    stubs += im->params[pi].first + " " + im->params[pi].second;
+                }
+                stubs += ")\n    {\n";
+                const std::string retStmt =
+                    defaultReturnStatementForType(semantic::PrimitiveType::Error, im->returnType);
+                if (!retStmt.empty()) {
+                    stubs += "        " + retStmt + "\n";
+                }
+                stubs += "    }\n";
+            }
+
+            const auto editRange = rangeFor(path, text::TextSpan{insertPos, 0});
+            CodeAction act;
+            act.title = "Implement interface '" + baseName + "' in '" + className + "'";
+            act.kind = "quickfix";
+            act.isPreferred = true;
+            act.edits.push_back(TextEdit{Location{path, editRange}, std::move(stubs)});
+            actions.push_back(std::move(act));
+        }
+    }
+
+    return actions;
+}
+
+void LanguageService::refreshSceneManifest() {
+    sceneDiskFiles_.clear();
+    for (const auto& rootPath : workspaceRoots_) {
+        std::error_code ec;
+        const std::filesystem::path fsRoot(rootPath);
+        if (!std::filesystem::is_directory(fsRoot, ec) || ec) continue;
+        const std::filesystem::path rootCfg = fsRoot / "realscript.project.json";
+        if (std::filesystem::is_regular_file(rootCfg, ec) && !ec) {
+            (void)loadProjectConfigFile(rootCfg.generic_string(), false);
+        }
+        std::filesystem::recursive_directory_iterator it(
+            fsRoot, std::filesystem::directory_options::skip_permission_denied, ec);
+        const std::filesystem::recursive_directory_iterator end;
+        while (!ec && it != end) {
+            const auto& entry = *it;
+            std::error_code eec;
+            if (entry.is_directory(eec) && !eec) {
+                if (shouldSkipDirectoryName(entry.path().filename().string())) {
+                    it.disable_recursion_pending();
+                }
+                it.increment(ec);
+                continue;
+            }
+            if (entry.is_regular_file(eec) && !eec && hasSceneOrPrefabExtension(entry.path())) {
+                std::string text;
+                if (readFileContents(entry.path(), text)) {
+                    sceneDiskFiles_[normalizeDocPath(entry.path().generic_string())] = std::move(text);
+                }
+            }
+            it.increment(ec);
+        }
+    }
+    manifestDirty_ = true;
+}
+
+SceneAssetManifest LanguageService::sceneManifest() const {
+    if (dirty_) {
+        const_cast<LanguageService*>(this)->rebuild();
+    }
+    rebuildSceneManifestIfNeeded();
+    return mergedManifest_;
+}
+
+void LanguageService::rebuildSceneManifestIfNeeded() const {
+    if (!manifestDirty_) return;
+    mergedManifest_ = {};
+    mergedManifest_.entities = configManifest_.entities;
+    mergedManifest_.signals = configManifest_.signals;
+    mergedManifest_.resources = configManifest_.resources;
+
+    std::set<std::string> seenEntities;
+    for (const auto& e : mergedManifest_.entities) seenEntities.insert(e.name + "|" + e.nodePath);
+    std::set<std::string> seenSignals;
+    for (const auto& s : mergedManifest_.signals) seenSignals.insert(s.name);
+    std::set<std::string> seenResources;
+    for (const auto& r : mergedManifest_.resources) seenResources.insert(r.path);
+
+    // 1. Extract [Guid("...")] and [Signal] / event declarations from compiled & source metadata
+    for (const auto& attr : result_.nativeAttributes) {
+        if (attr.name == "Guid" && !attr.arguments.empty() && !attr.arguments.front().value.empty()) {
+            std::string gVal = attr.arguments.front().value;
+            if (gVal.size() >= 2 && gVal.front() == '"' && gVal.back() == '"') {
+                gVal = gVal.substr(1, gVal.size() - 2);
+            }
+            mergedManifest_.scriptGuidsByType[attr.target] = gVal;
+            const auto sep = attr.target.rfind("::");
+            if (sep != std::string::npos) {
+                mergedManifest_.scriptGuidsByType[attr.target.substr(sep + 2)] = gVal;
+            }
+        } else if (attr.name == "Signal") {
+            std::string sigName;
+            if (!attr.arguments.empty() && !attr.arguments.front().value.empty()) {
+                sigName = attr.arguments.front().value;
+                if (sigName.size() >= 2 && sigName.front() == '"' && sigName.back() == '"') {
+                    sigName = sigName.substr(1, sigName.size() - 2);
+                }
+            } else {
+                const auto dot = attr.target.rfind('.');
+                const auto col = attr.target.rfind("::");
+                const std::size_t cut = (dot != std::string::npos) ? (dot + 1)
+                    : ((col != std::string::npos) ? (col + 2) : 0);
+                sigName = attr.target.substr(cut);
+            }
+            if (!sigName.empty() && seenSignals.insert(sigName).second) {
+                mergedManifest_.signals.push_back(SignalInfo{sigName, attr.target, {}, attr.sourceName});
+            }
+        }
+    }
+    for (const auto& mod : result_.modules) {
+        for (const auto& t : mod.types) {
+            if (t.synthetic) continue;
+            const std::string canon = semantic::canonicalTypeName(t);
+            if (mergedManifest_.scriptGuidsByType.find(canon) == mergedManifest_.scriptGuidsByType.end()) {
+                const std::string detGuid = game::AssetGuid::fromTypeName(canon).toString();
+                mergedManifest_.scriptGuidsByType.emplace(canon, detGuid);
+                mergedManifest_.scriptGuidsByType.emplace(t.name, detGuid);
+            }
+            for (const auto& ev : t.events) {
+                if (seenSignals.insert(ev.name).second) {
+                    std::string sig = "(";
+                    for (std::size_t pi = 0; pi < ev.parameters.size(); ++pi) {
+                        if (pi > 0) sig += ", ";
+                        sig += typeDetail(ev.parameters[pi].type, ev.parameters[pi].typeName) + " " + ev.parameters[pi].name;
+                    }
+                    sig += ")";
+                    mergedManifest_.signals.push_back(SignalInfo{ev.name, canon, std::move(sig), t.sourceName});
+                }
+            }
+        }
+    }
+
+    // 2. Parse workspace .scene.txt / .prefab.txt / .guid.txt files
+    const auto computeResUri = [&](const std::string& diskPath) -> std::string {
+        for (const auto& root : workspaceRoots_) {
+            if (isPathWithinRoot(diskPath, root) && diskPath.size() > root.size()) {
+                std::string rel = diskPath.substr(root.size());
+                if (!rel.empty() && rel.front() == '/') rel.erase(rel.begin());
+                return "res://" + rel;
+            }
+        }
+        return "res://" + std::filesystem::path(diskPath).filename().generic_string();
+    };
+
+    for (const auto& [filePath, text] : sceneDiskFiles_) {
+        const std::string resUri = computeResUri(filePath);
+        if (endsWithIgnoreCase(filePath, ".prefab.txt") || endsWithIgnoreCase(filePath, ".scene.txt")) {
+            if (seenResources.insert(resUri).second) {
+                AssetResourceInfo r;
+                r.path = resUri;
+                r.guid = game::AssetGuid::fromAssetPath(resUri).toString();
+                r.resourceType = endsWithIgnoreCase(filePath, ".prefab.txt") ? "Prefab" : "Scene";
+                r.sourceFile = filePath;
+                mergedManifest_.resources.push_back(std::move(r));
+            }
+        }
+
+        // Parse both Sprint 2 key=value format (`entity.<id>.name = "..."`, `node."$root/Child".name = "..."`, `signal.<idx>.name = "..."`)
+        // AND bracket header format (`[Entity "Player" id=1 path="/Root/Player" guid="..."]`)
+        std::map<std::uint64_t, SceneEntityInfo> kvEntities;
+        std::map<std::uint64_t, std::uint64_t> kvParents;
+        std::map<std::string, SceneEntityInfo> prefabNodes;
+        std::map<std::uint64_t, SignalInfo> kvSignals;
+        SceneEntityInfo* activeBracketEnt = nullptr;
+
+        std::istringstream in(text);
+        std::string rawLine;
+        while (std::getline(in, rawLine)) {
+            if (!rawLine.empty() && rawLine.back() == '\r') rawLine.pop_back();
+            std::string_view lv(rawLine);
+            while (!lv.empty() && std::isspace(static_cast<unsigned char>(lv.front()))) lv.remove_prefix(1);
+            while (!lv.empty() && std::isspace(static_cast<unsigned char>(lv.back()))) lv.remove_suffix(1);
+            if (lv.empty() || lv.front() == '#') continue;
+
+            if (lv.front() == '[' && lv.back() == ']') {
+                activeBracketEnt = nullptr;
+                const std::string hdrLine(lv.substr(1, lv.size() - 2));
+                if (hdrLine.rfind("Entity ", 0) == 0) {
+                    SceneEntityInfo ent;
+                    ent.sourceFile = filePath;
+                    const auto q1 = hdrLine.find('"');
+                    const auto q2 = (q1 != std::string::npos) ? hdrLine.find('"', q1 + 1) : std::string::npos;
+                    if (q1 != std::string::npos && q2 != std::string::npos) {
+                        ent.name = hdrLine.substr(q1 + 1, q2 - q1 - 1);
+                    }
+                    const auto extractAttr = [&](const std::string& key) -> std::string {
+                        const auto pos = hdrLine.find(key + "=");
+                        if (pos == std::string::npos) return {};
+                        std::size_t vStart = pos + key.size() + 1;
+                        if (vStart < hdrLine.size() && hdrLine[vStart] == '"') {
+                            const auto vEnd = hdrLine.find('"', vStart + 1);
+                            if (vEnd != std::string::npos) return hdrLine.substr(vStart + 1, vEnd - vStart - 1);
+                        }
+                        std::size_t vEnd = vStart;
+                        while (vEnd < hdrLine.size() && !std::isspace(static_cast<unsigned char>(hdrLine[vEnd]))) ++vEnd;
+                        return hdrLine.substr(vStart, vEnd - vStart);
+                    };
+                    if (const auto idStr = extractAttr("id"); !idStr.empty()) {
+                        ent.entityId = static_cast<std::uint64_t>(std::strtoull(idStr.c_str(), nullptr, 10));
+                    }
+                    ent.guid = extractAttr("guid");
+                    ent.nodePath = extractAttr("path");
+                    if (ent.nodePath.empty() && !ent.name.empty()) ent.nodePath = "/" + ent.name;
+                    if (!ent.name.empty() && seenEntities.insert(ent.name + "|" + ent.nodePath).second) {
+                        mergedManifest_.entities.push_back(std::move(ent));
+                        activeBracketEnt = &mergedManifest_.entities.back();
+                    }
+                } else if (hdrLine.rfind("Signal ", 0) == 0) {
+                    const auto q1 = hdrLine.find('"');
+                    const auto q2 = (q1 != std::string::npos) ? hdrLine.find('"', q1 + 1) : std::string::npos;
+                    if (q1 != std::string::npos && q2 != std::string::npos) {
+                        const std::string sName = hdrLine.substr(q1 + 1, q2 - q1 - 1);
+                        if (seenSignals.insert(sName).second) {
+                            mergedManifest_.signals.push_back(SignalInfo{sName, {}, {}, filePath});
+                        }
+                    }
+                } else if (hdrLine.rfind("Resource ", 0) == 0) {
+                    const auto q1 = hdrLine.find('"');
+                    const auto q2 = (q1 != std::string::npos) ? hdrLine.find('"', q1 + 1) : std::string::npos;
+                    if (q1 != std::string::npos && q2 != std::string::npos) {
+                        const std::string rPath = hdrLine.substr(q1 + 1, q2 - q1 - 1);
+                        if (seenResources.insert(rPath).second) {
+                            AssetResourceInfo r;
+                            r.path = rPath;
+                            r.guid = game::AssetGuid::fromAssetPath(rPath).toString();
+                            r.sourceFile = filePath;
+                            mergedManifest_.resources.push_back(std::move(r));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            const auto eqPos = lv.find('=');
+            if (eqPos == std::string_view::npos) continue;
+            std::string_view kView = lv.substr(0, eqPos);
+            std::string_view vView = lv.substr(eqPos + 1);
+            while (!kView.empty() && std::isspace(static_cast<unsigned char>(kView.back()))) kView.remove_suffix(1);
+            while (!vView.empty() && std::isspace(static_cast<unsigned char>(vView.front()))) vView.remove_prefix(1);
+
+            if (activeBracketEnt && kView == "component") {
+                std::string compName;
+                if (unescapeManifestValue(vView, compName)) {
+                    activeBracketEnt->components.push_back(std::move(compName));
+                }
+                continue;
+            }
+
+            // Native Sprint 2 scene text: `entity.<id>.name = "Hero"` / `entity.<id>.component.<guid>.type = "Game::Hero"`
+            if (kView.rfind("entity.", 0) == 0) {
+                const auto rest = kView.substr(7);
+                const auto dot = rest.find('.');
+                if (dot != std::string_view::npos) {
+                    const std::string idTok(rest.substr(0, dot));
+                    const auto eid = static_cast<std::uint64_t>(std::strtoull(idTok.c_str(), nullptr, 10));
+                    const auto prop = rest.substr(dot + 1);
+                    auto& ent = kvEntities[eid];
+                    ent.entityId = eid;
+                    ent.sourceFile = filePath;
+                    if (prop == "name") {
+                        (void)unescapeManifestValue(vView, ent.name);
+                    } else if (prop == "parent") {
+                        const std::string pTok(vView);
+                        const auto pid = static_cast<std::uint64_t>(std::strtoull(pTok.c_str(), nullptr, 10));
+                        kvParents[eid] = pid;
+                    } else if (prop.rfind("component.", 0) == 0 && endsWithIgnoreCase(prop, ".type")) {
+                        std::string compType;
+                        if (unescapeManifestValue(vView, compType)) {
+                            ent.components.push_back(std::move(compType));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Native Sprint 2 prefab text: `node."$root/Weapon".name = "Weapon"`
+            if (kView.rfind("node.\"", 0) == 0) {
+                std::size_t qEnd = std::string_view::npos;
+                for (std::size_t qi = 6; qi < kView.size(); ++qi) {
+                    if (kView[qi] == '\\') ++qi;
+                    else if (kView[qi] == '"') { qEnd = qi; break; }
+                }
+                if (qEnd != std::string_view::npos && qEnd + 1 < kView.size() && kView[qEnd + 1] == '.') {
+                    std::string nodeKey;
+                    if (unescapeManifestValue(kView.substr(5, qEnd - 4), nodeKey)) {
+                        const auto prop = kView.substr(qEnd + 2);
+                        auto& pEnt = prefabNodes[nodeKey];
+                        pEnt.nodePath = nodeKey;
+                        pEnt.sourceFile = filePath;
+                        if (prop == "name") {
+                            (void)unescapeManifestValue(vView, pEnt.name);
+                        } else if (prop.rfind("component.", 0) == 0 && endsWithIgnoreCase(prop, ".type")) {
+                            std::string compType;
+                            if (unescapeManifestValue(vView, compType)) {
+                                pEnt.components.push_back(std::move(compType));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Native Sprint 2 wired signals: `signal.<idx>.name = "on_damaged"` / `signal.<idx>.src_comp = "..."`
+            if (kView.rfind("signal.", 0) == 0) {
+                const auto rest = kView.substr(7);
+                const auto dot = rest.find('.');
+                if (dot != std::string_view::npos) {
+                    const std::string idxTok(rest.substr(0, dot));
+                    const auto sIdx = static_cast<std::uint64_t>(std::strtoull(idxTok.c_str(), nullptr, 10));
+                    const auto prop = rest.substr(dot + 1);
+                    auto& sig = kvSignals[sIdx];
+                    sig.sourceFile = filePath;
+                    if (prop == "name") (void)unescapeManifestValue(vView, sig.name);
+                    else if (prop == "src_comp") (void)unescapeManifestValue(vView, sig.ownerType);
+                }
+                continue;
+            }
+
+            // Native Sprint 2 AssetGuid registry text: `asset.<guid> = "res://..."`
+            if (kView.rfind("asset.", 0) == 0) {
+                const std::string guidStr(kView.substr(6));
+                std::string assetPath;
+                if (unescapeManifestValue(vView, assetPath) && seenResources.insert(assetPath).second) {
+                    mergedManifest_.resources.push_back(AssetResourceInfo{assetPath, guidStr, "Asset", filePath});
+                }
+            }
+        }
+
+        // Finalize hierarchy nodePaths for Sprint 2 kvEntities (two passes to avoid moving parent names early)
+        for (auto& [eid, ent] : kvEntities) {
+            if (ent.name.empty()) ent.name = "Entity_" + std::to_string(eid);
+        }
+        for (auto& [eid, ent] : kvEntities) {
+            std::vector<std::string> chain{ent.name};
+            std::uint64_t cur = eid;
+            std::unordered_set<std::uint64_t> guard{cur};
+            while (kvParents.find(cur) != kvParents.end()) {
+                const auto p = kvParents[cur];
+                if (p == 0 || p == ~std::uint64_t{0} || !guard.insert(p).second) break;
+                const auto pIt = kvEntities.find(p);
+                if (pIt == kvEntities.end()) break;
+                chain.push_back(pIt->second.name);
+                cur = p;
+            }
+            std::string fullPath;
+            for (auto rIt = chain.rbegin(); rIt != chain.rend(); ++rIt) {
+                fullPath += "/" + *rIt;
+            }
+            ent.nodePath = std::move(fullPath);
+        }
+        for (auto& [eid, ent] : kvEntities) {
+            (void)eid;
+            if (seenEntities.insert(ent.name + "|" + ent.nodePath).second) {
+                mergedManifest_.entities.push_back(std::move(ent));
+            }
+        }
+        for (auto& [nKey, pEnt] : prefabNodes) {
+            (void)nKey;
+            if (pEnt.name.empty()) pEnt.name = pEnt.nodePath;
+            if (!pEnt.nodePath.empty() && pEnt.nodePath.rfind("$root", 0) == 0) {
+                pEnt.nodePath = pEnt.nodePath.substr(5);
+                if (pEnt.nodePath.empty()) pEnt.nodePath = "/" + pEnt.name;
+            }
+            if (seenEntities.insert(pEnt.name + "|" + pEnt.nodePath).second) {
+                mergedManifest_.entities.push_back(std::move(pEnt));
+            }
+        }
+        for (auto& [sIdx, sig] : kvSignals) {
+            (void)sIdx;
+            if (!sig.name.empty() && seenSignals.insert(sig.name).second) {
+                mergedManifest_.signals.push_back(std::move(sig));
+            }
+        }
+    }
+
+    manifestDirty_ = false;
 }
 
 std::vector<DocumentSymbol> LanguageService::documentSymbols(const std::string& rawPath) {

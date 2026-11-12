@@ -2252,6 +2252,11 @@ bool executeQuickInstruction(
                     registers[decoded.result] = *elem;
                     return true;
                 }
+                if (auto packedElem = state.heap->arrayGet(
+                        *ref, static_cast<std::size_t>(idx))) {
+                    registers[decoded.result] = std::move(*packedElem);
+                    return true;
+                }
             }
             if (!state.heap || !state.heap->arrayLength(*ref)) {
                 return fail(state, ErrorCode::InvalidObjectReference,
@@ -4130,6 +4135,8 @@ bool executeFunction(
         struct FlatArrayCacheEntry {
             ObjectRef ref{};
             ArrayFastView view{};
+            PackedArrayFastView packedView{};
+            bool isPacked = false;
             bool valid = false;
         };
         struct FlatObjectCacheEntry {
@@ -4159,10 +4166,21 @@ bool executeFunction(
                 return false;
             }
             const ObjectRef ref = arrVal.u_.objectRef;
+            if (state.heap->tryBindPackedArrayFastView(ref, ce.packedView)) {
+                ce.ref = ref;
+                ce.view = {};
+                ce.view.length = ce.packedView.length;
+                ce.view.elementType = ce.packedView.elementType;
+                ce.view.elementTypeId = ce.packedView.elementTypeId;
+                ce.isPacked = true;
+                ce.valid = true;
+                return true;
+            }
             if (RS_FLAT_UNLIKELY(!state.heap->tryBindArrayFastView(ref, ce.view))) {
                 return false;
             }
             ce.ref = ref;
+            ce.isPacked = false;
             ce.valid = true;
             return true;
         };
@@ -4378,6 +4396,20 @@ bool executeFunction(
             &&L_AwaitSuspend,
             &&L_AwaitResume,
             &&L_AsyncResolve,
+            &&L_AddIntTrustedChecked,
+            &&L_AddIntTrustedUnchecked,
+            &&L_SubIntTrustedChecked,
+            &&L_SubIntTrustedUnchecked,
+            &&L_MulIntTrustedChecked,
+            &&L_MulIntTrustedUnchecked,
+            &&L_LessIntTrusted,
+            &&L_AddDoubleTrusted,
+            &&L_SubDoubleTrusted,
+            &&L_MulDoubleTrusted,
+            &&L_DivDoubleTrusted,
+            &&L_AddFloatTrusted,
+            &&L_SubFloatTrusted,
+            &&L_MulFloatTrusted,
             &&L_GenericBytecode,
             &&L_TermJumpNoArgs,
             &&L_TermBranchBoolNoArgs,
@@ -4722,7 +4754,11 @@ bool executeFunction(
                     goto L_FlatSuperFallback;
                 }
                 std::int64_t left = 0;
-                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(left))) goto L_FlatTypeMismatch;
+                if ((ip->arithFlags & detail::FlatInstruction::FlagTrustedSrc0) != 0u) {
+                    left = frameBase[ip->src0Slot].asInt64Unchecked();
+                } else if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(left))) {
+                    goto L_FlatTypeMismatch;
+                }
                 const std::int64_t right = ip->integerImmediate;
                 localExecuted += 3;
                 state.executed = localExecuted;
@@ -4894,8 +4930,14 @@ bool executeFunction(
                     goto L_FlatSuperFallback;
                 }
                 std::int64_t left = 0, right = 0;
-                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(left) ||
-                                     !frameBase[ip->src1Slot].tryGetInt64(right))) goto L_FlatTypeMismatch;
+                if ((ip->arithFlags & (detail::FlatInstruction::FlagTrustedSrc0 | detail::FlatInstruction::FlagTrustedSrc1)) ==
+                    (detail::FlatInstruction::FlagTrustedSrc0 | detail::FlatInstruction::FlagTrustedSrc1)) {
+                    left = frameBase[ip->src0Slot].asInt64Unchecked();
+                    right = frameBase[ip->src1Slot].asInt64Unchecked();
+                } else if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(left) ||
+                                            !frameBase[ip->src1Slot].tryGetInt64(right))) {
+                    goto L_FlatTypeMismatch;
+                }
                 localExecuted += 3;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 bool cond = false;
@@ -4918,7 +4960,11 @@ bool executeFunction(
                     goto L_FlatSuperFallback;
                 }
                 std::int64_t left = 0;
-                if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(left))) goto L_FlatTypeMismatch;
+                if ((ip->arithFlags & detail::FlatInstruction::FlagTrustedSrc0) != 0u) {
+                    left = frameBase[ip->src0Slot].asInt64Unchecked();
+                } else if (RS_FLAT_UNLIKELY(!frameBase[ip->src0Slot].tryGetInt64(left))) {
+                    goto L_FlatTypeMismatch;
+                }
                 localExecuted += 4;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 const std::int64_t right = ip->integerImmediate;
@@ -4960,6 +5006,31 @@ bool executeFunction(
                                      arrVal.u_.objectRef != ce.ref)) {
                     if (!bindArrayCacheSlot(arrVal, ce)) goto L_FlatMathFallback;
                 }
+                if (RS_FLAT_LIKELY(ce.isPacked)) {
+                    if (RS_FLAT_UNLIKELY(ce.packedView.encoding != PackedElemEncoding::Int32)) {
+                        goto L_FlatMathFallback;
+                    }
+                    RS_FLAT_SPAN_CHECK();
+                    const auto* rawInts = static_cast<const std::int32_t*>(ce.packedView.rawData);
+                    if ((ip->arithFlags & detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u) {
+                        const auto uIdx = static_cast<std::size_t>(frameBase[ip->src1Slot].asInt64Unchecked());
+                        localExecuted += spanCost;
+                        frameBase[ip->dstSlot].storeInt64(static_cast<std::int64_t>(rawInts[uIdx]));
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                    std::int64_t idx = 0;
+                    if ((ip->arithFlags & detail::FlatInstruction::FlagTrustedSrc0) != 0u) {
+                        idx = frameBase[ip->src1Slot].asInt64Unchecked();
+                    } else if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx))) {
+                        goto L_FlatMathFallback;
+                    }
+                    if (RS_FLAT_UNLIKELY(static_cast<std::uint64_t>(idx) >= ce.packedView.length)) {
+                        goto L_FlatMathFallback;
+                    }
+                    localExecuted += spanCost;
+                    frameBase[ip->dstSlot].storeInt64(static_cast<std::int64_t>(rawInts[static_cast<std::size_t>(idx)]));
+                    RS_FLAT_DISPATCH_NEXT();
+                }
                 if (RS_FLAT_UNLIKELY(ce.view.elementType != semantic::PrimitiveType::Int)) {
                     goto L_FlatMathFallback;
                 }
@@ -4989,6 +5060,41 @@ bool executeFunction(
                     if (!bindArrayCacheSlot(arrVal, ce)) goto L_FlatMathFallback;
                 }
                 const Value& storeVal = frameBase[ip->src2Slot];
+                if (RS_FLAT_LIKELY(ce.isPacked)) {
+                    if (RS_FLAT_UNLIKELY(ce.packedView.encoding != PackedElemEncoding::Int32)) {
+                        goto L_FlatMathFallback;
+                    }
+                    std::int64_t val64 = 0;
+                    if ((ip->arithFlags & detail::FlatInstruction::FlagTrustedSrc1) != 0u) {
+                        val64 = storeVal.asInt64Unchecked();
+                    } else if (RS_FLAT_UNLIKELY(!storeVal.tryGetInt64(val64))) {
+                        goto L_FlatMathFallback;
+                    }
+                    if (RS_FLAT_UNLIKELY(val64 < std::numeric_limits<std::int32_t>::min() ||
+                                         val64 > std::numeric_limits<std::int32_t>::max())) {
+                        goto L_FlatMathFallback;
+                    }
+                    RS_FLAT_SPAN_CHECK();
+                    auto* rawInts = static_cast<std::int32_t*>(ce.packedView.rawData);
+                    if ((ip->arithFlags & detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u) {
+                        const auto uIdx = static_cast<std::size_t>(frameBase[ip->src1Slot].asInt64Unchecked());
+                        localExecuted += spanCost;
+                        rawInts[uIdx] = static_cast<std::int32_t>(val64);
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                    std::int64_t idx = 0;
+                    if ((ip->arithFlags & detail::FlatInstruction::FlagTrustedSrc0) != 0u) {
+                        idx = frameBase[ip->src1Slot].asInt64Unchecked();
+                    } else if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx))) {
+                        goto L_FlatMathFallback;
+                    }
+                    if (RS_FLAT_UNLIKELY(static_cast<std::uint64_t>(idx) >= ce.packedView.length)) {
+                        goto L_FlatMathFallback;
+                    }
+                    localExecuted += spanCost;
+                    rawInts[static_cast<std::size_t>(idx)] = static_cast<std::int32_t>(val64);
+                    RS_FLAT_DISPATCH_NEXT();
+                }
                 if (RS_FLAT_UNLIKELY(ce.view.elementType != semantic::PrimitiveType::Int ||
                                      storeVal.rawTag() != ValueTag::Int64)) {
                     goto L_FlatMathFallback;
@@ -5930,8 +6036,17 @@ bool executeFunction(
                         }
                         frameBase[ip->dstSlot] = *ref;
                         auto& ce = arrayCache[ip->dstSlot & 3u];
-                        if (state.heap->tryBindArrayFastView(*ref, ce.view)) {
+                        if (state.heap->tryBindPackedArrayFastView(*ref, ce.packedView)) {
                             ce.ref = *ref;
+                            ce.view = {};
+                            ce.view.length = ce.packedView.length;
+                            ce.view.elementType = ce.packedView.elementType;
+                            ce.view.elementTypeId = ce.packedView.elementTypeId;
+                            ce.isPacked = true;
+                            ce.valid = true;
+                        } else if (state.heap->tryBindArrayFastView(*ref, ce.view)) {
+                            ce.ref = *ref;
+                            ce.isPacked = false;
                             ce.valid = true;
                         }
                         RS_FLAT_DISPATCH_NEXT();
@@ -7713,6 +7828,85 @@ bool executeFunction(
                 }
                 const auto expectedType = static_cast<semantic::PrimitiveType>(static_cast<std::uint8_t>(ip->binaryOpcode1));
                 const auto expectedTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                if (ce.isPacked) {
+                    if (RS_FLAT_UNLIKELY(ce.packedView.elementType != expectedType ||
+                                         ce.packedView.elementTypeId != expectedTid)) {
+                        goto L_FlatMathFallback;
+                    }
+                    const std::uint64_t spanCost = ip->span;
+                    if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                        if (spanCost > 1u) goto L_FlatSuperFallback;
+                        goto L_FlatBudgetExceeded;
+                    }
+                    std::size_t uIdx = 0;
+                    if ((ip->arithFlags & detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u) {
+                        uIdx = static_cast<std::size_t>(frameBase[ip->src1Slot].asInt64Unchecked());
+                    } else {
+                        std::int64_t idx = 0;
+                        if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx) ||
+                                             static_cast<std::uint64_t>(idx) >= ce.packedView.length)) {
+                            goto L_FlatMathFallback;
+                        }
+                        uIdx = static_cast<std::size_t>(idx);
+                    }
+                    const auto* rawBytes = static_cast<const std::uint8_t*>(ce.packedView.rawData);
+                    switch (ce.packedView.encoding) {
+                    case PackedElemEncoding::Float64:
+                        frameBase[ip->dstSlot].storeDouble(reinterpret_cast<const double*>(rawBytes)[uIdx]);
+                        break;
+                    case PackedElemEncoding::Float32:
+                        frameBase[ip->dstSlot].storeFloat(reinterpret_cast<const float*>(rawBytes)[uIdx]);
+                        break;
+                    case PackedElemEncoding::Int32:
+                        frameBase[ip->dstSlot].storeInt64(
+                            static_cast<std::int64_t>(reinterpret_cast<const std::int32_t*>(rawBytes)[uIdx]));
+                        break;
+                    case PackedElemEncoding::UInt32:
+                        frameBase[ip->dstSlot] = UIntValue{reinterpret_cast<const std::uint32_t*>(rawBytes)[uIdx]};
+                        break;
+                    case PackedElemEncoding::Int64:
+                        frameBase[ip->dstSlot].storeLong(reinterpret_cast<const std::int64_t*>(rawBytes)[uIdx]);
+                        break;
+                    case PackedElemEncoding::UInt64:
+                        frameBase[ip->dstSlot] = ULongValue{reinterpret_cast<const std::uint64_t*>(rawBytes)[uIdx]};
+                        break;
+                    case PackedElemEncoding::Int64Wide:
+                        frameBase[ip->dstSlot].storeInt64(reinterpret_cast<const std::int64_t*>(rawBytes)[uIdx]);
+                        break;
+                    case PackedElemEncoding::Bool:
+                        frameBase[ip->dstSlot].storeBool(rawBytes[uIdx] != 0u);
+                        break;
+                    case PackedElemEncoding::Byte:
+                        frameBase[ip->dstSlot] = ByteValue{rawBytes[uIdx]};
+                        break;
+                    case PackedElemEncoding::SByte:
+                        frameBase[ip->dstSlot] = SByteValue{static_cast<std::int8_t>(rawBytes[uIdx])};
+                        break;
+                    case PackedElemEncoding::Short:
+                        frameBase[ip->dstSlot] = ShortValue{reinterpret_cast<const std::int16_t*>(rawBytes)[uIdx]};
+                        break;
+                    case PackedElemEncoding::UShort:
+                        frameBase[ip->dstSlot] = UShortValue{reinterpret_cast<const std::uint16_t*>(rawBytes)[uIdx]};
+                        break;
+                    case PackedElemEncoding::Char:
+                        frameBase[ip->dstSlot] = CharValue{reinterpret_cast<const std::uint16_t*>(rawBytes)[uIdx]};
+                        break;
+                    case PackedElemEncoding::EnumInline:
+                        frameBase[ip->dstSlot] = EnumValue{
+                            expectedTid,
+                            static_cast<std::int64_t>(reinterpret_cast<const std::int32_t*>(rawBytes)[uIdx])};
+                        break;
+                    case PackedElemEncoding::EnumWide:
+                        frameBase[ip->dstSlot] = EnumValue{
+                            expectedTid,
+                            reinterpret_cast<const std::int64_t*>(rawBytes)[uIdx]};
+                        break;
+                    default:
+                        goto L_FlatMathFallback;
+                    }
+                    localExecuted += spanCost;
+                    RS_FLAT_DISPATCH_NEXT();
+                }
                 if (RS_FLAT_UNLIKELY(ce.view.elementType != expectedType ||
                                      ce.view.elementTypeId != expectedTid)) {
                     goto L_FlatMathFallback;
@@ -7749,6 +7943,81 @@ bool executeFunction(
                 const auto expectedType = static_cast<semantic::PrimitiveType>(static_cast<std::uint8_t>(ip->binaryOpcode1));
                 const auto expectedTag = static_cast<ValueTag>(static_cast<std::uint8_t>(ip->binaryOpcode2));
                 const Value& storeVal = frameBase[ip->src2Slot];
+                if (ce.isPacked) {
+                    if (RS_FLAT_UNLIKELY(ce.packedView.elementType != expectedType ||
+                                         ce.packedView.elementTypeId != 0 ||
+                                         storeVal.rawTag() != expectedTag)) {
+                        goto L_FlatMathFallback;
+                    }
+                    const std::uint64_t spanCost = ip->span;
+                    if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                        if (spanCost > 1u) goto L_FlatSuperFallback;
+                        goto L_FlatBudgetExceeded;
+                    }
+                    std::size_t uIdx = 0;
+                    if ((ip->arithFlags & detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u) {
+                        uIdx = static_cast<std::size_t>(frameBase[ip->src1Slot].asInt64Unchecked());
+                    } else {
+                        std::int64_t idx = 0;
+                        if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx) ||
+                                             static_cast<std::uint64_t>(idx) >= ce.packedView.length)) {
+                            goto L_FlatMathFallback;
+                        }
+                        uIdx = static_cast<std::size_t>(idx);
+                    }
+                    auto* rawBytes = static_cast<std::uint8_t*>(ce.packedView.rawData);
+                    switch (ce.packedView.encoding) {
+                    case PackedElemEncoding::Float64:
+                        reinterpret_cast<double*>(rawBytes)[uIdx] = storeVal.asDoubleUnchecked();
+                        break;
+                    case PackedElemEncoding::Float32:
+                        reinterpret_cast<float*>(rawBytes)[uIdx] = storeVal.asFloatUnchecked();
+                        break;
+                    case PackedElemEncoding::Int32: {
+                        const std::int64_t iv = storeVal.asInt64Unchecked();
+                        if (RS_FLAT_UNLIKELY(iv < std::numeric_limits<std::int32_t>::min() ||
+                                             iv > std::numeric_limits<std::int32_t>::max())) {
+                            goto L_FlatMathFallback;
+                        }
+                        reinterpret_cast<std::int32_t*>(rawBytes)[uIdx] = static_cast<std::int32_t>(iv);
+                        break;
+                    }
+                    case PackedElemEncoding::UInt32:
+                        reinterpret_cast<std::uint32_t*>(rawBytes)[uIdx] = storeVal.u_.uintCell.payload.value;
+                        break;
+                    case PackedElemEncoding::Int64:
+                        reinterpret_cast<std::int64_t*>(rawBytes)[uIdx] = storeVal.asLongUnchecked();
+                        break;
+                    case PackedElemEncoding::UInt64:
+                        reinterpret_cast<std::uint64_t*>(rawBytes)[uIdx] = storeVal.u_.ulongCell.payload.value;
+                        break;
+                    case PackedElemEncoding::Int64Wide:
+                        reinterpret_cast<std::int64_t*>(rawBytes)[uIdx] = storeVal.asInt64Unchecked();
+                        break;
+                    case PackedElemEncoding::Bool:
+                        rawBytes[uIdx] = storeVal.asBoolUnchecked() ? 1u : 0u;
+                        break;
+                    case PackedElemEncoding::Byte:
+                        rawBytes[uIdx] = storeVal.u_.byteCell.payload.value;
+                        break;
+                    case PackedElemEncoding::SByte:
+                        rawBytes[uIdx] = static_cast<std::uint8_t>(storeVal.u_.sbyteCell.payload.value);
+                        break;
+                    case PackedElemEncoding::Short:
+                        reinterpret_cast<std::int16_t*>(rawBytes)[uIdx] = storeVal.u_.shortCell.payload.value;
+                        break;
+                    case PackedElemEncoding::UShort:
+                        reinterpret_cast<std::uint16_t*>(rawBytes)[uIdx] = storeVal.u_.ushortCell.payload.value;
+                        break;
+                    case PackedElemEncoding::Char:
+                        reinterpret_cast<std::uint16_t*>(rawBytes)[uIdx] = storeVal.u_.charCell.payload.value;
+                        break;
+                    default:
+                        goto L_FlatMathFallback;
+                    }
+                    localExecuted += spanCost;
+                    RS_FLAT_DISPATCH_NEXT();
+                }
                 if (RS_FLAT_UNLIKELY(ce.view.elementType != expectedType ||
                                      ce.view.elementTypeId != 0 ||
                                      storeVal.rawTag() != expectedTag)) {
@@ -7784,7 +8053,8 @@ bool executeFunction(
                     if (!bindArrayCacheSlot(arrVal, ce)) goto L_FlatMathFallback;
                 }
                 const auto expectedTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
-                if (RS_FLAT_UNLIKELY(ce.view.elementType != semantic::PrimitiveType::Struct ||
+                if (RS_FLAT_UNLIKELY(ce.isPacked ||
+                                     ce.view.elementType != semantic::PrimitiveType::Struct ||
                                      ce.view.elementTypeId != expectedTid)) {
                     goto L_FlatMathFallback;
                 }
@@ -7861,7 +8131,8 @@ bool executeFunction(
                 }
                 const auto expectedType = static_cast<semantic::PrimitiveType>(static_cast<std::uint8_t>(ip->binaryOpcode1));
                 const auto expectedTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
-                if (RS_FLAT_UNLIKELY(ce.view.elementType != expectedType ||
+                if (RS_FLAT_UNLIKELY(ce.isPacked ||
+                                     ce.view.elementType != expectedType ||
                                      ce.view.elementTypeId != expectedTid)) {
                     goto L_FlatMathFallback;
                 }
@@ -8865,6 +9136,166 @@ bool executeFunction(
                     goto L_FlatError;
                 }
                 frameBase[ip->dstSlot] = std::move(wrapped);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            #define RS_TRUSTED_SPAN_CHECK() \
+                const std::uint64_t spanCost = ip->span; \
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) { \
+                    if (spanCost > 1u) goto L_FlatSuperFallback; \
+                    goto L_FlatBudgetExceeded; \
+                }
+
+            RS_FLAT_CASE(AddIntTrustedChecked) {
+                RS_TRUSTED_SPAN_CHECK();
+                const std::int64_t a = frameBase[ip->src0Slot].asInt64Unchecked();
+                const std::int64_t b = frameBase[ip->src1Slot].asInt64Unchecked();
+                const std::int64_t res = a + b;
+                if (RS_FLAT_UNLIKELY(res < std::numeric_limits<std::int32_t>::min() ||
+                                     res > std::numeric_limits<std::int32_t>::max())) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    state.executed = localExecuted;
+                    fail(state, ErrorCode::IntegerOverflow, "integer overflow");
+                    goto L_FlatError;
+                }
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeInt64(res);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(AddIntTrustedUnchecked) {
+                RS_TRUSTED_SPAN_CHECK();
+                const std::int64_t a = frameBase[ip->src0Slot].asInt64Unchecked();
+                const std::int64_t b = frameBase[ip->src1Slot].asInt64Unchecked();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeInt64(wrapInt32(a + b));
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(SubIntTrustedChecked) {
+                RS_TRUSTED_SPAN_CHECK();
+                const std::int64_t a = frameBase[ip->src0Slot].asInt64Unchecked();
+                const std::int64_t b = frameBase[ip->src1Slot].asInt64Unchecked();
+                const std::int64_t res = a - b;
+                if (RS_FLAT_UNLIKELY(res < std::numeric_limits<std::int32_t>::min() ||
+                                     res > std::numeric_limits<std::int32_t>::max())) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    state.executed = localExecuted;
+                    fail(state, ErrorCode::IntegerOverflow, "integer overflow");
+                    goto L_FlatError;
+                }
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeInt64(res);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(SubIntTrustedUnchecked) {
+                RS_TRUSTED_SPAN_CHECK();
+                const std::int64_t a = frameBase[ip->src0Slot].asInt64Unchecked();
+                const std::int64_t b = frameBase[ip->src1Slot].asInt64Unchecked();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeInt64(wrapInt32(a - b));
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(MulIntTrustedChecked) {
+                RS_TRUSTED_SPAN_CHECK();
+                const std::int64_t a = frameBase[ip->src0Slot].asInt64Unchecked();
+                const std::int64_t b = frameBase[ip->src1Slot].asInt64Unchecked();
+                const std::int64_t res = a * b;
+                if (RS_FLAT_UNLIKELY(res < std::numeric_limits<std::int32_t>::min() ||
+                                     res > std::numeric_limits<std::int32_t>::max())) {
+                    if (spanCost > 1u) goto L_FlatSuperFallback;
+                    ++localExecuted;
+                    state.executed = localExecuted;
+                    fail(state, ErrorCode::IntegerOverflow, "integer overflow");
+                    goto L_FlatError;
+                }
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeInt64(res);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(MulIntTrustedUnchecked) {
+                RS_TRUSTED_SPAN_CHECK();
+                const std::int64_t a = frameBase[ip->src0Slot].asInt64Unchecked();
+                const std::int64_t b = frameBase[ip->src1Slot].asInt64Unchecked();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeInt64(wrapInt32(a * b));
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(LessIntTrusted) {
+                RS_TRUSTED_SPAN_CHECK();
+                const std::int64_t a = frameBase[ip->src0Slot].asInt64Unchecked();
+                const std::int64_t b = frameBase[ip->src1Slot].asInt64Unchecked();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeBool(a < b);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(AddDoubleTrusted) {
+                RS_TRUSTED_SPAN_CHECK();
+                const double a = frameBase[ip->src0Slot].asDoubleUnchecked();
+                const double b = frameBase[ip->src1Slot].asDoubleUnchecked();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeDouble(a + b);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(SubDoubleTrusted) {
+                RS_TRUSTED_SPAN_CHECK();
+                const double a = frameBase[ip->src0Slot].asDoubleUnchecked();
+                const double b = frameBase[ip->src1Slot].asDoubleUnchecked();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeDouble(a - b);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(MulDoubleTrusted) {
+                RS_TRUSTED_SPAN_CHECK();
+                const double a = frameBase[ip->src0Slot].asDoubleUnchecked();
+                const double b = frameBase[ip->src1Slot].asDoubleUnchecked();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeDouble(a * b);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(DivDoubleTrusted) {
+                RS_TRUSTED_SPAN_CHECK();
+                const double a = frameBase[ip->src0Slot].asDoubleUnchecked();
+                const double b = frameBase[ip->src1Slot].asDoubleUnchecked();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeDouble(a / b);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(AddFloatTrusted) {
+                RS_TRUSTED_SPAN_CHECK();
+                const float a = frameBase[ip->src0Slot].asFloatUnchecked();
+                const float b = frameBase[ip->src1Slot].asFloatUnchecked();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeFloat(a + b);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(SubFloatTrusted) {
+                RS_TRUSTED_SPAN_CHECK();
+                const float a = frameBase[ip->src0Slot].asFloatUnchecked();
+                const float b = frameBase[ip->src1Slot].asFloatUnchecked();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeFloat(a - b);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(MulFloatTrusted) {
+                RS_TRUSTED_SPAN_CHECK();
+                const float a = frameBase[ip->src0Slot].asFloatUnchecked();
+                const float b = frameBase[ip->src1Slot].asFloatUnchecked();
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot].storeFloat(a * b);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
@@ -10522,3 +10953,5 @@ std::string valueToString(const Value& value, const ManagedHeap* heap) {
 }
 
 } // namespace realscript::runtime
+
+            #undef RS_TRUSTED_SPAN_CHECK

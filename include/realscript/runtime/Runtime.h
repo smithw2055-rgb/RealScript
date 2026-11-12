@@ -969,6 +969,15 @@ struct alignas(16) Value {
     [[nodiscard]] std::int64_t asInt64Unchecked() const noexcept {
         return u_.int64Cell.payload;
     }
+    [[nodiscard]] std::int64_t asLongUnchecked() const noexcept {
+        return u_.longCell.payload.value;
+    }
+    [[nodiscard]] double asDoubleUnchecked() const noexcept {
+        return u_.doubleCell.payload;
+    }
+    [[nodiscard]] float asFloatUnchecked() const noexcept {
+        return u_.floatCell.payload.value;
+    }
     [[nodiscard]] bool asBoolUnchecked() const noexcept {
         return u_.boolCell.payload;
     }
@@ -1713,6 +1722,33 @@ private:
     std::uint32_t registrySlot_ = InvalidRegistrySlot;
 };
 
+enum class PackedElemEncoding : std::uint8_t {
+    None       = 0,
+    Bool       = 1,  // 1B (uint8_t 0/1)
+    Byte       = 2,  // 1B (uint8_t)
+    SByte      = 3,  // 1B (int8_t)
+    Short      = 4,  // 2B (int16_t)
+    UShort     = 5,  // 2B (uint16_t)
+    Char       = 6,  // 2B (uint16_t)
+    Int32      = 7,  // 4B (int32_t, sign-extended to int64_t in Value)
+    UInt32     = 8,  // 4B (uint32_t)
+    Float32    = 9,  // 4B (float)
+    EnumInline = 10, // 4B (int32_t + elementTypeId)
+    Int64      = 11, // 8B (LongValue int64_t)
+    UInt64     = 12, // 8B (ULongValue uint64_t)
+    Float64    = 13, // 8B (double)
+    Int64Wide  = 14, // 8B (PrimitiveType::Int host values outside int32 range)
+    EnumWide   = 15, // 8B (int64_t + elementTypeId)
+};
+
+struct PackedArrayFastView {
+    void* rawData = nullptr;
+    std::uint32_t length = 0;
+    PackedElemEncoding encoding = PackedElemEncoding::None;
+    semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
+    semantic::SymbolId elementTypeId = 0;
+};
+
 struct ArrayFastView {
     Value* data = nullptr;
     std::uint8_t* dirtyCards = nullptr;
@@ -1815,8 +1851,19 @@ public:
     [[nodiscard]] std::optional<semantic::SymbolId> arrayElementTypeId(
         ObjectRef reference) const;
     [[nodiscard]] std::optional<Value> arrayGet(ObjectRef reference, std::size_t index) const;
+    [[nodiscard]] bool isPackedArray(ObjectRef reference) const noexcept;
+    [[nodiscard]] std::optional<std::size_t> objectSizeBytes(ObjectRef reference) const noexcept;
     [[nodiscard]] const Value* arrayGetFast(ObjectRef reference, std::size_t index) const noexcept;
     [[nodiscard]] bool tryBindArrayFastView(ObjectRef reference, ArrayFastView& outView) const noexcept;
+    [[nodiscard]] bool tryBindPackedArrayFastView(ObjectRef reference, PackedArrayFastView& outView) const noexcept;
+    [[nodiscard]] bool tryBindPackedInt32Array(
+        ObjectRef reference,
+        std::int32_t*& outData,
+        std::uint32_t& outLength) const noexcept;
+    [[nodiscard]] bool tryBindPackedDoubleArray(
+        ObjectRef reference,
+        double*& outData,
+        std::uint32_t& outLength) const noexcept;
     void recordArrayWriteBarrier(ObjectRef arrayRef, std::size_t index, const Value& value) noexcept;
     void recordArrayWriteBarrier(ObjectRef arrayRef, const Value& value) noexcept;
     [[nodiscard]] bool tryBindObjectFastView(ObjectRef reference, ObjectFastView& outView) const noexcept;

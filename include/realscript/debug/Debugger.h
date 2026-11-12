@@ -194,6 +194,9 @@ private:
     std::unordered_map<std::string, std::vector<BoundLocation>> executableLocations_;
     std::unordered_map<std::string, std::string> clientPathAliases_;
     std::unordered_map<semantic::SymbolId, semantic::TypeSymbol> types_;
+    std::unordered_map<std::string, semantic::SymbolId> typesByName_;
+    const runtime::ProgramImage* boundProgram_ = nullptr;
+    std::shared_ptr<const runtime::ProgramImage> synthesizedProgram_;
     runtime::ManagedHeap* lastHeap_ = nullptr;
     StopHandler stopHandler_;
     ResumeMode mode_ = ResumeMode::Continue;

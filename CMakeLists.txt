@@ -422,6 +422,14 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_sprint2_scene_hotreload_guid_tests
         realscript.sprint2.scene-hotreload-guid
         tests/sprint2_scene_hotreload_guid_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_p0_packed_heap_and_trusted_vm_tests
+        realscript.p0.packed-heap-and-trusted-vm
+        tests/p0_packed_heap_and_trusted_vm_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_p1_dap_eval_and_lsp_scene_tests
+        realscript.p1.dap-eval-and-lsp-scene
+        tests/p1_dap_eval_and_lsp_scene_tests.cpp)
     if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
         realscript_add_cpp_test(
             realscript_sprint2_generics_using_resource_tests

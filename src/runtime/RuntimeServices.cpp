@@ -4620,6 +4620,374 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                 }
             }
 
+            // Pass 3d (P0-B): Forward CFG Slot-Type & Definite-Initialization Proof Pass
+            // Eliminates redundant dynamic ValueTag checks on verified scalar registers/locals.
+            if (!execFunc.hasExceptionHandlers && !buildStream.empty() && execFunc.totalFrameSlots > 0 &&
+                execFunc.totalFrameSlots <= 1024) {
+                enum class ProvenTag : std::uint8_t {
+                    Uninit = 0,
+                    ExactInt32 = 1,
+                    ExactDouble = 2,
+                    ExactFloat = 3,
+                    ExactBool = 4,
+                    Mixed = 5,
+                };
+                const std::size_t nBlocks = execFunc.blocks.size();
+                const std::size_t nSlots = execFunc.totalFrameSlots;
+                const auto mergeTag = [](ProvenTag a, ProvenTag b) noexcept -> ProvenTag {
+                    if (a == b) return a;
+                    return ProvenTag::Mixed;
+                };
+
+                std::vector<std::size_t> blkEnd(nBlocks, buildStream.size());
+                for (std::size_t b = 0; b + 1 < nBlocks; ++b) {
+                    blkEnd[b] = execFunc.blockStreamOffsets[b + 1];
+                }
+
+                // Initialize entry block with verified entry parameter types; non-entry blocks start clean for intersection
+                std::vector<std::vector<ProvenTag>> blkIn(nBlocks, std::vector<ProvenTag>(nSlots, ProvenTag::Uninit));
+                std::vector<std::vector<ProvenTag>> blkOut(nBlocks, std::vector<ProvenTag>(nSlots, ProvenTag::Uninit));
+                std::vector<bool> blkVisited(nBlocks, false);
+                if (execFunc.entry < nBlocks) {
+                    blkVisited[execFunc.entry] = true;
+                    auto& entryState = blkIn[execFunc.entry];
+                    for (std::size_t p = 0; p < paramCount && (execFunc.paramOffset + p) < nSlots; ++p) {
+                        switch (function.parameterTypes[p]) {
+                        case semantic::PrimitiveType::Int:
+                            entryState[execFunc.paramOffset + p] = ProvenTag::ExactInt32;
+                            break;
+                        case semantic::PrimitiveType::Double:
+                            entryState[execFunc.paramOffset + p] = ProvenTag::ExactDouble;
+                            break;
+                        case semantic::PrimitiveType::Float:
+                            entryState[execFunc.paramOffset + p] = ProvenTag::ExactFloat;
+                            break;
+                        case semantic::PrimitiveType::Bool:
+                            entryState[execFunc.paramOffset + p] = ProvenTag::ExactBool;
+                            break;
+                        default:
+                            entryState[execFunc.paramOffset + p] = ProvenTag::Mixed;
+                            break;
+                        }
+                    }
+                }
+
+                const auto stepInstState = [&](const FlatInstruction& fi, std::vector<ProvenTag>& st, bool rewrite) {
+                    const auto isInt = [&](std::uint16_t s) noexcept {
+                        return s < nSlots && st[s] == ProvenTag::ExactInt32;
+                    };
+                    const auto isDbl = [&](std::uint16_t s) noexcept {
+                        return s < nSlots && st[s] == ProvenTag::ExactDouble;
+                    };
+                    const auto isFlt = [&](std::uint16_t s) noexcept {
+                        return s < nSlots && st[s] == ProvenTag::ExactFloat;
+                    };
+                    const auto setSlot = [&](std::uint16_t s, ProvenTag t) noexcept {
+                        if (s < nSlots) st[s] = t;
+                    };
+
+                    FlatInstruction out = fi;
+                    switch (fi.flatOpcode) {
+                    case FlatOpcode::MoveSlot:
+                        if (fi.dstSlot < nSlots) {
+                            st[fi.dstSlot] = (fi.src0Slot < nSlots) ? st[fi.src0Slot] : ProvenTag::Mixed;
+                        }
+                        break;
+                    case FlatOpcode::SuperMoveParamStoreLocal:
+                        if (fi.src0Slot < nSlots) {
+                            const ProvenTag pt = st[fi.src0Slot];
+                            setSlot(fi.dstSlot, pt);
+                            setSlot(fi.storeSlot, pt);
+                        }
+                        break;
+                    case FlatOpcode::SuperMoveParamStoreLocalElided:
+                        if (fi.src0Slot < nSlots) {
+                            setSlot(fi.storeSlot, st[fi.src0Slot]);
+                        }
+                        break;
+                    case FlatOpcode::ConstantInt:
+                        setSlot(fi.dstSlot,
+                            (fi.integerImmediate >= std::numeric_limits<std::int32_t>::min() &&
+                             fi.integerImmediate <= std::numeric_limits<std::int32_t>::max())
+                                ? ProvenTag::ExactInt32
+                                : ProvenTag::Mixed);
+                        break;
+                    case FlatOpcode::ConstantDouble:
+                        setSlot(fi.dstSlot, ProvenTag::ExactDouble);
+                        break;
+                    case FlatOpcode::ConstantBool:
+                        setSlot(fi.dstSlot, ProvenTag::ExactBool);
+                        break;
+                    case FlatOpcode::SuperConstFloat:
+                        setSlot(fi.dstSlot, ProvenTag::ExactFloat);
+                        break;
+                    case FlatOpcode::SuperConstFloatStoreLocal:
+                        setSlot(fi.dstSlot, ProvenTag::ExactFloat);
+                        setSlot(fi.storeSlot, ProvenTag::ExactFloat);
+                        break;
+                    case FlatOpcode::AddIntChecked:
+                        if (rewrite && isInt(fi.src0Slot) && isInt(fi.src1Slot)) {
+                            out.flatOpcode = FlatOpcode::AddIntTrustedChecked;
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactInt32);
+                        break;
+                    case FlatOpcode::AddIntUnchecked:
+                        if (rewrite && isInt(fi.src0Slot) && isInt(fi.src1Slot)) {
+                            out.flatOpcode = FlatOpcode::AddIntTrustedUnchecked;
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactInt32);
+                        break;
+                    case FlatOpcode::SubIntChecked:
+                        if (rewrite && isInt(fi.src0Slot) && isInt(fi.src1Slot)) {
+                            out.flatOpcode = FlatOpcode::SubIntTrustedChecked;
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactInt32);
+                        break;
+                    case FlatOpcode::SubIntUnchecked:
+                        if (rewrite && isInt(fi.src0Slot) && isInt(fi.src1Slot)) {
+                            out.flatOpcode = FlatOpcode::SubIntTrustedUnchecked;
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactInt32);
+                        break;
+                    case FlatOpcode::MulIntChecked:
+                        if (rewrite && isInt(fi.src0Slot) && isInt(fi.src1Slot)) {
+                            out.flatOpcode = FlatOpcode::MulIntTrustedChecked;
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactInt32);
+                        break;
+                    case FlatOpcode::MulIntUnchecked:
+                        if (rewrite && isInt(fi.src0Slot) && isInt(fi.src1Slot)) {
+                            out.flatOpcode = FlatOpcode::MulIntTrustedUnchecked;
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactInt32);
+                        break;
+                    case FlatOpcode::DivInt:
+                    case FlatOpcode::RemInt:
+                    case FlatOpcode::NegateIntUnchecked:
+                    case FlatOpcode::ArrayLengthFast:
+                    case FlatOpcode::ConvertFloatToIntFast:
+                    case FlatOpcode::ConvertLongToIntFast:
+                        setSlot(fi.dstSlot, ProvenTag::ExactInt32);
+                        break;
+                    case FlatOpcode::LessInt:
+                        if (rewrite && isInt(fi.src0Slot) && isInt(fi.src1Slot)) {
+                            out.flatOpcode = FlatOpcode::LessIntTrusted;
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactBool);
+                        break;
+                    case FlatOpcode::LessOrEqualInt:
+                    case FlatOpcode::GreaterInt:
+                    case FlatOpcode::GreaterOrEqualInt:
+                    case FlatOpcode::EqualInt:
+                    case FlatOpcode::NotEqualInt:
+                    case FlatOpcode::LogicalNot:
+                        setSlot(fi.dstSlot, ProvenTag::ExactBool);
+                        break;
+                    case FlatOpcode::AddDouble:
+                        if (rewrite && isDbl(fi.src0Slot) && isDbl(fi.src1Slot)) {
+                            out.flatOpcode = FlatOpcode::AddDoubleTrusted;
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactDouble);
+                        break;
+                    case FlatOpcode::SubDouble:
+                        if (rewrite && isDbl(fi.src0Slot) && isDbl(fi.src1Slot)) {
+                            out.flatOpcode = FlatOpcode::SubDoubleTrusted;
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactDouble);
+                        break;
+                    case FlatOpcode::MulDouble:
+                        if (rewrite && isDbl(fi.src0Slot) && isDbl(fi.src1Slot)) {
+                            out.flatOpcode = FlatOpcode::MulDoubleTrusted;
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactDouble);
+                        break;
+                    case FlatOpcode::DivDouble:
+                        if (rewrite && isDbl(fi.src0Slot) && isDbl(fi.src1Slot)) {
+                            out.flatOpcode = FlatOpcode::DivDoubleTrusted;
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactDouble);
+                        break;
+                    case FlatOpcode::ConvertIntToDoubleFast:
+                    case FlatOpcode::ConvertLongToDoubleFast:
+                    case FlatOpcode::ConvertFloatToDoubleFast:
+                    case FlatOpcode::NegateDouble:
+                    case FlatOpcode::MathSqrt64:
+                        setSlot(fi.dstSlot, ProvenTag::ExactDouble);
+                        break;
+                    case FlatOpcode::AddFloat:
+                        if (rewrite && isFlt(fi.src0Slot) && isFlt(fi.src1Slot)) {
+                            out.flatOpcode = FlatOpcode::AddFloatTrusted;
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactFloat);
+                        break;
+                    case FlatOpcode::SubFloat:
+                        if (rewrite && isFlt(fi.src0Slot) && isFlt(fi.src1Slot)) {
+                            out.flatOpcode = FlatOpcode::SubFloatTrusted;
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactFloat);
+                        break;
+                    case FlatOpcode::MulFloat:
+                        if (rewrite && isFlt(fi.src0Slot) && isFlt(fi.src1Slot)) {
+                            out.flatOpcode = FlatOpcode::MulFloatTrusted;
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactFloat);
+                        break;
+                    case FlatOpcode::DivFloat:
+                    case FlatOpcode::NegateFloat:
+                    case FlatOpcode::ConvertIntToFloatFast:
+                    case FlatOpcode::ConvertDoubleToFloatFast:
+                        setSlot(fi.dstSlot, ProvenTag::ExactFloat);
+                        break;
+                    case FlatOpcode::LoadElementIntFast:
+                        if (rewrite && isInt(fi.src1Slot)) {
+                            out.arithFlags = static_cast<std::uint8_t>(
+                                out.arithFlags | FlatInstruction::FlagTrustedSrc0);
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactInt32);
+                        break;
+                    case FlatOpcode::StoreElementIntFast:
+                        if (rewrite) {
+                            if (isInt(fi.src1Slot)) {
+                                out.arithFlags = static_cast<std::uint8_t>(
+                                    out.arithFlags | FlatInstruction::FlagTrustedSrc0);
+                            }
+                            if (isInt(fi.src2Slot)) {
+                                out.arithFlags = static_cast<std::uint8_t>(
+                                    out.arithFlags | FlatInstruction::FlagTrustedSrc1);
+                            }
+                        }
+                        break;
+                    case FlatOpcode::SuperLessLocalConstBranch:
+                        if (rewrite && isInt(fi.src0Slot)) {
+                            out.arithFlags = static_cast<std::uint8_t>(
+                                out.arithFlags | FlatInstruction::FlagTrustedSrc0);
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactInt32);
+                        setSlot(fi.aux0Slot, ProvenTag::ExactInt32);
+                        setSlot(fi.aux1Slot, ProvenTag::ExactBool);
+                        break;
+                    case FlatOpcode::SuperLessLocalRegBranch:
+                        if (rewrite && isInt(fi.src0Slot) && isInt(fi.src1Slot)) {
+                            out.arithFlags = static_cast<std::uint8_t>(
+                                out.arithFlags | FlatInstruction::FlagTrustedSrc0 | FlatInstruction::FlagTrustedSrc1);
+                        }
+                        setSlot(fi.dstSlot, ProvenTag::ExactInt32);
+                        setSlot(fi.aux1Slot, ProvenTag::ExactBool);
+                        break;
+                    case FlatOpcode::SuperBinaryLocalIntConstStoreElided:
+                    case FlatOpcode::SuperBinaryLocalIntConstStoreJump: {
+                        const bool producesBool =
+                            fi.binaryOpcode1 >= QuickOpcode::LessInt &&
+                            fi.binaryOpcode1 <= QuickOpcode::NotEqualInt;
+                        if (rewrite && isInt(fi.src0Slot)) {
+                            out.arithFlags = static_cast<std::uint8_t>(
+                                out.arithFlags | FlatInstruction::FlagTrustedSrc0);
+                        }
+                        const ProvenTag resTag = producesBool ? ProvenTag::ExactBool : ProvenTag::ExactInt32;
+                        if (fi.flatOpcode == FlatOpcode::SuperBinaryLocalIntConstStoreJump) {
+                            setSlot(fi.dstSlot, resTag);
+                        } else {
+                            setSlot(fi.storeSlot, resTag);
+                        }
+                        break;
+                    }
+                    case FlatOpcode::SuperBinaryLocalIntLocalStoreElided:
+                    case FlatOpcode::SuperBinaryLocalIntLocalStoreJump:
+                    case FlatOpcode::SuperBinaryLocalIntRegStoreElided:
+                    case FlatOpcode::SuperBinaryLocalIntRegStoreJump: {
+                        const bool producesBool =
+                            fi.binaryOpcode1 >= QuickOpcode::LessInt &&
+                            fi.binaryOpcode1 <= QuickOpcode::NotEqualInt;
+                        if (rewrite && isInt(fi.src0Slot) && isInt(fi.src1Slot)) {
+                            out.arithFlags = static_cast<std::uint8_t>(
+                                out.arithFlags | FlatInstruction::FlagTrustedSrc0 | FlatInstruction::FlagTrustedSrc1);
+                        }
+                        const ProvenTag resTag = producesBool ? ProvenTag::ExactBool : ProvenTag::ExactInt32;
+                        if (fi.flatOpcode == FlatOpcode::SuperBinaryLocalIntLocalStoreJump ||
+                            fi.flatOpcode == FlatOpcode::SuperBinaryLocalIntRegStoreJump) {
+                            setSlot(fi.dstSlot, resTag);
+                        } else {
+                            setSlot(fi.storeSlot, resTag);
+                        }
+                        break;
+                    }
+                    case FlatOpcode::GenericBytecode:
+                        std::fill(st.begin(), st.end(), ProvenTag::Mixed);
+                        break;
+                    default: {
+                        // Conservative transfer for any other instruction writing slots
+                        setSlot(fi.dstSlot, ProvenTag::Mixed);
+                        if (!isBranchOrJumpFlatOp(fi.flatOpcode)) {
+                            setSlot(fi.storeSlot, ProvenTag::Mixed);
+                        }
+                        setSlot(fi.aux0Slot, ProvenTag::Mixed);
+                        setSlot(fi.aux1Slot, ProvenTag::Mixed);
+                        break;
+                    }
+                    }
+                    return out;
+                };
+
+                const auto propagateEdge = [&](const std::vector<ProvenTag>& outSt,
+                                               const ExecutionEdge& edge) {
+                    if (edge.target == InvalidBlockIndex || edge.target >= nBlocks) return false;
+                    std::vector<ProvenTag> edgeSt = outSt;
+                    if (edge.hasArguments && edge.sources && edge.destinations) {
+                        const std::size_t cnt = std::min(edge.sources->size(), edge.destinations->size());
+                        std::vector<ProvenTag> transferred(cnt, ProvenTag::Mixed);
+                        for (std::size_t i = 0; i < cnt; ++i) {
+                            const std::size_t sSlot = execFunc.registerOffset + (*edge.sources)[i];
+                            transferred[i] = sSlot < nSlots ? outSt[sSlot] : ProvenTag::Mixed;
+                        }
+                        for (std::size_t i = 0; i < cnt; ++i) {
+                            const std::size_t dSlot = execFunc.registerOffset + (*edge.destinations)[i].target;
+                            if (dSlot < nSlots) edgeSt[dSlot] = transferred[i];
+                        }
+                    }
+                    bool changed = false;
+                    if (!blkVisited[edge.target]) {
+                        blkVisited[edge.target] = true;
+                        blkIn[edge.target] = std::move(edgeSt);
+                        changed = true;
+                    } else {
+                        auto& dstIn = blkIn[edge.target];
+                        for (std::size_t s = 0; s < nSlots; ++s) {
+                            const ProvenTag m = mergeTag(dstIn[s], edgeSt[s]);
+                            if (m != dstIn[s]) {
+                                dstIn[s] = m;
+                                changed = true;
+                            }
+                        }
+                    }
+                    return changed;
+                };
+
+                bool changed = true;
+                std::size_t guardIter = 0;
+                while (changed && guardIter++ < 32) {
+                    changed = false;
+                    for (std::size_t b = 0; b < nBlocks; ++b) {
+                        if (!blkVisited[b]) continue;
+                        std::vector<ProvenTag> cur = blkIn[b];
+                        for (std::size_t k = execFunc.blockStreamOffsets[b]; k < blkEnd[b]; ++k) {
+                            (void)stepInstState(buildStream[k].hot, cur, false);
+                        }
+                        blkOut[b] = cur;
+                        const auto& eb = execFunc.blocks[b];
+                        if (propagateEdge(cur, eb.branch)) changed = true;
+                        if (propagateEdge(cur, eb.falseBranch)) changed = true;
+                    }
+                }
+
+                for (std::size_t b = 0; b < nBlocks; ++b) {
+                    if (!blkVisited[b]) continue;
+                    std::vector<ProvenTag> cur = blkIn[b];
+                    for (std::size_t k = execFunc.blockStreamOffsets[b]; k < blkEnd[b]; ++k) {
+                        buildStream[k].hot = stepInstState(buildStream[k].hot, cur, true);
+                    }
+                }
+            }
+
             execFunc.flatStream.resize(buildStream.size());
             execFunc.flatCold.resize(buildStream.size());
             for (std::size_t idx = 0; idx < buildStream.size(); ++idx) {
@@ -4881,7 +5249,13 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                 fi.flatOpcode == FlatOpcode::SubIntChecked ||
                                 fi.flatOpcode == FlatOpcode::SubIntUnchecked ||
                                 fi.flatOpcode == FlatOpcode::MulIntChecked ||
-                                fi.flatOpcode == FlatOpcode::MulIntUnchecked) &&
+                                fi.flatOpcode == FlatOpcode::MulIntUnchecked ||
+                                fi.flatOpcode == FlatOpcode::AddIntTrustedChecked ||
+                                fi.flatOpcode == FlatOpcode::AddIntTrustedUnchecked ||
+                                fi.flatOpcode == FlatOpcode::SubIntTrustedChecked ||
+                                fi.flatOpcode == FlatOpcode::SubIntTrustedUnchecked ||
+                                fi.flatOpcode == FlatOpcode::MulIntTrustedChecked ||
+                                fi.flatOpcode == FlatOpcode::MulIntTrustedUnchecked) &&
                                !sawStoreField &&
                                computedExprKind == TrivialMethodKind::None &&
                                fi.src0Slot < execFunc.totalFrameSlots &&
@@ -4892,16 +5266,25 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         const bool checkedOp =
                             fi.flatOpcode == FlatOpcode::AddIntChecked ||
                             fi.flatOpcode == FlatOpcode::SubIntChecked ||
-                            fi.flatOpcode == FlatOpcode::MulIntChecked;
+                            fi.flatOpcode == FlatOpcode::MulIntChecked ||
+                            fi.flatOpcode == FlatOpcode::AddIntTrustedChecked ||
+                            fi.flatOpcode == FlatOpcode::SubIntTrustedChecked ||
+                            fi.flatOpcode == FlatOpcode::MulIntTrustedChecked;
                         const bool isAdd =
                             fi.flatOpcode == FlatOpcode::AddIntChecked ||
-                            fi.flatOpcode == FlatOpcode::AddIntUnchecked;
+                            fi.flatOpcode == FlatOpcode::AddIntUnchecked ||
+                            fi.flatOpcode == FlatOpcode::AddIntTrustedChecked ||
+                            fi.flatOpcode == FlatOpcode::AddIntTrustedUnchecked;
                         const bool isSub =
                             fi.flatOpcode == FlatOpcode::SubIntChecked ||
-                            fi.flatOpcode == FlatOpcode::SubIntUnchecked;
+                            fi.flatOpcode == FlatOpcode::SubIntUnchecked ||
+                            fi.flatOpcode == FlatOpcode::SubIntTrustedChecked ||
+                            fi.flatOpcode == FlatOpcode::SubIntTrustedUnchecked;
                         const bool isMul =
                             fi.flatOpcode == FlatOpcode::MulIntChecked ||
-                            fi.flatOpcode == FlatOpcode::MulIntUnchecked;
+                            fi.flatOpcode == FlatOpcode::MulIntUnchecked ||
+                            fi.flatOpcode == FlatOpcode::MulIntTrustedChecked ||
+                            fi.flatOpcode == FlatOpcode::MulIntTrustedUnchecked;
                         const auto intTag = static_cast<std::uint8_t>(ValueTag::Int64);
                         if (lf.valid && rf.valid &&
                             lf.exactTag == intTag && rf.exactTag == intTag &&
@@ -5140,6 +5523,20 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     case FlatOpcode::StoreElementPrimFast:
                     case FlatOpcode::StoreElementStructFast:
                     case FlatOpcode::SuperLessLocalArrayLengthBranch:
+                    case FlatOpcode::AddIntTrustedChecked:
+                    case FlatOpcode::AddIntTrustedUnchecked:
+                    case FlatOpcode::SubIntTrustedChecked:
+                    case FlatOpcode::SubIntTrustedUnchecked:
+                    case FlatOpcode::MulIntTrustedChecked:
+                    case FlatOpcode::MulIntTrustedUnchecked:
+                    case FlatOpcode::LessIntTrusted:
+                    case FlatOpcode::AddDoubleTrusted:
+                    case FlatOpcode::SubDoubleTrusted:
+                    case FlatOpcode::MulDoubleTrusted:
+                    case FlatOpcode::DivDoubleTrusted:
+                    case FlatOpcode::AddFloatTrusted:
+                    case FlatOpcode::SubFloatTrusted:
+                    case FlatOpcode::MulFloatTrusted:
                     case FlatOpcode::TermJumpNoArgs:
                     case FlatOpcode::TermBranchBoolNoArgs:
                     case FlatOpcode::TermReturnVoid:
