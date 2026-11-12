@@ -608,6 +608,10 @@ bool LanguageService::loadProjectConfigJson(
         loadedAnySection = true;
     }
 
+    if (parseLintConfigFromProjectJson(*parsed, lintConfig_, merge)) {
+        loadedAnySection = true;
+    }
+
     if (!loadedAnySection) return false;
     structuralDirty_ = true;
     dirty_ = true;
@@ -627,6 +631,58 @@ bool LanguageService::loadProjectConfigFile(const std::string& configPath, bool 
         ? fsConfig.parent_path().generic_string()
         : std::string{};
     return loadProjectConfigJson(jsonText, parentDir, merge);
+}
+
+void LanguageService::setLintConfig(LintConfig config) {
+    lintConfig_ = std::move(config);
+    hasCachedDiagnostics_ = false;
+}
+
+std::vector<LanguageDiagnostic> LanguageService::lint(const std::string& rawPath) {
+    return lint(rawPath, lintConfig_);
+}
+
+std::vector<LanguageDiagnostic> LanguageService::lint(
+    const std::string& rawPath,
+    const LintConfig& overrideConfig) {
+    const std::string path = normalizeDocPath(rawPath);
+    if (!contains(path)) return {};
+    (void)build();
+    const auto* doc = document(path);
+    if (!doc) return {};
+
+    std::vector<compiler::SourceFile> wsSources;
+    const auto allPaths = documentPaths();
+    wsSources.reserve(allPaths.size() + ambientDocuments_.size());
+    for (const auto& p : allPaths) {
+        if (const auto* d = document(p)) {
+            wsSources.push_back({p, d->content});
+        }
+    }
+    for (const auto& [ambPath, ambDoc] : ambientDocuments_) {
+        if (documents_.find(ambPath) == documents_.end() &&
+            workspaceDocuments_.find(ambPath) == workspaceDocuments_.end()) {
+            wsSources.push_back({ambPath, ambDoc.content});
+        }
+    }
+
+    GovernanceLinter linter(overrideConfig);
+    const auto rawDiags = linter.lintSource(path, doc->content, &result_, &wsSources);
+    std::vector<LanguageDiagnostic> output;
+    output.reserve(rawDiags.size());
+    for (const auto& item : rawDiags) {
+        const auto mappedSeverity = (item.severity == LintSeverity::Error)
+            ? diagnostics::DiagnosticSeverity::Error
+            : diagnostics::DiagnosticSeverity::Warning;
+        output.push_back(LanguageDiagnostic{
+            item.code,
+            item.message,
+            mappedSeverity,
+            Location{path, rangeFor(path, item.span)},
+            item.severity,
+        });
+    }
+    return output;
 }
 
 std::size_t LanguageService::addWorkspaceRoot(const std::string& rawRootPath) {
@@ -1542,7 +1598,7 @@ std::vector<LanguageDiagnostic> LanguageService::diagnostics(const std::string& 
                 if (!item.sourceName.empty()) {
                     const std::string itemPath = normalizeDocPath(item.sourceName);
                     cachedDiagnosticsByPath_[itemPath].push_back(
-                        {item.code, item.message, item.severity, {itemPath, rangeFor(itemPath, item.span)}});
+                        {item.code, item.message, item.severity, {itemPath, rangeFor(itemPath, item.span)}, std::nullopt});
                 } else {
                     bool validSpan = false;
                     const std::string ownerPath = inferOwnerForSourceless(item, validSpan);
@@ -1552,6 +1608,7 @@ std::vector<LanguageDiagnostic> LanguageService::diagnostics(const std::string& 
                             item.message,
                             item.severity,
                             {ownerPath, validSpan ? rangeFor(ownerPath, item.span) : debug::SourceRange{}},
+                            std::nullopt,
                         });
                     }
                 }
@@ -1560,7 +1617,16 @@ std::vector<LanguageDiagnostic> LanguageService::diagnostics(const std::string& 
         hasCachedDiagnostics_ = true;
     }
     const auto it = cachedDiagnosticsByPath_.find(path);
-    return it != cachedDiagnosticsByPath_.end() ? it->second : std::vector<LanguageDiagnostic>{};
+    std::vector<LanguageDiagnostic> out =
+        (it != cachedDiagnosticsByPath_.end()) ? it->second : std::vector<LanguageDiagnostic>{};
+    if (lintConfig_.enableGovernanceLint) {
+        auto govDiags = lint(path, lintConfig_);
+        out.insert(
+            out.end(),
+            std::make_move_iterator(govDiags.begin()),
+            std::make_move_iterator(govDiags.end()));
+    }
+    return out;
 }
 
 std::vector<CompletionItem> LanguageService::completion(
@@ -2999,6 +3065,83 @@ std::vector<CodeAction> LanguageService::codeActions(
         }
     }
 
+    // 3. Quick Fix: Insert `// realscript-disable-next-line <RSG_CODE>` for RSG* governance diagnostics
+    {
+        std::vector<LanguageDiagnostic> rsgCandidates;
+        for (const auto& d : diags) {
+            if (d.code.rfind("RSG", 0) == 0 && rangesOverlap(d.location.range, range)) {
+                rsgCandidates.push_back(d);
+            }
+        }
+        if (!lintConfig_.enableGovernanceLint) {
+            for (const auto& d : lint(path, lintConfig_)) {
+                if (d.code.rfind("RSG", 0) == 0 && rangesOverlap(d.location.range, range)) {
+                    rsgCandidates.push_back(d);
+                }
+            }
+        }
+
+        std::set<std::pair<std::string, std::size_t>> seenRsgFix;
+        for (const auto& d : rsgCandidates) {
+            const std::size_t line0 = d.location.range.start.line;
+            if (!seenRsgFix.emplace(d.code, line0).second) continue;
+            if (line0 >= doc->fileInfo.lineStarts.size()) continue;
+
+            const std::size_t lineStartOff = static_cast<std::size_t>(doc->fileInfo.lineStarts[line0]);
+            std::size_t indentEnd = lineStartOff;
+            while (indentEnd < doc->content.size() &&
+                   (doc->content[indentEnd] == ' ' || doc->content[indentEnd] == '\t')) {
+                ++indentEnd;
+            }
+            const std::string lineIndent = doc->content.substr(lineStartOff, indentEnd - lineStartOff);
+
+            // Check if the immediately preceding line already has a `// realscript-disable-next-line` directive
+            bool appendedToExisting = false;
+            TextEdit fixEdit;
+            if (line0 > 0) {
+                const std::size_t prevStart = static_cast<std::size_t>(doc->fileInfo.lineStarts[line0 - 1]);
+                std::size_t prevEnd = lineStartOff;
+                while (prevEnd > prevStart &&
+                       (doc->content[prevEnd - 1] == '\n' || doc->content[prevEnd - 1] == '\r')) {
+                    --prevEnd;
+                }
+                std::string_view prevLine(doc->content.data() + prevStart, prevEnd - prevStart);
+                while (!prevLine.empty() && (prevLine.front() == ' ' || prevLine.front() == '\t')) {
+                    prevLine.remove_prefix(1);
+                }
+                if (prevLine.rfind("//", 0) == 0) {
+                    std::string_view body = prevLine.substr(2);
+                    while (!body.empty() && (body.front() == ' ' || body.front() == '\t')) {
+                        body.remove_prefix(1);
+                    }
+                    constexpr std::string_view kDir = "realscript-disable-next-line";
+                    if (body.rfind(kDir, 0) == 0 &&
+                        body.size() > kDir.size() &&
+                        body.find("--") == std::string_view::npos) {
+                        fixEdit = TextEdit{
+                            Location{path, rangeFor(path, text::TextSpan{prevEnd, 0})},
+                            ", " + d.code,
+                        };
+                        appendedToExisting = true;
+                    }
+                }
+            }
+            if (!appendedToExisting) {
+                fixEdit = TextEdit{
+                    Location{path, rangeFor(path, text::TextSpan{lineStartOff, 0})},
+                    lineIndent + "// realscript-disable-next-line " + d.code + "\n",
+                };
+            }
+
+            CodeAction act;
+            act.title = "Suppress " + d.code + " with '// realscript-disable-next-line " + d.code + "'";
+            act.kind = "quickfix";
+            act.isPreferred = actions.empty();
+            act.edits.push_back(std::move(fixEdit));
+            actions.push_back(std::move(act));
+        }
+    }
+
     return actions;
 }
 
@@ -3638,74 +3781,24 @@ std::vector<InlayHint> LanguageService::inlayHints(const std::string& rawPath) {
 }
 
 std::vector<TextEdit> LanguageService::formatDocument(const std::string& rawPath, std::size_t tabSize) {
+    FormatOptions opts;
+    opts.indentWidth = std::max<std::size_t>(1, tabSize);
+    return formatDocument(rawPath, opts);
+}
+
+std::vector<TextEdit> LanguageService::formatDocument(
+    const std::string& rawPath,
+    const FormatOptions& options) {
     const std::string path = normalizeDocPath(rawPath);
     const auto* doc = document(path);
     if (!doc) return {};
-    std::string formatted;
-    formatted.reserve(doc->content.size() + 64);
 
-    int indentLevel = 0;
-    std::size_t pos = 0;
-    while (pos < doc->content.size()) {
-        std::size_t lineEnd = doc->content.find('\n', pos);
-        const bool hasNewline = lineEnd != std::string::npos;
-        if (!hasNewline) lineEnd = doc->content.size();
-
-        std::string line = doc->content.substr(pos, lineEnd - pos);
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-
-        std::size_t firstNonSpace = 0;
-        while (firstNonSpace < line.size() &&
-               (line[firstNonSpace] == ' ' || line[firstNonSpace] == '\t')) {
-            ++firstNonSpace;
-        }
-        std::size_t lastNonSpace = line.size();
-        while (lastNonSpace > firstNonSpace &&
-               (line[lastNonSpace - 1] == ' ' || line[lastNonSpace - 1] == '\t')) {
-            --lastNonSpace;
-        }
-        const std::string trimmed = line.substr(firstNonSpace, lastNonSpace - firstNonSpace);
-
-        if (!trimmed.empty()) {
-            int leadingClose = 0;
-            for (char ch : trimmed) {
-                if (ch == '}') ++leadingClose;
-                else break;
-            }
-            const int effectiveIndent = std::max(0, indentLevel - leadingClose);
-            formatted.append(static_cast<std::size_t>(effectiveIndent) * tabSize, ' ');
-            formatted.append(trimmed);
-
-            int netBraces = 0;
-            bool inStr = false;
-            for (std::size_t i = 0; i < trimmed.size(); ++i) {
-                if (trimmed[i] == '"') {
-                    std::size_t bsCount = 0;
-                    std::size_t back = i;
-                    while (back > 0 && trimmed[back - 1] == '\\') {
-                        ++bsCount;
-                        --back;
-                    }
-                    if ((bsCount % 2) == 0) {
-                        inStr = !inStr;
-                    }
-                } else if (!inStr) {
-                    if (trimmed[i] == '/' && i + 1 < trimmed.size() && trimmed[i + 1] == '/') {
-                        break;
-                    }
-                    if (trimmed[i] == '{') ++netBraces;
-                    else if (trimmed[i] == '}') --netBraces;
-                }
-            }
-            indentLevel = std::max(0, indentLevel + netBraces);
-        }
-        if (hasNewline) formatted.push_back('\n');
-        pos = lineEnd + 1;
+    const auto result = formatSource(doc->content, options);
+    if (result.unchangedOnError || !result.changed || result.formatted == doc->content) {
+        return {};
     }
-
-    if (formatted == doc->content) return {};
     const auto fullRange = rangeFor(path, text::TextSpan{0, doc->content.size()});
-    return {TextEdit{Location{path, fullRange}, std::move(formatted)}};
+    return {TextEdit{Location{path, fullRange}, result.formatted}};
 }
 
 std::vector<DocumentSymbol> LanguageService::workspaceSymbols(const std::string& query) {

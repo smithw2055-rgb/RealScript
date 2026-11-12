@@ -117,6 +117,9 @@ realscript_add_layer_library(realscript_layer_debug
 # Layer 6: Tooling & Language Server (JSON, LanguageService, LSP server)
 realscript_add_layer_library(realscript_layer_tooling
     src/tooling/Json.cpp
+    src/tooling/Formatter.cpp
+    src/tooling/GovernanceLinter.cpp
+    src/tooling/GovernanceFuzzer.cpp
     src/tooling/LanguageService.cpp
     src/tooling/LspServer.cpp
 )
@@ -494,6 +497,13 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_p3_stage1_modular_build_and_abi_governance_tests
         realscript.p3.stage1-modular-build-and-abi-governance
         tests/p3_stage1_modular_build_and_abi_governance_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_p3_stage2_formatter_linter_and_fuzzer_tests
+        realscript.p3.stage2-formatter-linter-and-fuzzer
+        tests/p3_stage2_formatter_linter_and_fuzzer_tests.cpp)
+    target_compile_definitions(
+        realscript_p3_stage2_formatter_linter_and_fuzzer_tests
+        PRIVATE REALSCRIPT_RSC_PATH="$<TARGET_FILE:rsc>")
     target_compile_definitions(
         realscript_p3_stage1_modular_build_and_abi_governance_tests
         PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")

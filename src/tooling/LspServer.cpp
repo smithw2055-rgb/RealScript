@@ -66,6 +66,18 @@ int documentSymbolKind(semantic::SymbolKind kind) {
     return 13;
 }
 
+int lspDiagnosticSeverity(const LanguageDiagnostic& diagnostic) noexcept {
+    if (diagnostic.lintSeverity.has_value()) {
+        switch (*diagnostic.lintSeverity) {
+        case LintSeverity::Error: return 1;
+        case LintSeverity::Warning: return 2;
+        case LintSeverity::Info: return 3;
+        case LintSeverity::Off: return 4;
+        }
+    }
+    return diagnostic.severity == diagnostics::DiagnosticSeverity::Error ? 1 : 2;
+}
+
 Json location(const Location& value) {
     return Json::Object{{"uri", pathToUri(value.path)}, {"range", range(value.range)}};
 }
@@ -119,7 +131,7 @@ void LspServer::publishDiagnostics(const std::string& path, std::ostream& output
     for (const auto& diagnostic : diags) {
         values.emplace_back(Json::Object{
             {"range", range(diagnostic.location.range)},
-            {"severity", diagnostic.severity == diagnostics::DiagnosticSeverity::Error ? 1 : 2},
+            {"severity", lspDiagnosticSeverity(diagnostic)},
             {"code", diagnostic.code},
             {"source", "realscript"},
             {"message", diagnostic.message},
@@ -349,8 +361,6 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
         service_.close(path);
         if (notifications) {
             if (service_.contains(path)) {
-                // Ensure publishWorkspaceDiagnostics refreshes the closed file's on-disk diagnostic state
-                // (clears any transient unsaved-buffer errors while keeping real disk errors accurate)
                 publishedNonEmptyDiagnostics_.insert(path);
             } else {
                 publishedNonEmptyDiagnostics_.erase(path);
@@ -537,12 +547,17 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
         return response(message, Json(std::move(items)));
     }
     if (method == "textDocument/formatting") {
-        std::size_t tabSize = 4;
+        FormatOptions fmtOpts;
         if (const auto* ts = nested(message, {"params", "options", "tabSize"})) {
-            tabSize = static_cast<std::size_t>(std::max<std::int64_t>(1, ts->integerValue(4)));
+            fmtOpts.indentWidth = static_cast<std::size_t>(std::max<std::int64_t>(1, ts->integerValue(4)));
+        }
+        if (const auto* fnl = nested(message, {"params", "options", "insertFinalNewline"})) {
+            if (fnl->isBool()) {
+                fmtOpts.insertFinalNewline = fnl->boolValue(true);
+            }
         }
         Json::Array edits;
-        for (const auto& edit : service_.formatDocument(path, tabSize)) {
+        for (const auto& edit : service_.formatDocument(path, fmtOpts)) {
             edits.emplace_back(Json::Object{
                 {"range", range(edit.location.range)},
                 {"newText", edit.replacement},

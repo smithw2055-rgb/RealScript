@@ -7,6 +7,9 @@
 #include "realscript/runtime/Runtime.h"
 #include "realscript/syntax/Syntax.h"
 #include "realscript/text/Text.h"
+#include "realscript/tooling/Formatter.h"
+#include "realscript/tooling/GovernanceLinter.h"
+#include "realscript/tooling/Json.h"
 
 #include <filesystem>
 #include <fstream>
@@ -29,6 +32,17 @@ std::string readFile(const std::string& path) {
     std::ostringstream content;
     content << stream.rdbuf();
     return content.str();
+}
+
+void writeTextFile(const std::string& path, const std::string& text) {
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    if (!stream) {
+        throw std::runtime_error("cannot open output file: " + path);
+    }
+    stream.write(text.data(), static_cast<std::streamsize>(text.size()));
+    if (!stream) {
+        throw std::runtime_error("cannot write output file: " + path);
+    }
 }
 
 std::vector<std::uint8_t> readBinaryFile(const std::string& path) {
@@ -114,6 +128,9 @@ void printUsage() {
         << "usage: rsc <file.rscript>... "
            "[--check|--tokens|--mir|--symbols|--bytecode] "
            "[--cache-dir <directory>] [--cache-stats]\n"
+        << "       rsc <file.rscript>... --format [--write|-i|--stdout|-o <output.rscript>]\n"
+        << "       rsc <file.rscript>... --check-format\n"
+        << "       rsc <file.rscript>... --lint [--lint-deny-warnings] [--project <realscript.project.json>]\n"
         << "       rsc <file.rscript>... --emit-bytecode <module.rsbc> "
            "[--cache-dir <directory>] [--cache-stats]\n"
         << "       rsc <file.rscript>... --emit-bytecode-dir <directory> "
@@ -138,6 +155,62 @@ void printDiagnostics(
             << ' ' << diagnostic.code << ": "
             << diagnostic.message << '\n';
     }
+}
+
+void printLintDiagnostics(
+    const std::vector<realscript::tooling::LintDiagnostic>& diagnostics) {
+    for (const auto& diag : diagnostics) {
+        std::cerr
+            << (diag.sourcePath.empty() ? "<lint>" : diag.sourcePath)
+            << ':' << (diag.range.start.line + 1)
+            << ':' << (diag.range.start.column + 1)
+            << ": " << realscript::tooling::lintSeverityName(diag.severity)
+            << ' ' << diag.code
+            << " [" << diag.ruleName << "]: "
+            << diag.message << '\n';
+    }
+}
+
+realscript::tooling::LintConfig discoverLintConfig(
+    const std::string& explicitConfigPath,
+    const std::vector<std::string>& sourcePaths) {
+    realscript::tooling::LintConfig cfg;
+    std::filesystem::path foundConfig;
+    std::error_code ec;
+
+    if (!explicitConfigPath.empty()) {
+        foundConfig = std::filesystem::path(explicitConfigPath);
+        if (!std::filesystem::is_regular_file(foundConfig, ec) || ec) {
+            throw std::runtime_error("cannot open project config file: " + explicitConfigPath);
+        }
+    } else if (!sourcePaths.empty()) {
+        std::filesystem::path cur = std::filesystem::absolute(std::filesystem::path(sourcePaths.front()), ec);
+        if (!ec) {
+            cur = cur.parent_path();
+            for (int depth = 0; depth < 16 && !cur.empty(); ++depth) {
+                const std::filesystem::path candidate = cur / "realscript.project.json";
+                if (std::filesystem::is_regular_file(candidate, ec) && !ec) {
+                    foundConfig = candidate;
+                    break;
+                }
+                const auto parent = cur.parent_path();
+                if (parent == cur) break;
+                cur = parent;
+            }
+        }
+    }
+
+    if (!foundConfig.empty()) {
+        const std::string jsonText = readFile(foundConfig.string());
+        std::string parseErr;
+        const auto parsed = realscript::tooling::Json::parse(jsonText, parseErr);
+        if (!parsed || !parsed->isObject()) {
+            throw std::runtime_error(
+                "invalid realscript.project.json (" + foundConfig.string() + "): " + parseErr);
+        }
+        (void)realscript::tooling::parseLintConfigFromProjectJson(*parsed, cfg, false);
+    }
+    return cfg;
 }
 
 int runLoadedBytecodeModules(
@@ -191,7 +264,9 @@ int main(int argc, char** argv) {
 
     std::string mode = "--check";
     std::string outputPath;
+    std::string formatOutputPath;
     std::string cacheDirectory;
+    std::string projectConfigPath;
     realscript::optimization::Options optimizationOptions;
     optimizationOptions.level = realscript::optimization::Level::None;
     bool optimizationReport = false;
@@ -199,7 +274,13 @@ int main(int argc, char** argv) {
     bool profile = false;
     bool printDigest = false;
     bool printCacheStats = false;
+    bool formatWriteInPlace = false;
+    bool formatForceStdout = false;
+    bool lintRequested = false;
+    bool lintDenyWarnings = false;
+    std::size_t indentWidth = 4;
     std::vector<std::string> paths;
+
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
         if (argument == "--emit-bytecode" ||
@@ -210,6 +291,56 @@ int main(int argc, char** argv) {
                 return 2;
             }
             outputPath = argv[++index];
+        } else if (argument == "-o" || argument == "--output") {
+            if (index + 1 >= argc) {
+                printUsage();
+                return 2;
+            }
+            formatOutputPath = argv[++index];
+        } else if (argument == "--project" || argument == "--config") {
+            if (index + 1 >= argc) {
+                printUsage();
+                return 2;
+            }
+            projectConfigPath = argv[++index];
+        } else if (argument.rfind("--project=", 0) == 0) {
+            projectConfigPath = argument.substr(10);
+        } else if (argument.rfind("--config=", 0) == 0) {
+            projectConfigPath = argument.substr(9);
+        } else if (argument == "--indent-width") {
+            if (index + 1 >= argc) {
+                printUsage();
+                return 2;
+            }
+            const int parsedWidth = std::stoi(argv[++index]);
+            if (parsedWidth <= 0) {
+                std::cerr << "--indent-width must be >= 1\n";
+                return 2;
+            }
+            indentWidth = static_cast<std::size_t>(parsedWidth);
+        } else if (argument == "--write" || argument == "--in-place" ||
+                   argument == "-i" || argument == "-w") {
+            formatWriteInPlace = true;
+        } else if (argument == "--stdout") {
+            formatForceStdout = true;
+        } else if (argument == "--format") {
+            mode = "--format";
+        } else if (argument == "--format-in-place") {
+            mode = "--format";
+            formatWriteInPlace = true;
+        } else if (argument == "--check-format") {
+            mode = "--check-format";
+        } else if (argument == "--lint") {
+            lintRequested = true;
+            if (mode == "--check") {
+                mode = "--lint";
+            }
+        } else if (argument == "--lint-deny-warnings") {
+            lintDenyWarnings = true;
+            lintRequested = true;
+            if (mode == "--check") {
+                mode = "--lint";
+            }
         } else if (argument == "--cache-dir") {
             if (index + 1 >= argc) {
                 printUsage();
@@ -258,6 +389,79 @@ int main(int argc, char** argv) {
     }
 
     try {
+        if (mode == "--format" || mode == "--check-format") {
+            realscript::tooling::FormatOptions fmtOptions;
+            fmtOptions.indentWidth = indentWidth;
+
+            bool anyCheckFailed = false;
+            for (const auto& path : paths) {
+                requireScriptExtension(path);
+                const std::string original = readFile(path);
+                const auto res = realscript::tooling::formatSource(original, fmtOptions);
+                if (res.unchangedOnError) {
+                    std::cerr << path << ": error " << res.errorMessage << '\n';
+                    return 1;
+                }
+                if (mode == "--check-format") {
+                    if (res.changed) {
+                        std::cerr << path << ": formatting check failed (file is not canonically formatted)\n";
+                        anyCheckFailed = true;
+                    }
+                    continue;
+                }
+
+                // `--format`: write to `-o <path>`, write in-place (`--write`/`-i`), or print to stdout
+                if (!formatOutputPath.empty()) {
+                    if (paths.size() != 1) {
+                        std::cerr << "-o/--output with --format accepts at most one input file\n";
+                        return 2;
+                    }
+                    writeTextFile(formatOutputPath, res.formatted);
+                } else if (formatWriteInPlace && !formatForceStdout) {
+                    if (res.changed) {
+                        writeTextFile(path, res.formatted);
+                    }
+                } else {
+                    std::cout << res.formatted;
+                }
+            }
+            return anyCheckFailed ? 1 : 0;
+        }
+
+        if (mode == "--lint") {
+            std::vector<realscript::compiler::SourceFile> sources;
+            sources.reserve(paths.size());
+            for (const auto& path : paths) {
+                requireScriptExtension(path);
+                sources.push_back({path, readFile(path)});
+            }
+
+            const auto lintCfg = discoverLintConfig(projectConfigPath, paths);
+            realscript::compiler::Compilation compilation(sources);
+            const auto buildRes = compilation.build();
+            printDiagnostics(buildRes.diagnostics);
+
+            realscript::tooling::GovernanceLinter linter(lintCfg);
+            const auto lintDiags = linter.lintWorkspace(sources, &buildRes);
+            printLintDiagnostics(lintDiags);
+
+            bool hasLintErrors = false;
+            bool hasLintWarnings = false;
+            for (const auto& ld : lintDiags) {
+                if (ld.severity == realscript::tooling::LintSeverity::Error) {
+                    hasLintErrors = true;
+                } else if (ld.severity == realscript::tooling::LintSeverity::Warning) {
+                    hasLintWarnings = true;
+                }
+            }
+            const bool hasCompilerWarnings = !buildRes.diagnostics.empty();
+            if (buildRes.diagnostics.hasErrors() || hasLintErrors ||
+                (lintDenyWarnings && (hasLintWarnings || hasCompilerWarnings))) {
+                return 1;
+            }
+            return 0;
+        }
+
         if (mode == "--tokens") {
             if (paths.size() != 1) {
                 std::cerr << "--tokens accepts exactly one source file\n";
@@ -414,10 +618,14 @@ int main(int argc, char** argv) {
             return cached.diagnostics.hasErrors() ? 1 : 0;
         }
 
+        std::vector<realscript::compiler::SourceFile> loadedSources;
+        loadedSources.reserve(paths.size());
         realscript::compiler::Compilation compilation;
         for (const auto& path : paths) {
             requireScriptExtension(path);
-            compilation.addSource({path, readFile(path)});
+            auto text = readFile(path);
+            loadedSources.push_back({path, text});
+            compilation.addSource({path, std::move(text)});
         }
         auto result = compilation.build();
         if (!result.diagnostics.hasErrors() &&
@@ -525,6 +733,18 @@ int main(int argc, char** argv) {
         }
 
         printDiagnostics(result.diagnostics);
+        if (lintRequested) {
+            const auto lintCfg = discoverLintConfig(projectConfigPath, paths);
+            realscript::tooling::GovernanceLinter linter(lintCfg);
+            const auto lintDiags = linter.lintWorkspace(loadedSources, &result);
+            printLintDiagnostics(lintDiags);
+            for (const auto& ld : lintDiags) {
+                if (ld.severity == realscript::tooling::LintSeverity::Error ||
+                    (lintDenyWarnings && ld.severity == realscript::tooling::LintSeverity::Warning)) {
+                    return 1;
+                }
+            }
+        }
         return result.diagnostics.hasErrors() ? 1 : 0;
     } catch (const std::exception& error) {
         std::cerr << "rsc: " << error.what() << '\n';

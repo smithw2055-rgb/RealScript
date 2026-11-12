@@ -3,6 +3,8 @@
 #include "realscript/compiler/Compilation.h"
 #include "realscript/debug/DebugInfo.h"
 #include "realscript/syntax/Syntax.h"
+#include "realscript/tooling/Formatter.h"
+#include "realscript/tooling/GovernanceLinter.h"
 
 #include <cstdint>
 #include <optional>
@@ -23,6 +25,7 @@ struct LanguageDiagnostic {
     std::string message;
     diagnostics::DiagnosticSeverity severity = diagnostics::DiagnosticSeverity::Error;
     Location location;
+    std::optional<LintSeverity> lintSeverity = std::nullopt;
 };
 
 struct CompletionItem {
@@ -149,6 +152,13 @@ public:
         bool merge = false);
     bool loadProjectConfigFile(const std::string& configPath, bool merge = false);
 
+    void setLintConfig(LintConfig config);
+    [[nodiscard]] const LintConfig& lintConfig() const noexcept { return lintConfig_; }
+    [[nodiscard]] std::vector<LanguageDiagnostic> lint(const std::string& path);
+    [[nodiscard]] std::vector<LanguageDiagnostic> lint(
+        const std::string& path,
+        const LintConfig& overrideConfig);
+
     std::size_t addWorkspaceRoot(const std::string& rootPath);
     void removeWorkspaceRoot(const std::string& rootPath);
     bool syncDiskFile(const std::string& path);
@@ -193,6 +203,7 @@ public:
     [[nodiscard]] std::vector<std::uint32_t> semanticTokensEncoded(const std::string& path);
     [[nodiscard]] std::vector<InlayHint> inlayHints(const std::string& path);
     [[nodiscard]] std::vector<TextEdit> formatDocument(const std::string& path, std::size_t tabSize = 4);
+    [[nodiscard]] std::vector<TextEdit> formatDocument(const std::string& path, const FormatOptions& options);
     [[nodiscard]] std::vector<DocumentSymbol> workspaceSymbols(const std::string& query = {});
 
     [[nodiscard]] const compiler::BuildResult& build();
@@ -279,6 +290,7 @@ private:
     std::unordered_map<std::string, std::string> sceneDiskFiles_;
     mutable SceneAssetManifest mergedManifest_;
     mutable bool manifestDirty_ = true;
+    LintConfig lintConfig_{};
 
     void rebuildSceneManifestIfNeeded() const;
 };
