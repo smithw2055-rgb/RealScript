@@ -18,7 +18,7 @@ deliberately smaller deterministic profile.
 | Accessibility | Supported | `public`, `internal`, `protected`, and `private` on supported declarations. |
 | Delegates and closures | Supported | First-class exact delegate values, method groups, heap closures, shared mutable captures, multicast, events. |
 | Generics | Supported | Compile-time specialization, inference, generic members, `class`/`struct`/`new()` and multi-interface `where` constraints, generic interfaces/delegates. No open runtime generics or variance. |
-| Collections and `foreach` | Supported | Growable deterministic `List`, `Dictionary`, `HashSet`, `Queue`, `Stack`; native enumerator protocol. Not the .NET collection library or LINQ. |
+| Collections and `foreach` | Supported | Growable deterministic `List`, `Dictionary`, `HashSet`, `Queue`, `Stack` with zero-allocation value-type `struct` enumerators, `this[i]` indexers, `Count`/`Capacity`/`IsEmpty` properties, and $O(1)$ Swap-and-Pop `Remove`. Not the .NET collection library or LINQ. |
 | Structs | Supported | Copy semantics, mutable receivers, implicit/ref `this`, nested managed references, structural equality. |
 | Exact primitive identities | Supported | Exact signed/unsigned integer widths, binary32 `float`, binary64 `double`, and `char`; checked/unchecked conversions. |
 | Nullable value types | Supported | Exact `T?`, lifted null-conditional results, `HasValue`, `Value`, `GetValueOrDefault`. |
@@ -33,12 +33,12 @@ deliberately smaller deterministic profile.
 | Area | Status | RealScript contract |
 |---|---|---|
 | Structured statements | Supported | `if`, `while`, `for`, `foreach`, `do/while`, `break`, `continue`, switch statements. |
-| Inference and convenience | Supported | `var`, `?:`, `??`, `?.`, object/struct/collection initializers. |
+| Inference and convenience | Supported | `var`, `?:`, `??`, `?.`, `$"..."` string interpolation, object/struct/collection initializers. |
 | Runtime type operators | Supported | `is`, `as`, `typeof`, exact runtime assignability. |
 | Patterns | Supported | Constant, null, type, and discard patterns; variables and `when` guards; exhaustive switch expressions. |
 | Pattern families | Partial | No relational, property, positional, list, recursive, `and`/`or`/`not`, or range patterns. |
-| Coroutines | Supported profile | Deterministic single-threaded `sequence` (`yield wait_ticks`, `wait_seconds`, `wait_event`, `wait_until`), persisted state, nesting, auto-cancellation on disable/detach, results, snapshots/rollback, plus `RealScript.Fiber` cooperative scheduling. |
-| `async`/`await`, `Task`, threads | Not supported | Deliberately outside the deterministic gameplay execution model. |
+| Dual-track coroutines: `sequence` (rollback track) | Supported | Purpose-built for deterministic tick simulation, `RSGS` binary state snapshots, and frame-level rollback (`yield wait_ticks`, `wait_seconds`, `wait_event`, `wait_signal`, `wait_until`), lowered to explicit object-field state machines alongside `RealScript.Fiber`. |
+| Dual-track coroutines: `async`/`await` (streaming & I/O track) | Supported profile | Phases 25–28 provide `RealScript.Async` (`Awaitable`/`Awaitable<T>`, 8-byte generational `AwaitableHandle`, `CancellationToken`/`CancellationTokenSource`, and 4 main-thread frame queues: `PreTickIo`, `FixedTick`, `Update`, `EndOfFrame`) for async `OnStart()`, prefab/asset streaming, save-game I/O, and HTTP/WebSocket bridges with automatic entity-destroy cancellation. Raw OS threads and CLR `Task` remain excluded. |
 
 ## Errors and resource cleanup
 
@@ -46,8 +46,9 @@ deliberately smaller deterministic profile.
 |---|---|---|
 | `throw`, `try`, `catch`, `finally` | Supported | Non-null script class objects, ordered typed/catch-all matching, rethrow, cross-call propagation. |
 | Cleanup exits | Supported | `finally` runs for normal completion, script exceptions, `return`, `break`, and `continue`. |
+| `using` resource disposal (`IDisposable` / `ResourceHandle<T>`) | Supported | `using (...)` blocks and `using var` declarations lower to deterministic LIFO `try`/`finally` `Dispose()` across `class`, `interface`, and `struct` with host ref-counted `ResourceRegistry` bridging (`RealScript.Resource`). |
 | Runtime faults | Structured host errors | Overflow, invalid bytecode, quota, null/bounds, and host failures are not catchable script exception objects. |
-| Filters and resource statements | Not supported | No catch filters, `using`, `lock`, or native/platform exception interop. |
+| Filters and resource statements | Partial | `using` is supported; catch filters, `lock`, and native/platform exception interop are not supported. |
 | Exceptions across sequence yields | Not supported | Sequence state is snapshot-safe; pending exception unwinding is not serialized across a suspension. |
 
 ## Runtime, backends, and tooling
@@ -58,7 +59,7 @@ deliberately smaller deterministic profile.
 | C++17 AOT | Supported | Generated native code executes the same MIR semantics, including delegates, value types, patterns, and exceptions, plus Zero-Budget Trusted Release (`--trusted-release`), `#line` source mapping directives, struct stack scalarization, and vectorized ECS fast-loops. |
 | Toolchain JIT | Platform-dependent | External C++ toolchain JIT where configured; it is not an in-process CLR-style machine-code JIT. |
 | `.rsbc` artifacts | Draft, versioned | Current output is 0.9; decoder supports 0.6–0.9. Format is not frozen. |
-| LSP/DAP/hot reload | Supported profile | Original-source symbols/sequence points, incremental `ParseSnapshot` and subgraph metadata caching, member `.` completion, `signatureHelp`, `.d.rs` host stubs, stdio & embedded TCP (`--dap-port` / `EmbeddedDapServer`) DAP debugging, conditional & exception breakpoints, reentrant safepoints, heap retaining-path profiler, side-effect-free watch `evaluate`, `vscode-realscript` extension, `rsbind` auto-binding CLI, and stateful scene hot reload (`[FormerlySerializedAs]`, static field rename migration, & cross-component ref migration). |
+| LSP/DAP/hot reload | Supported profile | Exclusive `.rscript` / `.d.rscript` file extensions; original-source symbols/sequence points, incremental `ParseSnapshot` and subgraph metadata caching, member `.` completion, `signatureHelp`, `.d.rscript` host stubs, stdio & embedded TCP (`--dap-port` / `EmbeddedDapServer`) DAP debugging, hierarchical Watch `variablesReference` object/struct/collection expansion, C++17 AOT `.natvis` & LLDB formatters, zero-dependency single-file C++ declaration parser in `rsbind` (`-D`/`-U` macro evaluation), and stateful scene hot reload. |
 | Reflection and dynamic | Not supported | Stable compile-time/runtime TypeIds exist, but no CLR reflection, `dynamic`, runtime code emission, or runtime generic construction. |
 | Standard library | Purpose-built | Deterministic game/runtime primitives and collections, not the .NET BCL. |
 

@@ -29,14 +29,14 @@ RealScript 是一门面向现代 C++17 游戏引擎的嵌入式强类型脚本�
 | 领域 | v0.98.0 已实现能力 |
 |---|---|
 | 语言 | Module/import、重载、运算符重载、复合赋值、Class、`static class`、静态构造函数（`static T()`）、`readonly` 字段、自动属性初始化器（`public int Hp { get; set; } = 100;`）、单继承（含脚本类直接继承 C++ 绑定类型）、Interface、Virtual Dispatch、Delegate、Closure、Event、Generic、Collection、Enum、可变 Struct、Nullable、Boxing、Pattern、Initializer、灵活参数与结构化异常。 |
-| 控制流 | `if`、`while`、`for`、`foreach`、`do/while`、`switch`、Switch Expression、`break`、`continue`、`try/catch/finally`、确定性 `sequence`（`yield wait_ticks`、`wait_seconds`、`wait_event`、`wait_signal`、`wait_until`）与 `RealScript.Fiber` 协作式纤程。 |
+| 控制流与双轨协程 | `if`、`while`、`for`、`foreach`（零堆分配 `struct` 迭代器快路径）、`do/while`、`switch`、Switch Expression、`break`、`continue`、`try/catch/finally`、确定性 `using (...)` / `using var` 资源释放（`IDisposable` / `ResourceHandle<T>`）；**双轨协程分工**：`sequence` 专司确定性帧模拟与 `RSGS` 快照回滚（`yield wait_ticks`/`wait_seconds`/`wait_event`/`wait_signal`/`wait_until`），`async`/`await`（`RealScript.Async`：`Awaitable<T>`、`CancellationToken`、四阶段主线程恢复队列）专司异步 `OnStart()`、资产/预制体流式加载与 HTTP/WebSocket 网络 I/O，辅以 `RealScript.Fiber` 协作式纤程。 |
 | 编译器 | Lexer、Parser、Binder、Flow Analysis、`[Deterministic]` 静态校验、稳定诊断、经过验证的多基本块 Typed MIR、自然循环 LICM 变量加载外提、跨模块 `-O2` 自动属性与 `void` 小函数内联，以及 O0/O1/O2 优化。 |
-| 字节码 | 类型化寄存器 VM、统一扁平栈帧布局（Unified Flat Frame）、Computed-goto 线程化派发（含 `double` 运算/超级指令与对象/结构体字段读写 `FlatOpcode` 快路径）、24B 紧凑 `Value` 与 8B `Instruction`、32 位拓宽 `BytecodeString` 及无锁池、整数循环指令快化（Quickening）、确定性 `.rsbc` 0.9 输出、0.6–0.8 兼容读取、防御性验证和结构化脚本调用栈。 |
+| 字节码 | 类型化寄存器 VM、统一扁平栈帧布局（Unified Flat Frame）、Computed-goto 线程化派发（含 `double` 运算/超级指令与对象/结构体字段读写 `FlatOpcode` 快路径）、16 字节（16B）紧凑 `Value` 与 8B `Instruction`、32 位拓宽 `BytecodeString` 及无锁池、整数循环指令快化（Quickening）、确定性 `.rsbc` 0.9 输出、0.6–0.8 兼容读取、防御性验证和结构化脚本调用栈。 |
 | 内存 | 代际 ObjectRef、12B 内联结构体槽（`InlineStructSlot`）、HeapObject 小缓冲区优化（SBO）、`ValuePoolArena` 池化对象 GC 回收、精确根、带阴影栈保护的增量 Mark/Sweep GC 步进、写屏障、有界 GC Work、Snapshot、Retaining Path 和泄漏诊断。 |
 | 原生执行 | 确定性 C++17 AOT、零预算 Trusted Release AOT（`--trusted-release`）、`#line` 源码行号映射指令、自定义 `struct` 栈标量化（`AotStruct_<id>`）、AVX2/SIMD 向量化 ECS 循环重构（`__restrict` + `#pragma loop(ivdep)`）、C11 Module Query ABI、Source Map、类型化 Native Thunk、原生快速路径与对象标识缓存（Identity Cache）、可选工具链 JIT、内容寻址缓存与 Interpreter/JIT/AOT 分层执行。 |
 | 确定性 | Off/Strict/Record/Replay、指令/递归/分配/堆预算、Mod 能力沙箱（Capability Sandboxing）、稳定 Digest、外部调用回放与跨后端差分验证。 |
 | Game SDK | 类型化 Binding（`structType<S>` 自定义结构体封送、`constructor<Args...>`、`staticMethod<M>`、同名重载绑定、`std::vector<T>` <-> `T[]` 数组封送）、C++ 头文件自动生成绑定（`rsbind`，支持 `RS_EXPORT_STRUCT`、`RS_EXPORT_CONSTRUCTOR`、`static_cast` 重载消歧、静态方法与模板容器类型）、数学原语直接封送与快路径（`Fixed`/`Fixed16`/`Vec2`/`Vec3`/`Quat`）、C++ 宿主连续内存零拷贝 ECS 列绑定（`bindEcsRawColumnAuto<T>`）、`Query<Write<T>, Read<U>, With<V>, Without<W>>()` 与 `EntityCommandBuffer`、2D/3D 定点物理（`stepPhysics2D`/`stepPhysics3D`）、空间查询（Raycast/Overlap）、确定性 `RealScript.Input`、单实体多组件、代际实体句柄、Editor/Play 模式（`[Tool]`/`[ExecuteInEditMode]`）、`OnValidate`、深度 `InspectorTypeSchema` 反射、宿主 `connectSignal`、JSON 场景/预制体序列化与 `RSGS` 状态编码。 |
-| 工具链 | `rsc`、`rsaot`、`rsbind`、`rsdebug`、`rslsp`、`rsbench`、DAP（标准流与内嵌 TCP `--dap-port` 附加调试、条件与异常断点、重入安全点、堆保留路径分析器、无副作用 Watch 求值）、LSP（`ParseSnapshot` 增量缓存、子图元数据增量重构缓存、异步请求桥接、成员 `.` 补全、`signatureHelp`、`.d.rs` 宿主声明导出）、`vscode-realscript` 官方 VS Code 插件、Chrome Tracing 性能导出，以及带状态结构化热重载（`[FormerlySerializedAs]`、静态字段重命名迁移与跨组件引用迁移）。 |
+| 工具链 | `rsc`、`rsaot`、`rsbind`、`rsdebug`、`rslsp`、`rsbench`、DAP（标准流与内嵌 TCP `--dap-port` 附加调试、条件与异常断点、重入安全点、堆保留路径分析器、无副作用 Watch 求值）、LSP（`ParseSnapshot` 增量缓存、子图元数据增量重构缓存、异步请求桥接、成员 `.` 补全、`signatureHelp`、`.d.rscript` 宿主声明导出）、`vscode-realscript` 官方 VS Code 插件、Chrome Tracing 性能导出，以及带状态结构化热重载（`[FormerlySerializedAs]`、静态字段重命名迁移与跨组件引用迁移）。 |
 
 完整的支持/部分支持/不支持清单见
 [C# 风格兼容矩阵](docs/zh-CN/CSHARP_COMPATIBILITY_MATRIX.md)。
@@ -65,7 +65,7 @@ Visual Studio generator 通常把工具放在 `build/Release/`；单配置 gener
 
 ### 编写并运行脚本
 
-创建 `hello.rs`：
+创建 `hello.rscript`：
 
 ```csharp
 module Demo.Hello;
@@ -95,10 +95,10 @@ int main()
 验证、检查并运行：
 
 ```bash
-build/rsc hello.rs
-build/rsc hello.rs --mir
-build/rsc hello.rs --bytecode
-build/rsc hello.rs --run Demo.Hello::main --opt-level 2
+build/rsc hello.rscript
+build/rsc hello.rscript --mir
+build/rsc hello.rscript --bytecode
+build/rsc hello.rscript --run Demo.Hello::main --opt-level 2
 ```
 
 ### 生成 C++17 AOT
@@ -109,7 +109,7 @@ build/rsaot \
   --program-name HelloScripts \
   --opt-level 2 \
   --opt-report \
-  hello.rs
+  hello.rscript
 ```
 
 输出包括公共 Header、C++17 实现、确定性 Manifest、源码元数据和 Native Function
@@ -166,7 +166,7 @@ v0.98.0 的关键性能改动包括：
 - 统一扁平栈帧布局（Unified Flat Frame）与 Computed-goto 解释器线程化派发；
 - 零预算 Trusted Release AOT 模式（`--trusted-release`）与自定义结构体栈标量化；
 - C++ 宿主连续结构体零拷贝 ECS 原始列绑定（`bindEcsRawColumnAuto`）与 AVX2 SIMD 循环重构；
-- 32 位拓宽 `BytecodeString` 及无锁分页池、24B/8B 紧凑值与指令表示；
+- 32 位拓宽 `BytecodeString` 及无锁分页池、16 字节（16B）/8B 紧凑值与指令表示；
 - 带阴影栈安全保护的增量 GC 步进与池化值回收；
 - Typed AOT/JIT Scalar Lowering 与 Range-Proven Checked Arithmetic；
 - 解释器整数特化与快化循环超级指令（Quickening）；
@@ -189,8 +189,10 @@ sequence Attack(long target)
 }
 ```
 
-Sequence 会降低为显式状态机；参数、Local、Temporary、嵌套进度和控制流位置可以跨越
-Suspend、Snapshot、Restore、Replay、Rollback 与 C++17 AOT。
+RealScript 采用**双轨协程分工架构**：
+
+- **`sequence`（确定性回滚轨）**：降低为显式对象字段状态机；参数、Local、Temporary、嵌套进度和控制流位置可完整跨越 Suspend、Snapshot、Restore、Replay、Rollback 与 C++17 AOT。
+- **`async` / `await`（流式加载与网络 I/O 轨）**：基于 8 字节代际句柄 `Awaitable<T>`、`CancellationToken` 与四阶段主线程队列（`PreTickIo` / `FixedTick` / `Update` / `EndOfFrame`），用于异步生命周期 `OnStart()`、场景/资源流式加载、存档读写与 HTTP/WebSocket 请求，并在实体销毁时自动触发取消令牌。
 
 ## 命令行工具
 
@@ -224,9 +226,9 @@ Suspend、Snapshot、Restore、Replay、Rollback 与 C++17 AOT。
 RealScript 不是 CLR 兼容 C#。v0.98.0 明确不提供：
 
 - 多类继承、默认 Interface 实现、开放运行时泛型或 Generic Variance；
-- 通用 `Task`、线程或不受限的 `async/await`；
+- 裸操作系统多线程共享可变状态或 CLR `System.Threading.Tasks.Task`（流式加载与网络 I/O 请使用受主线程帧队列约束的 `RealScript.Async` `Awaitable<T>`，帧回滚请使用 `sequence`）；
 - Unsafe Pointer、Ref Struct、Ref Property 或完整 Escape Analysis；
-- Exception Filter、`using`、Native Exception Interop，或异常跨越协程暂停点；
+- Exception Filter、`lock`、Native Exception Interop，或异常跨越协程暂停点；
 - LINQ、`dynamic`、反射代码生成或 .NET BCL；
 - 直接进程内机器码 JIT、OSR、PGO 或 Rollback Networking Protocol；
 - Source、`.rsbc`、AOT ABI、SDK Metadata 和 Gameplay State 的长期冻结兼容性。
@@ -237,3 +239,9 @@ AOT Artifact。
 ## License
 
 RealScript 使用 Apache License 2.0，详见 [LICENSE](LICENSE)。
+
+### Sprint 2 全栈架构演进要点
+- **每实例独立堆池与纳秒时间片 GC 预算**：每个 `ManagedHeap` 独立持有槽位/缓冲区对象池与同步状态，常规堆分配与 GC 标记清扫无跨实例锁竞争（仅在进程共享 `ValuePool` 触发滞留回收时执行极短安全点扫描），并新增 `collectIncrementalWithBudget` 帧剩余纳秒/微秒预算控制。
+- **扁平化生命周期与无损协程热重载**：`SceneScriptRuntime` 采用连续 `FlatLifecycleSlot` 热路径直调，热重载基于 64-bit 状态机指纹自动保留未变更的在途协程帧。
+- **AST 卫生泛型、AOT 共享折叠与 `using`/`Resource`**：泛型特化保留精确源文件行列号与跨模块词法卫生性，引用类型泛型共享底层 AOT 实现；支持块级/声明级 `using` 确定性 `Dispose()` 与统一引用计数 `ResourceHandle<T>`。
+- **分模块磁盘增量缓存与 Git 友好场景序列化**：`rsc`/`rsaot --cache-dir` 基于 `publicFingerprint` 隔离私有实现变更；引入 128-bit `AssetGuid` 与单行单属性有序场景/预制体文本格式。

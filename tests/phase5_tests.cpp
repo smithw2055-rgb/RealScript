@@ -28,14 +28,14 @@ std::string readFile(const std::string& path) {
 realscript::compiler::BuildResult buildFixtures() {
     realscript::compiler::Compilation compilation;
     compilation.addSource({
-        "tests/fixtures/phase5_model.rs",
+        "tests/fixtures/phase5_model.rscript",
         readFile(std::string(REALSCRIPT_SOURCE_DIR) +
-            "/tests/fixtures/phase5_model.rs"),
+            "/tests/fixtures/phase5_model.rscript"),
     });
     compilation.addSource({
-        "tests/fixtures/phase5_app.rs",
+        "tests/fixtures/phase5_app.rscript",
         readFile(std::string(REALSCRIPT_SOURCE_DIR) +
-            "/tests/fixtures/phase5_app.rs"),
+            "/tests/fixtures/phase5_app.rscript"),
     });
     return compilation.build();
 }

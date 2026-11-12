@@ -46,13 +46,13 @@ Source breakpoints bind to the nearest executable sequence point when an exact s
 Start the adapter with the source files that form the program:
 
 ```bash
-rsdebug game.rs common.rs
+rsdebug game.rscript common.rscript
 ```
 
 Or listen on a TCP port so an IDE can attach over a socket:
 
 ```bash
-rsdebug --dap-port 4711 game.rs common.rs
+rsdebug --dap-port 4711 game.rscript common.rscript
 ```
 
 Game engines can also embed `realscript::debug::EmbeddedDapServer` (`realscript/debug/DapServer.h`) directly in-process to accept live TCP attach connections (`127.0.0.1:<port>`) without restarting the host application.
@@ -112,7 +112,7 @@ Implemented capabilities include:
 - references;
 - rename;
 - document symbols;
-- workspace source tracking, `realscript.project.json` discovery, and `.d.rs` ambient host declaration loading (`GameApi::exportDeclarationStub()`);
+- workspace source tracking, `realscript.project.json` discovery, and `.d.rscript` ambient host declaration loading (`GameApi::exportDeclarationStub()`);
 - diagnostic publication.
 
 The initial synchronization model uses full-document updates.
@@ -125,7 +125,7 @@ Each source file maintains a cached `ParseSnapshot` (lexed tokens, parsed syntax
 
 The repository includes an official Visual Studio Code extension under `tools/vscode-realscript/` providing:
 
-- automatic `rslsp` Language Client startup for `.rs` and `.d.rs` files;
+- automatic `rslsp` Language Client startup for `.rscript` and `.d.rscript` files;
 - a `realscript` Debug Adapter supporting both `"request": "launch"` (`rsdebug --dap`) and `"request": "attach"` (connecting to `rsdebug --dap-port <port>` or an in-engine `EmbeddedDapServer` over TCP);
 - TextMate syntax highlighting and language configuration for RealScript keywords, attributes, `sequence` coroutines, and ECS `Query<...>()` expressions.
 
@@ -141,7 +141,7 @@ rsbind --output src/game/GameBindings.gen.cpp include/game/*.h
 - host type registrations and member thunks;
 - field and template type bindings;
 - zero-copy ECS raw column helpers (`bindEcsRawColumnAuto`);
-- `.d.rs` ambient type definition stubs for LSP editor autocompletion.
+- `.d.rscript` ambient type definition stubs for LSP editor autocompletion.
 
 ## Protocol Safety
 

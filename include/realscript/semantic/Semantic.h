@@ -109,6 +109,7 @@ struct VariableSymbol {
     std::size_t index = 0;
     bool parameter = false;
     bool isConst = false;
+    bool isUsingResource = false;
     bool hasConstantValue = false;
     syntax::TokenValue constantValue;
     text::TextSpan declarationSpan;
@@ -142,6 +143,7 @@ struct FieldSymbol {
     bool staticField = false;
     bool constField = false;
     bool readonlyField = false;
+    bool isUsingResource = false;
     bool hasConstantValue = false;
     syntax::TokenValue constantValue;
     const syntax::ExpressionSyntax* initializerSyntax = nullptr;
@@ -298,6 +300,7 @@ struct TypeSymbol {
     std::vector<EnumMemberSymbol> enumMembers;
     std::string sourceName;
     text::TextSpan declarationSpan;
+    std::unordered_set<std::string> hygienicAccessibleModules;
 };
 
 enum class SymbolKind {
@@ -443,6 +446,7 @@ struct FunctionBindingInput {
     bool sequenceCancellation = false;
     std::optional<FunctionSymbol> sequenceNextCallback;
     const syntax::LambdaExpressionSyntax* eventLambda = nullptr;
+    std::unordered_set<std::string> hygienicAccessibleModules;
 };
 
 struct ModuleBindingInput {
@@ -453,6 +457,7 @@ struct ModuleBindingInput {
     std::vector<TypeSymbol> types;
     FunctionOverloadMap visibleFunctions;
     TypeSymbolMap visibleTypes;
+    std::unordered_set<std::string> hygienicAccessibleModules;
 };
 
 enum class BoundNodeKind {
@@ -533,6 +538,7 @@ struct BoundLiteralExpression final : BoundExpression {
 
 struct BoundVariableExpression final : BoundExpression {
     VariableSymbol variable;
+    bool syntheticOverwriteRead = false;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::VariableExpression;
     }
@@ -692,6 +698,7 @@ struct BoundDelegateInvocationExpression final : BoundExpression {
         TypeSymbol wrapperType;
         FieldSymbol valueField;
         bool forwarded = false;
+        std::optional<FunctionSymbol> writebackAssignHandle;
     };
     TypeSymbol delegateType;
     std::unique_ptr<BoundExpression> delegate;
@@ -756,6 +763,7 @@ struct BoundReferenceCallArgument {
     FieldSymbol valueField;
     bool forwarded = false;
     bool defensiveCopy = false;
+    std::optional<FunctionSymbol> writebackAssignHandle;
     ReferenceTargetKind targetKind = ReferenceTargetKind::None;
     std::unique_ptr<BoundExpression> targetReceiver;
     std::unique_ptr<BoundExpression> targetIndex;
@@ -1137,6 +1145,13 @@ private:
     void appendSequenceRestartCancellation(
         BoundBlockStatement& result,
         const FunctionBindingInput& input);
+    void appendSequenceSuspendedCleanup(
+        BoundBlockStatement& result,
+        const FunctionBindingInput& input);
+    void appendSequenceParameterHandleReset(
+        BoundBlockStatement& result,
+        const FunctionBindingInput& input,
+        text::TextSpan span);
     [[nodiscard]] std::unique_ptr<BoundBlockStatement> bindBlockStatement(
         const syntax::BlockStatementSyntax& syntax,
         bool createScope);
@@ -1284,13 +1299,52 @@ private:
         Accessibility accessibility,
         SymbolId declaringTypeId,
         const std::string& declaringModule = {}) const noexcept;
+    [[nodiscard]] bool isManagedResourceHandleType(
+        PrimitiveType type,
+        const std::string& typeName) const noexcept;
+    [[nodiscard]] bool isInsideResourceHandleImplementation() const noexcept;
+    [[nodiscard]] bool shouldCloneResourceHandleValue(
+        const BoundExpression& expr,
+        bool isReturnContext) const noexcept;
+    [[nodiscard]] std::unique_ptr<BoundExpression> cloneResourceHandleIfNeeded(
+        std::unique_ptr<BoundExpression> expr,
+        text::TextSpan span,
+        bool isReturnContext = false);
+    [[nodiscard]] std::unique_ptr<BoundExpression> wrapResourceHandleOverwriteRelease(
+        std::unique_ptr<BoundExpression> oldValueExpr,
+        std::unique_ptr<BoundExpression> newValueExpr,
+        text::TextSpan span);
     bool declareVariable(VariableSymbol variable, text::TextSpan span);
     void pushScope(text::TextSpan span = {});
     void popScope();
     [[nodiscard]] std::unique_ptr<BoundErrorExpression> makeError(
         text::TextSpan span) const;
 
-    diagnostics::DiagnosticBag& diagnostics_;
+    struct ScopedDiagnosticProxy {
+        Binder& owner;
+        void report(
+            std::string code,
+            std::string message,
+            text::TextSpan span,
+            diagnostics::DiagnosticSeverity severity = diagnostics::DiagnosticSeverity::Error,
+            std::string sourceName = {}) {
+            if (sourceName.empty() && !owner.currentSourceName_.empty()) {
+                sourceName = owner.currentSourceName_;
+            }
+            owner.rootDiagnostics_.report(
+                std::move(code),
+                std::move(message),
+                span,
+                severity,
+                std::move(sourceName));
+        }
+        operator diagnostics::DiagnosticBag&() noexcept {
+            return owner.rootDiagnostics_;
+        }
+    };
+    diagnostics::DiagnosticBag& rootDiagnostics_;
+    ScopedDiagnosticProxy diagnostics_;
+    std::unordered_set<std::string> hygienicAccessibleModules_;
     std::vector<std::unordered_map<std::string, VariableSymbol>> scopes_;
     std::vector<std::unordered_map<std::string, VariableSymbol>>
         referenceAliasScopes_;

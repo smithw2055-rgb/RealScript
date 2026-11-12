@@ -26,7 +26,7 @@ std::string diagnosticsText(
 }
 
 realscript::runtime::ExecutionResult execute(const char* source) {
-    realscript::compiler::Compilation compilation({{"phase18.rs", source}});
+    realscript::compiler::Compilation compilation({{"phase18.rscript", source}});
     const auto build = compilation.build();
     require(
         !build.diagnostics.hasErrors(),
@@ -117,7 +117,7 @@ int main()
 }
 
 void testNativeDiagnostics() {
-    realscript::compiler::Compilation compilation({{"invalid.rs", R"(
+    realscript::compiler::Compilation compilation({{"invalid.rscript", R"(
 module Invalid;
 int main()
 {
@@ -167,8 +167,8 @@ int main()
 }
 )";
     realscript::compiler::Compilation compilation({
-        {"contracts.rs", contracts},
-        {"app.rs", app},
+        {"contracts.rscript", contracts},
+        {"app.rscript", app},
     });
     const auto build = compilation.build();
     require(
@@ -205,7 +205,7 @@ int main()
 }
 
 void testNativeInterfaceDiagnostics() {
-    realscript::compiler::Compilation compilation({{"bad-interface.rs", R"(
+    realscript::compiler::Compilation compilation({{"bad-interface.rscript", R"(
 module Phase18.Bad;
 interface IReader
 {
@@ -234,7 +234,7 @@ class Reader : IReader
 
 
 void testNativeAttributes() {
-    realscript::compiler::Compilation compilation({{"attributes.rs", R"(
+    realscript::compiler::Compilation compilation({{"attributes.rscript", R"(
 module Phase18.Attributes;
 [Serializable(version = 2), Editor(category = "combat")]
 class Unit
@@ -304,7 +304,7 @@ int main()
 
 void testNativeReferenceDiagnostics() {
     realscript::compiler::Compilation compilation({{
-        "bad-reference.rs",
+        "bad-reference.rscript",
         R"(
 module Phase18.ReferenceBad;
 void Mutate(in int value)
@@ -369,7 +369,7 @@ class Counter
     }
     void OnChanged(int amount) { total = total + amount; }
 }
-)", "event-syntax.rs");
+)", "event-syntax.rscript");
     realscript::diagnostics::DiagnosticBag diagnostics;
     realscript::syntax::Parser parser(source, diagnostics);
     auto unit = parser.parseCompilationUnit();
@@ -439,7 +439,7 @@ int main()
 
 void testNativeEventDiagnostics() {
     realscript::compiler::Compilation compilation({{
-        "bad-events.rs",
+        "bad-events.rscript",
         R"(
 module Phase18.BadEvents;
 delegate void ChangedHandler(int amount);
@@ -477,7 +477,7 @@ int main()
         new Pair<int, List<string>>();
     return Identity<int>(1);
 }
-)", "generic-syntax.rs");
+)", "generic-syntax.rscript");
     realscript::diagnostics::DiagnosticBag diagnostics;
     realscript::syntax::Parser parser(source, diagnostics);
     auto unit = parser.parseCompilationUnit();
@@ -508,7 +508,7 @@ int main()
 
 void testNativeGenericSpecialization() {
     realscript::compiler::Compilation compilation({{
-        "native-generics.rs",
+        "native-generics.rscript",
         R"(
 module Phase18.NativeGenerics;
 class Box<T>
@@ -554,7 +554,7 @@ int main()
 
 
 void testNativeSequenceDiagnostics() {
-    realscript::compiler::Compilation compilation({{"bad-sequence.rs", R"(
+    realscript::compiler::Compilation compilation({{"bad-sequence.rscript", R"(
 module Phase18.SequenceBad;
 class Behavior
 {
@@ -576,7 +576,7 @@ class Behavior
 }
 
 void testYieldOutsideSequenceDiagnostics() {
-    realscript::compiler::Compilation compilation({{"bad-yield.rs", R"(
+    realscript::compiler::Compilation compilation({{"bad-yield.rscript", R"(
 module Phase18.YieldBad;
 int main()
 {

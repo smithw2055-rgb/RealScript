@@ -37,6 +37,32 @@ std::string readFile(const std::string& path) {
     return content.str();
 }
 
+bool endsWithIgnoreCase(std::string_view text, std::string_view lowerSuffix) noexcept {
+    if (text.size() < lowerSuffix.size()) return false;
+    const std::size_t offset = text.size() - lowerSuffix.size();
+    for (std::size_t i = 0; i < lowerSuffix.size(); ++i) {
+        char ch = text[offset + i];
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        if (ch != lowerSuffix[i]) return false;
+    }
+    return true;
+}
+
+bool hasValidScriptExtension(const std::string& path) noexcept {
+    return endsWithIgnoreCase(path, ".d.rscript") ||
+        endsWithIgnoreCase(path, ".rscript");
+}
+
+void requireScriptExtension(const std::string& path) {
+    if (!hasValidScriptExtension(path)) {
+        throw std::runtime_error(
+            "RealScript source files must use the .rscript or .d.rscript extension: " + path);
+    }
+}
+
+
 std::uint64_t parseCount(
     const std::string& value,
     const char* option,
@@ -129,7 +155,7 @@ double percentile(const std::vector<double>& sorted, double fraction) {
 
 void usage() {
     std::cerr
-        << "usage: rsbench [options] <file.rs>...\n"
+        << "usage: rsbench [options] <file.rscript>...\n"
         << "  --entry <module::function>\n"
         << "  --iterations <count>\n"
         << "  --warmup <count>\n"
@@ -236,7 +262,10 @@ int main(int argc, char** argv) {
         }
 
         realscript::compiler::Compilation compilation;
-        for (const auto& path : paths) compilation.addSource({path, readFile(path)});
+        for (const auto& path : paths) {
+            requireScriptExtension(path);
+            compilation.addSource({path, readFile(path)});
+        }
         const auto frontendStarted = std::chrono::steady_clock::now();
         auto build = compilation.build();
         const auto frontendStopped = std::chrono::steady_clock::now();

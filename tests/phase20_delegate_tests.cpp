@@ -25,7 +25,7 @@ std::string diagnosticsText(
 std::vector<realscript::bytecode::Module> compileModules(
     const std::string& source) {
     realscript::compiler::Compilation compilation({{
-        "phase20-lifecycle.rs", source}});
+        "phase20-lifecycle.rscript", source}});
     const auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
         "Phase 20 lifecycle compilation failed:\n" +
@@ -40,7 +40,7 @@ std::vector<realscript::bytecode::Module> compileModules(
 
 void testDelegateDescriptorAndArtifactRoundTrip() {
     realscript::compiler::Compilation compilation({{
-        "phase20-descriptor.rs",
+        "phase20-descriptor.rscript",
         R"(
 module Phase20.Descriptor;
 
@@ -109,7 +109,7 @@ Transform Identity(Transform input)
 
 void testStaticMethodReferenceInvocation() {
     realscript::compiler::Compilation compilation({{
-        "phase20-static.rs",
+        "phase20-static.rscript",
         R"(
 module Phase20.Static;
 
@@ -155,7 +155,7 @@ int main()
 
 void testInstanceVirtualAndInterfaceMethodReferences() {
     realscript::compiler::Compilation compilation({{
-        "phase20-dispatch.rs",
+        "phase20-dispatch.rscript",
         R"(
 module Phase20.Dispatch;
 
@@ -224,7 +224,7 @@ int main()
 
 void testHeapClosureCaptureByValue() {
     realscript::compiler::Compilation compilation({{
-        "phase20-closure.rs",
+        "phase20-closure.rscript",
         R"(
 module Phase20.Closure;
 
@@ -283,7 +283,7 @@ int main()
 
 void testMutableCaptureSharedByDelegateCopies() {
     realscript::compiler::Compilation compilation({{
-        "phase20-mutable-closure.rs",
+        "phase20-mutable-closure.rscript",
         R"(
 module Phase20.MutableClosure;
 
@@ -318,7 +318,7 @@ int main()
 
 void testDelegateCombinationAndRemoval() {
     realscript::compiler::Compilation compilation({{
-        "phase20-multicast.rs",
+        "phase20-multicast.rscript",
         R"(
 module Phase20.Multicast;
 
@@ -359,7 +359,7 @@ int main()
 
 void testMutableParameterCapture() {
     realscript::compiler::Compilation compilation({{
-        "phase20-parameter-capture.rs",
+        "phase20-parameter-capture.rscript",
         R"(
 module Phase20.ParameterCapture;
 delegate int Reader();
@@ -389,7 +389,7 @@ int main() { return Run(40); }
 
 void testDelegateBackedEventStorage() {
     realscript::compiler::Compilation compilation({{
-        "phase20-events.rs",
+        "phase20-events.rscript",
         R"(
 module Phase20.Events;
 
@@ -500,7 +500,7 @@ int main() { Reader reader = Create(40, 2); return reader(); }
 
 void testSubscriberSideEventAccess() {
     realscript::compiler::Compilation compilation({{
-        "phase20-event-access.rs",
+        "phase20-event-access.rscript",
         R"(
 module Phase20.EventAccess;
 delegate void Changed(int value);
@@ -541,7 +541,7 @@ int main() { Subscriber value = new Subscriber(); return value.Run(); }
 
 void testDelegateReferenceParameters() {
     realscript::compiler::Compilation compilation({{
-        "phase20-delegate-ref.rs",
+        "phase20-delegate-ref.rscript",
         R"(
 module Phase20.DelegateRef;
 delegate void Mutator(ref int value);
@@ -588,7 +588,7 @@ int main()
 
 void testDelegateHeapSnapshotRestore() {
     realscript::compiler::Compilation compilation({{
-        "phase20-snapshot.rs",
+        "phase20-snapshot.rscript",
         R"(
 module Phase20.Snapshot;
 delegate void Changed(int value);
@@ -646,7 +646,7 @@ Holder main() { return new Holder(); }
 
 void testReentrantMulticastAndBudgetParity() {
     realscript::compiler::Compilation compilation({{
-        "phase20-reentrant-multicast.rs",
+        "phase20-reentrant-multicast.rscript",
         R"(
 module Phase20.ReentrantMulticast;
 

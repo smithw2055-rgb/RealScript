@@ -30,7 +30,7 @@ std::vector<realscript::bytecode::Module> compile(const std::vector<realscript::
 }
 
 void testArithmeticAndCalls() {
-    auto modules = compile({{"math.rs", "module Demo; int twice(int x) { return x * 2; } int main() { return twice(21) + 1; }"}});
+    auto modules = compile({{"math.rscript", "module Demo; int twice(int x) { return x * 2; } int main() { return twice(21) + 1; }"}});
     realscript::runtime::Interpreter interpreter(std::move(modules));
     const auto result = interpreter.invoke("Demo::main");
     require(result.succeeded, "main execution failed");
@@ -38,7 +38,7 @@ void testArithmeticAndCalls() {
 }
 
 void testControlFlowAndBlockArguments() {
-    auto modules = compile({{"flow.rs", "module Demo; bool guarded(bool enabled, int value) { return enabled && value > 0; }"}});
+    auto modules = compile({{"flow.rscript", "module Demo; bool guarded(bool enabled, int value) { return enabled && value > 0; }"}});
     realscript::runtime::Interpreter interpreter(std::move(modules));
     auto falseResult = interpreter.invoke("Demo::guarded", {false, std::int64_t{5}});
     auto trueResult = interpreter.invoke("Demo::guarded", {true, std::int64_t{5}});
@@ -47,14 +47,14 @@ void testControlFlowAndBlockArguments() {
 }
 
 void testLoop() {
-    auto modules = compile({{"loop.rs", "module Demo; int count(int value) { while (value > 0) value = value - 1; return value; }"}});
+    auto modules = compile({{"loop.rscript", "module Demo; int count(int value) { while (value > 0) value = value - 1; return value; }"}});
     realscript::runtime::Interpreter interpreter(std::move(modules));
     const auto result = interpreter.invoke("Demo::count", {std::int64_t{8}});
     require(result.succeeded && std::get<std::int64_t>(result.value) == 0, "loop execution failed");
 }
 
 void testDivisionTrap() {
-    auto modules = compile({{"trap.rs", "module Demo; int divide(int a, int b) { return a / b; }"}});
+    auto modules = compile({{"trap.rscript", "module Demo; int divide(int a, int b) { return a / b; }"}});
     realscript::runtime::Interpreter interpreter(std::move(modules));
     const auto result = interpreter.invoke("Demo::divide", {std::int64_t{1}, std::int64_t{0}});
     require(!result.succeeded, "division by zero must fail");
@@ -62,7 +62,7 @@ void testDivisionTrap() {
 }
 
 void testInstructionBudget() {
-    auto modules = compile({{"budget.rs", "module Demo; int forever() { while (true) { } }"}});
+    auto modules = compile({{"budget.rscript", "module Demo; int forever() { while (true) { } }"}});
     realscript::runtime::Interpreter interpreter(std::move(modules));
     realscript::runtime::Limits limits;
     limits.instructionBudget = 20;
@@ -72,7 +72,7 @@ void testInstructionBudget() {
 }
 
 void testRecursionLimit() {
-    auto modules = compile({{"rec.rs", "module Demo; int recurse(int value) { return recurse(value); }"}});
+    auto modules = compile({{"rec.rscript", "module Demo; int recurse(int value) { return recurse(value); }"}});
     realscript::runtime::Interpreter interpreter(std::move(modules));
     realscript::runtime::Limits limits;
     limits.recursionLimit = 8;
@@ -84,8 +84,8 @@ void testRecursionLimit() {
 
 void testCrossModuleCall() {
     auto modules = compile({
-        {"math.rs", "module Game.Math; int twice(int value) { return value * 2; }"},
-        {"main.rs", "module Game.Main; import Game.Math; int main() { return twice(20); }"},
+        {"math.rscript", "module Game.Math; int twice(int value) { return value * 2; }"},
+        {"main.rscript", "module Game.Main; import Game.Math; int main() { return twice(20); }"},
     });
     realscript::runtime::Interpreter interpreter(std::move(modules));
     const auto result = interpreter.invoke("Game.Main::main");
@@ -136,7 +136,7 @@ void testExternalResolver() {
 }
 
 void testIntegerOverflow() {
-    auto modules = compile({{"overflow.rs", "module Demo; int add(int a, int b) { return a + b; }"}});
+    auto modules = compile({{"overflow.rscript", "module Demo; int add(int a, int b) { return a + b; }"}});
     realscript::runtime::Interpreter interpreter(std::move(modules));
     const auto result = interpreter.invoke("Demo::add", {std::int64_t{2147483647}, std::int64_t{1}});
     require(!result.succeeded, "overflow must fail");
@@ -168,7 +168,7 @@ void testUnresolvedExternal() {
 }
 
 void testDeterministicExecutionCount() {
-    auto modules = compile({{"det.rs", "module Demo; int main() { int x = 3; while (x > 0) x = x - 1; return x; }"}});
+    auto modules = compile({{"det.rscript", "module Demo; int main() { int x = 3; while (x > 0) x = x - 1; return x; }"}});
     realscript::runtime::Interpreter interpreter(std::move(modules));
     const auto first = interpreter.invoke("Demo::main");
     const auto second = interpreter.invoke("Demo::main");
@@ -178,7 +178,7 @@ void testDeterministicExecutionCount() {
 }
 
 void testRawSuperinstructionsMatchInstrumentedExecution() {
-    auto modules = compile({{"super.rs", R"(
+    auto modules = compile({{"super.rscript", R"(
 module Demo;
 int main()
 {
@@ -212,7 +212,7 @@ int main()
 }
 
 void testRawSuperinstructionBudgetBoundaries() {
-    auto modules = compile({{"budget-super.rs", R"(
+    auto modules = compile({{"budget-super.rscript", R"(
 module Demo;
 int main()
 {
@@ -241,7 +241,7 @@ int main()
 }
 
 void testRawSuperinstructionOverflowAccounting() {
-    auto modules = compile({{"overflow-super.rs", R"(
+    auto modules = compile({{"overflow-super.rscript", R"(
 module Demo;
 int addOne(int value)
 {

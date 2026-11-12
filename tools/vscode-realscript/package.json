@@ -39,7 +39,7 @@
       {
         "id": "realscript",
         "aliases": ["RealScript", "realscript"],
-        "extensions": [".rs", ".d.rs"],
+        "extensions": [".rscript", ".d.rscript"],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -91,7 +91,7 @@
             "properties": {
               "program": {
                 "type": ["string", "array"],
-                "description": "Path(s) to the RealScript (.rs) source file(s) to compile and launch."
+                "description": "Path(s) to the RealScript (.rscript) source file(s) to compile and launch."
               },
               "function": {
                 "type": "string",

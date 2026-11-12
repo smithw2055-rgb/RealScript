@@ -69,7 +69,7 @@ class Controller
 void testTypedHostBindingsAndScriptObjects() {
     auto api = makeApi();
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"controller.rs", controllerSource}});
+    auto compiled = compiler.compile({{"controller.rscript", controllerSource}});
     require(compiled.succeeded(),
         "game script compilation failed:\n" + diagnosticsText(compiled.diagnostics));
     for (const auto& module : compiled.modules) {
@@ -155,7 +155,7 @@ class Behavior
 void testSceneLifecycleEventsAndTriggers() {
     realscript::game::GameApi api;
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"scene.rs", sceneSource}});
+    auto compiled = compiler.compile({{"scene.rscript", sceneSource}});
     require(compiled.succeeded(),
         "scene script compilation failed:\n" + diagnosticsText(compiled.diagnostics));
 
@@ -189,7 +189,7 @@ void testSceneLifecycleEventsAndTriggers() {
 void testStaleNativeHandlesAreRejected() {
     auto api = makeApi();
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"controller.rs", controllerSource}});
+    auto compiled = compiler.compile({{"controller.rscript", controllerSource}});
     require(compiled.succeeded(),
         "stale-handle fixture compilation failed:\n" + diagnosticsText(compiled.diagnostics));
 

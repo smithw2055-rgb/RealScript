@@ -77,9 +77,9 @@ Division and remainder are named as checked operations so later VM and AOT imple
 `rsc` provides three initial modes:
 
 ```bash
-rsc sample.rs           # parse and type-check
-rsc sample.rs --tokens  # print tokens
-rsc sample.rs --mir     # print Typed MIR
+rsc sample.rscript           # parse and type-check
+rsc sample.rscript --tokens  # print tokens
+rsc sample.rscript --mir     # print Typed MIR
 ```
 
 ## Build and test

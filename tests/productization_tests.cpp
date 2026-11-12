@@ -87,7 +87,7 @@ std::vector<std::vector<std::uint8_t>> encodedModules(
 void testBytecodePackageLoadingAndIdentity() {
     auto api = makeApi();
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"state.rs", source}});
+    auto compiled = compiler.compile({{"state.rscript", source}});
     require(compiled.succeeded(),
         "compile failed:\n" + diagnosticsText(compiled.diagnostics));
 
@@ -124,7 +124,7 @@ void testBytecodePackageLoadingAndIdentity() {
 void testBytecodeObjectMetadataRehydration() {
     auto api = makeApi();
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"state.rs", source}});
+    auto compiled = compiler.compile({{"state.rscript", source}});
     require(compiled.succeeded(),
         "object metadata fixture compile failed:\n" +
         diagnosticsText(compiled.diagnostics));
@@ -160,7 +160,7 @@ void testBytecodeObjectMetadataRehydration() {
 void testRestrictedScriptStateRoundTrip() {
     auto api = makeApi();
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"state.rs", source}});
+    auto compiled = compiler.compile({{"state.rscript", source}});
     require(compiled.succeeded(), "state fixture compile failed");
 
     realscript::game::ScriptRuntime runtime(compiled.program);
@@ -210,7 +210,7 @@ void testRestrictedScriptStateRoundTrip() {
 void testNativeHandlesAreNotPersistentState() {
     auto api = makeApi();
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"state.rs", source}});
+    auto compiled = compiler.compile({{"state.rscript", source}});
     require(compiled.succeeded(), "native fixture compile failed");
 
     realscript::game::ScriptRuntime runtime(compiled.program);

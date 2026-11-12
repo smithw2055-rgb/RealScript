@@ -99,7 +99,7 @@ int main()
 )";
 
 void testMethodsConstructorsAndProperties() {
-    auto modules = compile({{"objects.rs", objectSource}});
+    auto modules = compile({{"objects.rscript", objectSource}});
     require(modules.size() == 1, "expected one Phase 3D module");
     require(modules.front().version.major == 0 &&
             modules.front().version.minor == 7,
@@ -122,7 +122,7 @@ void testMethodsConstructorsAndProperties() {
 
 void testCrossModuleMemberBinding() {
     auto modules = compile({
-        {"model.rs", R"(
+        {"model.rscript", R"(
 module Phase3D.Model;
 class Widget
 {
@@ -133,7 +133,7 @@ class Widget
 }
 Widget create(int value) { return new Widget(value); }
 )"},
-        {"app.rs", R"(
+        {"app.rscript", R"(
 module Phase3D.App;
 import Phase3D.Model;
 int main()
@@ -151,7 +151,7 @@ int main()
 }
 
 void testValueReceiverShadowsTypeName() {
-    auto modules = compile({{"shadow.rs", R"(
+    auto modules = compile({{"shadow.rscript", R"(
 module Phase3D.Shadowing;
 class Counter
 {
@@ -174,7 +174,7 @@ int main()
 }
 
 void testPropertyAccessContextDiagnostics() {
-    const auto context = build({{"context.rs", R"(
+    const auto context = build({{"context.rscript", R"(
 module Phase3D.InvalidContext;
 class Sample
 {
@@ -191,7 +191,7 @@ int main()
             hasDiagnostic(context, "RS2484"),
         "static/instance property context mismatch was not diagnosed");
 
-    const auto readOnly = build({{"readonly.rs", R"(
+    const auto readOnly = build({{"readonly.rscript", R"(
 module Phase3D.ReadOnly;
 class Sample { static int Value { get { return 1; } } }
 int main() { Sample.Value = 2; return 0; }
@@ -201,7 +201,7 @@ int main() { Sample.Value = 2; return 0; }
         "assignment to a read-only static property was not diagnosed");
 
 
-    const auto mixedAccessors = build({{"mixed.rs", R"(
+    const auto mixedAccessors = build({{"mixed.rscript", R"(
 module Phase3D.MixedProperty;
 class Sample
 {
@@ -213,7 +213,7 @@ class Sample
             hasDiagnostic(mixedAccessors, "RS2463"),
         "mixed auto and explicit property accessors were not rejected");
 
-    const auto memberConflict = build({{"conflict.rs", R"(
+    const auto memberConflict = build({{"conflict.rscript", R"(
 module Phase3D.MemberConflict;
 class Sample
 {
@@ -228,11 +228,11 @@ class Sample
 
 void testDispatchChangeInvalidatesDependents() {
     const std::vector<realscript::compiler::SourceFile> initialSources{
-        {"model.rs", R"(
+        {"model.rscript", R"(
 module Phase3D.DispatchModel;
 class Widget { int Read() { return 1; } }
 )"},
-        {"app.rs", R"(
+        {"app.rscript", R"(
 module Phase3D.DispatchApp;
 import Phase3D.DispatchModel;
 int main() { Widget widget = new Widget(); return widget.Read(); }
@@ -243,7 +243,7 @@ int main() { Widget widget = new Widget(); return widget.Read(); }
         "initial dispatch fixture failed to compile");
 
     const auto changed = build({
-        {"model.rs", R"(
+        {"model.rscript", R"(
 module Phase3D.DispatchModel;
 class Widget { static int Read() { return 1; } }
 )"},
@@ -258,7 +258,7 @@ class Widget { static int Read() { return 1; } }
 }
 
 void testInstanceCallsCheckNullReceiver() {
-    auto modules = compile({{"null.rs", R"(
+    auto modules = compile({{"null.rscript", R"(
 module Phase3D.Nulls;
 class Probe { int Constant() { return 7; } }
 int main() { Probe probe = null; return probe.Constant(); }
@@ -271,7 +271,7 @@ int main() { Probe probe = null; return probe.Constant(); }
 }
 
 void testMemberCodecRoundTrip() {
-    auto module = compile({{"objects.rs", objectSource}}).front();
+    auto module = compile({{"objects.rscript", objectSource}}).front();
     const auto encoded = realscript::bytecode::encodeModule(module);
     realscript::bytecode::Module decoded;
     realscript::diagnostics::DiagnosticBag diagnostics;

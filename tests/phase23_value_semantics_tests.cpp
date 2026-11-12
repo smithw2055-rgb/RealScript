@@ -34,7 +34,7 @@ bool hasDiagnostic(
 }
 
 void testExactNumericIdentityAndWidening() {
-    realscript::compiler::Compilation compilation({{"phase23.rs", R"(
+    realscript::compiler::Compilation compilation({{"phase23.rscript", R"(
 module Phase23.Values;
 
 byte EchoByte(byte value) { return value; }
@@ -480,7 +480,7 @@ void Bad(in int value) { ref int alias = ref value; }
     };
     for (std::size_t index = 0; index < cases.size(); ++index) {
         realscript::compiler::Compilation compilation({{
-            "phase23_bad_" + std::to_string(index) + ".rs",
+            "phase23_bad_" + std::to_string(index) + ".rscript",
             cases[index].source,
         }});
         const auto build = compilation.build();
@@ -511,7 +511,7 @@ void testExactNativeBindingAbi() {
         "char native binding registration failed");
 
     realscript::game::GameScriptCompiler compiler(api);
-    const auto compiled = compiler.compile({{"phase23_native.rs", R"(
+    const auto compiled = compiler.compile({{"phase23_native.rscript", R"(
 module Phase23.NativeProbe;
 import Phase23.Native;
 

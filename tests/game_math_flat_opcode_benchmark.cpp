@@ -486,7 +486,7 @@ std::shared_ptr<realscript::runtime::ProgramImage> compileSources(
 
 std::shared_ptr<realscript::runtime::ProgramImage> buildBenchProgram(
     realscript::optimization::Level level = realscript::optimization::Level::Aggressive) {
-    return compileSources({{"game_math_bench.rs", kGameMathBenchSource}}, level);
+    return compileSources({{"game_math_bench.rscript", kGameMathBenchSource}}, level);
 }
 
 struct BenchMetrics {
@@ -724,8 +724,8 @@ void testReviewRegressions() {
             public class Sub : Base { public override int eval() { return 222; } }
             public int run() { Base b = new Sub(); return b.eval(); }
         )RS";
-        auto prog = compileSources({{"v1.rs", srcV1}}, optimization::Level::Aggressive);
-        auto prog2 = compileSources({{"v2.rs", srcV2}}, optimization::Level::Aggressive);
+        auto prog = compileSources({{"v1.rscript", srcV1}}, optimization::Level::Aggressive);
+        auto prog2 = compileSources({{"v2.rscript", srcV2}}, optimization::Level::Aggressive);
 
         runtime::Interpreter interp(prog);
         const auto r1 = interp.invoke("Test.Polymorph::run", {});
@@ -838,7 +838,7 @@ void testReviewRegressions() {
             public void writeCount(Box b, int v) { b.count = v; }
             public void writeLabel(Box b, string s) { b.label = s; }
         )RS";
-        auto prog = compileSources({{"box.rs", boxSrc}}, optimization::Level::None);
+        auto prog = compileSources({{"box.rscript", boxSrc}}, optimization::Level::None);
         runtime::Interpreter interp(prog);
         auto heap = interp.heap();
 
@@ -907,7 +907,7 @@ void testReviewRegressions() {
                 return c.a;
             }
         )RS";
-        auto prog = compileSources({{"nested.rs", nestedSrc}}, optimization::Level::None);
+        auto prog = compileSources({{"nested.rscript", nestedSrc}}, optimization::Level::None);
         runtime::Interpreter interp(prog);
 
         const auto structBId = semantic::stableTypeId("Test.NestedStructSafety::StructB");
@@ -955,7 +955,7 @@ void testReviewRegressions() {
             }
         )RS";
         auto prog = compileSources(
-            {{"custom_math.rs", customMath}, {"caller.rs", callerSrc}},
+            {{"custom_math.rscript", customMath}, {"caller.rscript", callerSrc}},
             optimization::Level::None);
         runtime::Interpreter interp(prog);
         runtime::ExecutionOptions fastOpts;
@@ -1038,7 +1038,7 @@ public int callerCatchAroundInline(int mode) {
                  optimization::Level::None,
                  optimization::Level::Basic,
                  optimization::Level::Aggressive}) {
-            auto prog = compileSources({{"small_inline.rs", inlineSrc}}, optLvl);
+            auto prog = compileSources({{"small_inline.rscript", inlineSrc}}, optLvl);
             runtime::Interpreter interp(prog);
 
             runtime::ExecutionOptions fastOpts;
@@ -1198,7 +1198,7 @@ public int runNullTrap() {
 }
 )RS";
         for (const auto optLvl : {optimization::Level::None, optimization::Level::Aggressive}) {
-            auto prog = compileSources({{"polled_inline.rs", polySrc}}, optLvl);
+            auto prog = compileSources({{"polled_inline.rscript", polySrc}}, optLvl);
             runtime::Interpreter interp(prog);
             runtime::ExecutionOptions fastOpts;
             fastOpts.determinism.mode = runtime::DeterminismMode::Off;
@@ -1366,7 +1366,7 @@ public int sumAnimalArray(Animal[] arr) {
                  optimization::Level::None,
                  optimization::Level::Basic,
                  optimization::Level::Aggressive}) {
-            auto prog = compileSources({{"typed_arrays_bce.rs", arrSrc}}, optLvl);
+            auto prog = compileSources({{"typed_arrays_bce.rscript", arrSrc}}, optLvl);
             runtime::Interpreter interp(prog);
 
             runtime::ExecutionOptions fastOpts;
@@ -1671,7 +1671,7 @@ public int trapNullInlinedHelper() {
                  optimization::Level::None,
                  optimization::Level::Basic,
                  optimization::Level::Aggressive}) {
-            auto prog = compileSources({{"object_ic_nursery.rs", objSrc}}, optLvl);
+            auto prog = compileSources({{"object_ic_nursery.rscript", objSrc}}, optLvl);
             runtime::Interpreter interp(prog);
 
             runtime::ExecutionOptions fastOpts;

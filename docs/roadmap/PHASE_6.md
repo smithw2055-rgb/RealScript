@@ -99,7 +99,7 @@ rsbench \
   --iterations 1000 \
   --opt-level 2 \
   --json \
-  game.rs common.rs
+  game.rscript common.rscript
 ```
 
 It reports elapsed time, nanoseconds per invocation, aggregate execution digest, final value, optimizer statistics and the per-function profile. Timing itself is informational; semantic validation uses the digest, value, error and statistics rather than asserting wall-clock thresholds in conformance tests.
@@ -126,8 +126,8 @@ This is a same-SDK optional JIT profile. It provides native execution and tierin
 ### `rsc`
 
 ```bash
-rsc game.rs --mir --opt-level 2 --opt-report
-rsc game.rs --run Game.Main::main \
+rsc game.rscript --mir --opt-level 2 --opt-report
+rsc game.rscript --run Game.Main::main \
   --opt-level 2 --deterministic --profile --digest
 ```
 
@@ -137,7 +137,7 @@ rsc game.rs --run Game.Main::main \
 rsaot --output-dir generated \
   --program-name GameScripts \
   --opt-level 2 --opt-report \
-  game.rs common.rs
+  game.rscript common.rscript
 ```
 
 ### CMake
@@ -146,7 +146,7 @@ rsaot --output-dir generated \
 realscript_add_aot_library(GameScripts
     PROGRAM_NAME GameScripts
     OPT_LEVEL 2
-    SOURCES game.rs common.rs
+    SOURCES game.rscript common.rscript
 )
 ```
 

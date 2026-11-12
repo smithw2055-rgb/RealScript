@@ -101,8 +101,8 @@ No Phase 2B execution path may bypass either layer.
 New commands:
 
 ```bash
-rsc game.rs --bytecode
-rsc game.rs --emit-bytecode game.rsbc
+rsc game.rscript --bytecode
+rsc game.rscript --emit-bytecode game.rsbc
 rsc game.rsbc --disassemble
 ```
 

@@ -469,16 +469,12 @@ public:
         top_ = base_ + count;
         if (previousSize < top_) {
             if (base_ < previousSize) {
-                std::memset(
-                    state_.values.data() + base_,
-                    0,
+                std::memset(static_cast<void*>(state_.values.data() + base_), 0,
                     (previousSize - base_) * sizeof(Value));
             }
             state_.values.resize(top_);
         } else if (base_ < top_) {
-            std::memset(
-                state_.values.data() + base_,
-                0,
+            std::memset(static_cast<void*>(state_.values.data() + base_), 0,
                 (top_ - base_) * sizeof(Value));
         }
         state_.valueTop = top_;
@@ -735,6 +731,9 @@ bool fail(State& state, ErrorCode code, std::string message) {
 
 inline void stepGcIfNeeded(State& state, std::uint64_t steps = 1) {
     if (state.limits.gcWorkBudget == 0 || !state.heap) return;
+    if (state.traceEventsEnabled && state.heap->isWallClockCycleActive()) {
+        state.heap->finishWallClockCycleForDeterminism(state.shadowStack);
+    }
     if (state.heap->phase() == GcPhase::Idle && !state.heap->collectionRequested()) {
         return;
     }
@@ -2549,6 +2548,12 @@ bool suspendInterpreterCoroutine(
         if (!existing) {
             return fail(state, ErrorCode::InvalidProgram, "active coroutine frame handle is stale");
         }
+        if (existing->invalidated) {
+            if (awaitedHandle.valid() && !awaitedHandle.isCompletedVoidSentinel()) {
+                (void)state.asyncRuntime->awaitables().discard(awaitedHandle);
+            }
+            return fail(state, ErrorCode::ExecutionTerminated, "coroutine invalidated by hot reload");
+        }
         completionHandle = existing->completionHandle;
     }
 
@@ -4069,7 +4074,7 @@ bool executeFunction(
                 localBase[i] = arguments[i];
             }
             if (nLocals > argCount) {
-                std::memset(localBase + argCount, 0, (nLocals - argCount) * sizeof(Value));
+                std::memset(static_cast<void*>(localBase + argCount), 0, (nLocals - argCount) * sizeof(Value));
             }
             prologueSpanBonus = 2u * argCount;
             initialEntryOffset = static_cast<std::uint32_t>(argCount);
@@ -4079,9 +4084,7 @@ bool executeFunction(
             }
             const std::size_t dirtyEnd = std::min(frameEnd, previousSize);
             if (frameOffset + argCount < dirtyEnd) {
-                std::memset(
-                    frameBase + argCount,
-                    0,
+                std::memset(static_cast<void*>(frameBase + argCount), 0,
                     (dirtyEnd - (frameOffset + argCount)) * sizeof(Value));
             }
         }
@@ -7621,7 +7624,7 @@ bool executeFunction(
                     if (nArgs >= 3u) calleeLocals[2] = frameBase[ip->src2Slot];
                     if (nArgs >= 4u) calleeLocals[3] = frameBase[ip->aux1Slot];
                     if (nLocals > nArgs) {
-                        std::memset(calleeLocals + nArgs, 0, (nLocals - nArgs) * sizeof(Value));
+                        std::memset(static_cast<void*>(calleeLocals + nArgs), 0, (nLocals - nArgs) * sizeof(Value));
                     }
                     localExecuted += 2u * nArgs;
                     ip += 1u + nArgs;
@@ -7632,7 +7635,7 @@ bool executeFunction(
                 if (nArgs >= 3u) calleeBase[2] = frameBase[ip->src2Slot];
                 if (nArgs >= 4u) calleeBase[3] = frameBase[ip->aux1Slot];
                 if (nLocals != 0u) {
-                    std::memset(calleeBase + nArgs, 0, nLocals * sizeof(Value));
+                    std::memset(static_cast<void*>(calleeBase + nArgs), 0, nLocals * sizeof(Value));
                 }
                 RS_FLAT_DISPATCH_NEXT();
             }
@@ -7642,9 +7645,7 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 if (ip->integerImmediate != 0) {
                     const auto packedClear = static_cast<std::uint64_t>(ip->integerImmediate);
-                    std::memset(
-                        frameBase + (packedClear & 0xFFFFu),
-                        0,
+                    std::memset(static_cast<void*>(frameBase + (packedClear & 0xFFFFu)), 0,
                         static_cast<std::size_t>(packedClear >> 16u) * sizeof(Value));
                 }
                 RS_FLAT_DISPATCH_NEXT();
@@ -7655,9 +7656,7 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 if (ip->integerImmediate != 0) {
                     const auto packedClear = static_cast<std::uint64_t>(ip->integerImmediate);
-                    std::memset(
-                        frameBase + (packedClear & 0xFFFFu),
-                        0,
+                    std::memset(static_cast<void*>(frameBase + (packedClear & 0xFFFFu)), 0,
                         static_cast<std::size_t>(packedClear >> 16u) * sizeof(Value));
                 }
                 ip = streamBase + ip->trueTargetOffset;
@@ -7670,9 +7669,7 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(ip->integerImmediate != 0)) {
                     const Value retVal = frameBase[ip->src0Slot];
                     const auto packedClear = static_cast<std::uint64_t>(ip->integerImmediate);
-                    std::memset(
-                        frameBase + (packedClear & 0xFFFFu),
-                        0,
+                    std::memset(static_cast<void*>(frameBase + (packedClear & 0xFFFFu)), 0,
                         static_cast<std::size_t>(packedClear >> 16u) * sizeof(Value));
                     if (ip->dstSlot != detail::InvalidCompactReg) {
                         frameBase[ip->dstSlot] = retVal;
@@ -7691,9 +7688,7 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(ip->integerImmediate != 0)) {
                     const Value retVal = frameBase[ip->src0Slot];
                     const auto packedClear = static_cast<std::uint64_t>(ip->integerImmediate);
-                    std::memset(
-                        frameBase + (packedClear & 0xFFFFu),
-                        0,
+                    std::memset(static_cast<void*>(frameBase + (packedClear & 0xFFFFu)), 0,
                         static_cast<std::size_t>(packedClear >> 16u) * sizeof(Value));
                     if (ip->dstSlot != detail::InvalidCompactReg) {
                         frameBase[ip->dstSlot] = retVal;
@@ -9772,8 +9767,14 @@ void resumeInterpreterCoroutineCallback(
     CoroutineFrameHandle frameHandle,
     CoroutineFrame& frame,
     AsyncRuntimeContext& asyncContext) {
+    detail::ActiveMutatorScope activeMutatorScope;
     const auto faultUnresolvedFrame = [&](const RuntimeError& err) {
         if (auto* f = asyncContext.coroutines().resolve(frameHandle)) {
+            if (f->invalidated) {
+                f->completed = true;
+                (void)asyncContext.awaitables().trySetCanceled(f->completionHandle);
+                return;
+            }
             if (!f->completed && !f->suspended) {
                 f->completed = true;
                 const ErrorCode code = (err.code != ErrorCode::None)
@@ -9825,6 +9826,7 @@ void resumeInterpreterCoroutineCallback(
         }
     }
 
+    const std::shared_ptr<const void> keepEnvAlive = frame.runnerOwner;
     auto* env = static_cast<InterpreterResumeEnv*>(runnerContext);
     if (!env || !env->program) return;
     const auto* found = env->program->resolveFunction(frame.functionSymbolId);
@@ -9919,6 +9921,9 @@ void resumeInterpreterCoroutineCallback(
 
     ShadowFrameScope roots(
         state.shadowStack, nullptr, nullptr, &state.values, &state.valueTop);
+    if (state.traceEventsEnabled && state.heap && state.heap->isWallClockCycleActive()) {
+        state.heap->finishWallClockCycleForDeterminism(state.shadowStack);
+    }
     Value ignoredResult{};
     const ArgumentSource emptyArgs{};
     const bool ok = executeFunction(state, *found, emptyArgs, ignoredResult);
@@ -10013,6 +10018,7 @@ ExecutionResult Interpreter::invoke(
         missing.error.message = "entry function was not found";
         return missing;
     }
+    detail::ActiveMutatorScope activeMutatorScope;
     auto& tlsScratch = tlsInvokeScratch;
     std::array<InlineCallCacheEntry, 64> fallbackInlineCache;
     std::vector<PolymorphicPicSite> fallbackPolyCache;
@@ -10159,6 +10165,9 @@ ExecutionResult Interpreter::invoke(
     ExecutionResult execution;
     ShadowFrameScope roots(
         state.shadowStack, nullptr, nullptr, &state.values, &state.valueTop);
+    if (state.traceEventsEnabled && state.heap && state.heap->isWallClockCycleActive()) {
+        state.heap->finishWallClockCycleForDeterminism(state.shadowStack);
+    }
     execution.succeeded = executeFunction(state, *found, arguments, value);
     state.statistics.instructionsExecuted = state.executed;
     if (!execution.succeeded && state.pendingException &&

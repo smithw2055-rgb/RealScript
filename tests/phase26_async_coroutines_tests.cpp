@@ -27,7 +27,7 @@ void require(bool condition, const std::string& message) {
 std::vector<bytecode::Module> compileModules(
     const std::string& source,
     optimization::Level optLevel = optimization::Level::Aggressive) {
-    compiler::Compilation compilation({{"async_test.rs", source}});
+    compiler::Compilation compilation({{"async_test.rscript", source}});
     auto build = compilation.build();
     if (build.diagnostics.hasErrors()) {
         std::string msg = "Compilation failed:";
@@ -51,7 +51,7 @@ std::vector<bytecode::Module> compileModules(
 }
 
 bool hasDiagnosticCode(const std::string& source, const std::string& expectedCode) {
-    compiler::Compilation compilation({{"diag_test.rs", source}});
+    compiler::Compilation compilation({{"diag_test.rscript", source}});
     auto build = compilation.build();
     for (const auto& entry : build.diagnostics.items()) {
         if (entry.code == expectedCode) {
@@ -625,8 +625,8 @@ public async Awaitable<int> ResumeIntoRestrictedExtern() {
 }
 )RS";
         compiler::Compilation compilation({
-            {"host_extern.rs", hostSrc},
-            {"caller_caps.rs", callerSrc},
+            {"host_extern.rscript", hostSrc},
+            {"caller_caps.rscript", callerSrc},
         });
         auto build = compilation.build();
         require(!build.diagnostics.hasErrors(), "AuditCaps compilation failed");
@@ -710,8 +710,8 @@ public int RunCrossModuleTest() {
 }
 )RS";
         compiler::Compilation compilation({
-            {"cross_a.rs", modASrc},
-            {"cross_b.rs", modBSrc},
+            {"cross_a.rscript", modASrc},
+            {"cross_b.rscript", modBSrc},
         });
         auto build = compilation.build();
         require(!build.diagnostics.hasErrors(),

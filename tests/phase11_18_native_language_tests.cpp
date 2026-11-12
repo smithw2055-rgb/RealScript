@@ -147,7 +147,7 @@ int main()
 }
 )";
 
-    auto modules = compileModules({{"extended.rs", source}});
+    auto modules = compileModules({{"extended.rscript", source}});
     realscript::runtime::Interpreter interpreter(std::move(modules));
     const auto result = interpreter.invoke("Extended::main");
     require(result.succeeded, "extended main execution failed: " + result.error.message);
@@ -183,7 +183,7 @@ int main()
 }
 )";
 
-    auto modules = compileModules({{"control_edges.rs", source}});
+    auto modules = compileModules({{"control_edges.rscript", source}});
     realscript::runtime::Interpreter interpreter(std::move(modules));
     const auto result = interpreter.invoke("ControlEdges::main");
     require(result.succeeded,
@@ -270,10 +270,10 @@ int Other()
 )";
 
     auto modules = compileModules({
-        {"01_contracts.rs", contracts},
-        {"02_model.rs", model},
-        {"03_app_a.rs", appA},
-        {"04_app_b.rs", appB},
+        {"01_contracts.rscript", contracts},
+        {"02_model.rscript", model},
+        {"03_app_a.rscript", appA},
+        {"04_app_b.rscript", appB},
     });
     realscript::runtime::Interpreter interpreter(std::move(modules));
     const auto result = interpreter.invoke("MultiFile::main");
@@ -356,9 +356,9 @@ int other()
 )";
 
     auto modules = compileModules({
-        {"01_shared_contracts.rs", contracts},
-        {"02_imported_app.rs", application},
-        {"03_other_contracts.rs", isolated},
+        {"01_shared_contracts.rscript", contracts},
+        {"02_imported_app.rscript", application},
+        {"03_other_contracts.rscript", isolated},
     });
     realscript::runtime::Interpreter interpreter(std::move(modules));
     const auto imported = interpreter.invoke("Imported.App::main");
@@ -376,7 +376,7 @@ int other()
 
 void testNativeMetadata() {
     realscript::compiler::Compilation compilation({{
-        "metadata.rs",
+        "metadata.rscript",
         "module Meta; [Replicated(channel = \"state\")] "
         "class Unit { int health; }"}});
     const auto build = compilation.build();
@@ -423,7 +423,7 @@ int main()
 }
 )";
 
-    realscript::compiler::Compilation compilation({{"expanded_aot.rs", source}});
+    realscript::compiler::Compilation compilation({{"expanded_aot.rscript", source}});
     auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
         "native AOT source failed to compile:\n" +
@@ -463,7 +463,7 @@ int main()
 }
 )";
 
-    realscript::compiler::Compilation compilation({{"artifact_meta.rs", source}});
+    realscript::compiler::Compilation compilation({{"artifact_meta.rscript", source}});
     auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
         "metadata artifact source failed to compile:\n" +
@@ -544,7 +544,7 @@ class Behavior
 )";
 
     realscript::game::GameScriptCompiler compiler(api);
-    const auto compiled = compiler.compile({{"sequence.rs", source}});
+    const auto compiled = compiler.compile({{"sequence.rscript", source}});
     require(compiled.succeeded(),
         "sequence source compilation failed:\n" + diagnosticsText(compiled.diagnostics));
     require(compiled.languageMetadata.attributes.size() == 1 &&

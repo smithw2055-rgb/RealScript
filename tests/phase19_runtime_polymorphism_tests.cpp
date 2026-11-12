@@ -46,7 +46,7 @@ internal sealed class Marine : Unit, IEntity
     public override int Kind() { return 1; }
 }
 )";
-    realscript::text::SourceText text(source, "phase19.rs");
+    realscript::text::SourceText text(source, "phase19.rscript");
     realscript::diagnostics::DiagnosticBag diagnostics;
     realscript::syntax::Parser parser(text, diagnostics);
     auto unit = parser.parseCompilationUnit();
@@ -84,7 +84,7 @@ internal sealed class Marine : Unit, IEntity
 }
 void testDuplicateModifier() {
     realscript::text::SourceText text(
-        "public public class Bad {}", "bad.rs");
+        "public public class Bad {}", "bad.rscript");
     realscript::diagnostics::DiagnosticBag diagnostics;
     realscript::syntax::Parser parser(text, diagnostics);
     (void)parser.parseCompilationUnit();
@@ -112,7 +112,7 @@ int main()
     return marine.Read() + marine.ReadBase();
 }
 )";
-    realscript::compiler::Compilation compilation({{"runtime.rs", source}});
+    realscript::compiler::Compilation compilation({{"runtime.rscript", source}});
     auto build = compilation.build();
     if (build.diagnostics.hasErrors()) {
         std::string messages;
@@ -171,7 +171,7 @@ int main()
 }
 )";
     realscript::compiler::Compilation compilation(
-        {{"base-constructor.rs", source}});
+        {{"base-constructor.rscript", source}});
     auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
         "base constructor source failed to compile:\n" +
@@ -186,7 +186,7 @@ int main()
         "base constructor did not execute before the derived body: " +
             result.error.message);
 
-    realscript::compiler::Compilation invalid({{"invalid-base.rs", R"(
+    realscript::compiler::Compilation invalid({{"invalid-base.rscript", R"(
 class Base { protected Base(int initial) { } }
 class Derived : Base { public Derived() { } }
 )"}});
@@ -214,7 +214,7 @@ bool hasDiagnostic(
 }
 
 void testVisibilityDiagnostics() {
-    realscript::compiler::Compilation privateMember({{"private-member.rs", R"(
+    realscript::compiler::Compilation privateMember({{"private-member.rscript", R"(
 class Box
 {
     private int Secret() { return 7; }
@@ -231,7 +231,7 @@ int main()
         "private method access was not rejected");
 
     realscript::compiler::Compilation privateConstructor(
-        {{"private-constructor.rs", R"(
+        {{"private-constructor.rscript", R"(
 class Locked { private Locked() { } }
 int main() { Locked value = new Locked(); return 0; }
 )"}});
@@ -240,7 +240,7 @@ int main() { Locked value = new Locked(); return 0; }
         "private constructor access was not rejected");
 
     realscript::compiler::Compilation protectedMember(
-        {{"protected-member.rs", R"(
+        {{"protected-member.rscript", R"(
 class Base { protected int value; }
 class Other
 {
@@ -252,11 +252,11 @@ class Other
         "protected field access from an unrelated type was not rejected");
 
     realscript::compiler::Compilation internalType({
-        {"hidden.rs", R"(
+        {"hidden.rscript", R"(
 module Hidden;
 internal class HiddenType { public HiddenType() { } }
 )"},
-        {"consumer.rs", R"(
+        {"consumer.rscript", R"(
 module Consumer;
 import Hidden;
 int main() { HiddenType value = new HiddenType(); return 0; }
@@ -290,7 +290,7 @@ int main()
     return Read(value);
 }
 )";
-    realscript::compiler::Compilation compilation({{"virtual.rs", source}});
+    realscript::compiler::Compilation compilation({{"virtual.rscript", source}});
     auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
         "virtual dispatch source failed to compile:\n" +
@@ -435,7 +435,7 @@ int main()
 )";
 
     realscript::compiler::Compilation compilation(
-        {{"interfaces.rs", source}});
+        {{"interfaces.rscript", source}});
     auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
         "interface dispatch source failed to compile:\n" +
@@ -585,7 +585,7 @@ int main()
     return value.Read();
 }
 )";
-    realscript::compiler::Compilation compilation({{"phase19-rsbc.rs", source}});
+    realscript::compiler::Compilation compilation({{"phase19-rsbc.rscript", source}});
     auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
         "Phase 19 RSBC source failed to compile:\n" +
@@ -687,7 +687,7 @@ int main()
     return value.Read();
 }
 )";
-    realscript::compiler::Compilation compilation({{"link-validation.rs", source}});
+    realscript::compiler::Compilation compilation({{"link-validation.rscript", source}});
     const auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
         "object-model link-validation source failed to compile:\n" +
@@ -803,7 +803,7 @@ int main()
 void testGameSdkInheritedObjectClosure() {
     realscript::game::GameApi api;
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"phase19-game-sdk.rs", R"(
+    auto compiled = compiler.compile({{"phase19-game-sdk.rscript", R"(
 module Phase19.GameSdk;
 class Base
 {
@@ -858,7 +858,7 @@ class Derived : Base
 
 void testLanguageToolingVisibilityAndInheritance() {
     realscript::tooling::LanguageService service;
-    service.open("base-tools.rs", R"(
+    service.open("base-tools.rscript", R"(
 module Phase19.Tools;
 class Base
 {
@@ -867,17 +867,17 @@ class Base
     public int Visible() { return 3; }
 }
 )" );
-    service.open("derived-tools.rs", R"(
+    service.open("derived-tools.rscript", R"(
 module Phase19.Tools;
 class Derived : Base
 {
     int Run() { return Shared(); }
 }
 )" );
-    require(service.diagnostics("derived-tools.rs").empty(),
+    require(service.diagnostics("derived-tools.rscript").empty(),
         "inherited tooling fixture produced diagnostics");
     const auto completion = service.completion(
-        "derived-tools.rs", {4, 24});
+        "derived-tools.rscript", {4, 24});
     require(std::any_of(
             completion.begin(), completion.end(),
             [](const auto& item) { return item.label == "Shared"; }) &&
@@ -886,25 +886,25 @@ class Derived : Base
                 [](const auto& item) { return item.label == "Secret"; }),
         "LSP completion did not respect inherited visibility");
     const auto definition = service.definition(
-        "derived-tools.rs", {4, 25});
-    require(definition && definition->path == "base-tools.rs",
+        "derived-tools.rscript", {4, 25});
+    require(definition && definition->path == "base-tools.rscript",
         "LSP definition did not resolve the inherited method");
     const auto edits = service.rename(
-        "derived-tools.rs", {4, 25}, "SharedValue");
+        "derived-tools.rscript", {4, 25}, "SharedValue");
     require(edits.size() == 2,
         "LSP rename did not include the inherited definition and call");
 
-    service.open("internal-tools.rs", R"(
+    service.open("internal-tools.rscript", R"(
 module Phase19.HiddenTools;
 internal class HiddenType { }
 )" );
-    service.open("consumer-tools.rs", R"(
+    service.open("consumer-tools.rscript", R"(
 module Phase19.ConsumerTools;
 import Phase19.HiddenTools;
 int main() { return 0; }
 )" );
     const auto externalCompletion = service.completion(
-        "consumer-tools.rs", {3, 12});
+        "consumer-tools.rscript", {3, 12});
     require(std::none_of(
             externalCompletion.begin(), externalCompletion.end(),
             [](const auto& item) { return item.label == "HiddenType"; }),
@@ -912,7 +912,7 @@ int main() { return 0; }
 }
 
 void testDebuggerShowsRuntimeUserMethod() {
-    realscript::compiler::Compilation compilation({{"phase19-debug.rs", R"(
+    realscript::compiler::Compilation compilation({{"phase19-debug.rscript", R"(
 module Phase19.Debug;
 interface IValue { public int Read(); }
 abstract class Base : IValue { public abstract int Read(); }
@@ -942,7 +942,7 @@ int main()
                 "bytecode exposed a polymorphism dispatch helper as a function");
             if (function.name.find("Derived.Read") != std::string::npos) {
                 sawDerivedUserMethod =
-                    function.debugInfo.sourceName == "phase19-debug.rs" &&
+                    function.debugInfo.sourceName == "phase19-debug.rscript" &&
                     !function.debugInfo.sequencePoints.empty();
             }
         }
@@ -954,7 +954,7 @@ int main()
 void testInterfaceDiagnostics() {
     const auto compile = [](const char* source) {
         realscript::compiler::Compilation compilation(
-            {{"invalid-interface.rs", source}});
+            {{"invalid-interface.rscript", source}});
         return compilation.build();
     };
 
@@ -977,7 +977,7 @@ int main() { IUnit value = new Other(); return value.Kind(); }
 
 void testGlobalInheritanceDeclarationOrder() {
     realscript::compiler::Compilation compilation({
-        {"a-derived.rs", R"(
+        {"a-derived.rscript", R"(
 module Phase19.CrossFile;
 class Derived : Base
 {
@@ -985,14 +985,14 @@ class Derived : Base
 }
 int main() { Base value = new Derived(); return value.Read(); }
 )"},
-        {"z-base.rs", R"(
+        {"z-base.rscript", R"(
 module Phase19.CrossFile;
 class Base
 {
     public virtual int Read() { return 1; }
 }
 )"},
-        {"a-consumer.rs", R"(
+        {"a-consumer.rscript", R"(
 module Phase19.AConsumer;
 import Phase19.ZBase;
 public class CrossDerived : CrossBase
@@ -1001,7 +1001,7 @@ public class CrossDerived : CrossBase
 }
 int main() { ICrossRead value = new CrossDerived(); return value.Read(); }
 )"},
-        {"z-base-module.rs", R"(
+        {"z-base-module.rscript", R"(
 module Phase19.ZBase;
 public interface ICrossRead { public int Read(); }
 public class CrossBase : ICrossRead
@@ -1041,7 +1041,7 @@ public class CrossBase : ICrossRead
 void testCanonicalVirtualSlotOrder() {
     const auto slots = [](const char* source) {
         realscript::compiler::Compilation compilation(
-            {{"virtual-order.rs", source}});
+            {{"virtual-order.rscript", source}});
         const auto build = compilation.build();
         require(!build.diagnostics.hasErrors(),
             "virtual-slot source failed to compile:\n" +
@@ -1081,7 +1081,7 @@ class Base
 
 void testVirtualDiagnostics() {
     const auto compile = [](const char* source) {
-        realscript::compiler::Compilation compilation({{"invalid.rs", source}});
+        realscript::compiler::Compilation compilation({{"invalid.rscript", source}});
         return compilation.build();
     };
 
@@ -1125,7 +1125,7 @@ int main() { Base value = new Base(); return 0; }
 void testDevirtAndPolymorphicFastPathRegressions() {
     // 1. Cross-module multi-level hierarchy devirtualization + intra-block StoreLocal overwrite safety
     realscript::compiler::Compilation compilation({
-        {"m_root.rs", R"(
+        {"m_root.rscript", R"(
 module Reg.RootMod;
 public interface ICompute { public int Calc(int x); }
 public class Root : ICompute
@@ -1135,7 +1135,7 @@ public class Root : ICompute
     public virtual int Calc(int x) { return this.factor * 4; }
 }
 )"},
-        {"m_mid.rs", R"(
+        {"m_mid.rscript", R"(
 module Reg.MidMod;
 import Reg.RootMod;
 public class Middle : Root
@@ -1143,7 +1143,7 @@ public class Middle : Root
     public Middle() : base() { this.factor = 5; }
 }
 )"},
-        {"m_leaf.rs", R"(
+        {"m_leaf.rscript", R"(
 module Reg.LeafMod;
 import Reg.MidMod;
 public class Leaf : Middle
@@ -1152,7 +1152,7 @@ public class Leaf : Middle
     public override int Calc(int x) { return this.factor * 6; }
 }
 )"},
-        {"m_caller.rs", R"(
+        {"m_caller.rscript", R"(
 module Reg.CallerMod;
 import Reg.RootMod;
 import Reg.LeafMod;
@@ -1224,7 +1224,7 @@ public int runOverwriteLocal(int mode)
     // 2. Verify intra-block local overwrite does not falsely devirtualize `local = dynamicObj` to `Leaf`
     // and verify CallPolledFast + StoreLocal instruction budget parity when callee traps/exceeds budget
     realscript::compiler::Compilation dynComp({
-        {"dyn.rs", R"(
+        {"dyn.rscript", R"(
 module Reg.Dyn;
 public interface IWorker
 {

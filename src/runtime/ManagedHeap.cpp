@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -52,20 +54,192 @@ const char* objectKindName(ObjectKind kind) noexcept {
     return "unknown";
 }
 
-std::mutex& liveHeapsPoolMutex() noexcept {
-    static std::mutex m;
-    return m;
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
+struct alignas(64) HeapSyncState {
+    static constexpr std::uint32_t kInvalidShardSlot = 0xFFFFFFFFu;
+
+    std::mutex mutex;
+    void* ownerImpl = nullptr;
+    bool (*markPoolFn)(void*) = nullptr;
+    std::uint64_t heapIdValue = 0;
+    std::uint32_t shardIndex = 0;
+    std::atomic<std::uint32_t> shardSlot{kInvalidShardSlot};
+    std::atomic<std::uint32_t> stringShardSlot{kInvalidShardSlot};
+
+    HeapSyncState(void* impl, bool (*markFn)(void*), std::uint64_t heapId) noexcept
+        : ownerImpl(impl),
+          markPoolFn(markFn),
+          heapIdValue(heapId),
+          shardIndex(static_cast<std::uint32_t>(heapId & 63u)) {}
+};
+
+constexpr std::size_t kHeapPoolMarkerShardCount = 64;
+
+struct alignas(64) HeapPoolMarkerShard {
+    std::mutex mutex;
+    std::vector<std::shared_ptr<HeapSyncState>> entries;
+    std::atomic<std::size_t> activeCount{0};
+};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>& heapPoolMarkerShards() noexcept {
+    static auto* shards = new std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>();
+    return *shards;
 }
 
-std::unordered_map<const void*, std::function<void()>>& liveHeapPoolMarkers() noexcept {
-    static std::unordered_map<const void*, std::function<void()>> markers;
-    return markers;
+std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>& liveStringHeapShards() noexcept {
+    static auto* shards = new std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>();
+    return *shards;
 }
 
-std::mutex& poolGcMutex() noexcept {
-    static std::mutex m;
-    return m;
+void registerHeapSyncInPoolShard(const std::shared_ptr<HeapSyncState>& sync) {
+    if (!sync) return;
+    if (sync->shardSlot.load(std::memory_order_relaxed) != HeapSyncState::kInvalidShardSlot) {
+        return;
+    }
+    auto& shard = heapPoolMarkerShards()[sync->shardIndex];
+    std::lock_guard<std::mutex> shardLock(shard.mutex);
+    if (sync->shardSlot.load(std::memory_order_relaxed) != HeapSyncState::kInvalidShardSlot) {
+        return;
+    }
+    const auto slot = static_cast<std::uint32_t>(shard.entries.size());
+    shard.entries.push_back(sync);
+    sync->shardSlot.store(slot, std::memory_order_release);
+    shard.activeCount.store(shard.entries.size(), std::memory_order_release);
 }
+
+void unregisterHeapSyncFromPoolShard(HeapSyncState& sync) noexcept {
+    if (sync.shardSlot.load(std::memory_order_relaxed) == HeapSyncState::kInvalidShardSlot) {
+        return;
+    }
+    auto& shard = heapPoolMarkerShards()[sync.shardIndex];
+    std::lock_guard<std::mutex> shardLock(shard.mutex);
+    const std::uint32_t slot = sync.shardSlot.load(std::memory_order_relaxed);
+    if (slot < shard.entries.size() && shard.entries[slot].get() == &sync) {
+        auto last = std::move(shard.entries.back());
+        shard.entries.pop_back();
+        if (slot < shard.entries.size()) {
+            last->shardSlot.store(slot, std::memory_order_relaxed);
+            shard.entries[slot] = std::move(last);
+        }
+        shard.activeCount.store(shard.entries.size(), std::memory_order_release);
+    }
+    sync.shardSlot.store(HeapSyncState::kInvalidShardSlot, std::memory_order_release);
+}
+
+void registerHeapSyncInStringShard(const std::shared_ptr<HeapSyncState>& sync) {
+    if (!sync) return;
+    if (sync->stringShardSlot.load(std::memory_order_relaxed) != HeapSyncState::kInvalidShardSlot) {
+        return;
+    }
+    auto& shard = liveStringHeapShards()[sync->shardIndex];
+    std::lock_guard<std::mutex> shardLock(shard.mutex);
+    if (sync->stringShardSlot.load(std::memory_order_relaxed) != HeapSyncState::kInvalidShardSlot) {
+        return;
+    }
+    const auto slot = static_cast<std::uint32_t>(shard.entries.size());
+    shard.entries.push_back(sync);
+    sync->stringShardSlot.store(slot, std::memory_order_release);
+    shard.activeCount.store(shard.entries.size(), std::memory_order_release);
+}
+
+void unregisterHeapSyncFromStringShard(HeapSyncState& sync) noexcept {
+    if (sync.stringShardSlot.load(std::memory_order_relaxed) == HeapSyncState::kInvalidShardSlot) {
+        return;
+    }
+    auto& shard = liveStringHeapShards()[sync.shardIndex];
+    std::lock_guard<std::mutex> shardLock(shard.mutex);
+    const std::uint32_t slot = sync.stringShardSlot.load(std::memory_order_relaxed);
+    if (slot < shard.entries.size() && shard.entries[slot].get() == &sync) {
+        auto last = std::move(shard.entries.back());
+        shard.entries.pop_back();
+        if (slot < shard.entries.size()) {
+            last->stringShardSlot.store(slot, std::memory_order_relaxed);
+            shard.entries[slot] = std::move(last);
+        }
+        shard.activeCount.store(shard.entries.size(), std::memory_order_release);
+    }
+    sync.stringShardSlot.store(HeapSyncState::kInvalidShardSlot, std::memory_order_release);
+}
+
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
+struct alignas(64) ValuePoolSweepCoordinator {
+    std::mutex sweepMutex;
+    std::atomic<std::uint64_t> requestedEpoch{0};
+    std::atomic<std::uint64_t> completedEpoch{0};
+};
+
+struct alignas(64) MutatorSweepCoordinator {
+    static constexpr std::uint64_t kSweepActiveBit = std::uint64_t{1} << 63u;
+    static constexpr std::uint64_t kActiveMutatorMask = ~kSweepActiveBit;
+
+    std::atomic<std::uint64_t> state{0};
+    std::atomic<bool> deferredSweepPending{false};
+    std::mutex waitMutex;
+    std::condition_variable cv;
+};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+ValuePoolSweepCoordinator& valuePoolSweepCoordinator() noexcept {
+    static auto* coord = new ValuePoolSweepCoordinator();
+    return *coord;
+}
+
+MutatorSweepCoordinator& mutatorSweepCoordinator() noexcept {
+    static auto* mc = new MutatorSweepCoordinator();
+    return *mc;
+}
+
+std::uint32_t& tlsMutatorDepthRef() noexcept {
+    thread_local std::uint32_t depth = 0;
+    return depth;
+}
+
+std::uint32_t& tlsHeapSyncLockDepthRef() noexcept {
+    thread_local std::uint32_t depth = 0;
+    return depth;
+}
+
+std::size_t reclaimPoolValuesInternal(
+    const ShadowStack* activeShadowStack,
+    bool waitIfBusy) noexcept;
+
+class HeapSyncMutexGuard {
+public:
+    explicit HeapSyncMutexGuard(std::mutex& m, bool flushDeferredOnUnlock = true)
+        : mutex_(m), flushDeferred_(flushDeferredOnUnlock) {
+        mutex_.lock();
+        ++tlsHeapSyncLockDepthRef();
+    }
+
+    ~HeapSyncMutexGuard() noexcept {
+        mutex_.unlock();
+        auto& depth = tlsHeapSyncLockDepthRef();
+        if (depth > 0u && --depth == 0u && flushDeferred_ && tlsMutatorDepthRef() == 0u) {
+            if (mutatorSweepCoordinator().deferredSweepPending.exchange(
+                    false, std::memory_order_acq_rel)) {
+                (void)reclaimPoolValuesInternal(nullptr, /*waitIfBusy=*/false);
+            }
+        }
+    }
+
+    HeapSyncMutexGuard(const HeapSyncMutexGuard&) = delete;
+    HeapSyncMutexGuard& operator=(const HeapSyncMutexGuard&) = delete;
+
+private:
+    std::mutex& mutex_;
+    bool flushDeferred_ = true;
+};
 
 std::uint64_t nextShadowStackId() noexcept {
     static std::atomic<std::uint64_t> next{1};
@@ -178,10 +352,18 @@ ShadowStack::~ShadowStack() noexcept {
 }
 
 ShadowStack::ShadowStack(const ShadowStack& other)
-    : inlineFrames_(other.inlineFrames_),
-      overflowFrames_(other.overflowFrames_),
-      frameCount_(other.frameCount_),
-      instanceId_(nextShadowStackId()) {
+    : instanceId_(nextShadowStackId()) {
+    if (other.registryShard_ != nullptr) {
+        auto* otherShard = static_cast<ThreadShadowStackShard*>(other.registryShard_);
+        std::lock_guard<std::mutex> lock(otherShard->mutex);
+        inlineFrames_ = other.inlineFrames_;
+        overflowFrames_ = other.overflowFrames_;
+        frameCount_ = other.frameCount_;
+    } else {
+        inlineFrames_ = other.inlineFrames_;
+        overflowFrames_ = other.overflowFrames_;
+        frameCount_ = other.frameCount_;
+    }
     if (frameCount_ > 0) {
         registerActiveShadowStack(this);
     }
@@ -189,16 +371,47 @@ ShadowStack::ShadowStack(const ShadowStack& other)
 
 ShadowStack& ShadowStack::operator=(const ShadowStack& other) {
     if (this == &other) return *this;
-    const bool wasEmpty = (frameCount_ == 0);
-    auto overflowCopy = other.overflowFrames_;
-    inlineFrames_ = other.inlineFrames_;
+    std::array<FrameRoots, InlineFrameCapacity> inlineCopy{};
+    std::vector<FrameRoots> overflowCopy;
+    std::size_t countCopy = 0;
+    if (other.registryShard_ != nullptr && other.registryShard_ != registryShard_) {
+        auto* otherShard = static_cast<ThreadShadowStackShard*>(other.registryShard_);
+        std::lock_guard<std::mutex> lock(otherShard->mutex);
+        inlineCopy = other.inlineFrames_;
+        overflowCopy = other.overflowFrames_;
+        countCopy = other.frameCount_;
+    } else if (other.registryShard_ == nullptr) {
+        inlineCopy = other.inlineFrames_;
+        overflowCopy = other.overflowFrames_;
+        countCopy = other.frameCount_;
+    }
+    const bool wasRegistered = (registryShard_ != nullptr);
+    if (wasRegistered) {
+        auto* shard = static_cast<ThreadShadowStackShard*>(registryShard_);
+        {
+            std::lock_guard<std::mutex> lock(shard->mutex);
+            if (other.registryShard_ == registryShard_) {
+                inlineFrames_ = other.inlineFrames_;
+                overflowFrames_ = other.overflowFrames_;
+                frameCount_ = other.frameCount_;
+            } else {
+                inlineFrames_ = inlineCopy;
+                overflowFrames_ = std::move(overflowCopy);
+                frameCount_ = countCopy;
+            }
+            instanceId_ = nextShadowStackId();
+        }
+        if (frameCount_ == 0) {
+            unregisterActiveShadowStack(this);
+        }
+        return *this;
+    }
+    inlineFrames_ = inlineCopy;
     overflowFrames_ = std::move(overflowCopy);
-    frameCount_ = other.frameCount_;
+    frameCount_ = countCopy;
     instanceId_ = nextShadowStackId();
-    if (wasEmpty && frameCount_ > 0) {
+    if (frameCount_ > 0) {
         registerActiveShadowStack(this);
-    } else if (!wasEmpty && frameCount_ == 0) {
-        unregisterActiveShadowStack(this);
     }
     return *this;
 }
@@ -225,6 +438,18 @@ void ShadowStack::pushFrame(
     const std::vector<Value>* locals,
     const std::vector<Value>* registers,
     const std::size_t* activeRegisterLimit) {
+    if (registryShard_ != nullptr) {
+        auto* shard = static_cast<ThreadShadowStackShard*>(registryShard_);
+        std::lock_guard<std::mutex> lock(shard->mutex);
+        const std::size_t idx = frameCount_;
+        if (idx < InlineFrameCapacity) {
+            inlineFrames_[idx] = {arguments, locals, registers, activeRegisterLimit};
+        } else {
+            overflowFrames_.push_back({arguments, locals, registers, activeRegisterLimit});
+        }
+        frameCount_ = idx + 1;
+        return;
+    }
     const std::size_t idx = frameCount_;
     if (idx < InlineFrameCapacity) {
         inlineFrames_[idx] = {arguments, locals, registers, activeRegisterLimit};
@@ -238,18 +463,35 @@ void ShadowStack::pushFrame(
 }
 
 void ShadowStack::popFrame() noexcept {
-    if (frameCount_ > 0) {
-        const std::size_t newCount = frameCount_ - 1;
-        if (newCount >= InlineFrameCapacity) {
-            overflowFrames_.pop_back();
-        } else {
-            inlineFrames_[newCount] = {};
+    if (frameCount_ == 0) return;
+    if (registryShard_ != nullptr) {
+        auto* shard = static_cast<ThreadShadowStackShard*>(registryShard_);
+        bool becameEmpty = false;
+        {
+            std::lock_guard<std::mutex> lock(shard->mutex);
+            if (frameCount_ > 0) {
+                const std::size_t newCount = frameCount_ - 1;
+                if (newCount >= InlineFrameCapacity) {
+                    overflowFrames_.pop_back();
+                } else {
+                    inlineFrames_[newCount] = {};
+                }
+                frameCount_ = newCount;
+                becameEmpty = (newCount == 0);
+            }
         }
-        frameCount_ = newCount;
-        if (newCount == 0) {
+        if (becameEmpty) {
             unregisterActiveShadowStack(this);
         }
+        return;
     }
+    const std::size_t newCount = frameCount_ - 1;
+    if (newCount >= InlineFrameCapacity) {
+        overflowFrames_.pop_back();
+    } else {
+        inlineFrames_[newCount] = {};
+    }
+    frameCount_ = newCount;
 }
 
 void ShadowStack::visitRoots(const std::function<void(const Value&)>& visitor) const {
@@ -303,6 +545,10 @@ struct ArrayLayoutKeyHash {
     }
 };
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct alignas(32) CompactSlot {
     static constexpr std::uint32_t kInvalidHandle = 0xFFFFFFFFu;
     static constexpr std::size_t kMaxSsoBytes = 23;
@@ -344,13 +590,11 @@ struct alignas(32) CompactSlot {
         return (gcFlags & f) != 0;
     }
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 static_assert(sizeof(CompactSlot) == 32, "CompactSlot must be exactly 32 bytes (2 per cache line)");
 static_assert(alignof(CompactSlot) == 32, "CompactSlot must be 32-byte aligned");
-
-[[nodiscard]] Value* emptyValueSlicePtr() noexcept {
-    static Value s_empty{};
-    return &s_empty;
-}
 
 class PagedValueSlabPool {
 public:
@@ -368,7 +612,7 @@ public:
         if (count == 0) {
             outClass = kZeroClass;
             outHandle = CompactSlot::kInvalidHandle;
-            return emptyValueSlicePtr();
+            return &emptyValue_;
         }
         const std::uint16_t cls = sizeToClass(count);
         outClass = cls;
@@ -415,6 +659,7 @@ private:
         std::size_t cursor = kBlocksPerPage;
     };
     std::array<ClassArena, 3> classes_;
+    Value emptyValue_{};
 };
 
 class LargeValueBufferPool {
@@ -694,14 +939,26 @@ struct ManagedHeap::Impl {
             elementType == semantic::PrimitiveType::Error;
     }
 
+    [[nodiscard]] static bool isValuePoolBacked(const Value& value) noexcept {
+        const auto t = value.rawTag();
+        return t >= ValueTag::FirstTraceable && t != ValueTag::ObjectRef;
+    }
+
+    static bool markPoolCallback(void* rawImpl) {
+        auto* self = static_cast<Impl*>(rawImpl);
+        const bool foundAny = self->markAllReachablePoolValues();
+        if (!foundAny) {
+            self->mayContainPoolValues.store(false, std::memory_order_relaxed);
+        }
+        return foundAny;
+    }
+
     explicit Impl(HeapConfig value)
-        : config(value), heapId(nextHeapId()),
+        : config(value),
+          heapId(nextHeapId()),
+          syncState(std::make_shared<HeapSyncState>(this, &Impl::markPoolCallback, heapId)),
           nextCollectionThreshold(value.initialCollectionThresholdBytes) {
         typeLayouts.push_back(TypeLayoutEntry{}); // layoutId 0: default empty
-        {
-            std::lock_guard<std::mutex> lock(liveHeapsPoolMutex());
-            liveHeapPoolMarkers()[this] = [this]() { this->markAllReachablePoolValues(); };
-        }
         if (config.initialCollectionThresholdBytes == 0) {
             config.initialCollectionThresholdBytes = 1;
             nextCollectionThreshold = 1;
@@ -712,8 +969,28 @@ struct ManagedHeap::Impl {
     }
 
     ~Impl() {
-        std::lock_guard<std::mutex> lock(liveHeapsPoolMutex());
-        liveHeapPoolMarkers().erase(this);
+        if (syncState) {
+            {
+                HeapSyncMutexGuard instanceLock(syncState->mutex, /*flushDeferredOnUnlock=*/false);
+                syncState->ownerImpl = nullptr;
+            }
+            unregisterHeapSyncFromPoolShard(*syncState);
+            unregisterHeapSyncFromStringShard(*syncState);
+        }
+    }
+
+    void noteMaybePoolBackedUnlocked() {
+        if (!mayContainPoolValues.load(std::memory_order_relaxed)) {
+            mayContainPoolValues.store(true, std::memory_order_release);
+            registerHeapSyncInPoolShard(syncState);
+        }
+    }
+
+    void pinHeapValueIfNeededUnlocked(const Value& value) {
+        if (isValuePoolBacked(value)) {
+            noteMaybePoolBackedUnlocked();
+            pinValueInPools(value);
+        }
     }
 
     [[nodiscard]] static std::size_t slotValueCount(const CompactSlot& slot) noexcept {
@@ -785,12 +1062,19 @@ struct ManagedHeap::Impl {
         slot.payload = CompactSlot::Payload{};
     }
 
-    void markAllReachablePoolValues() const {
-        for (const auto& entry : persistentRoots) markValueInPools(entry.second);
-        for (const auto& entry : staticFields) markValueInPools(entry.second);
+    bool markAllReachablePoolValues() const {
+        bool foundAny = false;
+        const auto markOne = [&](const Value& v) {
+            if (isValuePoolBacked(v)) {
+                foundAny = true;
+                markValueInPools(v);
+            }
+        };
+        for (const auto& entry : persistentRoots) markOne(entry.second);
+        for (const auto& entry : staticFields) markOne(entry.second);
         for (const auto& [typeName, table] : nativeEcsTables) {
             (void)typeName;
-            for (const auto& v : table.values) markValueInPools(v);
+            for (const auto& v : table.values) markOne(v);
         }
         for (const auto& slot : slots) {
             if (!slot.occupied()) continue;
@@ -798,9 +1082,10 @@ struct ManagedHeap::Impl {
             if (count == 0) continue;
             const Value* data = slot.payload.s.data;
             for (std::size_t i = 0; i < count; ++i) {
-                markValueInPools(data[i]);
+                markOne(data[i]);
             }
         }
+        return foundAny;
     }
 
     std::uint32_t internArrayLayout(
@@ -914,6 +1199,8 @@ struct ManagedHeap::Impl {
 
     HeapConfig config;
     std::uint64_t heapId = 0;
+    std::shared_ptr<HeapSyncState> syncState;
+    std::atomic<bool> mayContainPoolValues{false};
     std::vector<CompactSlot> slots;
     std::vector<std::uint32_t> freeSlots;
     std::vector<ObjectRef> markStack;
@@ -948,6 +1235,7 @@ struct ManagedHeap::Impl {
     GcPhase phase = GcPhase::Idle;
     bool requested = false;
     bool resumeSweep = false;
+    bool wallClockCycleActive = false;
     bool hasSparseEcsStaticFields = false;
     std::uint64_t lastScannedShadowStackId = 0;
     std::size_t sweepIndex = 0;
@@ -1054,6 +1342,7 @@ struct ManagedHeap::Impl {
         RuntimeError* error) {
         const auto slotIndex = acquireSlot(sizeBytes, error);
         if (!slotIndex) return std::nullopt;
+        registerHeapSyncInStringShard(syncState);
         auto& slot = slots[*slotIndex];
         if (value.size() <= CompactSlot::kMaxSsoBytes) {
             slot.auxMeta = static_cast<std::uint16_t>(value.size());
@@ -1082,10 +1371,24 @@ struct ManagedHeap::Impl {
         const std::uint32_t layoutId = internArrayLayout(arrayTypeId, elementType, elementTypeId);
         const auto slotIndex = acquireSlot(sizeBytes, error, outReallocated);
         if (!slotIndex) return std::nullopt;
-        if (initialValue.isTraceable()) {
-            pinValueInPools(initialValue);
+        if (length > 0) {
+            pinHeapValueIfNeededUnlocked(initialValue);
         }
         auto& slot = slots[*slotIndex];
+        if (length == 0) {
+            std::uint16_t cls = 0;
+            std::uint32_t handle = CompactSlot::kInvalidHandle;
+            Value* ptr = slabPool.allocate(0, cls, handle);
+            slot.auxMeta = cls;
+            slot.payload.s = {
+                layoutId,
+                0u,
+                ptr,
+                handle,
+                CompactSlot::kInvalidHandle,
+            };
+            return finalizeSlotAllocation(*slotIndex, ObjectKind::Array, SlotStorage::SlabValues, sizeBytes);
+        }
         if (length <= CompactSlot::kInlineValueCapacity) {
             std::uint16_t cls = 0;
             std::uint32_t handle = CompactSlot::kInvalidHandle;
@@ -1124,7 +1427,7 @@ struct ManagedHeap::Impl {
         const auto slotIndex = acquireSlot(sizeBytes, error);
         if (!slotIndex) return std::nullopt;
         for (const auto& v : vals) {
-            if (v.isTraceable()) pinValueInPools(v);
+            pinHeapValueIfNeededUnlocked(v);
         }
         auto& slot = slots[*slotIndex];
         const std::size_t count = vals.size();
@@ -1375,10 +1678,11 @@ struct ManagedHeap::Impl {
         }
     }
 
-    void finishCollection(const ShadowStack& shadowStack) {
+    [[nodiscard]] bool finishCollectionUnlocked() {
         phase = GcPhase::Idle;
         requested = false;
         resumeSweep = false;
+        wallClockCycleActive = false;
         lastScannedShadowStackId = 0;
         sweepIndex = 0;
         sweepLimit = 0;
@@ -1406,8 +1710,214 @@ struct ManagedHeap::Impl {
         nextCollectionThreshold = std::max(
             config.initialCollectionThresholdBytes,
             std::min(config.maximumHeapBytes, doubled));
-        (void)reclaimUnreferencedPoolValues(&shadowStack);
+        return hasAnyPinnedPoolValues();
     }
+
+    [[nodiscard]] std::optional<semantic::SymbolId> arrayTypeIdUnlocked(ObjectRef reference) const noexcept {
+        const auto* slot = getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Array) return std::nullopt;
+        return typeLayouts[slot->payload.s.layoutId].typeId;
+    }
+
+    [[nodiscard]] std::optional<semantic::SymbolId> objectTypeIdUnlocked(ObjectRef reference) const noexcept {
+        const auto* slot = getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Record) return std::nullopt;
+        const auto tid = typeLayouts[slot->payload.s.layoutId].typeId;
+        if (tid == 0) return std::nullopt;
+        return tid;
+    }
+
+    std::size_t stepUnlocked(
+        const ShadowStack& shadowStack,
+        std::size_t workBudget,
+        bool& outShouldSweepPools) {
+        if (workBudget == 0) return 0;
+        if (phase == GcPhase::Idle) {
+            if (!requested) return 0;
+            startCollection(shadowStack);
+        } else if (phase == GcPhase::Mark &&
+                   lastScannedShadowStackId != shadowStack.instanceId()) {
+            markRoots(shadowStack);
+        }
+
+        std::size_t performed = 0;
+        while (performed < workBudget) {
+            if (phase == GcPhase::Sweep && !markStack.empty()) {
+                reopenMarkFromSweep();
+            }
+            if (phase == GcPhase::Mark) {
+                if (markStack.empty()) {
+                    markRoots(shadowStack);
+                    if (!markStack.empty()) continue;
+                    phase = GcPhase::Sweep;
+                    if (!resumeSweep) sweepIndex = 0;
+                    resumeSweep = false;
+                    continue;
+                }
+                const auto reference = markStack.back();
+                markStack.pop_back();
+                scan(reference);
+                ++statistics.markWork;
+                ++performed;
+                continue;
+            }
+
+            if (phase == GcPhase::Sweep) {
+                if (sweepIndex >= sweepLimit) {
+                    if (finishCollectionUnlocked()) {
+                        outShouldSweepPools = true;
+                    }
+                    break;
+                }
+                const auto slotIdx = static_cast<std::uint32_t>(sweepIndex++);
+                auto& slot = slots[slotIdx];
+                if (slot.occupied() && !slot.hasFlag(GcFlag::Marked)) {
+                    sweepReclaimSlot(slotIdx, slot, false);
+                }
+                ++statistics.sweepWork;
+                ++performed;
+                continue;
+            }
+            break;
+        }
+        return performed;
+    }
+
+    IncrementalGcBudgetStats collectIncrementalWithBudgetUnlocked(
+        const RootSet& roots,
+        std::chrono::nanoseconds budget,
+        std::size_t checkInterval,
+        bool forceStartIfIdle,
+        std::chrono::steady_clock::time_point startTime,
+        bool& outShouldSweepPools) {
+        IncrementalGcBudgetStats stats{};
+
+        if (phase == GcPhase::Idle &&
+            !requested &&
+            statistics.liveBytes < nextCollectionThreshold &&
+            !forceStartIfIdle) {
+            stats.cycleCompleted = false;
+            stats.budgetExhausted = false;
+            stats.phaseAfterStep = GcPhase::Idle;
+            return stats;
+        }
+
+        if (phase == GcPhase::Idle && statistics.liveObjects == 0 && !requested) {
+            stats.cycleCompleted = true;
+            stats.budgetExhausted = false;
+            stats.phaseAfterStep = GcPhase::Idle;
+            return stats;
+        }
+
+        if (budget <= std::chrono::nanoseconds::zero()) {
+            stats.cycleCompleted = false;
+            stats.budgetExhausted = true;
+            stats.phaseAfterStep = phase;
+            return stats;
+        }
+
+        wallClockCycleActive = true;
+        bool startedThisCall = false;
+        if (phase == GcPhase::Idle) {
+            startCollection(roots);
+            startedThisCall = true;
+        } else if (phase == GcPhase::Mark &&
+                   roots.frameCount() > 0 &&
+                   lastScannedShadowStackId != roots.instanceId()) {
+            markRoots(roots);
+        }
+
+        if (startedThisCall) {
+            if (markStack.empty() && sweepLimit == 0) {
+                if (finishCollectionUnlocked()) {
+                    outShouldSweepPools = true;
+                }
+                stats.cycleCompleted = true;
+                stats.phaseAfterStep = phase;
+                return stats;
+            }
+            if ((std::chrono::steady_clock::now() - startTime) >= budget) {
+                stats.cycleCompleted = false;
+                stats.budgetExhausted = true;
+                stats.phaseAfterStep = phase;
+                return stats;
+            }
+        }
+
+        const std::size_t stride = (checkInterval == 0) ? 1u : checkInterval;
+        std::size_t sinceLastCheck = 0;
+
+        while (true) {
+            if (phase == GcPhase::Sweep && !markStack.empty()) {
+                reopenMarkFromSweep();
+            }
+
+            if (phase == GcPhase::Mark) {
+                if (markStack.empty()) {
+                    markRoots(roots);
+                    if (!markStack.empty()) continue;
+                    phase = GcPhase::Sweep;
+                    if (!resumeSweep) sweepIndex = 0;
+                    resumeSweep = false;
+                    if (sweepIndex >= sweepLimit) {
+                        if (finishCollectionUnlocked()) {
+                            outShouldSweepPools = true;
+                        }
+                        stats.cycleCompleted = true;
+                        break;
+                    }
+                    continue;
+                }
+                const auto reference = markStack.back();
+                markStack.pop_back();
+                scan(reference);
+                ++statistics.markWork;
+                ++stats.objectsMarked;
+                ++sinceLastCheck;
+            } else if (phase == GcPhase::Sweep) {
+                if (sweepIndex >= sweepLimit) {
+                    if (finishCollectionUnlocked()) {
+                        outShouldSweepPools = true;
+                    }
+                    stats.cycleCompleted = true;
+                    break;
+                }
+                const auto slotIdx = static_cast<std::uint32_t>(sweepIndex++);
+                auto& slot = slots[slotIdx];
+                if (slot.occupied() && !slot.hasFlag(GcFlag::Marked)) {
+                    sweepReclaimSlot(slotIdx, slot, false);
+                    ++stats.objectsReclaimed;
+                }
+                ++statistics.sweepWork;
+                ++stats.objectsSwept;
+                ++sinceLastCheck;
+
+                if (sweepIndex >= sweepLimit && markStack.empty()) {
+                    if (finishCollectionUnlocked()) {
+                        outShouldSweepPools = true;
+                    }
+                    stats.cycleCompleted = true;
+                    break;
+                }
+            } else {
+                stats.cycleCompleted = true;
+                break;
+            }
+
+            if (sinceLastCheck >= stride) {
+                sinceLastCheck = 0;
+                if ((std::chrono::steady_clock::now() - startTime) >= budget) {
+                    stats.budgetExhausted = true;
+                    break;
+                }
+            }
+        }
+
+        stats.phaseAfterStep = phase;
+        return stats;
+    }
+
+    HeapSnapshot snapshotUnlocked(const ShadowStack* shadowStack) const;
 };
 
 ManagedHeap::ManagedHeap(HeapConfig config)
@@ -1420,6 +1930,7 @@ ManagedHeap& ManagedHeap::operator=(ManagedHeap&&) noexcept = default;
 std::optional<ObjectRef> ManagedHeap::allocateString(
     std::string value,
     RuntimeError* error) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto size = Impl::BaseObjectSizeBytes + value.size();
     return impl_->allocateStringSlot(std::move(value), size, error);
 }
@@ -1427,6 +1938,7 @@ std::optional<ObjectRef> ManagedHeap::allocateString(
 std::optional<ObjectRef> ManagedHeap::internString(
     std::string_view value,
     RuntimeError* error) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const std::string key(value);
     const auto found = impl_->internedStrings.find(key);
     if (found != impl_->internedStrings.end()) {
@@ -1439,7 +1951,8 @@ std::optional<ObjectRef> ManagedHeap::internString(
         }
         impl_->internedStrings.erase(found);
     }
-    auto allocated = allocateString(key, error);
+    const auto size = Impl::BaseObjectSizeBytes + key.size();
+    auto allocated = impl_->allocateStringSlot(key, size, error);
     if (allocated) {
         impl_->slots[allocated->slot].gcFlags |= GcFlag::IsInterned;
         impl_->internedStrings[key] = *allocated;
@@ -1448,6 +1961,7 @@ std::optional<ObjectRef> ManagedHeap::internString(
 }
 
 std::size_t ManagedHeap::internedStringCount() const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     std::size_t aliveCount = 0;
     for (const auto& [k, ref] : impl_->internedStrings) {
         (void)k;
@@ -1457,6 +1971,7 @@ std::size_t ManagedHeap::internedStringCount() const noexcept {
 }
 
 std::size_t ManagedHeap::sharedTypeLayoutCount() const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     return impl_->sharedRecordLayoutByTypeId.size();
 }
 
@@ -1508,7 +2023,8 @@ std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
             "managed array element type metadata is invalid");
         return std::nullopt;
     }
-    if (elementType != semantic::PrimitiveType::Error &&
+    if (length > 0 &&
+        elementType != semantic::PrimitiveType::Error &&
         valueType(initialValue) != elementType) {
         setHeapError(error, ErrorCode::TypeMismatch,
             "managed array initial value does not match its element type");
@@ -1519,6 +2035,7 @@ std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
         setHeapError(error, ErrorCode::OutOfMemory, "managed array is too large");
         return std::nullopt;
     }
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     return impl_->allocateArraySlot(
         arrayTypeId,
         elementType,
@@ -1539,6 +2056,7 @@ std::optional<ObjectRef> ManagedHeap::allocateRecord(
         return std::nullopt;
     }
     std::vector<Value> fields(fieldCount);
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const std::uint32_t layoutId = impl_->internUntypedAllRefRecordLayout(fieldCount);
     return impl_->allocateRecordValuesSlot(
         layoutId,
@@ -1573,6 +2091,7 @@ std::optional<ObjectRef> ManagedHeap::allocateObject(
     referenceFields.erase(
         std::unique(referenceFields.begin(), referenceFields.end()),
         referenceFields.end());
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const std::uint32_t layoutId = impl_->internTypedRecordLayout(typeId, referenceFields);
     return impl_->allocateRecordValuesSlot(
         layoutId,
@@ -1598,12 +2117,13 @@ std::optional<ObjectRef> ManagedHeap::allocateObjectFromTemplate(
         setHeapError(error, ErrorCode::OutOfMemory, "managed object is too large");
         return std::nullopt;
     }
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const std::uint32_t layoutId = impl_->internTemplateRecordLayout(typeId, referenceFields);
     const std::size_t sizeBytes = Impl::BaseObjectSizeBytes + storage;
     const auto slotIndex = impl_->acquireSlot(sizeBytes, error, outSlotsReallocated);
     if (!slotIndex) return std::nullopt;
     for (std::size_t i = 0; i < fieldCount; ++i) {
-        if (defaultFields[i].isTraceable()) pinValueInPools(defaultFields[i]);
+        impl_->pinHeapValueIfNeededUnlocked(defaultFields[i]);
     }
     auto& slot = impl_->slots[*slotIndex];
     if (fieldCount <= CompactSlot::kInlineValueCapacity) {
@@ -1639,21 +2159,57 @@ std::optional<ObjectRef> ManagedHeap::allocateObjectFromTemplate(
 }
 
 bool ManagedHeap::isAlive(ObjectRef reference) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     return impl_->getSlot(reference) != nullptr;
 }
 
 std::optional<std::string_view> ManagedHeap::stringView(ObjectRef reference) const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::String) return std::nullopt;
     return impl_->slotStringView(*slot);
+}
+
+std::optional<std::string> ManagedHeap::tryCopyStringGlobal(ObjectRef reference) {
+    if (!reference.valid() || reference.kind != ObjectKind::String) {
+        return std::nullopt;
+    }
+    auto& shard = liveStringHeapShards()[reference.heapId & 63u];
+    if (shard.activeCount.load(std::memory_order_acquire) == 0) {
+        return std::nullopt;
+    }
+    std::vector<std::shared_ptr<HeapSyncState>> candidates;
+    {
+        std::lock_guard<std::mutex> shardLock(shard.mutex);
+        for (const auto& entry : shard.entries) {
+            if (entry && static_cast<std::uint32_t>(entry->heapIdValue) == reference.heapId) {
+                candidates.push_back(entry);
+            }
+        }
+    }
+    for (const auto& sync : candidates) {
+        HeapSyncMutexGuard instanceLock(sync->mutex);
+        auto* impl = static_cast<Impl*>(sync->ownerImpl);
+        if (!impl) continue;
+        const auto* slot = impl->getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::String) continue;
+        return std::string(impl->slotStringView(*slot));
+    }
+    return std::nullopt;
 }
 
 namespace {
 
 [[nodiscard]] constexpr std::size_t nativeFieldKindSize(NativeFieldKind kind) noexcept {
     switch (kind) {
+    case NativeFieldKind::Int8: return 1;
+    case NativeFieldKind::UInt8: return 1;
+    case NativeFieldKind::Int16: return 2;
+    case NativeFieldKind::UInt16: return 2;
     case NativeFieldKind::Int32: return 4;
+    case NativeFieldKind::UInt32: return 4;
     case NativeFieldKind::Int64: return 8;
+    case NativeFieldKind::UInt64: return 8;
     case NativeFieldKind::Float32: return 4;
     case NativeFieldKind::Float64: return 8;
     case NativeFieldKind::Bool: return 1;
@@ -1686,26 +2242,116 @@ namespace {
     return true;
 }
 
+[[nodiscard]] Value wrapIntegralNativeField(
+    std::int64_t signedVal,
+    std::uint64_t unsignedVal,
+    bool sourceUnsigned,
+    semantic::PrimitiveType requestedType,
+    semantic::PrimitiveType defaultType) noexcept {
+    const auto target = (requestedType == semantic::PrimitiveType::Error)
+        ? defaultType
+        : requestedType;
+    switch (target) {
+    case semantic::PrimitiveType::SByte:
+        return SByteValue{static_cast<std::int8_t>(sourceUnsigned ? static_cast<std::int64_t>(unsignedVal) : signedVal)};
+    case semantic::PrimitiveType::Byte:
+        return ByteValue{static_cast<std::uint8_t>(sourceUnsigned ? unsignedVal : static_cast<std::uint64_t>(signedVal))};
+    case semantic::PrimitiveType::Short:
+        return ShortValue{static_cast<std::int16_t>(sourceUnsigned ? static_cast<std::int64_t>(unsignedVal) : signedVal)};
+    case semantic::PrimitiveType::UShort:
+        return UShortValue{static_cast<std::uint16_t>(sourceUnsigned ? unsignedVal : static_cast<std::uint64_t>(signedVal))};
+    case semantic::PrimitiveType::UInt:
+        return UIntValue{static_cast<std::uint32_t>(sourceUnsigned ? unsignedVal : static_cast<std::uint64_t>(signedVal))};
+    case semantic::PrimitiveType::Long:
+        return LongValue{sourceUnsigned ? static_cast<std::int64_t>(unsignedVal) : signedVal};
+    case semantic::PrimitiveType::ULong:
+        return ULongValue{sourceUnsigned ? unsignedVal : static_cast<std::uint64_t>(signedVal)};
+    case semantic::PrimitiveType::Int:
+    default:
+        return sourceUnsigned ? static_cast<std::int64_t>(unsignedVal) : signedVal;
+    }
+}
+
+[[nodiscard]] bool tryExtractIntegralBits(const Value& val, std::uint64_t& outBits) noexcept {
+    if (const auto* i = std::get_if<std::int64_t>(&val)) {
+        outBits = static_cast<std::uint64_t>(*i);
+        return true;
+    }
+    if (const auto* l = std::get_if<LongValue>(&val)) {
+        outBits = static_cast<std::uint64_t>(l->value);
+        return true;
+    }
+    if (const auto* b = std::get_if<ByteValue>(&val)) {
+        outBits = static_cast<std::uint64_t>(b->value);
+        return true;
+    }
+    if (const auto* sb = std::get_if<SByteValue>(&val)) {
+        outBits = static_cast<std::uint64_t>(static_cast<std::int64_t>(sb->value));
+        return true;
+    }
+    if (const auto* s = std::get_if<ShortValue>(&val)) {
+        outBits = static_cast<std::uint64_t>(static_cast<std::int64_t>(s->value));
+        return true;
+    }
+    if (const auto* us = std::get_if<UShortValue>(&val)) {
+        outBits = static_cast<std::uint64_t>(us->value);
+        return true;
+    }
+    if (const auto* ui = std::get_if<UIntValue>(&val)) {
+        outBits = static_cast<std::uint64_t>(ui->value);
+        return true;
+    }
+    if (const auto* ul = std::get_if<ULongValue>(&val)) {
+        outBits = ul->value;
+        return true;
+    }
+    return false;
+}
+
 [[nodiscard]] Value readNativeFieldFromBytes(
     const std::uint8_t* elemBase,
     const NativeFieldLayout& layout) noexcept {
     const std::uint8_t* ptr = elemBase + layout.byteOffset;
     switch (layout.kind) {
+    case NativeFieldKind::Int8: {
+        std::int8_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        return wrapIntegralNativeField(v, 0u, false, layout.scriptType, semantic::PrimitiveType::SByte);
+    }
+    case NativeFieldKind::UInt8: {
+        std::uint8_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        return wrapIntegralNativeField(0, v, true, layout.scriptType, semantic::PrimitiveType::Byte);
+    }
+    case NativeFieldKind::Int16: {
+        std::int16_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        return wrapIntegralNativeField(v, 0u, false, layout.scriptType, semantic::PrimitiveType::Short);
+    }
+    case NativeFieldKind::UInt16: {
+        std::uint16_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        return wrapIntegralNativeField(0, v, true, layout.scriptType, semantic::PrimitiveType::UShort);
+    }
     case NativeFieldKind::Int32: {
         std::int32_t v = 0;
         std::memcpy(&v, ptr, sizeof(v));
-        if (layout.scriptType == semantic::PrimitiveType::Long) {
-            return LongValue{static_cast<std::int64_t>(v)};
-        }
-        return static_cast<std::int64_t>(v);
+        return wrapIntegralNativeField(v, 0u, false, layout.scriptType, semantic::PrimitiveType::Int);
+    }
+    case NativeFieldKind::UInt32: {
+        std::uint32_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        return wrapIntegralNativeField(0, v, true, layout.scriptType, semantic::PrimitiveType::UInt);
     }
     case NativeFieldKind::Int64: {
         std::int64_t v = 0;
         std::memcpy(&v, ptr, sizeof(v));
-        if (layout.scriptType == semantic::PrimitiveType::Long) {
-            return LongValue{v};
-        }
-        return v;
+        return wrapIntegralNativeField(v, 0u, false, layout.scriptType, semantic::PrimitiveType::Int);
+    }
+    case NativeFieldKind::UInt64: {
+        std::uint64_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        return wrapIntegralNativeField(0, v, true, layout.scriptType, semantic::PrimitiveType::ULong);
     }
     case NativeFieldKind::Float32: {
         float v = 0.0f;
@@ -1763,28 +2409,59 @@ bool writeNativeFieldToBytes(
     const Value& val) noexcept {
     std::uint8_t* ptr = elemBase + layout.byteOffset;
     switch (layout.kind) {
+    case NativeFieldKind::Int8: {
+        std::uint64_t bits = 0;
+        if (!tryExtractIntegralBits(val, bits)) return false;
+        const auto out = static_cast<std::int8_t>(bits);
+        std::memcpy(ptr, &out, sizeof(out));
+        return true;
+    }
+    case NativeFieldKind::UInt8: {
+        std::uint64_t bits = 0;
+        if (!tryExtractIntegralBits(val, bits)) return false;
+        const auto out = static_cast<std::uint8_t>(bits);
+        std::memcpy(ptr, &out, sizeof(out));
+        return true;
+    }
+    case NativeFieldKind::Int16: {
+        std::uint64_t bits = 0;
+        if (!tryExtractIntegralBits(val, bits)) return false;
+        const auto out = static_cast<std::int16_t>(bits);
+        std::memcpy(ptr, &out, sizeof(out));
+        return true;
+    }
+    case NativeFieldKind::UInt16: {
+        std::uint64_t bits = 0;
+        if (!tryExtractIntegralBits(val, bits)) return false;
+        const auto out = static_cast<std::uint16_t>(bits);
+        std::memcpy(ptr, &out, sizeof(out));
+        return true;
+    }
     case NativeFieldKind::Int32: {
-        std::int32_t out = 0;
-        if (const auto* i = std::get_if<std::int64_t>(&val)) {
-            out = static_cast<std::int32_t>(*i);
-        } else if (const auto* l = std::get_if<LongValue>(&val)) {
-            out = static_cast<std::int32_t>(l->value);
-        } else {
-            return false;
-        }
+        std::uint64_t bits = 0;
+        if (!tryExtractIntegralBits(val, bits)) return false;
+        const auto out = static_cast<std::int32_t>(bits);
+        std::memcpy(ptr, &out, sizeof(out));
+        return true;
+    }
+    case NativeFieldKind::UInt32: {
+        std::uint64_t bits = 0;
+        if (!tryExtractIntegralBits(val, bits)) return false;
+        const auto out = static_cast<std::uint32_t>(bits);
         std::memcpy(ptr, &out, sizeof(out));
         return true;
     }
     case NativeFieldKind::Int64: {
-        std::int64_t out = 0;
-        if (const auto* i = std::get_if<std::int64_t>(&val)) {
-            out = *i;
-        } else if (const auto* l = std::get_if<LongValue>(&val)) {
-            out = l->value;
-        } else {
-            return false;
-        }
+        std::uint64_t bits = 0;
+        if (!tryExtractIntegralBits(val, bits)) return false;
+        const auto out = static_cast<std::int64_t>(bits);
         std::memcpy(ptr, &out, sizeof(out));
+        return true;
+    }
+    case NativeFieldKind::UInt64: {
+        std::uint64_t bits = 0;
+        if (!tryExtractIntegralBits(val, bits)) return false;
+        std::memcpy(ptr, &bits, sizeof(bits));
         return true;
     }
     case NativeFieldKind::Float32: {
@@ -1834,8 +2511,16 @@ bool writeNativeFieldToBytes(
     }
     case NativeFieldKind::Fixed16: {
         if (const auto* fx = std::get_if<Fixed16Value>(&val)) {
-            std::memcpy(ptr, &fx->raw, sizeof(fx->raw));
+            const auto raw16 = static_cast<std::int16_t>(fx->raw);
+            std::memcpy(ptr, &raw16, sizeof(raw16));
             return true;
+        }
+        if (const auto f0 = loadInlineStructField(val, 0)) {
+            if (const auto* i = std::get_if<std::int64_t>(&*f0)) {
+                const auto raw16 = static_cast<std::int16_t>(*i);
+                std::memcpy(ptr, &raw16, sizeof(raw16));
+                return true;
+            }
         }
         return false;
     }
@@ -1868,6 +2553,7 @@ bool writeNativeFieldToBytes(
 } // namespace
 
 std::optional<std::size_t> ManagedHeap::arrayLength(ObjectRef reference) const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) return std::nullopt;
     if (slot->storage() == SlotStorage::RawColumn) {
@@ -1877,49 +2563,63 @@ std::optional<std::size_t> ManagedHeap::arrayLength(ObjectRef reference) const {
 }
 
 std::optional<semantic::SymbolId> ManagedHeap::arrayTypeId(ObjectRef reference) const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) return std::nullopt;
     return impl_->typeLayouts[slot->payload.s.layoutId].typeId;
 }
 
 std::optional<semantic::PrimitiveType> ManagedHeap::arrayElementType(ObjectRef reference) const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) return std::nullopt;
     return impl_->typeLayouts[slot->payload.s.layoutId].elementType;
 }
 
 std::optional<semantic::SymbolId> ManagedHeap::arrayElementTypeId(ObjectRef reference) const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) return std::nullopt;
     return impl_->typeLayouts[slot->payload.s.layoutId].elementTypeId;
 }
 
 std::optional<Value> ManagedHeap::arrayGet(ObjectRef reference, std::size_t index) const {
-    const auto* slot = impl_->getSlot(reference);
-    if (!slot || slot->kind() != ObjectKind::Array) return std::nullopt;
-    if (slot->storage() == SlotStorage::RawColumn) {
+    semantic::SymbolId rawStructTypeId = 0;
+    std::size_t rawFieldCount = 0;
+    std::array<Value, 16> stackFields{};
+    std::vector<Value> heapFields;
+    {
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        const auto* slot = impl_->getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Array) return std::nullopt;
+        if (slot->storage() != SlotStorage::RawColumn) {
+            if (index >= slot->payload.s.length) return std::nullopt;
+            return slot->payload.s.data[index];
+        }
         const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
         if (index >= view.count || (!view.basePtr && view.count > 0)) return std::nullopt;
         const auto* elemBase = static_cast<const std::uint8_t*>(view.basePtr) + index * view.strideBytes;
-        const auto fieldCount = view.fields.size();
-        if (fieldCount <= 16) {
-            std::array<Value, 16> stackFields{};
-            for (std::size_t i = 0; i < fieldCount; ++i) {
+        rawStructTypeId = view.structTypeId;
+        rawFieldCount = view.fields.size();
+        if (rawFieldCount <= 16) {
+            for (std::size_t i = 0; i < rawFieldCount; ++i) {
                 stackFields[i] = readNativeFieldFromBytes(elemBase, view.fields[i]);
             }
-            return Value{makeStructValueFromFields(view.structTypeId, ValueSpan(stackFields.data(), fieldCount))};
+        } else {
+            heapFields.resize(rawFieldCount);
+            for (std::size_t i = 0; i < rawFieldCount; ++i) {
+                heapFields[i] = readNativeFieldFromBytes(elemBase, view.fields[i]);
+            }
         }
-        std::vector<Value> heapFields(fieldCount);
-        for (std::size_t i = 0; i < fieldCount; ++i) {
-            heapFields[i] = readNativeFieldFromBytes(elemBase, view.fields[i]);
-        }
-        return Value{makeStructValueFromFields(view.structTypeId, std::move(heapFields))};
     }
-    if (index >= slot->payload.s.length) return std::nullopt;
-    return slot->payload.s.data[index];
+    if (rawFieldCount <= 16) {
+        return Value{makeStructValueFromFields(rawStructTypeId, ValueSpan(stackFields.data(), rawFieldCount))};
+    }
+    return Value{makeStructValueFromFields(rawStructTypeId, std::move(heapFields))};
 }
 
 const Value* ManagedHeap::arrayGetFast(ObjectRef reference, std::size_t index) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array ||
         slot->storage() == SlotStorage::RawColumn || index >= slot->payload.s.length) {
@@ -1929,6 +2629,7 @@ const Value* ManagedHeap::arrayGetFast(ObjectRef reference, std::size_t index) c
 }
 
 bool ManagedHeap::tryBindArrayFastView(ObjectRef reference, ArrayFastView& outView) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array ||
         slot->storage() == SlotStorage::RawColumn) {
@@ -1939,6 +2640,13 @@ bool ManagedHeap::tryBindArrayFastView(ObjectRef reference, ArrayFastView& outVi
         return false;
     }
     const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+    if (!impl_->mayContainPoolValues.load(std::memory_order_relaxed) &&
+        (layout.elementType == semantic::PrimitiveType::String ||
+         layout.elementType == semantic::PrimitiveType::Struct ||
+         layout.elementType == semantic::PrimitiveType::Enum ||
+         layout.elementType == semantic::PrimitiveType::Error)) {
+        impl_->noteMaybePoolBackedUnlocked();
+    }
     const bool inNursery = slot->hasFlag(GcFlag::InNursery);
     outView.data = slot->payload.s.data;
     outView.dirtyCards = (!inNursery && slot->hasFlag(GcFlag::HasCardTable))
@@ -1955,20 +2663,26 @@ void ManagedHeap::recordArrayWriteBarrier(
     ObjectRef arrayRef,
     std::size_t index,
     const Value& value) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     impl_->writeBarrierArrayElement(arrayRef, index, value);
 }
 
 void ManagedHeap::recordArrayWriteBarrier(ObjectRef arrayRef, const Value& value) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     impl_->writeBarrierArrayConservative(arrayRef, value);
 }
 
 bool ManagedHeap::tryBindObjectFastView(ObjectRef reference, ObjectFastView& outView) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Record) {
         return false;
     }
     const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
     if (layout.typeId == 0) return false;
+    if (!impl_->mayContainPoolValues.load(std::memory_order_relaxed)) {
+        impl_->noteMaybePoolBackedUnlocked();
+    }
     outView.fields = slot->payload.s.data;
     outView.fieldCount = slot->payload.s.length;
     outView.typeId = layout.typeId;
@@ -1978,14 +2692,17 @@ bool ManagedHeap::tryBindObjectFastView(ObjectRef reference, ObjectFastView& out
 }
 
 void ManagedHeap::recordObjectWriteBarrier(ObjectRef objectRef, const Value& value) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     impl_->writeBarrierObject(objectRef, value);
 }
 
 const void* ManagedHeap::slotStorageToken() const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     return impl_->slots.data();
 }
 
 semantic::SymbolId ManagedHeap::objectTypeIdFast(ObjectRef reference) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Record) {
         return 0;
@@ -1998,6 +2715,7 @@ bool ManagedHeap::arraySetPrevalidated(
     std::size_t index,
     const Value& value,
     bool mayBeReference) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) {
         return false;
@@ -2025,9 +2743,7 @@ bool ManagedHeap::arraySetPrevalidated(
     if (mayBeReference) {
         impl_->writeBarrierArrayElement(reference, index, value);
     }
-    if (value.isTraceable()) {
-        pinValueInPools(value);
-    }
+    impl_->pinHeapValueIfNeededUnlocked(value);
     slot->payload.s.data[index] = value;
     return true;
 }
@@ -2038,6 +2754,7 @@ bool ManagedHeap::arraySet(
     Value value,
     RuntimeError* error,
     ArrayStoreTypePolicy typePolicy) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference,
@@ -2092,7 +2809,7 @@ bool ManagedHeap::arraySet(
     if (expected == semantic::PrimitiveType::Object &&
         !std::holds_alternative<NullObject>(value)) {
         const auto* child = std::get_if<ObjectRef>(&value);
-        const auto actual = child ? objectTypeId(*child) : std::nullopt;
+        const auto actual = child ? impl_->objectTypeIdUnlocked(*child) : std::nullopt;
         if (!actual ||
             (typePolicy == ArrayStoreTypePolicy::Exact &&
              *actual != expectedTypeId)) {
@@ -2103,7 +2820,7 @@ bool ManagedHeap::arraySet(
     } else if (expected == semantic::PrimitiveType::Array &&
                !std::holds_alternative<NullArray>(value)) {
         const auto* child = std::get_if<ObjectRef>(&value);
-        const auto actual = child ? arrayTypeId(*child) : std::nullopt;
+        const auto actual = child ? impl_->arrayTypeIdUnlocked(*child) : std::nullopt;
         if (!actual || *actual != expectedTypeId) {
             setHeapError(error, ErrorCode::TypeMismatch,
                 "managed array nested array type mismatch");
@@ -2136,15 +2853,14 @@ bool ManagedHeap::arraySet(
             return false;
         }
     }
-    if (value.isTraceable()) {
-        pinValueInPools(value);
-    }
+    impl_->pinHeapValueIfNeededUnlocked(value);
     impl_->writeBarrierArrayElement(reference, index, value);
     values[index] = std::move(value);
     return true;
 }
 
 std::optional<semantic::SymbolId> ManagedHeap::objectTypeId(ObjectRef reference) const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Record) return std::nullopt;
     const auto tid = impl_->typeLayouts[slot->payload.s.layoutId].typeId;
@@ -2153,18 +2869,21 @@ std::optional<semantic::SymbolId> ManagedHeap::objectTypeId(ObjectRef reference)
 }
 
 std::optional<std::size_t> ManagedHeap::fieldCount(ObjectRef reference) const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Record) return std::nullopt;
     return static_cast<std::size_t>(slot->payload.s.length);
 }
 
 bool ManagedHeap::isInlineRecordObject(ObjectRef reference) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     return slot && slot->kind() == ObjectKind::Record &&
         slot->storage() == SlotStorage::SlabValues;
 }
 
 std::optional<Value> ManagedHeap::fieldGet(ObjectRef reference, std::size_t index) const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Record) return std::nullopt;
     if (index >= slot->payload.s.length) return std::nullopt;
@@ -2175,6 +2894,7 @@ const Value* ManagedHeap::fieldGetFast(
     ObjectRef reference,
     std::size_t index,
     semantic::SymbolId* outTypeId) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Record ||
         index >= slot->payload.s.length) {
@@ -2191,6 +2911,7 @@ bool ManagedHeap::fieldSet(
     std::size_t index,
     Value value,
     RuntimeError* error) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Record) {
         setHeapError(error, ErrorCode::InvalidObjectReference,
@@ -2208,9 +2929,7 @@ bool ManagedHeap::fieldSet(
         std::binary_search(refFields.begin(), refFields.end(), index)) {
         impl_->writeBarrierObject(reference, value);
     }
-    if (value.isTraceable()) {
-        pinValueInPools(value);
-    }
+    impl_->pinHeapValueIfNeededUnlocked(value);
     slot->payload.s.data[index] = std::move(value);
     return true;
 }
@@ -2221,6 +2940,7 @@ bool ManagedHeap::fieldSetFast(
     const Value& value,
     semantic::SymbolId expectedTypeId,
     semantic::PrimitiveType expectedFieldType) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Record ||
         index >= slot->payload.s.length ||
@@ -2238,9 +2958,7 @@ bool ManagedHeap::fieldSetFast(
         std::binary_search(layout.referenceFields.begin(), layout.referenceFields.end(), index)) {
         impl_->writeBarrierObject(reference, value);
     }
-    if (value.isTraceable()) {
-        pinValueInPools(value);
-    }
+    impl_->pinHeapValueIfNeededUnlocked(value);
     slot->payload.s.data[index] = value;
     return true;
 }
@@ -2250,6 +2968,7 @@ ManagedHeap::RootToken ManagedHeap::addPersistentRoot(ObjectRef reference) {
 }
 
 ManagedHeap::RootToken ManagedHeap::addPersistentRoot(Value value) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     if (!impl_->validRootValue(value)) return 0;
     if (impl_->phase != GcPhase::Idle) {
         impl_->markValue(value);
@@ -2259,7 +2978,7 @@ ManagedHeap::RootToken ManagedHeap::addPersistentRoot(Value value) {
     }
     auto token = impl_->nextRootToken++;
     if (token == 0) token = impl_->nextRootToken++;
-    pinValueInPools(value);
+    impl_->pinHeapValueIfNeededUnlocked(value);
     impl_->persistentRoots.emplace(token, std::move(value));
     return token;
 }
@@ -2271,6 +2990,7 @@ bool ManagedHeap::updatePersistentRoot(
 }
 
 bool ManagedHeap::updatePersistentRoot(RootToken token, Value value) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     if (token == 0 || !impl_->validRootValue(value)) return false;
     const auto found = impl_->persistentRoots.find(token);
     if (found == impl_->persistentRoots.end()) return false;
@@ -2280,12 +3000,13 @@ bool ManagedHeap::updatePersistentRoot(RootToken token, Value value) {
             impl_->reopenMarkFromSweep();
         }
     }
-    pinValueInPools(value);
+    impl_->pinHeapValueIfNeededUnlocked(value);
     found->second = std::move(value);
     return true;
 }
 
 bool ManagedHeap::removePersistentRoot(RootToken token) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     return impl_->persistentRoots.erase(token) != 0;
 }
 
@@ -2299,31 +3020,36 @@ PersistentRoot ManagedHeap::retain(Value value) {
 }
 
 bool ManagedHeap::hasStaticField(semantic::SymbolId id) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     return impl_->staticFields.find(id) != impl_->staticFields.end();
 }
 
 std::optional<Value> ManagedHeap::getStaticField(semantic::SymbolId id) const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto found = impl_->staticFields.find(id);
     if (found == impl_->staticFields.end()) return std::nullopt;
     return found->second;
 }
 
 void ManagedHeap::setStaticField(semantic::SymbolId id, Value value) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     if (impl_->phase != GcPhase::Idle) {
         impl_->markValue(value);
         if (!impl_->markStack.empty()) {
             impl_->reopenMarkFromSweep();
         }
     }
-    pinValueInPools(value);
+    impl_->pinHeapValueIfNeededUnlocked(value);
     impl_->staticFields[id] = std::move(value);
 }
 
 bool ManagedHeap::removeStaticField(semantic::SymbolId id) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     return impl_->staticFields.erase(id) != 0;
 }
 
 std::vector<semantic::SymbolId> ManagedHeap::staticFieldIds() const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     std::vector<semantic::SymbolId> ids;
     ids.reserve(impl_->staticFields.size());
     for (const auto& [id, val] : impl_->staticFields) {
@@ -2338,13 +3064,14 @@ bool ManagedHeap::setNativeEcsComponent(
     std::string_view canonicalTypeName,
     std::int64_t entityId,
     Value component) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     if (impl_->phase != GcPhase::Idle) {
         impl_->markValue(component);
         if (!impl_->markStack.empty()) {
             impl_->reopenMarkFromSweep();
         }
     }
-    pinValueInPools(component);
+    impl_->pinHeapValueIfNeededUnlocked(component);
     auto& table = impl_->nativeEcsTables[std::string(canonicalTypeName)];
     if (Impl::valueMayContainReferences(component)) {
         table.mayContainReferences = true;
@@ -2363,6 +3090,7 @@ bool ManagedHeap::setNativeEcsComponent(
 std::optional<Value> ManagedHeap::getNativeEcsComponent(
     std::string_view canonicalTypeName,
     std::int64_t entityId) const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
     if (found == impl_->nativeEcsTables.end()) return std::nullopt;
     const auto& table = found->second;
@@ -2375,6 +3103,7 @@ std::optional<Value> ManagedHeap::getNativeEcsComponent(
 bool ManagedHeap::hasNativeEcsComponent(
     std::string_view canonicalTypeName,
     std::int64_t entityId) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
     if (found == impl_->nativeEcsTables.end()) return false;
     const auto& table = found->second;
@@ -2384,6 +3113,7 @@ bool ManagedHeap::hasNativeEcsComponent(
 bool ManagedHeap::removeNativeEcsComponent(
     std::string_view canonicalTypeName,
     std::int64_t entityId) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
     if (found == impl_->nativeEcsTables.end()) return false;
     auto& table = found->second;
@@ -2396,6 +3126,7 @@ bool ManagedHeap::removeNativeEcsComponent(
 }
 
 bool ManagedHeap::destroyNativeEcsEntity(std::int64_t entityId) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     bool removedAny = false;
     for (auto& [typeName, table] : impl_->nativeEcsTables) {
         (void)typeName;
@@ -2411,11 +3142,13 @@ bool ManagedHeap::destroyNativeEcsEntity(std::int64_t entityId) {
 }
 
 bool ManagedHeap::hasNativeEcsTable(std::string_view canonicalTypeName) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
     return found != impl_->nativeEcsTables.end();
 }
 
 std::vector<std::string> ManagedHeap::nativeEcsTableNames() const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     std::vector<std::string> names;
     names.reserve(impl_->nativeEcsTables.size());
     for (const auto& [name, table] : impl_->nativeEcsTables) {
@@ -2427,17 +3160,20 @@ std::vector<std::string> ManagedHeap::nativeEcsTableNames() const {
 }
 
 void ManagedHeap::clearNativeEcsTables() noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     impl_->nativeEcsTables.clear();
 }
 
 const std::vector<std::int64_t>* ManagedHeap::nativeEcsEntityIds(
     std::string_view canonicalTypeName) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
     return found != impl_->nativeEcsTables.end() ? &found->second.entityIds : nullptr;
 }
 
 const std::vector<Value>* ManagedHeap::nativeEcsComponentValues(
     std::string_view canonicalTypeName) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
     return found != impl_->nativeEcsTables.end() ? &found->second.values : nullptr;
 }
@@ -2446,6 +3182,7 @@ bool ManagedHeap::setNativeEcsComponentByDenseIndex(
     std::string_view canonicalTypeName,
     std::size_t denseIndex,
     Value component) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
     if (found == impl_->nativeEcsTables.end() || denseIndex >= found->second.values.size()) {
         return false;
@@ -2459,7 +3196,7 @@ bool ManagedHeap::setNativeEcsComponentByDenseIndex(
     if (Impl::valueMayContainReferences(component)) {
         found->second.mayContainReferences = true;
     }
-    pinValueInPools(component);
+    impl_->pinHeapValueIfNeededUnlocked(component);
     found->second.values[denseIndex] = std::move(component);
     return true;
 }
@@ -2474,6 +3211,7 @@ std::optional<ObjectRef> ManagedHeap::allocateRawColumnArray(
             "raw ECS column view metadata is invalid");
         return std::nullopt;
     }
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const std::uint32_t layoutId = impl_->internArrayLayout(
         arrayTypeId, semantic::PrimitiveType::Struct, elementTypeId);
     const auto slotIndex = impl_->acquireSlot(Impl::BaseObjectSizeBytes, error);
@@ -2492,6 +3230,7 @@ std::optional<ObjectRef> ManagedHeap::allocateRawColumnArray(
 bool ManagedHeap::updateRawColumnArray(
     ObjectRef reference,
     NativeRawColumnView view) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array ||
         slot->storage() != SlotStorage::RawColumn) {
@@ -2506,20 +3245,24 @@ bool ManagedHeap::updateRawColumnArray(
 }
 
 bool ManagedHeap::isRawColumnArray(ObjectRef reference) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     return slot && slot->kind() == ObjectKind::Array &&
         slot->storage() == SlotStorage::RawColumn;
 }
 
 bool ManagedHeap::hasSparseEcsState() const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     return !impl_->nativeEcsTables.empty() || impl_->hasSparseEcsStaticFields;
 }
 
 void ManagedHeap::notifySparseEcsState() noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     impl_->hasSparseEcsStaticFields = true;
 }
 
 const NativeRawColumnView* ManagedHeap::rawColumnView(ObjectRef reference) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array ||
         slot->storage() != SlotStorage::RawColumn) {
@@ -2534,6 +3277,7 @@ bool ManagedHeap::readRawColumnFields(
     Value* outFields,
     std::size_t maxFields,
     std::uint8_t& outFieldCount) const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array ||
         slot->storage() != SlotStorage::RawColumn) {
@@ -2558,6 +3302,7 @@ bool ManagedHeap::writeRawColumnFields(
     const Value* fields,
     std::size_t fieldCount,
     RuntimeError* error) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array ||
         slot->storage() != SlotStorage::RawColumn) {
@@ -2590,95 +3335,160 @@ bool ManagedHeap::writeRawColumnFields(
     return true;
 }
 
-void ManagedHeap::requestCollection() noexcept { impl_->requested = true; }
-bool ManagedHeap::collectionRequested() const noexcept { return impl_->requested; }
-GcPhase ManagedHeap::phase() const noexcept { return impl_->phase; }
+void ManagedHeap::requestCollection() noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    impl_->requested = true;
+}
+bool ManagedHeap::collectionRequested() const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    return impl_->requested;
+}
+GcPhase ManagedHeap::phase() const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    return impl_->phase;
+}
 
 std::size_t ManagedHeap::step(
     const ShadowStack& shadowStack,
     std::size_t workBudget) {
-    if (workBudget == 0) return 0;
-    if (impl_->phase == GcPhase::Idle) {
-        if (!impl_->requested) return 0;
-        impl_->startCollection(shadowStack);
-    } else if (impl_->phase == GcPhase::Mark &&
-               impl_->lastScannedShadowStackId != shadowStack.instanceId()) {
-        impl_->markRoots(shadowStack);
-    }
-
+    bool shouldSweepPools = false;
     std::size_t performed = 0;
-    while (performed < workBudget) {
-        if (impl_->phase == GcPhase::Sweep && !impl_->markStack.empty()) {
-            impl_->reopenMarkFromSweep();
-        }
-        if (impl_->phase == GcPhase::Mark) {
-            if (impl_->markStack.empty()) {
-                impl_->markRoots(shadowStack);
-                if (!impl_->markStack.empty()) continue;
-                impl_->phase = GcPhase::Sweep;
-                if (!impl_->resumeSweep) impl_->sweepIndex = 0;
-                impl_->resumeSweep = false;
-                continue;
-            }
-            const auto reference = impl_->markStack.back();
-            impl_->markStack.pop_back();
-            impl_->scan(reference);
-            ++impl_->statistics.markWork;
-            ++performed;
-            continue;
-        }
-
-        if (impl_->phase == GcPhase::Sweep) {
-            if (impl_->sweepIndex >= impl_->sweepLimit) {
-                impl_->finishCollection(shadowStack);
-                break;
-            }
-            const auto slotIdx = static_cast<std::uint32_t>(impl_->sweepIndex++);
-            auto& slot = impl_->slots[slotIdx];
-            if (slot.occupied() && !slot.hasFlag(GcFlag::Marked)) {
-                impl_->sweepReclaimSlot(slotIdx, slot, false);
-            }
-            ++impl_->statistics.sweepWork;
-            ++performed;
-            continue;
-        }
-        break;
+    {
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        performed = impl_->stepUnlocked(shadowStack, workBudget, shouldSweepPools);
+    }
+    if (shouldSweepPools) {
+        (void)reclaimPoolValuesInternal(&shadowStack, /*waitIfBusy=*/false);
     }
     return performed;
 }
 
-void ManagedHeap::collectFull(const ShadowStack& shadowStack) {
-    const auto drainCollection = [&]() {
-        while (impl_->phase != GcPhase::Idle || impl_->requested) {
-            const auto budget = std::max<std::size_t>(64, impl_->slots.size() + 1);
-            (void)step(shadowStack, budget);
-        }
-    };
+std::size_t ManagedHeap::collectIncremental(
+    const RootSet& roots,
+    std::size_t workBudget) {
+    return step(roots, workBudget);
+}
 
-    if (impl_->phase != GcPhase::Idle) drainCollection();
-    requestCollection();
-    drainCollection();
+IncrementalGcBudgetStats ManagedHeap::collectIncrementalWithBudget(
+    const RootSet& roots,
+    std::chrono::nanoseconds budget,
+    std::size_t checkInterval,
+    bool forceStartIfIdle) {
+    const auto startTime = std::chrono::steady_clock::now();
+    bool shouldSweepPools = false;
+    IncrementalGcBudgetStats stats{};
+    {
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        stats = impl_->collectIncrementalWithBudgetUnlocked(
+            roots, budget, checkInterval, forceStartIfIdle, startTime, shouldSweepPools);
+    }
+    if (shouldSweepPools) {
+        (void)reclaimPoolValuesInternal(&roots, /*waitIfBusy=*/false);
+    }
+    const auto endTime = std::chrono::steady_clock::now();
+    stats.elapsed = detail::clampDurationToNanoseconds(endTime - startTime);
+    stats.elapsedNanoseconds = static_cast<std::uint64_t>(
+        std::max<std::chrono::nanoseconds::rep>(0, stats.elapsed.count()));
+    return stats;
+}
+
+IncrementalGcBudgetStats ManagedHeap::collectIncrementalWithBudget(
+    const RootSet& roots,
+    std::chrono::microseconds budget,
+    std::size_t checkInterval,
+    bool forceStartIfIdle) {
+    return collectIncrementalWithBudget(
+        roots,
+        detail::clampDurationToNanoseconds(budget),
+        checkInterval,
+        forceStartIfIdle);
+}
+
+IncrementalGcBudgetStats ManagedHeap::collectIncrementalWithBudgetUs(
+    const RootSet& roots,
+    std::uint64_t budgetMicroseconds,
+    std::size_t checkInterval,
+    bool forceStartIfIdle) {
+    constexpr auto kMaxUs = static_cast<std::uint64_t>(
+        std::chrono::nanoseconds::max().count() / 1000);
+    const auto clampedNs = (budgetMicroseconds >= kMaxUs)
+        ? std::chrono::nanoseconds::max()
+        : std::chrono::nanoseconds(static_cast<std::chrono::nanoseconds::rep>(budgetMicroseconds * 1000ULL));
+    return collectIncrementalWithBudget(roots, clampedNs, checkInterval, forceStartIfIdle);
+}
+
+bool ManagedHeap::isWallClockCycleActive() const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    return impl_->wallClockCycleActive && impl_->phase != GcPhase::Idle;
+}
+
+void ManagedHeap::finishWallClockCycleForDeterminism(const ShadowStack& shadowStack) {
+    bool shouldSweepPools = false;
+    {
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        if (!impl_->wallClockCycleActive || impl_->phase == GcPhase::Idle) {
+            impl_->wallClockCycleActive = false;
+            return;
+        }
+        while (impl_->phase != GcPhase::Idle) {
+            const auto budget = std::max<std::size_t>(64, impl_->slots.size() + 1);
+            (void)impl_->stepUnlocked(shadowStack, budget, shouldSweepPools);
+        }
+        impl_->wallClockCycleActive = false;
+    }
+    if (shouldSweepPools) {
+        (void)reclaimPoolValuesInternal(&shadowStack, /*waitIfBusy=*/false);
+    }
+}
+
+void ManagedHeap::collectFull(const ShadowStack& shadowStack) {
+    bool shouldSweepPools = false;
+    {
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        const auto drainUnlocked = [&]() {
+            while (impl_->phase != GcPhase::Idle || impl_->requested) {
+                const auto budget = std::max<std::size_t>(64, impl_->slots.size() + 1);
+                (void)impl_->stepUnlocked(shadowStack, budget, shouldSweepPools);
+            }
+        };
+        if (impl_->phase != GcPhase::Idle) drainUnlocked();
+        impl_->requested = true;
+        drainUnlocked();
+    }
+    if (shouldSweepPools) {
+        (void)reclaimPoolValuesInternal(&shadowStack, /*waitIfBusy=*/false);
+    }
+}
+
+void ManagedHeap::collect(const RootSet& roots) {
+    collectFull(roots);
 }
 
 std::size_t ManagedHeap::nurserySize() const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     return impl_->nurserySlots.size();
 }
 
 std::size_t ManagedHeap::collectYoung(
     const ShadowStack& shadowStack,
     std::size_t workBudget) {
-    if (impl_->phase != GcPhase::Idle) {
-        if (workBudget != 0) {
-            return step(shadowStack, workBudget);
-        }
-        std::size_t totalWork = 0;
-        while (impl_->phase != GcPhase::Idle) {
-            const auto budget = std::max<std::size_t>(64, impl_->slots.size() + 1);
-            totalWork += step(shadowStack, budget);
-        }
-        return totalWork;
-    }
-    if (impl_->nurserySlots.empty()) return 0;
+    bool shouldSweepPools = false;
+    std::size_t stepResult = 0;
+    bool handledIncremental = false;
+    {
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        if (impl_->phase != GcPhase::Idle) {
+            handledIncremental = true;
+            if (workBudget != 0) {
+                stepResult = impl_->stepUnlocked(shadowStack, workBudget, shouldSweepPools);
+            } else {
+                while (impl_->phase != GcPhase::Idle) {
+                    const auto budget = std::max<std::size_t>(64, impl_->slots.size() + 1);
+                    stepResult += impl_->stepUnlocked(shadowStack, budget, shouldSweepPools);
+                }
+            }
+        } else {
+            if (impl_->nurserySlots.empty()) return 0;
 
     for (const auto slotIdx : impl_->nurserySlots) {
         if (slotIdx < impl_->slots.size() && impl_->slots[slotIdx].occupied()) {
@@ -2805,17 +3615,24 @@ std::size_t ManagedHeap::collectYoung(
         }
     }
     impl_->rememberedSet.clear();
-    ++impl_->statistics.youngCollections;
-    if (impl_->statistics.liveBytes < impl_->nextCollectionThreshold) {
-        impl_->requested = false;
+            ++impl_->statistics.youngCollections;
+            if (impl_->statistics.liveBytes < impl_->nextCollectionThreshold) {
+                impl_->requested = false;
+            }
+            return processed;
+        }
     }
-    return processed;
+    if (handledIncremental && shouldSweepPools) {
+        (void)reclaimPoolValuesInternal(&shadowStack, /*waitIfBusy=*/false);
+    }
+    return stepResult;
 }
 
 bool ManagedHeap::readPackedIntArray(
     ObjectRef reference,
     std::vector<std::int64_t>& out,
     RuntimeError* error) const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
@@ -2846,6 +3663,7 @@ bool ManagedHeap::writePackedIntArray(
         setHeapError(error, ErrorCode::InvalidArguments, "bulk write source buffer is null");
         return false;
     }
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
@@ -2875,6 +3693,7 @@ bool ManagedHeap::readPackedDoubleArray(
     ObjectRef reference,
     std::vector<double>& out,
     RuntimeError* error) const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
@@ -2905,6 +3724,7 @@ bool ManagedHeap::writePackedDoubleArray(
         setHeapError(error, ErrorCode::InvalidArguments, "bulk write source buffer is null");
         return false;
     }
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
@@ -2934,6 +3754,7 @@ bool ManagedHeap::readPackedVec2Array(
     ObjectRef reference,
     std::vector<Vec2Value>& out,
     RuntimeError* error) const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
@@ -2968,6 +3789,7 @@ bool ManagedHeap::writePackedVec2Array(
         setHeapError(error, ErrorCode::InvalidArguments, "bulk write source buffer is null");
         return false;
     }
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) {
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
@@ -2996,35 +3818,37 @@ const GcStatistics& ManagedHeap::statistics() const noexcept {
     return impl_->statistics;
 }
 std::size_t ManagedHeap::liveObjects() const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     return impl_->statistics.liveObjects;
 }
 std::size_t ManagedHeap::liveBytes() const noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     return impl_->statistics.liveBytes;
 }
 
 std::uint64_t ManagedHeap::heapId() const noexcept { return impl_->heapId; }
 
-HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
+HeapSnapshot ManagedHeap::Impl::snapshotUnlocked(const ShadowStack* shadowStack) const {
     HeapSnapshot result;
-    result.heapId = impl_->heapId;
-    result.statistics = impl_->statistics;
-    result.objects.reserve(impl_->statistics.liveObjects);
-    for (std::size_t slotIndex = 0; slotIndex < impl_->slots.size(); ++slotIndex) {
-        const auto& slot = impl_->slots[slotIndex];
+    result.heapId = heapId;
+    result.statistics = statistics;
+    result.objects.reserve(statistics.liveObjects);
+    for (std::size_t slotIndex = 0; slotIndex < slots.size(); ++slotIndex) {
+        const auto& slot = slots[slotIndex];
         if (!slot.occupied()) continue;
         HeapObjectInfo info;
         info.reference = {
             static_cast<std::uint32_t>(slotIndex),
             slot.generation,
             slot.kind(),
-            impl_->heapId,
+            heapId,
         };
         info.kind = slot.kind();
-        info.sizeBytes = impl_->slotSizeBytes(static_cast<std::uint32_t>(slotIndex), slot);
+        info.sizeBytes = slotSizeBytes(static_cast<std::uint32_t>(slotIndex), slot);
         if (slot.kind() == ObjectKind::String) {
-            info.stringValue = std::string(impl_->slotStringView(slot));
+            info.stringValue = std::string(slotStringView(slot));
         } else {
-            const auto& layout = impl_->typeLayouts[slot.payload.s.layoutId];
+            const auto& layout = typeLayouts[slot.payload.s.layoutId];
             info.typeId = layout.typeId;
             info.elementType = layout.elementType;
             info.elementTypeId = layout.elementTypeId;
@@ -3045,7 +3869,7 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
                                                const Value& value,
                                                const std::string& label) -> void {
                     if (const auto* target = std::get_if<ObjectRef>(&value);
-                        target && impl_->getSlot(*target)) {
+                        target && getSlot(*target)) {
                         info.edges.push_back({*target, label});
                         return;
                     }
@@ -3079,7 +3903,7 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
         std::unordered_set<const StructStorage*> visitedStructs;
         const auto addRoots = [&](const auto& self, const Value& current) -> void {
             if (const auto* reference = std::get_if<ObjectRef>(&current);
-                reference && impl_->getSlot(*reference)) {
+                reference && getSlot(*reference)) {
                 result.roots.push_back({token, *reference, kind});
                 return;
             }
@@ -3093,15 +3917,15 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
         };
         addRoots(addRoots, value);
     };
-    for (const auto& [token, value] : impl_->persistentRoots) {
+    for (const auto& [token, value] : persistentRoots) {
         appendRoots(value, token, "persistent");
     }
-    for (const auto& [symId, value] : impl_->staticFields) {
+    for (const auto& [symId, value] : staticFields) {
         appendRoots(value, symId, "static");
     }
     {
         std::uint64_t ecsRootIndex = 0;
-        for (const auto& [typeName, table] : impl_->nativeEcsTables) {
+        for (const auto& [typeName, table] : nativeEcsTables) {
             (void)typeName;
             if (!table.mayContainReferences) continue;
             for (const auto& v : table.values) {
@@ -3128,9 +3952,15 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
     return result;
 }
 
+HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    return impl_->snapshotUnlocked(shadowStack);
+}
+
 bool ManagedHeap::restore(
     const HeapSnapshot& snapshot,
     RuntimeError* error) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     if (snapshot.heapId != impl_->heapId) {
         setHeapError(error, ErrorCode::InvalidObjectReference,
             "heap snapshot belongs to a different managed heap");
@@ -3336,13 +4166,13 @@ bool ManagedHeap::restore(
         } else {
             const auto count = Impl::slotValueCount(slot);
             for (std::size_t fi = 0; fi < count; ++fi) {
-                pinValueInPools(slot.payload.s.data[fi]);
+                impl_->pinHeapValueIfNeededUnlocked(slot.payload.s.data[fi]);
             }
         }
     }
     for (const auto& [token, val] : roots) {
         (void)token;
-        pinValueInPools(val);
+        impl_->pinHeapValueIfNeededUnlocked(val);
     }
     impl_->freeSlots = std::move(freeSlots);
     impl_->persistentRoots = std::move(roots);
@@ -3355,6 +4185,7 @@ bool ManagedHeap::restore(
     impl_->requested = false;
     impl_->sweepIndex = 0;
     impl_->resumeSweep = false;
+    impl_->wallClockCycleActive = false;
     impl_->sweepLimit = 0;
     impl_->statistics = snapshot.statistics;
     impl_->statistics.liveObjects = snapshot.objects.size();
@@ -3375,8 +4206,12 @@ bool ManagedHeap::restore(
 std::vector<ObjectRef> ManagedHeap::retainingPath(
     ObjectRef target,
     const ShadowStack* shadowStack) const {
-    if (!isAlive(target)) return {};
-    const auto image = snapshot(shadowStack);
+    HeapSnapshot image;
+    {
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        if (!impl_->getSlot(target)) return {};
+        image = impl_->snapshotUnlocked(shadowStack);
+    }
     std::unordered_map<std::uint32_t, const HeapObjectInfo*> objects;
     for (const auto& object : image.objects) {
         objects.emplace(object.reference.slot, &object);
@@ -3418,7 +4253,11 @@ std::vector<ObjectRef> ManagedHeap::retainingPath(
 }
 
 std::string ManagedHeap::leakSummary() const {
-    const auto image = snapshot();
+    HeapSnapshot image;
+    {
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        image = impl_->snapshotUnlocked(nullptr);
+    }
     std::size_t strings = 0;
     std::size_t arrays = 0;
     std::size_t records = 0;
@@ -3690,55 +4529,279 @@ std::string NativeHandleRegistry::debugName(NativeHandle handle) const {
     return isAlive(handle) ? slots_[handle.slot].debugName : std::string{};
 }
 
-
-std::size_t reclaimUnreferencedPoolValues(
-    const ShadowStack* activeShadowStack) noexcept {
-    if (!hasAnyPinnedPoolValues()) return 0u;
-    std::lock_guard<std::mutex> gcLock(poolGcMutex());
-    if (!hasAnyPinnedPoolValues()) return 0u;
-    beginValuePoolGcMark();
-    if (activeShadowStack) {
-        activeShadowStack->visitRoots([](const Value& value) {
-            markStackRootValueInPools(value);
-        });
+void NativeHandleRegistry::registerCppType(
+    std::type_index cppType,
+    semantic::SymbolId typeId) {
+    if (typeId != 0) {
+        cppTypeIds_[cppType] = typeId;
     }
+}
+
+semantic::SymbolId NativeHandleRegistry::findCppTypeId(
+    std::type_index cppType) const noexcept {
+    const auto it = cppTypeIds_.find(cppType);
+    return it != cppTypeIds_.end() ? it->second : 0;
+}
+
+
+namespace detail {
+
+std::shared_ptr<void> createValuePoolRootSync(
+    void* owner,
+    ValuePoolRootMarkFn markFn) {
+    return std::make_shared<HeapSyncState>(owner, markFn, nextHeapId());
+}
+
+void activateValuePoolRootSync(const std::shared_ptr<void>& syncHandle) {
+    if (!syncHandle) return;
+    registerHeapSyncInPoolShard(std::static_pointer_cast<HeapSyncState>(syncHandle));
+}
+
+void deactivateValuePoolRootSync(const std::shared_ptr<void>& syncHandle) noexcept {
+    if (!syncHandle) return;
+    unregisterHeapSyncFromPoolShard(*static_cast<HeapSyncState*>(syncHandle.get()));
+}
+
+void detachValuePoolRootSyncOwner(const std::shared_ptr<void>& syncHandle) noexcept {
+    if (!syncHandle) return;
+    auto* sync = static_cast<HeapSyncState*>(syncHandle.get());
     {
-        std::vector<std::shared_ptr<ThreadShadowStackShard>> shardsSnapshot;
-        {
-            std::lock_guard<std::mutex> listLock(shadowStackShardsMutex());
-            auto& shards = shadowStackShards();
-            shards.erase(
-                std::remove_if(
-                    shards.begin(),
-                    shards.end(),
-                    [](const std::shared_ptr<ThreadShadowStackShard>& shard) {
-                        if (!shard) return true;
-                        std::lock_guard<std::mutex> shardLock(shard->mutex);
-                        return shard->threadExited && shard->stacks.empty();
-                    }),
-                shards.end());
-            shardsSnapshot = shards;
+        HeapSyncMutexGuard lk(sync->mutex, /*flushDeferredOnUnlock=*/false);
+        sync->ownerImpl = nullptr;
+    }
+    unregisterHeapSyncFromPoolShard(*sync);
+}
+
+void lockValuePoolRootSync(const std::shared_ptr<void>& syncHandle) {
+    if (!syncHandle) return;
+    static_cast<HeapSyncState*>(syncHandle.get())->mutex.lock();
+    ++tlsHeapSyncLockDepthRef();
+}
+
+void unlockValuePoolRootSync(const std::shared_ptr<void>& syncHandle) noexcept {
+    if (!syncHandle) return;
+    static_cast<HeapSyncState*>(syncHandle.get())->mutex.unlock();
+    auto& depth = tlsHeapSyncLockDepthRef();
+    if (depth > 0u && --depth == 0u && tlsMutatorDepthRef() == 0u) {
+        if (mutatorSweepCoordinator().deferredSweepPending.exchange(
+                false, std::memory_order_acq_rel)) {
+            (void)reclaimPoolValuesInternal(nullptr, /*waitIfBusy=*/false);
         }
-        for (const auto& shard : shardsSnapshot) {
-            if (!shard) continue;
-            std::lock_guard<std::mutex> shardLock(shard->mutex);
-            for (const ShadowStack* stack : shard->stacks) {
-                if (stack && stack != activeShadowStack) {
-                    stack->visitRoots([](const Value& value) {
-                        markStackRootValueInPools(value);
-                    });
-                }
+    }
+}
+
+void enterInterpreterMutator() noexcept {
+    auto& depth = tlsMutatorDepthRef();
+    if (depth++ > 0u) {
+        return;
+    }
+    auto& mc = mutatorSweepCoordinator();
+    std::uint64_t cur = mc.state.load(std::memory_order_relaxed);
+    while (true) {
+        if ((cur & MutatorSweepCoordinator::kSweepActiveBit) == 0u) {
+            if (mc.state.compare_exchange_weak(
+                    cur,
+                    cur + 1u,
+                    std::memory_order_acquire,
+                    std::memory_order_relaxed)) {
+                return;
+            }
+            continue;
+        }
+        std::unique_lock<std::mutex> lk(mc.waitMutex);
+        mc.cv.wait(lk, [&]() {
+            return (mc.state.load(std::memory_order_acquire) &
+                    MutatorSweepCoordinator::kSweepActiveBit) == 0u;
+        });
+        cur = mc.state.load(std::memory_order_relaxed);
+    }
+}
+
+void leaveInterpreterMutator() noexcept {
+    auto& depth = tlsMutatorDepthRef();
+    if (depth == 0u || --depth > 0u) {
+        return;
+    }
+    auto& mc = mutatorSweepCoordinator();
+    const std::uint64_t prev = mc.state.fetch_sub(1u, std::memory_order_acq_rel);
+    const std::uint64_t remaining =
+        (prev & MutatorSweepCoordinator::kActiveMutatorMask) - 1u;
+    if (remaining == 0u) {
+        if ((prev & MutatorSweepCoordinator::kSweepActiveBit) != 0u) {
+            {
+                std::lock_guard<std::mutex> lk(mc.waitMutex);
+            }
+            mc.cv.notify_all();
+        } else if (mc.deferredSweepPending.exchange(false, std::memory_order_acq_rel)) {
+            (void)reclaimPoolValuesInternal(nullptr, /*waitIfBusy=*/false);
+        }
+    }
+}
+
+} // namespace detail
+
+namespace {
+
+std::size_t reclaimPoolValuesInternal(
+    const ShadowStack* activeShadowStack,
+    bool waitIfBusy) noexcept {
+    if (!hasAnyPinnedPoolValues()) return 0u;
+    auto& mc = mutatorSweepCoordinator();
+    if (tlsHeapSyncLockDepthRef() > 0u) {
+        mc.deferredSweepPending.store(true, std::memory_order_release);
+        return 0u;
+    }
+    const std::uint64_t selfContribution = (tlsMutatorDepthRef() > 0u) ? 1ULL : 0ULL;
+
+    // Never cross-thread scan concurrently mutating ShadowStacks or ObjectFastViews
+    // when another mutator thread is active. Defer to the mutator safe point instead.
+    if (!waitIfBusy || selfContribution > 0u) {
+        if ((mc.state.load(std::memory_order_acquire) &
+             MutatorSweepCoordinator::kActiveMutatorMask) > selfContribution) {
+            mc.deferredSweepPending.store(true, std::memory_order_seq_cst);
+            if ((mc.state.load(std::memory_order_seq_cst) &
+                 MutatorSweepCoordinator::kActiveMutatorMask) > selfContribution) {
+                return 0u;
             }
         }
     }
-    {
-        std::lock_guard<std::mutex> lock(liveHeapsPoolMutex());
-        for (const auto& [ptr, marker] : liveHeapPoolMarkers()) {
-            (void)ptr;
-            if (marker) marker();
+
+    auto& coord = valuePoolSweepCoordinator();
+    (void)coord.requestedEpoch.fetch_add(1, std::memory_order_acq_rel);
+
+    std::unique_lock<std::mutex> sweepLock(coord.sweepMutex, std::defer_lock);
+    if (waitIfBusy && selfContribution == 0u) {
+        sweepLock.lock();
+    } else if (!sweepLock.try_lock()) {
+        mc.deferredSweepPending.store(true, std::memory_order_release);
+        return 0u;
+    }
+
+    if (!waitIfBusy || selfContribution > 0u) {
+        std::uint64_t cur = mc.state.load(std::memory_order_acquire);
+        while (true) {
+            if ((cur & MutatorSweepCoordinator::kActiveMutatorMask) > selfContribution ||
+                (cur & MutatorSweepCoordinator::kSweepActiveBit) != 0u) {
+                mc.deferredSweepPending.store(true, std::memory_order_seq_cst);
+                cur = mc.state.load(std::memory_order_seq_cst);
+                if ((cur & MutatorSweepCoordinator::kActiveMutatorMask) > selfContribution ||
+                    (cur & MutatorSweepCoordinator::kSweepActiveBit) != 0u) {
+                    return 0u;
+                }
+            }
+            if (mc.state.compare_exchange_weak(
+                    cur,
+                    cur | MutatorSweepCoordinator::kSweepActiveBit,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                break;
+            }
+        }
+    } else {
+        const std::uint64_t prev = mc.state.fetch_or(
+            MutatorSweepCoordinator::kSweepActiveBit,
+            std::memory_order_acq_rel);
+        if ((prev & MutatorSweepCoordinator::kActiveMutatorMask) != 0u) {
+            std::unique_lock<std::mutex> lk(mc.waitMutex);
+            mc.cv.wait(lk, [&]() {
+                return (mc.state.load(std::memory_order_acquire) &
+                        MutatorSweepCoordinator::kActiveMutatorMask) == 0u;
+            });
         }
     }
-    return finishValuePoolGcSweep();
+
+    mc.deferredSweepPending.store(false, std::memory_order_relaxed);
+    struct SweepActiveBitGuard {
+        MutatorSweepCoordinator& mcRef;
+        ~SweepActiveBitGuard() noexcept {
+            {
+                std::lock_guard<std::mutex> lk(mcRef.waitMutex);
+                mcRef.state.fetch_and(
+                    ~MutatorSweepCoordinator::kSweepActiveBit,
+                    std::memory_order_release);
+            }
+            mcRef.cv.notify_all();
+        }
+    } sweepBitGuard{mc};
+
+    std::size_t totalReclaimed = 0u;
+    for (int pass = 0; pass < 2; ++pass) {
+        const std::uint64_t targetEpoch = coord.requestedEpoch.load(std::memory_order_acquire);
+        if (!hasAnyPinnedPoolValues()) {
+            coord.completedEpoch.store(targetEpoch, std::memory_order_release);
+            break;
+        }
+
+        beginValuePoolGcMark();
+        if (activeShadowStack) {
+            activeShadowStack->visitRoots([](const Value& value) {
+                markStackRootValueInPools(value);
+            });
+        }
+        {
+            std::vector<std::shared_ptr<ThreadShadowStackShard>> shardsSnapshot;
+            {
+                std::lock_guard<std::mutex> listLock(shadowStackShardsMutex());
+                auto& shards = shadowStackShards();
+                shards.erase(
+                    std::remove_if(
+                        shards.begin(),
+                        shards.end(),
+                        [](const std::shared_ptr<ThreadShadowStackShard>& shard) {
+                            if (!shard) return true;
+                            std::lock_guard<std::mutex> shardLock(shard->mutex);
+                            return shard->threadExited && shard->stacks.empty();
+                        }),
+                    shards.end());
+                shardsSnapshot = shards;
+            }
+            for (const auto& shard : shardsSnapshot) {
+                if (!shard) continue;
+                std::lock_guard<std::mutex> shardLock(shard->mutex);
+                for (const ShadowStack* stack : shard->stacks) {
+                    if (stack && stack != activeShadowStack) {
+                        stack->visitRoots([](const Value& value) {
+                            markStackRootValueInPools(value);
+                        });
+                    }
+                }
+            }
+        }
+
+        std::vector<std::shared_ptr<HeapSyncState>> heapSyncSnapshot;
+        {
+            auto& markerShards = heapPoolMarkerShards();
+            for (auto& shard : markerShards) {
+                if (shard.activeCount.load(std::memory_order_acquire) == 0) continue;
+                std::lock_guard<std::mutex> shardLock(shard.mutex);
+                heapSyncSnapshot.insert(
+                    heapSyncSnapshot.end(),
+                    shard.entries.begin(),
+                    shard.entries.end());
+            }
+        }
+        for (const auto& sync : heapSyncSnapshot) {
+            if (!sync) continue;
+            HeapSyncMutexGuard instanceLock(sync->mutex, /*flushDeferredOnUnlock=*/false);
+            if (sync->ownerImpl && sync->markPoolFn) {
+                (void)sync->markPoolFn(sync->ownerImpl);
+            }
+        }
+
+        totalReclaimed += finishValuePoolGcSweep();
+        coord.completedEpoch.store(targetEpoch, std::memory_order_release);
+        if (coord.requestedEpoch.load(std::memory_order_acquire) == targetEpoch) {
+            break;
+        }
+    }
+    return totalReclaimed;
+}
+
+} // namespace
+
+std::size_t reclaimUnreferencedPoolValues(
+    const ShadowStack* activeShadowStack) noexcept {
+    return reclaimPoolValuesInternal(activeShadowStack, /*waitIfBusy=*/true);
 }
 
 } // namespace realscript::runtime

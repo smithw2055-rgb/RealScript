@@ -148,6 +148,30 @@ void collectLambdaCaptureNames(
         visit(arr.initialValues);
         return;
     }
+    case syntax::SyntaxKind::TypeBinaryExpression:
+        collectLambdaCaptureNames(*static_cast<const
+            syntax::TypeBinaryExpressionSyntax&>(expression).expression,
+            insideLambda, parameterScopes, names);
+        return;
+    case syntax::SyntaxKind::ConditionalExpression: {
+        const auto& cond = static_cast<const
+            syntax::ConditionalExpressionSyntax&>(expression);
+        collectLambdaCaptureNames(*cond.condition, insideLambda, parameterScopes, names);
+        collectLambdaCaptureNames(*cond.whenTrue, insideLambda, parameterScopes, names);
+        collectLambdaCaptureNames(*cond.whenFalse, insideLambda, parameterScopes, names);
+        return;
+    }
+    case syntax::SyntaxKind::SwitchExpression: {
+        const auto& sw = static_cast<const
+            syntax::SwitchExpressionSyntax&>(expression);
+        collectLambdaCaptureNames(*sw.expression, insideLambda, parameterScopes, names);
+        for (const auto& arm : sw.arms) {
+            if (arm.label) collectLambdaCaptureNames(*arm.label, insideLambda, parameterScopes, names);
+            if (arm.guard) collectLambdaCaptureNames(*arm.guard, insideLambda, parameterScopes, names);
+            if (arm.value) collectLambdaCaptureNames(*arm.value, insideLambda, parameterScopes, names);
+        }
+        return;
+    }
     default:
         return;
     }
@@ -245,6 +269,22 @@ void collectLambdaCaptureNames(
         expression(static_cast<const
             syntax::ExpressionStatementSyntax&>(statement).expression);
         return;
+    case syntax::SyntaxKind::ThrowStatement:
+        expression(static_cast<const
+            syntax::ThrowStatementSyntax&>(statement).expression);
+        return;
+    case syntax::SyntaxKind::TryStatement: {
+        const auto& value = static_cast<const
+            syntax::TryStatementSyntax&>(statement);
+        collectLambdaCaptureNames(value.body, parameterScopes, names);
+        for (const auto& c : value.catches) {
+            collectLambdaCaptureNames(c.body, parameterScopes, names);
+        }
+        if (value.finallyBody) {
+            collectLambdaCaptureNames(*value.finallyBody, parameterScopes, names);
+        }
+        return;
+    }
     default:
         return;
     }
@@ -253,7 +293,7 @@ void collectLambdaCaptureNames(
 } // namespace
 
 Binder::Binder(diagnostics::DiagnosticBag& diagnostics)
-    : diagnostics_(diagnostics) {}
+    : rootDiagnostics_(diagnostics), diagnostics_{*this} {}
 
 SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
     ModuleBindingInput input;
@@ -587,6 +627,7 @@ SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
     visibleFunctions_ = input.visibleFunctions;
     occurrences_.clear();
     visibleTypes_ = input.visibleTypes;
+    hygienicAccessibleModules_ = input.hygienicAccessibleModules;
     pendingFunctionBindings_.clear();
     pendingTypes_.clear();
 
@@ -643,6 +684,8 @@ SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
 BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     BoundFunction result;
     result.symbol = input.symbol;
+    const auto savedHygienicAccessibleModules = hygienicAccessibleModules_;
+    hygienicAccessibleModules_ = input.hygienicAccessibleModules;
 
     scopes_.clear();
     referenceAliasScopes_.clear();
@@ -706,7 +749,12 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     currentOwnerType_.reset();
     if (!input.symbol.ownerTypeName.empty()) {
         const auto found = visibleTypes_.find(input.symbol.ownerTypeName);
-        if (found != visibleTypes_.end()) currentOwnerType_ = found->second;
+        if (found != visibleTypes_.end()) {
+            currentOwnerType_ = found->second;
+            hygienicAccessibleModules_.insert(
+                currentOwnerType_->hygienicAccessibleModules.begin(),
+                currentOwnerType_->hygienicAccessibleModules.end());
+        }
     }
     currentDeterministicContext_ = input.symbol.deterministic ||
         (currentOwnerType_ && currentOwnerType_->deterministic);
@@ -788,7 +836,8 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                         *currentOwnerType_, input.syntheticField);
                 }
                 auto statement = std::make_unique<BoundReturnStatement>();
-                statement->expression = std::move(memberAccess);
+                statement->expression = cloneResourceHandleIfNeeded(
+                    std::move(memberAccess), input.symbol.declarationSpan, true);
                 result.body->statements.push_back(std::move(statement));
             } else {
                 const auto* valueVariable = lookupVariable("value");
@@ -801,7 +850,13 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                 value->type = valueVariable->type;
                 value->typeName = valueVariable->typeName;
                 value->variable = *valueVariable;
-                assignment->expression = std::move(value);
+                auto oldAccess = std::make_unique<BoundMemberAccessExpression>();
+                oldAccess->type = input.syntheticField.type;
+                oldAccess->typeName = input.syntheticField.typeName;
+                oldAccess->ownerType = *currentOwnerType_;
+                oldAccess->field = input.syntheticField;
+                assignment->expression = wrapResourceHandleOverwriteRelease(
+                    std::move(oldAccess), std::move(value), input.symbol.declarationSpan);
                 auto statement = std::make_unique<BoundExpressionStatement>();
                 statement->expression = std::move(assignment);
                 result.body->statements.push_back(std::move(statement));
@@ -829,7 +884,8 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                     access = std::move(memberAccess);
                 }
                 auto statement = std::make_unique<BoundReturnStatement>();
-                statement->expression = std::move(access);
+                statement->expression = cloneResourceHandleIfNeeded(
+                    std::move(access), input.symbol.declarationSpan, true);
                 result.body->statements.push_back(std::move(statement));
             } else {
                 const auto* valueVariable = lookupVariable("value");
@@ -850,7 +906,14 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                     value->type = valueVariable->type;
                     value->typeName = valueVariable->typeName;
                     value->variable = *valueVariable;
-                    assignment->expression = std::move(value);
+                    auto oldAccess = std::make_unique<BoundMemberAccessExpression>();
+                    oldAccess->type = input.syntheticField.type;
+                    oldAccess->typeName = input.syntheticField.typeName;
+                    oldAccess->receiver = makeVariableAccess(*thisVariable, input.symbol.declarationSpan);
+                    oldAccess->ownerType = *currentOwnerType_;
+                    oldAccess->field = input.syntheticField;
+                    assignment->expression = wrapResourceHandleOverwriteRelease(
+                        std::move(oldAccess), std::move(value), input.symbol.declarationSpan);
                     auto statement = std::make_unique<BoundExpressionStatement>();
                     statement->expression = std::move(assignment);
                     result.body->statements.push_back(std::move(statement));
@@ -906,7 +969,8 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                     stmt->expression = std::move(assignment);
                     ctorFieldInitializers.push_back(std::move(stmt));
                 }
-            } else if (const auto* thisVar = lookupVariable("this")) {
+            } else if (const auto* foundThis = lookupVariable("this")) {
+                const VariableSymbol thisVar = *foundThis;
                 for (const auto& field : currentOwnerType_->fields) {
                     if ((initializer && field.declaringTypeId != currentOwnerType_->id) ||
                         field.staticField || field.constField ||
@@ -920,7 +984,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                         assignment->span = field.declarationSpan;
                         assignment->type = field.type;
                         assignment->typeName = field.typeName;
-                        assignment->variable = *thisVar;
+                        assignment->variable = thisVar;
                         assignment->ownerType = *currentOwnerType_;
                         assignment->field = field;
                         assignment->expression = std::move(value);
@@ -933,7 +997,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                         assignment->span = field.declarationSpan;
                         assignment->type = field.type;
                         assignment->typeName = field.typeName;
-                        assignment->receiver = makeVariableAccess(*thisVar, field.declarationSpan);
+                        assignment->receiver = makeVariableAccess(thisVar, field.declarationSpan);
                         assignment->ownerType = *currentOwnerType_;
                         assignment->field = field;
                         assignment->expression = std::move(value);
@@ -962,7 +1026,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                 result.body->statements.begin(), std::move(initializer));
         }
     }
-    if (input.sequence && input.sequenceSegment == 0 &&
+    if (input.sequence && !input.sequenceCancellation && input.sequenceSegment == 0 &&
         input.sequenceParameterFields.size() > 1 && currentOwnerType_) {
         std::vector<std::unique_ptr<BoundStatement>> parameterStores;
         for (std::size_t index = 1;
@@ -980,8 +1044,10 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                 *receiver, field.declarationSpan);
             assignment->ownerType = *currentOwnerType_;
             assignment->field = field;
-            assignment->expression = makeVariableAccess(
-                *parameter, field.declarationSpan);
+            assignment->expression = wrapResourceHandleOverwriteRelease(
+                makeSequenceFieldAccess(field, field.declarationSpan),
+                makeVariableAccess(*parameter, field.declarationSpan),
+                field.declarationSpan);
             auto statement = std::make_unique<BoundExpressionStatement>();
             statement->span = field.declarationSpan;
             statement->expression = std::move(assignment);
@@ -1021,15 +1087,100 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     result.variables = allVariables_;
 
     if (currentReturnType_ != PrimitiveType::Void &&
-        currentReturnType_ != PrimitiveType::Error &&
-        detail::canReachFunctionEnd(result, diagnostics_)) {
-        diagnostics_.report(
-            "RS2001",
-            "not all control-flow paths in function '" + result.symbol.name + "' return a value",
-            {});
+        currentReturnType_ != PrimitiveType::Error) {
+        diagnostics::DiagnosticBag flowDiagnostics;
+        const bool reachesEnd = detail::canReachFunctionEnd(result, flowDiagnostics);
+        for (const auto& item : flowDiagnostics.items()) {
+            diagnostics_.report(item.code, item.message, item.span, item.severity, item.sourceName);
+        }
+        if (reachesEnd) {
+            diagnostics_.report(
+                "RS2001",
+                "not all control-flow paths in function '" + result.symbol.name + "' return a value",
+                result.symbol.declarationSpan);
+        }
+    }
+
+    if (result.body &&
+        (input.body || input.eventLambda || (input.symbol.constructor && currentOwnerType_)) &&
+        !isInsideResourceHandleImplementation() &&
+        !input.syntheticAutoGetter &&
+        !input.syntheticAutoSetter &&
+        !input.sequence &&
+        !input.sequenceCancellation) {
+        const std::size_t visOffset =
+            (input.symbol.method && !input.symbol.staticMethod) ? 1u : 0u;
+        std::vector<VariableSymbol> handleParams;
+        for (std::size_t i = visOffset; i < input.symbol.parameters.size(); ++i) {
+            const auto& rawParam = input.symbol.parameters[i];
+            if (rawParam.modifier != ParameterModifier::None) continue;
+            if (!isManagedResourceHandleType(rawParam.type, rawParam.typeName)) continue;
+            const std::string paramName = i < input.parameterNames.size()
+                ? input.parameterNames[i]
+                : rawParam.name;
+            if (paramName.empty() || paramName == "this") continue;
+            if (capturedVariableNames_.find(paramName) != capturedVariableNames_.end()) continue;
+            if (const auto* declared = lookupVariable(paramName)) {
+                handleParams.push_back(*declared);
+            }
+        }
+        if (!handleParams.empty()) {
+            auto disposeBlock = std::make_unique<BoundBlockStatement>();
+            disposeBlock->span = result.body->span;
+            for (auto it = handleParams.rbegin(); it != handleParams.rend(); ++it) {
+                const auto ownerIt = visibleTypes_.find(it->typeName);
+                if (ownerIt == visibleTypes_.end()) continue;
+                const FunctionSymbol* disposeMethod = nullptr;
+                for (const auto& m : ownerIt->second.methods) {
+                    if (!m.staticMethod && m.name == "Dispose" && m.parameters.size() == 1) {
+                        disposeMethod = &m;
+                        break;
+                    }
+                }
+                if (!disposeMethod) continue;
+                std::vector<const syntax::ExpressionSyntax*> emptySyntaxArgs;
+                std::vector<std::optional<syntax::SyntaxToken>> emptyMods;
+                auto callExpr = bindSelectedCall(
+                    *disposeMethod,
+                    {},
+                    emptySyntaxArgs,
+                    emptyMods,
+                    {},
+                    makeVariableAccess(*it, it->declarationSpan),
+                    it->declarationSpan,
+                    "parameter dispose",
+                    true);
+                auto stmt = std::make_unique<BoundExpressionStatement>();
+                stmt->span = it->declarationSpan;
+                stmt->expression = std::move(callExpr);
+                disposeBlock->statements.push_back(std::move(stmt));
+            }
+            if (!disposeBlock->statements.empty()) {
+                VariableSymbol pending;
+                pending.name = "$finally_exception_" + std::to_string(nextVariableIndex_);
+                pending.type = PrimitiveType::Object;
+                pending.storageType = PrimitiveType::Object;
+                pending.index = nextVariableIndex_++;
+                (void)declareVariable(pending, result.body->span);
+
+                auto tryStmt = std::make_unique<BoundTryStatement>();
+                tryStmt->span = result.body->span;
+                tryStmt->finallyExceptionVariable = *lookupVariable(pending.name);
+                tryStmt->body = std::move(result.body);
+                tryStmt->finallyBody = std::move(disposeBlock);
+
+                auto outerBlock = std::make_unique<BoundBlockStatement>();
+                outerBlock->span = tryStmt->span;
+                outerBlock->statements.push_back(std::move(tryStmt));
+                result.body = std::move(outerBlock);
+                result.variableCount = nextVariableIndex_;
+                result.variables = allVariables_;
+            }
+        }
     }
 
     popScope();
+    hygienicAccessibleModules_ = savedHygienicAccessibleModules;
     currentOwnerType_.reset();
     currentStaticMethod_ = false;
     currentConstructor_ = false;
@@ -1070,7 +1221,7 @@ VariableSymbol Binder::allocateTempVariable(
 std::unique_ptr<BoundExpression> Binder::makeVariableAccess(
     const VariableSymbol& variable,
     text::TextSpan span) {
-    if (storageTypeOf(variable) != variable.type) {
+    if (storageTypeOf(variable) != variable.type || storageTypeNameOf(variable) != variable.typeName) {
         const auto wrapper = visibleTypes_.find(
             storageTypeNameOf(variable));
         if (wrapper != visibleTypes_.end() &&
@@ -1221,34 +1372,397 @@ std::unique_ptr<BoundExpression> Binder::bindSequenceYieldDelay(
     return mul;
 }
 
+void Binder::appendSequenceParameterHandleReset(
+    BoundBlockStatement& result,
+    const FunctionBindingInput& input,
+    text::TextSpan span) {
+    if (!currentOwnerType_ || isInsideResourceHandleImplementation()) return;
+    const auto* foundReceiver = lookupVariable("this");
+    if (!foundReceiver) return;
+    const VariableSymbol receiver = *foundReceiver;
+    for (std::size_t i = input.sequenceParameterFields.size(); i > 1; --i) {
+        const auto& field = input.sequenceParameterFields[i - 1].second;
+        if (!isManagedResourceHandleType(field.type, field.typeName)) continue;
+        const auto ownerIt = visibleTypes_.find(field.typeName);
+        if (ownerIt == visibleTypes_.end()) continue;
+        const FunctionSymbol* emptyMethod = nullptr;
+        for (const auto& m : ownerIt->second.methods) {
+            if (m.staticMethod && m.name == "Empty" &&
+                m.parameters.empty() && m.returnType == PrimitiveType::Struct) {
+                emptyMethod = &m;
+                break;
+            }
+        }
+        if (!emptyMethod) continue;
+        auto emptyCall = std::make_unique<BoundCallExpression>();
+        emptyCall->span = span;
+        emptyCall->type = field.type;
+        emptyCall->typeName = field.typeName;
+        emptyCall->function = *emptyMethod;
+        auto assignment = std::make_unique<BoundMemberAssignmentExpression>();
+        assignment->span = span;
+        assignment->type = field.type;
+        assignment->typeName = field.typeName;
+        assignment->receiver = makeVariableAccess(receiver, span);
+        assignment->ownerType = *currentOwnerType_;
+        assignment->field = field;
+        assignment->expression = wrapResourceHandleOverwriteRelease(
+            makeSequenceFieldAccess(field, span), std::move(emptyCall), span);
+        auto stmt = std::make_unique<BoundExpressionStatement>();
+        stmt->span = span;
+        stmt->expression = std::move(assignment);
+        result.statements.push_back(std::move(stmt));
+    }
+}
+
+void Binder::appendSequenceSuspendedCleanup(
+    BoundBlockStatement& result,
+    const FunctionBindingInput& input) {
+    if (!input.sequence || !currentOwnerType_ ||
+        input.sequenceStateField.name.empty() ||
+        isInsideResourceHandleImplementation()) {
+        return;
+    }
+    const auto* foundReceiver = lookupVariable("this");
+    if (!foundReceiver) return;
+    const VariableSymbol receiver = *foundReceiver;
+    const auto span = input.sequence->identifierToken.span;
+
+    const auto sequenceCompositionTarget =
+        [&](const syntax::StatementSyntax& statement)
+            -> std::optional<std::string> {
+        if (statement.kind() != syntax::SyntaxKind::ExpressionStatement) {
+            return std::nullopt;
+        }
+        const auto& expression = static_cast<const
+            syntax::ExpressionStatementSyntax&>(statement);
+        if (!expression.expression ||
+            expression.expression->kind() != syntax::SyntaxKind::CallExpression) {
+            return std::nullopt;
+        }
+        const auto& call = static_cast<const
+            syntax::CallExpressionSyntax&>(*expression.expression);
+        const auto stateName = "$sequence_state_" + call.identifierToken.text;
+        for (const auto& field : currentOwnerType_->fields) {
+            if (field.synthetic && field.name == stateName &&
+                field.type == PrimitiveType::Int) {
+                return call.identifierToken.text;
+            }
+        }
+        return std::nullopt;
+    };
+
+    std::unordered_map<const syntax::StatementSyntax*, std::int64_t> yieldIds;
+    std::int64_t nextYieldId = 1;
+    std::function<void(const syntax::StatementSyntax&)> collectYields;
+    collectYields = [&](const syntax::StatementSyntax& statement) {
+        switch (statement.kind()) {
+        case syntax::SyntaxKind::YieldWaitStatement:
+            yieldIds.emplace(&statement, nextYieldId++);
+            return;
+        case syntax::SyntaxKind::ExpressionStatement:
+            if (sequenceCompositionTarget(statement)) {
+                yieldIds.emplace(&statement, nextYieldId++);
+            }
+            return;
+        case syntax::SyntaxKind::BlockStatement:
+            for (const auto& child : static_cast<const
+                 syntax::BlockStatementSyntax&>(statement).statements) {
+                if (child->kind() == syntax::SyntaxKind::YieldBreakStatement ||
+                    child->kind() == syntax::SyntaxKind::ReturnStatement) break;
+                collectYields(*child);
+            }
+            return;
+        case syntax::SyntaxKind::IfStatement: {
+            const auto& branch = static_cast<const syntax::IfStatementSyntax&>(statement);
+            collectYields(*branch.thenStatement);
+            if (branch.elseStatement) collectYields(*branch.elseStatement);
+            return;
+        }
+        case syntax::SyntaxKind::WhileStatement:
+            collectYields(*static_cast<const syntax::WhileStatementSyntax&>(statement).body);
+            return;
+        case syntax::SyntaxKind::ForStatement:
+            collectYields(*static_cast<const syntax::ForStatementSyntax&>(statement).body);
+            return;
+        case syntax::SyntaxKind::ForeachStatement:
+            collectYields(*static_cast<const syntax::ForeachStatementSyntax&>(statement).body);
+            return;
+        case syntax::SyntaxKind::DoWhileStatement:
+            collectYields(*static_cast<const syntax::DoWhileStatementSyntax&>(statement).body);
+            return;
+        case syntax::SyntaxKind::SwitchStatement:
+            for (const auto& section : static_cast<const
+                 syntax::SwitchStatementSyntax&>(statement).sections) {
+                for (const auto& child : section.statements) collectYields(*child);
+            }
+            return;
+        case syntax::SyntaxKind::TryStatement: {
+            const auto& tryStmt = static_cast<const syntax::TryStatementSyntax&>(statement);
+            collectYields(tryStmt.body);
+            for (const auto& c : tryStmt.catches) collectYields(c.body);
+            if (tryStmt.finallyBody) collectYields(*tryStmt.finallyBody);
+            return;
+        }
+        default:
+            return;
+        }
+    };
+    collectYields(input.sequence->body);
+
+    std::function<std::vector<std::int64_t>(const syntax::StatementSyntax&)> descendantIds;
+    descendantIds = [&](const syntax::StatementSyntax& statement) {
+        std::vector<std::int64_t> ids;
+        const auto append = [&](std::vector<std::int64_t> values) {
+            ids.insert(ids.end(), values.begin(), values.end());
+        };
+        switch (statement.kind()) {
+        case syntax::SyntaxKind::YieldWaitStatement:
+        case syntax::SyntaxKind::ExpressionStatement: {
+            const auto found = yieldIds.find(&statement);
+            if (found != yieldIds.end()) ids.push_back(found->second);
+            break;
+        }
+        case syntax::SyntaxKind::BlockStatement:
+            for (const auto& child : static_cast<const
+                 syntax::BlockStatementSyntax&>(statement).statements) {
+                append(descendantIds(*child));
+                if (child->kind() == syntax::SyntaxKind::YieldBreakStatement ||
+                    child->kind() == syntax::SyntaxKind::ReturnStatement) break;
+            }
+            break;
+        case syntax::SyntaxKind::IfStatement: {
+            const auto& branch = static_cast<const syntax::IfStatementSyntax&>(statement);
+            append(descendantIds(*branch.thenStatement));
+            if (branch.elseStatement) append(descendantIds(*branch.elseStatement));
+            break;
+        }
+        case syntax::SyntaxKind::WhileStatement:
+            append(descendantIds(*static_cast<const syntax::WhileStatementSyntax&>(statement).body));
+            break;
+        case syntax::SyntaxKind::ForStatement: {
+            const auto& loop = static_cast<const syntax::ForStatementSyntax&>(statement);
+            if (loop.initializer) append(descendantIds(*loop.initializer));
+            append(descendantIds(*loop.body));
+            break;
+        }
+        case syntax::SyntaxKind::ForeachStatement:
+            append(descendantIds(*static_cast<const syntax::ForeachStatementSyntax&>(statement).body));
+            break;
+        case syntax::SyntaxKind::DoWhileStatement:
+            append(descendantIds(*static_cast<const syntax::DoWhileStatementSyntax&>(statement).body));
+            break;
+        case syntax::SyntaxKind::SwitchStatement:
+            for (const auto& section : static_cast<const
+                 syntax::SwitchStatementSyntax&>(statement).sections) {
+                for (const auto& child : section.statements) append(descendantIds(*child));
+            }
+            break;
+        case syntax::SyntaxKind::TryStatement: {
+            const auto& tryStmt = static_cast<const syntax::TryStatementSyntax&>(statement);
+            append(descendantIds(tryStmt.body));
+            for (const auto& c : tryStmt.catches) append(descendantIds(c.body));
+            if (tryStmt.finallyBody) append(descendantIds(*tryStmt.finallyBody));
+            break;
+        }
+        default:
+            break;
+        }
+        return ids;
+    };
+
+    const auto makeStateEquals = [&](std::int64_t value, text::TextSpan s) {
+        auto lit = std::make_unique<BoundLiteralExpression>();
+        lit->type = PrimitiveType::Int;
+        lit->value = value;
+        lit->span = s;
+        auto expr = std::make_unique<BoundBinaryExpression>();
+        expr->type = PrimitiveType::Bool;
+        expr->operatorKind = BoundBinaryOperatorKind::Equals;
+        expr->span = s;
+        expr->left = makeSequenceFieldAccess(input.sequenceStateField, s);
+        expr->right = std::move(lit);
+        return expr;
+    };
+    const auto makeStateIn = [&](const std::vector<std::int64_t>& ids, text::TextSpan s) {
+        std::unique_ptr<BoundExpression> cond;
+        for (const auto id : ids) {
+            auto eq = makeStateEquals(id, s);
+            if (!cond) {
+                cond = std::move(eq);
+            } else {
+                auto either = std::make_unique<BoundBinaryExpression>();
+                either->type = PrimitiveType::Bool;
+                either->operatorKind = BoundBinaryOperatorKind::LogicalOr;
+                either->span = s;
+                either->left = std::move(cond);
+                either->right = std::move(eq);
+                cond = std::move(either);
+            }
+        }
+        return cond;
+    };
+
+    auto cleanupBody = std::make_unique<BoundBlockStatement>();
+    cleanupBody->span = span;
+    const auto savedOccurrencesSize = occurrences_.size();
+
+    std::function<void(const syntax::StatementSyntax&)> collectUsingCleanups;
+    collectUsingCleanups = [&](const syntax::StatementSyntax& statement) {
+        switch (statement.kind()) {
+        case syntax::SyntaxKind::BlockStatement:
+            for (const auto& child : static_cast<const
+                 syntax::BlockStatementSyntax&>(statement).statements) {
+                collectUsingCleanups(*child);
+            }
+            break;
+        case syntax::SyntaxKind::IfStatement: {
+            const auto& branch = static_cast<const syntax::IfStatementSyntax&>(statement);
+            collectUsingCleanups(*branch.thenStatement);
+            if (branch.elseStatement) collectUsingCleanups(*branch.elseStatement);
+            break;
+        }
+        case syntax::SyntaxKind::WhileStatement:
+            collectUsingCleanups(*static_cast<const syntax::WhileStatementSyntax&>(statement).body);
+            break;
+        case syntax::SyntaxKind::ForStatement:
+            collectUsingCleanups(*static_cast<const syntax::ForStatementSyntax&>(statement).body);
+            break;
+        case syntax::SyntaxKind::ForeachStatement:
+            collectUsingCleanups(*static_cast<const syntax::ForeachStatementSyntax&>(statement).body);
+            break;
+        case syntax::SyntaxKind::DoWhileStatement:
+            collectUsingCleanups(*static_cast<const syntax::DoWhileStatementSyntax&>(statement).body);
+            break;
+        case syntax::SyntaxKind::SwitchStatement:
+            for (const auto& section : static_cast<const
+                 syntax::SwitchStatementSyntax&>(statement).sections) {
+                for (const auto& child : section.statements) collectUsingCleanups(*child);
+            }
+            break;
+        case syntax::SyntaxKind::TryStatement: {
+            const auto& tryStmt = static_cast<const syntax::TryStatementSyntax&>(statement);
+            collectUsingCleanups(tryStmt.body);
+            for (const auto& c : tryStmt.catches) collectUsingCleanups(c.body);
+            if (tryStmt.finallyBody) collectUsingCleanups(*tryStmt.finallyBody);
+            if (tryStmt.finallyKeyword &&
+                tryStmt.finallyKeyword->text == "$using_finally" &&
+                tryStmt.finallyBody) {
+                const auto ids = descendantIds(tryStmt.body);
+                if (!ids.empty()) {
+                    syntax::TryStatementSyntax finallyProbe;
+                    finallyProbe.tryKeyword = tryStmt.tryKeyword;
+                    finallyProbe.body.openBraceToken = tryStmt.body.openBraceToken;
+                    finallyProbe.body.closeBraceToken = tryStmt.body.closeBraceToken;
+                    finallyProbe.finallyKeyword = tryStmt.finallyKeyword;
+                    finallyProbe.finallyBody = syntax::cloneBlockStatementSyntax(*tryStmt.finallyBody);
+                    auto boundProbe = bindTryStatement(finallyProbe);
+                    auto& probeTry = static_cast<BoundTryStatement&>(*boundProbe);
+                    if (probeTry.finallyBody) {
+                        auto ifActive = std::make_unique<BoundIfStatement>();
+                        ifActive->span = tryStmt.finallyBody->span();
+                        ifActive->condition = makeStateIn(ids, tryStmt.finallyBody->span());
+                        ifActive->thenStatement = std::move(probeTry.finallyBody);
+                        cleanupBody->statements.push_back(std::move(ifActive));
+                    }
+                }
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    };
+    collectUsingCleanups(input.sequence->body);
+
+    for (auto it = input.sequenceLocalFields.rbegin();
+         it != input.sequenceLocalFields.rend(); ++it) {
+        const auto& field = it->second;
+        if (!isManagedResourceHandleType(field.type, field.typeName)) continue;
+        const auto ownerIt = visibleTypes_.find(field.typeName);
+        if (ownerIt == visibleTypes_.end()) continue;
+        const FunctionSymbol* emptyMethod = nullptr;
+        for (const auto& m : ownerIt->second.methods) {
+            if (m.staticMethod && m.name == "Empty" &&
+                m.parameters.empty() && m.returnType == PrimitiveType::Struct) {
+                emptyMethod = &m;
+                break;
+            }
+        }
+        if (!emptyMethod) continue;
+        auto emptyCall = std::make_unique<BoundCallExpression>();
+        emptyCall->span = span;
+        emptyCall->type = field.type;
+        emptyCall->typeName = field.typeName;
+        emptyCall->function = *emptyMethod;
+        auto assignment = std::make_unique<BoundMemberAssignmentExpression>();
+        assignment->span = span;
+        assignment->type = field.type;
+        assignment->typeName = field.typeName;
+        assignment->receiver = makeVariableAccess(receiver, span);
+        assignment->ownerType = *currentOwnerType_;
+        assignment->field = field;
+        assignment->expression = wrapResourceHandleOverwriteRelease(
+            makeSequenceFieldAccess(field, span), std::move(emptyCall), span);
+        auto stmt = std::make_unique<BoundExpressionStatement>();
+        stmt->span = span;
+        stmt->expression = std::move(assignment);
+        cleanupBody->statements.push_back(std::move(stmt));
+    }
+
+    appendSequenceParameterHandleReset(*cleanupBody, input, span);
+    occurrences_.resize(savedOccurrencesSize);
+
+    if (!cleanupBody->statements.empty()) {
+        auto zeroLit = std::make_unique<BoundLiteralExpression>();
+        zeroLit->type = PrimitiveType::Int;
+        zeroLit->value = std::int64_t{0};
+        zeroLit->span = span;
+        auto stateNonZero = std::make_unique<BoundBinaryExpression>();
+        stateNonZero->type = PrimitiveType::Bool;
+        stateNonZero->operatorKind = BoundBinaryOperatorKind::NotEquals;
+        stateNonZero->span = span;
+        stateNonZero->left = makeSequenceFieldAccess(input.sequenceStateField, span);
+        stateNonZero->right = std::move(zeroLit);
+        auto ifSuspended = std::make_unique<BoundIfStatement>();
+        ifSuspended->span = span;
+        ifSuspended->condition = std::move(stateNonZero);
+        ifSuspended->thenStatement = std::move(cleanupBody);
+        result.statements.push_back(std::move(ifSuspended));
+    }
+}
+
 void Binder::appendSequenceRestartCancellation(
     BoundBlockStatement& result,
     const FunctionBindingInput& input) {
     const auto found = visibleFunctions_.find("CancelTimer");
-    if (found == visibleFunctions_.end()) return;
-    const FunctionSymbol* cancel = nullptr;
-    for (const auto& candidate : found->second) {
-        if (!candidate.method &&
-            candidate.returnType == PrimitiveType::Bool &&
-            candidate.parameters.size() == 1 &&
-            candidate.parameters.front().type == PrimitiveType::Long) {
-            cancel = &candidate;
-            break;
+    if (found != visibleFunctions_.end()) {
+        const FunctionSymbol* cancel = nullptr;
+        for (const auto& candidate : found->second) {
+            if (!candidate.method &&
+                candidate.returnType == PrimitiveType::Bool &&
+                candidate.parameters.size() == 1 &&
+                candidate.parameters.front().type == PrimitiveType::Long) {
+                cancel = &candidate;
+                break;
+            }
+        }
+        if (cancel) {
+            auto call = std::make_unique<BoundCallExpression>();
+            call->type = PrimitiveType::Bool;
+            call->function = *cancel;
+            call->span = input.sequence
+                ? input.sequence->identifierToken.span
+                : input.symbol.declarationSpan;
+            call->arguments.push_back(makeSequenceFieldAccess(
+                input.sequenceTimerField, call->span));
+            auto statement = std::make_unique<BoundExpressionStatement>();
+            statement->span = call->span;
+            statement->expression = std::move(call);
+            result.statements.push_back(std::move(statement));
         }
     }
-    if (!cancel) return;
-    auto call = std::make_unique<BoundCallExpression>();
-    call->type = PrimitiveType::Bool;
-    call->function = *cancel;
-    call->span = input.sequence
-        ? input.sequence->identifierToken.span
-        : input.symbol.declarationSpan;
-    call->arguments.push_back(makeSequenceFieldAccess(
-        input.sequenceTimerField, call->span));
-    auto statement = std::make_unique<BoundExpressionStatement>();
-    statement->span = call->span;
-    statement->expression = std::move(call);
-    result.statements.push_back(std::move(statement));
+    appendSequenceSuspendedCleanup(result, input);
 }
 
 std::unique_ptr<BoundBlockStatement> Binder::bindSequenceCancellation(
@@ -1295,6 +1809,8 @@ std::unique_ptr<BoundBlockStatement> Binder::bindSequenceCancellation(
     declaration->variable = cancelled;
     declaration->initializer = std::move(call);
     result->statements.push_back(std::move(declaration));
+
+    appendSequenceSuspendedCleanup(*result, input);
 
     const auto assignField = [&](const FieldSymbol& field,
                                  std::int64_t value) {
@@ -1752,6 +2268,14 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                 for (const auto& child : section.statements) collectYields(*child);
             }
             return;
+        case syntax::SyntaxKind::TryStatement: {
+            const auto& tryStmt = static_cast<const
+                syntax::TryStatementSyntax&>(statement);
+            collectYields(tryStmt.body);
+            for (const auto& c : tryStmt.catches) collectYields(c.body);
+            if (tryStmt.finallyBody) collectYields(*tryStmt.finallyBody);
+            return;
+        }
         default:
             return;
         }
@@ -1820,6 +2344,14 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                 }
             }
             break;
+        case syntax::SyntaxKind::TryStatement: {
+            const auto& tryStmt = static_cast<const
+                syntax::TryStatementSyntax&>(statement);
+            append(descendantIds(tryStmt.body));
+            for (const auto& c : tryStmt.catches) append(descendantIds(c.body));
+            if (tryStmt.finallyBody) append(descendantIds(*tryStmt.finallyBody));
+            break;
+        }
         default:
             break;
         }
@@ -2322,6 +2854,7 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
         case syntax::SyntaxKind::YieldBreakStatement: {
             auto block = std::make_unique<BoundBlockStatement>();
             block->span = syntaxTree.span();
+            appendSequenceParameterHandleReset(*block, input, syntaxTree.span());
             block->statements.push_back(makeStateAssignment(0, syntaxTree.span()));
             block->statements.push_back(makeFieldAssignmentStatement(
                 input.sequenceCompletedField,
@@ -2344,11 +2877,15 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
             if (source.expression && hasResult) {
                 block->statements.push_back(makeFieldAssignmentStatement(
                     input.sequenceResultField,
-                    bindTargetExpression(
-                        *source.expression,
-                        input.sequenceResultField.type,
-                        input.sequenceResultField.typeName,
-                        "sequence result"),
+                    wrapResourceHandleOverwriteRelease(
+                        makeSequenceFieldAccess(
+                            input.sequenceResultField, source.expression->span()),
+                        bindTargetExpression(
+                            *source.expression,
+                            input.sequenceResultField.type,
+                            input.sequenceResultField.typeName,
+                            "sequence result"),
+                        source.expression->span()),
                     source.expression->span()));
             } else if (source.expression) {
                 diagnostics_.report(
@@ -2361,6 +2898,7 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                     "a result sequence must return a value",
                     source.span());
             }
+            appendSequenceParameterHandleReset(*block, input, source.span());
             block->statements.push_back(makeStateAssignment(
                 0, source.span()));
             block->statements.push_back(makeFieldAssignmentStatement(
@@ -2533,7 +3071,22 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                 const FunctionSymbol& method,
                 std::unique_ptr<BoundExpression> receiver,
                 std::vector<std::unique_ptr<BoundExpression>> arguments,
-                text::TextSpan span) {
+                text::TextSpan span) -> std::unique_ptr<BoundExpression> {
+                if (!method.parameters.empty() &&
+                    method.parameters.front().modifier != ParameterModifier::None) {
+                    std::vector<const syntax::ExpressionSyntax*> emptySyntaxArgs(arguments.size(), nullptr);
+                    std::vector<std::optional<syntax::SyntaxToken>> emptyMods(arguments.size());
+                    return bindSelectedCall(
+                        method,
+                        std::move(arguments),
+                        emptySyntaxArgs,
+                        emptyMods,
+                        {},
+                        std::move(receiver),
+                        span,
+                        "sequence foreach method",
+                        true);
+                }
                 auto call = std::make_unique<BoundCallExpression>();
                 call->type = method.returnType;
                 call->typeName = method.returnTypeName;
@@ -2579,7 +3132,8 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
             const FunctionSymbol* getMethod = nullptr;
             const FunctionSymbol* moveNextMethod = nullptr;
             const FunctionSymbol* currentMethod = nullptr;
-            if (state->collection.type == PrimitiveType::Object) {
+            if (state->collection.type == PrimitiveType::Object ||
+                state->collection.type == PrimitiveType::Struct) {
                 if (state->usesEnumerator) {
                     moveNextMethod = findInstanceMethod(
                         state->collection.typeName, "MoveNext", 0);
@@ -2588,8 +3142,29 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                 } else {
                     countMethod = findInstanceMethod(
                         state->collection.typeName, "Count", 0);
-                    getMethod = findInstanceMethod(
-                        state->collection.typeName, "Get", 1);
+                    const auto foundCol = visibleTypes_.find(state->collection.typeName);
+                    if (foundCol != visibleTypes_.end()) {
+                        for (const auto& m : foundCol->second.methods) {
+                            const auto visArity = m.parameters.size() -
+                                ((!m.staticMethod && m.method) ? 1u : 0u);
+                            if (!m.staticMethod && m.name == "GetAt" && visArity == 1 &&
+                                m.parameters.back().type == PrimitiveType::Int) {
+                                getMethod = &m;
+                                break;
+                            }
+                        }
+                        if (!getMethod) {
+                            for (const auto& m : foundCol->second.methods) {
+                                const auto visArity = m.parameters.size() -
+                                    ((!m.staticMethod && m.method) ? 1u : 0u);
+                                if (!m.staticMethod && m.name == "Get" && visArity == 1 &&
+                                    m.parameters.back().type == PrimitiveType::Int) {
+                                    getMethod = &m;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             const auto makeCondition = [&]() -> std::unique_ptr<BoundExpression> {
@@ -2879,6 +3454,86 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
             }
             return dispatch;
         }
+        case syntax::SyntaxKind::TryStatement: {
+            const auto& source = static_cast<const
+                syntax::TryStatementSyntax&>(syntaxTree);
+            const auto ids = descendantIds(source);
+            if (ids.empty()) {
+                return bindTryStatement(source);
+            }
+            auto tryResult = std::make_unique<BoundTryStatement>();
+            tryResult->span = source.span();
+            tryResult->body = transformBlock(source.body);
+            bool catchAllSeen = false;
+            for (const auto& sourceCatch : source.catches) {
+                BoundCatchClause clause;
+                clause.span = sourceCatch.span();
+                if (catchAllSeen) {
+                    diagnostics_.report(
+                        "RS8928", "catch clause is unreachable after catch-all",
+                        sourceCatch.span());
+                }
+                if (sourceCatch.type) {
+                    clause.type = bindType(*sourceCatch.type, false, &clause.typeName);
+                    clause.typeId = isExactType(clause.type)
+                        ? stableTypeId(clause.typeName)
+                        : 0;
+                    if (clause.type != PrimitiveType::Object) {
+                        diagnostics_.report(
+                            "RS8929", "catch type must be a class type",
+                            sourceCatch.type->span());
+                    }
+                } else {
+                    catchAllSeen = true;
+                    clause.type = PrimitiveType::Object;
+                    clause.typeId = 0;
+                }
+                pushScope(sourceCatch.span());
+                clause.exceptionVariable.name = sourceCatch.identifierToken
+                    ? sourceCatch.identifierToken->text
+                    : "$exception_" + std::to_string(nextVariableIndex_);
+                clause.exceptionVariable.type = PrimitiveType::Object;
+                clause.exceptionVariable.typeName = sourceCatch.type
+                    ? clause.typeName : std::string{};
+                clause.exceptionVariable.storageType = PrimitiveType::Object;
+                clause.exceptionVariable.storageTypeName = clause.exceptionVariable.typeName;
+                clause.exceptionVariable.index = nextVariableIndex_++;
+                (void)declareVariable(
+                    clause.exceptionVariable,
+                    sourceCatch.identifierToken
+                        ? sourceCatch.identifierToken->span
+                        : sourceCatch.catchKeyword.span);
+                clause.exceptionVariable = *lookupVariable(clause.exceptionVariable.name);
+                const auto previousException = currentExceptionVariable_;
+                currentExceptionVariable_ = clause.exceptionVariable;
+                clause.body = transformBlock(sourceCatch.body);
+                currentExceptionVariable_ = previousException;
+                popScope();
+                tryResult->catches.push_back(std::move(clause));
+            }
+            if (source.finallyBody) {
+                syntax::TryStatementSyntax finallyProbe;
+                finallyProbe.tryKeyword = source.tryKeyword;
+                finallyProbe.body.openBraceToken = source.body.openBraceToken;
+                finallyProbe.body.closeBraceToken = source.body.closeBraceToken;
+                finallyProbe.finallyKeyword = source.finallyKeyword;
+                finallyProbe.finallyBody = syntax::cloneBlockStatementSyntax(*source.finallyBody);
+                auto boundProbe = bindTryStatement(finallyProbe);
+                auto& probeTry = static_cast<BoundTryStatement&>(*boundProbe);
+                tryResult->finallyExceptionVariable = probeTry.finallyExceptionVariable;
+                if (probeTry.finallyBody) {
+                    auto guardedBlock = std::make_unique<BoundBlockStatement>();
+                    guardedBlock->span = source.finallyBody->span();
+                    auto ifCompleted = std::make_unique<BoundIfStatement>();
+                    ifCompleted->span = source.finallyBody->span();
+                    ifCompleted->condition = makeStateEquals(0, source.finallyBody->span());
+                    ifCompleted->thenStatement = std::move(probeTry.finallyBody);
+                    guardedBlock->statements.push_back(std::move(ifCompleted));
+                    tryResult->finallyBody = std::move(guardedBlock);
+                }
+            }
+            return tryResult;
+        }
         default:
             return bindStatement(syntaxTree);
         }
@@ -2934,6 +3589,8 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
         result->statements.end(),
         std::make_move_iterator(body->statements.begin()),
         std::make_move_iterator(body->statements.end()));
+    appendSequenceParameterHandleReset(
+        *result, input, input.sequence->body.closeBraceToken.span);
     result->statements.push_back(makeStateAssignment(
         0, input.sequence->body.closeBraceToken.span));
     result->statements.push_back(makeFieldAssignmentStatement(
@@ -3588,10 +4245,20 @@ std::unique_ptr<BoundStatement> Binder::bindForeachStatement(
         if (!decodeArrayTypeName(result->collection->typeName, elementType, elementTypeName)) {
             diagnostics_.report("RS2210", "foreach array element type is invalid", syntaxTree.collection->span());
         }
-    } else if (result->collection->type == PrimitiveType::Object) {
+    } else if (result->collection->type == PrimitiveType::Object ||
+               result->collection->type == PrimitiveType::Struct) {
         const auto found = visibleTypes_.find(result->collection->typeName);
         if (found != visibleTypes_.end()) collectionType = &found->second;
+        const FunctionSymbol* getAtMethod = nullptr;
+        bool isBuiltinIndexedCollection = false;
         if (collectionType) {
+            const auto& tname = collectionType->name;
+            isBuiltinIndexedCollection =
+                tname.rfind("List__", 0) == 0 ||
+                tname.rfind("Queue__", 0) == 0 ||
+                tname.rfind("Stack__", 0) == 0 ||
+                tname.rfind("HashSet__", 0) == 0 ||
+                tname.rfind("Dictionary__", 0) == 0;
             for (const auto& method : collectionType->methods) {
                 const auto visibleArity = method.parameters.size() -
                     ((method.method && !method.staticMethod) ? 1u : 0u);
@@ -3599,13 +4266,22 @@ std::unique_ptr<BoundStatement> Binder::bindForeachStatement(
                     method.returnType == PrimitiveType::Int) countMethod = &method;
                 if (!method.staticMethod && method.name == "Get" && visibleArity == 1 &&
                     method.parameters.back().type == PrimitiveType::Int) getMethod = &method;
+                if (!method.staticMethod && method.name == "GetAt" && visibleArity == 1 &&
+                    method.parameters.back().type == PrimitiveType::Int) getAtMethod = &method;
                 if (!method.staticMethod && method.name == "GetEnumerator" &&
-                    visibleArity == 0 && method.returnType == PrimitiveType::Object) {
+                    visibleArity == 0 &&
+                    (method.returnType == PrimitiveType::Object ||
+                     method.returnType == PrimitiveType::Struct)) {
                     getEnumeratorMethod = &method;
                 }
             }
+            if (isBuiltinIndexedCollection && getAtMethod) {
+                getMethod = getAtMethod;
+            } else if (!getMethod && getAtMethod) {
+                getMethod = getAtMethod;
+            }
         }
-        if (getEnumeratorMethod) {
+        if (getEnumeratorMethod && !(isBuiltinIndexedCollection && countMethod && getMethod)) {
             const auto enumeratorType = visibleTypes_.find(
                 getEnumeratorMethod->returnTypeName);
             if (enumeratorType != visibleTypes_.end()) {
@@ -3625,14 +4301,22 @@ std::unique_ptr<BoundStatement> Binder::bindForeachStatement(
                 }
             }
         }
-        if (getEnumeratorMethod && moveNextMethod && currentMethod) {
-            auto getEnumerator = std::make_unique<BoundCallExpression>();
-            getEnumerator->type = getEnumeratorMethod->returnType;
-            getEnumerator->typeName = getEnumeratorMethod->returnTypeName;
-            getEnumerator->function = *getEnumeratorMethod;
-            getEnumerator->span = syntaxTree.collection->span();
-            getEnumerator->arguments.push_back(std::move(result->collection));
-            result->collection = std::move(getEnumerator);
+        if (isBuiltinIndexedCollection && countMethod && getMethod) {
+            elementType = getMethod->returnType;
+            elementTypeName = getMethod->returnTypeName;
+        } else if (getEnumeratorMethod && moveNextMethod && currentMethod) {
+            std::vector<const syntax::ExpressionSyntax*> emptySyntaxArgs;
+            std::vector<std::optional<syntax::SyntaxToken>> emptyMods;
+            result->collection = bindSelectedCall(
+                *getEnumeratorMethod,
+                {},
+                emptySyntaxArgs,
+                emptyMods,
+                {},
+                std::move(result->collection),
+                syntaxTree.collection->span(),
+                "foreach GetEnumerator",
+                true);
             result->usesEnumerator = true;
             elementType = currentMethod->returnType;
             elementTypeName = currentMethod->returnTypeName;
@@ -3711,23 +4395,29 @@ std::unique_ptr<BoundStatement> Binder::bindForeachStatement(
         element->index = variableExpression(result->indexVariable, syntaxTree.identifierToken.span);
         result->element = std::move(element);
     } else if (result->usesEnumerator && moveNextMethod && currentMethod) {
-        auto moveNext = std::make_unique<BoundCallExpression>();
-        moveNext->type = moveNextMethod->returnType;
-        moveNext->typeName = moveNextMethod->returnTypeName;
-        moveNext->function = *moveNextMethod;
-        moveNext->span = syntaxTree.collection->span();
-        moveNext->arguments.push_back(variableExpression(
-            result->collectionVariable, syntaxTree.collection->span()));
-        result->count = std::move(moveNext);
+        std::vector<const syntax::ExpressionSyntax*> emptySyntaxArgs;
+        std::vector<std::optional<syntax::SyntaxToken>> emptyMods;
+        result->count = bindSelectedCall(
+            *moveNextMethod,
+            {},
+            emptySyntaxArgs,
+            emptyMods,
+            {},
+            variableExpression(result->collectionVariable, syntaxTree.collection->span()),
+            syntaxTree.collection->span(),
+            "foreach MoveNext",
+            true);
 
-        auto current = std::make_unique<BoundCallExpression>();
-        current->type = currentMethod->returnType;
-        current->typeName = currentMethod->returnTypeName;
-        current->function = *currentMethod;
-        current->span = syntaxTree.identifierToken.span;
-        current->arguments.push_back(variableExpression(
-            result->collectionVariable, syntaxTree.collection->span()));
-        result->element = std::move(current);
+        result->element = bindSelectedCall(
+            *currentMethod,
+            {},
+            emptySyntaxArgs,
+            emptyMods,
+            {},
+            variableExpression(result->collectionVariable, syntaxTree.collection->span()),
+            syntaxTree.identifierToken.span,
+            "foreach Current",
+            true);
     } else if (countMethod && getMethod) {
         auto count = std::make_unique<BoundCallExpression>();
         count->type = countMethod->returnType;
@@ -3972,12 +4662,11 @@ std::unique_ptr<BoundStatement> Binder::bindTryStatement(
         bindingFinally_ = true;
         finallyBreakableDepth_ = breakableDepth_;
         finallyLoopDepth_ = loopDepth_;
-        result->finallyBody = bindBlockStatement(
-            *syntaxTree.finallyBody, true);
+        bool skipUsingBind = false;
+        std::optional<VariableSymbol> usingVarSym;
+        const FieldSymbol* usingSeqFieldSym = nullptr;
+        text::TextSpan usingVarSpan{};
         if (syntaxTree.finallyKeyword->text == "$using_finally" &&
-            result->finallyBody &&
-            result->finallyBody->kind() == BoundNodeKind::BlockStatement &&
-            static_cast<BoundBlockStatement&>(*result->finallyBody).statements.size() == 1 &&
             syntaxTree.finallyBody->statements.size() == 1 &&
             syntaxTree.finallyBody->statements[0]->kind() ==
                 syntax::SyntaxKind::ExpressionStatement) {
@@ -3991,29 +4680,172 @@ std::unique_ptr<BoundStatement> Binder::bindTryStatement(
                     mcall.receiver->kind() == syntax::SyntaxKind::NameExpression) {
                     const auto& nameExpr = static_cast<const syntax::NameExpressionSyntax&>(
                         *mcall.receiver);
-                    if (const auto* varSym = lookupVariable(nameExpr.identifierToken.text);
-                        varSym && varSym->type == PrimitiveType::Object) {
-                        auto nullLit = std::make_unique<BoundLiteralExpression>();
-                        nullLit->type = PrimitiveType::Null;
-                        nullLit->span = nameExpr.identifierToken.span;
-                        auto cond = std::make_unique<BoundBinaryExpression>();
-                        cond->type = PrimitiveType::Bool;
-                        cond->operatorKind = BoundBinaryOperatorKind::NotEquals;
-                        cond->span = nameExpr.identifierToken.span;
-                        cond->left = makeVariableAccess(*varSym, nameExpr.identifierToken.span);
-                        cond->right = convertExpression(
-                            std::move(nullLit),
-                            PrimitiveType::Object,
-                            nameExpr.identifierToken.span,
-                            "using null check",
-                            varSym->typeName);
-                        auto ifStmt = std::make_unique<BoundIfStatement>();
-                        ifStmt->span = nameExpr.identifierToken.span;
-                        ifStmt->condition = std::move(cond);
-                        auto& finallyStmts = static_cast<BoundBlockStatement&>(*result->finallyBody).statements;
-                        ifStmt->thenStatement = std::move(finallyStmts[0]);
-                        finallyStmts[0] = std::move(ifStmt);
+                    usingVarSpan = nameExpr.identifierToken.span;
+                    if (const auto* foundUsing = lookupVariable(nameExpr.identifierToken.text)) {
+                        usingVarSym = *foundUsing;
                     }
+                    if (!usingVarSym) {
+                        const auto seqIt = sequenceLocalFields_.find(nameExpr.identifierToken.text);
+                        if (seqIt != sequenceLocalFields_.end()) {
+                            usingSeqFieldSym = &seqIt->second;
+                        }
+                    }
+                    const PrimitiveType uType = usingVarSym
+                        ? usingVarSym->type
+                        : (usingSeqFieldSym ? usingSeqFieldSym->type : PrimitiveType::Error);
+                    const std::string uTypeName = usingVarSym
+                        ? usingVarSym->typeName
+                        : (usingSeqFieldSym ? usingSeqFieldSym->typeName : std::string{});
+                    const text::TextSpan uDeclSpan = usingVarSym
+                        ? usingVarSym->declarationSpan
+                        : (usingSeqFieldSym ? usingSeqFieldSym->declarationSpan : text::TextSpan{});
+                    if ((!usingVarSym && !usingSeqFieldSym) || uType == PrimitiveType::Error) {
+                        skipUsingBind = true;
+                    } else {
+                        bool hasDispose = false;
+                        if ((uType == PrimitiveType::Object ||
+                             uType == PrimitiveType::Struct) &&
+                            !uTypeName.empty()) {
+                            const auto ownerIt = visibleTypes_.find(uTypeName);
+                            if (ownerIt != visibleTypes_.end()) {
+                                for (const auto& method : ownerIt->second.methods) {
+                                    if (!method.staticMethod &&
+                                        method.name == "Dispose" &&
+                                        method.parameters.size() == 1 &&
+                                        isMemberAccessible(
+                                            method.accessibility,
+                                            method.declaringTypeId,
+                                            method.moduleName)) {
+                                        hasDispose = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (!hasDispose) {
+                            const std::string dispName =
+                                isExactType(uType) && !uTypeName.empty()
+                                    ? uTypeName
+                                    : std::string(primitiveTypeName(uType));
+                            diagnostics_.report(
+                                "RS2650",
+                                "type '" + dispName +
+                                    "' used in a 'using' statement must implement 'IDisposable' or declare an accessible parameterless 'Dispose()' method",
+                                uDeclSpan.empty() ? usingVarSpan : uDeclSpan);
+                            skipUsingBind = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (skipUsingBind) {
+            auto emptyFinally = std::make_unique<BoundBlockStatement>();
+            emptyFinally->span = syntaxTree.finallyBody->span();
+            result->finallyBody = std::move(emptyFinally);
+        } else {
+            result->finallyBody = bindBlockStatement(
+                *syntaxTree.finallyBody, true);
+            const PrimitiveType uType = usingVarSym
+                ? usingVarSym->type
+                : (usingSeqFieldSym ? usingSeqFieldSym->type : PrimitiveType::Error);
+            const std::string uTypeName = usingVarSym
+                ? usingVarSym->typeName
+                : (usingSeqFieldSym ? usingSeqFieldSym->typeName : std::string{});
+            if ((usingVarSym || usingSeqFieldSym) &&
+                uType == PrimitiveType::Object &&
+                result->finallyBody &&
+                result->finallyBody->kind() == BoundNodeKind::BlockStatement &&
+                static_cast<BoundBlockStatement&>(*result->finallyBody).statements.size() == 1) {
+                auto nullLit = std::make_unique<BoundLiteralExpression>();
+                nullLit->type = PrimitiveType::Null;
+                nullLit->span = usingVarSpan;
+                auto cond = std::make_unique<BoundBinaryExpression>();
+                cond->type = PrimitiveType::Bool;
+                cond->operatorKind = BoundBinaryOperatorKind::NotEquals;
+                cond->span = usingVarSpan;
+                cond->left = usingVarSym
+                    ? makeVariableAccess(*usingVarSym, usingVarSpan)
+                    : makeSequenceFieldAccess(*usingSeqFieldSym, usingVarSpan);
+                cond->right = convertExpression(
+                    std::move(nullLit),
+                    PrimitiveType::Object,
+                    usingVarSpan,
+                    "using null check",
+                    uTypeName);
+                auto ifStmt = std::make_unique<BoundIfStatement>();
+                ifStmt->span = usingVarSpan;
+                ifStmt->condition = std::move(cond);
+                auto& finallyStmts = static_cast<BoundBlockStatement&>(*result->finallyBody).statements;
+                if (usingSeqFieldSym && currentOwnerType_) {
+                    const auto* receiver = lookupVariable("this");
+                    if (receiver) {
+                        auto thenBlock = std::make_unique<BoundBlockStatement>();
+                        thenBlock->span = usingVarSpan;
+                        thenBlock->statements.push_back(std::move(finallyStmts[0]));
+                        auto clearLit = std::make_unique<BoundLiteralExpression>();
+                        clearLit->type = PrimitiveType::Null;
+                        clearLit->span = usingVarSpan;
+                        auto clearAssign = std::make_unique<BoundMemberAssignmentExpression>();
+                        clearAssign->span = usingVarSpan;
+                        clearAssign->type = usingSeqFieldSym->type;
+                        clearAssign->typeName = usingSeqFieldSym->typeName;
+                        clearAssign->receiver = makeVariableAccess(*receiver, usingVarSpan);
+                        clearAssign->ownerType = *currentOwnerType_;
+                        clearAssign->field = *usingSeqFieldSym;
+                        clearAssign->expression = convertExpression(
+                            std::move(clearLit),
+                            PrimitiveType::Object,
+                            usingVarSpan,
+                            "using sequence field clear",
+                            uTypeName);
+                        auto clearStmt = std::make_unique<BoundExpressionStatement>();
+                        clearStmt->span = usingVarSpan;
+                        clearStmt->expression = std::move(clearAssign);
+                        thenBlock->statements.push_back(std::move(clearStmt));
+                        ifStmt->thenStatement = std::move(thenBlock);
+                    } else {
+                        ifStmt->thenStatement = std::move(finallyStmts[0]);
+                    }
+                } else {
+                    ifStmt->thenStatement = std::move(finallyStmts[0]);
+                }
+                finallyStmts[0] = std::move(ifStmt);
+            } else if (usingSeqFieldSym &&
+                       currentOwnerType_ &&
+                       isManagedResourceHandleType(uType, uTypeName) &&
+                       result->finallyBody &&
+                       result->finallyBody->kind() == BoundNodeKind::BlockStatement) {
+                const auto* receiver = lookupVariable("this");
+                const auto ownerIt = visibleTypes_.find(uTypeName);
+                const FunctionSymbol* emptyMethod = nullptr;
+                if (ownerIt != visibleTypes_.end()) {
+                    for (const auto& m : ownerIt->second.methods) {
+                        if (m.staticMethod && m.name == "Empty" &&
+                            m.parameters.empty() && m.returnType == PrimitiveType::Struct) {
+                            emptyMethod = &m;
+                            break;
+                        }
+                    }
+                }
+                if (receiver && emptyMethod) {
+                    auto emptyCall = std::make_unique<BoundCallExpression>();
+                    emptyCall->span = usingVarSpan;
+                    emptyCall->type = usingSeqFieldSym->type;
+                    emptyCall->typeName = usingSeqFieldSym->typeName;
+                    emptyCall->function = *emptyMethod;
+                    auto clearAssign = std::make_unique<BoundMemberAssignmentExpression>();
+                    clearAssign->span = usingVarSpan;
+                    clearAssign->type = usingSeqFieldSym->type;
+                    clearAssign->typeName = usingSeqFieldSym->typeName;
+                    clearAssign->receiver = makeVariableAccess(*receiver, usingVarSpan);
+                    clearAssign->ownerType = *currentOwnerType_;
+                    clearAssign->field = *usingSeqFieldSym;
+                    clearAssign->expression = std::move(emptyCall);
+                    auto clearStmt = std::make_unique<BoundExpressionStatement>();
+                    clearStmt->span = usingVarSpan;
+                    clearStmt->expression = std::move(clearAssign);
+                    static_cast<BoundBlockStatement&>(*result->finallyBody)
+                        .statements.push_back(std::move(clearStmt));
                 }
             }
         }
@@ -4316,11 +5148,15 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
         assignment->receiver = makeVariableAccess(*receiver, syntaxTree.span());
         assignment->ownerType = *currentOwnerType_;
         assignment->field = sequenceField->second;
-        assignment->expression = bindTargetExpression(
+        auto seqInitVal = bindTargetExpression(
             *syntaxTree.initializer,
             sequenceField->second.type,
             sequenceField->second.typeName,
             "sequence local initializer");
+        assignment->expression = wrapResourceHandleOverwriteRelease(
+            makeSequenceFieldAccess(sequenceField->second, syntaxTree.span()),
+            std::move(seqInitVal),
+            syntaxTree.span());
         auto statement = std::make_unique<BoundExpressionStatement>();
         statement->span = syntaxTree.span();
         statement->expression = std::move(assignment);
@@ -4393,23 +5229,31 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
         const auto& targetName = static_cast<const
             syntax::NameExpressionSyntax&>(*syntaxTree.initializer)
                 .identifierToken.text;
-        const auto* target = lookupVariable(targetName);
-        if (!target) {
+        const auto* foundTarget = lookupVariable(targetName);
+        if (!foundTarget) {
             diagnostics_.report(
                 "RS8823", "ref local target is not a variable",
                 syntaxTree.initializer->span());
             return result;
         }
-        if (target->modifier == ParameterModifier::In) {
+        const VariableSymbol target = *foundTarget;
+        if (target.modifier == ParameterModifier::In) {
             diagnostics_.report(
                 "RS8824", "an in parameter cannot be aliased by a ref local",
                 syntaxTree.initializer->span());
             return result;
         }
-        if (target->type != declaredType ||
+        if (target.isUsingResource) {
+            diagnostics_.report(
+                "RS2651",
+                "cannot alias 'using' variable '" + target.name + "' with a ref local",
+                syntaxTree.initializer->span());
+            return result;
+        }
+        if (target.type != declaredType ||
             ((isExactType(declaredType) ||
               declaredType == PrimitiveType::Object) &&
-             target->typeName != declaredTypeName)) {
+             target.typeName != declaredTypeName)) {
             diagnostics_.report(
                 "RS8825", "ref local type does not match its target",
                 syntaxTree.type.span());
@@ -4426,9 +5270,9 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
                 syntaxTree.identifierToken.span);
             return result;
         }
-        aliases.emplace(syntaxTree.identifierToken.text, *target);
+        aliases.emplace(syntaxTree.identifierToken.text, target);
         SymbolOccurrence occurrence;
-        occurrence.id = target->id;
+        occurrence.id = target.id;
         occurrence.kind = SymbolKind::Local;
         occurrence.name = syntaxTree.identifierToken.text;
         occurrence.detail = "ref " + std::string(
@@ -4486,6 +5330,7 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
     result->variable.index = nextVariableIndex_++;
     result->variable.parameter = false;
     result->variable.isConst = syntaxTree.constKeyword.has_value();
+    result->variable.isUsingResource = syntaxTree.isUsingDeclaration;
     result->variable.declarationSpan = syntaxTree.identifierToken.span;
     result->variable.id = stableTypeId(std::to_string(currentFunctionId_) +
         "::local:" + std::to_string(result->variable.index) + ":" +
@@ -4524,7 +5369,10 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
 
     (void)declareVariable(result->variable, syntaxTree.identifierToken.span);
     if (inferredInitializer) {
-        result->initializer = std::move(inferredInitializer);
+        result->initializer = cloneResourceHandleIfNeeded(
+            std::move(inferredInitializer),
+            syntaxTree.initializer->span(),
+            false);
     } else if (syntaxTree.initializer && !inferredType) {
         result->initializer = bindTargetExpression(
             *syntaxTree.initializer,
@@ -4641,6 +5489,13 @@ PrimitiveType Binder::bindType(
     if (baseType == PrimitiveType::Error) {
         const auto found = visibleTypes_.find(syntaxTree.name.text);
         if (found != visibleTypes_.end()) {
+            if (!isTypeAccessible(found->second)) {
+                diagnostics_.report(
+                    "RS2534",
+                    "type '" + canonicalTypeName(found->second) + "' is inaccessible",
+                    syntaxTree.span());
+                return PrimitiveType::Error;
+            }
             if (found->second.id != 0 && !syntaxTree.name.span.empty()) {
                 SymbolOccurrence occ;
                 occ.id = found->second.id;

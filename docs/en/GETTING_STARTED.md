@@ -35,7 +35,7 @@ cmake -S . -B build \
 
 ## First Program
 
-Create `hello.rs`:
+Create `hello.rscript`:
 
 ```csharp
 module Demo.Hello;
@@ -49,20 +49,20 @@ int main()
 Validate it:
 
 ```bash
-build/rsc hello.rs
+build/rsc hello.rscript
 ```
 
 Run it:
 
 ```bash
-build/rsc hello.rs --run Demo.Hello::main
+build/rsc hello.rscript --run Demo.Hello::main
 ```
 
 The exact executable location depends on the generator. Visual Studio builds normally place executables under `build/Debug/`.
 
 ## Multiple Modules
 
-Create `math.rs`:
+Create `math.rscript`:
 
 ```csharp
 module Demo.Math;
@@ -73,7 +73,7 @@ int twice(int value)
 }
 ```
 
-Create `app.rs`:
+Create `app.rscript`:
 
 ```csharp
 module Demo.App;
@@ -88,7 +88,7 @@ int main()
 Compile and run both files:
 
 ```bash
-build/rsc math.rs app.rs --run Demo.App::main
+build/rsc math.rscript app.rscript --run Demo.App::main
 ```
 
 A module may be split across multiple source files. Imports operate on module names, not physical file paths.
@@ -98,25 +98,25 @@ A module may be split across multiple source files. Imports operate on module na
 Print verified Typed MIR:
 
 ```bash
-build/rsc math.rs app.rs --mir
+build/rsc math.rscript app.rscript --mir
 ```
 
 List stable symbols:
 
 ```bash
-build/rsc math.rs app.rs --symbols
+build/rsc math.rscript app.rscript --symbols
 ```
 
 Print typed register bytecode:
 
 ```bash
-build/rsc math.rs app.rs --bytecode
+build/rsc math.rscript app.rscript --bytecode
 ```
 
 Write and disassemble a `.rsbc` module:
 
 ```bash
-build/rsc math.rs app.rs --emit-bytecode demo.rsbc
+build/rsc math.rscript app.rscript --emit-bytecode demo.rsbc
 build/rsc demo.rsbc --disassemble
 ```
 
@@ -125,7 +125,7 @@ build/rsc demo.rsbc --disassemble
 Run optimized MIR with deterministic tracing, a profile, and an execution digest:
 
 ```bash
-build/rsc math.rs app.rs \
+build/rsc math.rscript app.rscript \
   --run Demo.App::main \
   --opt-level 2 \
   --deterministic \
@@ -149,7 +149,7 @@ build/rsaot \
   --program-name DemoScripts \
   --opt-level 2 \
   --opt-report \
-  math.rs app.rs
+  math.rscript app.rscript
 ```
 
 The output directory contains:
@@ -170,8 +170,8 @@ realscript_add_aot_library(DemoScriptsAot
     PROGRAM_NAME DemoScripts
     OPT_LEVEL 2
     SOURCES
-        math.rs
-        app.rs
+        math.rscript
+        app.rscript
 )
 
 target_link_libraries(game PRIVATE DemoScriptsAot)
@@ -188,7 +188,7 @@ build/rsbench \
   --iterations 1000 \
   --opt-level 2 \
   --json \
-  math.rs app.rs
+  math.rscript app.rscript
 ```
 
 Benchmark output includes timing data, optimization statistics, a stable semantic digest, and per-function profile counters.
@@ -204,7 +204,7 @@ build/rslsp
 Start the debug adapter with source files:
 
 ```bash
-build/rsdebug math.rs app.rs
+build/rsdebug math.rscript app.rscript
 ```
 
 Both processes use standard stdin/stdout protocol framing and are intended to be launched by an editor extension or protocol client.

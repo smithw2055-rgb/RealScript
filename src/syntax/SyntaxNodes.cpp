@@ -399,4 +399,730 @@ text::TextSpan CompilationUnitSyntax::span() const noexcept {
     return endOfFileToken.span;
 }
 
+
+TypeSyntax cloneTypeSyntax(const TypeSyntax& value) {
+    return value;
+}
+
+namespace {
+
+InitializerElementSyntax cloneInitializerElement(const InitializerElementSyntax& value) {
+    InitializerElementSyntax out;
+    out.nameToken = value.nameToken;
+    out.equalsToken = value.equalsToken;
+    out.openBraceToken = value.openBraceToken;
+    for (const auto& expr : value.expressions) {
+        out.expressions.push_back(expr ? cloneExpressionSyntax(*expr) : nullptr);
+    }
+    out.commaTokens = value.commaTokens;
+    out.closeBraceToken = value.closeBraceToken;
+    return out;
+}
+
+SwitchExpressionArmSyntax cloneSwitchExpressionArm(const SwitchExpressionArmSyntax& value) {
+    SwitchExpressionArmSyntax out;
+    if (value.label) out.label = cloneExpressionSyntax(*value.label);
+    out.patternType = value.patternType;
+    out.patternDesignation = value.patternDesignation;
+    out.discardToken = value.discardToken;
+    out.whenKeyword = value.whenKeyword;
+    if (value.guard) out.guard = cloneExpressionSyntax(*value.guard);
+    out.arrowToken = value.arrowToken;
+    if (value.value) out.value = cloneExpressionSyntax(*value.value);
+    return out;
+}
+
+CatchClauseSyntax cloneCatchClause(const CatchClauseSyntax& value) {
+    CatchClauseSyntax out;
+    out.catchKeyword = value.catchKeyword;
+    out.openParenToken = value.openParenToken;
+    out.type = value.type;
+    out.identifierToken = value.identifierToken;
+    out.closeParenToken = value.closeParenToken;
+    out.body = cloneBlockStatementSyntax(value.body);
+    return out;
+}
+
+SwitchSectionSyntax cloneSwitchSection(const SwitchSectionSyntax& value) {
+    SwitchSectionSyntax out;
+    out.caseKeyword = value.caseKeyword;
+    out.defaultKeyword = value.defaultKeyword;
+    if (value.label) out.label = cloneExpressionSyntax(*value.label);
+    out.patternType = value.patternType;
+    out.patternDesignation = value.patternDesignation;
+    out.whenKeyword = value.whenKeyword;
+    if (value.guard) out.guard = cloneExpressionSyntax(*value.guard);
+    out.colonToken = value.colonToken;
+    for (const auto& stmt : value.statements) {
+        out.statements.push_back(stmt ? cloneStatementSyntax(*stmt) : nullptr);
+    }
+    return out;
+}
+
+std::unique_ptr<AccessorDeclarationSyntax> cloneAccessorDeclaration(
+    const AccessorDeclarationSyntax& value) {
+    auto out = std::make_unique<AccessorDeclarationSyntax>();
+    out->keyword = value.keyword;
+    out->semicolonToken = value.semicolonToken;
+    if (value.body) {
+        out->body = std::make_unique<BlockStatementSyntax>(
+            cloneBlockStatementSyntax(*value.body));
+    }
+    return out;
+}
+
+} // namespace
+
+std::unique_ptr<ExpressionSyntax> cloneExpressionSyntax(const ExpressionSyntax& value) {
+    switch (value.kind()) {
+    case SyntaxKind::LiteralExpression: {
+        auto out = std::make_unique<LiteralExpressionSyntax>();
+        out->literalToken = static_cast<const LiteralExpressionSyntax&>(value).literalToken;
+        return out;
+    }
+    case SyntaxKind::NameExpression: {
+        const auto& src = static_cast<const NameExpressionSyntax&>(value);
+        auto out = std::make_unique<NameExpressionSyntax>();
+        out->identifierToken = src.identifierToken;
+        out->lessToken = src.lessToken;
+        out->typeArguments = src.typeArguments;
+        out->typeArgumentCommaTokens = src.typeArgumentCommaTokens;
+        out->greaterToken = src.greaterToken;
+        return out;
+    }
+    case SyntaxKind::LambdaExpression: {
+        const auto& src = static_cast<const LambdaExpressionSyntax&>(value);
+        auto out = std::make_unique<LambdaExpressionSyntax>();
+        out->openParenToken = src.openParenToken;
+        out->parameterTokens = src.parameterTokens;
+        out->commaTokens = src.commaTokens;
+        out->closeParenToken = src.closeParenToken;
+        out->arrowToken = src.arrowToken;
+        if (src.body) out->body = cloneExpressionSyntax(*src.body);
+        return out;
+    }
+    case SyntaxKind::UnaryExpression: {
+        const auto& src = static_cast<const UnaryExpressionSyntax&>(value);
+        auto out = std::make_unique<UnaryExpressionSyntax>();
+        out->operatorToken = src.operatorToken;
+        if (src.operand) out->operand = cloneExpressionSyntax(*src.operand);
+        return out;
+    }
+    case SyntaxKind::BinaryExpression: {
+        const auto& src = static_cast<const BinaryExpressionSyntax&>(value);
+        auto out = std::make_unique<BinaryExpressionSyntax>();
+        if (src.left) out->left = cloneExpressionSyntax(*src.left);
+        out->operatorToken = src.operatorToken;
+        if (src.right) out->right = cloneExpressionSyntax(*src.right);
+        return out;
+    }
+    case SyntaxKind::TypeBinaryExpression: {
+        const auto& src = static_cast<const TypeBinaryExpressionSyntax&>(value);
+        auto out = std::make_unique<TypeBinaryExpressionSyntax>();
+        if (src.expression) out->expression = cloneExpressionSyntax(*src.expression);
+        out->operatorToken = src.operatorToken;
+        out->type = src.type;
+        out->designationToken = src.designationToken;
+        return out;
+    }
+    case SyntaxKind::TypeOfExpression: {
+        const auto& src = static_cast<const TypeOfExpressionSyntax&>(value);
+        auto out = std::make_unique<TypeOfExpressionSyntax>();
+        out->typeofKeyword = src.typeofKeyword;
+        out->openParenToken = src.openParenToken;
+        out->type = src.type;
+        out->closeParenToken = src.closeParenToken;
+        return out;
+    }
+    case SyntaxKind::SwitchExpression: {
+        const auto& src = static_cast<const SwitchExpressionSyntax&>(value);
+        auto out = std::make_unique<SwitchExpressionSyntax>();
+        if (src.expression) out->expression = cloneExpressionSyntax(*src.expression);
+        out->switchKeyword = src.switchKeyword;
+        out->openBraceToken = src.openBraceToken;
+        for (const auto& arm : src.arms) {
+            out->arms.push_back(cloneSwitchExpressionArm(arm));
+        }
+        out->commaTokens = src.commaTokens;
+        out->closeBraceToken = src.closeBraceToken;
+        return out;
+    }
+    case SyntaxKind::ConditionalExpression: {
+        const auto& src = static_cast<const ConditionalExpressionSyntax&>(value);
+        auto out = std::make_unique<ConditionalExpressionSyntax>();
+        if (src.condition) out->condition = cloneExpressionSyntax(*src.condition);
+        out->questionToken = src.questionToken;
+        if (src.whenTrue) out->whenTrue = cloneExpressionSyntax(*src.whenTrue);
+        out->colonToken = src.colonToken;
+        if (src.whenFalse) out->whenFalse = cloneExpressionSyntax(*src.whenFalse);
+        return out;
+    }
+    case SyntaxKind::AssignmentExpression: {
+        const auto& src = static_cast<const AssignmentExpressionSyntax&>(value);
+        auto out = std::make_unique<AssignmentExpressionSyntax>();
+        out->identifierToken = src.identifierToken;
+        out->equalsToken = src.equalsToken;
+        if (src.expression) out->expression = cloneExpressionSyntax(*src.expression);
+        return out;
+    }
+    case SyntaxKind::ParenthesizedExpression: {
+        const auto& src = static_cast<const ParenthesizedExpressionSyntax&>(value);
+        auto out = std::make_unique<ParenthesizedExpressionSyntax>();
+        out->openParenToken = src.openParenToken;
+        if (src.expression) out->expression = cloneExpressionSyntax(*src.expression);
+        out->closeParenToken = src.closeParenToken;
+        return out;
+    }
+    case SyntaxKind::CastExpression: {
+        const auto& src = static_cast<const CastExpressionSyntax&>(value);
+        auto out = std::make_unique<CastExpressionSyntax>();
+        out->openParenToken = src.openParenToken;
+        out->type = src.type;
+        out->closeParenToken = src.closeParenToken;
+        if (src.expression) out->expression = cloneExpressionSyntax(*src.expression);
+        return out;
+    }
+    case SyntaxKind::CallExpression: {
+        const auto& src = static_cast<const CallExpressionSyntax&>(value);
+        auto out = std::make_unique<CallExpressionSyntax>();
+        out->identifierToken = src.identifierToken;
+        out->lessToken = src.lessToken;
+        out->typeArguments = src.typeArguments;
+        out->typeArgumentCommaTokens = src.typeArgumentCommaTokens;
+        out->greaterToken = src.greaterToken;
+        out->openParenToken = src.openParenToken;
+        out->argumentModifiers = src.argumentModifiers;
+        out->argumentNames = src.argumentNames;
+        out->argumentNameColonTokens = src.argumentNameColonTokens;
+        for (const auto& arg : src.arguments) {
+            out->arguments.push_back(arg ? cloneExpressionSyntax(*arg) : nullptr);
+        }
+        out->commaTokens = src.commaTokens;
+        out->closeParenToken = src.closeParenToken;
+        return out;
+    }
+    case SyntaxKind::ThisExpression: {
+        auto out = std::make_unique<ThisExpressionSyntax>();
+        out->thisKeyword = static_cast<const ThisExpressionSyntax&>(value).thisKeyword;
+        return out;
+    }
+    case SyntaxKind::BaseExpression: {
+        auto out = std::make_unique<BaseExpressionSyntax>();
+        out->baseKeyword = static_cast<const BaseExpressionSyntax&>(value).baseKeyword;
+        return out;
+    }
+    case SyntaxKind::MemberCallExpression: {
+        const auto& src = static_cast<const MemberCallExpressionSyntax&>(value);
+        auto out = std::make_unique<MemberCallExpressionSyntax>();
+        if (src.receiver) out->receiver = cloneExpressionSyntax(*src.receiver);
+        out->dotToken = src.dotToken;
+        out->nameToken = src.nameToken;
+        out->lessToken = src.lessToken;
+        out->typeArguments = src.typeArguments;
+        out->typeArgumentCommaTokens = src.typeArgumentCommaTokens;
+        out->greaterToken = src.greaterToken;
+        out->openParenToken = src.openParenToken;
+        out->argumentModifiers = src.argumentModifiers;
+        out->argumentNames = src.argumentNames;
+        out->argumentNameColonTokens = src.argumentNameColonTokens;
+        for (const auto& arg : src.arguments) {
+            out->arguments.push_back(arg ? cloneExpressionSyntax(*arg) : nullptr);
+        }
+        out->commaTokens = src.commaTokens;
+        out->closeParenToken = src.closeParenToken;
+        return out;
+    }
+    case SyntaxKind::MemberAccessExpression: {
+        const auto& src = static_cast<const MemberAccessExpressionSyntax&>(value);
+        auto out = std::make_unique<MemberAccessExpressionSyntax>();
+        if (src.receiver) out->receiver = cloneExpressionSyntax(*src.receiver);
+        out->dotToken = src.dotToken;
+        out->nameToken = src.nameToken;
+        return out;
+    }
+    case SyntaxKind::ElementAccessExpression: {
+        const auto& src = static_cast<const ElementAccessExpressionSyntax&>(value);
+        auto out = std::make_unique<ElementAccessExpressionSyntax>();
+        if (src.receiver) out->receiver = cloneExpressionSyntax(*src.receiver);
+        out->openBracketToken = src.openBracketToken;
+        if (src.index) out->index = cloneExpressionSyntax(*src.index);
+        out->closeBracketToken = src.closeBracketToken;
+        return out;
+    }
+    case SyntaxKind::ElementAssignmentExpression: {
+        const auto& src = static_cast<const ElementAssignmentExpressionSyntax&>(value);
+        auto out = std::make_unique<ElementAssignmentExpressionSyntax>();
+        if (src.receiver) out->receiver = cloneExpressionSyntax(*src.receiver);
+        out->openBracketToken = src.openBracketToken;
+        if (src.index) out->index = cloneExpressionSyntax(*src.index);
+        out->closeBracketToken = src.closeBracketToken;
+        out->equalsToken = src.equalsToken;
+        if (src.expression) out->expression = cloneExpressionSyntax(*src.expression);
+        return out;
+    }
+    case SyntaxKind::MemberAssignmentExpression: {
+        const auto& src = static_cast<const MemberAssignmentExpressionSyntax&>(value);
+        auto out = std::make_unique<MemberAssignmentExpressionSyntax>();
+        if (src.receiver) out->receiver = cloneExpressionSyntax(*src.receiver);
+        out->dotToken = src.dotToken;
+        out->nameToken = src.nameToken;
+        out->equalsToken = src.equalsToken;
+        if (src.expression) out->expression = cloneExpressionSyntax(*src.expression);
+        return out;
+    }
+    case SyntaxKind::NewObjectExpression: {
+        const auto& src = static_cast<const NewObjectExpressionSyntax&>(value);
+        auto out = std::make_unique<NewObjectExpressionSyntax>();
+        out->newKeyword = src.newKeyword;
+        out->type = src.type;
+        out->openParenToken = src.openParenToken;
+        for (const auto& arg : src.arguments) {
+            out->arguments.push_back(arg ? cloneExpressionSyntax(*arg) : nullptr);
+        }
+        out->argumentNames = src.argumentNames;
+        out->argumentNameColonTokens = src.argumentNameColonTokens;
+        out->commaTokens = src.commaTokens;
+        out->closeParenToken = src.closeParenToken;
+        out->initializerOpenBraceToken = src.initializerOpenBraceToken;
+        for (const auto& init : src.initializers) {
+            out->initializers.push_back(cloneInitializerElement(init));
+        }
+        out->initializerCommaTokens = src.initializerCommaTokens;
+        out->initializerCloseBraceToken = src.initializerCloseBraceToken;
+        return out;
+    }
+    case SyntaxKind::NewArrayExpression: {
+        const auto& src = static_cast<const NewArrayExpressionSyntax&>(value);
+        auto out = std::make_unique<NewArrayExpressionSyntax>();
+        out->newKeyword = src.newKeyword;
+        out->elementType = src.elementType;
+        out->openBracketToken = src.openBracketToken;
+        if (src.length) out->length = cloneExpressionSyntax(*src.length);
+        out->explicitLength = src.explicitLength;
+        out->closeBracketToken = src.closeBracketToken;
+        out->initializerOpenBraceToken = src.initializerOpenBraceToken;
+        for (const auto& item : src.initialValues) {
+            out->initialValues.push_back(item ? cloneExpressionSyntax(*item) : nullptr);
+        }
+        out->initializerCommaTokens = src.initializerCommaTokens;
+        out->initializerCloseBraceToken = src.initializerCloseBraceToken;
+        return out;
+    }
+    default:
+        return nullptr;
+    }
+}
+
+BlockStatementSyntax cloneBlockStatementSyntax(const BlockStatementSyntax& value) {
+    BlockStatementSyntax out;
+    out.openBraceToken = value.openBraceToken;
+    for (const auto& stmt : value.statements) {
+        out.statements.push_back(stmt ? cloneStatementSyntax(*stmt) : nullptr);
+    }
+    out.closeBraceToken = value.closeBraceToken;
+    return out;
+}
+
+std::unique_ptr<StatementSyntax> cloneStatementSyntax(const StatementSyntax& value) {
+    switch (value.kind()) {
+    case SyntaxKind::BlockStatement:
+        return std::make_unique<BlockStatementSyntax>(
+            cloneBlockStatementSyntax(static_cast<const BlockStatementSyntax&>(value)));
+    case SyntaxKind::ReturnStatement: {
+        const auto& src = static_cast<const ReturnStatementSyntax&>(value);
+        auto out = std::make_unique<ReturnStatementSyntax>();
+        out->returnKeyword = src.returnKeyword;
+        out->refKeyword = src.refKeyword;
+        if (src.expression) out->expression = cloneExpressionSyntax(*src.expression);
+        out->semicolonToken = src.semicolonToken;
+        return out;
+    }
+    case SyntaxKind::IfStatement: {
+        const auto& src = static_cast<const IfStatementSyntax&>(value);
+        auto out = std::make_unique<IfStatementSyntax>();
+        out->ifKeyword = src.ifKeyword;
+        out->openParenToken = src.openParenToken;
+        if (src.condition) out->condition = cloneExpressionSyntax(*src.condition);
+        out->closeParenToken = src.closeParenToken;
+        if (src.thenStatement) out->thenStatement = cloneStatementSyntax(*src.thenStatement);
+        out->elseKeyword = src.elseKeyword;
+        if (src.elseStatement) out->elseStatement = cloneStatementSyntax(*src.elseStatement);
+        return out;
+    }
+    case SyntaxKind::WhileStatement: {
+        const auto& src = static_cast<const WhileStatementSyntax&>(value);
+        auto out = std::make_unique<WhileStatementSyntax>();
+        out->whileKeyword = src.whileKeyword;
+        out->openParenToken = src.openParenToken;
+        if (src.condition) out->condition = cloneExpressionSyntax(*src.condition);
+        out->closeParenToken = src.closeParenToken;
+        if (src.body) out->body = cloneStatementSyntax(*src.body);
+        return out;
+    }
+    case SyntaxKind::ForStatement: {
+        const auto& src = static_cast<const ForStatementSyntax&>(value);
+        auto out = std::make_unique<ForStatementSyntax>();
+        out->forKeyword = src.forKeyword;
+        out->openParenToken = src.openParenToken;
+        if (src.initializer) out->initializer = cloneStatementSyntax(*src.initializer);
+        out->firstSemicolonToken = src.firstSemicolonToken;
+        if (src.condition) out->condition = cloneExpressionSyntax(*src.condition);
+        out->secondSemicolonToken = src.secondSemicolonToken;
+        if (src.increment) out->increment = cloneExpressionSyntax(*src.increment);
+        out->closeParenToken = src.closeParenToken;
+        if (src.body) out->body = cloneStatementSyntax(*src.body);
+        return out;
+    }
+    case SyntaxKind::ForeachStatement: {
+        const auto& src = static_cast<const ForeachStatementSyntax&>(value);
+        auto out = std::make_unique<ForeachStatementSyntax>();
+        out->foreachKeyword = src.foreachKeyword;
+        out->openParenToken = src.openParenToken;
+        out->modifierToken = src.modifierToken;
+        out->type = src.type;
+        out->identifierToken = src.identifierToken;
+        out->bindingCommaTokens = src.bindingCommaTokens;
+        out->additionalBindings = src.additionalBindings;
+        out->inKeyword = src.inKeyword;
+        if (src.collection) out->collection = cloneExpressionSyntax(*src.collection);
+        out->closeParenToken = src.closeParenToken;
+        if (src.body) out->body = cloneStatementSyntax(*src.body);
+        return out;
+    }
+    case SyntaxKind::DoWhileStatement: {
+        const auto& src = static_cast<const DoWhileStatementSyntax&>(value);
+        auto out = std::make_unique<DoWhileStatementSyntax>();
+        out->doKeyword = src.doKeyword;
+        if (src.body) out->body = cloneStatementSyntax(*src.body);
+        out->whileKeyword = src.whileKeyword;
+        out->openParenToken = src.openParenToken;
+        if (src.condition) out->condition = cloneExpressionSyntax(*src.condition);
+        out->closeParenToken = src.closeParenToken;
+        out->semicolonToken = src.semicolonToken;
+        return out;
+    }
+    case SyntaxKind::BreakStatement: {
+        const auto& src = static_cast<const BreakStatementSyntax&>(value);
+        auto out = std::make_unique<BreakStatementSyntax>();
+        out->breakKeyword = src.breakKeyword;
+        out->semicolonToken = src.semicolonToken;
+        return out;
+    }
+    case SyntaxKind::ContinueStatement: {
+        const auto& src = static_cast<const ContinueStatementSyntax&>(value);
+        auto out = std::make_unique<ContinueStatementSyntax>();
+        out->continueKeyword = src.continueKeyword;
+        out->semicolonToken = src.semicolonToken;
+        return out;
+    }
+    case SyntaxKind::SwitchStatement: {
+        const auto& src = static_cast<const SwitchStatementSyntax&>(value);
+        auto out = std::make_unique<SwitchStatementSyntax>();
+        out->switchKeyword = src.switchKeyword;
+        out->openParenToken = src.openParenToken;
+        if (src.expression) out->expression = cloneExpressionSyntax(*src.expression);
+        out->closeParenToken = src.closeParenToken;
+        out->openBraceToken = src.openBraceToken;
+        for (const auto& sec : src.sections) {
+            out->sections.push_back(cloneSwitchSection(sec));
+        }
+        out->closeBraceToken = src.closeBraceToken;
+        return out;
+    }
+    case SyntaxKind::ThrowStatement: {
+        const auto& src = static_cast<const ThrowStatementSyntax&>(value);
+        auto out = std::make_unique<ThrowStatementSyntax>();
+        out->throwKeyword = src.throwKeyword;
+        if (src.expression) out->expression = cloneExpressionSyntax(*src.expression);
+        out->semicolonToken = src.semicolonToken;
+        return out;
+    }
+    case SyntaxKind::TryStatement: {
+        const auto& src = static_cast<const TryStatementSyntax&>(value);
+        auto out = std::make_unique<TryStatementSyntax>();
+        out->tryKeyword = src.tryKeyword;
+        out->body = cloneBlockStatementSyntax(src.body);
+        for (const auto& c : src.catches) {
+            out->catches.push_back(cloneCatchClause(c));
+        }
+        out->finallyKeyword = src.finallyKeyword;
+        if (src.finallyBody) {
+            out->finallyBody = cloneBlockStatementSyntax(*src.finallyBody);
+        }
+        return out;
+    }
+    case SyntaxKind::YieldWaitStatement: {
+        const auto& src = static_cast<const YieldWaitStatementSyntax&>(value);
+        auto out = std::make_unique<YieldWaitStatementSyntax>();
+        out->yieldKeyword = src.yieldKeyword;
+        out->waitTicksToken = src.waitTicksToken;
+        out->openParenToken = src.openParenToken;
+        if (src.delay) out->delay = cloneExpressionSyntax(*src.delay);
+        out->commaToken = src.commaToken;
+        if (src.secondArgument) out->secondArgument = cloneExpressionSyntax(*src.secondArgument);
+        out->closeParenToken = src.closeParenToken;
+        out->semicolonToken = src.semicolonToken;
+        return out;
+    }
+    case SyntaxKind::YieldBreakStatement: {
+        const auto& src = static_cast<const YieldBreakStatementSyntax&>(value);
+        auto out = std::make_unique<YieldBreakStatementSyntax>();
+        out->yieldKeyword = src.yieldKeyword;
+        out->breakKeyword = src.breakKeyword;
+        out->semicolonToken = src.semicolonToken;
+        return out;
+    }
+    case SyntaxKind::EventSubscriptionStatement: {
+        const auto& src = static_cast<const EventSubscriptionStatementSyntax&>(value);
+        auto out = std::make_unique<EventSubscriptionStatementSyntax>();
+        if (src.receiver) out->receiver = cloneExpressionSyntax(*src.receiver);
+        out->dotToken = src.dotToken;
+        out->eventNameToken = src.eventNameToken;
+        out->operatorToken = src.operatorToken;
+        if (src.handler) out->handler = cloneExpressionSyntax(*src.handler);
+        out->semicolonToken = src.semicolonToken;
+        return out;
+    }
+    case SyntaxKind::VariableDeclarationStatement: {
+        const auto& src = static_cast<const VariableDeclarationStatementSyntax&>(value);
+        auto out = std::make_unique<VariableDeclarationStatementSyntax>();
+        out->constKeyword = src.constKeyword;
+        out->refKeyword = src.refKeyword;
+        out->type = src.type;
+        out->identifierToken = src.identifierToken;
+        out->equalsToken = src.equalsToken;
+        out->initializerRefKeyword = src.initializerRefKeyword;
+        if (src.initializer) out->initializer = cloneExpressionSyntax(*src.initializer);
+        out->semicolonToken = src.semicolonToken;
+        out->isUsingDeclaration = src.isUsingDeclaration;
+        return out;
+    }
+    case SyntaxKind::ExpressionStatement: {
+        const auto& src = static_cast<const ExpressionStatementSyntax&>(value);
+        auto out = std::make_unique<ExpressionStatementSyntax>();
+        if (src.expression) out->expression = cloneExpressionSyntax(*src.expression);
+        out->semicolonToken = src.semicolonToken;
+        return out;
+    }
+    default:
+        return nullptr;
+    }
+}
+
+ParameterSyntax cloneParameterSyntax(const ParameterSyntax& value) {
+    ParameterSyntax out;
+    out.paramsKeyword = value.paramsKeyword;
+    out.modifierToken = value.modifierToken;
+    out.type = value.type;
+    out.identifierToken = value.identifierToken;
+    out.equalsToken = value.equalsToken;
+    if (value.defaultValue) out.defaultValue = cloneExpressionSyntax(*value.defaultValue);
+    return out;
+}
+
+FieldDeclarationSyntax cloneFieldDeclarationSyntax(const FieldDeclarationSyntax& value) {
+    FieldDeclarationSyntax out;
+    out.attributes = value.attributes;
+    out.modifiers = value.modifiers;
+    out.type = value.type;
+    out.identifierToken = value.identifierToken;
+    out.equalsToken = value.equalsToken;
+    if (value.initializer) out.initializer = cloneExpressionSyntax(*value.initializer);
+    out.semicolonToken = value.semicolonToken;
+    return out;
+}
+
+ConstructorDeclarationSyntax cloneConstructorDeclarationSyntax(
+    const ConstructorDeclarationSyntax& value) {
+    ConstructorDeclarationSyntax out;
+    out.attributes = value.attributes;
+    out.modifiers = value.modifiers;
+    out.identifierToken = value.identifierToken;
+    out.openParenToken = value.openParenToken;
+    for (const auto& param : value.parameters) {
+        out.parameters.push_back(cloneParameterSyntax(param));
+    }
+    out.commaTokens = value.commaTokens;
+    out.closeParenToken = value.closeParenToken;
+    out.initializerColonToken = value.initializerColonToken;
+    out.baseKeyword = value.baseKeyword;
+    out.initializerOpenParenToken = value.initializerOpenParenToken;
+    for (const auto& arg : value.baseArguments) {
+        out.baseArguments.push_back(arg ? cloneExpressionSyntax(*arg) : nullptr);
+    }
+    out.baseArgumentCommaTokens = value.baseArgumentCommaTokens;
+    out.initializerCloseParenToken = value.initializerCloseParenToken;
+    out.body = cloneBlockStatementSyntax(value.body);
+    return out;
+}
+
+PropertyDeclarationSyntax clonePropertyDeclarationSyntax(
+    const PropertyDeclarationSyntax& value) {
+    PropertyDeclarationSyntax out;
+    out.attributes = value.attributes;
+    out.modifiers = value.modifiers;
+    out.staticKeyword = value.staticKeyword;
+    out.type = value.type;
+    out.identifierToken = value.identifierToken;
+    out.openBraceToken = value.openBraceToken;
+    if (value.getter) out.getter = cloneAccessorDeclaration(*value.getter);
+    if (value.setter) out.setter = cloneAccessorDeclaration(*value.setter);
+    out.closeBraceToken = value.closeBraceToken;
+    out.equalsToken = value.equalsToken;
+    if (value.initializer) out.initializer = cloneExpressionSyntax(*value.initializer);
+    out.semicolonToken = value.semicolonToken;
+    return out;
+}
+
+SequenceDeclarationSyntax cloneSequenceDeclarationSyntax(
+    const SequenceDeclarationSyntax& value) {
+    SequenceDeclarationSyntax out;
+    out.attributes = value.attributes;
+    out.modifiers = value.modifiers;
+    out.sequenceKeyword = value.sequenceKeyword;
+    out.resultLessToken = value.resultLessToken;
+    if (value.resultType) {
+        out.resultType = std::make_unique<TypeSyntax>(*value.resultType);
+    }
+    out.resultGreaterToken = value.resultGreaterToken;
+    out.identifierToken = value.identifierToken;
+    out.openParenToken = value.openParenToken;
+    for (const auto& param : value.parameters) {
+        out.parameters.push_back(cloneParameterSyntax(param));
+    }
+    out.commaTokens = value.commaTokens;
+    out.closeParenToken = value.closeParenToken;
+    out.body = cloneBlockStatementSyntax(value.body);
+    return out;
+}
+
+FunctionDeclarationSyntax cloneFunctionDeclarationSyntax(
+    const FunctionDeclarationSyntax& value) {
+    FunctionDeclarationSyntax out;
+    out.attributes = value.attributes;
+    out.modifiers = value.modifiers;
+    out.staticKeyword = value.staticKeyword;
+    out.refReturnKeyword = value.refReturnKeyword;
+    out.returnType = value.returnType;
+    out.identifierToken = value.identifierToken;
+    out.typeParameterLessToken = value.typeParameterLessToken;
+    out.typeParameters = value.typeParameters;
+    out.typeParameterCommaTokens = value.typeParameterCommaTokens;
+    out.typeParameterGreaterToken = value.typeParameterGreaterToken;
+    out.constraints = value.constraints;
+    out.openParenToken = value.openParenToken;
+    for (const auto& param : value.parameters) {
+        out.parameters.push_back(cloneParameterSyntax(param));
+    }
+    out.commaTokens = value.commaTokens;
+    out.closeParenToken = value.closeParenToken;
+    out.semicolonToken = value.semicolonToken;
+    out.body = cloneBlockStatementSyntax(value.body);
+    out.hygienicModules = value.hygienicModules;
+    return out;
+}
+
+ClassDeclarationSyntax cloneClassDeclarationSyntax(const ClassDeclarationSyntax& value) {
+    ClassDeclarationSyntax out;
+    out.attributes = value.attributes;
+    out.modifiers = value.modifiers;
+    out.classKeyword = value.classKeyword;
+    out.identifierToken = value.identifierToken;
+    out.typeParameterLessToken = value.typeParameterLessToken;
+    out.typeParameters = value.typeParameters;
+    out.typeParameterCommaTokens = value.typeParameterCommaTokens;
+    out.typeParameterGreaterToken = value.typeParameterGreaterToken;
+    out.constraints = value.constraints;
+    out.colonToken = value.colonToken;
+    out.interfaces = value.interfaces;
+    out.interfaceCommaTokens = value.interfaceCommaTokens;
+    out.openBraceToken = value.openBraceToken;
+    for (const auto& f : value.fields) out.fields.push_back(cloneFieldDeclarationSyntax(f));
+    out.events = value.events;
+    for (const auto& m : value.methods) out.methods.push_back(cloneFunctionDeclarationSyntax(m));
+    for (const auto& s : value.sequences) out.sequences.push_back(cloneSequenceDeclarationSyntax(s));
+    for (const auto& c : value.constructors) out.constructors.push_back(cloneConstructorDeclarationSyntax(c));
+    for (const auto& p : value.properties) out.properties.push_back(clonePropertyDeclarationSyntax(p));
+    out.closeBraceToken = value.closeBraceToken;
+    return out;
+}
+
+StructDeclarationSyntax cloneStructDeclarationSyntax(const StructDeclarationSyntax& value) {
+    StructDeclarationSyntax out;
+    out.attributes = value.attributes;
+    out.modifiers = value.modifiers;
+    out.structKeyword = value.structKeyword;
+    out.identifierToken = value.identifierToken;
+    out.typeParameterLessToken = value.typeParameterLessToken;
+    out.typeParameters = value.typeParameters;
+    out.typeParameterCommaTokens = value.typeParameterCommaTokens;
+    out.typeParameterGreaterToken = value.typeParameterGreaterToken;
+    out.constraints = value.constraints;
+    out.colonToken = value.colonToken;
+    out.interfaces = value.interfaces;
+    out.interfaceCommaTokens = value.interfaceCommaTokens;
+    out.openBraceToken = value.openBraceToken;
+    for (const auto& f : value.fields) out.fields.push_back(cloneFieldDeclarationSyntax(f));
+    out.events = value.events;
+    for (const auto& m : value.methods) out.methods.push_back(cloneFunctionDeclarationSyntax(m));
+    for (const auto& s : value.sequences) out.sequences.push_back(cloneSequenceDeclarationSyntax(s));
+    for (const auto& c : value.constructors) out.constructors.push_back(cloneConstructorDeclarationSyntax(c));
+    for (const auto& p : value.properties) out.properties.push_back(clonePropertyDeclarationSyntax(p));
+    out.closeBraceToken = value.closeBraceToken;
+    return out;
+}
+
+InterfaceDeclarationSyntax cloneInterfaceDeclarationSyntax(const InterfaceDeclarationSyntax& value) {
+    InterfaceDeclarationSyntax out;
+    out.attributes = value.attributes;
+    out.modifiers = value.modifiers;
+    out.interfaceKeyword = value.interfaceKeyword;
+    out.identifierToken = value.identifierToken;
+    out.typeParameterLessToken = value.typeParameterLessToken;
+    out.typeParameters = value.typeParameters;
+    out.typeParameterCommaTokens = value.typeParameterCommaTokens;
+    out.typeParameterGreaterToken = value.typeParameterGreaterToken;
+    out.constraints = value.constraints;
+    out.openBraceToken = value.openBraceToken;
+    for (const auto& m : value.methods) {
+        InterfaceMethodDeclarationSyntax method;
+        method.attributes = m.attributes;
+        method.modifiers = m.modifiers;
+        method.returnType = m.returnType;
+        method.identifierToken = m.identifierToken;
+        method.openParenToken = m.openParenToken;
+        for (const auto& param : m.parameters) {
+            method.parameters.push_back(cloneParameterSyntax(param));
+        }
+        method.commaTokens = m.commaTokens;
+        method.closeParenToken = m.closeParenToken;
+        method.semicolonToken = m.semicolonToken;
+        out.methods.push_back(std::move(method));
+    }
+    out.closeBraceToken = value.closeBraceToken;
+    return out;
+}
+
+DelegateDeclarationSyntax cloneDelegateDeclarationSyntax(const DelegateDeclarationSyntax& value) {
+    DelegateDeclarationSyntax out;
+    out.attributes = value.attributes;
+    out.modifiers = value.modifiers;
+    out.delegateKeyword = value.delegateKeyword;
+    out.returnType = value.returnType;
+    out.identifierToken = value.identifierToken;
+    out.typeParameterLessToken = value.typeParameterLessToken;
+    out.typeParameters = value.typeParameters;
+    out.typeParameterCommaTokens = value.typeParameterCommaTokens;
+    out.typeParameterGreaterToken = value.typeParameterGreaterToken;
+    out.constraints = value.constraints;
+    out.openParenToken = value.openParenToken;
+    for (const auto& param : value.parameters) {
+        out.parameters.push_back(cloneParameterSyntax(param));
+    }
+    out.commaTokens = value.commaTokens;
+    out.closeParenToken = value.closeParenToken;
+    out.semicolonToken = value.semicolonToken;
+    return out;
+}
+
 } // namespace realscript::syntax

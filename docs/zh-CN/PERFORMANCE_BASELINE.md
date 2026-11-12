@@ -319,7 +319,7 @@ $cmake = 'C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\Comm
 .\build-perf\Release\rsbench.exe `
   --mode raw --gc-work 8 --samples 9 `
   --warmup 2 --iterations 3 --opt-level 2 --json `
-  benchmarks\micro\integer_loop.rs
+  benchmarks\micro\integer_loop.rscript
 
 .\build-perf\Release\rsbench_aot.exe
 

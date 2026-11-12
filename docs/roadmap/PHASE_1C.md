@@ -175,9 +175,9 @@ New diagnostics include:
 `rsc` now accepts multiple files:
 
 ```bash
-rsc lib.rs app.rs
-rsc lib.rs app.rs --mir
-rsc lib.rs app.rs --symbols
+rsc lib.rscript app.rscript
+rsc lib.rscript app.rscript --mir
+rsc lib.rscript app.rscript --symbols
 ```
 
 `--tokens` remains a single-file operation.

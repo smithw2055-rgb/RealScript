@@ -33,14 +33,14 @@ std::string readFile(const std::string& path) {
 std::vector<realscript::mir::Module> compileFixture() {
     realscript::compiler::Compilation compilation;
     compilation.addSource({
-        "tests/fixtures/phase5_model.rs",
+        "tests/fixtures/phase5_model.rscript",
         readFile(std::string(REALSCRIPT_SOURCE_DIR) +
-            "/tests/fixtures/phase5_model.rs"),
+            "/tests/fixtures/phase5_model.rscript"),
     });
     compilation.addSource({
-        "tests/fixtures/phase5_app.rs",
+        "tests/fixtures/phase5_app.rscript",
         readFile(std::string(REALSCRIPT_SOURCE_DIR) +
-            "/tests/fixtures/phase5_app.rs"),
+            "/tests/fixtures/phase5_app.rscript"),
     });
     auto result = compilation.build();
     require(!result.diagnostics.hasErrors(), "Phase 6 AOT fixture failed to compile");
@@ -202,7 +202,7 @@ Fixed simulateVec2Vec3(int steps) {
 )RS";
 
     realscript::compiler::Compilation compilation;
-    compilation.addSource({"phase6_expanded_typed_aot.rs", mathAndCallSource});
+    compilation.addSource({"phase6_expanded_typed_aot.rscript", mathAndCallSource});
     auto build = compilation.build();
     require(!build.diagnostics.hasErrors(), "Expanded Typed AOT source failed to compile");
 

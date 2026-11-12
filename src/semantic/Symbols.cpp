@@ -584,7 +584,8 @@ void appendSyntaxParameters(
     FunctionSymbol& result,
     const std::vector<syntax::ParameterSyntax>& parameters,
     const TypeSymbolMap& visibleTypes,
-    diagnostics::DiagnosticBag& diagnostics) {
+    diagnostics::DiagnosticBag& diagnostics,
+    const TypeSymbol* owner = nullptr) {
     bool sawOptional = false;
     for (std::size_t syntaxIndex = 0;
          syntaxIndex < parameters.size(); ++syntaxIndex) {
@@ -675,11 +676,25 @@ void appendSyntaxParameters(
                     break;
                 }
             }
+            if (parameter.defaultValueType == PrimitiveType::Error) {
+                syntax::TokenValue evalVal;
+                PrimitiveType evalType = PrimitiveType::Error;
+                if (evaluateConstantExpressionImpl(
+                        *parameterSyntax.defaultValue,
+                        owner,
+                        visibleTypes,
+                        evalVal,
+                        evalType,
+                        nullptr)) {
+                    parameter.defaultValue = std::move(evalVal);
+                    parameter.defaultValueType = evalType;
+                }
+            }
             if (parameter.defaultValueType == PrimitiveType::Error ||
                 parameter.paramsArray) {
                 diagnostics.report(
                     "RS8917",
-                    "optional parameter default must be a literal constant and params cannot have a default",
+                    "optional parameter default must be a compile-time constant and params cannot have a default",
                     parameterSyntax.defaultValue->span());
             } else {
                 const auto conversion = classifyConversion(
@@ -687,7 +702,41 @@ void appendSyntaxParameters(
                 const bool nullReference =
                     parameter.defaultValueType == PrimitiveType::Null &&
                     isReferenceType(parameter.type);
+                bool implicitConstNumeric = false;
+                if ((parameter.defaultValueType == PrimitiveType::Int ||
+                     parameter.defaultValueType == PrimitiveType::Long) &&
+                    std::holds_alternative<std::int64_t>(parameter.defaultValue)) {
+                    const auto v = std::get<std::int64_t>(parameter.defaultValue);
+                    switch (parameter.type) {
+                    case PrimitiveType::Byte: implicitConstNumeric = (v >= 0 && v <= 255); break;
+                    case PrimitiveType::SByte: implicitConstNumeric = (v >= -128 && v <= 127); break;
+                    case PrimitiveType::Short: implicitConstNumeric = (v >= -32768 && v <= 32767); break;
+                    case PrimitiveType::UShort:
+                    case PrimitiveType::Char: implicitConstNumeric = (v >= 0 && v <= 65535); break;
+                    case PrimitiveType::Int:
+                        implicitConstNumeric =
+                            v >= std::numeric_limits<std::int32_t>::min() &&
+                            v <= std::numeric_limits<std::int32_t>::max();
+                        break;
+                    case PrimitiveType::UInt:
+                    case PrimitiveType::ULong: implicitConstNumeric = (v >= 0); break;
+                    case PrimitiveType::Long: implicitConstNumeric = true; break;
+                    default: break;
+                    }
+                    if (implicitConstNumeric) {
+                        parameter.defaultValueType = parameter.type;
+                    }
+                } else if (parameter.defaultValueType == PrimitiveType::Double &&
+                           parameter.type == PrimitiveType::Float &&
+                           std::holds_alternative<double>(parameter.defaultValue)) {
+                    const auto v = std::get<double>(parameter.defaultValue);
+                    if (std::isfinite(v) && std::abs(v) <= std::numeric_limits<float>::max()) {
+                        implicitConstNumeric = true;
+                        parameter.defaultValueType = PrimitiveType::Float;
+                    }
+                }
                 if (conversion == ConversionKind::None && !nullReference &&
+                    !implicitConstNumeric &&
                     parameter.defaultValueType != parameter.type) {
                     diagnostics.report(
                         "RS8918",
@@ -1249,8 +1298,8 @@ FunctionSymbol declareFunctionSymbol(
         result.ownerTypeName = owner->name;
         result.ownerTypeId = owner->id;
         const bool mutableStructReceiver =
-            owner->sourceName != "$builtin/RealScript.Math.rs" &&
-            owner->sourceName != "$builtin/RealScript.Async.rs" &&
+            owner->sourceName != "$builtin/RealScript.Math.rscript" &&
+            owner->sourceName != "$builtin/RealScript.Async.rscript" &&
             owner->name.rfind("Awaitable__", 0) != 0;
         appendImplicitThis(result, *owner, mutableStructReceiver);
     }
@@ -1266,7 +1315,7 @@ FunctionSymbol declareFunctionSymbol(
     if (result.returnType == PrimitiveType::Error) {
         diagnostics.report("RS2200", "unknown return type '" + syntaxTree.returnType.name.text + "'", syntaxTree.returnType.span());
     }
-    appendSyntaxParameters(result, syntaxTree.parameters, visibleTypes, diagnostics);
+    appendSyntaxParameters(result, syntaxTree.parameters, visibleTypes, diagnostics, owner);
     if (result.asyncFunction) {
         if (result.abstractMethod) {
             diagnostics.report(
@@ -1356,7 +1405,7 @@ FunctionSymbol declareFunctionSymbol(
             syntaxTree.returnType.span());
     }
     appendSyntaxParameters(
-        result, syntaxTree.parameters, visibleTypes, diagnostics);
+        result, syntaxTree.parameters, visibleTypes, diagnostics, owner);
     result.id = stableFunctionId(result);
     result.declarationSpan = syntaxTree.identifierToken.span;
     result.bodySpan = syntaxTree.semicolonToken.span;
@@ -1428,7 +1477,7 @@ FunctionSymbol declareConstructorSymbol(
     }
     appendImplicitThis(result, owner);
     if (!result.staticMethod) {
-        appendSyntaxParameters(result, syntaxTree.parameters, visibleTypes, diagnostics);
+        appendSyntaxParameters(result, syntaxTree.parameters, visibleTypes, diagnostics, &owner);
     }
     result.id = stableFunctionId(result);
     result.declarationSpan = syntaxTree.identifierToken.span;

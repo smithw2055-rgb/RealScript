@@ -124,7 +124,7 @@ Differential tests compare return values, errors, digests, and profiles across i
 ## Example
 
 ```bash
-rsc game.rs \
+rsc game.rscript \
   --run Game.Main::main \
   --opt-level 2 \
   --deterministic \

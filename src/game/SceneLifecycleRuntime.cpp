@@ -264,7 +264,1077 @@ std::string normalizeHttpKey(std::string_view method, std::string_view url) {
     return m + " " + std::string(url);
 }
 
+
+constexpr std::uint64_t kCoroFpFnvOffset = 14695981039346656037ULL;
+constexpr std::uint64_t kCoroFpFnvPrime = 1099511628211ULL;
+
+void hashCoroMix64(std::uint64_t& h, std::uint64_t v) noexcept {
+    h ^= v;
+    h *= kCoroFpFnvPrime;
+}
+
+void hashCoroString(std::uint64_t& h, std::string_view s) noexcept {
+    hashCoroMix64(h, static_cast<std::uint64_t>(s.size()));
+    for (const char ch : s) {
+        h ^= static_cast<unsigned char>(ch);
+        h *= kCoroFpFnvPrime;
+    }
+}
+
+std::string formatProgramSlotType(
+    const runtime::ProgramImage& program,
+    semantic::PrimitiveType prim,
+    semantic::SymbolId typeId,
+    std::string_view fallbackTypeName = {}) {
+    if (prim == semantic::PrimitiveType::Void) {
+        return "void";
+    }
+    const std::string baseName(semantic::primitiveTypeName(prim));
+    if (!semantic::isExactType(prim)) {
+        return baseName;
+    }
+    if (!fallbackTypeName.empty()) {
+        return baseName + ":" + std::string(fallbackTypeName);
+    }
+    if (typeId == 0) {
+        return baseName;
+    }
+    if (const auto* resolved = program.resolveType(typeId)) {
+        return baseName + ":" + semantic::canonicalTypeName(*resolved);
+    }
+    if (typeId == runtime::fixedTypeId()) return "struct:RealScript.Math::Fixed";
+    if (typeId == runtime::fixed16TypeId()) return "struct:RealScript.Math::Fixed16";
+    if (typeId == runtime::vec2TypeId()) return "struct:RealScript.Math::Vec2";
+    if (typeId == runtime::vec3TypeId()) return "struct:RealScript.Math::Vec3";
+    if (typeId == runtime::quatTypeId()) return "struct:RealScript.Math::Quat";
+    if (typeId == runtime::awaitableVoidTypeId()) return "struct:RealScript.Async::Awaitable";
+    if (typeId == runtime::whenAnyResultTypeId()) return "struct:RealScript.Async::WhenAnyResult";
+    return baseName + ":#" + std::to_string(typeId);
+}
+
+bool methodReturnsAwaitableStruct(const ScriptMethod& method) {
+    if (semantic::storageReturnTypeOf(method.descriptor) !=
+        semantic::PrimitiveType::Struct) {
+        return false;
+    }
+    const std::string& retTypeName =
+        semantic::storageReturnTypeNameOf(method.descriptor);
+    return retTypeName == "RealScript.Async::Awaitable" ||
+        retTypeName.find("::Awaitable__") != std::string::npos;
+}
+
+std::string findExplicitTypeGuidAttribute(
+    const runtime::ProgramImage* program,
+    const std::string& canonicalTypeName) {
+    if (!program) return {};
+    for (const auto& module : program->modules()) {
+        for (const auto& attr : module.languageMetadata.attributes) {
+            if (attr.target == canonicalTypeName &&
+                (attr.name == "Guid" || attr.name == "AssetGuid") &&
+                !attr.arguments.empty()) {
+                std::string val = attr.arguments.front().value;
+                if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
+                    val = val.substr(1, val.size() - 2);
+                }
+                if (!val.empty()) return val;
+            }
+        }
+    }
+    return {};
+}
+
+std::vector<std::string> collectSequenceOwnedFieldNames(
+    const semantic::TypeSymbol& owner,
+    const std::string& seqName) {
+    std::vector<std::string> names;
+    const std::string targetField = "$sequence_target_" + seqName;
+    bool inSequenceRange = false;
+    for (const auto& field : owner.fields) {
+        if (!field.synthetic) {
+            if (inSequenceRange) break;
+            continue;
+        }
+        if (field.name == targetField) {
+            inSequenceRange = true;
+            names.push_back(field.name);
+            continue;
+        }
+        if (inSequenceRange) {
+            if (field.name.rfind("$sequence_target_", 0) == 0) {
+                break;
+            }
+            if (field.name.rfind("$sequence_", 0) == 0) {
+                names.push_back(field.name);
+            } else {
+                break;
+            }
+        }
+    }
+    return names;
+}
+
+const semantic::TypeSymbol* resolveProgramTypeByNameOrId(
+    const runtime::ProgramImage& program,
+    semantic::SymbolId typeId,
+    std::string_view typeName = {}) {
+    if (typeId != 0) {
+        if (const auto* byId = program.resolveType(typeId)) {
+            return byId;
+        }
+    }
+    if (!typeName.empty()) {
+        const auto byStableId = semantic::stableTypeId(std::string(typeName));
+        if (const auto* byId = program.resolveType(byStableId)) {
+            return byId;
+        }
+        for (const auto& mod : program.modules()) {
+            for (const auto& t : mod.types) {
+                if (semantic::canonicalTypeName(t) == typeName || t.name == typeName) {
+                    return &t;
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+const semantic::TypeSymbol* unwrapToRecordOrStructType(
+    const runtime::ProgramImage& program,
+    semantic::PrimitiveType prim,
+    semantic::SymbolId typeId,
+    std::string_view typeName = {}) {
+    if (prim == semantic::PrimitiveType::Object || prim == semantic::PrimitiveType::Struct) {
+        return resolveProgramTypeByNameOrId(program, typeId, typeName);
+    }
+    if (prim == semantic::PrimitiveType::Array) {
+        std::string arrName(typeName);
+        if (arrName.empty() && typeId != 0) {
+            if (const auto* arrDesc = program.resolveType(typeId)) {
+                arrName = semantic::canonicalTypeName(*arrDesc);
+            }
+        }
+        std::size_t guard = 0;
+        while (!arrName.empty() && guard++ < 16u) {
+            semantic::PrimitiveType elemPrim = semantic::PrimitiveType::Error;
+            std::string elemTypeName;
+            if (!semantic::decodeArrayTypeName(arrName, elemPrim, elemTypeName)) {
+                break;
+            }
+            if (elemPrim == semantic::PrimitiveType::Object ||
+                elemPrim == semantic::PrimitiveType::Struct) {
+                return resolveProgramTypeByNameOrId(
+                    program,
+                    elemTypeName.empty() ? 0 : semantic::stableTypeId(elemTypeName),
+                    elemTypeName);
+            }
+            if (elemPrim == semantic::PrimitiveType::Array) {
+                arrName = std::move(elemTypeName);
+                continue;
+            }
+            break;
+        }
+    }
+    return nullptr;
+}
+
+std::uint64_t computeRecursiveRecordOrStructLayoutHash(
+    const runtime::ProgramImage& program,
+    const semantic::TypeSymbol& typeDesc,
+    std::unordered_set<std::string>& activeStack,
+    std::unordered_map<std::string, std::uint64_t>& memo) {
+    const std::string canon = semantic::canonicalTypeName(typeDesc);
+    if (activeStack.empty()) {
+        if (const auto mIt = memo.find(canon); mIt != memo.end()) {
+            return mIt->second;
+        }
+    }
+    if (!activeStack.insert(canon).second) {
+        std::uint64_t cycleHash = kCoroFpFnvOffset;
+        hashCoroMix64(cycleHash, 0xC1C1EULL);
+        hashCoroString(cycleHash, canon);
+        return cycleHash == 0 ? 1u : cycleHash;
+    }
+
+    std::uint64_t h = kCoroFpFnvOffset;
+    hashCoroMix64(h, static_cast<std::uint64_t>(typeDesc.kind));
+    hashCoroString(h, canon);
+    hashCoroString(h, typeDesc.baseTypeName);
+    if (!typeDesc.baseTypeName.empty()) {
+        if (const auto* baseDesc = resolveProgramTypeByNameOrId(
+                program,
+                semantic::stableTypeId(typeDesc.baseTypeName),
+                typeDesc.baseTypeName)) {
+            hashCoroMix64(
+                h,
+                computeRecursiveRecordOrStructLayoutHash(
+                    program, *baseDesc, activeStack, memo));
+        }
+    }
+
+    std::size_t nonStaticCount = 0;
+    for (const auto& fld : typeDesc.fields) {
+        if (fld.staticField || fld.constField) continue;
+        // Exclude sequence-internal synthetic fields so independent sequences on a class
+        // do not cross-contaminate non-sequence field layout checks.
+        if (fld.synthetic && fld.name.rfind("$sequence_", 0) == 0) continue;
+        ++nonStaticCount;
+        const semantic::SymbolId ftid =
+            semantic::isExactType(fld.type) && !fld.typeName.empty()
+                ? semantic::stableTypeId(fld.typeName)
+                : 0;
+        hashCoroMix64(h, fld.index);
+        hashCoroMix64(h, fld.synthetic ? 1u : 0u);
+        hashCoroString(h, fld.name);
+        hashCoroString(h, formatProgramSlotType(program, fld.type, ftid, fld.typeName));
+
+        if (const auto* childDesc = unwrapToRecordOrStructType(
+                program, fld.type, ftid, fld.typeName)) {
+            if (childDesc->kind == semantic::TypeKind::Class ||
+                childDesc->kind == semantic::TypeKind::Struct) {
+                hashCoroMix64(
+                    h,
+                    computeRecursiveRecordOrStructLayoutHash(
+                        program, *childDesc, activeStack, memo));
+            }
+        }
+    }
+    hashCoroMix64(h, nonStaticCount);
+
+    activeStack.erase(canon);
+    if (h == 0) h = 1;
+    if (activeStack.empty()) {
+        memo.emplace(canon, h);
+    }
+    return h;
+}
+
+void collectReferencedTypesRecursive(
+    const runtime::ProgramImage& program,
+    const semantic::TypeSymbol* typeDesc,
+    std::unordered_map<std::string, std::uint64_t>& layoutMemo,
+    std::map<std::string, std::uint64_t>& outStructLayouts,
+    std::map<std::string, std::uint64_t>& outClassLayouts,
+    std::unordered_set<std::string>& visitedTypes) {
+    if (!typeDesc) return;
+    if (typeDesc->kind != semantic::TypeKind::Class &&
+        typeDesc->kind != semantic::TypeKind::Struct) {
+        return;
+    }
+    const std::string canon = semantic::canonicalTypeName(*typeDesc);
+    if (!visitedTypes.insert(canon).second) return;
+
+    std::unordered_set<std::string> stack;
+    const std::uint64_t layoutHash =
+        computeRecursiveRecordOrStructLayoutHash(program, *typeDesc, stack, layoutMemo);
+    if (typeDesc->kind == semantic::TypeKind::Struct) {
+        outStructLayouts[canon] = layoutHash;
+    } else {
+        outClassLayouts[canon] = layoutHash;
+    }
+
+    if (!typeDesc->baseTypeName.empty()) {
+        if (const auto* baseDesc = resolveProgramTypeByNameOrId(
+                program,
+                semantic::stableTypeId(typeDesc->baseTypeName),
+                typeDesc->baseTypeName)) {
+            collectReferencedTypesRecursive(
+                program, baseDesc, layoutMemo, outStructLayouts, outClassLayouts, visitedTypes);
+        }
+    }
+    for (const auto& fld : typeDesc->fields) {
+        if (fld.staticField || fld.constField) continue;
+        if (fld.synthetic && fld.name.rfind("$sequence_", 0) == 0) continue;
+        const semantic::SymbolId ftid =
+            semantic::isExactType(fld.type) && !fld.typeName.empty()
+                ? semantic::stableTypeId(fld.typeName)
+                : 0;
+        if (const auto* childDesc = unwrapToRecordOrStructType(
+                program, fld.type, ftid, fld.typeName)) {
+            collectReferencedTypesRecursive(
+                program, childDesc, layoutMemo, outStructLayouts, outClassLayouts, visitedTypes);
+        }
+    }
+}
+
+struct HotReloadCoroBridge {
+    static constexpr const char* kBridgeModuleName = "__rs_coro_hr_bridge";
+    static constexpr const char* kTrampolineName = "__trampoline";
+    static constexpr const char* kTrampolineQualName = "__rs_coro_hr_bridge::__trampoline";
+    static constexpr const char* kHostResumeName = "__rs_coro_hr_bridge::__host_resume";
+
+    runtime::CoroutineResumeCallback innerCallback = nullptr;
+    void* innerRunnerContext = nullptr;
+    std::shared_ptr<const void> innerRunnerOwner{};
+    semantic::SymbolId trampolineSymbolId = 0;
+    runtime::ExecutionOptions executionOptions{};
+    std::shared_ptr<debug::DebugController> fallbackDebugger{};
+    std::shared_ptr<const runtime::ProgramImage> targetProgram{};
+    std::unique_ptr<runtime::Interpreter> interpreter{};
+
+    struct ActiveResumeCall {
+        runtime::CoroutineResumeCallback innerCallback = nullptr;
+        void* innerRunnerContext = nullptr;
+        runtime::CoroutineFrameHandle frameHandle{};
+        runtime::CoroutineFrame* framePtr = nullptr;
+        runtime::AsyncRuntimeContext* asyncCtx = nullptr;
+    };
+
+    static inline thread_local ActiveResumeCall* tlsActiveCall_ = nullptr;
+
+    static void onResume(
+        void* runnerContext,
+        runtime::CoroutineFrameHandle frameHandle,
+        runtime::CoroutineFrame& frame,
+        runtime::AsyncRuntimeContext& asyncContext) {
+        auto* self = static_cast<HotReloadCoroBridge*>(runnerContext);
+        if (!self || !self->innerCallback) return;
+
+        // Keep `self` alive on the C++ stack and clear `frame.runnerOwner` so if the
+        // resumed coroutine suspends at a subsequent `await` inside the new ProgramImage,
+        // `suspendInterpreterCoroutine` binds `frame.runnerOwner` directly to the new env.
+        const std::shared_ptr<const void> selfOwnerKeepAlive = frame.runnerOwner;
+        frame.runnerOwner.reset();
+
+        if (!self->interpreter) {
+            self->innerCallback(self->innerRunnerContext, frameHandle, frame, asyncContext);
+            return;
+        }
+
+        // If already executing inside an active interpreter state that resolves the new
+        // function symbol, `resumeInterpreterCoroutineCallback` uses `activeInterpreterState` directly.
+        ActiveResumeCall callData{
+            self->innerCallback,
+            self->innerRunnerContext,
+            frameHandle,
+            &frame,
+            &asyncContext,
+        };
+        ActiveResumeCall* const prevTls = tlsActiveCall_;
+        tlsActiveCall_ = &callData;
+        void* const prevActiveInterp = asyncContext.activeInterpreterState();
+        asyncContext.setActiveInterpreterState(nullptr);
+        runtime::ExecutionOptions opts = self->executionOptions;
+        if (!opts.debugger && self->fallbackDebugger) {
+            opts.debugger = self->fallbackDebugger;
+        }
+        struct ScopeRestore {
+            runtime::AsyncRuntimeContext& ctx;
+            void* prevInterp;
+            ActiveResumeCall* prevCall;
+            debug::DebugController* dbg;
+            const runtime::ProgramImage* restoreProg;
+            ~ScopeRestore() noexcept {
+                ctx.setActiveInterpreterState(prevInterp);
+                tlsActiveCall_ = prevCall;
+                if (dbg && restoreProg) {
+                    dbg->bindProgram(*restoreProg);
+                }
+            }
+        } restore{
+            asyncContext,
+            prevActiveInterp,
+            prevTls,
+            opts.debugger.get(),
+            self->targetProgram.get(),
+        };
+
+        (void)self->interpreter->invoke(
+            self->trampolineSymbolId,
+            {},
+            std::move(opts));
+    }
+};
+
+std::shared_ptr<HotReloadCoroBridge> createHotReloadCoroBridge(
+    const GameProgram& newProgram,
+    const std::shared_ptr<const runtime::BindingRegistry>& fallbackBindings,
+    const std::shared_ptr<debug::DebugController>& fallbackDebugger,
+    const std::shared_ptr<runtime::ManagedHeap>& heap,
+    const std::shared_ptr<runtime::AsyncRuntimeContext>& asyncCtx,
+    const runtime::ExecutionOptions& execOpts,
+    runtime::CoroutineResumeCallback origCallback,
+    void* origRunnerContext,
+    std::shared_ptr<const void> origRunnerOwner) {
+    if (!newProgram.valid() || !newProgram.program() || !origCallback) {
+        return nullptr;
+    }
+
+    // Unwrap chained HotReloadCoroBridges across multiple consecutive hot reloads
+    if (origCallback == &HotReloadCoroBridge::onResume && origRunnerContext != nullptr) {
+        auto* prevBridge = static_cast<HotReloadCoroBridge*>(origRunnerContext);
+        origCallback = prevBridge->innerCallback;
+        origRunnerContext = prevBridge->innerRunnerContext;
+        origRunnerOwner = prevBridge->innerRunnerOwner;
+    }
+
+    std::vector<bytecode::Module> modules = newProgram.program()->modules();
+    const semantic::SymbolId hostResumeSym =
+        semantic::stableTypeId(HotReloadCoroBridge::kHostResumeName);
+    const semantic::SymbolId trampSym =
+        semantic::stableTypeId(HotReloadCoroBridge::kTrampolineQualName);
+
+    bytecode::Module bridgeMod;
+    bridgeMod.name = HotReloadCoroBridge::kBridgeModuleName;
+
+    bytecode::FunctionReference hostRef;
+    hostRef.symbolId = hostResumeSym;
+    hostRef.name = HotReloadCoroBridge::kHostResumeName;
+    hostRef.returnType = semantic::PrimitiveType::Void;
+    hostRef.returnTypeId = 0;
+    bridgeMod.functionReferences.push_back(std::move(hostRef));
+
+    bytecode::Function trampFn;
+    trampFn.symbolId = trampSym;
+    trampFn.name = HotReloadCoroBridge::kTrampolineName;
+    trampFn.returnType = semantic::PrimitiveType::Void;
+    trampFn.returnTypeId = 0;
+
+    bytecode::BasicBlock entryBb;
+    entryBb.id = 0;
+    bytecode::Instruction callInst;
+    callInst.opcode = bytecode::Opcode::Call;
+    callInst.elementType = semantic::PrimitiveType::Void;
+    callInst.result = bytecode::InvalidRegister;
+    callInst.index = 0;
+    entryBb.instructions.push_back(callInst);
+    entryBb.terminator.kind = bytecode::TerminatorKind::ReturnVoid;
+    trampFn.blocks.push_back(std::move(entryBb));
+    bridgeMod.functions.push_back(std::move(trampFn));
+
+    modules.push_back(std::move(bridgeMod));
+
+    runtime::RuntimeError linkErr;
+    auto linked = runtime::ProgramImage::link(std::move(modules), linkErr);
+    if (!linked) {
+        return nullptr;
+    }
+
+    const runtime::BindingRegistry* baseBindings = newProgram.bindings()
+        ? newProgram.bindings().get()
+        : fallbackBindings.get();
+    auto bridgeBindings = baseBindings
+        ? std::make_shared<runtime::BindingRegistry>(*baseBindings)
+        : std::make_shared<runtime::BindingRegistry>();
+    (void)bridgeBindings->bind(
+        hostResumeSym,
+        [](const bytecode::FunctionReference&,
+           runtime::ValueSpan,
+           runtime::RuntimeError&) -> std::optional<runtime::Value> {
+            auto* active = HotReloadCoroBridge::tlsActiveCall_;
+            if (active && active->innerCallback && active->framePtr && active->asyncCtx) {
+                active->innerCallback(
+                    active->innerRunnerContext,
+                    active->frameHandle,
+                    *active->framePtr,
+                    *active->asyncCtx);
+            }
+            return runtime::Value{};
+        },
+        runtime::BindingDeterminism::Deterministic);
+
+    auto bridge = std::make_shared<HotReloadCoroBridge>();
+    bridge->innerCallback = origCallback;
+    bridge->innerRunnerContext = origRunnerContext;
+    bridge->innerRunnerOwner = std::move(origRunnerOwner);
+    bridge->trampolineSymbolId = trampSym;
+    bridge->executionOptions = execOpts;
+    if (!bridge->executionOptions.debugger && fallbackDebugger) {
+        bridge->executionOptions.debugger = fallbackDebugger;
+    }
+    bridge->fallbackDebugger = fallbackDebugger;
+    bridge->targetProgram = newProgram.program();
+    bridge->interpreter = std::make_unique<runtime::Interpreter>(
+        std::make_shared<runtime::ProgramImage>(std::move(*linked)),
+        heap);
+    bridge->interpreter->setBindingRegistry(std::move(bridgeBindings));
+    bridge->interpreter->setAsyncRuntime(asyncCtx);
+    return bridge;
+}
+
 } // namespace
+
+std::vector<CoroutineStateMachineFingerprint> computeProgramCoroutineFingerprints(
+    const runtime::ProgramImage& program) {
+    std::vector<CoroutineStateMachineFingerprint> results;
+    std::unordered_map<semantic::SymbolId, std::uint32_t> linearIndexBySymbol;
+    std::unordered_map<std::string, std::uint64_t> layoutMemo;
+
+    std::uint32_t linearFuncIndex = 0;
+    for (const auto& module : program.modules()) {
+        for (const auto& func : module.functions) {
+            const std::uint32_t curFuncIdx = linearFuncIndex++;
+            linearIndexBySymbol[func.symbolId] = curFuncIdx;
+
+            bool isAsync = false;
+            for (const auto& blk : func.blocks) {
+                for (const auto& inst : blk.instructions) {
+                    if (inst.opcode == bytecode::Opcode::AsyncEnter ||
+                        inst.opcode == bytecode::Opcode::AwaitSuspend ||
+                        inst.opcode == bytecode::Opcode::AsyncResolve) {
+                        isAsync = true;
+                        break;
+                    }
+                }
+                if (isAsync) break;
+            }
+            if (!isAsync) continue;
+
+            CoroutineStateMachineFingerprint fp;
+            fp.isSequence = false;
+            const auto* loc = program.resolveFunction(func.symbolId);
+            fp.canonicalName = loc
+                ? loc->qualifiedName
+                : (module.name.empty() ? func.name : (module.name + "::" + func.name));
+            fp.functionIndex = curFuncIdx;
+            fp.symbolId = func.symbolId;
+            fp.returnTypeId = func.returnTypeId;
+            fp.returnTypeName = formatProgramSlotType(program, func.returnType, func.returnTypeId);
+
+            std::map<std::string, std::uint64_t> refStructs;
+            std::map<std::string, std::uint64_t> refClasses;
+            std::unordered_set<std::string> visitedRefTypes;
+            const auto noteSlotType = [&](semantic::PrimitiveType prim,
+                                          semantic::SymbolId tid,
+                                          std::string_view fallbackName = {}) {
+                if (const auto* td = unwrapToRecordOrStructType(program, prim, tid, fallbackName)) {
+                    collectReferencedTypesRecursive(
+                        program, td, layoutMemo, refStructs, refClasses, visitedRefTypes);
+                }
+            };
+
+            noteSlotType(func.returnType, func.returnTypeId);
+
+            // Extract parameter names from method metadata and/or debugInfo.locals
+            fp.parameterNames.assign(func.parameterTypes.size(), std::string{});
+            for (const auto& t : module.types) {
+                for (const auto& m : t.methods) {
+                    if (m.id == func.symbolId) {
+                        const std::size_t hasThisOffset = (!m.staticMethod && m.method) ? 1u : 0u;
+                        if (hasThisOffset == 1u && !fp.parameterNames.empty()) {
+                            fp.parameterNames[0] = "this";
+                        }
+                        for (std::size_t pi = 0;
+                             pi < m.parameters.size() && (pi + hasThisOffset) < fp.parameterNames.size();
+                             ++pi) {
+                            fp.parameterNames[pi + hasThisOffset] = m.parameters[pi].name;
+                        }
+                    }
+                }
+            }
+            for (const auto& dl : func.debugInfo.locals) {
+                if (dl.parameter && dl.slot < fp.parameterNames.size() &&
+                    fp.parameterNames[dl.slot].empty()) {
+                    fp.parameterNames[dl.slot] = dl.name;
+                }
+            }
+
+            fp.parameterSlotTypes.reserve(func.parameterTypes.size());
+            for (std::size_t i = 0; i < func.parameterTypes.size(); ++i) {
+                const semantic::SymbolId tid =
+                    i < func.parameterTypeIds.size() ? func.parameterTypeIds[i] : 0;
+                fp.parameterSlotTypes.push_back(
+                    formatProgramSlotType(program, func.parameterTypes[i], tid));
+                noteSlotType(func.parameterTypes[i], tid);
+            }
+
+            fp.localSlotTypes.reserve(func.localTypes.size());
+            for (std::size_t i = 0; i < func.localTypes.size(); ++i) {
+                const semantic::SymbolId tid =
+                    i < func.localTypeIds.size() ? func.localTypeIds[i] : 0;
+                fp.localSlotTypes.push_back(
+                    formatProgramSlotType(program, func.localTypes[i], tid));
+                noteSlotType(func.localTypes[i], tid);
+            }
+
+            fp.debugLocals.reserve(func.debugInfo.locals.size());
+            for (const auto& dl : func.debugInfo.locals) {
+                CoroutineLocalDebugDesc ddesc;
+                ddesc.name = dl.name;
+                ddesc.slot = dl.slot;
+                ddesc.parameter = dl.parameter;
+                ddesc.slotTypeName = formatProgramSlotType(program, dl.type, dl.typeId);
+                noteSlotType(dl.type, dl.typeId);
+                fp.debugLocals.push_back(std::move(ddesc));
+            }
+
+            for (std::size_t r = 0; r < func.registerTypes.size(); ++r) {
+                const semantic::SymbolId rtid =
+                    r < func.registerTypeIds.size() ? func.registerTypeIds[r] : 0;
+                noteSlotType(func.registerTypes[r], rtid);
+            }
+            for (const auto& blk : func.blocks) {
+                for (const auto& bp : blk.parameters) {
+                    noteSlotType(bp.type, bp.typeId);
+                }
+                for (const auto& inst : blk.instructions) {
+                    const bool opcodeUsesTypeIndex =
+                        inst.opcode == bytecode::Opcode::NewObject ||
+                        inst.opcode == bytecode::Opcode::NewStruct ||
+                        inst.opcode == bytecode::Opcode::LoadField ||
+                        inst.opcode == bytecode::Opcode::StoreField ||
+                        inst.opcode == bytecode::Opcode::LoadStructField ||
+                        inst.opcode == bytecode::Opcode::StoreStructField ||
+                        inst.opcode == bytecode::Opcode::IsType ||
+                        inst.opcode == bytecode::Opcode::AsType ||
+                        inst.opcode == bytecode::Opcode::AwaitSuspend;
+                    if (opcodeUsesTypeIndex && inst.typeIndex < module.types.size()) {
+                        const auto& modType = module.types[inst.typeIndex];
+                        if (modType.kind == semantic::TypeKind::Class ||
+                            modType.kind == semantic::TypeKind::Struct) {
+                            collectReferencedTypesRecursive(
+                                program, &modType, layoutMemo, refStructs, refClasses, visitedRefTypes);
+                        }
+                    }
+                    if (inst.usesElementTypeId() && inst.activeElementTypeId() != 0) {
+                        noteSlotType(inst.elementType, inst.activeElementTypeId());
+                        if (const auto* et = program.resolveType(inst.activeElementTypeId())) {
+                            collectReferencedTypesRecursive(
+                                program, et, layoutMemo, refStructs, refClasses, visitedRefTypes);
+                        }
+                    } else if (inst.opcode == bytecode::Opcode::ConstantTypeId) {
+                        const auto tid = static_cast<semantic::SymbolId>(inst.activeIntegerImmediate());
+                        if (const auto* ct = program.resolveType(tid)) {
+                            collectReferencedTypesRecursive(
+                                program, ct, layoutMemo, refStructs, refClasses, visitedRefTypes);
+                        }
+                    }
+                }
+            }
+            for (const auto& eh : func.exceptionHandlers) {
+                if (eh.catchTypeId != 0) {
+                    noteSlotType(semantic::PrimitiveType::Object, eh.catchTypeId);
+                }
+            }
+            fp.referencedStructLayouts.assign(refStructs.begin(), refStructs.end());
+            fp.referencedClassLayouts.assign(refClasses.begin(), refClasses.end());
+
+            fp.registerSlotCount = func.registerTypes.size();
+
+            // Backward liveness dataflow for SSA registers live-in at each basic block
+            const std::size_t nBlocks = func.blocks.size();
+            const std::size_t nRegs = func.registerTypes.size();
+            std::unordered_map<bytecode::BlockId, std::size_t> blockIdxById;
+            blockIdxById.reserve(nBlocks);
+            for (std::size_t b = 0; b < nBlocks; ++b) {
+                blockIdxById[func.blocks[b].id] = b;
+            }
+
+            std::vector<std::vector<bool>> useRegs(nBlocks, std::vector<bool>(nRegs, false));
+            std::vector<std::vector<bool>> defRegs(nBlocks, std::vector<bool>(nRegs, false));
+            std::vector<std::vector<std::size_t>> succBlocks(nBlocks);
+
+            for (std::size_t b = 0; b < nBlocks; ++b) {
+                const auto& blk = func.blocks[b];
+                auto& use = useRegs[b];
+                auto& def = defRegs[b];
+                for (const auto& bp : blk.parameters) {
+                    if (bp.target < nRegs) {
+                        def[bp.target] = true;
+                    }
+                }
+                for (const auto& inst : blk.instructions) {
+                    for (const auto op : inst.operands) {
+                        if (op < nRegs && !def[op]) {
+                            use[op] = true;
+                        }
+                    }
+                    if (inst.result != bytecode::InvalidRegister && inst.result < nRegs) {
+                        def[inst.result] = true;
+                    }
+                }
+                const auto& term = blk.terminator;
+                const auto markTermUse = [&](bytecode::Register r) {
+                    if (r != bytecode::InvalidRegister && r < nRegs && !def[r]) {
+                        use[r] = true;
+                    }
+                };
+                if (term.kind == bytecode::TerminatorKind::Branch) {
+                    markTermUse(term.condition);
+                    for (const auto r : term.arguments) markTermUse(r);
+                    for (const auto r : term.falseArguments) markTermUse(r);
+                    if (const auto it = blockIdxById.find(term.target); it != blockIdxById.end()) {
+                        succBlocks[b].push_back(it->second);
+                    }
+                    if (const auto it = blockIdxById.find(term.falseTarget); it != blockIdxById.end()) {
+                        succBlocks[b].push_back(it->second);
+                    }
+                } else if (term.kind == bytecode::TerminatorKind::Jump) {
+                    for (const auto r : term.arguments) markTermUse(r);
+                    if (const auto it = blockIdxById.find(term.target); it != blockIdxById.end()) {
+                        succBlocks[b].push_back(it->second);
+                    }
+                } else if (term.kind == bytecode::TerminatorKind::ReturnValue ||
+                           term.kind == bytecode::TerminatorKind::Throw) {
+                    markTermUse(term.value);
+                }
+
+                for (const auto& eh : func.exceptionHandlers) {
+                    if (std::find(
+                            eh.protectedBlocks.begin(),
+                            eh.protectedBlocks.end(),
+                            blk.id) != eh.protectedBlocks.end()) {
+                        if (const auto hIt = blockIdxById.find(eh.handlerBlock);
+                            hIt != blockIdxById.end()) {
+                            succBlocks[b].push_back(hIt->second);
+                        }
+                    }
+                }
+            }
+
+            std::vector<std::vector<bool>> liveIn = useRegs;
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                for (std::size_t rev = nBlocks; rev > 0; --rev) {
+                    const std::size_t b = rev - 1;
+                    for (const std::size_t s : succBlocks[b]) {
+                        for (std::size_t r = 0; r < nRegs; ++r) {
+                            if (liveIn[s][r] && !defRegs[b][r] && !liveIn[b][r]) {
+                                liveIn[b][r] = true;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            std::uint32_t ordinal = 0;
+            for (const auto& blk : func.blocks) {
+                for (const auto& inst : blk.instructions) {
+                    if (inst.opcode != bytecode::Opcode::AwaitSuspend) continue;
+                    CoroutineSuspensionPointDesc sp;
+                    sp.ordinal = ordinal++;
+                    sp.awaitLocalIndex = inst.index;
+                    sp.resumeBlockId = static_cast<std::uint32_t>(inst.activeIntegerImmediate());
+                    if (inst.typeIndex < module.types.size()) {
+                        sp.awaitedTypeName =
+                            semantic::canonicalTypeName(module.types[inst.typeIndex]);
+                    }
+                    if (const auto rbIt = blockIdxById.find(sp.resumeBlockId);
+                        rbIt != blockIdxById.end()) {
+                        const auto& rBlk = func.blocks[rbIt->second];
+                        for (const auto& bp : rBlk.parameters) {
+                            sp.resumeBlockParamTypes.push_back(
+                                formatProgramSlotType(program, bp.type, bp.typeId));
+                        }
+                        for (const auto& rInst : rBlk.instructions) {
+                            if (rInst.opcode == bytecode::Opcode::AwaitResume &&
+                                rInst.index == sp.awaitLocalIndex) {
+                                if (rInst.result == bytecode::InvalidRegister) {
+                                    sp.resumeResultTypeName = "void";
+                                } else if (rInst.result < func.registerTypes.size()) {
+                                    const semantic::SymbolId rtid =
+                                        rInst.result < func.registerTypeIds.size()
+                                            ? func.registerTypeIds[rInst.result]
+                                            : 0;
+                                    sp.resumeResultTypeName = formatProgramSlotType(
+                                        program, func.registerTypes[rInst.result], rtid);
+                                }
+                                break;
+                            }
+                        }
+                        for (std::size_t r = 0; r < nRegs; ++r) {
+                            if (liveIn[rbIt->second][r]) {
+                                const semantic::SymbolId rtid =
+                                    r < func.registerTypeIds.size() ? func.registerTypeIds[r] : 0;
+                                sp.liveInRegisters.emplace_back(
+                                    static_cast<std::uint32_t>(r),
+                                    formatProgramSlotType(program, func.registerTypes[r], rtid));
+                            }
+                        }
+                    }
+                    for (const auto& eh : func.exceptionHandlers) {
+                        if (std::find(
+                                eh.protectedBlocks.begin(),
+                                eh.protectedBlocks.end(),
+                                sp.resumeBlockId) != eh.protectedBlocks.end()) {
+                            sp.protectingHandlers.push_back(
+                                std::to_string(eh.handlerBlock) + ":" +
+                                std::to_string(eh.exceptionLocal) + ":" +
+                                formatProgramSlotType(
+                                    program, semantic::PrimitiveType::Object, eh.catchTypeId));
+                        }
+                    }
+                    fp.suspensionPoints.push_back(std::move(sp));
+                }
+            }
+            fp.suspensionPointCount = fp.suspensionPoints.size();
+
+            std::uint64_t h = kCoroFpFnvOffset;
+            hashCoroMix64(h, 0u); // async coroutine tag
+            hashCoroString(h, fp.canonicalName);
+            hashCoroString(h, fp.returnTypeName);
+            hashCoroMix64(h, fp.parameterNames.size());
+            for (const auto& pn : fp.parameterNames) hashCoroString(h, pn);
+            hashCoroMix64(h, fp.parameterSlotTypes.size());
+            for (const auto& pt : fp.parameterSlotTypes) hashCoroString(h, pt);
+            hashCoroMix64(h, fp.localSlotTypes.size());
+            for (const auto& lt : fp.localSlotTypes) hashCoroString(h, lt);
+            hashCoroMix64(h, fp.debugLocals.size());
+            for (const auto& dl : fp.debugLocals) {
+                hashCoroString(h, dl.name);
+                hashCoroMix64(h, dl.slot);
+                hashCoroMix64(h, dl.parameter ? 1u : 0u);
+                hashCoroString(h, dl.slotTypeName);
+            }
+            hashCoroMix64(h, fp.suspensionPointCount);
+            for (const auto& sp : fp.suspensionPoints) {
+                hashCoroMix64(h, sp.ordinal);
+                hashCoroMix64(h, sp.awaitLocalIndex);
+                hashCoroMix64(h, sp.resumeBlockId);
+                hashCoroString(h, sp.awaitedTypeName);
+                hashCoroString(h, sp.resumeResultTypeName);
+                hashCoroMix64(h, sp.resumeBlockParamTypes.size());
+                for (const auto& bpt : sp.resumeBlockParamTypes) hashCoroString(h, bpt);
+                hashCoroMix64(h, sp.liveInRegisters.size());
+                for (const auto& [rIdx, rType] : sp.liveInRegisters) {
+                    hashCoroMix64(h, rIdx);
+                    hashCoroString(h, rType);
+                }
+                hashCoroMix64(h, sp.protectingHandlers.size());
+                for (const auto& ph : sp.protectingHandlers) hashCoroString(h, ph);
+            }
+            hashCoroMix64(h, fp.referencedStructLayouts.size());
+            for (const auto& [sName, sHash] : fp.referencedStructLayouts) {
+                hashCoroString(h, sName);
+                hashCoroMix64(h, sHash);
+            }
+            std::uint64_t coreH = h;
+            if (coreH == 0) coreH = 1;
+            fp.coreStateMachineHash = coreH;
+
+            hashCoroMix64(h, fp.referencedClassLayouts.size());
+            for (const auto& [cName, cHash] : fp.referencedClassLayouts) {
+                hashCoroString(h, cName);
+                hashCoroMix64(h, cHash);
+            }
+            if (h == 0) h = 1;
+            fp.structuralHash = h;
+            results.push_back(std::move(fp));
+        }
+    }
+
+    // Also compute deterministic structural fingerprints for `sequence` state machines
+    for (const auto& module : program.modules()) {
+        for (const auto& seq : module.languageMetadata.sequences) {
+            const semantic::TypeSymbol* ownerType = nullptr;
+            for (const auto& t : module.types) {
+                if (semantic::canonicalTypeName(t) == seq.typeName || t.name == seq.typeName) {
+                    ownerType = &t;
+                    break;
+                }
+            }
+            if (!ownerType) continue;
+
+            const std::string ownerCanonical = semantic::canonicalTypeName(*ownerType);
+            CoroutineStateMachineFingerprint fp;
+            fp.isSequence = true;
+            fp.canonicalName = ownerCanonical + "." + seq.name;
+            fp.returnTypeName = seq.resultTypeName;
+
+            std::map<std::string, std::uint64_t> seqRefStructs;
+            std::map<std::string, std::uint64_t> seqRefClasses;
+            std::unordered_set<std::string> seqVisitedTypes;
+            collectReferencedTypesRecursive(
+                program, ownerType, layoutMemo, seqRefStructs, seqRefClasses, seqVisitedTypes);
+
+            for (const auto& m : ownerType->methods) {
+                if (m.name == seq.name && m.method && !m.staticMethod) {
+                    fp.symbolId = m.id;
+                    if (const auto fIt = linearIndexBySymbol.find(m.id);
+                        fIt != linearIndexBySymbol.end()) {
+                        fp.functionIndex = fIt->second;
+                    }
+                    for (const auto& p : m.parameters) {
+                        const semantic::SymbolId ptid =
+                            semantic::isExactType(p.type) && !p.typeName.empty()
+                                ? semantic::stableTypeId(p.typeName)
+                                : 0;
+                        fp.parameterNames.push_back(p.name);
+                        fp.parameterSlotTypes.push_back(
+                            formatProgramSlotType(program, p.type, ptid, p.typeName));
+                        if (const auto* td = unwrapToRecordOrStructType(program, p.type, ptid, p.typeName)) {
+                            collectReferencedTypesRecursive(
+                                program, td, layoutMemo, seqRefStructs, seqRefClasses, seqVisitedTypes);
+                        }
+                    }
+                    break;
+                }
+            }
+
+            std::size_t stateFieldIndex = static_cast<std::size_t>(-1);
+            const std::string stateFieldName = "$sequence_state_" + seq.name;
+            const auto seqFieldNames = collectSequenceOwnedFieldNames(*ownerType, seq.name);
+            const std::unordered_set<std::string> seqFieldSet(
+                seqFieldNames.begin(), seqFieldNames.end());
+
+            for (const auto& fld : ownerType->fields) {
+                if (!fld.synthetic || seqFieldSet.find(fld.name) == seqFieldSet.end()) continue;
+                if (fld.name == stateFieldName) {
+                    stateFieldIndex = fld.index;
+                }
+                if (fld.name.rfind("$sequence_local_", 0) == 0 ||
+                    fld.name.rfind("$sequence_foreach_", 0) == 0 ||
+                    fld.name.rfind("$sequence_parameter_", 0) == 0 ||
+                    fld.name.rfind("$sequence_result_", 0) == 0) {
+                    const semantic::SymbolId ftid =
+                        semantic::isExactType(fld.type) && !fld.typeName.empty()
+                            ? semantic::stableTypeId(fld.typeName)
+                            : 0;
+                    const std::string slotTypeStr =
+                        formatProgramSlotType(program, fld.type, ftid, fld.typeName);
+                    fp.localSlotTypes.push_back(fld.name + ":" + slotTypeStr);
+                    fp.debugLocals.push_back(CoroutineLocalDebugDesc{
+                        fld.name,
+                        static_cast<std::uint32_t>(fp.debugLocals.size()),
+                        fld.name.rfind("$sequence_parameter_", 0) == 0,
+                        slotTypeStr,
+                    });
+                    if (const auto* td = unwrapToRecordOrStructType(program, fld.type, ftid, fld.typeName)) {
+                        collectReferencedTypesRecursive(
+                            program, td, layoutMemo, seqRefStructs, seqRefClasses, seqVisitedTypes);
+                    }
+                }
+            }
+            fp.referencedStructLayouts.assign(seqRefStructs.begin(), seqRefStructs.end());
+            fp.referencedClassLayouts.assign(seqRefClasses.begin(), seqRefClasses.end());
+
+            // Extract yield suspension state IDs and schedule signatures in encounter order
+            struct SequenceYieldPoint {
+                std::uint32_t stateId = 0;
+                std::string scheduleSignature;
+            };
+            std::vector<SequenceYieldPoint> yieldPoints;
+            if (stateFieldIndex != static_cast<std::size_t>(-1)) {
+                std::vector<std::string> orderedSeqFuncNames;
+                orderedSeqFuncNames.reserve(1u + seq.callbacks.size());
+                orderedSeqFuncNames.push_back(ownerType->name + "." + seq.name);
+                for (const auto& cbName : seq.callbacks) {
+                    orderedSeqFuncNames.push_back(ownerType->name + "." + cbName);
+                }
+                for (const auto& seqFnName : orderedSeqFuncNames) {
+                    for (const auto& fn : module.functions) {
+                        if (fn.name != seqFnName) continue;
+                        for (const auto& blk : fn.blocks) {
+                            std::unordered_map<bytecode::Register, std::int64_t> constInts;
+                            std::unordered_map<bytecode::Register, std::string> constStrings;
+                            for (std::size_t ii = 0; ii < blk.instructions.size(); ++ii) {
+                                const auto& inst = blk.instructions[ii];
+                                if (inst.opcode == bytecode::Opcode::ConstantInt &&
+                                    inst.result != bytecode::InvalidRegister) {
+                                    constInts[inst.result] = inst.activeIntegerImmediate();
+                                } else if (inst.opcode == bytecode::Opcode::ConstantString &&
+                                           inst.result != bytecode::InvalidRegister) {
+                                    constStrings[inst.result] = inst.stringImmediate;
+                                } else if (inst.opcode == bytecode::Opcode::StoreField &&
+                                           inst.index == stateFieldIndex &&
+                                           inst.operands.size() == 2) {
+                                    const auto cIt = constInts.find(inst.operands[1]);
+                                    if (cIt != constInts.end() && cIt->second > 0) {
+                                        const auto sid = static_cast<std::uint32_t>(cIt->second);
+                                        std::string schedSig = fn.name;
+                                        for (std::size_t jj = ii + 1u; jj < blk.instructions.size(); ++jj) {
+                                            const auto& nextInst = blk.instructions[jj];
+                                            if (nextInst.opcode == bytecode::Opcode::StoreField &&
+                                                nextInst.index == stateFieldIndex) {
+                                                break;
+                                            }
+                                            if (nextInst.opcode == bytecode::Opcode::ConstantString &&
+                                                nextInst.result != bytecode::InvalidRegister) {
+                                                constStrings[nextInst.result] = nextInst.stringImmediate;
+                                            }
+                                            if (nextInst.opcode == bytecode::Opcode::Call &&
+                                                nextInst.index < module.functionReferences.size()) {
+                                                schedSig += "|" + module.functionReferences[nextInst.index].name;
+                                                for (const auto opReg : nextInst.operands) {
+                                                    if (const auto sIt = constStrings.find(opReg);
+                                                        sIt != constStrings.end()) {
+                                                        schedSig += ":" + sIt->second;
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
+                                        yieldPoints.push_back(SequenceYieldPoint{sid, std::move(schedSig)});
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!yieldPoints.empty()) {
+                std::uint32_t ord = 0;
+                for (auto& yp : yieldPoints) {
+                    CoroutineSuspensionPointDesc sp;
+                    sp.ordinal = ord++;
+                    sp.resumeBlockId = yp.stateId;
+                    sp.awaitedTypeName = std::move(yp.scheduleSignature);
+                    fp.suspensionPoints.push_back(std::move(sp));
+                }
+            } else {
+                for (std::size_t i = 0; i < seq.callbacks.size(); ++i) {
+                    CoroutineSuspensionPointDesc sp;
+                    sp.ordinal = static_cast<std::uint32_t>(i);
+                    sp.resumeBlockId = static_cast<std::uint32_t>(i + 1u);
+                    sp.awaitedTypeName = seq.callbacks[i];
+                    fp.suspensionPoints.push_back(std::move(sp));
+                }
+            }
+            fp.suspensionPointCount = fp.suspensionPoints.size();
+
+            std::uint64_t h = kCoroFpFnvOffset;
+            hashCoroMix64(h, 1u); // sequence tag
+            hashCoroString(h, fp.canonicalName);
+            hashCoroString(h, fp.returnTypeName);
+            hashCoroMix64(h, fp.parameterNames.size());
+            for (const auto& pn : fp.parameterNames) hashCoroString(h, pn);
+            hashCoroMix64(h, fp.parameterSlotTypes.size());
+            for (const auto& pt : fp.parameterSlotTypes) hashCoroString(h, pt);
+            hashCoroMix64(h, fp.localSlotTypes.size());
+            for (const auto& lt : fp.localSlotTypes) hashCoroString(h, lt);
+            hashCoroMix64(h, seq.callbacks.size());
+            for (const auto& cb : seq.callbacks) hashCoroString(h, cb);
+            hashCoroMix64(h, fp.suspensionPointCount);
+            for (const auto& sp : fp.suspensionPoints) {
+                hashCoroMix64(h, sp.ordinal);
+                hashCoroMix64(h, sp.resumeBlockId);
+                hashCoroString(h, sp.awaitedTypeName);
+            }
+            hashCoroMix64(h, fp.referencedStructLayouts.size());
+            for (const auto& [sName, sHash] : fp.referencedStructLayouts) {
+                hashCoroString(h, sName);
+                hashCoroMix64(h, sHash);
+            }
+            std::uint64_t coreH = h;
+            if (coreH == 0) coreH = 1;
+            fp.coreStateMachineHash = coreH;
+
+            hashCoroMix64(h, fp.referencedClassLayouts.size());
+            for (const auto& [cName, cHash] : fp.referencedClassLayouts) {
+                hashCoroString(h, cName);
+                hashCoroMix64(h, cHash);
+            }
+            if (h == 0) h = 1;
+            fp.structuralHash = h;
+            results.push_back(std::move(fp));
+        }
+    }
+
+    return results;
+}
+
+std::optional<CoroutineStateMachineFingerprint> findCoroutineStateMachineFingerprint(
+    const runtime::ProgramImage& program,
+    const std::string& canonicalName) {
+    for (auto& fp : computeProgramCoroutineFingerprints(program)) {
+        if (fp.canonicalName == canonicalName) {
+            return std::move(fp);
+        }
+    }
+    return std::nullopt;
+}
 
 SceneScriptRuntime::~SceneScriptRuntime() noexcept {
     releaseAsyncTemplateRoots();
@@ -527,12 +1597,34 @@ bool SceneScriptRuntime::matchesComponentType(
 }
 
 void SceneScriptRuntime::rebuildTickOrderIfNeeded() const {
-    if (!tickOrderDirty_) return;
+    if (!tickOrderDirty_ || tickDispatchDepth_ > 0) return;
+
+    const auto* prog = runtime_.program().get();
+    if (cachedProgramForFuncIndex_ != prog) {
+        functionIndexBySymbol_.clear();
+        if (prog) {
+            std::uint32_t linearIdx = 0;
+            for (const auto& mod : prog->modules()) {
+                for (const auto& fn : mod.functions) {
+                    functionIndexBySymbol_.emplace(fn.symbolId, linearIdx++);
+                }
+            }
+        }
+        cachedProgramForFuncIndex_ = prog;
+    }
+
     cachedTickOrder_.clear();
+    std::size_t totalComps = 0;
+    for (const auto& [entity, components] : instances_) {
+        (void)entity;
+        totalComps += components.size();
+    }
+    cachedTickOrder_.reserve(totalComps);
+
     for (const auto& [entity, components] : instances_) {
         for (std::size_t idx = 0; idx < components.size(); ++idx) {
             cachedTickOrder_.push_back(
-                TickRef{components[idx].executionOrder, entity, idx});
+                TickRef{components[idx].executionOrder, entity, idx, components[idx].instanceUid});
         }
     }
     std::sort(
@@ -543,7 +1635,80 @@ void SceneScriptRuntime::rebuildTickOrderIfNeeded() const {
             if (a.entity != b.entity) return a.entity < b.entity;
             return a.compIndex < b.compIndex;
         });
+
+    flatFixedUpdateSlots_.clear();
+    flatUpdateSlots_.clear();
+    flatLateUpdateSlots_.clear();
+    activeCachedComponents_ = 0;
+
+    std::unordered_map<SceneEntityId, bool> hierarchyActiveMemo;
+    hierarchyActiveMemo.reserve(instances_.size());
+
+    auto& mutableInstances = const_cast<std::unordered_map<SceneEntityId, std::vector<Instance>>&>(instances_);
+    for (std::size_t cursor = 0; cursor < cachedTickOrder_.size(); ++cursor) {
+        const TickRef& ref = cachedTickOrder_[cursor];
+        auto memoIt = hierarchyActiveMemo.find(ref.entity);
+        if (memoIt == hierarchyActiveMemo.end()) {
+            memoIt = hierarchyActiveMemo.emplace(ref.entity, isActiveInHierarchy(ref.entity)).first;
+        }
+        if (!memoIt->second) continue;
+
+        const auto instIt = mutableInstances.find(ref.entity);
+        if (instIt == mutableInstances.end() || ref.compIndex >= instIt->second.size()) continue;
+        Instance& instance = instIt->second[ref.compIndex];
+        if (!instance.enabled || !shouldTickInCurrentMode(instance)) continue;
+        if (!instance.started && executionMode_ == SceneExecutionMode::Play) continue;
+        if (!instance.object.valid()) continue;
+
+        ++activeCachedComponents_;
+        const runtime::ObjectRef recvRef = instance.object.reference();
+
+        const auto appendPhaseSlot = [&](
+            std::vector<FlatLifecycleSlot>& outVec,
+            const std::optional<ScriptMethod>& optMethod) {
+            if (!optMethod || !optMethod->valid()) return;
+            const semantic::SymbolId symId = optMethod->descriptor.id;
+            std::uint32_t fnIdx = 0;
+            if (const auto fIt = functionIndexBySymbol_.find(symId);
+                fIt != functionIndexBySymbol_.end()) {
+                fnIdx = fIt->second;
+            }
+            outVec.push_back(FlatLifecycleSlot{
+                ref.entity,
+                ref.compIndex,
+                ref.instanceUid,
+                cursor,
+                fnIdx,
+                symId,
+                recvRef,
+                &instance,
+                &*optMethod,
+                methodReturnsAwaitableStruct(*optMethod),
+            });
+        };
+
+        appendPhaseSlot(flatFixedUpdateSlots_, instance.onFixedUpdate);
+        appendPhaseSlot(flatUpdateSlots_, instance.onUpdate);
+        appendPhaseSlot(flatLateUpdateSlots_, instance.onLateUpdate);
+    }
+
     tickOrderDirty_ = false;
+    ++hotPathStats_.cacheRebuilds;
+}
+
+SceneLifecycleHotPathStats SceneScriptRuntime::lifecycleHotPathStats() const noexcept {
+    SceneLifecycleHotPathStats out = hotPathStats_;
+    out.structuralGeneration = structuralGeneration_;
+    out.activeCachedComponents = activeCachedComponents_;
+    out.cachedFixedUpdateSlots = flatFixedUpdateSlots_.size();
+    out.cachedUpdateSlots = flatUpdateSlots_.size();
+    out.cachedLateUpdateSlots = flatLateUpdateSlots_.size();
+    out.currentDispatchDepth = tickDispatchDepth_;
+    return out;
+}
+
+void SceneScriptRuntime::resetLifecycleHotPathStats() noexcept {
+    hotPathStats_ = SceneLifecycleHotPathStats{};
 }
 
 void SceneScriptRuntime::invalidateTransformSubtree(SceneEntityId entity) {
@@ -554,6 +1719,25 @@ void SceneScriptRuntime::invalidateTransformSubtree(SceneEntityId entity) {
     for (const auto child : chIt->second) {
         invalidateTransformSubtree(child);
     }
+}
+
+SceneScriptRuntime::Instance* SceneScriptRuntime::findComponentByUid(
+    SceneEntityId entity,
+    std::uint64_t instanceUid,
+    std::size_t hintIndex) noexcept {
+    if (instanceUid == 0) return nullptr;
+    const auto it = instances_.find(entity);
+    if (it == instances_.end()) return nullptr;
+    auto& vec = it->second;
+    if (hintIndex < vec.size() && vec[hintIndex].instanceUid == instanceUid) {
+        return &vec[hintIndex];
+    }
+    for (auto& inst : vec) {
+        if (inst.instanceUid == instanceUid) {
+            return &inst;
+        }
+    }
+    return nullptr;
 }
 
 bool SceneScriptRuntime::attachComponentWithoutLifecycle(
@@ -589,6 +1773,7 @@ bool SceneScriptRuntime::attachComponentWithoutLifecycle(
     }
 
     Instance instance;
+    instance.instanceUid = nextInstanceUid_++;
     instance.object = std::move(*object);
     instance.enabled = options.enabled;
     bindLifecycleMethods(instance);
@@ -597,7 +1782,7 @@ bool SceneScriptRuntime::attachComponentWithoutLifecycle(
     outCompIndex = list.size();
     list.push_back(std::move(instance));
     hasUnstartedPlayComponents_ = true;
-    tickOrderDirty_ = true;
+    markLifecycleCacheDirty();
     return true;
 }
 
@@ -655,37 +1840,66 @@ bool SceneScriptRuntime::attachComponent(
     }
 
     Instance instance;
+    instance.instanceUid = nextInstanceUid_++;
     instance.object = std::move(*object);
     instance.enabled = options.enabled;
     bindLifecycleMethods(instance);
 
+    const std::uint64_t createdUid = instance.instanceUid;
+    const std::uint64_t expectedResetEpoch = sceneResetEpoch_;
+    const std::optional<ScriptMethod> onCreate1Copy = instance.onCreate1;
+    const std::optional<ScriptMethod> onCreate0Copy = instance.onCreate0;
+    const std::optional<ScriptMethod> onEnableCopy = instance.onEnable;
+
     auto& list = instances_[entity];
+    const std::size_t hintIndex = list.size();
     list.push_back(std::move(instance));
     hasUnstartedPlayComponents_ = true;
-    tickOrderDirty_ = true;
-    auto& stored = list.back();
+    markLifecycleCacheDirty();
+
+    const auto rollbackByUid = [&]() {
+        if (sceneResetEpoch_ != expectedResetEpoch) return;
+        const auto entIt = instances_.find(entity);
+        if (entIt == instances_.end()) return;
+        auto& vec = entIt->second;
+        for (auto vIt = vec.begin(); vIt != vec.end(); ++vIt) {
+            if (vIt->instanceUid == createdUid) {
+                vec.erase(vIt);
+                break;
+            }
+        }
+        if (vec.empty()) {
+            instances_.erase(entIt);
+        }
+        markLifecycleCacheDirty();
+    };
+
     const bool hasOwner = !std::holds_alternative<std::monostate>(options.owner);
-    if (hasOwner && stored.onCreate1) {
+    Instance* createdPtr = findComponentByUid(entity, createdUid, hintIndex);
+    if (!createdPtr) return false;
+    if (hasOwner && onCreate1Copy) {
         if (!invokeLifecycle(
-                entity, stored, stored.onCreate1, {std::move(options.owner)}, "OnCreate")) {
-            list.pop_back();
-            if (list.empty()) instances_.erase(entity);
-            tickOrderDirty_ = true;
+                entity, *createdPtr, onCreate1Copy, {std::move(options.owner)}, "OnCreate")) {
+            rollbackByUid();
             return false;
         }
     } else if (!invokeLifecycle(
-            entity, stored, stored.onCreate0, {}, "OnCreate")) {
-        list.pop_back();
-        if (list.empty()) instances_.erase(entity);
-        tickOrderDirty_ = true;
+            entity, *createdPtr, onCreate0Copy, {}, "OnCreate")) {
+        rollbackByUid();
         return false;
     }
-    if (stored.enabled && isActiveInHierarchy(entity) && !invokeLifecycle(
-            entity, stored, stored.onEnable, {}, "OnEnable")) {
-        list.pop_back();
-        if (list.empty()) instances_.erase(entity);
-        tickOrderDirty_ = true;
-        return false;
+    if (sceneResetEpoch_ != expectedResetEpoch) {
+        return true;
+    }
+    Instance* postCreatePtr = findComponentByUid(entity, createdUid, hintIndex);
+    if (!postCreatePtr) {
+        return true;
+    }
+    if (postCreatePtr->enabled && isActiveInHierarchy(entity)) {
+        if (!invokeLifecycle(entity, *postCreatePtr, onEnableCopy, {}, "OnEnable")) {
+            rollbackByUid();
+            return false;
+        }
     }
     return true;
 }
@@ -787,8 +2001,12 @@ bool SceneScriptRuntime::detach(SceneEntityId entity) {
 
     const auto found = instances_.find(entity);
     if (found == instances_.end()) {
+        if (hadHierarchyOrTransform) {
+            markLifecycleCacheDirty();
+        }
         return hadHierarchyOrTransform;
     }
+    markLifecycleCacheDirty();
     for (auto& instance : found->second) {
         cancelInstanceSequencesFast(instance);
         if (shouldTickInCurrentMode(instance) || instance.started) {
@@ -798,8 +2016,8 @@ bool SceneScriptRuntime::detach(SceneEntityId entity) {
             (void)invokeLifecycle(entity, instance, instance.onDestroy, {}, "OnDestroy");
         }
     }
-    instances_.erase(found);
-    tickOrderDirty_ = true;
+    instances_.erase(entity);
+    markLifecycleCacheDirty();
     return true;
 }
 
@@ -813,6 +2031,7 @@ bool SceneScriptRuntime::detachComponent(
         if (matchesComponentType(it->object.type(), scriptType)) {
             const std::string canonicalRemoved = it->object.type().canonicalName();
             removeSignalsForEntityOrComponent(entity, canonicalRemoved);
+            markLifecycleCacheDirty();
             cancelInstanceSequencesFast(*it);
             if (shouldTickInCurrentMode(*it) || it->started) {
                 if (it->enabled && isActiveInHierarchy(entity)) {
@@ -820,9 +2039,18 @@ bool SceneScriptRuntime::detachComponent(
                 }
                 (void)invokeLifecycle(entity, *it, it->onDestroy, {}, "OnDestroy");
             }
-            list.erase(it);
-            if (list.empty()) instances_.erase(found);
-            tickOrderDirty_ = true;
+            const auto refound = instances_.find(entity);
+            if (refound != instances_.end()) {
+                auto& curList = refound->second;
+                for (auto curIt = curList.begin(); curIt != curList.end(); ++curIt) {
+                    if (curIt->object.type().canonicalName() == canonicalRemoved) {
+                        curList.erase(curIt);
+                        break;
+                    }
+                }
+                if (curList.empty()) instances_.erase(refound);
+            }
+            markLifecycleCacheDirty();
             return true;
         }
     }
@@ -848,7 +2076,7 @@ bool SceneScriptRuntime::setEntityActive(SceneEntityId entity, bool active) {
     const bool wasActiveInHierarchy = currentSelf && parentActive;
 
     entityActiveSelf_[entity] = active;
-    tickOrderDirty_ = true;
+    markLifecycleCacheDirty();
 
     const bool nowActiveInHierarchy = active && parentActive;
     if (nowActiveInHierarchy) {
@@ -895,13 +2123,15 @@ bool SceneScriptRuntime::setEntityActive(SceneEntityId entity, bool active) {
     const auto notifySubtree = [&](const auto& self, SceneEntityId parentNode) -> void {
         const auto chIt = childrenByEntity_.find(parentNode);
         if (chIt == childrenByEntity_.end()) return;
-        for (const auto childId : chIt->second) {
+        const auto childrenCopy = chIt->second;
+        for (const auto childId : childrenCopy) {
             if (!isEntityActiveSelf(childId)) continue;
             (void)notifyNodeComponents(childId, nowActiveInHierarchy);
             self(self, childId);
         }
     };
     notifySubtree(notifySubtree, entity);
+    markLifecycleCacheDirty();
     return true;
 }
 
@@ -915,7 +2145,6 @@ bool SceneScriptRuntime::setEnabled(SceneEntityId entity, bool enabled) {
     if (found->second.front().enabled == enabled) {
         return false;
     }
-    const bool wasEntityActive = isEntityActiveSelf(entity);
     const bool parentActive =
         getParent(entity) == BroadcastTarget || isActiveInHierarchy(getParent(entity));
     auto& instance = found->second.front();
@@ -948,8 +2177,7 @@ bool SceneScriptRuntime::setEnabled(SceneEntityId entity, bool enabled) {
     if (enabled && !instance.started) {
         hasUnstartedPlayComponents_ = true;
     }
-    (void)wasEntityActive;
-    tickOrderDirty_ = true;
+    markLifecycleCacheDirty();
     return true;
 }
 
@@ -980,7 +2208,7 @@ bool SceneScriptRuntime::setComponentEnabled(
         if (enabled && !instance.started) {
             hasUnstartedPlayComponents_ = true;
         }
-        tickOrderDirty_ = true;
+        markLifecycleCacheDirty();
         return true;
     }
     return false;
@@ -1024,6 +2252,7 @@ bool SceneScriptRuntime::restoreComponentWithoutLifecycle(
         return false;
     }
     instances_[entity][compIndex].started = started;
+    markLifecycleCacheDirty();
     return true;
 }
 
@@ -1032,10 +2261,11 @@ void SceneScriptRuntime::restoreEntityActiveWithoutLifecycle(
     bool active) {
     if (entity == BroadcastTarget || isStaleGenerationalEntity(entity)) return;
     entityActiveSelf_[entity] = active;
-    tickOrderDirty_ = true;
+    markLifecycleCacheDirty();
 }
 
 void SceneScriptRuntime::clearForSnapshotImport() {
+    ++sceneResetEpoch_;
     if (fiberScheduler_) {
         for (const auto entity : entities()) {
             const std::uint32_t gen = entityIdGeneration(entity);
@@ -1063,8 +2293,12 @@ void SceneScriptRuntime::clearForSnapshotImport() {
     entityActiveSelf_.clear();
     localTransforms_.clear();
     worldTransformCache_.clear();
-    tickOrderDirty_ = true;
+    markLifecycleCacheDirty();
     cachedTickOrder_.clear();
+    flatFixedUpdateSlots_.clear();
+    flatUpdateSlots_.clear();
+    flatLateUpdateSlots_.clear();
+    activeCachedComponents_ = 0;
     signalConnections_.clear();
     currentInputActions_.clear();
     previousInputActions_.clear();
@@ -1105,22 +2339,59 @@ void SceneScriptRuntime::clearForSnapshotImport() {
 }
 
 void SceneScriptRuntime::startPendingComponents() {
+    const std::uint64_t expectedResetEpoch = sceneResetEpoch_;
     for (std::size_t pass = 0; pass < 16u; ++pass) {
+        if (sceneResetEpoch_ != expectedResetEpoch) return;
         hasUnstartedPlayComponents_ = false;
-        rebuildTickOrderIfNeeded();
-        const auto snapshot = cachedTickOrder_;
+        std::vector<TickRef> snapshot;
+        if (tickDispatchDepth_ > 0 && tickOrderDirty_) {
+            std::size_t totalComps = 0;
+            for (const auto& [entity, components] : instances_) {
+                (void)entity;
+                totalComps += components.size();
+            }
+            snapshot.reserve(totalComps);
+            for (const auto& [entity, components] : instances_) {
+                for (std::size_t idx = 0; idx < components.size(); ++idx) {
+                    snapshot.push_back(
+                        TickRef{components[idx].executionOrder, entity, idx, components[idx].instanceUid});
+                }
+            }
+            std::sort(
+                snapshot.begin(),
+                snapshot.end(),
+                [](const TickRef& a, const TickRef& b) {
+                    if (a.order != b.order) return a.order < b.order;
+                    if (a.entity != b.entity) return a.entity < b.entity;
+                    return a.compIndex < b.compIndex;
+                });
+        } else {
+            rebuildTickOrderIfNeeded();
+            snapshot = cachedTickOrder_;
+        }
+        bool startedAny = false;
         for (const auto& ref : snapshot) {
+            if (sceneResetEpoch_ != expectedResetEpoch) return;
             if (!isActiveInHierarchy(ref.entity)) continue;
-            const auto it = instances_.find(ref.entity);
-            if (it == instances_.end() || ref.compIndex >= it->second.size()) continue;
-            auto& instance = it->second[ref.compIndex];
-            if (!instance.enabled || instance.started ||
-                !shouldTickInCurrentMode(instance)) {
+            auto* instance = findComponentByUid(ref.entity, ref.instanceUid, ref.compIndex);
+            if (!instance) continue;
+            if (!instance->enabled || instance->started ||
+                !shouldTickInCurrentMode(*instance)) {
                 continue;
             }
-            if (invokeLifecycle(ref.entity, instance, instance.onStart, {}, "OnStart")) {
-                instance.started = true;
+            const std::optional<ScriptMethod> onStartCopy = instance->onStart;
+            if (invokeLifecycle(ref.entity, *instance, onStartCopy, {}, "OnStart")) {
+                if (sceneResetEpoch_ != expectedResetEpoch) return;
+                if (auto* postStart = findComponentByUid(ref.entity, ref.instanceUid, ref.compIndex)) {
+                    postStart->started = true;
+                    startedAny = true;
+                }
+            } else if (sceneResetEpoch_ != expectedResetEpoch) {
+                return;
             }
+        }
+        if (startedAny) {
+            markLifecycleCacheDirty();
         }
         if (!hasUnstartedPlayComponents_) {
             break;
@@ -1135,78 +2406,209 @@ void SceneScriptRuntime::start() {
     startPendingComponents();
 }
 
+void SceneScriptRuntime::dispatchTickRefsFallback(
+    const TickRef* refs,
+    std::size_t count,
+    LifecyclePhase phase,
+    double deltaSeconds,
+    const char* callbackName) {
+    if (!refs || count == 0) return;
+    const std::uint64_t expectedResetEpoch = sceneResetEpoch_;
+    std::vector<runtime::Value> argVec{runtime::Value{deltaSeconds}};
+    for (std::size_t i = 0; i < count; ++i) {
+        if (sceneResetEpoch_ != expectedResetEpoch) return;
+        const TickRef& ref = refs[i];
+        if (!isActiveInHierarchy(ref.entity)) continue;
+        auto* instance = findComponentByUid(ref.entity, ref.instanceUid, ref.compIndex);
+        if (!instance) continue;
+        if (!instance->enabled || !shouldTickInCurrentMode(*instance)) continue;
+        if (!instance->started && executionMode_ == SceneExecutionMode::Play) {
+            continue;
+        }
+        std::optional<ScriptMethod> methodCopy;
+        switch (phase) {
+        case LifecyclePhase::FixedUpdate:
+            methodCopy = instance->onFixedUpdate;
+            break;
+        case LifecyclePhase::Update:
+            methodCopy = instance->onUpdate;
+            break;
+        case LifecyclePhase::LateUpdate:
+            methodCopy = instance->onLateUpdate;
+            break;
+        }
+        if (!methodCopy) continue;
+        ++hotPathStats_.fallbackDispatchedCallbacks;
+        (void)invokeLifecycle(ref.entity, *instance, methodCopy, argVec, callbackName);
+        if (sceneResetEpoch_ != expectedResetEpoch) return;
+    }
+}
+
+void SceneScriptRuntime::dispatchLifecyclePhase(
+    LifecyclePhase phase,
+    double deltaSeconds,
+    const char* callbackName) {
+    struct TickDispatchScope {
+        SceneScriptRuntime& self;
+        explicit TickDispatchScope(SceneScriptRuntime& s) noexcept : self(s) {
+            ++self.tickDispatchDepth_;
+        }
+        ~TickDispatchScope() noexcept {
+            --self.tickDispatchDepth_;
+        }
+    };
+
+    // Reentrant dispatch guard (`tickDispatchDepth_ > 0`): never mutate cached flat arrays
+    // while an outer frame loop is active; take an isolated on-demand snapshot instead.
+    if (tickDispatchDepth_ > 0) {
+        ++hotPathStats_.reentrantDispatches;
+        ++hotPathStats_.onDemandSnapshots;
+        TickDispatchScope depthGuard(*this);
+        std::vector<TickRef> reentrantSnapshot;
+        if (!tickOrderDirty_) {
+            reentrantSnapshot = cachedTickOrder_;
+        } else {
+            for (const auto& [entity, components] : instances_) {
+                for (std::size_t idx = 0; idx < components.size(); ++idx) {
+                    reentrantSnapshot.push_back(
+                        TickRef{components[idx].executionOrder, entity, idx, components[idx].instanceUid});
+                }
+            }
+            std::sort(
+                reentrantSnapshot.begin(),
+                reentrantSnapshot.end(),
+                [](const TickRef& a, const TickRef& b) {
+                    if (a.order != b.order) return a.order < b.order;
+                    if (a.entity != b.entity) return a.entity < b.entity;
+                    return a.compIndex < b.compIndex;
+                });
+        }
+        dispatchTickRefsFallback(
+            reentrantSnapshot.data(),
+            reentrantSnapshot.size(),
+            phase,
+            deltaSeconds,
+            callbackName);
+        return;
+    }
+
+    if (tickOrderDirty_) {
+        rebuildTickOrderIfNeeded();
+    } else {
+        ++hotPathStats_.cacheHits;
+    }
+
+    const std::vector<FlatLifecycleSlot>& phaseSlots =
+        (phase == LifecyclePhase::FixedUpdate)
+            ? flatFixedUpdateSlots_
+            : (phase == LifecyclePhase::Update ? flatUpdateSlots_ : flatLateUpdateSlots_);
+    if (phaseSlots.empty()) {
+        return;
+    }
+
+    TickDispatchScope depthGuard(*this);
+    const std::uint64_t expectedGen = structuralGeneration_;
+    const std::uint64_t expectedResetEpoch = sceneResetEpoch_;
+    if (tickScratchArgs_.size() != 2u) {
+        tickScratchArgs_.resize(2u);
+    }
+    tickScratchArgs_[1].storeDouble(deltaSeconds);
+
+    const std::size_t slotCount = phaseSlots.size();
+    for (std::size_t i = 0; i < slotCount; ++i) {
+        const FlatLifecycleSlot& slot = phaseSlots[i];
+        const SceneEntityId slotEntity = slot.entity;
+        const std::size_t slotTickCursor = slot.tickOrderIndex;
+        const semantic::SymbolId slotMethodSymbolId = slot.methodSymbolId;
+        const bool slotReturnsAwaitable = slot.returnsAwaitable;
+        std::optional<ScriptMethod> awaitableMethodCopy;
+        if (slotReturnsAwaitable && slot.methodPtr) {
+            awaitableMethodCopy = *slot.methodPtr;
+        }
+
+        tickScratchArgs_[0] = runtime::Value{slot.receiverRef};
+        ++hotPathStats_.fastDispatchedCallbacks;
+        const auto result = runtime_.invokeSymbol(
+            slotMethodSymbolId, tickScratchArgs_, executionOptions_);
+        if (!result.succeeded) {
+            recordError(slotEntity, callbackName ? callbackName : "", result.error);
+        } else if (slotReturnsAwaitable && awaitableMethodCopy) {
+            (void)consumeFireAndForgetInvocationResult(
+                slotEntity,
+                *awaitableMethodCopy,
+                result,
+                callbackName ? std::string_view(callbackName) : std::string_view{});
+        }
+
+        // Whole-scene replacement (clear() / deserialization load) inside callback:
+        // immediately abort all remaining cursors of the superseded scene!
+        if (sceneResetEpoch_ != expectedResetEpoch) {
+            break;
+        }
+
+        // Structural mutation occurred inside the callback: switch to an on-demand tail snapshot
+        // for the remaining components of the initial tick order (resolved by instanceUid!),
+        // leaving rebuild deferred to next frame.
+        if (structuralGeneration_ != expectedGen) {
+            ++hotPathStats_.midTickMutations;
+            if (slotTickCursor + 1u < cachedTickOrder_.size()) {
+                ++hotPathStats_.onDemandSnapshots;
+                const std::vector<TickRef> tailSnapshot(
+                    cachedTickOrder_.begin() + static_cast<std::ptrdiff_t>(slotTickCursor + 1u),
+                    cachedTickOrder_.end());
+                dispatchTickRefsFallback(
+                    tailSnapshot.data(),
+                    tailSnapshot.size(),
+                    phase,
+                    deltaSeconds,
+                    callbackName);
+            }
+            break;
+        }
+    }
+}
+
 void SceneScriptRuntime::update(double deltaTime) {
+    const std::uint64_t expectedResetEpoch = sceneResetEpoch_;
     (void)advanceAsyncTimeouts(deltaTime);
     (void)stepAsyncPreTickIo();
     (void)flushCompletedAsyncRequests();
+    if (sceneResetEpoch_ != expectedResetEpoch) return;
     if (sceneStarted_ && executionMode_ == SceneExecutionMode::Play &&
         hasUnstartedPlayComponents_) {
         startPendingComponents();
+        if (sceneResetEpoch_ != expectedResetEpoch) return;
     }
-    rebuildTickOrderIfNeeded();
-    const auto snapshot = cachedTickOrder_;
-    for (const auto& ref : snapshot) {
-        if (!isActiveInHierarchy(ref.entity)) continue;
-        const auto it = instances_.find(ref.entity);
-        if (it == instances_.end() || ref.compIndex >= it->second.size()) continue;
-        auto& instance = it->second[ref.compIndex];
-        if (!instance.enabled || !shouldTickInCurrentMode(instance)) continue;
-        if (!instance.started && executionMode_ == SceneExecutionMode::Play) {
-            continue;
-        }
-        (void)invokeLifecycle(
-            ref.entity, instance, instance.onUpdate, {deltaTime}, "OnUpdate");
-    }
+    dispatchLifecyclePhase(LifecyclePhase::Update, deltaTime, "OnUpdate");
+    if (sceneResetEpoch_ != expectedResetEpoch) return;
     (void)stepAsyncResumeQueue(runtime::ResumeQueue::Update);
+    if (sceneResetEpoch_ != expectedResetEpoch) return;
     (void)flushDestroyedEntities();
 }
 
 void SceneScriptRuntime::fixedUpdate(double fixedDeltaTime) {
+    const std::uint64_t expectedResetEpoch = sceneResetEpoch_;
     if (sceneStarted_ && executionMode_ == SceneExecutionMode::Play &&
         hasUnstartedPlayComponents_) {
         startPendingComponents();
+        if (sceneResetEpoch_ != expectedResetEpoch) return;
     }
-    rebuildTickOrderIfNeeded();
-    const auto snapshot = cachedTickOrder_;
-    for (const auto& ref : snapshot) {
-        if (!isActiveInHierarchy(ref.entity)) continue;
-        const auto it = instances_.find(ref.entity);
-        if (it == instances_.end() || ref.compIndex >= it->second.size()) continue;
-        auto& instance = it->second[ref.compIndex];
-        if (!instance.enabled || !shouldTickInCurrentMode(instance)) continue;
-        if (!instance.started && executionMode_ == SceneExecutionMode::Play) {
-            continue;
-        }
-        (void)invokeLifecycle(
-            ref.entity,
-            instance,
-            instance.onFixedUpdate,
-            {fixedDeltaTime},
-            "OnFixedUpdate");
-    }
+    dispatchLifecyclePhase(LifecyclePhase::FixedUpdate, fixedDeltaTime, "OnFixedUpdate");
+    if (sceneResetEpoch_ != expectedResetEpoch) return;
     (void)stepAsyncResumeQueue(runtime::ResumeQueue::FixedTick);
+    if (sceneResetEpoch_ != expectedResetEpoch) return;
     (void)flushDestroyedEntities();
 }
 
 void SceneScriptRuntime::lateUpdate(double deltaTime) {
+    const std::uint64_t expectedResetEpoch = sceneResetEpoch_;
     if (sceneStarted_ && executionMode_ == SceneExecutionMode::Play &&
         hasUnstartedPlayComponents_) {
         startPendingComponents();
+        if (sceneResetEpoch_ != expectedResetEpoch) return;
     }
-    rebuildTickOrderIfNeeded();
-    const auto snapshot = cachedTickOrder_;
-    for (const auto& ref : snapshot) {
-        if (!isActiveInHierarchy(ref.entity)) continue;
-        const auto it = instances_.find(ref.entity);
-        if (it == instances_.end() || ref.compIndex >= it->second.size()) continue;
-        auto& instance = it->second[ref.compIndex];
-        if (!instance.enabled || !shouldTickInCurrentMode(instance)) continue;
-        if (!instance.started && executionMode_ == SceneExecutionMode::Play) {
-            continue;
-        }
-        (void)invokeLifecycle(
-            ref.entity, instance, instance.onLateUpdate, {deltaTime}, "OnLateUpdate");
-    }
+    dispatchLifecyclePhase(LifecyclePhase::LateUpdate, deltaTime, "OnLateUpdate");
+    if (sceneResetEpoch_ != expectedResetEpoch) return;
     (void)stepAsyncResumeQueue(runtime::ResumeQueue::EndOfFrame);
     (void)flushDestroyedEntities();
 }
@@ -1226,30 +2628,301 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
     }
     mergedMetadata.populateFromProgram(newProgram);
 
-    if (const auto ctx = runtime_.asyncRuntime()) {
-        (void)ctx->coroutines().abortAllSuspendedFrames();
+    const auto oldProgramPtr = runtime_.program();
+    const auto newProgramPtr = newProgram.program();
+
+    std::vector<CoroutineStateMachineFingerprint> oldCoroFps;
+    std::vector<CoroutineStateMachineFingerprint> newCoroFps;
+    if (oldProgramPtr) {
+        oldCoroFps = computeProgramCoroutineFingerprints(*oldProgramPtr);
+    }
+    if (newProgramPtr) {
+        newCoroFps = computeProgramCoroutineFingerprints(*newProgramPtr);
     }
 
+    std::unordered_map<semantic::SymbolId, const CoroutineStateMachineFingerprint*> oldAsyncBySymbol;
+    std::unordered_map<std::string, const CoroutineStateMachineFingerprint*> oldSeqByName;
+    for (const auto& fp : oldCoroFps) {
+        if (fp.isSequence) {
+            oldSeqByName.emplace(fp.canonicalName, &fp);
+        } else {
+            oldAsyncBySymbol.emplace(fp.symbolId, &fp);
+        }
+    }
+
+    std::unordered_map<std::string, const CoroutineStateMachineFingerprint*> newAsyncByName;
+    std::unordered_map<std::string, const CoroutineStateMachineFingerprint*> newSeqByName;
+    for (const auto& fp : newCoroFps) {
+        if (fp.isSequence) {
+            newSeqByName.emplace(fp.canonicalName, &fp);
+        } else {
+            newAsyncByName.emplace(fp.canonicalName, &fp);
+        }
+    }
+
+    // Map explicit `[Guid("...")]` / `[AssetGuid("...")]` attributes on types for GUID-stable rename fallback
+    std::unordered_map<std::string, std::string> newTypeNameByExplicitGuid;
+    if (newProgramPtr) {
+        for (const auto& mod : newProgramPtr->modules()) {
+            for (const auto& t : mod.types) {
+                const std::string canon = semantic::canonicalTypeName(t);
+                const std::string g = findExplicitTypeGuidAttribute(newProgramPtr.get(), canon);
+                if (!g.empty()) {
+                    newTypeNameByExplicitGuid[g] = canon;
+                }
+            }
+        }
+    }
+
+    const auto resolveReloadTargetType = [&](const std::string& oldCanonicalTypeName)
+        -> std::optional<ScriptType> {
+        if (const auto direct = runtime_.findType(oldCanonicalTypeName)) {
+            return direct;
+        }
+        if (oldProgramPtr) {
+            const std::string explicitGuid =
+                findExplicitTypeGuidAttribute(oldProgramPtr.get(), oldCanonicalTypeName);
+            if (!explicitGuid.empty()) {
+                const auto gIt = newTypeNameByExplicitGuid.find(explicitGuid);
+                if (gIt != newTypeNameByExplicitGuid.end()) {
+                    return runtime_.findType(gIt->second);
+                }
+            }
+        }
+        return std::nullopt;
+    };
+
+    // Inspect active `sequence` state machines on live instances BEFORE replacing program so
+    // incompatible/removed in-flight sequences cancel their scheduled timers cleanly on old program.
     struct SavedComponentState {
         std::string canonicalTypeName;
         runtime::ObjectRef oldRef;
         bool enabled = true;
         bool started = false;
         std::unordered_map<std::string, runtime::Value> fields;
+        std::unordered_set<std::string> abortedSequenceFields;
     };
     std::map<SceneEntityId, std::vector<SavedComponentState>> savedEntities;
     std::map<std::string, SavedComponentState> savedAssets;
 
-    for (const auto& [entity, components] : instances_) {
+    for (auto& [entity, components] : instances_) {
         auto& savedList = savedEntities[entity];
         savedList.reserve(components.size());
-        for (const auto& instance : components) {
+        for (auto& instance : components) {
             SavedComponentState saved;
             saved.canonicalTypeName = instance.object.type().canonicalName();
             saved.oldRef = instance.object.reference();
             saved.enabled = instance.enabled;
             saved.started = instance.started;
-            for (const auto& field : instance.object.type().descriptor.fields) {
+
+            const auto& oldTypeDesc = instance.object.type().descriptor;
+            std::unordered_map<std::string, runtime::Value> rawFields;
+            for (const auto& field : oldTypeDesc.fields) {
+                if (auto val = runtime_.heap()->fieldGet(
+                        instance.object.reference(), field.index)) {
+                    rawFields.emplace(field.name, std::move(*val));
+                }
+            }
+
+            // Evaluate each sequence declared on `oldTypeDesc`
+            static constexpr const char* kSeqStatePrefix = "$sequence_state_";
+            const std::size_t statePrefixLen = std::strlen(kSeqStatePrefix);
+            for (const auto& field : oldTypeDesc.fields) {
+                if (!field.synthetic ||
+                    field.name.size() <= statePrefixLen ||
+                    field.name.rfind(kSeqStatePrefix, 0) != 0) {
+                    continue;
+                }
+                const std::string seqName = field.name.substr(statePrefixLen);
+                const std::string timerFieldName = "$sequence_timer_" + seqName;
+
+                std::optional<runtime::Value> stateVal;
+                if (const auto sIt = rawFields.find(field.name); sIt != rawFields.end()) {
+                    stateVal = sIt->second;
+                }
+                std::optional<runtime::Value> timerVal;
+                if (const auto tIt = rawFields.find(timerFieldName); tIt != rawFields.end()) {
+                    timerVal = tIt->second;
+                }
+                const bool inFlight =
+                    isNonZeroSequenceValue(stateVal) || isNonZeroSequenceValue(timerVal);
+                if (!inFlight) continue;
+
+                // Resolve target owner canonical name in `newProgram`
+                std::string targetOwnerCanonical = saved.canonicalTypeName;
+                if (newProgramPtr) {
+                    bool existsDirect = false;
+                    for (const auto& mod : newProgramPtr->modules()) {
+                        for (const auto& t : mod.types) {
+                            if (semantic::canonicalTypeName(t) == saved.canonicalTypeName) {
+                                existsDirect = true;
+                                break;
+                            }
+                        }
+                        if (existsDirect) break;
+                    }
+                    if (!existsDirect && oldProgramPtr) {
+                        const std::string explicitGuid =
+                            findExplicitTypeGuidAttribute(oldProgramPtr.get(), saved.canonicalTypeName);
+                        if (!explicitGuid.empty()) {
+                            if (const auto gIt = newTypeNameByExplicitGuid.find(explicitGuid);
+                                gIt != newTypeNameByExplicitGuid.end()) {
+                                targetOwnerCanonical = gIt->second;
+                            }
+                        }
+                    }
+                }
+
+                const std::string oldSeqKey = saved.canonicalTypeName + "." + seqName;
+                const std::string newSeqKey = targetOwnerCanonical + "." + seqName;
+                const auto oSeqIt = oldSeqByName.find(oldSeqKey);
+                const auto nSeqIt = newSeqByName.find(newSeqKey);
+
+                bool canPreserveSeq = false;
+                if (oSeqIt != oldSeqByName.end() && nSeqIt != newSeqByName.end()) {
+                    if (targetOwnerCanonical == saved.canonicalTypeName) {
+                        canPreserveSeq = oSeqIt->second->matchesCoreStateMachine(*nSeqIt->second);
+                    } else {
+                        CoroutineStateMachineFingerprint normalizedOld = *oSeqIt->second;
+                        normalizedOld.canonicalName = newSeqKey;
+                        canPreserveSeq =
+                            (normalizedOld.returnTypeName == nSeqIt->second->returnTypeName &&
+                             normalizedOld.parameterNames == nSeqIt->second->parameterNames &&
+                             normalizedOld.parameterSlotTypes == nSeqIt->second->parameterSlotTypes &&
+                             normalizedOld.localSlotTypes == nSeqIt->second->localSlotTypes &&
+                             normalizedOld.referencedStructLayouts ==
+                                 nSeqIt->second->referencedStructLayouts &&
+                             normalizedOld.suspensionPointCount ==
+                                 nSeqIt->second->suspensionPointCount);
+                    }
+                    // Abort sequence if any sequence-owned field holds a non-component heap object
+                    // whose class layout changed in newProgram!
+                    if (canPreserveSeq && oldProgramPtr && newProgramPtr && runtime_.heap()) {
+                        std::unordered_map<std::string, std::uint64_t> oldMemo;
+                        std::unordered_map<std::string, std::uint64_t> newMemo;
+                        std::unordered_set<std::uint64_t> allSceneCompRefs;
+                        for (const auto& [entKey, compVec] : instances_) {
+                            (void)entKey;
+                            for (const auto& cInst : compVec) {
+                                const auto r = cInst.object.reference();
+                                if (r.valid()) {
+                                    allSceneCompRefs.insert(
+                                        (static_cast<std::uint64_t>(r.generation) << 32u) | r.slot);
+                                }
+                            }
+                        }
+                        for (const auto& [aPath, aObj] : runtime_.assets_) {
+                            (void)aPath;
+                            const auto r = aObj.reference();
+                            if (r.valid()) {
+                                allSceneCompRefs.insert(
+                                    (static_cast<std::uint64_t>(r.generation) << 32u) | r.slot);
+                            }
+                        }
+                        std::unordered_set<std::uint64_t> visitedObjs;
+                        const auto hasStaleHeapLayout = [&](const auto& self,
+                                                            const runtime::Value& val) -> bool {
+                            if (const auto* sTid = std::get_if<runtime::StructValue>(&val)) {
+                                if (sTid->valid()) {
+                                    const auto* oTd = oldProgramPtr->resolveType(sTid->typeId);
+                                    const auto* nTd = oTd
+                                        ? resolveProgramTypeByNameOrId(
+                                              *newProgramPtr,
+                                              0,
+                                              semantic::canonicalTypeName(*oTd))
+                                        : nullptr;
+                                    if (!oTd || !nTd) return true;
+                                    std::unordered_set<std::string> st1, st2;
+                                    if (computeRecursiveRecordOrStructLayoutHash(
+                                            *oldProgramPtr, *oTd, st1, oldMemo) !=
+                                        computeRecursiveRecordOrStructLayoutHash(
+                                            *newProgramPtr, *nTd, st2, newMemo)) {
+                                        return true;
+                                    }
+                                    const std::size_t fc = sTid->fieldCount();
+                                    for (std::size_t fi = 0; fi < fc; ++fi) {
+                                        if (const auto fv = runtime::structValueFieldAt(*sTid, fi)) {
+                                            if (self(self, *fv)) return true;
+                                        }
+                                    }
+                                }
+                                return false;
+                            }
+                            const auto* ref = std::get_if<runtime::ObjectRef>(&val);
+                            if (!ref || !ref->valid() || ref->kind == runtime::ObjectKind::String) {
+                                return false;
+                            }
+                            const std::uint64_t key =
+                                (static_cast<std::uint64_t>(ref->generation) << 32u) | ref->slot;
+                            if (!visitedObjs.insert(key).second) return false;
+                            if (ref->kind == runtime::ObjectKind::Array) {
+                                const auto len = runtime_.heap()->arrayLength(*ref).value_or(0);
+                                for (std::size_t ai = 0; ai < len; ++ai) {
+                                    if (const auto ev = runtime_.heap()->arrayGet(*ref, ai)) {
+                                        if (self(self, *ev)) return true;
+                                    }
+                                }
+                                return false;
+                            }
+                            if (allSceneCompRefs.find(key) == allSceneCompRefs.end()) {
+                                const auto oTid = runtime_.heap()->objectTypeId(*ref);
+                                const auto* oTd = oTid ? oldProgramPtr->resolveType(*oTid) : nullptr;
+                                const auto* nTd = oTd
+                                    ? resolveProgramTypeByNameOrId(
+                                          *newProgramPtr, 0, semantic::canonicalTypeName(*oTd))
+                                    : nullptr;
+                                if (!oTd || !nTd) return true;
+                                std::unordered_set<std::string> st1, st2;
+                                if (computeRecursiveRecordOrStructLayoutHash(
+                                        *oldProgramPtr, *oTd, st1, oldMemo) !=
+                                    computeRecursiveRecordOrStructLayoutHash(
+                                        *newProgramPtr, *nTd, st2, newMemo)) {
+                                    return true;
+                                }
+                                const auto fc = runtime_.heap()->fieldCount(*ref).value_or(0);
+                                for (std::size_t fi = 0; fi < fc; ++fi) {
+                                    if (const auto fv = runtime_.heap()->fieldGet(*ref, fi)) {
+                                        if (self(self, *fv)) return true;
+                                    }
+                                }
+                            }
+                            return false;
+                        };
+                        for (const auto& f : oldTypeDesc.fields) {
+                            if (auto fv = runtime_.heap()->fieldGet(
+                                    instance.object.reference(), f.index)) {
+                                if (hasStaleHeapLayout(hasStaleHeapLayout, *fv)) {
+                                    canPreserveSeq = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (canPreserveSeq) {
+                    ++report.preservedCoroutines;
+                    report.remappedCoroutineFunctionIndices[oSeqIt->second->functionIndex] =
+                        nSeqIt->second->functionIndex;
+                } else {
+                    if (const auto cancelMethod =
+                            runtime_.findMethod(instance.object.type(), "Cancel" + seqName, 0)) {
+                        (void)runtime_.invoke(instance.object, *cancelMethod, {}, executionOptions_);
+                    }
+                    for (const auto& ownedSeqField :
+                         collectSequenceOwnedFieldNames(oldTypeDesc, seqName)) {
+                        saved.abortedSequenceFields.insert(ownedSeqField);
+                    }
+                    ++report.abortedCoroutines;
+                }
+            }
+
+            // Re-snapshot fields after any selective sequence cancellations
+            for (const auto& field : oldTypeDesc.fields) {
+                if (saved.abortedSequenceFields.find(field.name) !=
+                    saved.abortedSequenceFields.end()) {
+                    continue;
+                }
                 auto val = runtime_.heap()->fieldGet(
                     instance.object.reference(), field.index);
                 if (val) {
@@ -1274,12 +2947,46 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         savedAssets.emplace(assetPath, std::move(saved));
     }
 
+    // Collect currently allocated `async Awaitable` CoroutineFrames in `CoroutineFramePool`
+    struct ActiveCoroCandidate {
+        runtime::CoroutineFrameHandle handle{};
+        runtime::CoroutineFrame* frame = nullptr;
+        const CoroutineStateMachineFingerprint* oldFp = nullptr;
+        const CoroutineStateMachineFingerprint* newFp = nullptr;
+    };
+    std::vector<ActiveCoroCandidate> activeCoroFrames;
+    const auto asyncCtx = runtime_.asyncRuntime();
+    if (asyncCtx) {
+        const auto stats = asyncCtx->coroutines().statistics();
+        if (stats.activeCount > 0) {
+            activeCoroFrames.reserve(stats.activeCount);
+            asyncCtx->coroutines().forEachActiveFrame(
+                [&](runtime::CoroutineFrameHandle handle, runtime::CoroutineFrame& f) {
+                    ActiveCoroCandidate cand;
+                    cand.handle = handle;
+                    cand.frame = &f;
+                    if (const auto oIt = oldAsyncBySymbol.find(f.functionSymbolId);
+                        oIt != oldAsyncBySymbol.end()) {
+                        cand.oldFp = oIt->second;
+                        if (const auto nIt = newAsyncByName.find(cand.oldFp->canonicalName);
+                            nIt != newAsyncByName.end()) {
+                            cand.newFp = nIt->second;
+                        }
+                    }
+                    activeCoroFrames.push_back(cand);
+                });
+        }
+    }
+
     runtime_.replaceProgram(newProgram);
     methodCache_.clear();
     sequenceCancelPlanCache_.clear();
-    tickOrderDirty_ = true;
+    cachedProgramForFuncIndex_ = nullptr;
+    functionIndexBySymbol_.clear();
+    markLifecycleCacheDirty();
 
     std::unordered_map<std::uint64_t, runtime::ObjectRef> migratedRefMap;
+    std::unordered_set<std::uint64_t> failedComponentOldRefs;
     std::unordered_map<std::string, std::optional<ScriptObject>> prototypeCache;
 
     const auto migrateSavedFieldsToNewObject = [&](
@@ -1287,6 +2994,7 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         const ScriptType& newType,
         const ScriptObject& newObj,
         runtime::RuntimeError& allocError) {
+        const std::string newCanonicalName = newType.canonicalName();
         for (const auto& newField : newType.descriptor.fields) {
             const bool isSequenceSynthetic =
                 newField.synthetic && newField.name.rfind("$sequence_", 0) == 0;
@@ -1306,8 +3014,12 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                 continue;
             }
 
-            const std::string oldFieldName = findRenamedFieldSource(
-                mergedMetadata, saved.canonicalTypeName, newField.name);
+            std::string oldFieldName = findRenamedFieldSource(
+                mergedMetadata, newCanonicalName, newField.name);
+            if (oldFieldName.empty() && newCanonicalName != saved.canonicalTypeName) {
+                oldFieldName = findRenamedFieldSource(
+                    mergedMetadata, saved.canonicalTypeName, newField.name);
+            }
             if (!oldFieldName.empty()) {
                 const auto renamedIt = saved.fields.find(oldFieldName);
                 if (renamedIt != saved.fields.end() &&
@@ -1326,12 +3038,12 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                 }
             }
             if (isInstanceField) {
-                auto protoIt = prototypeCache.find(saved.canonicalTypeName);
+                auto protoIt = prototypeCache.find(newCanonicalName);
                 if (protoIt == prototypeCache.end()) {
                     runtime::RuntimeError protoErr;
                     protoIt = prototypeCache
                                   .emplace(
-                                      saved.canonicalTypeName,
+                                      newCanonicalName,
                                       runtime_.createPrototypeObject(newType, protoErr))
                                   .first;
                 }
@@ -1354,14 +3066,24 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
             continue;
         }
         const auto& saved = savedIt->second;
-        const auto newType = runtime_.findType(saved.canonicalTypeName);
+        const auto newType = resolveReloadTargetType(saved.canonicalTypeName);
         if (!newType) {
+            if (saved.oldRef.valid()) {
+                failedComponentOldRefs.insert(
+                    (static_cast<std::uint64_t>(saved.oldRef.generation) << 32u) |
+                    saved.oldRef.slot);
+            }
             assetIt = runtime_.assets_.erase(assetIt);
             continue;
         }
         runtime::RuntimeError allocError;
         auto newObj = runtime_.allocateUninitializedObject(*newType, allocError);
         if (!newObj) {
+            if (saved.oldRef.valid()) {
+                failedComponentOldRefs.insert(
+                    (static_cast<std::uint64_t>(saved.oldRef.generation) << 32u) |
+                    saved.oldRef.slot);
+            }
             assetIt = runtime_.assets_.erase(assetIt);
             continue;
         }
@@ -1386,9 +3108,13 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         for (std::size_t idx = 0; idx < components.size(); ++idx) {
             auto& instance = components[idx];
             const auto& saved = savedList[idx];
-            const auto newType = runtime_.findType(saved.canonicalTypeName);
+            const auto newType = resolveReloadTargetType(saved.canonicalTypeName);
             if (!newType) {
-                cancelInstanceSequencesFast(instance);
+                if (saved.oldRef.valid()) {
+                    failedComponentOldRefs.insert(
+                        (static_cast<std::uint64_t>(saved.oldRef.generation) << 32u) |
+                        saved.oldRef.slot);
+                }
                 removeSignalsForEntityOrComponent(entity, saved.canonicalTypeName);
                 report.errors.push_back(
                     "script type '" + saved.canonicalTypeName +
@@ -1398,7 +3124,11 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
             runtime::RuntimeError allocError;
             auto newObj = runtime_.allocateUninitializedObject(*newType, allocError);
             if (!newObj) {
-                cancelInstanceSequencesFast(instance);
+                if (saved.oldRef.valid()) {
+                    failedComponentOldRefs.insert(
+                        (static_cast<std::uint64_t>(saved.oldRef.generation) << 32u) |
+                        saved.oldRef.slot);
+                }
                 removeSignalsForEntityOrComponent(entity, saved.canonicalTypeName);
                 report.errors.push_back(
                     "failed to allocate migrated instance of '" +
@@ -1422,9 +3152,9 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                 hasUnstartedPlayComponents_ = true;
             }
             bindLifecycleMethods(instance);
-            if (mergedMetadata.findTypeAttribute(saved.canonicalTypeName, "Tool") ||
-                mergedMetadata.findTypeAttribute(
-                    saved.canonicalTypeName, "ExecuteInEditMode")) {
+            const std::string newTypeCanon = instance.object.type().canonicalName();
+            if (mergedMetadata.findTypeAttribute(newTypeCanon, "Tool") ||
+                mergedMetadata.findTypeAttribute(newTypeCanon, "ExecuteInEditMode")) {
                 instance.executeInEditMode = true;
             }
             migratedComponents.push_back(std::move(instance));
@@ -1434,6 +3164,325 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
             instances_.erase(instIt);
         } else {
             components = std::move(migratedComponents);
+        }
+    }
+
+    // Reconcile in-flight `async Awaitable` CoroutineFrames, `AwaitableCorePool` payloads,
+    // and scene async request results (`eff_1`):
+    // - Preserve frames whose state-machine structural fingerprint matches in `newProgram`,
+    //   patching migrated `ObjectRef`s, remapping `functionSymbolId` & `functionIndex`,
+    //   refreshing GC roots, and rebinding resumption to `newProgram`.
+    // - Safely abort frames whose function was removed or whose state-machine layout changed
+    //   (deferring slot recycle via `invalidated = true` if currently active on the C++ stack).
+    if (asyncCtx || !asyncRequests_.empty() || !pendingAsyncCompletions_.empty()) {
+        std::unordered_map<std::string, std::uint64_t> oldCoroLayoutMemo;
+        std::unordered_map<std::string, std::uint64_t> newCoroLayoutMemo;
+        auto* heapForCheck = runtime_.heap().get();
+
+        const auto valueHasIncompatibleUnmigratedLayout = [&](
+            const auto& self,
+            const runtime::Value& val,
+            std::unordered_set<std::uint64_t>& visitedHeapObjs) -> bool {
+            if (!oldProgramPtr || !newProgramPtr) return true;
+            if (const auto* stVal = std::get_if<runtime::StructValue>(&val)) {
+                if (!stVal->valid()) return false;
+                if (stVal->typeId == runtime::awaitableVoidTypeId() ||
+                    stVal->typeId == runtime::whenAnyResultTypeId() ||
+                    stVal->typeId == runtime::fixedTypeId() ||
+                    stVal->typeId == runtime::fixed16TypeId() ||
+                    stVal->typeId == runtime::vec2TypeId() ||
+                    stVal->typeId == runtime::vec3TypeId() ||
+                    stVal->typeId == runtime::quatTypeId()) {
+                    return false;
+                }
+                const auto* oTd = oldProgramPtr->resolveType(stVal->typeId);
+                if (!oTd) return false;
+                const std::string canon = semantic::canonicalTypeName(*oTd);
+                if (canon.find("::Awaitable__") != std::string::npos) return false;
+                const auto* nTd = resolveProgramTypeByNameOrId(*newProgramPtr, 0, canon);
+                if (!nTd || nTd->kind != semantic::TypeKind::Struct) return true;
+                std::unordered_set<std::string> s1, s2;
+                if (computeRecursiveRecordOrStructLayoutHash(
+                        *oldProgramPtr, *oTd, s1, oldCoroLayoutMemo) !=
+                    computeRecursiveRecordOrStructLayoutHash(
+                        *newProgramPtr, *nTd, s2, newCoroLayoutMemo)) {
+                    return true;
+                }
+                const std::size_t fc = stVal->fieldCount();
+                for (std::size_t fi = 0; fi < fc; ++fi) {
+                    if (const auto fv = runtime::structValueFieldAt(*stVal, fi)) {
+                        if (self(self, *fv, visitedHeapObjs)) return true;
+                    }
+                }
+                return false;
+            }
+            const auto* objRef = std::get_if<runtime::ObjectRef>(&val);
+            if (!objRef || !objRef->valid() || !heapForCheck ||
+                objRef->kind == runtime::ObjectKind::String) {
+                return false;
+            }
+            const std::uint64_t rawKey =
+                (static_cast<std::uint64_t>(objRef->generation) << 32u) | objRef->slot;
+            if (failedComponentOldRefs.find(rawKey) != failedComponentOldRefs.end()) {
+                return true;
+            }
+            if (!visitedHeapObjs.insert(rawKey).second) {
+                return false;
+            }
+            // If this ObjectRef was migrated by SceneScriptRuntime (component or asset),
+            // traverse its newly-migrated target fields instead of rejecting it!
+            const auto migIt = migratedRefMap.find(rawKey);
+            if (migIt != migratedRefMap.end()) {
+                const runtime::ObjectRef newRef = migIt->second;
+                const auto fc = heapForCheck->fieldCount(newRef).value_or(0);
+                for (std::size_t fi = 0; fi < fc; ++fi) {
+                    if (const auto fv = heapForCheck->fieldGet(newRef, fi)) {
+                        if (self(self, *fv, visitedHeapObjs)) return true;
+                    }
+                }
+                return false;
+            }
+            if (objRef->kind == runtime::ObjectKind::Array) {
+                const auto len = heapForCheck->arrayLength(*objRef).value_or(0);
+                for (std::size_t ai = 0; ai < len; ++ai) {
+                    if (const auto ev = heapForCheck->arrayGet(*objRef, ai)) {
+                        if (self(self, *ev, visitedHeapObjs)) return true;
+                    }
+                }
+                return false;
+            }
+            // Non-component heap Record object: if its class layout changed (including nested
+            // class/struct fields), the old heap slot still has old field offsets -> MUST ABORT!
+            const auto oTid = heapForCheck->objectTypeId(*objRef);
+            const auto* oTd = oTid ? oldProgramPtr->resolveType(*oTid) : nullptr;
+            if (!oTd) return false;
+            const auto* nTd = resolveProgramTypeByNameOrId(
+                *newProgramPtr, 0, semantic::canonicalTypeName(*oTd));
+            if (!nTd || nTd->kind != semantic::TypeKind::Class) {
+                return true;
+            }
+            std::unordered_set<std::string> s1, s2;
+            if (computeRecursiveRecordOrStructLayoutHash(
+                    *oldProgramPtr, *oTd, s1, oldCoroLayoutMemo) !=
+                computeRecursiveRecordOrStructLayoutHash(
+                    *newProgramPtr, *nTd, s2, newCoroLayoutMemo)) {
+                return true;
+            }
+            const auto fc = heapForCheck->fieldCount(*objRef).value_or(0);
+            for (std::size_t fi = 0; fi < fc; ++fi) {
+                if (const auto fv = heapForCheck->fieldGet(*objRef, fi)) {
+                    if (self(self, *fv, visitedHeapObjs)) return true;
+                }
+            }
+            return false;
+        };
+
+        std::unordered_set<std::uint64_t> sharedAsyncPatchVisited;
+        const auto patchOrValidateAsyncValue = [&](runtime::Value& val) -> bool {
+            std::unordered_set<std::uint64_t> visitedCheck;
+            if (valueHasIncompatibleUnmigratedLayout(
+                    valueHasIncompatibleUnmigratedLayout, val, visitedCheck)) {
+                return false;
+            }
+            if (auto* stVal = std::get_if<runtime::StructValue>(&val)) {
+                if (stVal->valid() && oldProgramPtr && newProgramPtr) {
+                    if (const auto* oTd = oldProgramPtr->resolveType(stVal->typeId)) {
+                        if (const auto* nTd = resolveProgramTypeByNameOrId(
+                                *newProgramPtr, 0, semantic::canonicalTypeName(*oTd))) {
+                            stVal->typeId = nTd->id;
+                        }
+                    }
+                }
+            }
+            if (!migratedRefMap.empty()) {
+                (void)patchMigratedObjectRefsInValue(
+                    heapForCheck, val, migratedRefMap, sharedAsyncPatchVisited);
+            }
+            return true;
+        };
+        const auto patchOrValidateAsyncObjectRef = [&](runtime::ObjectRef& ref) -> bool {
+            runtime::Value tmp{ref};
+            if (!patchOrValidateAsyncValue(tmp)) {
+                return false;
+            }
+            if (const auto* outRef = std::get_if<runtime::ObjectRef>(&tmp)) {
+                ref = *outRef;
+            }
+            return true;
+        };
+
+        if (asyncCtx && !activeCoroFrames.empty()) {
+            std::vector<ActiveCoroCandidate> toPreserve;
+            std::vector<ActiveCoroCandidate> toAbort;
+            toPreserve.reserve(activeCoroFrames.size());
+            toAbort.reserve(activeCoroFrames.size());
+
+            for (const auto& cand : activeCoroFrames) {
+                bool compatible = false;
+                if (cand.frame != nullptr &&
+                    cand.frame->suspended &&
+                    !cand.frame->completed &&
+                    !cand.frame->invalidated &&
+                    !cand.frame->usesScalarBuffer &&
+                    cand.oldFp != nullptr &&
+                    cand.newFp != nullptr &&
+                    cand.oldFp->matchesCoreStateMachine(*cand.newFp)) {
+                    bool resumeBlockFound = false;
+                    for (const auto& sp : cand.newFp->suspensionPoints) {
+                        if (sp.resumeBlockId == cand.frame->resumeBlockId) {
+                            resumeBlockFound = true;
+                            break;
+                        }
+                    }
+                    bool heapObjectsSafe = true;
+                    std::unordered_set<std::uint64_t> visitedHeapObjs;
+                    for (const auto& argVal : cand.frame->savedArguments) {
+                        if (valueHasIncompatibleUnmigratedLayout(
+                                valueHasIncompatibleUnmigratedLayout, argVal, visitedHeapObjs)) {
+                            heapObjectsSafe = false;
+                            break;
+                        }
+                    }
+                    for (std::size_t li = 0;
+                         heapObjectsSafe && li < cand.frame->savedLocals.size();
+                         ++li) {
+                        if (valueHasIncompatibleUnmigratedLayout(
+                                valueHasIncompatibleUnmigratedLayout,
+                                cand.frame->savedLocals[li],
+                                visitedHeapObjs)) {
+                            heapObjectsSafe = false;
+                        }
+                    }
+                    for (std::size_t ri = 0;
+                         heapObjectsSafe && ri < cand.frame->savedRegisters.size();
+                         ++ri) {
+                        if (valueHasIncompatibleUnmigratedLayout(
+                                valueHasIncompatibleUnmigratedLayout,
+                                cand.frame->savedRegisters[ri],
+                                visitedHeapObjs)) {
+                            heapObjectsSafe = false;
+                        }
+                    }
+                    if (heapObjectsSafe && heapForCheck &&
+                        !cand.oldFp->matchesLayout(*cand.newFp)) {
+                        // Check static fields on heap in case a non-component heap object with
+                        // mutated layout is held in a static field referenced after resume.
+                        for (const auto sfId : heapForCheck->staticFieldIds()) {
+                            if (const auto sfVal = heapForCheck->getStaticField(sfId)) {
+                                if (valueHasIncompatibleUnmigratedLayout(
+                                        valueHasIncompatibleUnmigratedLayout, *sfVal, visitedHeapObjs)) {
+                                    heapObjectsSafe = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    compatible = resumeBlockFound && heapObjectsSafe;
+                }
+
+                if (compatible) {
+                    toPreserve.push_back(cand);
+                } else {
+                    toAbort.push_back(cand);
+                }
+            }
+
+            if (toPreserve.empty()) {
+                const std::size_t abortedNow = asyncCtx->coroutines().abortAllSuspendedFrames();
+                report.abortedCoroutines += abortedNow;
+            } else {
+                // 1. Abort only incompatible frames
+                for (const auto& bad : toAbort) {
+                    auto* curFrame = asyncCtx->coroutines().resolve(bad.handle);
+                    if (!curFrame || curFrame->invalidated) continue;
+                    const runtime::AwaitableHandle completion = curFrame->completionHandle;
+                    const runtime::AwaitableHandle awaited = curFrame->awaitedHandle;
+                    if (!curFrame->suspended && !curFrame->completed) {
+                        curFrame->invalidated = true;
+                        curFrame->awaitedHandle = runtime::AwaitableHandle::invalid();
+                    } else {
+                        asyncCtx->coroutines().recycleFrame(bad.handle);
+                    }
+                    ++report.abortedCoroutines;
+
+                    if (awaited.valid() && !awaited.isCompletedVoidSentinel()) {
+                        (void)asyncCtx->awaitables().discard(awaited);
+                    }
+                    if (completion.valid() && !completion.isCompletedVoidSentinel()) {
+                        (void)asyncCtx->awaitables().trySetCanceled(completion);
+                    }
+                }
+
+                // 2. Remap & rebind preserved frames
+                auto* heap = runtime_.heap().get();
+                std::unordered_set<std::uint64_t> coroPatchVisited;
+                for (const auto& good : toPreserve) {
+                    auto* curFrame = asyncCtx->coroutines().resolve(good.handle);
+                    if (!curFrame) continue;
+
+                    curFrame->functionSymbolId = good.newFp->symbolId;
+                    curFrame->returnStructTypeId = good.newFp->returnTypeId;
+                    report.remappedCoroutineFunctionIndices[good.oldFp->functionIndex] =
+                        good.newFp->functionIndex;
+
+                    if (!migratedRefMap.empty()) {
+                        for (auto& argVal : curFrame->savedArguments) {
+                            (void)patchMigratedObjectRefsInValue(
+                                heap, argVal, migratedRefMap, coroPatchVisited);
+                        }
+                        for (auto& locVal : curFrame->savedLocals) {
+                            (void)patchMigratedObjectRefsInValue(
+                                heap, locVal, migratedRefMap, coroPatchVisited);
+                        }
+                        for (auto& regVal : curFrame->savedRegisters) {
+                            (void)patchMigratedObjectRefsInValue(
+                                heap, regVal, migratedRefMap, coroPatchVisited);
+                        }
+                    }
+                    curFrame->savedRegisters.resize(good.newFp->registerSlotCount, runtime::Value{});
+
+                    auto bridge = createHotReloadCoroBridge(
+                        newProgram,
+                        runtime_.bindings_,
+                        runtime_.debugger_,
+                        runtime_.heap(),
+                        asyncCtx,
+                        executionOptions_,
+                        curFrame->resumeCallback,
+                        curFrame->runnerContext,
+                        curFrame->runnerOwner);
+                    if (bridge) {
+                        curFrame->resumeCallback = &HotReloadCoroBridge::onResume;
+                        curFrame->runnerContext = bridge.get();
+                        curFrame->runnerOwner = std::move(bridge);
+                    }
+
+                    ++report.preservedCoroutines;
+                }
+
+                // 3. Refresh CoroutineFramePool GC roots so migrated V2 ObjectRefs are pinned
+                //    and superseded V1 ObjectRefs are unpinned cleanly.
+                asyncCtx->coroutines().setHeap(nullptr);
+                asyncCtx->coroutines().setHeap(heap);
+                asyncCtx->coroutines().notePoolRootsPotentiallyModified();
+            }
+        }
+
+        if (asyncCtx) {
+            asyncCtx->awaitables().reconcileValuesOnHotReload(
+                patchOrValidateAsyncValue,
+                patchOrValidateAsyncObjectRef);
+        }
+        for (auto& [reqId, entry] : asyncRequests_) {
+            (void)reqId;
+            if (!patchOrValidateAsyncValue(entry.result)) {
+                entry.result = runtime::Value{};
+            }
+        }
+        for (auto& item : pendingAsyncCompletions_) {
+            if (!patchOrValidateAsyncValue(item.result)) {
+                item.result = runtime::Value{};
+            }
         }
     }
 
@@ -1918,7 +3967,7 @@ bool SceneScriptRuntime::setParent(SceneEntityId child, SceneEntityId parent) {
         if (nowActiveInHierarchy) {
             hasUnstartedPlayComponents_ = true;
         }
-        tickOrderDirty_ = true;
+        markLifecycleCacheDirty();
         const auto notifyNodeComponents = [&](SceneEntityId nodeId, bool becomingActive) {
             if (!becomingActive && fiberScheduler_) {
                 const std::uint32_t nodeGen = entityIdGeneration(nodeId);
@@ -1957,6 +4006,7 @@ bool SceneScriptRuntime::setParent(SceneEntityId child, SceneEntityId parent) {
             }
         };
         notifySubtree(notifySubtree, child);
+        markLifecycleCacheDirty();
     }
     return true;
 }
@@ -2197,7 +4247,7 @@ SceneEntityId SceneScriptRuntime::instantiatePrefab(
             instances_.erase(eid);
         }
         nextEntityId = initialNextEntityId;
-        tickOrderDirty_ = true;
+        markLifecycleCacheDirty();
         return BroadcastTarget;
     }
 
@@ -2258,7 +4308,7 @@ SceneEntityId SceneScriptRuntime::instantiatePrefab(
         }
     }
 
-    tickOrderDirty_ = true;
+    markLifecycleCacheDirty();
     invalidateTransformSubtree(rootEntityId);
     return rootEntityId;
 }
@@ -2415,9 +4465,9 @@ std::size_t SceneScriptRuntime::emitSignal(
             const auto* method = findCachedMethod(
                 targetInst.object.type(), conn.targetMethod, arguments.size());
             if (!method) {
-                runtime::RuntimeError missingErr{
-                    runtime::ErrorCode::FunctionNotFound,
-                    "script callback '" + conn.targetMethod + "' was not found"};
+                runtime::RuntimeError missingErr;
+                missingErr.code = runtime::ErrorCode::FunctionNotFound;
+                missingErr.message = "script callback '" + conn.targetMethod + "' was not found";
                 recordError(conn.targetEntity, conn.targetMethod, missingErr);
                 break;
             }

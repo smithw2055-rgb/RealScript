@@ -156,7 +156,7 @@ class Behavior
 void testSceneDriverAndContracts() {
     GameApi api;
     GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"runtime_test.rs", behaviorSource}});
+    auto compiled = compiler.compile({{"runtime_test.rscript", behaviorSource}});
     require(compiled.succeeded(),
         "gameplay scene fixture failed to compile:\n" +
         diagnosticsText(compiled.diagnostics));

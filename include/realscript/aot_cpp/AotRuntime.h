@@ -85,9 +85,47 @@ template <typename FieldT>
             std::memcpy(&v, ptr, sizeof(v));
             return v;
         }
-        std::int32_t i32 = 0;
-        std::memcpy(&i32, ptr, sizeof(i32));
-        return static_cast<std::int64_t>(i32);
+        switch (field.kind) {
+        case runtime::NativeFieldKind::Int8: {
+            std::int8_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::int64_t>(v);
+        }
+        case runtime::NativeFieldKind::UInt8: {
+            std::uint8_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::int64_t>(v);
+        }
+        case runtime::NativeFieldKind::Int16: {
+            std::int16_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::int64_t>(v);
+        }
+        case runtime::NativeFieldKind::UInt16: {
+            std::uint16_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::int64_t>(v);
+        }
+        case runtime::NativeFieldKind::UInt32: {
+            std::uint32_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::int64_t>(v);
+        }
+        case runtime::NativeFieldKind::UInt64: {
+            std::uint64_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::int64_t>(v);
+        }
+        default: {
+            std::int32_t i32 = 0;
+            std::memcpy(&i32, ptr, sizeof(i32));
+            return static_cast<std::int64_t>(i32);
+        }
+        }
+    } else if constexpr (std::is_same_v<FieldT, runtime::Fixed16Value>) {
+        std::int16_t raw = 0;
+        std::memcpy(&raw, ptr, sizeof(raw));
+        return runtime::Fixed16Value{raw};
     } else {
         FieldT v{};
         std::memcpy(&v, ptr, sizeof(FieldT));
@@ -120,8 +158,46 @@ inline void writeRawColumnField(
             std::memcpy(ptr, &value, sizeof(value));
             return;
         }
-        const std::int32_t i32 = static_cast<std::int32_t>(value);
-        std::memcpy(ptr, &i32, sizeof(i32));
+        switch (field.kind) {
+        case runtime::NativeFieldKind::Int8: {
+            const auto v = static_cast<std::int8_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::UInt8: {
+            const auto v = static_cast<std::uint8_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::Int16: {
+            const auto v = static_cast<std::int16_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::UInt16: {
+            const auto v = static_cast<std::uint16_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::UInt32: {
+            const auto v = static_cast<std::uint32_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::UInt64: {
+            const auto v = static_cast<std::uint64_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        default: {
+            const std::int32_t i32 = static_cast<std::int32_t>(value);
+            std::memcpy(ptr, &i32, sizeof(i32));
+            return;
+        }
+        }
+    } else if constexpr (std::is_same_v<FieldT, runtime::Fixed16Value>) {
+        const auto raw = static_cast<std::int16_t>(value.raw);
+        std::memcpy(ptr, &raw, sizeof(raw));
     } else {
         std::memcpy(ptr, &value, sizeof(FieldT));
     }

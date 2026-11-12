@@ -28,7 +28,7 @@ std::vector<realscript::bytecode::Module> compile(
 void testProgramImageLinksOnce() {
     realscript::runtime::RuntimeError error;
     auto image = realscript::runtime::ProgramImage::link(
-        compile({{"main.rs", "module Demo; int main() { return 42; }"}}), error);
+        compile({{"main.rscript", "module Demo; int main() { return 42; }"}}), error);
     require(image.has_value(), "program image linking failed");
     require(image->moduleCount() == 1, "unexpected module count");
     require(image->functionCount() == 1, "unexpected function count");
@@ -36,7 +36,7 @@ void testProgramImageLinksOnce() {
 }
 
 void testRuntimeImageIndexesSurviveMove() {
-    auto modules = compile({{"indexed.rs", R"(
+    auto modules = compile({{"indexed.rscript", R"(
 module Demo.Indexed;
 class Box
 {
@@ -84,7 +84,7 @@ int main() { Box box = new Box(42); return box.Read(); }
 }
 
 void testDuplicateSymbolsRejected() {
-    auto modules = compile({{"main.rs", "module Demo; int main() { return 1; }"}});
+    auto modules = compile({{"main.rscript", "module Demo; int main() { return 1; }"}});
     auto duplicate = modules.front();
     duplicate.name = "Other";
     realscript::runtime::RuntimeError error;
@@ -94,7 +94,7 @@ void testDuplicateSymbolsRejected() {
 }
 
 void testQualifiedOverloadsLinkBySymbolIdentity() {
-    auto modules = compile({{"overloads.rs", R"(
+    auto modules = compile({{"overloads.rscript", R"(
 module Demo;
 int Pick(int value) { return value; }
 int Pick(bool value) { if (value) return 2; return 0; }
@@ -161,7 +161,7 @@ void testBindingRegistryByName() {
 void testTraceAndStatistics() {
     realscript::runtime::RuntimeError error;
     auto image = realscript::runtime::ProgramImage::link(
-        compile({{"trace.rs", "module Demo; int twice(int x) { return x * 2; } int main() { return twice(21); }"}}), error);
+        compile({{"trace.rscript", "module Demo; int twice(int x) { return x * 2; } int main() { return twice(21); }"}}), error);
     require(image.has_value(), "trace image failed to link");
     realscript::runtime::EngineRuntime runtime(
         std::make_shared<realscript::runtime::ProgramImage>(std::move(*image)));
@@ -180,7 +180,7 @@ void testTraceAndStatistics() {
 }
 
 void testBranchStatisticsDeterministic() {
-    auto modules = compile({{"flow.rs", "module Demo; int main() { int x = 3; while (x > 0) x = x - 1; return x; }"}});
+    auto modules = compile({{"flow.rscript", "module Demo; int main() { int x = 3; while (x > 0) x = x - 1; return x; }"}});
     realscript::runtime::RuntimeError error;
     auto image = realscript::runtime::ProgramImage::link(std::move(modules), error);
     require(image.has_value(), "flow image failed to link");

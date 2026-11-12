@@ -38,7 +38,7 @@ async function startLanguageClient(context: vscode.ExtensionContext): Promise<vo
       { scheme: 'untitled', language: 'realscript' },
     ],
     synchronize: {
-      fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{rs,d.rs}'),
+      fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{rscript,d.rscript}'),
     },
     outputChannelName: 'RealScript Language Server',
   };
@@ -91,7 +91,7 @@ class RealScriptDebugConfigurationProvider implements vscode.DebugConfigurationP
           config.program = [editor.document.uri.fsPath];
         } else {
           vscode.window.showErrorMessage(
-            'RealScript Launch requires at least one .rs source file in "program".'
+            'RealScript Launch requires at least one .rscript source file in "program".'
           );
           return undefined;
         }

@@ -789,6 +789,7 @@ struct VariableDeclarationStatementSyntax final : StatementSyntax {
     std::optional<SyntaxToken> initializerRefKeyword;
     std::unique_ptr<ExpressionSyntax> initializer;
     SyntaxToken semicolonToken;
+    bool isUsingDeclaration = false;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::VariableDeclarationStatement; }
     [[nodiscard]] text::TextSpan span() const noexcept override;
@@ -1069,6 +1070,7 @@ struct FunctionDeclarationSyntax final : SyntaxNode {
     SyntaxToken closeParenToken;
     std::optional<SyntaxToken> semicolonToken;
     BlockStatementSyntax body;
+    std::vector<std::string> hygienicModules;
 
     [[nodiscard]] bool hasBody() const noexcept { return !semicolonToken.has_value(); }
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::FunctionDeclaration; }
@@ -1279,11 +1281,41 @@ private:
         std::vector<std::optional<SyntaxToken>>* argumentNames = nullptr,
         std::vector<std::optional<SyntaxToken>>* argumentNameColonTokens = nullptr);
     [[nodiscard]] bool isVariableDeclarationStart() const noexcept;
+    [[nodiscard]] bool isVariableDeclarationStartAt(
+        std::size_t baseOffset,
+        bool requireInitializer = false) const noexcept;
+    [[nodiscard]] std::size_t moduleQualifiedIdentLength(std::size_t baseOffset = 0) const noexcept;
+    [[nodiscard]] SyntaxToken consumeModuleQualifiedIdentifier();
+    [[nodiscard]] bool isUsingDeclarationStart() const noexcept;
+    void parseStatementSequence(
+        std::vector<std::unique_ptr<StatementSyntax>>& statements,
+        bool stopAtSwitchLabel);
+    [[nodiscard]] std::unique_ptr<TryStatementSyntax> buildUsingTryStatement(
+        const SyntaxToken& usingToken,
+        const SyntaxToken& resourceToken,
+        BlockStatementSyntax tryBody,
+        text::TextSpan endSpan) const;
 
     const text::SourceText& source_;
     diagnostics::DiagnosticBag& diagnostics_;
     std::vector<SyntaxToken> tokens_;
     std::size_t position_ = 0;
 };
+
+
+[[nodiscard]] TypeSyntax cloneTypeSyntax(const TypeSyntax& value);
+[[nodiscard]] std::unique_ptr<ExpressionSyntax> cloneExpressionSyntax(const ExpressionSyntax& value);
+[[nodiscard]] std::unique_ptr<StatementSyntax> cloneStatementSyntax(const StatementSyntax& value);
+[[nodiscard]] BlockStatementSyntax cloneBlockStatementSyntax(const BlockStatementSyntax& value);
+[[nodiscard]] ParameterSyntax cloneParameterSyntax(const ParameterSyntax& value);
+[[nodiscard]] FieldDeclarationSyntax cloneFieldDeclarationSyntax(const FieldDeclarationSyntax& value);
+[[nodiscard]] ConstructorDeclarationSyntax cloneConstructorDeclarationSyntax(const ConstructorDeclarationSyntax& value);
+[[nodiscard]] PropertyDeclarationSyntax clonePropertyDeclarationSyntax(const PropertyDeclarationSyntax& value);
+[[nodiscard]] SequenceDeclarationSyntax cloneSequenceDeclarationSyntax(const SequenceDeclarationSyntax& value);
+[[nodiscard]] FunctionDeclarationSyntax cloneFunctionDeclarationSyntax(const FunctionDeclarationSyntax& value);
+[[nodiscard]] ClassDeclarationSyntax cloneClassDeclarationSyntax(const ClassDeclarationSyntax& value);
+[[nodiscard]] StructDeclarationSyntax cloneStructDeclarationSyntax(const StructDeclarationSyntax& value);
+[[nodiscard]] InterfaceDeclarationSyntax cloneInterfaceDeclarationSyntax(const InterfaceDeclarationSyntax& value);
+[[nodiscard]] DelegateDeclarationSyntax cloneDelegateDeclarationSyntax(const DelegateDeclarationSyntax& value);
 
 } // namespace realscript::syntax

@@ -480,12 +480,74 @@ CancellationPoolStatistics CancellationTokenPool::statistics() const noexcept {
 // AwaitableCorePool
 // ============================================================================
 
+namespace {
+
+inline bool isPoolBackedAsyncValue(const Value& v) noexcept {
+    const auto t = v.rawTag();
+    return t >= ValueTag::FirstTraceable && t != ValueTag::ObjectRef;
+}
+
+struct PoolRootSyncLock {
+    const std::shared_ptr<void>& sync;
+    explicit PoolRootSyncLock(const std::shared_ptr<void>& s) : sync(s) {
+        detail::lockValuePoolRootSync(sync);
+    }
+    ~PoolRootSyncLock() noexcept {
+        detail::unlockValuePoolRootSync(sync);
+    }
+    PoolRootSyncLock(const PoolRootSyncLock&) = delete;
+    PoolRootSyncLock& operator=(const PoolRootSyncLock&) = delete;
+};
+
+} // namespace
+
+bool AwaitableCorePool::markPoolRootsCallback(void* rawSelf) {
+    auto* self = static_cast<AwaitableCorePool*>(rawSelf);
+    if (!self) return false;
+    bool foundAny = false;
+    const auto markOne = [&](const Value& v) {
+        if (isPoolBackedAsyncValue(v)) {
+            foundAny = true;
+            markValueInPools(v);
+        }
+    };
+    for (std::uint32_t i = 0; i < self->nextNeverUsedSlot_; ++i) {
+        const auto& slot = self->slotAt(i);
+        if (!slot.allocated) continue;
+        markOne(slot.result);
+        if (slot.dirtyCold && slot.cold) {
+            markOne(slot.cold->exceptionObject);
+            if (slot.cold->hasWhenAnyMetadata) {
+                markOne(slot.cold->whenAnyWinnerValue);
+            }
+        }
+    }
+    for (const auto& comb : self->combinators_) {
+        if (!comb.allocated || comb.resolved) continue;
+        for (const auto& v : comb.values) {
+            markOne(v);
+        }
+    }
+    return foundAny;
+}
+
+void AwaitableCorePool::pinPoolBackedValueIfNeeded(const Value& value) {
+    if (!isPoolBackedAsyncValue(value)) return;
+    if (!poolRootSyncActive_) {
+        poolRootSyncActive_ = true;
+        detail::activateValuePoolRootSync(poolRootSync_);
+    }
+    pinValueInPools(value);
+}
+
 AwaitableCorePool::AwaitableCorePool(
     ManagedHeap* heap,
     CancellationTokenPool* cancellationPool,
     std::size_t initialReserve)
     : heap_(heap),
-      cancellationPool_(cancellationPool) {
+      cancellationPool_(cancellationPool),
+      poolRootSync_(detail::createValuePoolRootSync(
+          this, &AwaitableCorePool::markPoolRootsCallback)) {
     if (initialReserve > 0) {
         const std::size_t pagesNeeded = (initialReserve + kPageSize - 1u) / kPageSize;
         pages_.reserve(pagesNeeded);
@@ -502,6 +564,7 @@ AwaitableCorePool::AwaitableCorePool(
 
 AwaitableCorePool::~AwaitableCorePool() noexcept {
     clear();
+    detail::detachValuePoolRootSyncOwner(poolRootSync_);
 }
 
 void AwaitableCorePool::setHeap(ManagedHeap* heap) noexcept {
@@ -565,6 +628,103 @@ void AwaitableCorePool::setCancellationPool(
     cancellationPool_ = cancellationPool;
 }
 
+void AwaitableCorePool::reconcileValuesOnHotReload(
+    const std::function<bool(Value&)>& patchOrValidateValue,
+    const std::function<bool(ObjectRef&)>& patchOrValidateObjectRef) {
+    for (std::uint32_t i = 0; i < nextNeverUsedSlot_; ++i) {
+        auto& slot = slotAt(i);
+        if (!slot.allocated) continue;
+
+        if (slot.status == AwaitStatus::Succeeded) {
+            if (patchOrValidateValue && !patchOrValidateValue(slot.result)) {
+                releaseRootToken(slot.resultRootToken);
+                {
+                    PoolRootSyncLock syncLock(poolRootSync_);
+                    slot.result = Value{};
+                    slot.status = AwaitStatus::Faulted;
+                    slot.errorCode = ErrorCode::TypeMismatch;
+                    if (!slot.cold) slot.cold = std::make_unique<ColdSlotState>();
+                    slot.dirtyCold = true;
+                    slot.cold->errorMessage =
+                        "awaitable result type layout was invalidated by hot reload";
+                    slot.cold->exceptionObject = Value{};
+                    slot.cold->hasWhenAnyMetadata = false;
+                    slot.cold->whenAnyWinnerValue = Value{};
+                }
+                if (slot.cold) {
+                    releaseRootToken(slot.cold->exceptionRootToken);
+                }
+            } else {
+                pinPoolBackedValueIfNeeded(slot.result);
+                pinValueIfNeeded(slot.result, slot.resultRootToken);
+            }
+        }
+
+        if (slot.dirtyCold && slot.cold) {
+            if (patchOrValidateValue && !patchOrValidateValue(slot.cold->exceptionObject)) {
+                releaseRootToken(slot.cold->exceptionRootToken);
+                PoolRootSyncLock syncLock(poolRootSync_);
+                slot.cold->exceptionObject = Value{};
+            } else {
+                pinPoolBackedValueIfNeeded(slot.cold->exceptionObject);
+                pinValueIfNeeded(slot.cold->exceptionObject, slot.cold->exceptionRootToken);
+            }
+            if (slot.cold->hasWhenAnyMetadata) {
+                if (patchOrValidateValue &&
+                    !patchOrValidateValue(slot.cold->whenAnyWinnerValue)) {
+                    PoolRootSyncLock syncLock(poolRootSync_);
+                    slot.cold->whenAnyWinnerValue = Value{};
+                    slot.cold->whenAnyWinnerStatus = AwaitStatus::Faulted;
+                    slot.cold->whenAnyWinnerErrorCode = ErrorCode::TypeMismatch;
+                } else {
+                    pinPoolBackedValueIfNeeded(slot.cold->whenAnyWinnerValue);
+                }
+            }
+        }
+
+        if (slot.hasContinuation && slot.continuation.scriptTarget.valid() &&
+            patchOrValidateObjectRef) {
+            releaseRootToken(slot.continuationTargetRootToken);
+            if (!patchOrValidateObjectRef(slot.continuation.scriptTarget)) {
+                slot.continuation.scriptTarget = ObjectRef{};
+            } else if (heap_ && slot.continuation.scriptTarget.valid()) {
+                slot.continuationTargetRootToken =
+                    heap_->addPersistentRoot(slot.continuation.scriptTarget);
+                if (slot.continuationTargetRootToken != 0) {
+                    ++activeGcRoots_;
+                }
+            }
+        }
+    }
+
+    for (auto& comb : combinators_) {
+        if (!comb.allocated || comb.resolved) continue;
+        bool failedComb = false;
+        for (std::size_t i = 0; i < comb.values.size(); ++i) {
+            if (patchOrValidateValue && !patchOrValidateValue(comb.values[i])) {
+                failedComb = true;
+                break;
+            }
+            pinPoolBackedValueIfNeeded(comb.values[i]);
+            if (i < comb.valueRootTokens.size()) {
+                pinValueIfNeeded(comb.values[i], comb.valueRootTokens[i]);
+            }
+        }
+        if (failedComb) {
+            comb.resolved = true;
+            if (comb.parentCancelReg.valid() && cancellationPool_) {
+                cancellationPool_->unregisterCallback(comb.parentCancelReg);
+                comb.parentCancelReg = CancellationRegistration{};
+            }
+            releaseCombinatorValues(comb);
+            (void)trySetFaulted(
+                comb.parentHandle,
+                ErrorCode::TypeMismatch,
+                "combinator child result layout was invalidated by hot reload");
+        }
+    }
+}
+
 bool AwaitableCorePool::canRegisterContinuation(AwaitableHandle handle) const noexcept {
     if (handle.isCompletedVoidSentinel()) return true;
     if (!isValid(handle)) return false;
@@ -572,6 +732,7 @@ bool AwaitableCorePool::canRegisterContinuation(AwaitableHandle handle) const no
 }
 
 std::uint32_t AwaitableCorePool::allocateRawSlot(ResumeQueue defaultQueue) {
+    PoolRootSyncLock syncLock(poolRootSync_);
     std::uint32_t slotIndex = 0;
     if (!freeSlots_.empty()) {
         slotIndex = freeSlots_.back();
@@ -648,23 +809,29 @@ void AwaitableCorePool::recycleSlotAt(std::uint32_t slotIndex) noexcept {
 
     releaseRootToken(slot.resultRootToken);
     releaseRootToken(slot.continuationTargetRootToken);
-    if (slot.dirtyCold && slot.cold) {
-        slot.cold->resetHot(heap_, activeGcRoots_);
-        slot.dirtyCold = false;
+    ManagedHeap::RootToken coldExcToken = 0;
+    {
+        PoolRootSyncLock syncLock(poolRootSync_);
+        if (slot.dirtyCold && slot.cold) {
+            coldExcToken = slot.cold->exceptionRootToken;
+            slot.cold->exceptionRootToken = 0;
+            slot.cold->resetHot(nullptr, activeGcRoots_);
+            slot.dirtyCold = false;
+        }
+        slot.result = Value{};
+        if (slot.hasContinuation) {
+            slot.hasContinuation = false;
+            slot.continuation = AsyncContinuation{};
+        }
+        slot.autoRecycleOnComplete = false;
+        slot.errorCode = ErrorCode::None;
+        slot.allocated = false;
+        slot.status = AwaitStatus::Pending;
+        slot.version = nextNonZeroVersion(slot.version);
+        freeSlots_.push_back(slotIndex);
+        ++totalRecycled_;
     }
-
-    slot.result = Value{};
-    if (slot.hasContinuation) {
-        slot.hasContinuation = false;
-        slot.continuation = AsyncContinuation{};
-    }
-    slot.autoRecycleOnComplete = false;
-    slot.errorCode = ErrorCode::None;
-    slot.allocated = false;
-    slot.status = AwaitStatus::Pending;
-    slot.version = nextNonZeroVersion(slot.version);
-    freeSlots_.push_back(slotIndex);
-    ++totalRecycled_;
+    releaseRootToken(coldExcToken);
 }
 
 void AwaitableCorePool::onTokenCanceledCallback(
@@ -710,10 +877,14 @@ AwaitableHandle AwaitableCorePool::fromResult(Value value) {
         ++synchronousFastPathHits_;
         return AwaitableHandle::completedVoid();
     }
+    pinPoolBackedValueIfNeeded(value);
     const std::uint32_t slotIndex = allocateRawSlot(ResumeQueue::Update);
     auto& slot = slotAt(slotIndex);
-    slot.status = AwaitStatus::Succeeded;
-    slot.result = std::move(value);
+    {
+        PoolRootSyncLock syncLock(poolRootSync_);
+        slot.status = AwaitStatus::Succeeded;
+        slot.result = std::move(value);
+    }
     if (heap_ && slot.result.isTraceable()) {
         pinValueIfNeeded(slot.result, slot.resultRootToken);
     }
@@ -725,14 +896,18 @@ AwaitableHandle AwaitableCorePool::fromFaulted(
     ErrorCode code,
     std::string message,
     Value exceptionObject) {
+    pinPoolBackedValueIfNeeded(exceptionObject);
     const std::uint32_t slotIndex = allocateRawSlot(ResumeQueue::Update);
     auto& slot = slotAt(slotIndex);
-    slot.status = AwaitStatus::Faulted;
-    slot.errorCode = code == ErrorCode::None ? ErrorCode::ScriptException : code;
-    if (!slot.cold) slot.cold = std::make_unique<ColdSlotState>();
-    slot.dirtyCold = true;
-    slot.cold->errorMessage = std::move(message);
-    slot.cold->exceptionObject = std::move(exceptionObject);
+    {
+        PoolRootSyncLock syncLock(poolRootSync_);
+        slot.status = AwaitStatus::Faulted;
+        slot.errorCode = code == ErrorCode::None ? ErrorCode::ScriptException : code;
+        if (!slot.cold) slot.cold = std::make_unique<ColdSlotState>();
+        slot.dirtyCold = true;
+        slot.cold->errorMessage = std::move(message);
+        slot.cold->exceptionObject = std::move(exceptionObject);
+    }
     if (heap_ && slot.cold->exceptionObject.isTraceable()) {
         pinValueIfNeeded(slot.cold->exceptionObject, slot.cold->exceptionRootToken);
     }
@@ -817,9 +992,13 @@ bool AwaitableCorePool::trySetResult(AwaitableHandle handle, Value value) {
     auto& slot = slotAt(handle.slot);
     if (slot.status != AwaitStatus::Pending) return false;
 
+    pinPoolBackedValueIfNeeded(value);
     detachCancellation(slot);
-    slot.status = AwaitStatus::Succeeded;
-    slot.result = std::move(value);
+    {
+        PoolRootSyncLock syncLock(poolRootSync_);
+        slot.status = AwaitStatus::Succeeded;
+        slot.result = std::move(value);
+    }
     if (heap_ && slot.result.isTraceable()) {
         pinValueIfNeeded(slot.result, slot.resultRootToken);
     }
@@ -836,13 +1015,17 @@ bool AwaitableCorePool::trySetFaulted(
     auto& slot = slotAt(handle.slot);
     if (slot.status != AwaitStatus::Pending) return false;
 
+    pinPoolBackedValueIfNeeded(exceptionObject);
     detachCancellation(slot);
-    slot.status = AwaitStatus::Faulted;
-    slot.errorCode = code == ErrorCode::None ? ErrorCode::ScriptException : code;
-    if (!slot.cold) slot.cold = std::make_unique<ColdSlotState>();
-    slot.dirtyCold = true;
-    slot.cold->errorMessage = std::move(message);
-    slot.cold->exceptionObject = std::move(exceptionObject);
+    {
+        PoolRootSyncLock syncLock(poolRootSync_);
+        slot.status = AwaitStatus::Faulted;
+        slot.errorCode = code == ErrorCode::None ? ErrorCode::ScriptException : code;
+        if (!slot.cold) slot.cold = std::make_unique<ColdSlotState>();
+        slot.dirtyCold = true;
+        slot.cold->errorMessage = std::move(message);
+        slot.cold->exceptionObject = std::move(exceptionObject);
+    }
     if (heap_ && slot.cold->exceptionObject.isTraceable()) {
         pinValueIfNeeded(slot.cold->exceptionObject, slot.cold->exceptionRootToken);
     }
@@ -1088,6 +1271,7 @@ std::size_t AwaitableCorePool::cancelContinuationsForContext(
 }
 
 std::uint32_t AwaitableCorePool::allocateCombinatorSlot() {
+    PoolRootSyncLock syncLock(poolRootSync_);
     std::uint32_t combIdx = 0;
     if (!freeCombinators_.empty()) {
         combIdx = freeCombinators_.back();
@@ -1117,6 +1301,7 @@ void AwaitableCorePool::releaseCombinatorValues(CombinatorSlot& comb) noexcept {
         releaseRootToken(token);
     }
     comb.valueRootTokens.clear();
+    PoolRootSyncLock syncLock(poolRootSync_);
     comb.values.clear();
 }
 
@@ -1130,11 +1315,14 @@ void AwaitableCorePool::recycleCombinatorSlot(std::uint32_t combIndex) noexcept 
         comb.parentCancelReg = CancellationRegistration{};
     }
     releaseCombinatorValues(comb);
-    comb.allocated = false;
-    comb.resolved = false;
-    comb.parentHandle = AwaitableHandle::invalid();
-    comb.cancelLosersSource = CancellationSourceHandle{};
-    freeCombinators_.push_back(combIndex);
+    {
+        PoolRootSyncLock syncLock(poolRootSync_);
+        comb.allocated = false;
+        comb.resolved = false;
+        comb.parentHandle = AwaitableHandle::invalid();
+        comb.cancelLosersSource = CancellationSourceHandle{};
+        freeCombinators_.push_back(combIndex);
+    }
 }
 
 void AwaitableCorePool::onCombinatorCanceledCallback(
@@ -1219,9 +1407,11 @@ void AwaitableCorePool::handleWhenAllChild(
             trySetCanceled(comb.parentHandle);
         } else {
             if (childIndex < comb.values.size()) {
+                pinPoolBackedValueIfNeeded(childValue);
                 if (heap_ && childValue.isTraceable()) {
                     pinValueIfNeeded(childValue, comb.valueRootTokens[childIndex]);
                 }
+                PoolRootSyncLock syncLock(poolRootSync_);
                 comb.values[childIndex] = std::move(childValue);
             }
             if (comb.remainingToComplete > 0) {
@@ -1304,7 +1494,15 @@ void AwaitableCorePool::handleWhenAnyChild(
         if (comb.returnWinnerIndex) {
             trySetResult(parent, Value(static_cast<std::int64_t>(childIndex)));
         } else {
+            Value payloadForTuple =
+                (childStatus == AwaitStatus::Faulted &&
+                 std::holds_alternative<std::monostate>(childValue) &&
+                 !std::holds_alternative<std::monostate>(childException))
+                    ? std::move(childException)
+                    : std::move(childValue);
+            pinPoolBackedValueIfNeeded(payloadForTuple);
             if (isValid(parent) && !parent.isCompletedVoidSentinel()) {
+                PoolRootSyncLock syncLock(poolRootSync_);
                 auto& parentSlot = slotAt(parent.slot);
                 if (!parentSlot.cold) {
                     parentSlot.cold = std::make_unique<ColdSlotState>();
@@ -1315,16 +1513,7 @@ void AwaitableCorePool::handleWhenAnyChild(
                 parentSlot.cold->whenAnyWinnerStatus = childStatus;
                 parentSlot.cold->whenAnyWinnerErrorCode = childError.code;
                 parentSlot.cold->whenAnyWinnerErrorMessage = childError.message;
-            }
-
-            Value payloadForTuple =
-                (childStatus == AwaitStatus::Faulted &&
-                 std::holds_alternative<std::monostate>(childValue) &&
-                 !std::holds_alternative<std::monostate>(childException))
-                    ? std::move(childException)
-                    : std::move(childValue);
-            if (isValid(parent) && !parent.isCompletedVoidSentinel()) {
-                slotAt(parent.slot).cold->whenAnyWinnerValue = payloadForTuple;
+                parentSlot.cold->whenAnyWinnerValue = payloadForTuple;
             }
             trySetResult(parent, std::move(payloadForTuple));
         }
@@ -1411,7 +1600,10 @@ AwaitableHandle AwaitableCorePool::whenAll(
     combinators_[combIdx].totalChildren = count;
     combinators_[combIdx].remainingToComplete = count;
     combinators_[combIdx].unconsumedCallbacks = count;
-    combinators_[combIdx].values.resize(count);
+    {
+        PoolRootSyncLock syncLock(poolRootSync_);
+        combinators_[combIdx].values.resize(count);
+    }
     combinators_[combIdx].valueRootTokens.assign(count, 0);
 
     if (cancellationPool_ && options.token.canBeCanceled()) {
@@ -1626,8 +1818,6 @@ void AwaitableCorePool::clear() noexcept {
     for (auto& comb : combinators_) {
         releaseCombinatorValues(comb);
     }
-    combinators_.clear();
-    freeCombinators_.clear();
 
     for (std::uint32_t i = 0; i < nextNeverUsedSlot_; ++i) {
         auto& slot = slotAt(i);
@@ -1637,10 +1827,15 @@ void AwaitableCorePool::clear() noexcept {
             releaseRootToken(slot.cold->exceptionRootToken);
         }
     }
-    pages_.clear();
-    slotCapacity_ = 0;
-    nextNeverUsedSlot_ = 0;
-    freeSlots_.clear();
+    {
+        PoolRootSyncLock syncLock(poolRootSync_);
+        combinators_.clear();
+        freeCombinators_.clear();
+        pages_.clear();
+        slotCapacity_ = 0;
+        nextNeverUsedSlot_ = 0;
+        freeSlots_.clear();
+    }
     activeGcRoots_ = 0;
     totalAllocated_ = 0;
     totalRecycled_ = 0;
@@ -1669,6 +1864,35 @@ AwaitablePoolStatistics AwaitableCorePool::statistics() const noexcept {
 // ============================================================================
 // AsyncCompletionQueue
 // ============================================================================
+
+bool AsyncCompletionQueue::markPoolRootsCallback(void* rawSelf) {
+    auto* self = static_cast<AsyncCompletionQueue*>(rawSelf);
+    if (!self) return false;
+    bool foundAny = false;
+    std::lock_guard<std::mutex> lock(self->inboxMutex_);
+    for (const auto& pkt : self->inbox_) {
+        if (pkt.kind == AsyncPayloadKind::Scalar && isPoolBackedAsyncValue(pkt.scalarValue)) {
+            foundAny = true;
+            markValueInPools(pkt.scalarValue);
+        }
+    }
+    for (const auto& v : self->inFlightDrainValues_) {
+        if (isPoolBackedAsyncValue(v)) {
+            foundAny = true;
+            markValueInPools(v);
+        }
+    }
+    return foundAny;
+}
+
+AsyncCompletionQueue::AsyncCompletionQueue()
+    : poolRootSync_(detail::createValuePoolRootSync(
+          this, &AsyncCompletionQueue::markPoolRootsCallback)) {}
+
+AsyncCompletionQueue::~AsyncCompletionQueue() noexcept {
+    reset();
+    detail::detachValuePoolRootSyncOwner(poolRootSync_);
+}
 
 AsyncRequestId AsyncCompletionQueue::registerRequest(
     AwaitableHandle target,
@@ -1727,6 +1951,10 @@ void AsyncCompletionQueue::submitScalar(
     } else {
         pkt.kind = AsyncPayloadKind::Scalar;
         pkt.scalarValue = std::move(scalarOrInlineStruct);
+        if (isPoolBackedAsyncValue(pkt.scalarValue)) {
+            detail::activateValuePoolRootSync(poolRootSync_);
+            pinValueInPools(pkt.scalarValue);
+        }
     }
     std::lock_guard<std::mutex> lock(inboxMutex_);
     inbox_.push_back(std::move(pkt));
@@ -1785,6 +2013,7 @@ void AsyncCompletionQueue::reset() noexcept {
         std::lock_guard<std::mutex> lock(inboxMutex_);
         inbox_.clear();
         swapBuffer_.clear();
+        inFlightDrainValues_.clear();
     }
     pendingRequests_.clear();
     nextRequestId_ = 1;
@@ -2053,10 +2282,25 @@ AsyncDrainResult AsyncCompletionQueue::drainToMainThread(
     swapBuffer_.clear();
     {
         std::lock_guard<std::mutex> lock(inboxMutex_);
+        inFlightDrainValues_.clear();
         if (!inbox_.empty()) {
             swapBuffer_.swap(inbox_);
+            for (const auto& pkt : swapBuffer_) {
+                if (pkt.kind == AsyncPayloadKind::Scalar &&
+                    isPoolBackedAsyncValue(pkt.scalarValue)) {
+                    inFlightDrainValues_.push_back(pkt.scalarValue);
+                }
+            }
         }
     }
+    struct ClearInFlightGuard {
+        std::mutex& mtx;
+        std::vector<Value>& vec;
+        ~ClearInFlightGuard() noexcept {
+            std::lock_guard<std::mutex> lk(mtx);
+            vec.clear();
+        }
+    } clearInFlightGuard{inboxMutex_, inFlightDrainValues_};
 
     if (swapBuffer_.size() > 1) {
         std::sort(
@@ -2161,12 +2405,61 @@ AsyncDrainResult AsyncCompletionQueue::drainToMainThread(
 // CoroutineFramePool & RealScript.Async Runtime Bridge
 // ============================================================================
 
+bool CoroutineFramePool::markPoolRootsCallback(void* rawSelf) {
+    auto* self = static_cast<CoroutineFramePool*>(rawSelf);
+    if (!self) return false;
+    bool foundAny = false;
+    const auto markVec = [&](const std::vector<Value>& vec) {
+        for (const auto& v : vec) {
+            if (isPoolBackedAsyncValue(v)) {
+                foundAny = true;
+                markValueInPools(v);
+            }
+        }
+    };
+    for (const auto& slot : self->slots_) {
+        if (!slot.allocated) continue;
+        markVec(slot.frame.savedArguments);
+        markVec(slot.frame.savedLocals);
+        markVec(slot.frame.savedRegisters);
+    }
+    return foundAny;
+}
+
+void CoroutineFramePool::notePoolRootsPotentiallyModified() {
+    if (!poolRootSyncActive_) {
+        poolRootSyncActive_ = true;
+        detail::activateValuePoolRootSync(poolRootSync_);
+    }
+    PoolRootSyncLock syncLock(poolRootSync_);
+    for (const auto& slot : slots_) {
+        if (!slot.allocated) continue;
+        for (const auto& v : slot.frame.savedArguments) {
+            if (isPoolBackedAsyncValue(v)) pinValueInPools(v);
+        }
+        for (const auto& v : slot.frame.savedLocals) {
+            if (isPoolBackedAsyncValue(v)) pinValueInPools(v);
+        }
+        for (const auto& v : slot.frame.savedRegisters) {
+            if (isPoolBackedAsyncValue(v)) pinValueInPools(v);
+        }
+    }
+}
+
 CoroutineFramePool::CoroutineFramePool(
     ManagedHeap* heap,
     AsyncRuntimeContext* ownerContext,
     std::size_t initialReserve)
-    : heap_(heap), ownerContext_(ownerContext) {
+    : heap_(heap),
+      ownerContext_(ownerContext),
+      poolRootSync_(detail::createValuePoolRootSync(
+          this, &CoroutineFramePool::markPoolRootsCallback)) {
     freeSlots_.reserve(initialReserve);
+}
+
+CoroutineFramePool::~CoroutineFramePool() noexcept {
+    clear();
+    detail::detachValuePoolRootSyncOwner(poolRootSync_);
 }
 
 void CoroutineFramePool::setHeap(ManagedHeap* heap) noexcept {
@@ -2204,35 +2497,42 @@ CoroutineFrameHandle CoroutineFramePool::allocateFrame(
     semantic::SymbolId returnStructTypeId,
     AwaitableHandle completionHandle,
     ResumeQueue resumeQueue) {
+    std::shared_ptr<const void> oldRunnerOwner;
     std::uint32_t idx = 0;
-    if (!freeSlots_.empty()) {
-        idx = freeSlots_.back();
-        freeSlots_.pop_back();
-    } else {
-        idx = static_cast<std::uint32_t>(slots_.size());
-        slots_.emplace_back();
+    std::uint32_t ver = 1;
+    {
+        PoolRootSyncLock syncLock(poolRootSync_);
+        if (!freeSlots_.empty()) {
+            idx = freeSlots_.back();
+            freeSlots_.pop_back();
+        } else {
+            idx = static_cast<std::uint32_t>(slots_.size());
+            slots_.emplace_back();
+        }
+        auto& slot = slots_[idx];
+        slot.allocated = true;
+        slot.frame.functionSymbolId = functionSymbolId;
+        slot.frame.returnStructTypeId = returnStructTypeId;
+        slot.frame.completionHandle = completionHandle;
+        slot.frame.awaitedHandle = AwaitableHandle::invalid();
+        slot.frame.resumeBlockId = 0;
+        slot.frame.resumeQueue = resumeQueue;
+        slot.frame.suspended = false;
+        slot.frame.completed = false;
+        slot.frame.invalidated = false;
+        slot.frame.usesScalarBuffer = false;
+        slot.frame.scalarByteSize = 0;
+        slot.frame.resumeCallback = nullptr;
+        slot.frame.runnerContext = nullptr;
+        oldRunnerOwner = std::move(slot.frame.runnerOwner);
+        slot.frame.overflowScalarBytes.clear();
+        slot.frame.savedArguments.clear();
+        slot.frame.savedLocals.clear();
+        slot.frame.savedRegisters.clear();
+        ver = slot.version;
+        ++totalAllocated_;
     }
-    auto& slot = slots_[idx];
-    slot.allocated = true;
-    slot.frame.functionSymbolId = functionSymbolId;
-    slot.frame.returnStructTypeId = returnStructTypeId;
-    slot.frame.completionHandle = completionHandle;
-    slot.frame.awaitedHandle = AwaitableHandle::invalid();
-    slot.frame.resumeBlockId = 0;
-    slot.frame.resumeQueue = resumeQueue;
-    slot.frame.suspended = false;
-    slot.frame.completed = false;
-    slot.frame.usesScalarBuffer = false;
-    slot.frame.scalarByteSize = 0;
-    slot.frame.resumeCallback = nullptr;
-    slot.frame.runnerContext = nullptr;
-    slot.frame.runnerOwner.reset();
-    slot.frame.overflowScalarBytes.clear();
-    slot.frame.savedArguments.clear();
-    slot.frame.savedLocals.clear();
-    slot.frame.savedRegisters.clear();
-    ++totalAllocated_;
-    return CoroutineFrameHandle{idx, slot.version};
+    return CoroutineFrameHandle{idx, ver};
 }
 
 CoroutineFrame* CoroutineFramePool::resolve(CoroutineFrameHandle handle) noexcept {
@@ -2272,9 +2572,28 @@ void CoroutineFramePool::snapshotAndPinValues(
     std::size_t regCount) {
     releasePinnedRoots(slot);
 
-    slot.frame.savedArguments.assign(args, args + argCount);
-    slot.frame.savedLocals.assign(locals, locals + localCount);
-    slot.frame.savedRegisters.assign(regs, regs + regCount);
+    bool anyPoolBacked = false;
+    {
+        PoolRootSyncLock syncLock(poolRootSync_);
+        slot.frame.savedArguments.assign(args, args + argCount);
+        slot.frame.savedLocals.assign(locals, locals + localCount);
+        slot.frame.savedRegisters.assign(regs, regs + regCount);
+    }
+    const auto pinPoolRange = [&](const std::vector<Value>& vec) {
+        for (const auto& v : vec) {
+            if (isPoolBackedAsyncValue(v)) {
+                anyPoolBacked = true;
+                pinValueInPools(v);
+            }
+        }
+    };
+    pinPoolRange(slot.frame.savedArguments);
+    pinPoolRange(slot.frame.savedLocals);
+    pinPoolRange(slot.frame.savedRegisters);
+    if (anyPoolBacked && !poolRootSyncActive_) {
+        poolRootSyncActive_ = true;
+        detail::activateValuePoolRootSync(poolRootSync_);
+    }
 
     if (!heap_) return;
     auto pinRange = [&](const std::vector<Value>& vec) {
@@ -2309,7 +2628,7 @@ bool CoroutineFramePool::suspendFrame(
     if (!ownerContext_ || !resumeCallback) return false;
     if (!handle.valid() || handle.slot >= slots_.size()) return false;
     auto& slot = slots_[handle.slot];
-    if (!slot.allocated || slot.version != handle.version) return false;
+    if (!slot.allocated || slot.version != handle.version || slot.frame.invalidated) return false;
 
     snapshotAndPinValues(slot, args, argCount, locals, localCount, regs, regCount);
     slot.frame.usesScalarBuffer = false;
@@ -2354,38 +2673,48 @@ bool CoroutineFramePool::suspendScalarFrame(
     if (!ownerContext_ || !resumeCallback) return false;
     if (!handle.valid() || handle.slot >= slots_.size()) return false;
     auto& slot = slots_[handle.slot];
-    if (!slot.allocated || slot.version != handle.version) return false;
+    if (!slot.allocated || slot.version != handle.version || slot.frame.invalidated) return false;
 
     releasePinnedRoots(slot);
-    if (!slot.frame.savedArguments.empty()) slot.frame.savedArguments.clear();
-    if (!slot.frame.savedRegisters.empty()) slot.frame.savedRegisters.clear();
+    bool anyPoolBacked = false;
+    {
+        PoolRootSyncLock syncLock(poolRootSync_);
+        if (!slot.frame.savedArguments.empty()) slot.frame.savedArguments.clear();
+        if (!slot.frame.savedRegisters.empty()) slot.frame.savedRegisters.clear();
 
-    slot.frame.usesScalarBuffer = true;
-    slot.frame.scalarByteSize = static_cast<std::uint32_t>(scalarByteSize);
-    if (scalarByteSize > 0 && scalarData != nullptr) {
-        if (scalarByteSize <= CoroutineFrame::kInlineScalarBytes) {
-            std::memcpy(slot.frame.inlineScalarBytes.data(), scalarData, scalarByteSize);
-        } else {
-            slot.frame.overflowScalarBytes.resize(scalarByteSize);
-            std::memcpy(slot.frame.overflowScalarBytes.data(), scalarData, scalarByteSize);
-        }
-    }
-
-    if (refCount > 0 && refSlots != nullptr) {
-        slot.frame.savedLocals.assign(refSlots, refSlots + refCount);
-        if (heap_) {
-            for (const auto& v : slot.frame.savedLocals) {
-                if (valueNeedsManagedHeapRoot(v)) {
-                    const auto tok = heap_->addPersistentRoot(v);
-                    if (tok != 0) {
-                        ++activeGcRoots_;
-                        slot.pinnedRootTokens.push_back(tok);
-                    }
-                }
+        slot.frame.usesScalarBuffer = true;
+        slot.frame.scalarByteSize = static_cast<std::uint32_t>(scalarByteSize);
+        if (scalarByteSize > 0 && scalarData != nullptr) {
+            if (scalarByteSize <= CoroutineFrame::kInlineScalarBytes) {
+                std::memcpy(slot.frame.inlineScalarBytes.data(), scalarData, scalarByteSize);
+            } else {
+                slot.frame.overflowScalarBytes.resize(scalarByteSize);
+                std::memcpy(slot.frame.overflowScalarBytes.data(), scalarData, scalarByteSize);
             }
         }
-    } else if (!slot.frame.savedLocals.empty()) {
-        slot.frame.savedLocals.clear();
+
+        if (refCount > 0 && refSlots != nullptr) {
+            slot.frame.savedLocals.assign(refSlots, refSlots + refCount);
+        } else if (!slot.frame.savedLocals.empty()) {
+            slot.frame.savedLocals.clear();
+        }
+    }
+    for (const auto& v : slot.frame.savedLocals) {
+        if (isPoolBackedAsyncValue(v)) {
+            anyPoolBacked = true;
+            pinValueInPools(v);
+        }
+        if (heap_ && valueNeedsManagedHeapRoot(v)) {
+            const auto tok = heap_->addPersistentRoot(v);
+            if (tok != 0) {
+                ++activeGcRoots_;
+                slot.pinnedRootTokens.push_back(tok);
+            }
+        }
+    }
+    if (anyPoolBacked && !poolRootSyncActive_) {
+        poolRootSyncActive_ = true;
+        detail::activateValuePoolRootSync(poolRootSync_);
     }
 
     slot.frame.resumeBlockId = resumeBlockId;
@@ -2442,10 +2771,15 @@ void CoroutineFramePool::onAwaitedCompletedCallback(
                 if (postSlot.frame.completionHandle.valid() &&
                     self->ownerContext_->awaitables().status(postSlot.frame.completionHandle) ==
                         AwaitStatus::Pending) {
-                    (void)self->ownerContext_->awaitables().trySetFaulted(
-                        postSlot.frame.completionHandle,
-                        ErrorCode::InvalidProgram,
-                        "resumed coroutine terminated without resolving completion handle");
+                    if (postSlot.frame.invalidated) {
+                        (void)self->ownerContext_->awaitables().trySetCanceled(
+                            postSlot.frame.completionHandle);
+                    } else {
+                        (void)self->ownerContext_->awaitables().trySetFaulted(
+                            postSlot.frame.completionHandle,
+                            ErrorCode::InvalidProgram,
+                            "resumed coroutine terminated without resolving completion handle");
+                    }
                 }
             }
             if (postSlot.frame.completed || !postSlot.frame.suspended) {
@@ -2461,21 +2795,26 @@ void CoroutineFramePool::recycleFrame(CoroutineFrameHandle handle) noexcept {
     if (!slot.allocated || slot.version != handle.version) return;
 
     releasePinnedRoots(slot);
-    slot.frame.usesScalarBuffer = false;
-    slot.frame.scalarByteSize = 0;
-    slot.frame.overflowScalarBytes.clear();
-    slot.frame.savedArguments.clear();
-    slot.frame.savedLocals.clear();
-    slot.frame.savedRegisters.clear();
-    slot.frame.runnerOwner.reset();
-    slot.frame.resumeCallback = nullptr;
-    slot.frame.runnerContext = nullptr;
-    slot.frame.suspended = false;
-    slot.frame.completed = false;
-    slot.allocated = false;
-    slot.version = nextNonZeroVersion(slot.version);
-    freeSlots_.push_back(handle.slot);
-    ++totalRecycled_;
+    std::shared_ptr<const void> oldRunnerOwner;
+    {
+        PoolRootSyncLock syncLock(poolRootSync_);
+        slot.frame.usesScalarBuffer = false;
+        slot.frame.scalarByteSize = 0;
+        slot.frame.overflowScalarBytes.clear();
+        slot.frame.savedArguments.clear();
+        slot.frame.savedLocals.clear();
+        slot.frame.savedRegisters.clear();
+        oldRunnerOwner = std::move(slot.frame.runnerOwner);
+        slot.frame.resumeCallback = nullptr;
+        slot.frame.runnerContext = nullptr;
+        slot.frame.suspended = false;
+        slot.frame.completed = false;
+        slot.frame.invalidated = false;
+        slot.allocated = false;
+        slot.version = nextNonZeroVersion(slot.version);
+        freeSlots_.push_back(handle.slot);
+        ++totalRecycled_;
+    }
 }
 
 std::size_t CoroutineFramePool::abortAllSuspendedFrames() {
@@ -2483,7 +2822,7 @@ std::size_t CoroutineFramePool::abortAllSuspendedFrames() {
     std::vector<CoroutineFrameHandle> activeHandles;
     activeHandles.reserve(slots_.size());
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(slots_.size()); ++i) {
-        if (slots_[i].allocated) {
+        if (slots_[i].allocated && !slots_[i].frame.invalidated) {
             activeHandles.push_back(CoroutineFrameHandle{i, slots_[i].version});
         }
     }
@@ -2497,11 +2836,19 @@ std::size_t CoroutineFramePool::abortAllSuspendedFrames() {
     for (const auto handle : activeHandles) {
         if (handle.slot >= slots_.size()) continue;
         auto& slot = slots_[handle.slot];
-        if (!slot.allocated || slot.version != handle.version) continue;
+        if (!slot.allocated || slot.version != handle.version || slot.frame.invalidated) continue;
 
         const AwaitableHandle completion = slot.frame.completionHandle;
         const AwaitableHandle awaited = slot.frame.awaitedHandle;
-        recycleFrame(handle);
+        if (!slot.frame.suspended && !slot.frame.completed) {
+            // Frame is actively executing on the C++ call stack; defer slot recycling until
+            // `onAwaitedCompletedCallback` unwinds so stack references stay valid.
+            slot.frame.invalidated = true;
+            slot.frame.awaitedHandle = AwaitableHandle::invalid();
+            releasePinnedRoots(slot);
+        } else {
+            recycleFrame(handle);
+        }
         ++aborted;
 
         if (ownerContext_) {
@@ -2517,16 +2864,24 @@ std::size_t CoroutineFramePool::abortAllSuspendedFrames() {
 }
 
 void CoroutineFramePool::clear() noexcept {
+    std::vector<std::shared_ptr<const void>> oldOwners;
     for (auto& slot : slots_) {
         if (slot.allocated) {
             releasePinnedRoots(slot);
-            slot.frame.runnerOwner.reset();
-            slot.allocated = false;
-            slot.version = nextNonZeroVersion(slot.version);
+            oldOwners.push_back(std::move(slot.frame.runnerOwner));
         }
     }
-    slots_.clear();
-    freeSlots_.clear();
+    {
+        PoolRootSyncLock syncLock(poolRootSync_);
+        for (auto& slot : slots_) {
+            if (slot.allocated) {
+                slot.allocated = false;
+                slot.version = nextNonZeroVersion(slot.version);
+            }
+        }
+        slots_.clear();
+        freeSlots_.clear();
+    }
     activeGcRoots_ = 0;
     totalAllocated_ = 0;
     totalRecycled_ = 0;

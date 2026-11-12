@@ -288,7 +288,9 @@ void Parser::parseGenericConstraintClauses(
 
 TypeSyntax Parser::parseType() {
     TypeSyntax result;
-    if (isIdentifierLike(current().kind)) {
+    if (moduleQualifiedIdentLength(0) > 0) {
+        result.name = consumeModuleQualifiedIdentifier();
+    } else if (isIdentifierLike(current().kind)) {
         result.name = nextToken();
     } else {
         result.name = match(SyntaxKind::IdentifierToken);
@@ -323,6 +325,19 @@ TypeSyntax Parser::parseType() {
         peek(1).kind == SyntaxKind::CloseBracketToken) {
         result.openBracketToken = nextToken();
         result.closeBracketToken = nextToken();
+        bool reportedJagged = false;
+        while (current().kind == SyntaxKind::OpenBracketToken &&
+               peek(1).kind == SyntaxKind::CloseBracketToken) {
+            const auto extraOpen = nextToken();
+            const auto extraClose = nextToken();
+            if (!reportedJagged) {
+                diagnostics_.report(
+                    "RS8511",
+                    "jagged / nested array type (rank > 1) is not supported",
+                    text::TextSpan::fromBounds(extraOpen.span.start, extraClose.span.end()));
+                reportedJagged = true;
+            }
+        }
     }
     return result;
 }
@@ -1227,20 +1242,134 @@ EnumDeclarationSyntax Parser::parseEnumDeclaration(
     return result;
 }
 
-BlockStatementSyntax Parser::parseBlockStatement() {
-    BlockStatementSyntax result;
-    result.openBraceToken = match(SyntaxKind::OpenBraceToken);
+std::unique_ptr<TryStatementSyntax> Parser::buildUsingTryStatement(
+    const SyntaxToken& usingToken,
+    const SyntaxToken& resourceToken,
+    BlockStatementSyntax tryBody,
+    text::TextSpan endSpan) const {
+    auto disposeCall = std::make_unique<MemberCallExpressionSyntax>();
+    auto receiver = std::make_unique<NameExpressionSyntax>();
+    receiver->identifierToken = resourceToken;
+    disposeCall->receiver = std::move(receiver);
+    disposeCall->dotToken = {
+        SyntaxKind::DotToken, resourceToken.span, ".", {}, false};
+    disposeCall->nameToken = {
+        SyntaxKind::IdentifierToken, resourceToken.span, "Dispose", {}, false};
+    disposeCall->openParenToken = {
+        SyntaxKind::OpenParenToken, resourceToken.span, "(", {}, false};
+    disposeCall->closeParenToken = {
+        SyntaxKind::CloseParenToken, resourceToken.span, ")", {}, false};
 
-    while (current().kind != SyntaxKind::CloseBraceToken &&
-           current().kind != SyntaxKind::EndOfFileToken) {
+    auto disposeStmt = std::make_unique<ExpressionStatementSyntax>();
+    disposeStmt->expression = std::move(disposeCall);
+    disposeStmt->semicolonToken = {
+        SyntaxKind::SemicolonToken, resourceToken.span, ";", {}, false};
+
+    BlockStatementSyntax finallyBlock;
+    finallyBlock.openBraceToken = {
+        SyntaxKind::OpenBraceToken, endSpan, "{", {}, false};
+    finallyBlock.statements.push_back(std::move(disposeStmt));
+    finallyBlock.closeBraceToken = {
+        SyntaxKind::CloseBraceToken, endSpan, "}", {}, false};
+
+    auto tryStmt = std::make_unique<TryStatementSyntax>();
+    tryStmt->tryKeyword = {
+        SyntaxKind::TryKeyword, usingToken.span, "try", {}, false};
+    tryStmt->body = std::move(tryBody);
+    tryStmt->finallyKeyword = {
+        SyntaxKind::FinallyKeyword, endSpan, "$using_finally", {}, false};
+    tryStmt->finallyBody = std::move(finallyBlock);
+    return tryStmt;
+}
+
+void Parser::parseStatementSequence(
+    std::vector<std::unique_ptr<StatementSyntax>>& statements,
+    bool stopAtSwitchLabel) {
+    const auto atSequenceEnd = [&]() noexcept {
+        const auto kind = current().kind;
+        if (kind == SyntaxKind::CloseBraceToken ||
+            kind == SyntaxKind::EndOfFileToken) {
+            return true;
+        }
+        if (stopAtSwitchLabel &&
+            (kind == SyntaxKind::CaseKeyword ||
+             kind == SyntaxKind::DefaultKeyword)) {
+            return true;
+        }
+        return false;
+    };
+
+    while (!atSequenceEnd()) {
+        if (isUsingDeclarationStart()) {
+            const auto usingToken = nextToken();
+            auto declaredType = parseType();
+            std::vector<std::unique_ptr<VariableDeclarationStatementSyntax>> decls;
+            do {
+                auto varDecl = std::make_unique<VariableDeclarationStatementSyntax>();
+                varDecl->isUsingDeclaration = true;
+                varDecl->type = declaredType;
+                varDecl->identifierToken = match(SyntaxKind::IdentifierToken);
+                if (current().kind == SyntaxKind::EqualsToken) {
+                    varDecl->equalsToken = nextToken();
+                    varDecl->initializer = parseExpression();
+                } else {
+                    diagnostics_.report(
+                        "RS1125",
+                        "using declaration requires an initializer",
+                        varDecl->identifierToken.span);
+                }
+                decls.push_back(std::move(varDecl));
+            } while (current().kind == SyntaxKind::CommaToken &&
+                     (nextToken(), true));
+            const auto semiToken = match(SyntaxKind::SemicolonToken);
+            for (auto& d : decls) {
+                d->semicolonToken = semiToken;
+            }
+
+            BlockStatementSyntax restBlock;
+            restBlock.openBraceToken = {
+                SyntaxKind::OpenBraceToken, semiToken.span, "{", {}, false};
+            parseStatementSequence(restBlock.statements, stopAtSwitchLabel);
+            const auto tailSpan = current().span.empty() ? semiToken.span : current().span;
+            restBlock.closeBraceToken = {
+                SyntaxKind::CloseBraceToken, tailSpan, "}", {}, false};
+
+            BlockStatementSyntax currentBody = std::move(restBlock);
+            for (std::size_t idx = decls.size(); idx > 0; --idx) {
+                auto& decl = decls[idx - 1];
+                const auto varToken = decl->identifierToken;
+                auto wrappedTry = buildUsingTryStatement(
+                    usingToken, varToken, std::move(currentBody), tailSpan);
+                if (idx == 1) {
+                    statements.push_back(std::move(decl));
+                    statements.push_back(std::move(wrappedTry));
+                } else {
+                    BlockStatementSyntax nextBody;
+                    nextBody.openBraceToken = {
+                        SyntaxKind::OpenBraceToken, varToken.span, "{", {}, false};
+                    nextBody.statements.push_back(std::move(decl));
+                    nextBody.statements.push_back(std::move(wrappedTry));
+                    nextBody.closeBraceToken = {
+                        SyntaxKind::CloseBraceToken, tailSpan, "}", {}, false};
+                    currentBody = std::move(nextBody);
+                }
+            }
+            return;
+        }
+
         const auto before = position_;
-        result.statements.push_back(parseStatement());
+        statements.push_back(parseStatement());
         if (before == position_) {
             diagnostics_.report("RS1102", "parser made no progress while reading a statement", current().span);
             nextToken();
         }
     }
+}
 
+BlockStatementSyntax Parser::parseBlockStatement() {
+    BlockStatementSyntax result;
+    result.openBraceToken = match(SyntaxKind::OpenBraceToken);
+    parseStatementSequence(result.statements, false);
     result.closeBraceToken = match(SyntaxKind::CloseBraceToken);
     return result;
 }
@@ -1252,71 +1381,130 @@ std::unique_ptr<StatementSyntax> Parser::parseStatement() {
         const auto usingToken = nextToken();
         const auto openParen = match(SyntaxKind::OpenParenToken);
         (void)openParen;
-        auto varDecl = std::make_unique<VariableDeclarationStatementSyntax>();
-        varDecl->type = parseType();
-        varDecl->identifierToken = match(SyntaxKind::IdentifierToken);
-        varDecl->equalsToken = match(SyntaxKind::EqualsToken);
-        varDecl->initializer = parseExpression();
-        const auto closeParen = match(SyntaxKind::CloseParenToken);
-        varDecl->semicolonToken = {
-            SyntaxKind::SemicolonToken, closeParen.span, ";", {}, false};
-
-        const auto varToken = varDecl->identifierToken;
-        auto innerBody = parseStatement();
-        BlockStatementSyntax tryBody;
-        if (innerBody && innerBody->kind() == SyntaxKind::BlockStatement) {
-            tryBody = std::move(static_cast<BlockStatementSyntax&>(*innerBody));
+        std::vector<std::unique_ptr<VariableDeclarationStatementSyntax>> decls;
+        if (isVariableDeclarationStartAt(0, true)) {
+            const auto declaredType = parseType();
+            do {
+                auto varDecl = std::make_unique<VariableDeclarationStatementSyntax>();
+                varDecl->isUsingDeclaration = true;
+                varDecl->type = declaredType;
+                varDecl->identifierToken = match(SyntaxKind::IdentifierToken);
+                varDecl->equalsToken = match(SyntaxKind::EqualsToken);
+                varDecl->initializer = parseExpression();
+                decls.push_back(std::move(varDecl));
+            } while (current().kind == SyntaxKind::CommaToken &&
+                     (nextToken(), true));
         } else {
-            tryBody.openBraceToken = {
+            const auto exprPos = position_;
+            auto resourceExpr = parseExpression();
+            const auto exprSpan = resourceExpr ? resourceExpr->span() : usingToken.span;
+            auto varDecl = std::make_unique<VariableDeclarationStatementSyntax>();
+            varDecl->isUsingDeclaration = true;
+            varDecl->type.name = {
+                SyntaxKind::IdentifierToken, exprSpan, "var", {}, false};
+            varDecl->identifierToken = {
+                SyntaxKind::IdentifierToken,
+                exprSpan,
+                "$using_expr_" + std::to_string(exprPos),
+                {},
+                false};
+            varDecl->equalsToken = {
+                SyntaxKind::EqualsToken, exprSpan, "=", {}, false};
+            varDecl->initializer = std::move(resourceExpr);
+            decls.push_back(std::move(varDecl));
+        }
+        const auto closeParen = match(SyntaxKind::CloseParenToken);
+        for (auto& d : decls) {
+            d->semicolonToken = {
+                SyntaxKind::SemicolonToken, closeParen.span, ";", {}, false};
+        }
+
+        auto innerBody = parseStatement();
+        BlockStatementSyntax currentBody;
+        if (innerBody && innerBody->kind() == SyntaxKind::BlockStatement) {
+            currentBody = std::move(static_cast<BlockStatementSyntax&>(*innerBody));
+        } else {
+            currentBody.openBraceToken = {
                 SyntaxKind::OpenBraceToken, usingToken.span, "{", {}, false};
             if (innerBody) {
-                tryBody.statements.push_back(std::move(innerBody));
+                currentBody.statements.push_back(std::move(innerBody));
             }
-            tryBody.closeBraceToken = {
+            currentBody.closeBraceToken = {
                 SyntaxKind::CloseBraceToken, closeParen.span, "}", {}, false};
         }
 
-        auto disposeCall = std::make_unique<MemberCallExpressionSyntax>();
-        auto receiver = std::make_unique<NameExpressionSyntax>();
-        receiver->identifierToken = varToken;
-        disposeCall->receiver = std::move(receiver);
-        disposeCall->dotToken = {
-            SyntaxKind::DotToken, varToken.span, ".", {}, false};
-        disposeCall->nameToken = {
-            SyntaxKind::IdentifierToken, varToken.span, "Dispose", {}, false};
-        disposeCall->openParenToken = {
-            SyntaxKind::OpenParenToken, varToken.span, "(", {}, false};
-        disposeCall->closeParenToken = {
-            SyntaxKind::CloseParenToken, varToken.span, ")", {}, false};
-
-        auto disposeStmt = std::make_unique<ExpressionStatementSyntax>();
-        disposeStmt->expression = std::move(disposeCall);
-        disposeStmt->semicolonToken = {
-            SyntaxKind::SemicolonToken, varToken.span, ";", {}, false};
-
-        BlockStatementSyntax finallyBlock;
-        finallyBlock.openBraceToken = {
-            SyntaxKind::OpenBraceToken, closeParen.span, "{", {}, false};
-        finallyBlock.statements.push_back(std::move(disposeStmt));
-        finallyBlock.closeBraceToken = {
-            SyntaxKind::CloseBraceToken, closeParen.span, "}", {}, false};
-
-        auto tryStmt = std::make_unique<TryStatementSyntax>();
-        tryStmt->tryKeyword = {
-            SyntaxKind::TryKeyword, usingToken.span, "try", {}, false};
-        tryStmt->body = std::move(tryBody);
-        tryStmt->finallyKeyword = {
-            SyntaxKind::FinallyKeyword, closeParen.span, "$using_finally", {}, false};
-        tryStmt->finallyBody = std::move(finallyBlock);
-
-        auto outerBlock = std::make_unique<BlockStatementSyntax>();
-        outerBlock->openBraceToken = {
-            SyntaxKind::OpenBraceToken, usingToken.span, "{", {}, false};
-        outerBlock->statements.push_back(std::move(varDecl));
-        outerBlock->statements.push_back(std::move(tryStmt));
-        outerBlock->closeBraceToken = {
-            SyntaxKind::CloseBraceToken, closeParen.span, "}", {}, false};
-        return outerBlock;
+        const auto endSpan = currentBody.closeBraceToken.span.empty()
+            ? closeParen.span
+            : currentBody.closeBraceToken.span;
+        for (std::size_t idx = decls.size(); idx > 0; --idx) {
+            auto& decl = decls[idx - 1];
+            const auto varToken = decl->identifierToken;
+            auto tryStmt = buildUsingTryStatement(
+                usingToken, varToken, std::move(currentBody), endSpan);
+            BlockStatementSyntax outerBlock;
+            outerBlock.openBraceToken = {
+                SyntaxKind::OpenBraceToken, usingToken.span, "{", {}, false};
+            outerBlock.statements.push_back(std::move(decl));
+            outerBlock.statements.push_back(std::move(tryStmt));
+            outerBlock.closeBraceToken = {
+                SyntaxKind::CloseBraceToken, endSpan, "}", {}, false};
+            currentBody = std::move(outerBlock);
+        }
+        return std::make_unique<BlockStatementSyntax>(std::move(currentBody));
+    }
+    if (isUsingDeclarationStart()) {
+        diagnostics_.report(
+            "RS1126",
+            "embedded statement cannot be a 'using' declaration; wrap it in a '{ ... }' block",
+            current().span);
+        BlockStatementSyntax immediateBlock;
+        immediateBlock.openBraceToken = {
+            SyntaxKind::OpenBraceToken, current().span, "{", {}, false};
+        const auto usingToken = nextToken();
+        const auto declaredType = parseType();
+        std::vector<std::unique_ptr<VariableDeclarationStatementSyntax>> decls;
+        do {
+            auto varDecl = std::make_unique<VariableDeclarationStatementSyntax>();
+            varDecl->isUsingDeclaration = true;
+            varDecl->type = declaredType;
+            varDecl->identifierToken = match(SyntaxKind::IdentifierToken);
+            if (current().kind == SyntaxKind::EqualsToken) {
+                varDecl->equalsToken = nextToken();
+                varDecl->initializer = parseExpression();
+            } else {
+                diagnostics_.report(
+                    "RS1125",
+                    "using declaration requires an initializer",
+                    varDecl->identifierToken.span);
+            }
+            decls.push_back(std::move(varDecl));
+        } while (current().kind == SyntaxKind::CommaToken &&
+                 (nextToken(), true));
+        const auto semiToken = match(SyntaxKind::SemicolonToken);
+        for (auto& d : decls) {
+            d->semicolonToken = semiToken;
+        }
+        BlockStatementSyntax currentBody;
+        currentBody.openBraceToken = {
+            SyntaxKind::OpenBraceToken, semiToken.span, "{", {}, false};
+        currentBody.closeBraceToken = {
+            SyntaxKind::CloseBraceToken, semiToken.span, "}", {}, false};
+        for (std::size_t idx = decls.size(); idx > 0; --idx) {
+            auto& decl = decls[idx - 1];
+            const auto varToken = decl->identifierToken;
+            auto wrappedTry = buildUsingTryStatement(
+                usingToken, varToken, std::move(currentBody), semiToken.span);
+            BlockStatementSyntax nextBody;
+            nextBody.openBraceToken = {
+                SyntaxKind::OpenBraceToken, usingToken.span, "{", {}, false};
+            nextBody.statements.push_back(std::move(decl));
+            nextBody.statements.push_back(std::move(wrappedTry));
+            nextBody.closeBraceToken = {
+                SyntaxKind::CloseBraceToken, semiToken.span, "}", {}, false};
+            currentBody = std::move(nextBody);
+        }
+        immediateBlock = std::move(currentBody);
+        return std::make_unique<BlockStatementSyntax>(std::move(immediateBlock));
     }
     if (current().kind == SyntaxKind::IdentifierToken &&
         (peek(1).kind == SyntaxKind::PlusEqualsToken ||
@@ -1523,12 +1711,7 @@ std::unique_ptr<StatementSyntax> Parser::parseSwitchStatement() {
             continue;
         }
         section.colonToken = match(SyntaxKind::ColonToken);
-        while (current().kind != SyntaxKind::CaseKeyword &&
-               current().kind != SyntaxKind::DefaultKeyword &&
-               current().kind != SyntaxKind::CloseBraceToken &&
-               current().kind != SyntaxKind::EndOfFileToken) {
-            section.statements.push_back(parseStatement());
-        }
+        parseStatementSequence(section.statements, true);
         result->sections.push_back(std::move(section));
     }
     result->closeBraceToken = match(SyntaxKind::CloseBraceToken);
@@ -2406,13 +2589,17 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
         }
         return root ? std::move(root) : makeStringLiteral("", token.span);
     }
-    case SyntaxKind::IdentifierToken:
-        if (peek(1).kind == SyntaxKind::OpenParenToken ||
+    case SyntaxKind::IdentifierToken: {
+        const auto qualLen = moduleQualifiedIdentLength(0);
+        const std::size_t nextOff = qualLen > 0 ? qualLen : 1;
+        if (peek(nextOff).kind == SyntaxKind::OpenParenToken ||
             isGenericCallStart()) {
             return parseCallExpression();
         } else if (isGenericTypeMemberAccessStart()) {
             auto result = std::make_unique<NameExpressionSyntax>();
-            result->identifierToken = nextToken();
+            result->identifierToken = qualLen > 0
+                ? consumeModuleQualifiedIdentifier()
+                : nextToken();
             parseTypeArgumentList(
                 result->lessToken,
                 result->typeArguments,
@@ -2421,9 +2608,12 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
             return result;
         } else {
             auto result = std::make_unique<NameExpressionSyntax>();
-            result->identifierToken = nextToken();
+            result->identifierToken = qualLen > 0
+                ? consumeModuleQualifiedIdentifier()
+                : nextToken();
             return result;
         }
+    }
     default: {
         auto result = std::make_unique<NameExpressionSyntax>();
         result->identifierToken = match(SyntaxKind::IdentifierToken);
@@ -2432,13 +2622,61 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
     }
 }
 
+std::size_t Parser::moduleQualifiedIdentLength(
+    std::size_t baseOffset) const noexcept {
+    if (!isIdentifierLike(peek(baseOffset).kind)) {
+        return 0;
+    }
+    std::size_t cur = baseOffset + 1;
+    while (peek(cur).kind == SyntaxKind::DotToken &&
+           isIdentifierLike(peek(cur + 1).kind)) {
+        cur += 2;
+    }
+    if (peek(cur).kind == SyntaxKind::ColonToken &&
+        peek(cur + 1).kind == SyntaxKind::ColonToken &&
+        isIdentifierLike(peek(cur + 2).kind)) {
+        return (cur + 3) - baseOffset;
+    }
+    return 0;
+}
+
+SyntaxToken Parser::consumeModuleQualifiedIdentifier() {
+    const auto len = moduleQualifiedIdentLength(0);
+    if (len == 0) {
+        if (isIdentifierLike(current().kind)) {
+            return nextToken();
+        }
+        return match(SyntaxKind::IdentifierToken);
+    }
+    const auto firstTok = nextToken();
+    std::string combined = firstTok.text;
+    text::TextSpan lastSpan = firstTok.span;
+    for (std::size_t i = 1; i < len; ++i) {
+        const auto tok = nextToken();
+        combined += tok.text;
+        lastSpan = tok.span;
+    }
+    const std::size_t totalLen =
+        (lastSpan.start + lastSpan.length >= firstTok.span.start)
+            ? (lastSpan.start + lastSpan.length - firstTok.span.start)
+            : firstTok.span.length;
+    return SyntaxToken{
+        SyntaxKind::IdentifierToken,
+        {firstTok.span.start, totalLen},
+        std::move(combined),
+        {},
+        false};
+}
+
 bool Parser::isGenericTypeMemberAccessStart() const noexcept {
+    const auto qualLen = moduleQualifiedIdentLength(0);
+    const std::size_t lessOff = qualLen > 0 ? qualLen : 1;
     if (current().kind != SyntaxKind::IdentifierToken ||
-        peek(1).kind != SyntaxKind::LessToken) {
+        peek(lessOff).kind != SyntaxKind::LessToken) {
         return false;
     }
     int depth = 0;
-    std::size_t offset = 1;
+    std::size_t offset = lessOff;
     while (position_ + offset < tokens_.size()) {
         const auto kind = peek(offset).kind;
         if (kind == SyntaxKind::LessToken) {
@@ -2450,6 +2688,7 @@ bool Parser::isGenericTypeMemberAccessStart() const noexcept {
             }
         } else if (isIdentifierLike(kind) ||
                    kind == SyntaxKind::DotToken ||
+                   kind == SyntaxKind::ColonToken ||
                    kind == SyntaxKind::CommaToken ||
                    kind == SyntaxKind::QuestionToken ||
                    kind == SyntaxKind::OpenBracketToken ||
@@ -2463,12 +2702,14 @@ bool Parser::isGenericTypeMemberAccessStart() const noexcept {
 }
 
 bool Parser::isGenericCallStart() const noexcept {
+    const auto qualLen = moduleQualifiedIdentLength(0);
+    const std::size_t lessOff = qualLen > 0 ? qualLen : 1;
     if (current().kind != SyntaxKind::IdentifierToken ||
-        peek(1).kind != SyntaxKind::LessToken) {
+        peek(lessOff).kind != SyntaxKind::LessToken) {
         return false;
     }
     int depth = 0;
-    std::size_t offset = 1;
+    std::size_t offset = lessOff;
     while (position_ + offset < tokens_.size()) {
         const auto kind = peek(offset).kind;
         if (kind == SyntaxKind::LessToken) {
@@ -2481,6 +2722,7 @@ bool Parser::isGenericCallStart() const noexcept {
             }
         } else if (isIdentifierLike(kind) ||
                    kind == SyntaxKind::DotToken ||
+                   kind == SyntaxKind::ColonToken ||
                    kind == SyntaxKind::CommaToken ||
                    kind == SyntaxKind::QuestionToken ||
                    kind == SyntaxKind::OpenBracketToken ||
@@ -2496,7 +2738,9 @@ bool Parser::isGenericCallStart() const noexcept {
 
 std::unique_ptr<ExpressionSyntax> Parser::parseCallExpression() {
     auto result = std::make_unique<CallExpressionSyntax>();
-    result->identifierToken = match(SyntaxKind::IdentifierToken);
+    result->identifierToken = moduleQualifiedIdentLength(0) > 0
+        ? consumeModuleQualifiedIdentifier()
+        : match(SyntaxKind::IdentifierToken);
     parseTypeArgumentList(
         result->lessToken,
         result->typeArguments,
@@ -2511,14 +2755,23 @@ std::unique_ptr<ExpressionSyntax> Parser::parseCallExpression() {
     return result;
 }
 
-bool Parser::isVariableDeclarationStart() const noexcept {
-    std::size_t start = 0;
+bool Parser::isVariableDeclarationStartAt(
+    std::size_t baseOffset,
+    bool requireInitializer) const noexcept {
+    std::size_t start = baseOffset;
     if (peek(start).kind == SyntaxKind::ConstKeyword) ++start;
     if (peek(start).kind == SyntaxKind::RefKeyword) ++start;
     if (!isIdentifierLike(peek(start).kind)) {
         return false;
     }
-    std::size_t offset = start + 1;
+    const auto qualLen = moduleQualifiedIdentLength(start);
+    std::size_t offset = qualLen > 0 ? (start + qualLen) : (start + 1);
+    if (qualLen == 0) {
+        while (peek(offset).kind == SyntaxKind::DotToken &&
+               isIdentifierLike(peek(offset + 1).kind)) {
+            offset += 2;
+        }
+    }
     if (peek(offset).kind == SyntaxKind::LessToken) {
         int depth = 0;
         do {
@@ -2531,13 +2784,28 @@ bool Parser::isVariableDeclarationStart() const noexcept {
         } while (depth > 0);
     }
     if (peek(offset).kind == SyntaxKind::QuestionToken) ++offset;
-    if (peek(offset).kind == SyntaxKind::OpenBracketToken &&
-        peek(offset + 1).kind == SyntaxKind::CloseBracketToken) {
+    while (peek(offset).kind == SyntaxKind::OpenBracketToken &&
+           peek(offset + 1).kind == SyntaxKind::CloseBracketToken) {
         offset += 2;
     }
-    return peek(offset).kind == SyntaxKind::IdentifierToken &&
-        (peek(offset + 1).kind == SyntaxKind::EqualsToken ||
-         peek(offset + 1).kind == SyntaxKind::SemicolonToken);
+    if (peek(offset).kind != SyntaxKind::IdentifierToken) {
+        return false;
+    }
+    if (requireInitializer) {
+        return peek(offset + 1).kind == SyntaxKind::EqualsToken;
+    }
+    return peek(offset + 1).kind == SyntaxKind::EqualsToken ||
+        peek(offset + 1).kind == SyntaxKind::SemicolonToken;
+}
+
+bool Parser::isVariableDeclarationStart() const noexcept {
+    return isVariableDeclarationStartAt(0, false);
+}
+
+bool Parser::isUsingDeclarationStart() const noexcept {
+    return current().kind == SyntaxKind::IdentifierToken &&
+        current().text == "using" &&
+        isVariableDeclarationStartAt(1, false);
 }
 
 } // namespace realscript::syntax

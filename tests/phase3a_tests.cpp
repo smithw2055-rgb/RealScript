@@ -170,7 +170,7 @@ void testIncrementalSweepProgressDuringAllocation() {
 
 void testInterpreterShadowStackRootsManagedValues() {
     auto modules = compile({{
-        "identity.rs",
+        "identity.rscript",
         "module Demo; string identity(string value) { int n = 8; while (n > 0) n = n - 1; return value; }",
     }});
     realscript::runtime::Interpreter interpreter(std::move(modules));
@@ -196,7 +196,7 @@ void testInterpreterShadowStackRootsManagedValues() {
 
 void testStringLiteralUsesManagedHeap() {
     auto modules = compile({{
-        "greeting.rs",
+        "greeting.rscript",
         "module Demo; string greeting() { return \"hello managed\"; }",
     }});
     realscript::runtime::Interpreter interpreter(std::move(modules));
@@ -216,7 +216,7 @@ void testStringLiteralUsesManagedHeap() {
 
 void testManagedAndHostStringEquality() {
     auto modules = compile({{
-        "equal.rs",
+        "equal.rscript",
         "module Demo; bool equal(string left, string right) { return left == right; }",
     }});
     realscript::runtime::Interpreter interpreter(std::move(modules));
@@ -231,7 +231,7 @@ void testManagedAndHostStringEquality() {
 
 void testStaleManagedArgumentIsRejected() {
     auto modules = compile({{
-        "stale.rs",
+        "stale.rscript",
         "module Demo; string identity(string value) { return value; }",
     }});
     realscript::runtime::Interpreter interpreter(std::move(modules));

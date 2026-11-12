@@ -249,6 +249,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             semantic::TypeSymbol wrapperType;
             semantic::FieldSymbol field;
             ValueId wrapper = -1;
+            std::optional<semantic::FunctionSymbol> assignHandle;
         };
         std::vector<Writeback> writebacks;
         for (const auto& argument : invocation.arguments) {
@@ -286,13 +287,40 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 store.sourceSpan = expression.span;
                 block(*currentBlockId_).instructions.push_back(
                     std::move(store));
+            } else if (argument.modifier ==
+                           semantic::ParameterModifier::Out &&
+                       argument.valueField.type ==
+                           semantic::PrimitiveType::Struct &&
+                       !argument.valueField.typeName.empty()) {
+                const auto defaultStruct = emitValue(
+                    Opcode::NewStruct,
+                    semantic::PrimitiveType::Struct,
+                    {}, expression.span);
+                auto& structInst =
+                    block(*currentBlockId_).instructions.back();
+                structInst.typeId = semantic::stableTypeId(
+                    argument.valueField.typeName);
+                structInst.resultTypeId = structInst.typeId;
+                structInst.symbolName = argument.valueField.typeName;
+                Instruction store;
+                store.resultType = semantic::PrimitiveType::Void;
+                store.opcode = Opcode::StoreField;
+                store.operands = {wrapper, defaultStruct};
+                store.typeId = argument.wrapperType.id;
+                store.fieldIndex = argument.valueField.index;
+                store.symbolName = semantic::canonicalTypeName(
+                    argument.wrapperType);
+                store.sourceSpan = expression.span;
+                block(*currentBlockId_).instructions.push_back(
+                    std::move(store));
             }
             instruction.operands.push_back(wrapper);
             writebacks.push_back(Writeback{
                 argument.variable,
                 argument.wrapperType,
                 argument.valueField,
-                wrapper});
+                wrapper,
+                argument.writebackAssignHandle});
         }
         instruction.symbolName = semantic::canonicalTypeName(
             invocation.delegateType) + ".Invoke";
@@ -305,7 +333,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         const auto callResult =
             block(*currentBlockId_).instructions.back().result;
         for (const auto& writeback : writebacks) {
-            const auto value = emitValue(
+            auto value = emitValue(
                 Opcode::LoadField,
                 writeback.field.type,
                 {writeback.wrapper}, expression.span);
@@ -318,8 +346,89 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             load.fieldIndex = writeback.field.index;
             load.symbolName = semantic::canonicalTypeName(
                 writeback.wrapperType);
-            emitStoreLocal(
-                writeback.variable.index, value, expression.span);
+            const bool capturedCell =
+                (semantic::storageTypeOf(writeback.variable) !=
+                     writeback.variable.type ||
+                 semantic::storageTypeNameOf(writeback.variable) !=
+                     writeback.variable.typeName) &&
+                writeback.variable.modifier ==
+                    semantic::ParameterModifier::None;
+            if (writeback.assignHandle) {
+                ValueId oldVal = -1;
+                if (capturedCell) {
+                    const auto cell = emitValue(
+                        Opcode::LoadLocal,
+                        semantic::PrimitiveType::Object,
+                        {}, expression.span);
+                    auto& cellLoad =
+                        block(*currentBlockId_).instructions.back();
+                    cellLoad.localIndex = writeback.variable.index;
+                    cellLoad.resultTypeId = semantic::stableTypeId(
+                        semantic::storageTypeNameOf(writeback.variable));
+                    oldVal = emitValue(
+                        Opcode::LoadField,
+                        writeback.field.type,
+                        {cell}, expression.span);
+                    auto& oldFieldLoad =
+                        block(*currentBlockId_).instructions.back();
+                    oldFieldLoad.typeId = cellLoad.resultTypeId;
+                    oldFieldLoad.resultTypeId = semantic::isExactType(
+                            writeback.field.type)
+                        ? semantic::stableTypeId(writeback.field.typeName)
+                        : 0;
+                    oldFieldLoad.fieldIndex = 0;
+                    oldFieldLoad.symbolName =
+                        semantic::storageTypeNameOf(writeback.variable);
+                } else {
+                    oldVal = emitValue(
+                        Opcode::LoadLocal,
+                        writeback.field.type,
+                        {}, expression.span);
+                    auto& oldLocalLoad =
+                        block(*currentBlockId_).instructions.back();
+                    oldLocalLoad.localIndex = writeback.variable.index;
+                    oldLocalLoad.resultTypeId = semantic::isExactType(
+                            writeback.field.type)
+                        ? semantic::stableTypeId(writeback.field.typeName)
+                        : 0;
+                }
+                value = emitCallInstruction(
+                    *writeback.assignHandle,
+                    writeback.field.type,
+                    writeback.field.typeName,
+                    {oldVal, value},
+                    expression.span,
+                    false,
+                    std::numeric_limits<std::uint32_t>::max(),
+                    false,
+                    0,
+                    std::numeric_limits<std::uint32_t>::max());
+            }
+            if (capturedCell) {
+                const auto cell = emitValue(
+                    Opcode::LoadLocal,
+                    semantic::PrimitiveType::Object,
+                    {}, expression.span);
+                auto& cellLoad =
+                    block(*currentBlockId_).instructions.back();
+                cellLoad.localIndex = writeback.variable.index;
+                cellLoad.resultTypeId = semantic::stableTypeId(
+                    semantic::storageTypeNameOf(writeback.variable));
+                Instruction storeCell;
+                storeCell.resultType = semantic::PrimitiveType::Void;
+                storeCell.opcode = Opcode::StoreField;
+                storeCell.operands = {cell, value};
+                storeCell.typeId = cellLoad.resultTypeId;
+                storeCell.fieldIndex = 0;
+                storeCell.symbolName =
+                    semantic::storageTypeNameOf(writeback.variable);
+                storeCell.sourceSpan = expression.span;
+                block(*currentBlockId_).instructions.push_back(
+                    std::move(storeCell));
+            } else {
+                emitStoreLocal(
+                    writeback.variable.index, value, expression.span);
+            }
         }
         return callResult;
     }
@@ -350,11 +459,29 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             literal.type == semantic::PrimitiveType::Enum) {
             const auto value = emitValue(Opcode::ConstantInt, literal.type, {}, expression.span);
             auto& instruction = block(*currentBlockId_).instructions.back();
-            instruction.integerImmediate = std::get<std::int64_t>(literal.value);
+            instruction.integerImmediate = std::holds_alternative<std::int64_t>(literal.value)
+                ? std::get<std::int64_t>(literal.value)
+                : 0;
             instruction.resultTypeId = literal.type == semantic::PrimitiveType::Enum
                 ? semantic::stableTypeId(literal.typeName)
                 : 0;
             return value;
+        }
+        if (semantic::isIntegralType(literal.type)) {
+            const auto intVal = emitValue(
+                Opcode::ConstantInt,
+                semantic::PrimitiveType::Long,
+                {},
+                expression.span);
+            block(*currentBlockId_).instructions.back().integerImmediate =
+                std::holds_alternative<std::int64_t>(literal.value)
+                    ? std::get<std::int64_t>(literal.value)
+                    : 0;
+            return emitValue(
+                Opcode::ConvertNumeric,
+                literal.type,
+                {intVal},
+                expression.span);
         }
         if (literal.type == semantic::PrimitiveType::Float) {
             const auto dblVal = emitValue(
@@ -388,6 +515,9 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         }
         if (literal.type == semantic::PrimitiveType::Null) {
             return emitValue(Opcode::ConstantNull, literal.type, {}, expression.span);
+        }
+        if (literal.type == semantic::PrimitiveType::Error) {
+            return emitValue(Opcode::ConstantInt, semantic::PrimitiveType::Int, {}, expression.span);
         }
         throw std::logic_error("unsupported literal type in MIR lowerer");
     }
@@ -1423,6 +1553,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             semantic::PrimitiveType targetElementType =
                 semantic::PrimitiveType::Error;
             std::string targetElementTypeName;
+            std::optional<semantic::FunctionSymbol> assignHandle;
+            const semantic::BoundExpression* valueExpr = nullptr;
         };
         std::vector<Writeback> writebacks;
         for (const auto& argument : call.arguments) {
@@ -1564,6 +1696,32 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 store.sourceSpan = expression.span;
                 block(*currentBlockId_).instructions.push_back(
                     std::move(store));
+            } else if (argument.modifier ==
+                           semantic::ParameterModifier::Out &&
+                       argument.valueField.type ==
+                           semantic::PrimitiveType::Struct &&
+                       !argument.valueField.typeName.empty()) {
+                const auto defaultStruct = emitValue(
+                    Opcode::NewStruct,
+                    semantic::PrimitiveType::Struct,
+                    {}, expression.span);
+                auto& structInst =
+                    block(*currentBlockId_).instructions.back();
+                structInst.typeId = semantic::stableTypeId(
+                    argument.valueField.typeName);
+                structInst.resultTypeId = structInst.typeId;
+                structInst.symbolName = argument.valueField.typeName;
+                Instruction store;
+                store.resultType = semantic::PrimitiveType::Void;
+                store.opcode = Opcode::StoreField;
+                store.operands = {wrapper, defaultStruct};
+                store.typeId = argument.wrapperType.id;
+                store.fieldIndex = argument.valueField.index;
+                store.symbolName = semantic::canonicalTypeName(
+                    argument.wrapperType);
+                store.sourceSpan = expression.span;
+                block(*currentBlockId_).instructions.push_back(
+                    std::move(store));
             }
             arguments.push_back(wrapper);
             if (!argument.defensiveCopy) {
@@ -1578,7 +1736,9 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                     argument.targetOwnerType,
                     argument.targetField,
                     argument.targetElementType,
-                    argument.targetElementTypeName});
+                    argument.targetElementTypeName,
+                    argument.writebackAssignHandle,
+                    argument.value.get()});
             }
         }
 
@@ -1608,7 +1768,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             call.interfaceTypeId,
             call.interfaceSlot);
         for (const auto& writeback : writebacks) {
-            const auto value = emitValue(
+            auto value = emitValue(
                 Opcode::LoadField,
                 writeback.field.type,
                 {writeback.wrapper},
@@ -1624,13 +1784,105 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             load.fieldIndex = writeback.field.index;
             load.symbolName = semantic::canonicalTypeName(
                 writeback.wrapperType);
+            auto applyAssignHandle = [&](ValueId oldVal) -> ValueId {
+                if (!writeback.assignHandle || oldVal < 0) {
+                    return value;
+                }
+                return emitCallInstruction(
+                    *writeback.assignHandle,
+                    writeback.field.type,
+                    writeback.field.typeName,
+                    {oldVal, value},
+                    expression.span,
+                    false,
+                    std::numeric_limits<std::uint32_t>::max(),
+                    false,
+                    0,
+                    std::numeric_limits<std::uint32_t>::max());
+            };
             switch (writeback.targetKind) {
-            case semantic::ReferenceTargetKind::Variable:
-                emitStoreLocal(
-                    writeback.variable.index, value, expression.span);
+            case semantic::ReferenceTargetKind::Variable: {
+                const bool capturedCell =
+                    (semantic::storageTypeOf(writeback.variable) !=
+                         writeback.variable.type ||
+                     semantic::storageTypeNameOf(writeback.variable) !=
+                         writeback.variable.typeName) &&
+                    writeback.variable.modifier ==
+                        semantic::ParameterModifier::None;
+                if (writeback.assignHandle) {
+                    ValueId oldVal = -1;
+                    if (capturedCell) {
+                        const auto cell = emitValue(
+                            Opcode::LoadLocal,
+                            semantic::PrimitiveType::Object,
+                            {}, expression.span);
+                        auto& cellLoad =
+                            block(*currentBlockId_).instructions.back();
+                        cellLoad.localIndex = writeback.variable.index;
+                        cellLoad.resultTypeId = semantic::stableTypeId(
+                            semantic::storageTypeNameOf(writeback.variable));
+                        oldVal = emitValue(
+                            Opcode::LoadField,
+                            writeback.field.type,
+                            {cell}, expression.span);
+                        auto& oldFieldLoad =
+                            block(*currentBlockId_).instructions.back();
+                        oldFieldLoad.typeId = cellLoad.resultTypeId;
+                        oldFieldLoad.resultTypeId = semantic::isExactType(
+                                writeback.field.type)
+                            ? semantic::stableTypeId(writeback.field.typeName)
+                            : 0;
+                        oldFieldLoad.fieldIndex = 0;
+                        oldFieldLoad.symbolName =
+                            semantic::storageTypeNameOf(writeback.variable);
+                    } else {
+                        oldVal = emitValue(
+                            Opcode::LoadLocal,
+                            writeback.field.type,
+                            {}, expression.span);
+                        auto& oldLocalLoad =
+                            block(*currentBlockId_).instructions.back();
+                        oldLocalLoad.localIndex = writeback.variable.index;
+                        oldLocalLoad.resultTypeId = semantic::isExactType(
+                                writeback.field.type)
+                            ? semantic::stableTypeId(writeback.field.typeName)
+                            : 0;
+                    }
+                    value = applyAssignHandle(oldVal);
+                }
+                if (capturedCell) {
+                    const auto cell = emitValue(
+                        Opcode::LoadLocal,
+                        semantic::PrimitiveType::Object,
+                        {}, expression.span);
+                    auto& cellLoad =
+                        block(*currentBlockId_).instructions.back();
+                    cellLoad.localIndex = writeback.variable.index;
+                    cellLoad.resultTypeId = semantic::stableTypeId(
+                        semantic::storageTypeNameOf(writeback.variable));
+                    Instruction storeCell;
+                    storeCell.resultType = semantic::PrimitiveType::Void;
+                    storeCell.opcode = Opcode::StoreField;
+                    storeCell.operands = {cell, value};
+                    storeCell.typeId = cellLoad.resultTypeId;
+                    storeCell.fieldIndex = 0;
+                    storeCell.symbolName =
+                        semantic::storageTypeNameOf(writeback.variable);
+                    storeCell.sourceSpan = expression.span;
+                    block(*currentBlockId_).instructions.push_back(
+                        std::move(storeCell));
+                } else {
+                    emitStoreLocal(
+                        writeback.variable.index, value, expression.span);
+                }
                 break;
+            }
             case semantic::ReferenceTargetKind::ObjectField: {
                 if (writeback.targetField.staticField) {
+                    if (writeback.assignHandle && writeback.valueExpr) {
+                        value = applyAssignHandle(
+                            lowerExpression(*writeback.valueExpr));
+                    }
                     const auto fieldTypeId = semantic::isExactType(
                             writeback.targetField.type)
                         ? semantic::stableTypeId(
@@ -1651,6 +1903,22 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         std::move(setCall));
                     break;
                 }
+                if (writeback.assignHandle) {
+                    const auto oldVal = emitValue(
+                        Opcode::LoadField,
+                        writeback.targetField.type,
+                        {writeback.targetReceiver}, expression.span);
+                    auto& oldLoad = block(*currentBlockId_).instructions.back();
+                    oldLoad.typeId = writeback.targetOwnerType.id;
+                    oldLoad.resultTypeId = semantic::isExactType(
+                            writeback.targetField.type)
+                        ? semantic::stableTypeId(writeback.targetField.typeName)
+                        : 0;
+                    oldLoad.fieldIndex = writeback.targetField.index;
+                    oldLoad.symbolName = semantic::canonicalTypeName(
+                        writeback.targetOwnerType);
+                    value = applyAssignHandle(oldVal);
+                }
                 Instruction store;
                 store.resultType = semantic::PrimitiveType::Void;
                 store.opcode = Opcode::StoreField;
@@ -1665,6 +1933,21 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 break;
             }
             case semantic::ReferenceTargetKind::ArrayElement: {
+                if (writeback.assignHandle) {
+                    const auto oldVal = emitValue(
+                        Opcode::LoadElement,
+                        writeback.targetElementType,
+                        {writeback.targetReceiver, writeback.targetIndex},
+                        expression.span);
+                    auto& oldLoad = block(*currentBlockId_).instructions.back();
+                    oldLoad.elementType = writeback.targetElementType;
+                    oldLoad.elementTypeId = semantic::isExactType(
+                            writeback.targetElementType)
+                        ? semantic::stableTypeId(writeback.targetElementTypeName)
+                        : 0;
+                    oldLoad.resultTypeId = oldLoad.elementTypeId;
+                    value = applyAssignHandle(oldVal);
+                }
                 Instruction store;
                 store.resultType = semantic::PrimitiveType::Void;
                 store.opcode = Opcode::StoreElement;
@@ -1684,6 +1967,22 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 break;
             }
             case semantic::ReferenceTargetKind::StructField: {
+                if (writeback.assignHandle) {
+                    const auto oldVal = emitValue(
+                        Opcode::LoadStructField,
+                        writeback.targetField.type,
+                        {writeback.targetReceiver}, expression.span);
+                    auto& oldLoad = block(*currentBlockId_).instructions.back();
+                    oldLoad.typeId = writeback.targetOwnerType.id;
+                    oldLoad.fieldIndex = writeback.targetField.index;
+                    oldLoad.resultTypeId = semantic::isExactType(
+                            writeback.targetField.type)
+                        ? semantic::stableTypeId(writeback.targetField.typeName)
+                        : 0;
+                    oldLoad.symbolName = semantic::canonicalTypeName(
+                        writeback.targetOwnerType);
+                    value = applyAssignHandle(oldVal);
+                }
                 const auto updated = emitValue(
                     Opcode::StoreStructField,
                     semantic::PrimitiveType::Struct,
@@ -1694,8 +1993,38 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 store.fieldIndex = writeback.targetField.index;
                 store.symbolName = semantic::canonicalTypeName(
                     writeback.targetOwnerType);
-                emitStoreLocal(
-                    writeback.variable.index, updated, expression.span);
+                const bool capturedStructOwner =
+                    (semantic::storageTypeOf(writeback.variable) !=
+                         writeback.variable.type ||
+                     semantic::storageTypeNameOf(writeback.variable) !=
+                         writeback.variable.typeName) &&
+                    writeback.variable.modifier ==
+                        semantic::ParameterModifier::None;
+                if (capturedStructOwner) {
+                    const auto cell = emitValue(
+                        Opcode::LoadLocal,
+                        semantic::PrimitiveType::Object,
+                        {}, expression.span);
+                    auto& cellLoad =
+                        block(*currentBlockId_).instructions.back();
+                    cellLoad.localIndex = writeback.variable.index;
+                    cellLoad.resultTypeId = semantic::stableTypeId(
+                        semantic::storageTypeNameOf(writeback.variable));
+                    Instruction storeCell;
+                    storeCell.resultType = semantic::PrimitiveType::Void;
+                    storeCell.opcode = Opcode::StoreField;
+                    storeCell.operands = {cell, updated};
+                    storeCell.typeId = cellLoad.resultTypeId;
+                    storeCell.fieldIndex = 0;
+                    storeCell.symbolName =
+                        semantic::storageTypeNameOf(writeback.variable);
+                    storeCell.sourceSpan = expression.span;
+                    block(*currentBlockId_).instructions.push_back(
+                        std::move(storeCell));
+                } else {
+                    emitStoreLocal(
+                        writeback.variable.index, updated, expression.span);
+                }
                 break;
             }
             case semantic::ReferenceTargetKind::None:

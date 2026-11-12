@@ -97,9 +97,9 @@ realscript::bytecode::Module compileBytecode(
 realscript::bytecode::Module compileFixture() {
     const std::string root = REALSCRIPT_SOURCE_DIR;
     return compileBytecode({{
-        "phase2a.rs",
+        "phase2a.rscript",
         normalizeLineEndings(
-            readFile(root + "/tests/fixtures/phase2a.rs")),
+            readFile(root + "/tests/fixtures/phase2a.rscript")),
     }});
 }
 
@@ -259,8 +259,8 @@ void testVerifierRejectsBranchArguments() {
 
 void testEncodingIgnoresSourceInputOrder() {
     const std::vector<realscript::compiler::SourceFile> forward = {
-        {"a.rs", "module Stable; int first() { return second(); }"},
-        {"b.rs", "module Stable; int second() { return 2; }"},
+        {"a.rscript", "module Stable; int first() { return second(); }"},
+        {"b.rscript", "module Stable; int second() { return 2; }"},
     };
     const std::vector<realscript::compiler::SourceFile> reverse = {
         forward[1],

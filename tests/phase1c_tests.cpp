@@ -39,7 +39,7 @@ realscript::compiler::BuildResult build(
 
 void testDirectAndForwardCall() {
     const auto result = build({{
-        "main.rs",
+        "main.rscript",
         "module App; "
         "int main() { return add(2, 3); } "
         "int add(int a, int b) { return a + b; }",
@@ -54,7 +54,7 @@ void testDirectAndForwardCall() {
 
 void testOverloadExactMatch() {
     const auto result = build({{
-        "main.rs",
+        "main.rscript",
         "module App; "
         "int pick(int value) { return value; } "
         "string pick(string value) { return value; } "
@@ -69,7 +69,7 @@ void testOverloadExactMatch() {
 
 void testNullConversionChoosesString() {
     const auto result = build({{
-        "main.rs",
+        "main.rscript",
         "module App; "
         "string pick(string value) { return value; } "
         "string main() { return pick(null); }",
@@ -84,7 +84,7 @@ void testNullConversionChoosesString() {
 
 void testNoApplicableOverload() {
     const auto result = build({{
-        "main.rs",
+        "main.rscript",
         "module App; "
         "int pick(int value) { return value; } "
         "int main() { return pick(\"text\"); }",
@@ -98,11 +98,11 @@ void testNoApplicableOverload() {
 void testImportedFunction() {
     const auto result = build({
         {
-            "lib.rs",
+            "lib.rscript",
             "module Lib; int twice(int value) { return value * 2; }",
         },
         {
-            "app.rs",
+            "app.rscript",
             "module App; import Lib; int main() { return twice(4); }",
         },
     });
@@ -113,7 +113,7 @@ void testImportedFunction() {
 
 void testMissingImport() {
     const auto result = build({{
-        "app.rs",
+        "app.rscript",
         "module App; import Missing; int main() { return 0; }",
     }});
 
@@ -125,15 +125,15 @@ void testMissingImport() {
 void testAmbiguousImports() {
     const auto result = build({
         {
-            "a.rs",
+            "a.rscript",
             "module A; int choose(int value) { return value; }",
         },
         {
-            "b.rs",
+            "b.rscript",
             "module B; int choose(int value) { return value; }",
         },
         {
-            "app.rs",
+            "app.rscript",
             "module App; import A; import B; "
             "int main() { return choose(1); }",
         },
@@ -146,13 +146,13 @@ void testAmbiguousImports() {
 
 void testStableIdsIgnoreSourceOrder() {
     const auto first = build({{
-        "one.rs",
+        "one.rscript",
         "module App; "
         "int a() { return 1; } "
         "int b(int value) { return value; }",
     }});
     const auto second = build({{
-        "one.rs",
+        "one.rscript",
         "module App; "
         "int b(int value) { return value; } "
         "int a() { return 1; }",
@@ -182,11 +182,11 @@ void testStableIdsIgnoreSourceOrder() {
 void testMultiFileSameModule() {
     const auto result = build({
         {
-            "a.rs",
+            "a.rscript",
             "module App; int helper() { return 4; }",
         },
         {
-            "b.rs",
+            "b.rscript",
             "module App; int main() { return helper(); }",
         },
     });
@@ -201,11 +201,11 @@ void testMultiFileSameModule() {
 void testIncrementalReuseAndInvalidation() {
     const auto first = build({
         {
-            "lib.rs",
+            "lib.rscript",
             "module Lib; int value() { return 1; }",
         },
         {
-            "app.rs",
+            "app.rscript",
             "module App; import Lib; int main() { return value(); }",
         },
     });
@@ -215,11 +215,11 @@ void testIncrementalReuseAndInvalidation() {
 
     const auto second = build({
         {
-            "lib.rs",
+            "lib.rscript",
             "module Lib; int value() { return 2; }",
         },
         {
-            "app.rs",
+            "app.rscript",
             "module App; import Lib; int main() { return value(); }",
         },
     }, &first.snapshot);
@@ -243,13 +243,13 @@ void testIncrementalReuseAndInvalidation() {
 
     const auto third = build({
         {
-            "lib.rs",
+            "lib.rscript",
             "module Lib; "
             "int value() { return 2; } "
             "int extra() { return 3; }",
         },
         {
-            "app.rs",
+            "app.rscript",
             "module App; import Lib; int main() { return value(); }",
         },
     }, &second.snapshot);
@@ -267,7 +267,7 @@ void testIncrementalReuseAndInvalidation() {
 
 void testVoidCallExpressionStatement() {
     const auto result = build({{
-        "main.rs",
+        "main.rscript",
         "module App; "
         "void ping() { return; } "
         "int main() { ping(); return 0; }",

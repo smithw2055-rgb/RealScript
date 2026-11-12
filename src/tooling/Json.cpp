@@ -452,7 +452,11 @@ std::string uriToPath(const std::string& uri) {
 }
 
 std::string pathToUri(const std::string& path) {
-    if (path.rfind("file://", 0) == 0) return path;
+    if (path.rfind("file://", 0) == 0 ||
+        path.rfind("untitled:", 0) == 0 ||
+        path.rfind("inmemory:", 0) == 0) {
+        return path;
+    }
     std::string normalized = path;
     for (char& ch : normalized) {
         if (ch == '\\') ch = '/';

@@ -246,6 +246,7 @@ private:
     std::vector<const semantic::BoundForeachStatement*> ecsWriteBacks_;
     std::vector<std::size_t> breakEcsWriteBackDepths_;
     std::vector<BlockId> exceptionCleanupBlocks_;
+    std::vector<std::vector<BlockId>> finalizerCleanupBlocks_;
 };
 
 [[nodiscard]] const char* opcodeName(Opcode opcode) noexcept;

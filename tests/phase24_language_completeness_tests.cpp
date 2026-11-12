@@ -35,7 +35,7 @@ bool hasDiagnostic(
 }
 
 void testImplicitLocalTypes() {
-    realscript::compiler::Compilation compilation({{"phase24_var.rs", R"(
+    realscript::compiler::Compilation compilation({{"phase24_var.rscript", R"(
 module Phase24.Core;
 
 class Holder
@@ -482,7 +482,7 @@ void Uncaught() { Fail(1); }
 
 std::vector<realscript::bytecode::Module> compileModules(
     const std::string& source) {
-    realscript::compiler::Compilation compilation({{"phase24_tools.rs", source}});
+    realscript::compiler::Compilation compilation({{"phase24_tools.rscript", source}});
     const auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
         "Phase 24 tooling fixture compilation failed:\n" +
@@ -497,12 +497,12 @@ std::vector<realscript::bytecode::Module> compileModules(
 
 void testToolingAndHotReload() {
     realscript::tooling::LanguageService service;
-    service.open("phase24_completion.rs", R"(
+    service.open("phase24_completion.rscript", R"(
 module Phase24.Tooling;
 int Run() { return 1; }
 )");
     const auto completion = service.completion(
-        "phase24_completion.rs", {2, 0});
+        "phase24_completion.rscript", {2, 0});
     for (const auto* keyword : {
              "var", "params", "is", "as", "typeof", "when", "throw",
              "try", "catch", "finally"}) {
@@ -570,7 +570,7 @@ void testImplicitLocalDiagnostics() {
     };
     for (std::size_t index = 0; index < cases.size(); ++index) {
         realscript::compiler::Compilation compilation({{
-            "phase24_var_bad_" + std::to_string(index) + ".rs",
+            "phase24_var_bad_" + std::to_string(index) + ".rscript",
             cases[index].source,
         }});
         const auto build = compilation.build();

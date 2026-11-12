@@ -7,6 +7,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -32,6 +33,21 @@ void writeFile(const std::filesystem::path& path, const std::string& content) {
     stream.write(content.data(), static_cast<std::streamsize>(content.size()));
 }
 
+bool hasDeclarationStubExtension(const std::filesystem::path& path) {
+    const std::string name = path.filename().string();
+    if (name.size() < 10) return false;
+    const std::size_t offset = name.size() - 10;
+    constexpr const char* kSuffix = ".d.rscript";
+    for (std::size_t i = 0; i < 10; ++i) {
+        char ch = name[offset + i];
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        if (ch != kSuffix[i]) return false;
+    }
+    return true;
+}
+
 std::string escapeJson(const std::string& text) {
     std::string out;
     out.reserve(text.size() + 8);
@@ -48,14 +64,28 @@ std::string escapeJson(const std::string& text) {
     return out;
 }
 
+void parseDefineSpec(
+    const std::string& spec,
+    std::unordered_map<std::string, std::string>& macros) {
+    if (spec.empty()) return;
+    const auto eq = spec.find('=');
+    if (eq == std::string::npos) {
+        macros[spec] = "1";
+    } else {
+        macros[spec.substr(0, eq)] = spec.substr(eq + 1);
+    }
+}
+
 void usage() {
     std::cerr
         << "usage: rsbind [options] <header.h>...\n"
-        << "  --module <Module.Name>         Target RealScript module name (default: Engine.Native)\n"
-        << "  --output-cpp <path.h>          Output C++ registration & ECS column binding header\n"
-        << "  --output-drs <path.d.rs>       Output RealScript .d.rs declaration stub for LSP/Compiler\n"
-        << "  --output-project <path.json>   Output realscript.project.json with embedded ambientStubs\n"
-        << "  --project-name <name>          Project name for realscript.project.json (default: GameProject)\n"
+        << "  --module <Module.Name>            Target RealScript module name (default: Engine.Native)\n"
+        << "  --output-cpp <path.h>             Output C++ registration & ECS column binding header\n"
+        << "  --output-d-rscript <path.d.rscript> Output RealScript .d.rscript declaration stub\n"
+        << "  --output-project <path.json>      Output realscript.project.json with embedded ambientStubs\n"
+        << "  --project-name <name>             Project name for realscript.project.json (default: GameProject)\n"
+        << "  -D<MACRO>[=<VALUE>]               Define preprocessor macro for #if / #ifdef evaluation\n"
+        << "  -U<MACRO>                         Undefine preprocessor macro\n"
         << "  --help\n"
         << "  --version\n";
 }
@@ -71,8 +101,9 @@ int main(int argc, char** argv) {
     std::string moduleName = "Engine.Native";
     std::string projectName = "GameProject";
     std::filesystem::path outputCpp;
-    std::filesystem::path outputDrs;
+    std::filesystem::path outputStub;
     std::filesystem::path outputProject;
+    std::unordered_map<std::string, std::string> macros;
     std::vector<std::filesystem::path> headers;
 
     for (int i = 1; i < argc; ++i) {
@@ -95,10 +126,23 @@ int main(int argc, char** argv) {
             projectName = requireValue("--project-name");
         } else if (arg == "--output-cpp") {
             outputCpp = requireValue("--output-cpp");
-        } else if (arg == "--output-drs") {
-            outputDrs = requireValue("--output-drs");
+        } else if (arg == "--output-d-rscript") {
+            outputStub = requireValue("--output-d-rscript");
+            if (!hasDeclarationStubExtension(outputStub)) {
+                std::cerr << "rsbind: declaration stub must use .d.rscript extension: "
+                          << outputStub.string() << "\n";
+                return 2;
+            }
         } else if (arg == "--output-project") {
             outputProject = requireValue("--output-project");
+        } else if (arg == "-D") {
+            parseDefineSpec(requireValue("-D"), macros);
+        } else if (arg.rfind("-D", 0) == 0 && arg.size() > 2) {
+            parseDefineSpec(arg.substr(2), macros);
+        } else if (arg == "-U") {
+            macros.erase(requireValue("-U"));
+        } else if (arg.rfind("-U", 0) == 0 && arg.size() > 2) {
+            macros.erase(arg.substr(2));
         } else if (arg.rfind("--", 0) == 0) {
             std::cerr << "rsbind: unknown option: " << arg << "\n";
             return 2;
@@ -119,18 +163,18 @@ int main(int argc, char** argv) {
         }
 
         const auto generated = realscript::game::GameApi::generateBindingsFromCppHeader(
-            combinedHeaders.str(), moduleName);
+            combinedHeaders.str(), moduleName, macros);
 
         if (!outputCpp.empty()) {
             writeFile(outputCpp, generated.cppRegistrationSource);
         }
-        if (!outputDrs.empty()) {
-            writeFile(outputDrs, generated.scriptDeclarationStub);
+        if (!outputStub.empty()) {
+            writeFile(outputStub, generated.scriptDeclarationStub);
         }
         if (!outputProject.empty()) {
-            const std::string stubFilename = outputDrs.empty()
-                ? (moduleName + ".d.rs")
-                : outputDrs.filename().string();
+            const std::string stubFilename = outputStub.empty()
+                ? (moduleName + ".d.rscript")
+                : outputStub.filename().string();
             std::ostringstream json;
             json << "{\n"
                  << "  \"projectName\": \"" << escapeJson(projectName) << "\",\n"

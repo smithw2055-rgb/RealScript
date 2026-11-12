@@ -53,8 +53,8 @@ class EntityHolder {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"pool_test.rs", src}});
-        require(compiled.succeeded(), "pool_test.rs compile failed");
+        auto compiled = compiler.compile({{"pool_test.rscript", src}});
+        require(compiled.succeeded(), "pool_test.rscript compile failed");
 
         auto rt = std::make_unique<game::ScriptRuntime>(compiled.program);
         runtime::RuntimeError err;

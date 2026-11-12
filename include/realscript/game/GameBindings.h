@@ -102,6 +102,25 @@ private:
 template <typename T>
 class NativeTypeBuilder {
 public:
+    template <typename Base>
+    NativeTypeBuilder& base() {
+        static_assert(std::is_base_of_v<Base, T> && !std::is_same_v<std::remove_cv_t<Base>, std::remove_cv_t<T>>,
+            "Base must be a strict base class of T");
+        auto& type = state_->nativeTypes[index_];
+        type.baseCppType = std::type_index(typeid(Base));
+        type.upcastToBase = [](const std::shared_ptr<void>& ptr) -> std::shared_ptr<void> {
+            return std::static_pointer_cast<Base>(std::static_pointer_cast<T>(ptr));
+        };
+        const auto baseIt = state_->nativeTypeByCppType.find(*type.baseCppType);
+        if (baseIt != state_->nativeTypeByCppType.end()) {
+            const auto& baseDecl = state_->nativeTypes[baseIt->second];
+            if (!baseDecl.moduleName.empty() && baseDecl.moduleName != type.moduleName) {
+                state_->modules[type.moduleName].imports.insert(baseDecl.moduleName);
+            }
+        }
+        return *this;
+    }
+
     template <auto Method>
     NativeTypeBuilder& method(
         std::string name,
@@ -208,6 +227,9 @@ public:
         declaration.name = std::move(name);
         declaration.typeId = semantic::stableTypeId(
             declaration.moduleName + "::" + declaration.name);
+        if (state_->nativeHandles) {
+            state_->nativeHandles->registerCppType(key, declaration.typeId);
+        }
         const auto index = state_->nativeTypes.size();
         state_->nativeTypeByCppType.emplace(key, index);
         state_->nativeTypes.push_back(std::move(declaration));
@@ -326,7 +348,8 @@ public:
 
     [[nodiscard]] static HeaderBindingGenerationResult generateBindingsFromCppHeader(
         std::string_view headerContent,
-        const std::string& defaultModuleName = "Engine.Native");
+        const std::string& defaultModuleName = "Engine.Native",
+        const std::unordered_map<std::string, std::string>& predefinedMacros = {});
 
     template <typename T>
     [[nodiscard]] std::string canonicalTypeName() const {
@@ -352,8 +375,8 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::method(
     std::string requiredCapability) {
     using Traits = detail::FunctionTraits<decltype(Method)>;
     if constexpr (Traits::IsMemberFunction) {
-        static_assert(std::is_same_v<typename Traits::Class, T>,
-            "bound method must belong to the native type being registered");
+        static_assert(std::is_base_of_v<typename Traits::Class, T>,
+            "bound method must belong to or be inherited by the native type being registered");
     }
 
     auto returnType = detail::resolveScriptType<typename Traits::Return>(state_);
@@ -422,7 +445,7 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::method(
         state_->bindings->bind(
             bindingName,
             [state](const auto&, const auto& arguments, auto& error) {
-                const auto invoked = detail::invokeMethod<Method, Traits>(
+                const auto invoked = detail::invokeMethod<T, Method, Traits>(
                     state,
                     arguments,
                     error,
@@ -574,8 +597,8 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::property(
     std::string name,
     runtime::BindingDeterminism determinism) {
     using Traits = detail::FunctionTraits<decltype(Getter)>;
-    static_assert(std::is_same_v<typename Traits::Class, T>,
-        "bound property getter must belong to the native type being registered");
+    static_assert(std::is_base_of_v<typename Traits::Class, T>,
+        "bound property getter must belong to or be inherited by the native type being registered");
     static_assert(Traits::Arity == 0,
         "bound property getter must not take arguments");
     static_assert(!std::is_void_v<typename Traits::Return>,
@@ -625,7 +648,7 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::property(
     state_->bindings->bind(
         bindingName,
         [state](const auto&, const auto& arguments, auto& error) {
-            return detail::invokeMethod<Getter, Traits>(
+            return detail::invokeMethod<T, Getter, Traits>(
                 state,
                 arguments,
                 error,
@@ -642,10 +665,10 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::property(
     runtime::BindingDeterminism determinism) {
     using GetterTraits = detail::FunctionTraits<decltype(Getter)>;
     using SetterTraits = detail::FunctionTraits<decltype(Setter)>;
-    static_assert(std::is_same_v<typename GetterTraits::Class, T>,
-        "bound property getter must belong to the native type being registered");
-    static_assert(std::is_same_v<typename SetterTraits::Class, T>,
-        "bound property setter must belong to the native type being registered");
+    static_assert(std::is_base_of_v<typename GetterTraits::Class, T>,
+        "bound property getter must belong to or be inherited by the native type being registered");
+    static_assert(std::is_base_of_v<typename SetterTraits::Class, T>,
+        "bound property setter must belong to or be inherited by the native type being registered");
     static_assert(GetterTraits::Arity == 0,
         "bound property getter must not take arguments");
     static_assert(SetterTraits::Arity == 1,
@@ -716,7 +739,7 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::property(
     state_->bindings->bind(
         getterBinding,
         [state](const auto&, const auto& arguments, auto& error) {
-            return detail::invokeMethod<Getter, GetterTraits>(
+            return detail::invokeMethod<T, Getter, GetterTraits>(
                 state,
                 arguments,
                 error,
@@ -726,7 +749,7 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::property(
     state_->bindings->bind(
         setterBinding,
         [state](const auto&, const auto& arguments, auto& error) {
-            const auto invoked = detail::invokeMethod<Setter, SetterTraits>(
+            const auto invoked = detail::invokeMethod<T, Setter, SetterTraits>(
                 state,
                 arguments,
                 error,
@@ -758,8 +781,8 @@ NativeTypeBuilder<T>& NativeTypeBuilder<T>::field(
     std::string name,
     runtime::BindingDeterminism determinism) {
     using Traits = detail::MemberFieldTraits<decltype(FieldPtr)>;
-    static_assert(std::is_same_v<typename Traits::Class, T>,
-        "bound field must belong to the native type being registered");
+    static_assert(std::is_base_of_v<typename Traits::Class, T>,
+        "bound field must belong to or be inherited by the native type being registered");
     using ValueType = typename Traits::ValueType;
 
     auto fieldType = detail::resolveScriptType<ValueType>(state_);
@@ -886,8 +909,8 @@ template <typename S>
 template <auto FieldPtr>
 NativeStructBuilder<S>& NativeStructBuilder<S>::field(std::string name) {
     using Traits = detail::MemberFieldTraits<decltype(FieldPtr)>;
-    static_assert(std::is_same_v<typename Traits::Class, S>,
-        "bound struct field must belong to the native struct being registered");
+    static_assert(std::is_base_of_v<typename Traits::Class, S>,
+        "bound struct field must belong to or be inherited by the native struct being registered");
     using ValueType = typename Traits::ValueType;
 
     auto fieldType = detail::resolveScriptType<ValueType>(state_);

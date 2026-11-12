@@ -191,7 +191,7 @@ private:
 } // namespace
 
 int main() {
-    std::cout << "=== RealScript FiberScheduler (.rs Lowering) + Math Verification ===\n";
+    std::cout << "=== RealScript FiberScheduler (.rscript Lowering) + Math Verification ===\n";
 
     // 1. Verify 8-byte CompactInstruction, 8-byte GenerationalEntityHandle, and zero-pointer POD FiberContext
     static_assert(sizeof(CompactInstruction) == 8, "CompactInstruction must be 8 bytes");
@@ -211,15 +211,15 @@ int main() {
     assert((physicsVel * physicsTime).toIntFloor() == 15);
     std::cout << "[PASS] FixedPoint32<8> (Q24.8) & FixedPoint32<16> (Q16.16) deterministic math verified\n";
 
-    // 3. Compile RealScript (.rs) fiber coroutines & AI Behavior Trees directly into FiberScheduler!
+    // 3. Compile RealScript (.rscript) fiber coroutines & AI Behavior Trees directly into FiberScheduler!
     realscript::compiler::Compilation fiberCompilation;
     fiberCompilation.addSource(realscript::compiler::SourceFile{
-        "entity_fibers.rs",
+        "entity_fibers.rscript",
         R"RS(
 module EntityBehaviors;
 import RealScript.Fiber;
 
-// Zero-overhead .rs host command helpers (inlined by FiberCompiler into 8B CompactInstructions)
+// Zero-overhead .rscript host command helpers (inlined by FiberCompiler into 8B CompactInstructions)
 void SetSpriteFrame(int frameOffset) {
     Fiber.Command(1, 0, frameOffset);
 }
@@ -268,7 +268,7 @@ void AIWaveAdd(int unitTypeId, int count) {
     Fiber.Command(17, unitTypeId, count);
 }
 
-// High-frequency unit harvest/work animation coroutine written in .rs
+// High-frequency unit harvest/work animation coroutine written in .rscript
 public void WorkerHarvestLoop() {
     while (true) {
         Fiber.SetUnbreakable(true);
@@ -293,7 +293,7 @@ public void DefenseDaemon() {
     }
 }
 
-// Strategic AI Behavior Tree written in .rs
+// Strategic AI Behavior Tree written in .rscript
 public void CommanderBehaviorTree() {
     DefineMaxUnitCap(0, 24);
     DefineMaxUnitCap(5, 8);
@@ -352,7 +352,7 @@ public void CommanderBehaviorTree() {
 
     FiberScheduler scheduler(&host);
 
-    // Spawn 1,600 concurrent unit animation fibers + 1 AI Behavior Tree root fiber directly from compiled .rs functions!
+    // Spawn 1,600 concurrent unit animation fibers + 1 AI Behavior Tree root fiber directly from compiled .rscript functions!
     constexpr std::size_t NUM_UNITS = 1600;
     std::vector<GenerationalEntityHandle> units;
     units.reserve(NUM_UNITS);
@@ -387,7 +387,7 @@ public void CommanderBehaviorTree() {
     auto t1 = std::chrono::high_resolution_clock::now();
     double elapsedMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    // Verify ECS SoA zero-copy state updates & AI Blackboard semantics driven by .rs fibers
+    // Verify ECS SoA zero-copy state updates & AI Blackboard semantics driven by .rscript fibers
     [[maybe_unused]] const auto& bb = host.groupBlackboard(1);
     assert(host.sprites().lastOverlaySpawned[units[0].slot] == 431);
     assert(host.sprites().lastSoundCuePlayed[units[0].slot] == 65);
@@ -399,7 +399,7 @@ public void CommanderBehaviorTree() {
     assert(bb.techsQueued[0] == 1);
     assert(bb.defenseForces[0][0] == 4);
     assert(bb.defenseForces[2][124] == 3);
-    assert(bb.buildOrderQueued[124] == 3); // From forked DefenseDaemon .rs function!
+    assert(bb.buildOrderQueued[124] == 3); // From forked DefenseDaemon .rscript function!
     assert(bb.attackWavesDispatched >= 1);
     assert(bb.lastAttackWaveSize == 18);   // Computed from waveRoster (12 + 6)
 
@@ -422,9 +422,9 @@ public void CommanderBehaviorTree() {
     (void)digestAtTick120_RunB;
     assert(digestAtTick120_RunA == digestAtTick120_RunB);
 
-    std::cout << "[PASS] 1,600 concurrent .rs WorkerHarvestLoop fibers + Forked .rs CommanderBehaviorTree stepped 120 ticks in "
+    std::cout << "[PASS] 1,600 concurrent .rscript WorkerHarvestLoop fibers + Forked .rscript CommanderBehaviorTree stepped 120 ticks in "
               << elapsedMs << " ms (" << (elapsedMs / 120.0) << " ms/tick, " << totalInstr << " instructions)\n";
-    std::cout << "[PASS] .rs -> FiberCompiler lowering (inlined helpers, Fiber.Fork, Fiber.Cond, Fiber.WaitUntil) verified\n";
+    std::cout << "[PASS] .rscript -> FiberCompiler lowering (inlined helpers, Fiber.Fork, Fiber.Cond, Fiber.WaitUntil) verified\n";
     std::cout << "[PASS] Cross-instance Lockstep Snapshot Restore & 64-bit FNV-1a Digest verified: 0x"
               << std::hex << digestAtTick120_RunA << std::dec << "\n";
 
@@ -433,7 +433,7 @@ public void CommanderBehaviorTree() {
     {
         realscript::compiler::Compilation compilation;
         compilation.addSource(realscript::compiler::SourceFile{
-            "deterministic_gameplay_math.rs",
+            "deterministic_gameplay_math.rscript",
             R"RS(
 module GameSim;
 import RealScript.Math;

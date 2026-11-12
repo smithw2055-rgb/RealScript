@@ -578,6 +578,26 @@ bool ScriptRuntime::bindEcsRawColumnStandardLayout(
             std::size_t fieldSize = 0;
             std::size_t fieldAlign = 1;
             switch (field.type) {
+            case semantic::PrimitiveType::SByte:
+                layout.kind = runtime::NativeFieldKind::Int8;
+                fieldSize = 1;
+                fieldAlign = 1;
+                break;
+            case semantic::PrimitiveType::Byte:
+                layout.kind = runtime::NativeFieldKind::UInt8;
+                fieldSize = 1;
+                fieldAlign = 1;
+                break;
+            case semantic::PrimitiveType::Short:
+                layout.kind = runtime::NativeFieldKind::Int16;
+                fieldSize = 2;
+                fieldAlign = 2;
+                break;
+            case semantic::PrimitiveType::UShort:
+                layout.kind = runtime::NativeFieldKind::UInt16;
+                fieldSize = 2;
+                fieldAlign = 2;
+                break;
             case semantic::PrimitiveType::Int:
                 layout.kind = intAs32
                     ? runtime::NativeFieldKind::Int32
@@ -585,8 +605,18 @@ bool ScriptRuntime::bindEcsRawColumnStandardLayout(
                 fieldSize = intAs32 ? 4 : 8;
                 fieldAlign = fieldSize;
                 break;
+            case semantic::PrimitiveType::UInt:
+                layout.kind = runtime::NativeFieldKind::UInt32;
+                fieldSize = 4;
+                fieldAlign = 4;
+                break;
             case semantic::PrimitiveType::Long:
                 layout.kind = runtime::NativeFieldKind::Int64;
+                fieldSize = 8;
+                fieldAlign = 8;
+                break;
+            case semantic::PrimitiveType::ULong:
+                layout.kind = runtime::NativeFieldKind::UInt64;
                 fieldSize = 8;
                 fieldAlign = 8;
                 break;

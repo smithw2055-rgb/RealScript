@@ -39,7 +39,7 @@ int main() {
         require(realscript::game::installGameplayBindings(api, host),
             "failed to install gameplay bindings");
         realscript::game::GameScriptCompiler compiler(api);
-        const auto compiled = compiler.compile({{"product_macro.rs", R"(
+        const auto compiled = compiler.compile({{"product_macro.rscript", R"(
 module Bench.ProductMacro;
 import RealScript.Game;
 

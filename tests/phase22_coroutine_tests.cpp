@@ -28,7 +28,7 @@ void testPersistedLocalsYieldBreakAndRollback() {
     require(realscript::game::installGameplayBindings(api, host),
         "gameplay bindings failed");
     realscript::game::GameScriptCompiler compiler(api);
-    const auto compiled = compiler.compile({{"phase22.rs", R"(
+    const auto compiled = compiler.compile({{"phase22.rscript", R"(
 module Phase22.Coroutines;
 import RealScript.Game;
 
@@ -263,7 +263,7 @@ class Behavior
             if (function.name !=
                 "Behavior.$sequence_Nested_1") continue;
             sawNestedContinuationDebugInfo =
-                function.debugInfo.sourceName == "phase22.rs" &&
+                function.debugInfo.sourceName == "phase22.rscript" &&
                 !function.debugInfo.sequencePoints.empty();
             for (const auto& local : function.debugInfo.locals) {
                 require(local.name.find("$sequence_") != 0,
@@ -487,7 +487,7 @@ class Behavior
 void testActiveSequenceHotReloadMigration() {
     const auto compile = [](const std::string& source) {
         realscript::compiler::Compilation compilation({{
-            "phase22-reload.rs", source}});
+            "phase22-reload.rscript", source}});
         const auto build = compilation.build();
         require(!build.diagnostics.hasErrors(),
             "Phase 22 hot-reload fixture compilation failed:\n" +
@@ -575,7 +575,7 @@ void testSequenceResultDiagnostics() {
     const auto hasDiagnostic = [](const std::string& source,
                                   const std::string& code) {
         realscript::compiler::Compilation compilation({{
-            "phase22-invalid-result.rs", source}});
+            "phase22-invalid-result.rscript", source}});
         const auto build = compilation.build();
         for (const auto& diagnostic : build.diagnostics.items()) {
             if (diagnostic.code == code) return true;
@@ -609,7 +609,7 @@ class Invalid
     realscript::diagnostics::DiagnosticBag parseDiagnostics;
     realscript::text::SourceText malformed(
         "class Invalid { sequence<int Broken(long target) { } }",
-        "phase22-malformed-result.rs");
+        "phase22-malformed-result.rscript");
     realscript::syntax::Parser parser(malformed, parseDiagnostics);
     static_cast<void>(parser.parseCompilationUnit());
     require(parseDiagnostics.hasErrors(),

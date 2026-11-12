@@ -14,7 +14,7 @@ rsaot \
   --program-name GameScripts \
   --opt-level 2 \
   --opt-report \
-  game.rs common.rs
+  game.rscript common.rscript
 ```
 
 Generated output includes:
@@ -53,8 +53,8 @@ realscript_add_aot_library(GameScriptsAot
     OPT_LEVEL 2
     TRUSTED_RELEASE
     SOURCES
-        game.rs
-        common.rs
+        game.rscript
+        common.rscript
 )
 
 target_link_libraries(game PRIVATE GameScriptsAot)
@@ -172,7 +172,7 @@ rsbench \
   --iterations 1000 \
   --opt-level 2 \
   --json \
-  game.rs common.rs
+  game.rscript common.rscript
 ```
 
 Benchmark output includes:
@@ -196,7 +196,7 @@ In v0.98.0, the native execution model is further enhanced with:
 - **Zero-Budget Trusted Release AOT** (`--trusted-release`): eliminates instruction/branch/GC accounting guards via compile-time template branching (`if constexpr (!TrustedRelease)`).
 - **Custom Struct Stack Scalarization**: custom value structs up to 16 scalar/inline-math fields are scalarized to stack-allocated C++ structures (`AotStruct_<id>`).
 - **AVX2 / SIMD Vectorized ECS Query Loops**: vectorized inner loops with `__restrict` pointers and `#pragma loop(ivdep)`.
-- **`#line` Source Mapping**: maps C++17 AOT generated statements directly back to `.rs` script source lines for native C++ debuggers.
+- **`#line` Source Mapping**: maps C++17 AOT generated statements directly back to `.rscript` script source lines for native C++ debuggers.
 
 | Workload | Median |
 |---|---:|

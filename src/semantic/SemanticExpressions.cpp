@@ -763,6 +763,10 @@ const TypeSymbol* Binder::findVisibleType(SymbolId id) const noexcept {
 
 bool Binder::isTypeAccessible(const TypeSymbol& type) const noexcept {
     if (type.accessibility == Accessibility::Public) return true;
+    if (type.accessibility == Accessibility::Internal &&
+        hygienicAccessibleModules_.find(type.moduleName) != hygienicAccessibleModules_.end()) {
+        return true;
+    }
     return type.moduleName == currentModuleName_;
 }
 
@@ -778,7 +782,8 @@ bool Binder::isMemberAccessible(
         ? declaringType->moduleName
         : declaringModule;
     if (accessibility == Accessibility::Internal) {
-        return module == currentModuleName_;
+        return module == currentModuleName_ ||
+            hygienicAccessibleModules_.find(module) != hygienicAccessibleModules_.end();
     }
     if (!currentOwnerType_ || declaringTypeId == 0) {
         return false;
@@ -794,6 +799,147 @@ bool Binder::isMemberAccessible(
         baseTypeId = baseType->baseTypeId;
     }
     return false;
+}
+
+bool Binder::isManagedResourceHandleType(
+    PrimitiveType type,
+    const std::string& typeName) const noexcept {
+    if (type != PrimitiveType::Struct || typeName.empty()) return false;
+    const auto sep = typeName.rfind("::");
+    const std::string_view shortName = sep == std::string::npos
+        ? std::string_view(typeName)
+        : std::string_view(typeName).substr(sep + 2);
+    if (shortName != "ResourceHandle" &&
+        shortName.rfind("ResourceHandle__", 0) != 0) {
+        return false;
+    }
+    const auto found = visibleTypes_.find(typeName);
+    if (found == visibleTypes_.end() || found->second.kind != TypeKind::Struct) {
+        return false;
+    }
+    for (const auto& m : found->second.methods) {
+        if (!m.staticMethod && m.name == "Retain" &&
+            m.parameters.size() == 1 && m.returnType == PrimitiveType::Struct) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Binder::isInsideResourceHandleImplementation() const noexcept {
+    if (!currentOwnerType_) return false;
+    const auto ownerCanon = canonicalTypeName(*currentOwnerType_);
+    if (isManagedResourceHandleType(PrimitiveType::Struct, ownerCanon)) {
+        return true;
+    }
+    if (currentModuleName_ == "RealScript.Resource" &&
+        (currentOwnerType_->name == "Resource" ||
+         currentOwnerType_->name == "ResourceServer")) {
+        return true;
+    }
+    return false;
+}
+
+bool Binder::shouldCloneResourceHandleValue(
+    const BoundExpression& expr,
+    bool isReturnContext) const noexcept {
+    if (isInsideResourceHandleImplementation()) return false;
+    if (!isManagedResourceHandleType(expr.type, expr.typeName)) return false;
+    switch (expr.kind()) {
+    case BoundNodeKind::VariableExpression: {
+        if (!isReturnContext) return true;
+        const auto& v = static_cast<const BoundVariableExpression&>(expr).variable;
+        return v.isUsingResource || v.parameter || storageTypeOf(v) != v.type || storageTypeNameOf(v) != v.typeName;
+    }
+    case BoundNodeKind::MemberAccessExpression:
+    case BoundNodeKind::StructFieldAccessExpression:
+    case BoundNodeKind::ElementAccessExpression:
+    case BoundNodeKind::AssignmentExpression:
+    case BoundNodeKind::MemberAssignmentExpression:
+    case BoundNodeKind::StructFieldAssignmentExpression:
+    case BoundNodeKind::PropertyAssignmentExpression:
+    case BoundNodeKind::ElementAssignmentExpression:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::unique_ptr<BoundExpression> Binder::cloneResourceHandleIfNeeded(
+    std::unique_ptr<BoundExpression> expr,
+    text::TextSpan span,
+    bool isReturnContext) {
+    if (!expr || !shouldCloneResourceHandleValue(*expr, isReturnContext)) {
+        return expr;
+    }
+    const auto ownerIt = visibleTypes_.find(expr->typeName);
+    if (ownerIt == visibleTypes_.end()) return expr;
+    const FunctionSymbol* retainMethod = nullptr;
+    for (const auto& m : ownerIt->second.methods) {
+        if (!m.staticMethod && m.name == "Retain" &&
+            m.parameters.size() == 1 && m.returnType == PrimitiveType::Struct) {
+            retainMethod = &m;
+            break;
+        }
+    }
+    if (!retainMethod) return expr;
+    std::vector<const syntax::ExpressionSyntax*> emptySyntaxArgs;
+    std::vector<std::optional<syntax::SyntaxToken>> emptyMods;
+    return bindSelectedCall(
+        *retainMethod,
+        {},
+        emptySyntaxArgs,
+        emptyMods,
+        {},
+        std::move(expr),
+        span,
+        "resource handle clone",
+        true);
+}
+
+std::unique_ptr<BoundExpression> Binder::wrapResourceHandleOverwriteRelease(
+    std::unique_ptr<BoundExpression> oldValueExpr,
+    std::unique_ptr<BoundExpression> newValueExpr,
+    text::TextSpan span) {
+    if (!oldValueExpr || !newValueExpr ||
+        isInsideResourceHandleImplementation() ||
+        !isManagedResourceHandleType(newValueExpr->type, newValueExpr->typeName)) {
+        return newValueExpr;
+    }
+    const auto ownerIt = visibleTypes_.find(newValueExpr->typeName);
+    if (ownerIt == visibleTypes_.end()) return newValueExpr;
+    const FunctionSymbol* assignHelper = nullptr;
+    for (const auto& m : ownerIt->second.methods) {
+        if (m.staticMethod && m.name == "__AssignHandle" &&
+            m.parameters.size() == 2 && m.returnType == PrimitiveType::Struct) {
+            assignHelper = &m;
+            break;
+        }
+    }
+    if (!assignHelper) return newValueExpr;
+    auto markSyntheticRead = [](BoundExpression* expr) {
+        while (expr) {
+            if (expr->kind() == BoundNodeKind::VariableExpression) {
+                static_cast<BoundVariableExpression*>(expr)->syntheticOverwriteRead = true;
+                return;
+            }
+            if (expr->kind() == BoundNodeKind::MemberAccessExpression) {
+                expr = static_cast<BoundMemberAccessExpression*>(expr)->receiver.get();
+                continue;
+            }
+            break;
+        }
+    };
+    markSyntheticRead(oldValueExpr.get());
+    auto call = std::make_unique<BoundCallExpression>();
+    call->span = span;
+    call->type = newValueExpr->type;
+    call->typeName = newValueExpr->typeName;
+    call->function = *assignHelper;
+    call->arguments.push_back(std::move(oldValueExpr));
+    call->arguments.push_back(std::move(newValueExpr));
+    call->argumentEvaluationOrder = {1, 0};
+    return call;
 }
 
 std::unique_ptr<BoundExpression> Binder::bindStaticFieldInitializer(
@@ -812,6 +958,7 @@ std::unique_ptr<BoundExpression> Binder::bindStaticFieldInitializer(
     const auto savedStatic = currentStaticMethod_;
     const auto savedConstructor = currentConstructor_;
     const auto savedModule = currentModuleName_;
+    const auto savedHygienic = hygienicAccessibleModules_;
     std::vector<std::unordered_map<std::string, VariableSymbol>> savedScopes;
     std::vector<std::unordered_map<std::string, VariableSymbol>> savedAliases;
     std::swap(scopes_, savedScopes);
@@ -822,11 +969,15 @@ std::unique_ptr<BoundExpression> Binder::bindStaticFieldInitializer(
     if (!declType->moduleName.empty()) {
         currentModuleName_ = declType->moduleName;
     }
+    hygienicAccessibleModules_.insert(
+        declType->hygienicAccessibleModules.begin(),
+        declType->hygienicAccessibleModules.end());
     auto bound = bindTargetExpression(
         *field.initializerSyntax,
         field.type,
         field.typeName,
         field.staticField ? "static field initializer" : "field initializer");
+    hygienicAccessibleModules_ = savedHygienic;
     currentModuleName_ = savedModule;
     currentConstructor_ = savedConstructor;
     currentStaticMethod_ = savedStatic;
@@ -1030,6 +1181,7 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
         binding.symbol = lambdaFunction;
         binding.sourceName = currentSourceName_;
         binding.eventLambda = &lambda;
+        binding.hygienicAccessibleModules = hygienicAccessibleModules_;
         binding.parameterNames.push_back("this");
         binding.parameterSpans.push_back(lambda.arrowToken.span);
         for (const auto& parameter : lambda.parameterTokens) {
@@ -1051,7 +1203,7 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
         result->captureFields = closure.fields;
         for (const auto& variable : captured) {
             result->captures.push_back(
-                storageTypeOf(variable) != variable.type
+                (storageTypeOf(variable) != variable.type || storageTypeNameOf(variable) != variable.typeName)
                     ? storageVariableExpression(variable, lambda.span())
                     : variableExpression(variable, lambda.span()));
         }
@@ -1437,7 +1589,7 @@ std::unique_ptr<BoundExpression> Binder::bindNameExpression(
                     : primitiveTypeName(variable->type),
                 syntaxTree.identifierToken.span);
         }
-        if (storageTypeOf(*variable) != variable->type) {
+        if (storageTypeOf(*variable) != variable->type || storageTypeNameOf(*variable) != variable->typeName) {
             const auto wrapper = visibleTypes_.find(
                 storageTypeNameOf(*variable));
             if (wrapper == visibleTypes_.end() ||
@@ -2465,41 +2617,50 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
             context, targetTypeName);
     };
 
-    if (const auto* variable = lookupVariable(
+    if (const auto* foundVariable = lookupVariable(
             syntaxTree.identifierToken.text)) {
-        if (variable->name != "this" && !compoundOp) {
+        const VariableSymbol variable = *foundVariable;
+        if (variable.name != "this" && !compoundOp) {
             recordSymbolReference(
                 occurrences_,
                 currentSourceName_,
-                variable->id,
-                variable->parameter ? SymbolKind::Parameter : SymbolKind::Local,
-                variable->name,
-                isExactType(variable->type) && !variable->typeName.empty()
-                    ? variable->typeName
-                    : primitiveTypeName(variable->type),
+                variable.id,
+                variable.parameter ? SymbolKind::Parameter : SymbolKind::Local,
+                variable.name,
+                isExactType(variable.type) && !variable.typeName.empty()
+                    ? variable.typeName
+                    : primitiveTypeName(variable.type),
                 syntaxTree.identifierToken.span);
         }
-        if (variable->isConst) {
+        if (variable.isConst) {
             diagnostics_.report(
                 "RS2483",
                 "cannot assign to const local variable '" +
-                    variable->name + "'",
+                    variable.name + "'",
                 syntaxTree.identifierToken.span);
             return makeError(syntaxTree.span());
         }
-        if (variable->modifier == ParameterModifier::In) {
+        if (variable.modifier == ParameterModifier::In) {
             diagnostics_.report(
                 "RS8702",
                 "cannot assign to in parameter '" +
-                    variable->name + "'",
+                    variable.name + "'",
+                syntaxTree.identifierToken.span);
+            return makeError(syntaxTree.span());
+        }
+        if (variable.isUsingResource) {
+            diagnostics_.report(
+                "RS2651",
+                "cannot assign to '" + variable.name +
+                    "' because it is a 'using' variable",
                 syntaxTree.identifierToken.span);
             return makeError(syntaxTree.span());
         }
         auto value = bindAssignedValue(
-            variable->type, variable->typeName, "assignment");
-        if (storageTypeOf(*variable) != variable->type) {
+            variable.type, variable.typeName, "assignment");
+        if (storageTypeOf(variable) != variable.type || storageTypeNameOf(variable) != variable.typeName) {
             const auto wrapper = visibleTypes_.find(
-                storageTypeNameOf(*variable));
+                storageTypeNameOf(variable));
             if (wrapper == visibleTypes_.end() ||
                 wrapper->second.fields.empty()) {
                 diagnostics_.report(
@@ -2511,45 +2672,67 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
             auto result =
                 std::make_unique<BoundMemberAssignmentExpression>();
             result->span = syntaxTree.span();
-            result->type = variable->type;
-            result->typeName = variable->typeName;
+            result->type = variable.type;
+            result->typeName = variable.typeName;
             result->receiver = storageVariableExpression(
-                *variable, syntaxTree.span());
+                variable, syntaxTree.span());
             result->ownerType = wrapper->second;
             result->field = wrapper->second.fields.front();
-            result->expression = std::move(value);
+            result->expression = wrapResourceHandleOverwriteRelease(
+                makeVariableAccess(variable, syntaxTree.identifierToken.span),
+                std::move(value),
+                syntaxTree.span());
             return result;
         }
         auto result = std::make_unique<BoundAssignmentExpression>();
         result->span = syntaxTree.span();
-        result->type = variable->type;
-        result->typeName = variable->typeName;
-        result->variable = *variable;
-        result->expression = std::move(value);
+        result->type = variable.type;
+        result->typeName = variable.typeName;
+        result->variable = variable;
+        result->expression = wrapResourceHandleOverwriteRelease(
+            makeVariableAccess(variable, syntaxTree.identifierToken.span),
+            std::move(value),
+            syntaxTree.span());
         return result;
     }
 
     if (const auto field = sequenceLocalFields_.find(
             syntaxTree.identifierToken.text);
         field != sequenceLocalFields_.end()) {
-        const auto* receiver = lookupVariable("this");
-        if (!receiver || !currentOwnerType_) return makeError(syntaxTree.span());
+        if (field->second.isUsingResource) {
+            diagnostics_.report(
+                "RS2651",
+                "cannot assign to '" + field->first +
+                    "' because it is a 'using' variable",
+                syntaxTree.identifierToken.span);
+            return makeError(syntaxTree.span());
+        }
+        const auto* foundReceiver = lookupVariable("this");
+        if (!foundReceiver || !currentOwnerType_) return makeError(syntaxTree.span());
+        const VariableSymbol receiver = *foundReceiver;
         auto result = std::make_unique<BoundMemberAssignmentExpression>();
         result->span = syntaxTree.span();
         result->type = field->second.type;
         result->typeName = field->second.typeName;
-        result->receiver = variableExpression(*receiver, syntaxTree.span());
+        result->receiver = variableExpression(receiver, syntaxTree.span());
         result->ownerType = *currentOwnerType_;
         result->field = field->second;
-        result->expression = bindAssignedValue(
+        auto seqVal = bindAssignedValue(
             field->second.type,
             field->second.typeName,
             "sequence local assignment");
+        result->expression = wrapResourceHandleOverwriteRelease(
+            makeSequenceFieldAccess(field->second, syntaxTree.identifierToken.span),
+            std::move(seqVal),
+            syntaxTree.span());
         return result;
     }
 
     if (currentOwnerType_) {
-        const auto* thisVariable = lookupVariable("this");
+        std::optional<VariableSymbol> thisVariable;
+        if (const auto* foundThis = lookupVariable("this")) {
+            thisVariable = *foundThis;
+        }
         if (const auto* field = findField(
                 *currentOwnerType_, syntaxTree.identifierToken.text)) {
             if (!isMemberAccessible(
@@ -2590,13 +2773,20 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
             if (field->staticField) {
                 auto value = bindAssignedValue(
                     field->type, field->typeName, "field assignment");
+                auto oldAccess = std::make_unique<BoundMemberAccessExpression>();
+                oldAccess->span = syntaxTree.identifierToken.span;
+                oldAccess->type = field->type;
+                oldAccess->typeName = field->typeName;
+                oldAccess->ownerType = *currentOwnerType_;
+                oldAccess->field = *field;
                 auto result = std::make_unique<BoundMemberAssignmentExpression>();
                 result->span = syntaxTree.span();
                 result->type = field->type;
                 result->typeName = field->typeName;
                 result->ownerType = *currentOwnerType_;
                 result->field = *field;
-                result->expression = std::move(value);
+                result->expression = wrapResourceHandleOverwriteRelease(
+                    std::move(oldAccess), std::move(value), syntaxTree.span());
                 return result;
             }
             if (currentStaticMethod_ || !thisVariable) {
@@ -2628,6 +2818,23 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                     *thisVariable, syntaxTree.span());
                 cell->ownerType = *currentOwnerType_;
                 cell->field = *field;
+                auto oldCell =
+                    std::make_unique<BoundMemberAccessExpression>();
+                oldCell->span = syntaxTree.span();
+                oldCell->type = field->type;
+                oldCell->typeName = field->typeName;
+                oldCell->receiver = variableExpression(
+                    *thisVariable, syntaxTree.span());
+                oldCell->ownerType = *currentOwnerType_;
+                oldCell->field = *field;
+                auto oldAccess =
+                    std::make_unique<BoundMemberAccessExpression>();
+                oldAccess->span = syntaxTree.span();
+                oldAccess->type = valueField.type;
+                oldAccess->typeName = valueField.typeName;
+                oldAccess->receiver = std::move(oldCell);
+                oldAccess->ownerType = captureStorage->second;
+                oldAccess->field = valueField;
                 auto result =
                     std::make_unique<BoundMemberAssignmentExpression>();
                 result->span = syntaxTree.span();
@@ -2636,13 +2843,21 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 result->receiver = std::move(cell);
                 result->ownerType = captureStorage->second;
                 result->field = valueField;
-                result->expression = std::move(value);
+                result->expression = wrapResourceHandleOverwriteRelease(
+                    std::move(oldAccess), std::move(value), syntaxTree.span());
                 return result;
             }
             auto value = bindAssignedValue(
                 field->type,
                 field->typeName, "field assignment");
             if (currentOwnerType_->kind == TypeKind::Struct) {
+                auto oldAccess = std::make_unique<BoundStructFieldAccessExpression>();
+                oldAccess->span = syntaxTree.identifierToken.span;
+                oldAccess->type = field->type;
+                oldAccess->typeName = field->typeName;
+                oldAccess->receiver = makeVariableAccess(*thisVariable, syntaxTree.span());
+                oldAccess->ownerType = *currentOwnerType_;
+                oldAccess->field = *field;
                 auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
                 result->span = syntaxTree.span();
                 result->type = field->type;
@@ -2650,8 +2865,9 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 result->variable = *thisVariable;
                 result->ownerType = *currentOwnerType_;
                 result->field = *field;
-                result->expression = std::move(value);
-                if (storageTypeOf(*thisVariable) != thisVariable->type) {
+                result->expression = wrapResourceHandleOverwriteRelease(
+                    std::move(oldAccess), std::move(value), syntaxTree.span());
+                if (storageTypeOf(*thisVariable) != thisVariable->type || storageTypeNameOf(*thisVariable) != thisVariable->typeName) {
                     const auto wrapper = visibleTypes_.find(
                         storageTypeNameOf(*thisVariable));
                     if (wrapper == visibleTypes_.end() ||
@@ -2669,6 +2885,13 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 }
                 return result;
             }
+            auto oldAccess = std::make_unique<BoundMemberAccessExpression>();
+            oldAccess->span = syntaxTree.identifierToken.span;
+            oldAccess->type = field->type;
+            oldAccess->typeName = field->typeName;
+            oldAccess->receiver = variableExpression(*thisVariable, syntaxTree.span());
+            oldAccess->ownerType = *currentOwnerType_;
+            oldAccess->field = *field;
             auto receiver = variableExpression(*thisVariable, syntaxTree.span());
             auto result = std::make_unique<BoundMemberAssignmentExpression>();
             result->span = syntaxTree.span();
@@ -2677,7 +2900,8 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
             result->receiver = std::move(receiver);
             result->ownerType = *currentOwnerType_;
             result->field = *field;
-            result->expression = std::move(value);
+            result->expression = wrapResourceHandleOverwriteRelease(
+                std::move(oldAccess), std::move(value), syntaxTree.span());
             return result;
         }
         if (!currentStaticMethod_ && thisVariable && currentOwnerType_->synthetic) {
@@ -2704,6 +2928,23 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 auto value = bindAssignedValue(
                     outerField->type,
                     outerField->typeName, "captured field assignment");
+                auto oldCapRecv =
+                    std::make_unique<BoundMemberAccessExpression>();
+                oldCapRecv->span = syntaxTree.span();
+                oldCapRecv->type = capturedThis->type;
+                oldCapRecv->typeName = capturedThis->typeName;
+                oldCapRecv->receiver = variableExpression(
+                    *thisVariable, syntaxTree.span());
+                oldCapRecv->ownerType = *currentOwnerType_;
+                oldCapRecv->field = *capturedThis;
+                auto oldAccess =
+                    std::make_unique<BoundMemberAccessExpression>();
+                oldAccess->span = syntaxTree.span();
+                oldAccess->type = outerField->type;
+                oldAccess->typeName = outerField->typeName;
+                oldAccess->receiver = std::move(oldCapRecv);
+                oldAccess->ownerType = outer->second;
+                oldAccess->field = *outerField;
                 auto capturedReceiver =
                     std::make_unique<BoundMemberAccessExpression>();
                 capturedReceiver->span = syntaxTree.span();
@@ -2721,7 +2962,8 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 result->receiver = std::move(capturedReceiver);
                 result->ownerType = outer->second;
                 result->field = *outerField;
-                result->expression = std::move(value);
+                result->expression = wrapResourceHandleOverwriteRelease(
+                    std::move(oldAccess), std::move(value), syntaxTree.span());
                 return result;
             }
         }
@@ -2769,6 +3011,13 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                             "property assignment");
                         if (!property->staticProperty &&
                             currentOwnerType_->kind == TypeKind::Struct) {
+                            auto oldAccess = std::make_unique<BoundStructFieldAccessExpression>();
+                            oldAccess->span = syntaxTree.identifierToken.span;
+                            oldAccess->type = backingField.type;
+                            oldAccess->typeName = backingField.typeName;
+                            oldAccess->receiver = makeVariableAccess(*thisVariable, syntaxTree.span());
+                            oldAccess->ownerType = *currentOwnerType_;
+                            oldAccess->field = backingField;
                             auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
                             result->span = syntaxTree.span();
                             result->type = property->type;
@@ -2776,9 +3025,19 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                             result->variable = *thisVariable;
                             result->ownerType = *currentOwnerType_;
                             result->field = backingField;
-                            result->expression = std::move(assigned);
+                            result->expression = wrapResourceHandleOverwriteRelease(
+                                std::move(oldAccess), std::move(assigned), syntaxTree.span());
                             return result;
                         }
+                        auto oldAccess = std::make_unique<BoundMemberAccessExpression>();
+                        oldAccess->span = syntaxTree.identifierToken.span;
+                        oldAccess->type = backingField.type;
+                        oldAccess->typeName = backingField.typeName;
+                        if (!property->staticProperty && thisVariable) {
+                            oldAccess->receiver = makeVariableAccess(*thisVariable, syntaxTree.span());
+                        }
+                        oldAccess->ownerType = *currentOwnerType_;
+                        oldAccess->field = backingField;
                         auto result = std::make_unique<BoundMemberAssignmentExpression>();
                         result->span = syntaxTree.span();
                         result->type = property->type;
@@ -2788,7 +3047,8 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                         }
                         result->ownerType = *currentOwnerType_;
                         result->field = backingField;
-                        result->expression = std::move(assigned);
+                        result->expression = wrapResourceHandleOverwriteRelease(
+                            std::move(oldAccess), std::move(assigned), syntaxTree.span());
                         return result;
                     }
                 }
@@ -2811,6 +3071,13 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 auto assigned = bindAssignedValue(
                     property->type,
                     property->typeName, "property assignment");
+                auto oldAccess = std::make_unique<BoundStructFieldAccessExpression>();
+                oldAccess->span = syntaxTree.identifierToken.span;
+                oldAccess->type = backingField.type;
+                oldAccess->typeName = backingField.typeName;
+                oldAccess->receiver = makeVariableAccess(*thisVariable, syntaxTree.span());
+                oldAccess->ownerType = *currentOwnerType_;
+                oldAccess->field = backingField;
                 auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
                 result->span = syntaxTree.span();
                 result->type = property->type;
@@ -2818,7 +3085,8 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 result->variable = *thisVariable;
                 result->ownerType = *currentOwnerType_;
                 result->field = backingField;
-                result->expression = std::move(assigned);
+                result->expression = wrapResourceHandleOverwriteRelease(
+                    std::move(oldAccess), std::move(assigned), syntaxTree.span());
                 return result;
             }
             auto assigned = bindAssignedValue(
@@ -2915,6 +3183,10 @@ PreparedCallArguments Binder::prepareCallArguments(
             auto literal = std::make_unique<BoundLiteralExpression>();
             literal->span = callSpan;
             literal->type = parameter.defaultValueType;
+            if (parameter.defaultValueType == PrimitiveType::Enum &&
+                parameter.type == PrimitiveType::Enum) {
+                literal->typeName = parameter.typeName;
+            }
             literal->value = parameter.defaultValue;
             value = std::move(literal);
             order.push_back({
@@ -3044,7 +3316,8 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
         : std::numeric_limits<std::uint32_t>::max();
     const auto bindReferenceTarget = [&](BoundReferenceCallArgument& argument,
                                          std::unique_ptr<BoundExpression> value,
-                                         text::TextSpan targetSpan) {
+                                         text::TextSpan targetSpan,
+                                         bool isImplicitReceiver) {
         if (value->kind() == BoundNodeKind::VariableExpression) {
             argument.targetKind = ReferenceTargetKind::Variable;
             argument.variable = static_cast<const
@@ -3059,12 +3332,33 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
                 argument.value = std::move(value);
                 return false;
             }
+            if (!isImplicitReceiver &&
+                argument.variable.isUsingResource &&
+                argument.modifier != ParameterModifier::In) {
+                diagnostics_.report(
+                    "RS2651",
+                    "cannot pass '" + argument.variable.name +
+                        "' as a ref or out argument because it is a 'using' variable",
+                    targetSpan);
+                argument.value = std::move(value);
+                return false;
+            }
             argument.value = std::move(value);
             return true;
         }
         if (value->kind() == BoundNodeKind::MemberAccessExpression) {
             auto& member = static_cast<
                 BoundMemberAccessExpression&>(*value);
+            if (!isImplicitReceiver &&
+                member.field.isUsingResource &&
+                argument.modifier != ParameterModifier::In) {
+                diagnostics_.report(
+                    "RS2651",
+                    "cannot pass 'using' variable as a ref or out argument",
+                    targetSpan);
+                argument.value = std::move(value);
+                return false;
+            }
             if (member.field.constField &&
                 argument.modifier != ParameterModifier::In) {
                 diagnostics_.report(
@@ -3189,7 +3483,7 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
                         wrapper->second.fields.front();
                 }
             } else if (bindReferenceTarget(
-                    receiverArgument, std::move(receiver), receiverSpan)) {
+                    receiverArgument, std::move(receiver), receiverSpan, true)) {
                 const auto& variable = receiverArgument.variable;
                 const auto wrapper = visibleTypes_.find(
                     storageTypeNameOf(self));
@@ -3257,7 +3551,7 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
                 std::move(arguments[index]),
                 parameter.type,
                 argumentSpan(index),
-                context,
+                "in argument",
                 parameter.typeName);
             result->arguments.push_back(std::move(argument));
             continue;
@@ -3277,6 +3571,14 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
                             namedVariable->name + "' as ref or out",
                         argumentSpan(index));
                 }
+                if (namedVariable->isUsingResource &&
+                    parameter.modifier != ParameterModifier::In) {
+                    diagnostics_.report(
+                        "RS2651",
+                        "cannot pass '" + namedVariable->name +
+                            "' as a ref or out argument because it is a 'using' variable",
+                        argumentSpan(index));
+                }
                 argument.targetKind = ReferenceTargetKind::Variable;
                 argument.variable = *namedVariable;
                 argument.value = std::move(arguments[index]);
@@ -3285,7 +3587,7 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
         }
         if (!boundTarget && !bindReferenceTarget(
                 argument, std::move(arguments[index]),
-                argumentSpan(index))) {
+                argumentSpan(index), false)) {
             result->arguments.push_back(std::move(argument));
             continue;
         }
@@ -3328,6 +3630,21 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
             argument.forwarded = true;
             argument.value = storageVariableExpression(
                 *variable, argumentSpan(index));
+        } else if (parameter.modifier == ParameterModifier::Out &&
+                   !argument.defensiveCopy &&
+                   !isInsideResourceHandleImplementation() &&
+                   isManagedResourceHandleType(parameter.type, parameter.typeName)) {
+            const auto rhIt = visibleTypes_.find(parameter.typeName);
+            if (rhIt != visibleTypes_.end()) {
+                for (const auto& m : rhIt->second.methods) {
+                    if (m.staticMethod && m.name == "__AssignHandle" &&
+                        m.parameters.size() == 2 &&
+                        m.returnType == PrimitiveType::Struct) {
+                        argument.writebackAssignHandle = m;
+                        break;
+                    }
+                }
+            }
         }
         result->arguments.push_back(std::move(argument));
     }
@@ -3488,6 +3805,29 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
                 continue;
             }
             argument.variable = *variable;
+            if (variable->isConst &&
+                parameter.modifier != ParameterModifier::In) {
+                diagnostics_.report(
+                    "RS2483",
+                    "cannot pass const variable '" +
+                        variable->name + "' as ref or out",
+                    syntaxTree.arguments[index]->span());
+            }
+            if (variable->isUsingResource &&
+                parameter.modifier != ParameterModifier::In) {
+                diagnostics_.report(
+                    "RS2651",
+                    "cannot pass '" + variable->name +
+                        "' as a ref or out argument because it is a 'using' variable",
+                    syntaxTree.arguments[index]->span());
+            }
+            if (variable->modifier == ParameterModifier::In &&
+                parameter.modifier != ParameterModifier::In) {
+                diagnostics_.report(
+                    "RS8703",
+                    "an in parameter cannot be forwarded as ref or out",
+                    syntaxTree.arguments[index]->span());
+            }
             const auto wrapper = visibleTypes_.find(
                 storageTypeNameOf(parameter));
             if (wrapper == visibleTypes_.end() ||
@@ -3501,7 +3841,9 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
             }
             argument.wrapperType = wrapper->second;
             argument.valueField = wrapper->second.fields.front();
-            if (storageTypeOf(*variable) == PrimitiveType::Object &&
+            if ((variable->modifier == ParameterModifier::Ref ||
+                 variable->modifier == ParameterModifier::Out) &&
+                storageTypeOf(*variable) == PrimitiveType::Object &&
                 storageTypeNameOf(*variable) ==
                     storageTypeNameOf(parameter)) {
                 argument.forwarded = true;
@@ -3513,6 +3855,26 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
                     parameter.type,
                     parameter.typeName,
                     "delegate ref argument");
+            } else if (parameter.modifier == ParameterModifier::Out) {
+                (void)bindTargetExpression(
+                    *syntaxTree.arguments[index],
+                    parameter.type,
+                    parameter.typeName,
+                    "delegate out argument");
+                if (!isInsideResourceHandleImplementation() &&
+                    isManagedResourceHandleType(parameter.type, parameter.typeName)) {
+                    const auto rhIt = visibleTypes_.find(parameter.typeName);
+                    if (rhIt != visibleTypes_.end()) {
+                        for (const auto& m : rhIt->second.methods) {
+                            if (m.staticMethod && m.name == "__AssignHandle" &&
+                                m.parameters.size() == 2 &&
+                                m.returnType == PrimitiveType::Struct) {
+                                argument.writebackAssignHandle = m;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             result->arguments.push_back(std::move(argument));
         }
@@ -4590,6 +4952,14 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAccessExpression(
         const auto type = visibleTypes_.find(name.identifierToken.text);
         if (!lookupVariable(name.identifierToken.text) &&
             type != visibleTypes_.end()) {
+            if (!isTypeAccessible(type->second)) {
+                diagnostics_.report(
+                    "RS2534",
+                    "type '" + canonicalTypeName(type->second) +
+                        "' is inaccessible",
+                    name.identifierToken.span);
+                return makeError(syntaxTree.span());
+            }
             recordSymbolReference(
                 occurrences_,
                 currentSourceName_,
@@ -4856,22 +5226,31 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAccessExpression(
             std::move(result), syntaxTree.dotToken, syntaxTree.span());
     }
     if (syntaxTree.nameToken.text == "Count" ||
-        syntaxTree.nameToken.text == "Length") {
+        syntaxTree.nameToken.text == "Length" ||
+        syntaxTree.nameToken.text == "Capacity" ||
+        syntaxTree.nameToken.text == "IsEmpty" ||
+        syntaxTree.nameToken.text == "UseCount" ||
+        syntaxTree.nameToken.text == "IsDisposed" ||
+        syntaxTree.nameToken.text == "IsValid" ||
+        syntaxTree.nameToken.text == "ResourceId") {
         auto getterMethods = findMethods(type->second, syntaxTree.nameToken.text, false);
         if (getterMethods.empty() && syntaxTree.nameToken.text == "Length") {
             getterMethods = findMethods(type->second, "Count", false);
         }
         for (const auto* method : getterMethods) {
             if (method->parameters.size() == visibleParameterOffset(*method) &&
-                isMemberAccessible(method->accessibility, method->declaringTypeId)) {
-                auto result = std::make_unique<BoundCallExpression>();
-                result->span = syntaxTree.span();
-                result->type = method->returnType;
-                result->typeName = method->returnTypeName;
-                result->function = *method;
-                result->arguments.push_back(std::move(receiver));
+                isMemberAccessible(method->accessibility, method->declaringTypeId, method->moduleName)) {
                 return applyNullConditional(
-                    std::move(result), syntaxTree.dotToken, syntaxTree.span());
+                    bindSelectedCall(
+                        *method,
+                        {},
+                        {},
+                        {},
+                        {},
+                        std::move(receiver),
+                        syntaxTree.span(),
+                        "property getter"),
+                    syntaxTree.dotToken, syntaxTree.span());
             }
         }
     }
@@ -5173,13 +5552,20 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                         field->typeName,
                         "field assignment");
                 }
+                auto oldAccess = std::make_unique<BoundMemberAccessExpression>();
+                oldAccess->span = syntaxTree.nameToken.span;
+                oldAccess->type = field->type;
+                oldAccess->typeName = field->typeName;
+                oldAccess->ownerType = type->second;
+                oldAccess->field = *field;
                 auto result = std::make_unique<BoundMemberAssignmentExpression>();
                 result->span = syntaxTree.span();
                 result->type = field->type;
                 result->typeName = field->typeName;
                 result->ownerType = type->second;
                 result->field = *field;
-                result->expression = std::move(value);
+                result->expression = wrapResourceHandleOverwriteRelease(
+                    std::move(oldAccess), std::move(value), syntaxTree.span());
                 return result;
             }
             if (const auto* property = findProperty(
@@ -5270,13 +5656,20 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                         "property assignment");
                 }
                 if (writableBackingField) {
+                    auto oldAccess = std::make_unique<BoundMemberAccessExpression>();
+                    oldAccess->span = syntaxTree.nameToken.span;
+                    oldAccess->type = writableBackingField->type;
+                    oldAccess->typeName = writableBackingField->typeName;
+                    oldAccess->ownerType = type->second;
+                    oldAccess->field = *writableBackingField;
                     auto result = std::make_unique<BoundMemberAssignmentExpression>();
                     result->span = syntaxTree.span();
                     result->type = property->type;
                     result->typeName = property->typeName;
                     result->ownerType = type->second;
                     result->field = *writableBackingField;
-                    result->expression = std::move(assigned);
+                    result->expression = wrapResourceHandleOverwriteRelease(
+                        std::move(oldAccess), std::move(assigned), syntaxTree.span());
                     return result;
                 }
                 auto result = std::make_unique<BoundPropertyAssignmentExpression>();
@@ -5391,13 +5784,20 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                 "field assignment");
         }
         if (field->staticField) {
+            auto oldAccess = std::make_unique<BoundMemberAccessExpression>();
+            oldAccess->span = syntaxTree.nameToken.span;
+            oldAccess->type = field->type;
+            oldAccess->typeName = field->typeName;
+            oldAccess->ownerType = type->second;
+            oldAccess->field = *field;
             auto result = std::make_unique<BoundMemberAssignmentExpression>();
             result->span = syntaxTree.span();
             result->type = field->type;
             result->typeName = field->typeName;
             result->ownerType = type->second;
             result->field = *field;
-            result->expression = std::move(value);
+            result->expression = wrapResourceHandleOverwriteRelease(
+                std::move(oldAccess), std::move(value), syntaxTree.span());
             return result;
         }
         if (type->second.kind == TypeKind::Struct) {
@@ -5427,13 +5827,27 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                         return makeError(syntaxTree.span());
                     }
                     if (memberRecv.field.staticField) {
+                        auto oldStaticRecv = std::make_unique<BoundMemberAccessExpression>();
+                        oldStaticRecv->span = syntaxTree.receiver->span();
+                        oldStaticRecv->type = memberRecv.field.type;
+                        oldStaticRecv->typeName = memberRecv.field.typeName;
+                        oldStaticRecv->ownerType = memberRecv.ownerType;
+                        oldStaticRecv->field = memberRecv.field;
+                        auto oldAccess = std::make_unique<BoundStructFieldAccessExpression>();
+                        oldAccess->span = syntaxTree.nameToken.span;
+                        oldAccess->type = field->type;
+                        oldAccess->typeName = field->typeName;
+                        oldAccess->receiver = std::move(oldStaticRecv);
+                        oldAccess->ownerType = type->second;
+                        oldAccess->field = *field;
                         auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
                         result->span = syntaxTree.span();
                         result->type = field->type;
                         result->typeName = field->typeName;
                         result->ownerType = type->second;
                         result->field = *field;
-                        result->expression = std::move(value);
+                        result->expression = wrapResourceHandleOverwriteRelease(
+                            std::move(oldAccess), std::move(value), syntaxTree.span());
                         result->staticFieldReceiver = true;
                         result->staticReceiverOwnerType = memberRecv.ownerType;
                         result->staticReceiverField = memberRecv.field;
@@ -5466,6 +5880,21 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                     syntaxTree.receiver->span());
                 return makeError(syntaxTree.span());
             }
+            if (variable->isUsingResource) {
+                diagnostics_.report(
+                    "RS2651",
+                    "cannot modify members of '" + variable->name +
+                        "' because it is a 'using' variable",
+                    syntaxTree.receiver->span());
+                return makeError(syntaxTree.span());
+            }
+            auto oldAccess = std::make_unique<BoundStructFieldAccessExpression>();
+            oldAccess->span = syntaxTree.nameToken.span;
+            oldAccess->type = field->type;
+            oldAccess->typeName = field->typeName;
+            oldAccess->receiver = makeVariableAccess(*variable, syntaxTree.receiver->span());
+            oldAccess->ownerType = type->second;
+            oldAccess->field = *field;
             auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
             result->span = syntaxTree.span();
             result->type = field->type;
@@ -5473,8 +5902,9 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
             result->variable = *variable;
             result->ownerType = type->second;
             result->field = *field;
-            result->expression = std::move(value);
-            if (storageTypeOf(*variable) != variable->type) {
+            result->expression = wrapResourceHandleOverwriteRelease(
+                std::move(oldAccess), std::move(value), syntaxTree.span());
+            if (storageTypeOf(*variable) != variable->type || storageTypeNameOf(*variable) != variable->typeName) {
                 const auto wrapper = visibleTypes_.find(
                     storageTypeNameOf(*variable));
                 if (wrapper == visibleTypes_.end() ||
@@ -5492,6 +5922,35 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
             }
             return result;
         }
+        std::unique_ptr<BoundExpression> wrappedExpr = std::move(value);
+        if (!isInsideResourceHandleImplementation() &&
+            isManagedResourceHandleType(field->type, field->typeName)) {
+            std::unique_ptr<BoundExpression> oldRecv;
+            if (receiver->kind() == BoundNodeKind::VariableExpression) {
+                const auto& rv = static_cast<const BoundVariableExpression&>(*receiver).variable;
+                oldRecv = variableExpression(rv, syntaxTree.receiver->span());
+            } else {
+                const auto recvTemp = allocateTempVariable(
+                    "rh_recv", receiver->type, receiver->typeName, syntaxTree.receiver->span());
+                auto recvAssign = std::make_unique<BoundAssignmentExpression>();
+                recvAssign->span = syntaxTree.receiver->span();
+                recvAssign->type = receiver->type;
+                recvAssign->typeName = receiver->typeName;
+                recvAssign->variable = recvTemp;
+                recvAssign->expression = std::move(receiver);
+                receiver = std::move(recvAssign);
+                oldRecv = makeVariableAccess(recvTemp, syntaxTree.receiver->span());
+            }
+            auto oldAccess = std::make_unique<BoundMemberAccessExpression>();
+            oldAccess->span = syntaxTree.nameToken.span;
+            oldAccess->type = field->type;
+            oldAccess->typeName = field->typeName;
+            oldAccess->receiver = std::move(oldRecv);
+            oldAccess->ownerType = type->second;
+            oldAccess->field = *field;
+            wrappedExpr = wrapResourceHandleOverwriteRelease(
+                std::move(oldAccess), std::move(wrappedExpr), syntaxTree.span());
+        }
         auto result = std::make_unique<BoundMemberAssignmentExpression>();
         result->span = syntaxTree.span();
         result->type = field->type;
@@ -5499,7 +5958,7 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
         result->receiver = std::move(receiver);
         result->ownerType = type->second;
         result->field = *field;
-        result->expression = std::move(value);
+        result->expression = std::move(wrappedExpr);
         return result;
     }
     if (const auto* property = findProperty(type->second, syntaxTree.nameToken.text)) {
@@ -5596,6 +6055,13 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                 return makeError(syntaxTree.span());
             }
             const auto& field = type->second.fields[property->backingFieldIndex];
+            auto oldAccess = std::make_unique<BoundStructFieldAccessExpression>();
+            oldAccess->span = syntaxTree.nameToken.span;
+            oldAccess->type = field.type;
+            oldAccess->typeName = field.typeName;
+            oldAccess->receiver = makeVariableAccess(*variable, syntaxTree.receiver->span());
+            oldAccess->ownerType = type->second;
+            oldAccess->field = field;
             auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
             result->span = syntaxTree.span();
             result->type = property->type;
@@ -5603,11 +6069,20 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
             result->variable = *variable;
             result->ownerType = type->second;
             result->field = field;
-            result->expression = bindPropertyAssignedValue();
+            result->expression = wrapResourceHandleOverwriteRelease(
+                std::move(oldAccess), bindPropertyAssignedValue(), syntaxTree.span());
             return result;
         }
         auto assigned = bindPropertyAssignedValue();
         if (writableBackingField) {
+            const auto& thisVar = static_cast<const BoundVariableExpression&>(*receiver).variable;
+            auto oldAccess = std::make_unique<BoundMemberAccessExpression>();
+            oldAccess->span = syntaxTree.nameToken.span;
+            oldAccess->type = writableBackingField->type;
+            oldAccess->typeName = writableBackingField->typeName;
+            oldAccess->receiver = makeVariableAccess(thisVar, syntaxTree.receiver->span());
+            oldAccess->ownerType = type->second;
+            oldAccess->field = *writableBackingField;
             auto result = std::make_unique<BoundMemberAssignmentExpression>();
             result->span = syntaxTree.span();
             result->type = property->type;
@@ -5615,7 +6090,8 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
             result->receiver = std::move(receiver);
             result->ownerType = type->second;
             result->field = *writableBackingField;
-            result->expression = std::move(assigned);
+            result->expression = wrapResourceHandleOverwriteRelease(
+                std::move(oldAccess), std::move(assigned), syntaxTree.span());
             return result;
         }
         auto result = std::make_unique<BoundPropertyAssignmentExpression>();
@@ -5807,6 +6283,58 @@ std::unique_ptr<BoundExpression> Binder::bindElementAssignmentExpression(
     } else {
         value = convertExpression(bindExpression(*syntaxTree.expression), elementType, syntaxTree.expression->span(), "array element assignment", elementTypeName);
     }
+    if (!isInsideResourceHandleImplementation() &&
+        isManagedResourceHandleType(elementType, elementTypeName)) {
+        std::unique_ptr<BoundExpression> oldArrRecv;
+        if (receiver->kind() == BoundNodeKind::VariableExpression) {
+            const auto& rv = static_cast<const BoundVariableExpression&>(*receiver).variable;
+            oldArrRecv = variableExpression(rv, syntaxTree.receiver->span());
+        } else {
+            const auto recvTemp = allocateTempVariable(
+                "rh_arr", receiver->type, receiver->typeName, syntaxTree.receiver->span());
+            auto recvAssign = std::make_unique<BoundAssignmentExpression>();
+            recvAssign->span = syntaxTree.receiver->span();
+            recvAssign->type = receiver->type;
+            recvAssign->typeName = receiver->typeName;
+            recvAssign->variable = recvTemp;
+            recvAssign->expression = std::move(receiver);
+            receiver = std::move(recvAssign);
+            oldArrRecv = makeVariableAccess(recvTemp, syntaxTree.receiver->span());
+        }
+        std::unique_ptr<BoundExpression> oldIdx;
+        if (index->kind() == BoundNodeKind::LiteralExpression) {
+            const auto& lit = static_cast<const BoundLiteralExpression&>(*index);
+            auto copyLit = std::make_unique<BoundLiteralExpression>();
+            copyLit->span = lit.span;
+            copyLit->type = lit.type;
+            copyLit->typeName = lit.typeName;
+            copyLit->value = lit.value;
+            oldIdx = std::move(copyLit);
+        } else if (index->kind() == BoundNodeKind::VariableExpression) {
+            const auto& iv = static_cast<const BoundVariableExpression&>(*index).variable;
+            oldIdx = variableExpression(iv, syntaxTree.index->span());
+        } else {
+            const auto idxTemp = allocateTempVariable(
+                "rh_idx", PrimitiveType::Int, {}, syntaxTree.index->span());
+            auto idxAssign = std::make_unique<BoundAssignmentExpression>();
+            idxAssign->span = syntaxTree.index->span();
+            idxAssign->type = PrimitiveType::Int;
+            idxAssign->variable = idxTemp;
+            idxAssign->expression = std::move(index);
+            index = std::move(idxAssign);
+            oldIdx = makeVariableAccess(idxTemp, syntaxTree.index->span());
+        }
+        auto oldElem = std::make_unique<BoundElementAccessExpression>();
+        oldElem->span = syntaxTree.span();
+        oldElem->type = elementType;
+        oldElem->typeName = elementTypeName;
+        oldElem->receiver = std::move(oldArrRecv);
+        oldElem->index = std::move(oldIdx);
+        oldElem->elementType = elementType;
+        oldElem->elementTypeName = elementTypeName;
+        value = wrapResourceHandleOverwriteRelease(
+            std::move(oldElem), std::move(value), syntaxTree.span());
+    }
     auto result = std::make_unique<BoundElementAssignmentExpression>();
     result->span = syntaxTree.span();
     result->type = elementType;
@@ -5957,7 +6485,17 @@ std::unique_ptr<BoundExpression> Binder::convertExpression(
     }
     if (conversion == ConversionKind::Identity) {
         if (isExactType(target) && !targetTypeName.empty()) expression->typeName = std::move(targetTypeName);
-        return expression;
+        if (context == "in argument" ||
+            context == "using null check" ||
+            context == "equality operand" ||
+            context == "comparison operand") {
+            return expression;
+        }
+        const bool isReturnCtx =
+            context == "return value" ||
+            context == "lambda return value" ||
+            context == "sequence result";
+        return cloneResourceHandleIfNeeded(std::move(expression), span, isReturnCtx);
     }
     auto result = std::make_unique<BoundConversionExpression>();
     result->span = span;

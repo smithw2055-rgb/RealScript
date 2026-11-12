@@ -83,6 +83,8 @@ struct PropertyDeclaration {
 
 struct NativeTypeDeclaration {
     std::type_index cppType = typeid(void);
+    std::optional<std::type_index> baseCppType;
+    std::function<std::shared_ptr<void>(const std::shared_ptr<void>&)> upcastToBase;
     std::string moduleName;
     std::string name;
     semantic::SymbolId typeId = 0;

@@ -58,7 +58,7 @@ int main()
 )";
 
 void testTypeDescriptorAndObjectBytecode() {
-    auto modules = compile({{"point.rs", pointSource}});
+    auto modules = compile({{"point.rscript", pointSource}});
     require(modules.size() == 1, "expected one object module");
     const auto& module = modules.front();
     require(module.version.major == 0 && module.version.minor == 7,
@@ -84,8 +84,8 @@ void testTypeDescriptorAndObjectBytecode() {
 
 void testObjectExecutionAndFieldDefaults() {
     auto modules = compile({
-        {"point.rs", pointSource},
-        {"defaults.rs", R"(
+        {"point.rscript", pointSource},
+        {"defaults.rscript", R"(
 module Game.Defaults;
 class State { int count; bool enabled; string name; }
 int count() { State state = new State(); return state.count; }
@@ -110,7 +110,7 @@ bool nameIsNull() { State state = new State(); return state.name == null; }
 }
 
 void testNullReferenceTrap() {
-    auto modules = compile({{"null.rs", R"(
+    auto modules = compile({{"null.rscript", R"(
 module Game.Nulls;
 class Point { int x; }
 int main() { Point point = null; return point.x; }
@@ -123,7 +123,7 @@ int main() { Point point = null; return point.x; }
 }
 
 void testObjectGraphUsesDescriptorReferenceMap() {
-    auto modules = compile({{"node.rs", R"(
+    auto modules = compile({{"node.rscript", R"(
 module Game.Nodes;
 class Node { Node next; int value; }
 Node make() {
@@ -163,7 +163,7 @@ Node make() {
 }
 
 void testObjectNullEquality() {
-    auto modules = compile({{"equality.rs", R"(
+    auto modules = compile({{"equality.rscript", R"(
 module Game.Equality;
 class Item { int value; }
 bool isNull(Item item) { return item == null; }
@@ -189,12 +189,12 @@ Item create() { return new Item(); }
 
 void testCrossModuleObjectDescriptor() {
     auto modules = compile({
-        {"model.rs", R"(
+        {"model.rscript", R"(
 module Game.Model;
 class Point { int x; }
 Point create() { Point point = new Point(); point.x = 21; return point; }
 )"},
-        {"app.rs", R"(
+        {"app.rscript", R"(
 module Game.App;
 import Game.Model;
 int read(Point point) { return point.x * 2; }
@@ -208,7 +208,7 @@ int main() { return read(create()); }
 }
 
 void testRuntimeRejectsWrongObjectType() {
-    auto modules = compile({{"types.rs", R"(
+    auto modules = compile({{"types.rscript", R"(
 module Game.Types;
 class A { int value; }
 class B { int value; }
@@ -225,7 +225,7 @@ A identity(A value) { return value; }
 }
 
 void testObjectCodecRoundTrip() {
-    auto modules = compile({{"point.rs", pointSource}});
+    auto modules = compile({{"point.rscript", pointSource}});
     const auto encoded = realscript::bytecode::encodeModule(modules.front());
     realscript::bytecode::Module decoded;
     realscript::diagnostics::DiagnosticBag diagnostics;
@@ -239,7 +239,7 @@ void testObjectCodecRoundTrip() {
 }
 
 void testVerifierRejectsInvalidFieldDescriptor() {
-    auto modules = compile({{"point.rs", pointSource}});
+    auto modules = compile({{"point.rscript", pointSource}});
     auto module = modules.front();
     bool corrupted = false;
     for (auto& function : module.functions) {

@@ -66,7 +66,7 @@ std::string extractStringValue(
 
 std::string readFixtureText() {
     const std::string path =
-        std::string(REALSCRIPT_SOURCE_DIR) + "/tests/fixtures/phase28_trusted_async_aot.rs";
+        std::string(REALSCRIPT_SOURCE_DIR) + "/tests/fixtures/phase28_trusted_async_aot.rscript";
     std::ifstream in(path, std::ios::binary);
     require(in.good(), "failed to open fixture: " + path);
     std::ostringstream ss;
@@ -78,7 +78,7 @@ std::vector<bytecode::Module> compilePhase28BytecodeModules(
     compiler::BuildResult* optionalOutBuild = nullptr,
     optimization::Result* optionalOutOpt = nullptr) {
     compiler::Compilation compilation({
-        {"tests/fixtures/phase28_trusted_async_aot.rs", readFixtureText()},
+        {"tests/fixtures/phase28_trusted_async_aot.rscript", readFixtureText()},
     });
     auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
@@ -259,7 +259,7 @@ public class DestroyMidHttpAgent {
     require(game::installSceneComponentBindings(api, scene), "installSceneComponentBindings failed");
 
     game::GameScriptCompiler compiler(api);
-    const auto compiled = compiler.compile({{"phase28_http.rs", scriptSource}});
+    const auto compiled = compiler.compile({{"phase28_http.rscript", scriptSource}});
     require(compiled.succeeded(), "HTTP script compile failed:\n" + diagnosticsText(compiled.diagnostics));
     runtime.replaceProgram(compiled.program);
 
@@ -352,7 +352,7 @@ public class DetClient {
     }
 }
 )RS";
-        const auto detBuilt = detComp.compile({{"det_http.rs", detSrc}});
+        const auto detBuilt = detComp.compile({{"det_http.rscript", detSrc}});
         require(detBuilt.succeeded(), "det_http compile failed");
         detRt.replaceProgram(detBuilt.program);
 
@@ -486,7 +486,7 @@ public class WsEphemeralPeer {
     require(game::installSceneComponentBindings(api, scene), "installSceneComponentBindings failed");
 
     game::GameScriptCompiler compiler(api);
-    const auto compiled = compiler.compile({{"phase28_ws.rs", scriptSource}});
+    const auto compiled = compiler.compile({{"phase28_ws.rscript", scriptSource}});
     require(compiled.succeeded(), "WS script compile failed:\n" + diagnosticsText(compiled.diagnostics));
     runtime.replaceProgram(compiled.program);
 

@@ -32,14 +32,14 @@ std::string readFile(const std::string& path) {
 std::vector<realscript::bytecode::Module> compileFixture() {
     realscript::compiler::Compilation compilation;
     compilation.addSource({
-        "tests/fixtures/phase5_model.rs",
+        "tests/fixtures/phase5_model.rscript",
         readFile(std::string(REALSCRIPT_SOURCE_DIR) +
-            "/tests/fixtures/phase5_model.rs"),
+            "/tests/fixtures/phase5_model.rscript"),
     });
     compilation.addSource({
-        "tests/fixtures/phase5_app.rs",
+        "tests/fixtures/phase5_app.rscript",
         readFile(std::string(REALSCRIPT_SOURCE_DIR) +
-            "/tests/fixtures/phase5_app.rs"),
+            "/tests/fixtures/phase5_app.rscript"),
     });
     auto build = compilation.build();
     require(!build.diagnostics.hasErrors(), "Phase 5 fixture compilation failed");
@@ -256,16 +256,16 @@ void testBudgetsTracingAndGcRoots() {
             !atDivision.error.symbolizedStackTrace.empty() &&
             atDivision.error.sourceLocations[0].hasSourceLocation() &&
             atDivision.error.sourceLocations[0].sourceLine > 0 &&
-            atDivision.error.symbolizedStackTrace[0].find("phase5_app.rs:") != std::string::npos,
+            atDivision.error.symbolizedStackTrace[0].find("phase5_app.rscript:") != std::string::npos,
         "typed AOT runtime error did not reconstruct source file and line number in symbolizedStackTrace");
     const auto resolvedLoc = aot.resolveSourceLocation("Phase5.App::failDivision");
     require(resolvedLoc.has_value() &&
             resolvedLoc->hasSourceLocation() &&
-            resolvedLoc->sourcePath.find("phase5_app.rs") != std::string::npos,
+            resolvedLoc->sourcePath.find("phase5_app.rscript") != std::string::npos,
         "Program::resolveSourceLocation failed to resolve Phase5.App::failDivision");
     const auto symbolizedViaApi = aot.symbolizeStackTrace(atDivision.error);
     require(!symbolizedViaApi.empty() &&
-            symbolizedViaApi[0].find("phase5_app.rs:") != std::string::npos,
+            symbolizedViaApi[0].find("phase5_app.rscript:") != std::string::npos,
         "Program::symbolizeStackTrace failed to symbolize AOT stack trace");
 
     realscript::runtime::ExecutionOptions recursive;

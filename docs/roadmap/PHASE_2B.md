@@ -75,7 +75,7 @@ The same verified module, arguments and limits produce the same value, error and
 ## CLI
 
 ```bash
-rsc game.rs --run Game.Main::main
+rsc game.rscript --run Game.Main::main
 ```
 
 The initial CLI entry accepts a no-argument function and prints its primitive return value. Embedders use the C++ API for typed arguments, limits and host resolution.

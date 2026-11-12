@@ -73,12 +73,12 @@ int add(int value)
 )";
 
 void testDebugMetadataRoundTrip() {
-    auto modules = compile({{"debug.rs", debugSource}});
+    auto modules = compile({{"debug.rscript", debugSource}});
     require(modules.size() == 1, "expected one debug module");
     const auto& module = modules.front();
     require(module.version.minor == 7, "Phase 19 must use .rsbc 0.7");
     require(module.sourceFiles.size() == 1 &&
-            module.sourceFiles.front().path == "debug.rs",
+            module.sourceFiles.front().path == "debug.rscript",
         "debug source table is missing");
     require(module.functions.size() == 1, "debug function is missing");
     const auto& info = module.functions.front().debugInfo;
@@ -111,7 +111,7 @@ void testDebugMetadataRoundTrip() {
 
 
 void testDebugVerifierRejectsCorruption() {
-    auto modules = compile({{"debug.rs", debugSource}});
+    auto modules = compile({{"debug.rscript", debugSource}});
     auto invalidPoint = modules.front();
     invalidPoint.functions.front().debugInfo.sequencePoints.front().blockId = 999;
     realscript::diagnostics::DiagnosticBag pointDiagnostics;
@@ -150,13 +150,13 @@ void testDebugVerifierRejectsCorruption() {
 }
 
 void testDebuggerSession() {
-    auto modules = compile({{"debug.rs", debugSource}});
+    auto modules = compile({{"debug.rscript", debugSource}});
     const auto firstPoint = modules.front().functions.front().debugInfo.sequencePoints.front();
     const auto firstLine = firstPoint.range.start.line;
     auto program = link(std::move(modules));
     realscript::debug::DebugSession session(program);
     auto breakpoints = session.controller()->setBreakpoints(
-        "debug.rs", {{firstLine, 0}});
+        "debug.rscript", {{firstLine, 0}});
     require(breakpoints.size() == 1 && breakpoints.front().verified,
         "source breakpoint did not bind to an executable line");
     require(session.launch("Phase4.Debug::add", {std::int64_t{4}}, true),
@@ -188,7 +188,7 @@ void testDebuggerSession() {
 }
 
 void testDebuggerTermination() {
-    auto program = link(compile({{"loop.rs", R"(
+    auto program = link(compile({{"loop.rscript", R"(
 module Phase4.Terminate;
 int run()
 {
@@ -211,41 +211,41 @@ int run()
 
 void testLanguageService() {
     realscript::tooling::LanguageService service;
-    service.open("math.rs", R"(
+    service.open("math.rscript", R"(
 module Phase4.Math;
 int twice(int value) { return value * 2; }
 )");
-    service.open("app.rs", R"(
+    service.open("app.rscript", R"(
 module Phase4.App;
 import Phase4.Math;
 int main() { return twice(21); }
 )");
-    require(service.diagnostics("app.rs").empty(),
+    require(service.diagnostics("app.rscript").empty(),
         "valid workspace produced diagnostics");
-    const auto completion = service.completion("app.rs", {3, 10});
+    const auto completion = service.completion("app.rscript", {3, 10});
     require(std::any_of(completion.begin(), completion.end(),
             [](const auto& item) { return item.label == "twice"; }),
         "completion did not include imported functions");
 
-    const auto definition = service.definition("app.rs", {3, 21});
-    require(definition && definition->path == "math.rs",
+    const auto definition = service.definition("app.rscript", {3, 21});
+    require(definition && definition->path == "math.rscript",
         "go-to-definition did not resolve the imported function");
-    const auto hover = service.hover("app.rs", {3, 21});
+    const auto hover = service.hover("app.rscript", {3, 21});
     require(hover && hover->contents.find("twice") != std::string::npos,
         "hover did not describe the function");
-    const auto references = service.references("app.rs", {3, 21}, true);
+    const auto references = service.references("app.rscript", {3, 21}, true);
     require(references.size() == 2,
         "find-references did not include definition and call");
-    const auto edits = service.rename("app.rs", {3, 21}, "doubleValue");
+    const auto edits = service.rename("app.rscript", {3, 21}, "doubleValue");
     require(edits.size() == 2 &&
             std::all_of(edits.begin(), edits.end(), [](const auto& edit) {
                 return edit.replacement == "doubleValue";
             }),
         "rename did not produce workspace edits");
-    require(!service.documentSymbols("math.rs").empty(),
+    require(!service.documentSymbols("math.rscript").empty(),
         "document symbols are missing");
 
-    service.open("native_tools.rs", R"(
+    service.open("native_tools.rscript", R"(
 module Phase4.NativeTools;
 delegate void ChangedHandler(int amount);
 class Counter
@@ -262,9 +262,9 @@ int main()
     return Identity<int>(counter.Run());
 }
 )");
-    require(service.diagnostics("native_tools.rs").empty(),
+    require(service.diagnostics("native_tools.rscript").empty(),
         "native language tooling fixture produced diagnostics");
-    const auto nativeSymbols = service.documentSymbols("native_tools.rs");
+    const auto nativeSymbols = service.documentSymbols("native_tools.rscript");
     require(!nativeSymbols.empty(),
         "native language document symbols are missing");
     require(std::all_of(
@@ -276,14 +276,14 @@ int main()
             }),
         "LSP exposed compiler-owned native language symbols");
 
-    service.open("empty_mod.rs", R"(
+    service.open("empty_mod.rscript", R"(
 module Phase4.Empty;
 )");
-    require(service.diagnostics("empty_mod.rs").empty(),
+    require(service.diagnostics("empty_mod.rscript").empty(),
         "empty module produced diagnostics");
 
-    // Incremental update on native_tools.rs (which has generics/attributes/interface)
-    service.update("native_tools.rs", R"(
+    // Incremental update on native_tools.rscript (which has generics/attributes/interface)
+    service.update("native_tools.rscript", R"(
 module Phase4.NativeTools;
 interface IRunner { int Step(); }
 [Serializable(version = 2)]
@@ -300,7 +300,7 @@ int main()
     return list.Get(0) + counter.Step();
 }
 )", 2);
-    require(service.diagnostics("native_tools.rs").empty(),
+    require(service.diagnostics("native_tools.rscript").empty(),
         "incremental update with generics/attributes/interface/sequence failed");
     {
         const auto& built = service.build();
@@ -315,7 +315,7 @@ int main()
     }
 
     // Update generic instantiation from List<int> to List<string> and verify stale List__int is removed
-    service.update("native_tools.rs", R"(
+    service.update("native_tools.rscript", R"(
 module Phase4.NativeTools;
 int main()
 {
@@ -324,8 +324,8 @@ int main()
     return list.Count();
 }
 )", 3);
-    require(service.diagnostics("native_tools.rs").empty(),
-        "second incremental update on native_tools.rs failed");
+    require(service.diagnostics("native_tools.rscript").empty(),
+        "second incremental update on native_tools.rscript failed");
     {
         const auto& built = service.build();
         require(built.nativeGenericInstantiations.size() == 1 &&
@@ -333,8 +333,8 @@ int main()
             "stale generic instantiation List__int was not cleaned up on incremental rebuild");
     }
 
-    // Now edit the previously empty module after native_tools.rs shrank
-    service.update("empty_mod.rs", R"(
+    // Now edit the previously empty module after native_tools.rscript shrank
+    service.update("empty_mod.rscript", R"(
 module Phase4.Empty;
 int compute(int alpha, int beta) {
     var sum = alpha + beta;
@@ -344,15 +344,15 @@ int runEmpty() {
     return compute(1, 2);
 }
 )", 2);
-    require(service.diagnostics("empty_mod.rs").empty(),
+    require(service.diagnostics("empty_mod.rscript").empty(),
         "incremental update on previously empty module failed");
-    require(!service.semanticTokens("empty_mod.rs").empty(),
+    require(!service.semanticTokens("empty_mod.rscript").empty(),
         "semanticTokens on updated empty module returned empty");
-    require(!service.inlayHints("empty_mod.rs").empty(),
+    require(!service.inlayHints("empty_mod.rscript").empty(),
         "inlayHints on updated empty module returned empty");
 
-    service.update("app.rs", "module Phase4.App; int main() { return missing; }", 2);
-    require(!service.diagnostics("app.rs").empty(),
+    service.update("app.rscript", "module Phase4.App; int main() { return missing; }", 2);
+    require(!service.diagnostics("app.rscript").empty(),
         "language service did not publish semantic diagnostics after an update");
 }
 
@@ -404,7 +404,7 @@ void testProtocolAdapters() {
         {"method", "textDocument/didOpen"},
         {"params", realscript::tooling::Json::Object{
             {"textDocument", realscript::tooling::Json::Object{
-                {"uri", "file://protocol.rs"},
+                {"uri", "file://protocol.rscript"},
                 {"version", 1},
                 {"text", "module Phase4.Protocol; int main() { return 1; }"},
             }},
@@ -418,7 +418,7 @@ void testProtocolAdapters() {
         {"jsonrpc", "2.0"}, {"id", 2},
         {"method", "textDocument/documentSymbol"},
         {"params", realscript::tooling::Json::Object{
-            {"textDocument", realscript::tooling::Json::Object{{"uri", "file://protocol.rs"}}},
+            {"textDocument", realscript::tooling::Json::Object{{"uri", "file://protocol.rscript"}}},
         }},
     };
     const auto symbolsResponse = lsp.handle(symbolsRequest);
@@ -426,7 +426,7 @@ void testProtocolAdapters() {
             !symbolsResponse.find("result")->arrayValue().empty(),
         "LSP documentSymbol returned no symbols");
 
-    auto program = link(compile({{"dap.rs", R"(
+    auto program = link(compile({{"dap.rscript", R"(
 module Phase4.Dap;
 int main()
 {
@@ -464,7 +464,7 @@ int main()
     };
     (void)dap.handle(disconnect);
 
-    auto nativeProgram = link(compile({{"native_dap.rs", R"(
+    auto nativeProgram = link(compile({{"native_dap.rscript", R"(
 module Phase4.NativeDap;
 delegate void ChangedHandler(int amount);
 class Counter
@@ -515,7 +515,7 @@ int main()
 }
 
 void testHotReload() {
-    auto initialModules = compile({{"reload.rs", R"(
+    auto initialModules = compile({{"reload.rscript", R"(
 module Phase4.Reload;
 int value() { return 1; }
 )"}});
@@ -525,7 +525,7 @@ int value() { return 1; }
     require(before.succeeded && std::get<std::int64_t>(before.value) == 1,
         "initial program returned the wrong result");
 
-    auto replacement = compile({{"reload.rs", R"(
+    auto replacement = compile({{"reload.rscript", R"(
 module Phase4.Reload;
 int value() { return 2; }
 )"}});
@@ -536,7 +536,7 @@ int value() { return 2; }
     require(after.succeeded && std::get<std::int64_t>(after.value) == 2,
         "new invocations did not observe the reloaded body");
 
-    auto incompatible = compile({{"reload.rs", R"(
+    auto incompatible = compile({{"reload.rscript", R"(
 module Phase4.Reload;
 long value() { return 2; }
 )"}});
@@ -547,13 +547,13 @@ long value() { return 2; }
                 realscript::hot_reload::ReloadIssueKind::FunctionSignatureChanged,
         "signature-changing hot reload was not rejected");
 
-    auto initialType = compile({{"layout.rs", R"(
+    auto initialType = compile({{"layout.rscript", R"(
 module Phase4.Layout;
 class Item { int value; }
 int read(Item item) { return item.value; }
 )"}});
     auto typeProgram = link(initialType);
-    auto changedType = compile({{"layout.rs", R"(
+    auto changedType = compile({{"layout.rscript", R"(
 module Phase4.Layout;
 class Item { int value; int extra; }
 int read(Item item) { return item.value; }
@@ -566,14 +566,14 @@ int read(Item item) { return item.value; }
             }),
         "type-layout-changing hot reload was not rejected");
 
-    auto metadataInitial = compile({{"metadata_reload.rs", R"(
+    auto metadataInitial = compile({{"metadata_reload.rscript", R"(
 module Phase4.MetadataReload;
 [Replicated(channel = "state")]
 class Item { int value; }
 int read(Item item) { return item.value; }
 )"}});
     auto metadataProgram = link(metadataInitial);
-    auto metadataChanged = compile({{"metadata_reload.rs", R"(
+    auto metadataChanged = compile({{"metadata_reload.rscript", R"(
 module Phase4.MetadataReload;
 [Replicated(channel = "effects")]
 class Item { int value; }

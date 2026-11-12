@@ -34,9 +34,9 @@ std::string readFile(const std::string& path) {
 
 void testGrowableCollectionsAndEnumeratorProtocol() {
     const auto path = std::string(REALSCRIPT_SOURCE_DIR) +
-        "/tests/fixtures/phase21_aot.rs";
+        "/tests/fixtures/phase21_aot.rscript";
     realscript::compiler::Compilation compilation({{
-        "tests/fixtures/phase21_aot.rs", readFile(path)}});
+        "tests/fixtures/phase21_aot.rscript", readFile(path)}});
     const auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
         "Phase 21 collection compilation failed:\n" +
@@ -64,16 +64,16 @@ void testGrowableCollectionsAndEnumeratorProtocol() {
 
 void testCrossModuleSpecializationCache() {
     realscript::compiler::Compilation compilation({
-        {"box.rs", R"(
+        {"box.rscript", R"(
 module Phase21.Box;
 class Box<T> { T value; Box(T initial) { value = initial; } T Get() { return value; } }
 )"},
-        {"left.rs", R"(
+        {"left.rscript", R"(
 module Phase21.Left;
 import Phase21.Box;
 int Left() { Box<int> value = new Box<int>(3); return value.Get(); }
 )"},
-        {"right.rs", R"(
+        {"right.rscript", R"(
 module Phase21.Right;
 import Phase21.Box;
 int Right() { Box<int> value = new Box<int>(4); return value.Get(); }
@@ -94,7 +94,7 @@ int Right() { Box<int> value = new Box<int>(4); return value.Get(); }
 
 void testInferenceAndGenericContracts() {
     realscript::compiler::Compilation compilation({{
-        "phase21-contracts.rs", R"(
+        "phase21-contracts.rscript", R"(
 module Phase21.Contracts;
 
 interface IValue<T> { T Get(); }
@@ -132,7 +132,7 @@ int main()
 
 void testGenericMemberMethodsAndConstraints() {
     realscript::compiler::Compilation compilation({{
-        "phase21-members.rs", R"(
+        "phase21-members.rscript", R"(
 module Phase21.Members;
 class Converter
 {
@@ -158,7 +158,7 @@ int main()
         "generic member specialization produced the wrong result");
 
     realscript::compiler::Compilation invalid({{
-        "phase21-bad-constraint.rs", R"(
+        "phase21-bad-constraint.rscript", R"(
 module Phase21.BadConstraint;
 T ReferenceOnly<T>(T value) where T : class { return value; }
 int main() { return ReferenceOnly<int>(1); }

@@ -224,11 +224,11 @@ Hand-authored in-memory bytecode used by tests may omit debug information, but c
 ## Inspecting Output
 
 ```bash
-rsc source.rs --mir
-rsc source.rs --symbols
-rsc source.rs --bytecode
-rsc source.rs --emit-bytecode program.rsbc
-rsc model.rs app.rs --emit-bytecode-dir build/bytecode
+rsc source.rscript --mir
+rsc source.rscript --symbols
+rsc source.rscript --bytecode
+rsc source.rscript --emit-bytecode program.rsbc
+rsc model.rscript app.rscript --emit-bytecode-dir build/bytecode
 rsc program.rsbc --disassemble
 ```
 

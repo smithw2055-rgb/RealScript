@@ -3,6 +3,7 @@
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/mir/Mir.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -15,6 +16,7 @@ struct GenerationOptions {
     std::string querySymbol = "rs_module_query_v1";
     bool emitLineDirectives = true;
     bool trustedRelease = false;
+    bool enableSharedReferenceGenerics = true;
 };
 
 struct GeneratedProgram {
@@ -22,6 +24,8 @@ struct GeneratedProgram {
     std::string source;
     std::string manifest;
     std::uint64_t contentHash = 0;
+    std::size_t sharedGenericBodyCount = 0;
+    std::size_t foldedGenericFunctionCount = 0;
 };
 
 class CppGenerator {

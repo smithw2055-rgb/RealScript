@@ -20,7 +20,7 @@
       "patterns": [
         {
           "name": "keyword.control.realscript",
-          "match": "\\b(module|import|public|private|protected|static|abstract|virtual|override|class|struct|interface|enum|delegate|event|sequence|yield|wait_ticks|wait_seconds|wait_event|wait_until|wait_async|using|if|else|while|for|foreach|in|do|switch|case|default|when|break|continue|return|throw|try|catch|finally|new|this|base|null|true|false)\\b"
+          "match": "\\b(module|import|public|private|protected|static|abstract|virtual|override|sealed|readonly|const|class|struct|interface|enum|delegate|event|sequence|async|await|yield|wait_ticks|wait_seconds|wait_event|wait_until|wait_async|using|var|ref|out|is|as|if|else|while|for|foreach|in|do|switch|case|default|when|break|continue|return|throw|try|catch|finally|new|this|base|null|true|false)\\b"
         }
       ]
     },
@@ -28,7 +28,7 @@
       "patterns": [
         {
           "name": "storage.type.realscript",
-          "match": "\\b(void|bool|byte|sbyte|short|ushort|int|uint|long|ulong|float|double|char|string|handle|Fixed|Fixed16|Fixed64|Vec2|Vec3|Vec4|Quat|Transform3D|AABB|Ray)\\b"
+          "match": "\\b(void|bool|byte|sbyte|short|ushort|int|uint|long|ulong|float|double|char|string|handle|Fixed|Fixed16|Fixed64|Vec2|Vec3|Vec4|Quat|Transform3D|AABB|Ray|ResourceHandle|Resource|IDisposable|Awaitable|CancellationToken|CancellationTokenSource|List|Dictionary|HashSet|Queue|Stack|Nullable|Entity|Prefab)\\b"
         }
       ]
     },

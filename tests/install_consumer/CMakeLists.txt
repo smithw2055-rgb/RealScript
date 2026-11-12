@@ -7,7 +7,7 @@ include("${RealScript_AOT_MODULE}")
 realscript_add_aot_library(install_consumer_scripts
     PROGRAM_NAME InstallConsumer
     OPT_LEVEL 2
-    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/consumer.rs"
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/consumer.rscript"
 )
 
 add_executable(realscript_install_consumer main.cpp)

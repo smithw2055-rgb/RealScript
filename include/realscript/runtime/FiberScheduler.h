@@ -7,6 +7,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace realscript::mir {
@@ -204,6 +205,10 @@ enum class FiberOpcode : std::uint8_t {
  * Cache-Aligned 8-Byte (64-bit) Hot-Loop Instruction representation.
  * 8 instructions fit inside a single 64-byte CPU L1 cache line.
  */
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct alignas(8) CompactInstruction {
     FiberOpcode opcode{FiberOpcode::Nop};
     std::uint8_t flags{0};       // Command ID, condition kind, predicate channel, or probability threshold
@@ -222,6 +227,9 @@ struct alignas(8) CompactInstruction {
     constexpr CompactInstruction(FiberOpcode op, std::uint8_t flg, std::uint16_t dst, std::uint16_t a, std::uint16_t b) noexcept
         : opcode(op), flags(flg), regOrSlot(dst), regs{a, b} {}
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 static_assert(sizeof(CompactInstruction) == 8, "CompactInstruction must be exactly 8 bytes (8 per L1 cache line)");
 
 enum class FiberStatus : std::uint8_t {
@@ -238,7 +246,10 @@ enum class FiberStatus : std::uint8_t {
  */
 struct FiberContext {
     std::uint32_t fiberId{0};
+    std::uint32_t generation{1};
     std::uint32_t parentFiberId{0};
+    std::uint32_t parentGeneration{0};
+    std::uint32_t scheduleEpoch{1};
     std::uint32_t programId{0};
     GenerationalEntityHandle boundEntity{};
     std::uint8_t ownerGroupId{0};
@@ -288,9 +299,9 @@ struct IFiberHostCallbacks {
 using IFiberHost = IFiberHostCallbacks;
 
 /**
- * Compiled Fiber Program produced by lowering a RealScript (`.rs`) `mir::Module`.
+ * Compiled Fiber Program produced by lowering a RealScript (`.rscript`) `mir::Module`.
  * Contains a single contiguous 8-byte instruction stream and a symbol table mapping
- * `.rs` function names to their entry PC offsets.
+ * `.rscript` function names to their entry PC offsets.
  */
 struct CompiledFiberModule {
     std::string moduleName;
@@ -308,12 +319,67 @@ struct CompiledFiberModule {
 };
 
 /**
- * Compiler that lowers a RealScript `mir::Module` (written in `.rs` using `import RealScript.Fiber;`)
+ * Deterministic suspension-point descriptor inside a compiled Fiber state machine (`eff_1`).
+ */
+struct FiberSuspensionPointDesc {
+    std::uint32_t ordinal = 0;
+    FiberOpcode opcode = FiberOpcode::Nop;
+    std::uint32_t relativeResumePc = 0;
+    std::uint8_t flags = 0;
+    std::uint16_t regOrSlot = 0;
+    std::uint32_t imm32 = 0;
+    std::string targetShortName;
+};
+
+struct FiberCallSiteDesc {
+    std::uint32_t ordinal = 0;
+    std::uint32_t relativeCallPc = 0;
+    std::uint32_t relativeReturnPc = 0;
+    std::string targetShortName;
+};
+
+/**
+ * Deterministic state-machine structural fingerprint for a Fiber function (`eff_1`).
+ */
+struct FiberStateMachineFingerprint {
+    std::string canonicalName;
+    std::string shortName;
+    std::uint32_t functionIndex = 0;
+    std::uint32_t entryPc = 0;
+    std::uint32_t endPc = 0;
+    std::uint32_t instructionCount = 0;
+    std::uint8_t usedRegisterMask = 0;
+    std::vector<FiberSuspensionPointDesc> suspensionPoints;
+    std::vector<FiberCallSiteDesc> callSites;
+    std::uint64_t exactInstructionSequenceHash = 0;
+    std::uint64_t structuralHash = 0;
+
+    [[nodiscard]] bool matchesLayout(const FiberStateMachineFingerprint& other) const noexcept {
+        return structuralHash != 0 &&
+            structuralHash == other.structuralHash &&
+            shortName == other.shortName &&
+            usedRegisterMask == other.usedRegisterMask &&
+            suspensionPoints.size() == other.suspensionPoints.size() &&
+            callSites.size() == other.callSites.size();
+    }
+};
+
+struct FiberHotReloadReport {
+    bool succeeded = false;
+    std::size_t preservedFibers = 0;
+    std::size_t abortedFibers = 0;
+    std::unordered_map<std::uint32_t, std::uint32_t> remappedFunctionIndices;
+};
+
+/**
+ * Compiler that lowers a RealScript `mir::Module` (written in `.rscript` using `import RealScript.Fiber;`)
  * directly into an 8-byte `CompactInstruction` stream for `FiberScheduler`.
  */
 class FiberCompiler {
 public:
     [[nodiscard]] static CompiledFiberModule compileModule(const realscript::mir::Module& module);
+    [[nodiscard]] static std::vector<FiberStateMachineFingerprint> computeModuleFingerprints(
+        const CompiledFiberModule& module);
 };
 
 /**
@@ -337,6 +403,10 @@ public:
     std::uint32_t registerModule(const CompiledFiberModule& module);
     bool reloadProgram(std::uint32_t programId, std::vector<CompactInstruction> newCodeStream);
     bool reloadModule(
+        std::uint32_t programId,
+        const CompiledFiberModule& oldModule,
+        const CompiledFiberModule& newModule);
+    [[nodiscard]] FiberHotReloadReport reloadModuleWithReport(
         std::uint32_t programId,
         const CompiledFiberModule& oldModule,
         const CompiledFiberModule& newModule);
@@ -401,9 +471,9 @@ private:
     std::vector<const std::vector<CompactInstruction>*> externalStreamCache_;
     std::vector<FiberContext> fibers_;
     std::vector<std::uint32_t> freeFiberIds_;
-    std::vector<std::uint32_t> readyQueue_;
-    std::array<std::vector<std::uint32_t>, WHEEL_SLOTS> timingWheel_{};
-    std::vector<std::uint32_t> predicateWaitList_;
+    std::vector<std::uint64_t> readyQueue_;
+    std::array<std::vector<std::uint64_t>, WHEEL_SLOTS> timingWheel_{};
+    std::vector<std::uint64_t> predicateWaitList_;
 };
 
 using DeterministicFiberScheduler = FiberScheduler;

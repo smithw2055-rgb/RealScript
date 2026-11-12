@@ -38,6 +38,15 @@ bool containsBreakForCurrentTarget(const BoundStatement& statement, std::size_t 
         return containsBreakForCurrentTarget(*value.thenStatement, nestedBreakables) ||
             (value.elseStatement && containsBreakForCurrentTarget(*value.elseStatement, nestedBreakables));
     }
+    case BoundNodeKind::TryStatement: {
+        const auto& value = static_cast<const BoundTryStatement&>(statement);
+        if (value.body && containsBreakForCurrentTarget(*value.body, nestedBreakables)) return true;
+        for (const auto& clause : value.catches) {
+            if (clause.body && containsBreakForCurrentTarget(*clause.body, nestedBreakables)) return true;
+        }
+        if (value.finallyBody && containsBreakForCurrentTarget(*value.finallyBody, nestedBreakables)) return true;
+        return false;
+    }
     case BoundNodeKind::WhileStatement:
     case BoundNodeKind::ForStatement:
     case BoundNodeKind::ForeachStatement:
@@ -65,9 +74,10 @@ private:
     void analyzeExpression(const BoundExpression& expression, AssignedSet& assigned) {
         switch (expression.kind()) {
         case BoundNodeKind::VariableExpression: {
-            const auto& variable = static_cast<const BoundVariableExpression&>(expression).variable;
-            if (assigned.find(variable.index) == assigned.end())
-                diagnostics_.report("RS2300", "variable '" + variable.name + "' is used before it is definitely assigned", expression.span);
+            const auto& varExpr = static_cast<const BoundVariableExpression&>(expression);
+            if (!varExpr.syntheticOverwriteRead &&
+                assigned.find(varExpr.variable.index) == assigned.end())
+                diagnostics_.report("RS2300", "variable '" + varExpr.variable.name + "' is used before it is definitely assigned", expression.span);
             return;
         }
         case BoundNodeKind::AssignmentExpression: {
@@ -264,6 +274,17 @@ private:
         }
         case BoundNodeKind::MemberAssignmentExpression: {
             const auto& value = static_cast<const BoundMemberAssignmentExpression&>(expression);
+            if (value.ownerType.synthetic &&
+                value.ownerType.fields.size() == 1 &&
+                value.field.name == "Value" &&
+                value.receiver &&
+                value.receiver->kind() == BoundNodeKind::VariableExpression) {
+                analyzeExpression(*value.expression, assigned);
+                assigned.insert(
+                    static_cast<const BoundVariableExpression&>(*value.receiver)
+                        .variable.index);
+                return;
+            }
             if (value.receiver) analyzeExpression(*value.receiver, assigned);
             analyzeExpression(*value.expression, assigned);
             return;

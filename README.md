@@ -35,14 +35,14 @@ JIT, game-oriented bindings, fixed-tick coroutines, replay, and rollback.
 | Area | Implemented in v0.98.0 |
 |---|---|
 | Language | Modules/imports, overloads, operator overloads, compound assignments, classes, `static class`, static constructors (`static T()`), `readonly` fields, auto-property initializers (`public int Hp { get; set; } = 100;`), single inheritance (including script classes inheriting bound C++ types), interfaces, virtual dispatch, delegates, closures, events, generics, collections, enums, mutable structs, nullable values, boxing, patterns, initializers, flexible arguments, and structured exceptions. |
-| Control flow | `if`, `while`, `for`, `foreach`, `do/while`, `switch`, switch expressions, `break`, `continue`, `try/catch/finally`, deterministic `sequence` (`yield wait_ticks`, `wait_seconds`, `wait_event`, `wait_signal`, `wait_until`), and `RealScript.Fiber` cooperative fibers. |
+| Control flow & dual-track coroutines | `if`, `while`, `for`, zero-allocation `foreach` (`struct` enumerators), `do/while`, `switch`, switch expressions, `break`, `continue`, `try/catch/finally`, deterministic `using (...)` / `using var` disposal (`IDisposable` / `ResourceHandle<T>`); **dual-track coroutines**: `sequence` handles deterministic tick simulation & `RSGS` rollback snapshots (`yield wait_ticks`/`wait_seconds`/`wait_event`/`wait_signal`/`wait_until`), while `async`/`await` (`RealScript.Async`: `Awaitable<T>`, `CancellationToken`, 4 main-thread frame queues) handles async `OnStart()`, asset/prefab streaming, and HTTP/WebSocket I/O alongside `RealScript.Fiber`. |
 | Compiler | Lexer, parser, Binder, flow analysis, `[Deterministic]` static verification, stable diagnostics, verified multi-block Typed MIR, natural-loop LICM load hoisting, cross-module `-O2` auto-property & `void` small-method inlining, and O0/O1/O2 optimization. |
-| Bytecode | Typed register VM, unified flat-frame slot layout, computed-goto threaded dispatch (`double` arithmetic/superinstructions & object/struct field `FlatOpcode` fast paths), 24-byte `Value` & 8-byte `Instruction` layout, widened 32-bit `BytecodeString` with lock-free pools, quickened integer-loop superinstructions, deterministic `.rsbc` 0.9 output, 0.6–0.8 legacy decoding, defensive validation, and structured script stacks. |
+| Bytecode | Typed register VM, unified flat-frame slot layout, computed-goto threaded dispatch (`double` arithmetic/superinstructions & object/struct field `FlatOpcode` fast paths), 16-byte `Value` & 8-byte `Instruction` layout, widened 32-bit `BytecodeString` with lock-free pools, quickened integer-loop superinstructions, deterministic `.rsbc` 0.9 output, 0.6–0.8 legacy decoding, defensive validation, and structured script stacks. |
 | Memory | Generation-checked object references, 12-byte inline struct slots (`InlineStructSlot`), HeapObject Small Buffer Optimization (SBO), `ValuePoolArena` mark/sweep GC for pooled strings/structs/closures, precise roots, incremental mark/sweep GC stepping with shadow-stack safety, write barriers, bounded GC work, snapshots, retaining paths, and leak diagnostics. |
-| Native execution | Deterministic C++17 AOT, Zero-Budget Trusted Release AOT (`--trusted-release`), `#line` source mapping directives back to `.rs` script lines, custom `struct` stack scalarization (`AotStruct_<id>`), AVX2/SIMD vectorized ECS query loops (`__restrict` + `#pragma loop(ivdep)`), C11 module-query ABI, source maps, typed native thunks, native fast-paths & identity cache, optional toolchain JIT, content-addressed JIT cache, and tiered Interpreter/JIT/AOT dispatch. |
+| Native execution | Deterministic C++17 AOT, Zero-Budget Trusted Release AOT (`--trusted-release`), `#line` source mapping directives back to `.rscript` script lines, custom `struct` stack scalarization (`AotStruct_<id>`), AVX2/SIMD vectorized ECS query loops (`__restrict` + `#pragma loop(ivdep)`), C11 module-query ABI, source maps, typed native thunks, native fast-paths & identity cache, optional toolchain JIT, content-addressed JIT cache, and tiered Interpreter/JIT/AOT dispatch. |
 | Determinism | Off/Strict/Record/Replay modes, instruction/recursion/allocation/heap budgets, Mod capability sandboxing, stable digests, external-call replay, and cross-backend differential validation. |
 | Game SDK | Typed bindings (`structType<S>`, `constructor<Args...>`, `staticMethod<M>`, overloaded bindings, `std::vector<T>` <-> `T[]` marshaling), automated C++ binding generation (`rsbind` with `RS_EXPORT_STRUCT`, `RS_EXPORT_CONSTRUCTOR`, `static_cast` overload disambiguation, static methods, and template/container types), direct math struct marshaling (`Fixed`/`Fixed16`/`Vec2`/`Vec3`/`Quat`), zero-copy C++ host ECS raw column binding (`bindEcsRawColumnAuto<T>`), `Query<Write<T>, Read<U>, With<V>, Without<W>>()` & `EntityCommandBuffer`, 2D/3D fixed-point physics (`stepPhysics2D`/`stepPhysics3D`), spatial queries (raycast/overlap), deterministic `RealScript.Input`, multi-component entities, generational entity handles, Editor/Play modes (`[Tool]`/`[ExecuteInEditMode]`), `OnValidate`, deep `InspectorTypeSchema` reflection, host `connectSignal`, JSON prefab/scene serialization, and `RSGS` state encoding. |
-| Tooling | `rsc`, `rsaot`, `rsbind`, `rsdebug`, `rslsp`, `rsbench`, DAP (stdio & embedded TCP `--dap-port` attach, conditional & exception breakpoints, reentrant safepoints, heap retaining-path profiler, watch `evaluate`), LSP (incremental `ParseSnapshot` & subgraph metadata cache, async request bridge, member dot-completion, `signatureHelp`, `.d.rs` host stubs), `vscode-realscript` VS Code extension, Chrome Tracing profiler export, and stateful structural hot reload (`[FormerlySerializedAs]`, static field rename migration, & cross-component ref migration). |
+| Tooling | `rsc`, `rsaot`, `rsbind`, `rsdebug`, `rslsp`, `rsbench`, DAP (stdio & embedded TCP `--dap-port` attach, conditional & exception breakpoints, reentrant safepoints, heap retaining-path profiler, watch `evaluate`), LSP (incremental `ParseSnapshot` & subgraph metadata cache, async request bridge, member dot-completion, `signatureHelp`, `.d.rscript` host stubs), `vscode-realscript` VS Code extension, Chrome Tracing profiler export, and stateful structural hot reload (`[FormerlySerializedAs]`, static field rename migration, & cross-component ref migration). |
 
 For the exact supported/partial/unsupported language inventory, see the
 [C#-style compatibility matrix](docs/en/CSHARP_COMPATIBILITY_MATRIX.md).
@@ -71,7 +71,7 @@ single-config generator, omit `--config Release` and `-C Release`.
 
 ### Write and run a script
 
-Create `hello.rs`:
+Create `hello.rscript`:
 
 ```csharp
 module Demo.Hello;
@@ -101,10 +101,10 @@ int main()
 Validate, inspect, and run it:
 
 ```bash
-build/rsc hello.rs
-build/rsc hello.rs --mir
-build/rsc hello.rs --bytecode
-build/rsc hello.rs --run Demo.Hello::main --opt-level 2
+build/rsc hello.rscript
+build/rsc hello.rscript --mir
+build/rsc hello.rscript --bytecode
+build/rsc hello.rscript --run Demo.Hello::main --opt-level 2
 ```
 
 ### Generate C++17 AOT
@@ -115,7 +115,7 @@ build/rsaot \
   --program-name HelloScripts \
   --opt-level 2 \
   --opt-report \
-  hello.rs
+  hello.rscript
 ```
 
 Generated output contains a public header, C++17 implementation, deterministic
@@ -174,7 +174,7 @@ Key v0.98.0 performance changes:
 - unified flat-frame slot layout and computed-goto threaded interpreter dispatch;
 - zero-budget trusted release AOT mode (`--trusted-release`) and custom struct stack scalarization;
 - zero-copy host C++ contiguous struct ECS raw column binding (`bindEcsRawColumnAuto`) with AVX2 SIMD loop reconstruction;
-- widened 32-bit `BytecodeString` with lock-free paged pools and 24B/8B compacted value/instruction representations;
+- widened 32-bit `BytecodeString` with lock-free paged pools and 16B/8B compacted value/instruction representations;
 - incremental GC stepping with shadow-stack-safe value pool reclamation;
 - typed AOT/JIT scalar lowering and range-proven checked arithmetic;
 - interpreter integer specialization and quickened loop superinstructions;
@@ -237,9 +237,9 @@ RealScript is not CLR-compatible C#. v0.98.0 deliberately does not provide:
 
 - multiple class inheritance, default interface implementations, open runtime
   generics, or generic variance;
-- general `Task`, threads, or unrestricted `async/await`;
+- raw OS threads with shared mutable state or CLR `System.Threading.Tasks.Task` (use main-thread-queued `RealScript.Async` `Awaitable<T>` for streaming/network I/O and `sequence` for rollback simulation);
 - unsafe pointers, ref structs, ref properties, or complete escape analysis;
-- exception filters, `using`, native exception interop, or exceptions across a
+- exception filters, `lock`, native exception interop, or exceptions across a
   coroutine suspension point;
 - LINQ, `dynamic`, reflection code generation, or the .NET base-class library;
 - direct in-process machine-code JIT, OSR, PGO, or a rollback networking
@@ -253,3 +253,9 @@ generated AOT artifacts with the matching SDK.
 ## License
 
 RealScript is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
+
+### Sprint 2 Architecture Evolution Highlights
+- **Per-Instance Heap Pools & Nanosecond GC Budgets**: Eliminated cross-instance lock contention across `ManagedHeap` object/array allocations and GC mark/sweep cycles (coordinating brief safe-point sweeps only when shared `ValuePool` pin-reclamation triggers), and added `collectIncrementalWithBudget` nanosecond/microsecond frame-budget APIs.
+- **Flattened Lifecycle Dispatch & Coroutine-Preserving Hot Reload**: `SceneScriptRuntime` dispatches compact `FlatLifecycleSlot` arrays without per-frame copies and preserves suspended coroutines/sequences whose 64-bit state-machine fingerprint is unchanged across `hotReload`.
+- **AST-Hygienic Generics, Shared Ref-Type AOT & `using` / `Resource`**: Span-preserving AST monomorphization with cross-module lexical hygiene, shared C++ bodies for reference-type generics in `AotCpp`, deterministic `using` disposal, and Godot-style ref-counted `ResourceHandle<T>`.
+- **Modular `publicFingerprint` Build Cache & Git-Friendly `AssetGuid` Scenes**: `rsc`/`rsaot --cache-dir` caches `.rsbc` & AOT shards keyed by upstream `publicFingerprint`, paired with 128-bit `AssetGuid` and line-sorted scene/prefab text serialization.

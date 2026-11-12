@@ -5,6 +5,7 @@
 #include "realscript/text/Text.h"
 
 #include <algorithm>
+#include <deque>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -82,12 +83,16 @@ struct ParsedUnit {
     bool invalid = false;
     bool deterministic = false;
     bool hasGenericSyntax = false;
+    bool isGenericSpecialization = false;
+    std::uint32_t genericDepth = 0;
+    std::set<std::string> unitHygienicModules;
 };
 
 struct ModuleWork {
     std::string name;
     std::vector<ParsedUnit*> units;
     std::set<std::string> imports;
+    std::set<std::string> hygienicModules;
     std::vector<semantic::TypeSymbol> types;
     semantic::TypeSymbolMap visibleTypes;
     std::vector<InterfaceDeclarationInput> interfaceInputs;
@@ -123,8 +128,6 @@ struct CachedModuleFrontend {
     std::vector<std::shared_ptr<syntax::CompilationUnitSyntax>> keptSyntaxTrees;
 };
 
-#include "NativeGenerics.inl"
-
 std::uint64_t combineFingerprint(
     std::uint64_t seed,
     std::uint64_t value) noexcept {
@@ -132,6 +135,8 @@ std::uint64_t combineFingerprint(
         (seed << 6) + (seed >> 2);
     return seed;
 }
+
+#include "NativeGenerics.inl"
 
 void addVisibleType(
     semantic::TypeSymbolMap& map,
@@ -145,12 +150,22 @@ void refreshVisibleTypes(
     std::map<std::string, ModuleWork>& modules,
     ModuleWork& module) {
     module.visibleTypes.clear();
-    for (const auto& type : module.types) addVisibleType(module.visibleTypes, type, true);
     for (const auto& importedName : module.imports) {
         const auto imported = modules.find(importedName);
         if (imported == modules.end()) continue;
         for (const auto& type : imported->second.types) {
-            addVisibleType(module.visibleTypes, type, true);
+            module.visibleTypes[semantic::canonicalTypeName(type)] = type;
+            module.visibleTypes.try_emplace(type.name, type);
+        }
+    }
+    for (const auto& type : module.types) {
+        addVisibleType(module.visibleTypes, type, true);
+    }
+    for (const auto& hygienicName : module.hygienicModules) {
+        const auto hyg = modules.find(hygienicName);
+        if (hyg == modules.end()) continue;
+        for (const auto& type : hyg->second.types) {
+            addVisibleType(module.visibleTypes, type, false);
         }
     }
 }
@@ -232,16 +247,25 @@ void refreshVisibleDelegates(
     std::map<std::string, ModuleWork>& modules,
     ModuleWork& module) {
     module.visibleDelegates.clear();
+    for (const auto& importedName : module.imports) {
+        const auto imported = modules.find(importedName);
+        if (imported == modules.end()) continue;
+        for (const auto& [name, contract] : imported->second.delegates) {
+            module.visibleDelegates.try_emplace(name, contract);
+            module.visibleDelegates[
+                canonicalDelegateName(contract.moduleName, contract.name)] = contract;
+        }
+    }
     for (const auto& [name, contract] : module.delegates) {
         module.visibleDelegates[name] = contract;
         module.visibleDelegates[
             canonicalDelegateName(contract.moduleName, contract.name)] = contract;
     }
-    for (const auto& importedName : module.imports) {
-        const auto imported = modules.find(importedName);
-        if (imported == modules.end()) continue;
-        for (const auto& [name, contract] : imported->second.delegates) {
-            module.visibleDelegates[name] = contract;
+    for (const auto& hygienicName : module.hygienicModules) {
+        const auto hyg = modules.find(hygienicName);
+        if (hyg == modules.end()) continue;
+        for (const auto& [name, contract] : hyg->second.delegates) {
+            (void)name;
             module.visibleDelegates[
                 canonicalDelegateName(contract.moduleName, contract.name)] = contract;
         }
@@ -252,19 +276,42 @@ void refreshVisibleInterfaces(
     std::map<std::string, ModuleWork>& modules,
     ModuleWork& module) {
     module.visibleInterfaces.clear();
+    for (const auto& importedName : module.imports) {
+        const auto imported = modules.find(importedName);
+        if (imported == modules.end()) continue;
+        for (const auto& [name, contract] : imported->second.interfaces) {
+            module.visibleInterfaces.try_emplace(name, contract);
+            module.visibleInterfaces[
+                canonicalInterfaceName(contract.moduleName, contract.name)] = contract;
+        }
+    }
     for (const auto& [name, contract] : module.interfaces) {
         module.visibleInterfaces[name] = contract;
         module.visibleInterfaces[
             canonicalInterfaceName(contract.moduleName, contract.name)] = contract;
     }
-    for (const auto& importedName : module.imports) {
-        const auto imported = modules.find(importedName);
-        if (imported == modules.end()) continue;
-        for (const auto& [name, contract] : imported->second.interfaces) {
-            module.visibleInterfaces[name] = contract;
+    for (const auto& hygienicName : module.hygienicModules) {
+        const auto hyg = modules.find(hygienicName);
+        if (hyg == modules.end()) continue;
+        for (const auto& [name, contract] : hyg->second.interfaces) {
+            (void)name;
             module.visibleInterfaces[
                 canonicalInterfaceName(contract.moduleName, contract.name)] = contract;
         }
+    }
+}
+
+void appendStampedDiagnostics(
+    diagnostics::DiagnosticBag& target,
+    const diagnostics::DiagnosticBag& sourceBag,
+    const std::string& defaultSourceName) {
+    for (const auto& item : sourceBag.items()) {
+        target.report(
+            item.code,
+            item.message,
+            item.span,
+            item.severity,
+            item.sourceName.empty() ? defaultSourceName : item.sourceName);
     }
 }
 
@@ -486,6 +533,14 @@ std::vector<const syntax::YieldWaitStatementSyntax*> sequenceYields(
                 for (const auto& child : section.statements) collect(*child);
             }
             return;
+        case syntax::SyntaxKind::TryStatement: {
+            const auto& value = static_cast<const
+                syntax::TryStatementSyntax&>(statement);
+            collect(value.body);
+            for (const auto& c : value.catches) collect(c.body);
+            if (value.finallyBody) collect(*value.finallyBody);
+            return;
+        }
         default:
             return;
         }
@@ -643,6 +698,21 @@ void collectSequenceCompositionCalls(
             }
         }
         return;
+    case syntax::SyntaxKind::TryStatement: {
+        const auto& value = static_cast<const
+            syntax::TryStatementSyntax&>(statement);
+        collectSequenceCompositionCalls(
+            value.body, sequenceNames, output, targets);
+        for (const auto& c : value.catches) {
+            collectSequenceCompositionCalls(
+                c.body, sequenceNames, output, targets);
+        }
+        if (value.finallyBody) {
+            collectSequenceCompositionCalls(
+                *value.finallyBody, sequenceNames, output, targets);
+        }
+        return;
+    }
     default:
         return;
     }
@@ -686,6 +756,19 @@ bool sequenceStatementAlwaysReturnsResult(
             if (!returns) return false;
         }
         return hasDefault;
+    }
+    case syntax::SyntaxKind::TryStatement: {
+        const auto& value = static_cast<const
+            syntax::TryStatementSyntax&>(statement);
+        if (value.finallyBody &&
+            sequenceStatementAlwaysReturnsResult(*value.finallyBody)) {
+            return true;
+        }
+        if (!sequenceStatementAlwaysReturnsResult(value.body)) return false;
+        for (const auto& c : value.catches) {
+            if (!sequenceStatementAlwaysReturnsResult(c.body)) return false;
+        }
+        return true;
     }
     default:
         return false;
@@ -738,6 +821,18 @@ void collectSequenceLocals(
             }
         }
         return;
+    case syntax::SyntaxKind::TryStatement: {
+        const auto& value = static_cast<const
+            syntax::TryStatementSyntax&>(statement);
+        collectSequenceLocals(value.body, output);
+        for (const auto& c : value.catches) {
+            collectSequenceLocals(c.body, output);
+        }
+        if (value.finallyBody) {
+            collectSequenceLocals(*value.finallyBody, output);
+        }
+        return;
+    }
     default:
         return;
     }
@@ -792,6 +887,14 @@ void collectSuspendingSequenceForeach(
                     for (const auto& child : section.statements) visit(*child);
                 }
                 return;
+            case syntax::SyntaxKind::TryStatement: {
+                const auto& tryStmt = static_cast<const
+                    syntax::TryStatementSyntax&>(current);
+                visit(tryStmt.body);
+                for (const auto& c : tryStmt.catches) visit(c.body);
+                if (tryStmt.finallyBody) visit(*tryStmt.finallyBody);
+                return;
+            }
             default:
                 return;
             }
@@ -843,6 +946,18 @@ void collectSuspendingSequenceForeach(
             }
         }
         return;
+    case syntax::SyntaxKind::TryStatement: {
+        const auto& tryStmt = static_cast<const
+            syntax::TryStatementSyntax&>(statement);
+        collectSuspendingSequenceForeach(tryStmt.body, output);
+        for (const auto& c : tryStmt.catches) {
+            collectSuspendingSequenceForeach(c.body, output);
+        }
+        if (tryStmt.finallyBody) {
+            collectSuspendingSequenceForeach(*tryStmt.finallyBody, output);
+        }
+        return;
+    }
     default:
         return;
     }
@@ -852,85 +967,300 @@ std::optional<semantic::FieldSymbol> makeSequenceLocalField(
     const semantic::TypeSymbol& owner,
     const syntax::SequenceDeclarationSyntax& sequence,
     const syntax::VariableDeclarationStatementSyntax& declaration,
-    const semantic::TypeSymbolMap& visibleTypes,
+    const ModuleWork& module,
+    const std::map<std::string, ModuleWork>& allModules,
+    const std::vector<std::pair<std::string, semantic::FieldSymbol>>& sequenceParameterFields,
+    const std::vector<std::pair<std::string, semantic::FieldSymbol>>& existingSequenceLocals,
     const std::string& sourceName,
     diagnostics::DiagnosticBag& diagnostics) {
+    const auto& visibleTypes = module.visibleTypes;
     semantic::PrimitiveType type = semantic::resolvePrimitiveType(
         declaration.type.name.text);
     std::string typeName;
     if (declaration.type.name.text == "var" && declaration.initializer) {
-        std::function<void(const syntax::ExpressionSyntax&)> inferVar;
-        inferVar = [&](const syntax::ExpressionSyntax& expr) {
+        std::function<bool(const syntax::ExpressionSyntax&, semantic::PrimitiveType&, std::string&)> inferExpr;
+        inferExpr = [&](const syntax::ExpressionSyntax& expr,
+                        semantic::PrimitiveType& outType,
+                        std::string& outName) -> bool {
             switch (expr.kind()) {
             case syntax::SyntaxKind::LiteralExpression: {
                 const auto& lit = static_cast<const syntax::LiteralExpressionSyntax&>(expr);
                 switch (lit.literalToken.kind) {
                 case syntax::SyntaxKind::TrueKeyword:
                 case syntax::SyntaxKind::FalseKeyword:
-                    type = semantic::PrimitiveType::Bool;
-                    return;
+                    outType = semantic::PrimitiveType::Bool;
+                    return true;
                 case syntax::SyntaxKind::StringLiteralToken:
-                    type = semantic::PrimitiveType::String;
-                    return;
+                    outType = semantic::PrimitiveType::String;
+                    return true;
                 case syntax::SyntaxKind::IntegerLiteralToken: {
                     const auto& txt = lit.literalToken.text;
-                    type = (!txt.empty() && (txt.back() == 'L' || txt.back() == 'l'))
+                    outType = (!txt.empty() && (txt.back() == 'L' || txt.back() == 'l'))
                         ? semantic::PrimitiveType::Long
                         : semantic::PrimitiveType::Int;
-                    return;
+                    return true;
                 }
                 case syntax::SyntaxKind::FloatLiteralToken: {
                     const auto& txt = lit.literalToken.text;
-                    type = (!txt.empty() && (txt.back() == 'f' || txt.back() == 'F'))
+                    outType = (!txt.empty() && (txt.back() == 'f' || txt.back() == 'F'))
                         ? semantic::PrimitiveType::Float
                         : semantic::PrimitiveType::Double;
-                    return;
+                    return true;
                 }
                 default:
-                    return;
+                    return false;
                 }
             }
+            case syntax::SyntaxKind::ThisExpression:
+                outType = owner.kind == semantic::TypeKind::Struct
+                    ? semantic::PrimitiveType::Struct
+                    : semantic::PrimitiveType::Object;
+                outName = semantic::canonicalTypeName(owner);
+                return true;
+            case syntax::SyntaxKind::NameExpression: {
+                const auto& ident = static_cast<const syntax::NameExpressionSyntax&>(expr).identifierToken.text;
+                for (const auto& [lname, lfield] : existingSequenceLocals) {
+                    if (lname == ident) {
+                        outType = lfield.type;
+                        outName = lfield.typeName;
+                        return true;
+                    }
+                }
+                for (const auto& [pname, pfield] : sequenceParameterFields) {
+                    if (pname == ident) {
+                        outType = pfield.type;
+                        outName = pfield.typeName;
+                        return true;
+                    }
+                }
+                for (const auto& f : owner.fields) {
+                    if (!f.synthetic && f.name == ident) {
+                        outType = f.type;
+                        outName = f.typeName;
+                        return true;
+                    }
+                }
+                return false;
+            }
             case syntax::SyntaxKind::ParenthesizedExpression:
-                inferVar(*static_cast<const syntax::ParenthesizedExpressionSyntax&>(expr).expression);
-                return;
+                return inferExpr(
+                    *static_cast<const syntax::ParenthesizedExpressionSyntax&>(expr).expression,
+                    outType, outName);
             case syntax::SyntaxKind::UnaryExpression:
-                inferVar(*static_cast<const syntax::UnaryExpressionSyntax&>(expr).operand);
-                return;
+                return inferExpr(
+                    *static_cast<const syntax::UnaryExpressionSyntax&>(expr).operand,
+                    outType, outName);
             case syntax::SyntaxKind::BinaryExpression: {
                 const auto& bin = static_cast<const syntax::BinaryExpressionSyntax&>(expr);
-                inferVar(*bin.left);
-                return;
+                return inferExpr(*bin.left, outType, outName);
             }
             case syntax::SyntaxKind::NewObjectExpression: {
                 const auto& nw = static_cast<const syntax::NewObjectExpressionSyntax&>(expr);
                 const auto found = visibleTypes.find(nw.type.name.text);
                 if (found != visibleTypes.end()) {
-                    type = found->second.kind == semantic::TypeKind::Struct
+                    outType = found->second.kind == semantic::TypeKind::Struct
                         ? semantic::PrimitiveType::Struct
                         : (found->second.kind == semantic::TypeKind::Enum
                             ? semantic::PrimitiveType::Enum
                             : semantic::PrimitiveType::Object);
-                    typeName = semantic::canonicalTypeName(found->second);
+                    outName = semantic::canonicalTypeName(found->second);
+                    return true;
                 }
-                return;
+                return false;
+            }
+            case syntax::SyntaxKind::NewArrayExpression: {
+                const auto& na = static_cast<const syntax::NewArrayExpressionSyntax&>(expr);
+                auto elemPrim = semantic::resolvePrimitiveType(na.elementType.name.text);
+                std::string elemName;
+                if (elemPrim == semantic::PrimitiveType::Error) {
+                    const auto found = visibleTypes.find(na.elementType.name.text);
+                    if (found != visibleTypes.end()) {
+                        elemPrim = found->second.kind == semantic::TypeKind::Struct
+                            ? semantic::PrimitiveType::Struct
+                            : (found->second.kind == semantic::TypeKind::Enum
+                                ? semantic::PrimitiveType::Enum
+                                : semantic::PrimitiveType::Object);
+                        elemName = semantic::canonicalTypeName(found->second);
+                    }
+                }
+                if (elemPrim != semantic::PrimitiveType::Error) {
+                    outType = semantic::PrimitiveType::Array;
+                    outName = semantic::arrayTypeName(elemPrim, elemName);
+                    return true;
+                }
+                return false;
             }
             case syntax::SyntaxKind::CallExpression: {
                 const auto& call = static_cast<const syntax::CallExpressionSyntax&>(expr);
-                if (call.identifierToken.text == "FixedFromInt" ||
-                    call.identifierToken.text == "FixedFromRatio") {
+                const auto& fnName = call.identifierToken.text;
+                if (fnName == "FixedFromInt" || fnName == "FixedFromRatio") {
                     const auto found = visibleTypes.find("Fixed");
                     if (found != visibleTypes.end()) {
-                        type = semantic::PrimitiveType::Struct;
-                        typeName = semantic::canonicalTypeName(found->second);
+                        outType = semantic::PrimitiveType::Struct;
+                        outName = semantic::canonicalTypeName(found->second);
+                        return true;
                     }
                 }
-                return;
+                for (const auto& m : owner.methods) {
+                    if (m.name == fnName) {
+                        outType = m.returnType;
+                        outName = m.returnTypeName;
+                        return outType != semantic::PrimitiveType::Error;
+                    }
+                }
+                for (const auto& fn : module.declarations) {
+                    if (!fn.method && fn.name == fnName) {
+                        outType = fn.returnType;
+                        outName = fn.returnTypeName;
+                        return outType != semantic::PrimitiveType::Error;
+                    }
+                }
+                for (const auto& impName : module.imports) {
+                    const auto impIt = allModules.find(impName);
+                    if (impIt == allModules.end()) continue;
+                    for (const auto& fn : impIt->second.declarations) {
+                        if (!fn.method && fn.name == fnName) {
+                            outType = fn.returnType;
+                            outName = fn.returnTypeName;
+                            return outType != semantic::PrimitiveType::Error;
+                        }
+                    }
+                }
+                return false;
+            }
+            case syntax::SyntaxKind::MemberCallExpression: {
+                const auto& mcall = static_cast<const syntax::MemberCallExpressionSyntax&>(expr);
+                const auto& mname = mcall.nameToken.text;
+                auto resolveMethodOnType = [&](const semantic::TypeSymbol& targetType, bool wantStatic) -> bool {
+                    for (const auto& m : targetType.methods) {
+                        if (m.staticMethod == wantStatic && m.name == mname) {
+                            outType = m.returnType;
+                            outName = m.returnTypeName;
+                            return outType != semantic::PrimitiveType::Error;
+                        }
+                    }
+                    const auto modIt = allModules.find(targetType.moduleName);
+                    if (modIt == allModules.end()) return false;
+                    for (const auto& liveT : modIt->second.types) {
+                        if (liveT.id != targetType.id && liveT.name != targetType.name) continue;
+                        for (const auto& m : liveT.methods) {
+                            if (m.staticMethod == wantStatic && m.name == mname) {
+                                outType = m.returnType;
+                                outName = m.returnTypeName;
+                                return outType != semantic::PrimitiveType::Error;
+                            }
+                        }
+                    }
+                    auto checkSyntaxMethods = [&](const auto& decls) -> bool {
+                        for (const auto& decl : decls) {
+                            if (decl.identifierToken.text != targetType.name) continue;
+                            for (const auto& ms : decl.methods) {
+                                if (!ms.typeParameters.empty() || ms.identifierToken.text != mname) continue;
+                                const bool isStat = semantic::hasModifier(ms.modifiers, syntax::SyntaxKind::StaticKeyword);
+                                if (isStat != wantStatic) continue;
+                                diagnostics::DiagnosticBag ignored;
+                                const auto retRef = resolveInterfaceType(
+                                    ms.returnType, modIt->second.visibleTypes, ignored, sourceName, true);
+                                if (retRef.type != semantic::PrimitiveType::Error) {
+                                    outType = retRef.type;
+                                    outName = retRef.typeName;
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    };
+                    for (const auto* u : modIt->second.units) {
+                        if (!u || !u->syntaxTree) continue;
+                        if (checkSyntaxMethods(u->syntaxTree->classes) ||
+                            checkSyntaxMethods(u->syntaxTree->structs)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                if (mcall.receiver &&
+                    mcall.receiver->kind() == syntax::SyntaxKind::NameExpression) {
+                    const auto& recvIdent = static_cast<const syntax::NameExpressionSyntax&>(
+                        *mcall.receiver).identifierToken.text;
+                    const auto typeIt = visibleTypes.find(recvIdent);
+                    if (typeIt != visibleTypes.end() && resolveMethodOnType(typeIt->second, true)) {
+                        return true;
+                    }
+                }
+                if (mcall.receiver) {
+                    semantic::PrimitiveType recvPrim = semantic::PrimitiveType::Error;
+                    std::string recvName;
+                    if (inferExpr(*mcall.receiver, recvPrim, recvName) && !recvName.empty()) {
+                        if ((recvName == semantic::canonicalTypeName(owner) || recvName == owner.name) &&
+                            resolveMethodOnType(owner, false)) {
+                            return true;
+                        }
+                        const auto typeIt = visibleTypes.find(recvName);
+                        if (typeIt != visibleTypes.end() && resolveMethodOnType(typeIt->second, false)) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+            case syntax::SyntaxKind::MemberAccessExpression: {
+                const auto& macc = static_cast<const syntax::MemberAccessExpressionSyntax&>(expr);
+                const auto& mname = macc.nameToken.text;
+                auto lookupFieldOrProp = [&](const semantic::TypeSymbol& ts, bool staticOnly) -> bool {
+                    for (const auto& f : ts.fields) {
+                        if (f.staticField == staticOnly && f.name == mname) {
+                            outType = f.type;
+                            outName = f.typeName;
+                            return true;
+                        }
+                    }
+                    for (const auto& pr : ts.properties) {
+                        if (pr.staticProperty == staticOnly && pr.name == mname) {
+                            outType = pr.type;
+                            outName = pr.typeName;
+                            return true;
+                        }
+                    }
+                    for (const auto& m : ts.methods) {
+                        if (m.staticMethod == staticOnly && m.name == mname) {
+                            outType = m.returnType;
+                            outName = m.returnTypeName;
+                            return outType != semantic::PrimitiveType::Error;
+                        }
+                    }
+                    return false;
+                };
+                if (macc.receiver &&
+                    macc.receiver->kind() == syntax::SyntaxKind::NameExpression) {
+                    const auto& recvIdent = static_cast<const syntax::NameExpressionSyntax&>(
+                        *macc.receiver).identifierToken.text;
+                    const auto typeIt = visibleTypes.find(recvIdent);
+                    if (typeIt != visibleTypes.end() && lookupFieldOrProp(typeIt->second, true)) {
+                        return true;
+                    }
+                }
+                if (macc.receiver) {
+                    semantic::PrimitiveType recvPrim = semantic::PrimitiveType::Error;
+                    std::string recvName;
+                    if (inferExpr(*macc.receiver, recvPrim, recvName) && !recvName.empty()) {
+                        if ((recvName == semantic::canonicalTypeName(owner) || recvName == owner.name) &&
+                            lookupFieldOrProp(owner, false)) {
+                            return true;
+                        }
+                        const auto typeIt = visibleTypes.find(recvName);
+                        if (typeIt != visibleTypes.end() && lookupFieldOrProp(typeIt->second, false)) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
             }
             default:
-                return;
+                return false;
             }
         };
-        inferVar(*declaration.initializer);
+        (void)inferExpr(*declaration.initializer, type, typeName);
     }
     if (type == semantic::PrimitiveType::Error) {
         const auto found = visibleTypes.find(declaration.type.name.text);
@@ -962,6 +1292,7 @@ std::optional<semantic::FieldSymbol> makeSequenceLocalField(
     field.type = type;
     field.typeName = std::move(typeName);
     field.synthetic = true;
+    field.isUsingResource = declaration.isUsingDeclaration;
     field.sourceName = sourceName;
     field.declarationSpan = declaration.identifierToken.span;
     field.id = semantic::stableTypeId(
@@ -1016,6 +1347,18 @@ void collectEventSubscriptions(
             }
         }
         return;
+    case syntax::SyntaxKind::TryStatement: {
+        const auto& value = static_cast<const
+            syntax::TryStatementSyntax&>(statement);
+        collectEventSubscriptions(value.body, output);
+        for (const auto& c : value.catches) {
+            collectEventSubscriptions(c.body, output);
+        }
+        if (value.finallyBody) {
+            collectEventSubscriptions(*value.finallyBody, output);
+        }
+        return;
+    }
     default:
         return;
     }
@@ -1224,9 +1567,14 @@ LanguageModuleMetadata languageMetadataForModule(
             }
         }
         if (!emitted) {
+            const auto dotPos = instantiation.genericName.find('.');
+            const std::string expectedMemberFnName = dotPos != std::string::npos
+                ? (instantiation.genericName.substr(0, dotPos + 1) + instantiation.generatedName)
+                : std::string{};
             for (const auto& function : module.functions) {
                 if (function.moduleName == moduleName &&
-                    function.name == instantiation.generatedName) {
+                    (function.name == instantiation.generatedName ||
+                     (!expectedMemberFnName.empty() && function.name == expectedMemberFnName))) {
                     emitted = true;
                     break;
                 }
@@ -2698,15 +3046,85 @@ public class Async {
     return kSource;
 }
 
-bool sourceMentionsAsyncPrimitives(std::string_view text) noexcept {
-    return text.find("async") != std::string_view::npos ||
-        text.find("await") != std::string_view::npos ||
-        text.find("Awaitable") != std::string_view::npos ||
-        text.find("CancellationToken") != std::string_view::npos ||
-        text.find("AsyncException") != std::string_view::npos ||
-        text.find("AsyncCanceledException") != std::string_view::npos ||
-        text.find("Async.") != std::string_view::npos ||
-        text.find("RealScript.Async") != std::string_view::npos;
+bool sourceMentionsAsyncPrimitives(std::string_view text) {
+    if (text.find("async") == std::string_view::npos &&
+        text.find("await") == std::string_view::npos &&
+        text.find("Awaitable") == std::string_view::npos &&
+        text.find("CancellationToken") == std::string_view::npos &&
+        text.find("Async") == std::string_view::npos) {
+        return false;
+    }
+    text::SourceText source(std::string(text), "$async_scan");
+    diagnostics::DiagnosticBag ignored;
+    syntax::Lexer lexer(source, ignored);
+    for (;;) {
+        const auto token = lexer.nextToken();
+        if (token.kind == syntax::SyntaxKind::EndOfFileToken) {
+            break;
+        }
+        if (token.kind == syntax::SyntaxKind::AsyncKeyword ||
+            token.kind == syntax::SyntaxKind::AwaitKeyword) {
+            return true;
+        }
+        if (token.kind == syntax::SyntaxKind::IdentifierToken) {
+            if (token.text == "Awaitable" ||
+                token.text == "CancellationToken" ||
+                token.text == "CancellationTokenSource" ||
+                token.text == "AsyncException" ||
+                token.text == "AsyncCanceledException" ||
+                token.text == "Async") {
+                return true;
+            }
+        } else if (token.kind == syntax::SyntaxKind::InterpolatedStringToken) {
+            const std::string& raw = token.text;
+            std::size_t idx = (raw.size() >= 2 && raw[0] == '$' && raw[1] == '"') ? 2 : 0;
+            const std::size_t limit = (!raw.empty() && raw.back() == '"') ? (raw.size() - 1) : raw.size();
+            while (idx < limit) {
+                if (raw[idx] == '\\') {
+                    idx += 2;
+                    continue;
+                }
+                if (raw[idx] == '{') {
+                    if (idx + 1 < limit && raw[idx + 1] == '{') {
+                        idx += 2;
+                        continue;
+                    }
+                    ++idx;
+                    const std::size_t holeStart = idx;
+                    int depth = 1;
+                    bool inStr = false;
+                    while (idx < limit && depth > 0) {
+                        const char ch = raw[idx];
+                        if (inStr) {
+                            if (ch == '\\') {
+                                idx += 2;
+                                continue;
+                            }
+                            if (ch == '"') inStr = false;
+                        } else {
+                            if (ch == '"') inStr = true;
+                            else if (ch == '{') ++depth;
+                            else if (ch == '}') {
+                                --depth;
+                                if (depth == 0) break;
+                            }
+                        }
+                        ++idx;
+                    }
+                    const std::size_t holeLen = idx > holeStart ? (idx - holeStart) : 0;
+                    if (holeLen > 0 &&
+                        sourceMentionsAsyncPrimitives(
+                            std::string_view(raw).substr(holeStart, holeLen))) {
+                        return true;
+                    }
+                    if (idx < limit && raw[idx] == '}') ++idx;
+                    continue;
+                }
+                ++idx;
+            }
+        }
+    }
+    return false;
 }
 
 const std::string& builtinFiberModuleSource() {
@@ -2735,6 +3153,890 @@ public class Fiber {
 }
 )RS";
     return kSource;
+}
+
+const std::string& builtinResourceModuleSource() {
+    static const std::string kSource = R"RS(
+module RealScript.Resource;
+
+long __RsHostResAcquire(string path, string guid);
+int __RsHostResRetain(long resourceId);
+int __RsHostResRelease(long resourceId);
+int __RsHostResUseCount(long resourceId);
+bool __RsHostResIsDisposed(long resourceId);
+string __RsHostResGetPath(long resourceId);
+string __RsHostResGetGuid(long resourceId);
+long __RsHostResFindByPath(string path);
+long __RsHostResFindByGuid(string guid);
+int __RsHostResLiveCount();
+
+public interface IDisposable {
+    void Dispose();
+}
+
+public class Resource : IDisposable {
+    public long __resourceId;
+    public string __path;
+    public string __guid;
+    public int __useCount;
+    public bool __disposed;
+    public bool __hostBacked;
+
+    public Resource() {
+        __path = "";
+        __guid = "";
+        __useCount = 1;
+        __disposed = false;
+        __hostBacked = false;
+        __resourceId = ResourceServer.__RegisterScriptResource(this, "", "");
+    }
+
+    public Resource(string path) {
+        __path = path == null ? "" : path;
+        __guid = "";
+        __useCount = 1;
+        __disposed = false;
+        __hostBacked = false;
+        __resourceId = ResourceServer.__RegisterScriptResource(this, __path, "");
+    }
+
+    public Resource(string path, string guid) {
+        __path = path == null ? "" : path;
+        __guid = guid == null ? "" : guid;
+        __useCount = 1;
+        __disposed = false;
+        __hostBacked = false;
+        __resourceId = ResourceServer.__RegisterScriptResource(this, __path, __guid);
+    }
+
+    internal Resource(long hostId, string path, string guid, bool hostBacked) {
+        __resourceId = hostId;
+        __path = path == null ? "" : path;
+        __guid = guid == null ? "" : guid;
+        __hostBacked = hostBacked;
+        bool useBridge = hostBacked && ResourceServer.IsHostBridgeEnabled();
+        __disposed = useBridge ? __RsHostResIsDisposed(hostId) : false;
+        __useCount = useBridge ? __RsHostResUseCount(hostId) : 1;
+    }
+
+    internal void __RebindHost(long hostId, string path, string guid) {
+        __resourceId = hostId;
+        __path = path == null ? "" : path;
+        __guid = guid == null ? "" : guid;
+        __hostBacked = true;
+        bool useBridge = ResourceServer.IsHostBridgeEnabled();
+        __disposed = useBridge ? __RsHostResIsDisposed(hostId) : false;
+        __useCount = useBridge ? __RsHostResUseCount(hostId) : 1;
+    }
+
+    public static Resource WrapHost(long hostId, string path, string guid) {
+        Resource existing = ResourceServer.__FindWrapperDirect(hostId);
+        if (existing != null) {
+            existing.__RebindHost(hostId, path, guid);
+            ResourceServer.__AttachHostWrapper(hostId, existing);
+            return existing;
+        }
+        Resource r = new Resource(hostId, path, guid, true);
+        ResourceServer.__AttachHostWrapper(hostId, r);
+        return r;
+    }
+
+    public string Path {
+        get { return GetPath(); }
+        set { SetPath(value); }
+    }
+
+    public string Guid {
+        get { return GetGuid(); }
+        set { SetGuid(value); }
+    }
+
+    public long ResourceId() {
+        return __resourceId;
+    }
+
+    public string GetPath() {
+        if (__hostBacked && ResourceServer.IsHostBridgeEnabled()) {
+            return __RsHostResGetPath(__resourceId);
+        }
+        return __path;
+    }
+
+    public void SetPath(string path) {
+        __path = path == null ? "" : path;
+        ResourceServer.__UpdatePath(__resourceId, __path);
+    }
+
+    public string GetGuid() {
+        if (__hostBacked && ResourceServer.IsHostBridgeEnabled()) {
+            return __RsHostResGetGuid(__resourceId);
+        }
+        return __guid;
+    }
+
+    public void SetGuid(string guid) {
+        __guid = guid == null ? "" : guid;
+        ResourceServer.__UpdateGuid(__resourceId, __guid);
+    }
+
+    public int Retain() {
+        if (__hostBacked && ResourceServer.IsHostBridgeEnabled()) {
+            if (__RsHostResIsDisposed(__resourceId)) {
+                __disposed = true;
+                __useCount = 0;
+                return 0;
+            }
+            int nextCount = __RsHostResRetain(__resourceId);
+            __disposed = false;
+            __useCount = nextCount;
+            return nextCount;
+        }
+        if (__disposed || __useCount <= 0) {
+            return 0;
+        }
+        __useCount = __useCount + 1;
+        return __useCount;
+    }
+
+    public int Release() {
+        if (__hostBacked && ResourceServer.IsHostBridgeEnabled()) {
+            if (__disposed || __RsHostResIsDisposed(__resourceId)) {
+                __disposed = true;
+                __useCount = 0;
+                return 0;
+            }
+            int rem = __RsHostResRelease(__resourceId);
+            __useCount = rem;
+            if (rem <= 0) {
+                __disposed = true;
+                ResourceServer.__OnScriptResourceZero(__resourceId);
+                OnDispose();
+            }
+            return rem;
+        }
+        if (__disposed || __useCount <= 0) {
+            return 0;
+        }
+        __useCount = __useCount - 1;
+        if (__useCount == 0) {
+            __disposed = true;
+            ResourceServer.__OnScriptResourceZero(__resourceId);
+            OnDispose();
+        }
+        return __useCount;
+    }
+
+    public int UseCount() {
+        if (__hostBacked && ResourceServer.IsHostBridgeEnabled()) {
+            return __RsHostResUseCount(__resourceId);
+        }
+        if (__disposed) return 0;
+        return __useCount;
+    }
+
+    public bool IsDisposed() {
+        if (__hostBacked && ResourceServer.IsHostBridgeEnabled()) {
+            return __RsHostResIsDisposed(__resourceId);
+        }
+        return __disposed;
+    }
+
+    public virtual void OnDispose() {
+    }
+
+    public virtual void Dispose() {
+        Release();
+    }
+
+    public ResourceHandle AcquireHandle() {
+        return ResourceHandle.FromResource(this);
+    }
+
+    public ResourceHandle AdoptHandle() {
+        return ResourceHandle.Adopt(this);
+    }
+}
+
+public struct ResourceHandle : IDisposable {
+    public long __leaseId;
+    public long __resourceId;
+
+    public ResourceHandle(long leaseId, long resourceId) {
+        __leaseId = leaseId;
+        __resourceId = resourceId;
+    }
+
+    public static ResourceHandle Empty() {
+        return new ResourceHandle(0L, 0L);
+    }
+
+    public static ResourceHandle __AssignHandle(ResourceHandle oldVal, ResourceHandle newVal) {
+        if (oldVal.__leaseId > 0L && oldVal.__leaseId != newVal.__leaseId) {
+            ResourceServer.__ReleaseLease(oldVal.__leaseId);
+        }
+        return newVal;
+    }
+
+    public static ResourceHandle Adopt(Resource resource) {
+        if (resource == null) return new ResourceHandle(0L, 0L);
+        long rid = resource.ResourceId();
+        long lid = ResourceServer.__AllocObjectLease(resource, rid, false);
+        return new ResourceHandle(lid, rid);
+    }
+
+    public static ResourceHandle FromResource(Resource resource) {
+        if (resource == null) return new ResourceHandle(0L, 0L);
+        long rid = resource.ResourceId();
+        long lid = ResourceServer.__AllocObjectLease(resource, rid, true);
+        return new ResourceHandle(lid, rid);
+    }
+
+    public static ResourceHandle Load(string path) {
+        return ResourceServer.Load(path);
+    }
+
+    public static ResourceHandle LoadWithGuid(string path, string guid) {
+        return ResourceServer.LoadWithGuid(path, guid);
+    }
+
+    public ResourceHandle Retain() {
+        if (!IsValid()) return new ResourceHandle(0L, 0L);
+        long lid = ResourceServer.__AllocLease(__resourceId, true);
+        if (lid <= 0L) return new ResourceHandle(0L, 0L);
+        return new ResourceHandle(lid, __resourceId);
+    }
+
+    public int Release() {
+        if (__leaseId <= 0L || !ResourceServer.__IsLeaseActive(__leaseId)) {
+            return UseCount();
+        }
+        return ResourceServer.__ReleaseLease(__leaseId);
+    }
+
+    public void Dispose() {
+        ResourceServer.__ReleaseLease(__leaseId);
+    }
+
+    public int UseCount() {
+        if (__resourceId <= 0L) return 0;
+        return ResourceServer.GetUseCount(__resourceId);
+    }
+
+    public bool IsDisposed() {
+        if (__resourceId <= 0L) return true;
+        return ResourceServer.IsResourceDisposed(__resourceId);
+    }
+
+    public bool IsValid() {
+        return __leaseId > 0L &&
+            ResourceServer.__IsLeaseActive(__leaseId) &&
+            !IsDisposed();
+    }
+
+    public long ResourceId() {
+        return __resourceId;
+    }
+
+    public string GetPath() {
+        return ResourceServer.GetPath(__resourceId);
+    }
+
+    public string GetGuid() {
+        return ResourceServer.GetGuid(__resourceId);
+    }
+
+    public string Path {
+        get { return GetPath(); }
+    }
+
+    public string Guid {
+        get { return GetGuid(); }
+    }
+
+    public Resource Get() {
+        if (!IsValid()) return null;
+        return ResourceServer.GetResource(__resourceId);
+    }
+}
+
+public class ResourceServer {
+    static bool __initialized = false;
+    static bool __hostBridge = false;
+    static long __nextScriptId = 1L;
+
+    static Resource[] __resources;
+    static long[] __resourceIds;
+    static bool[] __resourceActive;
+    static string[] __resourcePaths;
+    static string[] __resourceGuids;
+    static int[] __freeResourceSlots;
+    static int __freeResourceCount = 0;
+    static int __resourceCount = 0;
+
+    static IDisposable[] __leaseObjects;
+    static long[] __leaseResourceIds;
+    static long[] __leaseGenerations;
+    static bool[] __leaseActive;
+    static int[] __freeLeaseSlots;
+    static int __freeLeaseCount = 0;
+    static int __leaseCount = 0;
+    static int __disposedCount = 0;
+
+    static void __EnsureInit() {
+        if (__initialized) return;
+        __resources = new Resource[16];
+        __resourceIds = new long[16];
+        __resourceActive = new bool[16];
+        __resourcePaths = new string[16];
+        __resourceGuids = new string[16];
+        __freeResourceSlots = new int[16];
+        __freeResourceCount = 0;
+        __resourceCount = 0;
+
+        __leaseObjects = new IDisposable[32];
+        __leaseResourceIds = new long[32];
+        __leaseGenerations = new long[32];
+        __leaseActive = new bool[32];
+        __freeLeaseSlots = new int[32];
+        __freeLeaseCount = 0;
+        __leaseCount = 0;
+        __initialized = true;
+    }
+
+    static void __GrowResources() {
+        int oldLen = __resources.length;
+        int nextLen = oldLen * 2;
+        Resource[] nr = new Resource[nextLen];
+        long[] ni = new long[nextLen];
+        bool[] na = new bool[nextLen];
+        string[] np = new string[nextLen];
+        string[] ng = new string[nextLen];
+        int[] nf = new int[nextLen];
+        int i = 0;
+        while (i < __resourceCount) {
+            nr[i] = __resources[i];
+            ni[i] = __resourceIds[i];
+            na[i] = __resourceActive[i];
+            np[i] = __resourcePaths[i];
+            ng[i] = __resourceGuids[i];
+            i = i + 1;
+        }
+        int fi = 0;
+        while (fi < __freeResourceCount) {
+            nf[fi] = __freeResourceSlots[fi];
+            fi = fi + 1;
+        }
+        __resources = nr;
+        __resourceIds = ni;
+        __resourceActive = na;
+        __resourcePaths = np;
+        __resourceGuids = ng;
+        __freeResourceSlots = nf;
+    }
+
+    static void __GrowLeases() {
+        int oldLen = __leaseResourceIds.length;
+        int nextLen = oldLen * 2;
+        IDisposable[] no = new IDisposable[nextLen];
+        long[] nl = new long[nextLen];
+        long[] ng = new long[nextLen];
+        bool[] na = new bool[nextLen];
+        int[] nf = new int[nextLen];
+        int i = 0;
+        while (i < __leaseCount) {
+            no[i] = __leaseObjects[i];
+            nl[i] = __leaseResourceIds[i];
+            ng[i] = __leaseGenerations[i];
+            na[i] = __leaseActive[i];
+            i = i + 1;
+        }
+        int fi = 0;
+        while (fi < __freeLeaseCount) {
+            nf[fi] = __freeLeaseSlots[fi];
+            fi = fi + 1;
+        }
+        __leaseObjects = no;
+        __leaseResourceIds = nl;
+        __leaseGenerations = ng;
+        __leaseActive = na;
+        __freeLeaseSlots = nf;
+    }
+
+    static int __AllocResourceSlot() {
+        __EnsureInit();
+        if (__freeResourceCount > 0) {
+            __freeResourceCount = __freeResourceCount - 1;
+            return __freeResourceSlots[__freeResourceCount];
+        }
+        if (__resourceCount >= __resources.length) {
+            __GrowResources();
+        }
+        int slot = __resourceCount;
+        __resourceCount = __resourceCount + 1;
+        return slot;
+    }
+
+    static int __FindIndexById(long resourceId) {
+        __EnsureInit();
+        if (resourceId <= 0L) return -1;
+        int i = 0;
+        while (i < __resourceCount) {
+            if (__resourceActive[i] && __resourceIds[i] == resourceId) return i;
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    internal static Resource __FindWrapperDirect(long hostId) {
+        int idx = __FindIndexById(hostId);
+        if (idx >= 0) {
+            return __resources[idx];
+        }
+        return null;
+    }
+
+    public static void EnableHostBridge(bool enabled) {
+        __EnsureInit();
+        __hostBridge = enabled;
+    }
+
+    public static bool IsHostBridgeEnabled() {
+        return __hostBridge;
+    }
+
+    public static void ResetForTesting() {
+        __initialized = false;
+        __hostBridge = false;
+        __resourceCount = 0;
+        __freeResourceCount = 0;
+        __leaseCount = 0;
+        __freeLeaseCount = 0;
+        __disposedCount = 0;
+        __EnsureInit();
+    }
+
+    public static int __DebugResourceHighWaterMark() {
+        __EnsureInit();
+        return __resourceCount;
+    }
+
+    public static int __DebugLeaseHighWaterMark() {
+        __EnsureInit();
+        return __leaseCount;
+    }
+
+    public static long __RegisterScriptResource(Resource res, string path, string guid) {
+        __EnsureInit();
+        long id = 1000000L + __nextScriptId;
+        __nextScriptId = __nextScriptId + 1L;
+        int idx = __AllocResourceSlot();
+        if (res != null) {
+            res.__disposed = false;
+        }
+        __resources[idx] = res;
+        __resourceIds[idx] = id;
+        __resourceActive[idx] = true;
+        __resourcePaths[idx] = path == null ? "" : path;
+        __resourceGuids[idx] = guid == null ? "" : guid;
+        return id;
+    }
+
+    public static void __AttachHostWrapper(long hostId, Resource wrapper) {
+        __EnsureInit();
+        if (wrapper == null || hostId <= 0L) return;
+        bool hostDisp = __hostBridge ? __RsHostResIsDisposed(hostId) : false;
+        wrapper.__disposed = hostDisp;
+        int idx = __FindIndexById(hostId);
+        if (idx >= 0) {
+            __resources[idx] = wrapper;
+            __resourceActive[idx] = !hostDisp;
+            __resourcePaths[idx] = wrapper.__path;
+            __resourceGuids[idx] = wrapper.__guid;
+            return;
+        }
+        int slot = __AllocResourceSlot();
+        __resources[slot] = wrapper;
+        __resourceIds[slot] = hostId;
+        __resourceActive[slot] = !hostDisp;
+        __resourcePaths[slot] = wrapper.__path;
+        __resourceGuids[slot] = wrapper.__guid;
+    }
+
+    public static void __UpdatePath(long resourceId, string path) {
+        int idx = __FindIndexById(resourceId);
+        if (idx >= 0) {
+            __resourcePaths[idx] = path == null ? "" : path;
+        }
+    }
+
+    public static void __UpdateGuid(long resourceId, string guid) {
+        int idx = __FindIndexById(resourceId);
+        if (idx >= 0) {
+            __resourceGuids[idx] = guid == null ? "" : guid;
+        }
+    }
+
+    public static void __OnScriptResourceZero(long resourceId) {
+        int idx = __FindIndexById(resourceId);
+        if (idx >= 0) {
+            if (__resourceActive[idx]) {
+                __disposedCount = __disposedCount + 1;
+            }
+            __resourceActive[idx] = false;
+            __resources[idx] = null;
+            __resourceIds[idx] = 0L;
+            __resourcePaths[idx] = null;
+            __resourceGuids[idx] = null;
+            if (__freeResourceCount >= __freeResourceSlots.length) {
+                __GrowResources();
+            }
+            __freeResourceSlots[__freeResourceCount] = idx;
+            __freeResourceCount = __freeResourceCount + 1;
+        }
+    }
+
+    static long __AllocRawLeaseWithObject(IDisposable targetObj, long resourceId) {
+        __EnsureInit();
+        int slot = -1;
+        if (__freeLeaseCount > 0) {
+            __freeLeaseCount = __freeLeaseCount - 1;
+            slot = __freeLeaseSlots[__freeLeaseCount];
+        } else {
+            if (__leaseCount >= __leaseResourceIds.length) {
+                __GrowLeases();
+            }
+            slot = __leaseCount;
+            __leaseCount = __leaseCount + 1;
+        }
+        long gen = __leaseGenerations[slot];
+        if (gen <= 0L) {
+            gen = 1L;
+            __leaseGenerations[slot] = 1L;
+        }
+        __leaseObjects[slot] = targetObj;
+        __leaseResourceIds[slot] = resourceId;
+        __leaseActive[slot] = true;
+        return gen * 1000000000L + (long)(slot + 1);
+    }
+
+    public static long __AllocRawLease(long resourceId) {
+        int idx = __FindIndexById(resourceId);
+        IDisposable obj = (idx >= 0) ? __resources[idx] : null;
+        return __AllocRawLeaseWithObject(obj, resourceId);
+    }
+
+    public static long __AllocLease(long resourceId, bool retainNow) {
+        if (resourceId <= 0L) return 0L;
+        int idx = __FindIndexById(resourceId);
+        if (idx >= 0 && __resources[idx] != null) {
+            Resource res = __resources[idx];
+            if (res.IsDisposed()) return 0L;
+            if (retainNow) {
+                if (res.Retain() <= 0) return 0L;
+            }
+            return __AllocRawLeaseWithObject(res, resourceId);
+        }
+        if (__hostBridge) {
+            if (__RsHostResIsDisposed(resourceId)) return 0L;
+            if (retainNow) {
+                if (__RsHostResRetain(resourceId) <= 0) return 0L;
+            }
+            return __AllocRawLeaseWithObject(null, resourceId);
+        }
+        return 0L;
+    }
+
+    public static long __AllocObjectLease(IDisposable targetObj, long resourceId, bool retainNow) {
+        if (targetObj == null || resourceId <= 0L) return 0L;
+        int idx = __FindIndexById(resourceId);
+        if (idx >= 0 && __resources[idx] != null) {
+            Resource res = __resources[idx];
+            if (res.IsDisposed()) return 0L;
+            if (retainNow) {
+                if (res.Retain() <= 0) return 0L;
+            }
+            return __AllocRawLeaseWithObject(targetObj, resourceId);
+        }
+        if (__hostBridge) {
+            if (__RsHostResIsDisposed(resourceId)) return 0L;
+            if (retainNow) {
+                if (__RsHostResRetain(resourceId) <= 0) return 0L;
+            }
+            return __AllocRawLeaseWithObject(targetObj, resourceId);
+        }
+        return 0L;
+    }
+
+    public static long __RetainByResourceId(long resourceId) {
+        return __AllocLease(resourceId, true);
+    }
+
+    public static bool __IsLeaseActive(long leaseId) {
+        __EnsureInit();
+        if (leaseId <= 0L) return false;
+        long gen = leaseId / 1000000000L;
+        int leaseIdx = (int)(leaseId % 1000000000L) - 1;
+        if (gen <= 0L || leaseIdx < 0 || leaseIdx >= __leaseCount) return false;
+        return __leaseActive[leaseIdx] && __leaseGenerations[leaseIdx] == gen;
+    }
+
+    public static int __ReleaseLease(long leaseId) {
+        __EnsureInit();
+        if (leaseId <= 0L) return 0;
+        long gen = leaseId / 1000000000L;
+        int leaseIdx = (int)(leaseId % 1000000000L) - 1;
+        if (gen <= 0L || leaseIdx < 0 || leaseIdx >= __leaseCount) return 0;
+        if (!__leaseActive[leaseIdx] || __leaseGenerations[leaseIdx] != gen) {
+            return 0;
+        }
+        long rid = __leaseResourceIds[leaseIdx];
+        __leaseActive[leaseIdx] = false;
+        __leaseObjects[leaseIdx] = null;
+        __leaseResourceIds[leaseIdx] = 0L;
+        __leaseGenerations[leaseIdx] = gen + 1L;
+        if (__freeLeaseCount >= __freeLeaseSlots.length) {
+            __GrowLeases();
+        }
+        __freeLeaseSlots[__freeLeaseCount] = leaseIdx;
+        __freeLeaseCount = __freeLeaseCount + 1;
+
+        int idx = __FindIndexById(rid);
+        if (idx >= 0 && __resources[idx] != null) {
+            return __resources[idx].Release();
+        }
+        if (__hostBridge) {
+            return __RsHostResRelease(rid);
+        }
+        return 0;
+    }
+
+    public static Resource GetResource(long resourceId) {
+        int idx = __FindIndexById(resourceId);
+        if (idx >= 0 && __resourceActive[idx] && __resources[idx] != null) {
+            return __resources[idx];
+        }
+        if (__hostBridge && resourceId > 0L && !__RsHostResIsDisposed(resourceId)) {
+            return Resource.WrapHost(
+                resourceId,
+                __RsHostResGetPath(resourceId),
+                __RsHostResGetGuid(resourceId));
+        }
+        return null;
+    }
+
+    public static int GetUseCount(long resourceId) {
+        int idx = __FindIndexById(resourceId);
+        if (idx >= 0 && __resources[idx] != null) {
+            return __resources[idx].UseCount();
+        }
+        if (__hostBridge && resourceId > 0L) {
+            return __RsHostResUseCount(resourceId);
+        }
+        return 0;
+    }
+
+    public static bool IsResourceDisposed(long resourceId) {
+        int idx = __FindIndexById(resourceId);
+        if (idx >= 0 && __resources[idx] != null) {
+            return __resources[idx].IsDisposed();
+        }
+        if (__hostBridge && resourceId > 0L) {
+            return __RsHostResIsDisposed(resourceId);
+        }
+        return true;
+    }
+
+    public static string GetPath(long resourceId) {
+        int idx = __FindIndexById(resourceId);
+        if (idx >= 0 && __resources[idx] != null) {
+            return __resources[idx].GetPath();
+        }
+        if (__hostBridge && resourceId > 0L) {
+            return __RsHostResGetPath(resourceId);
+        }
+        return "";
+    }
+
+    public static string GetGuid(long resourceId) {
+        int idx = __FindIndexById(resourceId);
+        if (idx >= 0 && __resources[idx] != null) {
+            return __resources[idx].GetGuid();
+        }
+        if (__hostBridge && resourceId > 0L) {
+            return __RsHostResGetGuid(resourceId);
+        }
+        return "";
+    }
+
+    public static Resource FindByPath(string path) {
+        __EnsureInit();
+        if (path == null || path == "") return null;
+        int i = 0;
+        while (i < __resourceCount) {
+            if (__resourceActive[i] && __resources[i] != null && !__resources[i].IsDisposed()) {
+                if (__resources[i].GetPath() == path) return __resources[i];
+            }
+            i = i + 1;
+        }
+        if (__hostBridge) {
+            long hid = __RsHostResFindByPath(path);
+            if (hid > 0L && !__RsHostResIsDisposed(hid)) {
+                return GetResource(hid);
+            }
+        }
+        return null;
+    }
+
+    public static Resource FindByGuid(string guid) {
+        __EnsureInit();
+        if (guid == null || guid == "") return null;
+        int i = 0;
+        while (i < __resourceCount) {
+            if (__resourceActive[i] && __resources[i] != null && !__resources[i].IsDisposed()) {
+                if (__resources[i].GetGuid() == guid) return __resources[i];
+            }
+            i = i + 1;
+        }
+        if (__hostBridge) {
+            long hid = __RsHostResFindByGuid(guid);
+            if (hid > 0L && !__RsHostResIsDisposed(hid)) {
+                return GetResource(hid);
+            }
+        }
+        return null;
+    }
+
+    public static ResourceHandle LoadWithGuid(string path, string guid) {
+        __EnsureInit();
+        string normPath = path == null ? "" : path;
+        string normGuid = guid == null ? "" : guid;
+        if (__hostBridge) {
+            long hid = __RsHostResAcquire(normPath, normGuid);
+            if (hid <= 0L) return ResourceHandle.Empty();
+            Resource wrapper = Resource.WrapHost(
+                hid, __RsHostResGetPath(hid), __RsHostResGetGuid(hid));
+            long lid = __AllocRawLeaseWithObject(wrapper, hid);
+            return new ResourceHandle(lid, hid);
+        }
+        if (normGuid != "") {
+            Resource byGuid = FindByGuid(normGuid);
+            if (byGuid != null) {
+                return ResourceHandle.FromResource(byGuid);
+            }
+        }
+        if (normPath != "") {
+            Resource byPath = FindByPath(normPath);
+            if (byPath != null) {
+                return ResourceHandle.FromResource(byPath);
+            }
+        }
+        Resource created = new Resource(normPath, normGuid);
+        return ResourceHandle.Adopt(created);
+    }
+
+    public static ResourceHandle Load(string path) {
+        return LoadWithGuid(path, "");
+    }
+
+    public static int LiveCount() {
+        __EnsureInit();
+        if (__hostBridge) {
+            return __RsHostResLiveCount();
+        }
+        int live = 0;
+        int i = 0;
+        while (i < __resourceCount) {
+            if (__resourceActive[i] && __resources[i] != null && !__resources[i].IsDisposed()) {
+                live = live + 1;
+            }
+            i = i + 1;
+        }
+        return live;
+    }
+
+    public static int DisposedCount() {
+        return __disposedCount;
+    }
+}
+)RS";
+    return kSource;
+}
+
+bool sourceMentionsResourcePrimitives(std::string_view text) {
+    // Fast pre-filter before running the full lexer: if none of the exact
+    // keyword/type tokens appear anywhere in `text`, we can skip lexing immediately.
+    if (text.find("using") == std::string_view::npos &&
+        text.find("IDisposable") == std::string_view::npos &&
+        text.find("Resource") == std::string_view::npos) {
+        return false;
+    }
+    text::SourceText source(std::string(text), "$resource_scan");
+    diagnostics::DiagnosticBag ignored;
+    syntax::Lexer lexer(source, ignored);
+    for (;;) {
+        const auto token = lexer.nextToken();
+        if (token.kind == syntax::SyntaxKind::EndOfFileToken) {
+            break;
+        }
+        if (token.kind == syntax::SyntaxKind::IdentifierToken) {
+            if (token.text == "using" ||
+                token.text == "IDisposable" ||
+                token.text == "Resource" ||
+                token.text == "ResourceHandle" ||
+                token.text == "ResourceServer") {
+                return true;
+            }
+        } else if (token.kind == syntax::SyntaxKind::InterpolatedStringToken) {
+            // Scan only `{ ... }` expression holes inside `$"..."` interpolated strings.
+            const std::string& raw = token.text;
+            std::size_t idx = (raw.size() >= 2 && raw[0] == '$' && raw[1] == '"') ? 2 : 0;
+            const std::size_t limit = (!raw.empty() && raw.back() == '"') ? (raw.size() - 1) : raw.size();
+            while (idx < limit) {
+                if (raw[idx] == '\\') {
+                    idx += 2;
+                    continue;
+                }
+                if (raw[idx] == '{') {
+                    if (idx + 1 < limit && raw[idx + 1] == '{') {
+                        idx += 2;
+                        continue;
+                    }
+                    ++idx;
+                    const std::size_t holeStart = idx;
+                    int depth = 1;
+                    bool inStr = false;
+                    while (idx < limit && depth > 0) {
+                        const char ch = raw[idx];
+                        if (inStr) {
+                            if (ch == '\\') {
+                                idx += 2;
+                                continue;
+                            }
+                            if (ch == '"') inStr = false;
+                        } else {
+                            if (ch == '"') inStr = true;
+                            else if (ch == '{') ++depth;
+                            else if (ch == '}') {
+                                --depth;
+                                if (depth == 0) break;
+                            }
+                        }
+                        ++idx;
+                    }
+                    const std::size_t holeLen = idx > holeStart ? (idx - holeStart) : 0;
+                    if (holeLen > 0 &&
+                        sourceMentionsResourcePrimitives(
+                            std::string_view(raw).substr(holeStart, holeLen))) {
+                        return true;
+                    }
+                    if (idx < limit && raw[idx] == '}') ++idx;
+                    continue;
+                }
+                ++idx;
+            }
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -2825,12 +4127,12 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     }
     if (importsBuiltinMath && modules.find("RealScript.Math") == modules.end()) {
         addSourceUnit(SourceFile{
-            "$builtin/RealScript.Math.rs",
+            "$builtin/RealScript.Math.rscript",
             builtinDeterministicMathModuleSource()});
     }
     if (importsBuiltinFiber && modules.find("RealScript.Fiber") == modules.end()) {
         addSourceUnit(SourceFile{
-            "$builtin/RealScript.Fiber.rs",
+            "$builtin/RealScript.Fiber.rscript",
             builtinFiberModuleSource()});
     }
 
@@ -2855,21 +4157,89 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     }
     if (needsBuiltinAsync && modules.find("RealScript.Async") == modules.end()) {
         addSourceUnit(SourceFile{
-            "$builtin/RealScript.Async.rs",
+            "$builtin/RealScript.Async.rscript",
             builtinAsyncModuleSource()});
     }
     for (const auto& modName : modulesUsingAsync) {
         modules[modName].imports.insert("RealScript.Async");
     }
 
+    bool needsBuiltinResource = false;
+    std::vector<std::string> modulesUsingResource;
+    for (const auto& [name, module] : modules) {
+        if (name == "RealScript.Resource" ||
+            name == "RealScript.Math" ||
+            name == "RealScript.Fiber" ||
+            name == "RealScript.Async") {
+            continue;
+        }
+        bool moduleUsesResource =
+            module.imports.find("RealScript.Resource") != module.imports.end();
+        if (!moduleUsesResource) {
+            for (const auto* u : module.units) {
+                if (u && u->source && sourceMentionsResourcePrimitives(u->source->content())) {
+                    moduleUsesResource = true;
+                    break;
+                }
+            }
+        }
+        if (moduleUsesResource) {
+            needsBuiltinResource = true;
+            modulesUsingResource.push_back(name);
+        }
+    }
+    if (needsBuiltinResource && modules.find("RealScript.Resource") == modules.end()) {
+        addSourceUnit(SourceFile{
+            "$builtin/RealScript.Resource.rscript",
+            builtinResourceModuleSource()});
+    }
+    for (const auto& modName : modulesUsingResource) {
+        modules[modName].imports.insert("RealScript.Resource");
+    }
+
     specializeNativeGenerics(units, modules, result);
+
+    {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (auto& [modName, mod] : modules) {
+                auto propagateFrom = [&](const std::string& depName) {
+                    if (depName == modName) return;
+                    const auto depIt = modules.find(depName);
+                    if (depIt == modules.end()) return;
+                    for (const auto& sub : depIt->second.imports) {
+                        if (sub != modName &&
+                            mod.imports.find(sub) == mod.imports.end() &&
+                            mod.hygienicModules.insert(sub).second) {
+                            changed = true;
+                        }
+                    }
+                    for (const auto& sub : depIt->second.hygienicModules) {
+                        if (sub != modName &&
+                            mod.imports.find(sub) == mod.imports.end() &&
+                            mod.hygienicModules.insert(sub).second) {
+                            changed = true;
+                        }
+                    }
+                };
+                const auto currentImports = mod.imports;
+                const auto currentHygienic = mod.hygienicModules;
+                for (const auto& dep : currentImports) propagateFrom(dep);
+                for (const auto& dep : currentHygienic) propagateFrom(dep);
+            }
+        }
+    }
 
     // Stable source order, source fingerprints, and incremental module frontend cache check.
     for (auto& [moduleName, module] : modules) {
         (void)moduleName;
-        std::sort(module.units.begin(), module.units.end(),
+        std::stable_sort(module.units.begin(), module.units.end(),
             [](const ParsedUnit* left, const ParsedUnit* right) {
-                return left->source->name() < right->source->name();
+                if (left->source->name() != right->source->name()) {
+                    return left->source->name() < right->source->name();
+                }
+                return left->sourceFingerprint < right->sourceFingerprint;
             });
         std::uint64_t sourceFingerprint = 14695981039346656037ull;
         for (const auto* unit : module.units) {
@@ -3001,6 +4371,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 if (module.types.size() != before) {
                     module.types.back().sourceName = unit->source->name();
                     module.types.back().declarationSpan = node.identifierToken.span;
+                    module.types.back().hygienicAccessibleModules.insert(
+                        unit->unitHygienicModules.begin(), unit->unitHygienicModules.end());
                 }
             }
             for (const auto& node : unit->syntaxTree->structs) {
@@ -3012,6 +4384,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 if (module.types.size() != before) {
                     module.types.back().sourceName = unit->source->name();
                     module.types.back().declarationSpan = node.identifierToken.span;
+                    module.types.back().hygienicAccessibleModules.insert(
+                        unit->unitHygienicModules.begin(), unit->unitHygienicModules.end());
                 }
             }
             for (const auto& node : unit->syntaxTree->enums) {
@@ -3022,6 +4396,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 if (module.types.size() != before) {
                     module.types.back().sourceName = unit->source->name();
                     module.types.back().declarationSpan = node.identifierToken.span;
+                    module.types.back().hygienicAccessibleModules.insert(
+                        unit->unitHygienicModules.begin(), unit->unitHygienicModules.end());
                 }
             }
             for (const auto& node : unit->syntaxTree->interfaces) {
@@ -3324,10 +4700,13 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             for (const auto& node : unit->syntaxTree->classes) {
                 if (!node.typeParameters.empty()) continue;
                 auto* type = findOwnType(module, node.identifierToken.text);
+                diagnostics::DiagnosticBag localBag;
                 if (!type || !semantic::populateTypeFields(
-                        *type, node, module.visibleTypes, result.diagnostics, true)) {
+                        *type, node, module.visibleTypes, localBag, true)) {
+                    appendStampedDiagnostics(result.diagnostics, localBag, unit->source->name());
                     module.invalid = true;
                 } else {
+                    appendStampedDiagnostics(result.diagnostics, localBag, unit->source->name());
                     type->sourceName = unit->source->name();
                     for (auto& field : type->fields) field.sourceName = unit->source->name();
                 }
@@ -3335,10 +4714,13 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             for (const auto& node : unit->syntaxTree->structs) {
                 if (!node.typeParameters.empty()) continue;
                 auto* type = findOwnType(module, node.identifierToken.text);
+                diagnostics::DiagnosticBag localBag;
                 if (!type || !semantic::populateTypeFields(
-                        *type, node, module.visibleTypes, result.diagnostics, true)) {
+                        *type, node, module.visibleTypes, localBag, true)) {
+                    appendStampedDiagnostics(result.diagnostics, localBag, unit->source->name());
                     module.invalid = true;
                 } else {
+                    appendStampedDiagnostics(result.diagnostics, localBag, unit->source->name());
                     type->sourceName = unit->source->name();
                     for (auto& field : type->fields) field.sourceName = unit->source->name();
                 }
@@ -3401,6 +4783,13 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         ModuleWork& module,
         semantic::FunctionBindingInput binding,
         text::TextSpan span) {
+        if (!binding.symbol.ownerTypeName.empty()) {
+            if (const auto* ownT = findOwnType(module, binding.symbol.ownerTypeName)) {
+                binding.hygienicAccessibleModules.insert(
+                    ownT->hygienicAccessibleModules.begin(),
+                    ownT->hygienicAccessibleModules.end());
+            }
+        }
         if (module.deterministic && !binding.symbol.nonDeterministic) {
             binding.symbol.deterministic = true;
         }
@@ -3423,12 +4812,39 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             for (const auto& functionSyntax : unit->syntaxTree->functions) {
                 if (!functionSyntax.typeParameters.empty()) continue;
                 semantic::FunctionBindingInput binding;
+                diagnostics::DiagnosticBag fnDeclBag;
                 binding.symbol = semantic::declareFunctionSymbol(
                     moduleName, functionSyntax, module.visibleTypes,
-                    result.diagnostics);
+                    fnDeclBag);
+                appendStampedDiagnostics(result.diagnostics, fnDeclBag, unit->source->name());
+                if (fnDeclBag.hasErrors()) module.invalid = true;
                 binding.sourceName = unit->source->name();
                 binding.symbol.sourceName = binding.sourceName;
+                if (functionSyntax.semicolonToken.has_value()) {
+                    if (module.deterministic && !binding.symbol.nonDeterministic) {
+                        binding.symbol.deterministic = true;
+                    }
+                    const auto key = semantic::canonicalFunctionKey(binding.symbol);
+                    auto& keys = functionKeys[module.name];
+                    if (!keys.insert(key).second) {
+                        result.diagnostics.report(
+                            "RS4002",
+                            "duplicate function overload '" + key + "'",
+                            functionSyntax.identifierToken.span,
+                            diagnostics::DiagnosticSeverity::Error,
+                            unit->source->name());
+                        module.invalid = true;
+                    }
+                    module.declarations.push_back(binding.symbol);
+                    continue;
+                }
                 binding.body = &functionSyntax.body;
+                binding.hygienicAccessibleModules.insert(
+                    unit->unitHygienicModules.begin(),
+                    unit->unitHygienicModules.end());
+                binding.hygienicAccessibleModules.insert(
+                    functionSyntax.hygienicModules.begin(),
+                    functionSyntax.hygienicModules.end());
                 appendParameters(binding, functionSyntax.parameters);
                 addBinding(
                     module, std::move(binding),
@@ -3527,9 +4943,12 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         }
                         methodNames.insert(methodSyntax.identifierToken.text);
                         semantic::FunctionBindingInput binding;
+                        diagnostics::DiagnosticBag methodDeclBag;
                         binding.symbol = semantic::declareFunctionSymbol(
                             moduleName, methodSyntax, module.visibleTypes,
-                            result.diagnostics, &owner);
+                            methodDeclBag, &owner);
+                        appendStampedDiagnostics(result.diagnostics, methodDeclBag, unit->source->name());
+                        if (methodDeclBag.hasErrors()) module.invalid = true;
                         if (owner.staticType && !binding.symbol.staticMethod) {
                             result.diagnostics.report(
                                 "RS2489",
@@ -3557,6 +4976,12 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             binding.parameterNames.push_back("this");
                             binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
                         }
+                        binding.hygienicAccessibleModules.insert(
+                            unit->unitHygienicModules.begin(),
+                            unit->unitHygienicModules.end());
+                        binding.hygienicAccessibleModules.insert(
+                            methodSyntax.hygienicModules.begin(),
+                            methodSyntax.hygienicModules.end());
                         appendParameters(binding, methodSyntax.parameters);
                         const auto inheritedIndex =
                             prepareVirtualMethod(
@@ -3835,7 +5260,10 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                                 owner,
                                 sequenceSyntax,
                                 *declaration,
-                                module.visibleTypes,
+                                module,
+                                modules,
+                                sequenceParameterFields,
+                                sequenceLocalFields,
                                 unit->source->name(),
                                 result.diagnostics);
                             if (!field) {
@@ -3965,7 +5393,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                                 (collectionType->type !=
                                      semantic::PrimitiveType::Array &&
                                  collectionType->type !=
-                                     semantic::PrimitiveType::Object)) {
+                                     semantic::PrimitiveType::Object &&
+                                 collectionType->type !=
+                                     semantic::PrimitiveType::Struct)) {
                                 result.diagnostics.report(
                                     "RS8807",
                                     "suspending foreach collection must have a statically identifiable array or object type",
@@ -3977,7 +5407,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             }
                             bool usesEnumerator = false;
                             if (collectionType->type ==
-                                semantic::PrimitiveType::Object) {
+                                    semantic::PrimitiveType::Object ||
+                                collectionType->type ==
+                                    semantic::PrimitiveType::Struct) {
                                 const auto found = module.visibleTypes.find(
                                     collectionType->typeName);
                                 bool hasCount = false;
@@ -3995,15 +5427,19 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                                             hasCount = true;
                                         }
                                         if (!method.staticMethod &&
-                                            method.name == "Get" && arity == 1 &&
+                                            (method.name == "Get" || method.name == "GetAt") &&
+                                            arity == 1 &&
                                             method.parameters.back().type ==
                                                 semantic::PrimitiveType::Int) {
                                             hasGet = true;
                                         }
                                         if (!method.staticMethod &&
                                             method.name == "GetEnumerator" &&
-                                            arity == 0 && method.returnType ==
-                                                semantic::PrimitiveType::Object &&
+                                            arity == 0 &&
+                                            (method.returnType ==
+                                                 semantic::PrimitiveType::Object ||
+                                             method.returnType ==
+                                                 semantic::PrimitiveType::Struct) &&
                                             !method.returnTypeName.empty()) {
                                             enumeratorType = InterfaceTypeRef{
                                                 method.returnType,
@@ -4048,8 +5484,10 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                                                         !method.returnType.isArray()) {
                                                         hasCount = true;
                                                     }
-                                                    if (method.identifierToken.text ==
-                                                            "Get" &&
+                                                    if ((method.identifierToken.text ==
+                                                             "Get" ||
+                                                         method.identifierToken.text ==
+                                                             "GetAt") &&
                                                         method.parameters.size() == 1 &&
                                                         method.parameters.front()
                                                                 .type.name.text ==
@@ -4069,9 +5507,12 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                                                                 candidateUnit->source
                                                                     ->name(),
                                                                 false);
-                                                        if (resolved.type ==
-                                                                semantic::PrimitiveType::
-                                                                    Object &&
+                                                        if ((resolved.type ==
+                                                                 semantic::PrimitiveType::
+                                                                     Object ||
+                                                             resolved.type ==
+                                                                 semantic::PrimitiveType::
+                                                                     Struct) &&
                                                             !resolved.typeName.empty()) {
                                                             enumeratorType = resolved;
                                                         }
@@ -4324,12 +5765,17 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             cancellationBinding.parameterSpans.push_back(
                                 typeSyntax.identifierToken.span);
                             cancellationBinding.sequenceCancellation = true;
+                            cancellationBinding.sequence = &sequenceSyntax;
                             cancellationBinding.sequenceTimerField = timerField;
                             cancellationBinding.sequenceStateField = stateField;
                             cancellationBinding.sequenceCompletedField =
                                 completedField;
                             cancellationBinding.sequenceResultField =
                                 resultField;
+                            cancellationBinding.sequenceParameterFields =
+                                sequenceParameterFields;
+                            cancellationBinding.sequenceLocalFields =
+                                sequenceLocalFields;
                             owner.methods.push_back(cancellation);
                             addBinding(module, 
                                 std::move(cancellationBinding),
@@ -5882,6 +7328,13 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             dependencies << importedModule << ':'
                 << imported->second.publicFingerprint << '\n';
         }
+        for (const auto& hygModule : module.hygienicModules) {
+            const auto hyg = modules.find(hygModule);
+            if (hyg != modules.end()) {
+                dependencies << "hyg:" << hygModule << ':'
+                    << hyg->second.publicFingerprint << '\n';
+            }
+        }
         module.dependencyFingerprint = stableFingerprint(dependencies.str());
     }
 
@@ -5956,27 +7409,80 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         // and only skip MIR lowering if errors remain.
         const bool hadSyntaxError = module.invalid;
 
+        auto freeFunctionParamKey = [](const semantic::FunctionSymbol& fn) {
+            std::string key = fn.name + "(";
+            for (std::size_t i = 0; i < fn.parameters.size(); ++i) {
+                if (i != 0) key += ",";
+                key += std::to_string(static_cast<int>(fn.parameters[i].modifier)) + ":" +
+                    std::to_string(static_cast<int>(fn.parameters[i].type)) + ":" +
+                    fn.parameters[i].typeName;
+            }
+            key += ")";
+            return key;
+        };
+        std::unordered_set<std::string> ownFreeFnSignatures;
         semantic::FunctionOverloadMap visibleFunctions;
         for (const auto& function : module.declarations) {
             visibleFunctions[function.name].push_back(function);
+            if (!function.method) {
+                ownFreeFnSignatures.insert(freeFunctionParamKey(function));
+            }
         }
         for (const auto& importedModule : module.imports) {
             const auto imported = modules.find(importedModule);
             if (imported == modules.end()) continue;
             for (const auto& function : imported->second.declarations) {
+                if (!function.method &&
+                    ownFreeFnSignatures.find(freeFunctionParamKey(function)) !=
+                        ownFreeFnSignatures.end()) {
+                    continue;
+                }
                 visibleFunctions[function.name].push_back(function);
             }
         }
 
         semantic::ModuleBindingInput bindingInput;
+        // Hygiene is scoped strictly per instantiated template unit/symbol,
+        // never opening another module's `internal` symbols to consumer user code.
         bindingInput.moduleName = moduleName;
         bindingInput.declarations = module.declarations;
         bindingInput.functionBindings = module.functionBindings;
         {
             std::unordered_map<semantic::SymbolId, semantic::TypeSymbol> descriptorsById;
+            std::vector<semantic::TypeSymbol> descriptorQueue;
             for (const auto& [visibleName, type] : module.visibleTypes) {
                 (void)visibleName;
-                descriptorsById.emplace(type.id, type);
+                if (descriptorsById.emplace(type.id, type).second) {
+                    descriptorQueue.push_back(type);
+                }
+            }
+            const auto enqueueGlobalTypeByName = [&](const std::string& canonical) {
+                if (canonical.empty()) return;
+                if (const auto* target = findGlobalType(modules, canonical)) {
+                    if (descriptorsById.emplace(target->id, *target).second) {
+                        descriptorQueue.push_back(*target);
+                    }
+                }
+            };
+            for (std::size_t qIdx = 0; qIdx < descriptorQueue.size(); ++qIdx) {
+                const auto curType = descriptorQueue[qIdx];
+                if (!curType.baseTypeName.empty()) {
+                    enqueueGlobalTypeByName(curType.baseTypeName);
+                }
+                for (const auto& fld : curType.fields) {
+                    if (fld.type == semantic::PrimitiveType::Object ||
+                        fld.type == semantic::PrimitiveType::Struct ||
+                        fld.type == semantic::PrimitiveType::Enum) {
+                        enqueueGlobalTypeByName(fld.typeName);
+                    } else if (fld.type == semantic::PrimitiveType::Array) {
+                        semantic::PrimitiveType elemPrim = semantic::PrimitiveType::Error;
+                        std::string elemTypeName;
+                        if (semantic::decodeArrayTypeName(fld.typeName, elemPrim, elemTypeName) &&
+                            !elemTypeName.empty()) {
+                            enqueueGlobalTypeByName(elemTypeName);
+                        }
+                    }
+                }
             }
             bindingInput.types.reserve(descriptorsById.size());
             for (auto& [typeId, type] : descriptorsById) {
@@ -6013,10 +7519,15 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             if (!dup) partialMod.types.push_back(visType);
                         }
                     }
-                    for (std::size_t sourceIndex = 0; sourceIndex < module.units.size(); ++sourceIndex) {
-                        partialMod.sourceFiles.push_back(makeSourceFileInfo(
-                            *module.units[sourceIndex]->source,
-                            static_cast<debug::SourceFileId>(sourceIndex)));
+                    {
+                        std::unordered_set<std::string> seenPaths;
+                        for (const auto* u : module.units) {
+                            if (u && u->source && seenPaths.insert(u->source->name()).second) {
+                                partialMod.sourceFiles.push_back(makeSourceFileInfo(
+                                    *u->source,
+                                    static_cast<debug::SourceFileId>(partialMod.sourceFiles.size())));
+                            }
+                        }
                     }
                     result.modules.push_back(std::move(partialMod));
                     break;
@@ -6029,10 +7540,15 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         mir::Lowerer lowerer;
         auto mirModule = lowerer.lower(semanticModel);
         mirModule.sourceFiles.reserve(module.units.size());
-        for (std::size_t sourceIndex = 0; sourceIndex < module.units.size(); ++sourceIndex) {
-            mirModule.sourceFiles.push_back(makeSourceFileInfo(
-                *module.units[sourceIndex]->source,
-                static_cast<debug::SourceFileId>(sourceIndex)));
+        {
+            std::unordered_set<std::string> seenPaths;
+            for (const auto* u : module.units) {
+                if (u && u->source && seenPaths.insert(u->source->name()).second) {
+                    mirModule.sourceFiles.push_back(makeSourceFileInfo(
+                        *u->source,
+                        static_cast<debug::SourceFileId>(mirModule.sourceFiles.size())));
+                }
+            }
         }
         for (auto& function : mirModule.functions) {
             debug::finalizeFunctionDebugInfo(

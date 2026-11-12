@@ -253,7 +253,67 @@ tooling::Json DapServer::response(
     return result;
 }
 
-std::int64_t DapServer::registerExpandableValue(const runtime::Value& value) {
+std::string DapServer::describeValueType(
+    const runtime::Value& value,
+    semantic::PrimitiveType fallback) const {
+    if (const auto* objRef = std::get_if<runtime::ObjectRef>(&value)) {
+        if (heap_ && objRef->valid() && heap_->isAlive(*objRef)) {
+            if (objRef->kind == runtime::ObjectKind::Array) {
+                const auto elemType = heap_->arrayElementType(*objRef).value_or(semantic::PrimitiveType::Error);
+                const auto elemTypeId = heap_->arrayElementTypeId(*objRef).value_or(0);
+                if (program_ && elemTypeId != 0) {
+                    if (const auto* elemDesc = program_->resolveType(elemTypeId)) {
+                        return elemDesc->name + "[]";
+                    }
+                }
+                if (elemType != semantic::PrimitiveType::Error) {
+                    return std::string(semantic::primitiveTypeName(elemType)) + "[]";
+                }
+                return "array";
+            }
+            const auto typeId = heap_->objectTypeId(*objRef).value_or(0);
+            if (program_ && typeId != 0) {
+                if (const auto* typeDesc = program_->resolveType(typeId)) {
+                    return typeDesc->name.empty()
+                        ? semantic::canonicalTypeName(*typeDesc)
+                        : typeDesc->name;
+                }
+            }
+        }
+    } else if (const auto* stVal = std::get_if<runtime::StructValue>(&value)) {
+        if (program_ && stVal->typeId != 0) {
+            if (const auto* typeDesc = program_->resolveType(stVal->typeId)) {
+                return typeDesc->name.empty()
+                    ? semantic::canonicalTypeName(*typeDesc)
+                    : typeDesc->name;
+            }
+        }
+    } else if (std::holds_alternative<runtime::Vec2Value>(value)) {
+        return "Vec2";
+    } else if (std::holds_alternative<runtime::Vec3Value>(value)) {
+        return "Vec3";
+    } else if (std::holds_alternative<runtime::QuatValue>(value)) {
+        return "Quat";
+    } else if (std::holds_alternative<runtime::FixedValue>(value)) {
+        return "Fixed";
+    } else if (std::holds_alternative<runtime::Fixed16Value>(value)) {
+        return "Fixed16";
+    }
+    const auto p = fallback != semantic::PrimitiveType::Error
+        ? fallback
+        : runtime::valueType(value);
+    return std::string(semantic::primitiveTypeName(p));
+}
+
+std::int64_t DapServer::registerExpandableValue(
+    const runtime::Value& value,
+    std::uint32_t ownerFrameId) {
+    const auto bindRefFrame = [&](std::int64_t refId) {
+        if (ownerFrameId != 0) {
+            variableFrameIds_[refId] = ownerFrameId;
+        }
+        return refId;
+    };
     if (const auto* objRef = std::get_if<runtime::ObjectRef>(&value)) {
         if (!heap_ || !objRef->valid() || !heap_->isAlive(*objRef)) return 0;
         if (objRef->kind == runtime::ObjectKind::String) return 0;
@@ -276,12 +336,172 @@ std::int64_t DapServer::registerExpandableValue(const runtime::Value& value) {
             const auto refId = nextChildRef_++;
             variables_[refId] = std::move(children);
             childOwnerObjects_[refId] = *objRef;
-            return refId;
+            return bindRefFrame(refId);
         }
         const auto typeId = heap_->objectTypeId(*objRef).value_or(0);
         const auto* typeDesc = (program_ && typeId != 0) ? program_->resolveType(typeId) : nullptr;
         const auto fCount = heap_->fieldCount(*objRef).value_or(0);
         std::vector<DebugVariable> children;
+
+        // Logical collection preview for List / Queue / Stack / HashSet / Dictionary
+        if (typeDesc) {
+            auto getNamedField = [&](std::string_view fname, std::size_t fallbackIdx) -> std::optional<runtime::Value> {
+                for (std::size_t i = 0; i < typeDesc->fields.size(); ++i) {
+                    const auto& fld = typeDesc->fields[i];
+                    if (fld.staticField || fld.constField) continue;
+                    if (fld.name == fname) {
+                        const std::size_t slotIdx = fld.index < fCount ? fld.index : i;
+                        return heap_->fieldGet(*objRef, slotIdx);
+                    }
+                }
+                return fallbackIdx < fCount ? heap_->fieldGet(*objRef, fallbackIdx) : std::nullopt;
+            };
+            const auto isBackingArrayOrNull = [&](const runtime::Value& v, const runtime::ObjectRef*& outArr) noexcept {
+                if (const auto* arr = std::get_if<runtime::ObjectRef>(&v);
+                    arr && arr->valid() && heap_->isAlive(*arr)) {
+                    outArr = arr;
+                    return true;
+                }
+                outArr = nullptr;
+                return std::holds_alternative<runtime::NullArray>(v) ||
+                    std::holds_alternative<runtime::NullObject>(v);
+            };
+            const auto& tName = typeDesc->name;
+            const bool isHashSet = (tName.rfind("HashSet__", 0) == 0);
+            if ((tName.rfind("List__", 0) == 0 || isHashSet) &&
+                fCount >= 2) {
+                const auto itemsVal = isHashSet
+                    ? getNamedField("values", 1)
+                    : getNamedField("items", 0);
+                const auto countVal = getNamedField("count", isHashSet ? (fCount - 1) : 1);
+                const runtime::ObjectRef* arrRef = nullptr;
+                if (itemsVal && countVal && std::holds_alternative<std::int64_t>(*countVal) &&
+                    isBackingArrayOrNull(*itemsVal, arrRef)) {
+                    const auto logicalCount = static_cast<std::size_t>(
+                        std::max<std::int64_t>(0, std::get<std::int64_t>(*countVal)));
+                    children.push_back(DebugVariable{"Count", *countVal, semantic::PrimitiveType::Int, 0});
+                    if (arrRef) {
+                        const auto elemType = heap_->arrayElementType(*arrRef).value_or(semantic::PrimitiveType::Error);
+                        const auto elemTypeId = heap_->arrayElementTypeId(*arrRef).value_or(0);
+                        for (std::size_t i = 0; i < std::min<std::size_t>(logicalCount, 256); ++i) {
+                            if (const auto elem = heap_->arrayGet(*arrRef, i)) {
+                                children.push_back(DebugVariable{
+                                    "[" + std::to_string(i) + "]",
+                                    *elem,
+                                    elemType != semantic::PrimitiveType::Error ? elemType : runtime::valueType(*elem),
+                                    elemTypeId,
+                                });
+                            }
+                        }
+                    }
+                    const auto refId = nextChildRef_++;
+                    variables_[refId] = std::move(children);
+                    childOwnerObjects_[refId] = *objRef;
+                    return bindRefFrame(refId);
+                }
+            } else if (tName.rfind("Stack__", 0) == 0 && fCount >= 2) {
+                const auto itemsVal = getNamedField("items", 0);
+                const auto countVal = getNamedField("count", 1);
+                const runtime::ObjectRef* arrRef = nullptr;
+                if (itemsVal && countVal && std::holds_alternative<std::int64_t>(*countVal) &&
+                    isBackingArrayOrNull(*itemsVal, arrRef)) {
+                    const auto logicalCount = static_cast<std::size_t>(
+                        std::max<std::int64_t>(0, std::get<std::int64_t>(*countVal)));
+                    children.push_back(DebugVariable{"Count", *countVal, semantic::PrimitiveType::Int, 0});
+                    if (arrRef && logicalCount > 0) {
+                        const auto elemType = heap_->arrayElementType(*arrRef).value_or(semantic::PrimitiveType::Error);
+                        const auto elemTypeId = heap_->arrayElementTypeId(*arrRef).value_or(0);
+                        const auto limit = std::min<std::size_t>(logicalCount, 256);
+                        for (std::size_t i = 0; i < limit; ++i) {
+                            const std::size_t physIdx = logicalCount - 1 - i;
+                            if (const auto elem = heap_->arrayGet(*arrRef, physIdx)) {
+                                children.push_back(DebugVariable{
+                                    "[" + std::to_string(i) + "]",
+                                    *elem,
+                                    elemType != semantic::PrimitiveType::Error ? elemType : runtime::valueType(*elem),
+                                    elemTypeId,
+                                });
+                            }
+                        }
+                    }
+                    const auto refId = nextChildRef_++;
+                    variables_[refId] = std::move(children);
+                    childOwnerObjects_[refId] = *objRef;
+                    return bindRefFrame(refId);
+                }
+            } else if (tName.rfind("Queue__", 0) == 0 && fCount >= 4) {
+                const auto itemsVal = getNamedField("items", 0);
+                const auto headVal = getNamedField("head", 1);
+                const auto countVal = getNamedField("count", 3);
+                const runtime::ObjectRef* arrRef = nullptr;
+                if (itemsVal && headVal && countVal &&
+                    std::holds_alternative<std::int64_t>(*headVal) &&
+                    std::holds_alternative<std::int64_t>(*countVal) &&
+                    isBackingArrayOrNull(*itemsVal, arrRef)) {
+                    const auto logicalCount = static_cast<std::size_t>(
+                        std::max<std::int64_t>(0, std::get<std::int64_t>(*countVal)));
+                    const auto headIdx = static_cast<std::size_t>(
+                        std::max<std::int64_t>(0, std::get<std::int64_t>(*headVal)));
+                    children.push_back(DebugVariable{"Count", *countVal, semantic::PrimitiveType::Int, 0});
+                    if (arrRef) {
+                        const auto arrLen = heap_->arrayLength(*arrRef).value_or(0);
+                        const auto elemType = heap_->arrayElementType(*arrRef).value_or(semantic::PrimitiveType::Error);
+                        const auto elemTypeId = heap_->arrayElementTypeId(*arrRef).value_or(0);
+                        if (arrLen > 0) {
+                            const auto limit = std::min<std::size_t>(logicalCount, 256);
+                            for (std::size_t i = 0; i < limit; ++i) {
+                                const std::size_t physIdx = (headIdx + i) % arrLen;
+                                if (const auto elem = heap_->arrayGet(*arrRef, physIdx)) {
+                                    children.push_back(DebugVariable{
+                                        "[" + std::to_string(i) + "]",
+                                        *elem,
+                                        elemType != semantic::PrimitiveType::Error ? elemType : runtime::valueType(*elem),
+                                        elemTypeId,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    const auto refId = nextChildRef_++;
+                    variables_[refId] = std::move(children);
+                    childOwnerObjects_[refId] = *objRef;
+                    return bindRefFrame(refId);
+                }
+            } else if (tName.rfind("Dictionary__", 0) == 0 && fCount >= 5) {
+                const auto keysVal = getNamedField("keys", 0);
+                const auto valsVal = getNamedField("values", 1);
+                const auto countVal = getNamedField("count", 4);
+                const runtime::ObjectRef* kArr = nullptr;
+                const runtime::ObjectRef* vArr = nullptr;
+                if (keysVal && valsVal && countVal && std::holds_alternative<std::int64_t>(*countVal) &&
+                    isBackingArrayOrNull(*keysVal, kArr) && isBackingArrayOrNull(*valsVal, vArr)) {
+                    const auto logicalCount = static_cast<std::size_t>(
+                        std::max<std::int64_t>(0, std::get<std::int64_t>(*countVal)));
+                    children.push_back(DebugVariable{"Count", *countVal, semantic::PrimitiveType::Int, 0});
+                    if (kArr && vArr) {
+                        const auto vElemType = heap_->arrayElementType(*vArr).value_or(semantic::PrimitiveType::Error);
+                        const auto vElemTypeId = heap_->arrayElementTypeId(*vArr).value_or(0);
+                        for (std::size_t i = 0; i < std::min<std::size_t>(logicalCount, 256); ++i) {
+                            const auto kElem = heap_->arrayGet(*kArr, i);
+                            const auto vElem = heap_->arrayGet(*vArr, i);
+                            if (kElem && vElem) {
+                                children.push_back(DebugVariable{
+                                    "[" + runtime::valueToString(*kElem, heap_.get()) + "]",
+                                    *vElem,
+                                    vElemType != semantic::PrimitiveType::Error ? vElemType : runtime::valueType(*vElem),
+                                    vElemTypeId,
+                                });
+                            }
+                        }
+                    }
+                    const auto refId = nextChildRef_++;
+                    variables_[refId] = std::move(children);
+                    childOwnerObjects_[refId] = *objRef;
+                    return bindRefFrame(refId);
+                }
+            }
+        }
+
         for (std::size_t i = 0; i < fCount; ++i) {
             if (typeDesc && i < typeDesc->fields.size()) {
                 if (typeDesc->fields[i].staticField ||
@@ -304,7 +524,7 @@ std::int64_t DapServer::registerExpandableValue(const runtime::Value& value) {
         const auto refId = nextChildRef_++;
         variables_[refId] = std::move(children);
         childOwnerObjects_[refId] = *objRef;
-        return refId;
+        return bindRefFrame(refId);
     }
     if (const auto* stVal = std::get_if<runtime::StructValue>(&value)) {
         if (!stVal->valid() || stVal->fieldCount() == 0) return 0;
@@ -331,7 +551,34 @@ std::int64_t DapServer::registerExpandableValue(const runtime::Value& value) {
         if (children.empty()) return 0;
         const auto refId = nextChildRef_++;
         variables_[refId] = std::move(children);
-        return refId;
+        return bindRefFrame(refId);
+    }
+    if (const auto* v2 = std::get_if<runtime::Vec2Value>(&value)) {
+        const auto refId = nextChildRef_++;
+        variables_[refId] = {
+            DebugVariable{"x", runtime::Value(runtime::FixedValue{v2->x}), semantic::PrimitiveType::Struct, 0},
+            DebugVariable{"y", runtime::Value(runtime::FixedValue{v2->y}), semantic::PrimitiveType::Struct, 0},
+        };
+        return bindRefFrame(refId);
+    }
+    if (const auto* v3 = std::get_if<runtime::Vec3Value>(&value)) {
+        const auto refId = nextChildRef_++;
+        variables_[refId] = {
+            DebugVariable{"x", runtime::Value(runtime::FixedValue{v3->x}), semantic::PrimitiveType::Struct, 0},
+            DebugVariable{"y", runtime::Value(runtime::FixedValue{v3->y}), semantic::PrimitiveType::Struct, 0},
+            DebugVariable{"z", runtime::Value(runtime::FixedValue{v3->z}), semantic::PrimitiveType::Struct, 0},
+        };
+        return bindRefFrame(refId);
+    }
+    if (const auto* q = std::get_if<runtime::QuatValue>(&value)) {
+        const auto refId = nextChildRef_++;
+        variables_[refId] = {
+            DebugVariable{"x", runtime::Value(runtime::FixedValue{q->x}), semantic::PrimitiveType::Struct, 0},
+            DebugVariable{"y", runtime::Value(runtime::FixedValue{q->y}), semantic::PrimitiveType::Struct, 0},
+            DebugVariable{"z", runtime::Value(runtime::FixedValue{q->z}), semantic::PrimitiveType::Struct, 0},
+            DebugVariable{"w", runtime::Value(runtime::FixedValue{q->w}), semantic::PrimitiveType::Struct, 0},
+        };
+        return bindRefFrame(refId);
     }
     return 0;
 }
@@ -339,12 +586,17 @@ std::int64_t DapServer::registerExpandableValue(const runtime::Value& value) {
 void DapServer::rebuildVariableReferences() {
     variables_.clear();
     childOwnerObjects_.clear();
-    nextChildRef_ = 1000;
+    variableFrameIds_.clear();
+    nextChildRef_ = kFirstChildVariablesReference;
     const auto stop = session_->currentStop();
     if (!stop) return;
     for (const auto& frame : stop->frames) {
-        variables_[static_cast<std::int64_t>(frame.id) * 2] = frame.arguments;
-        variables_[static_cast<std::int64_t>(frame.id) * 2 + 1] = frame.locals;
+        const auto argsRef = static_cast<std::int64_t>(frame.id) * 2;
+        const auto localsRef = static_cast<std::int64_t>(frame.id) * 2 + 1;
+        variables_[argsRef] = frame.arguments;
+        variables_[localsRef] = frame.locals;
+        variableFrameIds_[argsRef] = frame.id;
+        variableFrameIds_[localsRef] = frame.id;
     }
 }
 
@@ -1187,11 +1439,16 @@ tooling::Json DapServer::handle(
         std::optional<runtime::Value> evaluated;
         std::string evalText;
         std::string evalTypeName;
+        std::int64_t evalVarRef = 0;
         const auto runEval = [&]() {
+            if (variables_.empty() && session_ && session_->currentStop()) {
+                rebuildVariableReferences();
+            }
             evaluated = session_->evaluate(expression, frameId, &errorMessage);
             if (evaluated) {
                 evalText = runtime::valueToString(*evaluated, heap_.get());
-                evalTypeName = semantic::primitiveTypeName(runtime::valueType(*evaluated));
+                evalTypeName = describeValueType(*evaluated);
+                evalVarRef = registerExpandableValue(*evaluated, frameId);
             }
         };
         if (session_) {
@@ -1206,7 +1463,7 @@ tooling::Json DapServer::handle(
         return response(request, true, tooling::Json::Object{
             {"result", std::move(evalText)},
             {"type", std::move(evalTypeName)},
-            {"variablesReference", 0},
+            {"variablesReference", evalVarRef},
         });
     }
     if (command == "attach") {
@@ -1281,7 +1538,7 @@ tooling::Json DapServer::handle(
     }
     if (command == "scopes") {
         const auto frameId = arguments && arguments->find("frameId")
-            ? arguments->find("frameId")->integerValue() : 0;
+            ? std::max<std::int64_t>(1, arguments->find("frameId")->integerValue(1)) : 1;
         return response(request, true, tooling::Json::Object{{"scopes", tooling::Json::Array{
             tooling::Json::Object{{"name", "Arguments"}, {"variablesReference", frameId * 2}, {"expensive", false}},
             tooling::Json::Object{{"name", "Locals"}, {"variablesReference", frameId * 2 + 1}, {"expensive", false}},
@@ -1292,15 +1549,25 @@ tooling::Json DapServer::handle(
             ? arguments->find("variablesReference")->integerValue() : 0;
         tooling::Json::Array values;
         const auto collectVariables = [&]() {
+            if (variables_.empty() && session_ && session_->currentStop()) {
+                rebuildVariableReferences();
+            }
             const auto found = variables_.find(reference);
             if (found != variables_.end()) {
+                std::uint32_t ownerFrameId = 1u;
+                if (const auto fIt = variableFrameIds_.find(reference);
+                    fIt != variableFrameIds_.end()) {
+                    ownerFrameId = fIt->second;
+                } else if (reference >= 2 && reference < kFirstChildVariablesReference) {
+                    ownerFrameId = static_cast<std::uint32_t>(reference / 2);
+                }
                 const auto listCopy = found->second;
                 for (const auto& variable : listCopy) {
-                    const auto childRef = registerExpandableValue(variable.value);
+                    const auto childRef = registerExpandableValue(variable.value, ownerFrameId);
                     values.emplace_back(tooling::Json::Object{
                         {"name", variable.name},
                         {"value", runtime::valueToString(variable.value, heap_.get())},
-                        {"type", semantic::primitiveTypeName(variable.type)},
+                        {"type", describeValueType(variable.value, variable.type)},
                         {"variablesReference", childRef},
                     });
                 }
@@ -1322,47 +1589,187 @@ tooling::Json DapServer::handle(
             ? arguments->find("value")->stringValue() : std::string{};
         tooling::Json result;
         const auto doSetVariable = [&]() -> tooling::Json {
-        if (reference >= 1000) {
+        if (reference >= kFirstChildVariablesReference) {
             const auto ownerIt = childOwnerObjects_.find(reference);
             if (ownerIt == childOwnerObjects_.end() || !heap_ || !heap_->isAlive(ownerIt->second)) {
                 return response(request, false, nullptr,
                     "cannot mutate non-heap child variable reference");
             }
+            const auto ownerRef = ownerIt->second;
+            const std::uint32_t evalFrameId = [&]() -> std::uint32_t {
+                const auto fIt = variableFrameIds_.find(reference);
+                return fIt != variableFrameIds_.end() ? fIt->second : 1u;
+            }();
+            const auto parseBracketIndex = [](const std::string& label, std::size_t& outIdx) noexcept -> bool {
+                if (label.size() < 3 || label.front() != '[' || label.back() != ']') return false;
+                std::size_t acc = 0;
+                for (std::size_t pos = 1; pos + 1 < label.size(); ++pos) {
+                    const char ch = label[pos];
+                    if (ch < '0' || ch > '9') return false;
+                    const std::size_t digit = static_cast<std::size_t>(ch - '0');
+                    if (acc > (std::numeric_limits<std::size_t>::max() - digit) / 10) return false;
+                    acc = acc * 10 + digit;
+                }
+                outIdx = acc;
+                return true;
+            };
+            if (ownerRef.kind != runtime::ObjectKind::Array) {
+                const auto preTypeId = heap_->objectTypeId(ownerRef).value_or(0);
+                const auto* preTypeDesc = (program_ && preTypeId != 0) ? program_->resolveType(preTypeId) : nullptr;
+                if (preTypeDesc && preTypeDesc->name.rfind("HashSet__", 0) == 0) {
+                    return response(request, false, nullptr,
+                        "cannot modify HashSet elements in-place without rehashing; use Remove and Add instead");
+                }
+            }
             std::string errMsg;
-            const auto evaluated = session_->evaluate(valExpr, 1u, &errMsg);
+            const auto evaluated = session_->evaluate(valExpr, evalFrameId, &errMsg);
             if (!evaluated) {
                 return response(request, false, nullptr,
                     errMsg.empty() ? "failed to evaluate new value" : errMsg);
             }
-            const auto ownerRef = ownerIt->second;
             runtime::RuntimeError rtErr;
             if (ownerRef.kind == runtime::ObjectKind::Array) {
-                if (name.size() < 3 || name.front() != '[' || name.back() != ']') {
+                std::size_t idx = 0;
+                if (!parseBracketIndex(name, idx)) {
                     return response(request, false, nullptr, "invalid array element name: " + name);
                 }
-                const auto idx = static_cast<std::size_t>(
-                    std::strtoull(name.substr(1, name.size() - 2).c_str(), nullptr, 10));
                 if (!heap_->arraySet(ownerRef, idx, *evaluated, &rtErr)) {
                     return response(request, false, nullptr, rtErr.message);
                 }
             } else {
                 const auto typeId = heap_->objectTypeId(ownerRef).value_or(0);
                 const auto* typeDesc = (program_ && typeId != 0) ? program_->resolveType(typeId) : nullptr;
-                std::size_t targetIdx = std::numeric_limits<std::size_t>::max();
-                if (typeDesc) {
-                    for (std::size_t i = 0; i < typeDesc->fields.size(); ++i) {
-                        const auto& fld = typeDesc->fields[i];
-                        if (fld.staticField || fld.constField) continue;
-                        if (fld.name == name) {
-                            targetIdx = i;
+                const auto fCount = heap_->fieldCount(ownerRef).value_or(0);
+                auto getOwnerField = [&](std::string_view fname, std::size_t fallbackIdx) -> std::optional<runtime::Value> {
+                    if (typeDesc) {
+                        for (std::size_t i = 0; i < typeDesc->fields.size(); ++i) {
+                            const auto& fld = typeDesc->fields[i];
+                            if (fld.staticField || fld.constField) continue;
+                            if (fld.name == fname) {
+                                const std::size_t slotIdx = fld.index < fCount ? fld.index : i;
+                                return heap_->fieldGet(ownerRef, slotIdx);
+                            }
+                        }
+                    }
+                    return fallbackIdx < fCount ? heap_->fieldGet(ownerRef, fallbackIdx) : std::nullopt;
+                };
+                if (typeDesc && typeDesc->name.rfind("HashSet__", 0) == 0) {
+                    return response(request, false, nullptr,
+                        "cannot mutate HashSet element in-place without rehashing: " + name);
+                } else if (typeDesc && typeDesc->name.rfind("Dictionary__", 0) == 0 && fCount >= 5) {
+                    if (name.size() < 2 || name.front() != '[' || name.back() != ']') {
+                        return response(request, false, nullptr,
+                            "cannot modify read-only Dictionary property: " + name);
+                    }
+                    const auto keysVal = getOwnerField("keys", 0);
+                    const auto valsVal = getOwnerField("values", 1);
+                    const auto countVal = getOwnerField("count", 4);
+                    if (!keysVal || !valsVal || !countVal ||
+                        !std::holds_alternative<std::int64_t>(*countVal)) {
+                        return response(request, false, nullptr, "corrupted Dictionary state");
+                    }
+                    const auto logicalCount = static_cast<std::size_t>(
+                        std::max<std::int64_t>(0, std::get<std::int64_t>(*countVal)));
+                    const auto* kArr = std::get_if<runtime::ObjectRef>(&*keysVal);
+                    const auto* vArr = std::get_if<runtime::ObjectRef>(&*valsVal);
+                    if (!kArr || !vArr || !kArr->valid() || !vArr->valid() ||
+                        !heap_->isAlive(*kArr) || !heap_->isAlive(*vArr)) {
+                        return response(request, false, nullptr, "Dictionary backing storage is not alive");
+                    }
+                    std::size_t matchedIdx = std::numeric_limits<std::size_t>::max();
+                    for (std::size_t i = 0; i < logicalCount; ++i) {
+                        const auto kElem = heap_->arrayGet(*kArr, i);
+                        if (!kElem) continue;
+                        const std::string keyText = runtime::valueToString(*kElem, heap_.get());
+                        if (("[" + keyText + "]") == name || ("[\"" + keyText + "\"]") == name) {
+                            matchedIdx = i;
                             break;
                         }
                     }
-                }
-                if (targetIdx == std::numeric_limits<std::size_t>::max() ||
-                    !heap_->fieldSet(ownerRef, targetIdx, *evaluated, &rtErr)) {
-                    return response(request, false, nullptr,
-                        rtErr.message.empty() ? ("unknown field: " + name) : rtErr.message);
+                    if (matchedIdx == std::numeric_limits<std::size_t>::max()) {
+                        return response(request, false, nullptr, "Dictionary key not found: " + name);
+                    }
+                    if (!heap_->arraySet(*vArr, matchedIdx, *evaluated, &rtErr)) {
+                        return response(request, false, nullptr, rtErr.message);
+                    }
+                } else if (typeDesc && typeDesc->name.rfind("List__", 0) == 0 && fCount >= 2) {
+                    std::size_t idx = 0;
+                    if (!parseBracketIndex(name, idx)) {
+                        return response(request, false, nullptr,
+                            "cannot modify List property '" + name + "'; specify an [index] element");
+                    }
+                    const auto itemsVal = getOwnerField("items", 0);
+                    const auto countVal = getOwnerField("count", 1);
+                    const auto logicalCount = (countVal && std::holds_alternative<std::int64_t>(*countVal))
+                        ? static_cast<std::size_t>(std::max<std::int64_t>(0, std::get<std::int64_t>(*countVal)))
+                        : 0;
+                    const auto* arrRef = itemsVal ? std::get_if<runtime::ObjectRef>(&*itemsVal) : nullptr;
+                    if (!arrRef || !arrRef->valid() || !heap_->isAlive(*arrRef) || idx >= logicalCount) {
+                        return response(request, false, nullptr, "List index out of range: " + name);
+                    }
+                    if (!heap_->arraySet(*arrRef, idx, *evaluated, &rtErr)) {
+                        return response(request, false, nullptr, rtErr.message);
+                    }
+                } else if (typeDesc && typeDesc->name.rfind("Stack__", 0) == 0 && fCount >= 2) {
+                    std::size_t idx = 0;
+                    if (!parseBracketIndex(name, idx)) {
+                        return response(request, false, nullptr,
+                            "cannot modify Stack property '" + name + "'; specify an [index] element");
+                    }
+                    const auto itemsVal = getOwnerField("items", 0);
+                    const auto countVal = getOwnerField("count", 1);
+                    const auto logicalCount = (countVal && std::holds_alternative<std::int64_t>(*countVal))
+                        ? static_cast<std::size_t>(std::max<std::int64_t>(0, std::get<std::int64_t>(*countVal)))
+                        : 0;
+                    const auto* arrRef = itemsVal ? std::get_if<runtime::ObjectRef>(&*itemsVal) : nullptr;
+                    if (!arrRef || !arrRef->valid() || !heap_->isAlive(*arrRef) || idx >= logicalCount) {
+                        return response(request, false, nullptr, "Stack index out of range: " + name);
+                    }
+                    if (!heap_->arraySet(*arrRef, logicalCount - 1 - idx, *evaluated, &rtErr)) {
+                        return response(request, false, nullptr, rtErr.message);
+                    }
+                } else if (typeDesc && typeDesc->name.rfind("Queue__", 0) == 0 && fCount >= 4) {
+                    std::size_t idx = 0;
+                    if (!parseBracketIndex(name, idx)) {
+                        return response(request, false, nullptr,
+                            "cannot modify Queue property '" + name + "'; specify an [index] element");
+                    }
+                    const auto itemsVal = getOwnerField("items", 0);
+                    const auto headVal = getOwnerField("head", 1);
+                    const auto countVal = getOwnerField("count", 3);
+                    const auto logicalCount = (countVal && std::holds_alternative<std::int64_t>(*countVal))
+                        ? static_cast<std::size_t>(std::max<std::int64_t>(0, std::get<std::int64_t>(*countVal)))
+                        : 0;
+                    const auto headIdx = (headVal && std::holds_alternative<std::int64_t>(*headVal))
+                        ? static_cast<std::size_t>(std::max<std::int64_t>(0, std::get<std::int64_t>(*headVal)))
+                        : 0;
+                    const auto* arrRef = itemsVal ? std::get_if<runtime::ObjectRef>(&*itemsVal) : nullptr;
+                    const auto arrLen = (arrRef && arrRef->valid() && heap_->isAlive(*arrRef))
+                        ? heap_->arrayLength(*arrRef).value_or(0)
+                        : 0;
+                    if (!arrRef || arrLen == 0 || idx >= logicalCount) {
+                        return response(request, false, nullptr, "Queue index out of range: " + name);
+                    }
+                    if (!heap_->arraySet(*arrRef, (headIdx + idx) % arrLen, *evaluated, &rtErr)) {
+                        return response(request, false, nullptr, rtErr.message);
+                    }
+                } else {
+                    std::size_t targetIdx = std::numeric_limits<std::size_t>::max();
+                    if (typeDesc) {
+                        for (std::size_t i = 0; i < typeDesc->fields.size(); ++i) {
+                            const auto& fld = typeDesc->fields[i];
+                            if (fld.staticField || fld.constField) continue;
+                            if (fld.name == name) {
+                                targetIdx = fld.index < fCount ? fld.index : i;
+                                break;
+                            }
+                        }
+                    }
+                    if (targetIdx == std::numeric_limits<std::size_t>::max() ||
+                        !heap_->fieldSet(ownerRef, targetIdx, *evaluated, &rtErr)) {
+                        return response(request, false, nullptr,
+                            rtErr.message.empty() ? ("unknown field: " + name) : rtErr.message);
+                    }
                 }
             }
             if (auto it = variables_.find(reference); it != variables_.end()) {
@@ -1379,14 +1786,18 @@ tooling::Json DapServer::handle(
                     variables_[static_cast<std::int64_t>(frame.id) * 2 + 1] = frame.locals;
                 }
             }
-            const auto childRef = registerExpandableValue(*evaluated);
+            const auto childRef = registerExpandableValue(*evaluated, evalFrameId);
             return response(request, true, tooling::Json::Object{
                 {"value", runtime::valueToString(*evaluated, heap_.get())},
-                {"type", semantic::primitiveTypeName(runtime::valueType(*evaluated))},
+                {"type", describeValueType(*evaluated)},
                 {"variablesReference", childRef},
             });
         }
-        const auto frameId = static_cast<std::uint32_t>(std::max<std::int64_t>(1, reference / 2));
+        const auto frameId = [&]() -> std::uint32_t {
+            const auto fIt = variableFrameIds_.find(reference);
+            if (fIt != variableFrameIds_.end()) return fIt->second;
+            return static_cast<std::uint32_t>(std::max<std::int64_t>(1, reference / 2));
+        }();
         runtime::Value updatedVal{};
         std::string errMsg;
         if (!session_->setVariable(name, valExpr, frameId, &updatedVal, &errMsg)) {
@@ -1394,10 +1805,10 @@ tooling::Json DapServer::handle(
                 errMsg.empty() ? "failed to set variable" : errMsg);
         }
         rebuildVariableReferences();
-        const auto childRef = registerExpandableValue(updatedVal);
+        const auto childRef = registerExpandableValue(updatedVal, frameId);
         return response(request, true, tooling::Json::Object{
             {"value", runtime::valueToString(updatedVal, heap_.get())},
-            {"type", semantic::primitiveTypeName(runtime::valueType(updatedVal))},
+            {"type", describeValueType(updatedVal)},
             {"variablesReference", childRef},
         });
         };
@@ -1412,6 +1823,10 @@ tooling::Json DapServer::handle(
     }
     if (command == "continue" || command == "next" ||
         command == "stepIn" || command == "stepOut") {
+        variables_.clear();
+        childOwnerObjects_.clear();
+        variableFrameIds_.clear();
+        nextChildRef_ = kFirstChildVariablesReference;
         session_->resume(commandMode(command));
         const auto result = response(request, true, tooling::Json::Object{{"allThreadsContinued", true}});
         if (events) {
@@ -1429,6 +1844,10 @@ tooling::Json DapServer::handle(
         return result;
     }
     if (command == "disconnect" || command == "terminate") {
+        variables_.clear();
+        childOwnerObjects_.clear();
+        variableFrameIds_.clear();
+        nextChildRef_ = kFirstChildVariablesReference;
         if (session_->isAttached()) {
             session_->detach();
         } else {

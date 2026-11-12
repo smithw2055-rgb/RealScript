@@ -1,3 +1,4 @@
+#include "realscript/game/RsBindParser.h"
 #include "realscript/Version.h"
 #include "realscript/game/GameScripting.h"
 
@@ -80,6 +81,30 @@ void writeFunction(
         << " }\n";
 }
 
+std::vector<std::size_t> orderModuleNativeTypesBaseFirst(
+    const detail::GameApiState& state,
+    const std::vector<std::size_t>& nativeTypes) {
+    std::unordered_set<std::size_t> inModule(nativeTypes.begin(), nativeTypes.end());
+    std::unordered_set<std::size_t> visited;
+    std::vector<std::size_t> ordered;
+    ordered.reserve(nativeTypes.size());
+    const auto visit = [&](std::size_t idx, const auto& self) -> void {
+        if (visited.count(idx) > 0 || idx >= state.nativeTypes.size()) return;
+        visited.insert(idx);
+        const auto& decl = state.nativeTypes[idx];
+        if (decl.baseCppType.has_value()) {
+            const auto baseIt = state.nativeTypeByCppType.find(*decl.baseCppType);
+            if (baseIt != state.nativeTypeByCppType.end() && inModule.count(baseIt->second) > 0) {
+                self(baseIt->second, self);
+            }
+        }
+        ordered.push_back(idx);
+    };
+    for (const auto idx : nativeTypes) {
+        visit(idx, visit);
+    }
+    return ordered;
+}
 
 } // namespace
 
@@ -100,10 +125,23 @@ std::vector<compiler::SourceFile> GameApi::generatedSources() const {
     for (const auto& [moduleName, module] : state_->modules) {
         std::ostringstream out;
         out << "module " << moduleName << ";\n";
-        for (const auto& imported : module.imports) {
+        std::set<std::string> emittedImports = module.imports;
+        for (const auto typeIndex : orderModuleNativeTypesBaseFirst(*state_, module.nativeTypes)) {
+            if (typeIndex >= state_->nativeTypes.size()) continue;
+            const auto& type = state_->nativeTypes[typeIndex];
+            if (!type.baseCppType.has_value()) continue;
+            const auto baseIt = state_->nativeTypeByCppType.find(*type.baseCppType);
+            if (baseIt != state_->nativeTypeByCppType.end()) {
+                const auto& baseDecl = state_->nativeTypes[baseIt->second];
+                if (!baseDecl.moduleName.empty() && baseDecl.moduleName != moduleName) {
+                    emittedImports.insert(baseDecl.moduleName);
+                }
+            }
+        }
+        for (const auto& imported : emittedImports) {
             out << "import " << imported << ";\n";
         }
-        if (!module.imports.empty()) out << '\n';
+        if (!emittedImports.empty()) out << '\n';
 
         for (const auto structIndex : module.nativeStructs) {
             if (structIndex >= state_->nativeStructs.size()) continue;
@@ -114,11 +152,20 @@ std::vector<compiler::SourceFile> GameApi::generatedSources() const {
             }
             out << "}\n\n";
         }
-        for (const auto typeIndex : module.nativeTypes) {
+        for (const auto typeIndex : orderModuleNativeTypesBaseFirst(*state_, module.nativeTypes)) {
             if (typeIndex >= state_->nativeTypes.size()) continue;
             const auto& type = state_->nativeTypes[typeIndex];
-            out << "class " << type.name << "\n{\n";
-            out << "    handle __native;\n";
+            std::string baseClause;
+            if (type.baseCppType.has_value()) {
+                const auto baseIt = state_->nativeTypeByCppType.find(*type.baseCppType);
+                if (baseIt != state_->nativeTypeByCppType.end()) {
+                    baseClause = " : " + state_->nativeTypes[baseIt->second].name;
+                }
+            }
+            out << "class " << type.name << baseClause << "\n{\n";
+            if (baseClause.empty()) {
+                out << "    handle __native;\n";
+            }
             for (const auto& method : type.methods) {
                 writeFunction(out, method, "    ");
             }
@@ -147,7 +194,7 @@ std::vector<compiler::SourceFile> GameApi::generatedSources() const {
         }
 
         result.push_back({
-            "$generated/" + sanitizeFileName(moduleName) + ".native.rs",
+            "$generated/" + sanitizeFileName(moduleName) + ".native.rscript",
             out.str(),
         });
     }
@@ -161,10 +208,23 @@ std::vector<compiler::SourceFile> GameApi::exportDeclarationStubs() const {
         std::ostringstream out;
         out << "// Auto-generated RealScript Engine API Stub\n";
         out << "module " << moduleName << ";\n";
-        for (const auto& imported : module.imports) {
+        std::set<std::string> emittedImports = module.imports;
+        for (const auto typeIndex : module.nativeTypes) {
+            if (typeIndex >= state_->nativeTypes.size()) continue;
+            const auto& type = state_->nativeTypes[typeIndex];
+            if (!type.baseCppType.has_value()) continue;
+            const auto baseIt = state_->nativeTypeByCppType.find(*type.baseCppType);
+            if (baseIt != state_->nativeTypeByCppType.end()) {
+                const auto& baseDecl = state_->nativeTypes[baseIt->second];
+                if (!baseDecl.moduleName.empty() && baseDecl.moduleName != moduleName) {
+                    emittedImports.insert(baseDecl.moduleName);
+                }
+            }
+        }
+        for (const auto& imported : emittedImports) {
             out << "import " << imported << ";\n";
         }
-        if (!module.imports.empty()) out << '\n';
+        if (!emittedImports.empty()) out << '\n';
 
         for (const auto structIndex : module.nativeStructs) {
             if (structIndex >= state_->nativeStructs.size()) continue;
@@ -175,11 +235,20 @@ std::vector<compiler::SourceFile> GameApi::exportDeclarationStubs() const {
             }
             out << "}\n\n";
         }
-        for (const auto typeIndex : module.nativeTypes) {
+        for (const auto typeIndex : orderModuleNativeTypesBaseFirst(*state_, module.nativeTypes)) {
             if (typeIndex >= state_->nativeTypes.size()) continue;
             const auto& type = state_->nativeTypes[typeIndex];
-            out << "class " << type.name << "\n{\n";
-            out << "    handle __native;\n";
+            std::string baseClause;
+            if (type.baseCppType.has_value()) {
+                const auto baseIt = state_->nativeTypeByCppType.find(*type.baseCppType);
+                if (baseIt != state_->nativeTypeByCppType.end()) {
+                    baseClause = " : " + state_->nativeTypes[baseIt->second].name;
+                }
+            }
+            out << "class " << type.name << baseClause << "\n{\n";
+            if (baseClause.empty()) {
+                out << "    handle __native;\n";
+            }
             for (const auto& method : type.methods) {
                 out << "    " << (method.isStatic ? "public static " : "") << method.returnType.sourceName << ' ' << method.name << '(';
                 writeParameters(out, method.parameters);
@@ -205,7 +274,7 @@ std::vector<compiler::SourceFile> GameApi::exportDeclarationStubs() const {
         }
 
         result.push_back({
-            sanitizeFileName(moduleName) + ".d.rs",
+            sanitizeFileName(moduleName) + ".d.rscript",
             out.str(),
         });
     }
@@ -287,1232 +356,12 @@ std::shared_ptr<runtime::NativeHandleRegistry> GameApi::nativeHandles() const no
 
 GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
     std::string_view headerContent,
-    const std::string& defaultModuleName) {
-
-    HeaderBindingGenerationResult res;
-    std::ostringstream cppBodyOut;
-    std::ostringstream cppHelpersOut;
-    std::ostringstream rsBodyOut;
-    bool usesMathTypes = false;
-
-    const auto trim = [](std::string_view s) -> std::string {
-        std::size_t b = 0;
-        while (b < s.size() && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n')) ++b;
-        std::size_t e = s.size();
-        while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n')) --e;
-        return std::string(s.substr(b, e - b));
-    };
-
-    const auto stripQuotes = [&](std::string s) -> std::string {
-        s = trim(s);
-        if (s.size() >= 2 && s.front() == '"' && s.back() == '"') {
-            return s.substr(1, s.size() - 2);
-        }
-        return s;
-    };
-
-    const auto consumeMacro = [&](std::string& line, const std::string& macroName, std::vector<std::string>& outArgs) -> bool {
-        outArgs.clear();
-        std::size_t mPos = 0;
-        while (true) {
-            mPos = line.find(macroName, mPos);
-            if (mPos == std::string::npos) return false;
-            const bool validStart = (mPos == 0) ||
-                !(std::isalnum(static_cast<unsigned char>(line[mPos - 1])) || line[mPos - 1] == '_');
-            const std::size_t afterMacro = mPos + macroName.size();
-            const bool validEnd = (afterMacro >= line.size()) ||
-                !(std::isalnum(static_cast<unsigned char>(line[afterMacro])) || line[afterMacro] == '_');
-            if (validStart && validEnd) break;
-            mPos = afterMacro;
-        }
-        std::size_t cursor = mPos + macroName.size();
-        while (cursor < line.size() && (line[cursor] == ' ' || line[cursor] == '\t')) ++cursor;
-        if (cursor < line.size() && line[cursor] == '(') {
-            const auto openP = cursor;
-            int depth = 0;
-            std::size_t closeP = std::string::npos;
-            for (std::size_t i = openP; i < line.size(); ++i) {
-                if (line[i] == '(') ++depth;
-                else if (line[i] == ')') {
-                    --depth;
-                    if (depth == 0) {
-                        closeP = i;
-                        break;
-                    }
-                }
-            }
-            if (closeP != std::string::npos) {
-                if (closeP > openP + 1) {
-                    const std::string raw = trim(line.substr(openP + 1, closeP - openP - 1));
-                    std::size_t start = 0;
-                    while (start < raw.size()) {
-                        int argDepth = 0;
-                        std::size_t comma = start;
-                        while (comma < raw.size()) {
-                            const char c = raw[comma];
-                            if (c == '<' || c == '(' || c == '[' || c == '{') ++argDepth;
-                            else if (c == '>' || c == ')' || c == ']' || c == '}') --argDepth;
-                            else if (c == ',' && argDepth == 0) break;
-                            ++comma;
-                        }
-                        outArgs.push_back(stripQuotes(raw.substr(start, comma - start)));
-                        start = comma + 1;
-                    }
-                }
-                cursor = closeP + 1;
-            }
-        }
-        line = trim(line.substr(0, mPos) + " " + line.substr(cursor));
-        return true;
-    };
-
-    // ------------------------------------------------------------------------
-    // Preprocessor and comment stripping pass:
-    // - Strip // and /* ... */ comments and C++11/17 [[...]] attributes
-    // - Strip #define / #include / #pragma directives (including multi-line '\' continuations)
-    // - Evaluate #if / #elif / #else / #endif blocks to skip dead #if 0 branches
-    // ------------------------------------------------------------------------
-    std::string commentStripped;
-    commentStripped.reserve(headerContent.size());
-    for (std::size_t i = 0; i < headerContent.size();) {
-        if (headerContent[i] == '"' || headerContent[i] == '\'') {
-            const char quote = headerContent[i];
-            commentStripped.push_back(headerContent[i++]);
-            while (i < headerContent.size()) {
-                if (headerContent[i] == '\\' && i + 1 < headerContent.size()) {
-                    commentStripped.push_back(headerContent[i++]);
-                    commentStripped.push_back(headerContent[i++]);
-                    continue;
-                }
-                commentStripped.push_back(headerContent[i]);
-                if (headerContent[i++] == quote) break;
-            }
-        } else if (i + 1 < headerContent.size() && headerContent[i] == '/' && headerContent[i + 1] == '/') {
-            i += 2;
-            while (i < headerContent.size() && headerContent[i] != '\n') ++i;
-        } else if (i + 1 < headerContent.size() && headerContent[i] == '/' && headerContent[i + 1] == '*') {
-            i += 2;
-            while (i + 1 < headerContent.size() && !(headerContent[i] == '*' && headerContent[i + 1] == '/')) {
-                if (headerContent[i] == '\n') commentStripped.push_back('\n');
-                ++i;
-            }
-            if (i + 1 < headerContent.size()) i += 2;
-        } else if (i + 1 < headerContent.size() && headerContent[i] == '[' && headerContent[i + 1] == '[') {
-            i += 2;
-            while (i + 1 < headerContent.size() && !(headerContent[i] == ']' && headerContent[i + 1] == ']')) {
-                if (headerContent[i] == '\n') commentStripped.push_back('\n');
-                ++i;
-            }
-            if (i + 1 < headerContent.size()) i += 2;
-            commentStripped.push_back(' ');
-        } else {
-            commentStripped.push_back(headerContent[i]);
-            ++i;
-        }
-    }
-
-    std::string cleaned;
-    cleaned.reserve(commentStripped.size());
-    {
-        struct PreprocessorFrame {
-            bool active = true;
-            bool parentActive = true;
-            bool branchTaken = false;
-        };
-        std::vector<PreprocessorFrame> ppStack;
-        const auto isPpActive = [&]() noexcept -> bool {
-            return ppStack.empty() || ppStack.back().active;
-        };
-
-        std::size_t linePos = 0;
-        while (linePos < commentStripped.size()) {
-            std::size_t nl = commentStripped.find('\n', linePos);
-            if (nl == std::string::npos) nl = commentStripped.size();
-            std::string rawLine = commentStripped.substr(linePos, nl - linePos);
-            linePos = nl + 1;
-
-            // Merge multi-line preprocessor directives ending with '\'
-            std::string trimmedLine = trim(rawLine);
-            if (!trimmedLine.empty() && trimmedLine.front() == '#') {
-                std::size_t mergedNewlines = 1;
-                while (!trimmedLine.empty() && trimmedLine.back() == '\\' && linePos < commentStripped.size()) {
-                    trimmedLine.pop_back();
-                    std::size_t nextNl = commentStripped.find('\n', linePos);
-                    if (nextNl == std::string::npos) nextNl = commentStripped.size();
-                    trimmedLine += " " + trim(commentStripped.substr(linePos, nextNl - linePos));
-                    linePos = nextNl + 1;
-                    ++mergedNewlines;
-                }
-                const std::string directive = trim(trimmedLine.substr(1));
-                if (directive.rfind("if ", 0) == 0 || directive.rfind("ifdef ", 0) == 0 || directive.rfind("ifndef ", 0) == 0) {
-                    const bool parentAct = isPpActive();
-                    bool condAct = true;
-                    if (directive.rfind("if ", 0) == 0) {
-                        const std::string expr = trim(directive.substr(3));
-                        if (expr == "0" || expr == "false" || expr == "(0)") {
-                            condAct = false;
-                        }
-                    }
-                    const bool act = parentAct && condAct;
-                    ppStack.push_back(PreprocessorFrame{act, parentAct, act});
-                } else if (directive.rfind("else", 0) == 0) {
-                    if (!ppStack.empty()) {
-                        ppStack.back().active = ppStack.back().parentActive && !ppStack.back().branchTaken;
-                        ppStack.back().branchTaken = true;
-                    }
-                } else if (directive.rfind("elif ", 0) == 0) {
-                    if (!ppStack.empty()) {
-                        const std::string expr = trim(directive.substr(5));
-                        const bool condAct = !(expr == "0" || expr == "false" || expr == "(0)");
-                        const bool act = ppStack.back().parentActive && !ppStack.back().branchTaken && condAct;
-                        ppStack.back().active = act;
-                        if (act) {
-                            ppStack.back().branchTaken = true;
-                        }
-                    }
-                } else if (directive.rfind("endif", 0) == 0) {
-                    if (!ppStack.empty()) ppStack.pop_back();
-                }
-                cleaned.append(mergedNewlines, '\n');
-                continue;
-            }
-
-            if (isPpActive()) {
-                cleaned += rawLine;
-            }
-            cleaned.push_back('\n');
-        }
-    }
-
-    // ------------------------------------------------------------------------
-    // Scoped type alias table (`using Alias = Type;` and `typedef Type Alias;`)
-    // ------------------------------------------------------------------------
-    std::unordered_map<std::string, std::string> typeAliases;
-
-    const auto stripLeadingMethodQualifiers = [&](std::string s) -> std::string {
-        s = trim(s);
-        bool stripped = true;
-        while (stripped) {
-            stripped = false;
-            for (const char* kw : {
-                     "virtual ", "inline ", "constexpr ", "static ",
-                     "explicit ", "friend ", "extern ", "const ", "volatile "}) {
-                const std::size_t kwLen = std::strlen(kw);
-                if (s.rfind(kw, 0) == 0) {
-                    s = trim(s.substr(kwLen));
-                    stripped = true;
-                }
-            }
-        }
-        return s;
-    };
-
-    // Strip non-type return specifiers while preserving return-type const for C++ function pointer casts
-    const auto stripNonTypeReturnSpecifiers = [&](std::string s) -> std::string {
-        s = trim(s);
-        bool stripped = true;
-        while (stripped) {
-            stripped = false;
-            for (const char* kw : {
-                     "virtual ", "inline ", "constexpr ", "static ",
-                     "explicit ", "friend ", "extern "}) {
-                const std::size_t kwLen = std::strlen(kw);
-                if (s.rfind(kw, 0) == 0) {
-                    s = trim(s.substr(kwLen));
-                    stripped = true;
-                }
-            }
-        }
-        return s;
-    };
-
-    std::unordered_set<std::string> exportedStructs;
-    std::unordered_set<std::string> exportedClasses;
-    std::unordered_map<std::string, std::string> exportedEnumFirstMember;
-
-    std::function<std::string(std::string, int)> mapCppTypeToRsImpl;
-    mapCppTypeToRsImpl = [&](std::string cppType, int aliasDepth) -> std::string {
-        cppType = stripLeadingMethodQualifiers(std::move(cppType));
-        while (!cppType.empty() && (cppType.back() == '&' || cppType.back() == '*' || cppType.back() == ' ')) {
-            cppType.pop_back();
-        }
-        while (cppType.size() > 6 && cppType.compare(cppType.size() - 6, 6, " const") == 0) {
-            cppType = trim(cppType.substr(0, cppType.size() - 6));
-            while (!cppType.empty() && (cppType.back() == '&' || cppType.back() == '*' || cppType.back() == ' ')) {
-                cppType.pop_back();
-            }
-        }
-
-        // Recursively resolve using / typedef aliases (capped at depth 8 to prevent cycles)
-        if (aliasDepth < 8) {
-            auto aliasIt = typeAliases.find(cppType);
-            if (aliasIt == typeAliases.end()) {
-                const auto nsPos = cppType.rfind("::");
-                if (nsPos != std::string::npos) {
-                    aliasIt = typeAliases.find(cppType.substr(nsPos + 2));
-                }
-            }
-            if (aliasIt != typeAliases.end() && aliasIt->second != cppType) {
-                return mapCppTypeToRsImpl(aliasIt->second, aliasDepth + 1);
-            }
-        }
-
-        if (cppType.rfind("std::vector<", 0) == 0 && cppType.back() == '>') {
-            const std::string inner = trim(cppType.substr(12, cppType.size() - 13));
-            return mapCppTypeToRsImpl(inner, aliasDepth + 1) + "[]";
-        }
-        if (cppType.rfind("vector<", 0) == 0 && cppType.back() == '>') {
-            const std::string inner = trim(cppType.substr(7, cppType.size() - 8));
-            return mapCppTypeToRsImpl(inner, aliasDepth + 1) + "[]";
-        }
-        if (cppType.rfind("std::shared_ptr<", 0) == 0 && cppType.back() == '>') {
-            cppType = trim(cppType.substr(16, cppType.size() - 17));
-        } else if (cppType.rfind("shared_ptr<", 0) == 0 && cppType.back() == '>') {
-            cppType = trim(cppType.substr(11, cppType.size() - 12));
-        }
-        while (!cppType.empty() && (cppType.back() == '&' || cppType.back() == '*' || cppType.back() == ' ')) {
-            cppType.pop_back();
-        }
-        if (cppType == "int" || cppType == "signed int" || cppType == "int32_t" || cppType == "std::int32_t") return "int";
-        if (cppType == "int64_t" || cppType == "std::int64_t" || cppType == "long" || cppType == "long long" ||
-            cppType == "ssize_t" || cppType == "std::ptrdiff_t" || cppType == "ptrdiff_t") return "long";
-        if (cppType == "uint32_t" || cppType == "std::uint32_t" || cppType == "unsigned int" || cppType == "unsigned") return "uint";
-        if (cppType == "uint64_t" || cppType == "std::uint64_t" || cppType == "unsigned long" ||
-            cppType == "unsigned long long" || cppType == "size_t" || cppType == "std::size_t") return "ulong";
-        if (cppType == "uint8_t" || cppType == "std::uint8_t" || cppType == "unsigned char") return "byte";
-        if (cppType == "int8_t" || cppType == "std::int8_t" || cppType == "signed char") return "sbyte";
-        if (cppType == "int16_t" || cppType == "std::int16_t" || cppType == "short") return "short";
-        if (cppType == "uint16_t" || cppType == "std::uint16_t" || cppType == "unsigned short") return "ushort";
-        if (cppType == "float") return "float";
-        if (cppType == "double") return "double";
-        if (cppType == "bool") return "bool";
-        if (cppType == "void") return "void";
-        if (cppType.find("string") != std::string::npos) return "string";
-        if (cppType.find("Vec2") != std::string::npos) { usesMathTypes = true; return "Vec2"; }
-        if (cppType.find("Vec3") != std::string::npos) { usesMathTypes = true; return "Vec3"; }
-        if (cppType.find("Quat") != std::string::npos) { usesMathTypes = true; return "Quat"; }
-        if (cppType.find("Fixed16") != std::string::npos) { usesMathTypes = true; return "Fixed16"; }
-        if (cppType.find("Fixed") != std::string::npos) { usesMathTypes = true; return "Fixed"; }
-        const auto nsPos = cppType.rfind("::");
-        if (nsPos != std::string::npos) {
-            return cppType.substr(nsPos + 2);
-        }
-        return cppType;
-    };
-
-    const auto mapCppTypeToRs = [&](std::string cppType) -> std::string {
-        return mapCppTypeToRsImpl(std::move(cppType), 0);
-    };
-
-    const auto mapRsTypeToNativeFieldKind = [](const std::string& rsType) -> std::string {
-        if (rsType == "int" || rsType == "uint" || rsType == "short" || rsType == "ushort" || rsType == "byte" || rsType == "sbyte") {
-            return "realscript::runtime::NativeFieldKind::Int32";
-        }
-        if (rsType == "long" || rsType == "ulong") return "realscript::runtime::NativeFieldKind::Int64";
-        if (rsType == "float") return "realscript::runtime::NativeFieldKind::Float32";
-        if (rsType == "double") return "realscript::runtime::NativeFieldKind::Float64";
-        if (rsType == "bool") return "realscript::runtime::NativeFieldKind::Bool";
-        if (rsType == "Fixed") return "realscript::runtime::NativeFieldKind::Fixed";
-        if (rsType == "Fixed16") return "realscript::runtime::NativeFieldKind::Fixed16";
-        if (rsType == "Vec2") return "realscript::runtime::NativeFieldKind::Vec2";
-        if (rsType == "Vec3") return "realscript::runtime::NativeFieldKind::Vec3";
-        if (rsType == "Quat") return "realscript::runtime::NativeFieldKind::Quat";
-        return "realscript::runtime::NativeFieldKind::Int32";
-    };
-
-    const auto dummyRsReturn = [&](const std::string& rsRet) -> std::string {
-        if (rsRet == "void") return "return;";
-        if (rsRet == "bool") return "return false;";
-        if (rsRet == "string") return "return \"\";";
-        if (rsRet == "float") return "return (float)0.0;";
-        if (rsRet == "double") return "return 0.0;";
-        if (rsRet == "int" || rsRet == "long") return "return 0;";
-        if (rsRet == "uint" || rsRet == "ulong" || rsRet == "byte" ||
-            rsRet == "sbyte" || rsRet == "short" || rsRet == "ushort") {
-            return "return (" + rsRet + ")0;";
-        }
-        if (rsRet == "Vec2" || rsRet == "Vec3" || rsRet == "Quat" ||
-            rsRet == "Fixed" || rsRet == "Fixed16" ||
-            exportedStructs.count(rsRet) > 0) {
-            return "return new " + rsRet + "();";
-        }
-        if (const auto it = exportedEnumFirstMember.find(rsRet);
-            it != exportedEnumFirstMember.end() && !it->second.empty()) {
-            return "return " + rsRet + "." + it->second + ";";
-        }
-        if (rsRet.size() > 2 && rsRet.compare(rsRet.size() - 2, 2, "[]") == 0) {
-            return "return null;";
-        }
-        if (exportedClasses.count(rsRet) > 0) {
-            return "return null;";
-        }
-        return "return null;";
-    };
-
-    struct NamespaceFrame {
-        std::string name;
-        int depthBeforeOpen = 0;
-    };
-    std::vector<NamespaceFrame> namespaceStack;
-    int braceDepth = 0;
-    const auto currentNamespacePrefix = [&]() -> std::string {
-        std::string out;
-        for (const auto& ns : namespaceStack) {
-            if (!ns.name.empty()) out += ns.name + "::";
-        }
-        return out;
-    };
-    const auto updateBraceDepth = [&](std::string_view textLine) {
-        for (const char ch : textLine) {
-            if (ch == '{') ++braceDepth;
-            else if (ch == '}') {
-                --braceDepth;
-                while (!namespaceStack.empty() && braceDepth <= namespaceStack.back().depthBeforeOpen) {
-                    namespaceStack.pop_back();
-                }
-            }
-        }
-    };
-
-    const auto rfindSpaceOutsideAngles = [](std::string_view sv) -> std::size_t {
-        int angleDepth = 0;
-        for (std::size_t i = sv.size(); i > 0; --i) {
-            const char ch = sv[i - 1];
-            if (ch == '>') ++angleDepth;
-            else if (ch == '<' && angleDepth > 0) --angleDepth;
-            else if ((ch == ' ' || ch == '\t') && angleDepth == 0) {
-                return i - 1;
-            }
-        }
-        return std::string::npos;
-    };
-
-    std::string currentClass;
-    std::string currentClassQualified;
-    std::string currentClassModule = defaultModuleName;
-    int currentClassBraceDepth = 0;
-    bool currentIsEcsStruct = false;
-
-    bool pendingClassExport = false;
-    bool pendingEcsStructExport = false;
-    bool pendingEnumExport = false;
-    bool pendingMethodExport = false;
-    bool pendingCtorExport = false;
-    std::string pendingCtorFactoryName;
-    std::size_t currentClassCtorCount = 0;
-    std::unordered_map<std::string, std::size_t> classMethodCounts;
-    std::unordered_map<std::string, std::pair<std::string, std::string>> firstClassMethodCastUpgrade;
-    std::unordered_map<std::string, std::size_t> freeFuncCounts;
-    std::unordered_map<std::string, std::pair<std::string, std::string>> firstFreeFuncCastUpgrade;
-    bool pendingFuncExport = false;
-    bool pendingFieldExport = false;
-    bool pendingNonDeterministic = false;
-    std::string pendingCapability;
-    std::string pendingFuncModule = defaultModuleName;
-
-    struct PendingProperty {
-        std::string propName;
-        std::string getterMethod;
-        std::string setterMethod;
-        std::string rsType = "int";
-    };
-    std::vector<PendingProperty> pendingClassProperties;
-
-    struct EcsFieldInfo {
-        std::string name;
-        std::string rsType;
-        bool readOnly = false;
-    };
-    std::vector<EcsFieldInfo> currentEcsFields;
-    std::vector<EcsFieldInfo> pendingClassFields;
-
-    std::size_t pos = 0;
-    while (pos < cleaned.size()) {
-        std::size_t endLine = cleaned.find('\n', pos);
-        if (endLine == std::string::npos) endLine = cleaned.size();
-        std::string line = trim(cleaned.substr(pos, endLine - pos));
-        pos = endLine + 1;
-        if (line.empty()) continue;
-
-        // --------------------------------------------------------------------
-        // Support Allman multi-line `namespace A::B \n {` and nested `namespace A { namespace B {`
-        // --------------------------------------------------------------------
-        if (currentClass.empty() &&
-            (line.rfind("namespace ", 0) == 0 || line.rfind("inline namespace ", 0) == 0) &&
-            line.find('=') == std::string::npos) {
-            std::string nsDecl = line;
-            while (nsDecl.find('{') == std::string::npos &&
-                   nsDecl.find(';') == std::string::npos &&
-                   pos < cleaned.size()) {
-                std::size_t nextNl = cleaned.find('\n', pos);
-                if (nextNl == std::string::npos) nextNl = cleaned.size();
-                nsDecl += " " + trim(cleaned.substr(pos, nextNl - pos));
-                pos = nextNl + 1;
-            }
-            std::size_t scanPos = 0;
-            while (scanPos < nsDecl.size()) {
-                const auto nsKw = nsDecl.find("namespace ", scanPos);
-                const auto bracePos = nsDecl.find('{', scanPos);
-                if (nsKw != std::string::npos && (bracePos == std::string::npos || nsKw < bracePos)) {
-                    const auto openB = nsDecl.find('{', nsKw + 10);
-                    if (openB != std::string::npos) {
-                        updateBraceDepth(std::string_view(nsDecl).substr(scanPos, nsKw - scanPos));
-                        std::string nsName = trim(nsDecl.substr(nsKw + 10, openB - (nsKw + 10)));
-                        if (nsName.rfind("inline ", 0) == 0) {
-                            nsName = trim(nsName.substr(7));
-                        }
-                        if (!nsName.empty()) {
-                            namespaceStack.push_back(NamespaceFrame{nsName, braceDepth});
-                        }
-                        ++braceDepth;
-                        scanPos = openB + 1;
-                        continue;
-                    }
-                }
-                updateBraceDepth(std::string_view(nsDecl).substr(scanPos));
-                break;
-            }
-            continue;
-        }
-
-        // --------------------------------------------------------------------
-        // Collect `using Alias = Type;` and `typedef Type Alias;`
-        // --------------------------------------------------------------------
-        if (line.rfind("using ", 0) == 0 && line.rfind("using namespace ", 0) != 0 && line.back() == ';') {
-            const auto eqPos = line.find('=');
-            if (eqPos != std::string::npos) {
-                std::string aliasName = trim(line.substr(6, eqPos - 6));
-                std::string targetType = trim(line.substr(eqPos + 1, line.size() - eqPos - 2));
-                if (!aliasName.empty() && !targetType.empty() && aliasName.find('<') == std::string::npos) {
-                    typeAliases[aliasName] = targetType;
-                    if (!currentNamespacePrefix().empty()) {
-                        typeAliases[currentNamespacePrefix() + aliasName] = targetType;
-                    }
-                }
-            }
-            updateBraceDepth(line);
-            continue;
-        }
-        if (line.rfind("typedef ", 0) == 0 && line.back() == ';') {
-            std::string body = trim(line.substr(8, line.size() - 9));
-            const auto lastSp = rfindSpaceOutsideAngles(body);
-            if (lastSp != std::string::npos) {
-                std::string targetType = trim(body.substr(0, lastSp));
-                std::string aliasName = trim(body.substr(lastSp + 1));
-                while (!aliasName.empty() && (aliasName.front() == '*' || aliasName.front() == '&')) {
-                    targetType.push_back(aliasName.front());
-                    aliasName.erase(aliasName.begin());
-                }
-                if (!aliasName.empty() && !targetType.empty() && aliasName.find('(') == std::string::npos) {
-                    typeAliases[aliasName] = targetType;
-                    if (!currentNamespacePrefix().empty()) {
-                        typeAliases[currentNamespacePrefix() + aliasName] = targetType;
-                    }
-                }
-            }
-            updateBraceDepth(line);
-            continue;
-        }
-
-        std::vector<std::string> macroArgs;
-        if (consumeMacro(line, "RS_EXPORT_CLASS", macroArgs)) {
-            pendingClassExport = true;
-            pendingEcsStructExport = false;
-            currentClassModule = (!macroArgs.empty() && !macroArgs[0].empty()) ? macroArgs[0] : defaultModuleName;
-            if (line.empty()) continue;
-        }
-        if (consumeMacro(line, "RS_EXPORT_ECS_COMPONENT", macroArgs) ||
-            consumeMacro(line, "RS_EXPORT_STRUCT", macroArgs)) {
-            pendingEcsStructExport = true;
-            pendingClassExport = false;
-            currentClassModule = (!macroArgs.empty() && !macroArgs[0].empty()) ? macroArgs[0] : defaultModuleName;
-            if (line.empty()) continue;
-        }
-        if (consumeMacro(line, "RS_EXPORT_ENUM", macroArgs)) {
-            pendingEnumExport = true;
-            if (line.empty()) continue;
-        }
-        if (consumeMacro(line, "RS_EXPORT_FIELD", macroArgs)) {
-            pendingFieldExport = true;
-            if (line.empty()) continue;
-        }
-        if (consumeMacro(line, "RS_EXPORT_PROPERTY", macroArgs)) {
-            if (macroArgs.size() >= 2 && !currentClass.empty()) {
-                PendingProperty prop;
-                prop.propName = macroArgs[0];
-                prop.getterMethod = macroArgs[1];
-                if (macroArgs.size() >= 3) prop.setterMethod = macroArgs[2];
-                if (macroArgs.size() >= 4) prop.rsType = mapCppTypeToRs(macroArgs[3]);
-                pendingClassProperties.push_back(std::move(prop));
-            }
-            if (line.empty()) continue;
-        }
-        if (consumeMacro(line, "RS_EXPORT_CONSTRUCTOR", macroArgs)) {
-            pendingCtorExport = true;
-            pendingNonDeterministic = false;
-            pendingCapability.clear();
-            pendingCtorFactoryName = (!macroArgs.empty() && !macroArgs[0].empty()) ? macroArgs[0] : "";
-            if (line.empty()) continue;
-        }
-        if (consumeMacro(line, "RS_EXPORT_METHOD_EX", macroArgs) ||
-            consumeMacro(line, "RS_EXPORT_METHOD", macroArgs)) {
-            pendingMethodExport = true;
-            pendingNonDeterministic = false;
-            pendingCapability.clear();
-            for (const auto& a : macroArgs) {
-                if (a == "NonDeterministic") pendingNonDeterministic = true;
-                else if (!a.empty()) pendingCapability = a;
-            }
-            if (line.empty()) continue;
-        }
-        if (consumeMacro(line, "RS_EXPORT_FUNCTION_EX", macroArgs) ||
-            consumeMacro(line, "RS_EXPORT_FUNCTION", macroArgs)) {
-            pendingFuncExport = true;
-            pendingNonDeterministic = false;
-            pendingCapability.clear();
-            pendingFuncModule = defaultModuleName;
-            for (std::size_t i = 0; i < macroArgs.size(); ++i) {
-                if (macroArgs[i] == "NonDeterministic") pendingNonDeterministic = true;
-                else if (i == 0 && macroArgs[i].find('.') != std::string::npos) pendingFuncModule = macroArgs[i];
-                else if (!macroArgs[i].empty()) pendingCapability = macroArgs[i];
-            }
-            if (line.empty()) continue;
-        }
-
-        if (pendingEnumExport && line.rfind("enum ", 0) == 0) {
-            pendingEnumExport = false;
-            std::string fullEnum = line;
-            while (fullEnum.find('}') == std::string::npos && pos < cleaned.size()) {
-                std::size_t nextNl = cleaned.find('\n', pos);
-                if (nextNl == std::string::npos) nextNl = cleaned.size();
-                fullEnum += " " + trim(cleaned.substr(pos, nextNl - pos));
-                pos = nextNl + 1;
-            }
-            const auto openBrace = fullEnum.find('{');
-            const auto closeBrace = fullEnum.find('}', openBrace);
-            if (openBrace != std::string::npos && closeBrace != std::string::npos) {
-                std::string headerPart = trim(fullEnum.substr(0, openBrace));
-                if (headerPart.rfind("enum class ", 0) == 0) {
-                    headerPart = trim(headerPart.substr(11));
-                } else if (headerPart.rfind("enum struct ", 0) == 0) {
-                    headerPart = trim(headerPart.substr(12));
-                } else if (headerPart.rfind("enum ", 0) == 0) {
-                    headerPart = trim(headerPart.substr(5));
-                }
-                const auto colonPos = headerPart.find(':');
-                std::string enumName = trim(colonPos == std::string::npos ? headerPart : headerPart.substr(0, colonPos));
-                std::string bodyPart = trim(fullEnum.substr(openBrace + 1, closeBrace - openBrace - 1));
-                rsBodyOut << "enum " << enumName << " {\n";
-                std::size_t mStart = 0;
-                std::int64_t nextVal = 0;
-                std::string firstMember;
-                while (mStart < bodyPart.size()) {
-                    std::size_t comma = bodyPart.find(',', mStart);
-                    if (comma == std::string::npos) comma = bodyPart.size();
-                    std::string item = trim(bodyPart.substr(mStart, comma - mStart));
-                    mStart = comma + 1;
-                    if (item.empty()) continue;
-                    const auto eqPos = item.find('=');
-                    if (eqPos != std::string::npos) {
-                        std::string mName = trim(item.substr(0, eqPos));
-                        std::string mVal = trim(item.substr(eqPos + 1));
-                        if (firstMember.empty()) firstMember = mName;
-                        rsBodyOut << "    " << mName << " = " << mVal << ",\n";
-                        try { nextVal = std::stoll(mVal) + 1; } catch (...) { ++nextVal; }
-                    } else {
-                        if (firstMember.empty()) firstMember = item;
-                        rsBodyOut << "    " << item << " = " << nextVal++ << ",\n";
-                    }
-                }
-                rsBodyOut << "}\n\n";
-                if (!enumName.empty() && !firstMember.empty()) {
-                    exportedEnumFirstMember[enumName] = firstMember;
-                }
-                ++res.enumsExported;
-            }
-            updateBraceDepth(fullEnum);
-            continue;
-        }
-
-        if ((pendingClassExport || pendingEcsStructExport) &&
-            (line.rfind("class ", 0) == 0 || line.rfind("struct ", 0) == 0)) {
-            std::string fullHeader = line;
-            while (fullHeader.find('{') == std::string::npos &&
-                   fullHeader.find(';') == std::string::npos &&
-                   pos < cleaned.size()) {
-                std::size_t nextNl = cleaned.find('\n', pos);
-                if (nextNl == std::string::npos) nextNl = cleaned.size();
-                fullHeader += " " + trim(cleaned.substr(pos, nextNl - pos));
-                pos = nextNl + 1;
-            }
-            if (fullHeader.find('{') == std::string::npos) {
-                pendingClassExport = false;
-                pendingEcsStructExport = false;
-                updateBraceDepth(fullHeader);
-                continue;
-            }
-            currentIsEcsStruct = pendingEcsStructExport;
-            pendingClassExport = false;
-            pendingEcsStructExport = false;
-            currentClassBraceDepth = braceDepth;
-            const auto openBrace = fullHeader.find('{');
-            std::string beforeBrace = trim(fullHeader.substr(0, openBrace));
-            const auto spacePos = beforeBrace.find(' ');
-            std::string namePart = spacePos == std::string::npos ? "" : trim(beforeBrace.substr(spacePos + 1));
-            std::size_t baseColon = std::string::npos;
-            for (std::size_t ci = 0; ci < namePart.size(); ++ci) {
-                if (namePart[ci] == ':') {
-                    if (ci + 1 < namePart.size() && namePart[ci + 1] == ':') {
-                        ++ci;
-                        continue;
-                    }
-                    baseColon = ci;
-                    break;
-                }
-            }
-            if (baseColon != std::string::npos) {
-                namePart = trim(namePart.substr(0, baseColon));
-            }
-            std::vector<std::string> headerTokens;
-            std::istringstream tokenStream(namePart);
-            std::string tok;
-            while (tokenStream >> tok) {
-                headerTokens.push_back(std::move(tok));
-            }
-            while (!headerTokens.empty() && headerTokens.back() == "final") {
-                headerTokens.pop_back();
-            }
-            currentClass = headerTokens.empty() ? namePart : headerTokens.back();
-            currentClassQualified = currentNamespacePrefix() + currentClass;
-            pendingClassProperties.clear();
-            pendingClassFields.clear();
-            currentEcsFields.clear();
-            currentClassCtorCount = 0;
-            classMethodCounts.clear();
-            firstClassMethodCastUpgrade.clear();
-            if (currentIsEcsStruct) {
-                ++res.structsExported;
-                exportedStructs.insert(currentClass);
-                rsBodyOut << "struct " << currentClass << " {\n";
-            } else {
-                ++res.classesExported;
-                exportedClasses.insert(currentClass);
-                cppBodyOut << "    auto builder_" << currentClass << " = api.type<" << currentClassQualified
-                           << ">(\"" << currentClassModule << "\", \"" << currentClass << "\");\n";
-                rsBodyOut << "class " << currentClass << " {\n    handle __native;\n";
-            }
-            updateBraceDepth(fullHeader);
-            continue;
-        }
-
-        if (!currentClass.empty() && line.rfind("};", 0) == 0) {
-            updateBraceDepth(line);
-            if (braceDepth > currentClassBraceDepth) {
-                continue;
-            }
-            if (currentIsEcsStruct) {
-                cppBodyOut << "    auto struct_" << currentClass << " = api.structType<" << currentClassQualified
-                           << ">(\"" << currentClassModule << "\", \"" << currentClass << "\");\n";
-                for (const auto& f : currentEcsFields) {
-                    cppBodyOut << "    struct_" << currentClass << ".field<&" << currentClassQualified
-                               << "::" << f.name << ">(\"" << f.name << "\");\n";
-                }
-                cppHelpersOut << "inline bool bindEcsColumn_" << currentClass << "(\n"
-                              << "    realscript::game::ScriptRuntime& runtime,\n"
-                              << "    " << currentClassQualified << "* data,\n"
-                              << "    std::size_t count,\n"
-                              << "    realscript::runtime::RuntimeError& error,\n"
-                              << "    bool readOnly = false) {\n"
-                              << "    static_assert(std::is_standard_layout_v<" << currentClassQualified << ">,\n"
-                              << "        \"ECS component struct must satisfy std::is_standard_layout_v\");\n"
-                              << "    const std::vector<realscript::runtime::NativeFieldLayout> fields = {\n";
-                for (const auto& f : currentEcsFields) {
-                    cppHelpersOut << "        {offsetof(" << currentClassQualified << ", " << f.name << "), "
-                                  << mapRsTypeToNativeFieldKind(f.rsType) << "},\n";
-                }
-                cppHelpersOut << "    };\n"
-                              << "    return runtime.bindEcsRawColumn(\n"
-                              << "        \"" << currentClassModule << "::" << currentClass << "\",\n"
-                              << "        data,\n"
-                              << "        count,\n"
-                              << "        sizeof(" << currentClassQualified << "),\n"
-                              << "        fields,\n"
-                              << "        error,\n"
-                              << "        readOnly);\n"
-                              << "}\n\n";
-            } else {
-                for (const auto& fld : pendingClassFields) {
-                    ++res.propertiesExported;
-                    cppBodyOut << "    builder_" << currentClass << ".field<&" << currentClassQualified
-                               << "::" << fld.name << ">(\"" << fld.name << "\");\n";
-                    if (fld.readOnly) {
-                        rsBodyOut << "    " << fld.rsType << " " << fld.name << " {\n"
-                                  << "        get { " << dummyRsReturn(fld.rsType) << " }\n"
-                                  << "    }\n";
-                    } else {
-                        rsBodyOut << "    " << fld.rsType << " " << fld.name << " {\n"
-                                  << "        get { " << dummyRsReturn(fld.rsType) << " }\n"
-                                  << "        set { return; }\n"
-                                  << "    }\n";
-                    }
-                }
-                for (const auto& prop : pendingClassProperties) {
-                    ++res.propertiesExported;
-                    if (!prop.setterMethod.empty()) {
-                        cppBodyOut << "    builder_" << currentClass << ".property<&" << currentClassQualified
-                                   << "::" << prop.getterMethod << ", &" << currentClassQualified
-                                   << "::" << prop.setterMethod << ">(\"" << prop.propName << "\");\n";
-                        rsBodyOut << "    " << prop.rsType << " " << prop.propName << " {\n"
-                                  << "        get { " << dummyRsReturn(prop.rsType) << " }\n"
-                                  << "        set { return; }\n"
-                                  << "    }\n";
-                    } else {
-                        cppBodyOut << "    builder_" << currentClass << ".property<&" << currentClassQualified
-                                   << "::" << prop.getterMethod << ">(\"" << prop.propName << "\");\n";
-                        rsBodyOut << "    " << prop.rsType << " " << prop.propName << " {\n"
-                                  << "        get { " << dummyRsReturn(prop.rsType) << " }\n"
-                                  << "    }\n";
-                    }
-                }
-            }
-            pendingClassProperties.clear();
-            pendingClassFields.clear();
-            currentEcsFields.clear();
-            currentClass.clear();
-            currentClassQualified.clear();
-            currentIsEcsStruct = false;
-            pendingFieldExport = false;
-            rsBodyOut << "}\n\n";
-            continue;
-        }
-
-        // Parse exported fields inside RS_EXPORT_CLASS when preceded by RS_EXPORT_FIELD
-        if (!currentClass.empty() && !currentIsEcsStruct && pendingFieldExport) {
-            pendingFieldExport = false;
-            std::string fieldLine = line;
-            if (!fieldLine.empty() && fieldLine.back() == ';') {
-                fieldLine.pop_back();
-                const auto eqPos = fieldLine.find('=');
-                if (eqPos != std::string::npos) fieldLine = trim(fieldLine.substr(0, eqPos));
-                const auto bracePos = fieldLine.find('{');
-                if (bracePos != std::string::npos) fieldLine = trim(fieldLine.substr(0, bracePos));
-                if (fieldLine.find('(') == std::string::npos) {
-                    const auto lastSpace = rfindSpaceOutsideAngles(fieldLine);
-                    if (lastSpace != std::string::npos) {
-                        std::string fType = trim(fieldLine.substr(0, lastSpace));
-                        std::string fName = trim(fieldLine.substr(lastSpace + 1));
-                        while (!fName.empty() && (fName.front() == '*' || fName.front() == '&')) {
-                            fType.push_back(fName.front());
-                            fName.erase(fName.begin());
-                        }
-                        if (!fType.empty() && !fName.empty()) {
-                            const bool isConst =
-                                fType.rfind("const ", 0) == 0 ||
-                                fType.find(" const") != std::string::npos ||
-                                fType.rfind("constexpr ", 0) == 0;
-                            const std::string rsFieldType = mapCppTypeToRs(fType);
-                            pendingClassFields.push_back({fName, rsFieldType, isConst});
-                        }
-                    }
-                }
-            }
-            updateBraceDepth(line);
-            continue;
-        }
-
-        // --------------------------------------------------------------------
-        // Inside RS_EXPORT_ECS_COMPONENT / RS_EXPORT_STRUCT, skip inline method bodies
-        // and only parse top-level fields when braceDepth == currentClassBraceDepth + 1
-        // --------------------------------------------------------------------
-        if (!currentClass.empty() && currentIsEcsStruct) {
-            pendingFieldExport = false;
-            pendingCtorExport = false;
-            pendingMethodExport = false;
-            if (braceDepth > currentClassBraceDepth + 1) {
-                updateBraceDepth(line);
-                continue;
-            }
-            std::string fieldLine = line;
-            if (fieldLine == "public:" || fieldLine == "private:" || fieldLine == "protected:") {
-                updateBraceDepth(line);
-                continue;
-            }
-            std::vector<std::string> fieldMacroArgs;
-            consumeMacro(fieldLine, "RS_EXPORT_FIELD", fieldMacroArgs);
-
-            const auto eqCheck = fieldLine.find('=');
-            const auto parenOpen = fieldLine.find('(');
-            const auto parenClose = fieldLine.find(')');
-            const bool isUnexportedMethod =
-                (parenOpen != std::string::npos && (eqCheck == std::string::npos || parenOpen < eqCheck)) ||
-                (parenClose != std::string::npos && (eqCheck == std::string::npos || parenClose < eqCheck));
-
-            if (!isUnexportedMethod && !fieldLine.empty() && fieldLine.back() == ';') {
-                fieldLine.pop_back();
-                const auto eqPos = fieldLine.find('=');
-                if (eqPos != std::string::npos) fieldLine = trim(fieldLine.substr(0, eqPos));
-                const auto bracePos = fieldLine.find('{');
-                if (bracePos != std::string::npos) fieldLine = trim(fieldLine.substr(0, bracePos));
-                if (fieldLine.find('(') == std::string::npos && fieldLine.find(')') == std::string::npos) {
-                    const auto lastSpace = rfindSpaceOutsideAngles(fieldLine);
-                    if (lastSpace != std::string::npos) {
-                        std::string fType = trim(fieldLine.substr(0, lastSpace));
-                        std::string fName = trim(fieldLine.substr(lastSpace + 1));
-                        const bool isStaticOrFriend =
-                            fType.rfind("static ", 0) == 0 ||
-                            fType.find(" static ") != std::string::npos ||
-                            fType.rfind("friend ", 0) == 0 ||
-                            fType.rfind("constexpr ", 0) == 0;
-                        if (!fType.empty() && !fName.empty() && !isStaticOrFriend) {
-                            const std::string rsFieldType = mapCppTypeToRs(fType);
-                            currentEcsFields.push_back({fName, rsFieldType, false});
-                            rsBodyOut << "    public " << rsFieldType << " " << fName << ";\n";
-                        }
-                    }
-                }
-            }
-            updateBraceDepth(line);
-            continue;
-        }
-
-        if (pendingCtorExport || pendingMethodExport || pendingFuncExport) {
-            std::string decl = line;
-            const auto hasBalancedParens = [](std::string_view sv) -> bool {
-                int angleDepth = 0;
-                int parenDepth = 0;
-                bool sawOpen = false;
-                for (const char ch : sv) {
-                    if (ch == '<' && !sawOpen) ++angleDepth;
-                    else if (ch == '>' && !sawOpen && angleDepth > 0) --angleDepth;
-                    else if (ch == '(' && angleDepth == 0) {
-                        sawOpen = true;
-                        ++parenDepth;
-                    } else if (ch == ')' && sawOpen) {
-                        --parenDepth;
-                        if (parenDepth == 0) return true;
-                    }
-                }
-                return false;
-            };
-            while (!hasBalancedParens(decl) && pos < cleaned.size()) {
-                std::size_t nextNl = cleaned.find('\n', pos);
-                if (nextNl == std::string::npos) nextNl = cleaned.size();
-                decl += " " + trim(cleaned.substr(pos, nextNl - pos));
-                pos = nextNl + 1;
-            }
-            updateBraceDepth(decl);
-            const bool isCtor = pendingCtorExport && !currentClass.empty();
-            const bool isMethod = pendingMethodExport && !currentClass.empty();
-            const bool isNonDet = pendingNonDeterministic;
-            const std::string cap = pendingCapability;
-            const std::string ctorFactoryOverride = pendingCtorFactoryName;
-            pendingCtorExport = false;
-            pendingCtorFactoryName.clear();
-            pendingMethodExport = false;
-            pendingFuncExport = false;
-            pendingNonDeterministic = false;
-            pendingCapability.clear();
-
-            std::size_t openParen = std::string::npos;
-            std::size_t closeParen = std::string::npos;
-            {
-                int angleDepth = 0;
-                int parenDepth = 0;
-                for (std::size_t i = 0; i < decl.size(); ++i) {
-                    const char ch = decl[i];
-                    if (openParen == std::string::npos) {
-                        if (ch == '<') ++angleDepth;
-                        else if (ch == '>' && angleDepth > 0) --angleDepth;
-                        else if (ch == '(' && angleDepth == 0) {
-                            openParen = i;
-                            parenDepth = 1;
-                        }
-                    } else {
-                        if (ch == '(') ++parenDepth;
-                        else if (ch == ')') {
-                            --parenDepth;
-                            if (parenDepth == 0) {
-                                closeParen = i;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if (openParen == std::string::npos || closeParen == std::string::npos) continue;
-
-            const std::string prefix = trim(decl.substr(0, openParen));
-            std::string retCpp;
-            std::string fnName;
-            bool isStaticMethod = false;
-            if (isCtor) {
-                retCpp = currentClass;
-                fnName = ctorFactoryOverride.empty()
-                    ? std::string("Create")
-                    : ctorFactoryOverride;
-                ++currentClassCtorCount;
-                isStaticMethod = true;
-            } else {
-                const auto lastSpace = rfindSpaceOutsideAngles(prefix);
-                if (lastSpace == std::string::npos) continue;
-                retCpp = trim(prefix.substr(0, lastSpace));
-                if (retCpp.rfind("static ", 0) == 0 || retCpp.find(" static ") != std::string::npos ||
-                    (retCpp.size() >= 7 && retCpp.compare(retCpp.size() - 7, 7, " static") == 0)) {
-                    isStaticMethod = true;
-                }
-                fnName = trim(prefix.substr(lastSpace + 1));
-                while (!fnName.empty() && (fnName.front() == '*' || fnName.front() == '&')) {
-                    retCpp.push_back(fnName.front());
-                    fnName.erase(fnName.begin());
-                }
-            }
-            const std::string paramsStr = trim(decl.substr(openParen + 1, closeParen - openParen - 1));
-
-            // ----------------------------------------------------------------
-            // Recognize unnamed parameter types (built-in math types, exported classes/structs/enums, and type aliases)
-            // ----------------------------------------------------------------
-            const auto isCppTypeKeywordOrToken = [&](const std::string& token) -> bool {
-                if (token.empty()) return true;
-                if (token.back() == '*' || token.back() == '&' || token.back() == '>') return true;
-                if (token.find("::") != std::string::npos) return true;
-                if (token == "int" || token == "long" || token == "short" ||
-                    token == "char" || token == "float" || token == "double" ||
-                    token == "bool" || token == "void" || token == "unsigned" ||
-                    token == "signed" || token == "const" || token == "volatile" ||
-                    token == "int8_t" || token == "uint8_t" || token == "int16_t" ||
-                    token == "uint16_t" || token == "int32_t" || token == "uint32_t" ||
-                    token == "int64_t" || token == "uint64_t" || token == "size_t" ||
-                    token == "ssize_t" || token == "ptrdiff_t" ||
-                    token == "Vec2" || token == "Vec3" || token == "Quat" ||
-                    token == "Fixed" || token == "Fixed16" || token == "string") {
-                    return true;
-                }
-                if (exportedClasses.count(token) > 0 ||
-                    exportedStructs.count(token) > 0 ||
-                    exportedEnumFirstMember.count(token) > 0 ||
-                    typeAliases.count(token) > 0) {
-                    return true;
-                }
-                return false;
-            };
-
-            std::vector<std::pair<std::string, std::string>> rsParams;
-            std::vector<std::string> rawCppParamTypes;
-            if (!paramsStr.empty() && paramsStr != "void") {
-                std::size_t pStart = 0;
-                int idx = 0;
-                while (pStart < paramsStr.size()) {
-                    int depth = 0;
-                    std::size_t comma = pStart;
-                    while (comma < paramsStr.size()) {
-                        const char c = paramsStr[comma];
-                        if (c == '<' || c == '(' || c == '{' || c == '[') ++depth;
-                        else if (c == '>' || c == ')' || c == '}' || c == ']') --depth;
-                        else if (c == ',' && depth == 0) break;
-                        ++comma;
-                    }
-                    std::string pItem = trim(paramsStr.substr(pStart, comma - pStart));
-                    pStart = comma + 1;
-                    {
-                        int eqDepth = 0;
-                        std::size_t eqPos = std::string::npos;
-                        for (std::size_t ei = 0; ei < pItem.size(); ++ei) {
-                            const char ec = pItem[ei];
-                            if (ec == '<' || ec == '(' || ec == '{' || ec == '[') ++eqDepth;
-                            else if (ec == '>' || ec == ')' || ec == '}' || ec == ']') --eqDepth;
-                            else if (ec == '=' && eqDepth == 0) {
-                                eqPos = ei;
-                                break;
-                            }
-                        }
-                        if (eqPos != std::string::npos) {
-                            pItem = trim(pItem.substr(0, eqPos));
-                        }
-                    }
-                    const auto pSpace = rfindSpaceOutsideAngles(pItem);
-                    if (pSpace != std::string::npos) {
-                        std::string pName = trim(pItem.substr(pSpace + 1));
-                        std::string pType = trim(pItem.substr(0, pSpace));
-                        while (!pName.empty() && (pName.front() == '&' || pName.front() == '*')) {
-                            pType.push_back(pName.front());
-                            pName.erase(pName.begin());
-                        }
-                        if (isCppTypeKeywordOrToken(pName)) {
-                            rawCppParamTypes.push_back(pItem);
-                            rsParams.push_back({mapCppTypeToRs(pItem), "arg" + std::to_string(idx)});
-                        } else {
-                            rawCppParamTypes.push_back(pType);
-                            rsParams.push_back({mapCppTypeToRs(pType), std::move(pName)});
-                        }
-                    } else {
-                        rawCppParamTypes.push_back(pItem);
-                        rsParams.push_back({mapCppTypeToRs(pItem), "arg" + std::to_string(idx)});
-                    }
-                    ++idx;
-                }
-            }
-
-            const std::string rsRet = isCtor ? currentClass : mapCppTypeToRs(retCpp);
-            for (auto& prop : pendingClassProperties) {
-                if (prop.getterMethod == fnName) {
-                    prop.rsType = rsRet;
-                }
-            }
-
-            std::string detArg;
-            if (isNonDet || !cap.empty()) {
-                detArg = isNonDet
-                    ? ", realscript::runtime::BindingDeterminism::NonDeterministic"
-                    : ", realscript::runtime::BindingDeterminism::Deterministic";
-                if (!cap.empty()) {
-                    detArg += ", \"" + cap + "\"";
-                }
-            }
-
-            const std::string indent = (isMethod || isCtor) ? "    " : "";
-            if (isNonDet) rsBodyOut << indent << "[NonDeterministic]\n";
-            if (!cap.empty()) rsBodyOut << indent << "[Capability(\"" << cap << "\")]\n";
-
-            if (isCtor) {
-                ++res.constructorsExported;
-                ++res.methodsExported;
-                cppBodyOut << "    builder_" << currentClass << ".constructor<";
-                for (std::size_t i = 0; i < rawCppParamTypes.size(); ++i) {
-                    if (i != 0) cppBodyOut << ", ";
-                    cppBodyOut << rawCppParamTypes[i];
-                }
-                cppBodyOut << ">(\"" << fnName << "\"" << detArg << ");\n";
-                rsBodyOut << "    public static " << rsRet << " " << fnName << "(";
-            } else if (isMethod) {
-                ++res.methodsExported;
-                const std::size_t mCount = ++classMethodCounts[fnName];
-                // Strip all non-type function specifiers (e.g. `virtual inline constexpr`)
-                const std::string cleanRetCpp = stripNonTypeReturnSpecifiers(retCpp);
-
-                // Match standalone `const` token in the trailing qualifier list between `)` and `{` / `;`
-                std::string afterClose = trim(decl.substr(closeParen + 1));
-                const auto bodyStart = afterClose.find_first_of("{;=");
-                if (bodyStart != std::string::npos) {
-                    afterClose = trim(afterClose.substr(0, bodyStart));
-                }
-                bool isConstMethod = false;
-                if (!isStaticMethod) {
-                    std::istringstream tailTokens(afterClose);
-                    std::string tailTok;
-                    while (tailTokens >> tailTok) {
-                        if (tailTok == "const") {
-                            isConstMethod = true;
-                            break;
-                        }
-                    }
-                }
-
-                std::ostringstream sig;
-                if (isStaticMethod) {
-                    sig << "static_cast<" << cleanRetCpp << " (*)(";
-                } else {
-                    sig << "static_cast<" << cleanRetCpp << " (" << currentClassQualified << "::*)(";
-                }
-                for (std::size_t i = 0; i < rawCppParamTypes.size(); ++i) {
-                    if (i != 0) sig << ", ";
-                    sig << rawCppParamTypes[i];
-                }
-                sig << ")" << (isConstMethod ? " const" : "") << ">(&" << currentClassQualified << "::" << fnName << ")";
-                const std::string castLine = "    builder_" + currentClass + ".method<" + sig.str() +
-                    ">(\"" + fnName + "\"" + detArg + ");\n";
-                const std::string plainLine = "    builder_" + currentClass + ".method<&" + currentClassQualified +
-                    "::" + fnName + ">(\"" + fnName + "\"" + detArg + ");\n";
-                if (mCount == 1) {
-                    firstClassMethodCastUpgrade[fnName] = {plainLine, castLine};
-                    cppBodyOut << plainLine;
-                } else {
-                    if (mCount == 2) {
-                        const auto upIt = firstClassMethodCastUpgrade.find(fnName);
-                        if (upIt != firstClassMethodCastUpgrade.end()) {
-                            std::string cur = cppBodyOut.str();
-                            const auto foundPos = cur.find(upIt->second.first);
-                            if (foundPos != std::string::npos) {
-                                cur.replace(foundPos, upIt->second.first.size(), upIt->second.second);
-                                cppBodyOut.str(std::move(cur));
-                                cppBodyOut.seekp(0, std::ios_base::end);
-                            }
-                        }
-                    }
-                    cppBodyOut << castLine;
-                }
-                rsBodyOut << "    " << (isStaticMethod ? "public static " : "") << rsRet << " " << fnName << "(";
-            } else {
-                ++res.functionsExported;
-                const std::string qualifiedFn = currentNamespacePrefix() + fnName;
-                const std::size_t fCount = ++freeFuncCounts[qualifiedFn];
-                const std::string cleanRetCpp = stripNonTypeReturnSpecifiers(retCpp);
-                std::ostringstream sig;
-                sig << "static_cast<" << cleanRetCpp << " (*)(";
-                for (std::size_t i = 0; i < rawCppParamTypes.size(); ++i) {
-                    if (i != 0) sig << ", ";
-                    sig << rawCppParamTypes[i];
-                }
-                sig << ")>(&" << qualifiedFn << ")";
-                const std::string castLine = "    api.function(\"" + pendingFuncModule + "\", \"" +
-                    fnName + "\", " + sig.str() + detArg + ");\n";
-                const std::string plainLine = "    api.function(\"" + pendingFuncModule + "\", \"" +
-                    fnName + "\", &" + qualifiedFn + detArg + ");\n";
-                if (fCount == 1) {
-                    firstFreeFuncCastUpgrade[qualifiedFn] = {plainLine, castLine};
-                    cppBodyOut << plainLine;
-                } else {
-                    if (fCount == 2) {
-                        const auto upIt = firstFreeFuncCastUpgrade.find(qualifiedFn);
-                        if (upIt != firstFreeFuncCastUpgrade.end()) {
-                            std::string cur = cppBodyOut.str();
-                            const auto foundPos = cur.find(upIt->second.first);
-                            if (foundPos != std::string::npos) {
-                                cur.replace(foundPos, upIt->second.first.size(), upIt->second.second);
-                                cppBodyOut.str(std::move(cur));
-                                cppBodyOut.seekp(0, std::ios_base::end);
-                            }
-                        }
-                    }
-                    cppBodyOut << castLine;
-                }
-                rsBodyOut << rsRet << " " << fnName << "(";
-            }
-            for (std::size_t i = 0; i < rsParams.size(); ++i) {
-                if (i != 0) rsBodyOut << ", ";
-                rsBodyOut << rsParams[i].first << " " << rsParams[i].second;
-            }
-            rsBodyOut << ") { " << dummyRsReturn(rsRet) << " }\n";
-            continue;
-        }
-        updateBraceDepth(line);
-    }
-
-    std::ostringstream cppOut;
-    cppOut << "// Auto-generated RealScript C++ Binding Registration & Zero-Copy ECS Helpers\n";
-    cppOut << "#pragma once\n\n";
-    cppOut << "#include <cstddef>\n";
-    cppOut << "#include <type_traits>\n";
-    cppOut << "#include <vector>\n";
-    cppOut << "#include \"realscript/game/GameScripting.h\"\n\n";
-    if (!cppHelpersOut.str().empty()) {
-        cppOut << cppHelpersOut.str();
-    }
-    cppOut << "inline void registerGeneratedHeaderBindings(realscript::game::GameApi& api) {\n";
-    cppOut << "    (void)api;\n";
-    cppOut << cppBodyOut.str();
-    cppOut << "}\n";
-
-    std::ostringstream rsOut;
-    rsOut << "// Auto-generated RealScript Stub from C++ Header\n";
-    rsOut << "module " << defaultModuleName << ";\n";
-    if (usesMathTypes && defaultModuleName != "RealScript.Math") {
-        rsOut << "import RealScript.Math;\n";
-    }
-    rsOut << "\n" << rsBodyOut.str();
-
-    res.cppRegistrationSource = cppOut.str();
-    res.scriptDeclarationStub = rsOut.str();
-    return res;
+    const std::string& defaultModuleName,
+    const std::unordered_map<std::string, std::string>& predefinedMacros) {
+    return rsbind_detail::generateFromParsedHeader(
+        headerContent,
+        defaultModuleName,
+        predefinedMacros);
 }
 
 GameCompileResult GameScriptCompiler::compile(

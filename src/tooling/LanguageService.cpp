@@ -161,19 +161,48 @@ LanguageService::DocHeaderInfo LanguageService::parseDocHeader(const Document& d
 
 namespace {
 
+bool endsWithIgnoreCase(std::string_view text, std::string_view lowerSuffix) noexcept {
+    if (text.size() < lowerSuffix.size()) return false;
+    const std::size_t offset = text.size() - lowerSuffix.size();
+    for (std::size_t i = 0; i < lowerSuffix.size(); ++i) {
+        char ch = text[offset + i];
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        if (ch != lowerSuffix[i]) return false;
+    }
+    return true;
+}
+
 bool hasRealScriptExtension(const std::filesystem::path& p) {
     const std::string filename = p.filename().string();
-    if (filename.size() >= 5 && filename.compare(filename.size() - 5, 5, ".d.rs") == 0) {
-        return true;
-    }
-    if (filename.size() >= 3 && filename.compare(filename.size() - 3, 3, ".rs") == 0) {
-        return true;
-    }
-    return false;
+    return endsWithIgnoreCase(filename, ".d.rscript") ||
+        endsWithIgnoreCase(filename, ".rscript");
 }
 
 bool isDeclarationStubPath(const std::string& path) noexcept {
-    return path.size() >= 5 && path.compare(path.size() - 5, 5, ".d.rs") == 0;
+    return endsWithIgnoreCase(path, ".d.rscript");
+}
+
+bool isAcceptedEditorDocumentPath(const std::string& normalizedPath) {
+    if (normalizedPath.empty()) return false;
+    if (normalizedPath.rfind("untitled:", 0) == 0 ||
+        normalizedPath.rfind("inmemory:", 0) == 0) {
+        const auto colon = normalizedPath.find(':');
+        const std::string tail = normalizedPath.substr(colon + 1);
+        const auto slash = tail.find_last_of('/');
+        const std::string base = (slash == std::string::npos) ? tail : tail.substr(slash + 1);
+        if (base.find('.') == std::string::npos) {
+            return !base.empty();
+        }
+        return endsWithIgnoreCase(base, ".d.rscript") ||
+            endsWithIgnoreCase(base, ".rscript");
+    }
+    if (hasRealScriptExtension(std::filesystem::path(normalizedPath))) {
+        return true;
+    }
+    return normalizedPath.find('/') == std::string::npos &&
+        normalizedPath.find('.') == std::string::npos;
 }
 
 bool shouldSkipDirectoryName(const std::string& dirName) noexcept {
@@ -213,6 +242,14 @@ bool isPathWithinRoot(const std::string& filePath, const std::string& rootPath) 
 
 std::string LanguageService::normalizeDocPath(const std::string& rawPath) {
     if (rawPath.empty()) return {};
+    if (rawPath.rfind("untitled:", 0) == 0 ||
+        rawPath.rfind("inmemory:", 0) == 0) {
+        std::string v = rawPath;
+        for (char& ch : v) {
+            if (ch == '\\') ch = '/';
+        }
+        return v;
+    }
     std::string p = uriToPath(rawPath);
     for (char& ch : p) {
         if (ch == '\\') ch = '/';
@@ -237,7 +274,11 @@ std::string LanguageService::normalizeDocPath(const std::string& rawPath) {
 }
 
 bool LanguageService::reloadDiskFileIntoWorkspace(const std::string& normalizedPath) {
-    if (normalizedPath.empty()) return false;
+    if (normalizedPath.empty() ||
+        normalizedPath.rfind("untitled:", 0) == 0 ||
+        normalizedPath.rfind("inmemory:", 0) == 0) {
+        return false;
+    }
     const std::filesystem::path fsPath(normalizedPath);
     if (!hasRealScriptExtension(fsPath)) return false;
     std::string diskContent;
@@ -251,6 +292,9 @@ bool LanguageService::reloadDiskFileIntoWorkspace(const std::string& normalizedP
 
 void LanguageService::open(std::string rawPath, std::string content, std::int64_t version) {
     const std::string path = normalizeDocPath(rawPath);
+    if (!isAcceptedEditorDocumentPath(path)) {
+        return;
+    }
     const bool existedInOpen = (documents_.find(path) != documents_.end());
     const bool existedInWorkspace = (workspaceDocuments_.find(path) != workspaceDocuments_.end());
     auto& doc = documents_[path];
@@ -274,6 +318,9 @@ bool LanguageService::applyContentChanges(
     const std::vector<ContentChange>& changes,
     std::int64_t version) {
     const std::string path = normalizeDocPath(rawPath);
+    if (!isAcceptedEditorDocumentPath(path)) {
+        return false;
+    }
     auto it = documents_.find(path);
     if (it == documents_.end()) {
         if (changes.empty()) return false;
@@ -333,6 +380,9 @@ std::string LanguageService::documentContent(const std::string& rawPath) const {
 
 void LanguageService::close(const std::string& rawPath) {
     const std::string path = normalizeDocPath(rawPath);
+    if (!isAcceptedEditorDocumentPath(path)) {
+        return;
+    }
     documents_.erase(path);
     // If the closed file exists on disk (either in an indexed workspace or standalone file),
     // reload its saved on-disk version into workspaceDocuments_ so modules importing it never break,
@@ -417,6 +467,7 @@ bool LanguageService::loadProjectConfigJson(
             if (entry.isString() && !baseFsPath.empty()) {
                 const std::filesystem::path relPath(entry.stringValue());
                 const std::filesystem::path fullPath = relPath.is_absolute() ? relPath : (baseFsPath / relPath);
+                if (!hasRealScriptExtension(fullPath)) continue;
                 std::string diskStub;
                 if (readFileContents(fullPath, diskStub)) {
                     const std::string key = normalizeDocPath(fullPath.generic_string());
@@ -434,6 +485,7 @@ bool LanguageService::loadProjectConfigJson(
                 const std::filesystem::path entryFsPath(resolvedKey);
                 const std::filesystem::path fullPath =
                     entryFsPath.is_absolute() ? entryFsPath : (baseFsPath / entryFsPath);
+                if (!hasRealScriptExtension(fullPath)) continue;
                 resolvedKey = normalizeDocPath(fullPath.generic_string());
                 if (contentVal && contentVal->isString()) {
                     initDocument(resolvedKey, contentVal->stringValue(), 1, ambientDocuments_[resolvedKey]);
@@ -445,6 +497,7 @@ bool LanguageService::loadProjectConfigJson(
                 }
             } else if (contentVal && contentVal->isString()) {
                 resolvedKey = normalizeDocPath(resolvedKey);
+                if (!hasRealScriptExtension(std::filesystem::path(resolvedKey))) continue;
                 initDocument(resolvedKey, contentVal->stringValue(), 1, ambientDocuments_[resolvedKey]);
             }
         }
@@ -506,7 +559,7 @@ std::size_t LanguageService::addWorkspaceRoot(const std::string& rawRootPath) {
         }
     }
 
-    // 2. Recursively scan workspace directory for .rs / .d.rs files and nested realscript.project.json
+    // 2. Recursively scan workspace directory for .rscript / .d.rscript files and nested realscript.project.json
     std::filesystem::recursive_directory_iterator it(
         fsRoot,
         std::filesystem::directory_options::skip_permission_denied,
@@ -793,7 +846,10 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
     while (!queue.empty()) {
         auto curr = std::move(queue.back());
         queue.pop_back();
-        if (curr == "RealScript.Math" || curr == "RealScript.Fiber") continue;
+        if (curr == "RealScript.Math" || curr == "RealScript.Fiber" ||
+            curr == "RealScript.Async" || curr == "RealScript.Resource") {
+            continue;
+        }
         if (!subgraphModules.insert(curr).second) continue;
         if (curr != dirtyMod && snapshot_.modules.find(curr) == snapshot_.modules.end()) {
             return false;

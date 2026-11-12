@@ -116,7 +116,7 @@ int nullLength()
 )";
 
 void testLanguageArrays() {
-    auto modules = compile({{"arrays.rs", arraySource}});
+    auto modules = compile({{"arrays.rscript", arraySource}});
     require(modules.size() == 1, "expected one array module");
     const auto& module = modules.front();
     require(module.version.major == 0 && module.version.minor == 7,
@@ -168,7 +168,7 @@ void testLanguageArrays() {
 
 void testArrayRuntimeErrors() {
     realscript::runtime::Interpreter interpreter(
-        compile({{"arrays.rs", arraySource}}));
+        compile({{"arrays.rscript", arraySource}}));
     const auto bounds = interpreter.invoke("Game.Arrays::outOfBounds");
     const auto negative = interpreter.invoke("Game.Arrays::negativeLength");
     const auto nullLength = interpreter.invoke("Game.Arrays::nullLength");
@@ -185,7 +185,7 @@ void testArrayRuntimeErrors() {
 
 void testArrayGcGraph() {
     realscript::runtime::Interpreter interpreter(
-        compile({{"arrays.rs", arraySource}}));
+        compile({{"arrays.rscript", arraySource}}));
     const auto result = interpreter.invoke("Game.Arrays::makeGraph");
     require(result.succeeded &&
             std::holds_alternative<realscript::runtime::ObjectRef>(result.value),
@@ -222,7 +222,7 @@ void testArrayGcGraph() {
 }
 
 void testArrayCodecAndVerifier() {
-    auto module = compile({{"arrays.rs", arraySource}}).front();
+    auto module = compile({{"arrays.rscript", arraySource}}).front();
     const auto encoded = realscript::bytecode::encodeModule(module);
     realscript::bytecode::Module decoded;
     realscript::diagnostics::DiagnosticBag decodeDiagnostics;
@@ -330,7 +330,7 @@ void testNativeHandleRegistry() {
     require(registry->liveCount() == 1, "native handle live count is incorrect");
 
     const auto handleModules = compile({{
-        "handles.rs",
+        "handles.rscript",
         R"(
 module Game.Handles;
 handle echo(handle value) { return value; }

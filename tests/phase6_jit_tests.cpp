@@ -29,12 +29,12 @@ std::vector<realscript::mir::Module> compileFixture() {
     realscript::compiler::Compilation compilation;
     const auto root = std::filesystem::path(REALSCRIPT_SOURCE_DIR);
     compilation.addSource({
-        "tests/fixtures/phase5_model.rs",
-        readFile(root / "tests/fixtures/phase5_model.rs"),
+        "tests/fixtures/phase5_model.rscript",
+        readFile(root / "tests/fixtures/phase5_model.rscript"),
     });
     compilation.addSource({
-        "tests/fixtures/phase5_app.rs",
-        readFile(root / "tests/fixtures/phase5_app.rs"),
+        "tests/fixtures/phase5_app.rscript",
+        readFile(root / "tests/fixtures/phase5_app.rscript"),
     });
     auto result = compilation.build();
     require(!result.diagnostics.hasErrors(), "JIT fixture failed to compile");
@@ -151,7 +151,7 @@ string makeBridgeLabel(string prefix)
 }
 )";
         realscript::compiler::Compilation comp;
-        comp.addSource({"jit_bridge.rs", bridgeSrc});
+        comp.addSource({"jit_bridge.rscript", bridgeSrc});
         auto built = comp.build();
         require(!built.diagnostics.hasErrors(), "JIT value bridge fixture failed to compile");
 

@@ -10,6 +10,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -20,6 +21,31 @@ std::string readFile(const std::string& path) {
     output << stream.rdbuf();
     return output.str();
 }
+bool endsWithIgnoreCase(std::string_view text, std::string_view lowerSuffix) noexcept {
+    if (text.size() < lowerSuffix.size()) return false;
+    const std::size_t offset = text.size() - lowerSuffix.size();
+    for (std::size_t i = 0; i < lowerSuffix.size(); ++i) {
+        char ch = text[offset + i];
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        if (ch != lowerSuffix[i]) return false;
+    }
+    return true;
+}
+
+bool hasValidScriptExtension(const std::string& path) noexcept {
+    return endsWithIgnoreCase(path, ".d.rscript") ||
+        endsWithIgnoreCase(path, ".rscript");
+}
+
+void requireScriptExtension(const std::string& path) {
+    if (!hasValidScriptExtension(path)) {
+        throw std::runtime_error(
+            "RealScript source files must use the .rscript or .d.rscript extension: " + path);
+    }
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -73,12 +99,13 @@ int main(int argc, char** argv) {
     }
 
     if (sourceFiles.empty()) {
-        std::cerr << "usage: rsdebug [--port <port>] [--host <ip>] [--heap-report <Module::func> [--json]] <file.rs>...\n";
+        std::cerr << "usage: rsdebug [--port <port>] [--host <ip>] [--heap-report <Module::func> [--json]] <file.rscript>...\n";
         return 2;
     }
     try {
         realscript::compiler::Compilation compilation;
         for (const auto& file : sourceFiles) {
+            requireScriptExtension(file);
             compilation.addSource({file, readFile(file)});
         }
         auto result = compilation.build();

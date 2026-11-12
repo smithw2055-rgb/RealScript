@@ -77,9 +77,9 @@ std::int64_t nativeComputeSum(std::int64_t n) {
 int main() {
     std::cout << "=== [Test 1] Zero-Budget AOT Trusted Release Mode vs RAW Mode ===\n";
     {
-        const std::string mathScript = readFixtureFile("tests/fixtures/aot_trusted_math_bench.rs");
+        const std::string mathScript = readFixtureFile("tests/fixtures/aot_trusted_math_bench.rscript");
 
-        compiler::Compilation comp({{"aot_trusted_math_bench.rs", mathScript}});
+        compiler::Compilation comp({{"aot_trusted_math_bench.rscript", mathScript}});
         auto res = comp.build();
         requireCond(!res.diagnostics.hasErrors(), "math_bench compile failed");
 
@@ -166,15 +166,15 @@ int main() {
 
     std::cout << "\n=== [Test 2] Zero-Copy Host C++ Contiguous Struct ECS Query (Interpreter & AOT) ===\n";
     {
-        const std::string ecsScript = readFixtureFile("tests/fixtures/aot_trusted_ecs_bench.rs");
+        const std::string ecsScript = readFixtureFile("tests/fixtures/aot_trusted_ecs_bench.rscript");
 
         game::GameApi api;
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"aot_trusted_ecs_bench.rs", ecsScript}});
+        auto compiled = compiler.compile({{"aot_trusted_ecs_bench.rscript", ecsScript}});
         requireCond(compiled.succeeded(), "ECS script compilation failed");
 
         {
-            compiler::Compilation ecsComp({{"aot_trusted_ecs_bench.rs", ecsScript}});
+            compiler::Compilation ecsComp({{"aot_trusted_ecs_bench.rscript", ecsScript}});
             auto ecsCompRes = ecsComp.build();
             requireCond(!ecsCompRes.diagnostics.hasErrors(), "ECS MIR compile failed");
 

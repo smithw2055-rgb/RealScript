@@ -58,7 +58,7 @@ bool containsDiagnostic(
 std::string lowerSource(
     const std::string& sourceText,
     realscript::diagnostics::DiagnosticBag& diagnostics,
-    const std::string& name = "test.rs") {
+    const std::string& name = "test.rscript") {
     realscript::text::SourceText source(sourceText, name);
     realscript::syntax::Parser parser(source, diagnostics);
     auto unit = parser.parseCompilationUnit();
@@ -74,14 +74,14 @@ std::string lowerSource(
 }
 
 void testSourceTextLineMap() {
-    realscript::text::SourceText source("first\r\nsecond\nthird", "lines.rs");
+    realscript::text::SourceText source("first\r\nsecond\nthird", "lines.rscript");
     require(source.lineCount() == 3, "line map must recognize CRLF and LF");
     const auto position = source.linePosition(8);
     require(position.line == 1 && position.column == 1, "line/column mapping is incorrect");
 }
 
 void testLexerRecognizesControlFlowKeywords() {
-    realscript::text::SourceText source("if else while", "lexer.rs");
+    realscript::text::SourceText source("if else while", "lexer.rscript");
     realscript::diagnostics::DiagnosticBag diagnostics;
     realscript::syntax::Lexer lexer(source, diagnostics);
     const auto tokens = lexer.lexAll();
@@ -94,7 +94,7 @@ void testLexerRecognizesControlFlowKeywords() {
 void testParserBuildsControlFlowAndAssignment() {
     realscript::text::SourceText source(
         "int choose(bool flag) { int value; if (flag) value = 1; else value = 2; while (value < 3) value = value + 1; return value; }",
-        "parser.rs");
+        "parser.rscript");
     realscript::diagnostics::DiagnosticBag diagnostics;
     realscript::syntax::Parser parser(source, diagnostics);
     auto unit = parser.parseCompilationUnit();
@@ -113,7 +113,7 @@ void testDefiniteAssignmentRejectsPartialBranch() {
     (void)lowerSource(
         "int choose(bool flag) { int value; if (flag) value = 1; return value; }",
         diagnostics,
-        "partial.rs");
+        "partial.rscript");
     require(containsDiagnostic(diagnostics, "RS2300"),
             "partially assigned local must produce RS2300");
 }
@@ -123,7 +123,7 @@ void testDefiniteAssignmentAcceptsBothBranches() {
     const auto mir = lowerSource(
         "int choose(bool flag) { int value; if (flag) value = 1; else value = 2; return value; }",
         diagnostics,
-        "complete.rs");
+        "complete.rscript");
     require(!diagnostics.hasErrors(), "both assignment branches must satisfy definite assignment");
     require(mir.find("store.local 1") != std::string::npos, "assignment must lower to local stores");
     require(mir.find("load.local 1") != std::string::npos, "return must load the mutable local");
@@ -134,7 +134,7 @@ void testAllPathReturnAnalysis() {
     (void)lowerSource(
         "int choose(bool flag) { if (flag) return 1; else return 2; }",
         completeDiagnostics,
-        "returns.rs");
+        "returns.rscript");
     require(!containsDiagnostic(completeDiagnostics, "RS2001"),
             "if/else returning on both paths must satisfy return analysis");
 
@@ -142,7 +142,7 @@ void testAllPathReturnAnalysis() {
     (void)lowerSource(
         "int choose(bool flag) { if (flag) return 1; }",
         missingDiagnostics,
-        "missing-return.rs");
+        "missing-return.rscript");
     require(containsDiagnostic(missingDiagnostics, "RS2001"),
             "reachable function end must produce RS2001");
 }
@@ -152,7 +152,7 @@ void testMultiBlockMirAndVerifier() {
     const auto mir = lowerSource(
         "int count(int value) { while (value > 0) value = value - 1; return value; }",
         diagnostics,
-        "loop.rs");
+        "loop.rscript");
     require(!diagnostics.hasErrors(), "loop MIR must pass structural verification");
     require(mir.find("br %") != std::string::npos, "loop MIR must contain a conditional branch");
     require(mir.find("jmp bb") != std::string::npos, "loop MIR must contain jumps");
@@ -164,7 +164,7 @@ void testShortCircuitUsesBlockParameter() {
     const auto mir = lowerSource(
         "bool guarded(bool enabled, int value) { return enabled && value > 0; }",
         diagnostics,
-        "short-circuit.rs");
+        "short-circuit.rscript");
     require(!diagnostics.hasErrors(), "short-circuit MIR must verify");
     require(mir.find("bb2(%") != std::string::npos, "short-circuit merge must use a block parameter");
     require(mir.find("and.bool") == std::string::npos, "short-circuit must not lower to eager and.bool");
@@ -176,7 +176,7 @@ void testShortCircuitAssignmentIsNotDefinite() {
     (void)lowerSource(
         "int guarded(bool enabled) { int value; bool used = enabled && (value = 1) > 0; return value; }",
         diagnostics,
-        "short-circuit-assignment.rs");
+        "short-circuit-assignment.rscript");
     require(containsDiagnostic(diagnostics, "RS2300"),
             "assignment in a conditional RHS must not be definitely assigned afterward");
 }
@@ -186,7 +186,7 @@ void testInfiniteLoopMakesEndpointUnreachable() {
     const auto mir = lowerSource(
         "int forever() { while (true) { } }",
         diagnostics,
-        "forever.rs");
+        "forever.rscript");
     require(!containsDiagnostic(diagnostics, "RS2001"),
             "literal infinite loop must make the function endpoint unreachable");
     require(!diagnostics.hasErrors(), "infinite loop MIR must verify");
@@ -237,10 +237,10 @@ void testVerifierHandlesMalformedOperands() {
 
 void testControlFlowSnapshot() {
     const std::string root = REALSCRIPT_SOURCE_DIR;
-    const auto source = readFile(root + "/tests/fixtures/control_flow.rs");
+    const auto source = readFile(root + "/tests/fixtures/control_flow.rscript");
     const auto expected = readFile(root + "/tests/snapshots/control_flow.mir.txt");
     realscript::diagnostics::DiagnosticBag diagnostics;
-    const auto actual = lowerSource(source, diagnostics, "control_flow.rs");
+    const auto actual = lowerSource(source, diagnostics, "control_flow.rscript");
     require(!diagnostics.hasErrors(), "control-flow fixture failed to compile");
     require(
         normalizeLineEndings(actual) == normalizeLineEndings(expected),

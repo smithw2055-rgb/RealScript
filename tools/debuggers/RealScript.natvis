@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+
+  <!-- RealScript 16-Byte Tagged Value (realscript::runtime::Value) -->
+  <Type Name="realscript::runtime::Value">
+    <DisplayString Condition="u_.monostateCell.vtag == 0">[uninitialized]</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 1">null (string)</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 2">null (object)</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 3">null (array)</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 4">{u_.boolCell.payload}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 5">(byte) {(unsigned int)u_.byteCell.payload.value}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 6">(sbyte) {(int)u_.sbyteCell.payload.value}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 7">(short) {u_.shortCell.payload.value}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 8">(ushort) {u_.ushortCell.payload.value}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 9">{u_.int64Cell.payload}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 10">{u_.uintCell.payload.value}u</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 11">{u_.longCell.payload.value}L</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 12">{u_.ulongCell.payload.value}UL</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 13">{u_.floatCell.payload.value}f</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 14">{u_.doubleCell.payload}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 15">(char) {u_.charCell.payload.value}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 16">Enum(typeId={u_.enumInlineCell.typeId,x}) = {u_.enumInlineCell.value32}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 17">{u_.fixedCell.payload}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 18">{u_.fixed16Cell.payload}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 19">{u_.vec2Cell.payload}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 20">{u_.vec3Cell.payload}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 21">Quat({(double)u_.quatInlineCell.x / 65536.0}, {(double)u_.quatInlineCell.y / 65536.0}, {(double)u_.quatInlineCell.z / 65536.0}, {(double)((int)((unsigned int)u_.quatInlineCell.w0 | ((unsigned int)u_.quatInlineCell.w1 &lt;&lt; 8) | ((unsigned int)u_.quatInlineCell.w2 &lt;&lt; 16) | (((u_.quatInlineCell.w2 &amp; 0x80) != 0) ? 0xff000000u : 0u))) / 65536.0})</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 22 &amp;&amp; (u_.nativeHandleCell.slot == 0xffffffffu || u_.nativeHandleCell.generation == 0 || u_.nativeHandleCell.registryId == 0 || u_.nativeHandleCell.typeIdx == 0)">null NativeHandle</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 22">NativeHandle(slot={u_.nativeHandleCell.slot}, gen={u_.nativeHandleCell.generation}, reg={u_.nativeHandleCell.registryId}, typeIdx={u_.nativeHandleCell.typeIdx})</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 23">EnumArena(idx={u_.arenaRefCell.arenaIdx})</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 24">QuatArena(idx={u_.arenaRefCell.arenaIdx})</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 25">{u_.structVal}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 26">{u_.stringVal}</DisplayString>
+    <DisplayString Condition="u_.monostateCell.vtag == 27">{u_.objectRef}</DisplayString>
+    <Expand>
+      <Item Name="[tag]">(realscript::runtime::ValueTag)u_.monostateCell.vtag</Item>
+      <Item Name="[bool]" Condition="u_.monostateCell.vtag == 4">u_.boolCell.payload</Item>
+      <Item Name="[int]" Condition="u_.monostateCell.vtag == 9">u_.int64Cell.payload</Item>
+      <Item Name="[long]" Condition="u_.monostateCell.vtag == 11">u_.longCell.payload.value</Item>
+      <Item Name="[float]" Condition="u_.monostateCell.vtag == 13">u_.floatCell.payload.value</Item>
+      <Item Name="[double]" Condition="u_.monostateCell.vtag == 14">u_.doubleCell.payload</Item>
+      <Item Name="[fixed]" Condition="u_.monostateCell.vtag == 17">u_.fixedCell.payload</Item>
+      <Item Name="[vec2]" Condition="u_.monostateCell.vtag == 19">u_.vec2Cell.payload</Item>
+      <Item Name="[vec3]" Condition="u_.monostateCell.vtag == 20">u_.vec3Cell.payload</Item>
+      <Item Name="[quat_x]" Condition="u_.monostateCell.vtag == 21">(double)u_.quatInlineCell.x / 65536.0</Item>
+      <Item Name="[quat_y]" Condition="u_.monostateCell.vtag == 21">(double)u_.quatInlineCell.y / 65536.0</Item>
+      <Item Name="[quat_z]" Condition="u_.monostateCell.vtag == 21">(double)u_.quatInlineCell.z / 65536.0</Item>
+      <Item Name="[quat_w]" Condition="u_.monostateCell.vtag == 21">(double)((int)((unsigned int)u_.quatInlineCell.w0 | ((unsigned int)u_.quatInlineCell.w1 &lt;&lt; 8) | ((unsigned int)u_.quatInlineCell.w2 &lt;&lt; 16) | (((u_.quatInlineCell.w2 &amp; 0x80) != 0) ? 0xff000000u : 0u))) / 65536.0</Item>
+      <Item Name="[quat_signW]" Condition="u_.monostateCell.vtag == 21">(u_.quatInlineCell.w2 &amp; 0x80) != 0 ? -1 : 1</Item>
+      <Item Name="[struct]" Condition="u_.monostateCell.vtag == 25">u_.structVal</Item>
+      <Item Name="[string]" Condition="u_.monostateCell.vtag == 26">u_.stringVal</Item>
+      <Item Name="[object]" Condition="u_.monostateCell.vtag == 27">u_.objectRef</Item>
+    </Expand>
+  </Type>
+
+  <Type Name="realscript::runtime::StringValue">
+    <DisplayString Condition="ptr != nullptr">{*ptr}</DisplayString>
+    <DisplayString Condition="ptr == nullptr">"" (internId={id})</DisplayString>
+    <Expand>
+      <Item Name="text" Condition="ptr != nullptr">*ptr</Item>
+      <Item Name="internId">id</Item>
+    </Expand>
+  </Type>
+
+  <Type Name="realscript::runtime::ObjectRef">
+    <DisplayString Condition="slot == 0xffffffffu || generation == 0 || heapId == 0">null ObjectRef</DisplayString>
+    <DisplayString>{kind} [slot={slot}, gen={generation}, heap={heapId}]</DisplayString>
+    <Expand>
+      <Item Name="kind">kind</Item>
+      <Item Name="slot">slot</Item>
+      <Item Name="generation">generation</Item>
+      <Item Name="heapId">heapId</Item>
+    </Expand>
+  </Type>
+
+  <Type Name="realscript::runtime::StructValue">
+    <DisplayString Condition="typeId == 0">invalid StructValue</DisplayString>
+    <DisplayString Condition="isInline">Struct(typeId={typeId,x}, inlineFields={(int)inlineCount})</DisplayString>
+    <DisplayString>Struct(typeId={typeId,x}, heapHandle={storage.raw_,x})</DisplayString>
+    <Expand>
+      <Item Name="typeId">typeId,x</Item>
+      <Item Name="isInline">isInline</Item>
+      <Item Name="inlineFieldCount">(int)inlineCount</Item>
+      <Item Name="storageHandle">storage.raw_,x</Item>
+    </Expand>
+  </Type>
+
+  <Type Name="realscript::runtime::InlineStructSlot">
+    <DisplayString Condition="kind == realscript::runtime::InlineStructSlot::Kind::None">[empty]</DisplayString>
+    <DisplayString Condition="kind == realscript::runtime::InlineStructSlot::Kind::Int">{(int)lo}</DisplayString>
+    <DisplayString Condition="kind == realscript::runtime::InlineStructSlot::Kind::Bool">{lo != 0}</DisplayString>
+    <DisplayString Condition="kind == realscript::runtime::InlineStructSlot::Kind::Float">{*(float*)&amp;lo}f</DisplayString>
+    <DisplayString>{kind} (lo={lo}, hi={hi})</DisplayString>
+  </Type>
+
+  <!-- Deterministic Fixed-Point & Spatial Math Primitives (Q16.16 = 65536.0) -->
+  <Type Name="realscript::runtime::FixedValue">
+    <DisplayString>{(double)raw / 65536.0} (raw={raw})</DisplayString>
+  </Type>
+
+  <Type Name="realscript::runtime::Fixed16Value">
+    <DisplayString>{(double)raw / 65536.0} (raw64={raw})</DisplayString>
+  </Type>
+
+  <Type Name="realscript::runtime::Vec2Value">
+    <DisplayString>({(double)x / 65536.0}, {(double)y / 65536.0})</DisplayString>
+    <Expand>
+      <Item Name="x">(double)x / 65536.0</Item>
+      <Item Name="y">(double)y / 65536.0</Item>
+      <Item Name="raw_x">x</Item>
+      <Item Name="raw_y">y</Item>
+    </Expand>
+  </Type>
+
+  <Type Name="realscript::runtime::Vec3Value">
+    <DisplayString>({(double)x / 65536.0}, {(double)y / 65536.0}, {(double)z / 65536.0})</DisplayString>
+    <Expand>
+      <Item Name="x">(double)x / 65536.0</Item>
+      <Item Name="y">(double)y / 65536.0</Item>
+      <Item Name="z">(double)z / 65536.0</Item>
+      <Item Name="raw_x">x</Item>
+      <Item Name="raw_y">y</Item>
+      <Item Name="raw_z">z</Item>
+    </Expand>
+  </Type>
+
+  <Type Name="realscript::runtime::QuatValue">
+    <DisplayString>({(double)x / 65536.0}, {(double)y / 65536.0}, {(double)z / 65536.0}, {(double)w / 65536.0})</DisplayString>
+    <Expand>
+      <Item Name="x">(double)x / 65536.0</Item>
+      <Item Name="y">(double)y / 65536.0</Item>
+      <Item Name="z">(double)z / 65536.0</Item>
+      <Item Name="w">(double)w / 65536.0</Item>
+    </Expand>
+  </Type>
+
+  <Type Name="realscript::runtime::AwaitableHandle">
+    <DisplayString Condition="slot == 0xffffffffu || version == 0">invalid AwaitableHandle</DisplayString>
+    <DisplayString Condition="slot == 0xfffffffeu &amp;&amp; version == 1">CompletedVoid Awaitable</DisplayString>
+    <DisplayString>Awaitable(slot={slot}, ver={version})</DisplayString>
+  </Type>
+
+  <Type Name="realscript::runtime::CancellationToken">
+    <DisplayString Condition="ctsSlot == 0xffffffffu || version == 0">CancellationToken::None</DisplayString>
+    <DisplayString Condition="ctsSlot == 0xfffffffeu &amp;&amp; version == 1">CancellationToken::PreCanceled</DisplayString>
+    <DisplayString>CancellationToken(slot={ctsSlot}, ver={version})</DisplayString>
+  </Type>
+
+</AutoVisualizer>

@@ -5,6 +5,24 @@ remain versioned but unfrozen until a future 1.0 release.
 
 ## [Unreleased]
 
+### Sprint 2 Architecture Evolution
+
+- **Per-Instance Heap Pools & Nanosecond Incremental GC Budget (`perf_3`)**: Removed process-wide `poolGcMutex` contention across `ManagedHeap` object/array allocations and GC mark/sweep cycles; each `ManagedHeap` owns cache-line-aligned synchronization and private slot/buffer pools (while process-shared `ValuePool` arenas coordinate brief mutator safe-point sweeps only when pool pin-reclamation triggers), plus `collectIncrementalWithBudget(roots, ns/us)` time-sliced GC APIs.
+- **Flattened Scene Lifecycle Hot Path (`perf_4`)**: Replaced unconditional per-frame `cachedTickOrder_` copies and repeated entity/component hash lookups in `SceneScriptRuntime` (`fixedUpdate`/`update`/`lateUpdate`) with compact `FlatLifecycleSlot` tables, structural generation tracking, and `lifecycleHotPathStats()`.
+- **AST-Hygienic Generics & Reference-Type AOT Code Folding (`lang_3`)**: Rebuilt user generic specialization around span-preserving AST cloning (zero diagnostic line drift), lexical defining-module symbol hygiene across modules, and shared reference-type C++ bodies (`shared_ref_generic_*`) in `AotCpp` reducing multi-instantiation AOT code size by >25%.
+- **Deterministic `using` Statements & Unified `Resource` Model (`lang_4`)**: Added C#-style `using (...) { ... }` and `using var x = ...;` lowered to deterministic LIFO `try`/`finally` `Dispose()` across normal, `return`, `break`/`continue`, and exception paths, paired with built-in `IDisposable`, `Resource`, `ResourceHandle<T>`, `ResourceServer`, and C++ host `realscript::game::ResourceRegistry` (`ResourceHandle.h`).
+- **Hot-Reload In-Flight Coroutine Preservation (`eff_1`)**: Computed deterministic 64-bit state-machine structural fingerprints across `Awaitable` coroutines, `sequence` state machines, and `FiberScheduler` modules so `SceneScriptRuntime::hotReload` preserves and remaps unchanged suspended frames instead of unconditionally aborting all frames.
+- **Modular `publicFingerprint` Disk Build Cache (`eff_2`)**: Added `ModuleBuildCache` and `--cache-dir` / `--cache-stats` on `rsc` and `rsaot`, separating `publicFingerprint` from `implementationFingerprint` with cross-module generic specialization preservation, `RealScript.Resource` built-in caching, unified cross-module `-O2` optimization, and checksum self-healing.
+- **Stable `AssetGuid` & Git-Merge-Friendly Scene/Prefab Format (`eff_3`)**: Added deterministic 128-bit UUID v5 `AssetGuid`, `AssetGuidRegistry` (`[Guid("...")]` & rename-resilient rebinding), and sorted line-oriented `serializeSceneText` / `deserializeSceneText` and `serializePrefabText` / `deserializePrefabText` formats verified under 3-way `git merge-file`.
+
+### Sprint 1 Architecture Evolution & Tooling Hardening
+
+- **Exclusive `.rscript` / `.d.rscript` File Extension Cutover**: Migrated all script sources, fixtures, benchmarks, CMake AOT helpers, CLI tools (`rsc`, `rsaot`, `rsbind`, `rsdebug`, `rslsp`, `rsbench`), `LanguageService`, and `vscode-realscript` exclusively to `.rscript` and `.d.rscript`, eliminating file-association and LSP conflicts with Rust (`.rs`).
+- **Self-Contained Single-File C++ Declaration Parser (`RsBindParser.h`)**: Replaced the line-based regex/string scanner in `GameApi::generateBindingsFromCppHeader` and `rsbind` with a zero-dependency C++17 preprocessor (`#define`, `#undef`, `#ifdef`, `#ifndef`, `#if`/`#elif`/`#else` short-circuit constant-expression evaluator + CLI `-D`/`-U` flags), tokenizer (`[[...]]` / `__declspec` / `alignas` stripping, nested `>>` template splitting), and recursive-descent declaration AST parser supporting nested namespaces, `using`/`typedef` aliases, base class inheritance, two-pass property getter type inference, trailing return types (`auto -> T`), and automatic overload disambiguation.
+- **Zero-Allocation Collection `struct` Enumerators, Indexers & $O(1)$ Removal**: Converted `List<T>`, `Queue<T>`, `Stack<T>`, `HashSet<T>`, and `Dictionary<K, V>` enumerators from heap classes to value-type `struct`s, enabled zero-heap-allocation `foreach` fast paths, added `Dictionary` indexer writes (`dict[k] = v`) and `Count`/`Capacity`/`IsEmpty` property access, made `Clear()` capacity-preserving without heap reallocation, and replaced $O(N)$ shift+rehash `Remove` in `HashSet`/`Dictionary` with $O(1)$ expected-time Swap-and-Pop bucket relinking.
+- **DAP Watch Hierarchical Object Expansion & C++17 AOT Debugger Visualizers**: Upgraded `DapServer` `evaluate` to return live dynamic `variablesReference` IDs (`>= 1000000`) and exact script type names for objects, structs, arrays, logical `List`/`Queue`/`Stack`/`HashSet`/`Dictionary` views, and `Vec2`/`Vec3`/`Quat` math values; added Visual Studio `tools/debuggers/RealScript.natvis`, LLDB `tools/debuggers/realscript_lldb.py`, and field-name comments on generated AOT `AotStruct_<id>` types.
+- **Dual-Track Coroutine Documentation Sync (Phases 25–28)**: Documented the architectural split between `sequence` (deterministic tick simulation & `RSGS` rollback snapshots) and `RealScript.Async` `async`/`await` (`Awaitable<T>`, `CancellationToken`, 4 main-thread frame queues for streaming, save-game, and HTTP/WebSocket I/O), plus `$"..."` string interpolation.
+
 ## [0.98.0] - 2026-11-09
 
 v0.98.0 represents the major Game Engine Integration Evolution release, bringing deep parity with modern engine scripting workflows (Godot/Unity), flat-frame high-throughput VM execution, automated C++ binding generation (`rsbind`), zero-budget trusted AOT, native fast-paths, advanced DAP/LSP tooling, and zero-copy ECS architecture.
@@ -18,7 +36,7 @@ v0.98.0 represents the major Game Engine Integration Evolution release, bringing
 - Introduced **Small Buffer Optimization (SBO) for HeapObject**: optimized short strings and small inline objects to eliminate heap allocations for transient operations.
 - Added **Native Fast-Path & Identity Cache**: fast O(1) bi-directional C++ host object mapping and bypassing reflection thunks for hot-path method calls.
 - Flattened `SceneScriptRuntime` dispatch for direct invocation without intermediary bridge wrappers.
-- Compacted `runtime::Value` to 24 bytes (`PooledStringValue`, `PooledStructValue`, `PooledClosureValue`) and `bytecode::Instruction` to 8 bytes, added quickened integer-loop bytecode superinstructions (`AddIntLocalConst`, `SubIntLocalConst`, `LessIntLocalConstBranch`), and integrated `ValuePoolArena::collectGarbage` into `ManagedHeap::collect`.
+- Compacted `runtime::Value` to 16 bytes and `bytecode::Instruction` to 8 bytes, added quickened integer-loop bytecode superinstructions (`AddIntLocalConst`, `SubIntLocalConst`, `LessIntLocalConstBranch`), and integrated `ValuePoolArena::collectGarbage` into `ManagedHeap::collect`.
 
 ### C++17 AOT & Native Performance
 
@@ -34,7 +52,7 @@ v0.98.0 represents the major Game Engine Integration Evolution release, bringing
 - Added **`rsbind` Auto-Binding Generator CLI Tool & Custom C++ Value-Type Struct Marshaling**: parses C++ headers (including `RS_EXPORT_STRUCT`, `RS_EXPORT_CONSTRUCTOR`, `static` methods, `static_cast<...>` overload disambiguation, and `std::vector<T>` / template parameter lists) to automatically generate type-safe bindings (`GameApi::structType<S>`, `NativeStructBuilder<S>::field<&S::f>`, `NativeTypeBuilder::constructor<Args...>`, `staticMethod<M>`, same-name function/method/constructor overloading via signature-keyed `__ov*` native thunks, and `std::vector<T>` <-> `T[]` marshaling), method thunks, and ECS raw column helpers.
 - Extended `Query<...>()` ECS chunk queries with multi-entity Sparse-Set intersection joins (`setEcsEntityComponent`, `getEcsEntityComponent`, `hasEcsEntityComponent`, `removeEcsEntityComponent`, `destroyEcsEntity`), `With<T>` / `Without<U>` filter clauses, optional leading `int entityId` iteration bindings, and `EntityCommandBuffer` (ECB) deferred structural mutation queues.
 - Extended `RealScript.Physics` and `SceneScriptRuntime` with 3D fixed-point colliders (`Box3D`, `Sphere3D`, `Capsule3D`), `stepPhysics3D`, spatial queries (`raycast3D`, `raycastAll3D`, `overlapSphere3D`), 3D collision/trigger callbacks (`OnCollisionEnter3D`/`Stay3D`/`Exit3D`, `OnTriggerEnter3D`/`Stay3D`/`Exit3D`), generational entity handles, and deferred entity destruction.
-- Upgraded 12-byte `InlineStructSlot` bit-packing to support `Vec3`, `Quat`, and `Enum` fields inline inside `runtime::StructValue` without increasing `sizeof(InlineStructSlot)` (12B) or `sizeof(Value)` (24B), with in-place slot updates in `Opcode::StoreStructField`.
+- Upgraded 12-byte `InlineStructSlot` bit-packing to support `Vec3`, `Quat`, and `Enum` fields inline inside `runtime::StructValue` without increasing `sizeof(InlineStructSlot)` (12B) or `sizeof(Value)` (16B), with in-place slot updates in `Opcode::StoreStructField`.
 - Added `[ExportGroup]` / `[ExportSubgroup]` / `[ExportCategory]` inspector schema grouping, and `[FormerlySerializedAs]` static field rename migration.
 
 ### Language & Type System
@@ -51,7 +69,7 @@ v0.98.0 represents the major Game Engine Integration Evolution release, bringing
 - Enhanced **LSP Language Server (`rslsp`)**: incremental `ParseSnapshot` cache, incremental subgraph metadata rebuild cache, fast symbol-id navigation, member dot-completion, signature help, and async request bridging.
 - Published official **VS Code Extension (`vscode-realscript`)**: complete syntax highlighting, LSP client integration, and DAP launch/attach debugger configurations.
 - Extended `DebugController`, `DebugSession`, and `DapServer` with conditional breakpoints (`BreakpointSpec`, `setConditionalBreakpoints`), hot-reload `requestedLine` / `requestedColumn` breakpoint preservation (preventing downward drift on rebind), same-line sequence-point re-entry suppression, and side-effect-free watch/hover expression evaluation.
-- Extended `GameApi::exportDeclarationStub()` (`.d.rs`), `LanguageService` (`realscript.project.json`, ambient sources, member `.` dot-completion, and `signatureHelp`), and `LspServer` (`textDocument/signatureHelp`).
+- Extended `GameApi::exportDeclarationStub()` (`.d.rscript`), `LanguageService` (`realscript.project.json`, ambient sources, member `.` dot-completion, and `signatureHelp`), and `LspServer` (`textDocument/signatureHelp`).
 - Added `exportChromeTraceJson` to export `ExecutionProfile` and `GcStatistics` in Chrome Tracing / Perfetto (`traceEvents`) JSON format.
 
 ### Compatibility
@@ -178,7 +196,7 @@ v0.98.0 represents the major Game Engine Integration Evolution release, bringing
   expression evaluation (`evaluate` supporting locals, parameters, `this`
   fields, nested struct/object fields, array indexing, `.Length`, arithmetic,
   comparisons, and boolean operators).
-- Extended `GameApi::exportDeclarationStub()` (`.d.rs`), `LanguageService`
+- Extended `GameApi::exportDeclarationStub()` (`.d.rscript`), `LanguageService`
   (`realscript.project.json`, ambient sources, member `.` dot-completion, and
   `signatureHelp`), and `LspServer` (`textDocument/signatureHelp`).
 - Added `exportChromeTraceJson` to export `ExecutionProfile` and `GcStatistics`

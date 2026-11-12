@@ -37,14 +37,44 @@ std::optional<std::shared_ptr<T>> readNativeObject(
         return std::nullopt;
     }
     const auto handle = std::get<runtime::NativeHandle>(*handleValue);
-    if (*actualType != type->typeId && handle.typeId != type->typeId) {
-        setTypeMismatch(error, "script native-object wrapper has the wrong type");
-        return std::nullopt;
+    if (handle.typeId == type->typeId) {
+        auto resource = state->nativeHandles->resolve(
+            handle, type->typeId, &error);
+        if (!resource) return std::nullopt;
+        return std::static_pointer_cast<T>(std::move(resource));
     }
-    auto resource = state->nativeHandles->resolve(
-        handle, type->typeId, &error);
-    if (!resource) return std::nullopt;
-    return std::static_pointer_cast<T>(std::move(resource));
+
+    // Check registered native C++ inheritance chain (Derived -> ... -> T)
+    const NativeTypeDeclaration* derivedDecl = nullptr;
+    for (const auto& candidate : state->nativeTypes) {
+        if (candidate.typeId == handle.typeId) {
+            derivedDecl = &candidate;
+            break;
+        }
+    }
+    if (derivedDecl && derivedDecl->baseCppType.has_value()) {
+        auto rawResource = state->nativeHandles->resolve(handle, handle.typeId, &error);
+        if (!rawResource) return std::nullopt;
+        const NativeTypeDeclaration* cursor = derivedDecl;
+        std::size_t hops = 0;
+        while (cursor && cursor->baseCppType.has_value() && cursor->upcastToBase &&
+               hops < state->nativeTypes.size()) {
+            rawResource = cursor->upcastToBase(rawResource);
+            const auto baseIt = state->nativeTypeByCppType.find(*cursor->baseCppType);
+            if (baseIt == state->nativeTypeByCppType.end()) {
+                cursor = nullptr;
+                break;
+            }
+            cursor = &state->nativeTypes[baseIt->second];
+            if (cursor->typeId == type->typeId) {
+                return std::static_pointer_cast<T>(std::move(rawResource));
+            }
+            ++hops;
+        }
+    }
+
+    setTypeMismatch(error, "script native-object wrapper has the wrong type");
+    return std::nullopt;
 }
 
 inline runtime::Value makeFixedStructValue(Fixed value) {
@@ -627,18 +657,19 @@ std::optional<runtime::Value> invokeFree(
     }
 }
 
-template <auto Method, typename Traits, std::size_t... Indices>
+template <typename ReceiverType, auto Method, typename Traits, std::size_t... Indices>
 std::optional<runtime::Value> invokeMethod(
     const std::shared_ptr<GameApiState>& state,
     runtime::ValueSpan arguments,
     runtime::RuntimeError& error,
     std::index_sequence<Indices...>) {
-    using Class = typename Traits::Class;
+    static_assert(std::is_base_of_v<typename Traits::Class, ReceiverType>,
+        "receiver type must match or derive from member function class");
     if (arguments.size() != sizeof...(Indices) + 1) {
         setInvalidArguments(error, "native method received the wrong argument count");
         return std::nullopt;
     }
-    const auto receiver = readNativeObject<Class>(state, arguments.front(), error);
+    const auto receiver = readNativeObject<ReceiverType>(state, arguments.front(), error);
     if (!receiver || !*receiver) {
         if (error.code == runtime::ErrorCode::None) {
             error.code = runtime::ErrorCode::NullReference;

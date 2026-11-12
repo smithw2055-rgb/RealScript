@@ -252,6 +252,10 @@ struct BytecodeStringPool {
         std::string storage[kPageSize];
     };
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
     struct alignas(64) Shard {
         std::mutex writeMutex;
         std::atomic<StringPage*> pages[kMaxPagesPerShard]{};
@@ -259,6 +263,9 @@ struct BytecodeStringPool {
         std::unordered_map<std::string_view, std::uint32_t> indexByView;
         std::uint32_t nextSlot = 0u;
     };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
     std::string emptyString_{};
     Shard shards_[kShardCount]{};

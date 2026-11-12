@@ -86,7 +86,7 @@ Rejected changes return structured issue kinds for invalid bytecode, module-set 
 
 ```bash
 # Compile sources and start a DAP server on stdin/stdout
-rsdebug game.rs scripts/common.rs
+rsdebug game.rscript scripts/common.rscript
 
 # Start the LSP server on stdin/stdout
 rslsp

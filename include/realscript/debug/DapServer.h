@@ -18,6 +18,8 @@ namespace realscript::debug {
 
 class DapServer {
 public:
+    static constexpr std::int64_t kFirstChildVariablesReference = 1000000;
+
     explicit DapServer(
         std::shared_ptr<const runtime::ProgramImage> program,
         std::shared_ptr<runtime::ManagedHeap> heap = {});
@@ -54,7 +56,10 @@ private:
     void emitStopped(std::ostream& output);
     void emitTerminated(std::ostream& output);
     void rebuildVariableReferences();
-    [[nodiscard]] std::int64_t registerExpandableValue(const runtime::Value& value);
+    [[nodiscard]] std::int64_t registerExpandableValue(
+        const runtime::Value& value,
+        std::uint32_t ownerFrameId = 1u);
+    [[nodiscard]] std::string describeValueType(const runtime::Value& value, semantic::PrimitiveType fallback = semantic::PrimitiveType::Error) const;
     void collectActiveStackValues(std::vector<runtime::Value>& outValues) const;
     [[nodiscard]] std::string describeHeapObject(
         const runtime::HeapObjectInfo& obj) const;
@@ -70,8 +75,9 @@ private:
     std::atomic<std::uint32_t> sequence_{1};
     std::unordered_map<std::int64_t, std::vector<DebugVariable>> variables_;
     std::unordered_map<std::int64_t, runtime::ObjectRef> childOwnerObjects_;
+    std::unordered_map<std::int64_t, std::uint32_t> variableFrameIds_;
     std::optional<runtime::HeapSnapshot> baselineSnapshot_;
-    std::int64_t nextChildRef_ = 1000;
+    std::int64_t nextChildRef_ = kFirstChildVariablesReference;
 };
 
 class EmbeddedDapServer {

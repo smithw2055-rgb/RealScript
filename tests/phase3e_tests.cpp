@@ -139,7 +139,7 @@ long longOverflow()
 )";
 
 void testNumericEnumAndStructExecution() {
-    auto modules = compile({{"values.rs", valueSource}});
+    auto modules = compile({{"values.rscript", valueSource}});
     require(modules.size() == 1, "expected one Phase 3E module");
     const auto& module = modules.front();
     require(module.version.major == 0 && module.version.minor == 7,
@@ -190,7 +190,7 @@ void testNumericEnumAndStructExecution() {
 }
 
 void testNestedStructReferencesArePreciseRoots() {
-    auto modules = compile({{"graph.rs", R"(
+    auto modules = compile({{"graph.rscript", R"(
 module Phase3E.Graph;
 class Node { int value; }
 struct Holder
@@ -256,7 +256,7 @@ Holder create()
 }
 
 void testValueTypeDiagnostics() {
-    const auto recursive = build({{"recursive.rs", R"(
+    const auto recursive = build({{"recursive.rscript", R"(
 module Phase3E.Invalid;
 struct A { B value; }
 struct B { A value; }
@@ -265,7 +265,7 @@ struct B { A value; }
             hasDiagnostic(recursive, "RS2487"),
         "recursive struct layout was not rejected");
 
-    const auto mutation = build({{"mutation.rs", R"(
+    const auto mutation = build({{"mutation.rscript", R"(
 module Phase3E.InvalidMutation;
 struct Counter
 {
@@ -276,7 +276,7 @@ struct Counter
     require(!mutation.diagnostics.hasErrors(),
         "Phase 23 mutable struct receiver regressed declaration binding");
 
-    const auto setter = build({{"setter.rs", R"(
+    const auto setter = build({{"setter.rscript", R"(
 module Phase3E.InvalidProperty;
 struct Item { int Value { get; set; } }
 )"}});
@@ -285,7 +285,7 @@ struct Item { int Value { get; set; } }
         "struct property setter was silently accepted");
 
 
-    const auto enumOverflow = build({{"enum-overflow.rs", R"(
+    const auto enumOverflow = build({{"enum-overflow.rscript", R"(
 module Phase3E.InvalidEnum;
 enum Limits
 {
@@ -299,7 +299,7 @@ enum Limits
 }
 
 void testValueCodecAndVerifier() {
-    auto module = compile({{"values.rs", valueSource}}).front();
+    auto module = compile({{"values.rscript", valueSource}}).front();
     const auto encoded = realscript::bytecode::encodeModule(module);
     realscript::bytecode::Module decoded;
     realscript::diagnostics::DiagnosticBag diagnostics;

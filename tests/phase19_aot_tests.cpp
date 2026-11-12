@@ -29,9 +29,9 @@ std::string readFile(const std::string& path) {
 
 std::vector<realscript::bytecode::Module> compileFixture() {
     const auto path = std::string(REALSCRIPT_SOURCE_DIR) +
-        "/tests/fixtures/phase19_aot.rs";
+        "/tests/fixtures/phase19_aot.rscript";
     realscript::compiler::Compilation compilation({{
-        "tests/fixtures/phase19_aot.rs", readFile(path),
+        "tests/fixtures/phase19_aot.rscript", readFile(path),
     }});
     auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),

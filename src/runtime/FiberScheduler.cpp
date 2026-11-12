@@ -15,6 +15,230 @@ namespace realscript::runtime {
 
 using Opcode = FiberOpcode;
 
+namespace {
+
+void hashFiberMix64(std::uint64_t& h, std::uint64_t v) noexcept {
+    h ^= v;
+    h *= 1099511628211ULL;
+}
+
+void hashFiberString(std::uint64_t& h, const std::string& s) noexcept {
+    hashFiberMix64(h, static_cast<std::uint64_t>(s.size()));
+    for (const char ch : s) {
+        h ^= static_cast<unsigned char>(ch);
+        h *= 1099511628211ULL;
+    }
+}
+
+std::string stripModulePrefix(const std::string& name) {
+    const auto pos = name.find("::");
+    return pos == std::string::npos ? name : name.substr(pos + 2u);
+}
+
+constexpr std::uint32_t nextNonZeroFiberVersion(std::uint32_t v) noexcept {
+    ++v;
+    return v == 0u ? 1u : v;
+}
+
+constexpr std::uint64_t packScheduledFiber(std::uint32_t id, std::uint32_t epoch) noexcept {
+    return (static_cast<std::uint64_t>(epoch) << 32u) | static_cast<std::uint64_t>(id);
+}
+
+constexpr std::uint32_t unpackScheduledFiberId(std::uint64_t packed) noexcept {
+    return static_cast<std::uint32_t>(packed & 0xFFFFFFFFULL);
+}
+
+constexpr std::uint32_t unpackScheduledFiberEpoch(std::uint64_t packed) noexcept {
+    return static_cast<std::uint32_t>(packed >> 32u);
+}
+
+} // namespace
+
+std::vector<FiberStateMachineFingerprint> FiberCompiler::computeModuleFingerprints(
+    const CompiledFiberModule& module) {
+    // Deduplicate alias keys (`fn` and `mod::fn`) sharing the same entry PC.
+    std::unordered_map<std::uint32_t, std::string> bestNameByStartPc;
+    for (const auto& kv : module.entryPoints) {
+        auto it = bestNameByStartPc.find(kv.second);
+        if (it == bestNameByStartPc.end()) {
+            bestNameByStartPc.emplace(kv.second, kv.first);
+        } else {
+            const bool candidateHasQual = kv.first.find("::") != std::string::npos;
+            const bool curHasQual = it->second.find("::") != std::string::npos;
+            if ((candidateHasQual && !curHasQual) ||
+                (candidateHasQual == curHasQual && kv.first < it->second)) {
+                it->second = kv.first;
+            }
+        }
+    }
+
+    std::vector<FiberStateMachineFingerprint> fps;
+    fps.reserve(bestNameByStartPc.size());
+    const auto streamSize = static_cast<std::uint32_t>(module.instructions.size());
+    for (const auto& kv : bestNameByStartPc) {
+        FiberStateMachineFingerprint fp;
+        fp.entryPc = kv.first;
+        fp.endPc = streamSize;
+        fp.shortName = stripModulePrefix(kv.second);
+        fp.canonicalName = !module.moduleName.empty()
+            ? (module.moduleName + "::" + fp.shortName)
+            : kv.second;
+        fps.push_back(std::move(fp));
+    }
+
+    std::sort(fps.begin(), fps.end(), [](const FiberStateMachineFingerprint& a, const FiberStateMachineFingerprint& b) {
+        if (a.entryPc != b.entryPc) return a.entryPc < b.entryPc;
+        return a.canonicalName < b.canonicalName;
+    });
+
+    std::unordered_map<std::uint32_t, std::string> shortNameByEntryPc;
+    shortNameByEntryPc.reserve(fps.size());
+    for (const auto& fp : fps) {
+        shortNameByEntryPc.emplace(fp.entryPc, fp.shortName);
+    }
+
+    const auto resolveTargetLabel = [&](std::uint32_t targetPc) -> std::string {
+        const auto tit = shortNameByEntryPc.find(targetPc);
+        if (tit != shortNameByEntryPc.end()) {
+            return tit->second;
+        }
+        return "@pc:" + std::to_string(targetPc);
+    };
+
+    for (std::size_t i = 0; i < fps.size(); ++i) {
+        fps[i].functionIndex = static_cast<std::uint32_t>(i);
+        if (i + 1 < fps.size()) {
+            fps[i].endPc = fps[i + 1].entryPc;
+        }
+        fps[i].instructionCount = (fps[i].endPc >= fps[i].entryPc)
+            ? (fps[i].endPc - fps[i].entryPc)
+            : 0u;
+
+        std::uint8_t regMask = 0;
+        std::uint32_t ordinal = 0;
+        std::uint32_t callOrdinal = 0;
+        std::uint64_t seqHash = 14695981039346656037ULL;
+        hashFiberMix64(seqHash, fps[i].instructionCount);
+
+        for (std::uint32_t pc = fps[i].entryPc; pc < fps[i].endPc && pc < streamSize; ++pc) {
+            const auto& ins = module.instructions[pc];
+            const std::uint32_t relPc = pc - fps[i].entryPc;
+            hashFiberMix64(seqHash, relPc);
+            hashFiberMix64(seqHash, static_cast<std::uint64_t>(ins.opcode));
+
+            switch (ins.opcode) {
+            case Opcode::LoadInt:
+            case Opcode::LoadFixed24_8:
+                if (ins.regOrSlot < 8u) regMask |= static_cast<std::uint8_t>(1u << ins.regOrSlot);
+                break;
+            case Opcode::MoveReg:
+                if (ins.regOrSlot < 8u) regMask |= static_cast<std::uint8_t>(1u << ins.regOrSlot);
+                regMask |= static_cast<std::uint8_t>(1u << (ins.regs.srcA & 7u));
+                break;
+            case Opcode::Add:
+            case Opcode::Sub:
+            case Opcode::Mul:
+            case Opcode::Div:
+            case Opcode::Mod:
+            case Opcode::CmpEq:
+            case Opcode::CmpNe:
+            case Opcode::CmpLt:
+            case Opcode::CmpLe:
+            case Opcode::CmpGt:
+            case Opcode::CmpGe:
+                if (ins.regOrSlot < 8u) regMask |= static_cast<std::uint8_t>(1u << ins.regOrSlot);
+                regMask |= static_cast<std::uint8_t>(1u << (ins.regs.srcA & 7u));
+                regMask |= static_cast<std::uint8_t>(1u << (ins.regs.srcB & 7u));
+                break;
+            case Opcode::Jump:
+            case Opcode::RandJump:
+                hashFiberMix64(
+                    seqHash,
+                    (ins.imm32 >= fps[i].entryPc && ins.imm32 <= fps[i].endPc)
+                        ? static_cast<std::uint64_t>(ins.imm32 - fps[i].entryPc)
+                        : (0x80000000ULL | static_cast<std::uint64_t>(ins.imm32)));
+                break;
+            case Opcode::JumpIfZero:
+            case Opcode::JumpIfNonZero:
+                regMask |= static_cast<std::uint8_t>(1u << (ins.regOrSlot & 7u));
+                hashFiberMix64(
+                    seqHash,
+                    (ins.imm32 >= fps[i].entryPc && ins.imm32 <= fps[i].endPc)
+                        ? static_cast<std::uint64_t>(ins.imm32 - fps[i].entryPc)
+                        : (0x80000000ULL | static_cast<std::uint64_t>(ins.imm32)));
+                break;
+            case Opcode::HostCondJump:
+                hashFiberMix64(
+                    seqHash,
+                    (ins.regOrSlot >= fps[i].entryPc && ins.regOrSlot <= fps[i].endPc)
+                        ? static_cast<std::uint64_t>(ins.regOrSlot - fps[i].entryPc)
+                        : (0x80000000ULL | static_cast<std::uint64_t>(ins.regOrSlot)));
+                break;
+            case Opcode::Call: {
+                FiberCallSiteDesc cs;
+                cs.ordinal = callOrdinal++;
+                cs.relativeCallPc = relPc;
+                cs.relativeReturnPc = (pc + 1u) - fps[i].entryPc;
+                cs.targetShortName = resolveTargetLabel(ins.imm32);
+                hashFiberString(seqHash, cs.targetShortName);
+                fps[i].callSites.push_back(std::move(cs));
+                break;
+            }
+            case Opcode::YieldTicks:
+            case Opcode::YieldUntilPredicate:
+            case Opcode::ForkFiber: {
+                FiberSuspensionPointDesc sp;
+                sp.ordinal = ordinal++;
+                sp.opcode = ins.opcode;
+                sp.relativeResumePc = (pc + 1u) - fps[i].entryPc;
+                sp.flags = ins.flags;
+                sp.regOrSlot = (ins.opcode == Opcode::YieldUntilPredicate) ? ins.regOrSlot : 0u;
+                sp.imm32 = (ins.opcode == Opcode::YieldUntilPredicate) ? ins.imm32 : 0u;
+                if (ins.opcode == Opcode::ForkFiber) {
+                    sp.targetShortName = resolveTargetLabel(ins.imm32);
+                    hashFiberString(seqHash, sp.targetShortName);
+                }
+                fps[i].suspensionPoints.push_back(std::move(sp));
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        if (seqHash == 0) seqHash = 1;
+        fps[i].exactInstructionSequenceHash = seqHash;
+        fps[i].usedRegisterMask = regMask;
+
+        std::uint64_t h = 14695981039346656037ULL;
+        hashFiberString(h, fps[i].shortName);
+        hashFiberMix64(h, regMask);
+        hashFiberMix64(h, fps[i].suspensionPoints.size());
+        for (const auto& sp : fps[i].suspensionPoints) {
+            hashFiberMix64(h, sp.ordinal);
+            hashFiberMix64(h, static_cast<std::uint64_t>(sp.opcode));
+            hashFiberMix64(h, sp.relativeResumePc);
+            if (sp.opcode == Opcode::YieldUntilPredicate) {
+                hashFiberMix64(h, sp.flags);
+                hashFiberMix64(h, sp.regOrSlot);
+                hashFiberMix64(h, sp.imm32);
+            } else if (sp.opcode == Opcode::ForkFiber) {
+                hashFiberString(h, sp.targetShortName);
+            }
+        }
+        hashFiberMix64(h, fps[i].callSites.size());
+        for (const auto& cs : fps[i].callSites) {
+            hashFiberMix64(h, cs.ordinal);
+            hashFiberMix64(h, cs.relativeCallPc);
+            hashFiberMix64(h, cs.relativeReturnPc);
+            hashFiberString(h, cs.targetShortName);
+        }
+        if (h == 0) h = 1;
+        fps[i].structuralHash = h;
+    }
+
+    return fps;
+}
+
 struct FiberScheduler::ParallelWorkerPool {
     std::mutex dispatchMutex;
     std::mutex mutex;
@@ -145,66 +369,118 @@ bool FiberScheduler::reloadProgram(
     return true;
 }
 
-bool FiberScheduler::reloadModule(
+FiberHotReloadReport FiberScheduler::reloadModuleWithReport(
     std::uint32_t programId,
     const CompiledFiberModule& oldModule,
     const CompiledFiberModule& newModule) {
+    FiberHotReloadReport report;
     if (programId == 0 || programId >= programs_.size() || newModule.instructions.empty()) {
-        return false;
-    }
-    struct FuncRange {
-        std::string name;
-        std::uint32_t startPc = 0;
-        std::uint32_t endPc = 0;
-    };
-    std::vector<FuncRange> oldRanges;
-    oldRanges.reserve(oldModule.entryPoints.size());
-    for (const auto& kv : oldModule.entryPoints) {
-        oldRanges.push_back(FuncRange{kv.first, kv.second, static_cast<std::uint32_t>(oldModule.instructions.size())});
-    }
-    std::sort(oldRanges.begin(), oldRanges.end(), [](const FuncRange& a, const FuncRange& b) {
-        return a.startPc < b.startPc;
-    });
-    for (std::size_t i = 0; i + 1 < oldRanges.size(); ++i) {
-        oldRanges[i].endPc = oldRanges[i + 1].startPc;
+        return report;
     }
 
-    std::vector<FuncRange> newRanges;
-    newRanges.reserve(newModule.entryPoints.size());
-    for (const auto& kv : newModule.entryPoints) {
-        newRanges.push_back(FuncRange{kv.first, kv.second, static_cast<std::uint32_t>(newModule.instructions.size())});
-    }
-    std::sort(newRanges.begin(), newRanges.end(), [](const FuncRange& a, const FuncRange& b) {
-        return a.startPc < b.startPc;
-    });
-    for (std::size_t i = 0; i + 1 < newRanges.size(); ++i) {
-        newRanges[i].endPc = newRanges[i + 1].startPc;
-    }
-    std::unordered_map<std::string, FuncRange> newRangeByName;
-    for (const auto& nr : newRanges) {
-        newRangeByName.emplace(nr.name, nr);
+    const auto oldFps = FiberCompiler::computeModuleFingerprints(oldModule);
+    const auto newFps = FiberCompiler::computeModuleFingerprints(newModule);
+
+    std::unordered_map<std::string, const FiberStateMachineFingerprint*> newByShortName;
+    newByShortName.reserve(newFps.size());
+    for (const auto& nfp : newFps) {
+        newByShortName.emplace(nfp.shortName, &nfp);
     }
 
-    const auto remapPc = [&](std::uint32_t oldPc) -> std::uint32_t {
-        for (const auto& orng : oldRanges) {
-            if (oldPc >= orng.startPc && oldPc < orng.endPc) {
-                const auto nit = newRangeByName.find(orng.name);
-                if (nit != newRangeByName.end()) {
-                    const std::uint32_t relOffset = oldPc - orng.startPc;
-                    const std::uint32_t candidate = nit->second.startPc + relOffset;
-                    if (candidate < nit->second.endPc) {
-                        return candidate;
-                    }
-                    return nit->second.startPc;
+    for (const auto& ofp : oldFps) {
+        const auto nit = newByShortName.find(ofp.shortName);
+        if (nit != newByShortName.end() && ofp.matchesLayout(*nit->second)) {
+            report.remappedFunctionIndices[ofp.functionIndex] = nit->second->functionIndex;
+        }
+    }
+
+    const auto tryRemapPc = [&](const FiberContext& fiber,
+                                std::uint32_t oldPc,
+                                bool isCallReturnAddr,
+                                std::uint32_t& outNewPc) -> bool {
+        for (const auto& ofp : oldFps) {
+            if (oldPc >= ofp.entryPc && oldPc < ofp.endPc) {
+                const auto nit = newByShortName.find(ofp.shortName);
+                if (nit == newByShortName.end()) {
+                    return false;
                 }
-                return 0u;
+                const auto& nfp = *nit->second;
+                if (!ofp.matchesLayout(nfp)) {
+                    return false;
+                }
+                const std::uint32_t relOffset = oldPc - ofp.entryPc;
+                if (isCallReturnAddr) {
+                    for (std::size_t k = 0; k < ofp.callSites.size(); ++k) {
+                        if (ofp.callSites[k].relativeReturnPc == relOffset) {
+                            if (k >= nfp.callSites.size()) return false;
+                            const auto& ocs = ofp.callSites[k];
+                            const auto& ncs = nfp.callSites[k];
+                            if (ocs.relativeCallPc != ncs.relativeCallPc ||
+                                ocs.relativeReturnPc != ncs.relativeReturnPc ||
+                                ocs.targetShortName != ncs.targetShortName) {
+                                return false;
+                            }
+                            if (ncs.targetShortName.rfind("@pc:", 0) != 0 &&
+                                newByShortName.find(ncs.targetShortName) == newByShortName.end()) {
+                                return false;
+                            }
+                            outNewPc = nfp.entryPc + ncs.relativeReturnPc;
+                            return outNewPc < nfp.endPc;
+                        }
+                    }
+                    return false;
+                }
+                if (oldPc == ofp.entryPc) {
+                    outNewPc = nfp.entryPc;
+                    return true;
+                }
+                for (std::size_t k = 0; k < ofp.suspensionPoints.size(); ++k) {
+                    if (ofp.suspensionPoints[k].relativeResumePc == relOffset) {
+                        if (k >= nfp.suspensionPoints.size()) return false;
+                        const auto& osp = ofp.suspensionPoints[k];
+                        const auto& nsp = nfp.suspensionPoints[k];
+                        if (osp.opcode != nsp.opcode ||
+                            osp.relativeResumePc != nsp.relativeResumePc) {
+                            return false;
+                        }
+                        if (fiber.status == FiberStatus::WaitingPredicate) {
+                            if (nsp.opcode != Opcode::YieldUntilPredicate ||
+                                nsp.flags != fiber.waitPredicateChannel ||
+                                nsp.regOrSlot != fiber.waitTargetKey ||
+                                nsp.imm32 != fiber.waitRequiredValue) {
+                                return false;
+                            }
+                        }
+                        outNewPc = nfp.entryPc + nsp.relativeResumePc;
+                        return outNewPc < nfp.endPc;
+                    }
+                }
+                // Mid-slice preempted fiber (not at entryPc or suspension point):
+                // only preserve if exact instruction sequence skeleton is unchanged.
+                if (ofp.instructionCount == nfp.instructionCount &&
+                    ofp.exactInstructionSequenceHash == nfp.exactInstructionSequenceHash) {
+                    const std::uint32_t candidate = nfp.entryPc + relOffset;
+                    if (candidate < nfp.endPc) {
+                        outNewPc = candidate;
+                        return true;
+                    }
+                }
+                return false;
             }
         }
-        return oldPc < newModule.instructions.size() ? oldPc : 0u;
+        if (oldFps.empty() && !isCallReturnAddr &&
+            oldModule.instructions.size() == newModule.instructions.size() &&
+            oldPc < newModule.instructions.size()) {
+            outNewPc = oldPc;
+            return true;
+        }
+        return false;
     };
 
     programs_[programId] = newModule.instructions;
     externalStreamCache_[programId] = nullptr;
+
+    std::vector<std::uint32_t> fibersToAbort;
     for (std::size_t i = 1; i < fibers_.size(); ++i) {
         auto& f = fibers_[i];
         if (f.programId != programId ||
@@ -212,12 +488,39 @@ bool FiberScheduler::reloadModule(
             f.status == FiberStatus::Terminated) {
             continue;
         }
-        f.pc = remapPc(f.pc);
-        for (std::uint8_t d = 0; d < f.callDepth && d < f.callStack.size(); ++d) {
-            f.callStack[d] = remapPc(f.callStack[d]);
+        std::uint32_t mappedPc = 0;
+        bool valid = tryRemapPc(f, f.pc, false, mappedPc);
+        std::array<std::uint32_t, 8> mappedCallStack = f.callStack;
+        for (std::uint8_t d = 0; valid && d < f.callDepth && d < f.callStack.size(); ++d) {
+            valid = tryRemapPc(f, f.callStack[d], true, mappedCallStack[d]);
+        }
+        if (valid) {
+            f.pc = mappedPc;
+            f.callStack = mappedCallStack;
+            ++report.preservedFibers;
+        } else {
+            fibersToAbort.push_back(static_cast<std::uint32_t>(i));
         }
     }
-    return true;
+
+    for (const std::uint32_t fid : fibersToAbort) {
+        if (fid < fibers_.size() &&
+            fibers_[fid].status != FiberStatus::Inactive &&
+            fibers_[fid].status != FiberStatus::Terminated) {
+            killFiberTree(fid);
+            ++report.abortedFibers;
+        }
+    }
+
+    report.succeeded = true;
+    return report;
+}
+
+bool FiberScheduler::reloadModule(
+    std::uint32_t programId,
+    const CompiledFiberModule& oldModule,
+    const CompiledFiberModule& newModule) {
+    return reloadModuleWithReport(programId, oldModule, newModule).succeeded;
 }
 
 std::uint32_t FiberScheduler::spawnFiberByProgram(
@@ -228,17 +531,31 @@ std::uint32_t FiberScheduler::spawnFiberByProgram(
     std::uint32_t parentFiberId,
     std::uint32_t seed) {
     std::uint32_t id = 0;
+    std::uint32_t nextGen = 1u;
+    std::uint32_t nextEpoch = 1u;
     if (!freeFiberIds_.empty()) {
         id = freeFiberIds_.back();
         freeFiberIds_.pop_back();
+        nextGen = fibers_[id].generation == 0u ? 1u : fibers_[id].generation;
+        nextEpoch = nextNonZeroFiberVersion(fibers_[id].scheduleEpoch);
     } else {
         id = static_cast<std::uint32_t>(fibers_.size());
         fibers_.push_back(FiberContext{});
     }
 
+    const std::uint32_t parentGen =
+        (parentFiberId > 0 && parentFiberId < fibers_.size() &&
+         fibers_[parentFiberId].status != FiberStatus::Inactive &&
+         fibers_[parentFiberId].status != FiberStatus::Terminated)
+            ? fibers_[parentFiberId].generation
+            : 0u;
+
     FiberContext ctx{};
     ctx.fiberId = id;
+    ctx.generation = nextGen;
     ctx.parentFiberId = parentFiberId;
+    ctx.parentGeneration = parentGen;
+    ctx.scheduleEpoch = nextEpoch;
     ctx.programId = programId;
     ctx.boundEntity = entity;
     ctx.ownerGroupId = ownerGroupId;
@@ -248,7 +565,7 @@ std::uint32_t FiberScheduler::spawnFiberByProgram(
     ctx.prng.seed(seed ^ (id * 0x9E3779B9u));
 
     fibers_[id] = ctx;
-    readyQueue_.push_back(id);
+    readyQueue_.push_back(packScheduledFiber(id, ctx.scheduleEpoch));
     return id;
 }
 
@@ -299,10 +616,9 @@ bool FiberScheduler::interruptFiber(std::uint32_t fiberId, std::uint32_t newEntr
     f.pc = newEntryPc;
     f.callDepth = 0;
     f.waitPredicateChannel = 0;
-    if (f.status != FiberStatus::Ready) {
-        f.status = FiberStatus::Ready;
-        readyQueue_.push_back(fiberId);
-    }
+    f.scheduleEpoch = nextNonZeroFiberVersion(f.scheduleEpoch);
+    f.status = FiberStatus::Ready;
+    readyQueue_.push_back(packScheduledFiber(fiberId, f.scheduleEpoch));
     return true;
 }
 
@@ -312,12 +628,16 @@ void FiberScheduler::killFiberTree(std::uint32_t rootFiberId) noexcept {
         fibers_[rootFiberId].status == FiberStatus::Inactive) {
         return;
     }
+    const std::uint32_t killedGen = fibers_[rootFiberId].generation;
     fibers_[rootFiberId].status = FiberStatus::Terminated;
     fibers_[rootFiberId].unbreakableSection = false;
+    fibers_[rootFiberId].generation = nextNonZeroFiberVersion(killedGen);
+    fibers_[rootFiberId].scheduleEpoch = nextNonZeroFiberVersion(fibers_[rootFiberId].scheduleEpoch);
     freeFiberIds_.push_back(rootFiberId);
 
     for (std::size_t i = 1; i < fibers_.size(); ++i) {
         if (fibers_[i].parentFiberId == rootFiberId &&
+            (fibers_[i].parentGeneration == 0u || fibers_[i].parentGeneration == killedGen) &&
             fibers_[i].status != FiberStatus::Terminated &&
             fibers_[i].status != FiberStatus::Inactive) {
             killFiberTree(static_cast<std::uint32_t>(i));
@@ -354,10 +674,12 @@ std::size_t FiberScheduler::killEntityFibersBySlot(std::uint32_t entitySlot) noe
 }
 
 void FiberScheduler::scheduleAtTick(std::uint32_t fiberId, std::uint32_t wakeTick) {
-    fibers_[fiberId].status = FiberStatus::SleepingTicks;
-    fibers_[fiberId].wakeTick = wakeTick;
+    auto& f = fibers_[fiberId];
+    f.status = FiberStatus::SleepingTicks;
+    f.wakeTick = wakeTick;
+    f.scheduleEpoch = nextNonZeroFiberVersion(f.scheduleEpoch);
     std::size_t slot = static_cast<std::size_t>(wakeTick) & WHEEL_MASK;
-    timingWheel_[slot].push_back(fiberId);
+    timingWheel_[slot].push_back(packScheduledFiber(fiberId, f.scheduleEpoch));
 }
 
 std::uint64_t FiberScheduler::stepTick(std::uint32_t currentTick) {
@@ -369,16 +691,19 @@ std::uint64_t FiberScheduler::stepTick(std::uint32_t currentTick) {
     auto& bucket = timingWheel_[slot];
     std::size_t writeIdx = 0;
     for (std::size_t i = 0; i < bucket.size(); ++i) {
-        const std::uint32_t fid = bucket[i];
-        if (fid >= fibers_.size()) continue;
+        const std::uint64_t entry = bucket[i];
+        const std::uint32_t fid = unpackScheduledFiberId(entry);
+        const std::uint32_t epoch = unpackScheduledFiberEpoch(entry);
+        if (fid == 0 || fid >= fibers_.size()) continue;
         auto& f = fibers_[fid];
-        if (f.status == FiberStatus::SleepingTicks) {
+        if (f.status == FiberStatus::SleepingTicks && f.scheduleEpoch == epoch) {
             if (f.wakeTick <= currentTick) {
                 f.status = FiberStatus::Ready;
-                readyQueue_.push_back(fid);
+                f.scheduleEpoch = nextNonZeroFiberVersion(f.scheduleEpoch);
+                readyQueue_.push_back(packScheduledFiber(fid, f.scheduleEpoch));
             } else {
                 // Multi-rotation long wait (> 4096 ticks) compacted in-place without heap allocation
-                bucket[writeIdx++] = fid;
+                bucket[writeIdx++] = entry;
             }
         }
     }
@@ -386,10 +711,12 @@ std::uint64_t FiberScheduler::stepTick(std::uint32_t currentTick) {
 
     // 2. Drain readyQueue_ (note: ForkFiber may append new child fibers during loop)
     for (std::size_t idx = 0; idx < readyQueue_.size(); ++idx) {
-        std::uint32_t fid = readyQueue_[idx];
+        const std::uint64_t entry = readyQueue_[idx];
+        const std::uint32_t fid = unpackScheduledFiberId(entry);
+        const std::uint32_t epoch = unpackScheduledFiberEpoch(entry);
         if (fid == 0 || fid >= fibers_.size()) continue;
         auto& fiber = fibers_[fid];
-        if (fiber.status != FiberStatus::Ready) continue;
+        if (fiber.status != FiberStatus::Ready || fiber.scheduleEpoch != epoch) continue;
         executeFiberSlice(fiber, currentTick, instrExecuted);
     }
     readyQueue_.clear();
@@ -409,15 +736,18 @@ std::uint64_t FiberScheduler::stepTickParallel(
     auto& bucket = timingWheel_[slot];
     std::size_t writeIdx = 0;
     for (std::size_t i = 0; i < bucket.size(); ++i) {
-        const std::uint32_t fid = bucket[i];
-        if (fid >= fibers_.size()) continue;
+        const std::uint64_t entry = bucket[i];
+        const std::uint32_t fid = unpackScheduledFiberId(entry);
+        const std::uint32_t epoch = unpackScheduledFiberEpoch(entry);
+        if (fid == 0 || fid >= fibers_.size()) continue;
         auto& f = fibers_[fid];
-        if (f.status == FiberStatus::SleepingTicks) {
+        if (f.status == FiberStatus::SleepingTicks && f.scheduleEpoch == epoch) {
             if (f.wakeTick <= currentTick) {
                 f.status = FiberStatus::Ready;
-                readyQueue_.push_back(fid);
+                f.scheduleEpoch = nextNonZeroFiberVersion(f.scheduleEpoch);
+                readyQueue_.push_back(packScheduledFiber(fid, f.scheduleEpoch));
             } else {
-                bucket[writeIdx++] = fid;
+                bucket[writeIdx++] = entry;
             }
         }
     }
@@ -426,10 +756,12 @@ std::uint64_t FiberScheduler::stepTickParallel(
     if (readyQueue_.size() < 2) {
         std::uint64_t instrExecuted = 0;
         for (std::size_t idx = 0; idx < readyQueue_.size(); ++idx) {
-            std::uint32_t fid = readyQueue_[idx];
+            const std::uint64_t entry = readyQueue_[idx];
+            const std::uint32_t fid = unpackScheduledFiberId(entry);
+            const std::uint32_t epoch = unpackScheduledFiberEpoch(entry);
             if (fid == 0 || fid >= fibers_.size()) continue;
             auto& fiber = fibers_[fid];
-            if (fiber.status != FiberStatus::Ready) continue;
+            if (fiber.status != FiberStatus::Ready || fiber.scheduleEpoch != epoch) continue;
             executeFiberSlice(fiber, currentTick, instrExecuted);
         }
         readyQueue_.clear();
@@ -438,6 +770,7 @@ std::uint64_t FiberScheduler::stepTickParallel(
 
     struct DeferredFiberOutcome {
         std::uint32_t fiberId = 0;
+        std::uint32_t expectedEpoch = 0;
         std::uint64_t instructions = 0;
         bool sleepScheduled = false;
         std::uint32_t wakeTick = 0;
@@ -451,18 +784,21 @@ std::uint64_t FiberScheduler::stepTickParallel(
         std::uint32_t forkSeed = 0;
     };
 
-    const std::vector<std::uint32_t> batch = readyQueue_;
+    const std::vector<std::uint64_t> batch = readyQueue_;
     readyQueue_.clear();
     std::vector<DeferredFiberOutcome> outcomes(batch.size());
     std::mutex hostMutex;
 
     const auto runIsolatedFiber = [&](std::size_t batchIndex) {
-        const std::uint32_t fid = batch[batchIndex];
+        const std::uint64_t entry = batch[batchIndex];
+        const std::uint32_t fid = unpackScheduledFiberId(entry);
+        const std::uint32_t epoch = unpackScheduledFiberEpoch(entry);
         auto& out = outcomes[batchIndex];
         out.fiberId = fid;
+        out.expectedEpoch = epoch;
         if (fid == 0 || fid >= fibers_.size()) return;
         auto& fiber = fibers_[fid];
-        if (fiber.status != FiberStatus::Ready) return;
+        if (fiber.status != FiberStatus::Ready || fiber.scheduleEpoch != epoch) return;
         if (fiber.programId == 0 || fiber.programId >= programs_.size()) {
             out.killed = true;
             return;
@@ -684,6 +1020,8 @@ std::uint64_t FiberScheduler::stepTickParallel(
     std::uint64_t totalInstr = 0;
     for (const auto& out : outcomes) {
         totalInstr += out.instructions;
+        if (out.fiberId == 0 || out.fiberId >= fibers_.size()) continue;
+        if (fibers_[out.fiberId].scheduleEpoch != out.expectedEpoch) continue;
         if (out.killed) {
             killFiberTree(out.fiberId);
             continue;
@@ -692,7 +1030,9 @@ std::uint64_t FiberScheduler::stepTickParallel(
             scheduleAtTick(out.fiberId, out.wakeTick);
         }
         if (out.predicateWait) {
-            predicateWaitList_.push_back(out.fiberId);
+            auto& wf = fibers_[out.fiberId];
+            wf.scheduleEpoch = nextNonZeroFiberVersion(wf.scheduleEpoch);
+            predicateWaitList_.push_back(packScheduledFiber(out.fiberId, wf.scheduleEpoch));
         }
         if (out.forked) {
             spawnFiberByProgram(
@@ -706,10 +1046,12 @@ std::uint64_t FiberScheduler::stepTickParallel(
     }
 
     for (std::size_t idx = 0; idx < readyQueue_.size(); ++idx) {
-        std::uint32_t fid = readyQueue_[idx];
+        const std::uint64_t entry = readyQueue_[idx];
+        const std::uint32_t fid = unpackScheduledFiberId(entry);
+        const std::uint32_t epoch = unpackScheduledFiberEpoch(entry);
         if (fid == 0 || fid >= fibers_.size()) continue;
         auto& fiber = fibers_[fid];
-        if (fiber.status != FiberStatus::Ready) continue;
+        if (fiber.status != FiberStatus::Ready || fiber.scheduleEpoch != epoch) continue;
         executeFiberSlice(fiber, currentTick, totalInstr);
     }
     readyQueue_.clear();
@@ -914,7 +1256,8 @@ void FiberScheduler::executeFiberSlice(
             fiber.waitPredicateChannel = ins.flags;
             fiber.waitTargetKey = ins.regOrSlot;
             fiber.waitRequiredValue = ins.imm32;
-            predicateWaitList_.push_back(fiber.fiberId);
+            fiber.scheduleEpoch = nextNonZeroFiberVersion(fiber.scheduleEpoch);
+            predicateWaitList_.push_back(packScheduledFiber(fiber.fiberId, fiber.scheduleEpoch));
             return;
         }
 
@@ -968,21 +1311,24 @@ std::uint32_t FiberScheduler::notifyBlackboardEvent(
     std::uint16_t targetKey,
     std::uint32_t currentValue) {
     std::uint32_t woken = 0;
-    std::vector<std::uint32_t> stillWaiting;
-    for (std::uint32_t fid : predicateWaitList_) {
+    std::vector<std::uint64_t> stillWaiting;
+    for (const std::uint64_t entry : predicateWaitList_) {
+        const std::uint32_t fid = unpackScheduledFiberId(entry);
+        const std::uint32_t epoch = unpackScheduledFiberEpoch(entry);
         if (fid == 0 || fid >= fibers_.size()) continue;
         auto& f = fibers_[fid];
-        if (f.status != FiberStatus::WaitingPredicate) continue;
+        if (f.status != FiberStatus::WaitingPredicate || f.scheduleEpoch != epoch) continue;
         if (f.ownerGroupId == ownerGroupId &&
             f.waitPredicateChannel == predicateChannel &&
             f.waitTargetKey == targetKey &&
             currentValue >= f.waitRequiredValue) {
             f.status = FiberStatus::Ready;
             f.waitPredicateChannel = 0;
-            readyQueue_.push_back(fid);
+            f.scheduleEpoch = nextNonZeroFiberVersion(f.scheduleEpoch);
+            readyQueue_.push_back(packScheduledFiber(fid, f.scheduleEpoch));
             ++woken;
         } else {
-            stillWaiting.push_back(fid);
+            stillWaiting.push_back(entry);
         }
     }
     predicateWaitList_.swap(stillWaiting);
@@ -1055,13 +1401,16 @@ void FiberScheduler::restoreBinarySnapshot(const std::vector<std::uint8_t>& snap
     for (auto& slot : timingWheel_) slot.clear();
 
     for (std::uint32_t i = 1; i < count; ++i) {
-        const auto& f = fibers_[i];
+        auto& f = fibers_[i];
+        if (f.generation == 0u) f.generation = 1u;
+        if (f.scheduleEpoch == 0u) f.scheduleEpoch = 1u;
+        const std::uint64_t entry = packScheduledFiber(i, f.scheduleEpoch);
         if (f.status == FiberStatus::Ready) {
-            readyQueue_.push_back(i);
+            readyQueue_.push_back(entry);
         } else if (f.status == FiberStatus::SleepingTicks) {
-            timingWheel_[static_cast<std::size_t>(f.wakeTick) & WHEEL_MASK].push_back(i);
+            timingWheel_[static_cast<std::size_t>(f.wakeTick) & WHEEL_MASK].push_back(entry);
         } else if (f.status == FiberStatus::WaitingPredicate) {
-            predicateWaitList_.push_back(i);
+            predicateWaitList_.push_back(entry);
         } else {
             freeFiberIds_.push_back(i);
         }

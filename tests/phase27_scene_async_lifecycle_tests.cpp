@@ -130,7 +130,7 @@ public class LevelDirector {
     require(game::installSceneComponentBindings(api, scene), "installSceneComponentBindings failed");
 
     game::GameScriptCompiler compiler(api);
-    const auto compiled = compiler.compile({{"phase27_scene.rs", scriptSource}});
+    const auto compiled = compiler.compile({{"phase27_scene.rscript", scriptSource}});
     require(compiled.succeeded(), "compile failed:\n" + diagnosticsText(compiled.diagnostics));
     runtime.replaceProgram(compiled.program);
 
@@ -291,7 +291,7 @@ public class SaveWriterComponent {
 )RS";
 
     game::GameScriptCompiler compiler(api);
-    const auto compiled = compiler.compile({{"phase27_cancel.rs", scriptSource}});
+    const auto compiled = compiler.compile({{"phase27_cancel.rscript", scriptSource}});
     require(compiled.succeeded(), "compile failed:\n" + diagnosticsText(compiled.diagnostics));
     runtime.replaceProgram(compiled.program);
 
@@ -410,7 +410,7 @@ public class FaultingLoader {
 )RS";
 
     game::GameScriptCompiler compiler(api);
-    const auto compiled = compiler.compile({{"phase27_fault.rs", scriptSource}});
+    const auto compiled = compiler.compile({{"phase27_fault.rscript", scriptSource}});
     require(compiled.succeeded(), "compile failed:\n" + diagnosticsText(compiled.diagnostics));
     runtime.replaceProgram(compiled.program);
 
@@ -497,7 +497,7 @@ public class ReplayController {
         require(game::installSceneComponentBindings(api, scene), "installSceneComponentBindings failed");
 
         game::GameScriptCompiler compiler(api);
-        const auto compiled = compiler.compile({{"phase27_replay.rs", scriptSource}});
+        const auto compiled = compiler.compile({{"phase27_replay.rscript", scriptSource}});
         require(compiled.succeeded(), "compile failed:\n" + diagnosticsText(compiled.diagnostics));
         runtime.replaceProgram(compiled.program);
 
@@ -671,7 +671,7 @@ public class ModernAsyncActor {
 )RS";
 
     game::GameScriptCompiler compiler(api);
-    const auto compiled = compiler.compile({{"phase27_bench.rs", scriptSource}});
+    const auto compiled = compiler.compile({{"phase27_bench.rscript", scriptSource}});
     require(compiled.succeeded(), "compile failed:\n" + diagnosticsText(compiled.diagnostics));
     runtime.replaceProgram(compiled.program);
 
@@ -812,7 +812,7 @@ public class PhaseActor {
 )RS";
 
     game::GameScriptCompiler compiler(api);
-    const auto compiledV1 = compiler.compile({{"phase27_phases_v1.rs", srcV1}});
+    const auto compiledV1 = compiler.compile({{"phase27_phases_v1.rscript", srcV1}});
     require(compiledV1.succeeded(), "compile v1 failed");
     runtime.replaceProgram(compiledV1.program);
 
@@ -867,7 +867,7 @@ public class PhaseActor {
     require(eofRan == 1, "EndOfFrame continuation should drain in lateUpdate");
 
     // Hot-reload from V1 (had legacy sequence plan) to V2 (no legacy sequence plan)
-    const auto compiledV2 = compiler.compile({{"phase27_phases_v2.rs", srcV2}});
+    const auto compiledV2 = compiler.compile({{"phase27_phases_v2.rscript", srcV2}});
     require(compiledV2.succeeded(), "compile v2 failed");
     const auto reloadReport = scene.hotReload(compiledV2.program);
     require(reloadReport.succeeded, "hotReload failed");
@@ -990,7 +990,7 @@ public class ExplicitRootActor {
 )RS";
 
         game::GameScriptCompiler compiler(api);
-        const auto compiled = compiler.compile({{"phase27_reg.rs", src}});
+        const auto compiled = compiler.compile({{"phase27_reg.rscript", src}});
         require(compiled.succeeded(), "7A compile failed:\n" + diagnosticsText(compiled.diagnostics));
         runtime.replaceProgram(compiled.program);
 
@@ -1192,8 +1192,8 @@ public class Worker {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        const auto c1 = compiler.compile({{"hot_v1.rs", hotV1}});
-        const auto c2 = compiler.compile({{"hot_v2.rs", hotV2}});
+        const auto c1 = compiler.compile({{"hot_v1.rscript", hotV1}});
+        const auto c2 = compiler.compile({{"hot_v2.rscript", hotV2}});
         require(c1.succeeded() && c2.succeeded(), "7D compile failed");
 
         runtime.replaceProgram(c1.program);

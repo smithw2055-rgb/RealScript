@@ -63,9 +63,9 @@ int main() {
     try {
         const auto sourcePath =
             std::filesystem::path(REALSCRIPT_BENCH_SOURCE_DIR) /
-            "benchmarks/micro/integer_loop.rs";
+            "benchmarks/micro/integer_loop.rscript";
         realscript::compiler::Compilation compilation({{
-            "benchmarks/micro/integer_loop.rs",
+            "benchmarks/micro/integer_loop.rscript",
             readFile(sourcePath),
         }});
         auto build = compilation.build();

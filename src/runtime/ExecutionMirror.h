@@ -1,3 +1,7 @@
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 #pragma once
 
 #include "realscript/runtime/Runtime.h"
@@ -583,3 +587,7 @@ struct ExecutionMirror {
 }
 
 } // namespace realscript::runtime::detail
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif

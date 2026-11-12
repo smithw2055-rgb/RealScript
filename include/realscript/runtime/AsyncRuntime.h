@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
@@ -464,6 +465,10 @@ public:
     std::size_t drainReadyContinuations(ResumeQueue queue, std::size_t maxCount = 0);
     [[nodiscard]] std::size_t readyContinuationCount(ResumeQueue queue) const noexcept;
 
+    void reconcileValuesOnHotReload(
+        const std::function<bool(Value&)>& patchOrValidateValue,
+        const std::function<bool(ObjectRef&)>& patchOrValidateObjectRef);
+
     void clear() noexcept;
     [[nodiscard]] AwaitablePoolStatistics statistics() const noexcept;
 
@@ -617,8 +622,13 @@ private:
         std::size_t childIndex,
         AwaitableHandle childHandle);
 
+    static bool markPoolRootsCallback(void* rawSelf);
+    void pinPoolBackedValueIfNeeded(const Value& value);
+
     ManagedHeap* heap_ = nullptr;
     CancellationTokenPool* cancellationPool_ = nullptr;
+    std::shared_ptr<void> poolRootSync_;
+    bool poolRootSyncActive_ = false;
     std::vector<std::unique_ptr<AwaitableSlot[]>> pages_;
     std::size_t slotCapacity_ = 0;
     std::uint32_t nextNeverUsedSlot_ = 0;
@@ -653,8 +663,8 @@ struct AsyncDrainResult {
 
 class AsyncCompletionQueue {
 public:
-    AsyncCompletionQueue() = default;
-    ~AsyncCompletionQueue() = default;
+    AsyncCompletionQueue();
+    ~AsyncCompletionQueue() noexcept;
     AsyncCompletionQueue(const AsyncCompletionQueue&) = delete;
     AsyncCompletionQueue& operator=(const AsyncCompletionQueue&) = delete;
 
@@ -726,9 +736,13 @@ private:
         AsyncDrainResult& stats,
         RuntimeError& outError);
 
+    static bool markPoolRootsCallback(void* rawSelf);
+
+    std::shared_ptr<void> poolRootSync_;
     mutable std::mutex inboxMutex_;
     std::vector<AsyncHostPacket> inbox_;
     std::vector<AsyncHostPacket> swapBuffer_;
+    std::vector<Value> inFlightDrainValues_;
 
     std::unordered_map<AsyncRequestId, PendingRequestEntry> pendingRequests_;
     AsyncRequestId nextRequestId_ = 1;
@@ -778,6 +792,10 @@ using CoroutineResumeCallback = void (*)(
     CoroutineFrame& frame,
     AsyncRuntimeContext& asyncContext);
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct CoroutineFrame {
     static constexpr std::size_t kInlineScalarBytes = 256;
 
@@ -789,6 +807,7 @@ struct CoroutineFrame {
     ResumeQueue resumeQueue = ResumeQueue::Update;
     bool suspended = false;
     bool completed = false;
+    bool invalidated = false;
     bool usesScalarBuffer = false;
     std::uint32_t scalarByteSize = 0;
     CoroutineResumeCallback resumeCallback = nullptr;
@@ -806,6 +825,9 @@ struct CoroutineFrame {
             : static_cast<const void*>(overflowScalarBytes.data());
     }
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 struct CoroutinePoolStatistics {
     std::size_t capacity = 0;
@@ -824,7 +846,7 @@ public:
         ManagedHeap* heap = nullptr,
         AsyncRuntimeContext* ownerContext = nullptr,
         std::size_t initialReserve = 32);
-    ~CoroutineFramePool() noexcept { clear(); }
+    ~CoroutineFramePool() noexcept;
     CoroutineFramePool(const CoroutineFramePool&) = delete;
     CoroutineFramePool& operator=(const CoroutineFramePool&) = delete;
 
@@ -870,18 +892,49 @@ public:
         void* runnerContext,
         std::shared_ptr<const void> runnerOwner = {});
 
+    template <typename Visitor>
+    void forEachActiveFrame(Visitor&& visitor) {
+        const std::size_t count = slots_.size();
+        for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(count); ++i) {
+            auto& slot = slots_[i];
+            if (slot.allocated) {
+                visitor(CoroutineFrameHandle{i, slot.version}, slot.frame);
+            }
+        }
+    }
+
+    template <typename Visitor>
+    void forEachActiveFrame(Visitor&& visitor) const {
+        const std::size_t count = slots_.size();
+        for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(count); ++i) {
+            const auto& slot = slots_[i];
+            if (slot.allocated) {
+                visitor(CoroutineFrameHandle{i, slot.version}, slot.frame);
+            }
+        }
+    }
+
+    void notePoolRootsPotentiallyModified();
+
     void recycleFrame(CoroutineFrameHandle handle) noexcept;
     std::size_t abortAllSuspendedFrames();
     void clear() noexcept;
     [[nodiscard]] CoroutinePoolStatistics statistics() const noexcept;
 
 private:
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
     struct FrameSlot {
         CoroutineFrame frame{};
         std::vector<ManagedHeap::RootToken> pinnedRootTokens;
         std::uint32_t version = 1;
         bool allocated = false;
     };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
     void releasePinnedRoots(FrameSlot& slot) noexcept;
     void snapshotAndPinValues(
@@ -899,8 +952,12 @@ private:
         AwaitStatus terminalStatus,
         std::uint64_t packedFrameHandle);
 
+    static bool markPoolRootsCallback(void* rawSelf);
+
     ManagedHeap* heap_ = nullptr;
     AsyncRuntimeContext* ownerContext_ = nullptr;
+    std::shared_ptr<void> poolRootSync_;
+    bool poolRootSyncActive_ = false;
     std::deque<FrameSlot> slots_;
     std::vector<std::uint32_t> freeSlots_;
     std::size_t activeGcRoots_ = 0;

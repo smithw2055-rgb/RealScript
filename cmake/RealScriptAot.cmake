@@ -5,12 +5,18 @@ include(CMakeParseArguments)
 # include realscript_aot_generated.h and use either ProgramDescriptor or the
 # stable C query symbol.
 function(realscript_add_aot_library target)
-    set(options NO_LINE_DIRECTIVES TRUSTED_RELEASE)
+    set(options
+        NO_LINE_DIRECTIVES
+        NO_SHARED_GENERICS
+        TRUSTED_RELEASE
+        CACHE_STATS
+    )
     set(one_value_args
         PROGRAM_NAME
         CPP_NAMESPACE
         QUERY_SYMBOL
         OUTPUT_DIRECTORY
+        CACHE_DIR
         OPT_LEVEL
     )
     set(multi_value_args SOURCES)
@@ -94,8 +100,17 @@ function(realscript_add_aot_library target)
     if(RSAOT_NO_LINE_DIRECTIVES)
         list(APPEND generator_arguments --no-line-directives)
     endif()
+    if(RSAOT_NO_SHARED_GENERICS)
+        list(APPEND generator_arguments --no-shared-generics)
+    endif()
     if(RSAOT_TRUSTED_RELEASE)
         list(APPEND generator_arguments --trusted-release)
+    endif()
+    if(RSAOT_CACHE_DIR)
+        list(APPEND generator_arguments --cache-dir "${RSAOT_CACHE_DIR}")
+    endif()
+    if(RSAOT_CACHE_STATS)
+        list(APPEND generator_arguments --cache-stats)
     endif()
     list(APPEND generator_arguments ${aot_sources})
 

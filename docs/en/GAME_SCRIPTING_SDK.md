@@ -62,7 +62,7 @@ Generated `__rs_native_*` trampoline names are internal implementation details a
 ```cpp
 realscript::game::GameScriptCompiler compiler(api);
 auto result = compiler.compile({
-    {"controller.rs", R"(
+    {"controller.rscript", R"(
         module Game;
         import Engine.Game;
 
@@ -239,4 +239,4 @@ To eliminate repetitive boilerplate bindings, the SDK includes `rsbind`:
 - Extracts struct/class signatures, methods, properties, and template classes from C++ header files;
 - Emits registration code matching `GameApi` types and methods;
 - Generates zero-copy ECS column helpers (`bindEcsRawColumnAuto`);
-- Emits corresponding ambient `.d.rs` declaration files for LSP IDE completion.
+- Emits corresponding ambient `.d.rscript` declaration files for LSP IDE completion.

@@ -4,10 +4,12 @@
 #include "realscript/semantic/Semantic.h"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
+#include <typeindex>
 #include <functional>
 #include <initializer_list>
 #include <memory>
@@ -579,6 +581,10 @@ struct ValueTaggedCell {
 };
 } // namespace detail
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct alignas(16) Value {
     struct EnumInlineCell {
         semantic::SymbolId typeId = 0;
@@ -1076,6 +1082,9 @@ struct alignas(16) Value {
         return !(left == right);
     }
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 static_assert(sizeof(Value) == 16, "runtime::Value must be 16 bytes");
 static_assert(alignof(Value) == 16, "runtime::Value must be 16-byte aligned");
 static_assert(std::is_trivially_copyable_v<Value>, "runtime::Value must be trivially copyable");
@@ -1579,12 +1588,18 @@ enum class NativeFieldKind : std::uint8_t {
     Vec2,
     Vec3,
     Quat,
+    Int8,
+    UInt8,
+    Int16,
+    UInt16,
+    UInt32,
+    UInt64,
 };
 
 struct NativeFieldLayout {
     std::size_t byteOffset = 0;
     NativeFieldKind kind = NativeFieldKind::Int32;
-    semantic::PrimitiveType scriptType = semantic::PrimitiveType::Int;
+    semantic::PrimitiveType scriptType = semantic::PrimitiveType::Error;
     semantic::SymbolId scriptTypeId = 0;
 };
 
@@ -1714,9 +1729,27 @@ struct ObjectFastView {
     bool needsRememberedBarrier = false;
 };
 
+using RootSet = ShadowStack;
+
+struct IncrementalGcBudgetStats {
+    bool cycleCompleted = false;
+    bool budgetExhausted = false;
+    std::size_t objectsMarked = 0;
+    std::size_t objectsSwept = 0;
+    std::size_t objectsReclaimed = 0;
+    std::chrono::nanoseconds elapsed{0};
+    std::uint64_t elapsedNanoseconds = 0;
+    GcPhase phaseAfterStep = GcPhase::Idle;
+
+    [[nodiscard]] constexpr std::size_t totalWork() const noexcept {
+        return objectsMarked + objectsSwept;
+    }
+};
+
 class ManagedHeap {
 public:
     using RootToken = std::uint64_t;
+    using RootSet = ShadowStack;
     static constexpr std::size_t kCardElementShift = 6;
     static constexpr std::size_t kCardElements = std::size_t{1} << kCardElementShift;
     static constexpr std::size_t kCardTableMinLength = kCardElements + 1;
@@ -1773,6 +1806,7 @@ public:
 
     [[nodiscard]] bool isAlive(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<std::string_view> stringView(ObjectRef reference) const;
+    [[nodiscard]] static std::optional<std::string> tryCopyStringGlobal(ObjectRef reference);
     [[nodiscard]] std::optional<std::size_t> arrayLength(ObjectRef reference) const;
     [[nodiscard]] std::optional<semantic::SymbolId> arrayTypeId(
         ObjectRef reference) const;
@@ -1888,7 +1922,38 @@ public:
     [[nodiscard]] bool collectionRequested() const noexcept;
     [[nodiscard]] GcPhase phase() const noexcept;
     std::size_t step(const ShadowStack& shadowStack, std::size_t workBudget);
+    std::size_t collectIncremental(const RootSet& roots, std::size_t workBudget);
+    IncrementalGcBudgetStats collectIncrementalWithBudget(
+        const RootSet& roots,
+        std::chrono::nanoseconds budget,
+        std::size_t checkInterval = 32,
+        bool forceStartIfIdle = false);
+    IncrementalGcBudgetStats collectIncrementalWithBudget(
+        const RootSet& roots,
+        std::chrono::microseconds budget,
+        std::size_t checkInterval = 32,
+        bool forceStartIfIdle = false);
+    template <
+        typename Rep,
+        typename Period,
+        std::enable_if_t<
+            !std::is_same_v<std::chrono::duration<Rep, Period>, std::chrono::nanoseconds> &&
+                !std::is_same_v<std::chrono::duration<Rep, Period>, std::chrono::microseconds>,
+            int> = 0>
+    IncrementalGcBudgetStats collectIncrementalWithBudget(
+        const RootSet& roots,
+        std::chrono::duration<Rep, Period> budget,
+        std::size_t checkInterval = 32,
+        bool forceStartIfIdle = false);
+    IncrementalGcBudgetStats collectIncrementalWithBudgetUs(
+        const RootSet& roots,
+        std::uint64_t budgetMicroseconds,
+        std::size_t checkInterval = 32,
+        bool forceStartIfIdle = false);
+    [[nodiscard]] bool isWallClockCycleActive() const noexcept;
+    void finishWallClockCycleForDeterminism(const ShadowStack& shadowStack);
     void collectFull(const ShadowStack& shadowStack);
+    void collect(const RootSet& roots = RootSet{});
     std::size_t collectYoung(const ShadowStack& shadowStack, std::size_t workBudget = 0);
     [[nodiscard]] std::size_t nurserySize() const noexcept;
 
@@ -1940,6 +2005,10 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 class PersistentRoot {
 public:
     PersistentRoot() = default;
@@ -1964,6 +2033,9 @@ private:
     ManagedHeap::RootToken token_ = 0;
     Value value_{};
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 class NativeHandleRegistry {
 public:
@@ -1997,6 +2069,8 @@ public:
     [[nodiscard]] std::size_t liveCount() const noexcept;
     [[nodiscard]] std::uint64_t registryId() const noexcept;
     [[nodiscard]] std::string debugName(NativeHandle handle) const;
+    void registerCppType(std::type_index cppType, semantic::SymbolId typeId);
+    [[nodiscard]] semantic::SymbolId findCppTypeId(std::type_index cppType) const noexcept;
 
 private:
     struct Slot {
@@ -2026,6 +2100,7 @@ private:
     std::vector<Slot> slots_;
     std::vector<std::uint32_t> freeSlots_;
     std::unordered_map<PointerTypeKey, std::uint32_t, PointerTypeKeyHash> activeSlotByPointer_;
+    std::unordered_map<std::type_index, semantic::SymbolId> cppTypeIds_;
 };
 
 enum class DeterminismMode : std::uint8_t {
@@ -2481,6 +2556,120 @@ struct RuntimeValuePoolStatistics {
     std::uint64_t heapStructClockEvictions = 0;
     std::uint64_t heapStructGcReclaimed = 0;
 };
+
+namespace detail {
+template <typename Rep, typename Period>
+[[nodiscard]] inline std::chrono::nanoseconds clampDurationToNanoseconds(
+    std::chrono::duration<Rep, Period> budget) noexcept {
+    if constexpr (std::is_same_v<std::chrono::duration<Rep, Period>, std::chrono::nanoseconds>) {
+        return budget;
+    } else if constexpr (std::is_floating_point_v<Rep>) {
+        const long double ns = std::chrono::duration_cast<
+            std::chrono::duration<long double, std::nano>>(budget).count();
+        if (!(ns == ns)) {
+            return std::chrono::nanoseconds::zero();
+        }
+        constexpr long double kMaxNs =
+            static_cast<long double>(std::chrono::nanoseconds::max().count());
+        constexpr long double kMinNs =
+            static_cast<long double>(std::chrono::nanoseconds::min().count());
+        if (ns >= kMaxNs) return std::chrono::nanoseconds::max();
+        if (ns <= kMinNs) return std::chrono::nanoseconds::min();
+        return std::chrono::nanoseconds(static_cast<std::chrono::nanoseconds::rep>(ns));
+    } else {
+        using Ratio = std::ratio_divide<Period, std::nano>;
+        static_assert(Ratio::num > 0 && Ratio::den > 0, "duration ratio must be positive");
+        const auto count = budget.count();
+        if (count == 0) {
+            return std::chrono::nanoseconds::zero();
+        }
+        if constexpr (std::is_signed_v<Rep>) {
+            if (count < 0) {
+                constexpr auto kMinNs = std::chrono::nanoseconds::min().count();
+                const long double approx = static_cast<long double>(count) *
+                    (static_cast<long double>(Ratio::num) / static_cast<long double>(Ratio::den));
+                if (approx <= static_cast<long double>(kMinNs)) {
+                    return std::chrono::nanoseconds::min();
+                }
+                if constexpr (Ratio::num == 1) {
+                    const auto q = static_cast<std::int64_t>(count / static_cast<Rep>(Ratio::den));
+                    return std::chrono::nanoseconds(q < 0 ? q : std::chrono::nanoseconds::rep{-1});
+                } else {
+                    const std::int64_t maxMag = -(kMinNs + 1) / Ratio::num;
+                    if (count < -static_cast<Rep>(maxMag)) {
+                        return std::chrono::nanoseconds::min();
+                    }
+                    const auto scaled = static_cast<std::int64_t>(count) * Ratio::num / Ratio::den;
+                    return std::chrono::nanoseconds(scaled < 0 ? scaled : std::chrono::nanoseconds::rep{-1});
+                }
+            }
+        }
+        constexpr std::uint64_t kMaxNsU =
+            static_cast<std::uint64_t>(std::chrono::nanoseconds::max().count());
+        const auto ucount = static_cast<std::uint64_t>(count);
+        constexpr std::uint64_t kNum = static_cast<std::uint64_t>(Ratio::num);
+        constexpr std::uint64_t kDen = static_cast<std::uint64_t>(Ratio::den);
+        const std::uint64_t q = ucount / kDen;
+        const std::uint64_t r = ucount % kDen;
+        if (q > kMaxNsU / kNum) {
+            return std::chrono::nanoseconds::max();
+        }
+        const std::uint64_t part1 = q * kNum;
+        if (r > 0 && r > std::numeric_limits<std::uint64_t>::max() / kNum) {
+            const long double approx = static_cast<long double>(ucount) *
+                (static_cast<long double>(kNum) / static_cast<long double>(kDen));
+            if (approx >= static_cast<long double>(kMaxNsU)) {
+                return std::chrono::nanoseconds::max();
+            }
+        }
+        const std::uint64_t part2 = (r * kNum) / kDen;
+        if (part2 > kMaxNsU - part1) {
+            return std::chrono::nanoseconds::max();
+        }
+        return std::chrono::nanoseconds(
+            static_cast<std::chrono::nanoseconds::rep>(part1 + part2));
+    }
+}
+
+using ValuePoolRootMarkFn = bool (*)(void* owner);
+[[nodiscard]] std::shared_ptr<void> createValuePoolRootSync(
+    void* owner,
+    ValuePoolRootMarkFn markFn);
+void activateValuePoolRootSync(const std::shared_ptr<void>& syncHandle);
+void deactivateValuePoolRootSync(const std::shared_ptr<void>& syncHandle) noexcept;
+void detachValuePoolRootSyncOwner(const std::shared_ptr<void>& syncHandle) noexcept;
+void lockValuePoolRootSync(const std::shared_ptr<void>& syncHandle);
+void unlockValuePoolRootSync(const std::shared_ptr<void>& syncHandle) noexcept;
+
+void enterInterpreterMutator() noexcept;
+void leaveInterpreterMutator() noexcept;
+
+struct ActiveMutatorScope {
+    ActiveMutatorScope() noexcept { enterInterpreterMutator(); }
+    ~ActiveMutatorScope() noexcept { leaveInterpreterMutator(); }
+    ActiveMutatorScope(const ActiveMutatorScope&) = delete;
+    ActiveMutatorScope& operator=(const ActiveMutatorScope&) = delete;
+};
+} // namespace detail
+
+template <
+    typename Rep,
+    typename Period,
+    std::enable_if_t<
+        !std::is_same_v<std::chrono::duration<Rep, Period>, std::chrono::nanoseconds> &&
+            !std::is_same_v<std::chrono::duration<Rep, Period>, std::chrono::microseconds>,
+        int>>
+inline IncrementalGcBudgetStats ManagedHeap::collectIncrementalWithBudget(
+    const RootSet& roots,
+    std::chrono::duration<Rep, Period> budget,
+    std::size_t checkInterval,
+    bool forceStartIfIdle) {
+    return collectIncrementalWithBudget(
+        roots,
+        detail::clampDurationToNanoseconds(budget),
+        checkInterval,
+        forceStartIfIdle);
+}
 
 void pinValueInPools(const Value& value) noexcept;
 [[nodiscard]] bool hasAnyPinnedPoolValues() noexcept;

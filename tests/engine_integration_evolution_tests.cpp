@@ -113,7 +113,7 @@ class Hero : NativeActor
 )";
 
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"actors.rs", scriptSource}});
+    auto compiled = compiler.compile({{"actors.rscript", scriptSource}});
     require(
         compiled.succeeded(),
         "script inheriting native failed to compile:\n" +
@@ -300,7 +300,7 @@ class GizmoOverlayComponent
         "failed to bind scene component helpers");
 
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"scene_test.rs", source}});
+    auto compiled = compiler.compile({{"scene_test.rscript", source}});
     require(
         compiled.succeeded(),
         "multi-component scene script failed to compile:\n" +
@@ -396,7 +396,7 @@ class TurretController
 )";
 
     realscript::game::GameScriptCompiler compiler(api);
-    auto v1Compiled = compiler.compile({{"turret_v1.rs", v1Source}});
+    auto v1Compiled = compiler.compile({{"turret_v1.rscript", v1Source}});
     require(
         v1Compiled.succeeded(),
         "turret v1 compile failed:\n" + diagnosticsText(v1Compiled.diagnostics));
@@ -485,7 +485,7 @@ class TurretController
 }
 )";
 
-    auto v2Compiled = compiler.compile({{"turret_v2.rs", v2Source}});
+    auto v2Compiled = compiler.compile({{"turret_v2.rscript", v2Source}});
     require(
         v2Compiled.succeeded(),
         "turret v2 compile failed:\n" + diagnosticsText(v2Compiled.diagnostics));
@@ -532,7 +532,7 @@ class CutsceneRunner
 )";
 
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"coroutines.rs", source}});
+    auto compiled = compiler.compile({{"coroutines.rscript", source}});
     require(
         compiled.succeeded(),
         "wait_seconds coroutine failed to compile:\n" +
@@ -592,7 +592,7 @@ void testLspStubsDotCompletionAndSignatureHelp() {
         "failed to bind SpawnWave");
 
     const auto stubs = api.exportDeclarationStubs();
-    require(!stubs.empty(), "exportDeclarationStubs should produce .d.rs stubs");
+    require(!stubs.empty(), "exportDeclarationStubs should produce .d.rscript stubs");
     const std::string configJson = api.exportProjectConfigJson("SampleGame");
     require(!configJson.empty(), "exportProjectConfigJson should produce JSON");
 
@@ -613,10 +613,10 @@ class Player : NativeActor
     }
 }
 )";
-    service.open("player.rs", userCode, 1);
+    service.open("player.rscript", userCode, 1);
 
     // Dot completion right after "target." on line 7 (0-indexed), column 15
-    const auto completions = service.completion("player.rs", {7, 15});
+    const auto completions = service.completion("player.rscript", {7, 15});
     bool foundHeal = false;
     bool foundHealth = false;
     for (const auto& item : completions) {
@@ -628,7 +628,7 @@ class Player : NativeActor
         "dot completion on 'target.' should include NativeActor's Heal method and Health property");
 
     // Signature help inside "SpawnWave(3, 1.5)" after comma on line 8, column 21
-    const auto sigHelp = service.signatureHelp("player.rs", {8, 21});
+    const auto sigHelp = service.signatureHelp("player.rscript", {8, 21});
     require(
         sigHelp.has_value() &&
             !sigHelp->signatures.empty() &&
@@ -669,7 +669,7 @@ class Calculator
 }
 )";
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"tiered.rs", source}});
+    auto compiled = compiler.compile({{"tiered.rscript", source}});
     require(compiled.succeeded(), "tiered test compile failed");
 
     realscript::game::ScriptRuntime runtime(compiled.program);
@@ -829,7 +829,7 @@ class SwitchComponent
 
     realscript::game::GameApi api;
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"stage1.rs", sourceV1}});
+    auto compiled = compiler.compile({{"stage1.rscript", sourceV1}});
     require(
         compiled.succeeded(),
         "Stage 1 script failed to compile:\n" + diagnosticsText(compiled.diagnostics));
@@ -1004,7 +1004,7 @@ class SwitchComponent
     }
 }
 )";
-    auto compiledV2 = compiler.compile({{"stage1.rs", sourceV2}});
+    auto compiledV2 = compiler.compile({{"stage1.rscript", sourceV2}});
     require(compiledV2.succeeded(), "Stage 1 v2 failed to compile");
     const auto reloadReport = scene.hotReload(compiledV2.program);
     require(
@@ -1059,7 +1059,7 @@ class QuestRunner
 }
 )";
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"stage2.rs", coroutineSource}});
+    auto compiled = compiler.compile({{"stage2.rscript", coroutineSource}});
     require(
         compiled.succeeded(),
         "Stage 2 coroutine script failed to compile:\n" +
@@ -1155,15 +1155,15 @@ int Main()
     return tracker.Accumulate(5);
 }
 )";
-    auto debugCompiled = compiler.compile({{"debug_test.rs", debugSource}});
-    require(debugCompiled.succeeded(), "debug_test.rs failed to compile");
+    auto debugCompiled = compiler.compile({{"debug_test.rscript", debugSource}});
+    require(debugCompiled.succeeded(), "debug_test.rscript failed to compile");
 
     realscript::debug::DebugSession session(
         debugCompiled.program.program(),
         debugCompiled.program.heap());
     // Set conditional breakpoint inside loop (line 23, 0-based 22) when i == 3 && multiplier == 10
     const auto bps = session.controller()->setConditionalBreakpoints(
-        "debug_test.rs",
+        "debug_test.rscript",
         {realscript::debug::BreakpointSpec{{22, 0}, "i == 3 && multiplier == 10"}});
     require(bps.size() == 1 && bps[0].verified, "conditional breakpoint should be verified");
 
@@ -1216,7 +1216,7 @@ class Mover
 }
 )";
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"stage3.rs", source}});
+    auto compiled = compiler.compile({{"stage3.rscript", source}});
     require(
         compiled.succeeded(),
         "Stage 3 script failed to compile:\n" + diagnosticsText(compiled.diagnostics));
@@ -1355,7 +1355,7 @@ class MathRunner
 )";
 
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"boost_stage1.rs", source}});
+    auto compiled = compiler.compile({{"boost_stage1.rscript", source}});
     require(
         compiled.succeeded(),
         "boost_stage1 compile failed:\n" + diagnosticsText(compiled.diagnostics));
@@ -1446,7 +1446,7 @@ class BadConst
 }
 )";
         realscript::game::GameScriptCompiler compiler(api);
-        auto badCompiled = compiler.compile({{"bad_const.rs", badConstSource}});
+        auto badCompiled = compiler.compile({{"bad_const.rscript", badConstSource}});
         require(!badCompiled.succeeded(), "mutating const field/local must fail compilation");
         bool sawConstDiag = false;
         for (const auto& item : badCompiled.diagnostics.items()) {
@@ -1602,7 +1602,7 @@ class ProductivitySuite
 )";
 
     realscript::game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"boost_stage2.rs", source}});
+    auto compiled = compiler.compile({{"boost_stage2.rscript", source}});
     require(
         compiled.succeeded(),
         "boost_stage2 compile failed:\n" + diagnosticsText(compiled.diagnostics));
@@ -1790,12 +1790,12 @@ class Party
     }
 }
 )";
-    service.open("stage3_lsp.rs", source, 1);
+    service.open("stage3_lsp.rscript", source, 1);
 
     // 1. Exact SymbolId references & rename on Hero.hp (line 15: "    public int hp;")
     //    Hero.hp is declared on line 15, col 15, and referenced twice on line 20 ("        hp = hp - amount;").
     //    Monster.hp (line 26, 31) and local `int hp` (line 48, 49, 54) MUST NOT be included!
-    const auto heroHpRefs = service.references("stage3_lsp.rs", {15, 15}, true);
+    const auto heroHpRefs = service.references("stage3_lsp.rscript", {15, 15}, true);
     require(
         heroHpRefs.size() == 3,
         "Hero.hp references(includeDefinition=true) should be 3 (1 decl + 2 uses), got " +
@@ -1807,26 +1807,26 @@ class Party
                 std::to_string(loc.range.start.line));
     }
 
-    const auto heroHpRename = service.rename("stage3_lsp.rs", {20, 8}, "hitPoints");
+    const auto heroHpRename = service.rename("stage3_lsp.rscript", {20, 8}, "hitPoints");
     require(
         heroHpRename.size() == 3,
         "Hero.hp rename from usage site should produce 3 edits");
 
     // 1b. Unreferenced field Monster.unreferencedHp (line 27, col 15) MUST NOT fall back to lexical token scanning
     //     and leak to Party.unreferencedHp (line 39, 50)!
-    const auto monsterUnrefRefsNoDef = service.references("stage3_lsp.rs", {27, 15}, false);
+    const auto monsterUnrefRefsNoDef = service.references("stage3_lsp.rscript", {27, 15}, false);
     require(
         monsterUnrefRefsNoDef.empty(),
         "unreferenced Monster.unreferencedHp references(includeDefinition=false) must be empty, got " +
             std::to_string(monsterUnrefRefsNoDef.size()));
-    const auto monsterUnrefRename = service.rename("stage3_lsp.rs", {27, 15}, "monsterOnlyHp");
+    const auto monsterUnrefRename = service.rename("stage3_lsp.rscript", {27, 15}, "monsterOnlyHp");
     require(
         monsterUnrefRename.size() == 1 && monsterUnrefRename[0].location.range.start.line == 27,
         "renaming unreferenced Monster.unreferencedHp must only edit its own declaration on line 27");
 
     // 2. Exact SymbolId references on local `hp` in Party.ComputeLocal (line 48: "        int hp = 50;")
     //    Declared on line 48, used twice on line 49, and once on line 54 -> total 4 with definition, 3 without.
-    const auto localHpRefsNoDef = service.references("stage3_lsp.rs", {48, 12}, false);
+    const auto localHpRefsNoDef = service.references("stage3_lsp.rscript", {48, 12}, false);
     require(
         localHpRefsNoDef.size() == 3,
         "local hp references(includeDefinition=false) should be 3, got " +
@@ -1839,7 +1839,7 @@ class Party
 
     // 3. Chained dot completion:
     //    Line 51: "        party.leader.weapon." (column 28) -> Weapon members (damage, title, GetTitle)
-    const auto weaponChainItems = service.completion("stage3_lsp.rs", {51, 28});
+    const auto weaponChainItems = service.completion("stage3_lsp.rscript", {51, 28});
     bool foundDamage = false;
     bool foundGetTitle = false;
     for (const auto& item : weaponChainItems) {
@@ -1851,7 +1851,7 @@ class Party
         "chained completion 'party.leader.weapon.' should resolve Weapon members");
 
     //    Line 52: "        party.GetLeader().weapon.title." (column 39) -> string members (Trim, ToUpper, Length)
-    const auto stringChainItems = service.completion("stage3_lsp.rs", {52, 39});
+    const auto stringChainItems = service.completion("stage3_lsp.rscript", {52, 39});
     bool foundTrim = false;
     bool foundToUpper = false;
     bool foundLength = false;
@@ -1865,7 +1865,7 @@ class Party
         "chained completion 'party.GetLeader().weapon.title.' should resolve string methods/properties");
 
     //    Line 53: "        (party).members[0].weapon." (column 34) -> Weapon members via parenthesized receiver + array indexing
-    const auto indexedChainItems = service.completion("stage3_lsp.rs", {53, 34});
+    const auto indexedChainItems = service.completion("stage3_lsp.rscript", {53, 34});
     bool foundIndexedDamage = false;
     for (const auto& item : indexedChainItems) {
         if (item.label == "damage") foundIndexedDamage = true;
@@ -1908,7 +1908,7 @@ int runOptimizedLoop(int n, double scale) {
 }
 )RS";
         compiler::Compilation comp;
-        comp.addSource({"opt_test.rs", optSrc});
+        comp.addSource({"opt_test.rscript", optSrc});
         auto build = comp.build();
         require(!build.diagnostics.hasErrors(), "Evolution.Opt failed to compile");
 
@@ -1973,7 +1973,7 @@ int evaluateActorAndArray(UnitActor actor, int[] scores, StateKind st) {
 }
 )RS";
         compiler::Compilation comp;
-        comp.addSource({"typed_aot_obj.rs", aotSrc});
+        comp.addSource({"typed_aot_obj.rscript", aotSrc});
         auto build = comp.build();
         require(!build.diagnostics.hasErrors(), "Evolution.TypedAot failed to compile");
 
@@ -2023,7 +2023,7 @@ public int runUsingEarlyReturn(int v) {
 )RS";
         game::GameApi api;
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"using_test.rs", usingSrc}});
+        auto compiled = compiler.compile({{"using_test.rscript", usingSrc}});
         require(compiled.succeeded(), "Evolution.ResourceAndGc failed to compile");
         game::ScriptRuntime rt(compiled.program);
 
@@ -2157,7 +2157,7 @@ public class LateSystem {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"scene_hierarchy.rs", sceneSrc}});
+        auto compiled = compiler.compile({{"scene_hierarchy.rscript", sceneSrc}});
         require(compiled.succeeded(), "Evolution.SceneHierarchy failed to compile");
 
         game::ScriptRuntime rt(compiled.program);
@@ -2270,15 +2270,15 @@ public class LateSystem {
             "LSP server should advertise textDocumentSync = 2 (Incremental)");
 
         tooling::LanguageService ls;
-        ls.open("inc.rs", "module Inc;\nint val() {\n    return 10;\n}\n", 1);
+        ls.open("inc.rscript", "module Inc;\nint val() {\n    return 10;\n}\n", 1);
         debug::SourceRange editRange{};
         editRange.start = {3, 12};
         editRange.end = {3, 14};
-        require(ls.applyContentChanges("inc.rs", {{editRange, "42"}}, 2),
+        require(ls.applyContentChanges("inc.rscript", {{editRange, "42"}}, 2),
             "applyContentChanges failed");
-        require(ls.documentContent("inc.rs").find("return 42;") != std::string::npos,
+        require(ls.documentContent("inc.rscript").find("return 42;") != std::string::npos,
             "incremental range edit did not produce 'return 42;'");
-        require(ls.diagnostics("inc.rs").empty(),
+        require(ls.diagnostics("inc.rscript").empty(),
             "incrementally edited document should have zero diagnostics");
 
         const char* sampleHeader = R"CPP(
@@ -2301,7 +2301,7 @@ public class LateSystem {
                 genBind.scriptDeclarationStub.find("class PhysicsBody") != std::string::npos &&
                 genBind.scriptDeclarationStub.find("void ApplyImpulse(Vec2 impulse)") != std::string::npos &&
                 genBind.scriptDeclarationStub.find("float GetMass()") != std::string::npos,
-            "generateBindingsFromCppHeader failed to generate C++ registration and .d.rs stub");
+            "generateBindingsFromCppHeader failed to generate C++ registration and .d.rscript stub");
     }
 }
 
@@ -2352,7 +2352,7 @@ class VehicleController {
         });
 
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"parity_p1.rs", src}});
+        auto compiled = compiler.compile({{"parity_p1.rscript", src}});
         require(compiled.succeeded(), "Evolution.ParityPhase1 failed to compile:\n" + diagnosticsText(compiled.diagnostics));
 
         game::ScriptRuntime rt(compiled.program);
@@ -2468,7 +2468,7 @@ class HubComp {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiledV1 = compiler.compile({{"scene_v1.rs", srcV1}});
+        auto compiledV1 = compiler.compile({{"scene_v1.rscript", srcV1}});
         require(compiledV1.succeeded(), "SceneGraphV1 failed to compile:\n" + diagnosticsText(compiledV1.diagnostics));
 
         game::ScriptRuntime rt(compiledV1.program);
@@ -2582,7 +2582,7 @@ class HubComp {
     }
 }
 )RS";
-        auto compiledV2 = compiler.compile({{"scene_v2.rs", srcV2}});
+        auto compiledV2 = compiler.compile({{"scene_v2.rscript", srcV2}});
         require(compiledV2.succeeded(), "SceneGraphV2 failed to compile");
 
         // Check structural hot_reload::prepare with ReloadOptions{true}
@@ -2625,7 +2625,7 @@ void PatrolRoutine() {
 }
 )RS";
         compiler::Compilation fiberComp;
-        fiberComp.addSource({"patrol_fiber.rs", fiberScript});
+        fiberComp.addSource({"patrol_fiber.rscript", fiberScript});
         auto fiberBuild = fiberComp.build();
         require(!fiberBuild.diagnostics.hasErrors() && !fiberBuild.modules.empty(),
             "Evolution.SceneFiber failed to compile");
@@ -2646,7 +2646,7 @@ class GuardUnit {
 }
 )RS";
         game::GameScriptCompiler unitCompiler(api);
-        auto unitCompiled = unitCompiler.compile({{"guard.rs", unitScript}});
+        auto unitCompiled = unitCompiler.compile({{"guard.rscript", unitScript}});
         require(unitCompiled.succeeded(), "Evolution.UnitComp failed to compile");
 
         game::ScriptRuntime rt(unitCompiled.program);
@@ -2734,7 +2734,7 @@ class ParameterizedHero : NativeActor {
 }
 )RS";
         game::GameScriptCompiler derivedComp(nativeApi);
-        auto derivedBuilt = derivedComp.compile({{"derived.rs", derivedSrc}});
+        auto derivedBuilt = derivedComp.compile({{"derived.rscript", derivedSrc}});
         require(derivedBuilt.succeeded(), "Evolution.DerivedSchema failed to compile");
         game::ScriptRuntime derivedRt(derivedBuilt.program);
         game::ScriptMetadataRegistry derivedMeta;
@@ -2821,7 +2821,7 @@ class PhysicsSystem {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto built = compiler.compile({{"ecs_system.rs", ecsSrc}});
+        auto built = compiler.compile({{"ecs_system.rscript", ecsSrc}});
         if (!built.succeeded()) { for (const auto& d : built.diagnostics.items()) std::cerr << d.code << ": " << d.message << "\n"; }
         require(built.succeeded(), "Evolution.EcsDataOriented failed to compile");
 
@@ -2933,7 +2933,7 @@ class PhysicsSystem {
         for (const auto& stub : api.exportDeclarationStubs()) {
             aotComp.addSource(stub);
         }
-        aotComp.addSource({"ecs_system.rs", ecsSrc});
+        aotComp.addSource({"ecs_system.rscript", ecsSrc});
         auto aotBuild = aotComp.build();
         require(!aotBuild.diagnostics.hasErrors(), "ECS Query Compilation::build failed");
         diagnostics::DiagnosticBag aotDiag;
@@ -2961,7 +2961,7 @@ void BadSystem() {
     }
 }
 )RS";
-        auto badMutate = compiler.compile({{"bad_mutate.rs", mutateReadSrc}});
+        auto badMutate = compiler.compile({{"bad_mutate.rscript", mutateReadSrc}});
         require(!badMutate.succeeded(), "mutating Read<Velocity> component must fail compilation");
         bool sawRS8702 = false;
         for (const auto& d : badMutate.diagnostics.items()) {
@@ -2980,7 +2980,7 @@ void BadSystem() {
     }
 }
 )RS";
-        auto badRef = compiler.compile({{"bad_ref.rs", refOnReadSrc}});
+        auto badRef = compiler.compile({{"bad_ref.rscript", refOnReadSrc}});
         require(!badRef.succeeded(), "binding ref to Read<Velocity> must fail compilation");
         bool sawRS2215 = false;
         for (const auto& d : badRef.diagnostics.items()) {
@@ -3024,7 +3024,7 @@ class Updater {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"inline3d.rs", src}});
+        auto compiled = compiler.compile({{"inline3d.rscript", src}});
         require(
             compiled.succeeded(),
             "Inline3D compile failed:\n" + diagnosticsText(compiled.diagnostics));
@@ -3114,7 +3114,7 @@ class EcsSystem {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"sparse_ecs.rs", ecsSrc}});
+        auto compiled = compiler.compile({{"sparse_ecs.rscript", ecsSrc}});
         require(
             compiled.succeeded(),
             "SparseEcs compile failed:\n" + diagnosticsText(compiled.diagnostics));
@@ -3225,7 +3225,7 @@ class NodeItem {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"heap_opt.rs", heapSrc}});
+        auto compiled = compiler.compile({{"heap_opt.rscript", heapSrc}});
         require(compiled.succeeded(), "HeapOpt compile failed");
 
         game::ScriptRuntime runtime(compiled.program);
@@ -3282,7 +3282,7 @@ class QuestActor {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"cutscene.rs", seqSrc}});
+        auto compiled = compiler.compile({{"cutscene.rscript", seqSrc}});
         require(
             compiled.succeeded(),
             "Cutscene sequence compile failed:\n" + diagnosticsText(compiled.diagnostics));
@@ -3331,7 +3331,7 @@ class QuestActor {
     {
         game::GameApi api;
         game::GameScriptCompiler bootstrapCompiler(api);
-        auto bootstrap = bootstrapCompiler.compile({{"empty.rs", "module Empty; void Main() {}"}});
+        auto bootstrap = bootstrapCompiler.compile({{"empty.rscript", "module Empty; void Main() {}"}});
         game::ScriptRuntime dummyRuntime(bootstrap.program);
         game::SceneScriptRuntime scene(dummyRuntime);
         require(
@@ -3395,7 +3395,7 @@ class PlayerActor {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"phys_input.rs", physInputSrc}});
+        auto compiled = compiler.compile({{"phys_input.rscript", physInputSrc}});
         require(
             compiled.succeeded(),
             "PhysicsInput compile failed:\n" + diagnosticsText(compiled.diagnostics));
@@ -3510,7 +3510,7 @@ int SimulateTick() {
     return FetchWallClock();
 }
 )RS";
-        auto badDet = compiler.compile({{"bad_det.rs", badDetSrc}});
+        auto badDet = compiler.compile({{"bad_det.rscript", badDetSrc}});
         require(!badDet.succeeded(), "calling NonDeterministic function in [Deterministic] module must fail");
         bool sawRS2495 = false;
         for (const auto& d : badDet.diagnostics.items()) {
@@ -3529,7 +3529,7 @@ class ModRunner {
     }
 }
 )RS";
-        auto capCompiled = compiler.compile({{"mod_script.rs", capSrc}});
+        auto capCompiled = compiler.compile({{"mod_script.rscript", capSrc}});
         require(
             capCompiled.succeeded(),
             "ModScript compile failed:\n" + diagnosticsText(capCompiled.diagnostics));
@@ -3567,7 +3567,7 @@ void testRound3AuditFixesAndGodotUnityParity() {
     {
         game::GameApi api;
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"empty.rs", "module Empty; void Main() {}"}});
+        auto compiled = compiler.compile({{"empty.rscript", "module Empty; void Main() {}"}});
         require(compiled.succeeded(), "Empty compile failed");
         game::ScriptRuntime runtime(compiled.program);
         game::SceneScriptRuntime scene(runtime);
@@ -3640,7 +3640,7 @@ void testRound3AuditFixesAndGodotUnityParity() {
     {
         game::GameApi api;
         game::GameScriptCompiler bootstrapCompiler(api);
-        auto bootstrap = bootstrapCompiler.compile({{"empty.rs", "module Empty; void Main() {}"}});
+        auto bootstrap = bootstrapCompiler.compile({{"empty.rscript", "module Empty; void Main() {}"}});
         game::ScriptRuntime runtime(bootstrap.program);
         game::SceneScriptRuntime scene(runtime);
         require(
@@ -3685,7 +3685,7 @@ class BulletActor {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"parity_round3.rs", src}});
+        auto compiled = compiler.compile({{"parity_round3.rscript", src}});
         require(
             compiled.succeeded(),
             "ParityRound3 compile failed:\n" + diagnosticsText(compiled.diagnostics));
@@ -3777,7 +3777,7 @@ int CallSecret() {
     return SecretHook();
 }
 )RS";
-        auto compiled = compiler.compile({{"raw_check.rs", rawSrc}});
+        auto compiled = compiler.compile({{"raw_check.rscript", rawSrc}});
         require(compiled.succeeded(), "RawCheck compile failed");
 
         // Execute bytecode on an Interpreter WITHOUT BindingRegistry (only raw externalResolver)
@@ -3870,7 +3870,7 @@ class SpatialRunner {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"p0_test.rs", p0Src}});
+        auto compiled = compiler.compile({{"p0_test.rscript", p0Src}});
         require(
             compiled.succeeded(),
             "Evolution.P0NestedStructAndEcs compile failed:\n" +
@@ -3940,7 +3940,7 @@ class SpatialRunner {
         require(game::installGameplayBindings(api, host), "installGameplayBindings failed");
 
         game::GameScriptCompiler bootstrapCompiler(api);
-        auto bootstrap = bootstrapCompiler.compile({{"empty.rs", "module Empty; void Main() {}"}});
+        auto bootstrap = bootstrapCompiler.compile({{"empty.rscript", "module Empty; void Main() {}"}});
         game::ScriptRuntime rt(bootstrap.program);
         game::SceneScriptRuntime scene(rt);
         require(game::installSceneComponentBindings(api, scene), "installSceneComponentBindings failed");
@@ -3981,7 +3981,7 @@ class ShipController : EngineManagedMotor {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiledV1 = compiler.compile({{"p1_v1.rs", p1SrcV1}});
+        auto compiledV1 = compiler.compile({{"p1_v1.rscript", p1SrcV1}});
         require(
             compiledV1.succeeded(),
             "P1EngineRuntime V1 compile failed:\n" + diagnosticsText(compiledV1.diagnostics));
@@ -4143,7 +4143,7 @@ class ShipController : EngineManagedMotor {
     }
 }
 )RS";
-        auto compiledV2 = compiler.compile({{"p1_v2.rs", p1SrcV2}});
+        auto compiledV2 = compiler.compile({{"p1_v2.rscript", p1SrcV2}});
         require(compiledV2.succeeded(), "P1EngineRuntime V2 compile failed");
         const auto reloadRep = scene.hotReload(compiledV2.program);
         require(reloadRep.succeeded, "P1-4: hotReload during wait_ticks failed");
@@ -4205,7 +4205,7 @@ class InventoryManager {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"p2_lang.rs", p2Src}});
+        auto compiled = compiler.compile({{"p2_lang.rscript", p2Src}});
         require(
             compiled.succeeded(),
             "P2LanguageAndTools compile failed:\n" + diagnosticsText(compiled.diagnostics));
@@ -4246,7 +4246,7 @@ class InventoryManager {
             "P2-3: LspServer must advertise semanticTokensProvider and inlayHintProvider");
 
         tooling::LanguageService ls;
-        ls.open("p2_lsp.rs", R"RS(module Evolution.P2Lsp;
+        ls.open("p2_lsp.rscript", R"RS(module Evolution.P2Lsp;
 class Bag {
     public int coins;
 }
@@ -4256,18 +4256,18 @@ int Compute(Bag b) {
     return totalCoins;
 }
 )RS", 1);
-        const auto compItems = ls.completion("p2_lsp.rs", {6, 6});
+        const auto compItems = ls.completion("p2_lsp.rscript", {6, 6});
         bool foundCoins = false;
         for (const auto& item : compItems) {
             if (item.label == "coins") foundCoins = true;
         }
         require(foundCoins, "P2-1: resilient Parser must resolve 'b.' completion without line-blanking hack");
 
-        const auto semTokens = ls.semanticTokensEncoded("p2_lsp.rs");
+        const auto semTokens = ls.semanticTokensEncoded("p2_lsp.rscript");
         require(!semTokens.empty() && semTokens.size() % 5 == 0,
             "P2-3: semanticTokensEncoded must return 5-tuple encoded token stream");
 
-        const auto hints = ls.inlayHints("p2_lsp.rs");
+        const auto hints = ls.inlayHints("p2_lsp.rscript");
         require(!hints.empty() && hints.front().label == ": int",
             "P2-3: inlayHints must infer ': int' for 'var totalCoins = 100;'");
 
@@ -4280,8 +4280,8 @@ int RunCalc() {
     return score + bonus;
 }
 )RS";
-        auto dapCompiled = compiler.compile({{"dap_setvar.rs", dapSrc}});
-        require(dapCompiled.succeeded(), "dap_setvar.rs failed to compile");
+        auto dapCompiled = compiler.compile({{"dap_setvar.rscript", dapSrc}});
+        require(dapCompiled.succeeded(), "dap_setvar.rscript failed to compile");
 
         debug::DapServer dap(dapCompiled.program.program(), dapCompiled.program.heap());
         std::ostringstream dapEvents;
@@ -4290,7 +4290,7 @@ int RunCalc() {
             {"type", "request"},
             {"command", "setBreakpoints"},
             {"arguments", tooling::Json::Object{
-                {"source", tooling::Json::Object{{"path", "dap_setvar.rs"}}},
+                {"source", tooling::Json::Object{{"path", "dap_setvar.rscript"}}},
                 {"breakpoints", tooling::Json::Array{
                     tooling::Json::Object{{"line", 6}, {"column", 1}},
                 }},
@@ -4432,8 +4432,8 @@ class HeroCoroutine {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"r5_rollback.rs", src}});
-        require(compiled.succeeded(), "R5-2: failed to compile r5_rollback.rs:\n" + diagnosticsText(compiled.diagnostics));
+        auto compiled = compiler.compile({{"r5_rollback.rscript", src}});
+        require(compiled.succeeded(), "R5-2: failed to compile r5_rollback.rscript:\n" + diagnosticsText(compiled.diagnostics));
 
         game::ScriptRuntime rt(compiled.program);
         game::SceneScriptRuntime scene(rt);
@@ -4553,8 +4553,8 @@ class Sensor3D {
         require(game::installSceneComponentBindings(api, dummyScene), "R5-5: installSceneComponentBindings failed");
 
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"r5_phys3d.rs", physSrc}});
-        require(compiled.succeeded(), "R5-5: r5_phys3d.rs compile failed:\n" + diagnosticsText(compiled.diagnostics));
+        auto compiled = compiler.compile({{"r5_phys3d.rscript", physSrc}});
+        require(compiled.succeeded(), "R5-5: r5_phys3d.rscript compile failed:\n" + diagnosticsText(compiled.diagnostics));
 
         game::ScriptRuntime rt(compiled.program);
         game::SceneScriptRuntime scene(rt);
@@ -4760,8 +4760,8 @@ class Tester {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"r5_lang.rs", langSrc}});
-        require(compiled.succeeded(), "R5-6/R5-8: r5_lang.rs failed to compile:\n" + diagnosticsText(compiled.diagnostics));
+        auto compiled = compiler.compile({{"r5_lang.rscript", langSrc}});
+        require(compiled.succeeded(), "R5-6/R5-8: r5_lang.rscript failed to compile:\n" + diagnosticsText(compiled.diagnostics));
 
         game::ScriptRuntime rt(compiled.program);
         game::SceneScriptRuntime scene(rt);
@@ -4804,8 +4804,8 @@ int InspectHierarchy() {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto dapCompiled = compiler.compile({{"r5_dap.rs", dapSrc}});
-        require(dapCompiled.succeeded(), "R5-9: r5_dap.rs failed to compile");
+        auto dapCompiled = compiler.compile({{"r5_dap.rscript", dapSrc}});
+        require(dapCompiled.succeeded(), "R5-9: r5_dap.rscript failed to compile");
 
         debug::DapServer dap(dapCompiled.program.program(), dapCompiled.program.heap());
         std::ostringstream dapEvents;
@@ -4814,7 +4814,7 @@ int InspectHierarchy() {
             {"type", "request"},
             {"command", "setBreakpoints"},
             {"arguments", tooling::Json::Object{
-                {"source", tooling::Json::Object{{"path", "r5_dap.rs"}}},
+                {"source", tooling::Json::Object{{"path", "r5_dap.rscript"}}},
                 {"breakpoints", tooling::Json::Array{
                     tooling::Json::Object{{"line", 25}, {"column", 1}},
                 }},
@@ -4944,7 +4944,7 @@ int InspectHierarchy() {
             {"method", "textDocument/didOpen"},
             {"params", tooling::Json::Object{
                 {"textDocument", tooling::Json::Object{
-                    {"uri", "file:///lsp_r5.rs"},
+                    {"uri", "file:///lsp_r5.rscript"},
                     {"version", 1},
                     {"text", unformattedCode},
                 }},
@@ -4956,7 +4956,7 @@ int InspectHierarchy() {
             {"id", 2},
             {"method", "textDocument/inlayHint"},
             {"params", tooling::Json::Object{
-                {"textDocument", tooling::Json::Object{{"uri", "file:///lsp_r5.rs"}}},
+                {"textDocument", tooling::Json::Object{{"uri", "file:///lsp_r5.rscript"}}},
             }},
         }, &lspOut);
         const auto* inlayArr = inlayResp.find("result");
@@ -4980,7 +4980,7 @@ int InspectHierarchy() {
             {"id", 3},
             {"method", "textDocument/formatting"},
             {"params", tooling::Json::Object{
-                {"textDocument", tooling::Json::Object{{"uri", "file:///lsp_r5.rs"}}},
+                {"textDocument", tooling::Json::Object{{"uri", "file:///lsp_r5.rscript"}}},
                 {"options", tooling::Json::Object{{"tabSize", 4}}},
             }},
         }, &lspOut);
@@ -5030,7 +5030,7 @@ class Caller
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        const auto badBuild = compiler.compile({{"bad_static_class.rs", badStaticClassSrc}});
+        const auto badBuild = compiler.compile({{"bad_static_class.rscript", badStaticClassSrc}});
         require(!badBuild.succeeded(), "instantiating or adding instance members to static class must fail");
         bool sawRS2488 = false;
         bool sawRS2489 = false;
@@ -5106,7 +5106,7 @@ int main()
 }
 )RS";
         diagnostics::DiagnosticBag diags;
-        text::SourceText srcText(singleAstSrc, "standalone.rs");
+        text::SourceText srcText(singleAstSrc, "standalone.rscript");
         syntax::Parser parser(srcText, diags);
         const auto unit = parser.parseCompilationUnit();
         require(!diags.hasErrors(), "standalone parser failed: " + diagnosticsText(diags));
@@ -5117,7 +5117,7 @@ int main()
         const auto mirMod = mirLowerer.lower(model);
         require(mir::verifyModule(mirMod, diags) && !diags.hasErrors(),
             "standalone MIR verification failed: " + diagnosticsText(diags));
-        compiler::Compilation standaloneComp({{"standalone.rs", singleAstSrc}});
+        compiler::Compilation standaloneComp({{"standalone.rscript", singleAstSrc}});
         const auto standaloneBuilt = standaloneComp.build();
         require(!standaloneBuilt.diagnostics.hasErrors(),
             "standalone Compilation::build failed: " + diagnosticsText(standaloneBuilt.diagnostics));
@@ -5245,7 +5245,7 @@ public class Runner
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        const auto compiled = compiler.compile({{"game_config.rs", gameConfigSrc}});
+        const auto compiled = compiler.compile({{"game_config.rscript", gameConfigSrc}});
         require(
             compiled.succeeded(),
             "Game.ConfigAndUtils compilation failed: " + diagnosticsText(compiled.diagnostics));
@@ -5345,7 +5345,7 @@ void testStaticConstructorsAndReadonlyFieldsCompleteness() {
         realscript::game::GameScriptCompiler compiler(api);
 
         // 1a: Cannot assign to instance readonly field outside instance constructor
-        auto bad1 = compiler.compile({{"bad_readonly_method.rs", R"(
+        auto bad1 = compiler.compile({{"bad_readonly_method.rscript", R"(
 module Game.BadReadonly1;
 class Hero {
     public readonly int MaxLives = 3;
@@ -5356,7 +5356,7 @@ class Hero {
             "Assigning to instance readonly field in method must report RS2483");
 
         // 1b: Cannot assign to static readonly field inside instance constructor or normal method
-        auto bad2 = compiler.compile({{"bad_static_readonly_ctor.rs", R"(
+        auto bad2 = compiler.compile({{"bad_static_readonly_ctor.rscript", R"(
 module Game.BadReadonly2;
 class Hero {
     public static readonly int GlobalCap = 100;
@@ -5367,7 +5367,7 @@ class Hero {
             "Assigning to static readonly field in instance constructor must report RS2483");
 
         // 1c: Cannot assign to instance readonly field inside static constructor
-        auto bad3 = compiler.compile({{"bad_instance_readonly_cctor.rs", R"(
+        auto bad3 = compiler.compile({{"bad_instance_readonly_cctor.rscript", R"(
 module Game.BadReadonly3;
 class Hero {
     public readonly int Id = 1;
@@ -5381,7 +5381,7 @@ class Hero {
             "Assigning to instance readonly field in static constructor must report RS2483");
 
         // 1d: Cannot assign to readonly field in object initializer
-        auto bad4 = compiler.compile({{"bad_readonly_obj_init.rs", R"(
+        auto bad4 = compiler.compile({{"bad_readonly_obj_init.rscript", R"(
 module Game.BadReadonly4;
 class Hero {
     public readonly int Id = 1;
@@ -5392,7 +5392,7 @@ class Hero {
             "Assigning to readonly field in object initializer must report RS2483");
 
         // 1e: Cannot pass readonly or static readonly field as ref/out outside its constructor
-        auto bad5 = compiler.compile({{"bad_readonly_ref.rs", R"(
+        auto bad5 = compiler.compile({{"bad_readonly_ref.rscript", R"(
 module Game.BadReadonly5;
 class Hero {
     public static readonly int GlobalCap = 100;
@@ -5404,7 +5404,7 @@ class Hero {
             "Passing static readonly field as ref outside static constructor must report RS2483");
 
         // 1f: Cannot mutate struct sub-field of static readonly struct outside static constructor
-        auto bad6 = compiler.compile({{"bad_readonly_struct_subfield.rs", R"(
+        auto bad6 = compiler.compile({{"bad_readonly_struct_subfield.rscript", R"(
 module Game.BadReadonly6;
 struct Vec2i { public int x; public int y; }
 class World {
@@ -5416,7 +5416,7 @@ class World {
             "Mutating sub-field of static readonly struct outside static constructor must report RS2483");
 
         // 1g: Field cannot be both const and readonly
-        auto bad7 = compiler.compile({{"bad_const_readonly.rs", R"(
+        auto bad7 = compiler.compile({{"bad_const_readonly.rscript", R"(
 module Game.BadReadonly7;
 class World {
     public const readonly int Limit = 10;
@@ -5426,7 +5426,7 @@ class World {
             "Declaring field as both const and readonly must report RS2483");
 
         // 1h: Static constructor cannot have access modifiers or parameters
-        auto bad8 = compiler.compile({{"bad_cctor_sig.rs", R"(
+        auto bad8 = compiler.compile({{"bad_cctor_sig.rscript", R"(
 module Game.BadCctor1;
 class World {
     public static World(int x) {}
@@ -5436,7 +5436,7 @@ class World {
             "Static constructor with access modifier or parameters must report RS2497");
 
         // 1i: Duplicate static constructor must report RS2497
-        auto bad9 = compiler.compile({{"bad_cctor_dup.rs", R"(
+        auto bad9 = compiler.compile({{"bad_cctor_dup.rscript", R"(
 module Game.BadCctor2;
 class World {
     static World() {}
@@ -5447,7 +5447,7 @@ class World {
             "Duplicate static constructor must report RS2497");
 
         // 1j: Explicit array size mismatch with initializer list must report RS2421
-        auto bad10 = compiler.compile({{"bad_array_init_len.rs", R"(
+        auto bad10 = compiler.compile({{"bad_array_init_len.rscript", R"(
 module Game.BadArrayInitLen;
 class World {
     public static int[] Data = new int[2] { 10, 20, 30 };
@@ -5569,13 +5569,13 @@ class DungeonSession
 
         realscript::game::GameApi api;
         realscript::game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"cctor_readonly.rs", source}});
+        auto compiled = compiler.compile({{"cctor_readonly.rscript", source}});
         require(
             compiled.succeeded(),
             "Game.CctorReadonly compilation failed: " + diagnosticsText(compiled.diagnostics));
 
         // Verify RSBC bytecode encode/decode round-trip preserves staticConstructor and readonlyField
-        realscript::compiler::Compilation rawComp({{"cctor_readonly.rs", source}});
+        realscript::compiler::Compilation rawComp({{"cctor_readonly.rscript", source}});
         const auto rawBuilt = rawComp.build();
         for (const auto& mirMod : rawBuilt.modules) {
             realscript::bytecode::Lowerer bcLowerer;
@@ -5822,7 +5822,7 @@ int runPropertyInitializerSuite() {
 )";
 
     realscript::compiler::Compilation compilation;
-    compilation.addSource({"property_initializers.rs", source});
+    compilation.addSource({"property_initializers.rscript", source});
     const auto build = compilation.build();
     require(!build.diagnostics.hasErrors(),
         "property initializers compilation failed: " + diagnosticsText(build.diagnostics));
@@ -5892,14 +5892,14 @@ int runPropertyInitializerSuite() {
     // P2-2 check: Cross-module base class with auto-properties inherited by a derived class in another module
     {
         realscript::compiler::Compilation crossModComp({
-            {"mod_a.rs", R"(
+            {"mod_a.rscript", R"(
 module CrossMod.BasePkg;
 public class BaseEntity {
     public int Health { get; set; } = 120;
     public int Shield { get; } = 30;
 }
 )"},
-            {"mod_b.rs", R"(
+            {"mod_b.rscript", R"(
 module CrossMod.DerivedPkg;
 import CrossMod.BasePkg;
 public class PlayerEntity : BaseEntity {
@@ -5939,7 +5939,7 @@ public int testCrossMod() {
     // 2a. Assigning to getter-only auto-property outside constructor -> RS2483
     {
         realscript::compiler::Compilation badComp;
-        badComp.addSource({"bad_readonly_prop.rs", R"(
+        badComp.addSource({"bad_readonly_prop.rscript", R"(
 module Evolution.BadReadonlyProp;
 class Widget {
     public int Id { get; } = 10;
@@ -5957,7 +5957,7 @@ int main() { return 0; }
     // 2b. Assigning to static getter-only auto-property inside instance constructor -> RS2483
     {
         realscript::compiler::Compilation badComp;
-        badComp.addSource({"bad_static_readonly_prop.rs", R"(
+        badComp.addSource({"bad_static_readonly_prop.rscript", R"(
 module Evolution.BadStaticReadonlyProp;
 class Widget {
     public static int GlobalId { get; } = 10;
@@ -5975,7 +5975,7 @@ int main() { return 0; }
     // 2c. Property initializer on non-auto property (computed property with body) -> RS2465
     {
         realscript::compiler::Compilation badComp;
-        badComp.addSource({"bad_computed_prop_init.rs", R"(
+        badComp.addSource({"bad_computed_prop_init.rscript", R"(
 module Evolution.BadComputedPropInit;
 class Widget {
     int backing = 1;
@@ -5993,7 +5993,7 @@ int main() { return 0; }
     // 2d. P1-5: Initializing a static property inside an object initializer `new Widget { GlobalCap = 20 }` -> RS2484
     {
         realscript::compiler::Compilation badComp;
-        badComp.addSource({"bad_static_prop_obj_init.rs", R"(
+        badComp.addSource({"bad_static_prop_obj_init.rscript", R"(
 module Evolution.BadStaticPropObjInit;
 class Widget {
     public static int GlobalCap { get; set; } = 10;
@@ -6011,7 +6011,7 @@ int main() {
     // 2e. P1-6: Using a non-const static field with a literal initializer inside a `const` field declaration -> RS2407
     {
         realscript::compiler::Compilation badComp;
-        badComp.addSource({"bad_nonconst_in_const.rs", R"(
+        badComp.addSource({"bad_nonconst_in_const.rscript", R"(
 module Evolution.BadNonConstInConst;
 class Rules {
     public static int MutableLimit = 10;
@@ -6091,14 +6091,14 @@ int main()
     for (const auto optLevel : {realscript::optimization::Level::None,
                                 realscript::optimization::Level::Aggressive}) {
         realscript::compiler::Compilation comp;
-        comp.addSource({"flat_interpreter.rs", source});
+        comp.addSource({"flat_interpreter.rscript", source});
         const auto build = comp.build();
-        require(!build.diagnostics.hasErrors(), "flat_interpreter.rs failed to compile:\n" + diagnosticsText(build.diagnostics));
+        require(!build.diagnostics.hasErrors(), "flat_interpreter.rscript failed to compile:\n" + diagnosticsText(build.diagnostics));
 
         realscript::optimization::Optimizer optimizer;
         realscript::diagnostics::DiagnosticBag optDiags;
         const auto optimizedMir = optimizer.optimize(build.modules, optDiags, {optLevel});
-        require(!optDiags.hasErrors(), "flat_interpreter.rs optimization failed");
+        require(!optDiags.hasErrors(), "flat_interpreter.rscript optimization failed");
 
         realscript::bytecode::Lowerer lowerer;
         std::vector<realscript::bytecode::Module> bytecodeModules;
@@ -6253,7 +6253,7 @@ int ResetPhysicsSubsystem(int seed);
         gen.cppRegistrationSource.find("offsetof(engine::physics::RigidBodyComponent, velocity)") != std::string::npos,
         "expected ECS field with default constructor initializer Vec3(0.0f, 0.0f, 0.0f) to be parsed");
 
-    // Verify generated .d.rs stub compiles cleanly alongside a script using 0.0f float literals and ECS raw columns
+    // Verify generated .d.rscript stub compiles cleanly alongside a script using 0.0f float literals and ECS raw columns
     realscript::game::GameApi api;
     realscript::game::GameScriptCompiler compiler(api);
     const std::string testUserScript = R"RS(
@@ -6283,12 +6283,12 @@ class PhysicsRunner
 )RS";
 
     auto compiled = compiler.compile({
-        {"Engine_Physics.d.rs", gen.scriptDeclarationStub},
-        {"PhysicsTest.rs", testUserScript},
+        {"Engine_Physics.d.rscript", gen.scriptDeclarationStub},
+        {"PhysicsTest.rscript", testUserScript},
     });
     require(
         compiled.succeeded(),
-        "Generated .d.rs stub + user script failed to compile:\n" +
+        "Generated .d.rscript stub + user script failed to compile:\n" +
             diagnosticsText(compiled.diagnostics) + "\nStub was:\n" + gen.scriptDeclarationStub);
 
     struct NativeRigidBody {
@@ -6373,9 +6373,9 @@ class ScoreTracker
 }
 )RS";
         realscript::game::GameScriptCompiler compiler(api);
-        auto v1 = compiler.compile({{"static_v1.rs", v1Src}});
+        auto v1 = compiler.compile({{"static_v1.rscript", v1Src}});
         require(v1.succeeded(), "static_v1 compile failed: " + diagnosticsText(v1.diagnostics));
-        auto v2 = compiler.compile({{"static_v2.rs", v2Src}});
+        auto v2 = compiler.compile({{"static_v2.rscript", v2Src}});
         require(v2.succeeded(), "static_v2 compile failed: " + diagnosticsText(v2.diagnostics));
 
         realscript::game::ScriptRuntime runtime(v1.program);
@@ -6441,7 +6441,7 @@ class Worker
 }
 )RS";
         realscript::game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"safepoint_test.rs", src}});
+        auto compiled = compiler.compile({{"safepoint_test.rscript", src}});
         require(compiled.succeeded(), "safepoint_test compile failed: " + diagnosticsText(compiled.diagnostics));
 
         realscript::game::ScriptRuntime rt(compiled.program);
@@ -6538,7 +6538,7 @@ class AccBox
     }
 }
 )RS";
-        realscript::compiler::Compilation comp({{"licm_test.rs", licmSrc}});
+        realscript::compiler::Compilation comp({{"licm_test.rscript", licmSrc}});
         auto buildRes = comp.build();
         require(!buildRes.diagnostics.hasErrors(), "licm_test build failed");
         realscript::optimization::Optimizer optimizer;
@@ -6596,7 +6596,7 @@ class Runner
 }
 )RS";
         realscript::game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"p0_test.rs", p0Src}});
+        auto compiled = compiler.compile({{"p0_test.rscript", p0Src}});
         require(
             compiled.succeeded(),
             "P0 script compile failed:\n" + diagnosticsText(compiled.diagnostics));
@@ -6670,7 +6670,7 @@ public int MainUncaughtThrow()
 }
 )RS";
         realscript::game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"p0_debug.rs", crashSrc}});
+        auto compiled = compiler.compile({{"p0_debug.rscript", crashSrc}});
         require(
             compiled.succeeded(),
             "P0 debug script compile failed:\n" + diagnosticsText(compiled.diagnostics));
@@ -6841,7 +6841,7 @@ public int VerifyCollectionsAndStrings()
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"p1_stdlib.rs", stdlibSrc}});
+        auto compiled = compiler.compile({{"p1_stdlib.rscript", stdlibSrc}});
         require(
             compiled.succeeded(),
             "P1 stdlib compile failed:\n" + diagnosticsText(compiled.diagnostics));
@@ -6872,7 +6872,7 @@ class OrderedComponent {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"p1_scene.rs", sceneSrc}});
+        auto compiled = compiler.compile({{"p1_scene.rscript", sceneSrc}});
         require(compiled.succeeded(), "P1 scene compile failed");
 
         game::ScriptRuntime runtime(compiled.program);
@@ -6967,7 +6967,7 @@ public int TestBossField(P1NativeBoss boss)
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto compiled = compiler.compile({{"p1_boss.rs", bossScript}});
+        auto compiled = compiler.compile({{"p1_boss.rscript", bossScript}});
         require(
             compiled.succeeded(),
             "P1 boss script compile failed:\n" + diagnosticsText(compiled.diagnostics));
@@ -7042,7 +7042,7 @@ void testRemediationPhaseCP2Items() {
     {
         tooling::LanguageService service;
         service.open(
-            "core.rs",
+            "core.rscript",
             "module Game.Core;\n"
             "public class MathUtil {\n"
             "    public static int Compute(int x) {\n"
@@ -7051,7 +7051,7 @@ void testRemediationPhaseCP2Items() {
             "}\n",
             1);
         service.open(
-            "combat.rs",
+            "combat.rscript",
             "module Game.Combat;\n"
             "import Game.Core;\n"
             "public class DamageCalc {\n"
@@ -7061,7 +7061,7 @@ void testRemediationPhaseCP2Items() {
             "}\n",
             1);
         service.open(
-            "ui.rs",
+            "ui.rscript",
             "module Game.UI;\n"
             "import Game.Combat;\n"
             "public class Hud {\n"
@@ -7077,7 +7077,7 @@ void testRemediationPhaseCP2Items() {
 
         // Body-only edit in Game.Core (imported by Game.Combat and transitively by Game.UI)
         service.update(
-            "core.rs",
+            "core.rscript",
             "module Game.Core;\n"
             "public class MathUtil {\n"
             "    public static int Compute(int x) {\n"
@@ -7097,7 +7097,7 @@ void testRemediationPhaseCP2Items() {
 
         // Body-only edit with temporary diagnostic inside method body (simulating live typing)
         service.update(
-            "core.rs",
+            "core.rscript",
             "module Game.Core;\n"
             "public class MathUtil {\n"
             "    public static int Compute(int x) {\n"
@@ -7106,8 +7106,8 @@ void testRemediationPhaseCP2Items() {
             "    }\n"
             "}\n",
             3);
-        const auto diags = service.diagnostics("core.rs");
-        require(!diags.empty(), "Expected diagnostic for unknownIdentifier in core.rs");
+        const auto diags = service.diagnostics("core.rscript");
+        require(!diags.empty(), "Expected diagnostic for unknownIdentifier in core.rscript");
         require(
             service.publicApiFingerprint("Game.Core") == fpBefore &&
                 service.lastRebuiltModuleCount() == 1,
@@ -7121,7 +7121,7 @@ void testRemediationPhaseCP2Items() {
         require(game::installGameplayBindings(api, host), "installGameplayBindings failed");
 
         game::GameScriptCompiler bootstrapCompiler(api);
-        auto bootstrap = bootstrapCompiler.compile({{"empty.rs", "module Empty; void Main() {}"}});
+        auto bootstrap = bootstrapCompiler.compile({{"empty.rscript", "module Empty; void Main() {}"}});
         game::ScriptRuntime boundRuntime(bootstrap.program);
         game::SceneScriptRuntime activeScene(boundRuntime);
         require(
@@ -7148,7 +7148,7 @@ class LevelLoader {
 }
 )RS";
         game::GameScriptCompiler compiler(api);
-        auto finalCompiled = compiler.compile({{"p2_async.rs", asyncSrc}});
+        auto finalCompiled = compiler.compile({{"p2_async.rscript", asyncSrc}});
         require(
             finalCompiled.succeeded(),
             "P2 async script compile failed:\n" + diagnosticsText(finalCompiled.diagnostics));
@@ -7194,7 +7194,7 @@ void testAuditFixesMultiInterfaceConversionsAndAotSourceMap() {
     // 1. Multi-interface & base-class generic constraints + multiple where clauses
     {
         compiler::Compilation comp({
-            {"multi_constraints.rs", R"RS(
+            {"multi_constraints.rscript", R"RS(
 module Evolution.MultiConstraints;
 
 public interface IDamageable {
@@ -7270,7 +7270,7 @@ public int main() {
 
         // Negative test: HalfUnit does not implement IHealable -> must report RS8530
         compiler::Compilation badComp({
-            {"bad_multi_constraints.rs", R"RS(
+            {"bad_multi_constraints.rscript", R"RS(
 module Evolution.BadMultiConstraints;
 
 public interface IDamageable { int GetHp(); }
@@ -7362,7 +7362,7 @@ public int main() {
     return c1.cm + fromCall + c2.cm + rawMeters + (int)(rawMillimeters / 1000L);
 }
 )RS";
-        compiler::Compilation comp({{"conversions.rs", convSrc}});
+        compiler::Compilation comp({{"conversions.rscript", convSrc}});
         const auto build = comp.build();
         require(
             !build.diagnostics.hasErrors(),
@@ -7381,7 +7381,7 @@ public int main() {
 
         // Negative test: explicit conversion operator must NOT be used implicitly
         compiler::Compilation badImplicit({
-            {"bad_implicit.rs", R"RS(
+            {"bad_implicit.rscript", R"RS(
 module Evolution.BadImplicit;
 public struct Meter {
     public int value;
@@ -7422,9 +7422,9 @@ public class CrashDemo {
     }
 }
 )RS";
-        compiler::Compilation comp({{"scripts/aot_trace_demo.rs", aotTraceSrc}});
+        compiler::Compilation comp({{"scripts/aot_trace_demo.rscript", aotTraceSrc}});
         const auto build = comp.build();
-        require(!build.diagnostics.hasErrors(), "aot_trace_demo.rs failed to compile");
+        require(!build.diagnostics.hasErrors(), "aot_trace_demo.rscript failed to compile");
 
         bytecode::Lowerer lowerer;
         std::vector<bytecode::Module> bcMods;
@@ -7438,12 +7438,12 @@ public class CrashDemo {
                 interpRes.error.symbolizedStackTrace.size() == 3,
             "Interpreter RuntimeError must populate sourceLocations and symbolizedStackTrace");
         require(
-            interpRes.error.sourceLocations[0].sourcePath == "scripts/aot_trace_demo.rs" &&
+            interpRes.error.sourceLocations[0].sourcePath == "scripts/aot_trace_demo.rscript" &&
                 interpRes.error.sourceLocations[0].sourceLine == 7 &&
                 interpRes.error.sourceLocations[1].sourceLine == 12 &&
                 interpRes.error.sourceLocations[2].sourceLine == 16 &&
-                interpRes.error.symbolizedStackTrace[0].find("scripts/aot_trace_demo.rs:7:") != std::string::npos,
-            "Interpreter symbolizedStackTrace top frame must include exact statement line scripts/aot_trace_demo.rs:7");
+                interpRes.error.symbolizedStackTrace[0].find("scripts/aot_trace_demo.rscript:7:") != std::string::npos,
+            "Interpreter symbolizedStackTrace top frame must include exact statement line scripts/aot_trace_demo.rscript:7");
 
         diagnostics::DiagnosticBag aotDiags;
         aot::CppGenerator generator;
@@ -7579,7 +7579,7 @@ void testV2RoadmapP0SlicePoolAndRsbindEvolution() {
 
     game::GameScriptCompiler compiler(api);
     const auto compiled = compiler.compile({
-        {"p0_squad_test.rs", R"RS(
+        {"p0_squad_test.rscript", R"RS(
             module App.P0Test;
             import Game.Units;
 
@@ -7650,7 +7650,7 @@ void testV3NextStageFlatDoubleFieldsInlinerOverloadsAndHotReloadBreakpoints() {
             }
         )RS";
 
-        compiler::Compilation comp({{"v3_perf.rs", srcCode}});
+        compiler::Compilation comp({{"v3_perf.rscript", srcCode}});
         auto build = comp.build();
         require(!build.diagnostics.hasErrors(), "V3Perf source must compile");
 
@@ -7715,7 +7715,7 @@ void testV3NextStageFlatDoubleFieldsInlinerOverloadsAndHotReloadBreakpoints() {
 
         game::GameScriptCompiler compiler(api);
         const auto compiled = compiler.compile({
-            {"v3_overload.rs", R"RS(
+            {"v3_overload.rscript", R"RS(
                 module App.V3Overload;
                 import Game.Units;
 
@@ -7753,7 +7753,7 @@ public int calc(int x) {
     return y;
 }
 )RS";
-        compiler::Compilation c1({{"bp_reload.rs", v1Src}});
+        compiler::Compilation c1({{"bp_reload.rscript", v1Src}});
         auto b1 = c1.build();
         bytecode::Lowerer lowerer;
         std::vector<bytecode::Module> m1{lowerer.lower(b1.modules.front())};
@@ -7762,12 +7762,12 @@ public int calc(int x) {
         ctrl.stopOnEntry(true);
         ctrl.bindModules(m1);
         // Set breakpoint on line 3 (comment in v1 -> snaps to line 5 in v1)
-        const auto bpsV1 = ctrl.setBreakpoints("bp_reload.rs", {{2, 0}}); // 0-based line 2 = 1-based line 3
+        const auto bpsV1 = ctrl.setBreakpoints("bp_reload.rscript", {{2, 0}}); // 0-based line 2 = 1-based line 3
         require(bpsV1.size() == 1 && bpsV1[0].verified && bpsV1[0].line == 4 && bpsV1[0].requestedLine == 2,
             "v1 breakpoint requested at 0-based line 2 must snap to 0-based line 4 while preserving requestedLine == 2");
 
         // Now hot-reload v2 where 0-based line 2 has executable code `int y = x + 20;`
-        compiler::Compilation c2({{"bp_reload.rs", v2Src}});
+        compiler::Compilation c2({{"bp_reload.rscript", v2Src}});
         auto b2 = c2.build();
         std::vector<bytecode::Module> m2{lowerer.lower(b2.modules.front())};
         ctrl.bindModules(m2);
@@ -7816,7 +7816,7 @@ void testV4EvolutionCustomStructMarshalingDoubleSuperinstructionsAndCrossModuleI
 
         game::GameScriptCompiler compiler(api);
         const auto compiled = compiler.compile({
-            {"v4_struct.rs", R"RS(
+            {"v4_struct.rscript", R"RS(
                 module App.V4Struct;
                 import Combat;
 
@@ -7895,7 +7895,7 @@ int EvalImpulse(int mass, double velocity);
     // 3. Cross-module -O2 MIR inlining + FlatOpcode double superinstructions & conversion/array-length fast paths
     {
         compiler::Compilation comp({
-            {"math_util.rs", R"RS(
+            {"math_util.rscript", R"RS(
                 module MathUtil;
                 public double FmaStep(double x, double scale, double bias) {
                     return x * scale + bias;
@@ -7904,7 +7904,7 @@ int EvalImpulse(int mass, double velocity);
                     return v + 10L;
                 }
             )RS"},
-            {"sim.rs", R"RS(
+            {"sim.rscript", R"RS(
                 module Sim;
                 import MathUtil;
                 public double RunSim(int n) {
@@ -7958,7 +7958,7 @@ void testV5EvolutionCrossModuleStructInliningFiberHotReloadAndBranchFusion() {
     // 1. Cross-module struct/enum TypeSymbol auto-import + 2-pass transitive -O2 inlining + dead unchecked arithmetic elimination
     {
         compiler::Compilation comp({
-            {"vec_math.rs", R"RS(
+            {"vec_math.rscript", R"RS(
                 module VecMath;
 
                 public struct Vec2D {
@@ -7987,7 +7987,7 @@ void testV5EvolutionCrossModuleStructInliningFiberHotReloadAndBranchFusion() {
                     return b;
                 }
             )RS"},
-            {"app_sim.rs", R"RS(
+            {"app_sim.rscript", R"RS(
                 module AppSim;
                 import VecMath;
 
@@ -8035,7 +8035,7 @@ void testV5EvolutionCrossModuleStructInliningFiberHotReloadAndBranchFusion() {
     // 2. Safe body-only hot-reload with newly added helper function (allowAddedFunctions = true)
     {
         compiler::Compilation c1({
-            {"live_reload.rs", R"RS(
+            {"live_reload.rscript", R"RS(
                 module Game.LiveReload;
                 public int CalcScore(int baseVal) {
                     return baseVal + 10;
@@ -8051,7 +8051,7 @@ void testV5EvolutionCrossModuleStructInliningFiberHotReloadAndBranchFusion() {
         runtime::EngineRuntime eng(std::make_shared<runtime::ProgramImage>(*prog1));
 
         compiler::Compilation c2({
-            {"live_reload.rs", R"RS(
+            {"live_reload.rscript", R"RS(
                 module Game.LiveReload;
                 int ComputeBonusHelper(int v) {
                     return v * 3;
@@ -8130,7 +8130,7 @@ void testRound3SevenFixesVerification() {
         game::GameApi api;
         game::GameScriptCompiler compiler(api);
         const auto compiled = compiler.compile({
-            {"round3_scene.rs", R"RS(
+            {"round3_scene.rscript", R"RS(
                 module Game.Round3;
 
                 public class TrackedActor {
@@ -8234,7 +8234,7 @@ void testRound3SevenFixesVerification() {
         game::GameApi api;
         game::GameScriptCompiler compiler(api);
         const auto compiled = compiler.compile({
-            {"round3_state.rs", R"RS(
+            {"round3_state.rscript", R"RS(
                 module Game.Round3State;
 
                 public class NodeWithCtor {
@@ -8297,14 +8297,14 @@ void testRound3SevenFixesVerification() {
     // 3. LanguageService incremental rebuild module eviction on compile error & sourceless diagnostic deduplication (#7)
     {
         tooling::LanguageService ls;
-        ls.open("a.rs", "module ModA;\npublic int GetA() { return 1; }\n", 1);
-        ls.open("b.rs", "module ModB;\nimport ModA;\npublic int GetB() { return GetA() + 2; }\n", 1);
-        ls.open("c.rs", "module ModC;\npublic int GetC() { return 3; }\n", 1);
+        ls.open("a.rscript", "module ModA;\npublic int GetA() { return 1; }\n", 1);
+        ls.open("b.rscript", "module ModB;\nimport ModA;\npublic int GetB() { return GetA() + 2; }\n", 1);
+        ls.open("c.rscript", "module ModC;\npublic int GetC() { return 3; }\n", 1);
         const auto& build1 = ls.build();
         require(!build1.diagnostics.hasErrors() && build1.modules.size() == 3, "initial build has 3 modules");
 
         // Break leaf module ModB with a return type mismatch (subgraph {ModA, ModB} < 3 total modules)
-        ls.update("b.rs", "module ModB;\nimport ModA;\npublic int GetB() { return \"bad\"; }\n", 2);
+        ls.update("b.rscript", "module ModB;\nimport ModA;\npublic int GetB() { return \"bad\"; }\n", 2);
         const auto& build2 = ls.build();
         require(build2.diagnostics.hasErrors(), "build2 must have error");
         require(ls.lastRebuiltModuleCount() == 1, "incremental subgraph rebuild must have run for ModB");

@@ -185,7 +185,7 @@ The verifier also handles malformed operand arrays without indexing invalid memo
 The existing CLI automatically verifies generated MIR before printing it:
 
 ```bash
-rsc sample.rs --mir
+rsc sample.rscript --mir
 ```
 
 Invalid source is rejected during parsing, binding, or flow analysis. Invalid generated MIR is rejected with `RS30xx` diagnostics.

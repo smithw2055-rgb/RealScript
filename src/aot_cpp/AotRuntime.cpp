@@ -2521,10 +2521,33 @@ TypedRawColumnCache ExecutionContext::acquireRawColumnCache(
     if (generatedFields &&
         generatedFieldCount == view->fields.size() &&
         generatedStructSize == view->strideBytes) {
+        const auto nativeKindSize = [](runtime::NativeFieldKind kind) noexcept -> std::size_t {
+            switch (kind) {
+            case runtime::NativeFieldKind::Bool: return sizeof(bool);
+            case runtime::NativeFieldKind::Int8: return sizeof(std::int8_t);
+            case runtime::NativeFieldKind::UInt8: return sizeof(std::uint8_t);
+            case runtime::NativeFieldKind::Int16: return sizeof(std::int16_t);
+            case runtime::NativeFieldKind::UInt16: return sizeof(std::uint16_t);
+            case runtime::NativeFieldKind::Int32: return sizeof(std::int32_t);
+            case runtime::NativeFieldKind::UInt32: return sizeof(std::uint32_t);
+            case runtime::NativeFieldKind::Int64: return sizeof(std::int64_t);
+            case runtime::NativeFieldKind::UInt64: return sizeof(std::uint64_t);
+            case runtime::NativeFieldKind::Float32: return sizeof(float);
+            case runtime::NativeFieldKind::Float64: return sizeof(double);
+            case runtime::NativeFieldKind::Fixed: return sizeof(runtime::FixedValue);
+            case runtime::NativeFieldKind::Fixed16: return sizeof(std::int16_t);
+            case runtime::NativeFieldKind::Vec2: return sizeof(runtime::Vec2Value);
+            case runtime::NativeFieldKind::Vec3: return sizeof(runtime::Vec3Value);
+            case runtime::NativeFieldKind::Quat: return sizeof(runtime::QuatValue);
+            }
+            return 0u;
+        };
         bool exact = true;
         for (std::size_t i = 0; i < generatedFieldCount; ++i) {
             if (view->fields[i].byteOffset != generatedFields[i].byteOffset ||
-                view->fields[i].kind != generatedFields[i].expectedKind) {
+                view->fields[i].kind != generatedFields[i].expectedKind ||
+                nativeKindSize(view->fields[i].kind) != generatedFields[i].byteSize ||
+                view->fields[i].kind == runtime::NativeFieldKind::Fixed16) {
                 exact = false;
                 break;
             }
@@ -3227,6 +3250,14 @@ bool ExecutionContext::awaitSuspend(
                 runtime::ErrorCode::InvalidProgram,
                 "AOT active coroutine frame handle is stale");
         }
+        if (existing->invalidated) {
+            if (awaitedHandle.valid() && !awaitedHandle.isCompletedVoidSentinel()) {
+                (void)asyncRuntime_->awaitables().discard(awaitedHandle);
+            }
+            return fail(
+                runtime::ErrorCode::ExecutionTerminated,
+                "AOT coroutine invalidated by hot reload");
+        }
         completionHandle = existing->completionHandle;
     }
 
@@ -3238,6 +3269,11 @@ bool ExecutionContext::awaitSuspend(
             runtime::AsyncRuntimeContext& asyncContext) {
             const auto faultUnresolvedFrame = [&](const runtime::RuntimeError& err) {
                 if (auto* f = asyncContext.coroutines().resolve(frameHandle)) {
+                    if (f->invalidated) {
+                        f->completed = true;
+                        (void)asyncContext.awaitables().trySetCanceled(f->completionHandle);
+                        return;
+                    }
                     if (!f->completed && !f->suspended) {
                         f->completed = true;
                         const runtime::ErrorCode code =
@@ -3543,6 +3579,14 @@ bool ExecutionContext::awaitSuspendScalar(
                 runtime::ErrorCode::InvalidProgram,
                 "AOT active coroutine frame handle is stale");
         }
+        if (existing->invalidated) {
+            if (awaitedHandle.valid() && !awaitedHandle.isCompletedVoidSentinel()) {
+                (void)asyncRuntime_->awaitables().discard(awaitedHandle);
+            }
+            return fail(
+                runtime::ErrorCode::ExecutionTerminated,
+                "AOT coroutine invalidated by hot reload");
+        }
         completionHandle = existing->completionHandle;
     }
 
@@ -3554,6 +3598,11 @@ bool ExecutionContext::awaitSuspendScalar(
             runtime::AsyncRuntimeContext& asyncContext) {
             const auto faultUnresolvedFrame = [&](const runtime::RuntimeError& err) {
                 if (auto* f = asyncContext.coroutines().resolve(frameHandle)) {
+                    if (f->invalidated) {
+                        f->completed = true;
+                        (void)asyncContext.awaitables().trySetCanceled(f->completionHandle);
+                        return;
+                    }
                     if (!f->completed && !f->suspended) {
                         f->completed = true;
                         const runtime::ErrorCode code =

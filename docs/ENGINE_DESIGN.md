@@ -144,14 +144,14 @@ RealScript 的目标不是实现完整 C# 或替代 C++，而是覆盖游戏逻�
 建议扩展名：
 
 ```text
-.rs
+.rscript
 .rsi     # 可选接口/签名文件
 .rsm     # 编译模块包
 .rsbc    # 字节码包
 .rsmeta  # 可选独立元数据
 ```
 
-初期只需要 `.rs` 和内部模块缓存格式，避免过早冻结公共二进制格式。
+初期只需要 `.rscript` 和内部模块缓存格式，避免过早冻结公共二进制格式。
 
 模块示例：
 
@@ -1352,7 +1352,7 @@ runtime ← metadata ← bindings
 rsc check game.rsproj
 rsc build game.rsproj --backend=bytecode
 rsc build game.rsproj --backend=cpp-aot
-rsc emit-mir game.rs --output=game.mir
+rsc emit-mir game.rscript --output=game.mir
 rsc emit-cpp game.rsproj --output=generated/
 rsc migrate-check old.rsmeta new.rsmeta
 ```

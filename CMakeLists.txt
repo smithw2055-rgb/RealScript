@@ -43,6 +43,7 @@ add_library(realscript_frontend STATIC
     src/mir/MirVerifier.cpp
     src/mir/MirPrinter.cpp
     src/compiler/Compilation.cpp
+    src/compiler/ModuleBuildCache.cpp
     src/bytecode/BytecodeFacts.cpp
     src/bytecode/BytecodeLowerer.cpp
     src/bytecode/BytecodeVerifier.cpp
@@ -78,6 +79,11 @@ target_include_directories(realscript_frontend
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_compile_features(realscript_frontend PUBLIC cxx_std_17)
+if(MSVC)
+    target_sources(realscript_frontend INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/tools/debuggers/RealScript.natvis>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_DATADIR}/RealScript/debuggers/RealScript.natvis>)
+endif()
 if(CMAKE_DL_LIBS)
     target_link_libraries(realscript_frontend PUBLIC ${CMAKE_DL_LIBS})
 endif()
@@ -101,7 +107,7 @@ realscript_add_component(realscript_full Full)
 
 function(realscript_enable_cxx_warnings target)
     if(MSVC)
-        target_compile_options(${target} PRIVATE /W4 /permissive-)
+        target_compile_options(${target} PRIVATE /utf-8 /W4 /wd4324 /permissive-)
         if(REALSCRIPT_WARNINGS_AS_ERRORS)
             target_compile_options(${target} PRIVATE /WX)
         endif()
@@ -169,7 +175,7 @@ if(REALSCRIPT_BUILD_BENCHMARKS)
         OUTPUT_DIRECTORY "${REALSCRIPT_BENCH_INTEGER_GENERATED_DIR}"
         OPT_LEVEL 2
         SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/micro/integer_loop.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/micro/integer_loop.rscript"
     )
     add_executable(
         rsbench_aot benchmarks/aot_integer_driver.cpp)
@@ -271,8 +277,8 @@ if(REALSCRIPT_BUILD_TESTS)
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE5_GENERATED_DIR}"
         OPT_LEVEL 0
         SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rs"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rscript"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rscript"
     )
 
     add_executable(realscript_phase5_aot_tests tests/phase5_aot_tests.cpp)
@@ -401,6 +407,51 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_phase27_scene_async_lifecycle_tests
         realscript.phase27.scene-async-lifecycle
         tests/phase27_scene_async_lifecycle_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_sprint1_evolution_tests
+        realscript.sprint1-evolution
+        tests/sprint1_evolution_tests.cpp)
+    target_compile_definitions(
+        realscript_sprint1_evolution_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    realscript_add_cpp_test(
+        realscript_sprint2_gc_budget_and_pool_tests
+        realscript.sprint2.gc-budget-and-pool
+        tests/sprint2_gc_budget_and_pool_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_sprint2_scene_hotreload_guid_tests
+        realscript.sprint2.scene-hotreload-guid
+        tests/sprint2_scene_hotreload_guid_tests.cpp)
+    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
+        realscript_add_cpp_test(
+            realscript_sprint2_generics_using_resource_tests
+            realscript.sprint2.generics-using-resource
+            tests/sprint2_generics_using_resource_tests.cpp)
+        target_compile_definitions(
+            realscript_sprint2_generics_using_resource_tests
+            PRIVATE
+                REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+                REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
+                REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
+                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/sprint2-jit-cache")
+    endif()
+    realscript_add_cpp_test(
+        realscript_v2_audit_regression_tests
+        realscript.v2.audit-regressions
+        tests/v2_audit_regression_tests.cpp)
+    target_compile_definitions(
+        realscript_v2_audit_regression_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    realscript_add_cpp_test(
+        realscript_sprint2_module_build_cache_tests
+        realscript.sprint2.module-build-cache
+        tests/sprint2_module_build_cache_tests.cpp)
+    target_compile_definitions(
+        realscript_sprint2_module_build_cache_tests
+        PRIVATE
+            REALSCRIPT_RSC_BIN="$<TARGET_FILE:rsc>"
+            REALSCRIPT_RSAOT_BIN="$<TARGET_FILE:rsaot>")
     set(REALSCRIPT_PHASE20_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/phase20")
     realscript_add_aot_library(
@@ -409,7 +460,7 @@ if(REALSCRIPT_BUILD_TESTS)
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE20_GENERATED_DIR}"
         OPT_LEVEL 2
         SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase20_aot.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase20_aot.rscript"
     )
     add_executable(
         realscript_phase20_aot_tests tests/phase20_aot_tests.cpp)
@@ -432,7 +483,7 @@ if(REALSCRIPT_BUILD_TESTS)
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE21_GENERATED_DIR}"
         OPT_LEVEL 2
         SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase21_aot.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase21_aot.rscript"
     )
     add_executable(
         realscript_phase21_aot_tests tests/phase21_aot_tests.cpp)
@@ -455,7 +506,7 @@ if(REALSCRIPT_BUILD_TESTS)
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE22_GENERATED_DIR}"
         OPT_LEVEL 2
         SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase22_aot.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase22_aot.rscript"
     )
     add_executable(
         realscript_phase22_aot_tests tests/phase22_aot_tests.cpp)
@@ -478,7 +529,7 @@ if(REALSCRIPT_BUILD_TESTS)
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE23_GENERATED_DIR}"
         OPT_LEVEL 2
         SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase23_aot.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase23_aot.rscript"
     )
     add_executable(
         realscript_phase23_aot_tests tests/phase23_aot_tests.cpp)
@@ -501,7 +552,7 @@ if(REALSCRIPT_BUILD_TESTS)
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE24_GENERATED_DIR}"
         OPT_LEVEL 2
         SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase24_aot.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase24_aot.rscript"
     )
     add_executable(
         realscript_phase24_aot_tests tests/phase24_aot_tests.cpp)
@@ -524,7 +575,7 @@ if(REALSCRIPT_BUILD_TESTS)
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE26_GENERATED_DIR}"
         OPT_LEVEL 2
         SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase26_aot.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase26_aot.rscript"
     )
     add_executable(
         realscript_phase26_aot_tests tests/phase26_aot_tests.cpp)
@@ -547,7 +598,7 @@ if(REALSCRIPT_BUILD_TESTS)
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE19_GENERATED_DIR}"
         OPT_LEVEL 2
         SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase19_aot.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase19_aot.rscript"
     )
     add_executable(
         realscript_phase19_aot_tests tests/phase19_aot_tests.cpp)
@@ -573,7 +624,7 @@ if(REALSCRIPT_BUILD_TESTS)
         OUTPUT_DIRECTORY "${REALSCRIPT_AOT_MATH_BENCH_GENERATED_DIR}"
         OPT_LEVEL 2
         SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/aot_trusted_math_bench.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/aot_trusted_math_bench.rscript"
     )
     set(REALSCRIPT_AOT_ECS_BENCH_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/aot_ecs_bench")
@@ -586,7 +637,7 @@ if(REALSCRIPT_BUILD_TESTS)
         OPT_LEVEL 2
         TRUSTED_RELEASE
         SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/aot_trusted_ecs_bench.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/aot_trusted_ecs_bench.rscript"
     )
     add_executable(
         realscript_aot_trusted_and_zero_copy_ecs_tests
@@ -616,7 +667,7 @@ if(REALSCRIPT_BUILD_TESTS)
         OUTPUT_DIRECTORY "${REALSCRIPT_PHASE28_STD_GENERATED_DIR}"
         OPT_LEVEL 2
         SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase28_trusted_async_aot.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase28_trusted_async_aot.rscript"
     )
     set(REALSCRIPT_PHASE28_TRUSTED_GENERATED_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/phase28_trusted")
@@ -629,7 +680,7 @@ if(REALSCRIPT_BUILD_TESTS)
         OPT_LEVEL 2
         TRUSTED_RELEASE
         SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase28_trusted_async_aot.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase28_trusted_async_aot.rscript"
     )
     add_executable(
         realscript_phase28_net_async_and_trusted_aot_tests
@@ -662,8 +713,8 @@ if(REALSCRIPT_BUILD_TESTS)
     add_test(
         NAME realscript.phase6.cli-smoke
         COMMAND rsc
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rs"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rscript"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rscript"
             --run Phase5.App::main
             --opt-level 2
             --deterministic
@@ -678,15 +729,15 @@ if(REALSCRIPT_BUILD_TESTS)
             --warmup 1
             --opt-level 2
             --json
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rs"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rscript"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rscript"
     )
     add_test(
         NAME realscript.phase6.cli-multimodule-package
         COMMAND ${CMAKE_COMMAND}
             -DREALSCRIPT_RSC=$<TARGET_FILE:rsc>
-            -DREALSCRIPT_SOURCE_A=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rs
-            -DREALSCRIPT_SOURCE_B=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rs
+            -DREALSCRIPT_SOURCE_A=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rscript
+            -DREALSCRIPT_SOURCE_B=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rscript
             -DREALSCRIPT_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/cli-multimodule/$<CONFIG>
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/multimodule_cli_test.cmake
     )
@@ -746,6 +797,8 @@ if(REALSCRIPT_INSTALL_SDK)
         DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/RealScript)
     install(FILES cmake/RealScriptAot.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/RealScript)
+    install(DIRECTORY tools/debuggers/
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/RealScript/debuggers)
 
     configure_package_config_file(
         cmake/RealScriptConfig.cmake.in

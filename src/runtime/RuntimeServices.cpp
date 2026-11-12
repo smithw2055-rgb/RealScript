@@ -1305,7 +1305,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
     const auto isBuiltinMathModule = [](const bytecode::Module& mod) noexcept {
         return mod.name == "RealScript.Math" &&
             !mod.sourceFiles.empty() &&
-            mod.sourceFiles[0].path == "$builtin/RealScript.Math.rs";
+            mod.sourceFiles[0].path == "$builtin/RealScript.Math.rscript";
     };
 
     const auto computeStraightLineCallMetrics = [](
@@ -6074,6 +6074,10 @@ struct RuntimeStringPool {
         std::atomic<std::uint8_t> flags[kPageSize]{};
     };
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
     struct alignas(64) Shard {
         std::mutex mutex;
         std::atomic<StringPage*> pages[kHardMaxPagesPerShard]{};
@@ -6085,9 +6089,13 @@ struct RuntimeStringPool {
         std::uint32_t lastAllocatedSlot = kInvalidLocalSlot;
         std::atomic<std::uint32_t> epoch{1u};
         std::atomic<bool> mayHavePinnedOrMarked{false};
+        std::atomic<bool> needsPinReclaim{false};
         std::atomic<std::uint64_t> clockEvictions{0u};
         std::atomic<std::uint64_t> gcReclaimed{0u};
     };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
     std::string emptyString_{};
     Shard shards_[kPoolShardCount]{};
@@ -6149,6 +6157,7 @@ struct RuntimeStringPool {
         if (evicted != kInvalidLocalSlot) {
             return evicted;
         }
+        shard.needsPinReclaim.store(true, std::memory_order_relaxed);
         if (shard.highWaterMark < kHardMaxSlotsPerShard) {
             return allocateFreshSlotLocked(shard);
         }
@@ -6178,6 +6187,9 @@ struct RuntimeStringPool {
         const std::uint64_t h = fnv1a64(text);
         const std::uint32_t shardIdx = static_cast<std::uint32_t>((h >> 58u) & kPoolShardMask);
         Shard& shard = shards_[shardIdx];
+        if (shard.needsPinReclaim.exchange(false, std::memory_order_relaxed)) {
+            (void)reclaimUnreferencedPoolValues();
+        }
 
         struct TlsStringSlot {
             std::uint64_t hash = 0;
@@ -6398,6 +6410,10 @@ struct InlineStructPool {
         std::atomic<std::uint8_t> flags[kPageSize]{};
     };
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
     struct alignas(64) Shard {
         std::mutex mutex;
         std::atomic<InlinePage*> pages[kHardMaxPagesPerShard]{};
@@ -6413,9 +6429,13 @@ struct InlineStructPool {
         std::uint32_t lastAllocatedSlot = kInvalidLocalSlot;
         std::atomic<std::uint32_t> epoch{1u};
         std::atomic<bool> mayHavePinnedOrMarked{false};
+        std::atomic<bool> needsPinReclaim{false};
         std::atomic<std::uint64_t> clockEvictions{0u};
         std::atomic<std::uint64_t> gcReclaimed{0u};
     };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
     Shard shards_[kPoolShardCount]{};
 
@@ -6488,6 +6508,7 @@ struct InlineStructPool {
         if (evicted != kInvalidLocalSlot) {
             return evicted;
         }
+        shard.needsPinReclaim.store(true, std::memory_order_relaxed);
         if (shard.highWaterMark < kHardMaxSlotsPerShard) {
             return allocateFreshSlotLocked(shard);
         }
@@ -6498,6 +6519,9 @@ struct InlineStructPool {
         const std::size_t h = InlineStructEntryHash{}(entry);
         const std::uint32_t shardIdx = static_cast<std::uint32_t>((h >> 10u) & kPoolShardMask);
         Shard& shard = shards_[shardIdx];
+        if (shard.needsPinReclaim.exchange(false, std::memory_order_relaxed)) {
+            (void)reclaimUnreferencedPoolValues();
+        }
 
         struct TlsCacheSlot {
             InlineStructArenaEntry key{};
@@ -6752,6 +6776,10 @@ struct HeapStructStoragePool {
         std::atomic<std::uint8_t> flags[kPageSize]{};
     };
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
     struct alignas(64) Shard {
         std::mutex mutex;
         std::atomic<HeapStructPage*> pages[kHardMaxPagesPerShard]{};
@@ -6763,9 +6791,13 @@ struct HeapStructStoragePool {
         std::uint32_t lastAllocatedSlot = kInvalidLocalSlot;
         std::atomic<std::uint32_t> epoch{1u};
         std::atomic<bool> mayHavePinnedOrMarked{false};
+        std::atomic<bool> needsPinReclaim{false};
         std::atomic<std::uint64_t> clockEvictions{0u};
         std::atomic<std::uint64_t> gcReclaimed{0u};
     };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
     Shard shards_[kPoolShardCount]{};
 
@@ -6904,6 +6936,7 @@ struct HeapStructStoragePool {
         if (evicted != kInvalidLocalSlot) {
             return evicted;
         }
+        shard.needsPinReclaim.store(true, std::memory_order_relaxed);
         if (shard.highWaterMark < kHardMaxSlotsPerShard) {
             return allocateFreshSlotLocked(shard);
         }
@@ -6915,6 +6948,9 @@ struct HeapStructStoragePool {
         const std::uint64_t h = computeFieldsHash(store->fields);
         const std::uint32_t shardIdx = static_cast<std::uint32_t>((h >> 58u) & kPoolShardMask);
         Shard& shard = shards_[shardIdx];
+        if (shard.needsPinReclaim.exchange(false, std::memory_order_relaxed)) {
+            (void)reclaimUnreferencedPoolValues();
+        }
 
         std::lock_guard<std::mutex> lock(shard.mutex);
         auto range = shard.dedupByHash.equal_range(h);

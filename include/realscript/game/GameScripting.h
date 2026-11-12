@@ -37,6 +37,17 @@ class GameProgram {
 public:
     GameProgram() = default;
 
+    [[nodiscard]] static GameProgram fromProgramImage(
+        std::shared_ptr<const runtime::ProgramImage> program,
+        std::shared_ptr<const runtime::BindingRegistry> bindings = nullptr,
+        GameLanguageMetadata languageMetadata = {}) {
+        GameProgram gp;
+        gp.program_ = std::move(program);
+        gp.bindings_ = std::move(bindings);
+        gp.languageMetadata_ = std::move(languageMetadata);
+        return gp;
+    }
+
     [[nodiscard]] bool valid() const noexcept { return program_ != nullptr; }
     [[nodiscard]] std::shared_ptr<const runtime::ProgramImage> program() const noexcept {
         return program_;
@@ -233,7 +244,16 @@ public:
             error.message = "cannot wrap a null native object";
             return std::nullopt;
         }
-        const auto handleTypeId = nativeBaseTypeId(*type);
+        const auto cppTypeId = nativeHandles_
+            ? nativeHandles_->findCppTypeId(std::type_index(typeid(T)))
+            : 0;
+        if (cppTypeId != 0 && !isTypeAssignable(type->descriptor.id, cppTypeId)) {
+            error.code = runtime::ErrorCode::TypeMismatch;
+            error.message = "native C++ object type is not assignable to script wrapper type '" +
+                canonicalTypeName + "'";
+            return std::nullopt;
+        }
+        const auto handleTypeId = cppTypeId != 0 ? cppTypeId : nativeBaseTypeId(*type);
         const auto effectiveTypeId = handleTypeId != 0 ? handleTypeId : type->descriptor.id;
         auto handle = nativeHandles_->create(
             effectiveTypeId,
@@ -274,12 +294,21 @@ public:
             error.message = "cannot bind a null native object";
             return false;
         }
-        const auto handleTypeId = nativeBaseTypeId(object.type());
-        if (handleTypeId == 0) {
+        const auto baseHandleTypeId = nativeBaseTypeId(object.type());
+        if (baseHandleTypeId == 0) {
             error.code = runtime::ErrorCode::TypeMismatch;
             error.message = "script object does not inherit from a native handle wrapper type";
             return false;
         }
+        const auto cppTypeId = nativeHandles_
+            ? nativeHandles_->findCppTypeId(std::type_index(typeid(T)))
+            : 0;
+        if (cppTypeId != 0 && !isTypeAssignable(object.type().descriptor.id, cppTypeId)) {
+            error.code = runtime::ErrorCode::TypeMismatch;
+            error.message = "native C++ object type is not assignable to script object type";
+            return false;
+        }
+        const auto handleTypeId = cppTypeId != 0 ? cppTypeId : baseHandleTypeId;
         auto handle = nativeHandles_->create(
             handleTypeId,
             std::static_pointer_cast<void>(std::move(nativeObject)),
@@ -532,6 +561,17 @@ public:
     [[nodiscard]] const ScriptObject* findAsset(const std::string& assetPath) const;
     bool unloadAsset(const std::string& assetPath);
     [[nodiscard]] std::size_t assetCount() const noexcept { return assets_.size(); }
+    [[nodiscard]] const std::map<std::string, ScriptObject>& assets() const noexcept {
+        return assets_;
+    }
+    [[nodiscard]] std::optional<std::string> findAssetPath(
+        runtime::ObjectRef reference) const {
+        if (!reference.valid()) return std::nullopt;
+        for (const auto& [path, obj] : assets_) {
+            if (obj.reference() == reference) return path;
+        }
+        return std::nullopt;
+    }
 
     [[nodiscard]] std::shared_ptr<const runtime::ProgramImage> program() const noexcept {
         return program_;
@@ -590,6 +630,10 @@ private:
     std::shared_ptr<debug::DebugController> debugger_;
     std::shared_ptr<debug::EmbeddedDapServer> remoteDebugger_;
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
     struct EcsQueuedCommand {
         enum class Kind : std::uint8_t {
             SetComponent,
@@ -601,6 +645,9 @@ private:
         std::string canonicalTypeName;
         runtime::Value component;
     };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
     mutable std::vector<EcsQueuedCommand> ecsCommandBuffer_;
     std::map<std::string, ScriptObject> assets_;
 };
@@ -622,6 +669,93 @@ using SceneEntityId = std::uint64_t;
     return static_cast<std::uint32_t>(id >> 32u);
 }
 
+// ============================================================================
+// eff_1: Coroutine / Sequence Deterministic State-Machine Structural Fingerprints
+// ============================================================================
+
+struct CoroutineSuspensionPointDesc {
+    std::uint32_t ordinal = 0;
+    std::uint32_t awaitLocalIndex = 0;
+    std::uint32_t resumeBlockId = 0;
+    std::string awaitedTypeName;
+    std::string resumeResultTypeName;
+    std::vector<std::string> resumeBlockParamTypes;
+    std::vector<std::pair<std::uint32_t, std::string>> liveInRegisters;
+    std::vector<std::string> protectingHandlers;
+};
+
+struct CoroutineLocalDebugDesc {
+    std::string name;
+    std::uint32_t slot = 0;
+    bool parameter = false;
+    std::string slotTypeName;
+
+    friend bool operator==(
+        const CoroutineLocalDebugDesc& a,
+        const CoroutineLocalDebugDesc& b) noexcept {
+        return a.slot == b.slot &&
+            a.parameter == b.parameter &&
+            a.name == b.name &&
+            a.slotTypeName == b.slotTypeName;
+    }
+    friend bool operator!=(
+        const CoroutineLocalDebugDesc& a,
+        const CoroutineLocalDebugDesc& b) noexcept {
+        return !(a == b);
+    }
+};
+
+struct CoroutineStateMachineFingerprint {
+    bool isSequence = false;
+    std::string canonicalName;
+    std::uint32_t functionIndex = 0;
+    semantic::SymbolId symbolId = 0;
+    semantic::SymbolId returnTypeId = 0;
+    std::string returnTypeName;
+    std::vector<std::string> parameterNames;
+    std::vector<std::string> parameterSlotTypes;
+    std::vector<std::string> localSlotTypes;
+    std::vector<CoroutineLocalDebugDesc> debugLocals;
+    std::vector<std::pair<std::string, std::uint64_t>> referencedStructLayouts;
+    std::vector<std::pair<std::string, std::uint64_t>> referencedClassLayouts;
+    std::size_t registerSlotCount = 0;
+    std::size_t suspensionPointCount = 0;
+    std::vector<CoroutineSuspensionPointDesc> suspensionPoints;
+    std::uint64_t coreStateMachineHash = 0;
+    std::uint64_t structuralHash = 0;
+
+    [[nodiscard]] bool matchesCoreStateMachine(
+        const CoroutineStateMachineFingerprint& other) const noexcept {
+        return isSequence == other.isSequence &&
+            coreStateMachineHash != 0 &&
+            coreStateMachineHash == other.coreStateMachineHash &&
+            canonicalName == other.canonicalName &&
+            returnTypeName == other.returnTypeName &&
+            parameterNames == other.parameterNames &&
+            parameterSlotTypes == other.parameterSlotTypes &&
+            localSlotTypes == other.localSlotTypes &&
+            debugLocals == other.debugLocals &&
+            referencedStructLayouts == other.referencedStructLayouts &&
+            suspensionPointCount == other.suspensionPointCount;
+    }
+
+    [[nodiscard]] bool matchesLayout(
+        const CoroutineStateMachineFingerprint& other) const noexcept {
+        return structuralHash != 0 &&
+            structuralHash == other.structuralHash &&
+            matchesCoreStateMachine(other) &&
+            referencedClassLayouts == other.referencedClassLayouts;
+    }
+};
+
+[[nodiscard]] std::vector<CoroutineStateMachineFingerprint>
+computeProgramCoroutineFingerprints(const runtime::ProgramImage& program);
+
+[[nodiscard]] std::optional<CoroutineStateMachineFingerprint>
+findCoroutineStateMachineFingerprint(
+    const runtime::ProgramImage& program,
+    const std::string& canonicalName);
+
 struct SceneHotReloadReport {
     bool succeeded = false;
     std::size_t instancesMigrated = 0;
@@ -630,6 +764,29 @@ struct SceneHotReloadReport {
     std::size_t fieldsDefaulted = 0;
     std::size_t signalsRebound = 0;
     std::vector<std::string> errors;
+    std::size_t preservedCoroutines = 0;
+    std::size_t abortedCoroutines = 0;
+    std::unordered_map<std::uint32_t, std::uint32_t> remappedCoroutineFunctionIndices;
+};
+
+// ============================================================================
+// perf_4: Flattened SceneLifecycleRuntime Scheduling Hot-Path Statistics
+// ============================================================================
+
+struct SceneLifecycleHotPathStats {
+    std::uint64_t structuralGeneration = 0;
+    std::uint64_t cacheHits = 0;
+    std::uint64_t cacheRebuilds = 0;
+    std::uint64_t onDemandSnapshots = 0;
+    std::uint64_t midTickMutations = 0;
+    std::uint64_t reentrantDispatches = 0;
+    std::uint64_t fastDispatchedCallbacks = 0;
+    std::uint64_t fallbackDispatchedCallbacks = 0;
+    std::size_t activeCachedComponents = 0;
+    std::size_t cachedFixedUpdateSlots = 0;
+    std::size_t cachedUpdateSlots = 0;
+    std::size_t cachedLateUpdateSlots = 0;
+    std::uint32_t currentDispatchDepth = 0;
 };
 
 struct SceneScriptError {
@@ -787,14 +944,30 @@ public:
     void restoreEntityActiveWithoutLifecycle(
         SceneEntityId entity,
         bool active);
+    void clear() { clearForSnapshotImport(); }
     void clearForSnapshotImport();
+    [[nodiscard]] std::uint64_t sceneResetEpoch() const noexcept { return sceneResetEpoch_; }
     void start();
     void update(double deltaTime);
     void fixedUpdate(double fixedDeltaTime);
     void lateUpdate(double deltaTime);
 
+    [[nodiscard]] SceneLifecycleHotPathStats lifecycleHotPathStats() const noexcept;
+    void resetLifecycleHotPathStats() noexcept;
+    [[nodiscard]] std::uint64_t lifecycleStructuralGeneration() const noexcept {
+        return structuralGeneration_;
+    }
+    [[nodiscard]] std::uint32_t lifecycleDispatchDepth() const noexcept {
+        return tickDispatchDepth_;
+    }
+
     void setExecutionMode(SceneExecutionMode mode) noexcept {
-        executionMode_ = mode;
+        if (executionMode_ != mode) {
+            executionMode_ = mode;
+            markLifecycleCacheDirty();
+        } else {
+            executionMode_ = mode;
+        }
         if (mode == SceneExecutionMode::Editor) {
             sceneStarted_ = false;
         } else {
@@ -1255,6 +1428,12 @@ public:
     [[nodiscard]] runtime::AwaitableHandle wsCloseAsync(WebSocketHandle wsHandle);
 
 private:
+    enum class LifecyclePhase : std::uint8_t {
+        FixedUpdate = 0,
+        Update = 1,
+        LateUpdate = 2,
+    };
+
     struct AsyncRequestWaiter {
         SceneEntityId targetEntity = 0;
         std::string callbackMethod;
@@ -1398,6 +1577,7 @@ private:
     };
 
     struct Instance {
+        std::uint64_t instanceUid = 0;
         ScriptObject object;
         std::shared_ptr<const SequenceCancelPlan> sequenceCancelPlan;
         bool enabled = true;
@@ -1432,7 +1612,36 @@ private:
         int order = 0;
         SceneEntityId entity = 0;
         std::size_t compIndex = 0;
+        std::uint64_t instanceUid = 0;
     };
+
+    struct FlatLifecycleSlot {
+        SceneEntityId entity = 0;
+        std::size_t compIndex = 0;
+        std::uint64_t instanceUid = 0;
+        std::size_t tickOrderIndex = 0;
+        std::uint32_t functionIndex = 0;
+        semantic::SymbolId methodSymbolId = 0;
+        runtime::ObjectRef receiverRef{};
+        Instance* instancePtr = nullptr;
+        const ScriptMethod* methodPtr = nullptr;
+        bool returnsAwaitable = false;
+    };
+
+    void markLifecycleCacheDirty() const noexcept {
+        tickOrderDirty_ = true;
+        ++structuralGeneration_;
+    }
+    void dispatchLifecyclePhase(
+        LifecyclePhase phase,
+        double deltaSeconds,
+        const char* callbackName);
+    void dispatchTickRefsFallback(
+        const TickRef* refs,
+        std::size_t count,
+        LifecyclePhase phase,
+        double deltaSeconds,
+        const char* callbackName);
 
     void bindLifecycleMethods(Instance& instance) const;
     void startPendingComponents();
@@ -1495,6 +1704,10 @@ private:
     void removeSignalsForEntityOrComponent(
         SceneEntityId entity,
         const std::string& removedComponentType);
+    [[nodiscard]] Instance* findComponentByUid(
+        SceneEntityId entity,
+        std::uint64_t instanceUid,
+        std::size_t hintIndex = 0) noexcept;
     bool attachComponentWithoutLifecycle(
         SceneEntityId entity,
         const std::string& scriptType,
@@ -1534,7 +1747,24 @@ private:
     std::unordered_map<SceneEntityId, Transform3D> localTransforms_;
     mutable std::unordered_map<SceneEntityId, Transform3D> worldTransformCache_;
     mutable bool tickOrderDirty_ = true;
+    mutable std::uint64_t structuralGeneration_ = 1;
+    mutable std::uint32_t tickDispatchDepth_ = 0;
     mutable std::vector<TickRef> cachedTickOrder_;
+    mutable std::vector<FlatLifecycleSlot> flatFixedUpdateSlots_;
+    mutable std::vector<FlatLifecycleSlot> flatUpdateSlots_;
+    mutable std::vector<FlatLifecycleSlot> flatLateUpdateSlots_;
+    mutable std::size_t activeCachedComponents_ = 0;
+    mutable const runtime::ProgramImage* cachedProgramForFuncIndex_ = nullptr;
+    mutable std::unordered_map<semantic::SymbolId, std::uint32_t> functionIndexBySymbol_;
+    mutable SceneLifecycleHotPathStats hotPathStats_{};
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
+    std::vector<runtime::Value> tickScratchArgs_{runtime::Value{}, runtime::Value{}};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
     std::vector<SignalConnection> signalConnections_;
     std::function<std::size_t(const std::string&)> signalTopicPublisher_;
     std::map<std::string, bool> currentInputActions_;
@@ -1557,6 +1787,8 @@ private:
     std::vector<std::uint32_t> freeGenerationalSlots_;
     std::uint32_t nextGenerationalSlot_ = 1;
     SceneEntityId nextAutoEntityId_ = 1;
+    std::uint64_t nextInstanceUid_ = 1;
+    std::uint64_t sceneResetEpoch_ = 1;
     runtime::FiberScheduler* fiberScheduler_ = nullptr;
     AsyncRequestId nextAsyncRequestId_ = 1;
     std::unordered_map<AsyncRequestId, AsyncRequestEntry> asyncRequests_;

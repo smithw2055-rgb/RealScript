@@ -120,7 +120,7 @@ Generated source retains source correlation through:
 rsaot \
   --output-dir build/generated/game \
   --program-name GameScripts \
-  game.rs common.rs
+  game.rscript common.rscript
 ```
 
 It emits:
@@ -142,8 +142,8 @@ realscript_add_aot_library(GameScriptsAot
     PROGRAM_NAME GameScripts
     OPT_LEVEL 2
     SOURCES
-        scripts/game.rs
-        scripts/common.rs
+        scripts/game.rscript
+        scripts/common.rscript
 )
 
 target_link_libraries(game PRIVATE GameScriptsAot)

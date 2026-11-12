@@ -149,8 +149,8 @@ class BossUnit {
 )RS";
 
     game::GameScriptCompiler compiler(api);
-    auto compiled = compiler.compile({{"scripts/combat.rs", combatSrc}});
-    require(compiled.succeeded(), "scripts/combat.rs compile failed");
+    auto compiled = compiler.compile({{"scripts/combat.rscript", combatSrc}});
+    require(compiled.succeeded(), "scripts/combat.rscript compile failed");
 
     game::ScriptRuntime rt(compiled.program);
     game::SceneScriptRuntime scene(rt);
@@ -194,7 +194,7 @@ class BossUnit {
         {"type", "request"},
         {"command", "setBreakpoints"},
         {"arguments", tooling::Json::Object{
-            {"source", tooling::Json::Object{{"path", "/workspace/my_game/scripts/combat.rs"}}},
+            {"source", tooling::Json::Object{{"path", "/workspace/my_game/scripts/combat.rscript"}}},
             {"breakpoints", tooling::Json::Array{
                 tooling::Json::Object{{"line", 14}, {"column", 1}},
             }},
@@ -206,7 +206,7 @@ class BossUnit {
     require(
         bps && bps->isArray() && !bps->arrayValue().empty() &&
             bps->arrayValue()[0].find("verified")->boolValue(),
-        "setBreakpoints with full workspace path '/workspace/my_game/scripts/combat.rs' must verify against 'scripts/combat.rs'");
+        "setBreakpoints with full workspace path '/workspace/my_game/scripts/combat.rscript' must verify against 'scripts/combat.rscript'");
 
     tooling::writeProtocolMessage(dapStream, tooling::Json::Object{
         {"seq", 3},
@@ -233,7 +233,7 @@ class BossUnit {
         "Engine thread must stop with reason 'breakpoint'");
     std::cout << "[VS Code Client] Received 'stopped' event over TCP (reason=breakpoint)\n";
 
-    // 6. Inspect stackTrace (verify path alias mapping back to /workspace/my_game/scripts/combat.rs)
+    // 6. Inspect stackTrace (verify path alias mapping back to /workspace/my_game/scripts/combat.rscript)
     tooling::writeProtocolMessage(dapStream, tooling::Json::Object{
         {"seq", 4},
         {"type", "request"},
@@ -246,8 +246,8 @@ class BossUnit {
     require(
         frames && !frames->arrayValue().empty() &&
             frames->arrayValue()[0].find("source")->find("path")->stringValue() ==
-                "/workspace/my_game/scripts/combat.rs",
-        "stackTrace must resolve source path back to VS Code workspace path '/workspace/my_game/scripts/combat.rs'");
+                "/workspace/my_game/scripts/combat.rscript",
+        "stackTrace must resolve source path back to VS Code workspace path '/workspace/my_game/scripts/combat.rscript'");
 
     // 7. Evaluate Watch expression `damage * 2` (damage = 40 + 10 = 50 -> 100)
     tooling::writeProtocolMessage(dapStream, tooling::Json::Object{

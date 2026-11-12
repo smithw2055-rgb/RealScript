@@ -18,7 +18,7 @@ void require(bool condition, const std::string& message) {
 
 std::vector<realscript::mir::Module> compileMir(const std::string& source) {
     realscript::compiler::Compilation compilation;
-    compilation.addSource({"phase6.rs", source});
+    compilation.addSource({"phase6.rscript", source});
     auto result = compilation.build();
     require(!result.diagnostics.hasErrors(), "Phase 6 source compilation failed");
     return result.modules;

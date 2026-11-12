@@ -2361,9 +2361,10 @@ void emitTypedPrimitiveFunction(
             ? function.localTypeIds[index]
             : 0;
         const TypedSlotType localSlot{function.localTypes[index], typeId};
-        source.line("    " + typedCppType(localSlot) + " " +
+        source.line("    [[maybe_unused]] " + typedCppType(localSlot) + " " +
             typedLocalExpression(index) + " = " +
             typedDefaultValue(localSlot) + ";");
+        source.line("    (void)" + typedLocalExpression(index) + ";");
         if (function.localTypes[index] == semantic::PrimitiveType::Array) {
             source.line("    aot::TypedRawColumnCache typedLocalRawCol_" +
                 std::to_string(index) + "{};");
@@ -2371,7 +2372,7 @@ void emitTypedPrimitiveFunction(
         }
     }
     for (std::size_t index = 0; index < types.size(); ++index) {
-        source.line("    " + typedCppType(types[index]) + " " +
+        source.line("    [[maybe_unused]] " + typedCppType(types[index]) + " " +
             typedValueExpression(static_cast<mir::ValueId>(index)) + "{};");
     }
     if (options.emitLineDirectives && !function.debugInfo.locals.empty()) {
@@ -4397,7 +4398,12 @@ std::string canonicalInput(
     std::sort(ordered.begin(), ordered.end(), [](const auto* left, const auto* right) {
         return left->name < right->name;
     });
-    std::string value = options.programName + "\n" + options.cppNamespace + "\n";
+    std::string value = options.programName + "\n" + options.cppNamespace + "\n" +
+        options.querySymbol + "\n" +
+        "emitLineDirectives=" + (options.emitLineDirectives ? "1" : "0") + "\n" +
+        "trustedRelease=" + (options.trustedRelease ? "1" : "0") + "\n" +
+        "enableSharedReferenceGenerics=" +
+        (options.enableSharedReferenceGenerics ? "1" : "0") + "\n";
     for (const auto* module : ordered) {
         value += mir::printModule(*module);
         for (const auto& type : module->types) {
@@ -4782,6 +4788,7 @@ GeneratedProgram CppGenerator::generate(
         const auto& type = *view.type;
         const std::string structName = "AotStruct_" + hexId(type.id);
         source.line("struct " + structName + " {");
+        source.line("    // RealScript struct: " + semantic::canonicalTypeName(type));
         source.line("    static constexpr bool kIsGeneratedAotStruct = true;");
         source.line("    static constexpr semantic::SymbolId kTypeId = 0x" + hexId(type.id) + "ULL;");
         source.line("    static constexpr std::size_t kFieldCount = " + std::to_string(type.fields.size()) + "u;");
@@ -4790,7 +4797,7 @@ GeneratedProgram CppGenerator::generate(
             const auto fTypeId = exactTypeId(field.type, field.typeName);
             const TypedSlotType fSlot{field.type, fTypeId};
             source.line("    " + typedCppType(fSlot) + " f_" + std::to_string(i) +
-                " = " + typedDefaultValue(fSlot) + ";");
+                " = " + typedDefaultValue(fSlot) + "; // " + field.name);
         }
         std::string eqExpr = "true";
         for (std::size_t i = 0; i < type.fields.size(); ++i) {
@@ -4854,8 +4861,14 @@ GeneratedProgram CppGenerator::generate(
             std::string expectedKind = "runtime::NativeFieldKind::Int64";
             switch (field.type) {
             case semantic::PrimitiveType::Bool: expectedKind = "runtime::NativeFieldKind::Bool"; break;
+            case semantic::PrimitiveType::SByte:
+            case semantic::PrimitiveType::Byte:
+            case semantic::PrimitiveType::Short:
+            case semantic::PrimitiveType::UShort:
             case semantic::PrimitiveType::Int:
+            case semantic::PrimitiveType::UInt:
             case semantic::PrimitiveType::Long: expectedKind = "runtime::NativeFieldKind::Int64"; break;
+            case semantic::PrimitiveType::ULong: expectedKind = "runtime::NativeFieldKind::UInt64"; break;
             case semantic::PrimitiveType::Float: expectedKind = "runtime::NativeFieldKind::Float32"; break;
             case semantic::PrimitiveType::Double: expectedKind = "runtime::NativeFieldKind::Float64"; break;
             case semantic::PrimitiveType::Struct:
@@ -4877,6 +4890,20 @@ GeneratedProgram CppGenerator::generate(
     }
     source.line();
 
+    std::unordered_map<const mir::Instruction*, std::size_t> callIds;
+    for (const auto& call : callSites) callIds.emplace(call.instruction, call.id);
+
+    struct SharedGenericMemberSpec {
+        const FunctionView* view = nullptr;
+        std::vector<semantic::SymbolId> typeIds;
+        std::vector<std::size_t> callIds;
+    };
+    struct SharedGenericGroup {
+        std::size_t groupIndex = 0;
+        std::string stemKey;
+        std::vector<SharedGenericMemberSpec> members;
+    };
+
     std::unordered_map<semantic::SymbolId, const FunctionView*> typedFunctions;
     for (const auto& view : functions) {
         if (view.module->name == "RealScript.Async" &&
@@ -4887,6 +4914,264 @@ GeneratedProgram CppGenerator::generate(
             typedFunctions.emplace(view.function->symbolId, &view);
         }
     }
+
+    std::vector<SharedGenericGroup> sharedGenericGroups;
+    std::unordered_map<semantic::SymbolId, std::pair<std::size_t, std::size_t>> sharedGenericBySymbol;
+
+    if (options.enableSharedReferenceGenerics) {
+        std::unordered_map<semantic::SymbolId, std::string> genericStemBySymbol;
+        for (const auto& module : modules) {
+            for (const auto& inst : module.languageMetadata.genericInstantiations) {
+                const auto dotPos = inst.genericName.find('.');
+                const std::string memberOwnerPrefix = dotPos != std::string::npos
+                    ? inst.genericName.substr(0, dotPos + 1)
+                    : std::string{};
+                const std::string typePrefix = inst.generatedName + ".";
+                const std::string enumPrefix = inst.generatedName + "__Enumerator.";
+                for (const auto& fn : module.functions) {
+                    if (fn.name == inst.generatedName) {
+                        genericStemBySymbol[fn.symbolId] =
+                            module.name + "::fn:" + inst.genericName;
+                    } else if (!memberOwnerPrefix.empty() &&
+                               fn.name == memberOwnerPrefix + inst.generatedName) {
+                        genericStemBySymbol[fn.symbolId] =
+                            module.name + "::member:" + inst.genericName;
+                    } else if (fn.name.rfind(typePrefix, 0) == 0) {
+                        const auto suffix = fn.name.substr(typePrefix.size());
+                        genericStemBySymbol[fn.symbolId] =
+                            module.name + "::type:" + inst.genericName + "." + suffix;
+                    } else if (fn.name.rfind(enumPrefix, 0) == 0) {
+                        const auto suffix = fn.name.substr(enumPrefix.size());
+                        genericStemBySymbol[fn.symbolId] =
+                            module.name + "::type:" + inst.genericName + "__Enumerator." + suffix;
+                    }
+                }
+            }
+        }
+
+        auto buildErasedSignature = [&](const FunctionView& view,
+                                        SharedGenericMemberSpec& outSpec,
+                                        bool& usesReferenceSlot) -> std::string {
+            const auto& fn = *view.function;
+            outSpec.view = &view;
+            outSpec.typeIds.clear();
+            outSpec.callIds.clear();
+            usesReferenceSlot = false;
+
+            std::ostringstream sig;
+            auto recordSlot = [&](semantic::PrimitiveType prim, semantic::SymbolId tid, bool pushToSpec) {
+                sig << static_cast<int>(prim) << ':';
+                if (prim == semantic::PrimitiveType::Object ||
+                    prim == semantic::PrimitiveType::Array) {
+                    sig << "ref;";
+                    if (tid != 0 || prim == semantic::PrimitiveType::Object ||
+                        prim == semantic::PrimitiveType::Array) {
+                        usesReferenceSlot = true;
+                    }
+                    if (pushToSpec) outSpec.typeIds.push_back(tid);
+                } else {
+                    sig << tid << ';';
+                    if (pushToSpec) outSpec.typeIds.push_back(tid);
+                }
+            };
+
+            sig << "ret=";
+            recordSlot(fn.returnType, fn.returnTypeId, false);
+            sig << "params=" << fn.parameterTypes.size() << '[';
+            for (std::size_t i = 0; i < fn.parameterTypes.size(); ++i) {
+                const auto tid = i < fn.parameterTypeIds.size() ? fn.parameterTypeIds[i] : 0;
+                recordSlot(fn.parameterTypes[i], tid, false);
+            }
+            sig << "]locals=" << fn.localTypes.size() << '[';
+            for (std::size_t i = 0; i < fn.localTypes.size(); ++i) {
+                const auto tid = i < fn.localTypeIds.size() ? fn.localTypeIds[i] : 0;
+                recordSlot(fn.localTypes[i], tid, true);
+            }
+            sig << "]regs=" << registerCount(fn)
+                << ";eh=" << fn.exceptionHandlers.size() << '[';
+            for (const auto& h : fn.exceptionHandlers) {
+                sig << h.exceptionLocal << ':' << h.handlerBlock << ':'
+                    << (h.catchTypeId == 0 ? "all" : "typed") << '[';
+                for (const auto pb : h.protectedBlocks) sig << pb << ',';
+                sig << ']';
+                outSpec.typeIds.push_back(h.catchTypeId);
+                if (h.catchTypeId != 0) usesReferenceSlot = true;
+            }
+            sig << "]blocks=" << fn.blocks.size() << '{';
+            for (const auto& block : fn.blocks) {
+                sig << "b" << block.id << '(';
+                for (const auto& bp : block.parameters) {
+                    sig << bp.value << ':' << static_cast<int>(bp.type) << ',';
+                    if (bp.type == semantic::PrimitiveType::Struct ||
+                        bp.type == semantic::PrimitiveType::Enum) {
+                        return {};
+                    }
+                }
+                sig << ")[";
+                for (const auto& inst : block.instructions) {
+                    sig << static_cast<int>(inst.opcode) << ':'
+                        << inst.result << ':'
+                        << static_cast<int>(inst.resultType) << ':'
+                        << static_cast<int>(inst.elementType) << ':'
+                        << inst.localIndex << ':'
+                        << inst.fieldIndex << ':'
+                        << (inst.checkedArithmetic ? '1' : '0') << ':'
+                        << (inst.boolImmediate ? '1' : '0') << ':'
+                        << (inst.virtualDispatch ? '1' : '0') << ':'
+                        << inst.virtualSlot << ':'
+                        << (inst.interfaceDispatch ? '1' : '0') << ':'
+                        << inst.interfaceSlot << ':';
+                    if (inst.opcode != mir::Opcode::ConstantTypeId) {
+                        sig << inst.integerImmediate << ':';
+                    } else {
+                        sig << "typeid_imm:";
+                        outSpec.typeIds.push_back(
+                            static_cast<semantic::SymbolId>(inst.integerImmediate));
+                        usesReferenceSlot = true;
+                    }
+                    if (inst.opcode == mir::Opcode::ConstantDouble) {
+                        std::ostringstream ds;
+                        ds << std::setprecision(17) << inst.doubleImmediate;
+                        sig << ds.str() << ':';
+                    }
+                    if (inst.opcode == mir::Opcode::ConstantString) {
+                        sig << inst.stringImmediate.size() << '#' << inst.stringImmediate << ':';
+                    }
+                    sig << '(';
+                    for (const auto op : inst.operands) sig << op << ',';
+                    sig << ')';
+
+                    switch (inst.opcode) {
+                    case mir::Opcode::ConstantInt:
+                        if (inst.resultType == semantic::PrimitiveType::Enum) {
+                            sig << "enum=" << inst.resultTypeId << ';';
+                            outSpec.typeIds.push_back(inst.resultTypeId);
+                        }
+                        break;
+                    case mir::Opcode::NewObject: {
+                        const auto effId = inst.resultTypeId != 0 ? inst.resultTypeId : inst.typeId;
+                        outSpec.typeIds.push_back(effId);
+                        usesReferenceSlot = true;
+                        break;
+                    }
+                    case mir::Opcode::NewStruct: {
+                        const auto effId = inst.resultTypeId != 0 ? inst.resultTypeId : inst.typeId;
+                        sig << "newstruct=" << effId << ';';
+                        outSpec.typeIds.push_back(effId);
+                        break;
+                    }
+                    case mir::Opcode::NewArray:
+                        recordSlot(semantic::PrimitiveType::Array, inst.resultTypeId, true);
+                        recordSlot(inst.elementType, inst.elementTypeId, true);
+                        break;
+                    case mir::Opcode::CheckNotNull:
+                    case mir::Opcode::LoadField:
+                    case mir::Opcode::StoreField:
+                    case mir::Opcode::InvokeDelegate:
+                    case mir::Opcode::CombineDelegate:
+                    case mir::Opcode::RemoveDelegate:
+                    case mir::Opcode::AsyncResolve:
+                        outSpec.typeIds.push_back(inst.typeId);
+                        usesReferenceSlot = true;
+                        break;
+                    case mir::Opcode::LoadStructField:
+                    case mir::Opcode::StoreStructField:
+                        sig << "sfield=" << inst.typeId << ';';
+                        outSpec.typeIds.push_back(inst.typeId);
+                        break;
+                    case mir::Opcode::IsType:
+                    case mir::Opcode::AsType:
+                        sig << "tp=" << (inst.parameterTypes.empty()
+                            ? -1
+                            : static_cast<int>(inst.parameterTypes.front())) << ';';
+                        recordSlot(inst.elementType, inst.elementTypeId, true);
+                        break;
+                    case mir::Opcode::LoadElement:
+                    case mir::Opcode::StoreElement:
+                    case mir::Opcode::AwaitResume:
+                        recordSlot(inst.elementType, inst.elementTypeId, true);
+                        break;
+                    case mir::Opcode::Call: {
+                        sig << "callp=" << inst.parameterTypes.size() << '[';
+                        for (std::size_t pi = 0; pi < inst.parameterTypes.size(); ++pi) {
+                            const auto ptid = pi < inst.parameterTypeIds.size()
+                                ? inst.parameterTypeIds[pi]
+                                : 0;
+                            recordSlot(inst.parameterTypes[pi], ptid, false);
+                        }
+                        sig << ']';
+                        outSpec.callIds.push_back(callIds.at(&inst));
+                        break;
+                    }
+                    case mir::Opcode::NewDelegate: {
+                        sig << "ndelp=" << inst.parameterTypes.size() << '[';
+                        for (std::size_t pi = 0; pi < inst.parameterTypes.size(); ++pi) {
+                            const auto ptid = pi < inst.parameterTypeIds.size()
+                                ? inst.parameterTypeIds[pi]
+                                : 0;
+                            recordSlot(inst.parameterTypes[pi], ptid, false);
+                        }
+                        sig << ']';
+                        outSpec.typeIds.push_back(inst.typeId);
+                        outSpec.callIds.push_back(callIds.at(&inst));
+                        usesReferenceSlot = true;
+                        break;
+                    }
+                    default:
+                        break;
+                    }
+                    sig << '|';
+                }
+                sig << "]term=" << static_cast<int>(block.terminator.kind) << ':'
+                    << block.terminator.condition << ':'
+                    << block.terminator.value << ':'
+                    << block.terminator.target << ':'
+                    << block.terminator.falseTarget << '(';
+                for (const auto a : block.terminator.arguments) sig << a << ',';
+                sig << ")(";
+                for (const auto a : block.terminator.falseArguments) sig << a << ',';
+                sig << ");";
+            }
+            sig << '}';
+            return sig.str();
+        };
+
+        std::map<std::string, std::vector<SharedGenericMemberSpec>> groupedCandidates;
+        std::vector<std::string> groupOrder;
+        for (const auto& view : functions) {
+            if (typedFunctions.find(view.function->symbolId) != typedFunctions.end()) {
+                continue;
+            }
+            const auto stemIt = genericStemBySymbol.find(view.function->symbolId);
+            if (stemIt == genericStemBySymbol.end()) continue;
+            SharedGenericMemberSpec spec;
+            bool usesRef = false;
+            const auto layoutSig = buildErasedSignature(view, spec, usesRef);
+            if (layoutSig.empty() || !usesRef) continue;
+            const std::string fullKey = stemIt->second + "\n" + layoutSig;
+            auto& bucket = groupedCandidates[fullKey];
+            if (bucket.empty()) groupOrder.push_back(fullKey);
+            bucket.push_back(std::move(spec));
+        }
+
+        for (const auto& fullKey : groupOrder) {
+            auto& bucket = groupedCandidates[fullKey];
+            if (bucket.size() < 2) continue;
+            SharedGenericGroup group;
+            group.groupIndex = sharedGenericGroups.size();
+            group.stemKey = fullKey.substr(0, fullKey.find('\n'));
+            group.members = std::move(bucket);
+            for (std::size_t mIdx = 0; mIdx < group.members.size(); ++mIdx) {
+                sharedGenericBySymbol.emplace(
+                    group.members[mIdx].view->function->symbolId,
+                    std::make_pair(group.groupIndex, mIdx));
+            }
+            sharedGenericGroups.push_back(std::move(group));
+        }
+    }
+
+    generated.sharedGenericBodyCount = sharedGenericGroups.size();
+    generated.foldedGenericFunctionCount = sharedGenericBySymbol.size();
 
     for (const auto& view : functions) {
         const auto& function = *view.function;
@@ -4974,13 +5259,654 @@ GeneratedProgram CppGenerator::generate(
     source.line();
 
     std::vector<SourceMapRecord> sourceMap;
-    std::unordered_map<const mir::Instruction*, std::size_t> callIds;
-    for (const auto& call : callSites) callIds.emplace(call.instruction, call.id);
+
+    if (!sharedGenericGroups.empty()) {
+        source.line("// Reference-Type Shared Generic Implementation Table & Bodies");
+        source.line("struct SharedRefGenericSpec {");
+        source.line("    semantic::SymbolId symbolId;");
+        source.line("    semantic::SymbolId returnTypeId;");
+        source.line("    const semantic::SymbolId* typeIds;");
+        source.line("    const CallSignature* const* calls;");
+        source.line("};");
+        source.line();
+
+        for (const auto& group : sharedGenericGroups) {
+            const auto& primaryView = *group.members.front().view;
+            const auto& module = *primaryView.module;
+            const auto& function = *primaryView.function;
+            const std::string sharedFnName =
+                "shared_ref_generic_" + std::to_string(group.groupIndex);
+            source.line("// Shared reference-type generic body for " +
+                group.stemKey + " (" + std::to_string(group.members.size()) +
+                " instantiations)");
+            source.line("static bool " + sharedFnName + "(");
+            source.line("    ExecutionContext& context,");
+            source.line("    const runtime::Value* arguments,");
+            source.line("    std::size_t argumentCount,");
+            source.line("    runtime::Value& result,");
+            source.line("    const SharedRefGenericSpec& spec) {");
+            source.line("    (void)result;");
+            source.line("    (void)spec;");
+            source.line("    std::vector<runtime::Value> argumentValues;");
+            source.line("    if (argumentCount != 0) {");
+            source.line("        argumentValues.assign(arguments, arguments + argumentCount);");
+            source.line("    }");
+
+            std::size_t specTypeCursor = 0;
+            std::size_t specCallCursor = 0;
+            const auto nextSpecTypeExpr = [&]() {
+                return "spec.typeIds[" + std::to_string(specTypeCursor++) + "u]";
+            };
+            const auto nextSpecCallExpr = [&]() {
+                return "(*spec.calls[" + std::to_string(specCallCursor++) + "u])";
+            };
+
+            source.line("    std::vector<runtime::Value> locals(" +
+                std::to_string(function.localTypes.size()) + ");");
+            for (std::size_t index = 0; index < function.localTypes.size(); ++index) {
+                const auto tidExpr = nextSpecTypeExpr();
+                source.line("    locals[" + std::to_string(index) +
+                    "] = context.defaultValue(" +
+                    primitiveExpression(function.localTypes[index]) + ", " +
+                    tidExpr + ");");
+            }
+            std::vector<std::string> handlerCatchExprs;
+            handlerCatchExprs.reserve(function.exceptionHandlers.size());
+            for (std::size_t hi = 0; hi < function.exceptionHandlers.size(); ++hi) {
+                handlerCatchExprs.push_back(nextSpecTypeExpr());
+            }
+
+            source.line("    std::vector<runtime::Value> registers(" +
+                std::to_string(registerCount(function)) + ");");
+            const bool isAsyncFunction = !function.blocks.empty() &&
+                !function.blocks.front().instructions.empty() &&
+                function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
+            source.line("    FrameScope frame(context, argumentValues, locals, registers);");
+            source.line("    std::uint32_t currentBlock = 0;");
+            if (isAsyncFunction) {
+                source.line("    runtime::CoroutineFrameHandle activeCoroutine{};");
+                source.line("    (void)context.tryEnterResumingCoroutine(spec.symbolId, argumentValues, locals, registers, currentBlock, activeCoroutine);");
+            }
+            source.line("    for (;;) {");
+            source.line("        switch (currentBlock) {");
+
+            std::size_t functionCallIndex = 0;
+            for (const auto& block : function.blocks) {
+                source.line("        case " + std::to_string(block.id) + ": {");
+                const auto emitExceptionRoute = [&](const std::string& indent) {
+                    for (std::size_t hi = 0; hi < function.exceptionHandlers.size(); ++hi) {
+                        const auto& handler = function.exceptionHandlers[hi];
+                        if (std::find(
+                                handler.protectedBlocks.begin(),
+                                handler.protectedBlocks.end(),
+                                block.id) == handler.protectedBlocks.end()) {
+                            continue;
+                        }
+                        source.line(indent + "if (context.pendingExceptionMatches(" +
+                            handlerCatchExprs[hi] + ")) {");
+                        source.line(indent + "    if (!context.takePendingException(locals[" +
+                            std::to_string(handler.exceptionLocal) +
+                            "])) return false;");
+                        source.line(indent + "    currentBlock = " +
+                            std::to_string(handler.handlerBlock) + "u;");
+                        source.line(indent + "    continue;");
+                        source.line(indent + "}");
+                    }
+                };
+                bool activeSourceLine = false;
+                for (std::size_t instructionIndex = 0;
+                     instructionIndex < block.instructions.size();
+                     ++instructionIndex) {
+                    const auto& instruction = block.instructions[instructionIndex];
+                    if (!options.trustedRelease) {
+                        if (activeSourceLine) {
+                            emitGeneratedLineReset(source, options.emitLineDirectives);
+                            activeSourceLine = false;
+                        }
+                        source.line("            if (!context.trustedReleaseEnabled() && !context.consume(" +
+                            std::to_string(
+                                runtime::determinismOperationId(
+                                    mir::opcodeName(instruction.opcode))) +
+                            "ULL, \"" +
+                            escapeCppString(mir::opcodeName(instruction.opcode)) +
+                            "\")) return false;");
+                    }
+                    bool explicitPoint = false;
+                    const auto resolvedPoint = resolveSequencePoint(
+                        module,
+                        function,
+                        block.id,
+                        static_cast<std::uint32_t>(instructionIndex),
+                        false,
+                        instruction.sourceSpan,
+                        &explicitPoint);
+                    const std::uint32_t currentInstGenLine =
+                        source.nextLine() + (options.emitLineDirectives && resolvedPoint ? 1u : 0u);
+                    if (emitLineDirective(
+                            source,
+                            module,
+                            resolvedPoint,
+                            options.emitLineDirectives,
+                            &sourceMap,
+                            function.symbolId,
+                            true)) {
+                        activeSourceLine = true;
+                    }
+                    if (resolvedPoint) {
+                        for (std::size_t mIdx = 1; mIdx < group.members.size(); ++mIdx) {
+                            const auto& mView = *group.members[mIdx].view;
+                            bool mExplicit = false;
+                            if (const auto mPoint = resolveSequencePoint(
+                                    *mView.module,
+                                    *mView.function,
+                                    block.id,
+                                    static_cast<std::uint32_t>(instructionIndex),
+                                    false,
+                                    mView.function->blocks[&block - function.blocks.data()]
+                                        .instructions[instructionIndex]
+                                        .sourceSpan,
+                                    &mExplicit)) {
+                                if (const auto* mSrc = findSource(*mView.module, mPoint->range.fileId);
+                                    mSrc && !mSrc->path.empty()) {
+                                    sourceMap.push_back(SourceMapRecord{
+                                        mView.function->symbolId,
+                                        currentInstGenLine,
+                                        mSrc->path,
+                                        static_cast<std::uint32_t>(mPoint->range.start.line + 1),
+                                        static_cast<std::uint32_t>(mPoint->range.start.column + 1)});
+                                }
+                            }
+                        }
+                        source.line("            context.setActiveGeneratedLine(" +
+                            std::to_string(currentInstGenLine) + "u);");
+                    }
+                    const auto resExpr = instruction.result >= 0
+                        ? valueExpression(instruction.result)
+                        : std::string{};
+                    const auto operand = [&](std::size_t index) {
+                        return valueExpression(instruction.operands[index]);
+                    };
+
+                    switch (instruction.opcode) {
+                    case mir::Opcode::Parameter:
+                        source.line("            if (" +
+                            std::to_string(instruction.integerImmediate) +
+                            "u >= argumentValues.size()) return context.fail("
+                            "runtime::ErrorCode::InvalidArguments, "
+                            "\"AOT parameter index is invalid\");");
+                        source.line("            " + resExpr + " = argumentValues[" +
+                            std::to_string(instruction.integerImmediate) + "];");
+                        break;
+                    case mir::Opcode::ConstantInt:
+                        if (instruction.resultType == semantic::PrimitiveType::Long) {
+                            source.line("            " + resExpr +
+                                " = runtime::LongValue{" +
+                                int64Literal(instruction.integerImmediate) + "};");
+                        } else if (instruction.resultType == semantic::PrimitiveType::Enum) {
+                            const auto enumTidExpr = nextSpecTypeExpr();
+                            source.line("            " + resExpr +
+                                " = runtime::EnumValue{" + enumTidExpr + ", " +
+                                int64Literal(instruction.integerImmediate) + "};");
+                        } else {
+                            source.line("            " + resExpr + " = std::int64_t{" +
+                                int64Literal(instruction.integerImmediate) + "};");
+                        }
+                        break;
+                    case mir::Opcode::ConstantDouble: {
+                        std::ostringstream value;
+                        value << std::setprecision(17) << instruction.doubleImmediate;
+                        source.line("            " + resExpr + " = " + value.str() + ";");
+                        break;
+                    }
+                    case mir::Opcode::ConstantBool:
+                        source.line("            " + resExpr + " = " +
+                            (instruction.boolImmediate ? "true" : "false") + ";");
+                        break;
+                    case mir::Opcode::ConstantString:
+                        source.line("            if (!context.constantString(\"" +
+                            escapeCppString(instruction.stringImmediate) + "\", " +
+                            resExpr + ")) return false;");
+                        break;
+                    case mir::Opcode::ConstantNull:
+                        source.line("            " + resExpr + " = std::monostate{};");
+                        break;
+                    case mir::Opcode::ConstantTypeId: {
+                        const auto tidExpr = nextSpecTypeExpr();
+                        source.line("            " + resExpr +
+                            " = runtime::ULongValue{" + tidExpr + "};");
+                        break;
+                    }
+                    case mir::Opcode::LoadLocal:
+                        source.line("            " + resExpr + " = locals[" +
+                            std::to_string(instruction.localIndex) + "];");
+                        break;
+                    case mir::Opcode::StoreLocal:
+                        source.line("            locals[" +
+                            std::to_string(instruction.localIndex) + "] = " +
+                            operand(0) + ";");
+                        break;
+                    case mir::Opcode::NewObject: {
+                        const auto tidExpr = nextSpecTypeExpr();
+                        source.line("            if (!context.newObject(" +
+                            tidExpr + ", " + resExpr + ")) return false;");
+                        break;
+                    }
+                    case mir::Opcode::NewStruct: {
+                        const auto tidExpr = nextSpecTypeExpr();
+                        source.line("            if (!context.newStruct(" +
+                            tidExpr + ", " + resExpr + ")) return false;");
+                        break;
+                    }
+                    case mir::Opcode::NewArray: {
+                        const auto arrTidExpr = nextSpecTypeExpr();
+                        const auto elemTidExpr = nextSpecTypeExpr();
+                        source.line("            if (!context.newArray(" +
+                            arrTidExpr + ", " +
+                            primitiveExpression(instruction.elementType) + ", " +
+                            elemTidExpr + ", " + operand(0) +
+                            ", " + resExpr + ")) return false;");
+                        break;
+                    }
+                    case mir::Opcode::CheckNotNull: {
+                        const auto tidExpr = nextSpecTypeExpr();
+                        source.line("            if (!context.checkNotNull(" +
+                            tidExpr + ", " + operand(0) + ", " +
+                            resExpr + ")) return false;");
+                        break;
+                    }
+                    case mir::Opcode::IsType:
+                    case mir::Opcode::AsType: {
+                        const auto elemTidExpr = nextSpecTypeExpr();
+                        source.line("            if (!context.typeOperation(" +
+                            primitiveExpression(
+                                instruction.parameterTypes.empty()
+                                    ? semantic::PrimitiveType::Error
+                                    : instruction.parameterTypes.front()) +
+                            ", " + primitiveExpression(instruction.elementType) +
+                            ", " + elemTidExpr + ", " + operand(0) + ", " +
+                            (instruction.opcode == mir::Opcode::AsType ? "true" : "false") +
+                            ", " + resExpr + ")) return false;");
+                        break;
+                    }
+                    case mir::Opcode::ArrayLength:
+                        source.line("            if (!context.arrayLength(" + operand(0) +
+                            ", " + resExpr + ")) return false;");
+                        break;
+                    case mir::Opcode::LoadElement: {
+                        const auto elemTidExpr = nextSpecTypeExpr();
+                        source.line("            if (!context.loadElement(" +
+                            primitiveExpression(instruction.elementType) + ", " +
+                            elemTidExpr + ", " + operand(0) +
+                            ", " + operand(1) + ", " + resExpr +
+                            ")) return false;");
+                        break;
+                    }
+                    case mir::Opcode::StoreElement: {
+                        const auto elemTidExpr = nextSpecTypeExpr();
+                        source.line("            if (!context.storeElement(" +
+                            primitiveExpression(instruction.elementType) + ", " +
+                            elemTidExpr + ", " + operand(0) +
+                            ", " + operand(1) + ", " + operand(2) +
+                            ")) return false;");
+                        break;
+                    }
+                    case mir::Opcode::LoadField: {
+                        const auto tidExpr = nextSpecTypeExpr();
+                        source.line("            if (!context.loadField(" +
+                            tidExpr + ", " +
+                            std::to_string(instruction.fieldIndex) + "u, " + operand(0) +
+                            ", " + resExpr + ")) return false;");
+                        break;
+                    }
+                    case mir::Opcode::StoreField: {
+                        const auto tidExpr = nextSpecTypeExpr();
+                        source.line("            if (!context.storeField(" +
+                            tidExpr + ", " +
+                            std::to_string(instruction.fieldIndex) + "u, " + operand(0) +
+                            ", " + operand(1) + ")) return false;");
+                        break;
+                    }
+                    case mir::Opcode::LoadStructField: {
+                        const auto tidExpr = nextSpecTypeExpr();
+                        source.line("            if (!context.loadStructField(" +
+                            tidExpr + ", " +
+                            std::to_string(instruction.fieldIndex) + "u, " + operand(0) +
+                            ", " + resExpr + ")) return false;");
+                        break;
+                    }
+                    case mir::Opcode::StoreStructField: {
+                        const auto tidExpr = nextSpecTypeExpr();
+                        source.line("            if (!context.storeStructField(" +
+                            tidExpr + ", " +
+                            std::to_string(instruction.fieldIndex) + "u, " + operand(0) +
+                            ", " + operand(1) + ", " + resExpr +
+                            ")) return false;");
+                        break;
+                    }
+                    case mir::Opcode::Call: {
+                        const auto callSigExpr = nextSpecCallExpr();
+                        const auto callIndex = functionCallIndex++;
+                        const auto name = "callArguments_" + std::to_string(callIndex);
+                        const auto resultName = "callResult_" + std::to_string(callIndex);
+                        const auto pointer = arrayValues(
+                            instruction.operands, name, source, "            ");
+                        source.line("            runtime::Value " + resultName + ";");
+                        source.line("            if (!context.call(" +
+                            callSigExpr + ", " + pointer + ", " +
+                            std::to_string(instruction.operands.size()) +
+                            "u, " + resultName + ")) {");
+                        source.line("                if (context.hasPendingException()) {");
+                        emitExceptionRoute("                    ");
+                        if (isAsyncFunction) {
+                            source.line("                    return context.finishUncaughtAsyncException(activeCoroutine, spec.returnTypeId, result);");
+                        }
+                        source.line("                }");
+                        source.line("                return false;");
+                        source.line("            }");
+                        if (instruction.result >= 0) {
+                            source.line("            " + resExpr +
+                                " = std::move(" + resultName + ");");
+                        }
+                        break;
+                    }
+                    case mir::Opcode::NewDelegate: {
+                        const auto delTidExpr = nextSpecTypeExpr();
+                        const auto callSigExpr = nextSpecCallExpr();
+                        const auto callIndex = functionCallIndex++;
+                        const auto name = "delegateTarget_" + std::to_string(callIndex);
+                        const auto pointer = arrayValues(
+                            instruction.operands, name, source, "            ");
+                        source.line("            if (!context.newDelegate(" +
+                            delTidExpr + ", " + callSigExpr + ", " + pointer +
+                            ", " + std::to_string(instruction.operands.size()) +
+                            "u, " + resExpr + ")) return false;");
+                        break;
+                    }
+                    case mir::Opcode::InvokeDelegate: {
+                        const auto delTidExpr = nextSpecTypeExpr();
+                        const auto callIndex = functionCallIndex++;
+                        const auto name = "delegateArguments_" + std::to_string(callIndex);
+                        const auto resultName = "delegateResult_" + std::to_string(callIndex);
+                        const auto pointer = arrayValues(
+                            instruction.operands, name, source, "            ");
+                        source.line("            runtime::Value " + resultName + ";");
+                        source.line("            if (!context.invokeDelegate(" +
+                            delTidExpr + ", " + pointer + ", " +
+                            std::to_string(instruction.operands.size()) +
+                            "u, " + resultName + ")) {");
+                        source.line("                if (context.hasPendingException()) {");
+                        emitExceptionRoute("                    ");
+                        if (isAsyncFunction) {
+                            source.line("                    return context.finishUncaughtAsyncException(activeCoroutine, spec.returnTypeId, result);");
+                        }
+                        source.line("                }");
+                        source.line("                return false;");
+                        source.line("            }");
+                        if (instruction.result >= 0) {
+                            source.line("            " + resExpr +
+                                " = std::move(" + resultName + ");");
+                        }
+                        break;
+                    }
+                    case mir::Opcode::CombineDelegate:
+                    case mir::Opcode::RemoveDelegate: {
+                        const auto delTidExpr = nextSpecTypeExpr();
+                        source.line("            if (!context.combineDelegates(" +
+                            delTidExpr + ", " + operand(0) +
+                            ", " + operand(1) + ", " +
+                            (instruction.opcode == mir::Opcode::RemoveDelegate ? "true" : "false") +
+                            ", " + resExpr + ")) return false;");
+                        break;
+                    }
+                    case mir::Opcode::AsyncEnter:
+                        break;
+                    case mir::Opcode::AwaitSuspend:
+                        source.line("            {");
+                        source.line("                bool suspendedNow = false;");
+                        source.line("                if (!context.awaitSuspend(spec.symbolId, spec.returnTypeId, " +
+                            operand(0) + ", locals[" +
+                            std::to_string(instruction.localIndex) + "], " +
+                            std::to_string(instruction.integerImmediate) +
+                            "u, argumentValues, locals, registers, activeCoroutine, suspendedNow, result)) return false;");
+                        source.line("                if (suspendedNow) return true;");
+                        source.line("            }");
+                        break;
+                    case mir::Opcode::AwaitResume: {
+                        const auto elemTidExpr = nextSpecTypeExpr();
+                        const std::string outPtr = instruction.result >= 0
+                            ? ("&" + resExpr)
+                            : std::string("nullptr");
+                        source.line("            if (!context.awaitResume(locals[" +
+                            std::to_string(instruction.localIndex) + "], " +
+                            primitiveExpression(instruction.elementType) + ", " +
+                            elemTidExpr + ", " + outPtr + ")) {");
+                        source.line("                if (context.hasPendingException()) {");
+                        emitExceptionRoute("                    ");
+                        if (isAsyncFunction) {
+                            source.line("                    return context.finishUncaughtAsyncException(activeCoroutine, spec.returnTypeId, result);");
+                        }
+                        source.line("                }");
+                        source.line("                return false;");
+                        source.line("            }");
+                        break;
+                    }
+                    case mir::Opcode::AsyncResolve: {
+                        const auto tidExpr = nextSpecTypeExpr();
+                        const std::string payloadPtr = instruction.operands.empty()
+                            ? std::string("nullptr")
+                            : ("&" + operand(0));
+                        source.line("            if (!context.asyncResolve(activeCoroutine, " +
+                            tidExpr + ", " + payloadPtr + ", " + resExpr + ")) return false;");
+                        break;
+                    }
+                    default:
+                        if (isConversion(instruction.opcode)) {
+                            source.line("            if (!context.convert(" +
+                                conversionExpression(instruction.opcode) + ", " +
+                                primitiveExpression(instruction.resultType) + ", " +
+                                (instruction.checkedArithmetic ? "true" : "false") + ", " +
+                                operand(0) + ", " + resExpr + ")) return false;");
+                        } else if (isUnary(instruction.opcode)) {
+                            source.line("            if (!context.unary(" +
+                                unaryExpression(instruction.opcode) + ", " +
+                                (instruction.checkedArithmetic ? "true" : "false") + ", " +
+                                operand(0) + ", " + resExpr + ")) return false;");
+                        } else if (isBinary(instruction.opcode)) {
+                            source.line("            if (!context.binary(" +
+                                binaryExpression(instruction.opcode) + ", " +
+                                (instruction.checkedArithmetic ? "true" : "false") + ", " +
+                                operand(0) + ", " + operand(1) + ", " + resExpr +
+                                ")) return false;");
+                        } else {
+                            diagnostics.report("RS7005", "unsupported MIR opcode in AOT generator", {});
+                        }
+                        break;
+                    }
+                }
+
+                if (!options.trustedRelease) {
+                    if (activeSourceLine) {
+                        emitGeneratedLineReset(source, options.emitLineDirectives);
+                        activeSourceLine = false;
+                    }
+                    source.line("            if (!context.trustedReleaseEnabled() && !context.consume(" +
+                        std::to_string(
+                            runtime::determinismOperationId(
+                                mir::terminatorName(block.terminator.kind))) +
+                        "ULL, \"" +
+                        escapeCppString(mir::terminatorName(block.terminator.kind)) +
+                        "\")) return false;");
+                }
+                bool explicitTermPoint = false;
+                const auto resolvedTermPoint = resolveSequencePoint(
+                    module,
+                    function,
+                    block.id,
+                    static_cast<std::uint32_t>(block.instructions.size()),
+                    true,
+                    block.terminator.sourceSpan,
+                    &explicitTermPoint);
+                const std::uint32_t currentTermGenLine =
+                    source.nextLine() + (options.emitLineDirectives && resolvedTermPoint ? 1u : 0u);
+                emitLineDirective(
+                    source,
+                    module,
+                    resolvedTermPoint,
+                    options.emitLineDirectives,
+                    &sourceMap,
+                    function.symbolId,
+                    true);
+                if (resolvedTermPoint) {
+                    for (std::size_t mIdx = 1; mIdx < group.members.size(); ++mIdx) {
+                        const auto& mView = *group.members[mIdx].view;
+                        bool mExplicit = false;
+                        if (const auto mPoint = resolveSequencePoint(
+                                *mView.module,
+                                *mView.function,
+                                block.id,
+                                static_cast<std::uint32_t>(block.instructions.size()),
+                                true,
+                                mView.function->blocks[&block - function.blocks.data()]
+                                    .terminator.sourceSpan,
+                                &mExplicit)) {
+                            if (const auto* mSrc = findSource(*mView.module, mPoint->range.fileId);
+                                mSrc && !mSrc->path.empty()) {
+                                sourceMap.push_back(SourceMapRecord{
+                                    mView.function->symbolId,
+                                    currentTermGenLine,
+                                    mSrc->path,
+                                    static_cast<std::uint32_t>(mPoint->range.start.line + 1),
+                                    static_cast<std::uint32_t>(mPoint->range.start.column + 1)});
+                            }
+                        }
+                    }
+                    source.line("            context.setActiveGeneratedLine(" +
+                        std::to_string(currentTermGenLine) + "u);");
+                }
+                switch (block.terminator.kind) {
+                case mir::TerminatorKind::ReturnVoid:
+                    source.line("            result = std::monostate{};");
+                    source.line("            return true;");
+                    break;
+                case mir::TerminatorKind::ReturnValue:
+                    source.line("            result = " +
+                        valueExpression(block.terminator.value) + ";");
+                    source.line("            return true;");
+                    break;
+                case mir::TerminatorKind::Jump:
+                    emitTransfer(
+                        source,
+                        function,
+                        block.terminator.target,
+                        block.terminator.arguments,
+                        "edgeValues",
+                        "            ");
+                    source.line("            continue;");
+                    break;
+                case mir::TerminatorKind::Branch:
+                    source.line("            if (!context.expectType(" +
+                        valueExpression(block.terminator.condition) + ", " +
+                        primitiveExpression(semantic::PrimitiveType::Bool) +
+                        ", \"branch\")) return false;");
+                    source.line("            if (std::get<bool>(" +
+                        valueExpression(block.terminator.condition) + ")) {");
+                    emitTransfer(
+                        source,
+                        function,
+                        block.terminator.target,
+                        block.terminator.arguments,
+                        "trueEdgeValues",
+                        "                ");
+                    source.line("            } else {");
+                    emitTransfer(
+                        source,
+                        function,
+                        block.terminator.falseTarget,
+                        block.terminator.falseArguments,
+                        "falseEdgeValues",
+                        "                ");
+                    source.line("            }");
+                    source.line("            continue;");
+                    break;
+                case mir::TerminatorKind::Throw:
+                    source.line("            if (!context.throwScript(" +
+                        valueExpression(block.terminator.value) + ")) {");
+                    source.line("                if (context.hasPendingException()) {");
+                    emitExceptionRoute("                    ");
+                    if (isAsyncFunction) {
+                        source.line("                    return context.finishUncaughtAsyncException(activeCoroutine, spec.returnTypeId, result);");
+                    }
+                    source.line("                }");
+                    source.line("                return false;");
+                    source.line("            }");
+                    source.line("            return context.fail("
+                        "runtime::ErrorCode::InvalidProgram, "
+                        "\"AOT throw unexpectedly returned\");");
+                    break;
+                case mir::TerminatorKind::None:
+                    source.line("            return context.fail("
+                        "runtime::ErrorCode::InvalidProgram, "
+                        "\"AOT block has no terminator\");");
+                    break;
+                }
+                emitGeneratedLineReset(source, options.emitLineDirectives);
+                source.line("        }");
+            }
+            source.line("        default:");
+            source.line("            return context.fail(runtime::ErrorCode::InvalidProgram, "
+                "\"AOT branch target is invalid\");");
+            source.line("        }");
+            source.line("    }");
+            source.line("}");
+            source.line();
+        }
+    }
 
     for (const auto& view : functions) {
         const auto& module = *view.module;
         const auto& function = *view.function;
-        if (typedFunctions.find(function.symbolId) != typedFunctions.end()) {
+        const auto sharedIt = sharedGenericBySymbol.find(function.symbolId);
+        if (sharedIt != sharedGenericBySymbol.end()) {
+            const auto& group = sharedGenericGroups[sharedIt->second.first];
+            const auto& memberSpec = group.members[sharedIt->second.second];
+            std::string typesPtrExpr = "nullptr";
+            if (!memberSpec.typeIds.empty()) {
+                typesPtrExpr = view.cppName + "_sharedTypeIds";
+                std::string arrLine = "static constexpr semantic::SymbolId " + typesPtrExpr + "[] = {";
+                for (std::size_t idx = 0; idx < memberSpec.typeIds.size(); ++idx) {
+                    if (idx != 0) arrLine += ", ";
+                    arrLine += "0x" + hexId(memberSpec.typeIds[idx]) + "ULL";
+                }
+                arrLine += "};";
+                source.line(arrLine);
+            }
+            std::string callsPtrExpr = "nullptr";
+            if (!memberSpec.callIds.empty()) {
+                callsPtrExpr = view.cppName + "_sharedCalls";
+                std::string arrLine = "static constexpr const CallSignature* " + callsPtrExpr + "[] = {";
+                for (std::size_t idx = 0; idx < memberSpec.callIds.size(); ++idx) {
+                    if (idx != 0) arrLine += ", ";
+                    arrLine += "&call_" + std::to_string(memberSpec.callIds[idx]) + "_signature";
+                }
+                arrLine += "};";
+                source.line(arrLine);
+            }
+            source.line("static constexpr SharedRefGenericSpec " + view.cppName + "_sharedSpec{0x" +
+                hexId(function.symbolId) + "ULL, 0x" +
+                hexId(function.returnTypeId) + "ULL, " +
+                typesPtrExpr + ", " + callsPtrExpr + "};");
+            source.line("static bool " + view.cppName + "(");
+            source.line("    ExecutionContext& context,");
+            source.line("    const runtime::Value* arguments,");
+            source.line("    std::size_t argumentCount,");
+            source.line("    runtime::Value& result) {");
+            source.line("    return shared_ref_generic_" +
+                std::to_string(group.groupIndex) +
+                "(context, arguments, argumentCount, result, " +
+                view.cppName + "_sharedSpec);");
+            source.line("}");
+            source.line();
+        } else if (typedFunctions.find(function.symbolId) != typedFunctions.end()) {
             emitTypedPrimitiveFunction(
                 source, view, options, sourceMap, typedFunctions, types, callIds);
         } else {
@@ -5517,6 +6443,22 @@ GeneratedProgram CppGenerator::generate(
     }
 
     if (!sourceMap.empty()) {
+        std::stable_sort(
+            sourceMap.begin(),
+            sourceMap.end(),
+            [](const SourceMapRecord& left, const SourceMapRecord& right) {
+                if (left.symbolId != right.symbolId) return left.symbolId < right.symbolId;
+                return left.generatedLine < right.generatedLine;
+            });
+        sourceMap.erase(
+            std::unique(
+                sourceMap.begin(),
+                sourceMap.end(),
+                [](const SourceMapRecord& left, const SourceMapRecord& right) {
+                    return left.symbolId == right.symbolId &&
+                        left.generatedLine == right.generatedLine;
+                }),
+            sourceMap.end());
         source.line("static constexpr SourceMapEntry programSourceMap[] = {");
         for (const auto& map : sourceMap) {
             source.line("    {0x" + hexId(map.symbolId) + "ULL, " +
@@ -5639,6 +6581,8 @@ GeneratedProgram CppGenerator::generate(
     }
     manifest << "  ],\n  \"typeCount\": " << types.size()
         << ",\n  \"sourceMapCount\": " << sourceMap.size()
+        << ",\n  \"sharedGenericBodyCount\": " << generated.sharedGenericBodyCount
+        << ",\n  \"foldedGenericFunctionCount\": " << generated.foldedGenericFunctionCount
         << ",\n  \"languageMetadata\": {\n";
 
     manifest << "    \"attributes\": [";
