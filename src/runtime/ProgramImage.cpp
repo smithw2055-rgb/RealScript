@@ -298,6 +298,25 @@ bool validateObjectModel(
         }
     }
 
+    {
+        std::vector<std::pair<semantic::SymbolId, std::vector<BlittableFieldInput>>> structSpecs;
+        for (const auto& [typeId, type] : types) {
+            if (type->kind != semantic::TypeKind::Struct) continue;
+            std::vector<BlittableFieldInput> fInputs;
+            fInputs.reserve(type->fields.size());
+            for (const auto& field : type->fields) {
+                const semantic::SymbolId fTid = semantic::isExactType(field.type)
+                    ? semantic::stableTypeId(field.typeName)
+                    : 0;
+                fInputs.push_back(BlittableFieldInput{field.type, fTid});
+            }
+            structSpecs.emplace_back(typeId, std::move(fInputs));
+        }
+        if (!structSpecs.empty()) {
+            registerBlittableStructTypes(structSpecs);
+        }
+    }
+
     for (const auto& [typeId, type] : types) {
         (void)typeId;
         for (std::size_t slot = 0;
@@ -603,9 +622,13 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         if (function.registerTypeIds[instruction.result] == tid &&
                             (tid == fixedTypeId() ||
                              tid == fixed16TypeId() ||
+                             tid == fixed64TypeId() ||
                              tid == vec2TypeId() ||
                              tid == vec3TypeId() ||
-                             tid == quatTypeId())) {
+                             tid == quatTypeId() ||
+                             tid == vec2fTypeId() ||
+                             tid == vec3fTypeId() ||
+                             tid == quatfTypeId())) {
                             return QuickOpcode::NewStructFast;
                         }
                     }
@@ -935,9 +958,13 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                           function.registerTypeIds[bb.terminator.value] == function.returnTypeId &&
                           (function.returnTypeId == fixedTypeId() ||
                            function.returnTypeId == fixed16TypeId() ||
+                           function.returnTypeId == fixed64TypeId() ||
                            function.returnTypeId == vec2TypeId() ||
                            function.returnTypeId == vec3TypeId() ||
-                           function.returnTypeId == quatTypeId())))) {
+                           function.returnTypeId == quatTypeId() ||
+                           function.returnTypeId == vec2fTypeId() ||
+                           function.returnTypeId == vec3fTypeId() ||
+                           function.returnTypeId == quatfTypeId())))) {
                         blockMirror.returnPrevalidatedScalar = true;
                     }
                 }
@@ -1743,6 +1770,25 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             }
             if (fTid == quatTypeId()) {
                 outKind = FastFieldKind::Quat;
+                return true;
+            }
+            if (fTid == fixed64TypeId()) {
+                outKind = FastFieldKind::ExactValueTag;
+                outExactTag = static_cast<std::uint8_t>(ValueTag::Fixed64);
+                return true;
+            }
+            if (fTid == vec2fTypeId()) {
+                outKind = FastFieldKind::ExactValueTag;
+                outExactTag = static_cast<std::uint8_t>(ValueTag::Vec2f);
+                return true;
+            }
+            if (fTid == vec3fTypeId()) {
+                outKind = FastFieldKind::ExactValueTag;
+                outExactTag = static_cast<std::uint8_t>(ValueTag::Vec3f);
+                return true;
+            }
+            if (fTid == quatfTypeId()) {
+                outKind = FastFieldKind::Quatf;
                 return true;
             }
             outKind = FastFieldKind::UserStruct;
@@ -3273,6 +3319,10 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         else if (structTid == vec2TypeId()) flat.aux0Slot = 3;
                         else if (structTid == vec3TypeId()) flat.aux0Slot = 4;
                         else if (structTid == quatTypeId()) flat.aux0Slot = 5;
+                        else if (structTid == fixed64TypeId()) flat.aux0Slot = 6;
+                        else if (structTid == vec2fTypeId()) flat.aux0Slot = 7;
+                        else if (structTid == vec3fTypeId()) flat.aux0Slot = 8;
+                        else if (structTid == quatfTypeId()) flat.aux0Slot = 9;
                         else flat.aux0Slot = 0;
                         break;
                     }
@@ -3311,6 +3361,10 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                     else if (bcInst.elementTypeId == vec2TypeId()) flat.aux0Slot = 4;
                                     else if (bcInst.elementTypeId == vec3TypeId()) flat.aux0Slot = 5;
                                     else if (bcInst.elementTypeId == quatTypeId()) flat.aux0Slot = 6;
+                                    else if (bcInst.elementTypeId == fixed64TypeId()) flat.aux0Slot = 7;
+                                    else if (bcInst.elementTypeId == vec2fTypeId()) flat.aux0Slot = 8;
+                                    else if (bcInst.elementTypeId == vec3fTypeId()) flat.aux0Slot = 9;
+                                    else if (bcInst.elementTypeId == quatfTypeId()) flat.aux0Slot = 10;
                                     else flat.aux0Slot = 0;
                                 } else {
                                     flat.aux0Slot = 0;
@@ -3452,6 +3506,9 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                             if (tid == fixed16TypeId()) return static_cast<std::uint8_t>(ValueTag::Fixed16);
                                             if (tid == vec2TypeId()) return static_cast<std::uint8_t>(ValueTag::Vec2);
                                             if (tid == vec3TypeId()) return static_cast<std::uint8_t>(ValueTag::Vec3);
+                                            if (tid == fixed64TypeId()) return static_cast<std::uint8_t>(ValueTag::Fixed64);
+                                            if (tid == vec2fTypeId()) return static_cast<std::uint8_t>(ValueTag::Vec2f);
+                                            if (tid == vec3fTypeId()) return static_cast<std::uint8_t>(ValueTag::Vec3f);
                                             return 0u;
                                         default:
                                             return 0u;
@@ -3595,6 +3652,10 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                     else if (bcInst.elementTypeId == vec2TypeId()) flat.aux0Slot = 3;
                                     else if (bcInst.elementTypeId == vec3TypeId()) flat.aux0Slot = 4;
                                     else if (bcInst.elementTypeId == quatTypeId()) flat.aux0Slot = 5;
+                                    else if (bcInst.elementTypeId == fixed64TypeId()) flat.aux0Slot = 6;
+                                    else if (bcInst.elementTypeId == vec2fTypeId()) flat.aux0Slot = 7;
+                                    else if (bcInst.elementTypeId == vec3fTypeId()) flat.aux0Slot = 8;
+                                    else if (bcInst.elementTypeId == quatfTypeId()) flat.aux0Slot = 9;
                                     else flat.aux0Slot = 0;
                                     break;
                                 }
@@ -5218,7 +5279,8 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                computedExprKind == TrivialMethodKind::None) {
                         const auto tag = static_cast<ValueTag>(static_cast<std::uint8_t>(fi.binaryOpcode1));
                         const bool nonRefScalarTag =
-                            tag >= ValueTag::Bool && tag <= ValueTag::QuatInline;
+                            (tag >= ValueTag::Bool && tag <= ValueTag::QuatInline) ||
+                            (tag >= ValueTag::Fixed64 && tag <= ValueTag::QuatfInline);
                         if (nonRefScalarTag &&
                             fi.src0Slot < execFunc.totalFrameSlots &&
                             fi.src1Slot < execFunc.totalFrameSlots &&

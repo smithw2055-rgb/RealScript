@@ -246,9 +246,13 @@ struct ScopedChunkPrngBinding {
     return typeId != 0 && (
         typeId == fixedTypeId() ||
         typeId == fixed16TypeId() ||
+        typeId == fixed64TypeId() ||
         typeId == vec2TypeId() ||
         typeId == vec3TypeId() ||
-        typeId == quatTypeId());
+        typeId == quatTypeId() ||
+        typeId == vec2fTypeId() ||
+        typeId == vec3fTypeId() ||
+        typeId == quatfTypeId());
 }
 
 [[nodiscard]] bool isInlineSafeCustomStruct(
@@ -1175,6 +1179,26 @@ namespace {
             }};
             return true;
         }
+        if (const auto* l = std::get_if<Fixed64Value>(&left)) {
+            const auto* r = std::get_if<Fixed64Value>(&right);
+            if (!r) break;
+            const auto sumRaw = static_cast<std::int64_t>(
+                static_cast<std::uint64_t>(l->raw) + static_cast<std::uint64_t>(r->raw));
+            outReduced = Value{Fixed64Value{sumRaw}};
+            return true;
+        }
+        if (const auto* l = std::get_if<Vec2fValue>(&left)) {
+            const auto* r = std::get_if<Vec2fValue>(&right);
+            if (!r) break;
+            outReduced = Value{Vec2fValue{l->x + r->x, l->y + r->y}};
+            return true;
+        }
+        if (const auto* l = std::get_if<Vec3fValue>(&left)) {
+            const auto* r = std::get_if<Vec3fValue>(&right);
+            if (!r) break;
+            outReduced = Value{Vec3fValue{l->x + r->x, l->y + r->y, l->z + r->z}};
+            return true;
+        }
         break;
     }
 
@@ -1334,8 +1358,15 @@ namespace {
             if (op == ParallelReduceOp::Max) return Value{Fixed16Value{std::numeric_limits<std::int64_t>::min()}};
             return Value{Fixed16Value{0}};
         }
+        if (returnTypeId == fixed64TypeId()) {
+            if (op == ParallelReduceOp::Min) return Value{Fixed64Value{std::numeric_limits<std::int64_t>::max()}};
+            if (op == ParallelReduceOp::Max) return Value{Fixed64Value{std::numeric_limits<std::int64_t>::min()}};
+            return Value{Fixed64Value{0}};
+        }
         if (returnTypeId == vec2TypeId()) return Value{Vec2Value{0, 0}};
         if (returnTypeId == vec3TypeId()) return Value{Vec3Value{0, 0, 0}};
+        if (returnTypeId == vec2fTypeId()) return Value{Vec2fValue{0.0f, 0.0f}};
+        if (returnTypeId == vec3fTypeId()) return Value{Vec3fValue{0.0f, 0.0f, 0.0f}};
         break;
     default:
         break;

@@ -425,13 +425,35 @@ struct Fixed64 {
     [[nodiscard]] constexpr Fixed toFixed() const noexcept {
         return Fixed::fromRaw(static_cast<std::int32_t>(raw >> 24));
     }
+    [[nodiscard]] static constexpr Fixed64 fromDouble(double v) noexcept {
+        return Fixed64(static_cast<std::int64_t>(v * static_cast<double>(SCALE)));
+    }
     [[nodiscard]] constexpr double toDouble() const noexcept {
         return static_cast<double>(raw) / static_cast<double>(SCALE);
     }
+    [[nodiscard]] constexpr float toFloat() const noexcept {
+        return static_cast<float>(toDouble());
+    }
+    [[nodiscard]] constexpr std::int64_t toInt() const noexcept {
+        return raw >> 32;
+    }
+    [[nodiscard]] constexpr std::int64_t toIntTrunc() const noexcept {
+        return raw >= 0
+            ? (raw >> 32)
+            : -static_cast<std::int64_t>((0ULL - static_cast<std::uint64_t>(raw)) >> 32);
+    }
 
-    constexpr Fixed64 operator-() const noexcept { return Fixed64(-raw); }
-    constexpr Fixed64 operator+(Fixed64 rhs) const noexcept { return Fixed64(raw + rhs.raw); }
-    constexpr Fixed64 operator-(Fixed64 rhs) const noexcept { return Fixed64(raw - rhs.raw); }
+    constexpr Fixed64 operator-() const noexcept {
+        return Fixed64(static_cast<std::int64_t>(0ULL - static_cast<std::uint64_t>(raw)));
+    }
+    constexpr Fixed64 operator+(Fixed64 rhs) const noexcept {
+        return Fixed64(static_cast<std::int64_t>(
+            static_cast<std::uint64_t>(raw) + static_cast<std::uint64_t>(rhs.raw)));
+    }
+    constexpr Fixed64 operator-(Fixed64 rhs) const noexcept {
+        return Fixed64(static_cast<std::int64_t>(
+            static_cast<std::uint64_t>(raw) - static_cast<std::uint64_t>(rhs.raw)));
+    }
     constexpr Fixed64 operator*(Fixed64 rhs) const noexcept {
         const std::int64_t aHi = raw >> 32;
         const std::uint64_t aLo = static_cast<std::uint64_t>(raw) & 0xFFFFFFFFULL;
@@ -712,6 +734,76 @@ struct Ray {
     }
 };
 
+struct Vec2f {
+    float x = 0.0f;
+    float y = 0.0f;
+
+    constexpr Vec2f() noexcept = default;
+    constexpr Vec2f(float xVal, float yVal) noexcept : x(xVal), y(yVal) {}
+
+    [[nodiscard]] static constexpr float dot(Vec2f a, Vec2f b) noexcept {
+        return a.x * b.x + a.y * b.y;
+    }
+    [[nodiscard]] constexpr float lengthSq() const noexcept { return dot(*this, *this); }
+
+    friend constexpr Vec2f operator+(Vec2f a, Vec2f b) noexcept { return {a.x + b.x, a.y + b.y}; }
+    friend constexpr Vec2f operator-(Vec2f a, Vec2f b) noexcept { return {a.x - b.x, a.y - b.y}; }
+    friend constexpr Vec2f operator*(Vec2f v, float s) noexcept { return {v.x * s, v.y * s}; }
+    friend constexpr Vec2f operator*(float s, Vec2f v) noexcept { return {v.x * s, v.y * s}; }
+    friend constexpr bool operator==(Vec2f a, Vec2f b) noexcept { return a.x == b.x && a.y == b.y; }
+    friend constexpr bool operator!=(Vec2f a, Vec2f b) noexcept { return !(a == b); }
+};
+
+struct Vec3f {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+
+    constexpr Vec3f() noexcept = default;
+    constexpr Vec3f(float xVal, float yVal, float zVal) noexcept : x(xVal), y(yVal), z(zVal) {}
+
+    [[nodiscard]] static constexpr float dot(Vec3f a, Vec3f b) noexcept {
+        return a.x * b.x + a.y * b.y + a.z * b.z;
+    }
+    [[nodiscard]] static constexpr Vec3f cross(Vec3f a, Vec3f b) noexcept {
+        return {
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x};
+    }
+    [[nodiscard]] constexpr float lengthSq() const noexcept { return dot(*this, *this); }
+
+    friend constexpr Vec3f operator+(Vec3f a, Vec3f b) noexcept { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+    friend constexpr Vec3f operator-(Vec3f a, Vec3f b) noexcept { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+    friend constexpr Vec3f operator*(Vec3f v, float s) noexcept { return {v.x * s, v.y * s, v.z * s}; }
+    friend constexpr Vec3f operator*(float s, Vec3f v) noexcept { return {v.x * s, v.y * s, v.z * s}; }
+    friend constexpr bool operator==(Vec3f a, Vec3f b) noexcept {
+        return a.x == b.x && a.y == b.y && a.z == b.z;
+    }
+    friend constexpr bool operator!=(Vec3f a, Vec3f b) noexcept { return !(a == b); }
+};
+
+struct Quatf {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float w = 1.0f;
+
+    constexpr Quatf() noexcept = default;
+    constexpr Quatf(float xVal, float yVal, float zVal, float wVal) noexcept
+        : x(xVal), y(yVal), z(zVal), w(wVal) {}
+
+    [[nodiscard]] static constexpr Quatf identity() noexcept { return {0.0f, 0.0f, 0.0f, 1.0f}; }
+    [[nodiscard]] constexpr Vec3f rotate(Vec3f v) const noexcept {
+        const Vec3f u{x, y, z};
+        const Vec3f uv = Vec3f::cross(u, v);
+        const Vec3f uuv = Vec3f::cross(u, uv);
+        return v + (uv * w + uuv) * 2.0f;
+    }
+    friend constexpr bool operator==(Quatf a, Quatf b) noexcept {
+        return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
+    }
+    friend constexpr bool operator!=(Quatf a, Quatf b) noexcept { return !(a == b); }
+};
+
 } // namespace realscript::game
-
-

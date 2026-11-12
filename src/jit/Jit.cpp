@@ -1073,14 +1073,18 @@ std::uint32_t jitNewArrayHelper(JitAbiContext* ctx, std::uint32_t flatIdx) noexc
         default:
             break;
         }
-    } else if (fi.aux0Slot >= 2 && fi.aux0Slot <= 6) {
+    } else if (fi.aux0Slot >= 2 && fi.aux0Slot <= 10) {
         if (cold.bytecode) elemTid = cold.bytecode->elementTypeId;
         switch (fi.aux0Slot) {
         case 2: initVal = runtime::FixedValue{}; break;
         case 3: initVal = runtime::Fixed16Value{}; break;
         case 4: initVal = runtime::Vec2Value{}; break;
         case 5: initVal = runtime::Vec3Value{}; break;
-        default: initVal = runtime::QuatValue{}; break;
+        case 6: initVal = runtime::QuatValue{}; break;
+        case 7: initVal = runtime::Fixed64Value{}; break;
+        case 8: initVal = runtime::Vec2fValue{}; break;
+        case 9: initVal = runtime::Vec3fValue{}; break;
+        default: initVal = runtime::QuatfValue{}; break;
         }
     } else if (cold.bytecode) {
         elemTid = cold.bytecode->elementTypeId;
@@ -1088,6 +1092,10 @@ std::uint32_t jitNewArrayHelper(JitAbiContext* ctx, std::uint32_t flatIdx) noexc
             initVal = runtime::EnumValue{elemTid, 0};
         } else if (elemType == semantic::PrimitiveType::Array) {
             initVal = runtime::NullArray{};
+        } else if (elemType == semantic::PrimitiveType::Struct) {
+            if (auto defStruct = runtime::makeDefaultBlittableStructValue(elemTid)) {
+                initVal = std::move(*defStruct);
+            }
         }
     }
 
@@ -1740,8 +1748,19 @@ std::uint32_t jitPartialSuperBudgetHelper(JitAbiContext* ctx, std::uint32_t flat
     case FO::ConvertFloatToIntFast:
     case FO::ConvertLongToIntFast:
     case FO::ArrayLengthFast:
-    case FO::NewArrayFast:
         return validSlot(fi.dstSlot) && validSlot(fi.src0Slot);
+    case FO::NewArrayFast: {
+        if (!validSlot(fi.dstSlot) || !validSlot(fi.src0Slot)) return false;
+        const auto elemType = static_cast<semantic::PrimitiveType>(
+            static_cast<std::uint8_t>(fi.binaryOpcode1));
+        if (fi.aux0Slot == 0 && elemType == semantic::PrimitiveType::Struct) {
+            const auto idx = static_cast<std::size_t>(&fi - execFunc.flatStream.data());
+            return idx < execFunc.flatCold.size() &&
+                   execFunc.flatCold[idx].bytecode != nullptr &&
+                   runtime::isBlittableStructType(execFunc.flatCold[idx].bytecode->elementTypeId);
+        }
+        return true;
+    }
     case FO::SuperBinaryLocalIntConst:
         return validSlot(fi.src0Slot) && validSlot(fi.dstSlot) &&
                validSlot(fi.aux0Slot) && validSlot(fi.aux1Slot) &&

@@ -506,9 +506,13 @@ void emitVectorizedBodyInstruction(
             semantic::PrimitiveType::Struct, instruction.typeId);
         if (kind != InlineMathKind::None) {
             const char* member = inlineMathFieldMember(kind, instruction.fieldIndex);
-            if (kind == InlineMathKind::Fixed || kind == InlineMathKind::Fixed16) {
+            if (kind == InlineMathKind::Fixed || kind == InlineMathKind::Fixed16 ||
+                kind == InlineMathKind::Fixed64) {
                 source.line(indent + result + " = static_cast<std::int64_t>(" +
                     operand(0) + "." + member + ");");
+            } else if (kind == InlineMathKind::Vec2f || kind == InlineMathKind::Vec3f ||
+                       kind == InlineMathKind::Quatf) {
+                source.line(indent + result + " = " + operand(0) + "." + member + ";");
             } else {
                 source.line(indent + result + " = runtime::FixedValue{" +
                     operand(0) + "." + member + "};");
@@ -527,9 +531,16 @@ void emitVectorizedBodyInstruction(
             if (result != operand(0)) {
                 source.line(indent + result + " = " + operand(0) + ";");
             }
-            if (kind == InlineMathKind::Fixed || kind == InlineMathKind::Fixed16) {
+            if (kind == InlineMathKind::Fixed) {
                 source.line(indent + result + "." + member +
                     " = static_cast<std::int32_t>(" + operand(1) + ");");
+            } else if (kind == InlineMathKind::Fixed16 || kind == InlineMathKind::Fixed64) {
+                source.line(indent + result + "." + member +
+                    " = static_cast<std::int64_t>(" + operand(1) + ");");
+            } else if (kind == InlineMathKind::Vec2f || kind == InlineMathKind::Vec3f ||
+                       kind == InlineMathKind::Quatf) {
+                source.line(indent + result + "." + member +
+                    " = static_cast<float>(" + operand(1) + ");");
             } else {
                 source.line(indent + result + "." + member + " = " + operand(1) + ".raw;");
             }

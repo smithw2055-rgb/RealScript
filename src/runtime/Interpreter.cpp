@@ -5605,6 +5605,9 @@ bool executeFunction(
                                 case detail::FastFieldKind::Quat:
                                     fieldOk = (vt == ValueTag::QuatInline || vt == ValueTag::QuatArena);
                                     break;
+                                case detail::FastFieldKind::Quatf:
+                                    fieldOk = (vt == ValueTag::QuatfInline || vt == ValueTag::QuatfArena);
+                                    break;
                                 case detail::FastFieldKind::String:
                                     fieldOk = (vt == ValueTag::NullString || vt == ValueTag::String ||
                                                (vt == ValueTag::ObjectRef &&
@@ -5703,6 +5706,14 @@ bool executeFunction(
                                     if (vt == ValueTag::QuatInline) {
                                         rhsOk = true;
                                     } else if (vt == ValueTag::QuatArena) {
+                                        rhsOk = true;
+                                        needsPin = true;
+                                    }
+                                    break;
+                                case detail::FastFieldKind::Quatf:
+                                    if (vt == ValueTag::QuatfInline) {
+                                        rhsOk = true;
+                                    } else if (vt == ValueTag::QuatfArena) {
                                         rhsOk = true;
                                         needsPin = true;
                                     }
@@ -6048,14 +6059,18 @@ bool executeFunction(
                             initVal = defaultValue(*location.module, elemType, 0);
                             break;
                         }
-                    } else if (ip->aux0Slot >= 2 && ip->aux0Slot <= 6) {
+                    } else if (ip->aux0Slot >= 2 && ip->aux0Slot <= 10) {
                         elemTid = flatColdBase[ip - streamBase].bytecode->elementTypeId;
                         switch (ip->aux0Slot) {
                         case 2: initVal = FixedValue{}; break;
                         case 3: initVal = Fixed16Value{}; break;
                         case 4: initVal = Vec2Value{}; break;
                         case 5: initVal = Vec3Value{}; break;
-                        default: initVal = QuatValue{}; break;
+                        case 6: initVal = QuatValue{}; break;
+                        case 7: initVal = Fixed64Value{}; break;
+                        case 8: initVal = Vec2fValue{}; break;
+                        case 9: initVal = Vec3fValue{}; break;
+                        default: initVal = QuatfValue{}; break;
                         }
                     } else {
                         const auto& inst = *flatColdBase[ip - streamBase].bytecode;
@@ -6466,6 +6481,10 @@ bool executeFunction(
                 case 3: frameBase[ip->dstSlot] = Vec2Value{}; break;
                 case 4: frameBase[ip->dstSlot] = Vec3Value{}; break;
                 case 5: frameBase[ip->dstSlot] = QuatValue{}; break;
+                case 6: frameBase[ip->dstSlot] = Fixed64Value{}; break;
+                case 7: frameBase[ip->dstSlot] = Vec2fValue{}; break;
+                case 8: frameBase[ip->dstSlot] = Vec3fValue{}; break;
+                case 9: frameBase[ip->dstSlot] = QuatfValue{}; break;
                 default:
                     --localExecuted;
                     goto L_FlatGenericFallback;
@@ -8032,6 +8051,62 @@ bool executeFunction(
                             expectedTid,
                             reinterpret_cast<const std::int64_t*>(rawBytes)[uIdx]};
                         break;
+                    case PackedElemEncoding::Fixed24_8:
+                        frameBase[ip->dstSlot] = FixedValue{
+                            reinterpret_cast<const std::int32_t*>(rawBytes)[uIdx]};
+                        break;
+                    case PackedElemEncoding::Fixed48_16:
+                        frameBase[ip->dstSlot] = Fixed16Value{
+                            reinterpret_cast<const std::int64_t*>(rawBytes)[uIdx]};
+                        break;
+                    case PackedElemEncoding::Fixed32_32:
+                        frameBase[ip->dstSlot] = Fixed64Value{
+                            reinterpret_cast<const std::int64_t*>(rawBytes)[uIdx]};
+                        break;
+                    case PackedElemEncoding::Vec2: {
+                        Vec2Value v{};
+                        std::memcpy(&v, rawBytes + uIdx * sizeof(Vec2Value), sizeof(v));
+                        frameBase[ip->dstSlot] = v;
+                        break;
+                    }
+                    case PackedElemEncoding::Vec3: {
+                        Vec3Value v{};
+                        std::memcpy(&v, rawBytes + uIdx * sizeof(Vec3Value), sizeof(v));
+                        frameBase[ip->dstSlot] = v;
+                        break;
+                    }
+                    case PackedElemEncoding::Quat: {
+                        QuatValue v{};
+                        std::memcpy(&v, rawBytes + uIdx * sizeof(QuatValue), sizeof(v));
+                        frameBase[ip->dstSlot] = v;
+                        break;
+                    }
+                    case PackedElemEncoding::Vec2f: {
+                        Vec2fValue v{};
+                        std::memcpy(&v, rawBytes + uIdx * sizeof(Vec2fValue), sizeof(v));
+                        frameBase[ip->dstSlot] = v;
+                        break;
+                    }
+                    case PackedElemEncoding::Vec3f: {
+                        Vec3fValue v{};
+                        std::memcpy(&v, rawBytes + uIdx * sizeof(Vec3fValue), sizeof(v));
+                        frameBase[ip->dstSlot] = v;
+                        break;
+                    }
+                    case PackedElemEncoding::Quatf: {
+                        QuatfValue v{};
+                        std::memcpy(&v, rawBytes + uIdx * sizeof(QuatfValue), sizeof(v));
+                        frameBase[ip->dstSlot] = v;
+                        break;
+                    }
+                    case PackedElemEncoding::BlittableStruct:
+                        frameBase[ip->dstSlot] = readPackedStructElement(
+                            rawBytes,
+                            uIdx,
+                            PackedElemEncoding::BlittableStruct,
+                            expectedTid,
+                            ce.packedView.blittableSchemaId);
+                        break;
                     default:
                         goto L_FlatMathFallback;
                     }
@@ -8184,8 +8259,44 @@ bool executeFunction(
                     if (!bindArrayCacheSlot(arrVal, ce)) goto L_FlatMathFallback;
                 }
                 const auto expectedTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
-                if (RS_FLAT_UNLIKELY(ce.isPacked ||
-                                     ce.view.elementType != semantic::PrimitiveType::Struct ||
+                if (ce.isPacked) {
+                    if (RS_FLAT_UNLIKELY(ce.packedView.elementType != semantic::PrimitiveType::Struct ||
+                                         ce.packedView.elementTypeId != expectedTid)) {
+                        goto L_FlatMathFallback;
+                    }
+                    const std::uint64_t spanCost = ip->span;
+                    if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                        if (spanCost > 1u) goto L_FlatSuperFallback;
+                        goto L_FlatBudgetExceeded;
+                    }
+                    std::size_t uIdx = 0;
+                    if ((ip->arithFlags & detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u) {
+                        uIdx = static_cast<std::size_t>(frameBase[ip->src1Slot].asInt64Unchecked());
+                    } else {
+                        std::int64_t idx = 0;
+                        if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx) ||
+                                             static_cast<std::uint64_t>(idx) >= ce.packedView.length)) {
+                            goto L_FlatMathFallback;
+                        }
+                        uIdx = static_cast<std::size_t>(idx);
+                    }
+                    const Value& storeVal = frameBase[ip->src2Slot];
+                    bool needsDemote = false;
+                    if (RS_FLAT_UNLIKELY(!writePackedStructElement(
+                            ce.packedView.rawData,
+                            uIdx,
+                            ce.packedView.encoding,
+                            expectedTid,
+                            ce.packedView.blittableSchemaId,
+                            storeVal,
+                            needsDemote))) {
+                        ce.valid = false;
+                        goto L_FlatMathFallback;
+                    }
+                    localExecuted += spanCost;
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                if (RS_FLAT_UNLIKELY(ce.view.elementType != semantic::PrimitiveType::Struct ||
                                      ce.view.elementTypeId != expectedTid)) {
                     goto L_FlatMathFallback;
                 }
@@ -8203,6 +8314,17 @@ bool executeFunction(
                     if (vtag == ValueTag::QuatInline) {
                         structOk = true;
                     } else if (vtag == ValueTag::QuatArena) {
+                        structOk = true;
+                        needsPoolPin = true;
+                    }
+                    break;
+                case 6: structOk = (vtag == ValueTag::Fixed64); break;
+                case 7: structOk = (vtag == ValueTag::Vec2f); break;
+                case 8: structOk = (vtag == ValueTag::Vec3f); break;
+                case 9:
+                    if (vtag == ValueTag::QuatfInline) {
+                        structOk = true;
+                    } else if (vtag == ValueTag::QuatfArena) {
                         structOk = true;
                         needsPoolPin = true;
                     }
@@ -10976,7 +11098,7 @@ bool tryConvertNumeric(
 }
 
 semantic::PrimitiveType valueType(const Value& value) noexcept {
-    static constexpr semantic::PrimitiveType kTagPrimitive[28] = {
+    static constexpr semantic::PrimitiveType kTagPrimitive[33] = {
         semantic::PrimitiveType::Null,   // 0: Monostate
         semantic::PrimitiveType::String, // 1: NullString
         semantic::PrimitiveType::Object, // 2: NullObject
@@ -11005,6 +11127,11 @@ semantic::PrimitiveType valueType(const Value& value) noexcept {
         semantic::PrimitiveType::Struct, // 25: Struct
         semantic::PrimitiveType::String, // 26: String
         semantic::PrimitiveType::Object, // 27: ObjectRef (refined below)
+        semantic::PrimitiveType::Struct, // 28: Fixed64
+        semantic::PrimitiveType::Struct, // 29: Vec2f
+        semantic::PrimitiveType::Struct, // 30: Vec3f
+        semantic::PrimitiveType::Struct, // 31: QuatfInline
+        semantic::PrimitiveType::Struct, // 32: QuatfArena
     };
     const auto t = value.rawTag();
     if (t == ValueTag::ObjectRef) {
@@ -11014,7 +11141,7 @@ semantic::PrimitiveType valueType(const Value& value) noexcept {
         return semantic::PrimitiveType::Object;
     }
     const auto idx = static_cast<std::uint8_t>(t);
-    return idx < 28u ? kTagPrimitive[idx] : semantic::PrimitiveType::Null;
+    return idx < 33u ? kTagPrimitive[idx] : semantic::PrimitiveType::Null;
 }
 
 std::string valueToString(const Value& value) {
@@ -11058,6 +11185,20 @@ std::string valueToString(const Value& value, const ManagedHeap* heap) {
     if (QuatValue q{}; value.tryGetQuat(q)) {
         return "<Quat:" + std::to_string(q.x) + "," + std::to_string(q.y) + "," +
             std::to_string(q.z) + "," + std::to_string(q.w) + ">";
+    }
+    if (const auto* f64 = std::get_if<Fixed64Value>(&value)) {
+        return "<Fixed64:raw=" + std::to_string(f64->raw) + ">";
+    }
+    if (const auto* v2f = std::get_if<Vec2fValue>(&value)) {
+        return "<Vec2f:" + std::to_string(v2f->x) + "," + std::to_string(v2f->y) + ">";
+    }
+    if (const auto* v3f = std::get_if<Vec3fValue>(&value)) {
+        return "<Vec3f:" + std::to_string(v3f->x) + "," + std::to_string(v3f->y) + "," +
+            std::to_string(v3f->z) + ">";
+    }
+    if (QuatfValue qf{}; value.tryGetQuatf(qf)) {
+        return "<Quatf:" + std::to_string(qf.x) + "," + std::to_string(qf.y) + "," +
+            std::to_string(qf.z) + "," + std::to_string(qf.w) + ">";
     }
     if (const auto* structure = std::get_if<StructValue>(&value)) {
         return "<struct:type=0x" + std::to_string(structure->typeId) + ":fields=" +

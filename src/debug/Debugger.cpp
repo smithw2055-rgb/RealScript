@@ -130,6 +130,10 @@ bool tryAsDouble(const runtime::Value& value, double& out) noexcept {
         out = static_cast<double>(v->raw) / 65536.0;
         return true;
     }
+    if (const auto* v = std::get_if<runtime::Fixed64Value>(&value)) {
+        out = static_cast<double>(v->raw) / 4294967296.0;
+        return true;
+    }
     std::int64_t integer = 0;
     if (tryAsInt64(value, integer)) {
         out = static_cast<double>(integer);

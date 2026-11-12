@@ -654,8 +654,24 @@ bool ScriptRuntime::bindEcsRawColumnStandardLayout(
                     layout.kind = runtime::NativeFieldKind::Vec3;
                     fieldSize = 12;
                     fieldAlign = 4;
+                } else if (layout.scriptTypeId == runtime::fixed64TypeId()) {
+                    layout.kind = runtime::NativeFieldKind::Fixed64;
+                    fieldSize = 8;
+                    fieldAlign = 8;
                 } else if (layout.scriptTypeId == runtime::quatTypeId()) {
                     layout.kind = runtime::NativeFieldKind::Quat;
+                    fieldSize = 16;
+                    fieldAlign = 4;
+                } else if (layout.scriptTypeId == runtime::vec2fTypeId()) {
+                    layout.kind = runtime::NativeFieldKind::Vec2f;
+                    fieldSize = 8;
+                    fieldAlign = 4;
+                } else if (layout.scriptTypeId == runtime::vec3fTypeId()) {
+                    layout.kind = runtime::NativeFieldKind::Vec3f;
+                    fieldSize = 12;
+                    fieldAlign = 4;
+                } else if (layout.scriptTypeId == runtime::quatfTypeId()) {
+                    layout.kind = runtime::NativeFieldKind::Quatf;
                     fieldSize = 16;
                     fieldAlign = 4;
                 } else {

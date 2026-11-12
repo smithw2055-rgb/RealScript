@@ -1863,6 +1863,19 @@ bool tryExecuteRuntimeIntrinsic(
             else if (const auto* v2 = std::get_if<Vec2Value>(&v)) { mixU64(static_cast<std::uint32_t>(v2->x)); mixU64(static_cast<std::uint32_t>(v2->y)); }
             else if (const auto* v3 = std::get_if<Vec3Value>(&v)) { mixU64(static_cast<std::uint32_t>(v3->x)); mixU64(static_cast<std::uint32_t>(v3->y)); mixU64(static_cast<std::uint32_t>(v3->z)); }
             else if (QuatValue q{}; v.tryGetQuat(q)) { mixU64(static_cast<std::uint32_t>(q.x)); mixU64(static_cast<std::uint32_t>(q.y)); mixU64(static_cast<std::uint32_t>(q.z)); mixU64(static_cast<std::uint32_t>(q.w)); }
+            else if (const auto* f64 = std::get_if<Fixed64Value>(&v)) mixU64(static_cast<std::uint64_t>(f64->raw));
+            else if (const auto* v2f = std::get_if<Vec2fValue>(&v)) {
+                auto mixF = [&](float f) { std::uint32_t b = 0; const float n = (f == 0.0f) ? 0.0f : f; std::memcpy(&b, &n, 4); mixU64(b); };
+                mixF(v2f->x); mixF(v2f->y);
+            }
+            else if (const auto* v3f = std::get_if<Vec3fValue>(&v)) {
+                auto mixF = [&](float f) { std::uint32_t b = 0; const float n = (f == 0.0f) ? 0.0f : f; std::memcpy(&b, &n, 4); mixU64(b); };
+                mixF(v3f->x); mixF(v3f->y); mixF(v3f->z);
+            }
+            else if (QuatfValue qf{}; v.tryGetQuatf(qf)) {
+                auto mixF = [&](float f) { std::uint32_t b = 0; const float n = (f == 0.0f) ? 0.0f : f; std::memcpy(&b, &n, 4); mixU64(b); };
+                mixF(qf.x); mixF(qf.y); mixF(qf.z); mixF(qf.w);
+            }
             else if (const auto* d = std::get_if<double>(&v)) {
                 std::uint64_t bits = 0;
                 const double norm = (*d == 0.0) ? 0.0 : *d;
@@ -2349,6 +2362,51 @@ QuatValue lookupArenaQuat(std::uint32_t arenaIdx) noexcept {
     };
 }
 
+std::uint32_t internArenaQuatf(QuatfValue value) noexcept {
+    InlineStructArenaEntry entry{};
+    entry.nestedFieldMask = 0x8003u;
+    entry.slots[0].kind = InlineStructSlot::Kind::Quatf;
+    std::memcpy(&entry.slots[0].lo, &value.x, sizeof(float));
+    std::memcpy(&entry.slots[0].hi, &value.y, sizeof(float));
+    entry.slots[1].kind = InlineStructSlot::Kind::Quatf;
+    std::memcpy(&entry.slots[1].lo, &value.z, sizeof(float));
+    std::memcpy(&entry.slots[1].hi, &value.w, sizeof(float));
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->internInlineArenaFn) {
+            const std::uint32_t bid = bridge->internInlineArenaFn(entry);
+            if (bid != 0u) return bid;
+        }
+    }
+    const std::uint32_t id = inlineStructPool().intern(entry);
+    return id != 0u ? id : arenaScalarOverflowTable().intern(entry);
+}
+
+QuatfValue lookupArenaQuatf(std::uint32_t arenaIdx) noexcept {
+    if ((arenaIdx & 0x80000000u) == 0u) {
+        if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+            if (bridge->lookupInlineArenaFn) {
+                if (const auto* p = bridge->lookupInlineArenaFn(arenaIdx)) {
+                    QuatfValue out{};
+                    std::memcpy(&out.x, &p->slots[0].lo, sizeof(float));
+                    std::memcpy(&out.y, &p->slots[0].hi, sizeof(float));
+                    std::memcpy(&out.z, &p->slots[1].lo, sizeof(float));
+                    std::memcpy(&out.w, &p->slots[1].hi, sizeof(float));
+                    return out;
+                }
+            }
+        }
+    }
+    const auto& entry = (arenaIdx & 0x80000000u) != 0u
+        ? arenaScalarOverflowTable().get(arenaIdx)
+        : inlineStructPool().get(arenaIdx);
+    QuatfValue out{};
+    std::memcpy(&out.x, &entry.slots[0].lo, sizeof(float));
+    std::memcpy(&out.y, &entry.slots[0].hi, sizeof(float));
+    std::memcpy(&out.z, &entry.slots[1].lo, sizeof(float));
+    std::memcpy(&out.w, &entry.slots[1].hi, sizeof(float));
+    return out;
+}
+
 std::uint32_t internArenaEnum(EnumValue value) noexcept {
     if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
         if (bridge->internArenaEnumFn) return bridge->internArenaEnumFn(value);
@@ -2440,7 +2498,8 @@ void pinValueInPools(const Value& value) noexcept {
         return;
     }
     case ValueTag::EnumArena:
-    case ValueTag::QuatArena: {
+    case ValueTag::QuatArena:
+    case ValueTag::QuatfArena: {
         const std::uint32_t idx = value.arenaPoolIndex();
         if (idx != 0u) inlineStructPool().pinById(idx);
         return;
@@ -2515,7 +2574,8 @@ void markValueInPools(const Value& value) noexcept {
         return;
     }
     case ValueTag::EnumArena:
-    case ValueTag::QuatArena: {
+    case ValueTag::QuatArena:
+    case ValueTag::QuatfArena: {
         const std::uint32_t idx = value.arenaPoolIndex();
         if (idx != 0u) inlineStructPool().markById(idx);
         return;
@@ -2544,7 +2604,8 @@ void markStackRootValueInPools(const Value& value) noexcept {
         return;
     }
     case ValueTag::EnumArena:
-    case ValueTag::QuatArena: {
+    case ValueTag::QuatArena:
+    case ValueTag::QuatfArena: {
         const std::uint32_t idx = value.arenaPoolIndex();
         if (idx != 0u) inlineStructPool().markStackRootById(idx);
         return;

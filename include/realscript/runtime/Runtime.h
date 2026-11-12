@@ -64,12 +64,19 @@ enum class ValueTag : std::uint8_t {
     Vec3 = 20,
     QuatInline = 21,
     NativeHandle = 22,
-    // Traceable / Pool-backed tags (>= FirstTraceable)
+    // Traceable / Pool-backed tags (23..27, plus QuatfArena = 32)
     EnumArena = 23,
     QuatArena = 24,
     Struct = 25,
     String = 26,
     ObjectRef = 27,
+
+    // P0 Dual-Track Math extensions (16B Value ABI preserved; 0..27 untouched)
+    Fixed64 = 28,
+    Vec2f = 29,
+    Vec3f = 30,
+    QuatfInline = 31,
+    QuatfArena = 32,
 
     FirstTraceable = EnumArena,
 };
@@ -279,6 +286,56 @@ struct QuatValue {
     }
 };
 
+struct Fixed64Value {
+    std::int64_t raw = 0;
+    friend constexpr bool operator==(Fixed64Value left, Fixed64Value right) noexcept {
+        return left.raw == right.raw;
+    }
+    friend constexpr bool operator!=(Fixed64Value left, Fixed64Value right) noexcept {
+        return left.raw != right.raw;
+    }
+};
+
+struct Vec2fValue {
+    float x = 0.0f;
+    float y = 0.0f;
+    friend constexpr bool operator==(Vec2fValue left, Vec2fValue right) noexcept {
+        return left.x == right.x && left.y == right.y;
+    }
+    friend constexpr bool operator!=(Vec2fValue left, Vec2fValue right) noexcept {
+        return !(left == right);
+    }
+};
+static_assert(sizeof(Vec2fValue) == 8, "Vec2fValue must be 8 bytes");
+
+struct Vec3fValue {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    friend constexpr bool operator==(Vec3fValue left, Vec3fValue right) noexcept {
+        return left.x == right.x && left.y == right.y && left.z == right.z;
+    }
+    friend constexpr bool operator!=(Vec3fValue left, Vec3fValue right) noexcept {
+        return !(left == right);
+    }
+};
+static_assert(sizeof(Vec3fValue) == 12, "Vec3fValue must be 12 bytes");
+
+struct QuatfValue {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float w = 0.0f;
+    friend constexpr bool operator==(QuatfValue left, QuatfValue right) noexcept {
+        return left.x == right.x && left.y == right.y &&
+            left.z == right.z && left.w == right.w;
+    }
+    friend constexpr bool operator!=(QuatfValue left, QuatfValue right) noexcept {
+        return !(left == right);
+    }
+};
+static_assert(sizeof(QuatfValue) == 16, "QuatfValue must be 16 bytes");
+
 struct StructStorage;
 class ValueSpan;
 
@@ -300,9 +357,13 @@ struct InlineStructSlot {
         Enum,
         Fixed,
         Fixed16,
+        Fixed64,
         Vec2,
         Vec3,
         Quat,
+        Vec2f,
+        Vec3f,
+        Quatf,
         NullString,
         NullObject,
         NullArray,
@@ -549,6 +610,8 @@ static_assert(offsetof(ObjectRef, vtag_) == 15, "ObjectRef::vtag_ must reside at
 namespace detail {
 [[nodiscard]] std::uint32_t internArenaQuat(QuatValue value) noexcept;
 [[nodiscard]] QuatValue lookupArenaQuat(std::uint32_t arenaIdx) noexcept;
+[[nodiscard]] std::uint32_t internArenaQuatf(QuatfValue value) noexcept;
+[[nodiscard]] QuatfValue lookupArenaQuatf(std::uint32_t arenaIdx) noexcept;
 [[nodiscard]] std::uint32_t internArenaEnum(EnumValue value) noexcept;
 [[nodiscard]] EnumValue lookupArenaEnum(std::uint32_t arenaIdx) noexcept;
 [[nodiscard]] std::uint32_t internNativeHandleTypeId(semantic::SymbolId typeId) noexcept;
@@ -602,6 +665,15 @@ struct alignas(16) Value {
         std::uint8_t w2 = 0;
         std::uint8_t vtag = 0;
     };
+    struct QuatfInlineCell {
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        std::uint8_t w1 = 0;
+        std::uint8_t w2 = 0;
+        std::uint8_t w3 = 0;
+        std::uint8_t vtag = 0;
+    };
     struct NativeHandleCell {
         std::uint32_t slot = NativeHandle::InvalidSlot;
         std::uint16_t generation = 0;
@@ -636,9 +708,13 @@ struct alignas(16) Value {
         EnumInlineCell enumInlineCell;
         detail::ValueTaggedCell<FixedValue> fixedCell;
         detail::ValueTaggedCell<Fixed16Value> fixed16Cell;
+        detail::ValueTaggedCell<Fixed64Value> fixed64Cell;
         detail::ValueTaggedCell<Vec2Value> vec2Cell;
         detail::ValueTaggedCell<Vec3Value> vec3Cell;
+        detail::ValueTaggedCell<Vec2fValue> vec2fCell;
+        detail::ValueTaggedCell<Vec3fValue> vec3fCell;
         QuatInlineCell quatInlineCell;
+        QuatfInlineCell quatfInlineCell;
         NativeHandleCell nativeHandleCell;
         ArenaRefCell arenaRefCell;
         StructValue structVal;
@@ -760,6 +836,19 @@ struct alignas(16) Value {
         storeQuat(v);
     }
 
+    constexpr Value(Fixed64Value v) noexcept {
+        u_.fixed64Cell = {v, {}, static_cast<std::uint8_t>(ValueTag::Fixed64)};
+    }
+    constexpr Value(Vec2fValue v) noexcept {
+        u_.vec2fCell = {v, {}, static_cast<std::uint8_t>(ValueTag::Vec2f)};
+    }
+    constexpr Value(Vec3fValue v) noexcept {
+        u_.vec3fCell = {v, {}, static_cast<std::uint8_t>(ValueTag::Vec3f)};
+    }
+    Value(QuatfValue v) noexcept {
+        storeQuatf(v);
+    }
+
     Value(StructValue v) noexcept {
         v.vtag_ = static_cast<std::uint8_t>(ValueTag::Struct);
         u_.structVal = v;
@@ -848,6 +937,35 @@ struct alignas(16) Value {
                 static_cast<std::uint8_t>(ValueTag::QuatArena)};
         }
     }
+    void storeFixed64(std::int64_t raw) noexcept {
+        u_.fixed64Cell = {Fixed64Value{raw}, {}, static_cast<std::uint8_t>(ValueTag::Fixed64)};
+    }
+    void storeVec2f(float x, float y) noexcept {
+        u_.vec2fCell = {Vec2fValue{x, y}, {}, static_cast<std::uint8_t>(ValueTag::Vec2f)};
+    }
+    void storeVec3f(float x, float y, float z) noexcept {
+        u_.vec3fCell = {Vec3fValue{x, y, z}, {}, static_cast<std::uint8_t>(ValueTag::Vec3f)};
+    }
+    void storeQuatf(const QuatfValue& v) noexcept {
+        const float cw = (v.w == 0.0f) ? 0.0f : v.w;
+        std::uint32_t wBits = 0;
+        std::memcpy(&wBits, &cw, sizeof(wBits));
+        if ((wBits & 0xFFu) == 0u) {
+            u_.quatfInlineCell = {
+                v.x,
+                v.y,
+                v.z,
+                static_cast<std::uint8_t>((wBits >> 8u) & 0xFFu),
+                static_cast<std::uint8_t>((wBits >> 16u) & 0xFFu),
+                static_cast<std::uint8_t>((wBits >> 24u) & 0xFFu),
+                static_cast<std::uint8_t>(ValueTag::QuatfInline)};
+        } else {
+            u_.arenaRefCell = {
+                detail::internArenaQuatf(v),
+                {},
+                static_cast<std::uint8_t>(ValueTag::QuatfArena)};
+        }
+    }
 
     [[nodiscard]] ValueTag rawTag() const noexcept {
         unsigned char t = 0;
@@ -856,8 +974,10 @@ struct alignas(16) Value {
     }
 
     [[nodiscard]] bool isTraceable() const noexcept {
-        return static_cast<std::uint8_t>(rawTag()) >=
-            static_cast<std::uint8_t>(ValueTag::FirstTraceable);
+        const auto t = static_cast<std::uint8_t>(rawTag());
+        return (t >= static_cast<std::uint8_t>(ValueTag::FirstTraceable) &&
+                t <= static_cast<std::uint8_t>(ValueTag::ObjectRef)) ||
+               t == static_cast<std::uint8_t>(ValueTag::QuatfArena);
     }
 
     [[nodiscard]] std::uint32_t arenaPoolIndex() const noexcept {
@@ -867,12 +987,13 @@ struct alignas(16) Value {
     }
 
     [[nodiscard]] std::size_t index() const noexcept {
-        static constexpr std::uint8_t kCanonicalIndex[28] = {
+        static constexpr std::uint8_t kCanonicalIndex[33] = {
             0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13,
             14, 15, 16, 17, 18, 19, 20, 21, 25, 16, 21, 22, 23, 24,
+            26, 27, 28, 29, 29,
         };
         const auto t = static_cast<std::uint8_t>(rawTag());
-        return t < 28u ? static_cast<std::size_t>(kCanonicalIndex[t]) : 0u;
+        return t < 33u ? static_cast<std::size_t>(kCanonicalIndex[t]) : 0u;
     }
 
     [[nodiscard]] bool tryGetInt64(std::int64_t& out) const noexcept {
@@ -935,6 +1056,40 @@ struct alignas(16) Value {
         }
         if (t == ValueTag::QuatArena) {
             out = detail::lookupArenaQuat(u_.arenaRefCell.arenaIdx);
+            return true;
+        }
+        return false;
+    }
+    [[nodiscard]] bool tryGetFixed64(std::int64_t& outRaw) const noexcept {
+        if (rawTag() != ValueTag::Fixed64) return false;
+        outRaw = u_.fixed64Cell.payload.raw;
+        return true;
+    }
+    [[nodiscard]] bool tryGetVec2f(Vec2fValue& out) const noexcept {
+        if (rawTag() != ValueTag::Vec2f) return false;
+        out = u_.vec2fCell.payload;
+        return true;
+    }
+    [[nodiscard]] bool tryGetVec3f(Vec3fValue& out) const noexcept {
+        if (rawTag() != ValueTag::Vec3f) return false;
+        out = u_.vec3fCell.payload;
+        return true;
+    }
+    [[nodiscard]] bool tryGetQuatf(QuatfValue& out) const noexcept {
+        const auto t = rawTag();
+        if (t == ValueTag::QuatfInline) {
+            out.x = u_.quatfInlineCell.x;
+            out.y = u_.quatfInlineCell.y;
+            out.z = u_.quatfInlineCell.z;
+            const std::uint32_t wBits =
+                (static_cast<std::uint32_t>(u_.quatfInlineCell.w1) << 8u) |
+                (static_cast<std::uint32_t>(u_.quatfInlineCell.w2) << 16u) |
+                (static_cast<std::uint32_t>(u_.quatfInlineCell.w3) << 24u);
+            std::memcpy(&out.w, &wBits, sizeof(out.w));
+            return true;
+        }
+        if (t == ValueTag::QuatfArena) {
+            out = detail::lookupArenaQuatf(u_.arenaRefCell.arenaIdx);
             return true;
         }
         return false;
@@ -1084,6 +1239,19 @@ struct alignas(16) Value {
             return left.u_.stringVal == right.u_.stringVal;
         case ValueTag::ObjectRef:
             return left.u_.objectRef == right.u_.objectRef;
+        case ValueTag::Fixed64:
+            return left.u_.fixed64Cell.payload == right.u_.fixed64Cell.payload;
+        case ValueTag::Vec2f:
+            return left.u_.vec2fCell.payload == right.u_.vec2fCell.payload;
+        case ValueTag::Vec3f:
+            return left.u_.vec3fCell.payload == right.u_.vec3fCell.payload;
+        case ValueTag::QuatfInline:
+        case ValueTag::QuatfArena: {
+            QuatfValue lq{}, rq{};
+            (void)left.tryGetQuatf(lq);
+            (void)right.tryGetQuatf(rq);
+            return lq == rq;
+        }
         }
         return false;
     }
@@ -1134,8 +1302,11 @@ RS_DEFINE_VALUE_INPLACE_TRAIT(double, Double, doubleCell.payload);
 RS_DEFINE_VALUE_INPLACE_TRAIT(CharValue, Char, charCell.payload);
 RS_DEFINE_VALUE_INPLACE_TRAIT(FixedValue, Fixed, fixedCell.payload);
 RS_DEFINE_VALUE_INPLACE_TRAIT(Fixed16Value, Fixed16, fixed16Cell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(Fixed64Value, Fixed64, fixed64Cell.payload);
 RS_DEFINE_VALUE_INPLACE_TRAIT(Vec2Value, Vec2, vec2Cell.payload);
 RS_DEFINE_VALUE_INPLACE_TRAIT(Vec3Value, Vec3, vec3Cell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(Vec2fValue, Vec2f, vec2fCell.payload);
+RS_DEFINE_VALUE_INPLACE_TRAIT(Vec3fValue, Vec3f, vec3fCell.payload);
 RS_DEFINE_VALUE_INPLACE_TRAIT(StructValue, Struct, structVal);
 RS_DEFINE_VALUE_INPLACE_TRAIT(StringValue, String, stringVal);
 RS_DEFINE_VALUE_INPLACE_TRAIT(ObjectRef, ObjectRef, objectRef);
@@ -1185,6 +1356,15 @@ inline bool holds_alternative(const realscript::runtime::Value& value) noexcept 
     const auto t = value.rawTag();
     return t == realscript::runtime::ValueTag::QuatInline ||
         t == realscript::runtime::ValueTag::QuatArena;
+}
+
+template <
+    typename T,
+    std::enable_if_t<std::is_same_v<T, realscript::runtime::QuatfValue>, int> = 0>
+inline bool holds_alternative(const realscript::runtime::Value& value) noexcept {
+    const auto t = value.rawTag();
+    return t == realscript::runtime::ValueTag::QuatfInline ||
+        t == realscript::runtime::ValueTag::QuatfArena;
 }
 
 template <
@@ -1261,6 +1441,26 @@ inline const realscript::runtime::QuatValue* get_if(
 
 template <
     typename T,
+    std::enable_if_t<std::is_same_v<T, realscript::runtime::QuatfValue>, int> = 0>
+inline const realscript::runtime::QuatfValue* get_if(
+    const realscript::runtime::Value* value) noexcept {
+    if (!value) return nullptr;
+    realscript::runtime::QuatfValue decoded{};
+    if (!value->tryGetQuatf(decoded)) return nullptr;
+    return realscript::runtime::detail::tlsDecodedValueSlot(decoded);
+}
+
+template <
+    typename T,
+    std::enable_if_t<std::is_same_v<T, realscript::runtime::QuatfValue>, int> = 0>
+inline const realscript::runtime::QuatfValue* get_if(
+    realscript::runtime::Value* value) noexcept {
+    return std::get_if<realscript::runtime::QuatfValue>(
+        static_cast<const realscript::runtime::Value*>(value));
+}
+
+template <
+    typename T,
     std::enable_if_t<std::is_same_v<T, realscript::runtime::NativeHandle>, int> = 0>
 inline const realscript::runtime::NativeHandle* get_if(
     const realscript::runtime::Value* value) noexcept {
@@ -1332,6 +1532,7 @@ template <
     std::enable_if_t<
         std::is_same_v<T, realscript::runtime::EnumValue> ||
         std::is_same_v<T, realscript::runtime::QuatValue> ||
+        std::is_same_v<T, realscript::runtime::QuatfValue> ||
         std::is_same_v<T, realscript::runtime::NativeHandle>,
         int> = 0>
 inline T get(const realscript::runtime::Value& value) {
@@ -1340,6 +1541,8 @@ inline T get(const realscript::runtime::Value& value) {
         if (value.tryGetEnum(out)) return out;
     } else if constexpr (std::is_same_v<T, realscript::runtime::QuatValue>) {
         if (value.tryGetQuat(out)) return out;
+    } else if constexpr (std::is_same_v<T, realscript::runtime::QuatfValue>) {
+        if (value.tryGetQuatf(out)) return out;
     } else {
         if (value.tryGetNativeHandle(out)) return out;
     }
@@ -1351,6 +1554,7 @@ template <
     std::enable_if_t<
         std::is_same_v<T, realscript::runtime::EnumValue> ||
         std::is_same_v<T, realscript::runtime::QuatValue> ||
+        std::is_same_v<T, realscript::runtime::QuatfValue> ||
         std::is_same_v<T, realscript::runtime::NativeHandle>,
         int> = 0>
 inline T get(realscript::runtime::Value& value) {
@@ -1362,6 +1566,7 @@ template <
     std::enable_if_t<
         std::is_same_v<T, realscript::runtime::EnumValue> ||
         std::is_same_v<T, realscript::runtime::QuatValue> ||
+        std::is_same_v<T, realscript::runtime::QuatfValue> ||
         std::is_same_v<T, realscript::runtime::NativeHandle>,
         int> = 0>
 inline T get(const realscript::runtime::Value&& value) {
@@ -1373,6 +1578,7 @@ template <
     std::enable_if_t<
         std::is_same_v<T, realscript::runtime::EnumValue> ||
         std::is_same_v<T, realscript::runtime::QuatValue> ||
+        std::is_same_v<T, realscript::runtime::QuatfValue> ||
         std::is_same_v<T, realscript::runtime::NativeHandle>,
         int> = 0>
 inline T get(realscript::runtime::Value&& value) {
@@ -1604,6 +1810,10 @@ enum class NativeFieldKind : std::uint8_t {
     UInt16,
     UInt32,
     UInt64,
+    Fixed64,
+    Vec2f,
+    Vec3f,
+    Quatf,
 };
 
 struct NativeFieldLayout {
@@ -1738,9 +1948,48 @@ enum class PackedElemEncoding : std::uint8_t {
     Int64      = 11, // 8B (LongValue int64_t)
     UInt64     = 12, // 8B (ULongValue uint64_t)
     Float64    = 13, // 8B (double)
-    Int64Wide  = 14, // 8B (PrimitiveType::Int host values outside int32 range)
-    EnumWide   = 15, // 8B (int64_t + elementTypeId)
+    Int64Wide       = 14, // 8B (PrimitiveType::Int host values outside int32 range)
+    EnumWide        = 15, // 8B (int64_t + elementTypeId)
+    Fixed24_8       = 16, // 4B (FixedValue::raw int32_t)
+    Fixed48_16      = 17, // 8B (Fixed16Value::raw int64_t)
+    Fixed32_32      = 18, // 8B (Fixed64Value::raw int64_t)
+    Vec2            = 19, // 8B (Vec2Value: 2 * int32_t)
+    Vec3            = 20, // 12B (Vec3Value: 3 * int32_t)
+    Quat            = 21, // 16B (QuatValue: 4 * int32_t)
+    Vec2f           = 22, // 8B (Vec2fValue: 2 * float)
+    Vec3f           = 23, // 12B (Vec3fValue: 3 * float)
+    Quatf           = 24, // 16B (QuatfValue: 4 * float)
+    BlittableStruct = 25, // NB (flat unboxed user-defined blittable struct)
 };
+
+struct BlittableFieldInput {
+    semantic::PrimitiveType type = semantic::PrimitiveType::Error;
+    semantic::SymbolId typeId = 0;
+};
+
+void registerBlittableStructTypes(
+    const std::vector<std::pair<semantic::SymbolId, std::vector<BlittableFieldInput>>>& structTypes);
+
+[[nodiscard]] bool isBlittableStructType(semantic::SymbolId structTypeId) noexcept;
+
+[[nodiscard]] std::optional<Value> makeDefaultBlittableStructValue(
+    semantic::SymbolId structTypeId) noexcept;
+
+[[nodiscard]] Value readPackedStructElement(
+    const void* basePtr,
+    std::size_t index,
+    PackedElemEncoding encoding,
+    semantic::SymbolId elemTypeId,
+    std::uint32_t blittableSchemaId) noexcept;
+
+[[nodiscard]] bool writePackedStructElement(
+    void* basePtr,
+    std::size_t index,
+    PackedElemEncoding encoding,
+    semantic::SymbolId elemTypeId,
+    std::uint32_t blittableSchemaId,
+    const Value& value,
+    bool& outNeedsDemote) noexcept;
 
 struct PackedArrayFastView {
     void* rawData = nullptr;
@@ -1748,6 +1997,8 @@ struct PackedArrayFastView {
     PackedElemEncoding encoding = PackedElemEncoding::None;
     semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
     semantic::SymbolId elementTypeId = 0;
+    std::uint32_t strideBytes = 0;
+    std::uint32_t blittableSchemaId = 0;
 };
 
 struct ArrayFastView {
@@ -1937,6 +2188,7 @@ public:
         ObjectRef reference) const;
     [[nodiscard]] std::optional<Value> arrayGet(ObjectRef reference, std::size_t index) const;
     [[nodiscard]] bool isPackedArray(ObjectRef reference) const noexcept;
+    [[nodiscard]] std::optional<std::size_t> packedElementStrideBytes(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<std::size_t> objectSizeBytes(ObjectRef reference) const noexcept;
     [[nodiscard]] const Value* arrayGetFast(ObjectRef reference, std::size_t index) const noexcept;
     [[nodiscard]] bool tryBindArrayFastView(ObjectRef reference, ArrayFastView& outView) const noexcept;
@@ -2114,6 +2366,60 @@ public:
     bool writePackedVec2Array(
         ObjectRef reference,
         const Vec2Value* data,
+        std::size_t count,
+        RuntimeError* error = nullptr);
+    bool readPackedVec3Array(
+        ObjectRef reference,
+        std::vector<Vec3Value>& out,
+        RuntimeError* error = nullptr) const;
+    bool writePackedVec3Array(
+        ObjectRef reference,
+        const Vec3Value* data,
+        std::size_t count,
+        RuntimeError* error = nullptr);
+    bool readPackedQuatArray(
+        ObjectRef reference,
+        std::vector<QuatValue>& out,
+        RuntimeError* error = nullptr) const;
+    bool writePackedQuatArray(
+        ObjectRef reference,
+        const QuatValue* data,
+        std::size_t count,
+        RuntimeError* error = nullptr);
+    bool readPackedFixed64Array(
+        ObjectRef reference,
+        std::vector<Fixed64Value>& out,
+        RuntimeError* error = nullptr) const;
+    bool writePackedFixed64Array(
+        ObjectRef reference,
+        const Fixed64Value* data,
+        std::size_t count,
+        RuntimeError* error = nullptr);
+    bool readPackedVec2fArray(
+        ObjectRef reference,
+        std::vector<Vec2fValue>& out,
+        RuntimeError* error = nullptr) const;
+    bool writePackedVec2fArray(
+        ObjectRef reference,
+        const Vec2fValue* data,
+        std::size_t count,
+        RuntimeError* error = nullptr);
+    bool readPackedVec3fArray(
+        ObjectRef reference,
+        std::vector<Vec3fValue>& out,
+        RuntimeError* error = nullptr) const;
+    bool writePackedVec3fArray(
+        ObjectRef reference,
+        const Vec3fValue* data,
+        std::size_t count,
+        RuntimeError* error = nullptr);
+    bool readPackedQuatfArray(
+        ObjectRef reference,
+        std::vector<QuatfValue>& out,
+        RuntimeError* error = nullptr) const;
+    bool writePackedQuatfArray(
+        ObjectRef reference,
+        const QuatfValue* data,
         std::size_t count,
         RuntimeError* error = nullptr);
 
@@ -2797,9 +3103,13 @@ private:
 
 [[nodiscard]] semantic::SymbolId fixedTypeId() noexcept;
 [[nodiscard]] semantic::SymbolId fixed16TypeId() noexcept;
+[[nodiscard]] semantic::SymbolId fixed64TypeId() noexcept;
 [[nodiscard]] semantic::SymbolId vec2TypeId() noexcept;
 [[nodiscard]] semantic::SymbolId vec3TypeId() noexcept;
 [[nodiscard]] semantic::SymbolId quatTypeId() noexcept;
+[[nodiscard]] semantic::SymbolId vec2fTypeId() noexcept;
+[[nodiscard]] semantic::SymbolId vec3fTypeId() noexcept;
+[[nodiscard]] semantic::SymbolId quatfTypeId() noexcept;
 [[nodiscard]] std::optional<semantic::SymbolId> structValueTypeId(const Value& value) noexcept;
 [[nodiscard]] std::optional<Value> makeDefaultInlineStructValue(semantic::SymbolId typeId) noexcept;
 [[nodiscard]] std::optional<Value> loadInlineStructField(const Value& value, std::size_t fieldIndex) noexcept;

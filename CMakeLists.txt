@@ -504,6 +504,10 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript.p0.packed-heap-and-trusted-vm
         tests/p0_packed_heap_and_trusted_vm_tests.cpp)
     realscript_add_cpp_test(
+        realscript_p0_dual_math_and_packed_struct_tests
+        realscript.p0.dual-math-and-packed-struct
+        tests/p0_dual_math_and_packed_struct_tests.cpp)
+    realscript_add_cpp_test(
         realscript_p1_dap_eval_and_lsp_scene_tests
         realscript.p1.dap-eval-and-lsp-scene
         tests/p1_dap_eval_and_lsp_scene_tests.cpp)

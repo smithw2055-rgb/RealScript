@@ -202,9 +202,22 @@ ExecutionContext::ExecutionContext(
         typesPtr_ = prebuiltTypes;
     } else {
         ownedTypes_.reserve(program.typeCount);
+        std::vector<std::pair<semantic::SymbolId, std::vector<runtime::BlittableFieldInput>>> structSpecs;
         for (std::uint32_t index = 0; index < program.typeCount; ++index) {
             const auto& type = program.types[index];
             ownedTypes_.emplace(type.id, &type);
+            if (type.kind == semantic::TypeKind::Struct && type.fields && type.fieldCount > 0) {
+                std::vector<runtime::BlittableFieldInput> fInputs;
+                fInputs.reserve(type.fieldCount);
+                for (std::uint32_t fi = 0; fi < type.fieldCount; ++fi) {
+                    fInputs.push_back(runtime::BlittableFieldInput{
+                        type.fields[fi].type, type.fields[fi].typeId});
+                }
+                structSpecs.emplace_back(type.id, std::move(fInputs));
+            }
+        }
+        if (!structSpecs.empty()) {
+            runtime::registerBlittableStructTypes(structSpecs);
         }
         typesPtr_ = &ownedTypes_;
     }
@@ -2536,9 +2549,13 @@ TypedRawColumnCache ExecutionContext::acquireRawColumnCache(
             case runtime::NativeFieldKind::Float64: return sizeof(double);
             case runtime::NativeFieldKind::Fixed: return sizeof(runtime::FixedValue);
             case runtime::NativeFieldKind::Fixed16: return sizeof(std::int16_t);
+            case runtime::NativeFieldKind::Fixed64: return sizeof(runtime::Fixed64Value);
             case runtime::NativeFieldKind::Vec2: return sizeof(runtime::Vec2Value);
             case runtime::NativeFieldKind::Vec3: return sizeof(runtime::Vec3Value);
             case runtime::NativeFieldKind::Quat: return sizeof(runtime::QuatValue);
+            case runtime::NativeFieldKind::Vec2f: return sizeof(runtime::Vec2fValue);
+            case runtime::NativeFieldKind::Vec3f: return sizeof(runtime::Vec3fValue);
+            case runtime::NativeFieldKind::Quatf: return sizeof(runtime::QuatfValue);
             }
             return 0u;
         };
@@ -3067,6 +3084,24 @@ Program::Program(const ProgramDescriptor& descriptor)
                 throw std::invalid_argument(
                     "AOT field references an unknown exact type");
             }
+        }
+    }
+    {
+        std::vector<std::pair<semantic::SymbolId, std::vector<runtime::BlittableFieldInput>>> structSpecs;
+        for (std::uint32_t index = 0; index < descriptor.typeCount; ++index) {
+            const auto& type = descriptor.types[index];
+            if (type.kind == semantic::TypeKind::Struct && type.fields && type.fieldCount > 0) {
+                std::vector<runtime::BlittableFieldInput> fInputs;
+                fInputs.reserve(type.fieldCount);
+                for (std::uint32_t fi = 0; fi < type.fieldCount; ++fi) {
+                    fInputs.push_back(runtime::BlittableFieldInput{
+                        type.fields[fi].type, type.fields[fi].typeId});
+                }
+                structSpecs.emplace_back(type.id, std::move(fInputs));
+            }
+        }
+        if (!structSpecs.empty()) {
+            runtime::registerBlittableStructTypes(structSpecs);
         }
     }
 

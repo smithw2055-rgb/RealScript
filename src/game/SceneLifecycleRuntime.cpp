@@ -307,6 +307,10 @@ std::string formatProgramSlotType(
     if (typeId == runtime::vec2TypeId()) return "struct:RealScript.Math::Vec2";
     if (typeId == runtime::vec3TypeId()) return "struct:RealScript.Math::Vec3";
     if (typeId == runtime::quatTypeId()) return "struct:RealScript.Math::Quat";
+    if (typeId == runtime::fixed64TypeId()) return "struct:RealScript.Math::Fixed64";
+    if (typeId == runtime::vec2fTypeId()) return "struct:RealScript.Math::Vec2f";
+    if (typeId == runtime::vec3fTypeId()) return "struct:RealScript.Math::Vec3f";
+    if (typeId == runtime::quatfTypeId()) return "struct:RealScript.Math::Quatf";
     if (typeId == runtime::awaitableVoidTypeId()) return "struct:RealScript.Async::Awaitable";
     if (typeId == runtime::whenAnyResultTypeId()) return "struct:RealScript.Async::WhenAnyResult";
     return baseName + ":#" + std::to_string(typeId);
@@ -3192,7 +3196,11 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                     stVal->typeId == runtime::fixed16TypeId() ||
                     stVal->typeId == runtime::vec2TypeId() ||
                     stVal->typeId == runtime::vec3TypeId() ||
-                    stVal->typeId == runtime::quatTypeId()) {
+                    stVal->typeId == runtime::quatTypeId() ||
+                    stVal->typeId == runtime::fixed64TypeId() ||
+                    stVal->typeId == runtime::vec2fTypeId() ||
+                    stVal->typeId == runtime::vec3fTypeId() ||
+                    stVal->typeId == runtime::quatfTypeId()) {
                     return false;
                 }
                 const auto* oTd = oldProgramPtr->resolveType(stVal->typeId);

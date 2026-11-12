@@ -139,6 +139,32 @@ void hashValue(
         hashScalar(hash, v.y);
         hashScalar(hash, v.z);
         hashScalar(hash, v.w);
+    } else if (const auto* v = std::get_if<Fixed64Value>(&value)) {
+        hashScalar(hash, v->raw);
+    } else if (const auto* v = std::get_if<Vec2fValue>(&value)) {
+        auto hashF = [&](float f) {
+            const float n = canonicalizeFloatingPoint && f == 0.0f ? 0.0f : f;
+            std::uint32_t b = 0;
+            std::memcpy(&b, &n, sizeof(b));
+            hashScalar(hash, b);
+        };
+        hashF(v->x); hashF(v->y);
+    } else if (const auto* v = std::get_if<Vec3fValue>(&value)) {
+        auto hashF = [&](float f) {
+            const float n = canonicalizeFloatingPoint && f == 0.0f ? 0.0f : f;
+            std::uint32_t b = 0;
+            std::memcpy(&b, &n, sizeof(b));
+            hashScalar(hash, b);
+        };
+        hashF(v->x); hashF(v->y); hashF(v->z);
+    } else if (QuatfValue v{}; value.tryGetQuatf(v)) {
+        auto hashF = [&](float f) {
+            const float n = canonicalizeFloatingPoint && f == 0.0f ? 0.0f : f;
+            std::uint32_t b = 0;
+            std::memcpy(&b, &n, sizeof(b));
+            hashScalar(hash, b);
+        };
+        hashF(v.x); hashF(v.y); hashF(v.z); hashF(v.w);
     } else if (const auto* v = std::get_if<StructValue>(&value)) {
         hashScalar(hash, v->typeId);
         const auto count = static_cast<std::uint64_t>(v->fieldCount());

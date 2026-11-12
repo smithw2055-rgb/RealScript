@@ -532,20 +532,21 @@ void ShadowStack::visitRoots(const std::function<void(const Value&)>& visitor) c
 }
 
 enum class SlotStorage : std::uint8_t {
-    Empty      = 0,
-    SsoString  = 1,
-    HeapString = 2,
-    SlabValues = 3,
-    HeapValues = 4,
-    RawColumn  = 5,
-    PackedB8   = 6, // 1 byte/element (bool, byte, sbyte -> 16x compression)
-    PackedB16  = 7, // 2 bytes/element (short, ushort, char -> 8x compression)
-    PackedI32  = 8, // 4 bytes/element (int, uint, float, enum -> 4x compression)
-    PackedI64  = 9, // 8 bytes/element (long, ulong, double, wide-int/enum -> 2x compression)
+    Empty        = 0,
+    SsoString    = 1,
+    HeapString   = 2,
+    SlabValues   = 3,
+    HeapValues   = 4,
+    RawColumn    = 5,
+    PackedB8     = 6,  // 1 byte/element (bool, byte, sbyte -> 16x compression)
+    PackedB16    = 7,  // 2 bytes/element (short, ushort, char -> 8x compression)
+    PackedI32    = 8,  // 4 bytes/element (int, uint, float, enum -> 4x compression)
+    PackedI64    = 9,  // 8 bytes/element (long, ulong, double, wide-int/enum -> 2x compression)
+    PackedStruct = 10, // Contiguous flat math vectors & blittable user structs (0 GC scan)
 };
 
 [[nodiscard]] constexpr bool isPackedStorage(SlotStorage st) noexcept {
-    return st >= SlotStorage::PackedB8 && st <= SlotStorage::PackedI64;
+    return st >= SlotStorage::PackedB8 && st <= SlotStorage::PackedStruct;
 }
 
 [[nodiscard]] constexpr std::uint16_t packPackedAuxMeta(
@@ -564,10 +565,680 @@ enum class SlotStorage : std::uint8_t {
     return static_cast<std::uint8_t>((auxMeta >> 8u) & 0x03u);
 }
 
+enum class BlittableLeafKind : std::uint8_t {
+    Bool,
+    Byte,
+    SByte,
+    Short,
+    UShort,
+    Char,
+    Int32,
+    UInt32,
+    Float32,
+    Enum32,
+    Int64,
+    UInt64,
+    Float64,
+    Fixed24_8,
+    Fixed48_16,
+    Fixed32_32,
+    Vec2,
+    Vec3,
+    Quat,
+    Vec2f,
+    Vec3f,
+    Quatf,
+    NestedStruct,
+};
+
+struct BlittableFieldEntry {
+    BlittableLeafKind kind = BlittableLeafKind::Int32;
+    std::uint32_t byteOffset = 0;
+    semantic::SymbolId fieldTypeId = 0;
+    std::uint32_t nestedSchemaId = 0;
+
+    friend bool operator==(const BlittableFieldEntry& a, const BlittableFieldEntry& b) noexcept {
+        return a.kind == b.kind &&
+            a.byteOffset == b.byteOffset &&
+            a.fieldTypeId == b.fieldTypeId &&
+            a.nestedSchemaId == b.nestedSchemaId;
+    }
+};
+
+struct BlittableStructSchema {
+    std::uint32_t schemaId = 0;
+    semantic::SymbolId structTypeId = 0;
+    std::uint32_t strideBytes = 0;
+    std::uint32_t alignBytes = 1;
+    std::vector<BlittableFieldEntry> fields;
+};
+
+struct BlittableStructRegistry {
+    static constexpr std::uint32_t kBlockBits = 10u;
+    static constexpr std::uint32_t kBlockSize = 1u << kBlockBits; // 1024
+    static constexpr std::uint32_t kMaxBlocks = 256u;             // 262,144 schemas
+
+    std::mutex mutex;
+    std::array<std::atomic<BlittableStructSchema*>, kMaxBlocks> blocks{};
+    std::vector<std::unique_ptr<BlittableStructSchema[]>> ownedBlocks;
+    std::atomic<std::uint32_t> nextSchemaId{1u}; // 0 = invalid
+    std::unordered_map<semantic::SymbolId, std::uint32_t> latestByTypeId;
+
+    BlittableStructRegistry() noexcept {
+        for (auto& b : blocks) b.store(nullptr, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] const BlittableStructSchema* getByIdLockFree(std::uint32_t id) const noexcept {
+        const std::uint32_t limit = nextSchemaId.load(std::memory_order_acquire);
+        if (id == 0u || id >= limit) return nullptr;
+        const std::uint32_t blkIdx = id >> kBlockBits;
+        if (blkIdx >= kMaxBlocks) return nullptr;
+        const auto* blk = blocks[blkIdx].load(std::memory_order_acquire);
+        if (!blk) return nullptr;
+        return &blk[id & (kBlockSize - 1u)];
+    }
+
+    [[nodiscard]] std::uint32_t findLatestSchemaId(semantic::SymbolId typeId) noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = latestByTypeId.find(typeId);
+        return it != latestByTypeId.end() ? it->second : 0u;
+    }
+
+    std::uint32_t publishUnlocked(
+        semantic::SymbolId typeId,
+        std::uint32_t strideBytes,
+        std::uint32_t alignBytes,
+        std::vector<BlittableFieldEntry> fields) {
+        const auto existingIt = latestByTypeId.find(typeId);
+        if (existingIt != latestByTypeId.end() && existingIt->second != 0u) {
+            if (const auto* prev = getByIdLockFree(existingIt->second)) {
+                if (prev->strideBytes == strideBytes &&
+                    prev->alignBytes == alignBytes &&
+                    prev->fields == fields) {
+                    return existingIt->second;
+                }
+            }
+        }
+        const std::uint32_t id = nextSchemaId.load(std::memory_order_relaxed);
+        const std::uint32_t blkIdx = id >> kBlockBits;
+        if (blkIdx >= kMaxBlocks) return 0u;
+        auto* blk = blocks[blkIdx].load(std::memory_order_relaxed);
+        if (!blk) {
+            auto alloc = std::make_unique<BlittableStructSchema[]>(kBlockSize);
+            blk = alloc.get();
+            ownedBlocks.push_back(std::move(alloc));
+            blocks[blkIdx].store(blk, std::memory_order_release);
+        }
+        auto& slot = blk[id & (kBlockSize - 1u)];
+        slot.schemaId = id;
+        slot.structTypeId = typeId;
+        slot.strideBytes = strideBytes;
+        slot.alignBytes = alignBytes;
+        slot.fields = std::move(fields);
+        nextSchemaId.store(id + 1u, std::memory_order_release);
+        latestByTypeId[typeId] = id;
+        return id;
+    }
+
+    void markNonBlittableUnlocked(semantic::SymbolId typeId) {
+        latestByTypeId.erase(typeId);
+    }
+};
+
+BlittableStructRegistry& globalBlittableRegistry() noexcept {
+    static BlittableStructRegistry instance;
+    return instance;
+}
+
+[[nodiscard]] inline bool isBuiltinMathStructId(semantic::SymbolId tid) noexcept {
+    return tid != 0 && (
+        tid == fixedTypeId() ||
+        tid == fixed16TypeId() ||
+        tid == fixed64TypeId() ||
+        tid == vec2TypeId() ||
+        tid == vec3TypeId() ||
+        tid == quatTypeId() ||
+        tid == vec2fTypeId() ||
+        tid == vec3fTypeId() ||
+        tid == quatfTypeId());
+}
+
+[[nodiscard]] inline std::uint32_t alignUpU32(std::uint32_t offset, std::uint32_t align) noexcept {
+    return (offset + align - 1u) & ~(align - 1u);
+}
+
+[[nodiscard]] inline bool classifyLeafFieldSpec(
+    semantic::PrimitiveType fType,
+    semantic::SymbolId fTypeId,
+    BlittableLeafKind& outKind,
+    std::uint32_t& outSize,
+    std::uint32_t& outAlign) noexcept {
+    switch (fType) {
+    case semantic::PrimitiveType::Bool:   outKind = BlittableLeafKind::Bool;    outSize = 1; outAlign = 1; return true;
+    case semantic::PrimitiveType::Byte:   outKind = BlittableLeafKind::Byte;    outSize = 1; outAlign = 1; return true;
+    case semantic::PrimitiveType::SByte:  outKind = BlittableLeafKind::SByte;   outSize = 1; outAlign = 1; return true;
+    case semantic::PrimitiveType::Short:  outKind = BlittableLeafKind::Short;   outSize = 2; outAlign = 2; return true;
+    case semantic::PrimitiveType::UShort: outKind = BlittableLeafKind::UShort;  outSize = 2; outAlign = 2; return true;
+    case semantic::PrimitiveType::Char:   outKind = BlittableLeafKind::Char;    outSize = 2; outAlign = 2; return true;
+    case semantic::PrimitiveType::Int:    outKind = BlittableLeafKind::Int32;   outSize = 4; outAlign = 4; return true;
+    case semantic::PrimitiveType::UInt:   outKind = BlittableLeafKind::UInt32;  outSize = 4; outAlign = 4; return true;
+    case semantic::PrimitiveType::Float:  outKind = BlittableLeafKind::Float32; outSize = 4; outAlign = 4; return true;
+    case semantic::PrimitiveType::Enum:
+        if (fTypeId == 0) return false;
+        outKind = BlittableLeafKind::Enum32;
+        outSize = 4;
+        outAlign = 4;
+        return true;
+    case semantic::PrimitiveType::Long:   outKind = BlittableLeafKind::Int64;   outSize = 8; outAlign = 8; return true;
+    case semantic::PrimitiveType::ULong:  outKind = BlittableLeafKind::UInt64;  outSize = 8; outAlign = 8; return true;
+    case semantic::PrimitiveType::Double: outKind = BlittableLeafKind::Float64; outSize = 8; outAlign = 8; return true;
+    case semantic::PrimitiveType::Struct:
+        if (fTypeId == fixedTypeId())   { outKind = BlittableLeafKind::Fixed24_8;  outSize = 4;  outAlign = 4; return true; }
+        if (fTypeId == fixed16TypeId()) { outKind = BlittableLeafKind::Fixed48_16; outSize = 8;  outAlign = 8; return true; }
+        if (fTypeId == fixed64TypeId()) { outKind = BlittableLeafKind::Fixed32_32; outSize = 8;  outAlign = 8; return true; }
+        if (fTypeId == vec2TypeId())    { outKind = BlittableLeafKind::Vec2;       outSize = 8;  outAlign = 4; return true; }
+        if (fTypeId == vec3TypeId())    { outKind = BlittableLeafKind::Vec3;       outSize = 12; outAlign = 4; return true; }
+        if (fTypeId == quatTypeId())    { outKind = BlittableLeafKind::Quat;       outSize = 16; outAlign = 4; return true; }
+        if (fTypeId == vec2fTypeId())   { outKind = BlittableLeafKind::Vec2f;      outSize = 8;  outAlign = 4; return true; }
+        if (fTypeId == vec3fTypeId())   { outKind = BlittableLeafKind::Vec3f;      outSize = 12; outAlign = 4; return true; }
+        if (fTypeId == quatfTypeId())   { outKind = BlittableLeafKind::Quatf;      outSize = 16; outAlign = 4; return true; }
+        return false;
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] std::uint32_t tryInferBlittableSchemaFromSampleUnlocked(
+    BlittableStructRegistry& reg,
+    const StructValue& sv,
+    std::uint32_t depth = 0) {
+    if (!sv.valid() || sv.typeId == 0 || isBuiltinMathStructId(sv.typeId) || depth > 16u) {
+        return 0u;
+    }
+    const auto existingIt = reg.latestByTypeId.find(sv.typeId);
+    if (existingIt != reg.latestByTypeId.end() && existingIt->second != 0u) {
+        return existingIt->second;
+    }
+    const std::size_t fCount = sv.fieldCount();
+    if (fCount == 0u || fCount > 256u) return 0u;
+
+    std::vector<BlittableFieldEntry> entries;
+    entries.reserve(fCount);
+    std::uint32_t offset = 0u;
+    std::uint32_t maxAlign = 1u;
+
+    for (std::size_t i = 0; i < fCount; ++i) {
+        const auto fvOpt = structValueFieldAt(sv, i);
+        if (!fvOpt) return 0u;
+        const Value& fv = *fvOpt;
+        const auto prim = valueType(fv);
+        if (prim == semantic::PrimitiveType::Struct) {
+            const auto childTidOpt = structValueTypeId(fv);
+            if (!childTidOpt || *childTidOpt == 0) return 0u;
+            BlittableLeafKind mKind{};
+            std::uint32_t mSize = 0, mAlign = 1;
+            if (classifyLeafFieldSpec(prim, *childTidOpt, mKind, mSize, mAlign)) {
+                offset = alignUpU32(offset, mAlign);
+                maxAlign = std::max(maxAlign, mAlign);
+                entries.push_back(BlittableFieldEntry{mKind, offset, *childTidOpt, 0u});
+                offset += mSize;
+                continue;
+            }
+            const auto* childSv = std::get_if<StructValue>(&fv);
+            if (!childSv || !childSv->valid()) return 0u;
+            const std::uint32_t childSchemaId =
+                tryInferBlittableSchemaFromSampleUnlocked(reg, *childSv, depth + 1u);
+            if (childSchemaId == 0u) return 0u;
+            const auto* childSchema = reg.getByIdLockFree(childSchemaId);
+            if (!childSchema || childSchema->strideBytes == 0u) return 0u;
+            offset = alignUpU32(offset, childSchema->alignBytes);
+            maxAlign = std::max(maxAlign, childSchema->alignBytes);
+            entries.push_back(BlittableFieldEntry{
+                BlittableLeafKind::NestedStruct, offset, *childTidOpt, childSchemaId});
+            offset += childSchema->strideBytes;
+            continue;
+        }
+        semantic::SymbolId fTid = 0;
+        if (prim == semantic::PrimitiveType::Enum) {
+            EnumValue ev{};
+            if (!fv.tryGetEnum(ev) || ev.typeId == 0 ||
+                ev.value < std::numeric_limits<std::int32_t>::min() ||
+                ev.value > std::numeric_limits<std::int32_t>::max()) {
+                return 0u;
+            }
+            fTid = ev.typeId;
+        } else if (prim == semantic::PrimitiveType::Int) {
+            std::int64_t iv = 0;
+            if (!fv.tryGetInt64(iv) ||
+                iv < std::numeric_limits<std::int32_t>::min() ||
+                iv > std::numeric_limits<std::int32_t>::max()) {
+                return 0u;
+            }
+        }
+        BlittableLeafKind lKind{};
+        std::uint32_t lSize = 0, lAlign = 1;
+        if (!classifyLeafFieldSpec(prim, fTid, lKind, lSize, lAlign)) {
+            return 0u;
+        }
+        offset = alignUpU32(offset, lAlign);
+        maxAlign = std::max(maxAlign, lAlign);
+        entries.push_back(BlittableFieldEntry{lKind, offset, fTid, 0u});
+        offset += lSize;
+    }
+    const std::uint32_t stride = alignUpU32(offset, maxAlign);
+    if (stride == 0u || stride > (1u << 20u)) return 0u;
+    return reg.publishUnlocked(sv.typeId, stride, maxAlign, std::move(entries));
+}
+
+[[nodiscard]] Value decodeBlittableStructBytes(
+    const BlittableStructRegistry& reg,
+    const std::uint8_t* elemBase,
+    const BlittableStructSchema& schema) noexcept {
+    const std::size_t fCount = schema.fields.size();
+    std::array<Value, 16> stackFields{};
+    std::vector<Value> heapFields;
+    Value* dst = (fCount <= stackFields.size()) ? stackFields.data() : nullptr;
+    if (!dst) {
+        heapFields.resize(fCount);
+        dst = heapFields.data();
+    }
+    for (std::size_t i = 0; i < fCount; ++i) {
+        const auto& f = schema.fields[i];
+        const std::uint8_t* p = elemBase + f.byteOffset;
+        switch (f.kind) {
+        case BlittableLeafKind::Bool:
+            dst[i] = Value{p[0] != 0u};
+            break;
+        case BlittableLeafKind::Byte:
+            dst[i] = Value{ByteValue{p[0]}};
+            break;
+        case BlittableLeafKind::SByte:
+            dst[i] = Value{SByteValue{static_cast<std::int8_t>(p[0])}};
+            break;
+        case BlittableLeafKind::Short: {
+            std::int16_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{ShortValue{v}};
+            break;
+        }
+        case BlittableLeafKind::UShort: {
+            std::uint16_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{UShortValue{v}};
+            break;
+        }
+        case BlittableLeafKind::Char: {
+            std::uint16_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{CharValue{v}};
+            break;
+        }
+        case BlittableLeafKind::Int32: {
+            std::int32_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{static_cast<std::int64_t>(v)};
+            break;
+        }
+        case BlittableLeafKind::UInt32: {
+            std::uint32_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{UIntValue{v}};
+            break;
+        }
+        case BlittableLeafKind::Float32: {
+            float v = 0.0f;
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{FloatValue{v}};
+            break;
+        }
+        case BlittableLeafKind::Enum32: {
+            std::int32_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{EnumValue{f.fieldTypeId, static_cast<std::int64_t>(v)}};
+            break;
+        }
+        case BlittableLeafKind::Int64: {
+            std::int64_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{LongValue{v}};
+            break;
+        }
+        case BlittableLeafKind::UInt64: {
+            std::uint64_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{ULongValue{v}};
+            break;
+        }
+        case BlittableLeafKind::Float64: {
+            double v = 0.0;
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{v};
+            break;
+        }
+        case BlittableLeafKind::Fixed24_8: {
+            std::int32_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{FixedValue{v}};
+            break;
+        }
+        case BlittableLeafKind::Fixed48_16: {
+            std::int64_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{Fixed16Value{v}};
+            break;
+        }
+        case BlittableLeafKind::Fixed32_32: {
+            std::int64_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{Fixed64Value{v}};
+            break;
+        }
+        case BlittableLeafKind::Vec2: {
+            Vec2Value v{};
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{v};
+            break;
+        }
+        case BlittableLeafKind::Vec3: {
+            Vec3Value v{};
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{v};
+            break;
+        }
+        case BlittableLeafKind::Quat: {
+            QuatValue v{};
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{v};
+            break;
+        }
+        case BlittableLeafKind::Vec2f: {
+            Vec2fValue v{};
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{v};
+            break;
+        }
+        case BlittableLeafKind::Vec3f: {
+            Vec3fValue v{};
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{v};
+            break;
+        }
+        case BlittableLeafKind::Quatf: {
+            QuatfValue v{};
+            std::memcpy(&v, p, sizeof(v));
+            dst[i] = Value{v};
+            break;
+        }
+        case BlittableLeafKind::NestedStruct: {
+            const auto* childSchema = reg.getByIdLockFree(f.nestedSchemaId);
+            if (childSchema) {
+                dst[i] = decodeBlittableStructBytes(reg, p, *childSchema);
+            } else {
+                dst[i] = Value{StructValue{f.fieldTypeId, std::make_shared<StructStorage>()}};
+            }
+            break;
+        }
+        }
+    }
+    if (fCount <= stackFields.size()) {
+        return Value{makeStructValueFromFields(schema.structTypeId, ValueSpan(stackFields.data(), fCount))};
+    }
+    return Value{makeStructValueFromFields(schema.structTypeId, std::move(heapFields))};
+}
+
+[[nodiscard]] bool encodeBlittableStructBytesInPlace(
+    const BlittableStructRegistry& reg,
+    std::uint8_t* elemBase,
+    const BlittableStructSchema& schema,
+    const Value& value,
+    bool& outNeedsDemote) noexcept {
+    const auto* sv = std::get_if<StructValue>(&value);
+    if (!sv || !sv->valid() || sv->typeId != schema.structTypeId) {
+        return false;
+    }
+    const std::size_t fCount = schema.fields.size();
+    if (sv->fieldCount() != fCount) {
+        outNeedsDemote = true;
+        return false;
+    }
+    for (std::size_t i = 0; i < fCount; ++i) {
+        const auto fvOpt = structValueFieldAt(*sv, i);
+        if (!fvOpt) return false;
+        const Value& fv = *fvOpt;
+        const auto& f = schema.fields[i];
+        std::uint8_t* p = elemBase + f.byteOffset;
+        switch (f.kind) {
+        case BlittableLeafKind::Bool: {
+            bool b = false;
+            if (!fv.tryGetBool(b)) { outNeedsDemote = true; return false; }
+            p[0] = b ? 1u : 0u;
+            break;
+        }
+        case BlittableLeafKind::Byte: {
+            const auto* v = std::get_if<ByteValue>(&fv);
+            if (!v) { outNeedsDemote = true; return false; }
+            p[0] = v->value;
+            break;
+        }
+        case BlittableLeafKind::SByte: {
+            const auto* v = std::get_if<SByteValue>(&fv);
+            if (!v) { outNeedsDemote = true; return false; }
+            p[0] = static_cast<std::uint8_t>(v->value);
+            break;
+        }
+        case BlittableLeafKind::Short: {
+            const auto* v = std::get_if<ShortValue>(&fv);
+            if (!v) { outNeedsDemote = true; return false; }
+            std::memcpy(p, &v->value, sizeof(v->value));
+            break;
+        }
+        case BlittableLeafKind::UShort: {
+            const auto* v = std::get_if<UShortValue>(&fv);
+            if (!v) { outNeedsDemote = true; return false; }
+            std::memcpy(p, &v->value, sizeof(v->value));
+            break;
+        }
+        case BlittableLeafKind::Char: {
+            const auto* v = std::get_if<CharValue>(&fv);
+            if (!v) { outNeedsDemote = true; return false; }
+            std::memcpy(p, &v->value, sizeof(v->value));
+            break;
+        }
+        case BlittableLeafKind::Int32: {
+            std::int64_t iv = 0;
+            if (!fv.tryGetInt64(iv)) { outNeedsDemote = true; return false; }
+            if (iv < std::numeric_limits<std::int32_t>::min() ||
+                iv > std::numeric_limits<std::int32_t>::max()) {
+                outNeedsDemote = true;
+                return false;
+            }
+            const auto i32 = static_cast<std::int32_t>(iv);
+            std::memcpy(p, &i32, sizeof(i32));
+            break;
+        }
+        case BlittableLeafKind::UInt32: {
+            const auto* v = std::get_if<UIntValue>(&fv);
+            if (!v) { outNeedsDemote = true; return false; }
+            std::memcpy(p, &v->value, sizeof(v->value));
+            break;
+        }
+        case BlittableLeafKind::Float32: {
+            float fl = 0.0f;
+            if (!fv.tryGetFloat(fl)) { outNeedsDemote = true; return false; }
+            std::memcpy(p, &fl, sizeof(fl));
+            break;
+        }
+        case BlittableLeafKind::Enum32: {
+            EnumValue ev{};
+            if (!fv.tryGetEnum(ev) || ev.typeId != f.fieldTypeId) {
+                outNeedsDemote = true;
+                return false;
+            }
+            if (ev.value < std::numeric_limits<std::int32_t>::min() ||
+                ev.value > std::numeric_limits<std::int32_t>::max()) {
+                outNeedsDemote = true;
+                return false;
+            }
+            const auto e32 = static_cast<std::int32_t>(ev.value);
+            std::memcpy(p, &e32, sizeof(e32));
+            break;
+        }
+        case BlittableLeafKind::Int64: {
+            std::int64_t lv = 0;
+            if (!fv.tryGetLong(lv)) { outNeedsDemote = true; return false; }
+            std::memcpy(p, &lv, sizeof(lv));
+            break;
+        }
+        case BlittableLeafKind::UInt64: {
+            const auto* v = std::get_if<ULongValue>(&fv);
+            if (!v) { outNeedsDemote = true; return false; }
+            std::memcpy(p, &v->value, sizeof(v->value));
+            break;
+        }
+        case BlittableLeafKind::Float64: {
+            double dv = 0.0;
+            if (!fv.tryGetDouble(dv)) { outNeedsDemote = true; return false; }
+            std::memcpy(p, &dv, sizeof(dv));
+            break;
+        }
+        case BlittableLeafKind::Fixed24_8: {
+            const auto* v = std::get_if<FixedValue>(&fv);
+            if (!v) { outNeedsDemote = true; return false; }
+            std::memcpy(p, &v->raw, sizeof(v->raw));
+            break;
+        }
+        case BlittableLeafKind::Fixed48_16: {
+            const auto* v = std::get_if<Fixed16Value>(&fv);
+            if (!v) { outNeedsDemote = true; return false; }
+            std::memcpy(p, &v->raw, sizeof(v->raw));
+            break;
+        }
+        case BlittableLeafKind::Fixed32_32: {
+            const auto* v = std::get_if<Fixed64Value>(&fv);
+            if (!v) { outNeedsDemote = true; return false; }
+            std::memcpy(p, &v->raw, sizeof(v->raw));
+            break;
+        }
+        case BlittableLeafKind::Vec2: {
+            const auto* v = std::get_if<Vec2Value>(&fv);
+            if (!v) { outNeedsDemote = true; return false; }
+            std::memcpy(p, v, sizeof(*v));
+            break;
+        }
+        case BlittableLeafKind::Vec3: {
+            const auto* v = std::get_if<Vec3Value>(&fv);
+            if (!v) { outNeedsDemote = true; return false; }
+            std::memcpy(p, v, sizeof(*v));
+            break;
+        }
+        case BlittableLeafKind::Quat: {
+            QuatValue qv{};
+            if (!fv.tryGetQuat(qv)) { outNeedsDemote = true; return false; }
+            std::memcpy(p, &qv, sizeof(qv));
+            break;
+        }
+        case BlittableLeafKind::Vec2f: {
+            const auto* v = std::get_if<Vec2fValue>(&fv);
+            if (!v) { outNeedsDemote = true; return false; }
+            std::memcpy(p, v, sizeof(*v));
+            break;
+        }
+        case BlittableLeafKind::Vec3f: {
+            const auto* v = std::get_if<Vec3fValue>(&fv);
+            if (!v) { outNeedsDemote = true; return false; }
+            std::memcpy(p, v, sizeof(*v));
+            break;
+        }
+        case BlittableLeafKind::Quatf: {
+            QuatfValue qv{};
+            if (!fv.tryGetQuatf(qv)) { outNeedsDemote = true; return false; }
+            std::memcpy(p, &qv, sizeof(qv));
+            break;
+        }
+        case BlittableLeafKind::NestedStruct: {
+            const auto* childSchema = reg.getByIdLockFree(f.nestedSchemaId);
+            if (!childSchema ||
+                !encodeBlittableStructBytesInPlace(reg, p, *childSchema, fv, outNeedsDemote)) {
+                return false;
+            }
+            break;
+        }
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool encodeBlittableStructBytes(
+    const BlittableStructRegistry& reg,
+    std::uint8_t* elemBase,
+    const BlittableStructSchema& schema,
+    const Value& value,
+    bool& outNeedsDemote) noexcept {
+    if (schema.strideBytes == 0u || !elemBase) {
+        return false;
+    }
+    std::array<std::uint8_t, 256> stackBuf{};
+    std::vector<std::uint8_t> heapBuf;
+    std::uint8_t* const staging = (schema.strideBytes <= stackBuf.size())
+        ? stackBuf.data()
+        : (heapBuf.resize(schema.strideBytes, 0u), heapBuf.data());
+    if (!encodeBlittableStructBytesInPlace(reg, staging, schema, value, outNeedsDemote)) {
+        return false;
+    }
+    std::memcpy(elemBase, staging, schema.strideBytes);
+    return true;
+}
+
+[[nodiscard]] inline std::size_t packedElementStride(
+    PackedElemEncoding enc,
+    std::uint8_t elemShift,
+    std::uint32_t blittableSchemaId) noexcept {
+    switch (enc) {
+    case PackedElemEncoding::Bool:
+    case PackedElemEncoding::Byte:
+    case PackedElemEncoding::SByte:
+    case PackedElemEncoding::Short:
+    case PackedElemEncoding::UShort:
+    case PackedElemEncoding::Char:
+    case PackedElemEncoding::Int32:
+    case PackedElemEncoding::UInt32:
+    case PackedElemEncoding::Float32:
+    case PackedElemEncoding::EnumInline:
+    case PackedElemEncoding::Int64:
+    case PackedElemEncoding::UInt64:
+    case PackedElemEncoding::Float64:
+    case PackedElemEncoding::Int64Wide:
+    case PackedElemEncoding::EnumWide:
+        return std::size_t{1} << elemShift;
+    case PackedElemEncoding::Fixed24_8:
+        return 4u;
+    case PackedElemEncoding::Fixed48_16:
+    case PackedElemEncoding::Fixed32_32:
+    case PackedElemEncoding::Vec2:
+    case PackedElemEncoding::Vec2f:
+        return 8u;
+    case PackedElemEncoding::Vec3:
+    case PackedElemEncoding::Vec3f:
+        return 12u;
+    case PackedElemEncoding::Quat:
+    case PackedElemEncoding::Quatf:
+        return 16u;
+    case PackedElemEncoding::BlittableStruct: {
+        const auto* s = globalBlittableRegistry().getByIdLockFree(blittableSchemaId);
+        return s ? static_cast<std::size_t>(s->strideBytes) : 0u;
+    }
+    case PackedElemEncoding::None:
+        break;
+    }
+    return 0u;
+}
+
 struct PackedStorageSpec {
     SlotStorage storage = SlotStorage::Empty;
     PackedElemEncoding encoding = PackedElemEncoding::None;
     std::uint8_t elemShift = 0;
+    std::uint32_t strideBytes = 0;
+    std::uint32_t schemaId = 0xFFFFFFFFu;
 };
 
 [[nodiscard]] inline bool tryClassifyPackedArray(
@@ -577,39 +1248,39 @@ struct PackedStorageSpec {
     PackedStorageSpec& outSpec) noexcept {
     switch (elementType) {
     case semantic::PrimitiveType::Bool:
-        outSpec = {SlotStorage::PackedB8, PackedElemEncoding::Bool, 0};
+        outSpec = {SlotStorage::PackedB8, PackedElemEncoding::Bool, 0, 1u, 0xFFFFFFFFu};
         return true;
     case semantic::PrimitiveType::Byte:
-        outSpec = {SlotStorage::PackedB8, PackedElemEncoding::Byte, 0};
+        outSpec = {SlotStorage::PackedB8, PackedElemEncoding::Byte, 0, 1u, 0xFFFFFFFFu};
         return true;
     case semantic::PrimitiveType::SByte:
-        outSpec = {SlotStorage::PackedB8, PackedElemEncoding::SByte, 0};
+        outSpec = {SlotStorage::PackedB8, PackedElemEncoding::SByte, 0, 1u, 0xFFFFFFFFu};
         return true;
     case semantic::PrimitiveType::Short:
-        outSpec = {SlotStorage::PackedB16, PackedElemEncoding::Short, 1};
+        outSpec = {SlotStorage::PackedB16, PackedElemEncoding::Short, 1, 2u, 0xFFFFFFFFu};
         return true;
     case semantic::PrimitiveType::UShort:
-        outSpec = {SlotStorage::PackedB16, PackedElemEncoding::UShort, 1};
+        outSpec = {SlotStorage::PackedB16, PackedElemEncoding::UShort, 1, 2u, 0xFFFFFFFFu};
         return true;
     case semantic::PrimitiveType::Char:
-        outSpec = {SlotStorage::PackedB16, PackedElemEncoding::Char, 1};
+        outSpec = {SlotStorage::PackedB16, PackedElemEncoding::Char, 1, 2u, 0xFFFFFFFFu};
         return true;
     case semantic::PrimitiveType::Int: {
         std::int64_t initI64 = 0;
         if (initialSample && initialSample->tryGetInt64(initI64) &&
             (initI64 < std::numeric_limits<std::int32_t>::min() ||
              initI64 > std::numeric_limits<std::int32_t>::max())) {
-            outSpec = {SlotStorage::PackedI64, PackedElemEncoding::Int64Wide, 3};
+            outSpec = {SlotStorage::PackedI64, PackedElemEncoding::Int64Wide, 3, 8u, 0xFFFFFFFFu};
         } else {
-            outSpec = {SlotStorage::PackedI32, PackedElemEncoding::Int32, 2};
+            outSpec = {SlotStorage::PackedI32, PackedElemEncoding::Int32, 2, 4u, 0xFFFFFFFFu};
         }
         return true;
     }
     case semantic::PrimitiveType::UInt:
-        outSpec = {SlotStorage::PackedI32, PackedElemEncoding::UInt32, 2};
+        outSpec = {SlotStorage::PackedI32, PackedElemEncoding::UInt32, 2, 4u, 0xFFFFFFFFu};
         return true;
     case semantic::PrimitiveType::Float:
-        outSpec = {SlotStorage::PackedI32, PackedElemEncoding::Float32, 2};
+        outSpec = {SlotStorage::PackedI32, PackedElemEncoding::Float32, 2, 4u, 0xFFFFFFFFu};
         return true;
     case semantic::PrimitiveType::Enum: {
         if (elementTypeId == 0) return false;
@@ -617,21 +1288,90 @@ struct PackedStorageSpec {
         if (initialSample && initialSample->tryGetEnum(ev) &&
             (ev.value < std::numeric_limits<std::int32_t>::min() ||
              ev.value > std::numeric_limits<std::int32_t>::max())) {
-            outSpec = {SlotStorage::PackedI64, PackedElemEncoding::EnumWide, 3};
+            outSpec = {SlotStorage::PackedI64, PackedElemEncoding::EnumWide, 3, 8u, 0xFFFFFFFFu};
         } else {
-            outSpec = {SlotStorage::PackedI32, PackedElemEncoding::EnumInline, 2};
+            outSpec = {SlotStorage::PackedI32, PackedElemEncoding::EnumInline, 2, 4u, 0xFFFFFFFFu};
         }
         return true;
     }
     case semantic::PrimitiveType::Long:
-        outSpec = {SlotStorage::PackedI64, PackedElemEncoding::Int64, 3};
+        outSpec = {SlotStorage::PackedI64, PackedElemEncoding::Int64, 3, 8u, 0xFFFFFFFFu};
         return true;
     case semantic::PrimitiveType::ULong:
-        outSpec = {SlotStorage::PackedI64, PackedElemEncoding::UInt64, 3};
+        outSpec = {SlotStorage::PackedI64, PackedElemEncoding::UInt64, 3, 8u, 0xFFFFFFFFu};
         return true;
     case semantic::PrimitiveType::Double:
-        outSpec = {SlotStorage::PackedI64, PackedElemEncoding::Float64, 3};
+        outSpec = {SlotStorage::PackedI64, PackedElemEncoding::Float64, 3, 8u, 0xFFFFFFFFu};
         return true;
+    case semantic::PrimitiveType::Struct: {
+        if (elementTypeId == 0) return false;
+        if (elementTypeId == fixedTypeId()) {
+            outSpec = {SlotStorage::PackedStruct, PackedElemEncoding::Fixed24_8, 0, 4u, 0xFFFFFFFFu};
+            return true;
+        }
+        if (elementTypeId == fixed16TypeId()) {
+            outSpec = {SlotStorage::PackedStruct, PackedElemEncoding::Fixed48_16, 0, 8u, 0xFFFFFFFFu};
+            return true;
+        }
+        if (elementTypeId == fixed64TypeId()) {
+            outSpec = {SlotStorage::PackedStruct, PackedElemEncoding::Fixed32_32, 0, 8u, 0xFFFFFFFFu};
+            return true;
+        }
+        if (elementTypeId == vec2TypeId()) {
+            outSpec = {SlotStorage::PackedStruct, PackedElemEncoding::Vec2, 0, 8u, 0xFFFFFFFFu};
+            return true;
+        }
+        if (elementTypeId == vec3TypeId()) {
+            outSpec = {SlotStorage::PackedStruct, PackedElemEncoding::Vec3, 0, 12u, 0xFFFFFFFFu};
+            return true;
+        }
+        if (elementTypeId == quatTypeId()) {
+            outSpec = {SlotStorage::PackedStruct, PackedElemEncoding::Quat, 0, 16u, 0xFFFFFFFFu};
+            return true;
+        }
+        if (elementTypeId == vec2fTypeId()) {
+            outSpec = {SlotStorage::PackedStruct, PackedElemEncoding::Vec2f, 0, 8u, 0xFFFFFFFFu};
+            return true;
+        }
+        if (elementTypeId == vec3fTypeId()) {
+            outSpec = {SlotStorage::PackedStruct, PackedElemEncoding::Vec3f, 0, 12u, 0xFFFFFFFFu};
+            return true;
+        }
+        if (elementTypeId == quatfTypeId()) {
+            outSpec = {SlotStorage::PackedStruct, PackedElemEncoding::Quatf, 0, 16u, 0xFFFFFFFFu};
+            return true;
+        }
+        auto& reg = globalBlittableRegistry();
+        std::uint32_t sid = reg.findLatestSchemaId(elementTypeId);
+        if (sid == 0u && initialSample) {
+            if (const auto* sv = std::get_if<StructValue>(initialSample)) {
+                std::lock_guard<std::mutex> regLock(reg.mutex);
+                sid = tryInferBlittableSchemaFromSampleUnlocked(reg, *sv);
+            }
+        }
+        if (sid == 0u) return false;
+        const auto* schema = reg.getByIdLockFree(sid);
+        if (!schema || schema->strideBytes == 0u) return false;
+        if (initialSample) {
+            std::array<std::uint8_t, 256> scratch{};
+            std::vector<std::uint8_t> heapScratch;
+            std::uint8_t* probe = schema->strideBytes <= scratch.size()
+                ? scratch.data()
+                : (heapScratch.resize(schema->strideBytes), heapScratch.data());
+            bool needsDemote = false;
+            if (!encodeBlittableStructBytes(reg, probe, *schema, *initialSample, needsDemote)) {
+                return false;
+            }
+        }
+        outSpec = {
+            SlotStorage::PackedStruct,
+            PackedElemEncoding::BlittableStruct,
+            0,
+            schema->strideBytes,
+            sid,
+        };
+        return true;
+    }
     default:
         return false;
     }
@@ -641,7 +1381,8 @@ struct PackedStorageSpec {
     const void* basePtr,
     std::size_t index,
     PackedElemEncoding encoding,
-    semantic::SymbolId elemTypeId) noexcept {
+    semantic::SymbolId elemTypeId,
+    std::uint32_t blittableSchemaId = 0xFFFFFFFFu) noexcept {
     const auto* bytes = static_cast<const std::uint8_t*>(basePtr);
     switch (encoding) {
     case PackedElemEncoding::Bool:
@@ -674,6 +1415,49 @@ struct PackedStorageSpec {
         return Value{reinterpret_cast<const std::int64_t*>(bytes)[index]};
     case PackedElemEncoding::EnumWide:
         return Value{EnumValue{elemTypeId, reinterpret_cast<const std::int64_t*>(bytes)[index]}};
+    case PackedElemEncoding::Fixed24_8:
+        return Value{FixedValue{reinterpret_cast<const std::int32_t*>(bytes)[index]}};
+    case PackedElemEncoding::Fixed48_16:
+        return Value{Fixed16Value{reinterpret_cast<const std::int64_t*>(bytes)[index]}};
+    case PackedElemEncoding::Fixed32_32:
+        return Value{Fixed64Value{reinterpret_cast<const std::int64_t*>(bytes)[index]}};
+    case PackedElemEncoding::Vec2: {
+        Vec2Value v{};
+        std::memcpy(&v, bytes + index * sizeof(Vec2Value), sizeof(v));
+        return Value{v};
+    }
+    case PackedElemEncoding::Vec3: {
+        Vec3Value v{};
+        std::memcpy(&v, bytes + index * sizeof(Vec3Value), sizeof(v));
+        return Value{v};
+    }
+    case PackedElemEncoding::Quat: {
+        QuatValue v{};
+        std::memcpy(&v, bytes + index * sizeof(QuatValue), sizeof(v));
+        return Value{v};
+    }
+    case PackedElemEncoding::Vec2f: {
+        Vec2fValue v{};
+        std::memcpy(&v, bytes + index * sizeof(Vec2fValue), sizeof(v));
+        return Value{v};
+    }
+    case PackedElemEncoding::Vec3f: {
+        Vec3fValue v{};
+        std::memcpy(&v, bytes + index * sizeof(Vec3fValue), sizeof(v));
+        return Value{v};
+    }
+    case PackedElemEncoding::Quatf: {
+        QuatfValue v{};
+        std::memcpy(&v, bytes + index * sizeof(QuatfValue), sizeof(v));
+        return Value{v};
+    }
+    case PackedElemEncoding::BlittableStruct: {
+        const auto& reg = globalBlittableRegistry();
+        const auto* schema = reg.getByIdLockFree(blittableSchemaId);
+        if (!schema) return Value{};
+        return decodeBlittableStructBytes(
+            reg, bytes + index * static_cast<std::size_t>(schema->strideBytes), *schema);
+    }
     case PackedElemEncoding::None:
         break;
     }
@@ -686,7 +1470,8 @@ struct PackedStorageSpec {
     PackedElemEncoding encoding,
     semantic::SymbolId elemTypeId,
     const Value& value,
-    bool& outNeedsWidenTo64) noexcept {
+    bool& outNeedsWidenTo64,
+    std::uint32_t blittableSchemaId = 0xFFFFFFFFu) noexcept {
     outNeedsWidenTo64 = false;
     auto* bytes = static_cast<std::uint8_t*>(basePtr);
     switch (encoding) {
@@ -790,10 +1575,225 @@ struct PackedStorageSpec {
         reinterpret_cast<std::int64_t*>(bytes)[index] = ev.value;
         return true;
     }
+    case PackedElemEncoding::Fixed24_8: {
+        const auto* v = std::get_if<FixedValue>(&value);
+        if (!v) return false;
+        reinterpret_cast<std::int32_t*>(bytes)[index] = v->raw;
+        return true;
+    }
+    case PackedElemEncoding::Fixed48_16: {
+        const auto* v = std::get_if<Fixed16Value>(&value);
+        if (!v) return false;
+        reinterpret_cast<std::int64_t*>(bytes)[index] = v->raw;
+        return true;
+    }
+    case PackedElemEncoding::Fixed32_32: {
+        const auto* v = std::get_if<Fixed64Value>(&value);
+        if (!v) return false;
+        reinterpret_cast<std::int64_t*>(bytes)[index] = v->raw;
+        return true;
+    }
+    case PackedElemEncoding::Vec2: {
+        const auto* v = std::get_if<Vec2Value>(&value);
+        if (!v) return false;
+        std::memcpy(bytes + index * sizeof(Vec2Value), v, sizeof(*v));
+        return true;
+    }
+    case PackedElemEncoding::Vec3: {
+        const auto* v = std::get_if<Vec3Value>(&value);
+        if (!v) return false;
+        std::memcpy(bytes + index * sizeof(Vec3Value), v, sizeof(*v));
+        return true;
+    }
+    case PackedElemEncoding::Quat: {
+        QuatValue qv{};
+        if (!value.tryGetQuat(qv)) return false;
+        std::memcpy(bytes + index * sizeof(QuatValue), &qv, sizeof(qv));
+        return true;
+    }
+    case PackedElemEncoding::Vec2f: {
+        const auto* v = std::get_if<Vec2fValue>(&value);
+        if (!v) return false;
+        std::memcpy(bytes + index * sizeof(Vec2fValue), v, sizeof(*v));
+        return true;
+    }
+    case PackedElemEncoding::Vec3f: {
+        const auto* v = std::get_if<Vec3fValue>(&value);
+        if (!v) return false;
+        std::memcpy(bytes + index * sizeof(Vec3fValue), v, sizeof(*v));
+        return true;
+    }
+    case PackedElemEncoding::Quatf: {
+        QuatfValue qv{};
+        if (!value.tryGetQuatf(qv)) return false;
+        std::memcpy(bytes + index * sizeof(QuatfValue), &qv, sizeof(qv));
+        return true;
+    }
+    case PackedElemEncoding::BlittableStruct: {
+        const auto& reg = globalBlittableRegistry();
+        const auto* schema = reg.getByIdLockFree(blittableSchemaId);
+        if (!schema) return false;
+        return encodeBlittableStructBytes(
+            reg,
+            bytes + index * static_cast<std::size_t>(schema->strideBytes),
+            *schema,
+            value,
+            outNeedsWidenTo64);
+    }
     case PackedElemEncoding::None:
         break;
     }
     return false;
+}
+
+void registerBlittableStructTypes(
+    const std::vector<std::pair<semantic::SymbolId, std::vector<BlittableFieldInput>>>& structTypes) {
+    if (structTypes.empty()) return;
+    auto& reg = globalBlittableRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+
+    std::unordered_map<semantic::SymbolId, const std::vector<BlittableFieldInput>*> pending;
+    pending.reserve(structTypes.size());
+    for (const auto& [tid, fields] : structTypes) {
+        if (tid == 0 || isBuiltinMathStructId(tid)) continue;
+        pending[tid] = &fields;
+    }
+
+    // 0 = unvisited, 1 = visiting (cycle), 2 = resolved blittable, 3 = resolved non-blittable
+    std::unordered_map<semantic::SymbolId, int> state;
+    const auto resolve = [&](auto& self, semantic::SymbolId tid) -> std::uint32_t {
+        const auto stIt = state.find(tid);
+        if (stIt != state.end()) {
+            if (stIt->second == 2) {
+                const auto lIt = reg.latestByTypeId.find(tid);
+                return lIt != reg.latestByTypeId.end() ? lIt->second : 0u;
+            }
+            return 0u;
+        }
+        const auto pIt = pending.find(tid);
+        if (pIt == pending.end()) {
+            const auto lIt = reg.latestByTypeId.find(tid);
+            return lIt != reg.latestByTypeId.end() ? lIt->second : 0u;
+        }
+        state[tid] = 1;
+        const auto& fields = *pIt->second;
+        if (fields.empty() || fields.size() > 256u) {
+            reg.markNonBlittableUnlocked(tid);
+            state[tid] = 3;
+            return 0u;
+        }
+        std::vector<BlittableFieldEntry> entries;
+        entries.reserve(fields.size());
+        std::uint32_t offset = 0u;
+        std::uint32_t maxAlign = 1u;
+        for (const auto& f : fields) {
+            if (f.type == semantic::PrimitiveType::Struct &&
+                f.typeId != 0 &&
+                !isBuiltinMathStructId(f.typeId)) {
+                const std::uint32_t childSid = self(self, f.typeId);
+                if (childSid == 0u) {
+                    reg.markNonBlittableUnlocked(tid);
+                    state[tid] = 3;
+                    return 0u;
+                }
+                const auto* childSchema = reg.getByIdLockFree(childSid);
+                if (!childSchema || childSchema->strideBytes == 0u) {
+                    reg.markNonBlittableUnlocked(tid);
+                    state[tid] = 3;
+                    return 0u;
+                }
+                offset = alignUpU32(offset, childSchema->alignBytes);
+                maxAlign = std::max(maxAlign, childSchema->alignBytes);
+                entries.push_back(BlittableFieldEntry{
+                    BlittableLeafKind::NestedStruct, offset, f.typeId, childSid});
+                offset += childSchema->strideBytes;
+                continue;
+            }
+            BlittableLeafKind lKind{};
+            std::uint32_t lSize = 0, lAlign = 1;
+            if (!classifyLeafFieldSpec(f.type, f.typeId, lKind, lSize, lAlign)) {
+                reg.markNonBlittableUnlocked(tid);
+                state[tid] = 3;
+                return 0u;
+            }
+            offset = alignUpU32(offset, lAlign);
+            maxAlign = std::max(maxAlign, lAlign);
+            entries.push_back(BlittableFieldEntry{lKind, offset, f.typeId, 0u});
+            offset += lSize;
+        }
+        const std::uint32_t stride = alignUpU32(offset, maxAlign);
+        if (stride == 0u || stride > (1u << 20u)) {
+            reg.markNonBlittableUnlocked(tid);
+            state[tid] = 3;
+            return 0u;
+        }
+        const std::uint32_t sid = reg.publishUnlocked(tid, stride, maxAlign, std::move(entries));
+        if (sid == 0u) {
+            reg.markNonBlittableUnlocked(tid);
+            state[tid] = 3;
+            return 0u;
+        }
+        state[tid] = 2;
+        return sid;
+    };
+
+    for (const auto& [tid, fields] : structTypes) {
+        (void)fields;
+        if (tid == 0 || isBuiltinMathStructId(tid)) continue;
+        (void)resolve(resolve, tid);
+    }
+}
+
+bool isBlittableStructType(semantic::SymbolId structTypeId) noexcept {
+    if (structTypeId == 0) return false;
+    if (isBuiltinMathStructId(structTypeId)) return true;
+    return globalBlittableRegistry().findLatestSchemaId(structTypeId) != 0u;
+}
+
+std::optional<Value> makeDefaultBlittableStructValue(
+    semantic::SymbolId structTypeId) noexcept {
+    if (structTypeId == 0) return std::nullopt;
+    if (structTypeId == fixedTypeId()) return Value{FixedValue{}};
+    if (structTypeId == fixed16TypeId()) return Value{Fixed16Value{}};
+    if (structTypeId == fixed64TypeId()) return Value{Fixed64Value{}};
+    if (structTypeId == vec2TypeId()) return Value{Vec2Value{}};
+    if (structTypeId == vec3TypeId()) return Value{Vec3Value{}};
+    if (structTypeId == quatTypeId()) return Value{QuatValue{}};
+    if (structTypeId == vec2fTypeId()) return Value{Vec2fValue{}};
+    if (structTypeId == vec3fTypeId()) return Value{Vec3fValue{}};
+    if (structTypeId == quatfTypeId()) return Value{QuatfValue{}};
+    auto& reg = globalBlittableRegistry();
+    const std::uint32_t sid = reg.findLatestSchemaId(structTypeId);
+    if (sid == 0u) return std::nullopt;
+    const auto* schema = reg.getByIdLockFree(sid);
+    if (!schema || schema->strideBytes == 0u) return std::nullopt;
+    std::array<std::uint8_t, 256> stackZero{};
+    std::vector<std::uint8_t> heapZero;
+    const std::uint8_t* const zeroPtr = (schema->strideBytes <= stackZero.size())
+        ? stackZero.data()
+        : (heapZero.resize(schema->strideBytes, 0u), heapZero.data());
+    return decodeBlittableStructBytes(reg, zeroPtr, *schema);
+}
+
+Value readPackedStructElement(
+    const void* basePtr,
+    std::size_t index,
+    PackedElemEncoding encoding,
+    semantic::SymbolId elemTypeId,
+    std::uint32_t blittableSchemaId) noexcept {
+    return readPackedElementValue(basePtr, index, encoding, elemTypeId, blittableSchemaId);
+}
+
+bool writePackedStructElement(
+    void* basePtr,
+    std::size_t index,
+    PackedElemEncoding encoding,
+    semantic::SymbolId elemTypeId,
+    std::uint32_t blittableSchemaId,
+    const Value& value,
+    bool& outNeedsDemote) noexcept {
+    return writePackedElementValue(
+        basePtr, index, encoding, elemTypeId, value, outNeedsDemote, blittableSchemaId);
 }
 
 namespace GcFlag {
@@ -1311,8 +2311,7 @@ struct ManagedHeap::Impl {
     }
 
     [[nodiscard]] static bool isValuePoolBacked(const Value& value) noexcept {
-        const auto t = value.rawTag();
-        return t >= ValueTag::FirstTraceable && t != ValueTag::ObjectRef;
+        return value.isTraceable() && value.rawTag() != ValueTag::ObjectRef;
     }
 
     static bool markPoolCallback(void* rawImpl) {
@@ -1401,6 +2400,11 @@ struct ManagedHeap::Impl {
         case SlotStorage::PackedI64:
             return BaseObjectSizeBytes +
                 (static_cast<std::size_t>(slot.payload.s.length) << unpackPackedShift(slot.auxMeta));
+        case SlotStorage::PackedStruct:
+            return BaseObjectSizeBytes +
+                static_cast<std::size_t>(slot.payload.s.length) *
+                packedElementStride(
+                    unpackPackedEncoding(slot.auxMeta), 0u, slot.payload.s.cardHandle);
         case SlotStorage::RawColumn:
         case SlotStorage::Empty:
             return BaseObjectSizeBytes;
@@ -1433,6 +2437,7 @@ struct ManagedHeap::Impl {
         case SlotStorage::PackedB16:
         case SlotStorage::PackedI32:
         case SlotStorage::PackedI64:
+        case SlotStorage::PackedStruct:
             packedBuffers.release(slot.payload.s.handle);
             break;
         case SlotStorage::RawColumn:
@@ -1780,6 +2785,83 @@ struct ManagedHeap::Impl {
         return true;
     }
 
+    bool demotePackedStructSlotToValuesUnlocked(std::uint32_t slotIndex, CompactSlot& slot) {
+        if (slot.storage() != SlotStorage::PackedStruct) return false;
+        const std::size_t len = slot.payload.s.length;
+        const std::size_t valStorage = estimateValueStorage(len);
+        if (valStorage == std::numeric_limits<std::size_t>::max()) return false;
+        const std::size_t oldTotalBytes = slotSizeBytes(slotIndex, slot);
+        const std::size_t newTotalBytes = BaseObjectSizeBytes + valStorage;
+        if (!slot.hasFlag(GcFlag::CustomSize) &&
+            newTotalBytes > oldTotalBytes &&
+            statistics.liveBytes + (newTotalBytes - oldTotalBytes) > config.maximumHeapBytes) {
+            return false;
+        }
+        const auto enc = unpackPackedEncoding(slot.auxMeta);
+        const auto elemTid = typeLayouts[slot.payload.s.layoutId].elementTypeId;
+        const std::uint32_t oldSchemaId = slot.payload.s.cardHandle;
+        std::vector<Value> materialized(len);
+        for (std::size_t i = 0; i < len; ++i) {
+            materialized[i] = readPackedElementValue(
+                slot.payload.s.data, i, enc, elemTid, oldSchemaId);
+            pinHeapValueIfNeededUnlocked(materialized[i]);
+        }
+        const std::uint32_t oldBufHandle = slot.payload.s.handle;
+        const std::uint32_t layoutId = slot.payload.s.layoutId;
+        if (len <= CompactSlot::kInlineValueCapacity) {
+            std::uint16_t cls = 0;
+            std::uint32_t handle = CompactSlot::kInvalidHandle;
+            Value* ptr = slabPool.allocate(len, cls, handle);
+            for (std::size_t i = 0; i < len; ++i) {
+                ptr[i] = std::move(materialized[i]);
+            }
+            packedBuffers.release(oldBufHandle);
+            slot.setKindAndStorage(ObjectKind::Array, SlotStorage::SlabValues);
+            slot.auxMeta = cls;
+            slot.payload.s = {
+                layoutId,
+                static_cast<std::uint32_t>(len),
+                ptr,
+                handle,
+                CompactSlot::kInvalidHandle,
+            };
+        } else {
+            Value* ptr = nullptr;
+            const std::uint32_t handle = largeBuffers.acquireMove(std::move(materialized), ptr);
+            std::uint32_t cardHandle = CompactSlot::kInvalidHandle;
+            if (!slot.hasFlag(GcFlag::InNursery) &&
+                len >= ManagedHeap::kCardTableMinLength &&
+                typeLayouts[layoutId].mayContainReferences) {
+                cardHandle = cardArena.allocate(len);
+                slot.gcFlags |= GcFlag::HasCardTable;
+            }
+            packedBuffers.release(oldBufHandle);
+            slot.setKindAndStorage(ObjectKind::Array, SlotStorage::HeapValues);
+            slot.auxMeta = 0;
+            slot.payload.s = {
+                layoutId,
+                static_cast<std::uint32_t>(len),
+                ptr,
+                handle,
+                cardHandle,
+            };
+        }
+        if (!slot.hasFlag(GcFlag::CustomSize)) {
+            if (newTotalBytes >= oldTotalBytes) {
+                const std::size_t delta = newTotalBytes - oldTotalBytes;
+                statistics.bytesAllocated += delta;
+                statistics.liveBytes += delta;
+                statistics.peakLiveBytes = std::max(statistics.peakLiveBytes, statistics.liveBytes);
+                if (statistics.liveBytes >= nextCollectionThreshold) requested = true;
+            } else {
+                const std::size_t delta = oldTotalBytes - newTotalBytes;
+                statistics.liveBytes = (statistics.liveBytes >= delta) ? (statistics.liveBytes - delta) : 0;
+                statistics.bytesReclaimed += delta;
+            }
+        }
+        return true;
+    }
+
     [[nodiscard]] std::optional<ObjectRef> allocateArraySlot(
         semantic::SymbolId arrayTypeId,
         semantic::PrimitiveType elementType,
@@ -1796,8 +2878,11 @@ struct ManagedHeap::Impl {
                 elementType,
                 elementTypeId,
                 length > 0 ? &initialValue : nullptr,
-                packedSpec)) {
-            const std::size_t packedBytes = length << packedSpec.elemShift;
+                packedSpec) &&
+            packedSpec.strideBytes > 0u &&
+            length <= (std::numeric_limits<std::size_t>::max() - BaseObjectSizeBytes) /
+                static_cast<std::size_t>(packedSpec.strideBytes)) {
+            const std::size_t packedBytes = length * static_cast<std::size_t>(packedSpec.strideBytes);
             const std::size_t packedTotalBytes = BaseObjectSizeBytes + packedBytes;
             const auto slotIndex = acquireSlot(packedTotalBytes, error, outReallocated);
             if (!slotIndex) return std::nullopt;
@@ -1805,12 +2890,18 @@ struct ManagedHeap::Impl {
             const std::uint32_t bufHandle = packedBuffers.acquireZeroed(packedBytes, alignedPtr);
             if (length > 0) {
                 bool dummyWiden = false;
-                // Check if initialValue is non-zero; if zero, acquireZeroed already zero-filled the block!
-                Value zeroSample = readPackedElementValue(alignedPtr, 0, packedSpec.encoding, elementTypeId);
+                Value zeroSample = readPackedElementValue(
+                    alignedPtr, 0, packedSpec.encoding, elementTypeId, packedSpec.schemaId);
                 if (!(zeroSample == initialValue)) {
                     for (std::size_t i = 0; i < length; ++i) {
                         (void)writePackedElementValue(
-                            alignedPtr, i, packedSpec.encoding, elementTypeId, initialValue, dummyWiden);
+                            alignedPtr,
+                            i,
+                            packedSpec.encoding,
+                            elementTypeId,
+                            initialValue,
+                            dummyWiden,
+                            packedSpec.schemaId);
                     }
                 }
             }
@@ -1821,7 +2912,7 @@ struct ManagedHeap::Impl {
                 static_cast<std::uint32_t>(length),
                 alignedPtr,
                 bufHandle,
-                CompactSlot::kInvalidHandle,
+                packedSpec.schemaId,
             };
             return finalizeSlotAllocation(*slotIndex, ObjectKind::Array, packedSpec.storage, packedTotalBytes);
         }
@@ -2489,8 +3580,13 @@ std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
     PackedStorageSpec preSpec{};
     std::size_t storage = 0;
     if (length <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) &&
-        tryClassifyPackedArray(elementType, elementTypeId, length > 0 ? &initialValue : nullptr, preSpec)) {
-        storage = length << preSpec.elemShift;
+        tryClassifyPackedArray(elementType, elementTypeId, length > 0 ? &initialValue : nullptr, preSpec) &&
+        preSpec.strideBytes > 0u) {
+        if (length > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(preSpec.strideBytes)) {
+            storage = std::numeric_limits<std::size_t>::max();
+        } else {
+            storage = length * static_cast<std::size_t>(preSpec.strideBytes);
+        }
     } else {
         storage = estimateValueStorage(length);
     }
@@ -2679,9 +3775,13 @@ namespace {
     case NativeFieldKind::Bool: return 1;
     case NativeFieldKind::Fixed: return 4;
     case NativeFieldKind::Fixed16: return 2;
+    case NativeFieldKind::Fixed64: return 8;
     case NativeFieldKind::Vec2: return 8;
     case NativeFieldKind::Vec3: return 12;
     case NativeFieldKind::Quat: return 16;
+    case NativeFieldKind::Vec2f: return 8;
+    case NativeFieldKind::Vec3f: return 12;
+    case NativeFieldKind::Quatf: return 16;
     }
     return 0;
 }
@@ -2863,6 +3963,26 @@ namespace {
         std::memcpy(&v, ptr, sizeof(v));
         return v;
     }
+    case NativeFieldKind::Fixed64: {
+        std::int64_t raw = 0;
+        std::memcpy(&raw, ptr, sizeof(raw));
+        return Fixed64Value{raw};
+    }
+    case NativeFieldKind::Vec2f: {
+        Vec2fValue v{};
+        std::memcpy(&v, ptr, sizeof(v));
+        return v;
+    }
+    case NativeFieldKind::Vec3f: {
+        Vec3fValue v{};
+        std::memcpy(&v, ptr, sizeof(v));
+        return v;
+    }
+    case NativeFieldKind::Quatf: {
+        QuatfValue v{};
+        std::memcpy(&v, ptr, sizeof(v));
+        return v;
+    }
     }
     return std::int64_t{0};
 }
@@ -3010,6 +4130,41 @@ bool writeNativeFieldToBytes(
         }
         return false;
     }
+    case NativeFieldKind::Fixed64: {
+        if (const auto* fx = std::get_if<Fixed64Value>(&val)) {
+            std::memcpy(ptr, &fx->raw, sizeof(fx->raw));
+            return true;
+        }
+        if (const auto f0 = loadInlineStructField(val, 0)) {
+            if (const auto* i = std::get_if<std::int64_t>(&*f0)) {
+                std::memcpy(ptr, i, sizeof(*i));
+                return true;
+            }
+        }
+        return false;
+    }
+    case NativeFieldKind::Vec2f: {
+        if (const auto* v = std::get_if<Vec2fValue>(&val)) {
+            std::memcpy(ptr, v, sizeof(*v));
+            return true;
+        }
+        return false;
+    }
+    case NativeFieldKind::Vec3f: {
+        if (const auto* v = std::get_if<Vec3fValue>(&val)) {
+            std::memcpy(ptr, v, sizeof(*v));
+            return true;
+        }
+        return false;
+    }
+    case NativeFieldKind::Quatf: {
+        QuatfValue qv{};
+        if (val.tryGetQuatf(qv)) {
+            std::memcpy(ptr, &qv, sizeof(qv));
+            return true;
+        }
+        return false;
+    }
     }
     return false;
 }
@@ -3063,7 +4218,8 @@ std::optional<Value> ManagedHeap::arrayGet(ObjectRef reference, std::size_t inde
                 slot->payload.s.data,
                 index,
                 unpackPackedEncoding(slot->auxMeta),
-                elemTid);
+                elemTid,
+                slot->payload.s.cardHandle);
         }
         if (slot->storage() != SlotStorage::RawColumn) {
             if (index >= slot->payload.s.length) return std::nullopt;
@@ -3095,6 +4251,20 @@ bool ManagedHeap::isPackedArray(ObjectRef reference) const noexcept {
     HeapReadOrDisjointGuard heapLock(*impl_->syncState);
     const auto* slot = impl_->getSlot(reference);
     return slot && slot->kind() == ObjectKind::Array && isPackedStorage(slot->storage());
+}
+
+std::optional<std::size_t> ManagedHeap::packedElementStrideBytes(ObjectRef reference) const noexcept {
+    HeapReadOrDisjointGuard heapLock(*impl_->syncState);
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array || !isPackedStorage(slot->storage())) {
+        return std::nullopt;
+    }
+    const std::size_t stride = packedElementStride(
+        unpackPackedEncoding(slot->auxMeta),
+        unpackPackedShift(slot->auxMeta),
+        slot->payload.s.cardHandle);
+    if (stride == 0u) return std::nullopt;
+    return stride;
 }
 
 std::optional<std::size_t> ManagedHeap::objectSizeBytes(ObjectRef reference) const noexcept {
@@ -3131,12 +4301,19 @@ bool ManagedHeap::tryBindPackedArrayFastView(
         return false;
     }
     const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+    const auto enc = unpackPackedEncoding(slot->auxMeta);
+    const auto shift = unpackPackedShift(slot->auxMeta);
+    const std::uint32_t schemaId = (enc == PackedElemEncoding::BlittableStruct)
+        ? slot->payload.s.cardHandle
+        : 0u;
     outView.rawData = slot->payload.s.data;
     outView.length = count;
-    outView.encoding = unpackPackedEncoding(slot->auxMeta);
+    outView.encoding = enc;
     outView.elementType = layout.elementType;
     outView.elementTypeId = layout.elementTypeId;
-    return true;
+    outView.strideBytes = static_cast<std::uint32_t>(packedElementStride(enc, shift, schemaId));
+    outView.blittableSchemaId = schemaId;
+    return outView.strideBytes != 0u;
 }
 
 bool ManagedHeap::tryBindPackedInt32Array(
@@ -3279,7 +4456,8 @@ bool ManagedHeap::arraySetPrevalidated(
                 unpackPackedEncoding(slot->auxMeta),
                 elemTid,
                 value,
-                needsWiden);
+                needsWiden,
+                slot->payload.s.cardHandle);
         }
     }
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
@@ -3311,12 +4489,35 @@ bool ManagedHeap::arraySetPrevalidated(
         const auto elemTid = impl_->typeLayouts[slot->payload.s.layoutId].elementTypeId;
         bool needsWiden = false;
         if (writePackedElementValue(
-                slot->payload.s.data, index, unpackPackedEncoding(slot->auxMeta), elemTid, value, needsWiden)) {
+                slot->payload.s.data,
+                index,
+                unpackPackedEncoding(slot->auxMeta),
+                elemTid,
+                value,
+                needsWiden,
+                slot->payload.s.cardHandle)) {
             return true;
         }
-        if (needsWiden && impl_->widenPackedSlotTo64Unlocked(reference.slot, *slot)) {
-            return writePackedElementValue(
-                slot->payload.s.data, index, unpackPackedEncoding(slot->auxMeta), elemTid, value, needsWiden);
+        if (needsWiden) {
+            if (slot->storage() == SlotStorage::PackedStruct) {
+                if (impl_->demotePackedStructSlotToValuesUnlocked(reference.slot, *slot)) {
+                    if (mayBeReference) {
+                        impl_->writeBarrierArrayElement(reference, index, value);
+                    }
+                    impl_->pinHeapValueIfNeededUnlocked(value);
+                    slot->payload.s.data[index] = value;
+                    return true;
+                }
+            } else if (impl_->widenPackedSlotTo64Unlocked(reference.slot, *slot)) {
+                return writePackedElementValue(
+                    slot->payload.s.data,
+                    index,
+                    unpackPackedEncoding(slot->auxMeta),
+                    elemTid,
+                    value,
+                    needsWiden,
+                    slot->payload.s.cardHandle);
+            }
         }
         return false;
     }
@@ -3367,7 +4568,8 @@ bool ManagedHeap::arraySet(
                     unpackPackedEncoding(slot->auxMeta),
                     expectedTypeId,
                     value,
-                    needsWiden)) {
+                    needsWiden,
+                    slot->payload.s.cardHandle)) {
                 return true;
             }
             setHeapError(error, ErrorCode::TypeMismatch,
@@ -3484,22 +4686,36 @@ bool ManagedHeap::arraySet(
                 unpackPackedEncoding(slot->auxMeta),
                 expectedTypeId,
                 value,
-                needsWiden)) {
+                needsWiden,
+                slot->payload.s.cardHandle)) {
             return true;
         }
-        if (needsWiden && impl_->widenPackedSlotTo64Unlocked(reference.slot, *slot)) {
-            if (writePackedElementValue(
-                    slot->payload.s.data,
-                    index,
-                    unpackPackedEncoding(slot->auxMeta),
-                    expectedTypeId,
-                    value,
-                    needsWiden)) {
-                return true;
+        if (needsWiden) {
+            if (slot->storage() == SlotStorage::PackedStruct) {
+                if (impl_->demotePackedStructSlotToValuesUnlocked(reference.slot, *slot)) {
+                    impl_->pinHeapValueIfNeededUnlocked(value);
+                    impl_->writeBarrierArrayElement(reference, index, value);
+                    slot->payload.s.data[index] = std::move(value);
+                    return true;
+                }
+            } else if (impl_->widenPackedSlotTo64Unlocked(reference.slot, *slot)) {
+                if (writePackedElementValue(
+                        slot->payload.s.data,
+                        index,
+                        unpackPackedEncoding(slot->auxMeta),
+                        expectedTypeId,
+                        value,
+                        needsWiden,
+                        slot->payload.s.cardHandle)) {
+                    return true;
+                }
             }
+            setHeapError(error, ErrorCode::OutOfMemory,
+                "managed packed array widening exceeded heap budget");
+            return false;
         }
-        setHeapError(error, ErrorCode::OutOfMemory,
-            "managed packed array widening exceeded heap budget");
+        setHeapError(error, ErrorCode::TypeMismatch,
+            "managed array element type mismatch");
         return false;
     }
     impl_->pinHeapValueIfNeededUnlocked(value);
@@ -4503,6 +5719,18 @@ bool ManagedHeap::readPackedVec2Array(
         setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");
         return false;
     }
+    if (isPackedStorage(slot->storage())) {
+        if (unpackPackedEncoding(slot->auxMeta) != PackedElemEncoding::Vec2) {
+            setHeapError(error, ErrorCode::TypeMismatch, "array element is not a Vec2");
+            return false;
+        }
+        const std::size_t len = slot->payload.s.length;
+        out.resize(len);
+        if (len > 0) {
+            std::memcpy(out.data(), static_cast<const void*>(slot->payload.s.data), len * sizeof(Vec2Value));
+        }
+        return true;
+    }
     const auto len = Impl::slotValueCount(*slot);
     const Value* values = slot->payload.s.data;
     out.resize(len);
@@ -4545,6 +5773,20 @@ bool ManagedHeap::writePackedVec2Array(
         setHeapError(error, ErrorCode::TypeMismatch, "array element is not a Vec2");
         return false;
     }
+    if (isPackedStorage(slot->storage())) {
+        if (unpackPackedEncoding(slot->auxMeta) != PackedElemEncoding::Vec2) {
+            setHeapError(error, ErrorCode::TypeMismatch, "array element is not a Vec2");
+            return false;
+        }
+        if (count > slot->payload.s.length) {
+            setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
+            return false;
+        }
+        if (count > 0) {
+            std::memcpy(static_cast<void*>(slot->payload.s.data), data, count * sizeof(Vec2Value));
+        }
+        return true;
+    }
     const auto len = Impl::slotValueCount(*slot);
     if (count > len) {
         setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");
@@ -4556,6 +5798,17 @@ bool ManagedHeap::writePackedVec2Array(
     }
     return true;
 }
+
+#define RS_DEFINE_PACKED_MATH_BULK_IO(MethodSuffix, ValueStruct, EncodingEnum, TypeIdFn, LabelStr, TryGetExpr) bool ManagedHeap::readPacked##MethodSuffix##Array(                                                                 ObjectRef reference,                                                                                           std::vector<ValueStruct>& out,                                                                                 RuntimeError* error) const {                                                                                   HeapSyncMutexGuard heapLock(impl_->syncState->mutex);                                                          const auto* slot = impl_->getSlot(reference);                                                                  if (!slot || slot->kind() != ObjectKind::Array) {                                                                  setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");                  return false;                                                                                              }                                                                                                              if (isPackedStorage(slot->storage())) {                                                                            if (unpackPackedEncoding(slot->auxMeta) != PackedElemEncoding::EncodingEnum) {                                     setHeapError(error, ErrorCode::TypeMismatch, "array element is not a " LabelStr);                              return false;                                                                                              }                                                                                                              const std::size_t len = slot->payload.s.length;                                                                out.resize(len);                                                                                               if (len > 0) {                                                                                                     std::memcpy(out.data(), static_cast<const void*>(slot->payload.s.data), len * sizeof(ValueStruct));        }                                                                                                              return true;                                                                                               }                                                                                                              const auto len = Impl::slotValueCount(*slot);                                                                  const Value* values = slot->payload.s.data;                                                                    out.resize(len);                                                                                               for (std::size_t i = 0; i < len; ++i) {                                                                            ValueStruct elem{};                                                                                            const Value& cur = values[i];                                                                                  if (!(TryGetExpr)) {                                                                                               setHeapError(error, ErrorCode::TypeMismatch, "array element is not a " LabelStr);                              return false;                                                                                              }                                                                                                              out[i] = elem;                                                                                             }                                                                                                              return true;                                                                                               }                                                                                                              bool ManagedHeap::writePacked##MethodSuffix##Array(                                                                ObjectRef reference,                                                                                           const ValueStruct* data,                                                                                       std::size_t count,                                                                                             RuntimeError* error) {                                                                                         if (count > 0 && !data) {                                                                                          setHeapError(error, ErrorCode::InvalidArguments, "bulk write source buffer is null");                          return false;                                                                                              }                                                                                                              HeapSyncMutexGuard heapLock(impl_->syncState->mutex);                                                          auto* slot = impl_->getSlot(reference);                                                                        if (!slot || slot->kind() != ObjectKind::Array) {                                                                  setHeapError(error, ErrorCode::InvalidObjectReference, "managed array reference is invalid");                  return false;                                                                                              }                                                                                                              const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];                                             if (layout.elementType != semantic::PrimitiveType::Error &&                                                        !(layout.elementType == semantic::PrimitiveType::Struct && layout.elementTypeId == TypeIdFn())) {              setHeapError(error, ErrorCode::TypeMismatch, "array element is not a " LabelStr);                              return false;                                                                                              }                                                                                                              if (isPackedStorage(slot->storage())) {                                                                            if (unpackPackedEncoding(slot->auxMeta) != PackedElemEncoding::EncodingEnum) {                                     setHeapError(error, ErrorCode::TypeMismatch, "array element is not a " LabelStr);                              return false;                                                                                              }                                                                                                              if (count > slot->payload.s.length) {                                                                              setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");                            return false;                                                                                              }                                                                                                              if (count > 0) {                                                                                                   std::memcpy(static_cast<void*>(slot->payload.s.data), data, count * sizeof(ValueStruct));                  }                                                                                                              return true;                                                                                               }                                                                                                              const auto len = Impl::slotValueCount(*slot);                                                                  if (count > len) {                                                                                                 setHeapError(error, ErrorCode::IndexOutOfRange, "bulk write exceeds array length");                            return false;                                                                                              }                                                                                                              Value* values = slot->payload.s.data;                                                                          for (std::size_t i = 0; i < count; ++i) {                                                                          values[i] = Value{data[i]};                                                                                }                                                                                                              return true;                                                                                               }
+
+RS_DEFINE_PACKED_MATH_BULK_IO(Vec3, Vec3Value, Vec3, vec3TypeId, "Vec3", cur.tryGetVec3(elem))
+RS_DEFINE_PACKED_MATH_BULK_IO(Quat, QuatValue, Quat, quatTypeId, "Quat", cur.tryGetQuat(elem))
+RS_DEFINE_PACKED_MATH_BULK_IO(Fixed64, Fixed64Value, Fixed32_32, fixed64TypeId, "Fixed64", cur.tryGetFixed64(elem.raw))
+RS_DEFINE_PACKED_MATH_BULK_IO(Vec2f, Vec2fValue, Vec2f, vec2fTypeId, "Vec2f", cur.tryGetVec2f(elem))
+RS_DEFINE_PACKED_MATH_BULK_IO(Vec3f, Vec3fValue, Vec3f, vec3fTypeId, "Vec3f", cur.tryGetVec3f(elem))
+RS_DEFINE_PACKED_MATH_BULK_IO(Quatf, QuatfValue, Quatf, quatfTypeId, "Quatf", cur.tryGetQuatf(elem))
+
+#undef RS_DEFINE_PACKED_MATH_BULK_IO
 
 const GcStatistics& ManagedHeap::statistics() const noexcept {
     return impl_->statistics;
@@ -4602,7 +5855,7 @@ HeapSnapshot ManagedHeap::Impl::snapshotUnlocked(const ShadowStack* shadowStack)
                 info.values.resize(pCount);
                 for (std::size_t i = 0; i < pCount; ++i) {
                     info.values[i] = readPackedElementValue(
-                        slot.payload.s.data, i, enc, layout.elementTypeId);
+                        slot.payload.s.data, i, enc, layout.elementTypeId, slot.payload.s.cardHandle);
                 }
             } else {
                 const auto count = Impl::slotValueCount(slot);
@@ -4869,20 +6122,38 @@ bool ManagedHeap::restore(
 
             const std::size_t count = info.values.size();
             PackedStorageSpec restorePacked{};
-            if (info.kind == ObjectKind::Array &&
+            bool canPackRestore = info.kind == ObjectKind::Array &&
                 count <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) &&
                 tryClassifyPackedArray(
                     info.elementType,
                     info.elementTypeId,
                     count > 0 ? &info.values[0] : nullptr,
-                    restorePacked)) {
+                    restorePacked) &&
+                restorePacked.strideBytes > 0u;
+            if (canPackRestore && restorePacked.encoding == PackedElemEncoding::BlittableStruct) {
+                const auto& reg = globalBlittableRegistry();
+                const auto* schema = reg.getByIdLockFree(restorePacked.schemaId);
+                if (!schema) {
+                    canPackRestore = false;
+                } else {
+                    std::vector<std::uint8_t> probe(schema->strideBytes);
+                    for (const auto& v : info.values) {
+                        bool needsDemote = false;
+                        if (!encodeBlittableStructBytes(reg, probe.data(), *schema, v, needsDemote)) {
+                            canPackRestore = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (canPackRestore) {
                 if (restorePacked.encoding == PackedElemEncoding::Int32) {
                     for (const auto& v : info.values) {
                         std::int64_t iv = 0;
                         if (v.tryGetInt64(iv) &&
                             (iv < std::numeric_limits<std::int32_t>::min() ||
                              iv > std::numeric_limits<std::int32_t>::max())) {
-                            restorePacked = {SlotStorage::PackedI64, PackedElemEncoding::Int64Wide, 3};
+                            restorePacked = {SlotStorage::PackedI64, PackedElemEncoding::Int64Wide, 3, 8u, 0xFFFFFFFFu};
                             break;
                         }
                     }
@@ -4892,18 +6163,24 @@ bool ManagedHeap::restore(
                         if (v.tryGetEnum(ev) &&
                             (ev.value < std::numeric_limits<std::int32_t>::min() ||
                              ev.value > std::numeric_limits<std::int32_t>::max())) {
-                            restorePacked = {SlotStorage::PackedI64, PackedElemEncoding::EnumWide, 3};
+                            restorePacked = {SlotStorage::PackedI64, PackedElemEncoding::EnumWide, 3, 8u, 0xFFFFFFFFu};
                             break;
                         }
                     }
                 }
-                const std::size_t pBytes = count << restorePacked.elemShift;
+                const std::size_t pBytes = count * static_cast<std::size_t>(restorePacked.strideBytes);
                 Value* alignedPtr = nullptr;
                 const std::uint32_t handle = impl_->packedBuffers.acquireZeroed(pBytes, alignedPtr);
                 bool dummyWiden = false;
                 for (std::size_t fi = 0; fi < count; ++fi) {
                     (void)writePackedElementValue(
-                        alignedPtr, fi, restorePacked.encoding, info.elementTypeId, info.values[fi], dummyWiden);
+                        alignedPtr,
+                        fi,
+                        restorePacked.encoding,
+                        info.elementTypeId,
+                        info.values[fi],
+                        dummyWiden,
+                        restorePacked.schemaId);
                 }
                 slot.setKindAndStorage(ObjectKind::Array, restorePacked.storage);
                 slot.auxMeta = packPackedAuxMeta(restorePacked.encoding, restorePacked.elemShift);
@@ -4912,7 +6189,7 @@ bool ManagedHeap::restore(
                     static_cast<std::uint32_t>(count),
                     alignedPtr,
                     handle,
-                    CompactSlot::kInvalidHandle,
+                    restorePacked.schemaId,
                 };
             } else if (count <= CompactSlot::kInlineValueCapacity) {
                 std::uint16_t cls = 0;
@@ -5816,6 +7093,25 @@ bool ManagedHeap::migrateTypeLayouts(
                     outChanged = true;
                     return Value{makeStructValueFromFields(st->typeId, std::move(updatedFields))};
                 }
+            } else if (st->isInline && st->nestedTypeId() != 0 &&
+                       (!structMigrations.empty() || !removedTypeIds.empty())) {
+                const std::size_t fCount = st->fieldCount();
+                bool anyInnerChanged = false;
+                std::vector<Value> updatedFields;
+                updatedFields.reserve(fCount);
+                for (std::size_t i = 0; i < fCount; ++i) {
+                    Value inner{};
+                    if (const auto fv = structValueFieldAt(*st, i)) {
+                        inner = *fv;
+                    }
+                    bool elemChanged = false;
+                    updatedFields.push_back(self(self, inner, depth + 1, elemChanged));
+                    anyInnerChanged = anyInnerChanged || elemChanged;
+                }
+                if (anyInnerChanged) {
+                    outChanged = true;
+                    return Value{makeStructValueFromFields(st->typeId, std::move(updatedFields))};
+                }
             }
         }
         return val;
@@ -6166,12 +7462,146 @@ bool ManagedHeap::migrateTypeLayouts(
         ++localStats.objectsMigrated;
     }
 
+    if (!structMigrations.empty() || !removedTypeIds.empty()) {
+        std::vector<std::pair<semantic::SymbolId, std::vector<BlittableFieldInput>>> updatedStructs;
+        for (const auto& mig : migrations) {
+            if (mig.typeKind != semantic::TypeKind::Struct || mig.typeId == 0) continue;
+            if (mig.removedType) {
+                std::lock_guard<std::mutex> regLock(globalBlittableRegistry().mutex);
+                globalBlittableRegistry().markNonBlittableUnlocked(mig.typeId);
+                continue;
+            }
+            std::vector<BlittableFieldInput> fInputs;
+            fInputs.reserve(mig.newFieldCount);
+            for (std::size_t fi = 0; fi < mig.newFieldCount; ++fi) {
+                if (fi < mig.fieldOps.size()) {
+                    fInputs.push_back(BlittableFieldInput{
+                        mig.fieldOps[fi].targetType,
+                        mig.fieldOps[fi].targetTypeId});
+                } else {
+                    fInputs.push_back(BlittableFieldInput{semantic::PrimitiveType::Error, 0});
+                }
+            }
+            updatedStructs.emplace_back(mig.typeId, std::move(fInputs));
+        }
+        if (!updatedStructs.empty()) {
+            registerBlittableStructTypes(updatedStructs);
+        }
+    }
+
+    const auto schemaTouchesMigratedStruct = [&](auto& self, std::uint32_t sid, std::uint32_t depth) -> bool {
+        if (sid == 0u || sid == CompactSlot::kInvalidHandle || depth > 16u) return false;
+        const auto* sc = globalBlittableRegistry().getByIdLockFree(sid);
+        if (!sc) return false;
+        if (structMigrations.count(sc->structTypeId) != 0 ||
+            removedTypeIds.count(sc->structTypeId) != 0) {
+            return true;
+        }
+        for (const auto& f : sc->fields) {
+            if (f.kind == BlittableLeafKind::NestedStruct &&
+                self(self, f.nestedSchemaId, depth + 1u)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     // Rebind live Delegate dispatch slots & migrate embedded StructValues / removed ObjectRefs in remaining slots
     if (!delegateUpdates.empty() || !structMigrations.empty() || !removedTypeIds.empty()) {
         for (std::uint32_t slotIdx = 0; slotIdx < static_cast<std::uint32_t>(impl_->slots.size()); ++slotIdx) {
             if (migratedSlotIndices.count(slotIdx) != 0) continue;
             auto& slot = impl_->slots[slotIdx];
             if (!slot.occupied()) continue;
+            if (slot.kind() == ObjectKind::Array &&
+                slot.storage() == SlotStorage::PackedStruct &&
+                unpackPackedEncoding(slot.auxMeta) == PackedElemEncoding::BlittableStruct &&
+                schemaTouchesMigratedStruct(schemaTouchesMigratedStruct, slot.payload.s.cardHandle, 0u)) {
+                const auto& arrLayout = impl_->typeLayouts[slot.payload.s.layoutId];
+                const std::size_t pCount = slot.payload.s.length;
+                const std::uint32_t oldSid = slot.payload.s.cardHandle;
+                std::vector<Value> elems(pCount);
+                bool anyChanged = false;
+                for (std::size_t idx = 0; idx < pCount; ++idx) {
+                    Value orig = readPackedElementValue(
+                        slot.payload.s.data,
+                        idx,
+                        PackedElemEncoding::BlittableStruct,
+                        arrLayout.elementTypeId,
+                        oldSid);
+                    bool ch = false;
+                    elems[idx] = migrateEmbeddedValue(migrateEmbeddedValue, orig, 0, ch);
+                    anyChanged = anyChanged || ch;
+                }
+                PackedStorageSpec newSpec{};
+                bool canRepack = tryClassifyPackedArray(
+                    semantic::PrimitiveType::Struct,
+                    arrLayout.elementTypeId,
+                    pCount > 0 ? &elems[0] : nullptr,
+                    newSpec) &&
+                    newSpec.encoding == PackedElemEncoding::BlittableStruct &&
+                    newSpec.strideBytes > 0u;
+                if (canRepack) {
+                    const auto* newSc = globalBlittableRegistry().getByIdLockFree(newSpec.schemaId);
+                    if (!newSc) {
+                        canRepack = false;
+                    } else {
+                        std::vector<std::uint8_t> probe(newSc->strideBytes);
+                        for (const auto& ev : elems) {
+                            bool dummy = false;
+                            if (!encodeBlittableStructBytes(globalBlittableRegistry(), probe.data(), *newSc, ev, dummy)) {
+                                canRepack = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                const std::size_t oldSlotBytes = impl_->slotSizeBytes(slotIdx, slot);
+                if (canRepack) {
+                    const std::size_t newBufBytes = pCount * static_cast<std::size_t>(newSpec.strideBytes);
+                    Value* newAlignedPtr = nullptr;
+                    const std::uint32_t newHandle = impl_->packedBuffers.acquireZeroed(newBufBytes, newAlignedPtr);
+                    bool dummy = false;
+                    for (std::size_t idx = 0; idx < pCount; ++idx) {
+                        (void)writePackedElementValue(
+                            newAlignedPtr,
+                            idx,
+                            PackedElemEncoding::BlittableStruct,
+                            arrLayout.elementTypeId,
+                            elems[idx],
+                            dummy,
+                            newSpec.schemaId);
+                    }
+                    impl_->packedBuffers.release(slot.payload.s.handle);
+                    slot.payload.s.data = newAlignedPtr;
+                    slot.payload.s.handle = newHandle;
+                    slot.payload.s.cardHandle = newSpec.schemaId;
+                    const std::size_t newSlotBytes = impl_->slotSizeBytes(slotIdx, slot);
+                    if (!slot.hasFlag(GcFlag::CustomSize)) {
+                        if (newSlotBytes >= oldSlotBytes) {
+                            const std::size_t d = newSlotBytes - oldSlotBytes;
+                            impl_->statistics.liveBytes += d;
+                            impl_->statistics.bytesAllocated += d;
+                            impl_->statistics.peakLiveBytes = std::max(
+                                impl_->statistics.peakLiveBytes, impl_->statistics.liveBytes);
+                        } else {
+                            const std::size_t d = oldSlotBytes - newSlotBytes;
+                            impl_->statistics.liveBytes = (impl_->statistics.liveBytes >= d)
+                                ? (impl_->statistics.liveBytes - d)
+                                : 0;
+                            impl_->statistics.bytesReclaimed += d;
+                        }
+                    }
+                } else if (impl_->demotePackedStructSlotToValuesUnlocked(slotIdx, slot)) {
+                    Value* data = slot.payload.s.data;
+                    const ObjectRef ownerRef{slotIdx, slot.generation, ObjectKind::Array, impl_->heapId};
+                    for (std::size_t idx = 0; idx < pCount; ++idx) {
+                        impl_->pinHeapValueIfNeededUnlocked(elems[idx]);
+                        impl_->writeBarrierArrayElement(ownerRef, idx, elems[idx]);
+                        data[idx] = std::move(elems[idx]);
+                    }
+                }
+                continue;
+            }
             const std::size_t count = Impl::slotValueCount(slot);
             if (count == 0) continue;
             Value* data = slot.payload.s.data;

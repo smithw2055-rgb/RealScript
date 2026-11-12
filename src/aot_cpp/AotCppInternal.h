@@ -69,9 +69,13 @@ enum class InlineMathKind : std::uint8_t {
     None = 0,
     Fixed,
     Fixed16,
+    Fixed64,
     Vec2,
     Vec3,
     Quat,
+    Vec2f,
+    Vec3f,
+    Quatf,
 };
 
 struct TypedSlotType {

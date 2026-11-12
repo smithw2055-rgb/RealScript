@@ -547,9 +547,13 @@ GeneratedProgram CppGenerator::generate(
                 switch (classifyInlineMath(field.type, fTypeId)) {
                 case InlineMathKind::Fixed: expectedKind = "runtime::NativeFieldKind::Fixed"; break;
                 case InlineMathKind::Fixed16: expectedKind = "runtime::NativeFieldKind::Fixed16"; break;
+                case InlineMathKind::Fixed64: expectedKind = "runtime::NativeFieldKind::Fixed64"; break;
                 case InlineMathKind::Vec2: expectedKind = "runtime::NativeFieldKind::Vec2"; break;
                 case InlineMathKind::Vec3: expectedKind = "runtime::NativeFieldKind::Vec3"; break;
                 case InlineMathKind::Quat: expectedKind = "runtime::NativeFieldKind::Quat"; break;
+                case InlineMathKind::Vec2f: expectedKind = "runtime::NativeFieldKind::Vec2f"; break;
+                case InlineMathKind::Vec3f: expectedKind = "runtime::NativeFieldKind::Vec3f"; break;
+                case InlineMathKind::Quatf: expectedKind = "runtime::NativeFieldKind::Quatf"; break;
                 case InlineMathKind::None: break;
                 }
                 break;

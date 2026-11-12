@@ -1238,10 +1238,16 @@ void emitTypedPrimitiveFunction(
                     const char* member = inlineMathFieldMember(
                         kind, instruction.fieldIndex);
                     if (kind == InlineMathKind::Fixed ||
-                        kind == InlineMathKind::Fixed16) {
+                        kind == InlineMathKind::Fixed16 ||
+                        kind == InlineMathKind::Fixed64) {
                         source.line("            " + result +
                             " = static_cast<std::int64_t>(" + operand(0) + "." +
                             member + ");");
+                    } else if (kind == InlineMathKind::Vec2f ||
+                               kind == InlineMathKind::Vec3f ||
+                               kind == InlineMathKind::Quatf) {
+                        source.line("            " + result +
+                            " = " + operand(0) + "." + member + ";");
                     } else {
                         source.line("            " + result +
                             " = runtime::FixedValue{" + operand(0) + "." +
@@ -1260,10 +1266,18 @@ void emitTypedPrimitiveFunction(
                     const char* member = inlineMathFieldMember(
                         kind, instruction.fieldIndex);
                     source.line("            " + result + " = " + operand(0) + ";");
-                    if (kind == InlineMathKind::Fixed ||
-                        kind == InlineMathKind::Fixed16) {
+                    if (kind == InlineMathKind::Fixed) {
                         source.line("            " + result + "." + member +
                             " = static_cast<std::int32_t>(" + operand(1) + ");");
+                    } else if (kind == InlineMathKind::Fixed16 ||
+                               kind == InlineMathKind::Fixed64) {
+                        source.line("            " + result + "." + member +
+                            " = static_cast<std::int64_t>(" + operand(1) + ");");
+                    } else if (kind == InlineMathKind::Vec2f ||
+                               kind == InlineMathKind::Vec3f ||
+                               kind == InlineMathKind::Quatf) {
+                        source.line("            " + result + "." + member +
+                            " = " + operand(1) + ";");
                     } else {
                         source.line("            " + result + "." + member +
                             " = " + operand(1) + ".raw;");

@@ -246,6 +246,14 @@ std::optional<ScriptTypeRef> resolveScriptType(
         return ScriptTypeRef{"Vec3", "RealScript.Math", ScriptTypeCategory::Struct};
     } else if constexpr (std::is_same_v<ValueType, Quat>) {
         return ScriptTypeRef{"Quat", "RealScript.Math", ScriptTypeCategory::Struct};
+    } else if constexpr (std::is_same_v<ValueType, Fixed64>) {
+        return ScriptTypeRef{"Fixed64", "RealScript.Math", ScriptTypeCategory::Struct};
+    } else if constexpr (std::is_same_v<ValueType, Vec2f>) {
+        return ScriptTypeRef{"Vec2f", "RealScript.Math", ScriptTypeCategory::Struct};
+    } else if constexpr (std::is_same_v<ValueType, Vec3f>) {
+        return ScriptTypeRef{"Vec3f", "RealScript.Math", ScriptTypeCategory::Struct};
+    } else if constexpr (std::is_same_v<ValueType, Quatf>) {
+        return ScriptTypeRef{"Quatf", "RealScript.Math", ScriptTypeCategory::Struct};
     } else if constexpr (std::is_same_v<ValueType, runtime::CancellationToken>) {
         return ScriptTypeRef{"CancellationToken", "RealScript.Async", ScriptTypeCategory::Struct};
     } else if constexpr (std::is_same_v<ValueType, runtime::AwaitableHandle>) {

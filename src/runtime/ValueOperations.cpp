@@ -36,18 +36,46 @@ semantic::SymbolId vec3TypeId() noexcept {
     return id;
 }
 
+semantic::SymbolId fixed64TypeId() noexcept {
+    static const semantic::SymbolId id =
+        semantic::stableTypeId("RealScript.Math::Fixed64");
+    return id;
+}
+
 semantic::SymbolId quatTypeId() noexcept {
     static const semantic::SymbolId id =
         semantic::stableTypeId("RealScript.Math::Quat");
     return id;
 }
 
+semantic::SymbolId vec2fTypeId() noexcept {
+    static const semantic::SymbolId id =
+        semantic::stableTypeId("RealScript.Math::Vec2f");
+    return id;
+}
+
+semantic::SymbolId vec3fTypeId() noexcept {
+    static const semantic::SymbolId id =
+        semantic::stableTypeId("RealScript.Math::Vec3f");
+    return id;
+}
+
+semantic::SymbolId quatfTypeId() noexcept {
+    static const semantic::SymbolId id =
+        semantic::stableTypeId("RealScript.Math::Quatf");
+    return id;
+}
+
 std::optional<semantic::SymbolId> structValueTypeId(const Value& value) noexcept {
     if (std::holds_alternative<FixedValue>(value)) return fixedTypeId();
     if (std::holds_alternative<Fixed16Value>(value)) return fixed16TypeId();
+    if (std::holds_alternative<Fixed64Value>(value)) return fixed64TypeId();
     if (std::holds_alternative<Vec2Value>(value)) return vec2TypeId();
     if (std::holds_alternative<Vec3Value>(value)) return vec3TypeId();
     if (std::holds_alternative<QuatValue>(value)) return quatTypeId();
+    if (std::holds_alternative<Vec2fValue>(value)) return vec2fTypeId();
+    if (std::holds_alternative<Vec3fValue>(value)) return vec3fTypeId();
+    if (std::holds_alternative<QuatfValue>(value)) return quatfTypeId();
     if (const auto* s = std::get_if<StructValue>(&value)) return s->typeId;
     return std::nullopt;
 }
@@ -55,9 +83,13 @@ std::optional<semantic::SymbolId> structValueTypeId(const Value& value) noexcept
 std::optional<Value> makeDefaultInlineStructValue(semantic::SymbolId typeId) noexcept {
     if (typeId == fixedTypeId()) return Value{FixedValue{}};
     if (typeId == fixed16TypeId()) return Value{Fixed16Value{}};
+    if (typeId == fixed64TypeId()) return Value{Fixed64Value{}};
     if (typeId == vec2TypeId()) return Value{Vec2Value{}};
     if (typeId == vec3TypeId()) return Value{Vec3Value{}};
     if (typeId == quatTypeId()) return Value{QuatValue{}};
+    if (typeId == vec2fTypeId()) return Value{Vec2fValue{}};
+    if (typeId == vec3fTypeId()) return Value{Vec3fValue{}};
+    if (typeId == quatfTypeId()) return Value{QuatfValue{}};
     return std::nullopt;
 }
 
@@ -137,6 +169,40 @@ std::optional<InlineStructSlot> encodeInlineStructSlot(
         slot.kind = InlineStructSlot::Kind::Fixed16;
         slot.setBits(static_cast<std::uint64_t>(v->raw));
         return slot;
+    }
+    if (const auto* v = std::get_if<Fixed64Value>(&value)) {
+        slot.kind = InlineStructSlot::Kind::Fixed64;
+        slot.setBits(static_cast<std::uint64_t>(v->raw));
+        return slot;
+    }
+    if (const auto* v = std::get_if<Vec2fValue>(&value)) {
+        slot.kind = InlineStructSlot::Kind::Vec2f;
+        std::memcpy(&slot.lo, &v->x, sizeof(float));
+        std::memcpy(&slot.hi, &v->y, sizeof(float));
+        return slot;
+    }
+    if (const auto* v = std::get_if<Vec3fValue>(&value)) {
+        std::uint32_t zBits = 0;
+        std::memcpy(&zBits, &v->z, sizeof(float));
+        if ((zBits & 0xFFu) == 0u) {
+            slot.kind = InlineStructSlot::Kind::Vec3f;
+            std::memcpy(&slot.lo, &v->x, sizeof(float));
+            std::memcpy(&slot.hi, &v->y, sizeof(float));
+            slot.aux0 = static_cast<std::uint8_t>((zBits >> 8u) & 0xFFu);
+            slot.aux1 = static_cast<std::uint8_t>((zBits >> 16u) & 0xFFu);
+            slot.aux2 = static_cast<std::uint8_t>((zBits >> 24u) & 0xFFu);
+            return slot;
+        }
+        return std::nullopt;
+    }
+    if (QuatfValue qf{}; value.tryGetQuatf(qf)) {
+        if (qf.x == 0.0f && qf.y == 0.0f) {
+            slot.kind = InlineStructSlot::Kind::Quatf;
+            std::memcpy(&slot.lo, &qf.z, sizeof(float));
+            std::memcpy(&slot.hi, &qf.w, sizeof(float));
+            return slot;
+        }
+        return std::nullopt;
     }
     if (EnumValue ev{}; value.tryGetEnum(ev)) {
         if (ev.value >= -8388608 && ev.value <= 8388607) {
@@ -243,6 +309,31 @@ Value decodeInlineStructSlot(const InlineStructSlot& slot) noexcept {
         return FixedValue{static_cast<std::int32_t>(slot.lo)};
     case InlineStructSlot::Kind::Fixed16:
         return Fixed16Value{static_cast<std::int64_t>(bits)};
+    case InlineStructSlot::Kind::Fixed64:
+        return Fixed64Value{static_cast<std::int64_t>(bits)};
+    case InlineStructSlot::Kind::Vec2f: {
+        Vec2fValue out{};
+        std::memcpy(&out.x, &slot.lo, sizeof(float));
+        std::memcpy(&out.y, &slot.hi, sizeof(float));
+        return out;
+    }
+    case InlineStructSlot::Kind::Vec3f: {
+        Vec3fValue out{};
+        std::memcpy(&out.x, &slot.lo, sizeof(float));
+        std::memcpy(&out.y, &slot.hi, sizeof(float));
+        const std::uint32_t zBits =
+            (static_cast<std::uint32_t>(slot.aux0) << 8u) |
+            (static_cast<std::uint32_t>(slot.aux1) << 16u) |
+            (static_cast<std::uint32_t>(slot.aux2) << 24u);
+        std::memcpy(&out.z, &zBits, sizeof(float));
+        return out;
+    }
+    case InlineStructSlot::Kind::Quatf: {
+        QuatfValue out{};
+        std::memcpy(&out.z, &slot.lo, sizeof(float));
+        std::memcpy(&out.w, &slot.hi, sizeof(float));
+        return out;
+    }
     case InlineStructSlot::Kind::Enum:
         return EnumValue{
             bits,
@@ -532,6 +623,28 @@ std::optional<Value> loadInlineStructField(
         if (fieldIndex == 3) return Value{FixedValue{q.w}};
         return std::nullopt;
     }
+    if (const auto* f64 = std::get_if<Fixed64Value>(&value)) {
+        if (fieldIndex == 0) return Value{LongValue{f64->raw}};
+        return std::nullopt;
+    }
+    if (const auto* v2f = std::get_if<Vec2fValue>(&value)) {
+        if (fieldIndex == 0) return Value{FloatValue{v2f->x}};
+        if (fieldIndex == 1) return Value{FloatValue{v2f->y}};
+        return std::nullopt;
+    }
+    if (const auto* v3f = std::get_if<Vec3fValue>(&value)) {
+        if (fieldIndex == 0) return Value{FloatValue{v3f->x}};
+        if (fieldIndex == 1) return Value{FloatValue{v3f->y}};
+        if (fieldIndex == 2) return Value{FloatValue{v3f->z}};
+        return std::nullopt;
+    }
+    if (QuatfValue qf{}; value.tryGetQuatf(qf)) {
+        if (fieldIndex == 0) return Value{FloatValue{qf.x}};
+        if (fieldIndex == 1) return Value{FloatValue{qf.y}};
+        if (fieldIndex == 2) return Value{FloatValue{qf.z}};
+        if (fieldIndex == 3) return Value{FloatValue{qf.w}};
+        return std::nullopt;
+    }
     if (const auto* s = std::get_if<StructValue>(&value); s && s->isInline) {
         return structValueFieldAt(*s, fieldIndex);
     }
@@ -615,6 +728,47 @@ std::optional<Value> storeInlineStructField(
         }
         return std::nullopt;
     }
+    if (std::holds_alternative<Fixed64Value>(structure)) {
+        if (fieldIndex != 0) return std::nullopt;
+        if (const auto* l = std::get_if<LongValue>(&fieldValue)) {
+            return Value{Fixed64Value{l->value}};
+        }
+        if (const auto* i = std::get_if<std::int64_t>(&fieldValue)) {
+            return Value{Fixed64Value{*i}};
+        }
+        return std::nullopt;
+    }
+    const auto extractFloatField = [](const Value& fv) noexcept -> std::optional<float> {
+        if (const auto* f = std::get_if<FloatValue>(&fv)) return f->value;
+        if (const auto* d = std::get_if<double>(&fv)) return static_cast<float>(*d);
+        return std::nullopt;
+    };
+    if (const auto* v2f = std::get_if<Vec2fValue>(&structure)) {
+        const auto f = extractFloatField(fieldValue);
+        if (!f) return std::nullopt;
+        Vec2fValue out = *v2f;
+        if (fieldIndex == 0) { out.x = *f; return Value{out}; }
+        if (fieldIndex == 1) { out.y = *f; return Value{out}; }
+        return std::nullopt;
+    }
+    if (const auto* v3f = std::get_if<Vec3fValue>(&structure)) {
+        const auto f = extractFloatField(fieldValue);
+        if (!f) return std::nullopt;
+        Vec3fValue out = *v3f;
+        if (fieldIndex == 0) { out.x = *f; return Value{out}; }
+        if (fieldIndex == 1) { out.y = *f; return Value{out}; }
+        if (fieldIndex == 2) { out.z = *f; return Value{out}; }
+        return std::nullopt;
+    }
+    if (QuatfValue out{}; structure.tryGetQuatf(out)) {
+        const auto f = extractFloatField(fieldValue);
+        if (!f) return std::nullopt;
+        if (fieldIndex == 0) { out.x = *f; return Value{out}; }
+        if (fieldIndex == 1) { out.y = *f; return Value{out}; }
+        if (fieldIndex == 2) { out.z = *f; return Value{out}; }
+        if (fieldIndex == 3) { out.w = *f; return Value{out}; }
+        return std::nullopt;
+    }
     if (const auto* s = std::get_if<StructValue>(&structure); s && s->isInline) {
         if (fieldIndex < s->inlineCount) {
             std::array<Value, StructValue::MaxInlineFields> unpacked{};
@@ -692,6 +846,37 @@ std::uint64_t computeStructFieldsHash(const std::vector<Value>& fields) noexcept
                 (static_cast<std::uint64_t>(static_cast<std::uint32_t>(qt.y)) << 16u) ^
                 (static_cast<std::uint64_t>(static_cast<std::uint32_t>(qt.z)) << 32u) ^
                 (static_cast<std::uint64_t>(static_cast<std::uint32_t>(qt.w)) << 48u);
+        } else if (const auto* fx64 = std::get_if<Fixed64Value>(&v)) {
+            vw ^= static_cast<std::uint64_t>(fx64->raw);
+        } else if (const auto* v2f = std::get_if<Vec2fValue>(&v)) {
+            const auto normBits = [](float f) noexcept {
+                const float n = (f == 0.0f) ? 0.0f : f;
+                std::uint32_t b = 0;
+                std::memcpy(&b, &n, sizeof(b));
+                return b;
+            };
+            vw ^= normBits(v2f->x) | (static_cast<std::uint64_t>(normBits(v2f->y)) << 32u);
+        } else if (const auto* v3f = std::get_if<Vec3fValue>(&v)) {
+            const auto normBits = [](float f) noexcept {
+                const float n = (f == 0.0f) ? 0.0f : f;
+                std::uint32_t b = 0;
+                std::memcpy(&b, &n, sizeof(b));
+                return b;
+            };
+            vw ^= normBits(v3f->x) ^
+                (static_cast<std::uint64_t>(normBits(v3f->y)) << 21u) ^
+                (static_cast<std::uint64_t>(normBits(v3f->z)) << 42u);
+        } else if (QuatfValue qf{}; v.tryGetQuatf(qf)) {
+            const auto normBits = [](float f) noexcept {
+                const float n = (f == 0.0f) ? 0.0f : f;
+                std::uint32_t b = 0;
+                std::memcpy(&b, &n, sizeof(b));
+                return b;
+            };
+            vw ^= normBits(qf.x) ^
+                (static_cast<std::uint64_t>(normBits(qf.y)) << 16u) ^
+                (static_cast<std::uint64_t>(normBits(qf.z)) << 32u) ^
+                (static_cast<std::uint64_t>(normBits(qf.w)) << 48u);
         } else if (const auto* sv = std::get_if<StringValue>(&v)) {
             vw ^= sv->id;
         } else if (const auto* st = std::get_if<StructValue>(&v)) {
@@ -769,6 +954,7 @@ bool intrinsicValueLess(const Value& a, const Value& b, const ManagedHeap* heap)
         }
         if (const auto* fxa = std::get_if<FixedValue>(&a)) return fxa->raw < std::get<FixedValue>(b).raw;
         if (const auto* f16a = std::get_if<Fixed16Value>(&a)) return f16a->raw < std::get<Fixed16Value>(b).raw;
+        if (const auto* f64a = std::get_if<Fixed64Value>(&a)) return f64a->raw < std::get<Fixed64Value>(b).raw;
         if (const auto* da = std::get_if<double>(&a)) return *da < std::get<double>(b);
         if (const auto* fla = std::get_if<FloatValue>(&a)) return fla->value < std::get<FloatValue>(b).value;
     }

@@ -348,6 +348,30 @@ std::optional<RemoveCvRef<T>> readValue(
         }
         setTypeMismatch(error, "expected Quat argument");
         return std::nullopt;
+    } else if constexpr (std::is_same_v<ValueType, Fixed64>) {
+        if (const auto* fx64 = std::get_if<runtime::Fixed64Value>(&value)) {
+            return Fixed64::fromRaw(fx64->raw);
+        }
+        setTypeMismatch(error, "expected Fixed64 argument");
+        return std::nullopt;
+    } else if constexpr (std::is_same_v<ValueType, Vec2f>) {
+        if (const auto* v2f = std::get_if<runtime::Vec2fValue>(&value)) {
+            return Vec2f{v2f->x, v2f->y};
+        }
+        setTypeMismatch(error, "expected Vec2f argument");
+        return std::nullopt;
+    } else if constexpr (std::is_same_v<ValueType, Vec3f>) {
+        if (const auto* v3f = std::get_if<runtime::Vec3fValue>(&value)) {
+            return Vec3f{v3f->x, v3f->y, v3f->z};
+        }
+        setTypeMismatch(error, "expected Vec3f argument");
+        return std::nullopt;
+    } else if constexpr (std::is_same_v<ValueType, Quatf>) {
+        if (runtime::QuatfValue qf{}; value.tryGetQuatf(qf)) {
+            return Quatf{qf.x, qf.y, qf.z, qf.w};
+        }
+        setTypeMismatch(error, "expected Quatf argument");
+        return std::nullopt;
     } else if constexpr (std::is_same_v<ValueType, runtime::CancellationToken>) {
         const auto* sVal = std::get_if<runtime::StructValue>(&value);
         if (sVal && sVal->valid() &&
@@ -501,6 +525,14 @@ std::optional<runtime::Value> writeValue(
         return runtime::Value{runtime::Vec3Value{value.x.raw, value.y.raw, value.z.raw}};
     } else if constexpr (std::is_same_v<ValueType, Quat>) {
         return runtime::Value{runtime::QuatValue{value.x.raw, value.y.raw, value.z.raw, value.w.raw}};
+    } else if constexpr (std::is_same_v<ValueType, Fixed64>) {
+        return runtime::Value{runtime::Fixed64Value{value.raw}};
+    } else if constexpr (std::is_same_v<ValueType, Vec2f>) {
+        return runtime::Value{runtime::Vec2fValue{value.x, value.y}};
+    } else if constexpr (std::is_same_v<ValueType, Vec3f>) {
+        return runtime::Value{runtime::Vec3fValue{value.x, value.y, value.z}};
+    } else if constexpr (std::is_same_v<ValueType, Quatf>) {
+        return runtime::Value{runtime::QuatfValue{value.x, value.y, value.z, value.w}};
     } else if constexpr (std::is_same_v<ValueType, runtime::CancellationToken>) {
         const runtime::Value field{
             runtime::LongValue{static_cast<std::int64_t>(value.pack64())}};

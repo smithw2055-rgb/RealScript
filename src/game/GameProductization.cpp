@@ -45,6 +45,10 @@ enum class ValueTag : std::uint8_t {
     Vec2,
     Vec3,
     Quat,
+    Fixed64,
+    Vec2f,
+    Vec3f,
+    Quatf,
 };
 
 void fail(runtime::RuntimeError& error, runtime::ErrorCode code, std::string message) {
@@ -93,12 +97,16 @@ bool allowedValue(
         std::holds_alternative<runtime::FixedValue>(value) ||
         std::holds_alternative<runtime::Fixed16Value>(value) ||
         std::holds_alternative<runtime::Vec2Value>(value) ||
+        std::holds_alternative<runtime::Fixed64Value>(value) ||
         std::holds_alternative<runtime::Vec3Value>(value) ||
         std::holds_alternative<runtime::QuatValue>(value)) {
         return true;
     }
     if (std::holds_alternative<runtime::FloatValue>(value) ||
-        std::holds_alternative<double>(value)) return policy.allowDoubles;
+        std::holds_alternative<double>(value) ||
+        std::holds_alternative<runtime::Vec2fValue>(value) ||
+        std::holds_alternative<runtime::Vec3fValue>(value) ||
+        std::holds_alternative<runtime::QuatfValue>(value)) return policy.allowDoubles;
     if (std::holds_alternative<std::string>(value)) return policy.allowStrings;
     const auto* structure = std::get_if<runtime::StructValue>(&value);
     if (!structure || !structure->valid()) return false;
@@ -262,6 +270,25 @@ bool writeValue(
         writer.writeU32(static_cast<std::uint32_t>(item.y));
         writer.writeU32(static_cast<std::uint32_t>(item.z));
         writer.writeU32(static_cast<std::uint32_t>(item.w));
+    } else if (const auto* item = std::get_if<runtime::Fixed64Value>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::Fixed64));
+        writer.writeU64(static_cast<std::uint64_t>(item->raw));
+    } else if (const auto* item = std::get_if<runtime::Vec2fValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::Vec2f));
+        std::uint32_t bx = 0, by = 0;
+        std::memcpy(&bx, &item->x, 4); std::memcpy(&by, &item->y, 4);
+        writer.writeU32(bx); writer.writeU32(by);
+    } else if (const auto* item = std::get_if<runtime::Vec3fValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::Vec3f));
+        std::uint32_t bx = 0, by = 0, bz = 0;
+        std::memcpy(&bx, &item->x, 4); std::memcpy(&by, &item->y, 4); std::memcpy(&bz, &item->z, 4);
+        writer.writeU32(bx); writer.writeU32(by); writer.writeU32(bz);
+    } else if (runtime::QuatfValue qf{}; value.tryGetQuatf(qf)) {
+        writer.writeU8(static_cast<std::uint8_t>(ValueTag::Quatf));
+        std::uint32_t bx = 0, by = 0, bz = 0, bw = 0;
+        std::memcpy(&bx, &qf.x, 4); std::memcpy(&by, &qf.y, 4);
+        std::memcpy(&bz, &qf.z, 4); std::memcpy(&bw, &qf.w, 4);
+        writer.writeU32(bx); writer.writeU32(by); writer.writeU32(bz); writer.writeU32(bw);
     } else if (const auto* item = std::get_if<runtime::StructValue>(&value)) {
         writer.writeU8(static_cast<std::uint8_t>(ValueTag::Struct));
         writer.writeU64(item->typeId);
@@ -426,6 +453,39 @@ bool readValue(
             static_cast<std::int32_t>(y),
             static_cast<std::int32_t>(z),
             static_cast<std::int32_t>(w)};
+        return true;
+    }
+    case ValueTag::Fixed64: {
+        if (!reader.readU64(first)) return false;
+        value = runtime::Fixed64Value{static_cast<std::int64_t>(first)};
+        return true;
+    }
+    case ValueTag::Vec2f: {
+        if (!policy.allowDoubles) return false;
+        std::uint32_t bx = 0, by = 0;
+        if (!reader.readU32(bx) || !reader.readU32(by)) return false;
+        runtime::Vec2fValue out{};
+        std::memcpy(&out.x, &bx, 4); std::memcpy(&out.y, &by, 4);
+        value = out;
+        return true;
+    }
+    case ValueTag::Vec3f: {
+        if (!policy.allowDoubles) return false;
+        std::uint32_t bx = 0, by = 0, bz = 0;
+        if (!reader.readU32(bx) || !reader.readU32(by) || !reader.readU32(bz)) return false;
+        runtime::Vec3fValue out{};
+        std::memcpy(&out.x, &bx, 4); std::memcpy(&out.y, &by, 4); std::memcpy(&out.z, &bz, 4);
+        value = out;
+        return true;
+    }
+    case ValueTag::Quatf: {
+        if (!policy.allowDoubles) return false;
+        std::uint32_t bx = 0, by = 0, bz = 0, bw = 0;
+        if (!reader.readU32(bx) || !reader.readU32(by) || !reader.readU32(bz) || !reader.readU32(bw)) return false;
+        runtime::QuatfValue out{};
+        std::memcpy(&out.x, &bx, 4); std::memcpy(&out.y, &by, 4);
+        std::memcpy(&out.z, &bz, 4); std::memcpy(&out.w, &bw, 4);
+        value = out;
         return true;
     }
     }

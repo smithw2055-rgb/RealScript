@@ -286,9 +286,13 @@ InlineMathKind classifyInlineMath(
     }
     if (typeId == runtime::fixedTypeId()) return InlineMathKind::Fixed;
     if (typeId == runtime::fixed16TypeId()) return InlineMathKind::Fixed16;
+    if (typeId == runtime::fixed64TypeId()) return InlineMathKind::Fixed64;
     if (typeId == runtime::vec2TypeId()) return InlineMathKind::Vec2;
     if (typeId == runtime::vec3TypeId()) return InlineMathKind::Vec3;
     if (typeId == runtime::quatTypeId()) return InlineMathKind::Quat;
+    if (typeId == runtime::vec2fTypeId()) return InlineMathKind::Vec2f;
+    if (typeId == runtime::vec3fTypeId()) return InlineMathKind::Vec3f;
+    if (typeId == runtime::quatfTypeId()) return InlineMathKind::Quatf;
     return InlineMathKind::None;
 }
 
@@ -298,13 +302,17 @@ const char* inlineMathFieldMember(
     switch (kind) {
     case InlineMathKind::Fixed:
     case InlineMathKind::Fixed16:
+    case InlineMathKind::Fixed64:
         return fieldIndex == 0 ? "raw" : nullptr;
     case InlineMathKind::Vec2:
+    case InlineMathKind::Vec2f:
         return fieldIndex == 0 ? "x" : (fieldIndex == 1 ? "y" : nullptr);
     case InlineMathKind::Vec3:
+    case InlineMathKind::Vec3f:
         return fieldIndex == 0 ? "x"
             : (fieldIndex == 1 ? "y" : (fieldIndex == 2 ? "z" : nullptr));
     case InlineMathKind::Quat:
+    case InlineMathKind::Quatf:
         return fieldIndex == 0 ? "x"
             : (fieldIndex == 1 ? "y"
                 : (fieldIndex == 2 ? "z" : (fieldIndex == 3 ? "w" : nullptr)));
@@ -796,9 +804,13 @@ std::string typedCppType(TypedSlotType slot) {
         switch (classifyInlineMath(slot.primitive, slot.typeId)) {
         case InlineMathKind::Fixed:   return "runtime::FixedValue";
         case InlineMathKind::Fixed16: return "runtime::Fixed16Value";
+        case InlineMathKind::Fixed64: return "runtime::Fixed64Value";
         case InlineMathKind::Vec2:    return "runtime::Vec2Value";
         case InlineMathKind::Vec3:    return "runtime::Vec3Value";
         case InlineMathKind::Quat:    return "runtime::QuatValue";
+        case InlineMathKind::Vec2f:   return "runtime::Vec2fValue";
+        case InlineMathKind::Vec3f:   return "runtime::Vec3fValue";
+        case InlineMathKind::Quatf:   return "runtime::QuatfValue";
         case InlineMathKind::None:    return "AotStruct_" + hexId(slot.typeId);
         }
         break;
@@ -831,9 +843,13 @@ std::string typedDefaultValue(TypedSlotType slot) {
         switch (classifyInlineMath(slot.primitive, slot.typeId)) {
         case InlineMathKind::Fixed:   return "runtime::FixedValue{}";
         case InlineMathKind::Fixed16: return "runtime::Fixed16Value{}";
+        case InlineMathKind::Fixed64: return "runtime::Fixed64Value{}";
         case InlineMathKind::Vec2:    return "runtime::Vec2Value{}";
         case InlineMathKind::Vec3:    return "runtime::Vec3Value{}";
         case InlineMathKind::Quat:    return "runtime::QuatValue{}";
+        case InlineMathKind::Vec2f:   return "runtime::Vec2fValue{}";
+        case InlineMathKind::Vec3f:   return "runtime::Vec3fValue{}";
+        case InlineMathKind::Quatf:   return "runtime::QuatfValue{}";
         case InlineMathKind::None:    return "AotStruct_" + hexId(slot.typeId) + "{}";
         }
         break;

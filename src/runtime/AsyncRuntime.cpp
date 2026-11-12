@@ -483,8 +483,7 @@ CancellationPoolStatistics CancellationTokenPool::statistics() const noexcept {
 namespace {
 
 inline bool isPoolBackedAsyncValue(const Value& v) noexcept {
-    const auto t = v.rawTag();
-    return t >= ValueTag::FirstTraceable && t != ValueTag::ObjectRef;
+    return v.isTraceable() && v.rawTag() != ValueTag::ObjectRef;
 }
 
 struct PoolRootSyncLock {

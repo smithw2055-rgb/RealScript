@@ -454,6 +454,7 @@ enum class FastFieldKind : std::uint8_t {
     Array = 5,
     UserStruct = 6,
     Enum = 7,
+    Quatf = 8,
 };
 
 struct FieldAccessMeta {

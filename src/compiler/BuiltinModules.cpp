@@ -85,6 +85,59 @@ public class Math {
     public static Fixed Lerp(Fixed a, Fixed b, Fixed t) {
         return Fixed.Lerp(a, b, t);
     }
+
+    public static float Absf(float v) {
+        return v < 0.0f ? -v : v;
+    }
+
+    public static float Minf(float a, float b) {
+        return a <= b ? a : b;
+    }
+
+    public static float Maxf(float a, float b) {
+        return a >= b ? a : b;
+    }
+
+    public static float Clampf(float v, float lo, float hi) {
+        if (v < lo) return lo;
+        if (v > hi) return hi;
+        return v;
+    }
+
+    public static float Lerpf(float a, float b, float t) {
+        return a + (b - a) * t;
+    }
+
+    public static float Sqrtf(float v) {
+        if (v <= 0.0f) return 0.0f;
+        float x = v >= 1.0f ? v * 0.5f : 1.0f;
+        for (int i = 0; i < 8; i = i + 1) {
+            x = 0.5f * (x + v / x);
+        }
+        return x;
+    }
+
+    public static float Sinf(float radians) {
+        if (radians != radians || (radians - radians) != 0.0f) return 0.0f;
+        if (radians > 1000000000.0f || radians < -1000000000.0f) return 0.0f;
+        float twoPi = 6.2831853f;
+        float pi = 3.14159265f;
+        float r = radians;
+        if (r > twoPi || r < -twoPi) {
+            long q = (long)((double)r / 6.283185307179586);
+            r = (float)((double)r - (double)q * 6.283185307179586);
+        }
+        if (r > pi) r = r - twoPi;
+        if (r < -pi) r = r + twoPi;
+        float absR = r < 0.0f ? -r : r;
+        float y = 1.27323954f * r - 0.405284735f * r * absR;
+        float absY = y < 0.0f ? -y : y;
+        return 0.225f * (y * absY - y) + y;
+    }
+
+    public static float Cosf(float radians) {
+        return Math.Sinf(radians + 1.5707963f);
+    }
 }
 
 public struct Fixed {
@@ -994,12 +1047,112 @@ public struct Fixed64 {
         return new Fixed64(rawValue);
     }
 
+    public static Fixed64 Pi() {
+        return new Fixed64(13493037705L);
+    }
+
+    public static Fixed64 HalfPi() {
+        return new Fixed64(6746518852L);
+    }
+
+    public static Fixed64 TwoPi() {
+        return new Fixed64(26986075409L);
+    }
+
+    public static Fixed64 FromRaw(long rawValue) {
+        return new Fixed64(rawValue);
+    }
+
     public static Fixed64 Of(long whole) {
-        return new Fixed64(whole * 4294967296);
+        return new Fixed64(whole * 4294967296L);
+    }
+
+    public static Fixed64 FromInt(long whole) {
+        return new Fixed64(whole * 4294967296L);
+    }
+
+    public static Fixed64 Ratio(long num, long den) {
+        if (den == 0L) return new Fixed64(0L);
+        return Fixed64.FromInt(num) / Fixed64.FromInt(den);
+    }
+
+    public static Fixed64 FromFixed(Fixed f) {
+        return new Fixed64((long)f.raw * 16777216L);
+    }
+
+    public static Fixed64 FromFloat(float v) {
+        return new Fixed64((long)((double)v * 4294967296.0));
+    }
+
+    public static Fixed64 FromDouble(double v) {
+        return new Fixed64((long)(v * 4294967296.0));
     }
 
     public long ToInt() {
-        return raw >= 0 ? raw / 4294967296 : (raw - 4294967295) / 4294967296;
+        return raw >= 0L ? raw / 4294967296L : (raw - 4294967295L) / 4294967296L;
+    }
+
+    public long ToLong() {
+        return ToInt();
+    }
+
+    public Fixed ToFixed() {
+        return new Fixed((int)(raw / 16777216L));
+    }
+
+    public float ToFloat() {
+        return (float)((double)raw / 4294967296.0);
+    }
+
+    public double ToDouble() {
+        return (double)raw / 4294967296.0;
+    }
+
+    public static long FloorToInt(Fixed64 v) {
+        return v.ToInt();
+    }
+
+    public static long RoundToInt(Fixed64 v) {
+        long half = 2147483648L;
+        return v.raw >= 0L ? (v.raw + half) / 4294967296L : -((-v.raw + half) / 4294967296L);
+    }
+
+    public static Fixed64 Add(Fixed64 a, Fixed64 b) { return a + b; }
+    public static Fixed64 Sub(Fixed64 a, Fixed64 b) { return a - b; }
+    public static Fixed64 Mul(Fixed64 a, Fixed64 b) { return a * b; }
+    public static Fixed64 Div(Fixed64 a, Fixed64 b) { return a / b; }
+
+    public static Fixed64 Abs(Fixed64 v) {
+        return new Fixed64(v.raw < 0L ? -v.raw : v.raw);
+    }
+
+    public static Fixed64 Min(Fixed64 a, Fixed64 b) {
+        return a.raw <= b.raw ? a : b;
+    }
+
+    public static Fixed64 Max(Fixed64 a, Fixed64 b) {
+        return a.raw >= b.raw ? a : b;
+    }
+
+    public static Fixed64 Clamp(Fixed64 v, Fixed64 lo, Fixed64 hi) {
+        if (v.raw < lo.raw) return lo;
+        if (v.raw > hi.raw) return hi;
+        return v;
+    }
+
+    public static Fixed64 Lerp(Fixed64 a, Fixed64 b, Fixed64 t) {
+        return a + (b - a) * t;
+    }
+
+    public static Fixed64 Sqrt(Fixed64 v) {
+        if (v.raw <= 0L) return new Fixed64(0L);
+        Fixed64 x = v.raw > 4294967296L ? new Fixed64(v.raw / 2L) : Fixed64.One();
+        for (int i = 0; i < 16; i = i + 1) {
+            Fixed64 next = new Fixed64((x.raw + (v / x).raw) / 2L);
+            if (next.raw == x.raw) return x;
+            x = next;
+        }
+        return x;
     }
 
     public static Fixed64 operator +(Fixed64 a, Fixed64 b) {
@@ -1075,6 +1228,210 @@ public struct Fixed64 {
     public static bool operator >=(Fixed64 a, Fixed64 b) {
         return a.raw >= b.raw;
     }
+}
+
+public struct Vec2f {
+    public float x;
+    public float y;
+
+    public Vec2f(float xVal, float yVal) {
+        x = xVal;
+        y = yVal;
+    }
+
+    public static Vec2f Create(float xVal, float yVal) { return new Vec2f(xVal, yVal); }
+    public static Vec2f Zero() { return new Vec2f(0.0f, 0.0f); }
+    public static Vec2f One() { return new Vec2f(1.0f, 1.0f); }
+    public static Vec2f Up() { return new Vec2f(0.0f, 1.0f); }
+    public static Vec2f Right() { return new Vec2f(1.0f, 0.0f); }
+
+    public static Vec2f Add(Vec2f a, Vec2f b) { return a + b; }
+    public static Vec2f Sub(Vec2f a, Vec2f b) { return a - b; }
+    public static Vec2f Mul(Vec2f v, float s) { return v * s; }
+    public static Vec2f Div(Vec2f v, float s) { return v / s; }
+    public static float Dot(Vec2f a, Vec2f b) { return a.x * b.x + a.y * b.y; }
+    public static float Cross(Vec2f a, Vec2f b) { return a.x * b.y - a.y * b.x; }
+    public float LengthSq() { return x * x + y * y; }
+    public float Length() { return Math.Sqrtf(LengthSq()); }
+    public static float Length(Vec2f v) { return v.Length(); }
+
+    public Vec2f Normalized() {
+        float len = Length();
+        if (len <= 0.000001f) return new Vec2f(0.0f, 0.0f);
+        float inv = 1.0f / len;
+        return new Vec2f(x * inv, y * inv);
+    }
+
+    public static Vec2f Normalized(Vec2f v) { return v.Normalized(); }
+
+    public static Vec2f Lerp(Vec2f a, Vec2f b, float t) {
+        return new Vec2f(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+    }
+
+    public static Vec2f operator +(Vec2f a, Vec2f b) { return new Vec2f(a.x + b.x, a.y + b.y); }
+    public static Vec2f operator -(Vec2f a, Vec2f b) { return new Vec2f(a.x - b.x, a.y - b.y); }
+    public static Vec2f operator -(Vec2f v) { return new Vec2f(-v.x, -v.y); }
+    public static Vec2f operator *(Vec2f v, float s) { return new Vec2f(v.x * s, v.y * s); }
+    public static Vec2f operator *(float s, Vec2f v) { return new Vec2f(v.x * s, v.y * s); }
+    public static Vec2f operator /(Vec2f v, float s) { return new Vec2f(v.x / s, v.y / s); }
+    public static bool operator ==(Vec2f a, Vec2f b) { return a.x == b.x && a.y == b.y; }
+    public static bool operator !=(Vec2f a, Vec2f b) { return a.x != b.x || a.y != b.y; }
+}
+
+public struct Vec3f {
+    public float x;
+    public float y;
+    public float z;
+
+    public Vec3f(float xVal, float yVal, float zVal) {
+        x = xVal;
+        y = yVal;
+        z = zVal;
+    }
+
+    public static Vec3f Create(float xVal, float yVal, float zVal) { return new Vec3f(xVal, yVal, zVal); }
+    public static Vec3f Zero() { return new Vec3f(0.0f, 0.0f, 0.0f); }
+    public static Vec3f One() { return new Vec3f(1.0f, 1.0f, 1.0f); }
+    public static Vec3f Up() { return new Vec3f(0.0f, 1.0f, 0.0f); }
+    public static Vec3f Forward() { return new Vec3f(0.0f, 0.0f, 1.0f); }
+    public static Vec3f Right() { return new Vec3f(1.0f, 0.0f, 0.0f); }
+
+    public static Vec3f Add(Vec3f a, Vec3f b) { return a + b; }
+    public static Vec3f Sub(Vec3f a, Vec3f b) { return a - b; }
+    public static Vec3f Mul(Vec3f v, float s) { return v * s; }
+    public static Vec3f Div(Vec3f v, float s) { return v / s; }
+    public static float Dot(Vec3f a, Vec3f b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+    public static Vec3f Cross(Vec3f a, Vec3f b) {
+        return new Vec3f(
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x);
+    }
+
+    public float LengthSq() { return x * x + y * y + z * z; }
+    public float Length() { return Math.Sqrtf(LengthSq()); }
+    public static float Length(Vec3f v) { return v.Length(); }
+
+    public Vec3f Normalized() {
+        float len = Length();
+        if (len <= 0.000001f) return new Vec3f(0.0f, 0.0f, 0.0f);
+        float inv = 1.0f / len;
+        return new Vec3f(x * inv, y * inv, z * inv);
+    }
+
+    public static Vec3f Normalized(Vec3f v) { return v.Normalized(); }
+
+    public static Vec3f Lerp(Vec3f a, Vec3f b, float t) {
+        return new Vec3f(
+            a.x + (b.x - a.x) * t,
+            a.y + (b.y - a.y) * t,
+            a.z + (b.z - a.z) * t);
+    }
+
+    public static Vec3f operator +(Vec3f a, Vec3f b) { return new Vec3f(a.x + b.x, a.y + b.y, a.z + b.z); }
+    public static Vec3f operator -(Vec3f a, Vec3f b) { return new Vec3f(a.x - b.x, a.y - b.y, a.z - b.z); }
+    public static Vec3f operator -(Vec3f v) { return new Vec3f(-v.x, -v.y, -v.z); }
+    public static Vec3f operator *(Vec3f v, float s) { return new Vec3f(v.x * s, v.y * s, v.z * s); }
+    public static Vec3f operator *(float s, Vec3f v) { return new Vec3f(v.x * s, v.y * s, v.z * s); }
+    public static Vec3f operator /(Vec3f v, float s) { return new Vec3f(v.x / s, v.y / s, v.z / s); }
+    public static bool operator ==(Vec3f a, Vec3f b) { return a.x == b.x && a.y == b.y && a.z == b.z; }
+    public static bool operator !=(Vec3f a, Vec3f b) { return a.x != b.x || a.y != b.y || a.z != b.z; }
+}
+
+public struct Quatf {
+    public float x;
+    public float y;
+    public float z;
+    public float w;
+
+    public Quatf(float xVal, float yVal, float zVal, float wVal) {
+        x = xVal;
+        y = yVal;
+        z = zVal;
+        w = wVal;
+    }
+
+    public static Quatf Create(float xVal, float yVal, float zVal, float wVal) {
+        return new Quatf(xVal, yVal, zVal, wVal);
+    }
+
+    public static Quatf Identity() { return new Quatf(0.0f, 0.0f, 0.0f, 1.0f); }
+
+    public static Quatf FromAxisAngle(Vec3f axis, float radians) {
+        Vec3f n = axis.Normalized();
+        float half = radians * 0.5f;
+        float s = Math.Sinf(half);
+        float c = Math.Cosf(half);
+        return new Quatf(n.x * s, n.y * s, n.z * s, c);
+    }
+
+    public static Quatf FromEuler(float pitch, float yaw, float roll) {
+        float hp = pitch * 0.5f;
+        float hy = yaw * 0.5f;
+        float hr = roll * 0.5f;
+        float cp = Math.Cosf(hp);
+        float sp = Math.Sinf(hp);
+        float cy = Math.Cosf(hy);
+        float sy = Math.Sinf(hy);
+        float cr = Math.Cosf(hr);
+        float sr = Math.Sinf(hr);
+        return new Quatf(
+            cy * sp * cr + sy * cp * sr,
+            sy * cp * cr - cy * sp * sr,
+            cy * cp * sr - sy * sp * cr,
+            cy * cp * cr + sy * sp * sr);
+    }
+
+    public static float Dot(Quatf a, Quatf b) {
+        return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+
+    public float LengthSq() { return x * x + y * y + z * z + w * w; }
+
+    public Quatf Normalized() {
+        float len = Math.Sqrtf(LengthSq());
+        if (len <= 0.000001f) return Quatf.Identity();
+        float inv = 1.0f / len;
+        return new Quatf(x * inv, y * inv, z * inv, w * inv);
+    }
+
+    public static Quatf Normalized(Quatf q) { return q.Normalized(); }
+    public static Quatf Mul(Quatf a, Quatf b) { return a * b; }
+
+    public Vec3f Rotate(Vec3f v) {
+        Vec3f u = new Vec3f(x, y, z);
+        Vec3f uv = Vec3f.Cross(u, v);
+        Vec3f uuv = Vec3f.Cross(u, uv);
+        return v + (uv * w + uuv) * 2.0f;
+    }
+
+    public static Vec3f Rotate(Quatf q, Vec3f v) { return q.Rotate(v); }
+
+    public static Quatf Lerp(Quatf a, Quatf b, float t) {
+        Quatf target = b;
+        if (Quatf.Dot(a, b) < 0.0f) {
+            target = new Quatf(-b.x, -b.y, -b.z, -b.w);
+        }
+        Quatf res = new Quatf(
+            a.x + (target.x - a.x) * t,
+            a.y + (target.y - a.y) * t,
+            a.z + (target.z - a.z) * t,
+            a.w + (target.w - a.w) * t);
+        return res.Normalized();
+    }
+
+    public static Quatf operator *(Quatf a, Quatf b) {
+        return new Quatf(
+            a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z);
+    }
+
+    public static Vec3f operator *(Quatf q, Vec3f v) { return q.Rotate(v); }
+    public static bool operator ==(Quatf a, Quatf b) { return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w; }
+    public static bool operator !=(Quatf a, Quatf b) { return a.x != b.x || a.y != b.y || a.z != b.z || a.w != b.w; }
 }
 
 public struct Vec4 {

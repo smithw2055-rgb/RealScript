@@ -2199,6 +2199,34 @@ template <bool Checked>
 
 [[nodiscard]] inline runtime::Value typedBoxScalar(
     semantic::PrimitiveType type,
+    runtime::Fixed64Value value) noexcept {
+    (void)type;
+    return runtime::Value{value};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    runtime::Vec2fValue value) noexcept {
+    (void)type;
+    return runtime::Value{value};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    runtime::Vec3fValue value) noexcept {
+    (void)type;
+    return runtime::Value{value};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    runtime::QuatfValue value) noexcept {
+    (void)type;
+    return runtime::Value{value};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
     runtime::EnumValue value) noexcept {
     (void)type;
     return runtime::Value{value};
@@ -2419,6 +2447,50 @@ template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
     runtime::QuatValue& out) noexcept {
     (void)type;
     return value.tryGetQuat(out);
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    runtime::Fixed64Value& out) noexcept {
+    (void)type;
+    if (const auto* p = std::get_if<runtime::Fixed64Value>(&value)) {
+        out = *p;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    runtime::Vec2fValue& out) noexcept {
+    (void)type;
+    if (const auto* p = std::get_if<runtime::Vec2fValue>(&value)) {
+        out = *p;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    runtime::Vec3fValue& out) noexcept {
+    (void)type;
+    if (const auto* p = std::get_if<runtime::Vec3fValue>(&value)) {
+        out = *p;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    runtime::QuatfValue& out) noexcept {
+    (void)type;
+    return value.tryGetQuatf(out);
 }
 
 [[nodiscard]] inline bool typedUnboxScalar(

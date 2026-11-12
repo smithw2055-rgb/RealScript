@@ -904,8 +904,11 @@ MarshalResult marshalCrossHeapImpl(
     case runtime::ValueTag::Char:
     case runtime::ValueTag::Fixed:
     case runtime::ValueTag::Fixed16:
+    case runtime::ValueTag::Fixed64:
     case runtime::ValueTag::Vec2:
     case runtime::ValueTag::Vec3:
+    case runtime::ValueTag::Vec2f:
+    case runtime::ValueTag::Vec3f:
         return MarshalResult{true, MarshalErrorCode::None, {}, value};
 
     case runtime::ValueTag::EnumInline:
@@ -926,6 +929,16 @@ MarshalResult marshalCrossHeapImpl(
                 false, MarshalErrorCode::TypeMismatch, "failed to decode QuatValue", {}};
         }
         return MarshalResult{true, MarshalErrorCode::None, {}, runtime::Value{qv}};
+    }
+
+    case runtime::ValueTag::QuatfInline:
+    case runtime::ValueTag::QuatfArena: {
+        runtime::QuatfValue qfv{};
+        if (!value.tryGetQuatf(qfv)) {
+            return MarshalResult{
+                false, MarshalErrorCode::TypeMismatch, "failed to decode QuatfValue", {}};
+        }
+        return MarshalResult{true, MarshalErrorCode::None, {}, runtime::Value{qfv}};
     }
 
     case runtime::ValueTag::NativeHandle:

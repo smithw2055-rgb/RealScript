@@ -2110,7 +2110,7 @@ private:
             "char16_t", "char32_t", "int8_t", "uint8_t", "int16_t", "uint16_t",
             "int32_t", "uint32_t", "int64_t", "uint64_t", "size_t", "ssize_t",
             "ptrdiff_t", "intptr_t", "uintptr_t", "Vec2", "Vec3", "Quat",
-            "Fixed", "Fixed16", "string",
+            "Vec2f", "Vec3f", "Quatf", "Fixed", "Fixed16", "Fixed64", "string",
         };
         if (builtins.find(token) != builtins.end()) return true;
         if (knownTypes.find(token) != knownTypes.end()) return true;
@@ -3124,9 +3124,13 @@ inline GameApi::HeaderBindingGenerationResult generateFromParsedHeader(
         if (rsType == "bool") return "realscript::runtime::NativeFieldKind::Bool";
         if (rsType == "Fixed") return "realscript::runtime::NativeFieldKind::Fixed";
         if (rsType == "Fixed16") return "realscript::runtime::NativeFieldKind::Fixed16";
+        if (rsType == "Fixed64") return "realscript::runtime::NativeFieldKind::Fixed64";
         if (rsType == "Vec2") return "realscript::runtime::NativeFieldKind::Vec2";
         if (rsType == "Vec3") return "realscript::runtime::NativeFieldKind::Vec3";
         if (rsType == "Quat") return "realscript::runtime::NativeFieldKind::Quat";
+        if (rsType == "Vec2f") return "realscript::runtime::NativeFieldKind::Vec2f";
+        if (rsType == "Vec3f") return "realscript::runtime::NativeFieldKind::Vec3f";
+        if (rsType == "Quatf") return "realscript::runtime::NativeFieldKind::Quatf";
         return {};
     };
 
@@ -3226,6 +3230,10 @@ inline GameApi::HeaderBindingGenerationResult generateFromParsedHeader(
         if (cppType == "char") return "char";
         if (cppType == "void") return "void";
         if (cppType.find("string") != std::string::npos) return "string";
+        if (cppType.find("Vec2f") != std::string::npos) { usesMathTypes = true; return "Vec2f"; }
+        if (cppType.find("Vec3f") != std::string::npos) { usesMathTypes = true; return "Vec3f"; }
+        if (cppType.find("Quatf") != std::string::npos) { usesMathTypes = true; return "Quatf"; }
+        if (cppType.find("Fixed64") != std::string::npos) { usesMathTypes = true; return "Fixed64"; }
         if (cppType.find("Vec2") != std::string::npos) { usesMathTypes = true; return "Vec2"; }
         if (cppType.find("Vec3") != std::string::npos) { usesMathTypes = true; return "Vec3"; }
         if (cppType.find("Quat") != std::string::npos) { usesMathTypes = true; return "Quat"; }
@@ -3353,7 +3361,8 @@ inline GameApi::HeaderBindingGenerationResult generateFromParsedHeader(
             return "return (" + rsRet + ")0;";
         }
         if (rsRet == "Vec2" || rsRet == "Vec3" || rsRet == "Quat" ||
-            rsRet == "Fixed" || rsRet == "Fixed16" ||
+            rsRet == "Vec2f" || rsRet == "Vec3f" || rsRet == "Quatf" ||
+            rsRet == "Fixed" || rsRet == "Fixed16" || rsRet == "Fixed64" ||
             exportedStructs.count(rsRet) > 0) {
             return "return new " + rsRet + "();";
         }

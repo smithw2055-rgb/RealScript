@@ -458,6 +458,14 @@ std::string DapServer::describeValueType(
         return "Fixed";
     } else if (std::holds_alternative<runtime::Fixed16Value>(value)) {
         return "Fixed16";
+    } else if (std::holds_alternative<runtime::Fixed64Value>(value)) {
+        return "Fixed64";
+    } else if (std::holds_alternative<runtime::Vec2fValue>(value)) {
+        return "Vec2f";
+    } else if (std::holds_alternative<runtime::Vec3fValue>(value)) {
+        return "Vec3f";
+    } else if (std::holds_alternative<runtime::QuatfValue>(value)) {
+        return "Quatf";
     }
     const auto p = fallback != semantic::PrimitiveType::Error
         ? fallback
