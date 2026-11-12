@@ -1,5 +1,6 @@
 #pragma once
 
+#include "realscript/AbiGovernance.h"
 #include "realscript/Version.h"
 #include "realscript/game/GameScripting.h"
 #include "realscript/game/GameplayScripting.h"
@@ -24,10 +25,12 @@ struct GameProgramPackage {
     std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles;
     std::uint64_t programContentHash = 0;
     std::uint64_t hostApiHash = 0;
+    AbiContractManifest abiManifest = currentAbiContractManifest();
 
     [[nodiscard]] bool valid() const noexcept {
         return program != nullptr && bindings != nullptr && heap != nullptr &&
-            nativeHandles != nullptr && programContentHash != 0 && hostApiHash != 0;
+            nativeHandles != nullptr && programContentHash != 0 &&
+            hostApiHash != 0 && abiManifest.hasValidDigest();
     }
 
     [[nodiscard]] ScriptRuntime createRuntime() const {
@@ -39,9 +42,11 @@ struct GameProgramLoadResult {
     GameProgramPackage package;
     std::vector<bytecode::Module> modules;
     diagnostics::DiagnosticBag diagnostics;
+    AbiCompatibilityReport abiCompatibility{};
 
     [[nodiscard]] bool succeeded() const noexcept {
-        return package.valid() && !diagnostics.hasErrors();
+        return package.valid() && !diagnostics.hasErrors() &&
+            abiCompatibility.canLoad();
     }
 };
 
@@ -52,6 +57,10 @@ public:
     [[nodiscard]] GameProgramLoadResult loadBytecodeModules(
         const std::vector<std::vector<std::uint8_t>>& encodedModules) const;
 
+    [[nodiscard]] GameProgramLoadResult loadBytecodeModules(
+        const std::vector<std::vector<std::uint8_t>>& encodedModules,
+        const AbiContractManifest& embeddedPackageManifest) const;
+
 private:
     const GameApi& api_;
 };
@@ -59,6 +68,40 @@ private:
 [[nodiscard]] std::uint64_t stableProgramContentHash(
     const std::vector<bytecode::Module>& modules);
 [[nodiscard]] std::uint64_t stableGameApiHash(const GameApi& api);
+
+// Package-level ABI Contract Embedding & Preflight Governance Helpers
+struct GamePackageContractEnvelope {
+    std::uint32_t packageVersion = kGameSdkPackageVersion;
+    std::uint64_t programContentHash = 0;
+    std::uint64_t hostApiHash = 0;
+    std::uint32_t moduleCount = 0;
+    AbiContractManifest abiManifest = currentAbiContractManifest();
+
+    [[nodiscard]] std::string toJson() const;
+    [[nodiscard]] static std::optional<GamePackageContractEnvelope> fromJson(
+        std::string_view jsonText,
+        std::string* outError = nullptr);
+};
+
+[[nodiscard]] AbiContractManifest buildPackageAbiManifest(
+    const std::vector<bytecode::Module>& modules) noexcept;
+
+[[nodiscard]] GamePackageContractEnvelope buildPackageContractEnvelope(
+    const GameProgramPackage& package) noexcept;
+
+[[nodiscard]] AbiCompatibilityReport verifyPackageAbiCompatibility(
+    const GameProgramPackage& package,
+    const AbiContractManifest& hostManifest = currentAbiContractManifest());
+
+[[nodiscard]] AbiCompatibilityReport verifyPackageContractEnvelope(
+    const GamePackageContractEnvelope& envelope,
+    const GameApi* expectedApi = nullptr,
+    std::uint64_t expectedProgramContentHash = 0,
+    const AbiContractManifest& hostManifest = currentAbiContractManifest());
+
+[[nodiscard]] AbiCompatibilityReport preflightBytecodePackageHeaders(
+    const std::vector<std::vector<std::uint8_t>>& encodedModules,
+    const AbiContractManifest& hostManifest = currentAbiContractManifest());
 
 struct ScriptStatePolicy {
     bool allowStrings = true;

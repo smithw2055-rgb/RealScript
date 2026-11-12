@@ -514,7 +514,64 @@ GameProgramLoadResult GameProgramLoader::loadBytecodeModules(
     result.package.nativeHandles = api_.nativeHandles();
     result.package.programContentHash = stableProgramContentHash(result.modules);
     result.package.hostApiHash = stableGameApiHash(api_);
+    result.package.abiManifest = buildPackageAbiManifest(result.modules);
+    result.abiCompatibility = verifyPackageAbiCompatibility(result.package);
     return result;
+}
+
+GameProgramLoadResult GameProgramLoader::loadBytecodeModules(
+    const std::vector<std::vector<std::uint8_t>>& encodedModules,
+    const AbiContractManifest& embeddedPackageManifest) const {
+    GameProgramLoadResult result;
+    result.abiCompatibility =
+        verifyAbiCompatibility(currentAbiContractManifest(), embeddedPackageManifest);
+    if (!result.abiCompatibility.canLoad()) {
+        for (const auto& issue : result.abiCompatibility.issues) {
+            if (issue.impact == AbiCompatibilityStatus::Incompatible) {
+                result.diagnostics.report(
+                    issue.diagnosticCode.empty() ? "RS7103" : issue.diagnosticCode,
+                    "package ABI contract rejected: " + issue.message,
+                    {});
+            }
+        }
+        if (!result.diagnostics.hasErrors()) {
+            result.diagnostics.report(
+                "RS7103",
+                "package ABI contract is incompatible with host runtime",
+                {});
+        }
+        return result;
+    }
+
+    auto headerReport = preflightBytecodePackageHeaders(encodedModules);
+    if (!headerReport.canLoad()) {
+        result.abiCompatibility = std::move(headerReport);
+        for (const auto& issue : result.abiCompatibility.issues) {
+            result.diagnostics.report(
+                issue.diagnosticCode.empty() ? "RS7104" : issue.diagnosticCode,
+                issue.message,
+                {});
+        }
+        return result;
+    }
+
+    auto loaded = loadBytecodeModules(encodedModules);
+    if (!loaded.succeeded()) {
+        return loaded;
+    }
+    loaded.package.abiManifest = embeddedPackageManifest;
+    loaded.abiCompatibility =
+        verifyAbiCompatibility(currentAbiContractManifest(), embeddedPackageManifest);
+    for (const auto& issue : headerReport.issues) {
+        if (!loaded.abiCompatibility.hasIssue(issue.code)) {
+            if (static_cast<std::uint8_t>(issue.impact) >
+                static_cast<std::uint8_t>(loaded.abiCompatibility.status)) {
+                loaded.abiCompatibility.status = issue.impact;
+            }
+            loaded.abiCompatibility.issues.push_back(issue);
+        }
+    }
+    return loaded;
 }
 
 std::uint64_t ScriptObjectState::canonicalHash() const noexcept {
@@ -5752,6 +5809,268 @@ std::optional<PrefabNodeTemplate> deserializePrefabText(
         return std::nullopt;
     }
     return builtRoot;
+}
+
+
+// ============================================================================
+// P3 Stage 1: Package-level ABI Contract Embedding & Verification Helpers
+// ============================================================================
+
+namespace {
+
+std::string formatPackageU64Hex(std::uint64_t val) {
+    std::ostringstream oss;
+    oss << "0x" << std::hex << std::nouppercase << std::setw(16)
+        << std::setfill('0') << val;
+    return oss.str();
+}
+
+bool parsePackageU64Hex(const std::string& text, std::uint64_t& out) noexcept {
+    if (text.empty()) return false;
+    std::size_t idx = 0;
+    int base = 10;
+    if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        base = 16;
+        idx = 2;
+    }
+    if (idx >= text.size()) return false;
+    std::uint64_t acc = 0;
+    for (; idx < text.size(); ++idx) {
+        const char ch = text[idx];
+        unsigned d = 0;
+        if (ch >= '0' && ch <= '9') d = static_cast<unsigned>(ch - '0');
+        else if (base == 16 && ch >= 'a' && ch <= 'f') d = 10u + static_cast<unsigned>(ch - 'a');
+        else if (base == 16 && ch >= 'A' && ch <= 'F') d = 10u + static_cast<unsigned>(ch - 'A');
+        else return false;
+        const auto ubase = static_cast<std::uint64_t>(base);
+        if (acc > (std::numeric_limits<std::uint64_t>::max() - d) / ubase) return false;
+        acc = acc * ubase + d;
+    }
+    out = acc;
+    return true;
+}
+
+} // namespace
+
+std::string GamePackageContractEnvelope::toJson() const {
+    std::string parseErr;
+    auto manifestJson = tooling::Json::parse(abiManifest.toJson(), parseErr);
+    tooling::Json root = tooling::Json::Object{};
+    root["packageVersion"] = static_cast<std::int64_t>(packageVersion);
+    root["programContentHash"] = formatPackageU64Hex(programContentHash);
+    root["hostApiHash"] = formatPackageU64Hex(hostApiHash);
+    root["moduleCount"] = static_cast<std::int64_t>(moduleCount);
+    root["abiManifest"] = manifestJson.value_or(tooling::Json{});
+    return root.dump();
+}
+
+std::optional<GamePackageContractEnvelope> GamePackageContractEnvelope::fromJson(
+    std::string_view jsonText,
+    std::string* outError) {
+    std::string parseErr;
+    const auto parsed = tooling::Json::parse(std::string(jsonText), parseErr);
+    if (!parsed || !parsed->isObject()) {
+        if (outError) {
+            *outError = parseErr.empty()
+                ? "package contract envelope JSON must be an object"
+                : parseErr;
+        }
+        return std::nullopt;
+    }
+
+    const auto* pkgVer = parsed->find("packageVersion");
+    const auto* progHash = parsed->find("programContentHash");
+    const auto* apiHash = parsed->find("hostApiHash");
+    const auto* modCnt = parsed->find("moduleCount");
+    const auto* manifestObj = parsed->find("abiManifest");
+    if (!pkgVer || !pkgVer->isNumber() || pkgVer->integerValue(-1) < 0 ||
+        !progHash || !progHash->isString() ||
+        !apiHash || !apiHash->isString() ||
+        !modCnt || !modCnt->isNumber() || modCnt->integerValue(-1) < 0 ||
+        !manifestObj || !manifestObj->isObject()) {
+        if (outError) *outError = "missing or invalid fields in GamePackageContractEnvelope JSON";
+        return std::nullopt;
+    }
+
+    GamePackageContractEnvelope env{};
+    env.packageVersion = static_cast<std::uint32_t>(pkgVer->integerValue());
+    env.moduleCount = static_cast<std::uint32_t>(modCnt->integerValue());
+    if (!parsePackageU64Hex(progHash->stringValue(), env.programContentHash) ||
+        !parsePackageU64Hex(apiHash->stringValue(), env.hostApiHash)) {
+        if (outError) *outError = "invalid hex hash in GamePackageContractEnvelope JSON";
+        return std::nullopt;
+    }
+
+    std::string manifestErr;
+    auto decodedManifest =
+        AbiContractManifest::fromJson(manifestObj->dump(), &manifestErr);
+    if (!decodedManifest) {
+        if (outError) *outError = manifestErr;
+        return std::nullopt;
+    }
+    env.abiManifest = std::move(*decodedManifest);
+    return env;
+}
+
+AbiContractManifest buildPackageAbiManifest(
+    const std::vector<bytecode::Module>& modules) noexcept {
+    auto manifest = currentAbiContractManifest();
+    if (!modules.empty()) {
+        BytecodeVersionPoint minVer{
+            modules.front().version.major, modules.front().version.minor};
+        for (std::size_t i = 1; i < modules.size(); ++i) {
+            const BytecodeVersionPoint cur{
+                modules[i].version.major, modules[i].version.minor};
+            if (cur < minVer) minVer = cur;
+        }
+        manifest.bytecodeTargetVersion = minVer;
+        manifest.refreshLayoutDigest();
+    }
+    return manifest;
+}
+
+GamePackageContractEnvelope buildPackageContractEnvelope(
+    const GameProgramPackage& package) noexcept {
+    GamePackageContractEnvelope env{};
+    env.packageVersion = kGameSdkPackageVersion;
+    env.programContentHash = package.programContentHash;
+    env.hostApiHash = package.hostApiHash;
+    env.moduleCount = package.program
+        ? static_cast<std::uint32_t>(package.program->moduleCount())
+        : 0u;
+    env.abiManifest = package.abiManifest;
+    return env;
+}
+
+AbiCompatibilityReport verifyPackageAbiCompatibility(
+    const GameProgramPackage& package,
+    const AbiContractManifest& hostManifest) {
+    auto report = verifyAbiCompatibility(hostManifest, package.abiManifest);
+    if (package.program != nullptr) {
+        for (const auto& mod : package.program->modules()) {
+            const BytecodeVersionPoint modVer{mod.version.major, mod.version.minor};
+            if (modVer < hostManifest.bytecodeMinVersion ||
+                modVer > hostManifest.bytecodeMaxVersion) {
+                report.status = AbiCompatibilityStatus::Incompatible;
+                report.issues.push_back(AbiIssue{
+                    AbiIssueCode::BytecodeTargetVersionUnsupported,
+                    AbiCompatibilityStatus::Incompatible,
+                    "RS9019",
+                    "package.modules.version",
+                    "module '" + mod.name + "' uses unsupported bytecode version " +
+                        modVer.toString(),
+                });
+            } else if (modVer == BytecodeVersionPoint{0, 6} &&
+                       hostManifest.bytecodeTargetVersion >= BytecodeVersionPoint{0, 7} &&
+                       !report.hasIssue(AbiIssueCode::BytecodeLegacyMetadataMigration)) {
+                if (report.status == AbiCompatibilityStatus::Compatible) {
+                    report.status = AbiCompatibilityStatus::CompatibleWithMigration;
+                }
+                report.issues.push_back(AbiIssue{
+                    AbiIssueCode::BytecodeLegacyMetadataMigration,
+                    AbiCompatibilityStatus::CompatibleWithMigration,
+                    "RS9020",
+                    "package.modules.version",
+                    "module '" + mod.name +
+                        "' uses legacy .rsbc 0.6 metadata requiring rehydration",
+                });
+            }
+        }
+    }
+    return report;
+}
+
+AbiCompatibilityReport verifyPackageContractEnvelope(
+    const GamePackageContractEnvelope& envelope,
+    const GameApi* expectedApi,
+    std::uint64_t expectedProgramContentHash,
+    const AbiContractManifest& hostManifest) {
+    auto report = verifyAbiCompatibility(hostManifest, envelope.abiManifest);
+
+    if (envelope.packageVersion == 0 ||
+        envelope.packageVersion > hostManifest.gameSdkPackageVersion) {
+        report.status = AbiCompatibilityStatus::Incompatible;
+        report.issues.push_back(AbiIssue{
+            AbiIssueCode::GameSdkPackageNewerThanHost,
+            AbiCompatibilityStatus::Incompatible,
+            "RS9011",
+            "envelope.packageVersion",
+            "envelope packageVersion (" + std::to_string(envelope.packageVersion) +
+                ") is unsupported by host (" +
+                std::to_string(hostManifest.gameSdkPackageVersion) + ")",
+        });
+    } else if (envelope.packageVersion < hostManifest.gameSdkPackageVersion &&
+               !report.hasIssue(AbiIssueCode::GameSdkPackageOlderMigration)) {
+        if (report.status == AbiCompatibilityStatus::Compatible) {
+            report.status = AbiCompatibilityStatus::CompatibleWithMigration;
+        }
+        report.issues.push_back(AbiIssue{
+            AbiIssueCode::GameSdkPackageOlderMigration,
+            AbiCompatibilityStatus::CompatibleWithMigration,
+            "RS9012",
+            "envelope.packageVersion",
+            "legacy envelope packageVersion requires migration",
+        });
+    }
+
+    if (expectedApi != nullptr) {
+        const auto currentApiHash = stableGameApiHash(*expectedApi);
+        if (envelope.hostApiHash != currentApiHash) {
+            report.status = AbiCompatibilityStatus::Incompatible;
+            report.issues.push_back(AbiIssue{
+                AbiIssueCode::SdkCompatibilityMismatch,
+                AbiCompatibilityStatus::Incompatible,
+                "RS7105",
+                "envelope.hostApiHash",
+                "package hostApiHash does not match bound GameApi contract",
+            });
+        }
+    }
+
+    if (expectedProgramContentHash != 0 &&
+        envelope.programContentHash != expectedProgramContentHash) {
+        report.status = AbiCompatibilityStatus::Incompatible;
+        report.issues.push_back(AbiIssue{
+            AbiIssueCode::LayoutDigestMismatch,
+            AbiCompatibilityStatus::Incompatible,
+            "RS7106",
+            "envelope.programContentHash",
+            "package programContentHash does not match expected bytecode payload",
+        });
+    }
+
+    return report;
+}
+
+AbiCompatibilityReport preflightBytecodePackageHeaders(
+    const std::vector<std::vector<std::uint8_t>>& encodedModules,
+    const AbiContractManifest& hostManifest) {
+    AbiCompatibilityReport report{};
+    if (encodedModules.empty()) {
+        report.status = AbiCompatibilityStatus::Incompatible;
+        report.issues.push_back(AbiIssue{
+            AbiIssueCode::BytecodeHeaderTruncated,
+            AbiCompatibilityStatus::Incompatible,
+            "RS7101",
+            "encodedModules",
+            "no bytecode modules were supplied for header preflight",
+        });
+        return report;
+    }
+
+    for (std::size_t idx = 0; idx < encodedModules.size(); ++idx) {
+        const auto header =
+            inspectBytecodeHeaderCompatibility(encodedModules[idx], hostManifest);
+        if (static_cast<std::uint8_t>(header.status) >
+            static_cast<std::uint8_t>(report.status)) {
+            report.status = header.status;
+        }
+        for (auto issue : header.issues) {
+            issue.field = "module[" + std::to_string(idx) + "]." + issue.field;
+            report.issues.push_back(std::move(issue));
+        }
+    }
+    return report;
 }
 
 } // namespace realscript::game

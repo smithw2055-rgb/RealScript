@@ -11,24 +11,56 @@ option(REALSCRIPT_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS "Run external C++ toolchain JIT integration tests" ON)
 option(REALSCRIPT_INSTALL_SDK "Generate installable RealScript SDK targets" ON)
 
-# v0.98 keeps one implementation archive so existing applications retain the
-# exact same link behavior. Productized component targets below provide a
-# stable consumer surface and allow the implementation to be split later
-# without changing downstream CMake files.
-add_library(realscript_frontend STATIC
+function(realscript_enable_cxx_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /utf-8 /W4 /wd4324 /permissive-)
+        if(REALSCRIPT_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE /WX)
+        endif()
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+        if(REALSCRIPT_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE -Werror)
+        endif()
+    endif()
+endfunction()
+
+if(MSVC)
+    set_source_files_properties(
+        src/aot_cpp/AotCpp.cpp
+        PROPERTIES COMPILE_OPTIONS "/wd4267"
+    )
+    # MSVC diagnoses repeated if-initializer names across mutually exclusive
+    # branches as C4456. These translation units intentionally use that pattern.
+    set_source_files_properties(
+        src/optimization/Optimizer.cpp
+        src/runtime/ExecutionServices.cpp
+        src/game/GameProductization.cpp
+        src/game/GameplayStateCodec.cpp
+        PROPERTIES COMPILE_OPTIONS "/wd4456"
+    )
+endif()
+
+# P3 Stage 1: Physical layered OBJECT targets with zero circular link dependencies.
+function(realscript_add_layer_library target)
+    add_library(${target} OBJECT ${ARGN})
+    set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(${target}
+        PRIVATE
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    )
+    target_compile_features(${target} PRIVATE cxx_std_17)
+    realscript_enable_cxx_warnings(${target})
+endfunction()
+
+# Layer 1: Foundation (text & diagnostics)
+realscript_add_layer_library(realscript_layer_foundation
     src/text/Text.cpp
     src/diagnostics/Diagnostic.cpp
-    src/aot_cpp/AotRuntime.cpp
-    src/aot_cpp/AotCpp.cpp
-    src/optimization/Optimizer.cpp
-    src/jit/Jit.cpp
-    src/debug/DebugInfo.cpp
-    src/debug/Debugger.cpp
-    src/debug/DapServer.cpp
-    src/hot_reload/HotReload.cpp
-    src/tooling/Json.cpp
-    src/tooling/LanguageService.cpp
-    src/tooling/LspServer.cpp
+)
+
+# Layer 2: Compiler Core (syntax, semantic, mir, optimization, bytecode, compiler)
+realscript_add_layer_library(realscript_layer_compiler_core
     src/syntax/SyntaxFacts.cpp
     src/syntax/Lexer.cpp
     src/syntax/SyntaxNodes.cpp
@@ -42,20 +74,55 @@ add_library(realscript_frontend STATIC
     src/mir/MirExpressions.cpp
     src/mir/MirVerifier.cpp
     src/mir/MirPrinter.cpp
-    src/compiler/Compilation.cpp
-    src/compiler/ModuleBuildCache.cpp
+    src/optimization/Optimizer.cpp
     src/bytecode/BytecodeFacts.cpp
     src/bytecode/BytecodeLowerer.cpp
     src/bytecode/BytecodeVerifier.cpp
     src/bytecode/BytecodeDisassembler.cpp
     src/bytecode/BytecodeCodec.cpp
-    src/runtime/Interpreter.cpp
+    src/compiler/Compilation.cpp
+    src/compiler/ModuleBuildCache.cpp
+)
+
+# Layer 3: Runtime Core (modularized runtime services, VM, GC, fibers, async & ABI governance)
+realscript_add_layer_library(realscript_layer_runtime_core
+    src/runtime/AbiGovernance.cpp
+    src/runtime/ValueOperations.cpp
+    src/runtime/BindingRegistry.cpp
+    src/runtime/ProgramImage.cpp
     src/runtime/RuntimeServices.cpp
+    src/runtime/Interpreter.cpp
     src/runtime/ExecutionServices.cpp
     src/runtime/ManagedHeap.cpp
     src/runtime/ParallelJob.cpp
     src/runtime/FiberScheduler.cpp
     src/runtime/AsyncRuntime.cpp
+)
+
+# Layer 4: Native Backends & Hot Reload (aot_cpp, jit, hot_reload)
+realscript_add_layer_library(realscript_layer_native_backends
+    src/aot_cpp/AotRuntime.cpp
+    src/aot_cpp/AotCpp.cpp
+    src/jit/Jit.cpp
+    src/hot_reload/HotReload.cpp
+)
+
+# Layer 5: Debug Services (debug info, debugger, DAP server)
+realscript_add_layer_library(realscript_layer_debug
+    src/debug/DebugInfo.cpp
+    src/debug/Debugger.cpp
+    src/debug/DapServer.cpp
+)
+
+# Layer 6: Tooling & Language Server (JSON, LanguageService, LSP server)
+realscript_add_layer_library(realscript_layer_tooling
+    src/tooling/Json.cpp
+    src/tooling/LanguageService.cpp
+    src/tooling/LspServer.cpp
+)
+
+# Layer 7: Game SDK & Scene Productization
+realscript_add_layer_library(realscript_layer_game
     src/game/GameApi.cpp
     src/game/ScriptObjectRuntime.cpp
     src/game/ScriptInvokeRuntime.cpp
@@ -68,8 +135,19 @@ add_library(realscript_frontend STATIC
     src/game/GameplayScripting.cpp
     src/game/GameplayStateCodec.cpp
 )
+
+add_library(realscript_frontend STATIC
+    $<TARGET_OBJECTS:realscript_layer_foundation>
+    $<TARGET_OBJECTS:realscript_layer_compiler_core>
+    $<TARGET_OBJECTS:realscript_layer_runtime_core>
+    $<TARGET_OBJECTS:realscript_layer_native_backends>
+    $<TARGET_OBJECTS:realscript_layer_debug>
+    $<TARGET_OBJECTS:realscript_layer_tooling>
+    $<TARGET_OBJECTS:realscript_layer_game>
+)
 set_target_properties(realscript_frontend PROPERTIES
     POSITION_INDEPENDENT_CODE ON
+    LINKER_LANGUAGE CXX
     EXPORT_NAME Frontend
 )
 add_library(RealScript::Frontend ALIAS realscript_frontend)
@@ -105,37 +183,6 @@ realscript_add_component(realscript_aot_support AotSupport)
 realscript_add_component(realscript_debug Debug)
 realscript_add_component(realscript_tooling Tooling)
 realscript_add_component(realscript_full Full)
-
-function(realscript_enable_cxx_warnings target)
-    if(MSVC)
-        target_compile_options(${target} PRIVATE /utf-8 /W4 /wd4324 /permissive-)
-        if(REALSCRIPT_WARNINGS_AS_ERRORS)
-            target_compile_options(${target} PRIVATE /WX)
-        endif()
-    else()
-        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
-        if(REALSCRIPT_WARNINGS_AS_ERRORS)
-            target_compile_options(${target} PRIVATE -Werror)
-        endif()
-    endif()
-endfunction()
-
-if(MSVC)
-    set_source_files_properties(
-        src/aot_cpp/AotCpp.cpp
-        PROPERTIES COMPILE_OPTIONS "/wd4267"
-    )
-    # MSVC diagnoses repeated if-initializer names across mutually exclusive
-    # branches as C4456. These translation units intentionally use that pattern.
-    set_source_files_properties(
-        src/optimization/Optimizer.cpp
-        src/runtime/ExecutionServices.cpp
-        src/game/GameProductization.cpp
-        src/game/GameplayStateCodec.cpp
-        PROPERTIES COMPILE_OPTIONS "/wd4456"
-    )
-endif()
-realscript_enable_cxx_warnings(realscript_frontend)
 
 add_executable(rsc tools/rsc/main.cpp)
 target_link_libraries(rsc PRIVATE RealScript::Compiler RealScript::Runtime)
@@ -443,6 +490,13 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_p2_stage3_fiber_debug_and_telemetry_tests
         realscript.p2.stage3-fiber-debug-and-telemetry
         tests/p2_stage3_fiber_debug_and_telemetry_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_p3_stage1_modular_build_and_abi_governance_tests
+        realscript.p3.stage1-modular-build-and-abi-governance
+        tests/p3_stage1_modular_build_and_abi_governance_tests.cpp)
+    target_compile_definitions(
+        realscript_p3_stage1_modular_build_and_abi_governance_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     realscript_add_cpp_test(
         realscript_p2_stage4_stencil_jit_tests
         realscript.p2.stage4-stencil-jit
