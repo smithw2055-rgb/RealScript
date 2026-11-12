@@ -27,6 +27,10 @@ endfunction()
 
 if(MSVC)
     set_source_files_properties(
+        src/aot_cpp/AotRangeAnalysis.cpp
+        src/aot_cpp/AotTypedAnalysis.cpp
+        src/aot_cpp/AotSimdVectorizer.cpp
+        src/aot_cpp/AotTypedEmitter.cpp
         src/aot_cpp/AotCpp.cpp
         PROPERTIES COMPILE_OPTIONS "/wd4267"
     )
@@ -70,7 +74,11 @@ realscript_add_layer_library(realscript_layer_compiler_core
     src/semantic/Symbols.cpp
     src/semantic/FlowAnalysis.cpp
     src/semantic/SemanticBinding.cpp
-    src/semantic/SemanticExpressions.cpp
+    src/semantic/SemanticOverload.cpp
+    src/semantic/SemanticOperators.cpp
+    src/semantic/SemanticPatterns.cpp
+    src/semantic/SemanticCallsAndObjects.cpp
+    src/semantic/SemanticAccessAndAssign.cpp
     src/mir/MirFacts.cpp
     src/mir/MirLowerer.cpp
     src/mir/MirExpressions.cpp
@@ -82,6 +90,11 @@ realscript_add_layer_library(realscript_layer_compiler_core
     src/bytecode/BytecodeVerifier.cpp
     src/bytecode/BytecodeDisassembler.cpp
     src/bytecode/BytecodeCodec.cpp
+    src/compiler/BuiltinModules.cpp
+    src/compiler/NativeGenerics.cpp
+    src/compiler/TypeHierarchyAndContracts.cpp
+    src/compiler/SequenceAndEventSynthesis.cpp
+    src/compiler/MetadataAndValidation.cpp
     src/compiler/Compilation.cpp
     src/compiler/ModuleBuildCache.cpp
 )
@@ -104,6 +117,10 @@ realscript_add_layer_library(realscript_layer_runtime_core
 # Layer 4: Native Backends & Hot Reload (aot_cpp, jit, hot_reload)
 realscript_add_layer_library(realscript_layer_native_backends
     src/aot_cpp/AotRuntime.cpp
+    src/aot_cpp/AotRangeAnalysis.cpp
+    src/aot_cpp/AotTypedAnalysis.cpp
+    src/aot_cpp/AotSimdVectorizer.cpp
+    src/aot_cpp/AotTypedEmitter.cpp
     src/aot_cpp/AotCpp.cpp
     src/jit/Jit.cpp
     src/hot_reload/HotReload.cpp

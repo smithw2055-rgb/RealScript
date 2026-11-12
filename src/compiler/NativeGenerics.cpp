@@ -1,3 +1,21 @@
+#include "CompilationInternal.h"
+
+#include <algorithm>
+#include <deque>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <sstream>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+
+namespace realscript::compiler::detail {
+
+namespace {
+
 // Native bounded generic specialization (AST-level hygienic monomorphization).
 // Included inside compiler::anonymous namespace after ParsedUnit/ModuleWork.
 
@@ -4130,6 +4148,9 @@ private:
     std::map<std::string, std::string> specializedReturnTypes_;
 };
 
+
+} // namespace
+
 void specializeNativeGenerics(
     std::vector<std::unique_ptr<ParsedUnit>>& units,
     std::map<std::string, ModuleWork>& modules,
@@ -4137,3 +4158,5 @@ void specializeNativeGenerics(
     NativeGenericSpecializer specializer(units, modules, result);
     specializer.run();
 }
+
+} // namespace realscript::compiler::detail
