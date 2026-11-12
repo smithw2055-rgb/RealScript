@@ -5032,6 +5032,32 @@ std::optional<ResolvedBinding> BindingRegistry::resolve(
             byName->second.determinism,
             byName->second.requiredCapability};
     }
+    const std::size_t fnStart = [&]() -> std::size_t {
+        const auto modSep = reference.name.rfind("::");
+        std::size_t pos = (modSep != std::string::npos) ? (modSep + 2u) : 0u;
+        while (pos < reference.name.size() && reference.name[pos] == '_') {
+            ++pos;
+        }
+        return pos;
+    }();
+    if (const auto specPos = reference.name.find("__", fnStart); specPos != std::string::npos) {
+        const std::string baseGenericName = reference.name.substr(0, specPos);
+        auto byBase = byName_.find(baseGenericName);
+        if (byBase == byName_.end()) {
+            if (const auto modSep = baseGenericName.rfind("::"); modSep != std::string::npos) {
+                byBase = byName_.find(baseGenericName.substr(modSep + 2u));
+            }
+        }
+        if (byBase != byName_.end()) {
+            if (reference.symbolId != 0) {
+                resolvedBySymbolCache_.emplace(reference.symbolId, &byBase->second);
+            }
+            return ResolvedBinding{
+                &byBase->second.function,
+                byBase->second.determinism,
+                byBase->second.requiredCapability};
+        }
+    }
     return std::nullopt;
 }
 

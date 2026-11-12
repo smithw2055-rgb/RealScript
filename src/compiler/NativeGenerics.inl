@@ -13,7 +13,12 @@ struct NativeGenericTemplate {
     std::vector<std::string> parameterTypes;
     std::map<std::string, std::vector<std::string>> constraints;
     const ParsedUnit* unit = nullptr;
+    const ParsedUnit* sourceUnit = nullptr;
 };
+
+using PartialMethodOriginMap = std::map<
+    std::tuple<std::string, std::string, std::string, std::size_t, std::size_t>,
+    const ParsedUnit*>;
 
 struct NativeGenericRegistry {
     std::map<std::string, std::map<std::string, NativeGenericTemplate>> types;
@@ -403,12 +408,13 @@ std::string nativeSpecializedDeclarationSource(
     const std::vector<std::string>& arguments,
     const std::string& generatedName,
     diagnostics::DiagnosticBag& diagnostics) {
-    if (!declaration.unit || !declaration.unit->source ||
+    const auto* srcUnit = declaration.sourceUnit ? declaration.sourceUnit : declaration.unit;
+    if (!srcUnit || !srcUnit->source ||
         declaration.parameters.size() != arguments.size() ||
-        declaration.span.end() > declaration.unit->source->content().size()) {
+        declaration.span.end() > srcUnit->source->content().size()) {
         return {};
     }
-    const auto fragment = declaration.unit->source->content().substr(
+    const auto fragment = srcUnit->source->content().substr(
         declaration.span.start, declaration.span.length);
     text::SourceText source(fragment, declaration.sourceName);
     diagnostics::DiagnosticBag lexerDiagnostics;
@@ -472,8 +478,12 @@ public:
     NativeGenericSpecializer(
         std::vector<std::unique_ptr<ParsedUnit>>& units,
         std::map<std::string, ModuleWork>& modules,
-        BuildResult& result)
-        : units_(units), modules_(modules), result_(result) {}
+        BuildResult& result,
+        const PartialMethodOriginMap* partialMethodOrigins = nullptr)
+        : units_(units),
+          modules_(modules),
+          result_(result),
+          partialMethodOrigins_(partialMethodOrigins) {}
 
     void run() {
         bool anyGenericSyntax = false;
@@ -644,6 +654,7 @@ private:
         declaration.sourceName = unit->source->name();
         declaration.span = function.span();
         declaration.unit = unit;
+        declaration.sourceUnit = unit;
         for (const auto& parameter : function.typeParameters) {
             declaration.parameters.push_back(parameter.text);
         }
@@ -679,6 +690,20 @@ private:
         declaration.sourceName = unit->source->name();
         declaration.span = function.span();
         declaration.unit = unit;
+        declaration.sourceUnit = unit;
+        if (partialMethodOrigins_) {
+            const auto key = std::make_tuple(
+                moduleName,
+                ownerName,
+                function.identifierToken.text,
+                declaration.span.start,
+                declaration.span.length);
+            const auto it = partialMethodOrigins_->find(key);
+            if (it != partialMethodOrigins_->end() && it->second && it->second->source) {
+                declaration.sourceUnit = it->second;
+                declaration.sourceName = it->second->source->name();
+            }
+        }
         for (const auto& parameter : function.typeParameters) {
             declaration.parameters.push_back(parameter.text);
         }
@@ -1709,12 +1734,14 @@ private:
     std::set<ParsedUnit*> processed_;
     std::map<std::string, std::string> localTypes_;
     std::vector<PendingNativeGenericMember> pendingMembers_;
+    const PartialMethodOriginMap* partialMethodOrigins_ = nullptr;
 };
 
 void specializeNativeGenerics(
     std::vector<std::unique_ptr<ParsedUnit>>& units,
     std::map<std::string, ModuleWork>& modules,
-    BuildResult& result) {
-    NativeGenericSpecializer specializer(units, modules, result);
+    BuildResult& result,
+    const PartialMethodOriginMap* partialMethodOrigins = nullptr) {
+    NativeGenericSpecializer specializer(units, modules, result, partialMethodOrigins);
     specializer.run();
 }

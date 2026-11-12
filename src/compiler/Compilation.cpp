@@ -2604,8 +2604,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     }
 
     // Merge partial classes within each module in deterministic source order before specialization.
+    PartialMethodOriginMap partialMethodOrigins;
     for (auto& [moduleName, module] : modules) {
-        (void)moduleName;
         std::sort(module.units.begin(), module.units.end(),
             [](const ParsedUnit* left, const ParsedUnit* right) {
                 return left->source->name() < right->source->name();
@@ -2671,6 +2671,22 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             dst.events.end(),
                             std::make_move_iterator(cls.events.begin()),
                             std::make_move_iterator(cls.events.end()));
+                        if (unit->hasGenericSyntax) {
+                            found->second.first->hasGenericSyntax = true;
+                        }
+                        for (const auto& m : cls.methods) {
+                            if (!m.typeParameters.empty()) {
+                                const auto sp = m.span();
+                                partialMethodOrigins.emplace(
+                                    std::make_tuple(
+                                        moduleName,
+                                        cls.identifierToken.text,
+                                        m.identifierToken.text,
+                                        sp.start,
+                                        sp.length),
+                                    unit);
+                            }
+                        }
                         dst.methods.insert(
                             dst.methods.end(),
                             std::make_move_iterator(cls.methods.begin()),
@@ -2699,7 +2715,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         }
     }
 
-    specializeNativeGenerics(units, modules, result);
+    specializeNativeGenerics(units, modules, result, &partialMethodOrigins);
 
     // Stable source order, source fingerprints, and incremental module frontend cache check.
     for (auto& [moduleName, module] : modules) {

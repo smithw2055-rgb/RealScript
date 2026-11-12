@@ -644,6 +644,69 @@ Holder main() { return new Holder(); }
         "delegate invocation/capture state was not restored");
 }
 
+void testOverloadedDelegateAndMixedCallsAndGenericBindingResolve() {
+    realscript::compiler::Compilation compilation({{"OverloadDelegates.rs", R"(
+module Phase20.Overloads;
+
+public delegate void Action0();
+public delegate int IntOp(int x);
+public delegate string StrOp(string s);
+
+public class Dispatcher
+{
+    public int sum = 0;
+    public string text = "";
+
+    public Dispatcher() { }
+    public Dispatcher(Action0 a) { a(); }
+    public Dispatcher(IntOp op) { sum = op(5); }
+    public Dispatcher(int direct) { sum = direct; }
+
+    public void Run(Action0 a) { a(); }
+    public void Run(int v) { sum = sum + v; }
+
+    public void Apply(Action0 a) { a(); }
+    public void Apply(IntOp op) { sum = sum + op(7); }
+    public void Apply(StrOp op) { text = op("ok"); }
+
+    public void Bump() { sum = sum + 1; }
+}
+
+int main()
+{
+    Dispatcher d1 = new Dispatcher(10);
+    d1.Run(20);
+    d1.Run(d1.Bump);
+    d1.Apply(x => x * 2);
+    d1.Apply(s => s + "!");
+    Dispatcher d2 = new Dispatcher(x => x + 3);
+    if (d1.text != "ok!") { return -1; }
+    return d1.sum + d2.sum;
+}
+)"}});
+    const auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "overloaded delegate fixture compilation failed:\n" +
+            diagnosticsText(build.diagnostics));
+    realscript::bytecode::Lowerer lowerer;
+    auto module = lowerer.lower(build.modules.front());
+    realscript::runtime::Interpreter interpreter({std::move(module)});
+    const auto result = interpreter.invoke("Phase20.Overloads::main");
+    require(result.succeeded &&
+            std::holds_alternative<std::int64_t>(result.value) &&
+            std::get<std::int64_t>(result.value) == (10 + 20 + 1 + 14 + 8),
+        "overloaded delegate & mixed call resolution produced wrong result");
+
+    realscript::runtime::BindingRegistry registry;
+    (void)registry.bind("Aero.UI::__Aero_SetDataContext", [](const realscript::bytecode::FunctionReference&, realscript::runtime::ValueSpan, realscript::runtime::RuntimeError&) -> std::optional<realscript::runtime::Value> {
+        return true;
+    });
+    const auto resolved = registry.resolve(realscript::bytecode::FunctionReference{
+        0, "Aero.UI::__Aero_SetDataContext__MainWindow__ViewModel"});
+    require(resolved.has_value() && resolved->function != nullptr,
+        "BindingRegistry::resolve failed to strip generic suffix on leading-underscore function");
+}
+
 } // namespace
 
 int main() {
@@ -660,6 +723,7 @@ int main() {
         testSubscriberSideEventAccess();
         testDelegateReferenceParameters();
         testDelegateHeapSnapshotRestore();
+        testOverloadedDelegateAndMixedCallsAndGenericBindingResolve();
         std::cout << "Phase 20 delegate tests passed\n";
         return 0;
     } catch (const std::exception& error) {
