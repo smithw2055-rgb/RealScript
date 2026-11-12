@@ -37,6 +37,8 @@ if(MSVC)
         src/runtime/ExecutionServices.cpp
         src/game/GameProductization.cpp
         src/game/GameplayStateCodec.cpp
+    src/reflection/Reflection.cpp
+    src/plugin/ModHost.cpp
         PROPERTIES COMPILE_OPTIONS "/wd4456"
     )
 endif()
@@ -520,6 +522,10 @@ if(REALSCRIPT_BUILD_TESTS)
                 REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
                 REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/p3-stage3-jit-cache")
     endif()
+    realscript_add_cpp_test(
+        realscript_p3_stage4_reflection_and_mod_sandbox_tests
+        realscript.p3.stage4-reflection-and-mod-sandbox
+        tests/p3_stage4_reflection_and_mod_sandbox_tests.cpp)
     realscript_add_cpp_test(
         realscript_p2_stage4_stencil_jit_tests
         realscript.p2.stage4-stencil-jit
