@@ -408,6 +408,9 @@ std::uint64_t AbiContractManifest::computeLayoutDigest() const noexcept {
     std::uint64_t hash = kFnv1a64OffsetBasis;
     fnvMixTag(hash, "RealScript.AbiContractManifest.v1");
     fnvMixU32LE(hash, schemaVersion);
+    fnvMixU32LE(hash, engineVersionMajor);
+    fnvMixU32LE(hash, engineVersionMinor);
+    fnvMixU32LE(hash, engineVersionPatch);
     fnvMixU32LE(hash, sdkCompatibilityVersion);
     fnvMixU32LE(hash, gameSdkPackageVersion);
     fnvMixU32LE(hash, scriptObjectStateVersion);
@@ -929,14 +932,18 @@ AbiCompatibilityReport verifyAbiCompatibility(
     }
 
     if (host.bytecodeMinVersion > host.bytecodeMaxVersion ||
-        target.bytecodeMinVersion > target.bytecodeMaxVersion) {
+        target.bytecodeMinVersion > target.bytecodeMaxVersion ||
+        host.bytecodeTargetVersion < host.bytecodeMinVersion ||
+        host.bytecodeTargetVersion > host.bytecodeMaxVersion ||
+        target.bytecodeTargetVersion < target.bytecodeMinVersion ||
+        target.bytecodeTargetVersion > target.bytecodeMaxVersion) {
         pushIssue(
             report,
             AbiIssueCode::BytecodeVersionRangeInvalid,
             AbiCompatibilityStatus::Incompatible,
             "RS9017",
             "bytecodeVersionRange",
-            "invalid inverted .rsbc bytecode version interval");
+            "invalid .rsbc bytecode version interval or out-of-range target version");
     } else {
         const auto overlapMin =
             std::max(host.bytecodeMinVersion, target.bytecodeMinVersion);

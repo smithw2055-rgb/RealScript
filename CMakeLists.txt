@@ -37,8 +37,8 @@ if(MSVC)
         src/runtime/ExecutionServices.cpp
         src/game/GameProductization.cpp
         src/game/GameplayStateCodec.cpp
-    src/reflection/Reflection.cpp
-    src/plugin/ModHost.cpp
+        src/reflection/Reflection.cpp
+        src/plugin/ModHost.cpp
         PROPERTIES COMPILE_OPTIONS "/wd4456"
     )
 endif()
@@ -141,6 +141,12 @@ realscript_add_layer_library(realscript_layer_game
     src/game/GameplayStateCodec.cpp
 )
 
+# Layer 8: Reflection & Sandboxed Mod Host
+realscript_add_layer_library(realscript_layer_extensibility
+    src/reflection/Reflection.cpp
+    src/plugin/ModHost.cpp
+)
+
 add_library(realscript_frontend STATIC
     $<TARGET_OBJECTS:realscript_layer_foundation>
     $<TARGET_OBJECTS:realscript_layer_compiler_core>
@@ -149,6 +155,7 @@ add_library(realscript_frontend STATIC
     $<TARGET_OBJECTS:realscript_layer_debug>
     $<TARGET_OBJECTS:realscript_layer_tooling>
     $<TARGET_OBJECTS:realscript_layer_game>
+    $<TARGET_OBJECTS:realscript_layer_extensibility>
 )
 set_target_properties(realscript_frontend PROPERTIES
     POSITION_INDEPENDENT_CODE ON

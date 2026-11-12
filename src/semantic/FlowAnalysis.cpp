@@ -540,9 +540,12 @@ private:
             const auto& value = static_cast<const BoundForStatement&>(statement);
             if (value.initializer) state = analyzeStatement(*value.initializer, std::move(state));
             if (state.exit != ExitKind::None) return state;
-            analyzeExpression(*value.condition, state.assigned);
-            auto body = analyzeStatement(*value.body, {state.assigned, ExitKind::None});
+            AssignedSet trueAssigned;
+            AssignedSet falseAssigned;
+            analyzeCondition(*value.condition, state.assigned, trueAssigned, falseAssigned);
+            auto body = analyzeStatement(*value.body, {std::move(trueAssigned), ExitKind::None});
             if (value.increment && body.exit != ExitKind::Return) analyzeExpression(*value.increment, body.assigned);
+            state.assigned = std::move(falseAssigned);
             if (isLiteralTrue(*value.condition) && !containsBreakForCurrentTarget(*value.body)) state.exit = ExitKind::Return;
             return state;
         }

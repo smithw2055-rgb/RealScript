@@ -1060,6 +1060,33 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                 defaultIndex = i;
             }
         }
+        const auto storeSwitchPatternVar = [&](const semantic::VariableSymbol& var,
+                                               ValueId val,
+                                               text::TextSpan span) {
+            if (semantic::storageTypeOf(var) != var.type &&
+                var.modifier == semantic::ParameterModifier::None) {
+                const auto cell = emitValue(
+                    Opcode::NewObject, semantic::PrimitiveType::Object, {}, span);
+                auto& alloc = block(*currentBlockId_).instructions.back();
+                alloc.typeId = semantic::stableTypeId(semantic::storageTypeNameOf(var));
+                alloc.resultTypeId = alloc.typeId;
+                alloc.symbolName = semantic::storageTypeNameOf(var);
+                const auto cellTid = alloc.typeId;
+                const auto cellSym = alloc.symbolName;
+                Instruction storeField;
+                storeField.resultType = semantic::PrimitiveType::Void;
+                storeField.opcode = Opcode::StoreField;
+                storeField.operands = {cell, val};
+                storeField.typeId = cellTid;
+                storeField.fieldIndex = 0;
+                storeField.symbolName = cellSym;
+                storeField.sourceSpan = span;
+                block(*currentBlockId_).instructions.push_back(std::move(storeField));
+                emitStoreLocal(var.index, cell, span);
+                return;
+            }
+            emitStoreLocal(var.index, val, span);
+        };
         bool checksExhausted = false;
         for (std::size_t i = 0; i < value.sections.size(); ++i) {
             const auto& section = value.sections[i];
@@ -1073,8 +1100,8 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                     section.pattern->variable) {
                     const auto switchValue =
                         emitLoadLocal(value.valueVariable, value.expression->span);
-                    emitStoreLocal(
-                        section.pattern->variable->index, switchValue, section.span);
+                    storeSwitchPatternVar(
+                        *section.pattern->variable, switchValue, section.span);
                 }
                 emitJump(sectionBlocks[i], {}, section.span);
                 checksExhausted = true;
@@ -1112,8 +1139,8 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                     asType.parameterTypes = {value.expression->type};
                     asType.resultTypeId = section.patternTypeId;
                     asType.symbolName = section.patternTypeName;
-                    emitStoreLocal(
-                        section.patternVariable->index, cast, section.span);
+                    storeSwitchPatternVar(
+                        *section.patternVariable, cast, section.span);
                 }
             } else {
                 const auto switchValue =

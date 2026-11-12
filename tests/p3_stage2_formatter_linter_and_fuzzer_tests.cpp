@@ -19,7 +19,9 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#if !defined(_WIN32)
 #include <sys/wait.h>
+#endif
 #include <vector>
 
 namespace {
@@ -114,6 +116,18 @@ struct CommandOutput {
 };
 
 std::string shellQuote(const std::string& s) {
+#if defined(_WIN32)
+    std::string out = "\"";
+    for (char ch : s) {
+        if (ch == '"') {
+            out += "\\\"";
+        } else {
+            out.push_back(ch);
+        }
+    }
+    out.push_back('"');
+    return out;
+#else
     std::string out = "'";
     for (char ch : s) {
         if (ch == '\'') {
@@ -124,6 +138,7 @@ std::string shellQuote(const std::string& s) {
     }
     out.push_back('\'');
     return out;
+#endif
 }
 
 CommandOutput runCommand(const std::vector<std::string>& args) {
@@ -134,13 +149,23 @@ CommandOutput runCommand(const std::vector<std::string>& args) {
     }
     cmd += " 2>&1";
 
+#if defined(_WIN32)
+    const std::string winCmd = "\"" + cmd + "\"";
+    FILE* pipe = _popen(winCmd.c_str(), "r");
+#else
     FILE* pipe = popen(cmd.c_str(), "r");
+#endif
     RS_CHECK(pipe != nullptr);
     std::string output;
     char buffer[512];
     while (std::fgets(buffer, sizeof(buffer), pipe) != nullptr) {
         output += buffer;
     }
+#if defined(_WIN32)
+    const int status = _pclose(pipe);
+    CommandOutput res;
+    res.exitCode = status;
+#else
     const int status = pclose(pipe);
     CommandOutput res;
     if (WIFEXITED(status)) {
@@ -148,6 +173,7 @@ CommandOutput runCommand(const std::vector<std::string>& args) {
     } else {
         res.exitCode = status;
     }
+#endif
     res.combinedOutput = std::move(output);
     return res;
 }
@@ -647,7 +673,20 @@ void testLspFormattingLintAndQuickFix() {
 
 void testRscCliIntegration(const char* argv0) {
     const std::filesystem::path selfExe = std::filesystem::absolute(std::filesystem::path(argv0));
+#ifdef REALSCRIPT_RSC_PATH
+    std::filesystem::path rscExe = std::filesystem::path(REALSCRIPT_RSC_PATH);
+    if (!std::filesystem::exists(rscExe)) {
+#if defined(_WIN32)
+        rscExe = selfExe.parent_path() / "rsc.exe";
+#else
+        rscExe = selfExe.parent_path() / "rsc";
+#endif
+    }
+#elif defined(_WIN32)
+    const std::filesystem::path rscExe = selfExe.parent_path() / "rsc.exe";
+#else
     const std::filesystem::path rscExe = selfExe.parent_path() / "rsc";
+#endif
     RS_CHECK(std::filesystem::exists(rscExe));
 
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();

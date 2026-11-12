@@ -7535,7 +7535,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             AttrTarget_All       = 0xFFFFFFFFu
         };
         struct AttributeUsageRule {
-            std::uint32_t validTargets = AttrTarget_All;
+            std::uint32_t validTargets = 0xFFFFFFFFu;
             bool allowMultiple = false;
         };
 

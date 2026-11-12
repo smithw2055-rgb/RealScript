@@ -1348,19 +1348,36 @@ bool ReflectionRegistry::validateAndCoerceValue(
                 error.message = "struct value is uninitialized";
                 return false;
             }
-            // Validate no foreign ObjectRef sits inside struct fields
+            // Validate no foreign ObjectRef sits inside struct fields (including nested structs)
             if (targetHeap) {
-                for (std::size_t i = 0; i < sv->fieldCount(); ++i) {
-                    const auto sub = runtime::structValueFieldAt(*sv, i);
-                    if (!sub) continue;
-                    if (const auto* subRef = std::get_if<runtime::ObjectRef>(&*sub)) {
-                        if (subRef->heapId != static_cast<std::uint32_t>(targetHeap->heapId()) ||
-                            !targetHeap->isAlive(*subRef)) {
-                            error.code = runtime::ErrorCode::InvalidObjectReference;
-                            error.message = "struct contains dead or cross-heap ObjectRef";
-                            return false;
+                const auto checkStructRefs = [&](const auto& self,
+                                                 const runtime::StructValue& curSv,
+                                                 std::uint32_t depth) -> bool {
+                    if (depth > 32u) return true;
+                    for (std::size_t i = 0; i < curSv.fieldCount(); ++i) {
+                        const auto sub = runtime::structValueFieldAt(curSv, i);
+                        if (!sub) continue;
+                        if (const auto* subRef = std::get_if<runtime::ObjectRef>(&*sub)) {
+                            if (subRef->heapId != static_cast<std::uint32_t>(targetHeap->heapId()) ||
+                                !targetHeap->isAlive(*subRef)) {
+                                error.code = runtime::ErrorCode::InvalidObjectReference;
+                                error.message = "struct contains dead or cross-heap ObjectRef";
+                                return false;
+                            }
+                        } else if (const auto* nestedSv = std::get_if<runtime::StructValue>(&*sub)) {
+                            if (!nestedSv->valid() || !self(self, *nestedSv, depth + 1u)) {
+                                if (error.code == runtime::ErrorCode::None) {
+                                    error.code = runtime::ErrorCode::TypeMismatch;
+                                    error.message = "nested struct value is uninitialized";
+                                }
+                                return false;
+                            }
                         }
                     }
+                    return true;
+                };
+                if (!checkStructRefs(checkStructRefs, *sv, 0u)) {
+                    return false;
                 }
             }
         }
@@ -1412,6 +1429,7 @@ std::optional<runtime::ObjectRef> ReflectionRegistry::instantiateUninitializedOb
     }
 
     std::vector<runtime::Value> fieldValues;
+    std::vector<runtime::PersistentRoot> fieldRoots;
     std::vector<std::size_t> referenceFields;
     fieldValues.reserve(type->fields.size());
 
@@ -1424,6 +1442,9 @@ std::optional<runtime::ObjectRef> ReflectionRegistry::instantiateUninitializedOb
             } else if (error.code != runtime::ErrorCode::None) {
                 return std::nullopt;
             }
+        }
+        if (initial.isTraceable()) {
+            fieldRoots.push_back(heap.retain(initial));
         }
         fieldValues.push_back(std::move(initial));
         if (fld.type == semantic::PrimitiveType::String ||
@@ -1508,9 +1529,11 @@ std::optional<runtime::ObjectRef> ReflectionRegistry::instantiateObject(
     if (!constructorArgs.empty() || !type->constructors.empty()) {
         const MethodReflection* matchedCtor = nullptr;
         std::vector<runtime::Value> coercedArgs;
+        std::vector<runtime::PersistentRoot> argRoots;
         for (const auto& ctor : type->constructors) {
             if (ctor.parameters.size() != constructorArgs.size()) continue;
             coercedArgs.clear();
+            argRoots.clear();
             coercedArgs.reserve(constructorArgs.size());
             bool allMatch = true;
             runtime::RuntimeError matchErr;
@@ -1525,6 +1548,9 @@ std::optional<runtime::ObjectRef> ReflectionRegistry::instantiateObject(
                         matchErr)) {
                     allMatch = false;
                     break;
+                }
+                if (coerced.isTraceable()) {
+                    argRoots.push_back(heap->retain(coerced));
                 }
                 coercedArgs.push_back(std::move(coerced));
             }
@@ -2006,7 +2032,9 @@ runtime::ExecutionResult ReflectionRegistry::invokeMethod(
         targetSymbolId = actualType->virtualDispatchTable[slot];
     }
 
+    auto receiverRoot = heap->retain(receiver);
     std::vector<runtime::Value> fullArgs;
+    std::vector<runtime::PersistentRoot> argRoots;
     fullArgs.reserve(arguments.size() + 1u);
     fullArgs.push_back(runtime::Value{receiver});
     for (std::size_t i = 0; i < arguments.size(); ++i) {
@@ -2020,6 +2048,9 @@ runtime::ExecutionResult ReflectionRegistry::invokeMethod(
                 coerced,
                 argErr)) {
             return makeFailedExecution(argErr.code, std::move(argErr.message));
+        }
+        if (coerced.isTraceable()) {
+            argRoots.push_back(heap->retain(coerced));
         }
         fullArgs.push_back(std::move(coerced));
     }
@@ -2108,6 +2139,7 @@ runtime::ExecutionResult ReflectionRegistry::invokeStaticMethod(
                 continue;
             }
             std::vector<runtime::Value> coercedArgs;
+            std::vector<runtime::PersistentRoot> argRoots;
             coercedArgs.reserve(arguments.size());
             bool match = true;
             runtime::RuntimeError lastErr;
@@ -2122,6 +2154,9 @@ runtime::ExecutionResult ReflectionRegistry::invokeStaticMethod(
                         lastErr)) {
                     match = false;
                     break;
+                }
+                if (heap && coerced.isTraceable()) {
+                    argRoots.push_back(heap->retain(coerced));
                 }
                 coercedArgs.push_back(std::move(coerced));
             }
@@ -2142,6 +2177,7 @@ runtime::ExecutionResult ReflectionRegistry::invokeStaticMethod(
         if (!moduleMatch || fn.parameters.size() != arguments.size()) continue;
 
         std::vector<runtime::Value> coercedArgs;
+        std::vector<runtime::PersistentRoot> argRoots;
         coercedArgs.reserve(arguments.size());
         bool match = true;
         runtime::RuntimeError lastErr;
@@ -2156,6 +2192,9 @@ runtime::ExecutionResult ReflectionRegistry::invokeStaticMethod(
                     lastErr)) {
                 match = false;
                 break;
+            }
+            if (heap && coerced.isTraceable()) {
+                argRoots.push_back(heap->retain(coerced));
             }
             coercedArgs.push_back(std::move(coerced));
         }

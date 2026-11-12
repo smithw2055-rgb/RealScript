@@ -140,6 +140,15 @@ void verifyThreeBackendIntResult(
 #else
     tcOpts.outputDirectory = std::filesystem::temp_directory_path() / "realscript_p3_s3_aot_cache";
 #endif
+#if defined(_WIN32)
+#if defined(_DEBUG)
+    tcOpts.compilerArguments = {"/MDd"};
+#else
+    tcOpts.compilerArguments = {"/MD", "/O2"};
+#endif
+#else
+    tcOpts.compilerArguments = {"-O2"};
+#endif
     tcOpts.reuseCachedLibrary = false;
     tcOpts.generation.programName = "P3Stage3AotExec";
     if (realscript::jit::ToolchainJit::available(tcOpts)) {

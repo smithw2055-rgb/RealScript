@@ -3990,6 +3990,31 @@ bool expressionHasPatternVariables(const syntax::ExpressionSyntax& expr) noexcep
     }
 }
 
+bool boundStatementAlwaysExits(const BoundStatement& stmt) noexcept {
+    switch (stmt.kind()) {
+    case BoundNodeKind::ReturnStatement:
+    case BoundNodeKind::BreakStatement:
+    case BoundNodeKind::ContinueStatement:
+    case BoundNodeKind::ThrowStatement:
+        return true;
+    case BoundNodeKind::BlockStatement: {
+        const auto& blk = static_cast<const BoundBlockStatement&>(stmt);
+        for (const auto& s : blk.statements) {
+            if (s && boundStatementAlwaysExits(*s)) return true;
+        }
+        return false;
+    }
+    case BoundNodeKind::IfStatement: {
+        const auto& ifs = static_cast<const BoundIfStatement&>(stmt);
+        return ifs.thenStatement && ifs.elseStatement &&
+            boundStatementAlwaysExits(*ifs.thenStatement) &&
+            boundStatementAlwaysExits(*ifs.elseStatement);
+    }
+    default:
+        return false;
+    }
+}
+
 } // namespace
 
 std::unique_ptr<BoundStatement> Binder::bindIfStatement(
@@ -4008,7 +4033,18 @@ std::unique_ptr<BoundStatement> Binder::bindIfStatement(
     if (syntaxTree.elseStatement) {
         result->elseStatement = bindEmbeddedStatement(*syntaxTree.elseStatement);
     }
-    if (patternScope) popScope();
+    if (patternScope) {
+        const bool branchExits =
+            (result->thenStatement && boundStatementAlwaysExits(*result->thenStatement)) ||
+            (result->elseStatement && boundStatementAlwaysExits(*result->elseStatement));
+        if (branchExits && scopes_.size() >= 2) {
+            auto& parentScope = scopes_[scopes_.size() - 2];
+            for (const auto& [varName, varSym] : scopes_.back()) {
+                parentScope.try_emplace(varName, varSym);
+            }
+        }
+        popScope();
+    }
     return result;
 }
 

@@ -68,6 +68,54 @@ runtime::Value defaultElementForPrimitive(
 
 void walkExpressionSyntax(
     const syntax::ExpressionSyntax* expr,
+    const std::function<void(const syntax::SyntaxNode&)>& visitor);
+
+void walkPatternSyntax(
+    const syntax::PatternSyntax* pat,
+    const std::function<void(const syntax::SyntaxNode&)>& visitor) {
+    if (!pat) return;
+    visitor(*pat);
+    switch (pat->kind()) {
+    case syntax::SyntaxKind::ConstantPattern: {
+        const auto& cp = static_cast<const syntax::ConstantPatternSyntax&>(*pat);
+        walkExpressionSyntax(cp.expression.get(), visitor);
+        break;
+    }
+    case syntax::SyntaxKind::RelationalPattern: {
+        const auto& rp = static_cast<const syntax::RelationalPatternSyntax&>(*pat);
+        walkExpressionSyntax(rp.operand.get(), visitor);
+        break;
+    }
+    case syntax::SyntaxKind::UnaryPattern: {
+        const auto& up = static_cast<const syntax::UnaryPatternSyntax&>(*pat);
+        walkPatternSyntax(up.pattern.get(), visitor);
+        break;
+    }
+    case syntax::SyntaxKind::BinaryPattern: {
+        const auto& bp = static_cast<const syntax::BinaryPatternSyntax&>(*pat);
+        walkPatternSyntax(bp.left.get(), visitor);
+        walkPatternSyntax(bp.right.get(), visitor);
+        break;
+    }
+    case syntax::SyntaxKind::PropertyPattern: {
+        const auto& pp = static_cast<const syntax::PropertyPatternSyntax&>(*pat);
+        for (const auto& sub : pp.properties) {
+            walkPatternSyntax(sub.pattern.get(), visitor);
+        }
+        break;
+    }
+    case syntax::SyntaxKind::ParenthesizedPattern: {
+        const auto& par = static_cast<const syntax::ParenthesizedPatternSyntax&>(*pat);
+        walkPatternSyntax(par.pattern.get(), visitor);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void walkExpressionSyntax(
+    const syntax::ExpressionSyntax* expr,
     const std::function<void(const syntax::SyntaxNode&)>& visitor) {
     if (!expr) return;
     visitor(*expr);
@@ -162,12 +210,14 @@ void walkExpressionSyntax(
     case syntax::SyntaxKind::TypeBinaryExpression: {
         const auto& tb = static_cast<const syntax::TypeBinaryExpressionSyntax&>(*expr);
         walkExpressionSyntax(tb.expression.get(), visitor);
+        walkPatternSyntax(tb.pattern.get(), visitor);
         break;
     }
     case syntax::SyntaxKind::SwitchExpression: {
         const auto& sw = static_cast<const syntax::SwitchExpressionSyntax&>(*expr);
         walkExpressionSyntax(sw.expression.get(), visitor);
         for (const auto& arm : sw.arms) {
+            walkPatternSyntax(arm.pattern.get(), visitor);
             walkExpressionSyntax(arm.label.get(), visitor);
             walkExpressionSyntax(arm.guard.get(), visitor);
             walkExpressionSyntax(arm.value.get(), visitor);
@@ -232,6 +282,7 @@ void walkStatementSyntax(
         const auto& sw = static_cast<const syntax::SwitchStatementSyntax&>(*stmt);
         walkExpressionSyntax(sw.expression.get(), visitor);
         for (const auto& sec : sw.sections) {
+            walkPatternSyntax(sec.pattern.get(), visitor);
             walkExpressionSyntax(sec.label.get(), visitor);
             walkExpressionSyntax(sec.guard.get(), visitor);
             for (const auto& s : sec.statements) walkStatementSyntax(s.get(), visitor);
@@ -283,8 +334,15 @@ void walkCompilationUnitSyntax(
     visitor(unit);
     if (unit.moduleDeclaration) visitor(*unit.moduleDeclaration);
     for (const auto& imp : unit.imports) visitor(imp);
+    const auto walkParameters = [&](const std::vector<syntax::ParameterSyntax>& params) {
+        for (const auto& param : params) {
+            visitor(param);
+            walkExpressionSyntax(param.defaultValue.get(), visitor);
+        }
+    };
     for (const auto& fn : unit.functions) {
         visitor(fn);
+        walkParameters(fn.parameters);
         if (fn.hasBody()) walkStatementSyntax(&fn.body, visitor);
     }
     const auto walkTypeLike = [&](const auto& decl) {
@@ -295,14 +353,20 @@ void walkCompilationUnitSyntax(
         }
         for (const auto& c : decl.constructors) {
             visitor(c);
+            walkParameters(c.parameters);
+            for (const auto& arg : c.baseArguments) {
+                walkExpressionSyntax(arg.get(), visitor);
+            }
             walkStatementSyntax(&c.body, visitor);
         }
         for (const auto& m : decl.methods) {
             visitor(m);
+            walkParameters(m.parameters);
             if (m.hasBody()) walkStatementSyntax(&m.body, visitor);
         }
         for (const auto& seq : decl.sequences) {
             visitor(seq);
+            walkParameters(seq.parameters);
             walkStatementSyntax(&seq.body, visitor);
         }
         for (const auto& p : decl.properties) {
@@ -315,8 +379,18 @@ void walkCompilationUnitSyntax(
     for (const auto& cl : unit.classes) walkTypeLike(cl);
     for (const auto& st : unit.structs) walkTypeLike(st);
     for (const auto& en : unit.enums) visitor(en);
-    for (const auto& in : unit.interfaces) visitor(in);
-    for (const auto& del : unit.delegates) visitor(del);
+    for (const auto& in : unit.interfaces) {
+        visitor(in);
+        for (const auto& m : in.methods) {
+            visitor(m);
+            walkParameters(m.parameters);
+            if (m.hasBody()) walkStatementSyntax(&*m.body, visitor);
+        }
+    }
+    for (const auto& del : unit.delegates) {
+        visitor(del);
+        walkParameters(del.parameters);
+    }
 }
 
 } // namespace
@@ -899,10 +973,8 @@ MarshalResult marshalCrossHeapImpl(
             }
             auto sub = marshalCrossHeapImpl(*fieldVal, sourceHeap, targetHeap, depth + 1u, maxDepth);
             if (!sub.succeeded) return sub;
-            if (targetHeap) {
-                if (const auto* subRef = std::get_if<runtime::ObjectRef>(&sub.value)) {
-                    fieldRoots.push_back(targetHeap->retain(*subRef));
-                }
+            if (targetHeap && sub.value.isTraceable()) {
+                fieldRoots.push_back(targetHeap->retain(sub.value));
             }
             marshaledFields.push_back(std::move(sub.value));
         }
@@ -1710,6 +1782,17 @@ EventPublishReport ModHost::publishEvent(
             continue;
         }
 
+        if (sub.arity != payload.size()) {
+            outcome.succeeded = false;
+            outcome.status = BusCallStatus::MarshalFailed;
+            outcome.error.code = runtime::ErrorCode::InvalidArguments;
+            outcome.error.message = "event handler '" + sub.qualifiedName + "' expects " +
+                std::to_string(sub.arity) + " argument(s), got " + std::to_string(payload.size());
+            ++report.failedCount;
+            report.outcomes.push_back(std::move(outcome));
+            continue;
+        }
+
         std::vector<runtime::Value> marshaledArgs;
         std::vector<runtime::PersistentRoot> argRoots;
         marshaledArgs.reserve(payload.size());
@@ -1735,8 +1818,8 @@ EventPublishReport ModHost::publishEvent(
                 ++report.failedCount;
                 break;
             }
-            if (const auto* objRef = std::get_if<runtime::ObjectRef>(&m.value)) {
-                argRoots.push_back(sandbox->heap->retain(*objRef));
+            if (m.value.isTraceable()) {
+                argRoots.push_back(sandbox->heap->retain(m.value));
             }
             marshaledArgs.push_back(std::move(m.value));
         }
@@ -1843,8 +1926,8 @@ ModEndpointResult ModHost::invokeModEndpoint(
             }
             return out;
         }
-        if (const auto* objRef = std::get_if<runtime::ObjectRef>(&m.value)) {
-            argRoots.push_back(sandbox->heap->retain(*objRef));
+        if (m.value.isTraceable()) {
+            argRoots.push_back(sandbox->heap->retain(m.value));
         }
         marshaledArgs.push_back(std::move(m.value));
     }
@@ -1870,8 +1953,8 @@ ModEndpointResult ModHost::invokeModEndpoint(
     sandbox->consecutiveFaults = 0;
 
     runtime::PersistentRoot retTempRoot;
-    if (const auto* retObjRef = std::get_if<runtime::ObjectRef>(&execRes.value)) {
-        retTempRoot = sandbox->heap->retain(*retObjRef);
+    if (execRes.value.isTraceable()) {
+        retTempRoot = sandbox->heap->retain(execRes.value);
     }
     auto retMarshal = marshalCrossHeapValue(
         execRes.value,

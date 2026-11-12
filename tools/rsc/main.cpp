@@ -303,16 +303,40 @@ int main(int argc, char** argv) {
                 return 2;
             }
             projectConfigPath = argv[++index];
+            if (projectConfigPath.empty()) {
+                printUsage();
+                return 2;
+            }
         } else if (argument.rfind("--project=", 0) == 0) {
             projectConfigPath = argument.substr(10);
+            if (projectConfigPath.empty()) {
+                printUsage();
+                return 2;
+            }
         } else if (argument.rfind("--config=", 0) == 0) {
             projectConfigPath = argument.substr(9);
+            if (projectConfigPath.empty()) {
+                printUsage();
+                return 2;
+            }
         } else if (argument == "--indent-width") {
             if (index + 1 >= argc) {
                 printUsage();
                 return 2;
             }
-            const int parsedWidth = std::stoi(argv[++index]);
+            const std::string rawWidth = argv[++index];
+            int parsedWidth = 0;
+            try {
+                std::size_t parsedChars = 0;
+                parsedWidth = std::stoi(rawWidth, &parsedChars);
+                if (parsedChars != rawWidth.size()) {
+                    std::cerr << "--indent-width must be a positive integer\n";
+                    return 2;
+                }
+            } catch (const std::exception&) {
+                std::cerr << "--indent-width must be a positive integer\n";
+                return 2;
+            }
             if (parsedWidth <= 0) {
                 std::cerr << "--indent-width must be >= 1\n";
                 return 2;

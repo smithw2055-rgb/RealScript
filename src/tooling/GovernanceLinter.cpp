@@ -97,6 +97,7 @@ SuppressionMap parseInlineSuppressions(const std::string& content) {
         }
 
         std::unordered_set<std::string> codes;
+        bool sawAnyToken = false;
         std::size_t pos = 0;
         while (pos < tail.size()) {
             while (pos < tail.size() &&
@@ -109,6 +110,7 @@ SuppressionMap parseInlineSuppressions(const std::string& content) {
                    tail[end] != ' ' && tail[end] != '\t' && tail[end] != ',') {
                 ++end;
             }
+            sawAnyToken = true;
             const std::string_view rawTok = tail.substr(pos, end - pos);
             const std::string lower = toLowerAscii(rawTok);
             if (rawTok == "*" || lower == "all") {
@@ -121,7 +123,7 @@ SuppressionMap parseInlineSuppressions(const std::string& content) {
             }
             pos = end;
         }
-        if (codes.empty()) {
+        if (!sawAnyToken && codes.empty()) {
             codes.insert("*");
         }
         return codes;
@@ -133,8 +135,14 @@ SuppressionMap parseInlineSuppressions(const std::string& content) {
         bool inQuote = false;
         std::size_t commentPos = std::string_view::npos;
         for (std::size_t i = 0; i < lv.size(); ++i) {
-            if (lv[i] == '"' && (i == 0 || lv[i - 1] != '\\')) {
-                inQuote = !inQuote;
+            if (lv[i] == '"') {
+                std::size_t backslashes = 0;
+                for (std::size_t b = i; b > 0 && lv[b - 1] == '\\'; --b) {
+                    ++backslashes;
+                }
+                if ((backslashes % 2) == 0) {
+                    inQuote = !inQuote;
+                }
             } else if (!inQuote && i + 1 < lv.size() && lv[i] == '/' && lv[i + 1] == '/') {
                 commentPos = i + 2;
                 break;
@@ -566,8 +574,7 @@ struct WorkspaceKnowledge {
                 memMap[m.identifierToken.text] = renderTypeSyntaxSimple(m.returnType);
                 if (semantic::hasModifier(m.modifiers, syntax::SyntaxKind::StaticKeyword) &&
                     !m.parameters.empty() &&
-                    m.parameters.front().modifierToken &&
-                    m.parameters.front().modifierToken->kind == syntax::SyntaxKind::ThisKeyword) {
+                    m.parameters.front().hasThisModifier()) {
                     // Extension method exported by `modName`!
                     moduleSymbols[modName].insert(m.identifierToken.text);
                 }
@@ -799,7 +806,9 @@ std::vector<LintDiagnostic> GovernanceLinter::lintSource(
 
     WorkspaceKnowledge kb;
     kb.ingestCompilationUnit(unit);
-    if (workspaceSources) {
+    if (buildContext && !buildContext->modules.empty()) {
+        kb.ingestBuildResult(*buildContext);
+    } else if (workspaceSources) {
         for (const auto& ws : *workspaceSources) {
             if (ws.path == path) continue;
             text::SourceText wsSrc(ws.content, ws.path);
@@ -807,9 +816,9 @@ std::vector<LintDiagnostic> GovernanceLinter::lintSource(
             syntax::Parser wsParser(wsSrc, wsBag);
             kb.ingestCompilationUnit(wsParser.parseCompilationUnit());
         }
-    }
-    if (buildContext) {
-        kb.ingestBuildResult(*buildContext);
+        if (buildContext) {
+            kb.ingestBuildResult(*buildContext);
+        }
     }
 
     std::vector<LintDiagnostic> emitted;
@@ -1134,6 +1143,97 @@ std::vector<LintDiagnostic> GovernanceLinter::lintSource(
         case syntax::SyntaxKind::SwitchExpression: {
             const auto& sw = static_cast<const syntax::SwitchExpressionSyntax&>(*expr);
             self(self, sw.expression.get(), ctx, true);
+            const std::string subjType =
+                inferExpressionType(inferExpressionType, sw.expression.get(), ctx);
+            const auto visitPat = [&](
+                auto& pSelf,
+                const syntax::PatternSyntax* pat,
+                const std::string& patSubjType) -> void {
+                if (!pat) return;
+                switch (pat->kind()) {
+                case syntax::SyntaxKind::ConstantPattern: {
+                    const auto& cp = static_cast<const syntax::ConstantPatternSyntax&>(*pat);
+                    if (ctx.isSequenceCoroutine && cp.expression &&
+                        (isFloatOrDoubleTypeName(patSubjType) ||
+                         isFloatOrDoubleTypeName(
+                             inferExpressionType(inferExpressionType, cp.expression.get(), ctx)))) {
+                        report(
+                            "RSG004",
+                            cp.span(),
+                            "Non-deterministic floating-point pattern match inside deterministic 'sequence' coroutine; use Fixed math or epsilon tolerance");
+                    }
+                    self(self, cp.expression.get(), ctx, true);
+                    break;
+                }
+                case syntax::SyntaxKind::RelationalPattern: {
+                    const auto& rp = static_cast<const syntax::RelationalPatternSyntax&>(*pat);
+                    self(self, rp.operand.get(), ctx, true);
+                    break;
+                }
+                case syntax::SyntaxKind::TypePattern: {
+                    const auto& tp = static_cast<const syntax::TypePatternSyntax&>(*pat);
+                    if (tp.designationToken && !ctx.scopes.empty() &&
+                        !ctx.findLocal(tp.designationToken->text)) {
+                        ctx.scopes.back().push_back(
+                            {tp.designationToken->text,
+                             renderTypeSyntaxSimple(tp.type),
+                             tp.designationToken->span,
+                             true,
+                             true});
+                    }
+                    break;
+                }
+                case syntax::SyntaxKind::VarPattern: {
+                    const auto& vp = static_cast<const syntax::VarPatternSyntax&>(*pat);
+                    if (!vp.designationToken.missing && !ctx.scopes.empty() &&
+                        !ctx.findLocal(vp.designationToken.text)) {
+                        ctx.scopes.back().push_back(
+                            {vp.designationToken.text,
+                             patSubjType,
+                             vp.designationToken.span,
+                             true,
+                             true});
+                    }
+                    break;
+                }
+                case syntax::SyntaxKind::UnaryPattern: {
+                    const auto& up = static_cast<const syntax::UnaryPatternSyntax&>(*pat);
+                    pSelf(pSelf, up.pattern.get(), patSubjType);
+                    break;
+                }
+                case syntax::SyntaxKind::BinaryPattern: {
+                    const auto& bp = static_cast<const syntax::BinaryPatternSyntax&>(*pat);
+                    pSelf(pSelf, bp.left.get(), patSubjType);
+                    pSelf(pSelf, bp.right.get(), patSubjType);
+                    break;
+                }
+                case syntax::SyntaxKind::ParenthesizedPattern: {
+                    const auto& pp = static_cast<const syntax::ParenthesizedPatternSyntax&>(*pat);
+                    pSelf(pSelf, pp.pattern.get(), patSubjType);
+                    break;
+                }
+                case syntax::SyntaxKind::PropertyPattern: {
+                    const auto& prp = static_cast<const syntax::PropertyPatternSyntax&>(*pat);
+                    const std::string subType =
+                        prp.type ? renderTypeSyntaxSimple(*prp.type) : patSubjType;
+                    for (const auto& sub : prp.properties) {
+                        pSelf(pSelf, sub.pattern.get(), std::string{});
+                    }
+                    if (prp.designationToken && !ctx.scopes.empty() &&
+                        !ctx.findLocal(prp.designationToken->text)) {
+                        ctx.scopes.back().push_back(
+                            {prp.designationToken->text,
+                             subType,
+                             prp.designationToken->span,
+                             true,
+                             true});
+                    }
+                    break;
+                }
+                default:
+                    break;
+                }
+            };
             for (const auto& arm : sw.arms) {
                 ctx.pushScope();
                 if (arm.patternDesignation) {
@@ -1143,6 +1243,7 @@ std::vector<LintDiagnostic> GovernanceLinter::lintSource(
                     ctx.scopes.back().push_back(
                         {arm.patternDesignation->text, pType, arm.patternDesignation->span, true, true});
                 }
+                visitPat(visitPat, arm.pattern.get(), subjType);
                 self(self, arm.label.get(), ctx, true);
                 self(self, arm.guard.get(), ctx, true);
                 self(self, arm.value.get(), ctx, true);
@@ -1153,6 +1254,8 @@ std::vector<LintDiagnostic> GovernanceLinter::lintSource(
         case syntax::SyntaxKind::TypeBinaryExpression: {
             const auto& tb = static_cast<const syntax::TypeBinaryExpressionSyntax&>(*expr);
             self(self, tb.expression.get(), ctx, true);
+            const std::string subjType =
+                inferExpressionType(inferExpressionType, tb.expression.get(), ctx);
             if (tb.designationToken && !ctx.scopes.empty()) {
                 ctx.scopes.back().push_back({
                     tb.designationToken->text,
@@ -1161,6 +1264,99 @@ std::vector<LintDiagnostic> GovernanceLinter::lintSource(
                     false,
                     tb.designationToken->text.empty() || tb.designationToken->text[0] == '_'});
             }
+            const auto visitIsPat = [&](
+                auto& pSelf,
+                const syntax::PatternSyntax* pat,
+                const std::string& patSubjType) -> void {
+                if (!pat) return;
+                switch (pat->kind()) {
+                case syntax::SyntaxKind::ConstantPattern: {
+                    const auto& cp = static_cast<const syntax::ConstantPatternSyntax&>(*pat);
+                    if (ctx.isSequenceCoroutine && cp.expression &&
+                        (isFloatOrDoubleTypeName(patSubjType) ||
+                         isFloatOrDoubleTypeName(
+                             inferExpressionType(inferExpressionType, cp.expression.get(), ctx)))) {
+                        report(
+                            "RSG004",
+                            cp.span(),
+                            "Non-deterministic floating-point pattern match inside deterministic 'sequence' coroutine; use Fixed math or epsilon tolerance");
+                    }
+                    self(self, cp.expression.get(), ctx, true);
+                    break;
+                }
+                case syntax::SyntaxKind::RelationalPattern: {
+                    const auto& rp = static_cast<const syntax::RelationalPatternSyntax&>(*pat);
+                    self(self, rp.operand.get(), ctx, true);
+                    break;
+                }
+                case syntax::SyntaxKind::TypePattern: {
+                    const auto& tp = static_cast<const syntax::TypePatternSyntax&>(*pat);
+                    if (tp.designationToken && !ctx.scopes.empty() &&
+                        !ctx.findLocal(tp.designationToken->text)) {
+                        const std::string& vName = tp.designationToken->text;
+                        ctx.scopes.back().push_back(
+                            {vName,
+                             renderTypeSyntaxSimple(tp.type),
+                             tp.designationToken->span,
+                             false,
+                             vName.empty() || vName[0] == '_'});
+                    }
+                    break;
+                }
+                case syntax::SyntaxKind::VarPattern: {
+                    const auto& vp = static_cast<const syntax::VarPatternSyntax&>(*pat);
+                    if (!vp.designationToken.missing && !ctx.scopes.empty() &&
+                        !ctx.findLocal(vp.designationToken.text)) {
+                        const std::string& vName = vp.designationToken.text;
+                        ctx.scopes.back().push_back(
+                            {vName,
+                             patSubjType,
+                             vp.designationToken.span,
+                             false,
+                             vName.empty() || vName[0] == '_'});
+                    }
+                    break;
+                }
+                case syntax::SyntaxKind::UnaryPattern: {
+                    const auto& up = static_cast<const syntax::UnaryPatternSyntax&>(*pat);
+                    pSelf(pSelf, up.pattern.get(), patSubjType);
+                    break;
+                }
+                case syntax::SyntaxKind::BinaryPattern: {
+                    const auto& bp = static_cast<const syntax::BinaryPatternSyntax&>(*pat);
+                    pSelf(pSelf, bp.left.get(), patSubjType);
+                    pSelf(pSelf, bp.right.get(), patSubjType);
+                    break;
+                }
+                case syntax::SyntaxKind::ParenthesizedPattern: {
+                    const auto& pp = static_cast<const syntax::ParenthesizedPatternSyntax&>(*pat);
+                    pSelf(pSelf, pp.pattern.get(), patSubjType);
+                    break;
+                }
+                case syntax::SyntaxKind::PropertyPattern: {
+                    const auto& prp = static_cast<const syntax::PropertyPatternSyntax&>(*pat);
+                    const std::string subType =
+                        prp.type ? renderTypeSyntaxSimple(*prp.type) : patSubjType;
+                    for (const auto& sub : prp.properties) {
+                        pSelf(pSelf, sub.pattern.get(), std::string{});
+                    }
+                    if (prp.designationToken && !ctx.scopes.empty() &&
+                        !ctx.findLocal(prp.designationToken->text)) {
+                        const std::string& vName = prp.designationToken->text;
+                        ctx.scopes.back().push_back(
+                            {vName,
+                             subType,
+                             prp.designationToken->span,
+                             false,
+                             vName.empty() || vName[0] == '_'});
+                    }
+                    break;
+                }
+                default:
+                    break;
+                }
+            };
+            visitIsPat(visitIsPat, tb.pattern.get(), subjType);
             break;
         }
         case syntax::SyntaxKind::AssignmentExpression: {
@@ -1321,6 +1517,7 @@ std::vector<LintDiagnostic> GovernanceLinter::lintSource(
         case syntax::SyntaxKind::EventSubscriptionStatement: {
             const auto& ev = static_cast<const syntax::EventSubscriptionStatementSyntax&>(*stmt);
             if (ctx.isHotPathLifecycle &&
+                ev.operatorToken.kind == syntax::SyntaxKind::PlusEqualsToken &&
                 (!ev.handler || ev.handler->kind() != syntax::SyntaxKind::LambdaExpression)) {
                 report(
                     "RSG001",
@@ -1398,6 +1595,97 @@ std::vector<LintDiagnostic> GovernanceLinter::lintSource(
         case syntax::SyntaxKind::SwitchStatement: {
             const auto& sw = static_cast<const syntax::SwitchStatementSyntax&>(*stmt);
             visitExpr(visitExpr, sw.expression.get(), ctx, true);
+            const std::string subjType =
+                inferExpressionType(inferExpressionType, sw.expression.get(), ctx);
+            const auto visitSecPat = [&](
+                auto& pSelf,
+                const syntax::PatternSyntax* pat,
+                const std::string& patSubjType) -> void {
+                if (!pat) return;
+                switch (pat->kind()) {
+                case syntax::SyntaxKind::ConstantPattern: {
+                    const auto& cp = static_cast<const syntax::ConstantPatternSyntax&>(*pat);
+                    if (ctx.isSequenceCoroutine && cp.expression &&
+                        (isFloatOrDoubleTypeName(patSubjType) ||
+                         isFloatOrDoubleTypeName(
+                             inferExpressionType(inferExpressionType, cp.expression.get(), ctx)))) {
+                        report(
+                            "RSG004",
+                            cp.span(),
+                            "Non-deterministic floating-point pattern match inside deterministic 'sequence' coroutine; use Fixed math or epsilon tolerance");
+                    }
+                    visitExpr(visitExpr, cp.expression.get(), ctx, true);
+                    break;
+                }
+                case syntax::SyntaxKind::RelationalPattern: {
+                    const auto& rp = static_cast<const syntax::RelationalPatternSyntax&>(*pat);
+                    visitExpr(visitExpr, rp.operand.get(), ctx, true);
+                    break;
+                }
+                case syntax::SyntaxKind::TypePattern: {
+                    const auto& tp = static_cast<const syntax::TypePatternSyntax&>(*pat);
+                    if (tp.designationToken && !ctx.scopes.empty() &&
+                        !ctx.findLocal(tp.designationToken->text)) {
+                        ctx.scopes.back().push_back(
+                            {tp.designationToken->text,
+                             renderTypeSyntaxSimple(tp.type),
+                             tp.designationToken->span,
+                             true,
+                             true});
+                    }
+                    break;
+                }
+                case syntax::SyntaxKind::VarPattern: {
+                    const auto& vp = static_cast<const syntax::VarPatternSyntax&>(*pat);
+                    if (!vp.designationToken.missing && !ctx.scopes.empty() &&
+                        !ctx.findLocal(vp.designationToken.text)) {
+                        ctx.scopes.back().push_back(
+                            {vp.designationToken.text,
+                             patSubjType,
+                             vp.designationToken.span,
+                             true,
+                             true});
+                    }
+                    break;
+                }
+                case syntax::SyntaxKind::UnaryPattern: {
+                    const auto& up = static_cast<const syntax::UnaryPatternSyntax&>(*pat);
+                    pSelf(pSelf, up.pattern.get(), patSubjType);
+                    break;
+                }
+                case syntax::SyntaxKind::BinaryPattern: {
+                    const auto& bp = static_cast<const syntax::BinaryPatternSyntax&>(*pat);
+                    pSelf(pSelf, bp.left.get(), patSubjType);
+                    pSelf(pSelf, bp.right.get(), patSubjType);
+                    break;
+                }
+                case syntax::SyntaxKind::ParenthesizedPattern: {
+                    const auto& pp = static_cast<const syntax::ParenthesizedPatternSyntax&>(*pat);
+                    pSelf(pSelf, pp.pattern.get(), patSubjType);
+                    break;
+                }
+                case syntax::SyntaxKind::PropertyPattern: {
+                    const auto& prp = static_cast<const syntax::PropertyPatternSyntax&>(*pat);
+                    const std::string subType =
+                        prp.type ? renderTypeSyntaxSimple(*prp.type) : patSubjType;
+                    for (const auto& sub : prp.properties) {
+                        pSelf(pSelf, sub.pattern.get(), std::string{});
+                    }
+                    if (prp.designationToken && !ctx.scopes.empty() &&
+                        !ctx.findLocal(prp.designationToken->text)) {
+                        ctx.scopes.back().push_back(
+                            {prp.designationToken->text,
+                             subType,
+                             prp.designationToken->span,
+                             true,
+                             true});
+                    }
+                    break;
+                }
+                default:
+                    break;
+                }
+            };
             for (const auto& sec : sw.sections) {
                 ctx.pushScope();
                 if (sec.patternDesignation) {
@@ -1407,6 +1695,7 @@ std::vector<LintDiagnostic> GovernanceLinter::lintSource(
                     ctx.scopes.back().push_back(
                         {sec.patternDesignation->text, pType, sec.patternDesignation->span, true, true});
                 }
+                visitSecPat(visitSecPat, sec.pattern.get(), subjType);
                 visitExpr(visitExpr, sec.label.get(), ctx, true);
                 visitExpr(visitExpr, sec.guard.get(), ctx, true);
                 for (const auto& s : sec.statements) self(self, s.get(), ctx);

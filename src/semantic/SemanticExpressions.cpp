@@ -2577,16 +2577,48 @@ std::unique_ptr<BoundPattern> Binder::bindPattern(
                 effectiveInputName);
             return;
         }
-        if (isNumericType(effectiveInput) && isNumericType(boundConst->type)) {
+        if ((effectiveInput == PrimitiveType::Char || isNumericType(effectiveInput)) &&
+            (boundConst->type == PrimitiveType::Char || isNumericType(boundConst->type))) {
+            if (effectiveInput == PrimitiveType::Char) {
+                pat->comparisonType = PrimitiveType::Int;
+                pat->constantValue = convertExpression(
+                    std::move(boundConst),
+                    PrimitiveType::Int,
+                    constSyntax.span(),
+                    "constant pattern");
+                return;
+            }
             if ((effectiveInput == PrimitiveType::ULong || effectiveInput == PrimitiveType::UInt) &&
                 std::holds_alternative<std::int64_t>(evalVal) &&
-                std::get<std::int64_t>(evalVal) >= 0) {
+                std::get<std::int64_t>(evalVal) >= 0 &&
+                (effectiveInput == PrimitiveType::ULong ||
+                 static_cast<std::uint64_t>(std::get<std::int64_t>(evalVal)) <=
+                     static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))) {
                 auto lit = std::make_unique<BoundLiteralExpression>();
                 lit->span = constSyntax.span();
                 lit->type = effectiveInput;
                 lit->value = evalVal;
                 pat->comparisonType = effectiveInput;
                 pat->constantValue = std::move(lit);
+                return;
+            }
+            PrimitiveType carrier = commonNumericType(effectiveInput, boundConst->type);
+            if (carrier == PrimitiveType::Byte || carrier == PrimitiveType::SByte ||
+                carrier == PrimitiveType::Short || carrier == PrimitiveType::UShort ||
+                carrier == PrimitiveType::Char) {
+                carrier = PrimitiveType::Int;
+            }
+            if (carrier != PrimitiveType::Error &&
+                (effectiveInput == PrimitiveType::Byte ||
+                 effectiveInput == PrimitiveType::SByte ||
+                 effectiveInput == PrimitiveType::Short ||
+                 effectiveInput == PrimitiveType::UShort)) {
+                pat->comparisonType = carrier;
+                pat->constantValue = convertExpression(
+                    std::move(boundConst),
+                    carrier,
+                    constSyntax.span(),
+                    "constant pattern");
                 return;
             }
             pat->comparisonType = effectiveInput;
@@ -3909,6 +3941,8 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 : nullptr;
             if (capturedThis && outerField) {
                 if (!compoundOp) {
+                    checkObsoleteReference(
+                        outerField->id, "field", outerField->name, syntaxTree.identifierToken.span);
                     recordSymbolReference(
                         occurrences_,
                         currentSourceName_,

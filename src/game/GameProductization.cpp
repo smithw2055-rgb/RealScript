@@ -487,6 +487,7 @@ GameProgramLoadResult GameProgramLoader::loadBytecodeModules(
         return result;
     }
     if (encodedModules.empty()) {
+        result.abiCompatibility = preflightBytecodePackageHeaders(encodedModules);
         result.diagnostics.report("RS7101", "no bytecode modules were supplied", {});
         return result;
     }
@@ -494,7 +495,13 @@ GameProgramLoadResult GameProgramLoader::loadBytecodeModules(
     result.modules.reserve(encodedModules.size());
     for (const auto& bytes : encodedModules) {
         bytecode::Module module;
-        if (!bytecode::decodeModule(bytes, module, result.diagnostics)) return result;
+        if (!bytecode::decodeModule(bytes, module, result.diagnostics)) {
+            auto headerCheck = preflightBytecodePackageHeaders(encodedModules);
+            if (!headerCheck.compatible()) {
+                result.abiCompatibility = std::move(headerCheck);
+            }
+            return result;
+        }
         result.modules.push_back(std::move(module));
     }
     std::sort(result.modules.begin(), result.modules.end(),
@@ -547,9 +554,17 @@ GameProgramLoadResult GameProgramLoader::loadBytecodeModules(
     if (!headerReport.canLoad()) {
         result.abiCompatibility = std::move(headerReport);
         for (const auto& issue : result.abiCompatibility.issues) {
+            if (issue.impact == AbiCompatibilityStatus::Incompatible) {
+                result.diagnostics.report(
+                    issue.diagnosticCode.empty() ? "RS7104" : issue.diagnosticCode,
+                    issue.message,
+                    {});
+            }
+        }
+        if (!result.diagnostics.hasErrors()) {
             result.diagnostics.report(
-                issue.diagnosticCode.empty() ? "RS7104" : issue.diagnosticCode,
-                issue.message,
+                "RS7104",
+                "package bytecode headers are incompatible with host runtime",
                 {});
         }
         return result;
@@ -561,9 +576,15 @@ GameProgramLoadResult GameProgramLoader::loadBytecodeModules(
     }
     loaded.package.abiManifest = embeddedPackageManifest;
     loaded.abiCompatibility =
-        verifyAbiCompatibility(currentAbiContractManifest(), embeddedPackageManifest);
+        verifyPackageAbiCompatibility(loaded.package, currentAbiContractManifest());
     for (const auto& issue : headerReport.issues) {
-        if (!loaded.abiCompatibility.hasIssue(issue.code)) {
+        const bool alreadyPresent = std::any_of(
+            loaded.abiCompatibility.issues.begin(),
+            loaded.abiCompatibility.issues.end(),
+            [&](const AbiIssue& existing) {
+                return existing.code == issue.code && existing.field == issue.field;
+            });
+        if (!alreadyPresent) {
             if (static_cast<std::uint8_t>(issue.impact) >
                 static_cast<std::uint8_t>(loaded.abiCompatibility.status)) {
                 loaded.abiCompatibility.status = issue.impact;
@@ -5918,12 +5939,17 @@ AbiContractManifest buildPackageAbiManifest(
     if (!modules.empty()) {
         BytecodeVersionPoint minVer{
             modules.front().version.major, modules.front().version.minor};
+        BytecodeVersionPoint maxVer = minVer;
         for (std::size_t i = 1; i < modules.size(); ++i) {
             const BytecodeVersionPoint cur{
                 modules[i].version.major, modules[i].version.minor};
             if (cur < minVer) minVer = cur;
+            if (cur > maxVer) maxVer = cur;
         }
-        manifest.bytecodeTargetVersion = minVer;
+        manifest.bytecodeTargetVersion =
+            (minVer == BytecodeVersionPoint{0, 6} && maxVer <= manifest.bytecodeMaxVersion)
+                ? minVer
+                : maxVer;
         manifest.refreshLayoutDigest();
     }
     return manifest;

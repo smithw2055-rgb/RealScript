@@ -644,8 +644,12 @@ public int RunSeed(int x) {
                 checkDecodeAndVerify(m, true, "magic-tamper");
             }
             // Corrupt major & minor version
-            for (const auto& [maj, minVer] : std::vector<std::pair<std::uint16_t, std::uint16_t>>{
-                     {1, 7}, {0, 0}, {0, 5}, {0, 99}, {0xFFFFu, 0xFFFFu}}) {
+            struct VersionPair {
+                std::uint16_t maj;
+                std::uint16_t minVer;
+            };
+            for (const auto& [maj, minVer] : std::vector<VersionPair>{
+                     {1u, 7u}, {0u, 0u}, {0u, 5u}, {0u, 99u}, {0xFFFFu, 0xFFFFu}}) {
                 auto m = validBytes;
                 writeU16LE(m, 4, maj);
                 writeU16LE(m, 6, minVer);

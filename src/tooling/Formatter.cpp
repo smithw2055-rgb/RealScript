@@ -157,7 +157,8 @@ void parseTriviaSlice(
 bool isWordLikeKind(syntax::SyntaxKind kind) noexcept {
     if (kind == syntax::SyntaxKind::IdentifierToken ||
         kind == syntax::SyntaxKind::IntegerLiteralToken ||
-        kind == syntax::SyntaxKind::FloatLiteralToken) {
+        kind == syntax::SyntaxKind::FloatLiteralToken ||
+        kind == syntax::SyntaxKind::CharLiteralToken) {
         return true;
     }
     return kind >= syntax::SyntaxKind::ModuleKeyword &&
@@ -181,8 +182,15 @@ bool isAllowedInsideGeneric(const std::vector<FmtToken>& tokens, std::size_t idx
     case syntax::SyntaxKind::GreaterToken:
     case syntax::SyntaxKind::CommaToken:
     case syntax::SyntaxKind::DotToken:
-    case syntax::SyntaxKind::QuestionToken:
         return true;
+    case syntax::SyntaxKind::QuestionToken:
+        return idx > 0 && idx + 1 < tokens.size() &&
+            (isIdentifierOrTypeWord(tokens[idx - 1]) ||
+             tokens[idx - 1].kind == syntax::SyntaxKind::GreaterToken ||
+             tokens[idx - 1].kind == syntax::SyntaxKind::CloseBracketToken) &&
+            (tokens[idx + 1].kind == syntax::SyntaxKind::GreaterToken ||
+             tokens[idx + 1].kind == syntax::SyntaxKind::CommaToken ||
+             tokens[idx + 1].kind == syntax::SyntaxKind::OpenBracketToken);
     case syntax::SyntaxKind::OpenBracketToken:
         return idx + 1 < tokens.size() &&
             tokens[idx + 1].kind == syntax::SyntaxKind::CloseBracketToken &&
@@ -204,6 +212,7 @@ bool startsOperandAfterCast(const FmtToken& tok) noexcept {
     case syntax::SyntaxKind::IdentifierToken:
     case syntax::SyntaxKind::IntegerLiteralToken:
     case syntax::SyntaxKind::FloatLiteralToken:
+    case syntax::SyntaxKind::CharLiteralToken:
     case syntax::SyntaxKind::StringLiteralToken:
     case syntax::SyntaxKind::InterpolatedStringToken:
     case syntax::SyntaxKind::TrueKeyword:
@@ -509,35 +518,50 @@ void classifyBracketsParensBracesAndOperators(std::vector<FmtToken>& tokens) {
         }
 
         if (role == ParenRole::Normal && closeIdx > i + 1) {
-            // Check cast `(Type)expr`
-            bool onlyTypeTokens = true;
-            for (std::size_t k = i + 1; k < closeIdx; ++k) {
+            // Check cast `(Type)expr`: must be a single type (no top-level commas or parameter names)
+            // and must not be preceded by a callable name/keyword.
+            const bool precededByCallable =
+                i > 0 &&
+                (tokens[i - 1].kind == syntax::SyntaxKind::IdentifierToken ||
+                 tokens[i - 1].isGenericClose ||
+                 tokens[i - 1].kind == syntax::SyntaxKind::TypeofKeyword ||
+                 tokens[i - 1].kind == syntax::SyntaxKind::BaseKeyword ||
+                 tokens[i - 1].kind == syntax::SyntaxKind::ThisKeyword ||
+                 tokens[i - 1].kind == syntax::SyntaxKind::NewKeyword ||
+                 tokens[i - 1].kind == syntax::SyntaxKind::CatchKeyword);
+            bool onlySingleTypeTokens = !precededByCallable;
+            int genDepth = 0;
+            for (std::size_t k = i + 1; k < closeIdx && onlySingleTypeTokens; ++k) {
                 if (!isAllowedInsideGeneric(tokens, k)) {
-                    onlyTypeTokens = false;
+                    onlySingleTypeTokens = false;
+                    break;
+                }
+                if (tokens[k].isGenericOpen) ++genDepth;
+                else if (tokens[k].isGenericClose) --genDepth;
+                else if (genDepth == 0 && tokens[k].kind == syntax::SyntaxKind::CommaToken) {
+                    onlySingleTypeTokens = false;
+                    break;
+                }
+                if (k > i + 1 && isIdentifierOrTypeWord(tokens[k]) &&
+                    (isIdentifierOrTypeWord(tokens[k - 1]) ||
+                     tokens[k - 1].isGenericClose ||
+                     tokens[k - 1].kind == syntax::SyntaxKind::CloseBracketToken ||
+                     tokens[k - 1].kind == syntax::SyntaxKind::QuestionToken)) {
+                    // Parameter declaration like `(int x)` or `(Foo? x)`
+                    onlySingleTypeTokens = false;
                     break;
                 }
             }
-            if (onlyTypeTokens) {
+            if (onlySingleTypeTokens && closeIdx + 1 < n) {
                 const bool startsWithPrim = syntax::isPrimitiveTypeKeyword(tokens[i + 1].kind);
-                if (startsWithPrim && closeIdx + 1 < n &&
-                    tokens[closeIdx + 1].kind != syntax::SyntaxKind::SemicolonToken &&
-                    tokens[closeIdx + 1].kind != syntax::SyntaxKind::CommaToken &&
-                    tokens[closeIdx + 1].kind != syntax::SyntaxKind::CloseParenToken) {
+                if (startsWithPrim &&
+                    (startsOperandAfterCast(tokens[closeIdx + 1]) ||
+                     tokens[closeIdx + 1].kind == syntax::SyntaxKind::MinusToken ||
+                     tokens[closeIdx + 1].kind == syntax::SyntaxKind::PlusToken)) {
                     role = ParenRole::Cast;
                 } else if (tokens[i + 1].kind == syntax::SyntaxKind::IdentifierToken &&
-                           closeIdx + 1 < n &&
                            startsOperandAfterCast(tokens[closeIdx + 1])) {
-                    // Only a cast if `(` was NOT preceded by a callable identifier/keyword!
-                    const bool precededByCallable =
-                        i > 0 &&
-                        (tokens[i - 1].kind == syntax::SyntaxKind::IdentifierToken ||
-                         tokens[i - 1].isGenericClose ||
-                         tokens[i - 1].kind == syntax::SyntaxKind::TypeofKeyword ||
-                         tokens[i - 1].kind == syntax::SyntaxKind::BaseKeyword ||
-                         tokens[i - 1].kind == syntax::SyntaxKind::ThisKeyword);
-                    if (!precededByCallable) {
-                        role = ParenRole::Cast;
-                    }
+                    role = ParenRole::Cast;
                 }
             }
         }
@@ -669,6 +693,7 @@ void classifyBracketsParensBracesAndOperators(std::vector<FmtToken>& tokens) {
         case syntax::SyntaxKind::IdentifierToken:
         case syntax::SyntaxKind::IntegerLiteralToken:
         case syntax::SyntaxKind::FloatLiteralToken:
+        case syntax::SyntaxKind::CharLiteralToken:
         case syntax::SyntaxKind::StringLiteralToken:
         case syntax::SyntaxKind::InterpolatedStringToken:
         case syntax::SyntaxKind::TrueKeyword:
@@ -710,18 +735,26 @@ void classifyBracketsParensBracesAndOperators(std::vector<FmtToken>& tokens) {
         } else if (tok.kind == syntax::SyntaxKind::QuestionToken) {
             // Nullable `T?` or null-conditional element `?[0]` vs ternary `cond ? a : b`
             bool isNullOrAccess = false;
-            if (i + 1 < n && tokens[i + 1].kind == syntax::SyntaxKind::OpenBracketToken) {
-                // Both `int?[]` and `items?[0]` attach `?` with no spaces on either side!
+            const bool afterIsPattern =
+                i >= 2 && tokens[i - 2].kind == syntax::SyntaxKind::IsKeyword;
+            if (i + 1 < n &&
+                (tokens[i + 1].kind == syntax::SyntaxKind::OpenBracketToken ||
+                 tokens[i + 1].isGenericClose ||
+                 tokens[i + 1].kind == syntax::SyntaxKind::CommaToken ||
+                 tokens[i + 1].kind == syntax::SyntaxKind::CloseParenToken ||
+                 tokens[i + 1].kind == syntax::SyntaxKind::OpenBraceToken)) {
                 isNullOrAccess = true;
-            } else if (i > 0 && (syntax::isPrimitiveTypeKeyword(tokens[i - 1].kind) || tokens[i - 1].isGenericClose)) {
+            } else if (i > 0 &&
+                       (syntax::isPrimitiveTypeKeyword(tokens[i - 1].kind) ||
+                        tokens[i - 1].isGenericClose) &&
+                       !afterIsPattern) {
                 isNullOrAccess = true;
-            } else if (i > 0 && tokens[i - 1].kind == syntax::SyntaxKind::IdentifierToken) {
-                // Check if inside generic `<...>` or followed by declaration identifier
-                if (i + 1 < n &&
-                    (tokens[i + 1].isGenericClose ||
-                     tokens[i + 1].kind == syntax::SyntaxKind::IdentifierToken)) {
-                    // Wait: in `cond ? x : y`, `tokens[i + 1]` CAN be an identifier `x`!
-                    // Scan ahead at same paren/bracket/brace depth for a matching `:` before `;`, `,`, `)`, `]`, `}`, `=>`
+            } else if (i > 0 &&
+                       (tokens[i - 1].kind == syntax::SyntaxKind::IdentifierToken ||
+                        syntax::isPrimitiveTypeKeyword(tokens[i - 1].kind) ||
+                        tokens[i - 1].isGenericClose)) {
+                if (i + 1 < n && tokens[i + 1].kind == syntax::SyntaxKind::IdentifierToken) {
+                    // Scan ahead at same paren/bracket/brace depth for a matching `:` before `;`, `,`, `)`, `]`, `}`
                     int p = 0, b = 0, c = 0, q = 0;
                     bool foundTernaryColon = false;
                     for (std::size_t k = i + 1; k < n; ++k) {
@@ -742,8 +775,7 @@ void classifyBracketsParensBracesAndOperators(std::vector<FmtToken>& tokens) {
                         } else if (p == 0 && b == 0 && c == 0) {
                             if (kk == syntax::SyntaxKind::SemicolonToken ||
                                 kk == syntax::SyntaxKind::CommaToken ||
-                                kk == syntax::SyntaxKind::EqualsToken ||
-                                kk == syntax::SyntaxKind::ArrowToken) {
+                                kk == syntax::SyntaxKind::EqualsToken) {
                                 break;
                             }
                             if (kk == syntax::SyntaxKind::QuestionToken) {
@@ -1110,6 +1142,7 @@ FormatResult formatSource(std::string_view sourceText, const FormatOptions& opti
             : braceFrames.size();
         for (std::size_t bi = 0; bi < limit; ++bi) {
             const auto& bf = braceFrames[bi];
+            depth += bf.savedBracelessIndent;
             if (bf.role == BraceRole::Block ||
                 bf.role == BraceRole::SwitchExpression ||
                 bf.role == BraceRole::EnumBody) {
@@ -1121,6 +1154,9 @@ FormatResult formatSource(std::string_view sourceText, const FormatOptions& opti
                     ++depth;
                 }
             }
+        }
+        if (forClosingBrace && !braceFrames.empty()) {
+            depth += braceFrames.back().savedBracelessIndent;
         }
         if (!forClosingBrace && !forSwitchLabel) {
             depth += bracelessIndent;

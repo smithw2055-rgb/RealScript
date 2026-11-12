@@ -3649,6 +3649,21 @@ private:
                     if (ext->parameterTypeSyntaxes.size() != combinedArgs.size()) continue;
                     if (call.lessToken) {
                         if (ext->parameters.size() != explicitTypeArgs.size()) continue;
+                        if (!receiverType.empty() && !ext->parameterTypeSyntaxes.empty()) {
+                            std::set<std::string> tpSet(
+                                ext->parameters.begin(), ext->parameters.end());
+                            std::map<std::string, std::string> prefilled;
+                            for (std::size_t ti = 0; ti < ext->parameters.size(); ++ti) {
+                                prefilled[ext->parameters[ti]] = explicitTypeArgs[ti];
+                            }
+                            if (!matchFormalTypeAgainstActual(
+                                    ext->parameterTypeSyntaxes[0],
+                                    receiverType,
+                                    tpSet,
+                                    prefilled)) {
+                                continue;
+                            }
+                        }
                         matchedExt = ext;
                         matchedTypeArgs = explicitTypeArgs;
                         break;

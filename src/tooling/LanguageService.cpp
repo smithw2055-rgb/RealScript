@@ -3117,7 +3117,8 @@ std::vector<CodeAction> LanguageService::codeActions(
                     constexpr std::string_view kDir = "realscript-disable-next-line";
                     if (body.rfind(kDir, 0) == 0 &&
                         body.size() > kDir.size() &&
-                        body.find("--") == std::string_view::npos) {
+                        body.find("--") == std::string_view::npos &&
+                        body.find("//") == std::string_view::npos) {
                         fixEdit = TextEdit{
                             Location{path, rangeFor(path, text::TextSpan{prevEnd, 0})},
                             ", " + d.code,
