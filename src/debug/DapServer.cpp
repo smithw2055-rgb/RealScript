@@ -212,6 +212,71 @@ ResumeMode commandMode(const std::string& command) {
     return ResumeMode::Continue;
 }
 
+std::string formatFiberRegisterValue(
+    std::int32_t rawVal,
+    semantic::PrimitiveType ptype,
+    semantic::SymbolId typeId,
+    std::string& outTypeName) {
+    static const semantic::SymbolId kFixedId =
+        semantic::stableTypeId("RealScript.Math::Fixed");
+    static const semantic::SymbolId kFixed16Id =
+        semantic::stableTypeId("RealScript.Math::Fixed16");
+
+    if (ptype == semantic::PrimitiveType::Struct && typeId == kFixedId) {
+        outTypeName = "Fixed";
+        std::ostringstream os;
+        os << std::fixed << std::setprecision(4)
+           << runtime::Fixed24_8::fromRaw(rawVal).toDouble()
+           << " (raw=" << rawVal << ")";
+        return os.str();
+    }
+    if (ptype == semantic::PrimitiveType::Struct && typeId == kFixed16Id) {
+        outTypeName = "Fixed16";
+        std::ostringstream os;
+        os << std::fixed << std::setprecision(4)
+           << runtime::Fixed16_16::fromRaw(rawVal).toDouble()
+           << " (raw=" << rawVal << ")";
+        return os.str();
+    }
+    if (ptype == semantic::PrimitiveType::Bool) {
+        outTypeName = "bool";
+        return rawVal != 0 ? "true" : "false";
+    }
+    if (ptype != semantic::PrimitiveType::Error &&
+        ptype != semantic::PrimitiveType::Struct) {
+        outTypeName = semantic::primitiveTypeName(ptype);
+    } else {
+        outTypeName = "int";
+    }
+    return std::to_string(rawVal);
+}
+
+std::uint32_t computeFiberRemainingTicks(
+    const runtime::FiberScheduler& scheduler,
+    const runtime::FiberContext& fiber) noexcept {
+    if (fiber.status != runtime::FiberStatus::SleepingTicks) {
+        return 0u;
+    }
+    const std::uint32_t cur = scheduler.currentTick();
+    return fiber.wakeTick > cur ? (fiber.wakeTick - cur) : 0u;
+}
+
+std::uint32_t resolveFiberFramePc(
+    const runtime::CompiledFiberModule* fiberModule,
+    const runtime::FiberContext& fiber,
+    std::size_t depthIdx) noexcept {
+    if (depthIdx == 0) {
+        return fiberModule
+            ? fiberModule->effectiveInspectionPc(fiber)
+            : fiber.pc;
+    }
+    if (depthIdx <= fiber.callDepth && fiber.callDepth <= fiber.callStack.size()) {
+        const std::uint32_t retPc = fiber.callStack[fiber.callDepth - depthIdx];
+        return retPc > 0u ? (retPc - 1u) : 0u;
+    }
+    return fiber.pc;
+}
+
 } // namespace
 
 DapServer::DapServer(
@@ -234,6 +299,101 @@ void DapServer::rebindProgram(std::shared_ptr<const runtime::ProgramImage> progr
     if (session_) {
         session_->rebindProgram(program_);
     }
+}
+
+void DapServer::bindFiberScheduler(
+    const runtime::FiberScheduler* scheduler,
+    const runtime::CompiledFiberModule* fiberModule) noexcept {
+    fiberScheduler_ = scheduler;
+    fiberModule_ = fiberModule;
+}
+
+void DapServer::bindFrameTelemetry(
+    const runtime::FrameTelemetryCollector* telemetry) noexcept {
+    frameTelemetry_ = telemetry;
+}
+
+tooling::Json DapServer::serializeFrameTelemetrySample(
+    const runtime::FrameTelemetrySample& sample) const {
+    tooling::Json::Array hotArr;
+    for (std::uint8_t i = 0; i < sample.hotFunctionCount; ++i) {
+        const auto& hf = sample.topFunctions[i];
+        const auto* fnLoc = program_ ? program_->resolveFunction(hf.symbolId) : nullptr;
+        hotArr.emplace_back(tooling::Json::Object{
+            {"symbolId", static_cast<std::int64_t>(hf.symbolId)},
+            {"name", fnLoc ? fnLoc->qualifiedName : std::string{}},
+            {"instructions", static_cast<std::int64_t>(hf.instructions)},
+            {"share", hf.instructionShare},
+        });
+    }
+    return tooling::Json::Object{
+        {"frameNumber", static_cast<std::int64_t>(sample.frameNumber)},
+        {"totalInstructions", static_cast<std::int64_t>(sample.totalInstructions)},
+        {"fiberInstructions", static_cast<std::int64_t>(sample.fiberInstructions)},
+        {"compactHeapLiveBytes", static_cast<std::int64_t>(sample.compactHeapLiveBytes)},
+        {"boxedHeapLiveBytes", static_cast<std::int64_t>(sample.boxedHeapLiveBytes)},
+        {"gcSliceNanoseconds", static_cast<std::int64_t>(sample.gcSliceNanoseconds)},
+        {"activeCoroutines", static_cast<std::int64_t>(sample.activeCoroutines)},
+        {"activeFibers", static_cast<std::int64_t>(sample.activeFibers)},
+        {"topFunctions", tooling::Json(std::move(hotArr))},
+    };
+}
+
+tooling::Json DapServer::buildFrameTelemetryReport(std::size_t maxFrames) const {
+    const runtime::FrameTelemetryCollector* collector =
+        frameTelemetry_ ? frameTelemetry_ : runtime::activeFrameTelemetry();
+    if (!collector) {
+        return tooling::Json::Object{
+            {"capacity", 0},
+            {"totalFramesPublished", 0},
+            {"returnedFrames", 0},
+            {"latestFrame", nullptr},
+            {"frames", tooling::Json::Array{}},
+            {"summaryText", "No FrameTelemetryCollector bound to DapServer."},
+        };
+    }
+
+    std::array<runtime::FrameTelemetrySample, runtime::FrameTelemetryCollector::kRingCapacity> samples{};
+    const std::size_t clampedMax = std::min<std::size_t>(
+        maxFrames == 0 ? 16u : maxFrames,
+        runtime::FrameTelemetryCollector::kRingCapacity);
+    const std::size_t count = collector->copyRecentSamples(samples.data(), clampedMax);
+
+    tooling::Json::Array framesJson;
+    framesJson.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        framesJson.push_back(serializeFrameTelemetrySample(samples[i]));
+    }
+
+    tooling::Json latestJson = (count > 0)
+        ? serializeFrameTelemetrySample(samples[count - 1u])
+        : tooling::Json(nullptr);
+
+    return tooling::Json::Object{
+        {"capacity", static_cast<std::int64_t>(runtime::FrameTelemetryCollector::capacity())},
+        {"totalFramesPublished", static_cast<std::int64_t>(collector->totalFramesPublished())},
+        {"returnedFrames", static_cast<std::int64_t>(count)},
+        {"latestFrame", std::move(latestJson)},
+        {"frames", tooling::Json(std::move(framesJson))},
+        {"summaryText", collector->formatSummary(program_.get(), clampedMax)},
+    };
+}
+
+void DapServer::emitFrameTelemetry(std::ostream& output) {
+    const runtime::FrameTelemetryCollector* collector =
+        frameTelemetry_ ? frameTelemetry_ : runtime::activeFrameTelemetry();
+    if (!collector) return;
+
+    runtime::FrameTelemetrySample latest{};
+    if (!collector->latestSample(latest)) return;
+
+    tooling::writeProtocolMessage(output, tooling::Json::Object{
+        {"seq", static_cast<std::int64_t>(sequence_++)},
+        {"type", "event"},
+        {"event", "realscript/frameTelemetry"},
+        {"body", serializeFrameTelemetrySample(latest)},
+    });
+    output.flush();
 }
 
 tooling::Json DapServer::response(
@@ -1288,6 +1448,12 @@ tooling::Json DapServer::handle(
         }
         return response(request, true, tooling::Json::Object{{"breakpoints", tooling::Json(std::move(breakpoints))}});
     }
+    if (command == "frameTelemetry" || command == "realscript/frameTelemetry") {
+        const std::size_t maxFrames = arguments && arguments->find("maxFrames")
+            ? static_cast<std::size_t>(std::max<std::int64_t>(1, arguments->find("maxFrames")->integerValue(16)))
+            : 16u;
+        return response(request, true, buildFrameTelemetryReport(maxFrames));
+    }
     if (command == "heapSnapshot" || command == "realscript/heapSnapshot") {
         const bool diffBaseline = arguments && arguments->find("diffBaseline")
             ? arguments->find("diffBaseline")->boolValue(false)
@@ -1370,6 +1536,97 @@ tooling::Json DapServer::handle(
         }
         while (!expression.empty() && std::isspace(static_cast<unsigned char>(expression.back()))) {
             expression.pop_back();
+        }
+        if (expression == ":telemetry" || expression.rfind(":telemetry ", 0) == 0) {
+            std::string arg = expression.size() > 10 ? expression.substr(10) : std::string{};
+            while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.front()))) {
+                arg.erase(arg.begin());
+            }
+            const bool asJson = (arg == "json" || arg.rfind("json ", 0) == 0);
+            std::size_t maxFrames = 8u;
+            if (!arg.empty() && std::isdigit(static_cast<unsigned char>(arg.front()))) {
+                maxFrames = static_cast<std::size_t>(std::max<unsigned long long>(
+                    1ULL, std::strtoull(arg.c_str(), nullptr, 10)));
+            }
+            const runtime::FrameTelemetryCollector* collector =
+                frameTelemetry_ ? frameTelemetry_ : runtime::activeFrameTelemetry();
+            if (asJson) {
+                const std::string jsonStr = collector
+                    ? collector->toJson(program_.get(), maxFrames)
+                    : buildFrameTelemetryReport(maxFrames).dump();
+                return response(request, true, tooling::Json::Object{
+                    {"result", jsonStr},
+                    {"type", "FrameTelemetryJson"},
+                    {"variablesReference", 0},
+                });
+            }
+            const auto rep = buildFrameTelemetryReport(maxFrames);
+            return response(request, true, tooling::Json::Object{
+                {"result", rep.find("summaryText") ? rep.find("summaryText")->stringValue() : ""},
+                {"type", "FrameTelemetryReport"},
+                {"variablesReference", 0},
+            });
+        }
+        if (frameId >= static_cast<std::uint32_t>(kFiberFrameIdBase) && fiberScheduler_) {
+            const std::uint32_t rel = frameId - static_cast<std::uint32_t>(kFiberFrameIdBase);
+            const std::uint32_t fiberId = rel / 8u;
+            const std::size_t depthIdx = static_cast<std::size_t>(rel % 8u);
+            const auto* fiber = fiberScheduler_->getFiber(fiberId);
+            if (fiber &&
+                fiber->status != runtime::FiberStatus::Inactive &&
+                fiber->status != runtime::FiberStatus::Terminated) {
+                const std::uint32_t inspectPc = resolveFiberFramePc(fiberModule_, *fiber, depthIdx);
+                const auto* dbg = fiberModule_ ? fiberModule_->debugInfoForPc(inspectPc) : nullptr;
+                if (expression == "pc" || expression == "$pc") {
+                    return response(request, true, tooling::Json::Object{
+                        {"result", std::to_string(fiber->pc)},
+                        {"type", "uint32"},
+                        {"variablesReference", 0},
+                    });
+                }
+                if (expression == "status" || expression == "$status") {
+                    return response(request, true, tooling::Json::Object{
+                        {"result", std::string(runtime::fiberStatusDisplayName(fiber->status))},
+                        {"type", "FiberStatus"},
+                        {"variablesReference", 0},
+                    });
+                }
+                if (expression == "remainingTicks" || expression == "$remainingTicks") {
+                    return response(request, true, tooling::Json::Object{
+                        {"result", std::to_string(computeFiberRemainingTicks(*fiberScheduler_, *fiber))},
+                        {"type", "uint32"},
+                        {"variablesReference", 0},
+                    });
+                }
+                if (expression.size() == 2 && expression[0] == 'r' &&
+                    expression[1] >= '0' && expression[1] <= '7') {
+                    const std::size_t regIdx = static_cast<std::size_t>(expression[1] - '0');
+                    return response(request, true, tooling::Json::Object{
+                        {"result", std::to_string(fiber->regs[regIdx])},
+                        {"type", "int32"},
+                        {"variablesReference", 0},
+                    });
+                }
+                if (dbg) {
+                    for (std::size_t slot = 0; slot < dbg->registerNames.size(); ++slot) {
+                        if (!dbg->registerNames[slot].empty() && dbg->registerNames[slot] == expression) {
+                            const std::int32_t rawVal = dbg->registerIsConstFolded[slot]
+                                ? dbg->registerConstValues[slot]
+                                : fiber->regs[slot];
+                            std::string tName;
+                            const std::string valStr = formatFiberRegisterValue(
+                                rawVal, dbg->registerTypes[slot], dbg->registerTypeIds[slot], tName);
+                            return response(request, true, tooling::Json::Object{
+                                {"result", valStr},
+                                {"type", tName},
+                                {"variablesReference", 0},
+                            });
+                        }
+                    }
+                }
+                return response(request, false, nullptr,
+                    "unknown Fiber variable or register: " + expression);
+            }
         }
         if (expression == ":heap" || expression == ":heap diff") {
             const bool diffMode = (expression == ":heap diff");
@@ -1510,11 +1767,89 @@ tooling::Json DapServer::handle(
     }
     if (command == "configurationDone") return response(request, true, tooling::Json::Object{});
     if (command == "threads") {
-        return response(request, true, tooling::Json::Object{{"threads", tooling::Json::Array{
-            tooling::Json::Object{{"id", 1}, {"name", "RealScript main thread"}},
-        }}});
+        tooling::Json::Array threadList{
+            tooling::Json::Object{{"id", kMainThreadId}, {"name", "RealScript main thread"}},
+        };
+        if (fiberScheduler_ != nullptr) {
+            fiberScheduler_->forEachActiveFiber([&](const runtime::FiberContext& fiber) {
+                const std::uint32_t inspectPc = fiberModule_
+                    ? fiberModule_->effectiveInspectionPc(fiber)
+                    : fiber.pc;
+                const auto* fnInfo = fiberModule_
+                    ? fiberModule_->findFunctionByPc(inspectPc)
+                    : nullptr;
+                const std::string fnName = fnInfo
+                    ? fnInfo->name
+                    : ("@pc:" + std::to_string(inspectPc));
+                const std::string threadName = "Fiber #" + std::to_string(fiber.fiberId) +
+                    " (" + fnName + " - " + runtime::fiberStatusDisplayName(fiber.status) + ")";
+                threadList.emplace_back(tooling::Json::Object{
+                    {"id", kFiberThreadIdBase + static_cast<std::int64_t>(fiber.fiberId)},
+                    {"name", threadName},
+                });
+            });
+        }
+        return response(request, true, tooling::Json::Object{
+            {"threads", tooling::Json(std::move(threadList))},
+        });
     }
     if (command == "stackTrace") {
+        const auto threadId = arguments && arguments->find("threadId")
+            ? arguments->find("threadId")->integerValue(kMainThreadId)
+            : kMainThreadId;
+        if (threadId >= kFiberThreadIdBase) {
+            tooling::Json::Array fiberFrames;
+            const auto fiberId = static_cast<std::uint32_t>(threadId - kFiberThreadIdBase);
+            const auto* fiber = fiberScheduler_ ? fiberScheduler_->getFiber(fiberId) : nullptr;
+            if (fiber != nullptr &&
+                fiber->status != runtime::FiberStatus::Inactive &&
+                fiber->status != runtime::FiberStatus::Terminated) {
+                const std::size_t totalDepth = 1u + std::min<std::size_t>(
+                    fiber->callDepth, fiber->callStack.size());
+                for (std::size_t depthIdx = 0; depthIdx < totalDepth; ++depthIdx) {
+                    const std::uint32_t inspectPc = resolveFiberFramePc(fiberModule_, *fiber, depthIdx);
+                    const auto* fnInfo = fiberModule_ ? fiberModule_->findFunctionByPc(inspectPc) : nullptr;
+                    const debug::SourceRange rng = fiberModule_
+                        ? fiberModule_->sourceRangeForPc(inspectPc)
+                        : debug::SourceRange{};
+                    const std::string fnName = fnInfo
+                        ? fnInfo->name
+                        : ("@pc:" + std::to_string(inspectPc));
+                    const std::string rawPath = fnInfo ? fnInfo->debugInfo.sourcePath : std::string{};
+                    const std::string resolvedPath =
+                        (session_ && session_->controller() && !rawPath.empty())
+                            ? session_->controller()->resolveSourcePath(rawPath)
+                            : rawPath;
+                    const std::int64_t line1 = rng.valid()
+                        ? static_cast<std::int64_t>(rng.start.line + 1)
+                        : 1;
+                    const std::int64_t col1 = rng.valid()
+                        ? static_cast<std::int64_t>(rng.start.column + 1)
+                        : 1;
+                    const std::int64_t frameId = kFiberFrameIdBase +
+                        static_cast<std::int64_t>(fiberId) * 8 +
+                        static_cast<std::int64_t>(depthIdx);
+                    fiberFrames.emplace_back(tooling::Json::Object{
+                        {"id", frameId},
+                        {"name", fnName},
+                        {"line", line1},
+                        {"column", col1},
+                        {"instructionPointerReference", "pc:" + std::to_string(
+                            depthIdx == 0 ? fiber->pc : inspectPc)},
+                        {"source", tooling::Json::Object{
+                            {"name", rawPath},
+                            {"path", resolvedPath},
+                        }},
+                    });
+                }
+            }
+            const auto total = static_cast<std::int64_t>(fiberFrames.size());
+            return response(request, true, tooling::Json::Object{
+                {"stackFrames", tooling::Json(std::move(fiberFrames))},
+                {"totalFrames", total},
+            });
+        }
+
         tooling::Json::Array frames;
         const auto stop = session_->currentStop();
         if (stop) {
@@ -1539,6 +1874,12 @@ tooling::Json DapServer::handle(
     if (command == "scopes") {
         const auto frameId = arguments && arguments->find("frameId")
             ? std::max<std::int64_t>(1, arguments->find("frameId")->integerValue(1)) : 1;
+        if (frameId >= kFiberFrameIdBase) {
+            return response(request, true, tooling::Json::Object{{"scopes", tooling::Json::Array{
+                tooling::Json::Object{{"name", "Fiber State"}, {"variablesReference", frameId * 2}, {"expensive", false}},
+                tooling::Json::Object{{"name", "Locals"}, {"variablesReference", frameId * 2 + 1}, {"expensive", false}},
+            }}});
+        }
         return response(request, true, tooling::Json::Object{{"scopes", tooling::Json::Array{
             tooling::Json::Object{{"name", "Arguments"}, {"variablesReference", frameId * 2}, {"expensive", false}},
             tooling::Json::Object{{"name", "Locals"}, {"variablesReference", frameId * 2 + 1}, {"expensive", false}},
@@ -1547,6 +1888,119 @@ tooling::Json DapServer::handle(
     if (command == "variables") {
         const auto reference = arguments && arguments->find("variablesReference")
             ? arguments->find("variablesReference")->integerValue() : 0;
+        if (reference >= kFiberFrameIdBase * 2 && reference < kFirstChildVariablesReference) {
+            tooling::Json::Array fiberVars;
+            const std::int64_t frameId = reference / 2;
+            const bool isLocalsScope = (reference % 2) != 0;
+            const std::int64_t rel = frameId - kFiberFrameIdBase;
+            const auto fiberId = static_cast<std::uint32_t>(rel / 8);
+            const auto depthIdx = static_cast<std::size_t>(rel % 8);
+            const auto* fiber = fiberScheduler_ ? fiberScheduler_->getFiber(fiberId) : nullptr;
+            if (fiber != nullptr &&
+                fiber->status != runtime::FiberStatus::Inactive &&
+                fiber->status != runtime::FiberStatus::Terminated) {
+                const std::uint32_t inspectPc = resolveFiberFramePc(fiberModule_, *fiber, depthIdx);
+                const auto* dbg = fiberModule_ ? fiberModule_->debugInfoForPc(inspectPc) : nullptr;
+                const std::uint32_t remTicks = computeFiberRemainingTicks(*fiberScheduler_, *fiber);
+                if (!isLocalsScope) {
+                    fiberVars.emplace_back(tooling::Json::Object{
+                        {"name", "pc"},
+                        {"value", std::to_string(fiber->pc)},
+                        {"type", "uint32"},
+                        {"variablesReference", 0},
+                    });
+                    fiberVars.emplace_back(tooling::Json::Object{
+                        {"name", "status"},
+                        {"value", std::string(runtime::fiberStatusDisplayName(fiber->status))},
+                        {"type", "FiberStatus"},
+                        {"variablesReference", 0},
+                    });
+                    fiberVars.emplace_back(tooling::Json::Object{
+                        {"name", "remainingTicks"},
+                        {"value", std::to_string(remTicks)},
+                        {"type", "uint32"},
+                        {"variablesReference", 0},
+                    });
+                    fiberVars.emplace_back(tooling::Json::Object{
+                        {"name", "wakeTick"},
+                        {"value", std::to_string(fiber->wakeTick)},
+                        {"type", "uint32"},
+                        {"variablesReference", 0},
+                    });
+                    fiberVars.emplace_back(tooling::Json::Object{
+                        {"name", "callDepth"},
+                        {"value", std::to_string(fiber->callDepth)},
+                        {"type", "uint8"},
+                        {"variablesReference", 0},
+                    });
+                    fiberVars.emplace_back(tooling::Json::Object{
+                        {"name", "unbreakable"},
+                        {"value", fiber->unbreakableSection ? "true" : "false"},
+                        {"type", "bool"},
+                        {"variablesReference", 0},
+                    });
+                    fiberVars.emplace_back(tooling::Json::Object{
+                        {"name", "boundEntity"},
+                        {"value", fiber->boundEntity.valid()
+                            ? (std::to_string(fiber->boundEntity.slot) + ":" +
+                               std::to_string(fiber->boundEntity.generation))
+                            : std::string("none")},
+                        {"type", "GenerationalEntityHandle"},
+                        {"variablesReference", 0},
+                    });
+                    if (fiber->status == runtime::FiberStatus::WaitingPredicate) {
+                        fiberVars.emplace_back(tooling::Json::Object{
+                            {"name", "waitPredicateChannel"},
+                            {"value", std::to_string(fiber->waitPredicateChannel)},
+                            {"type", "uint8"},
+                            {"variablesReference", 0},
+                        });
+                        fiberVars.emplace_back(tooling::Json::Object{
+                            {"name", "waitTargetKey"},
+                            {"value", std::to_string(fiber->waitTargetKey)},
+                            {"type", "uint16"},
+                            {"variablesReference", 0},
+                        });
+                        fiberVars.emplace_back(tooling::Json::Object{
+                            {"name", "waitRequiredValue"},
+                            {"value", std::to_string(fiber->waitRequiredValue)},
+                            {"type", "uint32"},
+                            {"variablesReference", 0},
+                        });
+                    }
+                } else {
+                    if (dbg != nullptr) {
+                        for (std::size_t slot = 0; slot < dbg->registerNames.size(); ++slot) {
+                            if (dbg->registerNames[slot].empty()) continue;
+                            const std::int32_t rawVal = dbg->registerIsConstFolded[slot]
+                                ? dbg->registerConstValues[slot]
+                                : fiber->regs[slot];
+                            std::string tName;
+                            const std::string valStr = formatFiberRegisterValue(
+                                rawVal, dbg->registerTypes[slot], dbg->registerTypeIds[slot], tName);
+                            fiberVars.emplace_back(tooling::Json::Object{
+                                {"name", dbg->registerNames[slot]},
+                                {"value", valStr},
+                                {"type", tName},
+                                {"variablesReference", 0},
+                            });
+                        }
+                    }
+                    for (std::size_t slot = 0; slot < fiber->regs.size(); ++slot) {
+                        fiberVars.emplace_back(tooling::Json::Object{
+                            {"name", "r" + std::to_string(slot)},
+                            {"value", std::to_string(fiber->regs[slot])},
+                            {"type", "int32"},
+                            {"variablesReference", 0},
+                        });
+                    }
+                }
+            }
+            return response(request, true, tooling::Json::Object{
+                {"variables", tooling::Json(std::move(fiberVars))},
+            });
+        }
+
         tooling::Json::Array values;
         const auto collectVariables = [&]() {
             if (variables_.empty() && session_ && session_->currentStop()) {

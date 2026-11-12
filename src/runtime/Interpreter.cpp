@@ -131,6 +131,8 @@ struct State {
     CoroutineFrameHandle* currentBlockVmCoroutinePtr = nullptr;
     bool coroutineSuspendedNow = false;
     Value suspendedReturnValue{};
+    FrameTelemetryCollector* telemetry = activeFrameTelemetry();
+    std::uint64_t telemetryChildExecuted = 0;
 };
 
 struct InterpreterResumeEnv {
@@ -737,6 +739,9 @@ inline void stepGcIfNeeded(State& state, std::uint64_t steps = 1) {
     if (state.heap->phase() == GcPhase::Idle && !state.heap->collectionRequested()) {
         return;
     }
+    const auto gcSliceStart = state.telemetry
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     for (std::uint64_t i = 0; i < steps; ++i) {
         if (state.heap->phase() == GcPhase::Idle && !state.heap->collectionRequested()) {
             break;
@@ -753,6 +758,12 @@ inline void stepGcIfNeeded(State& state, std::uint64_t steps = 1) {
                 emitTrace(state, TraceEventKind::GcStep, work);
             }
         }
+    }
+    if (state.telemetry != nullptr) {
+        const auto elapsedNs = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - gcSliceStart).count());
+        state.telemetry->recordGcSliceNanoseconds(elapsedNs);
     }
 }
 
@@ -2907,6 +2918,9 @@ bool executeInstruction(
                     ? "managed array allocation failed"
                     : allocationError.message);
         }
+        if (state.telemetry != nullptr && state.heap->isPackedArray(*reference)) {
+            state.telemetry->noteCompactHeapObject(*reference);
+        }
         return storeResult(*reference);
     }
     case bytecode::Opcode::NewObject: {
@@ -3871,6 +3885,31 @@ bool executeFunction(
     const detail::ExecutionFunction* cachedExecution,
     bool argumentsPrevalidated) {
     const auto& function = *location.function;
+    struct TelemetrySelfInstructionsScope {
+        State& state;
+        semantic::SymbolId symbolId;
+        std::uint64_t entryExecuted;
+        std::uint64_t savedParentChildExecuted;
+        TelemetrySelfInstructionsScope(State& st, semantic::SymbolId sym) noexcept
+            : state(st),
+              symbolId(sym),
+              entryExecuted(st.executed),
+              savedParentChildExecuted(st.telemetryChildExecuted) {
+            st.telemetryChildExecuted = 0;
+        }
+        ~TelemetrySelfInstructionsScope() noexcept {
+            if (state.telemetry != nullptr) {
+                const std::uint64_t totalSubtree = state.executed - entryExecuted;
+                const std::uint64_t selfInst = totalSubtree >= state.telemetryChildExecuted
+                    ? (totalSubtree - state.telemetryChildExecuted)
+                    : 0u;
+                if (selfInst > 0) {
+                    state.telemetry->recordFunctionInstructions(symbolId, selfInst);
+                }
+                state.telemetryChildExecuted = savedParentChildExecuted + totalSubtree;
+            }
+        }
+    } telemetryScope{state, function.symbolId};
     const auto* execution = cachedExecution
         ? cachedExecution
         : detail::findExecutionFunction(
@@ -4016,6 +4055,13 @@ bool executeFunction(
 #endif
         const auto previousFunctionId = state.currentFunctionId;
         state.currentFunctionId = function.symbolId;
+        struct InlineTelemetryFrame {
+            semantic::SymbolId symbolId = 0;
+            std::uint64_t enterLocalExecuted = 0;
+            std::uint64_t nestedChildInst = 0;
+        };
+        std::array<InlineTelemetryFrame, 8> inlineTelemetryStack{};
+        std::uint32_t inlineTelemetryDepth = 0;
         struct RestoreFastFunctionId {
             State& state;
             semantic::SymbolId previous;
@@ -6037,6 +6083,9 @@ bool executeFunction(
                         frameBase[ip->dstSlot] = *ref;
                         auto& ce = arrayCache[ip->dstSlot & 3u];
                         if (state.heap->tryBindPackedArrayFastView(*ref, ce.packedView)) {
+                            if (RS_FLAT_UNLIKELY(state.telemetry != nullptr)) {
+                                state.telemetry->noteCompactHeapObject(*ref);
+                            }
                             ce.ref = *ref;
                             ce.view = {};
                             ce.view.length = ce.packedView.length;
@@ -7728,6 +7777,20 @@ bool executeFunction(
                 if (state.stack.size() + 1 > state.statistics.maximumCallDepth) {
                     state.statistics.maximumCallDepth = state.stack.size() + 1;
                 }
+                if (RS_FLAT_UNLIKELY(state.telemetry != nullptr &&
+                                     inlineTelemetryDepth < inlineTelemetryStack.size())) {
+                    const auto* callBc = flatColdBase[ip - streamBase].bytecode;
+                    const semantic::SymbolId calleeSym =
+                        (callBc && location.module &&
+                         callBc->index < location.module->functionReferences.size())
+                            ? location.module->functionReferences[callBc->index].symbolId
+                            : 0;
+                    inlineTelemetryStack[inlineTelemetryDepth++] = InlineTelemetryFrame{
+                        calleeSym,
+                        localExecuted - 1u,
+                        0u,
+                    };
+                }
                 Value* const calleeBase = frameBase + ip->dstSlot;
                 const std::uint32_t nArgs = ip->inlineArgCount;
                 const std::uint32_t nLocals = ip->aux0Slot;
@@ -7757,6 +7820,23 @@ bool executeFunction(
 
             RS_FLAT_CASE(InlineReturnVoid) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(state.telemetry != nullptr && inlineTelemetryDepth > 0u)) {
+                    const auto inlFrame = inlineTelemetryStack[--inlineTelemetryDepth];
+                    const std::uint64_t totalSub = localExecuted >= inlFrame.enterLocalExecuted
+                        ? (localExecuted - inlFrame.enterLocalExecuted)
+                        : 0u;
+                    const std::uint64_t selfInst = totalSub >= inlFrame.nestedChildInst
+                        ? (totalSub - inlFrame.nestedChildInst)
+                        : 0u;
+                    if (selfInst > 0u && inlFrame.symbolId != 0) {
+                        state.telemetry->recordFunctionInstructions(inlFrame.symbolId, selfInst);
+                    }
+                    if (inlineTelemetryDepth > 0u) {
+                        inlineTelemetryStack[inlineTelemetryDepth - 1u].nestedChildInst += totalSub;
+                    } else {
+                        state.telemetryChildExecuted += totalSub;
+                    }
+                }
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 if (ip->integerImmediate != 0) {
                     const auto packedClear = static_cast<std::uint64_t>(ip->integerImmediate);
@@ -7768,6 +7848,23 @@ bool executeFunction(
 
             RS_FLAT_CASE(InlineReturnVoidJump) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(state.telemetry != nullptr && inlineTelemetryDepth > 0u)) {
+                    const auto inlFrame = inlineTelemetryStack[--inlineTelemetryDepth];
+                    const std::uint64_t totalSub = localExecuted >= inlFrame.enterLocalExecuted
+                        ? (localExecuted - inlFrame.enterLocalExecuted)
+                        : 0u;
+                    const std::uint64_t selfInst = totalSub >= inlFrame.nestedChildInst
+                        ? (totalSub - inlFrame.nestedChildInst)
+                        : 0u;
+                    if (selfInst > 0u && inlFrame.symbolId != 0) {
+                        state.telemetry->recordFunctionInstructions(inlFrame.symbolId, selfInst);
+                    }
+                    if (inlineTelemetryDepth > 0u) {
+                        inlineTelemetryStack[inlineTelemetryDepth - 1u].nestedChildInst += totalSub;
+                    } else {
+                        state.telemetryChildExecuted += totalSub;
+                    }
+                }
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 if (ip->integerImmediate != 0) {
                     const auto packedClear = static_cast<std::uint64_t>(ip->integerImmediate);
@@ -7780,6 +7877,23 @@ bool executeFunction(
 
             RS_FLAT_CASE(InlineReturnScalar) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(state.telemetry != nullptr && inlineTelemetryDepth > 0u)) {
+                    const auto inlFrame = inlineTelemetryStack[--inlineTelemetryDepth];
+                    const std::uint64_t totalSub = localExecuted >= inlFrame.enterLocalExecuted
+                        ? (localExecuted - inlFrame.enterLocalExecuted)
+                        : 0u;
+                    const std::uint64_t selfInst = totalSub >= inlFrame.nestedChildInst
+                        ? (totalSub - inlFrame.nestedChildInst)
+                        : 0u;
+                    if (selfInst > 0u && inlFrame.symbolId != 0) {
+                        state.telemetry->recordFunctionInstructions(inlFrame.symbolId, selfInst);
+                    }
+                    if (inlineTelemetryDepth > 0u) {
+                        inlineTelemetryStack[inlineTelemetryDepth - 1u].nestedChildInst += totalSub;
+                    } else {
+                        state.telemetryChildExecuted += totalSub;
+                    }
+                }
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 if (RS_FLAT_UNLIKELY(ip->integerImmediate != 0)) {
                     const Value retVal = frameBase[ip->src0Slot];
@@ -7799,6 +7913,23 @@ bool executeFunction(
 
             RS_FLAT_CASE(InlineReturnScalarJump) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                if (RS_FLAT_UNLIKELY(state.telemetry != nullptr && inlineTelemetryDepth > 0u)) {
+                    const auto inlFrame = inlineTelemetryStack[--inlineTelemetryDepth];
+                    const std::uint64_t totalSub = localExecuted >= inlFrame.enterLocalExecuted
+                        ? (localExecuted - inlFrame.enterLocalExecuted)
+                        : 0u;
+                    const std::uint64_t selfInst = totalSub >= inlFrame.nestedChildInst
+                        ? (totalSub - inlFrame.nestedChildInst)
+                        : 0u;
+                    if (selfInst > 0u && inlFrame.symbolId != 0) {
+                        state.telemetry->recordFunctionInstructions(inlFrame.symbolId, selfInst);
+                    }
+                    if (inlineTelemetryDepth > 0u) {
+                        inlineTelemetryStack[inlineTelemetryDepth - 1u].nestedChildInst += totalSub;
+                    } else {
+                        state.telemetryChildExecuted += totalSub;
+                    }
+                }
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 if (RS_FLAT_UNLIKELY(ip->integerImmediate != 0)) {
                     const Value retVal = frameBase[ip->src0Slot];

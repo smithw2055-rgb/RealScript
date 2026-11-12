@@ -39,6 +39,8 @@ struct ReloadPlan {
     std::vector<semantic::SymbolId> addedTypes;
     std::vector<semantic::SymbolId> removedTypes;
     std::vector<semantic::SymbolId> layoutChangedTypes;
+    std::vector<runtime::TypeLayoutMigration> typeMigrations;
+    runtime::LayoutMigrationStats migrationStats{};
     std::vector<ReloadIssue> issues;
 };
 

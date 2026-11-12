@@ -1,5 +1,7 @@
 #pragma once
 
+#include "realscript/debug/DebugInfo.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +13,7 @@
 #include <vector>
 
 namespace realscript::mir {
+struct Function;
 struct Module;
 } // namespace realscript::mir
 
@@ -240,6 +243,18 @@ enum class FiberStatus : std::uint8_t {
     Terminated = 4
 };
 
+[[nodiscard]] constexpr const char* fiberStatusDisplayName(FiberStatus status) noexcept {
+    switch (status) {
+    case FiberStatus::Ready: return "Running";
+    case FiberStatus::SleepingTicks: return "WaitingTicks";
+    case FiberStatus::WaitingPredicate: return "WaitingPredicate";
+    case FiberStatus::Terminated: return "Terminated";
+    case FiberStatus::Inactive:
+    default:
+        return "Inactive";
+    }
+}
+
 /**
  * Purely POD / Trivially Copyable Fiber Execution Context (zero raw pointers).
  * Safe for cross-process binary snapshots, network rollback, and hot-reload.
@@ -299,14 +314,69 @@ struct IFiberHostCallbacks {
 using IFiberHost = IFiberHostCallbacks;
 
 /**
+ * Per-function debug metadata mapping 8-byte `CompactInstruction` PCs back to `.rscript`
+ * `debug::SourceRange` locations and mapping the 8 Fiber hardware registers to named locals.
+ */
+struct FiberDebugInfo {
+    std::string sourcePath;
+    std::string functionName;
+    std::string canonicalName;
+    std::uint32_t entryPc = 0;
+    std::uint32_t endPc = 0;
+    debug::SourceRange declaration{};
+    debug::SourceRange body{};
+    std::vector<debug::SourceRange> instructionRanges;
+    std::array<std::string, 8> registerNames{};
+    std::array<semantic::PrimitiveType, 8> registerTypes{
+        semantic::PrimitiveType::Int,
+        semantic::PrimitiveType::Int,
+        semantic::PrimitiveType::Int,
+        semantic::PrimitiveType::Int,
+        semantic::PrimitiveType::Int,
+        semantic::PrimitiveType::Int,
+        semantic::PrimitiveType::Int,
+        semantic::PrimitiveType::Int,
+    };
+    std::array<semantic::SymbolId, 8> registerTypeIds{};
+    std::array<bool, 8> registerIsConstFolded{};
+    std::array<std::int32_t, 8> registerConstValues{};
+
+    [[nodiscard]] const debug::SourceRange* rangeForPc(std::uint32_t globalPc) const noexcept {
+        if (globalPc >= entryPc && globalPc < endPc) {
+            const std::size_t rel = static_cast<std::size_t>(globalPc - entryPc);
+            if (rel < instructionRanges.size() && instructionRanges[rel].valid()) {
+                return &instructionRanges[rel];
+            }
+        }
+        if (body.valid()) return &body;
+        if (declaration.valid()) return &declaration;
+        return nullptr;
+    }
+};
+
+/**
+ * Compiled metadata & debug mapping for an individual Fiber function inside `CompiledFiberModule`.
+ */
+struct CompiledFiberFunction {
+    semantic::SymbolId symbolId = 0;
+    std::string name;
+    std::string canonicalName;
+    std::uint32_t entryPc = 0;
+    std::uint32_t endPc = 0;
+    bool autoLowerable = false;
+    FiberDebugInfo debugInfo;
+};
+
+/**
  * Compiled Fiber Program produced by lowering a RealScript (`.rscript`) `mir::Module`.
- * Contains a single contiguous 8-byte instruction stream and a symbol table mapping
- * `.rscript` function names to their entry PC offsets.
+ * Contains a single contiguous 8-byte instruction stream, entry symbol table, and `FiberDebugInfo`.
  */
 struct CompiledFiberModule {
     std::string moduleName;
     std::vector<CompactInstruction> instructions;
     std::unordered_map<std::string, std::uint32_t> entryPoints;
+    std::vector<CompiledFiberFunction> functions;
+    std::vector<debug::SourceRange> instructionLocations;
 
     [[nodiscard]] bool hasFunction(const std::string& name) const noexcept {
         return entryPoints.find(name) != entryPoints.end();
@@ -315,6 +385,69 @@ struct CompiledFiberModule {
     [[nodiscard]] std::uint32_t entryPc(const std::string& name) const noexcept {
         auto it = entryPoints.find(name);
         return it != entryPoints.end() ? it->second : 0u;
+    }
+
+    [[nodiscard]] const CompiledFiberFunction* findFunction(const std::string& name) const noexcept {
+        for (const auto& fn : functions) {
+            if (fn.name == name || fn.canonicalName == name) {
+                return &fn;
+            }
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] const CompiledFiberFunction* findFunctionByPc(std::uint32_t pc) const noexcept {
+        for (const auto& fn : functions) {
+            if (pc >= fn.entryPc && pc < fn.endPc) {
+                return &fn;
+            }
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] const FiberDebugInfo* debugInfoForPc(std::uint32_t pc) const noexcept {
+        if (const auto* fn = findFunctionByPc(pc)) {
+            return &fn->debugInfo;
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] debug::SourceRange sourceRangeForPc(std::uint32_t pc) const noexcept {
+        if (pc < instructionLocations.size() && instructionLocations[pc].valid()) {
+            return instructionLocations[pc];
+        }
+        if (const auto* dbg = debugInfoForPc(pc)) {
+            if (const auto* rng = dbg->rangeForPc(pc)) {
+                return *rng;
+            }
+        }
+        return {};
+    }
+
+    /**
+     * Resolves the active / suspended instruction PC for debugger stack traces.
+     * Because `YieldTicks`, `YieldUntilPredicate`, and `ForkFiber` advance `fiber.pc` to the
+     * resume instruction before yielding, a suspended fiber's active statement is `fiber.pc - 1`.
+     */
+    [[nodiscard]] std::uint32_t effectiveInspectionPc(const FiberContext& fiber) const noexcept {
+        if ((fiber.status == FiberStatus::SleepingTicks ||
+             fiber.status == FiberStatus::WaitingPredicate) &&
+            fiber.pc > 0) {
+            const std::uint32_t prevPc = fiber.pc - 1u;
+            if (prevPc < instructions.size()) {
+                const auto op = instructions[prevPc].opcode;
+                if (op == FiberOpcode::YieldTicks ||
+                    op == FiberOpcode::YieldUntilPredicate ||
+                    op == FiberOpcode::ForkFiber) {
+                    const auto* prevFn = findFunctionByPc(prevPc);
+                    const auto* curFn = findFunctionByPc(fiber.pc);
+                    if (prevFn != nullptr && (curFn == nullptr || curFn == prevFn || fiber.pc == prevFn->endPc)) {
+                        return prevPc;
+                    }
+                }
+            }
+        }
+        return fiber.pc;
     }
 };
 
@@ -372,12 +505,17 @@ struct FiberHotReloadReport {
 };
 
 /**
- * Compiler that lowers a RealScript `mir::Module` (written in `.rscript` using `import RealScript.Fiber;`)
- * directly into an 8-byte `CompactInstruction` stream for `FiberScheduler`.
+ * Compiler that lowers a RealScript `mir::Module` (written in `.rscript` using `import RealScript.Fiber;`
+ * or pure-value scalar/fixed-point state-machine coroutines) directly into an 8-byte `CompactInstruction`
+ * stream for `FiberScheduler`.
  */
 class FiberCompiler {
 public:
+    [[nodiscard]] static bool canAutoLowerToFiber(
+        const realscript::mir::Module& module,
+        const realscript::mir::Function& function);
     [[nodiscard]] static CompiledFiberModule compileModule(const realscript::mir::Module& module);
+    [[nodiscard]] static CompiledFiberModule compileAutoLoweredModule(const realscript::mir::Module& module);
     [[nodiscard]] static std::vector<FiberStateMachineFingerprint> computeModuleFingerprints(
         const CompiledFiberModule& module);
 };
@@ -455,8 +593,19 @@ public:
     [[nodiscard]] std::uint64_t computeLockstepDigest() const noexcept;
 
     [[nodiscard]] std::size_t activeFiberCount() const noexcept;
+    [[nodiscard]] std::size_t fiberCapacity() const noexcept { return fibers_.size(); }
     [[nodiscard]] const FiberContext* getFiber(std::uint32_t fiberId) const noexcept;
     [[nodiscard]] std::uint32_t currentTick() const noexcept { return currentTick_; }
+
+    template <typename Visitor>
+    void forEachActiveFiber(Visitor&& visitor) const {
+        for (std::size_t i = 1; i < fibers_.size(); ++i) {
+            const auto& f = fibers_[i];
+            if (f.status != FiberStatus::Inactive && f.status != FiberStatus::Terminated) {
+                visitor(f);
+            }
+        }
+    }
 
 private:
     void executeFiberSlice(FiberContext& fiber, std::uint32_t currentTick, std::uint64_t& instrCounter);

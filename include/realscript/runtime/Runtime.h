@@ -4,6 +4,7 @@
 #include "realscript/semantic/Semantic.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -1782,6 +1783,90 @@ struct IncrementalGcBudgetStats {
     }
 };
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
+enum class FieldMigrationKind : std::uint8_t {
+    Default = 0,
+    Copy = 1,
+    ConvertNumeric = 2,
+};
+
+struct FieldMigrationOp {
+    FieldMigrationKind kind = FieldMigrationKind::Default;
+    bool checkedArithmetic = true;
+    bool renamed = false;
+    semantic::PrimitiveType targetType = semantic::PrimitiveType::Error;
+    semantic::SymbolId targetTypeId = 0;
+    std::size_t sourceIndex = 0;
+    std::string fieldName;
+    std::string formerName;
+    Value defaultValue{};
+    std::vector<semantic::SymbolId> assignableTypeIds;
+};
+
+struct StaticFieldMigrationOp {
+    FieldMigrationKind kind = FieldMigrationKind::Default;
+    bool checkedArithmetic = true;
+    bool renamed = false;
+    bool hasConstantInitializer = false;
+    semantic::SymbolId sourceFieldId = 0;
+    semantic::SymbolId targetFieldId = 0;
+    semantic::PrimitiveType targetType = semantic::PrimitiveType::Error;
+    semantic::SymbolId targetTypeId = 0;
+    std::string fieldName;
+    std::string formerName;
+    Value defaultValue{};
+    std::vector<semantic::SymbolId> assignableTypeIds;
+};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+struct DelegateMethodSlotUpdate {
+    semantic::SymbolId methodSymbolId = 0;
+    std::int64_t dispatchFlags = 0;
+    std::uint32_t dispatchSlot = 0;
+    bool removed = false;
+};
+
+struct TypeLayoutMigration {
+    semantic::SymbolId typeId = 0;
+    semantic::TypeKind typeKind = semantic::TypeKind::Class;
+    std::string canonicalName;
+    bool addedType = false;
+    bool removedType = false;
+    bool delegateType = false;
+    bool interfaceType = false;
+    bool instanceLayoutChanged = false;
+    bool dispatchTableChanged = false;
+    std::size_t oldFieldCount = 0;
+    std::size_t newFieldCount = 0;
+    std::vector<FieldMigrationOp> fieldOps;
+    std::vector<std::size_t> newReferenceFields;
+    std::vector<StaticFieldMigrationOp> staticFieldOps;
+    std::vector<semantic::SymbolId> removedStaticFieldIds;
+    std::vector<semantic::SymbolId> virtualDispatchTable;
+    std::vector<semantic::InterfaceDispatchMap> interfaceDispatchMaps;
+    std::vector<DelegateMethodSlotUpdate> delegateSlotUpdates;
+};
+
+struct LayoutMigrationStats {
+    std::size_t objectsVisited = 0;
+    std::size_t objectsMigrated = 0;
+    std::size_t inlineToSlabOrHeapTransitions = 0;
+    std::size_t heapToInlineTransitions = 0;
+    std::size_t fieldsCopied = 0;
+    std::size_t fieldsRenamed = 0;
+    std::size_t fieldsConverted = 0;
+    std::size_t fieldsDefaulted = 0;
+    std::size_t staticFieldsMigrated = 0;
+    std::size_t staticFieldsRemoved = 0;
+    std::size_t delegatesRebound = 0;
+    std::size_t oldGenBarriersMarked = 0;
+};
+
 class ManagedHeap {
 public:
     using RootToken = std::uint64_t;
@@ -2041,10 +2126,31 @@ public:
     bool restore(
         const HeapSnapshot& snapshot,
         RuntimeError* error = nullptr);
+    bool migrateTypeLayouts(
+        const std::vector<TypeLayoutMigration>& migrations,
+        LayoutMigrationStats* outStats = nullptr,
+        RuntimeError* error = nullptr);
     [[nodiscard]] std::vector<ObjectRef> retainingPath(
         ObjectRef target,
         const ShadowStack* shadowStack = nullptr) const;
     [[nodiscard]] std::string leakSummary() const;
+
+    // P2-C: Lock-free parallel read & disjoint PackedArray shard epoch
+    void enterParallelLockFreeRegion() noexcept;
+    void leaveParallelLockFreeRegion() noexcept;
+    [[nodiscard]] bool inParallelLockFreeRegion() const noexcept;
+
+    struct ParallelLockFreeScope {
+        ManagedHeap* heap = nullptr;
+        explicit ParallelLockFreeScope(ManagedHeap& h) noexcept : heap(&h) {
+            heap->enterParallelLockFreeRegion();
+        }
+        ~ParallelLockFreeScope() noexcept {
+            if (heap) heap->leaveParallelLockFreeRegion();
+        }
+        ParallelLockFreeScope(const ParallelLockFreeScope&) = delete;
+        ParallelLockFreeScope& operator=(const ParallelLockFreeScope&) = delete;
+    };
 
 private:
     friend class PersistentRoot;
@@ -2296,6 +2402,142 @@ private:
     std::uint64_t totalEvents_ = 0;
 };
 
+class ProgramImage;
+class AsyncRuntimeContext;
+class FiberScheduler;
+
+struct HotFunctionTelemetry {
+    semantic::SymbolId symbolId = 0;
+    std::uint64_t instructions = 0;
+    double instructionShare = 0.0;
+};
+
+struct FrameTelemetrySample {
+    static constexpr std::size_t kMaxHotFunctions = 8;
+
+    std::uint64_t frameNumber = 0;
+    std::uint64_t totalInstructions = 0;
+    std::uint64_t fiberInstructions = 0;
+    std::uint8_t hotFunctionCount = 0;
+    std::array<HotFunctionTelemetry, kMaxHotFunctions> topFunctions{};
+    std::size_t compactHeapLiveBytes = 0;
+    std::size_t boxedHeapLiveBytes = 0;
+    std::uint64_t gcSliceNanoseconds = 0;
+    std::uint32_t activeCoroutines = 0;
+    std::uint32_t activeFibers = 0;
+};
+static_assert(
+    std::is_trivially_copyable_v<FrameTelemetrySample>,
+    "FrameTelemetrySample must remain trivially copyable for lock-free ring reads");
+
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
+class FrameTelemetryCollector {
+public:
+    static constexpr std::size_t kRingCapacity = 128;
+    static constexpr std::size_t kAccumulatorBuckets = 256;
+    static constexpr std::size_t kTrackedCompactCapacity = 512;
+
+    FrameTelemetryCollector() noexcept = default;
+    FrameTelemetryCollector(const FrameTelemetryCollector&) = delete;
+    FrameTelemetryCollector& operator=(const FrameTelemetryCollector&) = delete;
+
+    void beginFrame(std::uint64_t frameNumber) noexcept;
+    void recordFunctionInstructions(
+        semantic::SymbolId symbolId,
+        std::uint64_t instructions) noexcept;
+    void recordFiberStep(
+        std::uint64_t fiberInstructions,
+        std::uint32_t activeFibers) noexcept;
+    void recordGcSliceNanoseconds(std::uint64_t elapsedNs) noexcept;
+    void setHeapLiveBytes(
+        std::size_t compactLiveBytes,
+        std::size_t boxedLiveBytes) noexcept;
+    void noteCompactHeapObject(ObjectRef reference) noexcept;
+
+    FrameTelemetrySample endFrame(
+        const ManagedHeap* heap = nullptr,
+        const AsyncRuntimeContext* asyncRuntime = nullptr,
+        const FiberScheduler* fiberScheduler = nullptr) noexcept;
+
+    void commitSample(const FrameTelemetrySample& sample) noexcept;
+
+    [[nodiscard]] bool latestSample(FrameTelemetrySample& outSample) const noexcept;
+    [[nodiscard]] std::size_t copyRecentSamples(
+        FrameTelemetrySample* outSamples,
+        std::size_t maxSamples) const noexcept;
+    [[nodiscard]] std::uint64_t totalFramesPublished() const noexcept;
+    [[nodiscard]] static constexpr std::size_t capacity() noexcept { return kRingCapacity; }
+    void clear() noexcept;
+
+    [[nodiscard]] std::string formatSummary(
+        const ProgramImage* program = nullptr,
+        std::size_t maxFrames = 8) const;
+    [[nodiscard]] std::string toJson(
+        const ProgramImage* program = nullptr,
+        std::size_t maxFrames = 16) const;
+
+private:
+    struct FuncBucket {
+        semantic::SymbolId symbolId = 0;
+        std::uint64_t instructions = 0;
+    };
+
+    struct alignas(64) RingSlot {
+        std::atomic<std::uint64_t> version{0};
+        FrameTelemetrySample sample{};
+    };
+
+    void resetCurrentFrameAccumulators() noexcept;
+    [[nodiscard]] bool tryReadSlot(
+        std::size_t slotIndex,
+        FrameTelemetrySample& outSample) const noexcept;
+
+    std::array<RingSlot, kRingCapacity> ring_{};
+    std::atomic<std::uint64_t> publishedCount_{0};
+
+    std::uint64_t currentFrameNumber_ = 0;
+    std::uint64_t currentTotalInstructions_ = 0;
+    std::uint64_t currentFiberInstructions_ = 0;
+    std::uint64_t currentGcSliceNs_ = 0;
+    std::size_t explicitCompactBytes_ = 0;
+    std::size_t explicitBoxedBytes_ = 0;
+    bool hasExplicitHeapBytes_ = false;
+    std::uint32_t explicitActiveFibers_ = 0;
+    bool hasExplicitActiveFibers_ = false;
+
+    std::array<FuncBucket, kAccumulatorBuckets> activeBuckets_{};
+    std::array<std::uint8_t, kAccumulatorBuckets> touchedBuckets_{};
+    std::size_t touchedCount_ = 0;
+
+    std::array<ObjectRef, kTrackedCompactCapacity> trackedCompactRefs_{};
+    std::size_t trackedCompactCount_ = 0;
+    std::size_t compactReplaceCursor_ = 0;
+};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+using FrameTelemetryRing = FrameTelemetryCollector;
+
+void bindActiveFrameTelemetry(FrameTelemetryCollector* collector) noexcept;
+[[nodiscard]] FrameTelemetryCollector* activeFrameTelemetry() noexcept;
+
+struct ActiveFrameTelemetryScope {
+    FrameTelemetryCollector* previous = nullptr;
+    explicit ActiveFrameTelemetryScope(FrameTelemetryCollector* collector) noexcept
+        : previous(activeFrameTelemetry()) {
+        bindActiveFrameTelemetry(collector);
+    }
+    ~ActiveFrameTelemetryScope() noexcept {
+        bindActiveFrameTelemetry(previous);
+    }
+    ActiveFrameTelemetryScope(const ActiveFrameTelemetryScope&) = delete;
+    ActiveFrameTelemetryScope& operator=(const ActiveFrameTelemetryScope&) = delete;
+};
+
 struct ExecutionOptions {
     Limits limits;
     TraceSink trace;
@@ -2424,6 +2666,7 @@ private:
 
 class ProgramImage;
 class AsyncRuntimeContext;
+class FiberScheduler;
 
 namespace detail {
 struct ExecutionMirror;
@@ -2536,6 +2779,11 @@ public:
     [[nodiscard]] const ProgramImage& program() const noexcept;
     [[nodiscard]] std::shared_ptr<const ProgramImage> programSnapshot() const noexcept;
     void replaceProgram(std::shared_ptr<const ProgramImage> program);
+    bool replaceProgram(
+        std::shared_ptr<const ProgramImage> program,
+        const std::vector<TypeLayoutMigration>& migrations,
+        LayoutMigrationStats* outStats = nullptr,
+        RuntimeError* error = nullptr);
 
 private:
     mutable std::mutex programMutex_;

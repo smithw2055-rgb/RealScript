@@ -1111,16 +1111,32 @@ void FiberScheduler::executeFiberSlice(
 
         case Opcode::Mul:
             if (ins.regOrSlot < fiber.regs.size()) {
-                fiber.regs[ins.regOrSlot] =
-                    fiber.regs[ins.regs.srcA & 7u] * fiber.regs[ins.regs.srcB & 7u];
+                const std::int64_t lhs64 = fiber.regs[ins.regs.srcA & 7u];
+                const std::int64_t rhs64 = fiber.regs[ins.regs.srcB & 7u];
+                if (ins.flags > 0u && ins.flags < 31u) {
+                    const std::int64_t scale = std::int64_t{1} << ins.flags;
+                    fiber.regs[ins.regOrSlot] = static_cast<std::int32_t>((lhs64 * rhs64) / scale);
+                } else {
+                    fiber.regs[ins.regOrSlot] = static_cast<std::int32_t>(
+                        static_cast<std::uint32_t>(lhs64) * static_cast<std::uint32_t>(rhs64));
+                }
             }
             ++fiber.pc;
             break;
 
         case Opcode::Div:
             if (ins.regOrSlot < fiber.regs.size()) {
-                std::int32_t rhs = fiber.regs[ins.regs.srcB & 7u];
-                fiber.regs[ins.regOrSlot] = (rhs != 0) ? (fiber.regs[ins.regs.srcA & 7u] / rhs) : 0;
+                const std::int32_t rhs = fiber.regs[ins.regs.srcB & 7u];
+                if (rhs == 0) {
+                    fiber.regs[ins.regOrSlot] = 0;
+                } else if (ins.flags > 0u && ins.flags < 31u) {
+                    const std::int64_t num =
+                        static_cast<std::int64_t>(fiber.regs[ins.regs.srcA & 7u]) *
+                        (std::int64_t{1} << ins.flags);
+                    fiber.regs[ins.regOrSlot] = static_cast<std::int32_t>(num / rhs);
+                } else {
+                    fiber.regs[ins.regOrSlot] = fiber.regs[ins.regs.srcA & 7u] / rhs;
+                }
             }
             ++fiber.pc;
             break;
@@ -1443,9 +1459,460 @@ struct FunctionPatch {
     return symbolName == full;
 }
 
-} // namespace
+[[nodiscard]] bool isAnyFiberIntrinsic(const std::string& symbolName) {
+    return symbolName.rfind("RealScript.Fiber::Fiber.", 0) == 0;
+}
 
-CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& module) {
+[[nodiscard]] semantic::SymbolId fixed24_8TypeId() noexcept {
+    static const semantic::SymbolId kId = semantic::stableTypeId("RealScript.Math::Fixed");
+    return kId;
+}
+
+[[nodiscard]] semantic::SymbolId fixed16_16TypeId() noexcept {
+    static const semantic::SymbolId kId = semantic::stableTypeId("RealScript.Math::Fixed16");
+    return kId;
+}
+
+[[nodiscard]] semantic::SymbolId awaitableVoidStructTypeId() noexcept {
+    static const semantic::SymbolId kId = semantic::stableTypeId("RealScript.Async::Awaitable");
+    return kId;
+}
+
+[[nodiscard]] bool isFixedPointStructType(
+    semantic::PrimitiveType ptype,
+    semantic::SymbolId typeId,
+    const std::string& typeName = {}) noexcept {
+    if (ptype != semantic::PrimitiveType::Struct) return false;
+    if (typeId != 0 && (typeId == fixed24_8TypeId() || typeId == fixed16_16TypeId())) {
+        return true;
+    }
+    return typeName == "Fixed" || typeName == "RealScript.Math::Fixed" ||
+           typeName == "Fixed16" || typeName == "RealScript.Math::Fixed16";
+}
+
+[[nodiscard]] bool isAwaitableVoidType(
+    semantic::PrimitiveType ptype,
+    semantic::SymbolId typeId,
+    const std::string& typeName = {}) noexcept {
+    if (ptype != semantic::PrimitiveType::Struct) return false;
+    if (typeId != 0 && typeId == awaitableVoidStructTypeId()) return true;
+    return typeName == "Awaitable" || typeName == "RealScript.Async::Awaitable";
+}
+
+[[nodiscard]] bool isPureFiberScalarOrFixedType(
+    semantic::PrimitiveType ptype,
+    semantic::SymbolId typeId) noexcept {
+    switch (ptype) {
+    case semantic::PrimitiveType::Bool:
+    case semantic::PrimitiveType::Byte:
+    case semantic::PrimitiveType::SByte:
+    case semantic::PrimitiveType::Short:
+    case semantic::PrimitiveType::UShort:
+    case semantic::PrimitiveType::Char:
+    case semantic::PrimitiveType::Int:
+    case semantic::PrimitiveType::UInt:
+    case semantic::PrimitiveType::Enum:
+        return true;
+    case semantic::PrimitiveType::Struct:
+        return isFixedPointStructType(ptype, typeId);
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] bool isSupportedFixedMathCall(const std::string& symbolName) noexcept {
+    static const std::unordered_set<std::string> kSupported = {
+        "RealScript.Math::Fixed..ctor",
+        "RealScript.Math::Fixed.Zero",
+        "RealScript.Math::Fixed.One",
+        "RealScript.Math::Fixed.Half",
+        "RealScript.Math::Fixed.Quarter",
+        "RealScript.Math::Fixed.Pi",
+        "RealScript.Math::Fixed.Raw",
+        "RealScript.Math::Fixed.Of",
+        "RealScript.Math::Fixed.Trunc",
+        "RealScript.Math::Fixed.op_UnaryPlus",
+        "RealScript.Math::Fixed.op_UnaryNegation",
+        "RealScript.Math::Fixed.op_Addition",
+        "RealScript.Math::Fixed.op_Subtraction",
+        "RealScript.Math::Fixed.op_Multiply",
+        "RealScript.Math::Fixed.op_Division",
+        "RealScript.Math::Fixed.op_Modulus",
+        "RealScript.Math::Fixed.op_Equality",
+        "RealScript.Math::Fixed.op_Inequality",
+        "RealScript.Math::Fixed.op_LessThan",
+        "RealScript.Math::Fixed.op_LessThanOrEqual",
+        "RealScript.Math::Fixed.op_GreaterThan",
+        "RealScript.Math::Fixed.op_GreaterThanOrEqual",
+        "RealScript.Math::Fixed16..ctor",
+        "RealScript.Math::Fixed16.Zero",
+        "RealScript.Math::Fixed16.One",
+        "RealScript.Math::Fixed16.Half",
+        "RealScript.Math::Fixed16.Pi",
+        "RealScript.Math::Fixed16.Raw",
+        "RealScript.Math::Fixed16.Of",
+        "RealScript.Math::Fixed16.Trunc",
+        "RealScript.Math::Fixed16.op_UnaryPlus",
+        "RealScript.Math::Fixed16.op_UnaryNegation",
+        "RealScript.Math::Fixed16.op_Addition",
+        "RealScript.Math::Fixed16.op_Subtraction",
+        "RealScript.Math::Fixed16.op_Multiply",
+        "RealScript.Math::Fixed16.op_Division",
+        "RealScript.Math::Fixed16.op_Modulus",
+        "RealScript.Math::Fixed16.op_Equality",
+        "RealScript.Math::Fixed16.op_Inequality",
+        "RealScript.Math::Fixed16.op_LessThan",
+        "RealScript.Math::Fixed16.op_LessThanOrEqual",
+        "RealScript.Math::Fixed16.op_GreaterThan",
+        "RealScript.Math::Fixed16.op_GreaterThanOrEqual",
+    };
+    if (kSupported.find(symbolName) != kSupported.end()) return true;
+    // Operator methods in RealScript MIR may also appear as `Fixed.operator +`
+    return symbolName.rfind("RealScript.Math::Fixed.operator ", 0) == 0 ||
+           symbolName.rfind("RealScript.Math::Fixed16.operator ", 0) == 0;
+}
+
+[[nodiscard]] bool isSupportedAsyncYieldCall(const std::string& symbolName) noexcept {
+    return symbolName == "RealScript.Async::Awaitable.Yield" ||
+           symbolName == "RealScript.Async::Awaitable.Completed" ||
+           symbolName == "RealScript.Async::Awaitable..ctor" ||
+           symbolName == "RealScript.Async::Async.__Yield" ||
+           symbolName == "RealScript.Async::Async.__CompletedVoid";
+}
+
+bool canAutoLowerFunctionImpl(
+    const mir::Module& module,
+    const mir::Function& fn,
+    const std::unordered_map<std::string, const mir::Function*>& funcMap,
+    std::unordered_set<const mir::Function*>& visiting) {
+    if (fn.blocks.empty() || !fn.exceptionHandlers.empty()) {
+        return false;
+    }
+    if (fn.returnType != semantic::PrimitiveType::Void &&
+        !isPureFiberScalarOrFixedType(fn.returnType, fn.returnTypeId) &&
+        !isAwaitableVoidType(fn.returnType, fn.returnTypeId)) {
+        return false;
+    }
+    for (std::size_t i = 0; i < fn.parameterTypes.size(); ++i) {
+        const auto pType = fn.parameterTypes[i];
+        const auto pTid = i < fn.parameterTypeIds.size() ? fn.parameterTypeIds[i] : 0;
+        if (!isPureFiberScalarOrFixedType(pType, pTid)) {
+            return false;
+        }
+    }
+
+    if (!visiting.insert(&fn).second) {
+        // Recursive cycle in Fiber state machine is rejected for bounded deterministic stack
+        return false;
+    }
+    struct VisitGuard {
+        std::unordered_set<const mir::Function*>& set;
+        const mir::Function* ptr;
+        ~VisitGuard() { set.erase(ptr); }
+    } visitGuard{visiting, &fn};
+
+    std::unordered_set<std::size_t> syntheticAwaitLocals;
+    std::unordered_set<mir::ValueId> allowedForkStringVals;
+    std::unordered_set<mir::ValueId> awaitYieldVals;
+    std::unordered_map<mir::ValueId, std::int64_t> compileConsts;
+    std::unordered_map<std::size_t, std::size_t> localWrites;
+
+    for (const auto& blk : fn.blocks) {
+        if (!blk.parameters.empty()) return false;
+        for (const auto& ins : blk.instructions) {
+            if (ins.opcode == mir::Opcode::StoreLocal) {
+                ++localWrites[ins.localIndex];
+            } else if (ins.opcode == mir::Opcode::AwaitSuspend ||
+                       ins.opcode == mir::Opcode::AwaitResume) {
+                syntheticAwaitLocals.insert(ins.localIndex);
+            } else if (ins.opcode == mir::Opcode::Call &&
+                       isFiberIntrinsic(ins.symbolName, "Fork") &&
+                       !ins.operands.empty()) {
+                allowedForkStringVals.insert(ins.operands[0]);
+            }
+        }
+    }
+
+    std::size_t maxRuntimeRegSlot = 0;
+    bool hasRuntimeRegSlot = false;
+    bool usesBinaryScratchRegs = false;
+
+    for (std::size_t slot = 0; slot < fn.localTypes.size(); ++slot) {
+        if (syntheticAwaitLocals.find(slot) != syntheticAwaitLocals.end()) {
+            continue;
+        }
+        const auto lType = fn.localTypes[slot];
+        const auto lTid = slot < fn.localTypeIds.size() ? fn.localTypeIds[slot] : 0;
+        if (lType == semantic::PrimitiveType::Error && localWrites.find(slot) == localWrites.end() &&
+            slot >= fn.parameterTypes.size()) {
+            continue;
+        }
+        if (!isPureFiberScalarOrFixedType(lType, lTid)) {
+            return false;
+        }
+    }
+
+    for (const auto& blk : fn.blocks) {
+        for (const auto& ins : blk.instructions) {
+            switch (ins.opcode) {
+            case mir::Opcode::Parameter:
+                if (ins.localIndex >= 8u) return false;
+                hasRuntimeRegSlot = true;
+                maxRuntimeRegSlot = std::max(maxRuntimeRegSlot, ins.localIndex);
+                break;
+
+            case mir::Opcode::ConstantInt:
+                compileConsts[ins.result] = ins.integerImmediate;
+                break;
+
+            case mir::Opcode::ConstantBool:
+                compileConsts[ins.result] = ins.boolImmediate ? 1 : 0;
+                break;
+
+            case mir::Opcode::ConstantString:
+                if (allowedForkStringVals.find(ins.result) == allowedForkStringVals.end()) {
+                    return false;
+                }
+                break;
+
+            case mir::Opcode::LoadLocal:
+            case mir::Opcode::StoreLocal: {
+                if (syntheticAwaitLocals.find(ins.localIndex) != syntheticAwaitLocals.end()) {
+                    break;
+                }
+                if (ins.opcode == mir::Opcode::StoreLocal && !ins.operands.empty() &&
+                    localWrites[ins.localIndex] <= 1 &&
+                    compileConsts.find(ins.operands[0]) != compileConsts.end()) {
+                    compileConsts[static_cast<mir::ValueId>(100000 + ins.localIndex)] =
+                        compileConsts[ins.operands[0]];
+                    break;
+                }
+                if (ins.opcode == mir::Opcode::LoadLocal &&
+                    localWrites[ins.localIndex] <= 1 &&
+                    compileConsts.find(static_cast<mir::ValueId>(100000 + ins.localIndex)) != compileConsts.end()) {
+                    compileConsts[ins.result] =
+                        compileConsts[static_cast<mir::ValueId>(100000 + ins.localIndex)];
+                    break;
+                }
+                if (ins.localIndex >= 8u) return false;
+                hasRuntimeRegSlot = true;
+                maxRuntimeRegSlot = std::max(maxRuntimeRegSlot, ins.localIndex);
+                break;
+            }
+
+            case mir::Opcode::NewStruct:
+            case mir::Opcode::LoadStructField:
+            case mir::Opcode::StoreStructField:
+                if (!isFixedPointStructType(
+                        semantic::PrimitiveType::Struct, ins.typeId, ins.symbolName) &&
+                    !isAwaitableVoidType(
+                        semantic::PrimitiveType::Struct, ins.typeId, ins.symbolName)) {
+                    return false;
+                }
+                if (ins.opcode == mir::Opcode::NewStruct) {
+                    compileConsts[ins.result] = 0;
+                    if (isAwaitableVoidType(semantic::PrimitiveType::Struct, ins.typeId, ins.symbolName)) {
+                        awaitYieldVals.insert(ins.result);
+                    }
+                } else if (ins.opcode == mir::Opcode::StoreStructField && ins.operands.size() >= 2) {
+                    if (compileConsts.find(ins.operands[1]) != compileConsts.end()) {
+                        compileConsts[ins.result] = compileConsts[ins.operands[1]];
+                    }
+                } else if (ins.opcode == mir::Opcode::LoadStructField && !ins.operands.empty()) {
+                    if (compileConsts.find(ins.operands[0]) != compileConsts.end()) {
+                        compileConsts[ins.result] = compileConsts[ins.operands[0]];
+                    }
+                }
+                break;
+
+            case mir::Opcode::NegateInt:
+            case mir::Opcode::NegateLong:
+            case mir::Opcode::LogicalNot:
+            case mir::Opcode::ConvertIntToLong:
+            case mir::Opcode::ConvertNumeric:
+                if (ins.resultType == semantic::PrimitiveType::Float ||
+                    ins.resultType == semantic::PrimitiveType::Double) {
+                    return false;
+                }
+                if (!ins.operands.empty() && compileConsts.find(ins.operands[0]) != compileConsts.end()) {
+                    const std::int64_t v = compileConsts[ins.operands[0]];
+                    if (ins.opcode == mir::Opcode::NegateInt || ins.opcode == mir::Opcode::NegateLong) {
+                        compileConsts[ins.result] = -v;
+                    } else if (ins.opcode == mir::Opcode::LogicalNot) {
+                        compileConsts[ins.result] = (v == 0) ? 1 : 0;
+                    } else {
+                        compileConsts[ins.result] = v;
+                    }
+                } else if (ins.opcode == mir::Opcode::NegateInt || ins.opcode == mir::Opcode::NegateLong) {
+                    usesBinaryScratchRegs = true;
+                }
+                break;
+
+            case mir::Opcode::AddInt:
+            case mir::Opcode::SubtractInt:
+            case mir::Opcode::MultiplyInt:
+            case mir::Opcode::DivideInt:
+            case mir::Opcode::RemainderInt:
+            case mir::Opcode::Equal:
+            case mir::Opcode::NotEqual:
+            case mir::Opcode::LessInt:
+            case mir::Opcode::LessOrEqualInt:
+            case mir::Opcode::GreaterInt:
+            case mir::Opcode::GreaterOrEqualInt:
+                if (ins.operands.size() < 2) return false;
+                if (compileConsts.find(ins.operands[0]) != compileConsts.end() &&
+                    compileConsts.find(ins.operands[1]) != compileConsts.end()) {
+                    const std::int64_t a = compileConsts[ins.operands[0]];
+                    const std::int64_t b = compileConsts[ins.operands[1]];
+                    switch (ins.opcode) {
+                    case mir::Opcode::AddInt: compileConsts[ins.result] = a + b; break;
+                    case mir::Opcode::SubtractInt: compileConsts[ins.result] = a - b; break;
+                    case mir::Opcode::MultiplyInt: compileConsts[ins.result] = a * b; break;
+                    case mir::Opcode::DivideInt: compileConsts[ins.result] = (b != 0) ? (a / b) : 0; break;
+                    case mir::Opcode::RemainderInt: compileConsts[ins.result] = (b != 0) ? (a % b) : 0; break;
+                    case mir::Opcode::Equal: compileConsts[ins.result] = (a == b) ? 1 : 0; break;
+                    case mir::Opcode::NotEqual: compileConsts[ins.result] = (a != b) ? 1 : 0; break;
+                    case mir::Opcode::LessInt: compileConsts[ins.result] = (a < b) ? 1 : 0; break;
+                    case mir::Opcode::LessOrEqualInt: compileConsts[ins.result] = (a <= b) ? 1 : 0; break;
+                    case mir::Opcode::GreaterInt: compileConsts[ins.result] = (a > b) ? 1 : 0; break;
+                    case mir::Opcode::GreaterOrEqualInt: compileConsts[ins.result] = (a >= b) ? 1 : 0; break;
+                    default: break;
+                    }
+                } else {
+                    usesBinaryScratchRegs = true;
+                }
+                break;
+
+            case mir::Opcode::AsyncEnter:
+            case mir::Opcode::AsyncResolve:
+                break;
+
+            case mir::Opcode::AwaitSuspend:
+                if (ins.operands.empty() ||
+                    awaitYieldVals.find(ins.operands[0]) == awaitYieldVals.end()) {
+                    return false;
+                }
+                break;
+
+            case mir::Opcode::AwaitResume:
+                if (ins.result != -1 && ins.resultType != semantic::PrimitiveType::Void) {
+                    return false;
+                }
+                break;
+
+            case mir::Opcode::Call: {
+                if (ins.virtualDispatch || ins.interfaceDispatch) return false;
+                if (isAnyFiberIntrinsic(ins.symbolName)) {
+                    if (isFiberIntrinsic(ins.symbolName, "Fork")) {
+                        if (ins.operands.empty() ||
+                            allowedForkStringVals.find(ins.operands[0]) == allowedForkStringVals.end()) {
+                            return false;
+                        }
+                    }
+                    break;
+                }
+                if (isSupportedFixedMathCall(ins.symbolName)) {
+                    usesBinaryScratchRegs = true;
+                    break;
+                }
+                if (isSupportedAsyncYieldCall(ins.symbolName)) {
+                    if (ins.symbolName == "RealScript.Async::Awaitable.Yield" ||
+                        ins.symbolName == "RealScript.Async::Awaitable..ctor") {
+                        awaitYieldVals.insert(ins.result);
+                    }
+                    break;
+                }
+                const auto calleeIt = funcMap.find(ins.symbolName);
+                if (calleeIt == funcMap.end() || calleeIt->second == nullptr) {
+                    return false;
+                }
+                if (!canAutoLowerFunctionImpl(module, *calleeIt->second, funcMap, visiting)) {
+                    return false;
+                }
+                break;
+            }
+
+            default:
+                // Rejects NewObject, NewArray, LoadField, StoreField, NewDelegate, floats, etc.
+                return false;
+            }
+        }
+
+        if (blk.terminator.kind == mir::TerminatorKind::Throw ||
+            blk.terminator.kind == mir::TerminatorKind::None) {
+            return false;
+        }
+    }
+
+    if (hasRuntimeRegSlot && usesBinaryScratchRegs && maxRuntimeRegSlot >= 5u) {
+        // Slots 5, 6, 7 are reserved as arithmetic scratch registers when dynamic binary ops exist
+        return false;
+    }
+
+    return true;
+}
+
+const debug::SourceFileInfo* resolveMirSourceFile(
+    const mir::Module& module,
+    const mir::Function& fn) noexcept {
+    for (const auto& sf : module.sourceFiles) {
+        if (!fn.debugInfo.sourceName.empty() && sf.path == fn.debugInfo.sourceName) {
+            return &sf;
+        }
+    }
+    for (const auto& sf : module.sourceFiles) {
+        if (sf.id == fn.debugInfo.sourceFileId) {
+            return &sf;
+        }
+    }
+    return module.sourceFiles.empty() ? nullptr : &module.sourceFiles.front();
+}
+
+debug::SourceRange resolveSpanRange(
+    const debug::SourceFileInfo* sourceFile,
+    text::TextSpan span,
+    const debug::SourceRange& fallback) noexcept {
+    if (!span.empty() && sourceFile != nullptr) {
+        return debug::makeSourceRange(*sourceFile, span);
+    }
+    return fallback;
+}
+
+debug::SourceRange lookupMirSequencePointRange(
+    const mir::Function& fn,
+    const debug::SourceFileInfo* sourceFile,
+    mir::BlockId blockId,
+    std::size_t instIdx,
+    bool isTerminator,
+    text::TextSpan directSpan,
+    const debug::SourceRange& fallback) noexcept {
+    const debug::SequencePoint* bestSp = nullptr;
+    for (const auto& sp : fn.debugInfo.sequencePoints) {
+        if (sp.blockId != blockId) continue;
+        if (isTerminator) {
+            if (sp.terminator) {
+                bestSp = &sp;
+                break;
+            }
+        } else if (!sp.terminator && sp.instructionIndex <= instIdx) {
+            bestSp = &sp;
+        }
+    }
+    if (bestSp != nullptr) {
+        if (bestSp->range.valid() &&
+            (bestSp->range.start.line != 0 || bestSp->range.start.column != 0 || sourceFile == nullptr)) {
+            return bestSp->range;
+        }
+        if (!bestSp->range.span.empty() && sourceFile != nullptr) {
+            return debug::makeSourceRange(*sourceFile, bestSp->range.span);
+        }
+    }
+    return resolveSpanRange(sourceFile, directSpan, fallback);
+}
+
+CompiledFiberModule compileModuleInternal(
+    const mir::Module& module,
+    bool onlyAutoLowerable) {
     CompiledFiberModule result;
     result.moduleName = module.name;
 
@@ -1462,10 +1929,44 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
     for (const auto& fn : module.functions) {
         if (fn.blocks.empty()) continue;
 
+        std::unordered_set<const mir::Function*> visiting;
+        const bool isAutoLowerable = canAutoLowerFunctionImpl(module, fn, funcMap, visiting);
+        if (onlyAutoLowerable && !isAutoLowerable) {
+            continue;
+        }
+
         const std::uint32_t fnEntryPc = static_cast<std::uint32_t>(result.instructions.size());
         result.entryPoints[fn.name] = fnEntryPc;
+        const std::string canonicalFnName = !module.name.empty()
+            ? (module.name + "::" + fn.name)
+            : fn.name;
         if (!module.name.empty()) {
-            result.entryPoints[module.name + "::" + fn.name] = fnEntryPc;
+            result.entryPoints[canonicalFnName] = fnEntryPc;
+        }
+
+        const debug::SourceFileInfo* sourceFile = resolveMirSourceFile(module, fn);
+        FiberDebugInfo dbg;
+        dbg.sourcePath = !fn.debugInfo.sourceName.empty()
+            ? fn.debugInfo.sourceName
+            : (sourceFile ? sourceFile->path : std::string{});
+        dbg.functionName = fn.name;
+        dbg.canonicalName = canonicalFnName;
+        dbg.entryPc = fnEntryPc;
+        dbg.declaration = fn.debugInfo.declaration.valid()
+            ? fn.debugInfo.declaration
+            : resolveSpanRange(sourceFile, fn.debugInfo.declaration.span, {});
+        dbg.body = fn.debugInfo.body.valid()
+            ? fn.debugInfo.body
+            : resolveSpanRange(sourceFile, fn.debugInfo.body.span, dbg.declaration);
+
+        for (const auto& loc : fn.debugInfo.locals) {
+            if (loc.slot >= 8u || loc.name.empty()) continue;
+            if (!dbg.registerNames[loc.slot].empty() && loc.name[0] == '$') continue;
+            if (dbg.registerNames[loc.slot].empty()) {
+                dbg.registerNames[loc.slot] = loc.name;
+                dbg.registerTypes[loc.slot] = loc.type;
+                dbg.registerTypeIds[loc.slot] = loc.typeId;
+            }
         }
 
         // Count local writes to distinguish compile-time constant locals from loop/dynamic locals
@@ -1542,6 +2043,14 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
         std::unordered_map<std::size_t, std::int64_t> constLocal;
         std::unordered_map<mir::ValueId, std::uint16_t> valReg;
         std::unordered_map<mir::ValueId, HostCondExpr> condExprs;
+        std::unordered_set<mir::ValueId> fixed24Values;
+
+        debug::SourceRange currentSourceRange = dbg.body.valid() ? dbg.body : dbg.declaration;
+        const auto syncInstructionLocations = [&]() {
+            while (result.instructionLocations.size() < result.instructions.size()) {
+                result.instructionLocations.push_back(currentSourceRange);
+            }
+        };
 
         auto evalConstInt = [&](mir::ValueId vid, std::int64_t fallback = 0) -> std::int64_t {
             auto it = constInt.find(vid);
@@ -1552,25 +2061,52 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
             auto rIt = valReg.find(vid);
             if (rIt != valReg.end()) return rIt->second;
             std::int64_t cval = evalConstInt(vid, 0);
+            const Opcode loadOp = (fixed24Values.find(vid) != fixed24Values.end())
+                ? Opcode::LoadFixed24_8
+                : Opcode::LoadInt;
             result.instructions.push_back(CompactInstruction(
-                Opcode::LoadInt, std::uint8_t{0}, scratchReg, static_cast<std::uint32_t>(static_cast<std::int32_t>(cval))));
+                loadOp, std::uint8_t{0}, scratchReg, static_cast<std::uint32_t>(static_cast<std::int32_t>(cval))));
+            syncInstructionLocations();
             return scratchReg;
         };
 
-        // Helper lambda to emit instructions for a basic block (supports 1-level helper inlining)
-        auto emitInstructions = [&](const std::vector<mir::Instruction>& insts,
+        auto emitInstructions = [&](const mir::BasicBlock* ownerBlock,
+                                    const std::vector<mir::Instruction>& insts,
                                     const std::unordered_map<std::size_t, std::int64_t>* inlinedParamConsts,
+                                    const std::unordered_map<std::size_t, std::uint16_t>* inlinedParamRegs,
+                                    mir::ValueId* outInlinedReturnVal,
                                     auto& selfRef) -> void {
-            for (const auto& ins : insts) {
+            for (std::size_t iIdx = 0; iIdx < insts.size(); ++iIdx) {
+                const auto& ins = insts[iIdx];
+                if (ownerBlock != nullptr) {
+                    currentSourceRange = lookupMirSequencePointRange(
+                        fn, sourceFile, ownerBlock->id, iIdx, false, ins.sourceSpan, currentSourceRange);
+                }
+                if (isFixedPointStructType(ins.resultType, ins.resultTypeId) &&
+                    ins.resultTypeId == fixed24_8TypeId()) {
+                    fixed24Values.insert(ins.result);
+                }
+
                 switch (ins.opcode) {
                 case mir::Opcode::Parameter: {
+                    const std::size_t paramSlot = ins.integerImmediate >= 0
+                        ? static_cast<std::size_t>(ins.integerImmediate)
+                        : ins.localIndex;
                     if (inlinedParamConsts) {
-                        auto pIt = inlinedParamConsts->find(ins.localIndex);
+                        auto pIt = inlinedParamConsts->find(paramSlot);
                         if (pIt != inlinedParamConsts->end()) {
                             constInt[ins.result] = pIt->second;
+                            break;
                         }
                     }
-                    valReg[ins.result] = static_cast<std::uint16_t>(ins.localIndex & 7u);
+                    if (inlinedParamRegs) {
+                        auto rIt = inlinedParamRegs->find(paramSlot);
+                        if (rIt != inlinedParamRegs->end()) {
+                            valReg[ins.result] = rIt->second;
+                            break;
+                        }
+                    }
+                    valReg[ins.result] = static_cast<std::uint16_t>(paramSlot & 7u);
                     break;
                 }
                 case mir::Opcode::ConstantInt:
@@ -1590,9 +2126,20 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                             break;
                         }
                     }
+                    if (inlinedParamRegs) {
+                        auto rIt = inlinedParamRegs->find(ins.localIndex);
+                        if (rIt != inlinedParamRegs->end()) {
+                            valReg[ins.result] = rIt->second;
+                            break;
+                        }
+                    }
                     auto cIt = constLocal.find(ins.localIndex);
-                    if (cIt != constLocal.end() && localWriteCounts[ins.localIndex] <= 1) {
+                    if (cIt != constLocal.end() && ownerBlock != nullptr && localWriteCounts[ins.localIndex] <= 1) {
                         constInt[ins.result] = cIt->second;
+                    }
+                    if (ins.localIndex < fn.localTypeIds.size() &&
+                        fn.localTypeIds[ins.localIndex] == fixed24_8TypeId()) {
+                        fixed24Values.insert(ins.result);
                     }
                     valReg[ins.result] = static_cast<std::uint16_t>(ins.localIndex & 7u);
                     break;
@@ -1601,30 +2148,105 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                     if (ins.operands.empty()) break;
                     mir::ValueId src = ins.operands[0];
                     std::uint16_t dstReg = static_cast<std::uint16_t>(ins.localIndex & 7u);
+                    const bool isFixed24Slot =
+                        (ins.localIndex < fn.localTypeIds.size() &&
+                         fn.localTypeIds[ins.localIndex] == fixed24_8TypeId()) ||
+                        (fixed24Values.find(src) != fixed24Values.end());
                     auto cIt = constInt.find(src);
                     if (cIt != constInt.end()) {
-                        if (localWriteCounts[ins.localIndex] <= 1) {
+                        if (ownerBlock != nullptr && localWriteCounts[ins.localIndex] <= 1) {
                             constLocal[ins.localIndex] = cIt->second;
+                            if (ins.localIndex < 8u) {
+                                dbg.registerIsConstFolded[ins.localIndex] = true;
+                                dbg.registerConstValues[ins.localIndex] = static_cast<std::int32_t>(cIt->second);
+                            }
                         } else {
                             result.instructions.push_back(CompactInstruction(
-                                Opcode::LoadInt,
+                                isFixed24Slot ? Opcode::LoadFixed24_8 : Opcode::LoadInt,
                                 std::uint8_t{0},
                                 dstReg,
                                 static_cast<std::uint32_t>(static_cast<std::int32_t>(cIt->second))));
+                            syncInstructionLocations();
                         }
                     } else if (valReg.find(src) != valReg.end()) {
                         std::uint16_t srcReg = valReg[src];
                         if (srcReg != dstReg) {
                             result.instructions.push_back(
                                 CompactInstruction(Opcode::MoveReg, std::uint8_t{0}, dstReg, srcReg, std::uint16_t{0}));
+                            syncInstructionLocations();
+                        }
+                    }
+                    break;
+                }
+                case mir::Opcode::NewStruct: {
+                    if (isFixedPointStructType(semantic::PrimitiveType::Struct, ins.typeId, ins.symbolName)) {
+                        constInt[ins.result] = 0;
+                        if (ins.typeId == fixed24_8TypeId() ||
+                            ins.symbolName == "Fixed" ||
+                            ins.symbolName == "RealScript.Math::Fixed") {
+                            fixed24Values.insert(ins.result);
+                        }
+                    }
+                    break;
+                }
+                case mir::Opcode::StoreStructField: {
+                    if (ins.operands.size() >= 2 &&
+                        isFixedPointStructType(semantic::PrimitiveType::Struct, ins.typeId, ins.symbolName)) {
+                        const mir::ValueId rawSrc = ins.operands[1];
+                        if (constInt.find(rawSrc) != constInt.end()) {
+                            constInt[ins.result] = constInt[rawSrc];
+                        }
+                        if (valReg.find(rawSrc) != valReg.end()) {
+                            valReg[ins.result] = valReg[rawSrc];
+                        }
+                        if (ins.typeId == fixed24_8TypeId() ||
+                            ins.symbolName == "Fixed" ||
+                            ins.symbolName == "RealScript.Math::Fixed") {
+                            fixed24Values.insert(ins.result);
+                        }
+                    }
+                    break;
+                }
+                case mir::Opcode::LoadStructField: {
+                    if (!ins.operands.empty() &&
+                        isFixedPointStructType(semantic::PrimitiveType::Struct, ins.typeId, ins.symbolName)) {
+                        const mir::ValueId stSrc = ins.operands[0];
+                        if (constInt.find(stSrc) != constInt.end()) {
+                            constInt[ins.result] = constInt[stSrc];
+                        }
+                        if (valReg.find(stSrc) != valReg.end()) {
+                            valReg[ins.result] = valReg[stSrc];
+                        }
+                    }
+                    break;
+                }
+                case mir::Opcode::ConvertIntToLong:
+                case mir::Opcode::ConvertNumeric: {
+                    if (!ins.operands.empty()) {
+                        const mir::ValueId src = ins.operands[0];
+                        if (constInt.find(src) != constInt.end()) {
+                            constInt[ins.result] = constInt[src];
+                        } else if (valReg.find(src) != valReg.end()) {
+                            valReg[ins.result] = valReg[src];
                         }
                     }
                     break;
                 }
                 case mir::Opcode::NegateInt:
                 case mir::Opcode::NegateLong: {
-                    if (!ins.operands.empty() && constInt.find(ins.operands[0]) != constInt.end()) {
-                        constInt[ins.result] = -constInt[ins.operands[0]];
+                    if (!ins.operands.empty()) {
+                        const mir::ValueId src = ins.operands[0];
+                        if (constInt.find(src) != constInt.end()) {
+                            constInt[ins.result] = -constInt[src];
+                        } else {
+                            const std::uint16_t rSrc = ensureValReg(src, 6);
+                            result.instructions.push_back(CompactInstruction(
+                                Opcode::LoadInt, std::uint8_t{0}, std::uint16_t{5}, std::uint32_t{0}));
+                            result.instructions.push_back(CompactInstruction(
+                                Opcode::Sub, std::uint8_t{0}, std::uint16_t{7}, std::uint16_t{5}, rSrc));
+                            syncInstructionLocations();
+                            valReg[ins.result] = 7;
+                        }
                     }
                     break;
                 }
@@ -1639,6 +2261,14 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                         HostCondExpr neg = condIt->second;
                         neg.negated = !neg.negated;
                         condExprs[ins.result] = neg;
+                    } else if (constInt.find(src) == constInt.end() && valReg.find(src) != valReg.end()) {
+                        const std::uint16_t rSrc = valReg[src];
+                        result.instructions.push_back(CompactInstruction(
+                            Opcode::LoadInt, std::uint8_t{0}, std::uint16_t{5}, std::uint32_t{0}));
+                        result.instructions.push_back(CompactInstruction(
+                            Opcode::CmpEq, std::uint8_t{0}, std::uint16_t{7}, rSrc, std::uint16_t{5}));
+                        syncInstructionLocations();
+                        valReg[ins.result] = 7;
                     }
                     break;
                 }
@@ -1695,8 +2325,24 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                         default: break;
                         }
                         result.instructions.push_back(CompactInstruction(op, std::uint8_t{0}, rDst, rA, rB));
+                        syncInstructionLocations();
                         valReg[ins.result] = rDst;
                     }
+                    break;
+                }
+                case mir::Opcode::AsyncEnter:
+                case mir::Opcode::AwaitResume:
+                    break;
+                case mir::Opcode::AwaitSuspend: {
+                    result.instructions.push_back(CompactInstruction(
+                        Opcode::YieldTicks, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{1}));
+                    syncInstructionLocations();
+                    break;
+                }
+                case mir::Opcode::AsyncResolve: {
+                    result.instructions.push_back(CompactInstruction(
+                        Opcode::Return, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
+                    syncInstructionLocations();
                     break;
                 }
                 case mir::Opcode::Call: {
@@ -1706,31 +2352,37 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                             std::uint8_t{0},
                             std::uint16_t{0},
                             static_cast<std::uint32_t>(evalConstInt(ins.operands[0], 1))));
+                        syncInstructionLocations();
                     } else if (isFiberIntrinsic(ins.symbolName, "YieldRandom") && ins.operands.size() >= 2) {
                         result.instructions.push_back(CompactInstruction(
                             Opcode::YieldTicks,
                             std::uint8_t{1},
                             static_cast<std::uint16_t>(evalConstInt(ins.operands[0], 1)),
                             static_cast<std::uint32_t>(evalConstInt(ins.operands[1], 1))));
+                        syncInstructionLocations();
                     } else if (isFiberIntrinsic(ins.symbolName, "WaitUntil") && ins.operands.size() >= 3) {
                         result.instructions.push_back(CompactInstruction(
                             Opcode::YieldUntilPredicate,
                             static_cast<std::uint8_t>(evalConstInt(ins.operands[0], 0)),
                             static_cast<std::uint16_t>(evalConstInt(ins.operands[1], 0)),
                             static_cast<std::uint32_t>(evalConstInt(ins.operands[2], 0))));
+                        syncInstructionLocations();
                     } else if (isFiberIntrinsic(ins.symbolName, "SetUnbreakable") && ins.operands.size() >= 1) {
                         result.instructions.push_back(CompactInstruction(
                             Opcode::SetUnbreakable,
                             static_cast<std::uint8_t>(evalConstInt(ins.operands[0], 0) != 0 ? 1 : 0),
                             std::uint16_t{0},
                             std::uint32_t{0}));
+                        syncInstructionLocations();
                     } else if (isFiberIntrinsic(ins.symbolName, "Terminate")) {
                         result.instructions.push_back(
                             CompactInstruction(Opcode::KillFiber, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
+                        syncInstructionLocations();
                     } else if (isFiberIntrinsic(ins.symbolName, "Fork") && ins.operands.size() >= 1) {
                         std::size_t idx = result.instructions.size();
                         result.instructions.push_back(
                             CompactInstruction(Opcode::ForkFiber, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
+                        syncInstructionLocations();
                         auto sIt = constStr.find(ins.operands[0]);
                         if (sIt != constStr.end()) {
                             functionPatches.push_back(FunctionPatch{idx, sIt->second});
@@ -1741,12 +2393,14 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                             std::uint8_t{0},
                             std::uint16_t{0},
                             static_cast<std::uint32_t>(evalConstInt(ins.operands[0], 0))));
+                        syncInstructionLocations();
                     } else if (isFiberIntrinsic(ins.symbolName, "Command") && ins.operands.size() >= 3) {
                         result.instructions.push_back(CompactInstruction(
                             Opcode::HostCommand,
                             static_cast<std::uint8_t>(evalConstInt(ins.operands[0], 0)),
                             static_cast<std::uint16_t>(evalConstInt(ins.operands[1], 0)),
                             static_cast<std::uint32_t>(evalConstInt(ins.operands[2], 0))));
+                        syncInstructionLocations();
                     } else if (isFiberIntrinsic(ins.symbolName, "Cond") && ins.operands.size() >= 3) {
                         HostCondExpr ce{};
                         ce.isRand = false;
@@ -1771,27 +2425,218 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                                 std::uint8_t{0},
                                 slot,
                                 static_cast<std::uint32_t>(static_cast<std::int32_t>(constInt[ins.operands[1]]))));
+                            syncInstructionLocations();
                         } else if (valReg.find(ins.operands[1]) != valReg.end()) {
                             result.instructions.push_back(CompactInstruction(
                                 Opcode::MoveReg, std::uint8_t{0}, slot, valReg[ins.operands[1]], std::uint16_t{0}));
+                            syncInstructionLocations();
                         }
+                    } else if (isSupportedFixedMathCall(ins.symbolName)) {
+                        const bool isFixed16 = ins.symbolName.find("Fixed16") != std::string::npos;
+                        const std::int64_t scale = isFixed16 ? 65536LL : 256LL;
+                        if (!isFixed16) fixed24Values.insert(ins.result);
+
+                        auto endsWith = [&](const char* suf) {
+                            const std::size_t slen = std::strlen(suf);
+                            return ins.symbolName.size() >= slen &&
+                                   ins.symbolName.compare(ins.symbolName.size() - slen, slen, suf) == 0;
+                        };
+
+                        if (endsWith(".Zero")) {
+                            constInt[ins.result] = 0;
+                        } else if (endsWith(".One")) {
+                            constInt[ins.result] = scale;
+                        } else if (endsWith(".Half")) {
+                            constInt[ins.result] = scale / 2;
+                        } else if (endsWith(".Quarter")) {
+                            constInt[ins.result] = scale / 4;
+                        } else if (endsWith(".Pi")) {
+                            constInt[ins.result] = isFixed16 ? 205887LL : 804LL;
+                        } else if ((endsWith(".Raw") || endsWith("..ctor") || endsWith(".op_UnaryPlus") || endsWith("operator +")) &&
+                                   ins.operands.size() == 1) {
+                            const mir::ValueId arg0 = ins.operands[0];
+                            if (constInt.find(arg0) != constInt.end()) constInt[ins.result] = constInt[arg0];
+                            else if (valReg.find(arg0) != valReg.end()) valReg[ins.result] = valReg[arg0];
+                        } else if (endsWith(".Of") && ins.operands.size() == 1) {
+                            const mir::ValueId arg0 = ins.operands[0];
+                            if (constInt.find(arg0) != constInt.end()) {
+                                constInt[ins.result] = constInt[arg0] * scale;
+                            } else {
+                                const std::uint16_t rA = ensureValReg(arg0, 5);
+                                result.instructions.push_back(CompactInstruction(
+                                    Opcode::LoadInt, std::uint8_t{0}, std::uint16_t{6}, static_cast<std::uint32_t>(scale)));
+                                result.instructions.push_back(CompactInstruction(
+                                    Opcode::Mul, std::uint8_t{0}, std::uint16_t{7}, rA, std::uint16_t{6}));
+                                syncInstructionLocations();
+                                valReg[ins.result] = 7;
+                            }
+                        } else if (endsWith(".Trunc") && ins.operands.size() == 1) {
+                            fixed24Values.erase(ins.result);
+                            const mir::ValueId arg0 = ins.operands[0];
+                            if (constInt.find(arg0) != constInt.end()) {
+                                constInt[ins.result] = constInt[arg0] / scale;
+                            } else {
+                                const std::uint16_t rA = ensureValReg(arg0, 5);
+                                result.instructions.push_back(CompactInstruction(
+                                    Opcode::LoadInt, std::uint8_t{0}, std::uint16_t{6}, static_cast<std::uint32_t>(scale)));
+                                result.instructions.push_back(CompactInstruction(
+                                    Opcode::Div, std::uint8_t{0}, std::uint16_t{7}, rA, std::uint16_t{6}));
+                                syncInstructionLocations();
+                                valReg[ins.result] = 7;
+                            }
+                        } else if ((endsWith(".op_UnaryNegation") || (endsWith("operator -") && ins.operands.size() == 1)) &&
+                                   ins.operands.size() == 1) {
+                            const mir::ValueId arg0 = ins.operands[0];
+                            if (constInt.find(arg0) != constInt.end()) {
+                                constInt[ins.result] = -constInt[arg0];
+                            } else {
+                                const std::uint16_t rA = ensureValReg(arg0, 6);
+                                result.instructions.push_back(CompactInstruction(
+                                    Opcode::LoadInt, std::uint8_t{0}, std::uint16_t{5}, std::uint32_t{0}));
+                                result.instructions.push_back(CompactInstruction(
+                                    Opcode::Sub, std::uint8_t{0}, std::uint16_t{7}, std::uint16_t{5}, rA));
+                                syncInstructionLocations();
+                                valReg[ins.result] = 7;
+                            }
+                        } else if (ins.operands.size() >= 2) {
+                            const mir::ValueId lhs = ins.operands[0];
+                            const mir::ValueId rhs = ins.operands[1];
+                            const bool lhsFixed = ins.parameterTypes.size() >= 1 &&
+                                                  ins.parameterTypes[0] == semantic::PrimitiveType::Struct;
+                            const bool rhsFixed = ins.parameterTypes.size() >= 2 &&
+                                                  ins.parameterTypes[1] == semantic::PrimitiveType::Struct;
+                            const bool bothConst =
+                                constInt.find(lhs) != constInt.end() &&
+                                constInt.find(rhs) != constInt.end();
+                            if (bothConst) {
+                                std::int64_t a = constInt[lhs];
+                                std::int64_t b = constInt[rhs];
+                                if (!lhsFixed && rhsFixed && (endsWith("Addition") || endsWith("operator +") ||
+                                    endsWith("Subtraction") || endsWith("operator -") ||
+                                    endsWith("Equality") || endsWith("operator ==") ||
+                                    endsWith("Inequality") || endsWith("operator !=") ||
+                                    endsWith("LessThan") || endsWith("operator <") ||
+                                    endsWith("LessThanOrEqual") || endsWith("operator <=") ||
+                                    endsWith("GreaterThan") || endsWith("operator >") ||
+                                    endsWith("GreaterThanOrEqual") || endsWith("operator >="))) {
+                                    a *= scale;
+                                } else if (lhsFixed && !rhsFixed && (endsWith("Addition") || endsWith("operator +") ||
+                                    endsWith("Subtraction") || endsWith("operator -") ||
+                                    endsWith("Equality") || endsWith("operator ==") ||
+                                    endsWith("Inequality") || endsWith("operator !=") ||
+                                    endsWith("LessThan") || endsWith("operator <") ||
+                                    endsWith("LessThanOrEqual") || endsWith("operator <=") ||
+                                    endsWith("GreaterThan") || endsWith("operator >") ||
+                                    endsWith("GreaterThanOrEqual") || endsWith("operator >="))) {
+                                    b *= scale;
+                                }
+                                if (endsWith("Addition") || endsWith("operator +")) constInt[ins.result] = a + b;
+                                else if (endsWith("Subtraction") || endsWith("operator -")) constInt[ins.result] = a - b;
+                                else if (endsWith("Multiply") || endsWith("operator *")) {
+                                    constInt[ins.result] = (lhsFixed && rhsFixed) ? ((a * b) / scale) : (a * b);
+                                } else if (endsWith("Division") || endsWith("operator /")) {
+                                    if (b == 0) constInt[ins.result] = 0;
+                                    else constInt[ins.result] = (lhsFixed && rhsFixed) ? ((a * scale) / b) : (a / b);
+                                } else if (endsWith("Modulus") || endsWith("operator %")) {
+                                    constInt[ins.result] = (b != 0) ? (a % b) : 0;
+                                } else if (endsWith("Equality") || endsWith("operator ==")) {
+                                    fixed24Values.erase(ins.result);
+                                    constInt[ins.result] = (a == b) ? 1 : 0;
+                                } else if (endsWith("Inequality") || endsWith("operator !=")) {
+                                    fixed24Values.erase(ins.result);
+                                    constInt[ins.result] = (a != b) ? 1 : 0;
+                                } else if (endsWith("LessThan") || endsWith("operator <")) {
+                                    fixed24Values.erase(ins.result);
+                                    constInt[ins.result] = (a < b) ? 1 : 0;
+                                } else if (endsWith("LessThanOrEqual") || endsWith("operator <=")) {
+                                    fixed24Values.erase(ins.result);
+                                    constInt[ins.result] = (a <= b) ? 1 : 0;
+                                } else if (endsWith("GreaterThan") || endsWith("operator >")) {
+                                    fixed24Values.erase(ins.result);
+                                    constInt[ins.result] = (a > b) ? 1 : 0;
+                                } else if (endsWith("GreaterThanOrEqual") || endsWith("operator >=")) {
+                                    fixed24Values.erase(ins.result);
+                                    constInt[ins.result] = (a >= b) ? 1 : 0;
+                                }
+                            } else {
+                                std::uint16_t rA = ensureValReg(lhs, 5);
+                                std::uint16_t rB = ensureValReg(rhs, 6);
+                                Opcode op = Opcode::Add;
+                                std::uint8_t opFlags = 0u;
+                                const std::uint8_t fixedFracBits = (scale == 65536) ? 16u : 8u;
+                                if (endsWith("Addition") || endsWith("operator +")) op = Opcode::Add;
+                                else if (endsWith("Subtraction") || endsWith("operator -")) op = Opcode::Sub;
+                                else if (endsWith("Multiply") || endsWith("operator *")) {
+                                    op = Opcode::Mul;
+                                    if (lhsFixed && rhsFixed) opFlags = fixedFracBits;
+                                } else if (endsWith("Division") || endsWith("operator /")) {
+                                    op = Opcode::Div;
+                                    if (lhsFixed && rhsFixed) opFlags = fixedFracBits;
+                                } else if (endsWith("Modulus") || endsWith("operator %")) op = Opcode::Mod;
+                                else if (endsWith("Equality") || endsWith("operator ==")) { op = Opcode::CmpEq; fixed24Values.erase(ins.result); }
+                                else if (endsWith("Inequality") || endsWith("operator !=")) { op = Opcode::CmpNe; fixed24Values.erase(ins.result); }
+                                else if (endsWith("LessThan") || endsWith("operator <")) { op = Opcode::CmpLt; fixed24Values.erase(ins.result); }
+                                else if (endsWith("LessThanOrEqual") || endsWith("operator <=")) { op = Opcode::CmpLe; fixed24Values.erase(ins.result); }
+                                else if (endsWith("GreaterThan") || endsWith("operator >")) { op = Opcode::CmpGt; fixed24Values.erase(ins.result); }
+                                else if (endsWith("GreaterThanOrEqual") || endsWith("operator >=")) { op = Opcode::CmpGe; fixed24Values.erase(ins.result); }
+
+                                result.instructions.push_back(CompactInstruction(op, opFlags, std::uint16_t{7}, rA, rB));
+                                syncInstructionLocations();
+                                valReg[ins.result] = 7;
+                            }
+                        }
+                    } else if (isSupportedAsyncYieldCall(ins.symbolName)) {
+                        // Lowered at the paired AwaitSuspend / AsyncResolve site
                     } else {
                         // Check if target is a single-block helper function in the same module
                         auto targetIt = funcMap.find(ins.symbolName);
+                        const auto canInlineSingleBlockHelper = [&](const mir::Function& cand) {
+                            if (cand.blocks.size() != 1) return false;
+                            for (const auto& hIns : cand.blocks[0].instructions) {
+                                if (hIns.opcode == mir::Opcode::AwaitSuspend) return false;
+                                if (hIns.opcode == mir::Opcode::Call) {
+                                    if (isFiberIntrinsic(hIns.symbolName, "Yield") ||
+                                        isFiberIntrinsic(hIns.symbolName, "YieldRandom") ||
+                                        isFiberIntrinsic(hIns.symbolName, "WaitUntil") ||
+                                        isFiberIntrinsic(hIns.symbolName, "Fork") ||
+                                        isFiberIntrinsic(hIns.symbolName, "ForkPc")) {
+                                        return false;
+                                    }
+                                    if (!isAnyFiberIntrinsic(hIns.symbolName) &&
+                                        !isSupportedFixedMathCall(hIns.symbolName)) {
+                                        return false;
+                                    }
+                                }
+                            }
+                            return true;
+                        };
                         if (targetIt != funcMap.end() &&
                             targetIt->second != &fn &&
-                            targetIt->second->blocks.size() == 1) {
+                            canInlineSingleBlockHelper(*targetIt->second)) {
                             std::unordered_map<std::size_t, std::int64_t> paramConsts;
+                            std::unordered_map<std::size_t, std::uint16_t> paramRegs;
                             for (std::size_t p = 0; p < ins.operands.size(); ++p) {
                                 if (constInt.find(ins.operands[p]) != constInt.end()) {
                                     paramConsts[p] = constInt[ins.operands[p]];
+                                } else if (valReg.find(ins.operands[p]) != valReg.end()) {
+                                    paramRegs[p] = valReg[ins.operands[p]];
                                 }
                             }
-                            selfRef(targetIt->second->blocks[0].instructions, &paramConsts, selfRef);
+                            mir::ValueId helperRet = -1;
+                            selfRef(nullptr, targetIt->second->blocks[0].instructions, &paramConsts, &paramRegs, &helperRet, selfRef);
+                            if (targetIt->second->blocks[0].terminator.kind == mir::TerminatorKind::ReturnValue) {
+                                const mir::ValueId retVid = targetIt->second->blocks[0].terminator.value;
+                                if (constInt.find(retVid) != constInt.end()) {
+                                    constInt[ins.result] = constInt[retVid];
+                                } else if (valReg.find(retVid) != valReg.end()) {
+                                    valReg[ins.result] = valReg[retVid];
+                                }
+                            }
                         } else if (targetIt != funcMap.end()) {
                             std::size_t idx = result.instructions.size();
                             result.instructions.push_back(
                                 CompactInstruction(Opcode::Call, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
+                            syncInstructionLocations();
                             functionPatches.push_back(FunctionPatch{idx, ins.symbolName});
                         }
                     }
@@ -1801,6 +2646,7 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                     break;
                 }
             }
+            (void)outInlinedReturnVal;
         };
 
         for (std::size_t bIdx = 0; bIdx < activeBlocks.size(); ++bIdx) {
@@ -1809,15 +2655,19 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
             const bool hasNextBlock = (bIdx + 1 < activeBlocks.size());
             const mir::BlockId nextBlockId = hasNextBlock ? activeBlocks[bIdx + 1]->id : 0xFFFFFFFFu;
 
-            emitInstructions(blk.instructions, nullptr, emitInstructions);
+            emitInstructions(&blk, blk.instructions, nullptr, nullptr, nullptr, emitInstructions);
 
             const auto& term = blk.terminator;
+            currentSourceRange = lookupMirSequencePointRange(
+                fn, sourceFile, blk.id, blk.instructions.size(), true, term.sourceSpan, currentSourceRange);
+
             switch (term.kind) {
             case mir::TerminatorKind::Jump: {
                 if (!hasNextBlock || term.target != nextBlockId) {
                     std::size_t patchIdx = result.instructions.size();
                     result.instructions.push_back(
                         CompactInstruction(Opcode::Jump, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
+                    syncInstructionLocations();
                     blockPatches.push_back(BlockPatch{patchIdx, term.target, false});
                 }
                 break;
@@ -1831,6 +2681,7 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                         std::size_t patchIdx = result.instructions.size();
                         result.instructions.push_back(
                             CompactInstruction(Opcode::Jump, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
+                        syncInstructionLocations();
                         blockPatches.push_back(BlockPatch{patchIdx, taken, false});
                     }
                     break;
@@ -1840,7 +2691,6 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                 auto condIt = condExprs.find(term.condition);
                 if (condIt != condExprs.end()) {
                     const HostCondExpr& ce = condIt->second;
-                    // When host condition is TRUE, jumpTarget is `term.target` (or `term.falseTarget` if negated)
                     mir::BlockId jumpOnHostTrue = ce.negated ? term.falseTarget : term.target;
                     mir::BlockId fallthroughOnHostFalse = ce.negated ? term.target : term.falseTarget;
 
@@ -1848,10 +2698,12 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                     if (ce.isRand) {
                         result.instructions.push_back(CompactInstruction(
                             Opcode::RandJump, ce.kindOrThreshold, std::uint16_t{0}, std::uint32_t{0}));
+                        syncInstructionLocations();
                         blockPatches.push_back(BlockPatch{condIdx, jumpOnHostTrue, false});
                     } else {
                         result.instructions.push_back(CompactInstruction(
                             Opcode::HostCondJump, ce.kindOrThreshold, std::uint16_t{0}, ce.key16, ce.threshold16));
+                        syncInstructionLocations();
                         blockPatches.push_back(BlockPatch{condIdx, jumpOnHostTrue, true});
                     }
 
@@ -1859,6 +2711,7 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                         std::size_t jmpIdx = result.instructions.size();
                         result.instructions.push_back(
                             CompactInstruction(Opcode::Jump, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
+                        syncInstructionLocations();
                         blockPatches.push_back(BlockPatch{jmpIdx, fallthroughOnHostFalse, false});
                     }
                     break;
@@ -1870,16 +2723,19 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                     std::size_t jzIdx = result.instructions.size();
                     result.instructions.push_back(
                         CompactInstruction(Opcode::JumpIfZero, std::uint8_t{0}, condReg, std::uint32_t{0}));
+                    syncInstructionLocations();
                     blockPatches.push_back(BlockPatch{jzIdx, term.falseTarget, false});
                 } else {
                     std::size_t jnzIdx = result.instructions.size();
                     result.instructions.push_back(
                         CompactInstruction(Opcode::JumpIfNonZero, std::uint8_t{0}, condReg, std::uint32_t{0}));
+                    syncInstructionLocations();
                     blockPatches.push_back(BlockPatch{jnzIdx, term.target, false});
                     if (!hasNextBlock || term.falseTarget != nextBlockId) {
                         std::size_t jmpIdx = result.instructions.size();
                         result.instructions.push_back(
                             CompactInstruction(Opcode::Jump, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
+                        syncInstructionLocations();
                         blockPatches.push_back(BlockPatch{jmpIdx, term.falseTarget, false});
                     }
                 }
@@ -1887,13 +2743,27 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
             }
             case mir::TerminatorKind::ReturnVoid:
             case mir::TerminatorKind::ReturnValue: {
-                result.instructions.push_back(
-                    CompactInstruction(Opcode::Return, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
+                // Avoid duplicate trailing Return right after AsyncResolve already emitted Return
+                if (result.instructions.size() == fnEntryPc ||
+                    result.instructions.back().opcode != Opcode::Return ||
+                    blk.instructions.empty() ||
+                    blk.instructions.back().opcode != mir::Opcode::AsyncResolve) {
+                    result.instructions.push_back(
+                        CompactInstruction(Opcode::Return, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
+                    syncInstructionLocations();
+                }
                 break;
             }
             default:
                 break;
             }
+        }
+
+        // Ensure at least one instruction per compiled function entry so [entryPc, endPc) is non-empty
+        if (result.instructions.size() == fnEntryPc) {
+            result.instructions.push_back(
+                CompactInstruction(Opcode::Return, std::uint8_t{0}, std::uint16_t{0}, std::uint32_t{0}));
+            syncInstructionLocations();
         }
 
         // Resolve basic-block PC relocations for this function
@@ -1906,6 +2776,22 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
                 result.instructions[patch.instrIndex].imm32 = bIt->second;
             }
         }
+
+        const std::uint32_t fnEndPc = static_cast<std::uint32_t>(result.instructions.size());
+        dbg.endPc = fnEndPc;
+        dbg.instructionRanges.assign(
+            result.instructionLocations.begin() + static_cast<std::ptrdiff_t>(fnEntryPc),
+            result.instructionLocations.begin() + static_cast<std::ptrdiff_t>(fnEndPc));
+
+        CompiledFiberFunction compiledFn;
+        compiledFn.symbolId = fn.symbolId;
+        compiledFn.name = fn.name;
+        compiledFn.canonicalName = canonicalFnName;
+        compiledFn.entryPc = fnEntryPc;
+        compiledFn.endPc = fnEndPc;
+        compiledFn.autoLowerable = isAutoLowerable;
+        compiledFn.debugInfo = std::move(dbg);
+        result.functions.push_back(std::move(compiledFn));
     }
 
     // Resolve cross-function PC relocations (`Fiber.Fork("...")` and subroutine `Call`)
@@ -1917,6 +2803,30 @@ CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& 
     }
 
     return result;
+}
+
+} // namespace
+
+bool FiberCompiler::canAutoLowerToFiber(
+    const realscript::mir::Module& module,
+    const realscript::mir::Function& function) {
+    std::unordered_map<std::string, const mir::Function*> funcMap;
+    for (const auto& fn : module.functions) {
+        funcMap[fn.name] = &fn;
+        if (!module.name.empty()) {
+            funcMap[module.name + "::" + fn.name] = &fn;
+        }
+    }
+    std::unordered_set<const mir::Function*> visiting;
+    return canAutoLowerFunctionImpl(module, function, funcMap, visiting);
+}
+
+CompiledFiberModule FiberCompiler::compileModule(const realscript::mir::Module& module) {
+    return compileModuleInternal(module, /*onlyAutoLowerable=*/false);
+}
+
+CompiledFiberModule FiberCompiler::compileAutoLoweredModule(const realscript::mir::Module& module) {
+    return compileModuleInternal(module, /*onlyAutoLowerable=*/true);
 }
 
 } // namespace realscript::runtime

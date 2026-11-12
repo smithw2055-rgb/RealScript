@@ -53,6 +53,7 @@ add_library(realscript_frontend STATIC
     src/runtime/RuntimeServices.cpp
     src/runtime/ExecutionServices.cpp
     src/runtime/ManagedHeap.cpp
+    src/runtime/ParallelJob.cpp
     src/runtime/FiberScheduler.cpp
     src/runtime/AsyncRuntime.cpp
     src/game/GameApi.cpp
@@ -430,6 +431,31 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_p1_dap_eval_and_lsp_scene_tests
         realscript.p1.dap-eval-and-lsp-scene
         tests/p1_dap_eval_and_lsp_scene_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_p2_stage1_structural_hot_reload_tests
+        realscript.p2.stage1-structural-hot-reload
+        tests/p2_stage1_structural_hot_reload_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_p2_stage2_parallel_job_and_aot_simd_tests
+        realscript.p2.stage2-parallel-job-and-aot-simd
+        tests/p2_stage2_parallel_job_and_aot_simd_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_p2_stage3_fiber_debug_and_telemetry_tests
+        realscript.p2.stage3-fiber-debug-and-telemetry
+        tests/p2_stage3_fiber_debug_and_telemetry_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_p2_stage4_stencil_jit_tests
+        realscript.p2.stage4-stencil-jit
+        tests/p2_stage4_stencil_jit_tests.cpp)
+    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
+        target_compile_definitions(
+            realscript_p2_stage4_stencil_jit_tests
+            PRIVATE
+                REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
+                REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
+                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/p2-stage4-jit-cache")
+    endif()
     if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
         realscript_add_cpp_test(
             realscript_sprint2_generics_using_resource_tests

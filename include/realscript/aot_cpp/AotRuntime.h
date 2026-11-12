@@ -30,6 +30,24 @@
 #define RS_AOT_UNLIKELY(x) (x)
 #endif
 
+#if defined(_MSC_VER)
+#define RS_AOT_RESTRICT __restrict
+#elif defined(__GNUC__) || defined(__clang__)
+#define RS_AOT_RESTRICT __restrict__
+#else
+#define RS_AOT_RESTRICT
+#endif
+
+#if defined(__clang__)
+#define RS_AOT_PRAGMA_SIMD_LOOP _Pragma("clang loop vectorize(enable) interleave(enable)")
+#elif defined(__GNUC__)
+#define RS_AOT_PRAGMA_SIMD_LOOP _Pragma("GCC ivdep")
+#elif defined(_MSC_VER)
+#define RS_AOT_PRAGMA_SIMD_LOOP __pragma(loop(ivdep))
+#else
+#define RS_AOT_PRAGMA_SIMD_LOOP
+#endif
+
 namespace realscript::aot {
 
 constexpr std::uint32_t RuntimeAbiMajor = 2;
@@ -55,6 +73,132 @@ struct TypedRawColumnCache {
     std::uint8_t fieldCount = 0;
     std::array<TypedRawFieldCache, 16> fields{};
 };
+
+// P2-C: Zero-boxing P0 PackedArray fast-path caches & __restrict SIMD batch operators
+struct TypedPackedInt32ArrayCache {
+    std::int32_t* data = nullptr;
+    std::int64_t count = -1;
+};
+
+struct TypedPackedDoubleArrayCache {
+    double* data = nullptr;
+    std::int64_t count = -1;
+};
+
+[[nodiscard]] inline bool packedBuffersDisjoint(
+    const void* aBase,
+    std::size_t aByteLength,
+    const void* bBase,
+    std::size_t bByteLength) noexcept {
+    if (!aBase || !bBase) return false;
+    const auto aStart = reinterpret_cast<std::uintptr_t>(aBase);
+    const auto bStart = reinterpret_cast<std::uintptr_t>(bBase);
+    const auto aEnd = aStart + aByteLength;
+    const auto bEnd = bStart + bByteLength;
+    return aEnd <= bStart || bEnd <= aStart;
+}
+
+template <typename UnaryFn>
+inline void simdTransformPackedInt32(
+    std::int32_t* RS_AOT_RESTRICT dst,
+    const std::int32_t* RS_AOT_RESTRICT src,
+    std::size_t count,
+    UnaryFn&& op) noexcept {
+    RS_AOT_PRAGMA_SIMD_LOOP
+    for (std::size_t i = 0; i < count; ++i) {
+        dst[i] = op(src[i]);
+    }
+}
+
+template <typename BinaryFn>
+inline void simdZipPackedInt32(
+    std::int32_t* RS_AOT_RESTRICT dst,
+    const std::int32_t* RS_AOT_RESTRICT lhs,
+    const std::int32_t* RS_AOT_RESTRICT rhs,
+    std::size_t count,
+    BinaryFn&& op) noexcept {
+    RS_AOT_PRAGMA_SIMD_LOOP
+    for (std::size_t i = 0; i < count; ++i) {
+        dst[i] = op(lhs[i], rhs[i]);
+    }
+}
+
+inline void simdFmaPackedInt32(
+    std::int32_t* RS_AOT_RESTRICT dst,
+    const std::int32_t* RS_AOT_RESTRICT x,
+    const std::int32_t* RS_AOT_RESTRICT y,
+    std::size_t count,
+    std::int32_t alpha) noexcept {
+    const auto uAlpha = static_cast<std::uint32_t>(alpha);
+    RS_AOT_PRAGMA_SIMD_LOOP
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto prod = uAlpha * static_cast<std::uint32_t>(x[i]);
+        dst[i] = static_cast<std::int32_t>(prod + static_cast<std::uint32_t>(y[i]));
+    }
+}
+
+inline void simdScaleBiasPackedInt32(
+    std::int32_t* RS_AOT_RESTRICT dst,
+    const std::int32_t* RS_AOT_RESTRICT src,
+    std::size_t count,
+    std::int32_t scale,
+    std::int32_t bias) noexcept {
+    const auto uScale = static_cast<std::uint32_t>(scale);
+    const auto uBias = static_cast<std::uint32_t>(bias);
+    RS_AOT_PRAGMA_SIMD_LOOP
+    for (std::size_t i = 0; i < count; ++i) {
+        dst[i] = static_cast<std::int32_t>(uScale * static_cast<std::uint32_t>(src[i]) + uBias);
+    }
+}
+
+template <typename UnaryFn>
+inline void simdTransformPackedDouble(
+    double* RS_AOT_RESTRICT dst,
+    const double* RS_AOT_RESTRICT src,
+    std::size_t count,
+    UnaryFn&& op) noexcept {
+    RS_AOT_PRAGMA_SIMD_LOOP
+    for (std::size_t i = 0; i < count; ++i) {
+        dst[i] = op(src[i]);
+    }
+}
+
+template <typename BinaryFn>
+inline void simdZipPackedDouble(
+    double* RS_AOT_RESTRICT dst,
+    const double* RS_AOT_RESTRICT lhs,
+    const double* RS_AOT_RESTRICT rhs,
+    std::size_t count,
+    BinaryFn&& op) noexcept {
+    RS_AOT_PRAGMA_SIMD_LOOP
+    for (std::size_t i = 0; i < count; ++i) {
+        dst[i] = op(lhs[i], rhs[i]);
+    }
+}
+
+inline void simdFmaPackedDouble(
+    double* RS_AOT_RESTRICT dst,
+    const double* RS_AOT_RESTRICT x,
+    const double* RS_AOT_RESTRICT y,
+    std::size_t count,
+    double alpha) noexcept {
+    RS_AOT_PRAGMA_SIMD_LOOP
+    for (std::size_t i = 0; i < count; ++i) {
+        dst[i] = alpha * x[i] + y[i];
+    }
+}
+
+inline void simdScaleBiasPackedDouble(
+    double* RS_AOT_RESTRICT dst,
+    const double* RS_AOT_RESTRICT src,
+    std::size_t count,
+    double scale,
+    double bias) noexcept {
+    RS_AOT_PRAGMA_SIMD_LOOP
+    for (std::size_t i = 0; i < count; ++i) {
+        dst[i] = src[i] * scale + bias;
+    }
+}
 
 template <typename FieldT>
 [[nodiscard]] inline FieldT readRawColumnField(
@@ -410,8 +554,23 @@ public:
                 return true;
             }
         }
+        [[nodiscard]] bool canConsume(std::uint64_t count) const noexcept {
+            if constexpr (!Enabled) {
+                (void)count;
+                return true;
+            } else {
+                return count <= state_.remaining - state_.consumed;
+            }
+        }
         void branch() noexcept {
             if constexpr (Enabled) ++state_.branches;
+        }
+        void addBranches(std::uint64_t count) noexcept {
+            if constexpr (Enabled) {
+                state_.branches += count;
+            } else {
+                (void)count;
+            }
         }
         void suspendBeforeCall() noexcept {
             if constexpr (Enabled) {
@@ -990,6 +1149,161 @@ public:
         }
         return storeField(typeId, fieldIndex, receiver, runtime::Value{value});
     }
+    [[nodiscard]] bool tryBindPackedInt32Array(
+        const runtime::Value& arrayValue,
+        std::int32_t*& outData,
+        std::uint32_t& outLength) const noexcept {
+        if (RS_AOT_LIKELY(arrayValue.rawTag() == runtime::ValueTag::ObjectRef && heap_ != nullptr)) {
+            const auto ref = arrayValue.asObjectRefUnchecked();
+            if (RS_AOT_LIKELY(
+                    heap_->tryBindPackedInt32Array(ref, outData, outLength) &&
+                    outLength <= static_cast<std::uint32_t>(INT32_MAX))) {
+                static const semantic::SymbolId kIntArrayTypeId =
+                    semantic::stableTypeId("int[]");
+                if (RS_AOT_LIKELY(heap_->arrayTypeId(ref) == kIntArrayTypeId)) {
+                    return true;
+                }
+            }
+        }
+        outData = nullptr;
+        outLength = 0;
+        return false;
+    }
+
+    [[nodiscard]] bool tryBindPackedDoubleArray(
+        const runtime::Value& arrayValue,
+        double*& outData,
+        std::uint32_t& outLength) const noexcept {
+        if (RS_AOT_LIKELY(arrayValue.rawTag() == runtime::ValueTag::ObjectRef && heap_ != nullptr)) {
+            const auto ref = arrayValue.asObjectRefUnchecked();
+            if (RS_AOT_LIKELY(
+                    heap_->tryBindPackedDoubleArray(ref, outData, outLength) &&
+                    outLength <= static_cast<std::uint32_t>(INT32_MAX))) {
+                return true;
+            }
+        }
+        outData = nullptr;
+        outLength = 0;
+        return false;
+    }
+
+    [[nodiscard]] TypedPackedInt32ArrayCache acquirePackedInt32ArrayCache(
+        const runtime::Value& arrayValue) const noexcept {
+        TypedPackedInt32ArrayCache cache{};
+        std::int32_t* ptr = nullptr;
+        std::uint32_t len = 0;
+        if (tryBindPackedInt32Array(arrayValue, ptr, len)) {
+            cache.data = ptr;
+            cache.count = static_cast<std::int64_t>(len);
+        }
+        return cache;
+    }
+
+    [[nodiscard]] TypedPackedDoubleArrayCache acquirePackedDoubleArrayCache(
+        const runtime::Value& arrayValue) const noexcept {
+        TypedPackedDoubleArrayCache cache{};
+        double* ptr = nullptr;
+        std::uint32_t len = 0;
+        if (tryBindPackedDoubleArray(arrayValue, ptr, len)) {
+            cache.data = ptr;
+            cache.count = static_cast<std::int64_t>(len);
+        }
+        return cache;
+    }
+
+    [[nodiscard]] bool loadElementInt32Fast(
+        const runtime::Value& receiver,
+        std::int64_t index,
+        std::int64_t& result) {
+        std::int32_t* data = nullptr;
+        std::uint32_t len = 0;
+        if (RS_AOT_LIKELY(tryBindPackedInt32Array(receiver, data, len))) {
+            if (RS_AOT_UNLIKELY(static_cast<std::uint64_t>(index) >= len)) {
+                return fail(
+                    runtime::ErrorCode::IndexOutOfRange,
+                    "array element index is out of range");
+            }
+            result = static_cast<std::int64_t>(data[static_cast<std::size_t>(index)]);
+            return true;
+        }
+        runtime::Value boxed;
+        if (!loadElement(semantic::PrimitiveType::Int, 0, receiver, runtime::Value{index}, boxed)) {
+            return false;
+        }
+        return boxed.tryGetInt64(result);
+    }
+
+    [[nodiscard]] bool storeElementInt32Fast(
+        const runtime::Value& receiver,
+        std::int64_t index,
+        std::int64_t value) {
+        std::int32_t* data = nullptr;
+        std::uint32_t len = 0;
+        if (RS_AOT_LIKELY(
+                tryBindPackedInt32Array(receiver, data, len) &&
+                value >= static_cast<std::int64_t>(INT32_MIN) &&
+                value <= static_cast<std::int64_t>(INT32_MAX))) {
+            if (RS_AOT_UNLIKELY(static_cast<std::uint64_t>(index) >= len)) {
+                return fail(
+                    runtime::ErrorCode::IndexOutOfRange,
+                    "array element index is out of range");
+            }
+            data[static_cast<std::size_t>(index)] = static_cast<std::int32_t>(value);
+            return true;
+        }
+        return storeElement(
+            semantic::PrimitiveType::Int,
+            0,
+            receiver,
+            runtime::Value{index},
+            runtime::Value{value});
+    }
+
+    [[nodiscard]] bool loadElementDoubleFast(
+        const runtime::Value& receiver,
+        std::int64_t index,
+        double& result) {
+        double* data = nullptr;
+        std::uint32_t len = 0;
+        if (RS_AOT_LIKELY(tryBindPackedDoubleArray(receiver, data, len))) {
+            if (RS_AOT_UNLIKELY(static_cast<std::uint64_t>(index) >= len)) {
+                return fail(
+                    runtime::ErrorCode::IndexOutOfRange,
+                    "array element index is out of range");
+            }
+            result = data[static_cast<std::size_t>(index)];
+            return true;
+        }
+        runtime::Value boxed;
+        if (!loadElement(semantic::PrimitiveType::Double, 0, receiver, runtime::Value{index}, boxed)) {
+            return false;
+        }
+        return boxed.tryGetDouble(result);
+    }
+
+    [[nodiscard]] bool storeElementDoubleFast(
+        const runtime::Value& receiver,
+        std::int64_t index,
+        double value) {
+        double* data = nullptr;
+        std::uint32_t len = 0;
+        if (RS_AOT_LIKELY(tryBindPackedDoubleArray(receiver, data, len))) {
+            if (RS_AOT_UNLIKELY(static_cast<std::uint64_t>(index) >= len)) {
+                return fail(
+                    runtime::ErrorCode::IndexOutOfRange,
+                    "array element index is out of range");
+            }
+            data[static_cast<std::size_t>(index)] = value;
+            return true;
+        }
+        return storeElement(
+            semantic::PrimitiveType::Double,
+            0,
+            receiver,
+            runtime::Value{index},
+            runtime::Value{value});
+    }
+
     [[nodiscard]] bool loadElementObjectFast(
         semantic::SymbolId elementTypeId,
         const runtime::Value& receiver,

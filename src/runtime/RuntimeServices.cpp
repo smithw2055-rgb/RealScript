@@ -6057,6 +6057,14 @@ bool BindingRegistry::bind(
     return inserted;
 }
 
+namespace {
+std::mutex& bindingCacheMutexFor(const BindingRegistry* reg) noexcept {
+    static auto* stripes = new std::array<std::mutex, 64>();
+    const auto idx = (reinterpret_cast<std::uintptr_t>(reg) >> 4u) & 63u;
+    return (*stripes)[idx];
+}
+} // namespace
+
 std::optional<ResolvedBinding> BindingRegistry::resolve(
     const bytecode::FunctionReference& reference) const {
     if (reference.symbolId != 0) {
@@ -6067,17 +6075,21 @@ std::optional<ResolvedBinding> BindingRegistry::resolve(
                 bySymbol->second.determinism,
                 bySymbol->second.requiredCapability};
         }
-        const auto cached = resolvedBySymbolCache_.find(reference.symbolId);
-        if (cached != resolvedBySymbolCache_.end() && cached->second) {
-            return ResolvedBinding{
-                &cached->second->function,
-                cached->second->determinism,
-                cached->second->requiredCapability};
+        {
+            std::lock_guard<std::mutex> cacheLock(bindingCacheMutexFor(this));
+            const auto cached = resolvedBySymbolCache_.find(reference.symbolId);
+            if (cached != resolvedBySymbolCache_.end() && cached->second) {
+                return ResolvedBinding{
+                    &cached->second->function,
+                    cached->second->determinism,
+                    cached->second->requiredCapability};
+            }
         }
     }
     const auto byName = byName_.find(reference.name);
     if (byName != byName_.end()) {
         if (reference.symbolId != 0) {
+            std::lock_guard<std::mutex> cacheLock(bindingCacheMutexFor(this));
             resolvedBySymbolCache_.emplace(reference.symbolId, &byName->second);
         }
         return ResolvedBinding{
@@ -6103,6 +6115,7 @@ std::optional<Value> BindingRegistry::invoke(
 
 std::size_t BindingRegistry::size() const noexcept { return entryCount_; }
 std::size_t BindingRegistry::cachedSymbolCount() const noexcept {
+    std::lock_guard<std::mutex> cacheLock(bindingCacheMutexFor(this));
     return bySymbol_.size() + resolvedBySymbolCache_.size();
 }
 
@@ -8069,6 +8082,29 @@ void EngineRuntime::replaceProgram(std::shared_ptr<const ProgramImage> program) 
     std::lock_guard<std::mutex> lock(programMutex_);
     if (program_) retiredPrograms_.push_back(program_);
     program_ = std::move(program);
+}
+
+bool EngineRuntime::replaceProgram(
+    std::shared_ptr<const ProgramImage> program,
+    const std::vector<TypeLayoutMigration>& migrations,
+    LayoutMigrationStats* outStats,
+    RuntimeError* error) {
+    if (!program) {
+        if (error) {
+            error->code = ErrorCode::InvalidProgram;
+            error->message = "replacement program image is null";
+        }
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(programMutex_);
+    if (heap_ && !migrations.empty()) {
+        if (!heap_->migrateTypeLayouts(migrations, outStats, error)) {
+            return false;
+        }
+    }
+    if (program_) retiredPrograms_.push_back(program_);
+    program_ = std::move(program);
+    return true;
 }
 
 const char* traceEventKindName(TraceEventKind kind) noexcept {

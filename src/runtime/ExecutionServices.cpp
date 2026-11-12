@@ -1,4 +1,6 @@
 #include "realscript/runtime/Runtime.h"
+#include "realscript/runtime/AsyncRuntime.h"
+#include "realscript/runtime/FiberScheduler.h"
 
 #include <algorithm>
 #include <cmath>
@@ -14,6 +16,8 @@ namespace {
 
 constexpr std::uint64_t FnvOffset = 1469598103934665603ULL;
 constexpr std::uint64_t FnvPrime = 1099511628211ULL;
+
+thread_local FrameTelemetryCollector* gActiveFrameTelemetry = nullptr;
 
 void hashBytes(std::uint64_t& hash, const void* data, std::size_t size) noexcept {
     const auto* bytes = static_cast<const unsigned char*>(data);
@@ -283,6 +287,370 @@ void ProfileCollector::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
     functions_.clear();
     totalEvents_ = 0;
+}
+
+// ============================================================================
+// Zero-Allocation Lock-Free Per-Frame Ring Telemetry (`FrameTelemetryCollector`)
+// ============================================================================
+
+void bindActiveFrameTelemetry(FrameTelemetryCollector* collector) noexcept {
+    gActiveFrameTelemetry = collector;
+}
+
+FrameTelemetryCollector* activeFrameTelemetry() noexcept {
+    return gActiveFrameTelemetry;
+}
+
+void FrameTelemetryCollector::resetCurrentFrameAccumulators() noexcept {
+    for (std::size_t i = 0; i < touchedCount_; ++i) {
+        const std::uint8_t idx = touchedBuckets_[i];
+        activeBuckets_[idx].symbolId = 0;
+        activeBuckets_[idx].instructions = 0;
+    }
+    touchedCount_ = 0;
+    currentTotalInstructions_ = 0;
+    currentFiberInstructions_ = 0;
+    currentGcSliceNs_ = 0;
+    explicitCompactBytes_ = 0;
+    explicitBoxedBytes_ = 0;
+    hasExplicitHeapBytes_ = false;
+    explicitActiveFibers_ = 0;
+    hasExplicitActiveFibers_ = false;
+}
+
+void FrameTelemetryCollector::beginFrame(std::uint64_t frameNumber) noexcept {
+    resetCurrentFrameAccumulators();
+    currentFrameNumber_ = frameNumber;
+}
+
+void FrameTelemetryCollector::recordFunctionInstructions(
+    semantic::SymbolId symbolId,
+    std::uint64_t instructions) noexcept {
+    if (instructions == 0) return;
+    currentTotalInstructions_ += instructions;
+    if (symbolId == 0) return;
+
+    constexpr std::size_t kMask = kAccumulatorBuckets - 1u;
+    std::size_t idx = static_cast<std::size_t>((symbolId * 0x9E3779B97F4A7C15ULL) >> 56u) & kMask;
+    std::size_t minSlot = idx;
+    std::uint64_t minCount = std::numeric_limits<std::uint64_t>::max();
+
+    for (std::size_t probe = 0; probe < kAccumulatorBuckets; ++probe) {
+        auto& bucket = activeBuckets_[idx];
+        if (bucket.symbolId == symbolId) {
+            bucket.instructions += instructions;
+            return;
+        }
+        if (bucket.symbolId == 0 && bucket.instructions == 0) {
+            bucket.symbolId = symbolId;
+            bucket.instructions = instructions;
+            if (touchedCount_ < touchedBuckets_.size()) {
+                touchedBuckets_[touchedCount_++] = static_cast<std::uint8_t>(idx);
+            }
+            return;
+        }
+        if (bucket.instructions < minCount) {
+            minCount = bucket.instructions;
+            minSlot = idx;
+        }
+        idx = (idx + 1u) & kMask;
+    }
+
+    // Space-Saving heavy-hitter replacement if >256 distinct functions execute in 1 frame
+    if (instructions > minCount) {
+        activeBuckets_[minSlot].symbolId = symbolId;
+        activeBuckets_[minSlot].instructions = instructions;
+    }
+}
+
+void FrameTelemetryCollector::recordFiberStep(
+    std::uint64_t fiberInstructions,
+    std::uint32_t activeFibers) noexcept {
+    currentFiberInstructions_ += fiberInstructions;
+    currentTotalInstructions_ += fiberInstructions;
+    explicitActiveFibers_ = activeFibers;
+    hasExplicitActiveFibers_ = true;
+}
+
+void FrameTelemetryCollector::recordGcSliceNanoseconds(std::uint64_t elapsedNs) noexcept {
+    currentGcSliceNs_ += elapsedNs;
+}
+
+void FrameTelemetryCollector::setHeapLiveBytes(
+    std::size_t compactLiveBytes,
+    std::size_t boxedLiveBytes) noexcept {
+    explicitCompactBytes_ = compactLiveBytes;
+    explicitBoxedBytes_ = boxedLiveBytes;
+    hasExplicitHeapBytes_ = true;
+}
+
+void FrameTelemetryCollector::noteCompactHeapObject(ObjectRef reference) noexcept {
+    if (!reference.valid()) return;
+    for (std::size_t i = 0; i < trackedCompactCount_; ++i) {
+        if (trackedCompactRefs_[i] == reference) return;
+    }
+    if (trackedCompactCount_ < trackedCompactRefs_.size()) {
+        trackedCompactRefs_[trackedCompactCount_++] = reference;
+    } else {
+        trackedCompactRefs_[compactReplaceCursor_ & (trackedCompactRefs_.size() - 1u)] = reference;
+        ++compactReplaceCursor_;
+    }
+}
+
+FrameTelemetrySample FrameTelemetryCollector::endFrame(
+    const ManagedHeap* heap,
+    const AsyncRuntimeContext* asyncRuntime,
+    const FiberScheduler* fiberScheduler) noexcept {
+    FrameTelemetrySample sample{};
+    sample.frameNumber = currentFrameNumber_;
+    sample.totalInstructions = currentTotalInstructions_;
+    sample.fiberInstructions = currentFiberInstructions_;
+    sample.gcSliceNanoseconds = currentGcSliceNs_;
+
+    // Extract Top-8 hotspot functions by (instructions DESC, symbolId ASC) with zero heap allocation
+    std::uint8_t topCount = 0;
+    for (std::size_t i = 0; i < touchedCount_; ++i) {
+        const auto& b = activeBuckets_[touchedBuckets_[i]];
+        if (b.symbolId == 0 || b.instructions == 0) continue;
+
+        HotFunctionTelemetry candidate{};
+        candidate.symbolId = b.symbolId;
+        candidate.instructions = b.instructions;
+        candidate.instructionShare = sample.totalInstructions > 0
+            ? (static_cast<double>(b.instructions) / static_cast<double>(sample.totalInstructions))
+            : 0.0;
+
+        if (topCount < FrameTelemetrySample::kMaxHotFunctions) {
+            sample.topFunctions[topCount++] = candidate;
+        } else {
+            const auto& tail = sample.topFunctions[FrameTelemetrySample::kMaxHotFunctions - 1u];
+            const bool better = (candidate.instructions > tail.instructions) ||
+                (candidate.instructions == tail.instructions && candidate.symbolId < tail.symbolId);
+            if (!better) continue;
+            sample.topFunctions[FrameTelemetrySample::kMaxHotFunctions - 1u] = candidate;
+        }
+
+        // Insertion-sort newly placed element upward (at most 8 elements)
+        for (std::size_t k = static_cast<std::size_t>(topCount - 1u); k > 0; --k) {
+            const auto& prev = sample.topFunctions[k - 1u];
+            const auto& curr = sample.topFunctions[k];
+            if (curr.instructions > prev.instructions ||
+                (curr.instructions == prev.instructions && curr.symbolId < prev.symbolId)) {
+                std::swap(sample.topFunctions[k - 1u], sample.topFunctions[k]);
+            } else {
+                break;
+            }
+        }
+    }
+    sample.hotFunctionCount = topCount;
+
+    if (hasExplicitHeapBytes_) {
+        sample.compactHeapLiveBytes = explicitCompactBytes_;
+        sample.boxedHeapLiveBytes = explicitBoxedBytes_;
+    } else {
+        const auto poolStats = getRuntimeValuePoolStatistics();
+        const std::size_t inlineArenaBytes =
+            poolStats.inlineStructActiveSlots * sizeof(InlineStructArenaEntry);
+        std::size_t trackedPackedBytes = 0;
+        std::size_t totalHeapBytes = 0;
+        if (heap != nullptr) {
+            totalHeapBytes = heap->liveBytes();
+            std::size_t writeIdx = 0;
+            for (std::size_t i = 0; i < trackedCompactCount_; ++i) {
+                const ObjectRef ref = trackedCompactRefs_[i];
+                if (heap->isAlive(ref)) {
+                    trackedCompactRefs_[writeIdx++] = ref;
+                    if (heap->isPackedArray(ref) ||
+                        heap->isInlineRecordObject(ref) ||
+                        heap->isRawColumnArray(ref)) {
+                        trackedPackedBytes += heap->objectSizeBytes(ref).value_or(0);
+                    }
+                }
+            }
+            trackedCompactCount_ = writeIdx;
+            if (trackedPackedBytes > totalHeapBytes) {
+                trackedPackedBytes = totalHeapBytes;
+            }
+        }
+        sample.compactHeapLiveBytes = trackedPackedBytes + inlineArenaBytes;
+        sample.boxedHeapLiveBytes =
+            (totalHeapBytes >= trackedPackedBytes ? (totalHeapBytes - trackedPackedBytes) : 0u) +
+            poolStats.heapStructActiveSlots * 64u;
+    }
+
+    if (asyncRuntime != nullptr) {
+        sample.activeCoroutines = static_cast<std::uint32_t>(
+            asyncRuntime->coroutines().statistics().activeCount);
+    }
+    if (fiberScheduler != nullptr) {
+        sample.activeFibers = static_cast<std::uint32_t>(fiberScheduler->activeFiberCount());
+    } else if (hasExplicitActiveFibers_) {
+        sample.activeFibers = explicitActiveFibers_;
+    }
+
+    commitSample(sample);
+    ++currentFrameNumber_;
+    resetCurrentFrameAccumulators();
+    return sample;
+}
+
+void FrameTelemetryCollector::commitSample(const FrameTelemetrySample& sample) noexcept {
+    const std::uint64_t seq = publishedCount_.load(std::memory_order_relaxed);
+    RingSlot& slot = ring_[static_cast<std::size_t>(seq) & (kRingCapacity - 1u)];
+
+    const std::uint64_t v0 = slot.version.load(std::memory_order_relaxed);
+    slot.version.store(v0 + 1u, std::memory_order_relaxed); // odd: write in progress
+    std::atomic_thread_fence(std::memory_order_release);
+    slot.sample = sample;
+    slot.version.store(v0 + 2u, std::memory_order_release); // even: committed
+    publishedCount_.store(seq + 1u, std::memory_order_release);
+}
+
+bool FrameTelemetryCollector::tryReadSlot(
+    std::size_t slotIndex,
+    FrameTelemetrySample& outSample) const noexcept {
+    const RingSlot& slot = ring_[slotIndex & (kRingCapacity - 1u)];
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const std::uint64_t v1 = slot.version.load(std::memory_order_acquire);
+        if ((v1 & 1u) != 0u || v1 == 0u) {
+            continue;
+        }
+        const FrameTelemetrySample snap = slot.sample;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const std::uint64_t v2 = slot.version.load(std::memory_order_relaxed);
+        if (v1 == v2) {
+            outSample = snap;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FrameTelemetryCollector::latestSample(FrameTelemetrySample& outSample) const noexcept {
+    const std::uint64_t total = publishedCount_.load(std::memory_order_acquire);
+    if (total == 0u) return false;
+    return tryReadSlot(static_cast<std::size_t>(total - 1u), outSample);
+}
+
+std::size_t FrameTelemetryCollector::copyRecentSamples(
+    FrameTelemetrySample* outSamples,
+    std::size_t maxSamples) const noexcept {
+    if (outSamples == nullptr || maxSamples == 0) return 0;
+    const std::uint64_t total = publishedCount_.load(std::memory_order_acquire);
+    if (total == 0u) return 0;
+
+    const std::size_t available = static_cast<std::size_t>(
+        std::min<std::uint64_t>(total, kRingCapacity));
+    const std::size_t toRead = std::min(available, maxSamples);
+    const std::uint64_t startSeq = total - static_cast<std::uint64_t>(toRead);
+
+    std::size_t written = 0;
+    for (std::size_t i = 0; i < toRead; ++i) {
+        const std::size_t idx = static_cast<std::size_t>(startSeq + i) & (kRingCapacity - 1u);
+        FrameTelemetrySample snap{};
+        if (tryReadSlot(idx, snap)) {
+            outSamples[written++] = snap;
+        }
+    }
+    return written;
+}
+
+std::uint64_t FrameTelemetryCollector::totalFramesPublished() const noexcept {
+    return publishedCount_.load(std::memory_order_acquire);
+}
+
+void FrameTelemetryCollector::clear() noexcept {
+    resetCurrentFrameAccumulators();
+    currentFrameNumber_ = 0;
+    trackedCompactCount_ = 0;
+    compactReplaceCursor_ = 0;
+    publishedCount_.store(0, std::memory_order_release);
+    for (auto& slot : ring_) {
+        slot.version.store(0, std::memory_order_release);
+        slot.sample = FrameTelemetrySample{};
+    }
+}
+
+std::string FrameTelemetryCollector::formatSummary(
+    const ProgramImage* program,
+    std::size_t maxFrames) const {
+    std::array<FrameTelemetrySample, kRingCapacity> buf{};
+    const std::size_t count = copyRecentSamples(
+        buf.data(), std::min(maxFrames == 0 ? 1u : maxFrames, kRingCapacity));
+    std::ostringstream out;
+    out << "FrameTelemetryRing(capacity=" << kRingCapacity
+        << ", published=" << totalFramesPublished()
+        << ", shown=" << count << ")\n";
+    if (count == 0) {
+        out << "  <no frames recorded>";
+        return out.str();
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& f = buf[i];
+        out << "[Frame #" << f.frameNumber << "] inst=" << f.totalInstructions
+            << " (fiber=" << f.fiberInstructions << ")"
+            << " compactHeap=" << f.compactHeapLiveBytes << "B"
+            << " boxedHeap=" << f.boxedHeapLiveBytes << "B"
+            << " gcSlice=" << f.gcSliceNanoseconds << "ns"
+            << " coros=" << f.activeCoroutines
+            << " fibers=" << f.activeFibers;
+        if (f.hotFunctionCount > 0) {
+            out << " top=[";
+            for (std::uint8_t h = 0; h < f.hotFunctionCount; ++h) {
+                if (h != 0) out << ", ";
+                const auto& hf = f.topFunctions[h];
+                const auto* fnLoc = program ? program->resolveFunction(hf.symbolId) : nullptr;
+                if (fnLoc) {
+                    out << fnLoc->qualifiedName << "(0x" << std::hex << hf.symbolId << std::dec << ")";
+                } else {
+                    out << "sym#" << hf.symbolId;
+                }
+                out << ":" << hf.instructions << "("
+                    << std::fixed << std::setprecision(1) << (hf.instructionShare * 100.0) << "%)";
+            }
+            out << "]";
+        }
+        if (i + 1 < count) out << '\n';
+    }
+    return out.str();
+}
+
+std::string FrameTelemetryCollector::toJson(
+    const ProgramImage* program,
+    std::size_t maxFrames) const {
+    std::array<FrameTelemetrySample, kRingCapacity> buf{};
+    const std::size_t count = copyRecentSamples(
+        buf.data(), std::min(maxFrames == 0 ? kRingCapacity : maxFrames, kRingCapacity));
+    std::ostringstream out;
+    out << "{\"capacity\":" << kRingCapacity
+        << ",\"totalFramesPublished\":" << totalFramesPublished()
+        << ",\"frames\":[";
+    for (std::size_t i = 0; i < count; ++i) {
+        if (i != 0) out << ',';
+        const auto& f = buf[i];
+        out << "{\"frameNumber\":" << f.frameNumber
+            << ",\"totalInstructions\":" << f.totalInstructions
+            << ",\"fiberInstructions\":" << f.fiberInstructions
+            << ",\"compactHeapLiveBytes\":" << f.compactHeapLiveBytes
+            << ",\"boxedHeapLiveBytes\":" << f.boxedHeapLiveBytes
+            << ",\"gcSliceNanoseconds\":" << f.gcSliceNanoseconds
+            << ",\"activeCoroutines\":" << f.activeCoroutines
+            << ",\"activeFibers\":" << f.activeFibers
+            << ",\"topFunctions\":[";
+        for (std::uint8_t h = 0; h < f.hotFunctionCount; ++h) {
+            if (h != 0) out << ',';
+            const auto& hf = f.topFunctions[h];
+            const auto* fnLoc = program ? program->resolveFunction(hf.symbolId) : nullptr;
+            out << "{\"symbolId\":" << hf.symbolId
+                << ",\"name\":\"" << (fnLoc ? escapeJson(fnLoc->qualifiedName) : std::string{}) << "\""
+                << ",\"instructions\":" << hf.instructions
+                << ",\"share\":" << std::fixed << std::setprecision(6) << hf.instructionShare
+                << '}';
+        }
+        out << "]}";
+    }
+    out << "]}";
+    return out.str();
 }
 
 DeterminismSession::DeterminismSession(DeterminismOptions options)

@@ -2208,6 +2208,751 @@ void emitVectorizedEcsLoop(
     source.line("            }");
 }
 
+
+struct VectorizedPackedArrayBinding {
+    std::size_t arrayLocalIndex = 0;
+    semantic::PrimitiveType elemPrim = semantic::PrimitiveType::Error;
+    bool isRead = false;
+    bool isWrite = false;
+};
+
+struct VectorizedPackedArrayLoopPlan {
+    mir::BlockId headerBlockId = 0;
+    mir::BlockId bodyBlockId = 0;
+    mir::BlockId incrementBlockId = 0;
+    mir::BlockId exitBlockId = 0;
+    std::size_t indexLocalIndex = 0;
+    std::string boundExpr;
+    std::vector<VectorizedPackedArrayBinding> arrays;
+    std::unordered_map<mir::ValueId, std::size_t> bodyArrayLoadRegs;
+    std::unordered_set<mir::ValueId> bodyIndexLoadRegs;
+    std::uint64_t headerInstsWithTerminator = 0;
+    std::uint64_t iterInstsWithTerminators = 0;
+    std::uint64_t iterBranches = 3;
+};
+
+std::string packedArrayCacheName(
+    std::size_t localIndex,
+    semantic::PrimitiveType elemPrim) {
+    return (elemPrim == semantic::PrimitiveType::Int
+        ? "typedLocalPackedI32_"
+        : "typedLocalPackedF64_") + std::to_string(localIndex);
+}
+
+std::unordered_map<mir::BlockId, VectorizedPackedArrayLoopPlan> analyzeVectorizedPackedArrayLoops(
+    const mir::Function& function,
+    const std::vector<TypedSlotType>& types,
+    const TypedRangeAnalysis& rangeAnalysis,
+    const std::unordered_map<std::size_t, semantic::PrimitiveType>& singleStorePackedArrayLocals) {
+    std::unordered_map<mir::BlockId, VectorizedPackedArrayLoopPlan> plans;
+    if (singleStorePackedArrayLocals.empty() || !function.exceptionHandlers.empty()) {
+        return plans;
+    }
+
+    // Count block predecessors & constant integer values
+    std::unordered_map<mir::BlockId, std::size_t> predCounts;
+    std::unordered_map<mir::ValueId, std::int64_t> constantInts;
+    std::unordered_map<mir::ValueId, mir::BlockId> valueDefBlock;
+    for (const auto& blk : function.blocks) {
+        for (const auto& bp : blk.parameters) {
+            if (bp.value >= 0) valueDefBlock[bp.value] = blk.id;
+        }
+        for (const auto& inst : blk.instructions) {
+            if (inst.result >= 0) {
+                valueDefBlock[inst.result] = blk.id;
+                if (inst.opcode == mir::Opcode::ConstantInt) {
+                    constantInts[inst.result] = inst.integerImmediate;
+                }
+            }
+        }
+        if (blk.terminator.kind == mir::TerminatorKind::Jump) {
+            ++predCounts[blk.terminator.target];
+        } else if (blk.terminator.kind == mir::TerminatorKind::Branch) {
+            ++predCounts[blk.terminator.target];
+            ++predCounts[blk.terminator.falseTarget];
+        }
+    }
+
+    for (const auto& headerBlock : function.blocks) {
+        if (headerBlock.terminator.kind != mir::TerminatorKind::Branch ||
+            !headerBlock.terminator.arguments.empty() ||
+            !headerBlock.terminator.falseArguments.empty() ||
+            headerBlock.instructions.size() < 2 ||
+            headerBlock.instructions.size() > 4) {
+            continue;
+        }
+        const auto& idxLoad = headerBlock.instructions[0];
+        if (idxLoad.opcode != mir::Opcode::LoadLocal ||
+            idxLoad.result < 0 ||
+            idxLoad.localIndex >= function.localTypes.size() ||
+            function.localTypes[idxLoad.localIndex] != semantic::PrimitiveType::Int) {
+            continue;
+        }
+
+        const mir::BlockId bodyId = headerBlock.terminator.target;
+        const mir::BlockId exitId = headerBlock.terminator.falseTarget;
+        if (bodyId == headerBlock.id || exitId == headerBlock.id || bodyId == exitId) {
+            continue;
+        }
+        const auto* bodyBlock = findBlock(function, bodyId);
+        const auto* exitBlock = findBlock(function, exitId);
+        if (!bodyBlock || !exitBlock ||
+            !bodyBlock->parameters.empty() ||
+            !exitBlock->parameters.empty() ||
+            predCounts[bodyId] != 1u ||
+            bodyBlock->terminator.kind != mir::TerminatorKind::Jump ||
+            !bodyBlock->terminator.arguments.empty()) {
+            continue;
+        }
+
+        const mir::BlockId incId = bodyBlock->terminator.target;
+        const auto* incBlock = findBlock(function, incId);
+        if (!incBlock ||
+            incId == headerBlock.id ||
+            incId == bodyId ||
+            incId == exitId ||
+            !incBlock->parameters.empty() ||
+            predCounts[incId] != 1u ||
+            incBlock->terminator.kind != mir::TerminatorKind::Jump ||
+            incBlock->terminator.target != headerBlock.id ||
+            !incBlock->terminator.arguments.empty()) {
+            continue;
+        }
+
+        const auto isInsideLoop = [&](mir::BlockId bid) noexcept {
+            return bid == headerBlock.id || bid == bodyId || bid == incId;
+        };
+
+        // Check increment block: [load.local idx, (const.int 1)?, add.i32 idx 1, store.local idx]
+        std::size_t incPos = 0;
+        if (incBlock->instructions.size() != 3 && incBlock->instructions.size() != 4) {
+            continue;
+        }
+        const auto& incLoad = incBlock->instructions[incPos++];
+        if (incLoad.opcode != mir::Opcode::LoadLocal ||
+            incLoad.localIndex != idxLoad.localIndex ||
+            incLoad.result < 0) {
+            continue;
+        }
+        if (incBlock->instructions.size() == 4) {
+            const auto& incConst = incBlock->instructions[incPos++];
+            if (incConst.opcode != mir::Opcode::ConstantInt || incConst.integerImmediate != 1) {
+                continue;
+            }
+        }
+        const auto& incAdd = incBlock->instructions[incPos++];
+        const auto& incStore = incBlock->instructions[incPos++];
+        if (incAdd.opcode != mir::Opcode::AddInt ||
+            incAdd.operands.size() != 2 ||
+            incAdd.operands[0] != incLoad.result ||
+            incAdd.result < 0 ||
+            incStore.opcode != mir::Opcode::StoreLocal ||
+            incStore.localIndex != idxLoad.localIndex ||
+            incStore.operands.size() != 1 ||
+            incStore.operands[0] != incAdd.result) {
+            continue;
+        }
+        const auto oneIt = constantInts.find(incAdd.operands[1]);
+        if (oneIt == constantInts.end() || oneIt->second != 1) {
+            continue;
+        }
+
+        // Collect locals written inside bodyBlock or incBlock
+        std::unordered_set<std::size_t> loopWrittenLocals{idxLoad.localIndex};
+        for (const auto& inst : bodyBlock->instructions) {
+            if (inst.opcode == mir::Opcode::StoreLocal) {
+                loopWrittenLocals.insert(inst.localIndex);
+            }
+        }
+
+        // Match header bound shape
+        VectorizedPackedArrayLoopPlan plan;
+        plan.headerBlockId = headerBlock.id;
+        plan.bodyBlockId = bodyId;
+        plan.incrementBlockId = incId;
+        plan.exitBlockId = exitId;
+        plan.indexLocalIndex = idxLoad.localIndex;
+
+        std::map<std::size_t, VectorizedPackedArrayBinding> boundArrays;
+        auto touchArrayLocal = [&](std::size_t arrLoc, semantic::PrimitiveType prim, bool rd, bool wr) -> bool {
+            const auto pIt = singleStorePackedArrayLocals.find(arrLoc);
+            if (pIt == singleStorePackedArrayLocals.end() || pIt->second != prim) {
+                return false;
+            }
+            auto& entry = boundArrays[arrLoc];
+            entry.arrayLocalIndex = arrLoc;
+            entry.elemPrim = prim;
+            if (rd) entry.isRead = true;
+            if (wr) entry.isWrite = true;
+            return true;
+        };
+
+        if (headerBlock.instructions.size() == 2) {
+            const auto& cmp = headerBlock.instructions[1];
+            if (cmp.opcode != mir::Opcode::LessInt ||
+                cmp.operands.size() != 2 ||
+                cmp.operands[0] != idxLoad.result ||
+                cmp.result != headerBlock.terminator.condition) {
+                continue;
+            }
+            const mir::ValueId bndVal = cmp.operands[1];
+            const auto defIt = valueDefBlock.find(bndVal);
+            if (bndVal < 0 ||
+                static_cast<std::size_t>(bndVal) >= types.size() ||
+                types[static_cast<std::size_t>(bndVal)].primitive != semantic::PrimitiveType::Int ||
+                (defIt != valueDefBlock.end() && isInsideLoop(defIt->second))) {
+                continue;
+            }
+            plan.boundExpr = typedValueExpression(bndVal);
+        } else if (headerBlock.instructions.size() == 3) {
+            const auto& bndInst = headerBlock.instructions[1];
+            const auto& cmp = headerBlock.instructions[2];
+            if (cmp.opcode != mir::Opcode::LessInt ||
+                cmp.operands.size() != 2 ||
+                cmp.operands[0] != idxLoad.result ||
+                cmp.operands[1] != bndInst.result ||
+                cmp.result != headerBlock.terminator.condition) {
+                continue;
+            }
+            if (bndInst.opcode == mir::Opcode::LoadLocal &&
+                bndInst.localIndex < function.localTypes.size() &&
+                function.localTypes[bndInst.localIndex] == semantic::PrimitiveType::Int &&
+                loopWrittenLocals.find(bndInst.localIndex) == loopWrittenLocals.end()) {
+                plan.boundExpr = typedLocalExpression(bndInst.localIndex);
+            } else if (bndInst.opcode == mir::Opcode::ConstantInt) {
+                plan.boundExpr = "std::int64_t{" + int64Literal(bndInst.integerImmediate) + "}";
+            } else {
+                continue;
+            }
+        } else if (headerBlock.instructions.size() == 4) {
+            const auto& arrLoad = headerBlock.instructions[1];
+            const auto& lenInst = headerBlock.instructions[2];
+            const auto& cmp = headerBlock.instructions[3];
+            if (arrLoad.opcode != mir::Opcode::LoadLocal ||
+                arrLoad.result < 0 ||
+                lenInst.opcode != mir::Opcode::ArrayLength ||
+                lenInst.operands.size() != 1 ||
+                lenInst.operands[0] != arrLoad.result ||
+                lenInst.result < 0 ||
+                cmp.opcode != mir::Opcode::LessInt ||
+                cmp.operands.size() != 2 ||
+                cmp.operands[0] != idxLoad.result ||
+                cmp.operands[1] != lenInst.result ||
+                cmp.result != headerBlock.terminator.condition) {
+                continue;
+            }
+            const auto pIt = singleStorePackedArrayLocals.find(arrLoad.localIndex);
+            if (pIt == singleStorePackedArrayLocals.end()) {
+                continue;
+            }
+            (void)touchArrayLocal(arrLoad.localIndex, pIt->second, true, false);
+            plan.boundExpr = packedArrayCacheName(arrLoad.localIndex, pIt->second) + ".count";
+        } else {
+            continue;
+        }
+
+        // Verify no ValueId defined inside the loop is read outside the loop
+        bool ssaEscapes = false;
+        for (const auto& blk : function.blocks) {
+            if (isInsideLoop(blk.id)) continue;
+            auto checkExternalUse = [&](mir::ValueId vid) {
+                if (vid < 0) return;
+                const auto dIt = valueDefBlock.find(vid);
+                if (dIt != valueDefBlock.end() && isInsideLoop(dIt->second)) {
+                    ssaEscapes = true;
+                }
+            };
+            for (const auto& inst : blk.instructions) {
+                for (const auto op : inst.operands) checkExternalUse(op);
+            }
+            checkExternalUse(blk.terminator.value);
+            checkExternalUse(blk.terminator.condition);
+            for (const auto a : blk.terminator.arguments) checkExternalUse(a);
+            for (const auto a : blk.terminator.falseArguments) checkExternalUse(a);
+            if (ssaEscapes) break;
+        }
+        if (ssaEscapes) continue;
+
+        // Inspect bodyBlock instructions
+        bool bodyOk = true;
+        bool hasElementAccess = false;
+        for (const auto& inst : bodyBlock->instructions) {
+            // Operands cannot come from headerBlock or incBlock
+            for (const auto op : inst.operands) {
+                const auto dIt = valueDefBlock.find(op);
+                if (dIt != valueDefBlock.end() &&
+                    (dIt->second == headerBlock.id || dIt->second == incId)) {
+                    bodyOk = false;
+                    break;
+                }
+            }
+            if (!bodyOk) break;
+
+            switch (inst.opcode) {
+            case mir::Opcode::LoadLocal: {
+                if (inst.localIndex >= function.localTypes.size() || inst.result < 0) {
+                    bodyOk = false;
+                    break;
+                }
+                const auto lPrim = function.localTypes[inst.localIndex];
+                if (lPrim == semantic::PrimitiveType::Array) {
+                    if (singleStorePackedArrayLocals.find(inst.localIndex) ==
+                        singleStorePackedArrayLocals.end()) {
+                        bodyOk = false;
+                        break;
+                    }
+                    plan.bodyArrayLoadRegs[inst.result] = inst.localIndex;
+                } else if (inst.localIndex == plan.indexLocalIndex) {
+                    plan.bodyIndexLoadRegs.insert(inst.result);
+                } else if (lPrim == semantic::PrimitiveType::Object ||
+                           lPrim == semantic::PrimitiveType::String ||
+                           lPrim == semantic::PrimitiveType::Handle) {
+                    bodyOk = false;
+                }
+                break;
+            }
+            case mir::Opcode::StoreLocal: {
+                if (inst.localIndex == plan.indexLocalIndex ||
+                    inst.localIndex >= function.localTypes.size()) {
+                    bodyOk = false;
+                    break;
+                }
+                const auto lPrim = function.localTypes[inst.localIndex];
+                if (lPrim == semantic::PrimitiveType::Array ||
+                    lPrim == semantic::PrimitiveType::Object ||
+                    lPrim == semantic::PrimitiveType::String ||
+                    lPrim == semantic::PrimitiveType::Handle) {
+                    bodyOk = false;
+                }
+                break;
+            }
+            case mir::Opcode::LoadElement: {
+                if (inst.operands.size() != 2 ||
+                    inst.result < 0 ||
+                    inst.elementTypeId != 0 ||
+                    (inst.elementType != semantic::PrimitiveType::Int &&
+                     inst.elementType != semantic::PrimitiveType::Double) ||
+                    inst.resultType != inst.elementType) {
+                    bodyOk = false;
+                    break;
+                }
+                const auto arrIt = plan.bodyArrayLoadRegs.find(inst.operands[0]);
+                if (arrIt == plan.bodyArrayLoadRegs.end() ||
+                    plan.bodyIndexLoadRegs.find(inst.operands[1]) == plan.bodyIndexLoadRegs.end() ||
+                    !touchArrayLocal(arrIt->second, inst.elementType, true, false)) {
+                    bodyOk = false;
+                    break;
+                }
+                hasElementAccess = true;
+                break;
+            }
+            case mir::Opcode::StoreElement: {
+                if (inst.operands.size() != 3 ||
+                    inst.elementTypeId != 0 ||
+                    (inst.elementType != semantic::PrimitiveType::Int &&
+                     inst.elementType != semantic::PrimitiveType::Double)) {
+                    bodyOk = false;
+                    break;
+                }
+                const auto valVid = inst.operands[2];
+                if (valVid < 0 ||
+                    static_cast<std::size_t>(valVid) >= types.size() ||
+                    types[static_cast<std::size_t>(valVid)].primitive != inst.elementType) {
+                    bodyOk = false;
+                    break;
+                }
+                const auto arrIt = plan.bodyArrayLoadRegs.find(inst.operands[0]);
+                if (arrIt == plan.bodyArrayLoadRegs.end() ||
+                    plan.bodyIndexLoadRegs.find(inst.operands[1]) == plan.bodyIndexLoadRegs.end() ||
+                    !touchArrayLocal(arrIt->second, inst.elementType, false, true)) {
+                    bodyOk = false;
+                    break;
+                }
+                hasElementAccess = true;
+                break;
+            }
+            case mir::Opcode::ConstantInt:
+                if (inst.resultType == semantic::PrimitiveType::Enum) bodyOk = false;
+                break;
+            case mir::Opcode::ConstantDouble:
+            case mir::Opcode::ConstantBool:
+            case mir::Opcode::ConvertIntToLong:
+            case mir::Opcode::ConvertIntToDouble:
+            case mir::Opcode::ConvertLongToDouble:
+            case mir::Opcode::AddDouble:
+            case mir::Opcode::SubtractDouble:
+            case mir::Opcode::MultiplyDouble:
+            case mir::Opcode::DivideDouble:
+            case mir::Opcode::NegateDouble:
+            case mir::Opcode::LogicalNot:
+            case mir::Opcode::Equal:
+            case mir::Opcode::NotEqual:
+            case mir::Opcode::LessInt:
+            case mir::Opcode::LessOrEqualInt:
+            case mir::Opcode::GreaterInt:
+            case mir::Opcode::GreaterOrEqualInt:
+            case mir::Opcode::LessLong:
+            case mir::Opcode::LessOrEqualLong:
+            case mir::Opcode::GreaterLong:
+            case mir::Opcode::GreaterOrEqualLong:
+            case mir::Opcode::LessDouble:
+            case mir::Opcode::LessOrEqualDouble:
+            case mir::Opcode::GreaterDouble:
+            case mir::Opcode::GreaterOrEqualDouble:
+                break;
+            case mir::Opcode::AddLong:
+            case mir::Opcode::SubtractLong:
+            case mir::Opcode::MultiplyLong:
+            case mir::Opcode::NegateLong:
+                if (inst.checkedArithmetic) {
+                    bodyOk = false;
+                }
+                break;
+            case mir::Opcode::AddInt:
+            case mir::Opcode::SubtractInt:
+            case mir::Opcode::MultiplyInt:
+            case mir::Opcode::NegateInt:
+                if (inst.checkedArithmetic &&
+                    !typedCheckedArithmeticProvenSafe(rangeAnalysis, inst)) {
+                    bodyOk = false;
+                }
+                break;
+            default:
+                bodyOk = false;
+                break;
+            }
+            if (!bodyOk) break;
+        }
+        if (!bodyOk || !hasElementAccess || boundArrays.empty()) {
+            continue;
+        }
+
+        // Verify any LoadLocal(array) register inside bodyBlock is ONLY consumed by LoadElement/StoreElement[0]
+        for (const auto& inst : bodyBlock->instructions) {
+            for (std::size_t oi = 0; oi < inst.operands.size(); ++oi) {
+                if (plan.bodyArrayLoadRegs.find(inst.operands[oi]) != plan.bodyArrayLoadRegs.end()) {
+                    const bool validArrayUse =
+                        oi == 0u &&
+                        (inst.opcode == mir::Opcode::LoadElement ||
+                         inst.opcode == mir::Opcode::StoreElement);
+                    if (!validArrayUse) {
+                        bodyOk = false;
+                        break;
+                    }
+                }
+            }
+            if (!bodyOk) break;
+        }
+        if (!bodyOk) continue;
+
+        for (const auto& [arrLoc, binding] : boundArrays) {
+            (void)arrLoc;
+            plan.arrays.push_back(binding);
+        }
+        plan.headerInstsWithTerminator =
+            static_cast<std::uint64_t>(headerBlock.instructions.size()) + 1ULL;
+        plan.iterInstsWithTerminators =
+            plan.headerInstsWithTerminator +
+            (static_cast<std::uint64_t>(bodyBlock->instructions.size()) + 1ULL) +
+            (static_cast<std::uint64_t>(incBlock->instructions.size()) + 1ULL);
+        plan.iterBranches = 3ULL;
+
+        plans.emplace(plan.headerBlockId, std::move(plan));
+    }
+
+    return plans;
+}
+
+void emitVectorizedPackedArrayLoop(
+    Emitter& source,
+    const mir::Function& function,
+    const std::vector<TypedSlotType>& types,
+    const VectorizedPackedArrayLoopPlan& plan) {
+    const auto* bodyBlock = findBlock(function, plan.bodyBlockId);
+    if (!bodyBlock) return;
+
+    const std::string idxLocalExpr = typedLocalExpression(plan.indexLocalIndex);
+    std::string validCachesCond;
+    std::string inBoundsCond;
+    std::string noAliasCond;
+
+    for (const auto& arr : plan.arrays) {
+        const std::string cName = packedArrayCacheName(arr.arrayLocalIndex, arr.elemPrim);
+        if (!validCachesCond.empty()) validCachesCond += " && ";
+        validCachesCond += "(" + cName + ".count >= 0)";
+        if (!inBoundsCond.empty()) inBoundsCond += " && ";
+        inBoundsCond += "(vecEnd <= " + cName + ".count)";
+    }
+
+    for (std::size_t i = 0; i < plan.arrays.size(); ++i) {
+        for (std::size_t j = i + 1u; j < plan.arrays.size(); ++j) {
+            if (!plan.arrays[i].isWrite && !plan.arrays[j].isWrite) continue;
+            const std::string cA =
+                packedArrayCacheName(plan.arrays[i].arrayLocalIndex, plan.arrays[i].elemPrim);
+            const std::string cB =
+                packedArrayCacheName(plan.arrays[j].arrayLocalIndex, plan.arrays[j].elemPrim);
+            if (!noAliasCond.empty()) noAliasCond += " && ";
+            noAliasCond += "(static_cast<const void*>(" + cA +
+                ".data) != static_cast<const void*>(" + cB + ".data))";
+        }
+    }
+
+    std::string activeTripGuard = inBoundsCond;
+    if (!noAliasCond.empty()) {
+        activeTripGuard += " && " + noAliasCond;
+    }
+
+    // Track body-defined ValueIds so Int temporaries use narrow 32-bit std::int32_t for AVX2/NEON SIMD
+    std::unordered_set<mir::ValueId> bodyDefinedValues;
+    for (const auto& inst : bodyBlock->instructions) {
+        if (inst.result >= 0 &&
+            plan.bodyArrayLoadRegs.find(inst.result) == plan.bodyArrayLoadRegs.end()) {
+            bodyDefinedValues.insert(inst.result);
+        }
+    }
+
+    const auto bodyOperandExpr = [&](mir::ValueId vid) -> std::string {
+        if (bodyDefinedValues.find(vid) != bodyDefinedValues.end()) {
+            return "vecReg_" + std::to_string(vid);
+        }
+        return typedValueExpression(vid);
+    };
+
+    const auto vecRegCppType = [&](mir::ValueId vid) -> std::string {
+        const auto& slot = types[static_cast<std::size_t>(vid)];
+        if (slot.primitive == semantic::PrimitiveType::Int) {
+            return "std::int32_t";
+        }
+        return typedCppType(slot);
+    };
+
+    source.line("            // P2-C: Reconstructed PackedArray __restrict SIMD Fast-Loop");
+    source.line("            if constexpr (TrustedRelease || FastAccounting) {");
+    source.line("                const std::int64_t vecStart = " + idxLocalExpr + ";");
+    source.line("                const std::int64_t vecEnd = " + plan.boundExpr + ";");
+    source.line("                if (RS_AOT_LIKELY(" + validCachesCond +
+        " && (vecStart >= 0) && (vecEnd <= static_cast<std::int64_t>(INT32_MAX)) && "
+        "((vecEnd <= vecStart) || (" + activeTripGuard + ")))) {");
+    source.line("                    const std::uint64_t vecTrips = (vecEnd > vecStart) "
+        "? static_cast<std::uint64_t>(vecEnd - vecStart) : 0ULL;");
+    source.line("                    const std::uint64_t vecTotalInsts = vecTrips * " +
+        std::to_string(plan.iterInstsWithTerminators) + "ULL + " +
+        std::to_string(plan.headerInstsWithTerminator) + "ULL;");
+    source.line("                    const std::uint64_t vecTotalBranches = vecTrips * " +
+        std::to_string(plan.iterBranches) + "ULL + 1ULL;");
+    source.line("                    if (TrustedRelease || rawAccounting.canConsume(vecTotalInsts)) {");
+    source.line("                        if constexpr (FastAccounting && !TrustedRelease) {");
+    source.line("                            (void)rawAccounting.consume(vecTotalInsts);");
+    source.line("                            rawAccounting.addBranches(vecTotalBranches);");
+    source.line("                        }");
+    source.line("                        if (vecTrips > 0ULL) {");
+    for (const auto& arr : plan.arrays) {
+        const std::string cName = packedArrayCacheName(arr.arrayLocalIndex, arr.elemPrim);
+        const std::string ptrName = "packedPtr_" + std::to_string(arr.arrayLocalIndex);
+        const std::string elemTypeStr =
+            (arr.elemPrim == semantic::PrimitiveType::Int) ? "std::int32_t" : "double";
+        if (arr.isWrite) {
+            source.line("                            " + elemTypeStr + "* RS_AOT_RESTRICT " +
+                ptrName + " = " + cName + ".data;");
+        } else {
+            source.line("                            const " + elemTypeStr + "* RS_AOT_RESTRICT " +
+                ptrName + " = " + cName + ".data;");
+        }
+        source.line("                            (void)" + ptrName + ";");
+    }
+    source.line("                            const auto vecStartIdx = static_cast<std::ptrdiff_t>(vecStart);");
+    source.line("                            const auto vecEndIdx = static_cast<std::ptrdiff_t>(vecEnd);");
+    source.line("                            RS_AOT_PRAGMA_SIMD_LOOP");
+    source.line("                            for (std::ptrdiff_t vecIdx = vecStartIdx; vecIdx < vecEndIdx; ++vecIdx) {");
+
+    const std::string ind = "                                ";
+    for (const auto& inst : bodyBlock->instructions) {
+        if (inst.opcode == mir::Opcode::LoadLocal &&
+            plan.bodyArrayLoadRegs.find(inst.result) != plan.bodyArrayLoadRegs.end()) {
+            continue;
+        }
+        const std::string resDecl = (inst.result >= 0)
+            ? ("[[maybe_unused]] const " + vecRegCppType(inst.result) +
+               " vecReg_" + std::to_string(inst.result))
+            : std::string{};
+        const auto op = [&](std::size_t idx) {
+            return bodyOperandExpr(inst.operands[idx]);
+        };
+
+        switch (inst.opcode) {
+        case mir::Opcode::LoadLocal:
+            if (inst.localIndex == plan.indexLocalIndex) {
+                source.line(ind + resDecl + " = static_cast<std::int32_t>(vecIdx);");
+            } else if (function.localTypes[inst.localIndex] == semantic::PrimitiveType::Int) {
+                source.line(ind + resDecl + " = static_cast<std::int32_t>(" +
+                    typedLocalExpression(inst.localIndex) + ");");
+            } else {
+                source.line(ind + resDecl + " = " +
+                    typedLocalExpression(inst.localIndex) + ";");
+            }
+            break;
+        case mir::Opcode::StoreLocal:
+            if (function.localTypes[inst.localIndex] == semantic::PrimitiveType::Int) {
+                source.line(ind + typedLocalExpression(inst.localIndex) +
+                    " = static_cast<std::int64_t>(" + op(0) + ");");
+            } else {
+                source.line(ind + typedLocalExpression(inst.localIndex) + " = " + op(0) + ";");
+            }
+            break;
+        case mir::Opcode::LoadElement: {
+            const std::size_t arrLoc = plan.bodyArrayLoadRegs.at(inst.operands[0]);
+            source.line(ind + resDecl + " = packedPtr_" + std::to_string(arrLoc) + "[vecIdx];");
+            break;
+        }
+        case mir::Opcode::StoreElement: {
+            const std::size_t arrLoc = plan.bodyArrayLoadRegs.at(inst.operands[0]);
+            if (inst.elementType == semantic::PrimitiveType::Int) {
+                source.line(ind + "packedPtr_" + std::to_string(arrLoc) +
+                    "[vecIdx] = static_cast<std::int32_t>(" + op(2) + ");");
+            } else {
+                source.line(ind + "packedPtr_" + std::to_string(arrLoc) +
+                    "[vecIdx] = " + op(2) + ";");
+            }
+            break;
+        }
+        case mir::Opcode::ConstantInt:
+            if (inst.resultType == semantic::PrimitiveType::Long) {
+                source.line(ind + resDecl + " = std::int64_t{" +
+                    int64Literal(inst.integerImmediate) + "};");
+            } else {
+                source.line(ind + resDecl + " = static_cast<std::int32_t>(" +
+                    int64Literal(inst.integerImmediate) + ");");
+            }
+            break;
+        case mir::Opcode::ConstantDouble: {
+            std::ostringstream lit;
+            lit << std::setprecision(17) << inst.doubleImmediate;
+            if (inst.resultType == semantic::PrimitiveType::Float) {
+                source.line(ind + resDecl + " = static_cast<float>(" + lit.str() + ");");
+            } else {
+                source.line(ind + resDecl + " = " + lit.str() + ";");
+            }
+            break;
+        }
+        case mir::Opcode::ConstantBool:
+            source.line(ind + resDecl + " = " +
+                (inst.boolImmediate ? "true" : "false") + ";");
+            break;
+        case mir::Opcode::ConvertIntToLong:
+            source.line(ind + resDecl + " = static_cast<std::int64_t>(" + op(0) + ");");
+            break;
+        case mir::Opcode::ConvertIntToDouble:
+        case mir::Opcode::ConvertLongToDouble:
+            source.line(ind + resDecl + " = static_cast<double>(" + op(0) + ");");
+            break;
+        case mir::Opcode::AddInt:
+        case mir::Opcode::SubtractInt:
+        case mir::Opcode::MultiplyInt: {
+            const char* sym = inst.opcode == mir::Opcode::AddInt
+                ? " + "
+                : (inst.opcode == mir::Opcode::SubtractInt ? " - " : " * ");
+            source.line(ind + resDecl +
+                " = static_cast<std::int32_t>(static_cast<std::uint32_t>(" + op(0) + ")" +
+                sym + "static_cast<std::uint32_t>(" + op(1) + "));");
+            break;
+        }
+        case mir::Opcode::NegateInt:
+            source.line(ind + resDecl +
+                " = static_cast<std::int32_t>(0u - static_cast<std::uint32_t>(" + op(0) + "));");
+            break;
+        case mir::Opcode::AddLong:
+        case mir::Opcode::SubtractLong:
+        case mir::Opcode::MultiplyLong: {
+            const char* sym = inst.opcode == mir::Opcode::AddLong
+                ? " + "
+                : (inst.opcode == mir::Opcode::SubtractLong ? " - " : " * ");
+            source.line(ind + resDecl +
+                " = static_cast<std::int64_t>(static_cast<std::uint64_t>(" + op(0) + ")" +
+                sym + "static_cast<std::uint64_t>(" + op(1) + "));");
+            break;
+        }
+        case mir::Opcode::NegateLong:
+            source.line(ind + resDecl +
+                " = static_cast<std::int64_t>(0ULL - static_cast<std::uint64_t>(" + op(0) + "));");
+            break;
+        case mir::Opcode::AddDouble:
+        case mir::Opcode::SubtractDouble:
+        case mir::Opcode::MultiplyDouble:
+        case mir::Opcode::DivideDouble: {
+            const char* sym = inst.opcode == mir::Opcode::AddDouble
+                ? " + "
+                : (inst.opcode == mir::Opcode::SubtractDouble
+                    ? " - "
+                    : (inst.opcode == mir::Opcode::MultiplyDouble ? " * " : " / "));
+            source.line(ind + resDecl + " = " + op(0) + sym + op(1) + ";");
+            break;
+        }
+        case mir::Opcode::NegateDouble:
+            source.line(ind + resDecl + " = -" + op(0) + ";");
+            break;
+        case mir::Opcode::LogicalNot:
+            source.line(ind + resDecl + " = !" + op(0) + ";");
+            break;
+        case mir::Opcode::Equal:
+        case mir::Opcode::NotEqual: {
+            const auto lhsPrim = types[static_cast<std::size_t>(inst.operands[0])].primitive;
+            const char* cmpOp = (inst.opcode == mir::Opcode::Equal) ? " == " : " != ";
+            if (lhsPrim == semantic::PrimitiveType::Int) {
+                source.line(ind + resDecl + " = (static_cast<std::int32_t>(" + op(0) + ")" +
+                    cmpOp + "static_cast<std::int32_t>(" + op(1) + "));");
+            } else {
+                source.line(ind + resDecl + " = (" + op(0) + cmpOp + op(1) + ");");
+            }
+            break;
+        }
+        case mir::Opcode::LessInt:
+        case mir::Opcode::LessOrEqualInt:
+        case mir::Opcode::GreaterInt:
+        case mir::Opcode::GreaterOrEqualInt: {
+            const char* cmpOp = inst.opcode == mir::Opcode::LessInt
+                ? " < "
+                : (inst.opcode == mir::Opcode::LessOrEqualInt
+                    ? " <= "
+                    : (inst.opcode == mir::Opcode::GreaterInt ? " > " : " >= "));
+            source.line(ind + resDecl + " = (static_cast<std::int32_t>(" + op(0) + ")" +
+                cmpOp + "static_cast<std::int32_t>(" + op(1) + "));");
+            break;
+        }
+        case mir::Opcode::LessLong:
+        case mir::Opcode::LessOrEqualLong:
+        case mir::Opcode::GreaterLong:
+        case mir::Opcode::GreaterOrEqualLong:
+        case mir::Opcode::LessDouble:
+        case mir::Opcode::LessOrEqualDouble:
+        case mir::Opcode::GreaterDouble:
+        case mir::Opcode::GreaterOrEqualDouble: {
+            const char* cmpOp =
+                (inst.opcode == mir::Opcode::LessLong || inst.opcode == mir::Opcode::LessDouble)
+                ? " < "
+                : ((inst.opcode == mir::Opcode::LessOrEqualLong ||
+                    inst.opcode == mir::Opcode::LessOrEqualDouble)
+                    ? " <= "
+                    : ((inst.opcode == mir::Opcode::GreaterLong ||
+                        inst.opcode == mir::Opcode::GreaterDouble)
+                        ? " > "
+                        : " >= "));
+            source.line(ind + resDecl + " = (" + op(0) + cmpOp + op(1) + ");");
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    source.line("                            }");
+    source.line("                            " + idxLocalExpr + " = vecEnd;");
+    source.line("                        }");
+    source.line("                        goto typedBlock_" + std::to_string(plan.exitBlockId) + ";");
+    source.line("                    }");
+    source.line("                }");
+    source.line("            }");
+}
+
 bool aotTypeAssignable(
     semantic::SymbolId actual,
     semantic::SymbolId expected,
@@ -2328,7 +3073,30 @@ void emitTypedPrimitiveFunction(
             }
         }
     }
+    const semantic::SymbolId kPackedInt32ArrayTid = semantic::stableTypeId("int[]");
+    const semantic::SymbolId kPackedDoubleArrayTid = semantic::stableTypeId("double[]");
+    std::unordered_map<std::size_t, semantic::PrimitiveType> arrayParamPackedPrim;
+    for (std::size_t pIdx = 0; pIdx < function.parameterTypes.size(); ++pIdx) {
+        if (function.parameterTypes[pIdx] != semantic::PrimitiveType::Array) continue;
+        const auto pTid = pIdx < function.parameterTypeIds.size() ? function.parameterTypeIds[pIdx] : 0;
+        if (pTid == kPackedInt32ArrayTid) {
+            arrayParamPackedPrim[pIdx] = semantic::PrimitiveType::Int;
+        } else if (pTid == kPackedDoubleArrayTid) {
+            arrayParamPackedPrim[pIdx] = semantic::PrimitiveType::Double;
+        }
+    }
+    std::unordered_map<std::size_t, semantic::PrimitiveType> arrayLocalPackedPrim;
+    for (std::size_t lIdx = 0; lIdx < function.localTypes.size(); ++lIdx) {
+        if (function.localTypes[lIdx] != semantic::PrimitiveType::Array) continue;
+        const auto lTid = lIdx < function.localTypeIds.size() ? function.localTypeIds[lIdx] : 0;
+        if (lTid == kPackedInt32ArrayTid) {
+            arrayLocalPackedPrim[lIdx] = semantic::PrimitiveType::Int;
+        } else if (lTid == kPackedDoubleArrayTid) {
+            arrayLocalPackedPrim[lIdx] = semantic::PrimitiveType::Double;
+        }
+    }
     std::unordered_map<mir::ValueId, std::size_t> valueToArrayLocal;
+    std::unordered_map<mir::ValueId, std::size_t> valueToArrayParam;
     std::unordered_map<std::size_t, semantic::SymbolId> arrayLocalStructElemType;
     for (const auto& blk : function.blocks) {
         for (const auto& inst : blk.instructions) {
@@ -2338,6 +3106,13 @@ void emitTypedPrimitiveFunction(
                 function.localTypes[inst.localIndex] == semantic::PrimitiveType::Array &&
                 localStoreCounts[inst.localIndex] == 1) {
                 valueToArrayLocal[inst.result] = inst.localIndex;
+            } else if (inst.opcode == mir::Opcode::Parameter &&
+                       inst.result >= 0) {
+                const auto pIdx = static_cast<std::size_t>(inst.integerImmediate);
+                if (pIdx < function.parameterTypes.size() &&
+                    function.parameterTypes[pIdx] == semantic::PrimitiveType::Array) {
+                    valueToArrayParam[inst.result] = pIdx;
+                }
             }
         }
     }
@@ -2345,15 +3120,39 @@ void emitTypedPrimitiveFunction(
         for (const auto& inst : blk.instructions) {
             if ((inst.opcode == mir::Opcode::LoadElement ||
                  inst.opcode == mir::Opcode::StoreElement) &&
-                !inst.operands.empty() &&
-                inst.elementType == semantic::PrimitiveType::Struct &&
-                classifyInlineMath(inst.elementType, inst.elementTypeId) ==
-                    InlineMathKind::None) {
+                !inst.operands.empty()) {
                 const auto it = valueToArrayLocal.find(inst.operands[0]);
                 if (it != valueToArrayLocal.end()) {
-                    arrayLocalStructElemType[it->second] = inst.elementTypeId;
+                    if (inst.elementType == semantic::PrimitiveType::Struct &&
+                        classifyInlineMath(inst.elementType, inst.elementTypeId) ==
+                            InlineMathKind::None) {
+                        arrayLocalStructElemType[it->second] = inst.elementTypeId;
+                    } else if (inst.elementTypeId == 0 &&
+                               (inst.elementType == semantic::PrimitiveType::Int ||
+                                inst.elementType == semantic::PrimitiveType::Double)) {
+                        arrayLocalPackedPrim.try_emplace(it->second, inst.elementType);
+                    }
                 }
             }
+        }
+    }
+    std::unordered_map<std::size_t, semantic::PrimitiveType> singleStorePackedArrayLocals;
+    for (const auto& [lIdx, prim] : arrayLocalPackedPrim) {
+        if (lIdx < localStoreCounts.size() && localStoreCounts[lIdx] == 1) {
+            singleStorePackedArrayLocals.emplace(lIdx, prim);
+        }
+    }
+    for (const auto& [pIdx, prim] : arrayParamPackedPrim) {
+        if (prim == semantic::PrimitiveType::Int) {
+            source.line("    const aot::TypedPackedInt32ArrayCache typedArgPackedI32_" +
+                std::to_string(pIdx) + " = context.acquirePackedInt32ArrayCache(typedArg_" +
+                std::to_string(pIdx) + ");");
+            source.line("    (void)typedArgPackedI32_" + std::to_string(pIdx) + ";");
+        } else {
+            source.line("    const aot::TypedPackedDoubleArrayCache typedArgPackedF64_" +
+                std::to_string(pIdx) + " = context.acquirePackedDoubleArrayCache(typedArg_" +
+                std::to_string(pIdx) + ");");
+            source.line("    (void)typedArgPackedF64_" + std::to_string(pIdx) + ";");
         }
     }
     for (std::size_t index = 0; index < function.localTypes.size(); ++index) {
@@ -2369,6 +3168,18 @@ void emitTypedPrimitiveFunction(
             source.line("    aot::TypedRawColumnCache typedLocalRawCol_" +
                 std::to_string(index) + "{};");
             source.line("    (void)typedLocalRawCol_" + std::to_string(index) + ";");
+            const auto packedIt = arrayLocalPackedPrim.find(index);
+            if (packedIt != arrayLocalPackedPrim.end()) {
+                if (packedIt->second == semantic::PrimitiveType::Int) {
+                    source.line("    aot::TypedPackedInt32ArrayCache typedLocalPackedI32_" +
+                        std::to_string(index) + "{};");
+                    source.line("    (void)typedLocalPackedI32_" + std::to_string(index) + ";");
+                } else {
+                    source.line("    aot::TypedPackedDoubleArrayCache typedLocalPackedF64_" +
+                        std::to_string(index) + "{};");
+                    source.line("    (void)typedLocalPackedF64_" + std::to_string(index) + ";");
+                }
+            }
         }
     }
     for (std::size_t index = 0; index < types.size(); ++index) {
@@ -2598,6 +3409,16 @@ void emitTypedPrimitiveFunction(
                     source.line("            typedLocalRawCol_" + std::to_string(lIdx) +
                         " = context.acquireRawColumnCache(" + typedLocalExpression(lIdx) + ");");
                 }
+                const auto packedIt = arrayLocalPackedPrim.find(lIdx);
+                if (packedIt != arrayLocalPackedPrim.end()) {
+                    if (packedIt->second == semantic::PrimitiveType::Int) {
+                        source.line("            typedLocalPackedI32_" + std::to_string(lIdx) +
+                            " = context.acquirePackedInt32ArrayCache(" + typedLocalExpression(lIdx) + ");");
+                    } else {
+                        source.line("            typedLocalPackedF64_" + std::to_string(lIdx) +
+                            " = context.acquirePackedDoubleArrayCache(" + typedLocalExpression(lIdx) + ");");
+                    }
+                }
             }
             source.line("            switch (resumeBlockId) {");
             for (const auto rbId : asyncResumeBlockIds) {
@@ -2628,6 +3449,27 @@ void emitTypedPrimitiveFunction(
 
     const auto vectorizedEcsLoops =
         analyzeVectorizedEcsLoops(function, arrayLocalStructElemType);
+    const auto vectorizedPackedLoops = analyzeVectorizedPackedArrayLoops(
+        function, types, rangeAnalysis, singleStorePackedArrayLocals);
+    const auto resolvePackedCacheExpr = [&](mir::ValueId arrVal, semantic::PrimitiveType expectedPrim) -> std::string {
+        const auto locIt = valueToArrayLocal.find(arrVal);
+        if (locIt != valueToArrayLocal.end()) {
+            const auto pIt = singleStorePackedArrayLocals.find(locIt->second);
+            if (pIt != singleStorePackedArrayLocals.end() && pIt->second == expectedPrim) {
+                return packedArrayCacheName(locIt->second, expectedPrim);
+            }
+        }
+        const auto parIt = valueToArrayParam.find(arrVal);
+        if (parIt != valueToArrayParam.end()) {
+            const auto pIt = arrayParamPackedPrim.find(parIt->second);
+            if (pIt != arrayParamPackedPrim.end() && pIt->second == expectedPrim) {
+                return (expectedPrim == semantic::PrimitiveType::Int
+                    ? "typedArgPackedI32_"
+                    : "typedArgPackedF64_") + std::to_string(parIt->second);
+            }
+        }
+        return {};
+    };
     std::size_t typedCallSiteCounter = 0;
     for (const auto& block : function.blocks) {
         source.line("    typedBlock_" + std::to_string(block.id) + ":");
@@ -2636,6 +3478,12 @@ void emitTypedPrimitiveFunction(
         if (vecLoopIt != vectorizedEcsLoops.end()) {
             emitVectorizedEcsLoop(
                 source, module, function, types, vecLoopIt->second, options.emitLineDirectives);
+        } else {
+            const auto vecPackedIt = vectorizedPackedLoops.find(block.id);
+            if (vecPackedIt != vectorizedPackedLoops.end()) {
+                emitVectorizedPackedArrayLoop(
+                    source, function, types, vecPackedIt->second);
+            }
         }
         const auto rawConsumeBatches =
             typedRawConsumeBatches(block, rangeAnalysis);
@@ -2826,8 +3674,19 @@ void emitTypedPrimitiveFunction(
                 break;
             }
             case mir::Opcode::ArrayLength: {
+                const std::string i32Cache = resolvePackedCacheExpr(
+                    instruction.operands[0], semantic::PrimitiveType::Int);
+                const std::string f64Cache = i32Cache.empty()
+                    ? resolvePackedCacheExpr(instruction.operands[0], semantic::PrimitiveType::Double)
+                    : std::string{};
+                const std::string& packedCache = !i32Cache.empty() ? i32Cache : f64Cache;
                 const auto arrLocalIt = valueToArrayLocal.find(instruction.operands[0]);
-                if (arrLocalIt != valueToArrayLocal.end()) {
+                if (!packedCache.empty()) {
+                    source.line("            if (RS_AOT_LIKELY(" + packedCache + ".count >= 0)) {");
+                    source.line("                " + result + " = " + packedCache + ".count;");
+                    source.line("            } else if (!context.arrayLengthFast(" + operand(0) +
+                        ", " + result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                } else if (arrLocalIt != valueToArrayLocal.end()) {
                     const auto rawColExpr = "typedLocalRawCol_" + std::to_string(arrLocalIt->second);
                     source.line("            if (RS_AOT_LIKELY(" + rawColExpr + ".count >= 0)) {");
                     source.line("                " + result + " = " + rawColExpr + ".count;");
@@ -2870,6 +3729,44 @@ void emitTypedPrimitiveFunction(
                             ", runtime::Value{" + operand(1) + "}, " + tmpElem +
                             ") || !aot::typedUnboxScalar(semantic::PrimitiveType::Struct, " + tmpElem +
                             ", " + result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                    }
+                } else if (instruction.elementType == semantic::PrimitiveType::Int &&
+                           instruction.elementTypeId == 0 &&
+                           instruction.resultType == semantic::PrimitiveType::Int) {
+                    const std::string packedCache = resolvePackedCacheExpr(
+                        instruction.operands[0], semantic::PrimitiveType::Int);
+                    if (!packedCache.empty()) {
+                        source.line("            if (RS_AOT_LIKELY(" + packedCache + ".count >= 0)) {");
+                        source.line("                if constexpr (!TrustedRelease) {");
+                        source.line("                    if (RS_AOT_UNLIKELY(static_cast<std::uint64_t>(" + operand(1) + ") >= static_cast<std::uint64_t>(" + packedCache + ".count))) {");
+                        source.line("                        return typedFail(runtime::ErrorCode::IndexOutOfRange, \"array element index is out of range\");");
+                        source.line("                    }");
+                        source.line("                }");
+                        source.line("                " + result + " = static_cast<std::int64_t>(" + packedCache + ".data[static_cast<std::size_t>(" + operand(1) + ")]);");
+                        source.line("            } else if (!context.loadElementInt32Fast(" + operand(0) + ", " + operand(1) + ", " + result +
+                            ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                    } else {
+                        source.line("            if (!context.loadElementInt32Fast(" + operand(0) + ", " + operand(1) + ", " + result +
+                            ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                    }
+                } else if (instruction.elementType == semantic::PrimitiveType::Double &&
+                           instruction.elementTypeId == 0 &&
+                           instruction.resultType == semantic::PrimitiveType::Double) {
+                    const std::string packedCache = resolvePackedCacheExpr(
+                        instruction.operands[0], semantic::PrimitiveType::Double);
+                    if (!packedCache.empty()) {
+                        source.line("            if (RS_AOT_LIKELY(" + packedCache + ".count >= 0)) {");
+                        source.line("                if constexpr (!TrustedRelease) {");
+                        source.line("                    if (RS_AOT_UNLIKELY(static_cast<std::uint64_t>(" + operand(1) + ") >= static_cast<std::uint64_t>(" + packedCache + ".count))) {");
+                        source.line("                        return typedFail(runtime::ErrorCode::IndexOutOfRange, \"array element index is out of range\");");
+                        source.line("                    }");
+                        source.line("                }");
+                        source.line("                " + result + " = " + packedCache + ".data[static_cast<std::size_t>(" + operand(1) + ")];");
+                        source.line("            } else if (!context.loadElementDoubleFast(" + operand(0) + ", " + operand(1) + ", " + result +
+                            ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                    } else {
+                        source.line("            if (!context.loadElementDoubleFast(" + operand(0) + ", " + operand(1) + ", " + result +
+                            ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
                     }
                 } else if (instruction.elementType == semantic::PrimitiveType::Object &&
                            instruction.resultType == semantic::PrimitiveType::Object) {
@@ -2922,6 +3819,44 @@ void emitTypedPrimitiveFunction(
                             hexId(instruction.elementTypeId) + "ULL, " + operand(0) +
                             ", runtime::Value{" + operand(1) + "}, " + operand(2) +
                             ".boxToValue())) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                    }
+                } else if (instruction.elementType == semantic::PrimitiveType::Int &&
+                           instruction.elementTypeId == 0 &&
+                           valSlot.primitive == semantic::PrimitiveType::Int) {
+                    const std::string packedCache = resolvePackedCacheExpr(
+                        instruction.operands[0], semantic::PrimitiveType::Int);
+                    if (!packedCache.empty()) {
+                        source.line("            if (RS_AOT_LIKELY(" + packedCache + ".count >= 0)) {");
+                        source.line("                if constexpr (!TrustedRelease) {");
+                        source.line("                    if (RS_AOT_UNLIKELY(static_cast<std::uint64_t>(" + operand(1) + ") >= static_cast<std::uint64_t>(" + packedCache + ".count))) {");
+                        source.line("                        return typedFail(runtime::ErrorCode::IndexOutOfRange, \"array element index is out of range\");");
+                        source.line("                    }");
+                        source.line("                }");
+                        source.line("                " + packedCache + ".data[static_cast<std::size_t>(" + operand(1) + ")] = static_cast<std::int32_t>(" + operand(2) + ");");
+                        source.line("            } else if (!context.storeElementInt32Fast(" + operand(0) + ", " + operand(1) + ", " + operand(2) +
+                            ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                    } else {
+                        source.line("            if (!context.storeElementInt32Fast(" + operand(0) + ", " + operand(1) + ", " + operand(2) +
+                            ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                    }
+                } else if (instruction.elementType == semantic::PrimitiveType::Double &&
+                           instruction.elementTypeId == 0 &&
+                           valSlot.primitive == semantic::PrimitiveType::Double) {
+                    const std::string packedCache = resolvePackedCacheExpr(
+                        instruction.operands[0], semantic::PrimitiveType::Double);
+                    if (!packedCache.empty()) {
+                        source.line("            if (RS_AOT_LIKELY(" + packedCache + ".count >= 0)) {");
+                        source.line("                if constexpr (!TrustedRelease) {");
+                        source.line("                    if (RS_AOT_UNLIKELY(static_cast<std::uint64_t>(" + operand(1) + ") >= static_cast<std::uint64_t>(" + packedCache + ".count))) {");
+                        source.line("                        return typedFail(runtime::ErrorCode::IndexOutOfRange, \"array element index is out of range\");");
+                        source.line("                    }");
+                        source.line("                }");
+                        source.line("                " + packedCache + ".data[static_cast<std::size_t>(" + operand(1) + ")] = " + operand(2) + ";");
+                        source.line("            } else if (!context.storeElementDoubleFast(" + operand(0) + ", " + operand(1) + ", " + operand(2) +
+                            ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                    } else {
+                        source.line("            if (!context.storeElementDoubleFast(" + operand(0) + ", " + operand(1) + ", " + operand(2) +
+                            ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
                     }
                 } else {
                     source.line("            if (!context.storeElement(" +
@@ -2991,6 +3926,30 @@ void emitTypedPrimitiveFunction(
                             std::to_string(instruction.localIndex) +
                             " = context.acquireRawColumnCache(" +
                             typedLocalExpression(instruction.localIndex) + ");");
+                    }
+                    const auto packedIt = arrayLocalPackedPrim.find(instruction.localIndex);
+                    if (packedIt != arrayLocalPackedPrim.end()) {
+                        const auto parIt = valueToArrayParam.find(instruction.operands[0]);
+                        if (parIt != valueToArrayParam.end() &&
+                            arrayParamPackedPrim.find(parIt->second) != arrayParamPackedPrim.end() &&
+                            arrayParamPackedPrim.at(parIt->second) == packedIt->second) {
+                            const std::string argCache = (packedIt->second == semantic::PrimitiveType::Int
+                                ? "typedArgPackedI32_"
+                                : "typedArgPackedF64_") + std::to_string(parIt->second);
+                            source.line("            " +
+                                packedArrayCacheName(instruction.localIndex, packedIt->second) +
+                                " = " + argCache + ";");
+                        } else if (packedIt->second == semantic::PrimitiveType::Int) {
+                            source.line("            typedLocalPackedI32_" +
+                                std::to_string(instruction.localIndex) +
+                                " = context.acquirePackedInt32ArrayCache(" +
+                                typedLocalExpression(instruction.localIndex) + ");");
+                        } else {
+                            source.line("            typedLocalPackedF64_" +
+                                std::to_string(instruction.localIndex) +
+                                " = context.acquirePackedDoubleArrayCache(" +
+                                typedLocalExpression(instruction.localIndex) + ");");
+                        }
                     }
                 }
                 break;
