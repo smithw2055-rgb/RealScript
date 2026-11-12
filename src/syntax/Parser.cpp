@@ -55,17 +55,52 @@ SyntaxToken Parser::match(SyntaxKind expected) {
 }
 
 CompilationUnitSyntax Parser::parseCompilationUnit() {
+    const auto isImportDirectiveStart = [&]() noexcept {
+        return current().kind == SyntaxKind::ImportKeyword ||
+            (current().kind == SyntaxKind::IdentifierToken &&
+             current().text == "using" &&
+             peek(1).kind == SyntaxKind::IdentifierToken);
+    };
+    const auto isModuleOrNamespaceStart = [&]() noexcept {
+        return current().kind == SyntaxKind::ModuleKeyword ||
+            (current().kind == SyntaxKind::IdentifierToken &&
+             current().text == "namespace" &&
+             peek(1).kind == SyntaxKind::IdentifierToken);
+    };
+
     CompilationUnitSyntax result;
+    while (isImportDirectiveStart()) {
+        result.imports.push_back(parseImportDeclaration());
+    }
     auto leadingAttributes = parseAttributeLists();
-    if (current().kind == SyntaxKind::ModuleKeyword) {
+    int bracedNamespaceDepth = 0;
+    if (isModuleOrNamespaceStart()) {
         result.moduleDeclaration = parseModuleDeclaration();
         result.moduleDeclaration->attributes = std::move(leadingAttributes);
         leadingAttributes.clear();
+        if (result.moduleDeclaration->openBraceToken.has_value()) {
+            bracedNamespaceDepth = 1;
+        }
     }
-    while (current().kind == SyntaxKind::ImportKeyword) {
+    while (isImportDirectiveStart()) {
         result.imports.push_back(parseImportDeclaration());
     }
     while (current().kind != SyntaxKind::EndOfFileToken) {
+        if (bracedNamespaceDepth > 0 && current().kind == SyntaxKind::CloseBraceToken) {
+            auto closeTok = nextToken();
+            if (result.moduleDeclaration) {
+                result.moduleDeclaration->closeBraceToken = std::move(closeTok);
+            }
+            if (current().kind == SyntaxKind::SemicolonToken) {
+                nextToken();
+            }
+            --bracedNamespaceDepth;
+            continue;
+        }
+        if (leadingAttributes.empty() && isImportDirectiveStart()) {
+            result.imports.push_back(parseImportDeclaration());
+            continue;
+        }
         const auto before = position_;
         auto attributes = std::move(leadingAttributes);
         leadingAttributes.clear();
@@ -74,6 +109,27 @@ CompilationUnitSyntax Parser::parseCompilationUnit() {
             attributes.end(),
             std::make_move_iterator(moreAttributes.begin()),
             std::make_move_iterator(moreAttributes.end()));
+        if (attributes.empty() && isModuleOrNamespaceStart()) {
+            auto nextMod = parseModuleDeclaration();
+            const bool nextHasBrace = nextMod->openBraceToken.has_value();
+            if (!result.moduleDeclaration) {
+                result.moduleDeclaration = std::move(nextMod);
+            } else if (bracedNamespaceDepth > 0 &&
+                       result.classes.empty() && result.structs.empty() &&
+                       result.enums.empty() && result.interfaces.empty() &&
+                       result.delegates.empty() && result.functions.empty()) {
+                for (auto& dot : nextMod->dotTokens) {
+                    result.moduleDeclaration->dotTokens.push_back(std::move(dot));
+                }
+                for (auto& part : nextMod->nameParts) {
+                    result.moduleDeclaration->nameParts.push_back(std::move(part));
+                }
+            }
+            if (nextHasBrace) {
+                ++bracedNamespaceDepth;
+            }
+            continue;
+        }
         auto modifiers = parseModifiers();
         if (current().kind == SyntaxKind::ClassKeyword) {
             result.classes.push_back(parseClassDeclaration(
@@ -100,21 +156,38 @@ CompilationUnitSyntax Parser::parseCompilationUnit() {
             nextToken();
         }
     }
+    while (bracedNamespaceDepth > 0 && result.moduleDeclaration) {
+        result.moduleDeclaration->closeBraceToken = match(SyntaxKind::CloseBraceToken);
+        --bracedNamespaceDepth;
+    }
     result.endOfFileToken = match(SyntaxKind::EndOfFileToken);
     return result;
 }
 
 std::unique_ptr<ModuleDeclarationSyntax> Parser::parseModuleDeclaration() {
     auto result = std::make_unique<ModuleDeclarationSyntax>();
-    result->moduleKeyword = match(SyntaxKind::ModuleKeyword);
+    const bool isCSharpNamespace =
+        current().kind == SyntaxKind::IdentifierToken && current().text == "namespace";
+    result->moduleKeyword = isCSharpNamespace
+        ? nextToken()
+        : match(SyntaxKind::ModuleKeyword);
     parseQualifiedName(result->nameParts, result->dotTokens);
-    result->semicolonToken = match(SyntaxKind::SemicolonToken);
+    if (isCSharpNamespace && current().kind == SyntaxKind::OpenBraceToken) {
+        result->openBraceToken = nextToken();
+        result->semicolonToken = {SyntaxKind::SemicolonToken, result->openBraceToken->span, "", {}, true};
+    } else {
+        result->semicolonToken = match(SyntaxKind::SemicolonToken);
+    }
     return result;
 }
 
 ImportDeclarationSyntax Parser::parseImportDeclaration() {
     ImportDeclarationSyntax result;
-    result.importKeyword = match(SyntaxKind::ImportKeyword);
+    if (current().kind == SyntaxKind::IdentifierToken && current().text == "using") {
+        result.importKeyword = nextToken();
+    } else {
+        result.importKeyword = match(SyntaxKind::ImportKeyword);
+    }
     parseQualifiedName(result.nameParts, result.dotTokens);
     result.semicolonToken = match(SyntaxKind::SemicolonToken);
     return result;

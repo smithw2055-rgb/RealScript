@@ -2603,6 +2603,43 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             builtinFiberModuleSource()});
     }
 
+    // C# / WPF ergonomics: treat standard .NET/WPF/Noesis namespace imports as benign when
+    // no explicit script module with that name exists, and auto-import Aero.UI when present.
+    const auto isDotNetCompatNamespace = [](const std::string& ns) noexcept {
+        return ns == "System" ||
+            ns.rfind("System.", 0) == 0 ||
+            ns.rfind("Microsoft.", 0) == 0 ||
+            ns == "Noesis" ||
+            ns.rfind("Noesis.", 0) == 0 ||
+            ns == "NoesisGUIExtensions";
+    };
+    const auto impliesAeroUiSdk = [](const std::string& ns) noexcept {
+        return ns == "System.Windows" ||
+            ns.rfind("System.Windows.", 0) == 0 ||
+            ns == "System.ComponentModel" ||
+            ns == "System.Collections.ObjectModel" ||
+            ns == "Noesis" ||
+            ns.rfind("Noesis.", 0) == 0 ||
+            ns == "NoesisGUIExtensions";
+    };
+    const bool hasAeroUiModule = (modules.find("Aero.UI") != modules.end());
+    for (auto& [modName, mod] : modules) {
+        bool addAeroUi = false;
+        for (auto it = mod.imports.begin(); it != mod.imports.end();) {
+            if (modules.find(*it) == modules.end() && isDotNetCompatNamespace(*it)) {
+                if (hasAeroUiModule && modName != "Aero.UI" && impliesAeroUiSdk(*it)) {
+                    addAeroUi = true;
+                }
+                it = mod.imports.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (addAeroUi) {
+            mod.imports.insert("Aero.UI");
+        }
+    }
+
     // Merge partial classes within each module in deterministic source order before specialization.
     PartialMethodOriginMap partialMethodOrigins;
     for (auto& [moduleName, module] : modules) {
@@ -3317,6 +3354,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                             }
                             owner.fields = base->fields;
                             owner.nextObservableBitIndex = base->nextObservableBitIndex;
+                            owner.observable = owner.observable || base->observable;
                             owner.simState = owner.simState || base->simState;
                             for (auto& f : ownFields) {
                                 f.index = owner.fields.size();
@@ -4996,6 +5034,26 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         declaration.attributes,
                         ownerName,
                         *unit->source);
+                    if (owner->kind == semantic::TypeKind::Class && owner->observable) {
+                        bool hasExplicitObservableAttr = false;
+                        for (const auto& attrList : declaration.attributes) {
+                            for (const auto& attr : attrList.attributes) {
+                                if (attr.nameToken.text == "Observable" ||
+                                    attr.nameToken.text == "ObservableAttribute") {
+                                    hasExplicitObservableAttr = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!hasExplicitObservableAttr) {
+                            LanguageAttributeRecord synthObs;
+                            synthObs.target = ownerName;
+                            synthObs.name = "Observable";
+                            synthObs.sourceName = unit->source->name();
+                            synthObs.offset = declaration.identifierToken.span.start;
+                            result.nativeAttributes.push_back(std::move(synthObs));
+                        }
+                    }
                     for (const auto& field : declaration.fields) {
                         appendNativeAttributes(
                             result.nativeAttributes,

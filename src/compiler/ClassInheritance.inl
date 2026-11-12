@@ -145,6 +145,9 @@ void applyInheritedFieldLayouts(
                 }
                 if (base && baseModule) {
                     apply(*baseModule, *base);
+                    if (base->observable) {
+                        type.observable = true;
+                    }
                     auto ownFields = type.fields;
                     type.fields = base->fields;
                     type.nextObservableBitIndex = base->nextObservableBitIndex;
@@ -165,6 +168,9 @@ void applyInheritedFieldLayouts(
                             continue;
                         }
                         field.index = type.fields.size();
+                        if (type.observable && !field.staticField && !field.constField && !field.synthetic) {
+                            field.observable = true;
+                        }
                         if (field.observable) {
                             field.observableBitIndex = (type.nextObservableBitIndex < 63u)
                                 ? type.nextObservableBitIndex++

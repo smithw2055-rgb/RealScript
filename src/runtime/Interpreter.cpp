@@ -798,7 +798,7 @@ bool runtimeAssignable(
     const State& state,
     semantic::SymbolId actual,
     semantic::SymbolId expected) noexcept {
-    if (actual == expected) return true;
+    if (expected == 0 || actual == expected) return true;
     if (!state.program) return false;
     auto current = actual;
     for (std::size_t depth = 0; current != 0 && depth < 256; ++depth) {

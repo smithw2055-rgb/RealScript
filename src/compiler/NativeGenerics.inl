@@ -50,7 +50,9 @@ std::string nativeGenericSanitize(std::string value) {
 std::string nativeGenericGeneratedName(
     const std::string& name,
     const std::vector<std::string>& arguments) {
-    auto result = name;
+    auto result = (name == "ObservableCollection")
+        ? std::string("ObservableList")
+        : name;
     for (const auto& argument : arguments) {
         result += "__" + nativeGenericSanitize(argument);
     }
@@ -93,7 +95,8 @@ std::map<std::string, std::vector<std::string>> nativeGenericConstraints(
 }
 
 std::size_t nativeBuiltinGenericArity(const std::string& name) {
-    if (name == "List" || name == "ObservableList" || name == "Queue" || name == "Stack" ||
+    if (name == "List" || name == "ObservableList" || name == "ObservableCollection" ||
+        name == "Queue" || name == "Stack" ||
         name == "Optional" || name == "Nullable" || name == "Box" ||
         name == "HashSet") {
         return 1;
@@ -112,7 +115,7 @@ std::string nativeBuiltinGenericSource(
         ? arguments[1]
         : std::string{};
     std::ostringstream source;
-    if (name == "ObservableList") {
+    if (name == "ObservableList" || name == "ObservableCollection") {
         const auto enumerator = generatedName + "__Enumerator";
         source << "class " << generatedName << "{" << first << "[] items;"
             << generatedName << "(){items=new " << first << "[0];}"
@@ -126,6 +129,8 @@ std::string nativeBuiltinGenericSource(
             << "void insert(int index," << first << " value){items.insert(index,value);return;}"
             << "void RemoveAt(int index){items.removeAt(index);return;}"
             << "void removeAt(int index){items.removeAt(index);return;}"
+            << "void Move(int oldIndex,int newIndex){int n=items.length;if(oldIndex<0||oldIndex>=n||newIndex<0||newIndex>=n||oldIndex==newIndex)return;"
+            << first << " moved=items[oldIndex];items.removeAt(oldIndex);items.insert(newIndex,moved);return;}"
             << "bool Remove(" << first << " value){int i=items.IndexOf(value);"
             << "if(i<0)return false;items.removeAt(i);return true;}"
             << "int IndexOf(" << first << " value){return items.IndexOf(value);}"
@@ -795,6 +800,8 @@ private:
 
     std::string expressionType(const syntax::ExpressionSyntax& expression) const {
         switch (expression.kind()) {
+        case syntax::SyntaxKind::ThisExpression:
+            return currentTypeName_;
         case syntax::SyntaxKind::NameExpression: {
             const auto& name = static_cast<const
                 syntax::NameExpressionSyntax&>(expression).identifierToken.text;
@@ -820,6 +827,16 @@ private:
         case syntax::SyntaxKind::NewArrayExpression:
             return typeText(static_cast<const
                 syntax::NewArrayExpressionSyntax&>(expression).elementType) + "[]";
+        case syntax::SyntaxKind::MemberAccessExpression: {
+            const auto& ma = static_cast<const
+                syntax::MemberAccessExpressionSyntax&>(expression);
+            const auto recvType = expressionType(*ma.receiver);
+            if (!recvType.empty() && recvType == currentTypeName_) {
+                const auto found = memberTypes_.find(ma.nameToken.text);
+                if (found != memberTypes_.end()) return found->second;
+            }
+            return {};
+        }
         default:
             return {};
         }
@@ -1320,6 +1337,14 @@ private:
             for (auto& argument : call.arguments) {
                 rewriteExpression(*argument, moduleName, sourceName, queue);
             }
+            const NativeGenericTemplate* memberDecl = !currentTypeName_.empty()
+                ? resolveMember(
+                      moduleName,
+                      call.identifierToken.text,
+                      currentTypeName_,
+                      call.span(),
+                      sourceName)
+                : nullptr;
             if (call.lessToken) {
                 for (auto& argument : call.typeArguments) {
                     rewriteType(argument, moduleName, sourceName, queue);
@@ -1328,18 +1353,37 @@ private:
                 for (const auto& argument : call.typeArguments) {
                     arguments.push_back(typeText(argument));
                 }
-                call.identifierToken.text = request(
-                    moduleName,
-                    call.identifierToken.text,
-                    std::move(arguments),
-                    true,
-                    call.span(),
-                    sourceName,
-                    queue);
+                if (memberDecl) {
+                    call.identifierToken.text = requestMember(
+                        moduleName,
+                        *memberDecl,
+                        arguments,
+                        call.span(),
+                        sourceName);
+                } else {
+                    call.identifierToken.text = request(
+                        moduleName,
+                        call.identifierToken.text,
+                        std::move(arguments),
+                        true,
+                        call.span(),
+                        sourceName,
+                        queue);
+                }
                 call.lessToken.reset();
                 call.typeArguments.clear();
                 call.typeArgumentCommaTokens.clear();
                 call.greaterToken.reset();
+            } else if (memberDecl) {
+                const auto inferred = inferArguments(*memberDecl, call.arguments);
+                if (inferred) {
+                    call.identifierToken.text = requestMember(
+                        moduleName,
+                        *memberDecl,
+                        *inferred,
+                        call.span(),
+                        sourceName);
+                }
             } else if (const auto* declaration = resolve(
                            moduleName,
                            call.identifierToken.text,
@@ -1643,7 +1687,10 @@ private:
         std::vector<ParsedUnit*>& queue) {
         if (!function.typeParameters.empty()) return;
         const auto previousLocalTypes = localTypes_;
-        localTypes_.clear();
+        localTypes_ = memberTypes_;
+        if (!currentTypeName_.empty()) {
+            localTypes_["this"] = currentTypeName_;
+        }
         rewriteType(function.returnType, moduleName, sourceName, queue);
         for (auto& parameter : function.parameters) {
             rewriteParameter(parameter, moduleName, sourceName, queue);
@@ -1660,9 +1707,20 @@ private:
         const std::string& sourceName,
         std::vector<ParsedUnit*>& queue) {
         if (!declaration.typeParameters.empty()) return;
+        const auto prevTypeName = currentTypeName_;
+        const auto prevMemberTypes = memberTypes_;
+        currentTypeName_ = declaration.identifierToken.text;
+        memberTypes_.clear();
         for (auto& interfaceType : declaration.interfaces) rewriteType(interfaceType, moduleName, sourceName, queue);
         for (auto& field : declaration.fields) {
             rewriteType(field.type, moduleName, sourceName, queue);
+            memberTypes_[field.identifierToken.text] = typeText(field.type);
+        }
+        for (auto& property : declaration.properties) {
+            rewriteType(property.type, moduleName, sourceName, queue);
+            memberTypes_[property.identifierToken.text] = typeText(property.type);
+        }
+        for (auto& field : declaration.fields) {
             if (field.initializer) rewriteExpression(*field.initializer, moduleName, sourceName, queue);
         }
         for (auto& event : declaration.events) rewriteType(event.delegateType, moduleName, sourceName, queue);
@@ -1679,18 +1737,31 @@ private:
             rewriteStatement(sequence.body, moduleName, sourceName, queue);
         }
         for (auto& constructor : declaration.constructors) {
-            for (auto& parameter : constructor.parameters) rewriteParameter(parameter, moduleName, sourceName, queue);
+            const auto prevLocals = localTypes_;
+            localTypes_ = memberTypes_;
+            localTypes_["this"] = currentTypeName_;
+            for (auto& parameter : constructor.parameters) {
+                rewriteParameter(parameter, moduleName, sourceName, queue);
+                localTypes_[parameter.identifierToken.text] = typeText(parameter.type);
+            }
             for (auto& baseArg : constructor.baseArguments) {
                 if (baseArg) rewriteExpression(*baseArg, moduleName, sourceName, queue);
             }
             rewriteStatement(constructor.body, moduleName, sourceName, queue);
+            localTypes_ = prevLocals;
         }
         for (auto& property : declaration.properties) {
-            rewriteType(property.type, moduleName, sourceName, queue);
+            const auto prevLocals = localTypes_;
+            localTypes_ = memberTypes_;
+            localTypes_["this"] = currentTypeName_;
+            localTypes_["value"] = typeText(property.type);
             if (property.getter && property.getter->body) rewriteStatement(*property.getter->body, moduleName, sourceName, queue);
             if (property.setter && property.setter->body) rewriteStatement(*property.setter->body, moduleName, sourceName, queue);
             if (property.initializer) rewriteExpression(*property.initializer, moduleName, sourceName, queue);
+            localTypes_ = prevLocals;
         }
+        currentTypeName_ = prevTypeName;
+        memberTypes_ = prevMemberTypes;
     }
 
     static void detachSyntaxTree(ParsedUnit& unit) {
@@ -1732,6 +1803,8 @@ private:
     NativeGenericRegistry registry_;
     std::set<std::string> specializations_;
     std::set<ParsedUnit*> processed_;
+    std::string currentTypeName_;
+    std::map<std::string, std::string> memberTypes_;
     std::map<std::string, std::string> localTypes_;
     std::vector<PendingNativeGenericMember> pendingMembers_;
     const PartialMethodOriginMap* partialMethodOrigins_ = nullptr;

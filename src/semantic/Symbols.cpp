@@ -1,5 +1,6 @@
 #include "realscript/semantic/Semantic.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <sstream>
@@ -841,6 +842,7 @@ PrimitiveType resolvePrimitiveType(const std::string& name) noexcept {
     if (name == "double") return PrimitiveType::Double;
     if (name == "char") return PrimitiveType::Char;
     if (name == "string") return PrimitiveType::String;
+    if (name == "object") return PrimitiveType::Object;
     if (name == "handle") return PrimitiveType::Handle;
     return PrimitiveType::Error;
 }
@@ -1034,7 +1036,16 @@ TypeSymbol declareTypeShell(
     result.partialType = hasModifier(
         syntaxTree.modifiers, syntax::SyntaxKind::PartialKeyword);
     result.observable = hasAttributeName(
-        syntaxTree.attributes, "Observable");
+        syntaxTree.attributes, "Observable") ||
+        std::any_of(
+            syntaxTree.interfaces.begin(),
+            syntaxTree.interfaces.end(),
+            [](const syntax::TypeSyntax& iface) {
+                return iface.name.text == "INotifyPropertyChanged" ||
+                    iface.name.text == "ObservableObject" ||
+                    iface.name.text == "ViewModelBase" ||
+                    iface.name.text == "BindableBase";
+            });
     result.simState = hasAttributeName(
         syntaxTree.attributes, "SimState");
     result.deterministic = hasAttributeName(

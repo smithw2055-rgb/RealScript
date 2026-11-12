@@ -360,6 +360,12 @@ text::TextSpan SequenceDeclarationSyntax::span() const noexcept {
 }
 
 text::TextSpan ModuleDeclarationSyntax::span() const noexcept {
+    if (closeBraceToken) {
+        return combine(moduleKeyword.span, closeBraceToken->span);
+    }
+    if (openBraceToken) {
+        return combine(moduleKeyword.span, openBraceToken->span);
+    }
     return combine(moduleKeyword.span, semicolonToken.span);
 }
 

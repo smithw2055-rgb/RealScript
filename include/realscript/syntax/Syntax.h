@@ -1112,6 +1112,8 @@ struct ModuleDeclarationSyntax final : SyntaxNode {
     std::vector<SyntaxToken> nameParts;
     std::vector<SyntaxToken> dotTokens;
     SyntaxToken semicolonToken;
+    std::optional<SyntaxToken> openBraceToken;
+    std::optional<SyntaxToken> closeBraceToken;
 
     [[nodiscard]] std::string fullName() const;
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ModuleDeclaration; }

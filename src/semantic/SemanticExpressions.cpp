@@ -16,8 +16,12 @@ bool sameExactType(
     const TypeSymbolMap& visibleTypes) {
     if (expression.type != targetType) return false;
     if (!isExactType(targetType)) return true;
-    return targetTypeName.empty() || expression.typeName.empty() ||
-        expression.typeName == targetTypeName ||
+    if (targetTypeName.empty()) return true;
+    if (expression.typeName.empty()) {
+        return expression.kind() == BoundNodeKind::ConversionExpression ||
+            expression.kind() == BoundNodeKind::ErrorExpression;
+    }
+    return expression.typeName == targetTypeName ||
         (targetType == PrimitiveType::Object &&
          isAssignable(visibleTypes, expression.typeName, targetTypeName));
 }
@@ -3796,6 +3800,21 @@ std::unique_ptr<BoundExpression> Binder::bindCastExpression(
             call->argumentEvaluationOrder = {0};
             return call;
         }
+    }
+    if (expression->type == PrimitiveType::Object &&
+        target == PrimitiveType::Object &&
+        !targetTypeName.empty() &&
+        !sameExactType(*expression, target, targetTypeName, visibleTypes_)) {
+        auto cast = std::make_unique<BoundTypeBinaryExpression>();
+        cast->span = syntaxTree.span();
+        cast->expression = std::move(expression);
+        cast->targetType = target;
+        cast->targetTypeName = targetTypeName;
+        cast->targetTypeId = stableTypeId(targetTypeName);
+        cast->safeCast = true;
+        cast->type = target;
+        cast->typeName = std::move(targetTypeName);
+        return cast;
     }
     if (conversion == ConversionKind::None) {
         diagnostics_.report(
