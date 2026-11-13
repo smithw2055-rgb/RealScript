@@ -782,11 +782,17 @@ bool isAssignable(
     const auto targetTypeId = stableTypeId(targetTypeName);
     auto currentName = sourceTypeName;
     std::unordered_set<SymbolId> visited;
+    std::vector<std::string> ifaceStack;
+    std::unordered_set<SymbolId> visitedIfaces;
     while (!currentName.empty()) {
         const auto found = visibleTypes.find(currentName);
         if (found == visibleTypes.end() ||
             !visited.insert(found->second.id).second) {
-            return false;
+            break;
+        }
+        for (const auto& baseIfaceName : found->second.baseInterfaceNames) {
+            if (baseIfaceName == targetTypeName) return true;
+            ifaceStack.push_back(baseIfaceName);
         }
         for (const auto& interfaceMap :
              found->second.interfaceDispatchMaps) {
@@ -796,6 +802,20 @@ bool isAssignable(
         }
         if (found->second.baseTypeName == targetTypeName) return true;
         currentName = found->second.baseTypeName;
+    }
+    while (!ifaceStack.empty()) {
+        const auto ifaceName = std::move(ifaceStack.back());
+        ifaceStack.pop_back();
+        if (ifaceName == targetTypeName) return true;
+        const auto foundIface = visibleTypes.find(ifaceName);
+        if (foundIface == visibleTypes.end() ||
+            !visitedIfaces.insert(foundIface->second.id).second) {
+            continue;
+        }
+        for (const auto& parentIface : foundIface->second.baseInterfaceNames) {
+            if (parentIface == targetTypeName) return true;
+            ifaceStack.push_back(parentIface);
+        }
     }
     return false;
 }
@@ -1392,11 +1412,13 @@ FunctionSymbol declareConstructorSymbol(
                 "a static constructor must be parameterless",
                 syntaxTree.identifierToken.span);
         }
-        if (syntaxTree.baseKeyword) {
+        if (syntaxTree.baseKeyword || syntaxTree.thisKeyword) {
             diagnostics.report(
                 "RS2497",
                 "a static constructor cannot have a base constructor initializer",
-                syntaxTree.baseKeyword->span);
+                syntaxTree.baseKeyword
+                    ? syntaxTree.baseKeyword->span
+                    : syntaxTree.thisKeyword->span);
         }
     }
     appendImplicitThis(result, owner);

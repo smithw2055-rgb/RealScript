@@ -648,6 +648,7 @@ SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
     visibleTypes_ = input.visibleTypes;
     pendingFunctionBindings_.clear();
     pendingTypes_.clear();
+    ctorThisEdges_.clear();
 
     SemanticModel result;
     result.moduleName = input.moduleName;
@@ -670,6 +671,41 @@ SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
              index < pendingFunctionBindings_.size(); ++index) {
             const auto binding = pendingFunctionBindings_[index];
             result.functions.push_back(bindFunction(binding));
+        }
+        if (!ctorThisEdges_.empty()) {
+            std::vector<SymbolId> ctorIds;
+            ctorIds.reserve(ctorThisEdges_.size());
+            for (const auto& entry : ctorThisEdges_) {
+                ctorIds.push_back(entry.first);
+            }
+            std::sort(ctorIds.begin(), ctorIds.end());
+            std::unordered_map<SymbolId, int> color; // 0=unvisited, 1=visiting, 2=visited
+            for (const auto startId : ctorIds) {
+                if (color[startId] != 0) continue;
+                std::vector<SymbolId> path;
+                SymbolId cur = startId;
+                while (cur != 0) {
+                    const int st = color[cur];
+                    if (st == 2) break;
+                    if (st == 1) {
+                        const auto edgeIt = ctorThisEdges_.find(path.back());
+                        const auto& diagEdge = edgeIt->second;
+                        diagnostics_.report(
+                            "RS2535",
+                            "constructor '" + diagEdge.ctorDisplayName +
+                                "' cannot delegate to itself through a constructor cycle",
+                            diagEdge.span);
+                        break;
+                    }
+                    color[cur] = 1;
+                    path.push_back(cur);
+                    const auto nextIt = ctorThisEdges_.find(cur);
+                    cur = (nextIt != ctorThisEdges_.end()) ? nextIt->second.targetCtor : 0;
+                }
+                for (const auto nodeId : path) {
+                    color[nodeId] = 2;
+                }
+            }
         }
         result.types.insert(
             result.types.end(),
@@ -722,6 +758,15 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     for (const auto& entry : input.sequenceLocalFields) {
         sequenceLocalFields_[entry.first] = entry.second;
     }
+    if (input.constructorSyntax && !input.constructorSyntax->baseArguments.empty()) {
+        std::vector<std::unordered_set<std::string>> parameterScopes;
+        for (const auto& baseArg : input.constructorSyntax->baseArguments) {
+            if (baseArg) {
+                collectLambdaCaptureNames(
+                    *baseArg, false, parameterScopes, capturedVariableNames_);
+            }
+        }
+    }
     if (input.body) {
         std::vector<std::unordered_set<std::string>> parameterScopes;
         collectLambdaCaptureNames(
@@ -748,6 +793,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     nextVariableIndex_ = input.symbol.parameters.size();
     currentStaticMethod_ = input.symbol.staticMethod;
     currentConstructor_ = input.symbol.constructor;
+    bindingConstructorInitializer_ = input.inConstructorInitializer;
     currentOwnerType_.reset();
     if (!input.symbol.ownerTypeName.empty()) {
         const auto found = visibleTypes_.find(input.symbol.ownerTypeName);
@@ -955,7 +1001,9 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                     stmt->expression = std::move(assignment);
                     ctorFieldInitializers.push_back(std::move(stmt));
                 }
-            } else if (const auto* thisVarPtr = lookupVariable("this")) {
+            } else if (!(input.constructorSyntax && input.constructorSyntax->thisKeyword) &&
+                       lookupVariable("this") != nullptr) {
+                const auto* thisVarPtr = lookupVariable("this");
                 const VariableSymbol thisVar = *thisVarPtr;
                 for (const auto& field : currentOwnerType_->fields) {
                     if ((initializer && field.declaringTypeId != currentOwnerType_->id) ||
@@ -1043,14 +1091,8 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
             std::make_move_iterator(parameterStores.end()));
     }
     if (!capturedParameterInitializers.empty()) {
-        auto insertion = result.body->statements.begin();
-        if (input.constructorSyntax &&
-            input.constructorSyntax->baseKeyword &&
-            insertion != result.body->statements.end()) {
-            ++insertion;
-        }
         result.body->statements.insert(
-            insertion,
+            result.body->statements.begin(),
             std::make_move_iterator(
                 capturedParameterInitializers.begin()),
             std::make_move_iterator(
@@ -4171,17 +4213,21 @@ Binder::bindEventSubscriptionStatement(
                     (currentOwnerType_ &&
                      hasFieldOrProperty(
                          *currentOwnerType_, name.identifierToken.text))) {
+                    const auto savedDiag = diagnostics_.items().size();
                     const auto savedOcc = occurrences_.size();
                     probeReceiver = bindExpression(*syntaxTree.receiver);
                     occurrences_.resize(savedOcc);
+                    diagnostics_.truncate(savedDiag);
                 }
             } else if (syntaxTree.receiver->kind() ==
                            syntax::SyntaxKind::MemberAccessExpression ||
                        syntaxTree.receiver->kind() ==
                            syntax::SyntaxKind::ElementAccessExpression) {
+                const auto savedDiag = diagnostics_.items().size();
                 const auto savedOcc = occurrences_.size();
                 probeReceiver = bindExpression(*syntaxTree.receiver);
                 occurrences_.resize(savedOcc);
+                diagnostics_.truncate(savedDiag);
             }
             if (probeReceiver &&
                 (probeReceiver->type == PrimitiveType::Object ||

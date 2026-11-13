@@ -1,3 +1,4 @@
+#include "realscript/aot_cpp/AotCpp.h"
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
 #include "realscript/hot_reload/HotReload.h"
@@ -887,6 +888,298 @@ int main()
     }
 }
 
+
+void testWpfCSharpErgonomicsAndAotCodegen() {
+    realscript::compiler::Compilation compilation({{
+        "phase20-wpf-ergonomics.rs",
+        R"RS(
+module Phase20.WpfErgonomics;
+
+delegate void RoutedHandler(object sender, int code);
+delegate int IntOp(int x);
+delegate int StrOp(string s);
+
+class ButtonBox
+{
+    public event RoutedHandler Click;
+    public void Raise(int code) => Click(this, code);
+}
+
+class PanelBox
+{
+    public ButtonBox ActionButton = new ButtonBox();
+    int _count = 2;
+    public int Count
+    {
+        get => _count;
+        set => _count = value;
+    }
+}
+
+class ViewHost
+{
+    public PanelBox Panel = new PanelBox();
+    int _baseValue = 100;
+    public int CtorChainCalls = 0;
+    public int EventTotal = 0;
+
+    public ViewHost(int seed, int bonus)
+    {
+        _baseValue += seed + bonus;
+        CtorChainCalls += 1;
+    }
+
+    public ViewHost(int seed) : this(seed, 5)
+    {
+        CtorChainCalls += 10;
+    }
+
+    public ViewHost() : this(7) => CtorChainCalls += 100;
+
+    public int Computed => _baseValue + Panel.Count;
+    public void AddEventTotal(int v) => EventTotal += v;
+
+    public int PickOverload(IntOp op) => op(9);
+    public int PickOverload(StrOp op) => op("hello");
+
+    public void WireEvents()
+    {
+        this.Panel.ActionButton.Click += (object sender, int code) =>
+        {
+            if (sender != null)
+            {
+                AddEventTotal(code);
+            }
+        };
+        this.Panel.ActionButton.Click += (_, _) => AddEventTotal(3);
+        Panel.ActionButton.Click += (object _, int _) => AddEventTotal(4);
+    }
+}
+
+int main()
+{
+    ViewHost host = new ViewHost();
+    host.Panel.Count += 8;
+    host.WireEvents();
+    host.Panel.ActionButton.Raise(20);
+
+    int o1 = host.PickOverload((int x) => x * 2);
+    int o2 = host.PickOverload((string s) => s.Length);
+
+    string p1 = $@"C:\UI\""{host.Panel.Count}""";
+    string p2 = @$"[{o2}:{@"ok"}]";
+    int lenScore = p1.Length + p2.Length; // C:\UI\"10" (10 chars) + [5:ok] (6 chars) = 16
+
+    return host.Computed + host.CtorChainCalls + host.EventTotal + o1 + o2 + lenScore;
+}
+)RS"}});
+    const auto build = compilation.build();
+    require(!build.diagnostics.hasErrors(),
+        "WPF C# ergonomics compilation failed:\n" +
+            diagnosticsText(build.diagnostics));
+
+    realscript::diagnostics::DiagnosticBag aotDiagnostics;
+    const auto generated = realscript::aot::CppGenerator{}.generate(
+        build.modules, aotDiagnostics);
+    require(!aotDiagnostics.hasErrors() && !generated.source.empty(),
+        "WPF C# ergonomics AOT C++17 generation failed:\n" +
+            diagnosticsText(aotDiagnostics));
+
+    realscript::bytecode::Lowerer lowerer;
+    auto module = lowerer.lower(build.modules.front());
+    const auto encoded = realscript::bytecode::encodeModule(module);
+    realscript::bytecode::Module decoded;
+    realscript::diagnostics::DiagnosticBag decodeDiag;
+    require(realscript::bytecode::decodeModule(encoded, decoded, decodeDiag),
+        "WPF C# ergonomics .rsbc decode failed");
+
+    realscript::runtime::Interpreter interpreter({std::move(decoded)});
+    const auto result = interpreter.invoke("Phase20.WpfErgonomics::main");
+    require(result.succeeded &&
+            std::holds_alternative<std::int64_t>(result.value) &&
+            std::get<std::int64_t>(result.value) == 299,
+        "WPF C# ergonomics execution mismatch: got " +
+            (std::holds_alternative<std::int64_t>(result.value)
+                ? std::to_string(std::get<std::int64_t>(result.value))
+                : result.error.message));
+
+    realscript::compiler::Compilation badLambdaComp({{
+        "phase20-wpf-bad-lambda-type.rs",
+        R"RS(
+module Phase20.WpfErgonomics.Bad;
+delegate int IntOp(int x);
+int Apply(IntOp op) => op(1);
+int main() => Apply((string wrong) => 0);
+)RS"}});
+    require(badLambdaComp.build().diagnostics.hasErrors(),
+        "mismatched explicit lambda parameter type should report diagnostic");
+}
+
+bool hasDiagCode(
+    const realscript::diagnostics::DiagnosticBag& diagnostics,
+    const std::string& code) {
+    for (const auto& d : diagnostics.items()) {
+        if (d.code == code) return true;
+    }
+    return false;
+}
+
+void testInterfaceInheritanceAndConstructorInitializerReviewFixes() {
+    // 1. Interface inheritance + constructor initializer captures / defaults / params / struct : this() / static lambda
+    realscript::compiler::Compilation goodComp({{
+        "phase20-iface-ctor-init.rs",
+        R"RS(
+module Phase20.IfaceCtorFixes;
+interface IBase {
+    int BaseVal();
+}
+interface IDerived : IBase {
+    int DerivedVal();
+}
+class Widget : IDerived {
+    int b;
+    int d;
+    Widget(int bv, int dv) {
+        b = bv;
+        d = dv;
+    }
+    public int BaseVal() => b;
+    public int DerivedVal() => d;
+}
+
+delegate int IntTransform(int v);
+class BaseObj {
+    public int total;
+    BaseObj(int seed = 10, params int[] extra) {
+        int s = seed;
+        int i = 0;
+        while (i < extra.length) {
+            s = s + extra[i];
+            i = i + 1;
+        }
+        total = s;
+    }
+}
+class DerivedObj : BaseObj {
+    public int value;
+    static int StaticHelper() => 7;
+    DerivedObj(IntTransform fn) : base(5, 2, 3) {
+        value = fn(total);
+    }
+    DerivedObj(int capturedParam)
+        : this((int p) => p + capturedParam + StaticHelper()) {
+        value = value + 100;
+    }
+}
+
+struct PointStruct {
+    public int v;
+    PointStruct(int x) : this() {
+        v = x + 1;
+    }
+}
+
+int main() {
+    IDerived derived = new Widget(11, 22);
+    IBase asBase = derived;
+    int ifaceScore = derived.BaseVal() + derived.DerivedVal() + asBase.BaseVal(); // 11 + 22 + 11 = 44
+
+    DerivedObj obj = new DerivedObj(30); // base(5,2,3)=>total=10, fn(10)=10+30+7=47, +100 => 147
+    PointStruct pt = new PointStruct(8); // 9
+    return ifaceScore + obj.value + pt.v; // 44 + 147 + 9 = 200
+}
+)RS"}});
+    const auto build = goodComp.build();
+    require(!build.diagnostics.hasErrors(),
+        "interface inheritance & ctor initializer fixes failed to compile:\n" +
+            diagnosticsText(build.diagnostics));
+    realscript::bytecode::Lowerer lowerer;
+    auto lowered = lowerer.lower(build.modules.front());
+    realscript::runtime::Interpreter interp({std::move(lowered)});
+    const auto res = interp.invoke("Phase20.IfaceCtorFixes::main");
+    require(res.succeeded && std::holds_alternative<std::int64_t>(res.value) &&
+            std::get<std::int64_t>(res.value) == 200,
+        "interface inheritance & ctor initializer runtime mismatch");
+
+    // 2. Interface inheritance cycle -> RS2476
+    realscript::compiler::Compilation cycleIface({{
+        "phase20-iface-cycle.rs",
+        R"RS(
+module Phase20.IfaceCycle;
+interface IA : IB { int A(); }
+interface IB : IA { int B(); }
+int main() => 0;
+)RS"}});
+    const auto cycleIfaceBuild = cycleIface.build();
+    require(cycleIfaceBuild.diagnostics.hasErrors() &&
+            hasDiagCode(cycleIfaceBuild.diagnostics, "RS2476"),
+        "expected RS2476 on interface inheritance cycle");
+
+    // 3. Direct & mutual : this(...) cycles -> RS2535
+    realscript::compiler::Compilation directCycle({{
+        "phase20-ctor-direct-cycle.rs",
+        R"RS(
+module Phase20.CtorDirectCycle;
+class C {
+    C(int x) : this(x) {}
+}
+int main() => 0;
+)RS"}});
+    const auto directBuild = directCycle.build();
+    require(directBuild.diagnostics.hasErrors() &&
+            hasDiagCode(directBuild.diagnostics, "RS2535"),
+        "expected RS2535 on direct : this(...) cycle");
+
+    realscript::compiler::Compilation mutualCycle({{
+        "phase20-ctor-mutual-cycle.rs",
+        R"RS(
+module Phase20.CtorMutualCycle;
+class C {
+    C() : this(1) {}
+    C(int x) : this() {}
+}
+int main() => 0;
+)RS"}});
+    const auto mutualBuild = mutualCycle.build();
+    require(mutualBuild.diagnostics.hasErrors() &&
+            hasDiagCode(mutualBuild.diagnostics, "RS2535"),
+        "expected RS2535 on mutual : this(...) cycle");
+
+    // 4. Instance / this access before constructor initializer completes -> RS2536
+    realscript::compiler::Compilation badThisArg({{
+        "phase20-ctor-this-arg.rs",
+        R"RS(
+module Phase20.CtorThisArg;
+class C {
+    int x = 1;
+    C(int a) {}
+    C() : this(this.x) {}
+}
+int main() => 0;
+)RS"}});
+    const auto badThisBuild = badThisArg.build();
+    require(badThisBuild.diagnostics.hasErrors() &&
+            hasDiagCode(badThisBuild.diagnostics, "RS2536"),
+        "expected RS2536 on : this(this.x)");
+
+    realscript::compiler::Compilation badThisLambda({{
+        "phase20-ctor-this-lambda.rs",
+        R"RS(
+module Phase20.CtorThisLambda;
+delegate int Fn();
+class C {
+    int x = 1;
+    C(Fn f) {}
+    C() : this(() => this.x) {}
+}
+int main() => 0;
+)RS"}});
+    const auto badLambdaThisBuild = badThisLambda.build();
+    require(badLambdaThisBuild.diagnostics.hasErrors() &&
+            hasDiagCode(badLambdaThisBuild.diagnostics, "RS2536"),
+        "expected RS2536 on : this(() => this.x)");
+}
+
 } // namespace
 
 int main() {
@@ -905,6 +1198,8 @@ int main() {
         testDelegateHeapSnapshotRestore();
         testOverloadedDelegateAndMixedCallsAndGenericBindingResolve();
         testReviewFixesClosureUnwrapCapturesAndOverloadProbes();
+        testWpfCSharpErgonomicsAndAotCodegen();
+        testInterfaceInheritanceAndConstructorInitializerReviewFixes();
         std::cout << "Phase 20 delegate tests passed\n";
         return 0;
     } catch (const std::exception& error) {

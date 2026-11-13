@@ -89,6 +89,7 @@ bool sameTypeContract(
         left.sealedType != right.sealedType ||
         left.baseTypeId != right.baseTypeId ||
         left.baseTypeName != right.baseTypeName ||
+        left.baseInterfaceNames != right.baseInterfaceNames ||
         left.moduleName != right.moduleName || left.name != right.name ||
         left.virtualDispatchTable != right.virtualDispatchTable ||
         left.interfaceDispatchMaps != right.interfaceDispatchMaps ||

@@ -61,6 +61,36 @@ std::vector<const FunctionSymbol*> findMethods(
     return result;
 }
 
+std::vector<const FunctionSymbol*> collectInterfaceAndBaseMethods(
+    const TypeSymbol& type,
+    const std::string& name,
+    bool staticMethod,
+    const TypeSymbolMap& visibleTypes) {
+    auto result = findMethods(type, name, staticMethod);
+    if (!type.interfaceType || staticMethod) return result;
+    std::unordered_set<SymbolId> visited;
+    visited.insert(type.id);
+    std::vector<std::string> queue = type.baseInterfaceNames;
+    while (!queue.empty()) {
+        const auto baseName = std::move(queue.back());
+        queue.pop_back();
+        const auto found = visibleTypes.find(baseName);
+        if (found == visibleTypes.end() ||
+            !visited.insert(found->second.id).second) {
+            continue;
+        }
+        for (const auto& method : found->second.methods) {
+            if (method.name == name && !method.staticMethod) {
+                result.push_back(&method);
+            }
+        }
+        for (const auto& nextBase : found->second.baseInterfaceNames) {
+            queue.push_back(nextBase);
+        }
+    }
+    return result;
+}
+
 PrimitiveType commonNumericType(PrimitiveType left, PrimitiveType right) noexcept {
     if (!isNumericType(left) || !isNumericType(right)) return PrimitiveType::Error;
     if (left == PrimitiveType::Double || right == PrimitiveType::Double) return PrimitiveType::Double;
@@ -213,10 +243,14 @@ const TypeSymbol* unwrapEnclosingOwner(
     const TypeSymbol* cur = owner;
     for (int depth = 0; depth < 16 && cur && cur->synthetic; ++depth) {
         const FieldSymbol* capturedThis = findField(*cur, "this");
-        if (!capturedThis || capturedThis->typeName.empty()) {
+        const std::string outerName =
+            (capturedThis && !capturedThis->typeName.empty())
+                ? capturedThis->typeName
+                : cur->enclosingOwnerTypeName;
+        if (outerName.empty()) {
             break;
         }
-        const auto outerIt = visibleTypes.find(capturedThis->typeName);
+        const auto outerIt = visibleTypes.find(outerName);
         if (outerIt == visibleTypes.end()) {
             break;
         }
@@ -278,6 +312,34 @@ bool hasAncestorMemberOrCapture(
         if (outerIt == visibleTypes.end()) {
             break;
         }
+        cur = &outerIt->second;
+    }
+    return false;
+}
+
+bool hasInstanceMemberOrThis(
+    const TypeSymbol& startOwner,
+    const std::string& name,
+    const TypeSymbolMap& visibleTypes) noexcept {
+    if (name == "this" || name == "base") return true;
+    const TypeSymbol* cur = &startOwner;
+    for (int depth = 0; depth < 16 && cur; ++depth) {
+        if (const auto* f = findField(*cur, name);
+            f && !f->staticField && !f->constField) {
+            return true;
+        }
+        if (const auto* p = findProperty(*cur, name);
+            p && !p->staticProperty) {
+            return true;
+        }
+        if (!findMethods(*cur, name, false).empty()) {
+            return true;
+        }
+        if (!cur->synthetic) break;
+        const FieldSymbol* capturedThis = findField(*cur, "this");
+        if (!capturedThis || capturedThis->typeName.empty()) break;
+        const auto outerIt = visibleTypes.find(capturedThis->typeName);
+        if (outerIt == visibleTypes.end()) break;
         cur = &outerIt->second;
     }
     return false;
@@ -903,6 +965,10 @@ void collectLambdaNames(
         names.push_back(static_cast<const
             syntax::ThisExpressionSyntax&>(expression).thisKeyword);
         return;
+    case syntax::SyntaxKind::BaseExpression:
+        names.push_back(static_cast<const
+            syntax::BaseExpressionSyntax&>(expression).baseKeyword);
+        return;
     case syntax::SyntaxKind::ConditionalExpression: {
         const auto& cond = static_cast<const
             syntax::ConditionalExpressionSyntax&>(expression);
@@ -937,7 +1003,6 @@ void collectLambdaNames(
         return;
     }
     case syntax::SyntaxKind::LiteralExpression:
-    case syntax::SyntaxKind::BaseExpression:
         return;
     default:
         return;
@@ -1225,9 +1290,37 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
                 lambda.span());
             return makeError(lambda.span());
         }
+        for (std::size_t index = 0; index < lambda.parameterTypes.size() &&
+             index < lambda.parameterTokens.size(); ++index) {
+            if (!lambda.parameterTypes[index].has_value()) continue;
+            std::string resolvedTypeName;
+            const PrimitiveType resolvedType = bindType(
+                *lambda.parameterTypes[index], false, &resolvedTypeName);
+            const auto& expectedParam = invoke->parameters[index + invokeOffset];
+            if (resolvedType == PrimitiveType::Error ||
+                resolvedType != expectedParam.type ||
+                (isExactType(expectedParam.type) &&
+                 resolvedTypeName != expectedParam.typeName)) {
+                diagnostics_.report(
+                    "RS8804",
+                    "lambda parameter '" + lambda.parameterTokens[index].text +
+                        "' type does not match delegate '" +
+                        canonicalTypeName(delegateType) + "'",
+                    lambda.parameterTypes[index]->span());
+                return makeError(lambda.span());
+            }
+        }
+        std::size_t underscoreCount = 0;
+        for (const auto& parameter : lambda.parameterTokens) {
+            if (parameter.text == "_") ++underscoreCount;
+        }
         const auto lambdaOrdinal = nextLambdaOrdinal_++;
         std::unordered_set<std::string> lambdaParameters;
         for (const auto& parameter : lambda.parameterTokens) {
+            if (underscoreCount > 1 && parameter.text == "_") {
+                lambdaParameters.insert("_");
+                continue;
+            }
             if (!lambdaParameters.insert(parameter.text).second) {
                 diagnostics_.report(
                     "RS8804", "duplicate lambda parameter '" +
@@ -1256,6 +1349,15 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
             }
             if (currentOwnerType_ && !currentStaticMethod_ &&
                 hasAncestorMemberOrCapture(*currentOwnerType_, name.text, visibleTypes_)) {
+                if (bindingConstructorInitializer_ &&
+                    hasInstanceMemberOrThis(*currentOwnerType_, name.text, visibleTypes_)) {
+                    diagnostics_.report(
+                        "RS2536",
+                        "cannot access 'this' or non-static member '" + name.text +
+                            "' in constructor initializer",
+                        name.span);
+                    return makeError(syntaxTree.span());
+                }
                 const auto* self = lookupVariable("this");
                 if (self && capturedIds.insert(self->id).second) {
                     captured.push_back(*self);
@@ -1279,6 +1381,9 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
         closure.synthetic = true;
         closure.sealedType = true;
         closure.moduleName = currentModuleName_;
+        if (currentOwnerType_) {
+            closure.enclosingOwnerTypeName = canonicalTypeName(*currentOwnerType_);
+        }
         closure.name = "$closure_" +
             std::to_string(currentFunctionId_) + "_" +
             std::to_string(lambdaOrdinal);
@@ -1330,7 +1435,10 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
         for (std::size_t index = 0;
              index < lambda.parameterTokens.size(); ++index) {
             auto parameter = invoke->parameters[index + invokeOffset];
-            parameter.name = lambda.parameterTokens[index].text;
+            parameter.name = (underscoreCount > 1 &&
+                              lambda.parameterTokens[index].text == "_")
+                ? ("$discard_" + std::to_string(index))
+                : lambda.parameterTokens[index].text;
             parameter.parameter = true;
             parameter.index = lambdaFunction.parameters.size();
             parameter.declarationSpan =
@@ -1350,10 +1458,16 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
         binding.symbol = lambdaFunction;
         binding.sourceName = currentSourceName_;
         binding.eventLambda = &lambda;
+        binding.inConstructorInitializer = bindingConstructorInitializer_;
         binding.parameterNames.push_back("this");
         binding.parameterSpans.push_back(lambda.arrowToken.span);
-        for (const auto& parameter : lambda.parameterTokens) {
-            binding.parameterNames.push_back(parameter.text);
+        for (std::size_t index = 0;
+             index < lambda.parameterTokens.size(); ++index) {
+            const auto& parameter = lambda.parameterTokens[index];
+            binding.parameterNames.push_back(
+                (underscoreCount > 1 && parameter.text == "_")
+                    ? ("$discard_" + std::to_string(index))
+                    : parameter.text);
             binding.parameterSpans.push_back(parameter.span);
         }
         pendingFunctionBindings_.push_back(std::move(binding));
@@ -1421,13 +1535,16 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
                 if (currentOwnerType_->synthetic) {
                     const TypeSymbol* enclosingOwner = unwrapEnclosingOwner(&*currentOwnerType_, visibleTypes_);
                     if (enclosingOwner && enclosingOwner != &*currentOwnerType_) {
-                        for (const auto* method : findMethods(
-                                 *enclosingOwner, methodName, false)) {
-                            if (isMemberAccessible(
-                                    method->accessibility,
-                                    method->declaringTypeId,
-                                    method->moduleName)) {
-                                candidates.push_back(method);
+                        if (findField(*currentOwnerType_, "this") != nullptr ||
+                            bindingConstructorInitializer_) {
+                            for (const auto* method : findMethods(
+                                     *enclosingOwner, methodName, false)) {
+                                if (isMemberAccessible(
+                                        method->accessibility,
+                                        method->declaringTypeId,
+                                        method->moduleName)) {
+                                    candidates.push_back(method);
+                                }
                             }
                         }
                         for (const auto* method : findMethods(
@@ -1479,8 +1596,8 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
             }
             methodOwner = found->second;
         }
-        for (const auto* method : findMethods(
-                 methodOwner, methodName, staticMemberGroup)) {
+        for (const auto* method : collectInterfaceAndBaseMethods(
+                 methodOwner, methodName, staticMemberGroup, visibleTypes_)) {
             if (isMemberAccessible(
                     method->accessibility,
                     method->declaringTypeId,
@@ -1520,6 +1637,14 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
     }
     if (selected->staticMethod || !selected->method) receiver.reset();
     if (selected->method && !selected->staticMethod && !receiver) {
+        if (bindingConstructorInitializer_) {
+            diagnostics_.report(
+                "RS2536",
+                "cannot reference instance method '" + selected->name +
+                    "' in constructor initializer",
+                syntaxTree.span());
+            return makeError(syntaxTree.span());
+        }
         const auto* self = lookupVariable("this");
         if (!self) {
             diagnostics_.report(
@@ -1604,9 +1729,15 @@ std::optional<FunctionSymbol> findStaticConstructorForFunction(
 std::unique_ptr<BoundStatement> Binder::bindBaseConstructorInitializer(
     const FunctionBindingInput& input) {
     if ((!input.constructorSyntax && !input.symbol.constructor) ||
-        input.symbol.staticMethod || !currentOwnerType_ ||
-        currentOwnerType_->kind != TypeKind::Class ||
-        currentOwnerType_->baseTypeId == 0) {
+        input.symbol.staticMethod || !currentOwnerType_) {
+        return nullptr;
+    }
+
+    const bool isThisInit =
+        input.constructorSyntax && input.constructorSyntax->thisKeyword.has_value();
+    if (!isThisInit &&
+        (currentOwnerType_->kind != TypeKind::Class ||
+         currentOwnerType_->baseTypeId == 0)) {
         return nullptr;
     }
 
@@ -1616,6 +1747,200 @@ std::unique_ptr<BoundStatement> Binder::bindBaseConstructorInitializer(
     const auto callSpan = input.constructorSyntax
         ? input.constructorSyntax->span()
         : input.symbol.declarationSpan;
+
+    const auto bindInitArgsWithCandidates =
+        [&](const std::vector<const FunctionSymbol*>& candidates,
+            const std::vector<std::unique_ptr<syntax::ExpressionSyntax>>& syntaxArgs,
+            const std::string& argContext) {
+            const bool prevCtorInit = bindingConstructorInitializer_;
+            bindingConstructorInitializer_ = true;
+            std::vector<std::unique_ptr<BoundExpression>> outArgs;
+            outArgs.reserve(syntaxArgs.size());
+            for (std::size_t index = 0; index < syntaxArgs.size(); ++index) {
+                const auto& argSyntax = *syntaxArgs[index];
+                std::vector<std::pair<PrimitiveType, std::string>> delegateTargets;
+                std::size_t nonDelegateCandidates = 0u;
+                for (const auto* cand : candidates) {
+                    if (!cand) continue;
+                    const auto off = visibleParameterOffset(*cand);
+                    if (cand->parameters.size() != syntaxArgs.size() + off) continue;
+                    const auto& param = cand->parameters[index + off];
+                    const auto tt = visibleTypes_.find(param.typeName);
+                    if (param.type == PrimitiveType::Object &&
+                        tt != visibleTypes_.end() && tt->second.delegateType) {
+                        bool dup = false;
+                        for (const auto& existing : delegateTargets) {
+                            if (existing.second == param.typeName) { dup = true; break; }
+                        }
+                        if (!dup) delegateTargets.emplace_back(param.type, param.typeName);
+                    } else {
+                        ++nonDelegateCandidates;
+                    }
+                }
+                if (delegateTargets.size() == 1u && nonDelegateCandidates == 0u) {
+                    outArgs.push_back(bindTargetExpression(
+                        argSyntax, delegateTargets[0].first, delegateTargets[0].second, argContext));
+                } else if (!delegateTargets.empty() &&
+                           (argSyntax.kind() == syntax::SyntaxKind::NameExpression ||
+                            argSyntax.kind() == syntax::SyntaxKind::MemberAccessExpression ||
+                            argSyntax.kind() == syntax::SyntaxKind::LambdaExpression ||
+                            argSyntax.kind() == syntax::SyntaxKind::ParenthesizedExpression)) {
+                    std::unique_ptr<BoundExpression> matched;
+                    for (const auto& dt : delegateTargets) {
+                        const std::size_t savedDiag = diagnostics_.items().size();
+                        const std::size_t savedOcc = occurrences_.size();
+                        const std::size_t savedLambdaOrd = nextLambdaOrdinal_;
+                        const std::size_t savedPendingFuncs = pendingFunctionBindings_.size();
+                        const std::size_t savedPendingTypes = pendingTypes_.size();
+                        auto attempt = bindTargetExpression(argSyntax, dt.first, dt.second, argContext);
+                        bool ok = (diagnostics_.items().size() == savedDiag &&
+                                   attempt && attempt->type != PrimitiveType::Error);
+                        if (ok && pendingFunctionBindings_.size() > savedPendingFuncs &&
+                            delegateTargets.size() > 1u) {
+                            const auto lb = pendingFunctionBindings_.back();
+                            ok = probeOverloadLambdaBody(lb);
+                        }
+                        if (ok) {
+                            matched = std::move(attempt);
+                            break;
+                        }
+                        diagnostics_.truncate(savedDiag);
+                        if (savedOcc < occurrences_.size()) occurrences_.resize(savedOcc);
+                        nextLambdaOrdinal_ = savedLambdaOrd;
+                        while (pendingTypes_.size() > savedPendingTypes) {
+                            visibleTypes_.erase(pendingTypes_.back().name);
+                            visibleTypes_.erase(canonicalTypeName(pendingTypes_.back()));
+                            pendingTypes_.pop_back();
+                        }
+                        if (savedPendingFuncs < pendingFunctionBindings_.size()) {
+                            pendingFunctionBindings_.resize(savedPendingFuncs);
+                        }
+                    }
+                    outArgs.push_back(matched ? std::move(matched) : bindExpression(argSyntax));
+                } else {
+                    outArgs.push_back(bindExpression(argSyntax));
+                }
+            }
+            bindingConstructorInitializer_ = prevCtorInit;
+            return outArgs;
+        };
+
+    if (isThisInit) {
+        std::vector<const FunctionSymbol*> constructors;
+        for (const auto& constructor : currentOwnerType_->constructors) {
+            if (!constructor.staticMethod &&
+                isMemberAccessible(
+                    constructor.accessibility,
+                    constructor.declaringTypeId,
+                    constructor.moduleName)) {
+                constructors.push_back(&constructor);
+            }
+        }
+        auto arguments = bindInitArgsWithCandidates(
+            constructors,
+            input.constructorSyntax->baseArguments,
+            "constructor initializer argument");
+
+        bool ambiguous = false;
+        const auto plan = selectFlexibleCall(
+            constructors, arguments, nullptr, nullptr, visibleTypes_, ambiguous);
+        const auto* selected = plan.function;
+
+        if (!selected &&
+            currentOwnerType_->kind == TypeKind::Struct &&
+            arguments.empty()) {
+            const auto* thisVariable = lookupVariable("this");
+            if (!thisVariable) return nullptr;
+            auto newStruct = std::make_unique<BoundNewStructExpression>();
+            newStruct->span = callSpan;
+            newStruct->type = PrimitiveType::Struct;
+            newStruct->typeName = canonicalTypeName(*currentOwnerType_);
+            newStruct->structType = *currentOwnerType_;
+            for (const auto& field : currentOwnerType_->fields) {
+                if (field.staticField || field.constField ||
+                    field.hasConstantValue || !field.initializerSyntax) {
+                    continue;
+                }
+                auto initExpr = bindStaticFieldInitializer(*currentOwnerType_, field);
+                if (!initExpr) continue;
+                BoundNewObjectExpression::Initializer defaultInit;
+                defaultInit.kind = BoundNewObjectExpression::Initializer::Kind::Field;
+                defaultInit.field = field;
+                defaultInit.arguments.push_back(std::move(initExpr));
+                newStruct->defaultFieldInitializers.push_back(std::move(defaultInit));
+            }
+            auto assign = std::make_unique<BoundAssignmentExpression>();
+            assign->span = callSpan;
+            assign->type = thisVariable->type;
+            assign->typeName = thisVariable->typeName;
+            assign->variable = *thisVariable;
+            assign->expression = std::move(newStruct);
+            auto statement = std::make_unique<BoundExpressionStatement>();
+            statement->span = callSpan;
+            statement->expression = std::move(assign);
+            return statement;
+        }
+
+        if (!selected) {
+            diagnostics_.report(
+                "RS2532",
+                "no applicable constructor overload for ': this(...)' on type '" +
+                    canonicalTypeName(*currentOwnerType_) + "'",
+                callSpan);
+            return nullptr;
+        }
+        if (ambiguous) {
+            diagnostics_.report(
+                "RS2533",
+                "constructor initializer ': this(...)' is ambiguous for type '" +
+                    canonicalTypeName(*currentOwnerType_) + "'",
+                callSpan);
+            return nullptr;
+        }
+        if (selected->id == input.symbol.id) {
+            diagnostics_.report(
+                "RS2535",
+                "constructor '" + canonicalTypeName(*currentOwnerType_) +
+                    "' cannot call itself via ': this(...)'",
+                input.constructorSyntax->thisKeyword->span);
+            return nullptr;
+        }
+        ctorThisEdges_[input.symbol.id] = CtorDelegationEdge{
+            selected->id,
+            input.constructorSyntax->thisKeyword->span,
+            canonicalTypeName(*currentOwnerType_)};
+        const auto* thisVariable = lookupVariable("this");
+        if (!thisVariable) return nullptr;
+        const std::vector<std::optional<syntax::SyntaxToken>> noModifiers;
+        auto prepared = prepareCallArguments(
+            *selected, plan.sources, std::move(arguments),
+            input.constructorSyntax->baseArguments, noModifiers,
+            callSpan, "constructor initializer argument");
+        auto call = bindSelectedCall(
+            *selected,
+            std::move(prepared.arguments),
+            prepared.syntaxArguments,
+            prepared.modifiers,
+            std::move(prepared.evaluationOrder),
+            variableExpression(*thisVariable, diagSpan),
+            callSpan,
+            "constructor initializer argument",
+            true);
+        auto statement = std::make_unique<BoundExpressionStatement>();
+        statement->span = callSpan;
+        if (currentOwnerType_->kind == TypeKind::Struct) {
+            auto assign = std::make_unique<BoundAssignmentExpression>();
+            assign->span = callSpan;
+            assign->type = thisVariable->type;
+            assign->typeName = thisVariable->typeName;
+            assign->variable = *thisVariable;
+            assign->expression = std::move(call);
+            statement->expression = std::move(assign);
+        } else {
+            statement->expression = std::move(call);
+        }
+        return statement;
+    }
 
     const auto* baseType = findVisibleType(currentOwnerType_->baseTypeId);
     if (!baseType) {
@@ -1627,13 +1952,24 @@ std::unique_ptr<BoundStatement> Binder::bindBaseConstructorInitializer(
         return nullptr;
     }
 
-    std::vector<std::unique_ptr<BoundExpression>> arguments;
-    if (input.constructorSyntax) {
-        arguments.reserve(input.constructorSyntax->baseArguments.size());
-        for (const auto& argument : input.constructorSyntax->baseArguments) {
-            arguments.push_back(bindExpression(*argument));
+    std::vector<const FunctionSymbol*> constructors;
+    constructors.reserve(baseType->constructors.size());
+    for (const auto& constructor : baseType->constructors) {
+        if (!constructor.staticMethod &&
+            isMemberAccessible(
+                constructor.accessibility,
+                constructor.declaringTypeId,
+                constructor.moduleName)) {
+            constructors.push_back(&constructor);
         }
     }
+
+    const std::vector<std::unique_ptr<syntax::ExpressionSyntax>> emptySyntaxArgs;
+    const auto& syntaxArgs = input.constructorSyntax
+        ? input.constructorSyntax->baseArguments
+        : emptySyntaxArgs;
+    auto arguments = bindInitArgsWithCandidates(
+        constructors, syntaxArgs, "base constructor argument");
 
     if (baseType->constructors.empty()) {
         if (!arguments.empty()) {
@@ -1646,19 +1982,10 @@ std::unique_ptr<BoundStatement> Binder::bindBaseConstructorInitializer(
         return nullptr;
     }
 
-    std::vector<const FunctionSymbol*> constructors;
-    constructors.reserve(baseType->constructors.size());
-    for (const auto& constructor : baseType->constructors) {
-        if (isMemberAccessible(
-                constructor.accessibility,
-                constructor.declaringTypeId,
-                constructor.moduleName)) {
-            constructors.push_back(&constructor);
-        }
-    }
     bool ambiguous = false;
-    const auto* selected = selectBest(
-        constructors, arguments, nullptr, visibleTypes_, ambiguous);
+    const auto plan = selectFlexibleCall(
+        constructors, arguments, nullptr, nullptr, visibleTypes_, ambiguous);
+    const auto* selected = plan.function;
     if (!selected) {
         diagnostics_.report(
             "RS2532",
@@ -1678,16 +2005,16 @@ std::unique_ptr<BoundStatement> Binder::bindBaseConstructorInitializer(
 
     const auto* thisVariable = lookupVariable("this");
     if (!thisVariable) return nullptr;
-    std::vector<std::optional<syntax::SyntaxToken>> modifiers;
-    const std::vector<const syntax::ExpressionSyntax*> emptySyntaxArgs;
+    const std::vector<std::optional<syntax::SyntaxToken>> noModifiers;
+    auto prepared = prepareCallArguments(
+        *selected, plan.sources, std::move(arguments),
+        syntaxArgs, noModifiers, callSpan, "base constructor argument");
     auto call = bindSelectedCall(
         *selected,
-        std::move(arguments),
-        input.constructorSyntax
-            ? syntaxPointers(input.constructorSyntax->baseArguments)
-            : emptySyntaxArgs,
-        modifiers,
-        {},
+        std::move(prepared.arguments),
+        prepared.syntaxArguments,
+        prepared.modifiers,
+        std::move(prepared.evaluationOrder),
         variableExpression(*thisVariable, diagSpan),
         callSpan,
         "base constructor argument",
@@ -1746,6 +2073,13 @@ std::unique_ptr<BoundExpression> Binder::bindLiteralExpression(
 
 std::unique_ptr<BoundExpression> Binder::bindThisExpression(
     const syntax::ThisExpressionSyntax& syntaxTree) {
+    if (bindingConstructorInitializer_) {
+        diagnostics_.report(
+            "RS2536",
+            "keyword 'this' is not available in a constructor initializer",
+            syntaxTree.span());
+        return makeError(syntaxTree.span());
+    }
     const auto* variable = lookupVariable("this");
     if (!variable || currentStaticMethod_) {
         diagnostics_.report("RS2470", "'this' is not available in a static context", syntaxTree.span());
@@ -1765,6 +2099,13 @@ std::unique_ptr<BoundExpression> Binder::bindThisExpression(
 
 std::unique_ptr<BoundExpression> Binder::bindBaseExpression(
     const syntax::BaseExpressionSyntax& syntaxTree) {
+    if (bindingConstructorInitializer_) {
+        diagnostics_.report(
+            "RS2536",
+            "keyword 'base' is not available in a constructor initializer",
+            syntaxTree.span());
+        return makeError(syntaxTree.span());
+    }
     const auto* variable = lookupVariable("this");
     if (!variable || currentStaticMethod_ || !currentOwnerType_ ||
         currentOwnerType_->baseTypeName.empty()) {
@@ -1883,6 +2224,14 @@ std::unique_ptr<BoundExpression> Binder::bindNameExpression(
                         *currentOwnerType_, *field);
                 }
                 return result;
+            }
+            if (bindingConstructorInitializer_ && !currentOwnerType_->synthetic) {
+                diagnostics_.report(
+                    "RS2536",
+                    "cannot access instance field '" + field->name +
+                        "' in constructor initializer",
+                    syntaxTree.identifierToken.span);
+                return makeError(syntaxTree.span());
             }
             if (currentStaticMethod_ || !thisVariable) {
                 diagnostics_.report(
@@ -2055,6 +2404,22 @@ std::unique_ptr<BoundExpression> Binder::bindNameExpression(
                     return result;
                 }
                 if (!outerProperty->staticProperty && outerProperty->getter) {
+                    if (bindingConstructorInitializer_) {
+                        diagnostics_.report(
+                            "RS2536",
+                            "cannot access instance property '" + outerProperty->name +
+                                "' in constructor initializer",
+                            syntaxTree.identifierToken.span);
+                        return makeError(syntaxTree.span());
+                    }
+                    if (!findField(*currentOwnerType_, "this")) {
+                        diagnostics_.report(
+                            "RS2484",
+                            "instance property '" + outerProperty->name +
+                                "' requires a value receiver",
+                            syntaxTree.identifierToken.span);
+                        return makeError(syntaxTree.span());
+                    }
                     auto [capturedReceiver, resolvedOwner] = buildUnwrappedCapturedThis(
                         *thisVariable, *currentOwnerType_, visibleTypes_, syntaxTree.span());
                     (void)resolvedOwner;
@@ -2103,6 +2468,14 @@ std::unique_ptr<BoundExpression> Binder::bindNameExpression(
                     return result;
                 }
             } else if (!currentStaticMethod_ && thisVariable && property->getter) {
+                if (bindingConstructorInitializer_) {
+                    diagnostics_.report(
+                        "RS2536",
+                        "cannot access instance property '" + property->name +
+                            "' in constructor initializer",
+                        syntaxTree.identifierToken.span);
+                    return makeError(syntaxTree.span());
+                }
                 auto result = std::make_unique<BoundCallExpression>();
                 result->span = syntaxTree.span();
                 result->type = property->type;
@@ -3010,6 +3383,14 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                 result->expression = std::move(value);
                 return result;
             }
+            if (bindingConstructorInitializer_ && !currentOwnerType_->synthetic) {
+                diagnostics_.report(
+                    "RS2536",
+                    "cannot access instance field '" + field->name +
+                        "' in constructor initializer",
+                    syntaxTree.identifierToken.span);
+                return makeError(syntaxTree.span());
+            }
             if (currentStaticMethod_ || !thisVariable) {
                 diagnostics_.report(
                     "RS2484",
@@ -3219,6 +3600,22 @@ std::unique_ptr<BoundExpression> Binder::bindAssignmentExpression(
                     result->staticConstructor = findStaticConstructorForFunction(
                         visibleTypes_, *outerProperty->setter);
                 } else {
+                    if (bindingConstructorInitializer_) {
+                        diagnostics_.report(
+                            "RS2536",
+                            "cannot access instance property '" + outerProperty->name +
+                                "' in constructor initializer",
+                            syntaxTree.identifierToken.span);
+                        return makeError(syntaxTree.span());
+                    }
+                    if (!findField(*currentOwnerType_, "this")) {
+                        diagnostics_.report(
+                            "RS2484",
+                            "instance property '" + outerProperty->name +
+                                "' requires a value receiver",
+                            syntaxTree.identifierToken.span);
+                        return makeError(syntaxTree.span());
+                    }
                     auto [capturedReceiver, resolvedOwner] = buildUnwrappedCapturedThis(
                         *thisVariable, *currentOwnerType_, visibleTypes_, syntaxTree.span());
                     (void)resolvedOwner;
@@ -4150,9 +4547,12 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
         if (!currentStaticMethod_ && currentOwnerType_->synthetic) {
             const TypeSymbol* enclosingOwner = unwrapEnclosingOwner(&*currentOwnerType_, visibleTypes_);
             if (enclosingOwner && enclosingOwner != &*currentOwnerType_) {
-                for (const auto* method : findMethods(*enclosingOwner, syntaxTree.identifierToken.text, false)) {
-                    if (isMemberAccessible(method->accessibility, method->declaringTypeId, method->moduleName)) {
-                        targetCandidates.push_back(*method);
+                if (findField(*currentOwnerType_, "this") != nullptr ||
+                    bindingConstructorInitializer_) {
+                    for (const auto* method : findMethods(*enclosingOwner, syntaxTree.identifierToken.text, false)) {
+                        if (isMemberAccessible(method->accessibility, method->declaringTypeId, method->moduleName)) {
+                            targetCandidates.push_back(*method);
+                        }
                     }
                 }
                 for (const auto* method : findMethods(*enclosingOwner, syntaxTree.identifierToken.text, true)) {
@@ -4228,6 +4628,14 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
     if (currentOwnerType_ && !currentStaticMethod_) {
         for (const auto& event : currentOwnerType_->events) {
             if (event.name != syntaxTree.identifierToken.text) continue;
+            if (bindingConstructorInitializer_) {
+                diagnostics_.report(
+                    "RS2536",
+                    "cannot invoke instance event '" + event.name +
+                        "' in constructor initializer",
+                    syntaxTree.span());
+                return makeError(syntaxTree.span());
+            }
             auto result =
                 std::make_unique<BoundEventInvocationExpression>();
             result->span = syntaxTree.span();
@@ -4318,9 +4726,12 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
         if (!currentStaticMethod_ && currentOwnerType_->synthetic) {
             const TypeSymbol* enclosingOwner = unwrapEnclosingOwner(&*currentOwnerType_, visibleTypes_);
             if (enclosingOwner && enclosingOwner != &*currentOwnerType_) {
-                for (const auto* method : findMethods(*enclosingOwner, syntaxTree.identifierToken.text, false)) {
-                    if (isMemberAccessible(method->accessibility, method->declaringTypeId, method->moduleName)) {
-                        candidates.push_back(method);
+                if (findField(*currentOwnerType_, "this") != nullptr ||
+                    bindingConstructorInitializer_) {
+                    for (const auto* method : findMethods(*enclosingOwner, syntaxTree.identifierToken.text, false)) {
+                        if (isMemberAccessible(method->accessibility, method->declaringTypeId, method->moduleName)) {
+                            candidates.push_back(method);
+                        }
                     }
                 }
                 for (const auto* method : findMethods(*enclosingOwner, syntaxTree.identifierToken.text, true)) {
@@ -4365,11 +4776,26 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
 
     std::unique_ptr<BoundExpression> receiver;
     if (best->method && !best->staticMethod) {
+        if (bindingConstructorInitializer_) {
+            diagnostics_.report(
+                "RS2536",
+                "cannot call instance method '" + best->name +
+                    "' in constructor initializer",
+                syntaxTree.span());
+            return makeError(syntaxTree.span());
+        }
         const auto* thisVariable = lookupVariable("this");
         if (!thisVariable) return makeError(syntaxTree.span());
         if (currentOwnerType_ && currentOwnerType_->synthetic &&
             best->declaringTypeId != currentOwnerType_->id) {
-            if (!findField(*currentOwnerType_, "this")) return makeError(syntaxTree.span());
+            if (!findField(*currentOwnerType_, "this")) {
+                diagnostics_.report(
+                    "RS2484",
+                    "instance method '" + best->name +
+                        "' requires a value receiver",
+                    syntaxTree.span());
+                return makeError(syntaxTree.span());
+            }
             auto [capturedReceiver, resolvedOwner] = buildUnwrappedCapturedThis(
                 *thisVariable, *currentOwnerType_, visibleTypes_, syntaxTree.span());
             (void)resolvedOwner;
@@ -4882,8 +5308,8 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
         }
     }
 
-    auto methods = findMethods(
-        owner, syntaxTree.nameToken.text, staticCall);
+    auto methods = collectInterfaceAndBaseMethods(
+        owner, syntaxTree.nameToken.text, staticCall, visibleTypes_);
     methods.erase(
         std::remove_if(
             methods.begin(), methods.end(),
@@ -4981,7 +5407,8 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
                     arguments.push_back(bindExpression(argSyntax));
                 }
             }
-            methods = findMethods(owner, syntaxTree.nameToken.text, staticCall);
+            methods = collectInterfaceAndBaseMethods(
+                owner, syntaxTree.nameToken.text, staticCall, visibleTypes_);
             methods.erase(
                 std::remove_if(
                     methods.begin(),

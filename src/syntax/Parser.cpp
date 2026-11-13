@@ -345,6 +345,7 @@ void Parser::parseGenericConstraintClauses(
         while (current().kind != SyntaxKind::EndOfFileToken &&
                current().kind != SyntaxKind::OpenBraceToken &&
                current().kind != SyntaxKind::SemicolonToken &&
+               current().kind != SyntaxKind::ArrowToken &&
                !(current().kind == SyntaxKind::IdentifierToken &&
                  current().text == "where")) {
             clause.constraints.push_back(nextToken());
@@ -570,7 +571,11 @@ ConstructorDeclarationSyntax Parser::parseConstructorDeclaration(
     result.closeParenToken = match(SyntaxKind::CloseParenToken);
     if (current().kind == SyntaxKind::ColonToken) {
         result.initializerColonToken = nextToken();
-        result.baseKeyword = match(SyntaxKind::BaseKeyword);
+        if (current().kind == SyntaxKind::ThisKeyword) {
+            result.thisKeyword = nextToken();
+        } else {
+            result.baseKeyword = match(SyntaxKind::BaseKeyword);
+        }
         result.initializerOpenParenToken = match(SyntaxKind::OpenParenToken);
         SyntaxToken close;
         parseArgumentList(
@@ -578,7 +583,25 @@ ConstructorDeclarationSyntax Parser::parseConstructorDeclaration(
             result.baseArgumentCommaTokens, close);
         result.initializerCloseParenToken = std::move(close);
     }
-    result.body = parseBlockStatement();
+    if (current().kind == SyntaxKind::ArrowToken) {
+        const auto arrow = nextToken();
+        BlockStatementSyntax block;
+        block.openBraceToken = {SyntaxKind::OpenBraceToken, arrow.span, "{", {}, true};
+        if (current().kind == SyntaxKind::ThrowKeyword) {
+            auto thr = parseThrowStatement();
+            block.closeBraceToken = {SyntaxKind::CloseBraceToken, thr->span(), "}", {}, true};
+            block.statements.push_back(std::move(thr));
+        } else {
+            auto exprStmt = std::make_unique<ExpressionStatementSyntax>();
+            exprStmt->expression = parseExpression();
+            exprStmt->semicolonToken = match(SyntaxKind::SemicolonToken);
+            block.closeBraceToken = {SyntaxKind::CloseBraceToken, exprStmt->semicolonToken.span, "}", {}, true};
+            block.statements.push_back(std::move(exprStmt));
+        }
+        result.body = std::move(block);
+    } else {
+        result.body = parseBlockStatement();
+    }
     return result;
 }
 
@@ -592,6 +615,32 @@ AccessorDeclarationSyntax Parser::parseAccessorDeclaration() {
     }
     if (current().kind == SyntaxKind::SemicolonToken) {
         result.semicolonToken = nextToken();
+    } else if (current().kind == SyntaxKind::ArrowToken) {
+        const auto arrow = nextToken();
+        auto block = std::make_unique<BlockStatementSyntax>();
+        block->openBraceToken = {SyntaxKind::OpenBraceToken, arrow.span, "{", {}, true};
+        if (current().kind == SyntaxKind::ThrowKeyword) {
+            auto thr = parseThrowStatement();
+            block->closeBraceToken = {SyntaxKind::CloseBraceToken, thr->span(), "}", {}, true};
+            block->statements.push_back(std::move(thr));
+        } else if (result.keyword.kind == SyntaxKind::GetKeyword) {
+            auto retStmt = std::make_unique<ReturnStatementSyntax>();
+            retStmt->returnKeyword = {SyntaxKind::ReturnKeyword, arrow.span, "return", {}, true};
+            if (current().kind == SyntaxKind::RefKeyword) {
+                retStmt->refKeyword = nextToken();
+            }
+            retStmt->expression = parseExpression();
+            retStmt->semicolonToken = match(SyntaxKind::SemicolonToken);
+            block->closeBraceToken = {SyntaxKind::CloseBraceToken, retStmt->semicolonToken.span, "}", {}, true};
+            block->statements.push_back(std::move(retStmt));
+        } else {
+            auto exprStmt = std::make_unique<ExpressionStatementSyntax>();
+            exprStmt->expression = parseExpression();
+            exprStmt->semicolonToken = match(SyntaxKind::SemicolonToken);
+            block->closeBraceToken = {SyntaxKind::CloseBraceToken, exprStmt->semicolonToken.span, "}", {}, true};
+            block->statements.push_back(std::move(exprStmt));
+        }
+        result.body = std::move(block);
     } else {
         result.body = std::make_unique<BlockStatementSyntax>(parseBlockStatement());
     }
@@ -609,6 +658,37 @@ PropertyDeclarationSyntax Parser::parsePropertyDeclaration(
     result.staticKeyword = findModifier(result.modifiers, SyntaxKind::StaticKeyword);
     result.type = std::move(type);
     result.identifierToken = std::move(identifier);
+    if (current().kind == SyntaxKind::ArrowToken) {
+        const auto arrow = nextToken();
+        auto accessor = std::make_unique<AccessorDeclarationSyntax>();
+        accessor->keyword = {SyntaxKind::GetKeyword, arrow.span, "get", {}, true};
+        auto block = std::make_unique<BlockStatementSyntax>();
+        block->openBraceToken = {SyntaxKind::OpenBraceToken, arrow.span, "{", {}, true};
+        SyntaxToken endToken = arrow;
+        if (current().kind == SyntaxKind::ThrowKeyword) {
+            auto thr = parseThrowStatement();
+            endToken = {SyntaxKind::SemicolonToken, thr->span(), ";", {}, true};
+            block->closeBraceToken = {SyntaxKind::CloseBraceToken, thr->span(), "}", {}, true};
+            block->statements.push_back(std::move(thr));
+        } else {
+            auto retStmt = std::make_unique<ReturnStatementSyntax>();
+            retStmt->returnKeyword = {SyntaxKind::ReturnKeyword, arrow.span, "return", {}, true};
+            if (current().kind == SyntaxKind::RefKeyword) {
+                retStmt->refKeyword = nextToken();
+            }
+            retStmt->expression = parseExpression();
+            retStmt->semicolonToken = match(SyntaxKind::SemicolonToken);
+            endToken = retStmt->semicolonToken;
+            block->closeBraceToken = {SyntaxKind::CloseBraceToken, endToken.span, "}", {}, true};
+            block->statements.push_back(std::move(retStmt));
+        }
+        accessor->body = std::move(block);
+        result.openBraceToken = {SyntaxKind::OpenBraceToken, arrow.span, "{", {}, true};
+        result.closeBraceToken = {SyntaxKind::CloseBraceToken, endToken.span, "}", {}, true};
+        result.semicolonToken = endToken;
+        result.getter = std::move(accessor);
+        return result;
+    }
     result.openBraceToken = match(SyntaxKind::OpenBraceToken);
     while (current().kind != SyntaxKind::CloseBraceToken &&
            current().kind != SyntaxKind::EndOfFileToken) {
@@ -678,6 +758,35 @@ FunctionDeclarationSyntax Parser::parseFunctionDeclaration(
     parseGenericConstraintClauses(result.constraints);
     if (current().kind == SyntaxKind::SemicolonToken) {
         result.semicolonToken = nextToken();
+    } else if (current().kind == SyntaxKind::ArrowToken) {
+        const auto arrow = nextToken();
+        BlockStatementSyntax block;
+        block.openBraceToken = {SyntaxKind::OpenBraceToken, arrow.span, "{", {}, true};
+        const bool isVoidReturn =
+            result.returnType.name.kind == SyntaxKind::VoidKeyword &&
+            !result.returnType.isArray();
+        if (current().kind == SyntaxKind::ThrowKeyword) {
+            auto thr = parseThrowStatement();
+            block.closeBraceToken = {SyntaxKind::CloseBraceToken, thr->span(), "}", {}, true};
+            block.statements.push_back(std::move(thr));
+        } else if (isVoidReturn) {
+            auto exprStmt = std::make_unique<ExpressionStatementSyntax>();
+            exprStmt->expression = parseExpression();
+            exprStmt->semicolonToken = match(SyntaxKind::SemicolonToken);
+            block.closeBraceToken = {SyntaxKind::CloseBraceToken, exprStmt->semicolonToken.span, "}", {}, true};
+            block.statements.push_back(std::move(exprStmt));
+        } else {
+            auto retStmt = std::make_unique<ReturnStatementSyntax>();
+            retStmt->returnKeyword = {SyntaxKind::ReturnKeyword, arrow.span, "return", {}, true};
+            if (current().kind == SyntaxKind::RefKeyword) {
+                retStmt->refKeyword = nextToken();
+            }
+            retStmt->expression = parseExpression();
+            retStmt->semicolonToken = match(SyntaxKind::SemicolonToken);
+            block.closeBraceToken = {SyntaxKind::CloseBraceToken, retStmt->semicolonToken.span, "}", {}, true};
+            block.statements.push_back(std::move(retStmt));
+        }
+        result.body = std::move(block);
     } else {
         result.body = parseBlockStatement();
     }
@@ -918,7 +1027,8 @@ ClassDeclarationSyntax Parser::parseClassDeclaration(
                         std::move(identifier), std::move(memberAttributes));
                     method.refReturnKeyword = refReturnKeyword;
                     result.methods.push_back(std::move(method));
-                } else if (current().kind == SyntaxKind::OpenBraceToken) {
+                } else if (current().kind == SyntaxKind::OpenBraceToken ||
+                           current().kind == SyntaxKind::ArrowToken) {
                     result.properties.push_back(parsePropertyDeclaration(
                         std::move(memberModifiers), std::move(type),
                         std::move(identifier), std::move(memberAttributes)));
@@ -1172,7 +1282,8 @@ StructDeclarationSyntax Parser::parseStructDeclaration(
                         std::move(identifier), std::move(memberAttributes));
                     method.refReturnKeyword = refReturnKeyword;
                     result.methods.push_back(std::move(method));
-                } else if (current().kind == SyntaxKind::OpenBraceToken) {
+                } else if (current().kind == SyntaxKind::OpenBraceToken ||
+                           current().kind == SyntaxKind::ArrowToken) {
                     result.properties.push_back(parsePropertyDeclaration(
                         std::move(memberModifiers), std::move(type),
                         std::move(identifier), std::move(memberAttributes)));
@@ -1240,6 +1351,10 @@ InterfaceDeclarationSyntax Parser::parseInterfaceDeclaration(
         result.typeParameters,
         result.typeParameterCommaTokens,
         result.typeParameterGreaterToken);
+    parseInterfaceList(
+        result.colonToken,
+        result.interfaces,
+        result.interfaceCommaTokens);
     parseGenericConstraintClauses(result.constraints);
     result.openBraceToken = match(SyntaxKind::OpenBraceToken);
     while (current().kind != SyntaxKind::CloseBraceToken &&
@@ -1391,18 +1506,18 @@ std::unique_ptr<StatementSyntax> Parser::parseStatement() {
             SyntaxKind::CloseBraceToken, closeParen.span, "}", {}, false};
         return outerBlock;
     }
-    if (current().kind == SyntaxKind::IdentifierToken &&
-        (peek(1).kind == SyntaxKind::PlusEqualsToken ||
-         peek(1).kind == SyntaxKind::MinusEqualsToken)) {
-        return parseEventSubscriptionStatement();
-    }
-    if ((current().kind == SyntaxKind::IdentifierToken ||
-         current().kind == SyntaxKind::ThisKeyword) &&
-        peek(1).kind == SyntaxKind::DotToken &&
-        peek(2).kind == SyntaxKind::IdentifierToken &&
-        (peek(3).kind == SyntaxKind::PlusEqualsToken ||
-         peek(3).kind == SyntaxKind::MinusEqualsToken)) {
-        return parseEventSubscriptionStatement();
+    if (current().kind == SyntaxKind::IdentifierToken ||
+        current().kind == SyntaxKind::ThisKeyword) {
+        std::size_t off = 1;
+        while (peek(off).kind == SyntaxKind::DotToken &&
+               peek(off + 1).kind == SyntaxKind::IdentifierToken) {
+            off += 2;
+        }
+        if ((off > 1 || current().kind == SyntaxKind::IdentifierToken) &&
+            (peek(off).kind == SyntaxKind::PlusEqualsToken ||
+             peek(off).kind == SyntaxKind::MinusEqualsToken)) {
+            return parseEventSubscriptionStatement();
+        }
     }
     switch (current().kind) {
     case SyntaxKind::ReturnKeyword:
@@ -1682,9 +1797,13 @@ std::unique_ptr<StatementSyntax> Parser::parseYieldStatement() {
 }
 
 std::unique_ptr<ExpressionSyntax> Parser::parseEventHandler() {
+    if (!isLambdaExpressionStart()) {
+        return parseExpression();
+    }
     auto lambda = std::make_unique<LambdaExpressionSyntax>();
     if (current().kind == SyntaxKind::IdentifierToken &&
         peek(1).kind == SyntaxKind::ArrowToken) {
+        lambda->parameterTypes.push_back(std::nullopt);
         lambda->parameterTokens.push_back(nextToken());
         lambda->arrowToken = nextToken();
         if (current().kind == SyntaxKind::OpenBraceToken) {
@@ -1696,13 +1815,23 @@ std::unique_ptr<ExpressionSyntax> Parser::parseEventHandler() {
     }
     if (current().kind == SyntaxKind::OpenParenToken) {
         lambda->openParenToken = nextToken();
-        if (current().kind != SyntaxKind::CloseParenToken) {
-            lambda->parameterTokens.push_back(
-                match(SyntaxKind::IdentifierToken));
+        const auto parseLambdaParam = [&]() {
+            if (current().kind == SyntaxKind::IdentifierToken &&
+                (peek(1).kind == SyntaxKind::CommaToken ||
+                 peek(1).kind == SyntaxKind::CloseParenToken)) {
+                lambda->parameterTypes.push_back(std::nullopt);
+                lambda->parameterTokens.push_back(nextToken());
+            } else {
+                lambda->parameterTypes.push_back(parseType());
+                lambda->parameterTokens.push_back(match(SyntaxKind::IdentifierToken));
+            }
+        };
+        if (current().kind != SyntaxKind::CloseParenToken &&
+            current().kind != SyntaxKind::EndOfFileToken) {
+            parseLambdaParam();
             while (current().kind == SyntaxKind::CommaToken) {
                 lambda->commaTokens.push_back(nextToken());
-                lambda->parameterTokens.push_back(
-                    match(SyntaxKind::IdentifierToken));
+                parseLambdaParam();
             }
         }
         lambda->closeParenToken = match(SyntaxKind::CloseParenToken);
@@ -1722,16 +1851,27 @@ Parser::parseEventSubscriptionStatement() {
     auto result =
         std::make_unique<EventSubscriptionStatementSyntax>();
     if (peek(1).kind == SyntaxKind::DotToken) {
+        std::unique_ptr<ExpressionSyntax> recv;
         if (current().kind == SyntaxKind::ThisKeyword) {
             auto receiver = std::make_unique<ThisExpressionSyntax>();
             receiver->thisKeyword = nextToken();
-            result->receiver = std::move(receiver);
+            recv = std::move(receiver);
         } else {
             auto receiver = std::make_unique<NameExpressionSyntax>();
             receiver->identifierToken = match(
                 SyntaxKind::IdentifierToken);
-            result->receiver = std::move(receiver);
+            recv = std::move(receiver);
         }
+        while (current().kind == SyntaxKind::DotToken &&
+               peek(1).kind == SyntaxKind::IdentifierToken &&
+               peek(2).kind == SyntaxKind::DotToken) {
+            auto ma = std::make_unique<MemberAccessExpressionSyntax>();
+            ma->receiver = std::move(recv);
+            ma->dotToken = nextToken();
+            ma->nameToken = nextToken();
+            recv = std::move(ma);
+        }
+        result->receiver = std::move(recv);
         result->dotToken = match(SyntaxKind::DotToken);
     }
     result->eventNameToken = match(SyntaxKind::IdentifierToken);
@@ -1752,22 +1892,64 @@ bool Parser::isLambdaExpressionStart() const noexcept {
         return true;
     }
     if (current().kind != SyntaxKind::OpenParenToken) return false;
+    if (peek(1).kind == SyntaxKind::CloseParenToken) {
+        return peek(2).kind == SyntaxKind::ArrowToken;
+    }
+    const auto skipLambdaType = [&](std::size_t& off) noexcept -> bool {
+        const auto k = peek(off).kind;
+        if (!isIdentifierLike(k) || k == SyntaxKind::VoidKeyword) return false;
+        ++off;
+        if (peek(off).kind == SyntaxKind::LessToken) {
+            int depth = 0;
+            while (position_ + off < tokens_.size()) {
+                const auto gk = peek(off).kind;
+                if (gk == SyntaxKind::LessToken) {
+                    ++depth;
+                } else if (gk == SyntaxKind::GreaterToken) {
+                    --depth;
+                    if (depth == 0) {
+                        ++off;
+                        break;
+                    }
+                } else if (isIdentifierLike(gk) ||
+                           gk == SyntaxKind::CommaToken ||
+                           gk == SyntaxKind::QuestionToken ||
+                           gk == SyntaxKind::OpenBracketToken ||
+                           gk == SyntaxKind::CloseBracketToken) {
+                } else {
+                    return false;
+                }
+                ++off;
+            }
+            if (depth != 0) return false;
+        }
+        if (peek(off).kind == SyntaxKind::QuestionToken) ++off;
+        if (peek(off).kind == SyntaxKind::OpenBracketToken &&
+            peek(off + 1).kind == SyntaxKind::CloseBracketToken) {
+            off += 2;
+        }
+        return true;
+    };
     std::size_t offset = 1;
-    bool expectParameter = true;
     while (position_ + offset < tokens_.size()) {
-        const auto kind = peek(offset).kind;
-        if (kind == SyntaxKind::CloseParenToken) {
-            return peek(offset + 1).kind == SyntaxKind::ArrowToken &&
-                (expectParameter || offset > 1);
-        }
-        if (expectParameter) {
-            if (kind != SyntaxKind::IdentifierToken) return false;
-            expectParameter = false;
+        if (peek(offset).kind == SyntaxKind::IdentifierToken &&
+            (peek(offset + 1).kind == SyntaxKind::CommaToken ||
+             peek(offset + 1).kind == SyntaxKind::CloseParenToken)) {
+            ++offset;
         } else {
-            if (kind != SyntaxKind::CommaToken) return false;
-            expectParameter = true;
+            if (!skipLambdaType(offset)) return false;
+            if (peek(offset).kind != SyntaxKind::IdentifierToken) return false;
+            ++offset;
         }
-        ++offset;
+        if (peek(offset).kind == SyntaxKind::CommaToken) {
+            ++offset;
+            if (peek(offset).kind == SyntaxKind::CloseParenToken) return false;
+            continue;
+        }
+        if (peek(offset).kind == SyntaxKind::CloseParenToken) {
+            return peek(offset + 1).kind == SyntaxKind::ArrowToken;
+        }
+        return false;
     }
     return false;
 }
@@ -2275,7 +2457,11 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
     case SyntaxKind::InterpolatedStringToken: {
         const auto token = nextToken();
         const std::string_view raw(token.text);
-        const std::size_t end = (raw.size() >= 3 && raw.back() == '"')
+        const bool isVerbatim = raw.size() >= 4 &&
+            ((raw[0] == '$' && raw[1] == '@' && raw[2] == '"') ||
+             (raw[0] == '@' && raw[1] == '$' && raw[2] == '"'));
+        const std::size_t prefixLen = isVerbatim ? 3 : 2;
+        const std::size_t end = (raw.size() >= prefixLen + 1 && raw.back() == '"')
             ? raw.size() - 1
             : raw.size();
         auto makeStringLiteral = [&](std::string val, text::TextSpan span)
@@ -2304,11 +2490,17 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
         std::unique_ptr<ExpressionSyntax> root;
         std::string currentText;
         std::size_t segmentStart = token.span.start;
-        std::size_t i = raw.size() >= 2 ? 2 : raw.size();
+        std::size_t i = raw.size() >= prefixLen ? prefixLen : raw.size();
         bool hasHole = false;
 
         while (i < end) {
-            if (raw[i] == '\\' && i + 1 < end) {
+            if (isVerbatim) {
+                if (raw[i] == '"' && i + 1 < end && raw[i + 1] == '"') {
+                    currentText.push_back('"');
+                    i += 2;
+                    continue;
+                }
+            } else if (raw[i] == '\\' && i + 1 < end) {
                 const char esc = raw[i + 1];
                 switch (esc) {
                 case 'n': currentText.push_back('\n'); break;
@@ -2348,7 +2540,7 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
 
                 const std::size_t exprStart = i + 1;
                 std::size_t j = exprStart;
-                enum class HoleModeKind { InterpText, InterpHole, NormalString };
+                enum class HoleModeKind { InterpText, VerbatimInterpText, InterpHole, NormalString, VerbatimString };
                 struct HoleMode {
                     HoleModeKind kind;
                     int braceDepth = 0;
@@ -2356,13 +2548,46 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
                 std::vector<HoleMode> modeStack{{HoleModeKind::InterpHole, 1}};
                 while (j < end && !modeStack.empty()) {
                     const auto mode = modeStack.back().kind;
-                    if (mode == HoleModeKind::NormalString) {
+                    if (mode == HoleModeKind::VerbatimString) {
+                        if (raw[j] == '"') {
+                            if (j + 1 < end && raw[j + 1] == '"') {
+                                j += 2;
+                                continue;
+                            }
+                            modeStack.pop_back();
+                        }
+                        ++j;
+                    } else if (mode == HoleModeKind::NormalString) {
                         if (raw[j] == '\\' && j + 1 < end) {
                             j += 2;
                             continue;
                         }
                         if (raw[j] == '"') {
                             modeStack.pop_back();
+                        }
+                        ++j;
+                    } else if (mode == HoleModeKind::VerbatimInterpText) {
+                        if (raw[j] == '"') {
+                            if (j + 1 < end && raw[j + 1] == '"') {
+                                j += 2;
+                                continue;
+                            }
+                            modeStack.pop_back();
+                            ++j;
+                            continue;
+                        }
+                        if (raw[j] == '{') {
+                            if (j + 1 < end && raw[j + 1] == '{') {
+                                j += 2;
+                                continue;
+                            }
+                            modeStack.push_back({HoleModeKind::InterpHole, 1});
+                            ++j;
+                            continue;
+                        }
+                        if (raw[j] == '}' && j + 1 < end && raw[j + 1] == '}') {
+                            j += 2;
+                            continue;
                         }
                         ++j;
                     } else if (mode == HoleModeKind::InterpText) {
@@ -2390,8 +2615,20 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
                         }
                         ++j;
                     } else {
+                        if (j + 2 < end &&
+                            ((raw[j] == '$' && raw[j + 1] == '@' && raw[j + 2] == '"') ||
+                             (raw[j] == '@' && raw[j + 1] == '$' && raw[j + 2] == '"'))) {
+                            modeStack.push_back({HoleModeKind::VerbatimInterpText, 0});
+                            j += 3;
+                            continue;
+                        }
                         if (raw[j] == '$' && j + 1 < end && raw[j + 1] == '"') {
                             modeStack.push_back({HoleModeKind::InterpText, 0});
+                            j += 2;
+                            continue;
+                        }
+                        if (raw[j] == '@' && j + 1 < end && raw[j + 1] == '"') {
+                            modeStack.push_back({HoleModeKind::VerbatimString, 0});
                             j += 2;
                             continue;
                         }

@@ -75,6 +75,7 @@ bool sameType(const semantic::TypeSymbol& left, const semantic::TypeSymbol& righ
     if (left.id != right.id || left.kind != right.kind ||
         left.baseTypeId != right.baseTypeId ||
         left.baseTypeName != right.baseTypeName ||
+        left.baseInterfaceNames != right.baseInterfaceNames ||
         left.moduleName != right.moduleName || left.name != right.name ||
         left.abstractType != right.abstractType ||
         left.sealedType != right.sealedType ||

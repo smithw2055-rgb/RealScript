@@ -45,6 +45,8 @@ struct InterfaceContract {
     std::string name;
     std::string sourceName;
     text::TextSpan declarationSpan;
+    std::vector<std::string> baseInterfaces;
+    std::vector<text::TextSpan> baseInterfaceSpans;
     std::vector<InterfaceMethodContract> methods;
 };
 
@@ -3059,6 +3061,10 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 descriptor->methods[slotOrder[slot].second].interfaceSlot =
                     static_cast<std::uint32_t>(slot);
             }
+            for (const auto& baseIface : input.syntax->interfaces) {
+                contract.baseInterfaces.push_back(baseIface.name.text);
+                contract.baseInterfaceSpans.push_back(baseIface.span());
+            }
             module.interfaces[contract.name] = std::move(contract);
         }
     }
@@ -3066,6 +3072,84 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         (void)name;
         if (module.frontendCached) continue;
         refreshVisibleInterfaces(modules, module);
+    }
+    for (auto& [moduleName, module] : modules) {
+        (void)moduleName;
+        if (module.frontendCached) continue;
+        for (auto& [ifaceName, contract] : module.interfaces) {
+            (void)ifaceName;
+            auto* descriptor = findOwnType(module, contract.name);
+            if (!descriptor || !descriptor->interfaceType) continue;
+            std::vector<std::string> resolvedBases;
+            std::unordered_set<std::string> seenBases;
+            for (std::size_t bi = 0; bi < contract.baseInterfaces.size(); ++bi) {
+                const auto& rawBase = contract.baseInterfaces[bi];
+                const auto baseSpan = bi < contract.baseInterfaceSpans.size()
+                    ? contract.baseInterfaceSpans[bi]
+                    : contract.declarationSpan;
+                const auto foundBase = module.visibleInterfaces.find(rawBase);
+                if (foundBase == module.visibleInterfaces.end()) {
+                    result.diagnostics.report(
+                        "RS2473",
+                        "unknown interface '" + rawBase + "'",
+                        baseSpan,
+                        diagnostics::DiagnosticSeverity::Error,
+                        contract.sourceName);
+                    module.invalid = true;
+                    continue;
+                }
+                const auto canonicalBase = canonicalInterfaceName(
+                    foundBase->second.moduleName, foundBase->second.name);
+                if (!seenBases.insert(canonicalBase).second) {
+                    continue;
+                }
+                resolvedBases.push_back(canonicalBase);
+            }
+            contract.baseInterfaces = resolvedBases;
+            descriptor->baseInterfaceNames = resolvedBases;
+        }
+    }
+    for (auto& [name, module] : modules) {
+        (void)name;
+        if (module.frontendCached) continue;
+        refreshVisibleInterfaces(modules, module);
+    }
+    for (auto& [moduleName, module] : modules) {
+        (void)moduleName;
+        if (module.frontendCached) continue;
+        for (const auto& [ifaceName, contract] : module.interfaces) {
+            (void)ifaceName;
+            const auto selfCanon = canonicalInterfaceName(contract.moduleName, contract.name);
+            std::unordered_set<std::string> visiting;
+            std::unordered_set<std::string> visited;
+            std::function<bool(const InterfaceContract&)> hasCycle =
+                [&](const InterfaceContract& cur) -> bool {
+                    const auto curCanon = canonicalInterfaceName(cur.moduleName, cur.name);
+                    if (!visiting.insert(curCanon).second) return true;
+                    if (visited.find(curCanon) != visited.end()) {
+                        visiting.erase(curCanon);
+                        return false;
+                    }
+                    for (const auto& bName : cur.baseInterfaces) {
+                        const auto it = module.visibleInterfaces.find(bName);
+                        if (it != module.visibleInterfaces.end() && hasCycle(it->second)) {
+                            return true;
+                        }
+                    }
+                    visiting.erase(curCanon);
+                    visited.insert(curCanon);
+                    return false;
+                };
+            if (hasCycle(contract)) {
+                result.diagnostics.report(
+                    "RS2476",
+                    "cyclic interface inheritance involving '" + selfCanon + "'",
+                    contract.declarationSpan,
+                    diagnostics::DiagnosticSeverity::Error,
+                    contract.sourceName);
+                module.invalid = true;
+            }
+        }
     }
     resolveClassInheritance(modules, result);
     for (auto& [name, module] : modules) {
@@ -5202,13 +5286,46 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 LanguageInterfaceImplementation implementation;
                 implementation.typeName =
                     semantic::canonicalTypeName(*owner);
-                std::unordered_set<std::string> implementedNames;
+                std::unordered_set<std::string> directImplementedNames;
+                std::unordered_set<std::string> allImplementedNames;
                 std::map<
                     semantic::SymbolId,
                     std::pair<
                         const InterfaceContract*,
                         const semantic::TypeSymbol*>>
                     runtimeContracts;
+
+                const auto registerInterfaceClosure =
+                    [&](auto& self,
+                        const InterfaceContract& ifaceContract,
+                        const text::TextSpan& reportSpan) -> void {
+                        const auto canon = canonicalInterfaceName(
+                            ifaceContract.moduleName, ifaceContract.name);
+                        if (!allImplementedNames.insert(canon).second) {
+                            return;
+                        }
+                        const auto ifaceTypeId = semantic::stableTypeId(canon);
+                        const auto* ifaceDesc = findInterfaceType(ifaceTypeId);
+                        if (!ifaceDesc) {
+                            result.diagnostics.report(
+                                "RS2531",
+                                "interface type descriptor '" +
+                                    canon + "' is unavailable",
+                                reportSpan,
+                                diagnostics::DiagnosticSeverity::Error,
+                                owner->sourceName);
+                            module.invalid = true;
+                            return;
+                        }
+                        runtimeContracts[ifaceTypeId] = {&ifaceContract, ifaceDesc};
+                        implementation.interfaces.push_back(canon);
+                        for (const auto& baseName : ifaceContract.baseInterfaces) {
+                            const auto baseFound = module.visibleInterfaces.find(baseName);
+                            if (baseFound != module.visibleInterfaces.end()) {
+                                self(self, baseFound->second, reportSpan);
+                            }
+                        }
+                    };
 
                 const auto inheritRuntimeContracts =
                     [&](const semantic::TypeSymbol& source) {
@@ -5264,7 +5381,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     const auto canonicalName = canonicalInterfaceName(
                         found->second.moduleName,
                         found->second.name);
-                    if (!implementedNames.insert(canonicalName).second) {
+                    if (!directImplementedNames.insert(canonicalName).second) {
                         result.diagnostics.report(
                             "RS2474",
                             "interface '" + canonicalName +
@@ -5275,24 +5392,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         module.invalid = true;
                         continue;
                     }
-                    const auto interfaceTypeId =
-                        semantic::stableTypeId(canonicalName);
-                    const auto* descriptor =
-                        findInterfaceType(interfaceTypeId);
-                    if (!descriptor) {
-                        result.diagnostics.report(
-                            "RS2531",
-                            "interface type descriptor '" +
-                                canonicalName + "' is unavailable",
-                            interfaceSyntax.span(),
-                            diagnostics::DiagnosticSeverity::Error,
-                            owner->sourceName);
-                        module.invalid = true;
-                        continue;
-                    }
-                    runtimeContracts[interfaceTypeId] = {
-                        &found->second, descriptor};
-                    implementation.interfaces.push_back(canonicalName);
+                    registerInterfaceClosure(
+                        registerInterfaceClosure, found->second, interfaceSyntax.span());
                 }
 
                 std::vector<semantic::InterfaceDispatchMap> dispatchMaps;

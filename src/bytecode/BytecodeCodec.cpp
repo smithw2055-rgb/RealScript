@@ -670,6 +670,9 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         strings.add(type.moduleName);
         strings.add(type.name);
         if (!type.baseTypeName.empty()) strings.add(type.baseTypeName);
+        for (const auto& bi : type.baseInterfaceNames) {
+            if (!bi.empty()) strings.add(bi);
+        }
         for (const auto& field : type.fields) {
             strings.add(field.declaringTypeName);
             strings.add(field.sourceName);
@@ -797,11 +800,19 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         if (type.sealedType) flags |= 0x08u;
         if (type.delegateType) flags |= 0x10u;
         if (type.staticType) flags |= 0x20u;
+        if (!type.baseInterfaceNames.empty()) flags |= 0x40u;
         objectModelSection.u8(flags);
         objectModelSection.u64(type.baseTypeId);
         objectModelSection.u32(type.baseTypeName.empty()
             ? InvalidIndex
             : strings.indexOf(type.baseTypeName));
+        if (!type.baseInterfaceNames.empty()) {
+            objectModelSection.u32(static_cast<std::uint32_t>(
+                type.baseInterfaceNames.size()));
+            for (const auto& bi : type.baseInterfaceNames) {
+                objectModelSection.u32(strings.indexOf(bi));
+            }
+        }
         objectModelSection.u32(static_cast<std::uint32_t>(type.fields.size()));
         for (const auto& field : type.fields) {
             objectModelSection.u8(static_cast<std::uint8_t>(
@@ -1500,7 +1511,7 @@ bool decodeModule(
             if (!reader.valid() ||
                 accessibility > static_cast<std::uint8_t>(
                     semantic::Accessibility::Private) ||
-                (flags & 0xc0u) != 0) {
+                (flags & 0x80u) != 0) {
                 diagnostics.report("RS5004", "invalid object-model type flags", {});
                 return false;
             }
@@ -1521,6 +1532,26 @@ bool decodeModule(
                     return false;
                 }
                 type.baseTypeName = strings[baseTypeNameIndex];
+            }
+            if ((flags & 0x40u) != 0) {
+                const auto baseIfaceCount = reader.u32();
+                if (!reader.valid() || baseIfaceCount > reader.remaining() / 4) {
+                    diagnostics.report(
+                        "RS5003", "truncated base interface list", {});
+                    return false;
+                }
+                type.baseInterfaceNames.reserve(baseIfaceCount);
+                for (std::uint32_t ifaceIndex = 0;
+                     ifaceIndex < baseIfaceCount;
+                     ++ifaceIndex) {
+                    const auto ifaceNameIndex = reader.u32();
+                    if (!validStringIndex(
+                            ifaceNameIndex, strings, diagnostics,
+                            "invalid base interface string index")) {
+                        return false;
+                    }
+                    type.baseInterfaceNames.push_back(strings[ifaceNameIndex]);
+                }
             }
 
             const auto fieldMetadataCount = reader.u32();

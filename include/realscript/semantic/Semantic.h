@@ -301,6 +301,8 @@ struct TypeSymbol {
     bool deterministic = false;
     SymbolId baseTypeId = 0;
     std::string baseTypeName;
+    std::vector<std::string> baseInterfaceNames;
+    std::string enclosingOwnerTypeName;
     std::string moduleName;
     std::string name;
     std::vector<FieldSymbol> fields;
@@ -459,6 +461,7 @@ struct FunctionBindingInput {
     bool sequenceCancellation = false;
     std::optional<FunctionSymbol> sequenceNextCallback;
     const syntax::LambdaExpressionSyntax* eventLambda = nullptr;
+    bool inConstructorInitializer = false;
 };
 
 struct ModuleBindingInput {
@@ -1331,7 +1334,14 @@ private:
     std::size_t breakableDepth_ = 0;
     bool checkedArithmetic_ = true;
     bool currentDeterministicContext_ = false;
+    bool bindingConstructorInitializer_ = false;
     std::unordered_set<SymbolId> bindingStaticFields_;
+    struct CtorDelegationEdge {
+        SymbolId targetCtor = 0;
+        text::TextSpan span{};
+        std::string ctorDisplayName;
+    };
+    std::unordered_map<SymbolId, CtorDelegationEdge> ctorThisEdges_;
 };
 
 } // namespace realscript::semantic

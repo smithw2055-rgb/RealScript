@@ -239,19 +239,50 @@ SyntaxToken Lexer::lexVerbatimString() {
 
 SyntaxToken Lexer::lexInterpolatedString() {
     const auto start = position_;
-    advance(2); // skip $"
+    const bool initialVerbatim =
+        (current() == '$' && peek(1) == '@' && peek(2) == '"') ||
+        (current() == '@' && peek(1) == '$' && peek(2) == '"');
+    advance(initialVerbatim ? 3 : 2);
     bool terminated = false;
 
-    enum class ModeKind { InterpText, InterpHole, NormalString };
+    enum class ModeKind { InterpText, VerbatimInterpText, InterpHole, NormalString, VerbatimString };
     struct Mode {
         ModeKind kind;
         int braceDepth = 0;
     };
-    std::vector<Mode> stack{{ModeKind::InterpText, 0}};
+    std::vector<Mode> stack{{initialVerbatim ? ModeKind::VerbatimInterpText : ModeKind::InterpText, 0}};
 
     while (current() != '\0' && !stack.empty()) {
         const auto mode = stack.back().kind;
-        if (mode == ModeKind::InterpText) {
+        if (mode == ModeKind::VerbatimInterpText) {
+            if (current() == '"') {
+                if (peek(1) == '"') {
+                    advance(2);
+                    continue;
+                }
+                advance();
+                stack.pop_back();
+                if (stack.empty()) {
+                    terminated = true;
+                    break;
+                }
+                continue;
+            }
+            if (current() == '{') {
+                if (peek(1) == '{') {
+                    advance(2);
+                    continue;
+                }
+                stack.push_back({ModeKind::InterpHole, 1});
+                advance();
+                continue;
+            }
+            if (current() == '}' && peek(1) == '}') {
+                advance(2);
+                continue;
+            }
+            advance();
+        } else if (mode == ModeKind::InterpText) {
             if (current() == '"') {
                 advance();
                 stack.pop_back();
@@ -293,6 +324,15 @@ SyntaxToken Lexer::lexInterpolatedString() {
                 continue;
             }
             advance();
+        } else if (mode == ModeKind::VerbatimString) {
+            if (current() == '"') {
+                if (peek(1) == '"') {
+                    advance(2);
+                    continue;
+                }
+                stack.pop_back();
+            }
+            advance();
         } else if (mode == ModeKind::NormalString) {
             if (current() == '\\' && peek(1) != '\0') {
                 advance(2);
@@ -303,9 +343,20 @@ SyntaxToken Lexer::lexInterpolatedString() {
             }
             advance();
         } else {
+            if ((current() == '$' && peek(1) == '@' && peek(2) == '"') ||
+                (current() == '@' && peek(1) == '$' && peek(2) == '"')) {
+                advance(3);
+                stack.push_back({ModeKind::VerbatimInterpText, 0});
+                continue;
+            }
             if (current() == '$' && peek(1) == '"') {
                 advance(2);
                 stack.push_back({ModeKind::InterpText, 0});
+                continue;
+            }
+            if (current() == '@' && peek(1) == '"') {
+                advance(2);
+                stack.push_back({ModeKind::VerbatimString, 0});
                 continue;
             }
             if (current() == '"') {
@@ -359,7 +410,9 @@ SyntaxToken Lexer::nextToken() {
     if (current() >= '0' && current() <= '9') {
         return lexNumber();
     }
-    if (current() == '$' && peek(1) == '"') {
+    if ((current() == '$' && peek(1) == '"') ||
+        (current() == '$' && peek(1) == '@' && peek(2) == '"') ||
+        (current() == '@' && peek(1) == '$' && peek(2) == '"')) {
         return lexInterpolatedString();
     }
     if (current() == '@' && peek(1) == '"') {

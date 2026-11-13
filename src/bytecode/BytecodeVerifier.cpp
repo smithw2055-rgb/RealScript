@@ -110,16 +110,36 @@ bool descriptorAssignable(
         const semantic::TypeSymbol*>& descriptors) noexcept {
     if (actual == expected) return true;
     std::unordered_set<semantic::SymbolId> visited;
+    std::vector<semantic::SymbolId> ifaceStack;
+    std::unordered_set<semantic::SymbolId> visitedIfaces;
     auto current = actual;
     while (current != 0 && visited.insert(current).second) {
         const auto found = descriptors.find(current);
-        if (found == descriptors.end()) return false;
+        if (found == descriptors.end()) break;
+        for (const auto& baseIfaceName : found->second->baseInterfaceNames) {
+            const auto baseIfaceId = semantic::stableTypeId(baseIfaceName);
+            if (baseIfaceId == expected) return true;
+            ifaceStack.push_back(baseIfaceId);
+        }
         for (const auto& interfaceMap :
              found->second->interfaceDispatchMaps) {
             if (interfaceMap.interfaceTypeId == expected) return true;
         }
         if (found->second->baseTypeId == expected) return true;
         current = found->second->baseTypeId;
+    }
+    while (!ifaceStack.empty()) {
+        const auto curIface = ifaceStack.back();
+        ifaceStack.pop_back();
+        if (curIface == expected) return true;
+        if (!visitedIfaces.insert(curIface).second) continue;
+        const auto foundIface = descriptors.find(curIface);
+        if (foundIface == descriptors.end()) continue;
+        for (const auto& baseIfaceName : foundIface->second->baseInterfaceNames) {
+            const auto baseIfaceId = semantic::stableTypeId(baseIfaceName);
+            if (baseIfaceId == expected) return true;
+            ifaceStack.push_back(baseIfaceId);
+        }
     }
     return false;
 }
